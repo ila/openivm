@@ -7,7 +7,7 @@ set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
-set(LPTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../lpts")
+set(LPTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lpts")
 include_directories(src/include ${LPTS_DIR}/src/include)
 
 set(EXTENSION_SOURCES

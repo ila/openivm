@@ -6,3 +6,6 @@
 	path = extension-ci-tools
 	url = https://github.com/duckdb/extension-ci-tools
 	branch = main
+[submodule "third_party/lpts"]
+	path = third_party/lpts
+	url = git@github.com:ila/lpts.git
