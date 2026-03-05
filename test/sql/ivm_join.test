@@ -268,3 +268,98 @@ query I
 SELECT count(*) FROM named_payments WHERE from_uid = 1 AND to_uid = 3 AND amount = 999;
 ----
 0
+
+# ==========================================
+# Test 12: 3-table join
+# ==========================================
+
+statement ok
+CREATE TABLE cities (city_id INT, city_name VARCHAR);
+
+statement ok
+INSERT INTO cities VALUES (1, 'Athens'), (2, 'Sparta'), (3, 'Thebes');
+
+statement ok
+CREATE TABLE god_cities (uid INT, city_id INT);
+
+statement ok
+INSERT INTO god_cities VALUES (1, 1), (2, 2), (3, 1), (5, 3);
+
+# MV: god name + city name (gods ⋈ god_cities ⋈ cities)
+statement ok
+CREATE TABLE god_locations AS
+    SELECT g.user_name, c.city_name
+    FROM gods g
+    INNER JOIN god_cities gc ON gc.uid = g.uid
+    INNER JOIN cities c ON c.city_id = gc.city_id;
+
+statement ok
+CREATE TABLE delta_god_locations AS SELECT *, true AS _duckdb_ivm_multiplicity FROM god_locations LIMIT 0;
+
+statement ok
+CREATE TABLE delta_cities AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM cities LIMIT 0;
+
+statement ok
+CREATE TABLE delta_god_cities AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM god_cities LIMIT 0;
+
+statement ok
+INSERT INTO _duckdb_ivm_views VALUES ('god_locations', 'select g.user_name, c.city_name from gods as g inner join god_cities as gc on gc.uid = g.uid inner join cities as c on c.city_id = gc.city_id', 2, now()::timestamp);
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('god_locations', 'delta_gods', '1970-01-01');
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('god_locations', 'delta_god_cities', '1970-01-01');
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('god_locations', 'delta_cities', '1970-01-01');
+
+# Verify initial state
+query II
+SELECT user_name, city_name FROM god_locations ORDER BY user_name;
+----
+Apollo	Athens
+Artemis	Sparta
+Dionysus	Athens
+Zeus	Thebes
+
+# Insert into middle table (god_cities)
+statement ok
+INSERT INTO god_cities VALUES (4, 2);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'god_locations');
+
+query II
+SELECT user_name, city_name FROM god_locations WHERE user_name = 'Poseidon';
+----
+Poseidon	Sparta
+
+# Insert into rightmost table (cities) + link table
+statement ok
+INSERT INTO cities VALUES (4, 'Corinth');
+
+statement ok
+INSERT INTO god_cities VALUES (1, 4);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'god_locations');
+
+query II
+SELECT user_name, city_name FROM god_locations WHERE user_name = 'Apollo' ORDER BY city_name;
+----
+Apollo	Athens
+Apollo	Corinth
+
+# Delete from middle table
+statement ok
+DELETE FROM god_cities WHERE uid = 4 AND city_id = 2;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'god_locations');
+
+query I
+SELECT count(*) FROM god_locations WHERE user_name = 'Poseidon';
+----
+0
+

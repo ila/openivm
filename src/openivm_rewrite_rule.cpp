@@ -26,49 +26,24 @@
 namespace {
 using duckdb::BoundColumnRefExpression;
 using duckdb::ColumnBinding;
+using duckdb::ColumnIndex;
+using duckdb::Connection;
+using duckdb::ConstantFilter;
 using duckdb::Expression;
+using duckdb::ExpressionType;
 using duckdb::JoinCondition;
 using duckdb::LogicalComparisonJoin;
+using duckdb::LogicalGet;
 using duckdb::LogicalOperator;
+using duckdb::LogicalProjection;
 using duckdb::LogicalType;
 using duckdb::make_uniq;
 using duckdb::unique_ptr;
 using duckdb::vector;
 
-#if OPENIVM_DEBUG
-void print_column_bindings(const unique_ptr<LogicalComparisonJoin> &join) {
-	const auto join_bindings = join->GetColumnBindings();
-	const auto lc_bindings = join->children[0]->GetColumnBindings();
-	const auto rc_bindings = join->children[1]->GetColumnBindings();
-	const size_t join_cb_count = join_bindings.size();
-	const size_t lc_cb_count = lc_bindings.size();
-	const size_t rc_cb_count = rc_bindings.size();
-
-	OPENIVM_DEBUG_PRINT("Join CB count: %zu (left child: %zu, right child: %zu)\n", join_cb_count, lc_cb_count,
-	                    rc_cb_count);
-	for (size_t i = 0; i < lc_cb_count; i++) {
-		OPENIVM_DEBUG_PRINT("Left child CB after %zu %s\n", i, join_bindings[i].ToString().c_str());
-	}
-	for (size_t i = 0; i < rc_cb_count; i++) {
-		OPENIVM_DEBUG_PRINT("Right child CB after %zu %s\n", i, join_bindings[i].ToString().c_str());
-	}
-	for (size_t i = 0; i < join_cb_count; i++) {
-		OPENIVM_DEBUG_PRINT("Join CB after %zu %s\n", i, join_bindings[i].ToString().c_str());
-	}
-}
-#endif
-
-unique_ptr<LogicalComparisonJoin> create_empty_join(duckdb::ClientContext &context,
-                                                    const unique_ptr<LogicalComparisonJoin> &current_join) {
-	unique_ptr<LogicalComparisonJoin> copied_join =
-	    duckdb::unique_ptr_cast<LogicalOperator, LogicalComparisonJoin>(current_join->Copy(context));
-	copied_join->children[0].reset(nullptr);
-	copied_join->children[1].reset(nullptr);
-	copied_join->expressions.clear();
-	copied_join->left_projection_map.clear();
-	copied_join->right_projection_map.clear();
-	return copied_join;
-}
+//==============================================================================
+// General helpers
+//==============================================================================
 
 void rebind_bcr_if_needed(BoundColumnRefExpression &bcr, const std::unordered_map<idx_t, idx_t> &idx_map) {
 	const idx_t table_index = bcr.binding.table_index;
@@ -101,6 +76,26 @@ vector<JoinCondition> rebind_join_conditions(const vector<JoinCondition> &origin
 	return return_vec;
 }
 
+/// Rebind join conditions in ALL join nodes throughout a subtree.
+void rebind_all_conditions_in_tree(unique_ptr<LogicalOperator> &node,
+                                   const std::unordered_map<idx_t, idx_t> &idx_map) {
+	if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto *join = dynamic_cast<LogicalComparisonJoin *>(node.get());
+		join->conditions = rebind_join_conditions(join->conditions, idx_map);
+	}
+	for (auto &child : node->children) {
+		rebind_all_conditions_in_tree(child, idx_map);
+	}
+}
+
+/// Call ResolveOperatorTypes bottom-up on a join subtree.
+void resolve_types_bottom_up(unique_ptr<LogicalOperator> &node) {
+	for (auto &child : node->children) {
+		resolve_types_bottom_up(child);
+	}
+	node->ResolveOperatorTypes();
+}
+
 vector<unique_ptr<Expression>> project_multiplicity_to_end(const vector<ColumnBinding> &bindings,
                                                            const vector<LogicalType> &types,
                                                            const ColumnBinding &mul_binding) {
@@ -123,38 +118,7 @@ vector<unique_ptr<Expression>> project_multiplicity_to_end(const vector<ColumnBi
 	return projection_col_refs;
 }
 
-vector<unique_ptr<Expression>> project_out_duplicate_mul_column(const vector<ColumnBinding> &bindings,
-                                                                const vector<LogicalType> &types,
-                                                                const ColumnBinding &redundant_mul_binding) {
-	const size_t col_count = bindings.size();
-	assert(col_count == types.size());
-
-	auto projection_col_refs = vector<unique_ptr<Expression>>();
-	projection_col_refs.reserve(col_count - 1);
-	for (idx_t i = 0; i < col_count; ++i) {
-		const auto &binding = bindings[i];
-		if (binding != redundant_mul_binding) {
-			projection_col_refs.emplace_back(make_uniq<BoundColumnRefExpression>(types[i], binding));
-		}
-	}
-	return projection_col_refs;
-}
-
-vector<unique_ptr<Expression>> bindings_to_expressions(const vector<ColumnBinding> &bindings,
-                                                       const vector<LogicalType> &types) {
-	const size_t col_count = bindings.size();
-	assert(col_count == types.size());
-
-	auto projection_col_refs = vector<unique_ptr<Expression>>();
-	projection_col_refs.reserve(col_count);
-	for (idx_t i = 0; i < col_count; ++i) {
-		projection_col_refs.emplace_back(make_uniq<BoundColumnRefExpression>(types[i], bindings[i]));
-	}
-	return projection_col_refs;
-}
-
 /// Filter a delta subtree by multiplicity (true=inserts, false=deletes) and project out the mul column.
-/// Returns a projection node with only the base table columns.
 unique_ptr<LogicalOperator> filter_delta_and_project_out_mul(unique_ptr<LogicalOperator> delta_copy,
                                                              const ColumnBinding &mul_binding,
                                                              const duckdb::LogicalType &mul_type,
@@ -182,28 +146,143 @@ unique_ptr<LogicalOperator> filter_delta_and_project_out_mul(unique_ptr<LogicalO
 	return projection;
 }
 
-/// Build R_old = (R_new EXCEPT ALL DR_inserts) UNION ALL DR_deletes.
-unique_ptr<LogicalOperator>
-build_r_old(duckdb::ClientContext &context, unique_ptr<LogicalOperator> r_new,
-            const unique_ptr<LogicalOperator> &delta_right, const ColumnBinding &org_dr_mul,
-            const duckdb::LogicalType &mul_type, duckdb::Binder &binder) {
+//==============================================================================
+// Delta GET creation (extracted from the old LOGICAL_GET case)
+//==============================================================================
+
+struct DeltaGetResult {
+	unique_ptr<LogicalOperator> node;
+	ColumnBinding mul_binding;
+};
+
+/// Create a delta GET node for a given base table GET node.
+/// The delta GET scans the delta table, adds multiplicity column, filters by timestamp.
+DeltaGetResult create_delta_get_node(duckdb::ClientContext &context, LogicalGet *old_get, const std::string &view_name) {
+	unique_ptr<LogicalGet> delta_get_node;
+	ColumnBinding new_mul_binding;
+	std::string table_name;
+
+	duckdb::optional_ptr<duckdb::TableCatalogEntry> opt_catalog_entry;
+	{
+		std::string delta_table;
+		std::string delta_table_schema;
+		std::string delta_table_catalog;
+		if (old_get->GetTable().get() == nullptr) {
+			delta_table_schema = "public";
+			delta_table_catalog = "p"; // todo
+		} else {
+			delta_table = "delta_" + old_get->GetTable().get()->name;
+			delta_table_schema = old_get->GetTable().get()->schema.name;
+			delta_table_catalog = old_get->GetTable().get()->catalog.GetName();
+		}
+		duckdb::QueryErrorContext error_context;
+		opt_catalog_entry = duckdb::Catalog::GetEntry<duckdb::TableCatalogEntry>(
+		    context, delta_table_catalog, delta_table_schema, delta_table, duckdb::OnEntryNotFound::RETURN_NULL,
+		    error_context);
+		if (opt_catalog_entry == nullptr) {
+			throw duckdb::Exception(duckdb::ExceptionType::BINDER,
+			                        "Table " + delta_table + " does not exist, no deltas to compute!");
+		}
+	}
+	auto &table_entry = opt_catalog_entry->Cast<duckdb::TableCatalogEntry>();
+	table_name = table_entry.name;
+	unique_ptr<duckdb::FunctionData> bind_data;
+	auto scan_function = table_entry.GetScanFunction(context, bind_data);
+
+	vector<ColumnIndex> column_ids = {};
+	idx_t mul_oid = 0, ts_oid = 0, max_oid = 0;
+	for (auto &col : table_entry.GetColumns().Logical()) {
+		if (col.Name() == "_duckdb_ivm_multiplicity") {
+			mul_oid = col.Oid();
+		} else if (col.Name() == "_duckdb_ivm_timestamp") {
+			ts_oid = col.Oid();
+		}
+		if (col.Oid() > max_oid) {
+			max_oid = col.Oid();
+		}
+	}
+
+	vector<LogicalType> return_types(max_oid + 1, LogicalType::ANY);
+	vector<std::string> return_names(max_oid + 1, "");
+	for (auto &col : table_entry.GetColumns().Logical()) {
+		return_types[col.Oid()] = col.Type();
+		return_names[col.Oid()] = col.Name();
+	}
+
+	for (auto &id : old_get->GetColumnIds()) {
+		column_ids.push_back(id);
+	}
+	column_ids.push_back(ColumnIndex(mul_oid));
+	column_ids.push_back(ColumnIndex(ts_oid));
+
+	delta_get_node = make_uniq<LogicalGet>(old_get->table_index, scan_function, std::move(bind_data),
+	                                       std::move(return_types), std::move(return_names));
+	delta_get_node->SetColumnIds(std::move(column_ids));
+
+	// Timestamp filter
+	Connection con(*context.db);
+	con.SetAutoCommit(false);
+	auto timestamp_query = "select last_update from _duckdb_ivm_delta_tables where view_name = '" + view_name +
+	                        "' and table_name = '" + table_name + "';";
+	auto r = con.Query(timestamp_query);
+	if (r->HasError()) {
+		throw duckdb::InternalException("Error while querying last_update");
+	}
+	auto ts_value = r->GetValue(0, 0);
+	if (ts_value.type() != LogicalType::TIMESTAMP) {
+		ts_value = ts_value.DefaultCastAs(LogicalType::TIMESTAMP);
+	}
+	auto table_filter = make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, ts_value);
+	auto &ts_col_id = delta_get_node->GetColumnIds().back();
+	idx_t ts_filter_key = ts_col_id.GetPrimaryIndex();
+	delta_get_node->table_filters.filters[ts_filter_key] = std::move(table_filter);
+
+	// projection_ids
+	delta_get_node->projection_ids.clear();
+	idx_t n_base = old_get->GetColumnIds().size();
+	if (!old_get->projection_ids.empty()) {
+		for (auto &pid : old_get->projection_ids) {
+			delta_get_node->projection_ids.push_back(pid);
+		}
+	} else {
+		for (idx_t i = 0; i < n_base; i++) {
+			delta_get_node->projection_ids.push_back(i);
+		}
+	}
+	delta_get_node->projection_ids.push_back(n_base); // mul column
+	idx_t mul_proj_pos = delta_get_node->projection_ids.size() - 1;
+	new_mul_binding = ColumnBinding(old_get->table_index, mul_proj_pos);
+
+	delta_get_node->ResolveOperatorTypes();
+	return {std::move(delta_get_node), new_mul_binding};
+}
+
+//==============================================================================
+// R_old construction: (T_new EXCEPT ALL ΔT_inserts) UNION ALL ΔT_deletes
+//==============================================================================
+
+/// Build R_old from a base table GET and its delta GET.
+unique_ptr<LogicalOperator> build_r_old_from_delta(duckdb::ClientContext &context, unique_ptr<LogicalOperator> r_new,
+                                                   const unique_ptr<LogicalOperator> &delta_get,
+                                                   const ColumnBinding &delta_mul_binding,
+                                                   const duckdb::LogicalType &mul_type, duckdb::Binder &binder) {
 	auto r_types = r_new->types;
 	auto r_col_count = r_new->GetColumnBindings().size();
 
-	// DR_inserts: filter delta_right where mul=true, project out mul
+	// DR_inserts: filter delta where mul=true, project out mul
 	unique_ptr<LogicalOperator> dr_inserts;
 	{
-		duckdb::RenumberWrapper res = duckdb::renumber_and_rebind_subtree(delta_right->Copy(context), binder);
-		ColumnBinding dr_mul(res.idx_map[org_dr_mul.table_index], org_dr_mul.column_index);
+		duckdb::RenumberWrapper res = duckdb::renumber_and_rebind_subtree(delta_get->Copy(context), binder);
+		ColumnBinding dr_mul(res.idx_map[delta_mul_binding.table_index], delta_mul_binding.column_index);
 		dr_inserts =
 		    filter_delta_and_project_out_mul(std::move(res.op), dr_mul, mul_type, binder.GenerateTableIndex(), true);
 	}
 
-	// DR_deletes: filter delta_right where mul=false, project out mul
+	// DR_deletes: filter delta where mul=false, project out mul
 	unique_ptr<LogicalOperator> dr_deletes;
 	{
-		duckdb::RenumberWrapper res = duckdb::renumber_and_rebind_subtree(delta_right->Copy(context), binder);
-		ColumnBinding dr_mul(res.idx_map[org_dr_mul.table_index], org_dr_mul.column_index);
+		duckdb::RenumberWrapper res = duckdb::renumber_and_rebind_subtree(delta_get->Copy(context), binder);
+		ColumnBinding dr_mul(res.idx_map[delta_mul_binding.table_index], delta_mul_binding.column_index);
 		dr_deletes =
 		    filter_delta_and_project_out_mul(std::move(res.op), dr_mul, mul_type, binder.GenerateTableIndex(), false);
 	}
@@ -221,6 +300,55 @@ build_r_old(duckdb::ClientContext &context, unique_ptr<LogicalOperator> r_new,
 	                                                    duckdb::LogicalOperatorType::LOGICAL_UNION, true);
 	r_old->types = r_types;
 	return r_old;
+}
+
+/// Build R_old for a base table by creating its delta GET internally.
+unique_ptr<LogicalOperator> build_r_old_for_table(duckdb::ClientContext &context, LogicalGet *original_get,
+                                                  const std::string &view_name, duckdb::Binder &binder) {
+	// T_new = copy of original base table scan
+	auto r_new = original_get->Copy(context);
+	r_new->ResolveOperatorTypes();
+
+	// Create delta GET for this table
+	DeltaGetResult delta = create_delta_get_node(context, original_get, view_name);
+
+	return build_r_old_from_delta(context, std::move(r_new), delta.node, delta.mul_binding, LogicalType::BOOLEAN,
+	                              binder);
+}
+
+//==============================================================================
+// Join subtree helpers
+//==============================================================================
+
+struct JoinLeafInfo {
+	vector<size_t> path; // navigation path from join root (0=left child, 1=right child)
+	LogicalGet *get;     // pointer to the GET node in the ORIGINAL tree
+};
+
+/// Collect all leaf GET nodes from a join subtree in left-to-right order.
+void collect_join_leaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves) {
+	if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		path.push_back(0);
+		collect_join_leaves(node->children[0].get(), path, leaves);
+		path.pop_back();
+		path.push_back(1);
+		collect_join_leaves(node->children[1].get(), path, leaves);
+		path.pop_back();
+	} else if (node->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+		leaves.push_back({path, dynamic_cast<LogicalGet *>(node)});
+	} else {
+		throw duckdb::NotImplementedException("Unexpected node type in join subtree: " +
+		                                      duckdb::LogicalOperatorToString(node->type));
+	}
+}
+
+/// Navigate to a node at the given path in a tree, returning a reference to the unique_ptr holding it.
+unique_ptr<LogicalOperator> &get_node_at_path(unique_ptr<LogicalOperator> &root, const vector<size_t> &path) {
+	unique_ptr<LogicalOperator> *current = &root;
+	for (size_t step : path) {
+		current = &((*current)->children[step]);
+	}
+	return *current;
 }
 
 } // namespace
@@ -256,18 +384,130 @@ void IVMRewriteRule::AddInsertNode(ClientContext &context, unique_ptr<LogicalOpe
 	plan = std::move(insert_node);
 }
 
+/// Flat N-term join incrementalization.
+///
+/// For a join over N base tables T1, T2, ..., TN, produces N terms:
+///   Term i:  T1_new ⋈ ... ⋈ T(i-1)_new ⋈ ΔTi ⋈ T(i+1)_old ⋈ ... ⋈ TN_old
+///
+/// Tables before the delta table use T_new (current base table).
+/// Tables after the delta table use T_old = (T_new EXCEPT ALL ΔT_inserts) UNION ALL ΔT_deletes.
+/// The N terms are combined with UNION ALL.
+///
+/// This avoids recursive rewriting of nested joins, which causes binding corruption.
+ModifiedPlan IVMRewriteRule::HandleJoinSubtree(PlanWrapper pw) {
+	ClientContext &context = pw.input.context;
+	Binder &binder = pw.input.optimizer.binder;
+	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
+
+	// Verify all joins are INNER
+	std::function<void(LogicalOperator *)> verify_inner_joins = [&](LogicalOperator *node) {
+		if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+			auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
+			if (join->join_type != JoinType::INNER) {
+				throw Exception(ExceptionType::OPTIMIZER,
+				                JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM");
+			}
+			for (auto &child : node->children) {
+				verify_inner_joins(child.get());
+			}
+		}
+	};
+	verify_inner_joins(pw.plan.get());
+
+	// 1. Collect all leaf GET nodes from the join subtree
+	vector<JoinLeafInfo> leaves;
+	collect_join_leaves(pw.plan.get(), {}, leaves);
+	size_t N = leaves.size();
+	OPENIVM_DEBUG_PRINT("HandleJoinSubtree: %zu leaves found\n", N);
+
+	// Output type: original join columns + multiplicity
+	auto types = pw.plan->types;
+	types.emplace_back(pw.mul_type);
+
+	// 2. Build N terms
+	vector<unique_ptr<LogicalOperator>> terms;
+
+	for (size_t i = 0; i < N; i++) {
+		OPENIVM_DEBUG_PRINT("Building term %zu (delta on table_index %llu)\n", i, leaves[i].get->table_index);
+
+		// Copy the original join subtree
+		auto term = pw.plan->Copy(context);
+
+		// Replace leaf i with its delta GET (has mul column)
+		DeltaGetResult delta_i = create_delta_get_node(context, leaves[i].get, pw.view);
+		ColumnBinding mul_binding = delta_i.mul_binding;
+		get_node_at_path(term, leaves[i].path) = std::move(delta_i.node);
+
+		// Replace leaves j > i with R_old (no mul column, same column count as original)
+		std::unordered_map<idx_t, idx_t> idx_map;
+		for (size_t j = i + 1; j < N; j++) {
+			auto r_old = build_r_old_for_table(context, leaves[j].get, pw.view, binder);
+			idx_t r_old_table_idx = r_old->GetColumnBindings()[0].table_index;
+			idx_map[leaves[j].get->table_index] = r_old_table_idx;
+			get_node_at_path(term, leaves[j].path) = std::move(r_old);
+		}
+
+		// Rebind join conditions throughout the tree for R_old table index changes
+		if (!idx_map.empty()) {
+			rebind_all_conditions_in_tree(term, idx_map);
+		}
+
+		// Resolve types bottom-up after leaf replacement
+		resolve_types_bottom_up(term);
+
+		// Add projection: original columns + mul at end
+		auto term_bindings = term->GetColumnBindings();
+		auto term_types = term->types;
+		auto proj_exprs = project_multiplicity_to_end(term_bindings, term_types, mul_binding);
+		auto projection =
+		    make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(proj_exprs));
+		projection->children.push_back(std::move(term));
+		projection->ResolveOperatorTypes();
+		terms.push_back(std::move(projection));
+	}
+
+	// 3. UNION ALL all terms
+	auto result = std::move(terms[0]);
+	for (size_t i = 1; i < N; i++) {
+		auto union_table_index = binder.GenerateTableIndex();
+		result = make_uniq<LogicalSetOperation>(union_table_index, types.size(), std::move(result),
+		                                        std::move(terms[i]), LogicalOperatorType::LOGICAL_UNION, true);
+		result->types = types;
+	}
+
+	// 4. Update column bindings in parent
+	ColumnBinding new_mul_binding;
+	{
+		auto union_bindings = result->GetColumnBindings();
+		if (union_bindings.size() - original_bindings.size() != 1) {
+			throw InternalException(
+			    "Union (with multiplicity column) should have exactly 1 more binding than original join!");
+		}
+		ColumnBindingReplacer replacer;
+		vector<ReplacementBinding> &replacement_bindings = replacer.replacement_bindings;
+		for (idx_t col_idx = 0; col_idx < original_bindings.size(); ++col_idx) {
+			replacement_bindings.emplace_back(original_bindings[col_idx], union_bindings[col_idx]);
+		}
+		replacer.stop_operator = result;
+		replacer.VisitOperator(*pw.root);
+		new_mul_binding = union_bindings.back();
+	}
+
+	pw.plan = std::move(result);
+	return {std::move(pw.plan), new_mul_binding};
+}
+
 ModifiedPlan IVMRewriteRule::ModifyPlan(PlanWrapper pw) {
 	ClientContext &context = pw.input.context;
 	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
 
-	unique_ptr<LogicalOperator> left_child, right_child;
-	if (pw.plan.get()->type == LogicalOperatorType::LOGICAL_JOIN ||
-	    pw.plan.get()->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		left_child = pw.plan->children[0]->Copy(context);
-		right_child = pw.plan->children[1]->Copy(context);
-		left_child->ResolveOperatorTypes();
-		right_child->ResolveOperatorTypes();
+	// For joins: handle the entire join subtree without recursing into children.
+	if (pw.plan->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	    pw.plan->type == LogicalOperatorType::LOGICAL_JOIN) {
+		return HandleJoinSubtree(pw);
 	}
+
+	// For non-join nodes: recurse into children normally.
 	vector<ColumnBinding> child_mul_bindings;
 	for (auto &&child : pw.plan->children) {
 		auto rec_pw = PlanWrapper(pw.input, child, pw.view, pw.root);
@@ -275,270 +515,14 @@ ModifiedPlan IVMRewriteRule::ModifyPlan(PlanWrapper pw) {
 		child = std::move(child_plan.op);
 		child_mul_bindings.emplace_back(child_plan.mul_binding);
 	}
-	QueryErrorContext error_context = QueryErrorContext();
 
 	switch (pw.plan->type) {
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
-		vector<ColumnBinding> modified_plan_bindings = pw.plan->GetColumnBindings();
-		auto types = pw.plan->types;
-		types.emplace_back(pw.mul_type);
-		OPENIVM_DEBUG_PRINT("Modified plan (join, start):\n%s\nParameters:", pw.plan->ToString().c_str());
-		for (const auto &i_param : pw.plan->ParamsToString()) {
-			OPENIVM_DEBUG_PRINT("%s", i_param.second.c_str());
-		}
-#if OPENIVM_DEBUG
-		OPENIVM_DEBUG_PRINT("join detected. join child count: %zu\n", pw.plan->children.size());
-		OPENIVM_DEBUG_PRINT("plan left_child child count: %zu\n", left_child->children.size());
-		OPENIVM_DEBUG_PRINT("plan right_child child count: %zu\n", right_child->children.size());
-#endif
-		unique_ptr<LogicalComparisonJoin> plan_as_join =
-		    unique_ptr_cast<LogicalOperator, LogicalComparisonJoin>(std::move(pw.plan));
-		if (plan_as_join->join_type != JoinType::INNER) {
-			throw Exception(ExceptionType::OPTIMIZER,
-			                JoinTypeToString(plan_as_join->join_type) + " type not yet supported in OpenIVM");
-		}
-		const unique_ptr<LogicalOperator> &delta_left = plan_as_join->children[0];
-		const unique_ptr<LogicalOperator> &delta_right = plan_as_join->children[1];
-		const ColumnBinding org_dl_mul = child_mul_bindings[0];
-		const ColumnBinding org_dr_mul = child_mul_bindings[1];
-
-		// New 2-term formula: ΔL ⋈ R_old  UNION ALL  L_new ⋈ ΔR
-		// where R_old = (R_new EXCEPT ALL DR_inserts) UNION ALL DR_deletes
-
-		// Term 1: dL ⋈ R_old
-		unique_ptr<LogicalProjection> dl_r_old_projected;
-		{
-			RenumberWrapper res = renumber_and_rebind_subtree(delta_left->Copy(context), pw.input.optimizer.binder);
-			unique_ptr<LogicalOperator> dl = std::move(res.op);
-
-			// Build R_old from R_new and delta_right
-			unique_ptr<LogicalOperator> r_old =
-			    build_r_old(context, right_child->Copy(context), delta_right, org_dr_mul, pw.mul_type,
-			                pw.input.optimizer.binder);
-
-			// Rebind join conditions: left side renumbered, right side maps to R_old's table index
-			std::unordered_map<old_idx, new_idx> idx_map = res.idx_map;
-			idx_t r_orig_table_idx = right_child->GetColumnBindings()[0].table_index;
-			idx_t r_old_table_idx = r_old->GetColumnBindings()[0].table_index;
-			idx_map[r_orig_table_idx] = r_old_table_idx;
-
-			unique_ptr<LogicalComparisonJoin> dl_r_old = create_empty_join(context, plan_as_join);
-			dl_r_old->conditions = rebind_join_conditions(plan_as_join->conditions, idx_map);
-			dl_r_old->children[0] = std::move(dl);
-			dl_r_old->children[1] = std::move(r_old);
-			dl_r_old->ResolveOperatorTypes();
-#if OPENIVM_DEBUG
-			OPENIVM_DEBUG_PRINT("--- Column bindings of dL JOIN R_old (before projection) ---\n");
-			print_column_bindings(dl_r_old);
-#endif
-			{
-				const vector<ColumnBinding> join_bindings = dl_r_old->GetColumnBindings();
-				const vector<LogicalType> join_types = dl_r_old->types;
-				const ColumnBinding dl_mul_binding = {res.idx_map[org_dl_mul.table_index], org_dl_mul.column_index};
-				vector<unique_ptr<Expression>> projection_bindings =
-				    project_multiplicity_to_end(join_bindings, join_types, dl_mul_binding);
-				dl_r_old_projected = make_uniq<LogicalProjection>(pw.input.optimizer.binder.GenerateTableIndex(),
-				                                                  std::move(projection_bindings));
-			}
-			dl_r_old_projected->children.emplace_back(std::move(dl_r_old));
-		}
-
-		// Term 2: L_new ⋈ ΔR (L_new is the current base table, already includes inserts)
-		unique_ptr<LogicalProjection> l_dr_projected;
-		{
-			unique_ptr<LogicalOperator> l = left_child->Copy(context);
-			RenumberWrapper res = renumber_and_rebind_subtree(delta_right->Copy(context), pw.input.optimizer.binder);
-			unique_ptr<LogicalOperator> dr = std::move(res.op);
-
-			unique_ptr<LogicalComparisonJoin> l_dr = create_empty_join(context, plan_as_join);
-			l_dr->conditions = rebind_join_conditions(plan_as_join->conditions, res.idx_map);
-			l_dr->children[0] = std::move(l);
-			l_dr->children[1] = std::move(dr);
-			l_dr->ResolveOperatorTypes();
-#if OPENIVM_DEBUG
-			OPENIVM_DEBUG_PRINT("--- Column bindings of L_new JOIN dR (before projection) ---\n");
-			print_column_bindings(l_dr);
-#endif
-			{
-				const vector<ColumnBinding> join_bindings = l_dr->GetColumnBindings();
-				const vector<LogicalType> join_types = l_dr->types;
-				vector<unique_ptr<Expression>> l_dr_projection_bindings =
-				    bindings_to_expressions(join_bindings, join_types);
-				l_dr_projected = make_uniq<LogicalProjection>(pw.input.optimizer.binder.GenerateTableIndex(),
-				                                              std::move(l_dr_projection_bindings));
-			}
-			l_dr_projected->children.emplace_back(std::move(l_dr));
-		}
-
-		// Final: UNION ALL of the two terms
-		auto union_table_index = pw.input.optimizer.binder.GenerateTableIndex();
-		pw.plan = make_uniq<LogicalSetOperation>(union_table_index, types.size(), std::move(dl_r_old_projected),
-		                                         std::move(l_dr_projected), LogicalOperatorType::LOGICAL_UNION, true);
-		pw.plan->types = types;
-		OPENIVM_DEBUG_PRINT("Modified plan (join, end):\n%s\nParameters:", pw.plan->ToString().c_str());
-		for (const auto &i_param : pw.plan->ParamsToString()) {
-			OPENIVM_DEBUG_PRINT("%s", i_param.second.c_str());
-		}
-		ColumnBinding new_mul_binding;
-		{
-			auto union_bindings = pw.plan->GetColumnBindings();
-			if (union_bindings.size() - original_bindings.size() != 1) {
-				throw InternalException(
-				    "Union (with multiplicity column) should have exactly 1 more binding than original join!");
-			}
-			ColumnBindingReplacer replacer;
-			vector<ReplacementBinding> &replacement_bindings = replacer.replacement_bindings;
-			for (idx_t col_idx = 0; col_idx < original_bindings.size(); ++col_idx) {
-				const auto &old_binding = original_bindings[col_idx];
-				const auto &new_binding = union_bindings[col_idx];
-				replacement_bindings.emplace_back(old_binding, new_binding);
-			}
-#if OPENIVM_DEBUG
-			OPENIVM_DEBUG_PRINT("\n--- Running a ColumnBindingReplacer after the Union ---\n");
-			for (const auto &i_binding : replacement_bindings) {
-				OPENIVM_DEBUG_PRINT("old binding %s -> ", (i_binding.old_binding.ToString().c_str()));
-				OPENIVM_DEBUG_PRINT("new binding %s\n", (i_binding.new_binding.ToString().c_str()));
-			}
-#endif
-			replacer.stop_operator = pw.plan;
-			replacer.VisitOperator(*pw.root);
-			new_mul_binding = union_bindings[union_bindings.size() - 1];
-#if OPENIVM_DEBUG
-			OPENIVM_DEBUG_PRINT("The new multiplicity binding shall be %s.\n", (new_mul_binding.ToString().c_str()));
-			OPENIVM_DEBUG_PRINT("--- End of ColumnBindingReplacer ---\n");
-#endif
-		}
-		return {std::move(pw.plan), new_mul_binding};
-	}
 	case LogicalOperatorType::LOGICAL_GET: {
-		// we are at the bottom of the tree
-		auto old_get = dynamic_cast<LogicalGet *>(pw.plan.get());
-
 		OPENIVM_DEBUG_PRINT("Create replacement get node\n");
-
-		unique_ptr<LogicalGet> delta_get_node;
-		ColumnBinding new_mul_binding, timestamp_binding;
-		string table_name;
-		{
-			optional_ptr<TableCatalogEntry> opt_catalog_entry;
-			{
-				string delta_table;
-				string delta_table_schema;
-				string delta_table_catalog;
-				if (old_get->GetTable().get() == nullptr) {
-					delta_table_schema = "public";
-					delta_table_catalog = "p"; // todo
-				} else {
-					delta_table = "delta_" + old_get->GetTable().get()->name;
-					delta_table_schema = old_get->GetTable().get()->schema.name;
-					delta_table_catalog = old_get->GetTable().get()->catalog.GetName();
-				}
-				opt_catalog_entry =
-				    Catalog::GetEntry<TableCatalogEntry>(context, delta_table_catalog, delta_table_schema, delta_table,
-				                                         OnEntryNotFound::RETURN_NULL, error_context);
-				if (opt_catalog_entry == nullptr) {
-					throw Exception(ExceptionType::BINDER,
-					                "Table " + delta_table + " does not exist, no deltas to compute!");
-				}
-			}
-			TableCatalogEntry &table_entry = opt_catalog_entry->Cast<TableCatalogEntry>();
-			table_name = table_entry.name;
-			unique_ptr<FunctionData> bind_data;
-			auto scan_function = table_entry.GetScanFunction(context, bind_data);
-
-			// Define the return names and types.
-			// returned_types is indexed by ColumnIndex primary value (physical OID).
-			// GetColumnType does returned_types[index.GetPrimaryIndex()], so we must
-			// pad returned_types to cover all referenced OIDs.
-			vector<ColumnIndex> column_ids = {};
-
-			// Find mul/ts OIDs and max OID from the delta table
-			idx_t mul_oid = 0, ts_oid = 0, max_oid = 0;
-			for (auto &col : table_entry.GetColumns().Logical()) {
-				if (col.Name() == "_duckdb_ivm_multiplicity") {
-					mul_oid = col.Oid();
-				} else if (col.Name() == "_duckdb_ivm_timestamp") {
-					ts_oid = col.Oid();
-				}
-				if (col.Oid() > max_oid) {
-					max_oid = col.Oid();
-				}
-			}
-
-			// Build returned_types/names padded to max OID
-			vector<LogicalType> return_types(max_oid + 1, LogicalType::ANY);
-			vector<string> return_names(max_oid + 1, "");
-			for (auto &col : table_entry.GetColumns().Logical()) {
-				return_types[col.Oid()] = col.Type();
-				return_names[col.Oid()] = col.Name();
-			}
-
-			// Copy original column_ids (physical OIDs from base table, same in delta)
-			for (auto &id : old_get->GetColumnIds()) {
-				column_ids.push_back(id);
-			}
-			// Multiplicity column (actual physical OID)
-			column_ids.push_back(ColumnIndex(mul_oid));
-			idx_t mul_pos = column_ids.size() - 1;
-			new_mul_binding = ColumnBinding(old_get->table_index, mul_pos);
-
-			// Timestamp column (actual physical OID)
-			column_ids.push_back(ColumnIndex(ts_oid));
-			idx_t ts_pos = column_ids.size() - 1;
-			timestamp_binding = ColumnBinding(old_get->table_index, ts_pos);
-
-			// Finally, create the delta GET node.
-			delta_get_node = make_uniq<LogicalGet>(old_get->table_index, // Will get renumbered later.
-			                                       scan_function, std::move(bind_data), std::move(return_types),
-			                                       std::move(return_names));
-			delta_get_node->SetColumnIds(std::move(column_ids));
-		}
-		delta_get_node->table_filters = std::move(old_get->table_filters); // this should be empty
-		// Add a filter for the timestamp.
-		Connection con(*context.db);
-		con.SetAutoCommit(false);
-		auto timestamp_query = "select last_update from _duckdb_ivm_delta_tables where view_name = '" + pw.view +
-		                       "' and table_name = '" + table_name + "';";
-		auto r = con.Query(timestamp_query);
-		if (r->HasError()) {
-			throw InternalException("Error while querying last_update");
-		}
-		auto ts_value = r->GetValue(0, 0);
-		// Cast to TIMESTAMP if needed (now() returns TIMESTAMPTZ in modern DuckDB)
-		if (ts_value.type() != LogicalType::TIMESTAMP) {
-			ts_value = ts_value.DefaultCastAs(LogicalType::TIMESTAMP);
-		}
-		auto table_filter = make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, ts_value);
-		// Filter key must be the column OID (GetPrimaryIndex value), because CreateTableFilterSet
-		// searches column_ids for an entry whose GetPrimaryIndex() == filter_key.
-		auto &ts_col_id = delta_get_node->GetColumnIds().back(); // last entry = timestamp
-		idx_t ts_filter_key = ts_col_id.GetPrimaryIndex();       // the physical OID
-		delta_get_node->table_filters.filters[ts_filter_key] = std::move(table_filter);
-
-		// projection_ids: maps output positions to positions in column_ids.
-		// With padded returned_types, we need projection_ids to select the right columns.
-		delta_get_node->projection_ids.clear();
-		idx_t n_base = old_get->GetColumnIds().size();
-		if (!old_get->projection_ids.empty()) {
-			// Copy original projection_ids (they index into old column_ids, same positions in new)
-			for (auto &pid : old_get->projection_ids) {
-				delta_get_node->projection_ids.push_back(pid);
-			}
-		} else {
-			// No projection_ids means all base column_ids are output, in order
-			for (idx_t i = 0; i < n_base; i++) {
-				delta_get_node->projection_ids.push_back(i);
-			}
-		}
-		// Add multiplicity column (position n_base in column_ids)
-		delta_get_node->projection_ids.push_back(n_base);
-		idx_t mul_proj_pos = delta_get_node->projection_ids.size() - 1;
-		new_mul_binding = ColumnBinding(old_get->table_index, mul_proj_pos);
-		// Timestamp column is NOT added to projection_ids (filtered, not output)
-
-		delta_get_node->ResolveOperatorTypes();
-		delta_get_node->Verify(pw.input.context);
-		return {std::move(delta_get_node), new_mul_binding};
+		auto old_get = dynamic_cast<LogicalGet *>(pw.plan.get());
+		DeltaGetResult result = create_delta_get_node(context, old_get, pw.view);
+		result.node->Verify(pw.input.context);
+		return {std::move(result.node), result.mul_binding};
 	}
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
 

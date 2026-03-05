@@ -37,6 +37,8 @@ public:
 
 	static ModifiedPlan ModifyPlan(PlanWrapper pw);
 
+	static ModifiedPlan HandleJoinSubtree(PlanWrapper pw);
+
 	static void IVMRewriteRuleFunction(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
 };
 
