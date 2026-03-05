@@ -4,6 +4,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -152,6 +153,76 @@ vector<unique_ptr<Expression>> bindings_to_expressions(const vector<ColumnBindin
 	return projection_col_refs;
 }
 
+/// Filter a delta subtree by multiplicity (true=inserts, false=deletes) and project out the mul column.
+/// Returns a projection node with only the base table columns.
+unique_ptr<LogicalOperator> filter_delta_and_project_out_mul(unique_ptr<LogicalOperator> delta_copy,
+                                                             const ColumnBinding &mul_binding,
+                                                             const duckdb::LogicalType &mul_type,
+                                                             idx_t proj_table_index, bool mul_value) {
+	auto filter = make_uniq<duckdb::LogicalFilter>();
+	auto mul_ref = make_uniq<BoundColumnRefExpression>("_duckdb_ivm_multiplicity", mul_type, mul_binding);
+	auto const_val = make_uniq<duckdb::BoundConstantExpression>(duckdb::Value::BOOLEAN(mul_value));
+	auto comparison = make_uniq<duckdb::BoundComparisonExpression>(duckdb::ExpressionType::COMPARE_EQUAL,
+	                                                               std::move(mul_ref), std::move(const_val));
+	filter->expressions.push_back(std::move(comparison));
+	filter->children.push_back(std::move(delta_copy));
+	filter->ResolveOperatorTypes();
+
+	auto filter_bindings = filter->GetColumnBindings();
+	auto filter_types = filter->types;
+	vector<unique_ptr<duckdb::Expression>> proj_expressions;
+	for (size_t i = 0; i < filter_bindings.size(); i++) {
+		if (filter_bindings[i] != mul_binding) {
+			proj_expressions.push_back(make_uniq<BoundColumnRefExpression>(filter_types[i], filter_bindings[i]));
+		}
+	}
+	auto projection = make_uniq<duckdb::LogicalProjection>(proj_table_index, std::move(proj_expressions));
+	projection->children.push_back(std::move(filter));
+	projection->ResolveOperatorTypes();
+	return projection;
+}
+
+/// Build R_old = (R_new EXCEPT ALL DR_inserts) UNION ALL DR_deletes.
+unique_ptr<LogicalOperator>
+build_r_old(duckdb::ClientContext &context, unique_ptr<LogicalOperator> r_new,
+            const unique_ptr<LogicalOperator> &delta_right, const ColumnBinding &org_dr_mul,
+            const duckdb::LogicalType &mul_type, duckdb::Binder &binder) {
+	auto r_types = r_new->types;
+	auto r_col_count = r_new->GetColumnBindings().size();
+
+	// DR_inserts: filter delta_right where mul=true, project out mul
+	unique_ptr<LogicalOperator> dr_inserts;
+	{
+		duckdb::RenumberWrapper res = duckdb::renumber_and_rebind_subtree(delta_right->Copy(context), binder);
+		ColumnBinding dr_mul(res.idx_map[org_dr_mul.table_index], org_dr_mul.column_index);
+		dr_inserts =
+		    filter_delta_and_project_out_mul(std::move(res.op), dr_mul, mul_type, binder.GenerateTableIndex(), true);
+	}
+
+	// DR_deletes: filter delta_right where mul=false, project out mul
+	unique_ptr<LogicalOperator> dr_deletes;
+	{
+		duckdb::RenumberWrapper res = duckdb::renumber_and_rebind_subtree(delta_right->Copy(context), binder);
+		ColumnBinding dr_mul(res.idx_map[org_dr_mul.table_index], org_dr_mul.column_index);
+		dr_deletes =
+		    filter_delta_and_project_out_mul(std::move(res.op), dr_mul, mul_type, binder.GenerateTableIndex(), false);
+	}
+
+	// R_old = (R_new EXCEPT ALL DR_inserts) UNION ALL DR_deletes
+	idx_t except_table_idx = binder.GenerateTableIndex();
+	auto r_except = make_uniq<duckdb::LogicalSetOperation>(
+	    except_table_idx, r_col_count, std::move(r_new), std::move(dr_inserts),
+	    duckdb::LogicalOperatorType::LOGICAL_EXCEPT, true);
+	r_except->types = r_types;
+
+	idx_t union_table_idx = binder.GenerateTableIndex();
+	auto r_old = make_uniq<duckdb::LogicalSetOperation>(union_table_idx, r_col_count, std::move(r_except),
+	                                                    std::move(dr_deletes),
+	                                                    duckdb::LogicalOperatorType::LOGICAL_UNION, true);
+	r_old->types = r_types;
+	return r_old;
+}
+
 } // namespace
 
 namespace duckdb {
@@ -231,34 +302,48 @@ ModifiedPlan IVMRewriteRule::ModifyPlan(PlanWrapper pw) {
 		const ColumnBinding org_dl_mul = child_mul_bindings[0];
 		const ColumnBinding org_dr_mul = child_mul_bindings[1];
 
-		unique_ptr<LogicalProjection> dl_r_projected;
-		// dLR
+		// New 2-term formula: ΔL ⋈ R_old  UNION ALL  L_new ⋈ ΔR
+		// where R_old = (R_new EXCEPT ALL DR_inserts) UNION ALL DR_deletes
+
+		// Term 1: dL ⋈ R_old
+		unique_ptr<LogicalProjection> dl_r_old_projected;
 		{
 			RenumberWrapper res = renumber_and_rebind_subtree(delta_left->Copy(context), pw.input.optimizer.binder);
 			unique_ptr<LogicalOperator> dl = std::move(res.op);
-			unique_ptr<LogicalOperator> r = right_child->Copy(context);
 
-			unique_ptr<LogicalComparisonJoin> dl_r = create_empty_join(context, plan_as_join);
-			dl_r->conditions = rebind_join_conditions(plan_as_join->conditions, res.idx_map);
-			dl_r->children[0] = std::move(dl);
-			dl_r->children[1] = std::move(r);
-			dl_r->ResolveOperatorTypes();
+			// Build R_old from R_new and delta_right
+			unique_ptr<LogicalOperator> r_old =
+			    build_r_old(context, right_child->Copy(context), delta_right, org_dr_mul, pw.mul_type,
+			                pw.input.optimizer.binder);
+
+			// Rebind join conditions: left side renumbered, right side maps to R_old's table index
+			std::unordered_map<old_idx, new_idx> idx_map = res.idx_map;
+			idx_t r_orig_table_idx = right_child->GetColumnBindings()[0].table_index;
+			idx_t r_old_table_idx = r_old->GetColumnBindings()[0].table_index;
+			idx_map[r_orig_table_idx] = r_old_table_idx;
+
+			unique_ptr<LogicalComparisonJoin> dl_r_old = create_empty_join(context, plan_as_join);
+			dl_r_old->conditions = rebind_join_conditions(plan_as_join->conditions, idx_map);
+			dl_r_old->children[0] = std::move(dl);
+			dl_r_old->children[1] = std::move(r_old);
+			dl_r_old->ResolveOperatorTypes();
 #if OPENIVM_DEBUG
-			OPENIVM_DEBUG_PRINT("--- Column bindings of dL JOIN R after modifications (but before projection) ---\n");
-			print_column_bindings(dl_r);
+			OPENIVM_DEBUG_PRINT("--- Column bindings of dL JOIN R_old (before projection) ---\n");
+			print_column_bindings(dl_r_old);
 #endif
 			{
-				const vector<ColumnBinding> join_bindings = dl_r->GetColumnBindings();
-				const vector<LogicalType> join_types = dl_r->types;
+				const vector<ColumnBinding> join_bindings = dl_r_old->GetColumnBindings();
+				const vector<LogicalType> join_types = dl_r_old->types;
 				const ColumnBinding dl_mul_binding = {res.idx_map[org_dl_mul.table_index], org_dl_mul.column_index};
-				vector<unique_ptr<Expression>> dl_r_projection_bindings =
+				vector<unique_ptr<Expression>> projection_bindings =
 				    project_multiplicity_to_end(join_bindings, join_types, dl_mul_binding);
-				dl_r_projected = make_uniq<LogicalProjection>(pw.input.optimizer.binder.GenerateTableIndex(),
-				                                              std::move(dl_r_projection_bindings));
+				dl_r_old_projected = make_uniq<LogicalProjection>(pw.input.optimizer.binder.GenerateTableIndex(),
+				                                                  std::move(projection_bindings));
 			}
-			dl_r_projected->children.emplace_back(std::move(dl_r));
+			dl_r_old_projected->children.emplace_back(std::move(dl_r_old));
 		}
-		// LdR
+
+		// Term 2: L_new ⋈ ΔR (L_new is the current base table, already includes inserts)
 		unique_ptr<LogicalProjection> l_dr_projected;
 		{
 			unique_ptr<LogicalOperator> l = left_child->Copy(context);
@@ -271,7 +356,7 @@ ModifiedPlan IVMRewriteRule::ModifyPlan(PlanWrapper pw) {
 			l_dr->children[1] = std::move(dr);
 			l_dr->ResolveOperatorTypes();
 #if OPENIVM_DEBUG
-			OPENIVM_DEBUG_PRINT("--- Column bindings of L JOIN dR after modifications (but before projection) ---\n");
+			OPENIVM_DEBUG_PRINT("--- Column bindings of L_new JOIN dR (before projection) ---\n");
 			print_column_bindings(l_dr);
 #endif
 			{
@@ -284,57 +369,11 @@ ModifiedPlan IVMRewriteRule::ModifyPlan(PlanWrapper pw) {
 			}
 			l_dr_projected->children.emplace_back(std::move(l_dr));
 		}
-		// dLdR
-		unique_ptr<LogicalProjection> dl_dr_projected;
-		{
-			RenumberWrapper dl_res = renumber_and_rebind_subtree(delta_left->Copy(context), pw.input.optimizer.binder);
-			unique_ptr<LogicalOperator> dl = std::move(dl_res.op);
-			RenumberWrapper dr_res = renumber_and_rebind_subtree(delta_right->Copy(context), pw.input.optimizer.binder);
-			unique_ptr<LogicalOperator> dr = std::move(dr_res.op);
-			unique_ptr<LogicalComparisonJoin> dl_dr = create_empty_join(context, plan_as_join);
-			{
-				std::unordered_map<old_idx, new_idx> idx_map = dl_res.idx_map;
-				for (const auto &pair : dr_res.idx_map) {
-					idx_map.insert(pair);
-				}
-				dl_dr->conditions = rebind_join_conditions(plan_as_join->conditions, idx_map);
-			}
-			{
-				ColumnBinding dl_mul_binding = {dl_res.idx_map[org_dl_mul.table_index], org_dl_mul.column_index};
-				ColumnBinding dr_mul_binding = {dr_res.idx_map[org_dr_mul.table_index], org_dr_mul.column_index};
-				JoinCondition mul_equal_condition;
-				mul_equal_condition.left =
-				    make_uniq<BoundColumnRefExpression>("left_mul", pw.mul_type, dl_mul_binding, 0);
-				mul_equal_condition.right =
-				    make_uniq<BoundColumnRefExpression>("right_mul", pw.mul_type, dr_mul_binding, 0);
-				mul_equal_condition.comparison = ExpressionType::COMPARE_EQUAL;
-				dl_dr->conditions.emplace_back(std::move(mul_equal_condition));
-			}
-			dl_dr->children[0] = std::move(dl);
-			dl_dr->children[1] = std::move(dr);
-			dl_dr->ResolveOperatorTypes();
-#if OPENIVM_DEBUG
-			OPENIVM_DEBUG_PRINT("--- Column bindings of dL JOIN dR after modifications (but before projection) ---\n");
-			print_column_bindings(dl_dr);
-#endif
-			const vector<ColumnBinding> join_bindings = dl_dr->GetColumnBindings();
-			{
-				const vector<LogicalType> join_types = dl_dr->types;
-				const ColumnBinding dl_mul_binding = {dl_res.idx_map[org_dl_mul.table_index], org_dl_mul.column_index};
-				auto dl_dr_projection_bindings =
-				    project_out_duplicate_mul_column(join_bindings, join_types, dl_mul_binding);
-				dl_dr_projected = make_uniq<LogicalProjection>(pw.input.optimizer.binder.GenerateTableIndex(),
-				                                               std::move(dl_dr_projection_bindings));
-			}
-			dl_dr_projected->children.emplace_back(std::move(dl_dr));
-		}
-		auto copy_union = make_uniq<LogicalSetOperation>(pw.input.optimizer.binder.GenerateTableIndex(), types.size(),
-		                                                 std::move(dl_r_projected), std::move(l_dr_projected),
-		                                                 LogicalOperatorType::LOGICAL_UNION, true);
-		copy_union->types = types;
-		auto upper_u_table_index = pw.input.optimizer.binder.GenerateTableIndex();
-		pw.plan = make_uniq<LogicalSetOperation>(upper_u_table_index, types.size(), std::move(copy_union),
-		                                         std::move(dl_dr_projected), LogicalOperatorType::LOGICAL_UNION, true);
+
+		// Final: UNION ALL of the two terms
+		auto union_table_index = pw.input.optimizer.binder.GenerateTableIndex();
+		pw.plan = make_uniq<LogicalSetOperation>(union_table_index, types.size(), std::move(dl_r_old_projected),
+		                                         std::move(l_dr_projected), LogicalOperatorType::LOGICAL_UNION, true);
 		pw.plan->types = types;
 		OPENIVM_DEBUG_PRINT("Modified plan (join, end):\n%s\nParameters:", pw.plan->ToString().c_str());
 		for (const auto &i_param : pw.plan->ParamsToString()) {

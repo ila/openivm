@@ -71,3 +71,37 @@ query II
 SELECT total, cnt FROM score_totals;
 ----
 120	3
+
+# --- No-op PRAGMA ---
+statement ok
+PRAGMA ivm_options('memory', 'main', 'score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+120	3
+
+# --- Batch insert ---
+statement ok
+INSERT INTO scores VALUES (6, 10, 'f'), (7, 20, 'g'), (8, 30, 'h');
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+180	6
+
+# --- Delete multiple rows at once ---
+statement ok
+DELETE FROM scores WHERE value <= 20;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'score_totals');
+
+# Remaining: id=3(30), id=4(40), id=5(50), id=8(30) = 150, cnt=4
+query II
+SELECT total, cnt FROM score_totals;
+----
+150	4

@@ -157,3 +157,69 @@ SELECT region, total, cnt FROM paid_summary ORDER BY region;
 ----
 east	160	2
 west	75	1
+
+# ==========================================
+# Test 3: Delete ALL rows from a group
+# ==========================================
+
+# Delete all east sales (ids 3, 4 remain in sales; id 1 already deleted)
+statement ok
+DELETE FROM sales WHERE region = 'east';
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'sales_summary');
+
+# East group should have total=0 and cnt=0 (or be gone, depending on upsert)
+query III
+SELECT region, total, cnt FROM sales_summary WHERE region != 'east' ORDER BY region;
+----
+north	300	1
+west	300	3
+
+# ==========================================
+# Test 4: No-op PRAGMA (no changes)
+# ==========================================
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary WHERE region != 'east' ORDER BY region;
+----
+north	300	1
+west	300	3
+
+# ==========================================
+# Test 5: Batch insert into multiple groups at once
+# ==========================================
+
+statement ok
+INSERT INTO sales VALUES (10, 'south', 100), (11, 'south', 200), (12, 'north', 50);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary WHERE region IN ('south', 'north') ORDER BY region;
+----
+north	350	2
+south	300	2
+
+# ==========================================
+# Test 6: Mixed insert + delete in same cycle
+# ==========================================
+
+statement ok
+INSERT INTO sales VALUES (13, 'west', 100);
+
+statement ok
+DELETE FROM sales WHERE id = 6;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'sales_summary');
+
+# west had: 200 + 75 + 25 = 300, cnt=3. Now: -75 + 100 = 325, cnt=3
+query III
+SELECT region, total, cnt FROM sales_summary WHERE region = 'west';
+----
+west	325	3

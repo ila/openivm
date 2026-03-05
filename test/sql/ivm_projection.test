@@ -62,3 +62,46 @@ SELECT id, name FROM emp_names ORDER BY id;
 ----
 2	Bob
 3	Charlie
+
+# --- No-op PRAGMA ---
+statement ok
+PRAGMA ivm_options('memory', 'main', 'emp_names');
+
+query II
+SELECT id, name FROM emp_names ORDER BY id;
+----
+2	Bob
+3	Charlie
+
+# --- Batch insert ---
+statement ok
+INSERT INTO employees VALUES (4, 'Diana', 'eng'), (5, 'Eve', 'sales');
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'emp_names');
+
+query II
+SELECT id, name FROM emp_names ORDER BY id;
+----
+2	Bob
+3	Charlie
+4	Diana
+5	Eve
+
+# --- Mixed insert + delete ---
+statement ok
+INSERT INTO employees VALUES (6, 'Frank', 'ops');
+
+statement ok
+DELETE FROM employees WHERE id = 2;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'emp_names');
+
+query II
+SELECT id, name FROM emp_names ORDER BY id;
+----
+3	Charlie
+4	Diana
+5	Eve
+6	Frank

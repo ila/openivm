@@ -74,3 +74,72 @@ SELECT id, name, price FROM cheap_products ORDER BY id;
 ----
 3	Doohickey	5
 4	Thingamajig	8
+
+# --- No-op PRAGMA ---
+statement ok
+PRAGMA ivm_options('memory', 'main', 'cheap_products');
+
+query III
+SELECT id, name, price FROM cheap_products ORDER BY id;
+----
+3	Doohickey	5
+4	Thingamajig	8
+
+# --- Insert at the boundary (price = 19, just under filter) ---
+statement ok
+INSERT INTO products VALUES (6, 'Boundary', 19, 'C');
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'cheap_products');
+
+query III
+SELECT id, name, price FROM cheap_products ORDER BY id;
+----
+3	Doohickey	5
+4	Thingamajig	8
+6	Boundary	19
+
+# --- Insert at the boundary (price = 20, NOT matching filter) ---
+statement ok
+INSERT INTO products VALUES (7, 'TooExpensive', 20, 'C');
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'cheap_products');
+
+query III
+SELECT id, name, price FROM cheap_products ORDER BY id;
+----
+3	Doohickey	5
+4	Thingamajig	8
+6	Boundary	19
+
+# --- Mixed insert + delete ---
+statement ok
+INSERT INTO products VALUES (8, 'Cheap', 1, 'A');
+
+statement ok
+DELETE FROM products WHERE id = 3;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'cheap_products');
+
+query III
+SELECT id, name, price FROM cheap_products ORDER BY id;
+----
+4	Thingamajig	8
+6	Boundary	19
+8	Cheap	1
+
+# --- Delete row not in MV (should be no-op for MV) ---
+statement ok
+DELETE FROM products WHERE id = 5;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'cheap_products');
+
+query III
+SELECT id, name, price FROM cheap_products ORDER BY id;
+----
+4	Thingamajig	8
+6	Boundary	19
+8	Cheap	1
