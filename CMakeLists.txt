@@ -8,7 +8,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 set(LPTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lpts")
-include_directories(src/include ${LPTS_DIR}/src/include)
+include_directories(src/include src/rules ${LPTS_DIR}/src/include)
 
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
@@ -19,6 +19,12 @@ set(EXTENSION_SOURCES
     src/openivm_utils.cpp
     src/openivm_compile_upsert.cpp
     src/openivm_insert_rule.cpp
+    src/rules/ivm_helpers.cpp
+    src/rules/ivm_scan_rule.cpp
+    src/rules/ivm_filter_rule.cpp
+    src/rules/ivm_projection_rule.cpp
+    src/rules/ivm_aggregate_rule.cpp
+    src/rules/ivm_join_rule.cpp
     ${LPTS_DIR}/src/logical_plan_to_sql.cpp
     ${LPTS_DIR}/src/lpts_helpers.cpp
     ${LPTS_DIR}/src/lpts_ast.cpp
