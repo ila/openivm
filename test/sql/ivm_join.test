@@ -50,9 +50,13 @@ INSERT INTO _duckdb_ivm_delta_tables VALUES ('named_payments', 'delta_gods', '19
 statement ok
 INSERT INTO _duckdb_ivm_delta_tables VALUES ('named_payments', 'delta_payments', '1970-01-01');
 
+# ==========================================
+# Test 1: Insert on RIGHT side (payments)
+# ==========================================
+
 # Insert a new payment to Apollo (uid 1)
 statement ok
-INSERT INTO delta_payments VALUES (3, 1, 30, true, now()::timestamp);
+INSERT INTO payments VALUES (3, 1, 30);
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'named_payments');
@@ -69,7 +73,7 @@ Apollo	3	1	80
 # ==========================================
 
 statement ok
-INSERT INTO delta_payments VALUES (5, 1, 42, false, now()::timestamp);
+DELETE FROM payments WHERE from_uid = 5 AND to_uid = 1 AND amount = 42;
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'named_payments');
@@ -77,5 +81,69 @@ PRAGMA ivm_options('memory', 'main', 'named_payments');
 # The payment (5, 1, 42) to Apollo should be gone
 query I
 SELECT count(*) FROM named_payments WHERE from_uid = 5 AND to_uid = 1 AND amount = 42;
+----
+0
+
+# ==========================================
+# Test 3: Insert on LEFT side (gods table)
+# ==========================================
+
+statement ok
+INSERT INTO gods VALUES (6, 'Hera');
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'named_payments');
+
+# No payments reference uid 6 yet, so MV unchanged
+query I
+SELECT count(*) FROM named_payments WHERE user_name = 'Hera';
+----
+0
+
+# Now add a payment TO the new god
+statement ok
+INSERT INTO payments VALUES (1, 6, 99);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'named_payments');
+
+query III
+SELECT user_name, from_uid, amount FROM named_payments WHERE to_uid = 6;
+----
+Hera	1	99
+
+# ==========================================
+# Test 4: Insert on BOTH sides (separate PRAGMA per delta)
+# ==========================================
+
+statement ok
+INSERT INTO gods VALUES (7, 'Athena');
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'named_payments');
+
+statement ok
+INSERT INTO payments VALUES (2, 7, 500);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'named_payments');
+
+query III
+SELECT user_name, from_uid, amount FROM named_payments WHERE to_uid = 7;
+----
+Athena	2	500
+
+# ==========================================
+# Test 5: Delete from LEFT side
+# ==========================================
+
+statement ok
+DELETE FROM gods WHERE uid = 6;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'named_payments');
+
+query I
+SELECT count(*) FROM named_payments WHERE user_name = 'Hera';
 ----
 0

@@ -38,7 +38,7 @@ INSERT INTO _duckdb_ivm_delta_tables VALUES ('sales_summary', 'delta_sales', '19
 
 # --- Insert into existing group ---
 statement ok
-INSERT INTO delta_sales VALUES (4, 'east', 50, true, now()::timestamp);
+INSERT INTO sales VALUES (4, 'east', 50);
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'sales_summary');
@@ -51,7 +51,7 @@ west	200	1
 
 # --- Insert into new group ---
 statement ok
-INSERT INTO delta_sales VALUES (5, 'north', 300, true, now()::timestamp);
+INSERT INTO sales VALUES (5, 'north', 300);
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'sales_summary');
@@ -65,7 +65,7 @@ west	200	1
 
 # --- Delete from existing group ---
 statement ok
-INSERT INTO delta_sales VALUES (1, 'east', 100, false, now()::timestamp);
+DELETE FROM sales WHERE id = 1;
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'sales_summary');
@@ -79,7 +79,7 @@ west	200	1
 
 # --- Multiple inserts in same group ---
 statement ok
-INSERT INTO delta_sales VALUES (6, 'west', 75, true, now()::timestamp), (7, 'west', 25, true, now()::timestamp);
+INSERT INTO sales VALUES (6, 'west', 75), (7, 'west', 25);
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'sales_summary');
@@ -90,3 +90,70 @@ SELECT region, total, cnt FROM sales_summary ORDER BY region;
 east	200	2
 north	300	1
 west	300	3
+
+# ==========================================
+# Test 2: Aggregate with filter (WHERE clause)
+# ==========================================
+
+statement ok
+CREATE TABLE orders (id INT, region VARCHAR, amount INT, status VARCHAR);
+
+statement ok
+INSERT INTO orders VALUES (1, 'east', 100, 'paid'), (2, 'west', 200, 'paid'), (3, 'east', 50, 'pending'), (4, 'west', 75, 'paid');
+
+statement ok
+CREATE TABLE paid_summary AS SELECT region, sum(amount) AS total, count(amount) AS cnt FROM orders WHERE status = 'paid' GROUP BY region;
+
+statement ok
+CREATE TABLE delta_paid_summary AS SELECT *, true AS _duckdb_ivm_multiplicity FROM paid_summary LIMIT 0;
+
+statement ok
+CREATE UNIQUE INDEX paid_summary_ivm_index ON paid_summary (region);
+
+statement ok
+CREATE TABLE delta_orders AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM orders LIMIT 0;
+
+statement ok
+INSERT INTO _duckdb_ivm_views VALUES ('paid_summary', 'select region, sum(amount) as total, count(amount) as cnt from orders where status = ''paid'' group by region', 0, now()::timestamp);
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('paid_summary', 'delta_orders', '1970-01-01');
+
+# Insert a paid order — should affect MV
+statement ok
+INSERT INTO orders VALUES (5, 'east', 60, 'paid');
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'paid_summary');
+
+query III
+SELECT region, total, cnt FROM paid_summary ORDER BY region;
+----
+east	160	2
+west	275	2
+
+# Insert a pending order — should NOT affect MV (filtered out)
+statement ok
+INSERT INTO orders VALUES (6, 'west', 300, 'pending');
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'paid_summary');
+
+query III
+SELECT region, total, cnt FROM paid_summary ORDER BY region;
+----
+east	160	2
+west	275	2
+
+# Delete a paid order
+statement ok
+DELETE FROM orders WHERE id = 2;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'paid_summary');
+
+query III
+SELECT region, total, cnt FROM paid_summary ORDER BY region;
+----
+east	160	2
+west	75	1

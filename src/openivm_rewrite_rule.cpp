@@ -679,6 +679,10 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 #endif
 	Optimizer optimizer(*planner.binder, input.context);
 	auto optimized_plan = optimizer.Optimize(std::move(planner.plan));
+
+	// Reset disabled_optimizers to avoid polluting the session
+	con.Query("RESET disabled_optimizers;");
+
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Optimized plan: \n%s\n", optimized_plan->ToString().c_str());
 #endif

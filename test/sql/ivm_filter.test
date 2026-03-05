@@ -35,7 +35,7 @@ INSERT INTO _duckdb_ivm_delta_tables VALUES ('cheap_products', 'delta_products',
 
 # --- Insert: matching filter ---
 statement ok
-INSERT INTO delta_products VALUES (4, 'Thingamajig', 8, 'A', true, now()::timestamp);
+INSERT INTO products VALUES (4, 'Thingamajig', 8, 'A');
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'cheap_products');
@@ -49,7 +49,7 @@ SELECT id, name, price FROM cheap_products ORDER BY id;
 
 # --- Insert: NOT matching filter (price >= 20) ---
 statement ok
-INSERT INTO delta_products VALUES (5, 'Expensive', 50, 'B', true, now()::timestamp);
+INSERT INTO products VALUES (5, 'Expensive', 50, 'B');
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'cheap_products');
@@ -64,7 +64,7 @@ SELECT id, name, price FROM cheap_products ORDER BY id;
 
 # --- Delete: row that was in the view ---
 statement ok
-INSERT INTO delta_products VALUES (1, 'Widget', 10, 'A', false, now()::timestamp);
+DELETE FROM products WHERE id = 1;
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'cheap_products');

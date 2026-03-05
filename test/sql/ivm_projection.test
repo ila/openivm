@@ -33,9 +33,9 @@ INSERT INTO _duckdb_ivm_views VALUES ('emp_names', 'select id, name from employe
 statement ok
 INSERT INTO _duckdb_ivm_delta_tables VALUES ('emp_names', 'delta_employees', '1970-01-01');
 
-# --- Insert a new employee into delta ---
+# --- Insert a new employee ---
 statement ok
-INSERT INTO delta_employees VALUES (3, 'Charlie', 'eng', true, now()::timestamp);
+INSERT INTO employees VALUES (3, 'Charlie', 'eng');
 
 # --- Trigger IVM ---
 statement ok
@@ -49,9 +49,9 @@ SELECT id, name FROM emp_names ORDER BY id;
 2	Bob
 3	Charlie
 
-# --- Insert a deletion into delta ---
+# --- Delete an employee ---
 statement ok
-INSERT INTO delta_employees VALUES (1, 'Alice', 'eng', false, now()::timestamp);
+DELETE FROM employees WHERE id = 1;
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'emp_names');

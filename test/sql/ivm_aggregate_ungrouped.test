@@ -35,7 +35,7 @@ INSERT INTO _duckdb_ivm_delta_tables VALUES ('score_totals', 'delta_scores', '19
 
 # --- Insert ---
 statement ok
-INSERT INTO delta_scores VALUES (4, 40, 'd', true, now()::timestamp);
+INSERT INTO scores VALUES (4, 40, 'd');
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'score_totals');
@@ -47,7 +47,7 @@ SELECT total, cnt FROM score_totals;
 
 # --- Delete ---
 statement ok
-INSERT INTO delta_scores VALUES (1, 10, 'a', false, now()::timestamp);
+DELETE FROM scores WHERE id = 1;
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'score_totals');
@@ -59,7 +59,10 @@ SELECT total, cnt FROM score_totals;
 
 # --- Mixed insert + delete ---
 statement ok
-INSERT INTO delta_scores VALUES (5, 50, 'e', true, now()::timestamp), (2, 20, 'b', false, now()::timestamp);
+INSERT INTO scores VALUES (5, 50, 'e');
+
+statement ok
+DELETE FROM scores WHERE id = 2;
 
 statement ok
 PRAGMA ivm_options('memory', 'main', 'score_totals');

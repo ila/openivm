@@ -4,6 +4,7 @@
 
 #include "logical_plan_to_sql.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/column_index.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/function/table/read_csv.hpp"
 #include "duckdb/main/connection.hpp"
@@ -156,12 +157,26 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				                       " select *, false, now()::timestamp from " + full_table_name;
 				if (plan->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
 					auto filter = dynamic_cast<LogicalFilter *>(plan->children[0].get());
-					insert_string += " where " + filter->ToString();
+					insert_string += " where ";
+					for (idx_t i = 0; i < filter->expressions.size(); i++) {
+						if (i > 0) {
+							insert_string += " AND ";
+						}
+						insert_string += filter->expressions[i]->ToString();
+					}
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
 					auto get = dynamic_cast<LogicalGet *>(plan->children[0].get());
 					if (!get->table_filters.filters.empty()) {
-						insert_string += " where " + get->ToString();
-						insert_string = insert_string.substr(0, insert_string.find('\n'));
+						insert_string += " where ";
+						bool first_filter = true;
+						for (auto &entry : get->table_filters.filters) {
+							if (!first_filter) {
+								insert_string += " AND ";
+							}
+							first_filter = false;
+							auto col_name = get->GetColumnName(ColumnIndex(entry.first));
+							insert_string += entry.second->ToString(col_name);
+						}
 					}
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
 					return;
