@@ -1,0 +1,70 @@
+# name: test/sql/ivm_aggregate_ungrouped.test
+# description: Test IVM with ungrouped (scalar) aggregation
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE IF NOT EXISTS _duckdb_ivm_views (view_name VARCHAR PRIMARY KEY, sql_string VARCHAR, type TINYINT, last_update TIMESTAMP);
+
+statement ok
+CREATE TABLE IF NOT EXISTS _duckdb_ivm_delta_tables (view_name VARCHAR, table_name VARCHAR, last_update TIMESTAMP, PRIMARY KEY(view_name, table_name));
+
+# --- Base table ---
+statement ok
+CREATE TABLE scores (id INT, value INT, label VARCHAR);
+
+statement ok
+INSERT INTO scores VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c');
+
+# --- Materialized view: ungrouped SUM + COUNT ---
+statement ok
+CREATE TABLE score_totals AS SELECT sum(value) AS total, count(label) AS cnt FROM scores;
+
+statement ok
+CREATE TABLE delta_score_totals AS SELECT *, true AS _duckdb_ivm_multiplicity FROM score_totals LIMIT 0;
+
+statement ok
+CREATE TABLE delta_scores AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM scores LIMIT 0;
+
+statement ok
+INSERT INTO _duckdb_ivm_views VALUES ('score_totals', 'select sum(value) as total, count(label) as cnt from scores', 1, now()::timestamp);
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('score_totals', 'delta_scores', '1970-01-01');
+
+# --- Insert ---
+statement ok
+INSERT INTO delta_scores VALUES (4, 40, 'd', true, now()::timestamp);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+100	4
+
+# --- Delete ---
+statement ok
+INSERT INTO delta_scores VALUES (1, 10, 'a', false, now()::timestamp);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+90	3
+
+# --- Mixed insert + delete ---
+statement ok
+INSERT INTO delta_scores VALUES (5, 50, 'e', true, now()::timestamp), (2, 20, 'b', false, now()::timestamp);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+120	3

@@ -1,0 +1,92 @@
+# name: test/sql/ivm_aggregate_groupby.test
+# description: Test IVM with GROUP BY aggregation (sum, count)
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE IF NOT EXISTS _duckdb_ivm_views (view_name VARCHAR PRIMARY KEY, sql_string VARCHAR, type TINYINT, last_update TIMESTAMP);
+
+statement ok
+CREATE TABLE IF NOT EXISTS _duckdb_ivm_delta_tables (view_name VARCHAR, table_name VARCHAR, last_update TIMESTAMP, PRIMARY KEY(view_name, table_name));
+
+# --- Base table ---
+statement ok
+CREATE TABLE sales (id INT, region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO sales VALUES (1, 'east', 100), (2, 'west', 200), (3, 'east', 150);
+
+# --- Materialized view: SUM + COUNT grouped by region ---
+statement ok
+CREATE TABLE sales_summary AS SELECT region, sum(amount) AS total, count(amount) AS cnt FROM sales GROUP BY region;
+
+statement ok
+CREATE TABLE delta_sales_summary AS SELECT *, true AS _duckdb_ivm_multiplicity FROM sales_summary LIMIT 0;
+
+statement ok
+CREATE UNIQUE INDEX sales_summary_ivm_index ON sales_summary (region);
+
+statement ok
+CREATE TABLE delta_sales AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM sales LIMIT 0;
+
+statement ok
+INSERT INTO _duckdb_ivm_views VALUES ('sales_summary', 'select region, sum(amount) as total, count(amount) as cnt from sales group by region', 0, now()::timestamp);
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('sales_summary', 'delta_sales', '1970-01-01');
+
+# --- Insert into existing group ---
+statement ok
+INSERT INTO delta_sales VALUES (4, 'east', 50, true, now()::timestamp);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	300	3
+west	200	1
+
+# --- Insert into new group ---
+statement ok
+INSERT INTO delta_sales VALUES (5, 'north', 300, true, now()::timestamp);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	300	3
+north	300	1
+west	200	1
+
+# --- Delete from existing group ---
+statement ok
+INSERT INTO delta_sales VALUES (1, 'east', 100, false, now()::timestamp);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	200	2
+north	300	1
+west	200	1
+
+# --- Multiple inserts in same group ---
+statement ok
+INSERT INTO delta_sales VALUES (6, 'west', 75, true, now()::timestamp), (7, 'west', 25, true, now()::timestamp);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	200	2
+north	300	1
+west	300	3
