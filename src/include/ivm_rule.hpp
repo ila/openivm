@@ -52,17 +52,6 @@ public:
 
 DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, const string &view_name);
 
-unique_ptr<LogicalOperator> BuildTableOld(ClientContext &context, LogicalGet *original_get, const string &view_name,
-                                          Binder &binder);
-
-unique_ptr<LogicalOperator> FilterDeltaAndProjectOutMul(unique_ptr<LogicalOperator> delta_copy,
-                                                        const ColumnBinding &mul_binding, const LogicalType &mul_type,
-                                                        idx_t proj_table_index, bool mul_value);
-
-vector<unique_ptr<Expression>> ProjectMultiplicityToEnd(const vector<ColumnBinding> &bindings,
-                                                        const vector<LogicalType> &types,
-                                                        const ColumnBinding &mul_binding);
-
 } // namespace duckdb
 
 #endif // IVM_RULE_HPP

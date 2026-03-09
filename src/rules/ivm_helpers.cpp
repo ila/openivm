@@ -1,14 +1,7 @@
 #include "ivm_rule.hpp"
-#include "openivm_index_regen.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/expression/bound_comparison_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/operator/logical_set_operation.hpp"
 
 namespace duckdb {
 
@@ -111,95 +104,5 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, c
 	return {std::move(delta_get_node), new_mul_binding};
 }
 
-unique_ptr<LogicalOperator> FilterDeltaAndProjectOutMul(unique_ptr<LogicalOperator> delta_copy,
-                                                        const ColumnBinding &mul_binding, const LogicalType &mul_type,
-                                                        idx_t proj_table_index, bool mul_value) {
-	auto filter = make_uniq<LogicalFilter>();
-	auto mul_ref = make_uniq<BoundColumnRefExpression>("_duckdb_ivm_multiplicity", mul_type, mul_binding);
-	auto const_val = make_uniq<BoundConstantExpression>(Value::BOOLEAN(mul_value));
-	auto comparison = make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_EQUAL, std::move(mul_ref),
-	                                                       std::move(const_val));
-	filter->expressions.push_back(std::move(comparison));
-	filter->children.push_back(std::move(delta_copy));
-	filter->ResolveOperatorTypes();
-
-	auto filter_bindings = filter->GetColumnBindings();
-	auto filter_types = filter->types;
-	vector<unique_ptr<Expression>> proj_expressions;
-	for (size_t i = 0; i < filter_bindings.size(); i++) {
-		if (filter_bindings[i] != mul_binding) {
-			proj_expressions.push_back(make_uniq<BoundColumnRefExpression>(filter_types[i], filter_bindings[i]));
-		}
-	}
-	auto projection = make_uniq<LogicalProjection>(proj_table_index, std::move(proj_expressions));
-	projection->children.push_back(std::move(filter));
-	projection->ResolveOperatorTypes();
-	return projection;
-}
-
-unique_ptr<LogicalOperator> BuildTableOld(ClientContext &context, LogicalGet *original_get, const string &view_name,
-                                          Binder &binder) {
-	// T_new = copy of original base table scan
-	auto r_new = original_get->Copy(context);
-	r_new->ResolveOperatorTypes();
-
-	// Create delta GET for this table
-	DeltaGetResult delta = CreateDeltaGetNode(context, original_get, view_name);
-	auto r_types = r_new->types;
-	auto r_col_count = r_new->GetColumnBindings().size();
-	auto &delta_mul_binding = delta.mul_binding;
-	auto mul_type = LogicalType::BOOLEAN;
-
-	// DR_inserts: filter delta where mul=true, project out mul
-	unique_ptr<LogicalOperator> dr_inserts;
-	{
-		RenumberWrapper res = renumber_and_rebind_subtree(delta.node->Copy(context), binder);
-		ColumnBinding dr_mul(res.idx_map[delta_mul_binding.table_index], delta_mul_binding.column_index);
-		dr_inserts = FilterDeltaAndProjectOutMul(std::move(res.op), dr_mul, mul_type, binder.GenerateTableIndex(), true);
-	}
-
-	// DR_deletes: filter delta where mul=false, project out mul
-	unique_ptr<LogicalOperator> dr_deletes;
-	{
-		RenumberWrapper res = renumber_and_rebind_subtree(delta.node->Copy(context), binder);
-		ColumnBinding dr_mul(res.idx_map[delta_mul_binding.table_index], delta_mul_binding.column_index);
-		dr_deletes =
-		    FilterDeltaAndProjectOutMul(std::move(res.op), dr_mul, mul_type, binder.GenerateTableIndex(), false);
-	}
-
-	// T_old = (T_new EXCEPT ALL DR_inserts) UNION ALL DR_deletes
-	idx_t except_table_idx = binder.GenerateTableIndex();
-	auto r_except = make_uniq<LogicalSetOperation>(except_table_idx, r_col_count, std::move(r_new),
-	                                               std::move(dr_inserts), LogicalOperatorType::LOGICAL_EXCEPT, true);
-	r_except->types = r_types;
-
-	idx_t union_table_idx = binder.GenerateTableIndex();
-	auto r_old = make_uniq<LogicalSetOperation>(union_table_idx, r_col_count, std::move(r_except),
-	                                            std::move(dr_deletes), LogicalOperatorType::LOGICAL_UNION, true);
-	r_old->types = r_types;
-	return r_old;
-}
-
-vector<unique_ptr<Expression>> ProjectMultiplicityToEnd(const vector<ColumnBinding> &bindings,
-                                                        const vector<LogicalType> &types,
-                                                        const ColumnBinding &mul_binding) {
-	D_ASSERT(bindings.size() == types.size());
-	const size_t col_count = bindings.size();
-	auto result = vector<unique_ptr<Expression>>(col_count);
-
-	bool mul_is_seen = false;
-	for (idx_t i = 0; i < col_count; ++i) {
-		auto binding = bindings[i];
-		auto bound_col_ref = make_uniq<BoundColumnRefExpression>(types[i], binding);
-		if (binding == mul_binding) {
-			mul_is_seen = true;
-			result[col_count - 1] = std::move(bound_col_ref);
-		} else {
-			const size_t insert_at = mul_is_seen ? i - 1 : i;
-			result[insert_at] = std::move(bound_col_ref);
-		}
-	}
-	return result;
-}
 
 } // namespace duckdb

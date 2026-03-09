@@ -1,6 +1,7 @@
 #include "ivm_join_rule.hpp"
 #include "openivm_debug.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
@@ -11,7 +12,6 @@ namespace {
 
 using duckdb::ColumnBinding;
 using duckdb::Expression;
-using duckdb::JoinCondition;
 using duckdb::LogicalComparisonJoin;
 using duckdb::LogicalGet;
 using duckdb::LogicalOperator;
@@ -45,45 +45,6 @@ unique_ptr<LogicalOperator> &get_node_at_path(unique_ptr<LogicalOperator> &root,
 		current = &((*current)->children[step]);
 	}
 	return *current;
-}
-
-void rebind_bcr_if_needed(duckdb::BoundColumnRefExpression &bcr, const std::unordered_map<idx_t, idx_t> &idx_map) {
-	if (idx_map.find(bcr.binding.table_index) != idx_map.end()) {
-		bcr.binding.table_index = idx_map.at(bcr.binding.table_index);
-	}
-}
-
-vector<JoinCondition> rebind_join_conditions(const vector<JoinCondition> &original_conditions,
-                                             const std::unordered_map<idx_t, idx_t> &idx_map) {
-	vector<JoinCondition> result;
-	result.reserve(original_conditions.size());
-	for (const JoinCondition &cond : original_conditions) {
-		unique_ptr<Expression> left = cond.left->Copy();
-		unique_ptr<Expression> right = cond.right->Copy();
-		if (cond.left->expression_class == duckdb::ExpressionClass::BOUND_COLUMN_REF) {
-			rebind_bcr_if_needed(left->Cast<duckdb::BoundColumnRefExpression>(), idx_map);
-		}
-		if (cond.right->expression_class == duckdb::ExpressionClass::BOUND_COLUMN_REF) {
-			rebind_bcr_if_needed(right->Cast<duckdb::BoundColumnRefExpression>(), idx_map);
-		}
-		JoinCondition new_cond;
-		new_cond.left = std::move(left);
-		new_cond.right = std::move(right);
-		new_cond.comparison = cond.comparison;
-		result.emplace_back(std::move(new_cond));
-	}
-	return result;
-}
-
-void rebind_all_conditions_in_tree(unique_ptr<LogicalOperator> &node,
-                                   const std::unordered_map<idx_t, idx_t> &idx_map) {
-	if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto *join = dynamic_cast<LogicalComparisonJoin *>(node.get());
-		join->conditions = rebind_join_conditions(join->conditions, idx_map);
-	}
-	for (auto &child : node->children) {
-		rebind_all_conditions_in_tree(child, idx_map);
-	}
 }
 
 void resolve_types_bottom_up(unique_ptr<LogicalOperator> &node) {
@@ -123,43 +84,70 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	size_t N = leaves.size();
 	OPENIVM_DEBUG_PRINT("IvmJoinRule: %zu leaves found\n", N);
 
+	if (N > 16) {
+		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
+	}
+
 	// Output type: original columns + multiplicity
 	auto types = pw.plan->types;
 	types.emplace_back(pw.mul_type);
 
-	// 2. Build N terms
+	// 2. Build 2^N - 1 terms (inclusion-exclusion)
+	//
+	// For each non-empty subset S of {0..N-1}:
+	//   - Replace leaf i with delta(T_i) for i in S
+	//   - Keep T_new for leaves not in S
+	//   - Combined multiplicity = XOR of all delta multiplicities
+	//     (this accounts for the (-1)^(|S|-1) sign in inclusion-exclusion)
 	vector<unique_ptr<LogicalOperator>> terms;
 
-	for (size_t i = 0; i < N; i++) {
-		// Copy the original join subtree
+	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
 		auto term = pw.plan->Copy(context);
+		vector<ColumnBinding> mul_bindings;
 
-		// Replace leaf i with its delta GET
-		DeltaGetResult delta_i = CreateDeltaGetNode(context, leaves[i].get, pw.view);
-		ColumnBinding mul_binding = delta_i.mul_binding;
-		get_node_at_path(term, leaves[i].path) = std::move(delta_i.node);
-
-		// Replace leaves j > i with T_old
-		std::unordered_map<idx_t, idx_t> idx_map;
-		for (size_t j = i + 1; j < N; j++) {
-			auto t_old = BuildTableOld(context, leaves[j].get, pw.view, binder);
-			idx_t t_old_table_idx = t_old->GetColumnBindings()[0].table_index;
-			idx_map[leaves[j].get->table_index] = t_old_table_idx;
-			get_node_at_path(term, leaves[j].path) = std::move(t_old);
+		for (size_t i = 0; i < N; i++) {
+			if (mask & (1ULL << i)) {
+				DeltaGetResult delta_i = CreateDeltaGetNode(context, leaves[i].get, pw.view);
+				mul_bindings.push_back(delta_i.mul_binding);
+				get_node_at_path(term, leaves[i].path) = std::move(delta_i.node);
+			}
 		}
 
-		// Rebind join conditions for T_old table index changes
-		if (!idx_map.empty()) {
-			rebind_all_conditions_in_tree(term, idx_map);
-		}
-
-		// Resolve types bottom-up
 		resolve_types_bottom_up(term);
 
-		// Add projection: original columns + mul at end
+		// Build projection: original columns + combined multiplicity
 		auto term_bindings = term->GetColumnBindings();
 		auto term_types = term->types;
-		auto proj_exprs = ProjectMultiplicityToEnd(term_bindings, term_types, mul_binding);
+
+		vector<unique_ptr<Expression>> proj_exprs;
+
+		// Add non-multiplicity columns
+		for (idx_t i = 0; i < term_bindings.size(); i++) {
+			bool is_mul = false;
+			for (auto &mb : mul_bindings) {
+				if (term_bindings[i] == mb) {
+					is_mul = true;
+					break;
+				}
+			}
+			if (!is_mul) {
+				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
+			}
+		}
+
+		// Build combined multiplicity: XOR chain of all delta multiplicities
+		// XOR(a, b) for booleans = (a != b)
+		// This naturally handles the inclusion-exclusion sign:
+		//   sign * product(mul_i) in {+1,-1} space = XOR(mul_i) in boolean space
+		unique_ptr<Expression> combined_mul =
+		    make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[0]);
+		for (size_t i = 1; i < mul_bindings.size(); i++) {
+			auto next = make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[i]);
+			combined_mul = make_uniq<BoundComparisonExpression>(
+			    ExpressionType::COMPARE_NOTEQUAL, std::move(combined_mul), std::move(next));
+		}
+		proj_exprs.push_back(std::move(combined_mul));
+
 		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(proj_exprs));
 		projection->children.push_back(std::move(term));
 		projection->ResolveOperatorTypes();
@@ -168,7 +156,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 
 	// 3. UNION ALL all terms
 	auto result = std::move(terms[0]);
-	for (size_t i = 1; i < N; i++) {
+	for (size_t i = 1; i < terms.size(); i++) {
 		auto union_table_index = binder.GenerateTableIndex();
 		result = make_uniq<LogicalSetOperation>(union_table_index, types.size(), std::move(result),
 		                                        std::move(terms[i]), LogicalOperatorType::LOGICAL_UNION, true);
