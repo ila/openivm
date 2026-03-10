@@ -80,8 +80,7 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 	}
 }
 
-void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input,
-                                             duckdb::unique_ptr<LogicalOperator> &plan) {
+void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duckdb::unique_ptr<LogicalOperator> &plan) {
 	if (plan->children.empty()) {
 		return;
 	}

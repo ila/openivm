@@ -18,6 +18,7 @@ set(EXTENSION_SOURCES
     src/openivm_index_regen.cpp
     src/openivm_utils.cpp
     src/openivm_compile_upsert.cpp
+    src/openivm_cost_model.cpp
     src/openivm_insert_rule.cpp
     src/rules/ivm_helpers.cpp
     src/rules/ivm_scan_rule.cpp
@@ -38,3 +39,17 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
+# Benchmark executable - only build for native platforms
+if(NOT EMSCRIPTEN AND NOT WIN32)
+    add_executable(openivm_benchmark benchmarks/openivm_benchmark.cpp)
+    target_link_libraries(openivm_benchmark
+        duckdb_static
+        duckdb_generated_extension_loader
+        ${EXTENSION_NAME}
+        core_functions_extension
+        parquet_extension
+        jemalloc_extension
+        duckdb_static)
+    target_include_directories(openivm_benchmark PUBLIC benchmarks)
+endif()

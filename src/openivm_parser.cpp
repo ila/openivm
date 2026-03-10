@@ -50,7 +50,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 	auto statement = dynamic_cast<SQLStatement *>(ivm_parse_data.statement.get());
 
 	if (!done) {
-
 		Connection con(*context.db.get());
 
 		auto view_name = OpenIVMUtils::ExtractTableName(statement->query);
@@ -144,7 +143,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		OpenIVMUtils::WriteFile(compiled_file_path, false, table);
 
 		for (const auto &table_name : table_names) {
-
 			Value catalog_value;
 			Value schema_value;
 

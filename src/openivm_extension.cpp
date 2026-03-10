@@ -106,9 +106,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto ivm_rewrite_rule = duckdb::IVMRewriteRule();
 	auto ivm_insert_rule = duckdb::IVMInsertRule();
 
-	db_config.parser_extensions.push_back(ivm_parser);
-	db_config.optimizer_extensions.push_back(ivm_rewrite_rule);
-	db_config.optimizer_extensions.push_back(ivm_insert_rule);
+	ParserExtension::Register(db_config, std::move(ivm_parser));
+	OptimizerExtension::Register(db_config, std::move(ivm_rewrite_rule));
+	OptimizerExtension::Register(db_config, std::move(ivm_insert_rule));
 
 	TableFunction ivm_func("DoIVM", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, DoIVMFunction,
 	                       DoIVMBind, DoIVMInit);

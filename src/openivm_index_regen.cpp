@@ -1,5 +1,6 @@
 #include "openivm_index_regen.hpp"
 #include "openivm_debug.hpp"
+#include "duckdb/planner/binder.hpp"
 
 #include <duckdb/planner/operator/logical_aggregate.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
@@ -9,7 +10,6 @@
 namespace duckdb {
 
 RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder &binder) {
-
 	std::unordered_map<old_idx, new_idx> table_reassign;
 	std::vector<ColumnBinding> current_bindings = plan->GetColumnBindings();
 	std::vector<unique_ptr<LogicalOperator>> rec_children;

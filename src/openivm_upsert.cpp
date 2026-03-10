@@ -1,10 +1,12 @@
 #include "openivm_upsert.hpp"
 
+#include "openivm_cost_model.hpp"
 #include "openivm_debug.hpp"
 #include "openivm_compile_upsert.hpp"
 #include "openivm_utils.hpp"
 #include "logical_plan_to_sql.hpp"
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
@@ -66,8 +68,9 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	    catalog.GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name, "delta_" + view_name,
 	                                        OnEntryNotFound::THROW_EXCEPTION, error_context);
 	auto index_delta_view_catalog_entry =
-	    catalog.GetEntry<IndexCatalogEntry>(context, view_catalog_name, view_schema_name, view_name + "_ivm_index",
-	                                        OnEntryNotFound::RETURN_NULL, error_context);
+	    Catalog::GetEntry(context, view_catalog_name, view_schema_name,
+	                      EntryLookupInfo(CatalogType::INDEX_ENTRY, view_name + "_ivm_index", error_context),
+	                      OnEntryNotFound::RETURN_NULL);
 
 	auto view_query_entry = con.Query("select * from _duckdb_ivm_views where view_name = '" + view_name + "';");
 	if (view_query_entry->HasError()) {
@@ -76,18 +79,59 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	if (view_query_entry->RowCount() == 0) {
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
+	auto view_query_sql = view_query_entry->GetValue(1, 0).ToString();
 	auto view_query_type_data = view_query_entry->GetValue(2, 0);
 	IVMType view_query_type = static_cast<IVMType>(view_query_type_data.GetValue<int8_t>());
 
-	// we cannot use column references in ART indexes since their implementation is really messy
-	// we need to use column indexes; maybe there is a more efficient way (unique constraints?)
-	// but I cannot be bothered to think about this now
+	// Adaptive cost model: estimate IVM vs full recompute cost.
+	// Plan the original view query to get cardinality estimates.
+	{
+		Parser cost_parser;
+		cost_parser.ParseQuery(view_query_sql);
+		Planner cost_planner(context);
+		cost_planner.CreatePlan(cost_parser.statements[0]->Copy());
+		Optimizer cost_optimizer(*cost_planner.binder, context);
+		auto cost_plan = cost_optimizer.Optimize(std::move(cost_planner.plan));
 
-	// note: joins are hash joins by default, with group hash (try forcing index joins?)
+		auto cost_estimate = EstimateIVMCost(context, *cost_plan, view_name);
+		if (cost_estimate.ShouldRecompute()) {
+			OPENIVM_DEBUG_PRINT("[ADAPTIVE] Full recompute is cheaper — skipping IVM\n");
+
+			// Build recompute query: delete all from MV, re-insert from original query
+			string recompute_query = "DELETE FROM " + view_name + ";\n";
+			recompute_query += "INSERT INTO " + view_name + " " + view_query_sql + ";\n";
+
+			// Still need to update timestamps and clean up delta tables
+			string update_timestamp_query =
+			    "update _duckdb_ivm_delta_tables set last_update = now() where view_name = '" + view_name + "';\n";
+
+			auto tables =
+			    con.Query("select table_name from _duckdb_ivm_delta_tables where view_name = '" + view_name + "';");
+			string delete_from_delta_table_query;
+			if (!tables->HasError()) {
+				for (size_t i = 0; i < tables->RowCount(); i++) {
+					auto table_name = tables->GetValue(0, i).ToString();
+					if (cross_system) {
+						table_name = attached_db_catalog_name + "." + attached_db_schema_name + "." + table_name;
+					}
+					delete_from_delta_table_query += "delete from " + table_name +
+					                                 " where _duckdb_ivm_timestamp < (select min(last_update) from "
+					                                 "_duckdb_ivm_delta_tables where table_name = '" +
+					                                 table_name + "');\n";
+				}
+			}
+
+			string query = recompute_query + "\n" + update_timestamp_query + "\n" + delete_from_delta_table_query;
+
+			OPENIVM_DEBUG_PRINT("[ADAPTIVE] Recompute query:\n%s\n", query.c_str());
+			return query;
+		}
+	}
+
+	// IVM path: proceed with incremental maintenance
 
 	// first of all we need to understand the keys
 	auto delta_view_entry = dynamic_cast<TableCatalogEntry *>(delta_view_catalog_entry.get());
-	// compiler is too stupid to figure out "auto" here
 	const ColumnList &delta_view_columns = delta_view_entry->GetColumns();
 
 	auto column_names = delta_view_columns.GetColumnNames();

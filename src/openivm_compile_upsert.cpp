@@ -114,17 +114,15 @@ string CompileProjectionsFilters(string &view_name, const vector<string> &column
 	// Consolidate the delta using EXCEPT ALL to cancel out matching insert/delete pairs.
 	// This is needed because the inclusion-exclusion join delta rule can produce
 	// redundant entries that cancel each other in bag arithmetic.
-	string ins_cte = "SELECT " + select_columns + " FROM delta_" + view_name +
-	                 " WHERE _duckdb_ivm_multiplicity = true";
-	string dels_cte = "SELECT " + select_columns + " FROM delta_" + view_name +
-	                  " WHERE _duckdb_ivm_multiplicity = false";
+	string ins_cte = "SELECT " + select_columns + " FROM delta_" + view_name + " WHERE _duckdb_ivm_multiplicity = true";
+	string dels_cte =
+	    "SELECT " + select_columns + " FROM delta_" + view_name + " WHERE _duckdb_ivm_multiplicity = false";
 
-	string delete_query = "WITH net_dels AS (\n  " + dels_cte + "\n  EXCEPT ALL\n  " + ins_cte +
-	                      "\n)\ndelete from " + view_name + " where exists (select 1 from net_dels where " +
-	                      match_conditions + ");\n\n";
+	string delete_query = "WITH net_dels AS (\n  " + dels_cte + "\n  EXCEPT ALL\n  " + ins_cte + "\n)\ndelete from " +
+	                      view_name + " where exists (select 1 from net_dels where " + match_conditions + ");\n\n";
 
-	string insert_query = "WITH net_ins AS (\n  " + ins_cte + "\n  EXCEPT ALL\n  " + dels_cte +
-	                      "\n)\ninsert into " + view_name + " select " + select_columns + " from net_ins;\n";
+	string insert_query = "WITH net_ins AS (\n  " + ins_cte + "\n  EXCEPT ALL\n  " + dels_cte + "\n)\ninsert into " +
+	                      view_name + " select " + select_columns + " from net_ins;\n";
 
 	return delete_query + insert_query;
 }

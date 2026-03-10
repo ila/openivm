@@ -2,6 +2,8 @@
 #define OPENIVM_PARSER_HPP
 
 #include "duckdb.hpp"
+#include "duckdb/parser/parser_extension.hpp"
+#include "duckdb/planner/operator_extension.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "openivm_upsert.hpp"
 
@@ -41,12 +43,16 @@ public:
 BoundStatement IVMBind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info, SQLStatement &statement);
 
 struct IVMOperatorExtension : public OperatorExtension {
-	IVMOperatorExtension() : OperatorExtension() {
+	IVMOperatorExtension() {
 		Bind = IVMBind;
 	}
 
 	std::string GetName() override {
 		return "IVM";
+	}
+
+	unique_ptr<LogicalExtensionOperator> Deserialize(Deserializer &) override {
+		throw NotImplementedException("IVMOperatorExtension::Deserialize not implemented");
 	}
 };
 

@@ -1,5 +1,6 @@
 #include "ivm_join_rule.hpp"
 #include "openivm_debug.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -139,12 +140,11 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 		// XOR(a, b) for booleans = (a != b)
 		// This naturally handles the inclusion-exclusion sign:
 		//   sign * product(mul_i) in {+1,-1} space = XOR(mul_i) in boolean space
-		unique_ptr<Expression> combined_mul =
-		    make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[0]);
+		unique_ptr<Expression> combined_mul = make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[0]);
 		for (size_t i = 1; i < mul_bindings.size(); i++) {
 			auto next = make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[i]);
-			combined_mul = make_uniq<BoundComparisonExpression>(
-			    ExpressionType::COMPARE_NOTEQUAL, std::move(combined_mul), std::move(next));
+			combined_mul = make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL,
+			                                                    std::move(combined_mul), std::move(next));
 		}
 		proj_exprs.push_back(std::move(combined_mul));
 
@@ -158,8 +158,8 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	auto result = std::move(terms[0]);
 	for (size_t i = 1; i < terms.size(); i++) {
 		auto union_table_index = binder.GenerateTableIndex();
-		result = make_uniq<LogicalSetOperation>(union_table_index, types.size(), std::move(result),
-		                                        std::move(terms[i]), LogicalOperatorType::LOGICAL_UNION, true);
+		result = make_uniq<LogicalSetOperation>(union_table_index, types.size(), std::move(result), std::move(terms[i]),
+		                                        LogicalOperatorType::LOGICAL_UNION, true);
 		result->types = types;
 	}
 

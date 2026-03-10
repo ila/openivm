@@ -3,6 +3,8 @@
 
 #include "duckdb.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
 namespace duckdb {

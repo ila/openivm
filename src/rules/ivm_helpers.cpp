@@ -27,8 +27,7 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, c
 		opt_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
 		    context, delta_table_catalog, delta_table_schema, delta_table, OnEntryNotFound::RETURN_NULL, error_context);
 		if (opt_catalog_entry == nullptr) {
-			throw Exception(ExceptionType::BINDER,
-			                "Table " + delta_table + " does not exist, no deltas to compute!");
+			throw Exception(ExceptionType::BINDER, "Table " + delta_table + " does not exist, no deltas to compute!");
 		}
 	}
 	auto &table_entry = opt_catalog_entry->Cast<TableCatalogEntry>();
@@ -70,7 +69,7 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, c
 	Connection con(*context.db);
 	con.SetAutoCommit(false);
 	auto timestamp_query = "select last_update from _duckdb_ivm_delta_tables where view_name = '" + view_name +
-	                        "' and table_name = '" + table_name + "';";
+	                       "' and table_name = '" + table_name + "';";
 	auto r = con.Query(timestamp_query);
 	if (r->HasError()) {
 		throw InternalException("Error while querying last_update");
@@ -103,6 +102,5 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, c
 	delta_get_node->ResolveOperatorTypes();
 	return {std::move(delta_get_node), new_mul_binding};
 }
-
 
 } // namespace duckdb

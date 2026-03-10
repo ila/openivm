@@ -24,7 +24,6 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/planner/planner.hpp"
-#include "duckdb/planner/tableref/bound_basetableref.hpp"
 
 #include <iostream>
 #include <map>
@@ -49,7 +48,6 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 
 	switch (root->type) {
 	case LogicalOperatorType::LOGICAL_INSERT: {
-
 		auto insert_node = dynamic_cast<LogicalInsert *>(root);
 		auto insert_table_name = insert_node->table.name;
 		auto delta_insert_table = "delta_" + insert_node->table.name;
@@ -62,7 +60,6 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		    OnEntryNotFound::RETURN_NULL);
 
 		if (delta_table_catalog_entry) {
-
 			Connection con(*input.context.db);
 			con.SetAutoCommit(false);
 			auto t = con.Query("select * from _duckdb_ivm_views where view_name = '" + insert_table_name + "'");
@@ -196,7 +193,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 	case LogicalOperatorType::LOGICAL_UPDATE: {
 		auto &bindings_list = input.optimizer.binder.bind_context.GetBindingsList();
 		if (!bindings_list.empty()) {
-			if (bindings_list[0]->alias.GetAlias() == "rdda_metadata_update") {
+			if (bindings_list[0]->GetAlias() == "rdda_metadata_update") {
 				return;
 			}
 		}
