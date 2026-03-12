@@ -1,5 +1,5 @@
-#include "ivm_join_rule.hpp"
-#include "openivm_debug.hpp"
+#include "rules/ivm_join_rule.hpp"
+#include "core/openivm_debug.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"

@@ -1,7 +1,7 @@
 #ifndef IVM_AGGREGATE_RULE_HPP
 #define IVM_AGGREGATE_RULE_HPP
 
-#include "ivm_rule.hpp"
+#include "rules/ivm_rule.hpp"
 
 namespace duckdb {
 

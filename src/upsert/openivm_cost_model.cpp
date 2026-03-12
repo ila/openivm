@@ -1,5 +1,5 @@
-#include "openivm_cost_model.hpp"
-#include "openivm_debug.hpp"
+#include "upsert/openivm_cost_model.hpp"
+#include "core/openivm_debug.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"

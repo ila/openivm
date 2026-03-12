@@ -1,5 +1,5 @@
-#include "openivm_index_regen.hpp"
-#include "openivm_debug.hpp"
+#include "upsert/openivm_index_regen.hpp"
+#include "core/openivm_debug.hpp"
 #include "duckdb/planner/binder.hpp"
 
 #include <duckdb/planner/operator/logical_aggregate.hpp>

@@ -1,6 +1,6 @@
-#include "openivm_insert_rule.hpp"
-#include "openivm_debug.hpp"
-#include "openivm_parser.hpp"
+#include "rules/openivm_insert_rule.hpp"
+#include "core/openivm_debug.hpp"
+#include "core/openivm_parser.hpp"
 
 #include "logical_plan_to_sql.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"

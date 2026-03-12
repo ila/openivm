@@ -8,18 +8,18 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 set(LPTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lpts")
-include_directories(src/include src/rules ${LPTS_DIR}/src/include)
+include_directories(src/include ${LPTS_DIR}/src/include)
 
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
-    src/openivm_parser.cpp
-    src/openivm_upsert.cpp
-    src/openivm_rewrite_rule.cpp
-    src/openivm_index_regen.cpp
-    src/openivm_utils.cpp
-    src/openivm_compile_upsert.cpp
-    src/openivm_cost_model.cpp
-    src/openivm_insert_rule.cpp
+    src/core/openivm_parser.cpp
+    src/core/openivm_utils.cpp
+    src/upsert/openivm_upsert.cpp
+    src/upsert/openivm_compile_upsert.cpp
+    src/upsert/openivm_cost_model.cpp
+    src/upsert/openivm_index_regen.cpp
+    src/rules/openivm_rewrite_rule.cpp
+    src/rules/openivm_insert_rule.cpp
     src/rules/ivm_helpers.cpp
     src/rules/ivm_scan_rule.cpp
     src/rules/ivm_filter_rule.cpp

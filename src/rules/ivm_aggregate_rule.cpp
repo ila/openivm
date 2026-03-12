@@ -1,6 +1,6 @@
-#include "ivm_aggregate_rule.hpp"
-#include "openivm_debug.hpp"
-#include "openivm_rewrite_rule.hpp"
+#include "rules/ivm_aggregate_rule.hpp"
+#include "core/openivm_debug.hpp"
+#include "rules/openivm_rewrite_rule.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 

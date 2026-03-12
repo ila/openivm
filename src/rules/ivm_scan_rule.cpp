@@ -1,5 +1,5 @@
-#include "ivm_scan_rule.hpp"
-#include "openivm_debug.hpp"
+#include "rules/ivm_scan_rule.hpp"
+#include "core/openivm_debug.hpp"
 
 namespace duckdb {
 

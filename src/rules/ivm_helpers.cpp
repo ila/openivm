@@ -1,4 +1,4 @@
-#include "ivm_rule.hpp"
+#include "rules/ivm_rule.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"

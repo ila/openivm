@@ -1,6 +1,6 @@
-#include "openivm_parser.hpp"
+#include "core/openivm_parser.hpp"
 
-#include "openivm_utils.hpp"
+#include "core/openivm_utils.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"

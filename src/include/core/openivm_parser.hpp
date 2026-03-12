@@ -5,7 +5,7 @@
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/planner/operator_extension.hpp"
 #include "duckdb/function/pragma_function.hpp"
-#include "openivm_upsert.hpp"
+#include "upsert/openivm_upsert.hpp"
 
 #include <utility>
 

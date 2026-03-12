@@ -1,6 +1,6 @@
 #define DUCKDB_EXTENSION_MAIN
 
-#include "openivm_extension.hpp"
+#include "core/openivm_extension.hpp"
 
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
@@ -19,11 +19,11 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
-#include "openivm_upsert.hpp"
-#include "openivm_parser.hpp"
-#include "openivm_rewrite_rule.hpp"
-#include "openivm_insert_rule.hpp"
-#include "openivm_debug.hpp"
+#include "upsert/openivm_upsert.hpp"
+#include "core/openivm_parser.hpp"
+#include "rules/openivm_rewrite_rule.hpp"
+#include "rules/openivm_insert_rule.hpp"
+#include "core/openivm_debug.hpp"
 
 #include <map>
 

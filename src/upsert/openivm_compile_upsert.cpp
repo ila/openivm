@@ -1,4 +1,4 @@
-#include "openivm_compile_upsert.hpp"
+#include "upsert/openivm_compile_upsert.hpp"
 
 namespace duckdb {
 
