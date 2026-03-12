@@ -20,8 +20,6 @@
 
 namespace duckdb {
 
-bool done = false;
-
 ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionInfo *info, const string &query) {
 	auto query_lower = OpenIVMUtils::SQLToLowercase(StringUtil::Replace(query, ";", ""));
 	StringUtil::Trim(query_lower);
@@ -49,16 +47,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 	auto &ivm_parse_data = dynamic_cast<IVMParseData &>(*parse_data);
 	auto statement = dynamic_cast<SQLStatement *>(ivm_parse_data.statement.get());
 
-	if (!done) {
+	if (ivm_parse_data.plan) {
 		Connection con(*context.db.get());
 
 		auto view_name = OpenIVMUtils::ExtractTableName(statement->query);
 		auto view_query = OpenIVMUtils::ExtractViewQuery(statement->query);
 
-		string db_path;
-		if (!context.db->config.options.database_path.empty()) {
-			db_path = context.db->GetFileSystem().GetWorkingDirectory();
-		}
+		string db_path = context.db->GetFileSystem().GetWorkingDirectory();
 		Value db_path_value;
 		context.TryGetCurrentSetting("ivm_files_path", db_path_value);
 		if (!db_path_value.IsNull()) {
@@ -190,38 +185,30 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			OpenIVMUtils::WriteFile(index_file_path, false, index_query_view);
 		}
 
-		Value execute;
-		context.TryGetCurrentSetting("execute", execute);
-
-		if (!context.db->config.options.database_path.empty() && (execute.IsNull() || execute.GetValue<bool>())) {
-			auto system_queries = duckdb::OpenIVMUtils::ReadFile(system_tables_path);
-			for (auto &query : StringUtil::Split(system_queries, '\n')) {
-				auto r = con.Query(query);
-				if (r->HasError()) {
-					throw Exception(ExceptionType::PARSER, "Could not create system tables: " + r->GetError());
-				}
-			}
-
-			auto queries = duckdb::OpenIVMUtils::ReadFile(compiled_file_path);
-
-			for (auto &query : StringUtil::Split(queries, '\n')) {
-				auto r = con.Query(query);
-				if (r->HasError()) {
-					throw Exception(ExceptionType::PARSER, "Could not create materialized view: " + r->GetError());
-				}
-			}
-
-			if (ivm_type == IVMType::AGGREGATE_GROUP) {
-				auto index = duckdb::OpenIVMUtils::ReadFile(index_file_path);
-				auto r = con.Query(index);
-				if (r->HasError()) {
-					throw Exception(ExceptionType::PARSER, "Could not create index: " + r->GetError());
-				}
+		auto system_queries = duckdb::OpenIVMUtils::ReadFile(system_tables_path);
+		for (auto &query : StringUtil::Split(system_queries, '\n')) {
+			auto r = con.Query(query);
+			if (r->HasError()) {
+				throw Exception(ExceptionType::PARSER, "Could not create system tables: " + r->GetError());
 			}
 		}
-		done = true;
-	} else {
-		done = false;
+
+		auto queries = duckdb::OpenIVMUtils::ReadFile(compiled_file_path);
+
+		for (auto &query : StringUtil::Split(queries, '\n')) {
+			auto r = con.Query(query);
+			if (r->HasError()) {
+				throw Exception(ExceptionType::PARSER, "Could not create materialized view: " + r->GetError());
+			}
+		}
+
+		if (ivm_type == IVMType::AGGREGATE_GROUP) {
+			auto index = duckdb::OpenIVMUtils::ReadFile(index_file_path);
+			auto r = con.Query(index);
+			if (r->HasError()) {
+				throw Exception(ExceptionType::PARSER, "Could not create index: " + r->GetError());
+			}
+		}
 	}
 
 	ParserExtensionPlanResult result;

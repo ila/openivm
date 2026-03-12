@@ -5,40 +5,25 @@
 require openivm
 
 statement ok
-CREATE TABLE IF NOT EXISTS _duckdb_ivm_views (view_name VARCHAR PRIMARY KEY, sql_string VARCHAR, type TINYINT, last_update TIMESTAMP);
-
-statement ok
-CREATE TABLE IF NOT EXISTS _duckdb_ivm_delta_tables (view_name VARCHAR, table_name VARCHAR, last_update TIMESTAMP, PRIMARY KEY(view_name, table_name));
-
-# --- Base table ---
-statement ok
 CREATE TABLE scores (id INT, value INT, label VARCHAR);
 
 statement ok
 INSERT INTO scores VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c');
 
-# --- Materialized view: ungrouped SUM + COUNT ---
 statement ok
-CREATE TABLE score_totals AS SELECT sum(value) AS total, count(label) AS cnt FROM scores;
+create materialized view score_totals as (select sum(value) as total, count(label) as cnt from scores);
 
-statement ok
-CREATE TABLE delta_score_totals AS SELECT *, true AS _duckdb_ivm_multiplicity FROM score_totals LIMIT 0;
-
-statement ok
-CREATE TABLE delta_scores AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM scores LIMIT 0;
-
-statement ok
-INSERT INTO _duckdb_ivm_views VALUES ('score_totals', 'select sum(value) as total, count(label) as cnt from scores', 1, now()::timestamp);
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('score_totals', 'delta_scores', '1970-01-01');
+query II
+SELECT total, cnt FROM score_totals;
+----
+60	3
 
 # --- Insert ---
 statement ok
 INSERT INTO scores VALUES (4, 40, 'd');
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'score_totals');
+pragma ivm('score_totals');
 
 query II
 SELECT total, cnt FROM score_totals;
@@ -50,7 +35,7 @@ statement ok
 DELETE FROM scores WHERE id = 1;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'score_totals');
+pragma ivm('score_totals');
 
 query II
 SELECT total, cnt FROM score_totals;
@@ -65,7 +50,7 @@ statement ok
 DELETE FROM scores WHERE id = 2;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'score_totals');
+pragma ivm('score_totals');
 
 query II
 SELECT total, cnt FROM score_totals;
@@ -74,7 +59,7 @@ SELECT total, cnt FROM score_totals;
 
 # --- No-op PRAGMA ---
 statement ok
-PRAGMA ivm_options('memory', 'main', 'score_totals');
+pragma ivm('score_totals');
 
 query II
 SELECT total, cnt FROM score_totals;
@@ -86,7 +71,7 @@ statement ok
 INSERT INTO scores VALUES (6, 10, 'f'), (7, 20, 'g'), (8, 30, 'h');
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'score_totals');
+pragma ivm('score_totals');
 
 query II
 SELECT total, cnt FROM score_totals;
@@ -98,7 +83,7 @@ statement ok
 DELETE FROM scores WHERE value <= 20;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'score_totals');
+pragma ivm('score_totals');
 
 # Remaining: id=3(30), id=4(40), id=5(50), id=8(30) = 150, cnt=4
 query II

@@ -233,12 +233,6 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 
 	OPENIVM_DEBUG_PRINT("[UPSERT] Generated query:\n%s\n", query.c_str());
 
-	Value execute;
-	context.TryGetCurrentSetting("execute", execute);
-	// (the "execute" flag is only for benchmarking purposes)
-	if (!execute.IsNull() && !execute.GetValue<bool>()) {
-		return "select 1"; // dummy query for benchmarking
-	}
 	return query;
 }
 

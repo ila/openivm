@@ -5,43 +5,27 @@
 require openivm
 
 statement ok
-CREATE TABLE IF NOT EXISTS _duckdb_ivm_views (view_name VARCHAR PRIMARY KEY, sql_string VARCHAR, type TINYINT, last_update TIMESTAMP);
-
-statement ok
-CREATE TABLE IF NOT EXISTS _duckdb_ivm_delta_tables (view_name VARCHAR, table_name VARCHAR, last_update TIMESTAMP, PRIMARY KEY(view_name, table_name));
-
-# --- Base table ---
-statement ok
 CREATE TABLE employees (id INT, name VARCHAR, dept VARCHAR);
 
 statement ok
 INSERT INTO employees VALUES (1, 'Alice', 'eng'), (2, 'Bob', 'sales');
 
-# --- Materialized view: simple projection ---
 statement ok
-CREATE TABLE emp_names AS SELECT id, name FROM employees;
+create materialized view emp_names as (select id, name from employees);
 
-statement ok
-CREATE TABLE delta_emp_names AS SELECT *, true AS _duckdb_ivm_multiplicity FROM emp_names LIMIT 0;
-
-statement ok
-CREATE TABLE delta_employees AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM employees LIMIT 0;
-
-statement ok
-INSERT INTO _duckdb_ivm_views VALUES ('emp_names', 'select id, name from employees', 2, now()::timestamp);
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('emp_names', 'delta_employees', '1970-01-01');
+query II
+SELECT id, name FROM emp_names ORDER BY id;
+----
+1	Alice
+2	Bob
 
 # --- Insert a new employee ---
 statement ok
 INSERT INTO employees VALUES (3, 'Charlie', 'eng');
 
-# --- Trigger IVM ---
 statement ok
-PRAGMA ivm_options('memory', 'main', 'emp_names');
+pragma ivm('emp_names');
 
-# --- Check that the materialized view now has the new row ---
 query II
 SELECT id, name FROM emp_names ORDER BY id;
 ----
@@ -54,9 +38,8 @@ statement ok
 DELETE FROM employees WHERE id = 1;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'emp_names');
+pragma ivm('emp_names');
 
-# --- Check that Alice was removed from the materialized view ---
 query II
 SELECT id, name FROM emp_names ORDER BY id;
 ----
@@ -65,7 +48,7 @@ SELECT id, name FROM emp_names ORDER BY id;
 
 # --- No-op PRAGMA ---
 statement ok
-PRAGMA ivm_options('memory', 'main', 'emp_names');
+pragma ivm('emp_names');
 
 query II
 SELECT id, name FROM emp_names ORDER BY id;
@@ -78,7 +61,7 @@ statement ok
 INSERT INTO employees VALUES (4, 'Diana', 'eng'), (5, 'Eve', 'sales');
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'emp_names');
+pragma ivm('emp_names');
 
 query II
 SELECT id, name FROM emp_names ORDER BY id;
@@ -96,7 +79,7 @@ statement ok
 DELETE FROM employees WHERE id = 2;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'emp_names');
+pragma ivm('emp_names');
 
 query II
 SELECT id, name FROM emp_names ORDER BY id;

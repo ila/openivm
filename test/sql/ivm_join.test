@@ -4,12 +4,6 @@
 
 require openivm
 
-statement ok
-CREATE TABLE IF NOT EXISTS _duckdb_ivm_views (view_name VARCHAR PRIMARY KEY, sql_string VARCHAR, type TINYINT, last_update TIMESTAMP);
-
-statement ok
-CREATE TABLE IF NOT EXISTS _duckdb_ivm_delta_tables (view_name VARCHAR, table_name VARCHAR, last_update TIMESTAMP, PRIMARY KEY(view_name, table_name));
-
 # --- Base tables ---
 statement ok
 CREATE TABLE gods (uid INT, user_name VARCHAR);
@@ -24,44 +18,22 @@ statement ok
 INSERT INTO payments VALUES (1, 2, 1722), (2, 3, 53), (2, 5, 360), (3, 1, 80), (3, 2, 137), (3, 5, 83), (5, 1, 42), (1, 2, 222);
 
 # ==========================================
-# Test 1: Simple join projection
+# Simple join projection
 # ==========================================
 
 statement ok
-CREATE TABLE named_payments AS
-    SELECT g.user_name, p.from_uid, p.to_uid, p.amount
-    FROM gods g INNER JOIN payments p ON p.to_uid = g.uid;
-
-statement ok
-CREATE TABLE delta_named_payments AS SELECT *, true AS _duckdb_ivm_multiplicity FROM named_payments LIMIT 0;
-
-statement ok
-CREATE TABLE delta_gods AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM gods LIMIT 0;
-
-statement ok
-CREATE TABLE delta_payments AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM payments LIMIT 0;
-
-statement ok
-INSERT INTO _duckdb_ivm_views VALUES ('named_payments', 'select g.user_name, p.from_uid, p.to_uid, p.amount from gods as g inner join payments as p on p.to_uid = g.uid', 2, now()::timestamp);
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('named_payments', 'delta_gods', '1970-01-01');
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('named_payments', 'delta_payments', '1970-01-01');
+create materialized view named_payments as (select g.user_name, p.from_uid, p.to_uid, p.amount from gods as g inner join payments as p on p.to_uid = g.uid);
 
 # ==========================================
 # Test 1: Insert on RIGHT side (payments)
 # ==========================================
 
-# Insert a new payment to Apollo (uid 1)
 statement ok
 INSERT INTO payments VALUES (3, 1, 30);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
-# named_payments should now have the new payment
 query IIII
 SELECT user_name, from_uid, to_uid, amount FROM named_payments WHERE from_uid = 3 AND to_uid = 1 ORDER BY amount;
 ----
@@ -76,9 +48,8 @@ statement ok
 DELETE FROM payments WHERE from_uid = 5 AND to_uid = 1 AND amount = 42;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
-# The payment (5, 1, 42) to Apollo should be gone
 query I
 SELECT count(*) FROM named_payments WHERE from_uid = 5 AND to_uid = 1 AND amount = 42;
 ----
@@ -92,7 +63,7 @@ statement ok
 INSERT INTO gods VALUES (6, 'Hera');
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
 # No payments reference uid 6 yet, so MV unchanged
 query I
@@ -105,7 +76,7 @@ statement ok
 INSERT INTO payments VALUES (1, 6, 99);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
 query III
 SELECT user_name, from_uid, amount FROM named_payments WHERE to_uid = 6;
@@ -123,7 +94,7 @@ statement ok
 INSERT INTO payments VALUES (2, 7, 500);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
 query III
 SELECT user_name, from_uid, amount FROM named_payments WHERE to_uid = 7;
@@ -138,7 +109,7 @@ statement ok
 DELETE FROM gods WHERE uid = 6;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
 query I
 SELECT count(*) FROM named_payments WHERE user_name = 'Hera';
@@ -149,7 +120,6 @@ SELECT count(*) FROM named_payments WHERE user_name = 'Hera';
 # Test 6: Simultaneous delete on BOTH sides
 # ==========================================
 
-# First verify current state: Athena has payment (2, 7, 500)
 query III
 SELECT user_name, from_uid, amount FROM named_payments WHERE to_uid = 7;
 ----
@@ -162,7 +132,7 @@ statement ok
 DELETE FROM payments WHERE to_uid = 7;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
 query I
 SELECT count(*) FROM named_payments WHERE user_name = 'Athena';
@@ -177,7 +147,7 @@ statement ok
 INSERT INTO payments VALUES (1, 2, 10), (1, 2, 20), (1, 2, 30);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
 # Count all payments from 1 to 2 (original: 1722, 222 + new: 10, 20, 30)
 query I
@@ -190,7 +160,7 @@ SELECT count(*) FROM named_payments WHERE from_uid = 1 AND to_uid = 2;
 # ==========================================
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
 query I
 SELECT count(*) FROM named_payments WHERE from_uid = 1 AND to_uid = 2;
@@ -208,9 +178,8 @@ statement ok
 INSERT INTO payments VALUES (4, 5, 777);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
-# Should have 2 copies of the duplicate
 query I
 SELECT count(*) FROM named_payments WHERE from_uid = 4 AND to_uid = 5 AND amount = 777;
 ----
@@ -220,24 +189,20 @@ SELECT count(*) FROM named_payments WHERE from_uid = 4 AND to_uid = 5 AND amount
 # Test 10: Mixed insert + delete in same PRAGMA cycle
 # ==========================================
 
-# Delete the duplicates from base table
 statement ok
 DELETE FROM payments WHERE from_uid = 4 AND to_uid = 5 AND amount = 777;
 
-# Also insert something new
 statement ok
 INSERT INTO payments VALUES (1, 3, 999);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
-# Both duplicates should be gone (DELETE removes all matching)
 query I
 SELECT count(*) FROM named_payments WHERE from_uid = 4 AND to_uid = 5 AND amount = 777;
 ----
 0
 
-# New payment should be there
 query III
 SELECT user_name, from_uid, amount FROM named_payments WHERE from_uid = 1 AND to_uid = 3;
 ----
@@ -257,7 +222,7 @@ statement ok
 DELETE FROM payments WHERE from_uid = 1 AND to_uid = 3 AND amount = 999;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'named_payments');
+pragma ivm('named_payments');
 
 query III
 SELECT user_name, from_uid, amount FROM named_payments WHERE to_uid = 8;
@@ -285,36 +250,9 @@ CREATE TABLE god_cities (uid INT, city_id INT);
 statement ok
 INSERT INTO god_cities VALUES (1, 1), (2, 2), (3, 1), (5, 3);
 
-# MV: god name + city name (gods ⋈ god_cities ⋈ cities)
 statement ok
-CREATE TABLE god_locations AS
-    SELECT g.user_name, c.city_name
-    FROM gods g
-    INNER JOIN god_cities gc ON gc.uid = g.uid
-    INNER JOIN cities c ON c.city_id = gc.city_id;
+create materialized view god_locations as (select g.user_name, c.city_name from gods as g inner join god_cities as gc on gc.uid = g.uid inner join cities as c on c.city_id = gc.city_id);
 
-statement ok
-CREATE TABLE delta_god_locations AS SELECT *, true AS _duckdb_ivm_multiplicity FROM god_locations LIMIT 0;
-
-statement ok
-CREATE TABLE delta_cities AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM cities LIMIT 0;
-
-statement ok
-CREATE TABLE delta_god_cities AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM god_cities LIMIT 0;
-
-statement ok
-INSERT INTO _duckdb_ivm_views VALUES ('god_locations', 'select g.user_name, c.city_name from gods as g inner join god_cities as gc on gc.uid = g.uid inner join cities as c on c.city_id = gc.city_id', 2, now()::timestamp);
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('god_locations', 'delta_gods', '1970-01-01');
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('god_locations', 'delta_god_cities', '1970-01-01');
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('god_locations', 'delta_cities', '1970-01-01');
-
-# Verify initial state
 query II
 SELECT user_name, city_name FROM god_locations ORDER BY user_name;
 ----
@@ -328,7 +266,7 @@ statement ok
 INSERT INTO god_cities VALUES (4, 2);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'god_locations');
+pragma ivm('god_locations');
 
 query II
 SELECT user_name, city_name FROM god_locations WHERE user_name = 'Poseidon';
@@ -343,7 +281,7 @@ statement ok
 INSERT INTO god_cities VALUES (1, 4);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'god_locations');
+pragma ivm('god_locations');
 
 query II
 SELECT user_name, city_name FROM god_locations WHERE user_name = 'Apollo' ORDER BY city_name;
@@ -356,10 +294,9 @@ statement ok
 DELETE FROM god_cities WHERE uid = 4 AND city_id = 2;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'god_locations');
+pragma ivm('god_locations');
 
 query I
 SELECT count(*) FROM god_locations WHERE user_name = 'Poseidon';
 ----
 0
-

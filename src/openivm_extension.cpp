@@ -97,7 +97,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("ivm_system", "database for cross-system openivm", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("ivm_catalog_name", "catalog name", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("ivm_schema_name", "schema name", LogicalType::VARCHAR);
-	db_config.AddExtensionOption("execute", "whether to execute queries", LogicalType::BOOLEAN);
 	db_config.AddExtensionOption("ivm_done", "whether the query has been parsed", LogicalType::BOOLEAN);
 
 	Connection con(instance);
@@ -122,10 +121,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ivm_func.named_parameters["view_name"];
 	CreateTableFunctionInfo ivm_func_info(ivm_func);
 	catalog.CreateTableFunction(*con.context, &ivm_func_info);
-	con.Commit();
-
-	con.BeginTransaction();
-	con.Query("set execute=true");
 	con.Commit();
 
 	auto ivm_options = PragmaFunction::PragmaCall("ivm_options", UpsertDeltaQueries,
