@@ -83,7 +83,11 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	vector<JoinLeafInfo> leaves;
 	collect_join_leaves(pw.plan.get(), {}, leaves);
 	size_t N = leaves.size();
-	OPENIVM_DEBUG_PRINT("IvmJoinRule: %zu leaves found\n", N);
+	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Rewriting JOIN node, %zu leaves found\n", N);
+	for (size_t i = 0; i < N; i++) {
+		OPENIVM_DEBUG_PRINT("[IvmJoinRule]   Leaf %zu: table_index=%lu, path_depth=%zu\n", i,
+		                    (unsigned long)leaves[i].get->table_index, leaves[i].path.size());
+	}
 
 	if (N > 16) {
 		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
@@ -102,6 +106,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	//     (this accounts for the (-1)^(|S|-1) sign in inclusion-exclusion)
 	vector<unique_ptr<LogicalOperator>> terms;
 
+	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building %lu inclusion-exclusion terms\n", (unsigned long)((1ULL << N) - 1));
 	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
 		auto term = pw.plan->Copy(context);
 		vector<ColumnBinding> mul_bindings;
@@ -182,6 +187,8 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	}
 
 	pw.plan = std::move(result);
+	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Done, %zu terms unioned, mul_binding: table=%lu col=%lu\n", terms.size(),
+	                    (unsigned long)new_mul_binding.table_index, (unsigned long)new_mul_binding.column_index);
 	return {std::move(pw.plan), new_mul_binding};
 }
 

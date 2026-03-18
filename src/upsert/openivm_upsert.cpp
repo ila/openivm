@@ -44,6 +44,16 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// extracting the query from the view definition
 	Connection con(*context.db.get());
 
+	// Disable PAC's protected column check during IVM upsert compilation,
+	// since delta queries need to project protected columns outside aggregates.
+	// Only set if PAC is loaded (the setting exists).
+	Value pac_check_val;
+	bool pac_loaded = context.TryGetCurrentSetting("pac_check", pac_check_val);
+	if (pac_loaded) {
+		con.Query("SET pac_check = false");
+		con.Query("SET pac_rewrite = false");
+	}
+
 	if (parameters.values.size() == 3) {
 		// ivm_options was called, so different schema and catalog
 		view_catalog_name = StringValue::Get(parameters.values[0]);
@@ -82,18 +92,27 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	auto view_query_sql = view_query_entry->GetValue(1, 0).ToString();
 	auto view_query_type_data = view_query_entry->GetValue(2, 0);
 	IVMType view_query_type = static_cast<IVMType>(view_query_type_data.GetValue<int8_t>());
+	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
+	                    view_query_sql.c_str());
 
 	// Adaptive cost model: estimate IVM vs full recompute cost.
-	// Plan the original view query to get cardinality estimates.
-	{
+	// Gated by ivm_adaptive setting (default false — always use IVM).
+	Value ivm_adaptive_val;
+	bool ivm_adaptive = false;
+	if (context.TryGetCurrentSetting("ivm_adaptive", ivm_adaptive_val) && !ivm_adaptive_val.IsNull()) {
+		ivm_adaptive = ivm_adaptive_val.GetValue<bool>();
+	}
+	if (ivm_adaptive) {
+		con.BeginTransaction();
 		Parser cost_parser;
 		cost_parser.ParseQuery(view_query_sql);
-		Planner cost_planner(context);
+		Planner cost_planner(*con.context);
 		cost_planner.CreatePlan(cost_parser.statements[0]->Copy());
-		Optimizer cost_optimizer(*cost_planner.binder, context);
+		Optimizer cost_optimizer(*cost_planner.binder, *con.context);
 		auto cost_plan = cost_optimizer.Optimize(std::move(cost_planner.plan));
 
-		auto cost_estimate = EstimateIVMCost(context, *cost_plan, view_name);
+		auto cost_estimate = EstimateIVMCost(*con.context, *cost_plan, view_name);
+		con.Rollback();
 		if (cost_estimate.ShouldRecompute()) {
 			OPENIVM_DEBUG_PRINT("[ADAPTIVE] Full recompute is cheaper — skipping IVM\n");
 
@@ -141,6 +160,11 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// this is to compile the query to merge the materialized view with its delta version
 	// depending on the query type, this procedure will be done differently
 	// aggregates require an upsert query, while simple filters and projections are an insert
+	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n",
+	                    view_query_type == IVMType::AGGREGATE_GROUP       ? "AGGREGATE_GROUP"
+	                    : view_query_type == IVMType::SIMPLE_AGGREGATE    ? "SIMPLE_AGGREGATE"
+	                    : view_query_type == IVMType::SIMPLE_PROJECTION   ? "SIMPLE_PROJECTION"
+	                                                                     : "UNKNOWN");
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_GROUP: {
 		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names);
@@ -159,6 +183,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	}
 		// todo joins
 	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] Upsert query:\n%s\n", upsert_query.c_str());
 	// DoIVM is a table function (root of the tree)
 	string ivm_query;
 
@@ -175,14 +200,17 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	}
 
 	// now we can plan the query
+	OPENIVM_DEBUG_PRINT("[UPSERT] Planning DoIVM query: %s\n", do_ivm.c_str());
 	Parser p;
 	p.ParseQuery(do_ivm);
 
 	Planner planner(*con.context);
 	planner.CreatePlan(move(p.statements[0]));
 	auto plan = move(planner.plan);
+	OPENIVM_DEBUG_PRINT("[UPSERT] Unoptimized plan:\n%s\n", plan->ToString().c_str());
 	Optimizer optimizer(*planner.binder, *con.context);
 	plan = optimizer.Optimize(move(plan)); // this transforms the plan into an incremental plan
+	OPENIVM_DEBUG_PRINT("[UPSERT] Optimized (incremental) plan:\n%s\n", plan->ToString().c_str());
 
 	con.Rollback();
 
@@ -216,8 +244,10 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 		                                 table_name + "');\n";
 	}
 
-	string query = ivm_query + "\n\n" + update_timestamp_query + "\n" + upsert_query + "\n" + delete_from_view_query +
-	               "\n" + ivm_result + "\n" + delete_from_delta_table_query;
+	// Build the clean SQL (written to file for reference/replay)
+	string clean_query = ivm_query + "\n\n" + update_timestamp_query + "\n" +
+	                     upsert_query + "\n" + delete_from_view_query + "\n" + ivm_result + "\n" +
+	                     delete_from_delta_table_query;
 
 	// now also compiling the queries for future usage
 	string db_path;
@@ -229,7 +259,23 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 		db_path = db_path_value.ToString();
 	}
 	string ivm_file_path = db_path + "/ivm_upsert_queries_" + view_name + ".sql";
-	duckdb::OpenIVMUtils::WriteFile(ivm_file_path, false, query);
+	duckdb::OpenIVMUtils::WriteFile(ivm_file_path, false, clean_query);
+
+	// Build the execution query with PAC flags:
+	// - Step A (ivm_query = delta computation INSERT): PAC ON so aggregates get noise
+	// - Step B (upsert_query = merge into MV): PAC OFF since it's just bookkeeping
+	// - Cleanup (delete from delta tables): PAC OFF
+	string query;
+	if (pac_loaded) {
+		string pac_off = "SET pac_check = false;\nSET pac_rewrite = false;\n";
+		string pac_on = "SET pac_check = false;\nSET pac_rewrite = true;\n";
+		query = pac_on + ivm_query + "\n\n" + update_timestamp_query + "\n" +
+		        pac_off + upsert_query + "\n" +
+		        delete_from_view_query + "\n" + ivm_result + "\n" +
+		        delete_from_delta_table_query;
+	} else {
+		query = clean_query;
+	}
 
 	OPENIVM_DEBUG_PRINT("[UPSERT] Generated query:\n%s\n", query.c_str());
 

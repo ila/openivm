@@ -53,6 +53,9 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
                                          string &view, LogicalOperator *&root) {
 	PlanWrapper pw(input, plan, view, root);
 
+	OPENIVM_DEBUG_PRINT("[RewritePlan] Visiting node: %s\n", LogicalOperatorToString(plan->type).c_str());
+	OPENIVM_DEBUG_PRINT("[RewritePlan] Node detail: %s\n", plan->ToString().c_str());
+
 	switch (plan->type) {
 	case LogicalOperatorType::LOGICAL_GET: {
 		IvmScanRule rule;
@@ -148,18 +151,12 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 		throw NotImplementedException("Plan contains single node, this is not supported");
 	}
 
-#if OPENIVM_DEBUG
-	std::cout << "Running RewritePlan..." << '\n';
-#endif
+	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === Starting RewritePlan ===\n");
 	auto root = optimized_plan.get();
 	ModifiedPlan modified_plan = RewritePlan(input, optimized_plan, view, root);
-#if OPENIVM_DEBUG
-	std::cout << "Running AddInsertNode..." << '\n';
-#endif
+	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === RewritePlan done, running AddInsertNode ===\n");
 	AddInsertNode(input.context, modified_plan.op, view, view_catalog, view_schema);
-#if OPENIVM_DEBUG
-	std::cout << "\nFINAL PLAN:\n" << modified_plan.op->ToString() << '\n';
-#endif
+	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === FINAL PLAN ===\n%s\n", modified_plan.op->ToString().c_str());
 	plan = std::move(modified_plan.op);
 	return;
 }

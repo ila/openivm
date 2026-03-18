@@ -1,4 +1,10 @@
 #include "rules/ivm_rule.hpp"
+
+
+
+
+
+#include "core/openivm_debug.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
@@ -9,6 +15,8 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, c
 	unique_ptr<LogicalGet> delta_get_node;
 	ColumnBinding new_mul_binding;
 	string table_name;
+	OPENIVM_DEBUG_PRINT("[CreateDeltaGet] Creating delta get for view '%s', original table_index=%lu\n",
+	                    view_name.c_str(), (unsigned long)old_get->table_index);
 
 	optional_ptr<TableCatalogEntry> opt_catalog_entry;
 	{
@@ -100,6 +108,9 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, c
 	new_mul_binding = ColumnBinding(old_get->table_index, mul_proj_pos);
 
 	delta_get_node->ResolveOperatorTypes();
+	OPENIVM_DEBUG_PRINT("[CreateDeltaGet] Delta table: %s, mul_binding: table=%lu col=%lu, columns: %zu\n",
+	                    table_name.c_str(), (unsigned long)new_mul_binding.table_index,
+	                    (unsigned long)new_mul_binding.column_index, delta_get_node->GetColumnIds().size());
 	return {std::move(delta_get_node), new_mul_binding};
 }
 

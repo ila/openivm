@@ -1,0 +1,68 @@
+# name: test/sql/ivm_pac.test
+# description: Test IVM with PAC (Privacy-Augmented Computation) extension
+# group: [openivm]
+
+require openivm
+
+statement ok
+INSTALL 'pac';
+
+statement ok
+LOAD 'pac';
+
+statement ok
+SET pac_mi = 0;
+
+statement ok
+SET pac_seed = 42;
+
+statement ok
+SET threads = 1;
+
+# ==========================================
+# 1. Grouped aggregate: SUM with GROUP BY
+# ==========================================
+
+statement ok
+CREATE PU TABLE scores (id INT, grp INT, value INT, PAC_KEY(id), protected(value));
+
+statement ok
+INSERT INTO scores VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_grp AS (SELECT grp, SUM(value) AS total FROM scores GROUP BY grp);
+
+# SELECT from derived_pu table should work (not blocked by PAC)
+query II
+SELECT * FROM mv_grp;
+----
+1	60
+2	60
+
+# --- Insert into existing group ---
+statement ok
+INSERT INTO scores VALUES (4, 2, 40);
+
+statement ok
+pragma ivm('mv_grp');
+
+# Still 2 groups after insert
+query II
+SELECT * FROM mv_grp;
+----
+1	60
+2	140
+
+# --- Verify IVM result matches full recomputation ---
+statement ok
+CREATE PU TABLE scores_check (id INT, grp INT, value INT, PAC_KEY(id), protected(value));
+
+statement ok
+INSERT INTO scores_check VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40);
+
+query II
+SELECT grp, SUM(value) AS total FROM scores GROUP BY grp
+----
+1	30
+2	70
+

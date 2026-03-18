@@ -62,17 +62,21 @@ static duckdb::unique_ptr<FunctionData> DoIVMBind(ClientContext &context, TableF
 		throw InternalException("Error while querying view definition");
 	}
 	string view_query = v->GetValue(0, 0).ToString();
+	OPENIVM_DEBUG_PRINT("[DoIVM Bind] View: %s, Query: %s\n", view_name.c_str(), view_query.c_str());
 
 	Parser parser;
 	parser.ParseQuery(view_query);
 	auto statement = parser.statements[0].get();
 	Planner planner(context);
 	planner.CreatePlan(statement->Copy());
+	OPENIVM_DEBUG_PRINT("[DoIVM Bind] Plan:\n%s\n", planner.plan->ToString().c_str());
 
 	auto result = make_uniq<DoIVMFunctionData>();
 	for (size_t i = 0; i < planner.names.size(); i++) {
 		return_types.emplace_back(planner.types[i]);
 		names.emplace_back(planner.names[i]);
+		OPENIVM_DEBUG_PRINT("[DoIVM Bind] Column %zu: %s (%s)\n", i, planner.names[i].c_str(),
+		                    planner.types[i].ToString().c_str());
 	}
 
 	return_types.emplace_back(LogicalTypeId::BOOLEAN);
@@ -98,6 +102,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("ivm_catalog_name", "catalog name", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("ivm_schema_name", "schema name", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("ivm_done", "whether the query has been parsed", LogicalType::BOOLEAN);
+	db_config.AddExtensionOption("ivm_adaptive", "enable adaptive cost model (when false, always use IVM)",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	Connection con(instance);
 	auto ivm_parser = duckdb::IVMParserExtension();
