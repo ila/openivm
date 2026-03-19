@@ -190,9 +190,13 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	con.Rollback();
 
 	// we turn the plan into a string using LogicalPlanToSql (replacement for LogicalPlanToString)
+	OPENIVM_DEBUG_PRINT("[LPTS TRACE] Creating LPTS...\n");
 	LogicalPlanToSql lpts(context, plan);
+	OPENIVM_DEBUG_PRINT("[LPTS TRACE] LogicalPlanToCteList...\n");
 	auto cte_list = lpts.LogicalPlanToCteList();
+	OPENIVM_DEBUG_PRINT("[LPTS TRACE] CteListToSql...\n");
 	ivm_query += LogicalPlanToSql::CteListToSql(cte_list);
+	OPENIVM_DEBUG_PRINT("[LPTS TRACE] Done.\n");
 
 	// we delete everything from the delta view (we don't need the data anymore, it will be inserted in the view)
 	string delete_from_view_query = "delete from delta_" + view_name + ";";
