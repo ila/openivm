@@ -83,6 +83,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	auto view_query_type_data = view_query_entry->GetValue(2, 0);
 	IVMType view_query_type = static_cast<IVMType>(view_query_type_data.GetValue<int8_t>());
 
+	bool has_minmax = StringUtil::Contains(view_query_sql, "min(") || StringUtil::Contains(view_query_sql, "max(");
+
 	// Adaptive cost model: estimate IVM vs full recompute cost.
 	// Plan the original view query to get cardinality estimates.
 	{
@@ -143,7 +145,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// aggregates require an upsert query, while simple filters and projections are an insert
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_GROUP: {
-		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names);
+		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
+		                                      view_query_sql, has_minmax);
 		break;
 	}
 
@@ -154,7 +157,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	}
 
 	case IVMType::SIMPLE_AGGREGATE: {
-		upsert_query = CompileSimpleAggregates(view_name, column_names);
+		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax);
 		break;
 	}
 		// todo joins

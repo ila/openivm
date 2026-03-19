@@ -3,7 +3,7 @@
 namespace duckdb {
 
 string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
-                              vector<string> column_names) {
+                              vector<string> column_names, const string &view_query_sql, bool has_minmax) {
 	auto index_catalog_entry = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
 	auto key_ids = index_catalog_entry->column_ids;
 
@@ -19,6 +19,26 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 		if (keys_set.find(column) == keys_set.end() && column != "_duckdb_ivm_multiplicity") {
 			aggregates.push_back(column);
 		}
+	}
+
+	if (has_minmax) {
+		// Group-recompute strategy: delete affected groups, re-insert from original query
+		string keys_tuple;
+		for (size_t i = 0; i < keys.size(); i++) {
+			keys_tuple += keys[i];
+			if (i != keys.size() - 1) {
+				keys_tuple += ", ";
+			}
+		}
+
+		string delete_query = "delete from " + view_name + " where (" + keys_tuple + ") in (\n" +
+		                      "  select distinct " + keys_tuple + " from delta_" + view_name + "\n);\n";
+
+		string insert_query = "insert into " + view_name + "\n" + "select * from (" + view_query_sql +
+		                      ") _ivm_recompute\n" + "where (" + keys_tuple + ") in (\n" + "  select distinct " +
+		                      keys_tuple + " from delta_" + view_name + "\n);\n";
+
+		return delete_query + "\n" + insert_query;
 	}
 
 	string cte_string = "with ivm_cte AS (\n";
@@ -81,7 +101,15 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	return upsert_query;
 }
 
-string CompileSimpleAggregates(string &view_name, const vector<string> &column_names) {
+string CompileSimpleAggregates(string &view_name, const vector<string> &column_names, const string &view_query_sql,
+                               bool has_minmax) {
+	if (has_minmax) {
+		// Full recompute for ungrouped MIN/MAX
+		string delete_query = "delete from " + view_name + ";\n";
+		string insert_query = "insert into " + view_name + " " + view_query_sql + ";\n";
+		return delete_query + insert_query;
+	}
+
 	string update_query = "update " + view_name + "\nset ";
 	bool first = true;
 	for (auto &column : column_names) {

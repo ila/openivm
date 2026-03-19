@@ -65,7 +65,7 @@ string OpenIVMUtils::EscapeSingleQuotes(const string &input) {
 }
 
 void OpenIVMUtils::ReplaceMaterializedView(string &query) {
-	query = std::regex_replace(query, std::regex("\\bmaterialized\\s+view\\b"), "table if not exists");
+	query = std::regex_replace(query, std::regex("\\bmaterialized\\s+view\\b"), "table");
 	query = regex_replace(query, std::regex("\\s*;$"), "");
 }
 
@@ -165,6 +165,16 @@ void OpenIVMUtils::ReplaceCount(string &query) {
 void OpenIVMUtils::ReplaceSum(string &query) {
 	std::regex pattern("(sum\\((\\w+)\\))(?![^()]*\\bas\\b)", std::regex_constants::icase);
 	query = std::regex_replace(query, pattern, "sum($2) as sum_$2");
+}
+
+void OpenIVMUtils::ReplaceMin(string &query) {
+	std::regex pattern("(min\\((\\w+)\\))(?![^()]*\\bas\\b)", std::regex_constants::icase);
+	query = std::regex_replace(query, pattern, "min($2) as min_$2");
+}
+
+void OpenIVMUtils::ReplaceMax(string &query) {
+	std::regex pattern("(max\\((\\w+)\\))(?![^()]*\\bas\\b)", std::regex_constants::icase);
+	query = std::regex_replace(query, pattern, "max($2) as max_$2");
 }
 
 void OpenIVMUtils::RemoveRedundantWhitespaces(string &query) {

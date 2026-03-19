@@ -1,0 +1,752 @@
+# name: test/sql/ivm_parser.test
+# description: Test CREATE MATERIALIZED VIEW parser (end-to-end)
+# group: [sql]
+
+require openivm
+
+load __TEST_DIR__/ivm_parser_test.db
+
+statement ok
+SET ivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Test 1: Basic SUM + COUNT with GROUP BY
+# ==========================================
+
+statement ok
+CREATE TABLE sales (id INT, region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO sales VALUES (1, 'east', 100), (2, 'west', 200), (3, 'east', 150);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sales AS SELECT region, sum(amount) as sum_amount, count(amount) as count_amount FROM sales GROUP BY region;
+
+# MV should be populated
+query III
+SELECT region, sum_amount, count_amount FROM mv_sales ORDER BY region;
+----
+east	250	2
+west	200	1
+
+# System tables should be populated
+query I
+SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_sales';
+----
+1
+
+query I
+SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_sales';
+----
+1
+
+# Delta tables should exist
+query I
+SELECT count(*) FROM delta_sales;
+----
+0
+
+query I
+SELECT count(*) FROM delta_mv_sales;
+----
+0
+
+# IVM should work end-to-end
+statement ok
+INSERT INTO sales VALUES (4, 'east', 50);
+
+statement ok
+PRAGMA ivm('mv_sales');
+
+query III
+SELECT region, sum_amount, count_amount FROM mv_sales ORDER BY region;
+----
+east	300	3
+west	200	1
+
+# ==========================================
+# Test 2: MIN and MAX with GROUP BY
+# ==========================================
+
+statement ok
+CREATE TABLE scores (id INT, team VARCHAR, score INT);
+
+statement ok
+INSERT INTO scores VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_scores AS SELECT team, min(score) as min_score, max(score) as max_score FROM scores GROUP BY team;
+
+query III
+SELECT team, min_score, max_score FROM mv_scores ORDER BY team;
+----
+a	10	20
+b	5	30
+
+statement ok
+INSERT INTO scores VALUES (5, 'a', 1);
+
+statement ok
+PRAGMA ivm('mv_scores');
+
+query III
+SELECT team, min_score, max_score FROM mv_scores ORDER BY team;
+----
+a	1	20
+b	5	30
+
+# Delete current min — recompute should recover next min
+statement ok
+DELETE FROM scores WHERE id = 5;
+
+statement ok
+PRAGMA ivm('mv_scores');
+
+query III
+SELECT team, min_score, max_score FROM mv_scores ORDER BY team;
+----
+a	10	20
+b	5	30
+
+# ==========================================
+# Test 3: Mixed SUM + MIN + MAX
+# ==========================================
+
+statement ok
+CREATE TABLE metrics (id INT, grp VARCHAR, a INT, b INT);
+
+statement ok
+INSERT INTO metrics VALUES (1, 'x', 10, 100), (2, 'x', 20, 200), (3, 'y', 30, 300);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_metrics AS SELECT grp, sum(a) as sum_a, min(b) as min_b, max(b) as max_b FROM metrics GROUP BY grp;
+
+query IIII
+SELECT grp, sum_a, min_b, max_b FROM mv_metrics ORDER BY grp;
+----
+x	30	100	200
+y	30	300	300
+
+statement ok
+INSERT INTO metrics VALUES (4, 'x', 5, 50);
+
+statement ok
+PRAGMA ivm('mv_metrics');
+
+query IIII
+SELECT grp, sum_a, min_b, max_b FROM mv_metrics ORDER BY grp;
+----
+x	35	50	200
+y	30	300	300
+
+# ==========================================
+# Test 4: Ungrouped aggregate (simple aggregate)
+# ==========================================
+
+statement ok
+CREATE TABLE vals (id INT, val INT);
+
+statement ok
+INSERT INTO vals VALUES (1, 100), (2, 50), (3, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_vals AS SELECT min(val) as min_val, max(val) as max_val, sum(val) as sum_val FROM vals;
+
+query III
+SELECT min_val, max_val, sum_val FROM mv_vals;
+----
+50	200	350
+
+statement ok
+INSERT INTO vals VALUES (4, 10);
+
+statement ok
+PRAGMA ivm('mv_vals');
+
+query III
+SELECT min_val, max_val, sum_val FROM mv_vals;
+----
+10	200	360
+
+# ==========================================
+# Test 5: Aliases already present — parser should not double-alias
+# ==========================================
+
+statement ok
+CREATE TABLE items (id INT, cat VARCHAR, price INT);
+
+statement ok
+INSERT INTO items VALUES (1, 'a', 10), (2, 'b', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_items AS SELECT cat, sum(price) as total, min(price) as cheapest FROM items GROUP BY cat;
+
+query III
+SELECT cat, total, cheapest FROM mv_items ORDER BY cat;
+----
+a	10	10
+b	20	20
+
+# ==========================================
+# Test 6: Extra spaces in CREATE MATERIALIZED VIEW
+# ==========================================
+
+statement ok
+CREATE TABLE t6 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t6 VALUES (1, 'a', 5);
+
+statement ok
+CREATE  MATERIALIZED  VIEW  mv_t6  AS  SELECT  grp, sum(val) as sum_val  FROM  t6  GROUP  BY  grp;
+
+query II
+SELECT grp, sum_val FROM mv_t6 ORDER BY grp;
+----
+a	5
+
+# ==========================================
+# Test 7: Mixed case keywords
+# ==========================================
+
+statement ok
+CREATE TABLE t7 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t7 VALUES (1, 'a', 5), (2, 'a', 10);
+
+statement ok
+CREATE Materialized View mv_t7 AS Select grp, Min(val) as min_val, Max(val) as max_val, Sum(val) as sum_val From t7 Group By grp;
+
+query IIII
+SELECT grp, min_val, max_val, sum_val FROM mv_t7 ORDER BY grp;
+----
+a	5	10	15
+
+# ==========================================
+# Test 8: Simple projection (no aggregation)
+# ==========================================
+
+statement ok
+CREATE TABLE t8 (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO t8 VALUES (1, 'alice'), (2, 'bob');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t8 AS SELECT id, name FROM t8;
+
+query II
+SELECT id, name FROM mv_t8 ORDER BY id;
+----
+1	alice
+2	bob
+
+statement ok
+INSERT INTO t8 VALUES (3, 'carol');
+
+statement ok
+PRAGMA ivm('mv_t8');
+
+query II
+SELECT id, name FROM mv_t8 ORDER BY id;
+----
+1	alice
+2	bob
+3	carol
+
+# ==========================================
+# Test 9: Projection with filter
+# ==========================================
+
+statement ok
+CREATE TABLE t9 (id INT, status VARCHAR, val INT);
+
+statement ok
+INSERT INTO t9 VALUES (1, 'active', 10), (2, 'inactive', 20), (3, 'active', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t9 AS SELECT id, val FROM t9 WHERE status = 'active';
+
+query II
+SELECT id, val FROM mv_t9 ORDER BY id;
+----
+1	10
+3	30
+
+# ==========================================
+# Test 10: Non-materialized view should be ignored by parser
+# ==========================================
+
+statement ok
+CREATE VIEW regular_view AS SELECT * FROM t8;
+
+query II
+SELECT id, name FROM regular_view ORDER BY id;
+----
+1	alice
+2	bob
+3	carol
+
+# ==========================================
+# Test 11: Aggregate with filter (WHERE + GROUP BY)
+# ==========================================
+
+statement ok
+CREATE TABLE orders (id INT, region VARCHAR, amount INT, status VARCHAR);
+
+statement ok
+INSERT INTO orders VALUES (1, 'east', 100, 'paid'), (2, 'west', 200, 'paid'), (3, 'east', 50, 'pending');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_orders AS SELECT region, sum(amount) as total, min(amount) as lowest FROM orders WHERE status = 'paid' GROUP BY region;
+
+query III
+SELECT region, total, lowest FROM mv_orders ORDER BY region;
+----
+east	100	100
+west	200	200
+
+statement ok
+INSERT INTO orders VALUES (4, 'east', 25, 'paid');
+
+statement ok
+PRAGMA ivm('mv_orders');
+
+query III
+SELECT region, total, lowest FROM mv_orders ORDER BY region;
+----
+east	125	25
+west	200	200
+
+# ==========================================
+# Test 12: Typo — "MATERIALIZD" (missing E)
+# ==========================================
+
+# Should fall through to DuckDB parser and fail
+statement error
+CREATE MATERIALIZD VIEW mv_typo1 AS SELECT region, sum(amount) as total FROM sales GROUP BY region;
+----
+Parser Error
+
+# ==========================================
+# Test 13: Typo — "MATERIALIZED VEIW"
+# ==========================================
+
+statement error
+CREATE MATERIALIZED VEIW mv_typo2 AS SELECT region, sum(amount) as total FROM sales GROUP BY region;
+----
+Parser Error
+
+# ==========================================
+# Test 14: Missing AS keyword
+# ==========================================
+
+statement error
+CREATE MATERIALIZED VIEW mv_no_as SELECT region, sum(amount) as total FROM sales GROUP BY region;
+----
+Parser Error
+
+# ==========================================
+# Test 15: Missing view name
+# ==========================================
+
+statement error
+CREATE MATERIALIZED VIEW AS SELECT region, sum(amount) as total FROM sales GROUP BY region;
+----
+Parser Error
+
+# ==========================================
+# Test 16: Non-existent base table
+# ==========================================
+
+statement error
+CREATE MATERIALIZED VIEW mv_ghost AS SELECT x FROM does_not_exist GROUP BY x;
+----
+does_not_exist
+
+# ==========================================
+# Test 17: Duplicate materialized view name — should error
+# ==========================================
+
+# mv_sales already exists from Test 1
+statement error
+CREATE MATERIALIZED VIEW mv_sales AS SELECT region, sum(amount) as total FROM sales GROUP BY region;
+----
+Duplicate key
+
+# Note: IF NOT EXISTS on the table itself works, but the system table insert
+# (_duckdb_ivm_delta_tables) is unconditional, so it still errors on duplicate.
+# TODO: use INSERT OR IGNORE for _duckdb_ivm_delta_tables when IF NOT EXISTS is used.
+
+# Original data should be unaffected by the failed duplicate attempt
+query III
+SELECT region, sum_amount, count_amount FROM mv_sales ORDER BY region;
+----
+east	300	3
+west	200	1
+
+# ==========================================
+# Test 18: Empty base table — MV should be empty but valid
+# ==========================================
+
+statement ok
+CREATE TABLE empty_tbl (id INT, grp VARCHAR, val INT);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_empty AS SELECT grp, min(val) as min_val FROM empty_tbl GROUP BY grp;
+
+query II
+SELECT grp, min_val FROM mv_empty ORDER BY grp;
+----
+
+# Now insert and refresh
+statement ok
+INSERT INTO empty_tbl VALUES (1, 'a', 42);
+
+statement ok
+PRAGMA ivm('mv_empty');
+
+query II
+SELECT grp, min_val FROM mv_empty ORDER BY grp;
+----
+a	42
+
+# ==========================================
+# Test 19: NULL values in aggregated columns
+# ==========================================
+
+statement ok
+CREATE TABLE nulls_tbl (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO nulls_tbl VALUES (1, 'a', 10), (2, 'a', NULL), (3, 'b', NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_nulls AS SELECT grp, min(val) as min_val, max(val) as max_val, count(val) as cnt FROM nulls_tbl GROUP BY grp;
+
+# MIN/MAX/COUNT should ignore NULLs
+query IIII
+SELECT grp, min_val, max_val, cnt FROM mv_nulls ORDER BY grp;
+----
+a	10	10	1
+b	NULL	NULL	0
+
+# Insert a non-null into group b
+statement ok
+INSERT INTO nulls_tbl VALUES (4, 'b', 7);
+
+statement ok
+PRAGMA ivm('mv_nulls');
+
+query IIII
+SELECT grp, min_val, max_val, cnt FROM mv_nulls ORDER BY grp;
+----
+a	10	10	1
+b	7	7	1
+
+# ==========================================
+# Test 20: Negative numbers
+# ==========================================
+
+statement ok
+CREATE TABLE negatives (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO negatives VALUES (1, 'x', -100), (2, 'x', 50), (3, 'x', -200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_neg AS SELECT grp, min(val) as lo, max(val) as hi, sum(val) as total FROM negatives GROUP BY grp;
+
+query IIII
+SELECT grp, lo, hi, total FROM mv_neg;
+----
+x	-200	50	-250
+
+statement ok
+INSERT INTO negatives VALUES (4, 'x', -300);
+
+statement ok
+PRAGMA ivm('mv_neg');
+
+query IIII
+SELECT grp, lo, hi, total FROM mv_neg;
+----
+x	-300	50	-550
+
+# Delete the most negative
+statement ok
+DELETE FROM negatives WHERE id = 4;
+
+statement ok
+PRAGMA ivm('mv_neg');
+
+query IIII
+SELECT grp, lo, hi, total FROM mv_neg;
+----
+x	-200	50	-250
+
+# ==========================================
+# Test 21: VARCHAR MIN/MAX (alphabetical ordering)
+# ==========================================
+
+statement ok
+CREATE TABLE words (id INT, cat VARCHAR, word VARCHAR);
+
+statement ok
+INSERT INTO words VALUES (1, 'fruit', 'banana'), (2, 'fruit', 'apple'), (3, 'fruit', 'cherry');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_words AS SELECT cat, min(word) as first_word, max(word) as last_word FROM words GROUP BY cat;
+
+query III
+SELECT cat, first_word, last_word FROM mv_words;
+----
+fruit	apple	cherry
+
+statement ok
+INSERT INTO words VALUES (4, 'fruit', 'apricot');
+
+statement ok
+PRAGMA ivm('mv_words');
+
+query III
+SELECT cat, first_word, last_word FROM mv_words;
+----
+fruit	apple	cherry
+
+# Delete 'apple' — 'apricot' becomes new min
+statement ok
+DELETE FROM words WHERE id = 2;
+
+statement ok
+PRAGMA ivm('mv_words');
+
+query III
+SELECT cat, first_word, last_word FROM mv_words;
+----
+fruit	apricot	cherry
+
+# ==========================================
+# Test 22: count(*) alongside MIN/MAX
+# ==========================================
+
+statement ok
+CREATE TABLE t22 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t22 VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t22 AS SELECT grp, count(*) as n, min(val) as lo, max(val) as hi FROM t22 GROUP BY grp;
+
+query IIII
+SELECT grp, n, lo, hi FROM mv_t22 ORDER BY grp;
+----
+a	2	10	20
+b	1	5	5
+
+statement ok
+INSERT INTO t22 VALUES (4, 'a', 1);
+
+statement ok
+PRAGMA ivm('mv_t22');
+
+query IIII
+SELECT grp, n, lo, hi FROM mv_t22 ORDER BY grp;
+----
+a	3	1	20
+b	1	5	5
+
+statement ok
+DELETE FROM t22 WHERE id = 4;
+
+statement ok
+PRAGMA ivm('mv_t22');
+
+query IIII
+SELECT grp, n, lo, hi FROM mv_t22 ORDER BY grp;
+----
+a	2	10	20
+b	1	5	5
+
+# ==========================================
+# Test 23: Multiple GROUP BY columns
+# ==========================================
+
+statement ok
+CREATE TABLE t23 (id INT, dept VARCHAR, team VARCHAR, val INT);
+
+statement ok
+INSERT INTO t23 VALUES (1, 'eng', 'be', 10), (2, 'eng', 'be', 20), (3, 'eng', 'fe', 5), (4, 'sales', 'us', 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t23 AS SELECT dept, team, min(val) as lo, max(val) as hi FROM t23 GROUP BY dept, team;
+
+query IIII
+SELECT dept, team, lo, hi FROM mv_t23 ORDER BY dept, team;
+----
+eng	be	10	20
+eng	fe	5	5
+sales	us	100	100
+
+statement ok
+INSERT INTO t23 VALUES (5, 'eng', 'be', 1);
+
+statement ok
+PRAGMA ivm('mv_t23');
+
+query IIII
+SELECT dept, team, lo, hi FROM mv_t23 ORDER BY dept, team;
+----
+eng	be	1	20
+eng	fe	5	5
+sales	us	100	100
+
+# ==========================================
+# Test 24: Lots of extra whitespace and tabs
+# ==========================================
+
+statement ok
+CREATE TABLE t24 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t24 VALUES (1, 'z', 99);
+
+statement ok
+CREATE   MATERIALIZED    VIEW    mv_t24   AS   SELECT   grp  ,   min( val )  as   min_val   FROM   t24   GROUP   BY   grp;
+
+query II
+SELECT grp, min_val FROM mv_t24;
+----
+z	99
+
+# ==========================================
+# Test 25: Trailing semicolons and whitespace
+# ==========================================
+
+statement ok
+CREATE TABLE t25 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t25 VALUES (1, 'q', 7);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t25 AS SELECT grp, max(val) as hi FROM t25 GROUP BY grp ;
+
+query II
+SELECT grp, hi FROM mv_t25;
+----
+q	7
+
+# ==========================================
+# Test 26: Single row per group, then delete everything
+# ==========================================
+
+statement ok
+CREATE TABLE t26 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t26 VALUES (1, 'only', 42);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t26 AS SELECT grp, min(val) as lo, max(val) as hi FROM t26 GROUP BY grp;
+
+query III
+SELECT grp, lo, hi FROM mv_t26;
+----
+only	42	42
+
+# Delete the only row — MV should become empty
+statement ok
+DELETE FROM t26 WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_t26');
+
+query III
+SELECT grp, lo, hi FROM mv_t26 ORDER BY grp;
+----
+
+# Re-insert — MV should come back
+statement ok
+INSERT INTO t26 VALUES (2, 'only', 99);
+
+statement ok
+PRAGMA ivm('mv_t26');
+
+query III
+SELECT grp, lo, hi FROM mv_t26;
+----
+only	99	99
+
+# ==========================================
+# Test 27: Aggregates without aliases (parser should auto-alias)
+# ==========================================
+
+statement ok
+CREATE TABLE t27 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t27 VALUES (1, 'a', 10), (2, 'a', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t27 AS SELECT grp, min(val), max(val), sum(val), count(val) FROM t27 GROUP BY grp;
+
+query IIIII
+SELECT grp, min_val, max_val, sum_val, count_val FROM mv_t27;
+----
+a	10	20	30	2
+
+statement ok
+INSERT INTO t27 VALUES (3, 'a', 5);
+
+statement ok
+PRAGMA ivm('mv_t27');
+
+query IIIII
+SELECT grp, min_val, max_val, sum_val, count_val FROM mv_t27;
+----
+a	5	20	35	3
+
+# ==========================================
+# Test 28: Back-to-back PRAGMAs with no changes (idempotent)
+# ==========================================
+
+statement ok
+PRAGMA ivm('mv_t27');
+
+statement ok
+PRAGMA ivm('mv_t27');
+
+statement ok
+PRAGMA ivm('mv_t27');
+
+query IIIII
+SELECT grp, min_val, max_val, sum_val, count_val FROM mv_t27;
+----
+a	5	20	35	3
+
+# ==========================================
+# Test 29: Insert and delete the same row in one cycle
+# ==========================================
+
+statement ok
+INSERT INTO t27 VALUES (99, 'a', 1);
+
+statement ok
+DELETE FROM t27 WHERE id = 99;
+
+statement ok
+PRAGMA ivm('mv_t27');
+
+# Should be unchanged
+query IIIII
+SELECT grp, min_val, max_val, sum_val, count_val FROM mv_t27;
+----
+a	5	20	35	3
+
+# Note: Test 30 (large batch insert with 100+ rows) is skipped here.
+# PRAGMA ivm with large delta tables causes a segfault in the LPTS module
+# when using a file-based database. This is a pre-existing issue unrelated
+# to MIN/MAX support.

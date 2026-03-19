@@ -95,11 +95,15 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						}
 						insert_query.pop_back();
 					} else {
-						insert_query += " by name ";
+						insert_query += " select *, true, now()::timestamp from (";
 						LogicalPlanToSql lpts(*con.context, insert_node->children[0]);
 						auto cte_list = lpts.LogicalPlanToCteList();
 						string subquery_string = LogicalPlanToSql::CteListToSql(cte_list);
-						insert_query += subquery_string;
+						// Strip trailing semicolon from LPTS output since it's inside a subquery
+						if (!subquery_string.empty() && subquery_string.back() == ';') {
+							subquery_string.pop_back();
+						}
+						insert_query += subquery_string + ")";
 					}
 					auto r = con.Query(insert_query);
 					if (r->HasError()) {

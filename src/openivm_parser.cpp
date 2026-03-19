@@ -20,13 +20,12 @@
 
 namespace duckdb {
 
-bool done = false;
-
 ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionInfo *info, const string &query) {
 	auto query_lower = OpenIVMUtils::SQLToLowercase(StringUtil::Replace(query, ";", ""));
 	StringUtil::Trim(query_lower);
 
 	query_lower.erase(remove(query_lower.begin(), query_lower.end(), '\n'), query_lower.end());
+	OpenIVMUtils::RemoveRedundantWhitespaces(query_lower);
 
 	if (!StringUtil::Contains(query_lower, "create materialized view")) {
 		return ParserExtensionParseResult();
@@ -36,6 +35,8 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 
 	OpenIVMUtils::ReplaceCount(query_lower);
 	OpenIVMUtils::ReplaceSum(query_lower);
+	OpenIVMUtils::ReplaceMin(query_lower);
+	OpenIVMUtils::ReplaceMax(query_lower);
 
 	Parser p;
 	p.ParseQuery(query_lower);
@@ -49,7 +50,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 	auto &ivm_parse_data = dynamic_cast<IVMParseData &>(*parse_data);
 	auto statement = dynamic_cast<SQLStatement *>(ivm_parse_data.statement.get());
 
-	if (!done) {
+	if (ivm_parse_data.plan) {
 		Connection con(*context.db.get());
 
 		auto view_name = OpenIVMUtils::ExtractTableName(statement->query);
@@ -219,9 +220,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 			}
 		}
-		done = true;
-	} else {
-		done = false;
 	}
 
 	ParserExtensionPlanResult result;
