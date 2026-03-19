@@ -44,16 +44,6 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// extracting the query from the view definition
 	Connection con(*context.db.get());
 
-	// Disable PAC's protected column check during IVM upsert compilation,
-	// since delta queries need to project protected columns outside aggregates.
-	// Only set if PAC is loaded (the setting exists).
-	Value pac_check_val;
-	bool pac_loaded = context.TryGetCurrentSetting("pac_check", pac_check_val);
-	if (pac_loaded) {
-		con.Query("SET pac_check = false");
-		con.Query("SET pac_rewrite = false");
-	}
-
 	if (parameters.values.size() == 3) {
 		// ivm_options was called, so different schema and catalog
 		view_catalog_name = StringValue::Get(parameters.values[0]);
@@ -270,23 +260,9 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	string ivm_file_path = db_path + "/ivm_upsert_queries_" + view_name + ".sql";
 	duckdb::OpenIVMUtils::WriteFile(ivm_file_path, false, clean_query);
 
-	// Build the execution query with PAC flags:
-	// - Step A (ivm_query = delta computation INSERT): PAC ON so aggregates get noise
-	// - Step B (upsert_query = merge into MV): PAC OFF since it's just bookkeeping
-	// - Cleanup (delete from delta tables): PAC OFF
-	string query;
-	if (pac_loaded) {
-		string pac_off = "SET pac_check = false;\nSET pac_rewrite = false;\n";
-		string pac_on = "SET pac_check = false;\nSET pac_rewrite = true;\n";
-		query = pac_on + ivm_query + "\n\n" + update_timestamp_query + "\n" + pac_off + upsert_query + "\n" +
-		        delete_from_view_query + "\n" + ivm_result + "\n" + delete_from_delta_table_query;
-	} else {
-		query = clean_query;
-	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] Generated query:\n%s\n", clean_query.c_str());
 
-	OPENIVM_DEBUG_PRINT("[UPSERT] Generated query:\n%s\n", query.c_str());
-
-	return query;
+	return clean_query;
 }
 
 } // namespace duckdb

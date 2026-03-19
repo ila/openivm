@@ -1,9 +1,5 @@
 #include "rules/ivm_rule.hpp"
 
-
-
-
-
 #include "core/openivm_debug.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"

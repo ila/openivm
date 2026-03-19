@@ -61,8 +61,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		Value pac_check_val;
 		bool pac_loaded = context.TryGetCurrentSetting("pac_check", pac_check_val);
 		if (pac_loaded) {
-			for (auto &name : {"pac_mi", "pac_seed", "pac_m", "pac_noise", "pac_hash_repair",
-			                   "pac_check", "pac_rewrite", "pac_conservative_mode"}) {
+			for (auto &name : {"pac_mi", "pac_seed", "pac_m", "pac_noise", "pac_hash_repair", "pac_check",
+			                   "pac_rewrite", "pac_conservative_mode"}) {
 				Value val;
 				if (context.TryGetCurrentSetting(name, val) && !val.IsNull()) {
 					con.Query("SET " + string(name) + " = " + val.ToString());
@@ -146,10 +146,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, projection=%d, group_cols=%zu)\n",
-		                    ivm_type == IVMType::AGGREGATE_GROUP       ? "AGGREGATE_GROUP"
-		                    : ivm_type == IVMType::SIMPLE_AGGREGATE    ? "SIMPLE_AGGREGATE"
-		                    : ivm_type == IVMType::SIMPLE_PROJECTION   ? "SIMPLE_PROJECTION"
-		                                                               : "UNKNOWN",
+		                    ivm_type == IVMType::AGGREGATE_GROUP     ? "AGGREGATE_GROUP"
+		                    : ivm_type == IVMType::SIMPLE_AGGREGATE  ? "SIMPLE_AGGREGATE"
+		                    : ivm_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
+		                                                             : "UNKNOWN",
 		                    (int)found_aggregation, (int)found_projection, aggregate_columns.size());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
 		for (const auto &t : table_names) {

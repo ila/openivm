@@ -62,6 +62,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		if (delta_table_catalog_entry) {
 			Connection con(*input.context.db);
 			con.SetAutoCommit(false);
+			con.Query("SET pac_check = false");
 			auto t = con.Query("select * from _duckdb_ivm_views where view_name = '" + insert_table_name + "'");
 			if (t->RowCount() == 0) {
 				string full_delta_table_name = insert_node->table.catalog.GetName() + "." +
@@ -148,6 +149,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 			                             ".delta_" + delete_node->table.name;
 			Connection con(*input.context.db);
 			con.SetAutoCommit(false);
+			con.Query("SET pac_check = false");
 			auto t = con.Query("select * from _duckdb_ivm_views where view_name = '" + delete_table_name + "'");
 			if (t->RowCount() == 0) {
 				string insert_string = "insert into " + full_delta_table_name +
@@ -215,6 +217,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 			auto full_delta_table_name = update_node->table.catalog.GetName() + "." + update_node->table.schema.name +
 			                             ".delta_" + update_node->table.name;
 			con.SetAutoCommit(false);
+			con.Query("SET pac_check = false");
 			auto t = con.Query("select * from _duckdb_ivm_views where view_name = '" + update_table_name + "'");
 			if (t->RowCount() == 0) {
 				string insert_old = "insert into " + full_delta_table_name +

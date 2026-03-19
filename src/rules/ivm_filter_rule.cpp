@@ -6,8 +6,7 @@
 namespace duckdb {
 
 ModifiedPlan IvmFilterRule::Rewrite(PlanWrapper pw) {
-	OPENIVM_DEBUG_PRINT("[IvmFilterRule] Rewriting FILTER node, %zu filter expressions\n",
-	                    pw.plan->expressions.size());
+	OPENIVM_DEBUG_PRINT("[IvmFilterRule] Rewriting FILTER node, %zu filter expressions\n", pw.plan->expressions.size());
 	// Recurse into child first
 	auto child_mul = IVMRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
 	pw.plan->children[0] = std::move(child_mul.op);
@@ -38,8 +37,7 @@ ModifiedPlan IvmFilterRule::Rewrite(PlanWrapper pw) {
 		plan_as_filter->projection_map.emplace_back(mul_index);
 	}
 	OPENIVM_DEBUG_PRINT("[IvmFilterRule] Done, mul_binding: table=%lu col=%lu\n",
-	                    (unsigned long)child_mul_binding.table_index,
-	                    (unsigned long)child_mul_binding.column_index);
+	                    (unsigned long)child_mul_binding.table_index, (unsigned long)child_mul_binding.column_index);
 	return {std::move(plan_as_filter), child_mul_binding};
 }
 
