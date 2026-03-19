@@ -1,0 +1,114 @@
+# name: test/sql/ivm_list.test
+# description: Test IVM with LIST-typed aggregate columns
+# group: [sql]
+
+require openivm
+
+# --- Base table with LIST<FLOAT> column ---
+statement ok
+CREATE TABLE items (id INT, grp INT, val FLOAT[]);
+
+statement ok
+INSERT INTO items VALUES
+    (1, 1, list_transform(generate_series(1, 64), lambda x: 10.0::FLOAT)),
+    (2, 1, list_transform(generate_series(1, 64), lambda x: 20.0::FLOAT)),
+    (3, 2, list_transform(generate_series(1, 64), lambda x: 30.0::FLOAT));
+
+# --- MV: element-wise list sum using pure DuckDB ---
+statement ok
+CREATE MATERIALIZED VIEW mv_list AS (
+    SELECT grp,
+        list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM items GROUP BY grp
+);
+
+# Verify initial state (check first element of each list)
+query IR
+SELECT grp, total[1] FROM mv_list ORDER BY grp;
+----
+1	30.0
+2	30.0
+
+# ==========================================
+# 1. Insert into existing group
+# ==========================================
+
+statement ok
+INSERT INTO items VALUES (4, 2, list_transform(generate_series(1, 64), lambda x: 40.0::FLOAT));
+
+statement ok
+pragma ivm('mv_list');
+
+query IR
+SELECT grp, total[1] FROM mv_list ORDER BY grp;
+----
+1	30.0
+2	70.0
+
+# ==========================================
+# 2. Insert new group
+# ==========================================
+
+statement ok
+INSERT INTO items VALUES (5, 3, list_transform(generate_series(1, 64), lambda x: 50.0::FLOAT));
+
+statement ok
+pragma ivm('mv_list');
+
+query IR
+SELECT grp, total[1] FROM mv_list ORDER BY grp;
+----
+1	30.0
+2	70.0
+3	50.0
+
+# ==========================================
+# 3. Delete from existing group
+# ==========================================
+
+statement ok
+DELETE FROM items WHERE id = 1;
+
+statement ok
+pragma ivm('mv_list');
+
+query IR
+SELECT grp, total[1] FROM mv_list ORDER BY grp;
+----
+1	20.0
+2	70.0
+3	50.0
+
+# ==========================================
+# 4. Mixed insert + delete in same batch
+# ==========================================
+
+statement ok
+INSERT INTO items VALUES (6, 1, list_transform(generate_series(1, 64), lambda x: 100.0::FLOAT));
+
+statement ok
+DELETE FROM items WHERE id = 2;
+
+statement ok
+pragma ivm('mv_list');
+
+query IR
+SELECT grp, total[1] FROM mv_list ORDER BY grp;
+----
+1	100.0
+2	70.0
+3	50.0
+
+# ==========================================
+# 5. No-op pragma
+# ==========================================
+
+statement ok
+pragma ivm('mv_list');
+
+query IR
+SELECT grp, total[1] FROM mv_list ORDER BY grp;
+----
+1	100.0
+2	70.0
+3	50.0

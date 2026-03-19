@@ -11,8 +11,8 @@
 namespace duckdb {
 
 string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
-                              vector<string> column_names);
-string CompileSimpleAggregates(string &view_name, const vector<string> &column_names);
+                              vector<string> column_names, bool list_mode = false);
+string CompileSimpleAggregates(string &view_name, const vector<string> &column_names, bool list_mode = false);
 string CompileProjectionsFilters(string &view_name, const vector<string> &column_names);
 
 } // namespace duckdb

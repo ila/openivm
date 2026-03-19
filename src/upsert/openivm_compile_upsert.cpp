@@ -3,7 +3,7 @@
 namespace duckdb {
 
 string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
-                              vector<string> column_names) {
+                              vector<string> column_names, bool list_mode) {
 	auto index_catalog_entry = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
 	auto key_ids = index_catalog_entry->column_ids;
 
@@ -21,14 +21,27 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 		}
 	}
 
+	// CTE: consolidate deltas per group
 	string cte_string = "with ivm_cte AS (\n";
 	string cte_select_string = "select ";
 	for (auto &key : keys) {
 		cte_select_string = cte_select_string + key + ", ";
 	}
 	for (auto &column : aggregates) {
-		cte_select_string = cte_select_string + "\n\tsum(case when _duckdb_ivm_multiplicity = false then -" + column +
-		                    " else " + column + " end) as " + column + ", ";
+		if (list_mode) {
+			cte_select_string += "\n\tlist_reduce(list(CASE WHEN _duckdb_ivm_multiplicity = false "
+			                     "THEN list_transform(" +
+			                     column +
+			                     ", lambda x: -x) "
+			                     "ELSE " +
+			                     column +
+			                     " END), "
+			                     "lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS " +
+			                     column + ", ";
+		} else {
+			cte_select_string = cte_select_string + "\n\tsum(case when _duckdb_ivm_multiplicity = false then -" +
+			                    column + " else " + column + " end) as " + column + ", ";
+		}
 	}
 	cte_select_string.erase(cte_select_string.size() - 2, 2);
 	cte_select_string += "\n";
@@ -41,13 +54,24 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 
 	cte_string = cte_string + cte_select_string + cte_from_string + cte_group_by_string + ")\n";
 
+	// Outer select: merge delta into MV
+	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 	string select_string = "select ";
 	for (auto &key : keys) {
 		select_string = select_string + "delta_" + view_name + "." + key + ", ";
 	}
 	for (auto &column : aggregates) {
-		select_string = select_string + "\n\tsum(coalesce(" + view_name + "." + column + ", 0) + delta_" + view_name +
-		                "." + column + "), ";
+		if (list_mode) {
+			select_string += "\n\tlist_transform(list_zip("
+			                 "COALESCE(" +
+			                 view_name + "." + column + ", " + zeros_list +
+			                 "), "
+			                 "delta_" +
+			                 view_name + "." + column + "), lambda x: x[1] + x[2]) AS " + column + ", ";
+		} else {
+			select_string = select_string + "\n\tsum(coalesce(" + view_name + "." + column + ", 0) + delta_" +
+			                view_name + "." + column + "), ";
+		}
 	}
 	select_string.erase(select_string.size() - 2, 2);
 	select_string += "\n";
@@ -60,19 +84,30 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	join_string.erase(join_string.size() - 5, 5);
 	join_string += "\n";
 
-	string group_by_string = "group by ";
-	for (auto &key : keys) {
-		group_by_string = group_by_string + "delta_" + view_name + "." + key + ", ";
+	string external_query_string;
+	if (list_mode) {
+		// No GROUP BY for list mode — CTE consolidates per group, LEFT JOIN is 1:1
+		external_query_string = select_string + from_string + join_string + ";";
+	} else {
+		string group_by_string = "group by ";
+		for (auto &key : keys) {
+			group_by_string = group_by_string + "delta_" + view_name + "." + key + ", ";
+		}
+		group_by_string.erase(group_by_string.size() - 2, 2);
+		external_query_string = select_string + from_string + join_string + group_by_string + ";";
 	}
-	group_by_string.erase(group_by_string.size() - 2, 2);
 
-	string external_query_string = select_string + from_string + join_string + group_by_string + ";";
 	string query_string = cte_string + external_query_string;
 	string upsert_query = "insert or replace into " + view_name + "\n" + query_string + "\n";
 
+	// Delete zero rows
 	string delete_query = "\ndelete from " + view_name + " where ";
 	for (auto &column : aggregates) {
-		delete_query += column + " = 0 and ";
+		if (list_mode) {
+			delete_query += "list_reduce(" + column + ", lambda a, b: a + b) = 0.0 and ";
+		} else {
+			delete_query += column + " = 0 and ";
+		}
 	}
 	delete_query.erase(delete_query.size() - 5, 5);
 	delete_query += ";\n";
@@ -81,18 +116,29 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	return upsert_query;
 }
 
-string CompileSimpleAggregates(string &view_name, const vector<string> &column_names) {
+string CompileSimpleAggregates(string &view_name, const vector<string> &column_names, bool list_mode) {
 	string update_query = "update " + view_name + "\nset ";
 	bool first = true;
+	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 	for (auto &column : column_names) {
 		if (column != "_duckdb_ivm_multiplicity") {
 			if (!first) {
 				update_query += ",\n";
 			}
 			first = false;
-			update_query += column + " = \n\t" + column + " \n\t\t- coalesce((select " + column + " from delta_" +
-			                view_name + " where _duckdb_ivm_multiplicity = false), 0)\n\t\t+ coalesce((select " +
-			                column + " from delta_" + view_name + " where _duckdb_ivm_multiplicity = true), 0)";
+			if (list_mode) {
+				string negate_del = "coalesce((select list_transform(" + column + ", lambda x: -x) from delta_" +
+				                    view_name + " where _duckdb_ivm_multiplicity = false), " + zeros_list + ")";
+				string ins = "coalesce((select " + column + " from delta_" + view_name +
+				             " where _duckdb_ivm_multiplicity = true), " + zeros_list + ")";
+				string delta = "list_transform(list_zip(" + negate_del + ", " + ins + "), lambda x: x[1] + x[2])";
+				update_query +=
+				    column + " = list_transform(list_zip(" + column + ", " + delta + "), lambda x: x[1] + x[2])";
+			} else {
+				update_query += column + " = \n\t" + column + " \n\t\t- coalesce((select " + column + " from delta_" +
+				                view_name + " where _duckdb_ivm_multiplicity = false), 0)\n\t\t+ coalesce((select " +
+				                column + " from delta_" + view_name + " where _duckdb_ivm_multiplicity = true), 0)";
+			}
 		}
 	}
 	update_query += ";\n";

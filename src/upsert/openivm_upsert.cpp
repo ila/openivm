@@ -155,19 +155,29 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 
 	auto column_names = delta_view_columns.GetColumnNames();
 
+	// Detect list mode: use element-wise list operations for LIST-typed aggregate columns
+	bool list_mode = false;
+	for (auto &col : delta_view_columns.Logical()) {
+		if (col.GetName() != "_duckdb_ivm_multiplicity" && col.GetType().id() == LogicalTypeId::LIST) {
+			list_mode = true;
+			break;
+		}
+	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] List mode: %s\n", list_mode ? "true" : "false");
+
 	string upsert_query;
 
 	// this is to compile the query to merge the materialized view with its delta version
 	// depending on the query type, this procedure will be done differently
 	// aggregates require an upsert query, while simple filters and projections are an insert
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n",
-	                    view_query_type == IVMType::AGGREGATE_GROUP       ? "AGGREGATE_GROUP"
-	                    : view_query_type == IVMType::SIMPLE_AGGREGATE    ? "SIMPLE_AGGREGATE"
-	                    : view_query_type == IVMType::SIMPLE_PROJECTION   ? "SIMPLE_PROJECTION"
-	                                                                     : "UNKNOWN");
+	                    view_query_type == IVMType::AGGREGATE_GROUP     ? "AGGREGATE_GROUP"
+	                    : view_query_type == IVMType::SIMPLE_AGGREGATE  ? "SIMPLE_AGGREGATE"
+	                    : view_query_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
+	                                                                    : "UNKNOWN");
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_GROUP: {
-		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names);
+		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, list_mode);
 		break;
 	}
 
@@ -178,7 +188,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	}
 
 	case IVMType::SIMPLE_AGGREGATE: {
-		upsert_query = CompileSimpleAggregates(view_name, column_names);
+		upsert_query = CompileSimpleAggregates(view_name, column_names, list_mode);
 		break;
 	}
 		// todo joins
@@ -245,9 +255,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	}
 
 	// Build the clean SQL (written to file for reference/replay)
-	string clean_query = ivm_query + "\n\n" + update_timestamp_query + "\n" +
-	                     upsert_query + "\n" + delete_from_view_query + "\n" + ivm_result + "\n" +
-	                     delete_from_delta_table_query;
+	string clean_query = ivm_query + "\n\n" + update_timestamp_query + "\n" + upsert_query + "\n" +
+	                     delete_from_view_query + "\n" + ivm_result + "\n" + delete_from_delta_table_query;
 
 	// now also compiling the queries for future usage
 	string db_path;
@@ -269,10 +278,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	if (pac_loaded) {
 		string pac_off = "SET pac_check = false;\nSET pac_rewrite = false;\n";
 		string pac_on = "SET pac_check = false;\nSET pac_rewrite = true;\n";
-		query = pac_on + ivm_query + "\n\n" + update_timestamp_query + "\n" +
-		        pac_off + upsert_query + "\n" +
-		        delete_from_view_query + "\n" + ivm_result + "\n" +
-		        delete_from_delta_table_query;
+		query = pac_on + ivm_query + "\n\n" + update_timestamp_query + "\n" + pac_off + upsert_query + "\n" +
+		        delete_from_view_query + "\n" + ivm_result + "\n" + delete_from_delta_table_query;
 	} else {
 		query = clean_query;
 	}
