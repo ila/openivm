@@ -1,5 +1,6 @@
 #include "openivm_rewrite_rule.hpp"
 
+#include "openivm_utils.hpp"
 #include "ivm_aggregate_rule.hpp"
 #include "ivm_filter_rule.hpp"
 #include "ivm_join_rule.hpp"
@@ -32,7 +33,8 @@ void IVMRewriteRule::AddInsertNode(ClientContext &context, unique_ptr<LogicalOpe
 #endif
 
 	auto table =
-	    Catalog::GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name, "delta_" + view_name,
+	    Catalog::GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name,
+	                                         OpenIVMUtils::DeltaName(view_name),
 	                                         OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
 	auto insert_node = make_uniq<LogicalInsert>(*table, 999);
 

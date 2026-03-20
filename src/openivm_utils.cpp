@@ -133,8 +133,8 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 	std::regex primary_key_re(R"((primary\s+key\s*\([^\)]+\)))", std::regex::icase);
 	std::regex inline_primary_key_re(R"(([^\s,]+[^\),]*\s+primary\s+key))", std::regex::icase);
 
-	std::string multiplicity_col = "_duckdb_ivm_multiplicity boolean default true";
-	std::string timestamp_col = "timestamp timestamp default now()";
+	std::string multiplicity_col = string(ivm::MULTIPLICITY_COL) + " boolean default true";
+	std::string timestamp_col = string(ivm::TIMESTAMP_COL) + " timestamp default now()";
 
 	std::smatch match;
 	std::string output = input;
@@ -154,7 +154,7 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 			table_name = full_table_name;
 		}
 
-		std::string new_table_name = prefix + "delta_" + table_name;
+		std::string new_table_name = prefix + ivm::DELTA_PREFIX + table_name;
 
 		if (std::regex_search(columns, match, primary_key_re)) {
 			primary_key = match[0].str();
@@ -171,9 +171,9 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 		}
 
 		if (!pk_columns.empty()) {
-			pk_columns += ", _duckdb_ivm_multiplicity";
+			pk_columns += string(", ") + ivm::MULTIPLICITY_COL;
 		} else {
-			pk_columns = "_duckdb_ivm_multiplicity";
+			pk_columns = ivm::MULTIPLICITY_COL;
 		}
 
 		columns += ", " + multiplicity_col + ", " + timestamp_col;

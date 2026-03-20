@@ -66,7 +66,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	}
 
 	auto delta_view_catalog_entry =
-	    catalog.GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name, "delta_" + view_name,
+	    catalog.GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name,
+	                                        OpenIVMUtils::DeltaName(view_name),
 	                                        OnEntryNotFound::THROW_EXCEPTION, error_context);
 	auto index_delta_view_catalog_entry =
 	    Catalog::GetEntry(context, view_catalog_name, view_schema_name,
@@ -189,7 +190,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	OPENIVM_DEBUG_PRINT("[LPTS TRACE] Done.\n");
 
 	// we delete everything from the delta view (we don't need the data anymore, it will be inserted in the view)
-	string delete_from_view_query = "delete from delta_" + view_name + ";";
+	string delete_from_view_query = "delete from " + OpenIVMUtils::DeltaName(view_name) + ";";
 	string ivm_result;
 
 	// now we can also delete from the delta table, but only if all the dependent views have been refreshed
