@@ -1,6 +1,7 @@
 #include "openivm_parser.hpp"
 
 #include "openivm_constants.hpp"
+#include "openivm_metadata.hpp"
 #include "openivm_utils.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
@@ -120,17 +121,19 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			throw NotImplementedException("IVM does not support this query type yet");
 		}
 
-		auto system_table = "create table if not exists " + string(ivm::VIEWS_TABLE) + " (view_name varchar primary key, sql_string "
+		auto system_table = "create table if not exists " + string(ivm::VIEWS_TABLE) +
+		                    " (view_name varchar primary key, sql_string "
 		                    "varchar, type tinyint, last_update timestamp);\n";
 		OpenIVMUtils::WriteFile(system_tables_path, false, system_table);
 
-		auto delta_tables_table = "create table if not exists " + string(ivm::DELTA_TABLES_TABLE) + " (view_name varchar, table_name "
+		auto delta_tables_table = "create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
+		                          " (view_name varchar, table_name "
 		                          "varchar, last_update timestamp, primary key(view_name, table_name));\n";
 		OpenIVMUtils::WriteFile(system_tables_path, true, delta_tables_table);
 
-		auto ivm_table_insert = "insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
-		                        OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) +
-		                        ", now());\n";
+		auto ivm_table_insert = "insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name +
+		                        "', '" + OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " +
+		                        to_string((int)ivm_type) + ", now());\n";
 		OpenIVMUtils::WriteFile(system_tables_path, true, ivm_table_insert);
 
 		auto table = "create table " + view_name + " as " + view_query + ";\n";
@@ -157,19 +160,19 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 			auto catalog_schema = catalog_value.ToString() + "." + schema_value.ToString() + ".";
 
-			auto delta_table =
-			    "create table if not exists " + catalog_schema + OpenIVMUtils::DeltaName(table_name) +
-			    " as select *, true as " + string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " + string(ivm::TIMESTAMP_COL) + " from " +
-			    catalog_schema + table_name + " limit 0;\n";
+			auto delta_table = "create table if not exists " + catalog_schema + OpenIVMUtils::DeltaName(table_name) +
+			                   " as select *, true as " + string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
+			                   string(ivm::TIMESTAMP_COL) + " from " + catalog_schema + table_name + " limit 0;\n";
 			OpenIVMUtils::WriteFile(compiled_file_path, true, delta_table);
 
-			auto delta_table_insert = "insert into " + string(ivm::DELTA_TABLES_TABLE) + " values ('" + view_name + "', '" +
-			                          OpenIVMUtils::DeltaName(table_name) + "', now());\n";
+			auto delta_table_insert = "insert into " + string(ivm::DELTA_TABLES_TABLE) + " values ('" + view_name +
+			                          "', '" + OpenIVMUtils::DeltaName(table_name) + "', now());\n";
 			OpenIVMUtils::WriteFile(system_tables_path, true, delta_table_insert);
 		}
 
 		string delta_view = "create table if not exists " + OpenIVMUtils::DeltaName(view_name) +
-		                    " as select *, true as " + string(ivm::MULTIPLICITY_COL) + " from " + view_name + " limit 0;\n";
+		                    " as select *, true as " + string(ivm::MULTIPLICITY_COL) + " from " + view_name +
+		                    " limit 0;\n";
 		OpenIVMUtils::WriteFile(compiled_file_path, true, delta_view);
 
 		if (ivm_type == IVMType::AGGREGATE_GROUP) {

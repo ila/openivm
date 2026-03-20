@@ -11,6 +11,7 @@
 #include "duckdb/function/table/read_csv.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
@@ -24,6 +25,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/planner/planner.hpp"
 
@@ -32,21 +34,97 @@
 
 namespace duckdb {
 
-
 IVMInsertRule::IVMInsertRule() {
 	optimize_function = IVMInsertRuleFunction;
 	optimizer_info = make_shared_ptr<IVMInsertOptimizerInfo>();
 }
 
 void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb::unique_ptr<LogicalOperator> &plan) {
+	auto root = plan.get();
+
+	// Handle DROP TABLE: clean up IVM metadata if the dropped table is an IVM view
+	if (root->type == LogicalOperatorType::LOGICAL_DROP) {
+		auto *simple = dynamic_cast<LogicalSimple *>(root);
+		if (!simple) {
+			return;
+		}
+		auto *drop_info = dynamic_cast<DropInfo *>(simple->info.get());
+		if (!drop_info || drop_info->type != CatalogType::TABLE_ENTRY) {
+			return;
+		}
+
+		auto table_name = drop_info->name;
+		Connection con(*input.context.db);
+
+		// Check if the dropped table is a registered IVM view
+		auto view_check =
+		    con.Query("SELECT 1 FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + table_name + "'");
+		if (!view_check->HasError() && view_check->RowCount() > 0) {
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] DROP TABLE '%s' is an IVM view — cleaning up metadata\n",
+			                    table_name.c_str());
+			IVMMetadata metadata(con);
+			auto delta_tables = metadata.GetDeltaTables(table_name);
+
+			// Remove metadata entries
+			con.Query("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + table_name + "'");
+			con.Query("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + table_name + "'");
+
+			// Drop delta view for the MV
+			con.Query("DROP TABLE IF EXISTS " + OpenIVMUtils::DeltaName(table_name));
+
+			// Drop delta tables no longer used by any MV
+			for (auto &dt : delta_tables) {
+				auto remaining = con.Query("SELECT count(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+				                           " WHERE table_name = '" + dt + "'");
+				if (!remaining->HasError() && remaining->RowCount() > 0 &&
+				    remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
+					con.Query("DROP TABLE IF EXISTS " + dt);
+				}
+			}
+		}
+
+		// Check if the dropped table is a base table with dependent MVs
+		auto dep_check = con.Query("SELECT DISTINCT view_name FROM " + string(ivm::DELTA_TABLES_TABLE) +
+		                           " WHERE table_name = '" + OpenIVMUtils::DeltaName(table_name) + "'");
+		if (!dep_check->HasError() && dep_check->RowCount() > 0 && drop_info->cascade) {
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] DROP TABLE CASCADE '%s' — dropping %lu dependent IVM views\n",
+			                    table_name.c_str(), (unsigned long)dep_check->RowCount());
+			for (size_t i = 0; i < dep_check->RowCount(); i++) {
+				auto dep_view = dep_check->GetValue(0, i).ToString();
+				IVMMetadata dep_metadata(con);
+				auto dep_delta_tables = dep_metadata.GetDeltaTables(dep_view);
+
+				// Clean up metadata
+				con.Query("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + dep_view + "'");
+				con.Query("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + dep_view + "'");
+
+				// Drop delta view
+				con.Query("DROP TABLE IF EXISTS " + OpenIVMUtils::DeltaName(dep_view));
+
+				// Drop MV table
+				con.Query("DROP TABLE IF EXISTS " + dep_view);
+
+				// Drop delta tables no longer used
+				for (auto &dt : dep_delta_tables) {
+					auto remaining = con.Query("SELECT count(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+					                           " WHERE table_name = '" + dt + "'");
+					if (!remaining->HasError() && remaining->RowCount() > 0 &&
+					    remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
+						con.Query("DROP TABLE IF EXISTS " + dt);
+					}
+				}
+			}
+		}
+
+		return;
+	}
+
 	if (plan->children.empty()) {
 		return;
 	}
 
-	auto root = plan.get();
 	auto root_name = root->GetName();
-	if (root_name.rfind("INSERT", 0) != 0 && root_name.rfind("DELETE", 0) != 0 &&
-	    root_name.rfind("UPDATE", 0) != 0) {
+	if (root_name.rfind("INSERT", 0) != 0 && root_name.rfind("DELETE", 0) != 0 && root_name.rfind("UPDATE", 0) != 0) {
 		return;
 	}
 
@@ -181,8 +259,8 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					// from COMPRESSED_MATERIALIZATION. Consider replanning without it.
 					// FIXME: SEMI/ANTI joins not yet fully supported in LPTS
 					try {
-						insert_string = "insert into " + full_delta_table_name +
-						                " select *, false, now()::timestamp from (";
+						insert_string =
+						    "insert into " + full_delta_table_name + " select *, false, now()::timestamp from (";
 						LogicalPlanToSql lpts(*con.context, plan->children[0]);
 						auto cte_list = lpts.LogicalPlanToCteList();
 						string subquery_string = LogicalPlanToSql::CteListToSql(cte_list);
@@ -238,9 +316,8 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					auto column = update_node->columns[i].index;
 					auto *value = dynamic_cast<BoundConstantExpression *>(projection->expressions[i].get());
 					if (!value) {
-						throw NotImplementedException(
-						    "UPDATE with computed SET expressions (e.g., SET col = col + 1) "
-						    "is not yet supported for IVM delta tracking!");
+						throw NotImplementedException("UPDATE with computed SET expressions (e.g., SET col = col + 1) "
+						                              "is not yet supported for IVM delta tracking!");
 					}
 					update_values[to_string(column)] = value->value.ToSQLString();
 				}
