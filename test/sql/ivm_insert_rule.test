@@ -753,3 +753,282 @@ query I
 SELECT count(*) FROM mv_staff;
 ----
 9
+
+# ==========================================
+# COMPLEX QUERY TESTS — test various SQL patterns
+# ==========================================
+
+# ==========================================
+# Complex 1: DELETE with OR condition
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (90, 'OrTest1', 'eng', 10), (91, 'OrTest2', 'sales', 20), (92, 'OrTest3', 'hr', 30);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE id = 90 OR id = 92;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# Only id=91 should remain from the 3 inserted
+query I
+SELECT count(*) FROM mv_staff WHERE id IN (90, 91, 92);
+----
+1
+
+# ==========================================
+# Complex 2: DELETE with IN (...)
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (93, 'InTest1', 'eng', 10), (94, 'InTest2', 'eng', 20), (95, 'InTest3', 'eng', 30);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE id IN (93, 95);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 3: DELETE with BETWEEN
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (100, 'Bet1', 'eng', 10), (101, 'Bet2', 'eng', 20), (102, 'Bet3', 'eng', 30), (103, 'Bet4', 'eng', 40);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE id BETWEEN 101 AND 102;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 4: DELETE with LIKE
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (110, 'LikeAlpha', 'eng', 1), (111, 'LikeBeta', 'eng', 2), (112, 'NoMatch', 'eng', 3);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE name LIKE 'Like%';
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 5: DELETE with IS NULL
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (120, NULL, 'eng', 1), (121, 'NotNull', 'eng', 2);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE name IS NULL;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 6: UPDATE multiple columns at once
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (130, 'Multi', 'eng', 500);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+UPDATE staff SET name = 'Updated', dept = 'sales', salary = 999 WHERE id = 130;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+query IIII
+SELECT id, name, dept, salary FROM mv_staff WHERE id = 130;
+----
+130	Updated	sales	999
+
+# ==========================================
+# Complex 7: INSERT...SELECT with JOIN
+# ==========================================
+
+statement ok
+CREATE TABLE dept_bonus (dept VARCHAR, bonus INT);
+
+statement ok
+INSERT INTO dept_bonus VALUES ('eng', 50), ('sales', 100);
+
+statement ok
+INSERT INTO staff SELECT s.id + 1000, s.name, s.dept, s.salary + d.bonus FROM staff s JOIN dept_bonus d ON s.dept = d.dept WHERE s.id = 130;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 8: INSERT...SELECT with aggregation
+# ==========================================
+
+statement ok
+CREATE TABLE agg_target (id INT, name VARCHAR, dept VARCHAR, salary INT);
+
+statement ok
+CREATE TABLE delta_agg_target AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM agg_target LIMIT 0;
+
+statement ok
+INSERT INTO agg_target SELECT 999, dept, dept, SUM(salary) FROM staff WHERE dept = 'eng' GROUP BY dept;
+
+query I
+SELECT count(*) FROM delta_agg_target;
+----
+1
+
+# ==========================================
+# Complex 9: DELETE with subquery (WHERE id IN (SELECT ...))
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (140, 'Sub1', 'temp', 1), (141, 'Sub2', 'temp', 2), (142, 'Sub3', 'keep', 3);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+# DELETE with subquery not yet supported — should give clean error
+statement error
+DELETE FROM staff WHERE dept IN (SELECT 'temp');
+----
+not yet fully supported
+
+# Clean up manually since the DELETE didn't execute
+statement ok
+DELETE FROM staff WHERE dept = 'temp';
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 10: DELETE with >= and <= (range filter)
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (150, 'Range1', 'eng', 10), (151, 'Range2', 'eng', 20), (152, 'Range3', 'eng', 30);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE salary >= 10 AND salary <= 20 AND id >= 150;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+query I
+SELECT count(*) FROM mv_staff WHERE id IN (150, 151, 152);
+----
+1

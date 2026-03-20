@@ -132,7 +132,8 @@ string CompileProjectionsFilters(string &view_name, const vector<string> &column
 	string match_conditions;
 	for (auto &column : column_names) {
 		if (column != "_duckdb_ivm_multiplicity") {
-			match_conditions += view_name + "." + column + " = net_dels." + column + " and ";
+			match_conditions +=
+			    view_name + "." + column + " IS NOT DISTINCT FROM net_dels." + column + " and ";
 			select_columns += column + ", ";
 		}
 	}

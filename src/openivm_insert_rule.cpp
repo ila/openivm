@@ -103,6 +103,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						}
 						insert_query += subquery_string + ")";
 					}
+					OPENIVM_DEBUG_PRINT("[INSERT RULE] insert_query: %s\n", insert_query.c_str());
 					auto r = con.Query(insert_query);
 					if (r->HasError()) {
 						throw InternalException("Cannot insert in delta table after insertion! " + r->GetError());
@@ -180,7 +181,24 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
 					return;
 				} else {
-					throw NotImplementedException("Only simple DELETE statements are supported in IVM!");
+					// Complex DELETE (subquery, join, etc.) — use LPTS to convert the plan
+					// FIXME: LPTS on post-optimizer plans may encounter internal functions
+					// from COMPRESSED_MATERIALIZATION. Consider replanning without it.
+					// FIXME: SEMI/ANTI joins not yet fully supported in LPTS
+					try {
+						insert_string = "insert into " + full_delta_table_name +
+						                " select *, false, now()::timestamp from (";
+						LogicalPlanToSql lpts(*con.context, plan->children[0]);
+						auto cte_list = lpts.LogicalPlanToCteList();
+						string subquery_string = LogicalPlanToSql::CteListToSql(cte_list);
+						if (!subquery_string.empty() && subquery_string.back() == ';') {
+							subquery_string.pop_back();
+						}
+						insert_string += subquery_string + ")";
+					} catch (...) {
+						throw NotImplementedException(
+						    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");
+					}
 				}
 
 				auto r = con.Query(insert_string);
