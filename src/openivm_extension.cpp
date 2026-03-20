@@ -19,6 +19,8 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "openivm_constants.hpp"
+#include "openivm_metadata.hpp"
 #include "openivm_upsert.hpp"
 #include "openivm_parser.hpp"
 #include "openivm_rewrite_rule.hpp"
@@ -57,11 +59,10 @@ static duckdb::unique_ptr<FunctionData> DoIVMBind(ClientContext &context, TableF
 	input.named_parameters["view_schema_name"] = view_schema_name;
 
 	Connection con(*context.db);
-	auto v = con.Query("select sql_string from _duckdb_ivm_views where view_name = '" + view_name + "';");
-	if (v->HasError()) {
+	string view_query = IVMMetadata(con).GetViewQuery(view_name);
+	if (view_query.empty()) {
 		throw InternalException("Error while querying view definition");
 	}
-	string view_query = v->GetValue(0, 0).ToString();
 
 	Parser parser;
 	parser.ParseQuery(view_query);
@@ -76,7 +77,7 @@ static duckdb::unique_ptr<FunctionData> DoIVMBind(ClientContext &context, TableF
 	}
 
 	return_types.emplace_back(LogicalTypeId::BOOLEAN);
-	names.emplace_back("_duckdb_ivm_multiplicity");
+	names.emplace_back(ivm::MULTIPLICITY_COL);
 
 	return std::move(result);
 }

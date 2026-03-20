@@ -3,6 +3,7 @@
 #include "openivm_cost_model.hpp"
 #include "openivm_debug.hpp"
 #include "openivm_compile_upsert.hpp"
+#include "openivm_metadata.hpp"
 #include "openivm_utils.hpp"
 #include "logical_plan_to_sql.hpp"
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
@@ -72,16 +73,12 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	                      EntryLookupInfo(CatalogType::INDEX_ENTRY, view_name + "_ivm_index", error_context),
 	                      OnEntryNotFound::RETURN_NULL);
 
-	auto view_query_entry = con.Query("select * from _duckdb_ivm_views where view_name = '" + view_name + "';");
-	if (view_query_entry->HasError()) {
-		throw ParserException("Error while querying view definition");
-	}
-	if (view_query_entry->RowCount() == 0) {
+	IVMMetadata metadata(con);
+	auto view_query_sql = metadata.GetViewQuery(view_name);
+	if (view_query_sql.empty()) {
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
-	auto view_query_sql = view_query_entry->GetValue(1, 0).ToString();
-	auto view_query_type_data = view_query_entry->GetValue(2, 0);
-	IVMType view_query_type = static_cast<IVMType>(view_query_type_data.GetValue<int8_t>());
+	IVMType view_query_type = metadata.GetViewType(view_name);
 
 	bool has_minmax = StringUtil::Contains(view_query_sql, "min(") || StringUtil::Contains(view_query_sql, "max(");
 
@@ -104,23 +101,20 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 			recompute_query += "INSERT INTO " + view_name + " " + view_query_sql + ";\n";
 
 			// Still need to update timestamps and clean up delta tables
-			string update_timestamp_query =
-			    "update _duckdb_ivm_delta_tables set last_update = now() where view_name = '" + view_name + "';\n";
+			string update_timestamp_query = "update " + string(ivm::DELTA_TABLES_TABLE) +
+			                                " set last_update = now() where view_name = '" + view_name + "';\n";
 
-			auto tables =
-			    con.Query("select table_name from _duckdb_ivm_delta_tables where view_name = '" + view_name + "';");
+			auto recompute_delta_tables = metadata.GetDeltaTables(view_name);
 			string delete_from_delta_table_query;
-			if (!tables->HasError()) {
-				for (size_t i = 0; i < tables->RowCount(); i++) {
-					auto table_name = tables->GetValue(0, i).ToString();
-					if (cross_system) {
-						table_name = attached_db_catalog_name + "." + attached_db_schema_name + "." + table_name;
-					}
-					delete_from_delta_table_query += "delete from " + table_name +
-					                                 " where _duckdb_ivm_timestamp < (select min(last_update) from "
-					                                 "_duckdb_ivm_delta_tables where table_name = '" +
-					                                 table_name + "');\n";
+			for (auto &table_name : recompute_delta_tables) {
+				string resolved_name = table_name;
+				if (cross_system) {
+					resolved_name = attached_db_catalog_name + "." + attached_db_schema_name + "." + table_name;
 				}
+				delete_from_delta_table_query +=
+				    "delete from " + resolved_name + " where " + ivm::TIMESTAMP_COL +
+				    " < (select min(last_update) from " + ivm::DELTA_TABLES_TABLE + " where table_name = '" +
+				    table_name + "');\n";
 			}
 
 			string query = recompute_query + "\n" + update_timestamp_query + "\n" + delete_from_delta_table_query;
@@ -171,11 +165,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// we need to check if the view is in fact a MV
 	con.BeginTransaction();
 	// we need the table names since we need to update the metadata tables
-	auto tables = con.Query("select table_name from _duckdb_ivm_delta_tables where view_name = '" + view_name + "';");
-
-	if (tables->HasError()) {
-		throw ParserException("Error while querying _duckdb_ivm_delta_tables");
-	}
+	auto delta_table_names = metadata.GetDeltaTables(view_name);
 
 	// now we can plan the query
 	Parser p;
@@ -208,33 +198,24 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// to check this, we extract the minimum timestamp from _duckdb_ivm_delta_tables
 	string delete_from_delta_table_query;
 	// firstly we reset the timestamp
-	string update_timestamp_query =
-	    "update _duckdb_ivm_delta_tables set last_update = now() where view_name = '" + view_name + "';\n";
+	string update_timestamp_query = "update " + string(ivm::DELTA_TABLES_TABLE) +
+	                                " set last_update = now() where view_name = '" + view_name + "';\n";
 
-	for (size_t i = 0; i < tables->RowCount(); i++) {
-		auto table_name = tables->GetValue(0, i).ToString();
+	for (auto &table_name : delta_table_names) {
+		string resolved_name = table_name;
 		if (cross_system) {
-			table_name = attached_db_catalog_name + "." + attached_db_schema_name + "." + table_name;
+			resolved_name = attached_db_catalog_name + "." + attached_db_schema_name + "." + table_name;
 		}
-		// now we delete anything we don't need anymore
-		delete_from_delta_table_query += "delete from " + table_name +
-		                                 " where _duckdb_ivm_timestamp < (select min(last_update) from "
-		                                 "_duckdb_ivm_delta_tables where table_name = '" +
-		                                 table_name + "');\n";
+		delete_from_delta_table_query +=
+		    "delete from " + resolved_name + " where " + ivm::TIMESTAMP_COL + " < (select min(last_update) from " +
+		    ivm::DELTA_TABLES_TABLE + " where table_name = '" + table_name + "');\n";
 	}
 
 	string query = ivm_query + "\n\n" + update_timestamp_query + "\n" + upsert_query + "\n" + delete_from_view_query +
 	               "\n" + ivm_result + "\n" + delete_from_delta_table_query;
 
 	// now also compiling the queries for future usage
-	string db_path;
-	if (!context.db->config.options.database_path.empty()) {
-		db_path = context.db->GetFileSystem().GetWorkingDirectory();
-	} else {
-		Value db_path_value;
-		context.TryGetCurrentSetting("ivm_files_path", db_path_value);
-		db_path = db_path_value.ToString();
-	}
+	string db_path = OpenIVMUtils::DbPath(context);
 	string ivm_file_path = db_path + "/ivm_upsert_queries_" + view_name + ".sql";
 	duckdb::OpenIVMUtils::WriteFile(ivm_file_path, false, query);
 

@@ -2,6 +2,7 @@
 #define OPENIVM_UTILS_HPP
 
 #include "duckdb.hpp"
+#include "openivm_constants.hpp"
 
 #include <string>
 
@@ -12,6 +13,13 @@ namespace duckdb {
 
 class OpenIVMUtils {
 public:
+	// Name construction helpers
+	static string DeltaName(const string &name);
+	static string FullName(const string &catalog, const string &schema, const string &table);
+	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
+	static bool IsDelta(const string &name);
+	static string DbPath(ClientContext &context);
+
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
 	static string ReadFile(const string &file_path);
 	static string ExtractTableName(const string &sql);

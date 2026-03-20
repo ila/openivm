@@ -8,6 +8,35 @@
 
 namespace duckdb {
 
+string OpenIVMUtils::DeltaName(const string &name) {
+	return string(ivm::DELTA_PREFIX) + name;
+}
+
+string OpenIVMUtils::FullName(const string &catalog, const string &schema, const string &table) {
+	return catalog + "." + schema + "." + table;
+}
+
+string OpenIVMUtils::FullDeltaName(const string &catalog, const string &schema, const string &table) {
+	return catalog + "." + schema + "." + ivm::DELTA_PREFIX + table;
+}
+
+bool OpenIVMUtils::IsDelta(const string &name) {
+	return name.size() >= 6 && name.rfind(ivm::DELTA_PREFIX, 0) == 0;
+}
+
+string OpenIVMUtils::DbPath(ClientContext &context) {
+	string db_path;
+	if (!context.db->config.options.database_path.empty()) {
+		db_path = context.db->GetFileSystem().GetWorkingDirectory();
+	}
+	Value db_path_value;
+	context.TryGetCurrentSetting("ivm_files_path", db_path_value);
+	if (!db_path_value.IsNull()) {
+		db_path = db_path_value.ToString();
+	}
+	return db_path;
+}
+
 void OpenIVMUtils::WriteFile(const string &filename, bool append, const string &compiled_query) {
 	std::ofstream file;
 	if (append) {

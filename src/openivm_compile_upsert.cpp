@@ -1,4 +1,6 @@
 #include "openivm_compile_upsert.hpp"
+#include "openivm_constants.hpp"
+#include "openivm_utils.hpp"
 
 namespace duckdb {
 
@@ -16,7 +18,7 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	unordered_set<std::string> keys_set(keys.begin(), keys.end());
 
 	for (auto &column : column_names) {
-		if (keys_set.find(column) == keys_set.end() && column != "_duckdb_ivm_multiplicity") {
+		if (keys_set.find(column) == keys_set.end() && column != ivm::MULTIPLICITY_COL) {
 			aggregates.push_back(column);
 		}
 	}
@@ -31,12 +33,13 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 			}
 		}
 
+		auto delta_view = OpenIVMUtils::DeltaName(view_name);
 		string delete_query = "delete from " + view_name + " where (" + keys_tuple + ") in (\n" +
-		                      "  select distinct " + keys_tuple + " from delta_" + view_name + "\n);\n";
+		                      "  select distinct " + keys_tuple + " from " + delta_view + "\n);\n";
 
 		string insert_query = "insert into " + view_name + "\n" + "select * from (" + view_query_sql +
 		                      ") _ivm_recompute\n" + "where (" + keys_tuple + ") in (\n" + "  select distinct " +
-		                      keys_tuple + " from delta_" + view_name + "\n);\n";
+		                      keys_tuple + " from " + delta_view + "\n);\n";
 
 		return delete_query + "\n" + insert_query;
 	}
@@ -47,12 +50,13 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 		cte_select_string = cte_select_string + key + ", ";
 	}
 	for (auto &column : aggregates) {
-		cte_select_string = cte_select_string + "\n\tsum(case when _duckdb_ivm_multiplicity = false then -" + column +
+		cte_select_string = cte_select_string + "\n\tsum(case when " + string(ivm::MULTIPLICITY_COL) + " = false then -" + column +
 		                    " else " + column + " end) as " + column + ", ";
 	}
 	cte_select_string.erase(cte_select_string.size() - 2, 2);
 	cte_select_string += "\n";
-	string cte_from_string = "from delta_" + view_name + "\n";
+	auto delta_view = OpenIVMUtils::DeltaName(view_name);
+	string cte_from_string = "from " + delta_view + "\n";
 	string cte_group_by_string = "group by ";
 	for (auto &key : keys) {
 		cte_group_by_string = cte_group_by_string + key + ", ";
@@ -63,26 +67,26 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 
 	string select_string = "select ";
 	for (auto &key : keys) {
-		select_string = select_string + "delta_" + view_name + "." + key + ", ";
+		select_string = select_string + delta_view + "." + key + ", ";
 	}
 	for (auto &column : aggregates) {
-		select_string = select_string + "\n\tsum(coalesce(" + view_name + "." + column + ", 0) + delta_" + view_name +
+		select_string = select_string + "\n\tsum(coalesce(" + view_name + "." + column + ", 0) + " + delta_view +
 		                "." + column + "), ";
 	}
 	select_string.erase(select_string.size() - 2, 2);
 	select_string += "\n";
 
-	string from_string = "from ivm_cte as delta_" + view_name + "\n";
+	string from_string = "from ivm_cte as " + delta_view + "\n";
 	string join_string = "left join " + view_name + " on ";
 	for (auto &key : keys) {
-		join_string = join_string + view_name + "." + key + " = delta_" + view_name + "." + key + " and ";
+		join_string = join_string + view_name + "." + key + " = " + delta_view + "." + key + " and ";
 	}
 	join_string.erase(join_string.size() - 5, 5);
 	join_string += "\n";
 
 	string group_by_string = "group by ";
 	for (auto &key : keys) {
-		group_by_string = group_by_string + "delta_" + view_name + "." + key + ", ";
+		group_by_string = group_by_string + delta_view + "." + key + ", ";
 	}
 	group_by_string.erase(group_by_string.size() - 2, 2);
 
@@ -112,15 +116,16 @@ string CompileSimpleAggregates(string &view_name, const vector<string> &column_n
 
 	string update_query = "update " + view_name + "\nset ";
 	bool first = true;
+	auto delta_view = OpenIVMUtils::DeltaName(view_name);
 	for (auto &column : column_names) {
-		if (column != "_duckdb_ivm_multiplicity") {
+		if (column != ivm::MULTIPLICITY_COL) {
 			if (!first) {
 				update_query += ",\n";
 			}
 			first = false;
-			update_query += column + " = \n\t" + column + " \n\t\t- coalesce((select " + column + " from delta_" +
-			                view_name + " where _duckdb_ivm_multiplicity = false), 0)\n\t\t+ coalesce((select " +
-			                column + " from delta_" + view_name + " where _duckdb_ivm_multiplicity = true), 0)";
+			update_query += column + " = \n\t" + column + " \n\t\t- coalesce((select " + column + " from " +
+			                delta_view + " where " + string(ivm::MULTIPLICITY_COL) + " = false), 0)\n\t\t+ coalesce((select " +
+			                column + " from " + delta_view + " where " + string(ivm::MULTIPLICITY_COL) + " = true), 0)";
 		}
 	}
 	update_query += ";\n";
@@ -131,7 +136,7 @@ string CompileProjectionsFilters(string &view_name, const vector<string> &column
 	string select_columns;
 	string match_conditions;
 	for (auto &column : column_names) {
-		if (column != "_duckdb_ivm_multiplicity") {
+		if (column != ivm::MULTIPLICITY_COL) {
 			match_conditions +=
 			    view_name + "." + column + " IS NOT DISTINCT FROM net_dels." + column + " and ";
 			select_columns += column + ", ";
@@ -143,9 +148,10 @@ string CompileProjectionsFilters(string &view_name, const vector<string> &column
 	// Consolidate the delta using EXCEPT ALL to cancel out matching insert/delete pairs.
 	// This is needed because the inclusion-exclusion join delta rule can produce
 	// redundant entries that cancel each other in bag arithmetic.
-	string ins_cte = "SELECT " + select_columns + " FROM delta_" + view_name + " WHERE _duckdb_ivm_multiplicity = true";
+	auto delta_view = OpenIVMUtils::DeltaName(view_name);
+	string ins_cte = "SELECT " + select_columns + " FROM " + delta_view + " WHERE " + string(ivm::MULTIPLICITY_COL) + " = true";
 	string dels_cte =
-	    "SELECT " + select_columns + " FROM delta_" + view_name + " WHERE _duckdb_ivm_multiplicity = false";
+	    "SELECT " + select_columns + " FROM " + delta_view + " WHERE " + string(ivm::MULTIPLICITY_COL) + " = false";
 
 	string delete_query = "WITH net_dels AS (\n  " + dels_cte + "\n  EXCEPT ALL\n  " + ins_cte + "\n)\ndelete from " +
 	                      view_name + " where exists (select 1 from net_dels where " + match_conditions + ");\n\n";

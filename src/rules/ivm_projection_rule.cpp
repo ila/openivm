@@ -1,4 +1,5 @@
 #include "ivm_projection_rule.hpp"
+#include "openivm_constants.hpp"
 #include "openivm_debug.hpp"
 #include "openivm_rewrite_rule.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -14,7 +15,7 @@ ModifiedPlan IvmProjectionRule::Rewrite(PlanWrapper pw) {
 
 	auto projection_node = unique_ptr_cast<LogicalOperator, LogicalProjection>(std::move(pw.plan));
 	auto mul_expression =
-	    make_uniq<BoundColumnRefExpression>("_duckdb_ivm_multiplicity", pw.mul_type, child_mul_binding);
+	    make_uniq<BoundColumnRefExpression>(ivm::MULTIPLICITY_COL, pw.mul_type, child_mul_binding);
 	projection_node->expressions.emplace_back(std::move(mul_expression));
 
 	const auto new_bindings = projection_node->GetColumnBindings();

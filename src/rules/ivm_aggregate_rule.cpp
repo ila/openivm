@@ -1,4 +1,5 @@
 #include "ivm_aggregate_rule.hpp"
+#include "openivm_constants.hpp"
 #include "openivm_debug.hpp"
 #include "openivm_rewrite_rule.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -16,7 +17,7 @@ ModifiedPlan IvmAggregateRule::Rewrite(PlanWrapper pw) {
 
 	// Add multiplicity as a new group-by key
 	auto mult_group_by =
-	    make_uniq<BoundColumnRefExpression>("_duckdb_ivm_multiplicity", pw.mul_type, input_mul_binding);
+	    make_uniq<BoundColumnRefExpression>(ivm::MULTIPLICITY_COL, pw.mul_type, input_mul_binding);
 	ColumnBinding mod_mul_binding;
 	mod_mul_binding.column_index = modified_node->groups.size();
 	modified_node->groups.emplace_back(std::move(mult_group_by));

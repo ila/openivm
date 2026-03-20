@@ -17,6 +17,7 @@ set(EXTENSION_SOURCES
     src/openivm_rewrite_rule.cpp
     src/openivm_index_regen.cpp
     src/openivm_utils.cpp
+    src/openivm_metadata.cpp
     src/openivm_compile_upsert.cpp
     src/openivm_cost_model.cpp
     src/openivm_insert_rule.cpp

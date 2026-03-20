@@ -1,6 +1,8 @@
 #include "openivm_insert_rule.hpp"
 #include "openivm_debug.hpp"
+#include "openivm_metadata.hpp"
 #include "openivm_parser.hpp"
+#include "openivm_utils.hpp"
 
 #include "logical_plan_to_sql.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -30,10 +32,6 @@
 
 namespace duckdb {
 
-static bool StartsWith(const string &str, const string &prefix) {
-	return str.size() >= prefix.size() && str.rfind(prefix, 0) == 0;
-}
-
 
 IVMInsertRule::IVMInsertRule() {
 	optimize_function = IVMInsertRuleFunction;
@@ -46,8 +44,9 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 	}
 
 	auto root = plan.get();
-	if (!StartsWith(root->GetName(), "INSERT") && !StartsWith(root->GetName(), "DELETE") &&
-	    !StartsWith(root->GetName(), "UPDATE")) {
+	auto root_name = root->GetName();
+	if (root_name.rfind("INSERT", 0) != 0 && root_name.rfind("DELETE", 0) != 0 &&
+	    root_name.rfind("UPDATE", 0) != 0) {
 		return;
 	}
 
@@ -56,21 +55,20 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		auto insert_node = dynamic_cast<LogicalInsert *>(root);
 		auto insert_table_name = insert_node->table.name;
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] INSERT into '%s'\n", insert_table_name.c_str());
-		auto delta_insert_table = "delta_" + insert_node->table.name;
 
-		if (StartsWith(insert_table_name, "delta_") || insert_table_name.empty()) {
+		if (OpenIVMUtils::IsDelta(insert_table_name) || insert_table_name.empty()) {
 			return;
 		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    input.context, insert_node->table.catalog.GetName(), insert_node->table.schema.name, delta_insert_table,
-		    OnEntryNotFound::RETURN_NULL);
+		    input.context, insert_node->table.catalog.GetName(), insert_node->table.schema.name,
+		    OpenIVMUtils::DeltaName(insert_table_name), OnEntryNotFound::RETURN_NULL);
 
 		if (delta_table_catalog_entry) {
 			Connection con(*input.context.db);
-			auto t = con.Query("select * from _duckdb_ivm_views where view_name = '" + insert_table_name + "'");
-			if (t->RowCount() == 0) {
-				string full_delta_table_name = insert_node->table.catalog.GetName() + "." +
-				                               insert_node->table.schema.name + ".delta_" + insert_node->table.name;
+			IVMMetadata metadata(con);
+			if (metadata.IsBaseTable(insert_table_name)) {
+				string full_delta_table_name = OpenIVMUtils::FullDeltaName(
+				    insert_node->table.catalog.GetName(), insert_node->table.schema.name, insert_node->table.name);
 				if (insert_node->children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 					string insert_query = "insert into " + full_delta_table_name;
 
@@ -134,25 +132,22 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 	case LogicalOperatorType::LOGICAL_DELETE: {
 		auto delete_node = dynamic_cast<LogicalDelete *>(root);
 		auto delete_table_name = delete_node->table.name;
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] DELETE from '%s' (full: %s.%s.%s)\n",
-		                    delete_table_name.c_str(), delete_node->table.catalog.GetName().c_str(),
-		                    delete_node->table.schema.name.c_str(), delete_table_name.c_str());
-		if (StartsWith(delete_table_name, "delta_")) {
+		OPENIVM_DEBUG_PRINT("[INSERT RULE] DELETE from '%s'\n", delete_table_name.c_str());
+		if (OpenIVMUtils::IsDelta(delete_table_name)) {
 			return;
 		}
-		auto delta_delete_table = "delta_" + delete_node->table.name;
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    input.context, delete_node->table.catalog.GetName(), delete_node->table.schema.name, delta_delete_table,
-		    OnEntryNotFound::RETURN_NULL);
+		    input.context, delete_node->table.catalog.GetName(), delete_node->table.schema.name,
+		    OpenIVMUtils::DeltaName(delete_table_name), OnEntryNotFound::RETURN_NULL);
 
 		if (delta_table_catalog_entry) {
-			auto full_table_name = delete_node->table.catalog.GetName() + "." + delete_node->table.schema.name + "." +
-			                       delete_node->table.name;
-			auto full_delta_table_name = delete_node->table.catalog.GetName() + "." + delete_node->table.schema.name +
-			                             ".delta_" + delete_node->table.name;
+			auto full_table_name = OpenIVMUtils::FullName(delete_node->table.catalog.GetName(),
+			                                              delete_node->table.schema.name, delete_node->table.name);
+			auto full_delta_table_name = OpenIVMUtils::FullDeltaName(
+			    delete_node->table.catalog.GetName(), delete_node->table.schema.name, delete_node->table.name);
 			Connection con(*input.context.db);
-			auto t = con.Query("select * from _duckdb_ivm_views where view_name = '" + delete_table_name + "'");
-			if (t->RowCount() == 0) {
+			IVMMetadata metadata(con);
+			if (metadata.IsBaseTable(delete_table_name)) {
 				string insert_string = "insert into " + full_delta_table_name +
 				                       " select *, false, now()::timestamp from " + full_table_name;
 				if (plan->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
@@ -212,28 +207,24 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 	case LogicalOperatorType::LOGICAL_UPDATE: {
 		auto update_node = dynamic_cast<LogicalUpdate *>(root);
 		auto update_table_name = update_node->table.name;
-		if (StartsWith(update_table_name, "delta_")) {
+		if (OpenIVMUtils::IsDelta(update_table_name)) {
 			return;
 		}
-		auto delta_update_table_name = "delta_" + update_node->table.name;
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
 		    input.context, update_node->table.catalog.GetName(), update_node->table.schema.name,
-		    delta_update_table_name, OnEntryNotFound::RETURN_NULL);
+		    OpenIVMUtils::DeltaName(update_table_name), OnEntryNotFound::RETURN_NULL);
 
 		if (delta_table_catalog_entry) {
 			Connection con(*input.context.db);
-			// Scope the query result so it's released before reusing the connection
-			{
-				auto t = con.Query("select * from _duckdb_ivm_views where view_name = '" + update_table_name + "'");
-				if (t->RowCount() != 0) {
-					break;
-				}
+			IVMMetadata metadata(con);
+			if (!metadata.IsBaseTable(update_table_name)) {
+				break;
 			}
 			{
-				auto full_table_name = update_node->table.catalog.GetName() + "." + update_node->table.schema.name +
-				                       "." + update_node->table.name;
-				auto full_delta_table_name = update_node->table.catalog.GetName() + "." +
-				                             update_node->table.schema.name + ".delta_" + update_node->table.name;
+				auto full_table_name = OpenIVMUtils::FullName(update_node->table.catalog.GetName(),
+				                                              update_node->table.schema.name, update_node->table.name);
+				auto full_delta_table_name = OpenIVMUtils::FullDeltaName(
+				    update_node->table.catalog.GetName(), update_node->table.schema.name, update_node->table.name);
 				auto *projection = dynamic_cast<LogicalProjection *>(update_node->children[0].get());
 				if (!projection) {
 					OPENIVM_DEBUG_PRINT("[INSERT RULE] UPDATE skipped: no projection child (child type: %s)\n",

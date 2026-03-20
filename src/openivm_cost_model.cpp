@@ -1,4 +1,7 @@
 #include "openivm_cost_model.hpp"
+#include "openivm_constants.hpp"
+#include "openivm_metadata.hpp"
+#include "openivm_utils.hpp"
 #include "openivm_debug.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
@@ -23,14 +26,12 @@ static double GetTableRowCount(ClientContext &context, const string &table_name)
 /// Get the number of pending delta rows for a given base delta table and view.
 static double GetDeltaRowCount(ClientContext &context, const string &delta_table_name, const string &view_name) {
 	Connection con(*context.db);
-	auto ts_result = con.Query("SELECT last_update FROM _duckdb_ivm_delta_tables WHERE view_name = '" + view_name +
-	                           "' AND table_name = '" + delta_table_name + "';");
-	if (ts_result->HasError() || ts_result->RowCount() == 0) {
+	auto ts_string = IVMMetadata(con).GetLastUpdate(view_name, delta_table_name);
+	if (ts_string.empty()) {
 		return 0;
 	}
-	auto ts_value = ts_result->GetValue(0, 0);
-	auto count_result = con.Query("SELECT COUNT(*) FROM " + delta_table_name + " WHERE _duckdb_ivm_timestamp >= '" +
-	                              ts_value.ToString() + "';");
+	auto count_result = con.Query("SELECT COUNT(*) FROM " + delta_table_name + " WHERE " +
+	                              string(ivm::TIMESTAMP_COL) + " >= '" + ts_string + "';");
 	if (count_result->HasError()) {
 		return 0;
 	}
@@ -52,7 +53,7 @@ static void CollectTableStats(ClientContext &context, LogicalOperator &op, const
 		if (get.GetTable().get() != nullptr) {
 			TableStats ts;
 			ts.table_name = get.GetTable()->name;
-			ts.delta_table_name = "delta_" + ts.table_name;
+			ts.delta_table_name = OpenIVMUtils::DeltaName(ts.table_name);
 			ts.base_card = get.EstimateCardinality(context);
 			if (ts.base_card == 0) {
 				ts.base_card = 1; // avoid division by zero
