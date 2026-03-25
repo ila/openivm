@@ -1,6 +1,9 @@
 #include "rules/openivm_insert_rule.hpp"
+#include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/openivm_metadata.hpp"
 #include "core/openivm_parser.hpp"
+#include "core/openivm_utils.hpp"
 
 #include "logical_plan_to_sql.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -8,6 +11,8 @@
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/function/table/read_csv.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
@@ -36,13 +41,51 @@ IVMInsertRule::IVMInsertRule() {
 }
 
 void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb::unique_ptr<LogicalOperator> &plan) {
+	auto root = plan.get();
+
+	// Handle DROP TABLE: clean up IVM metadata
+	if (root->type == LogicalOperatorType::LOGICAL_DROP) {
+		auto *simple = dynamic_cast<LogicalSimple *>(root);
+		if (!simple) {
+			return;
+		}
+		auto *drop_info = dynamic_cast<DropInfo *>(simple->info.get());
+		if (!drop_info || drop_info->type != CatalogType::TABLE_ENTRY) {
+			return;
+		}
+
+		auto table_name = drop_info->name;
+		Connection con(*input.context.db);
+
+		auto view_check =
+		    con.Query("SELECT 1 FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + table_name + "'");
+		if (!view_check->HasError() && view_check->RowCount() > 0) {
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] DROP TABLE '%s' — cleaning up IVM metadata\n", table_name.c_str());
+			IVMMetadata metadata(con);
+			auto delta_tables = metadata.GetDeltaTables(table_name);
+
+			con.Query("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + table_name + "'");
+			con.Query("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + table_name + "'");
+			con.Query("DROP TABLE IF EXISTS " + OpenIVMUtils::DeltaName(table_name));
+
+			for (auto &dt : delta_tables) {
+				auto remaining = con.Query("SELECT count(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+				                           " WHERE table_name = '" + dt + "'");
+				if (!remaining->HasError() && remaining->RowCount() > 0 &&
+				    remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
+					con.Query("DROP TABLE IF EXISTS " + dt);
+				}
+			}
+		}
+		return;
+	}
+
 	if (plan->children.empty()) {
 		return;
 	}
 
-	auto root = plan.get();
-	if (root->GetName().substr(0, 6) != "INSERT" && root->GetName().substr(0, 6) != "DELETE" &&
-	    root->GetName().substr(0, 6) != "UPDATE") {
+	auto root_name = root->GetName();
+	if (root_name.rfind("INSERT", 0) != 0 && root_name.rfind("DELETE", 0) != 0 && root_name.rfind("UPDATE", 0) != 0) {
 		return;
 	}
 

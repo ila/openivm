@@ -1,6 +1,10 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "core/openivm_extension.hpp"
+#include "core/openivm_constants.hpp"
+#include "core/openivm_metadata.hpp"
+#include "upsert/openivm_cost_model.hpp"
+#include "upsert/openivm_upsert.hpp"
 
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
@@ -57,11 +61,10 @@ static duckdb::unique_ptr<FunctionData> DoIVMBind(ClientContext &context, TableF
 	input.named_parameters["view_schema_name"] = view_schema_name;
 
 	Connection con(*context.db);
-	auto v = con.Query("select sql_string from _duckdb_ivm_views where view_name = '" + view_name + "';");
-	if (v->HasError()) {
+	string view_query = IVMMetadata(con).GetViewQuery(view_name);
+	if (view_query.empty()) {
 		throw InternalException("Error while querying view definition");
 	}
-	string view_query = v->GetValue(0, 0).ToString();
 	OPENIVM_DEBUG_PRINT("[DoIVM Bind] View: %s, Query: %s\n", view_name.c_str(), view_query.c_str());
 
 	Parser parser;
@@ -80,7 +83,7 @@ static duckdb::unique_ptr<FunctionData> DoIVMBind(ClientContext &context, TableF
 	}
 
 	return_types.emplace_back(LogicalTypeId::BOOLEAN);
-	names.emplace_back("_duckdb_ivm_multiplicity");
+	names.emplace_back(ivm::MULTIPLICITY_COL);
 
 	return std::move(result);
 }
@@ -101,7 +104,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("ivm_system", "database for cross-system openivm", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("ivm_catalog_name", "catalog name", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("ivm_schema_name", "schema name", LogicalType::VARCHAR);
+	db_config.AddExtensionOption("execute", "whether to execute queries", LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("ivm_done", "whether the query has been parsed", LogicalType::BOOLEAN);
+	db_config.AddExtensionOption("ivm_refresh_mode", "refresh strategy: auto, incremental, or full",
+	                             LogicalType::VARCHAR, Value("auto"));
 	db_config.AddExtensionOption("ivm_adaptive", "enable adaptive cost model (when false, always use IVM)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
@@ -134,6 +140,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ivm_options);
 	auto ivm = PragmaFunction::PragmaCall("ivm", UpsertDeltaQueries, {LogicalType::VARCHAR});
 	loader.RegisterFunction(ivm);
+	auto ivm_cost = PragmaFunction::PragmaCall("ivm_cost", IVMCostQuery, {LogicalType::VARCHAR});
+	loader.RegisterFunction(ivm_cost);
 	auto ivm_cross_system = PragmaFunction::PragmaCall(
 	    "ivm_cross_system", UpsertDeltaQueries,
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});

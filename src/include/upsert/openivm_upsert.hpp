@@ -4,10 +4,9 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "core/openivm_constants.hpp"
 
 namespace duckdb {
-
-enum class IVMType : uint8_t { AGGREGATE_GROUP, SIMPLE_AGGREGATE, SIMPLE_PROJECTION };
 
 string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &parameters);
 
