@@ -20,6 +20,9 @@ struct IVMCostEstimate {
 /// and computes a cost estimate for both strategies.
 IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name);
 
+/// Pragma function: returns the IVM cost estimate for a view as a string.
+void IVMCostQuery(ClientContext &context, const FunctionParameters &parameters);
+
 } // namespace duckdb
 
 #endif // OPENIVM_COST_MODEL_HPP

@@ -60,7 +60,13 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, c
 	}
 
 	for (auto &id : old_get->GetColumnIds()) {
-		column_ids.push_back(id);
+		if (id.IsVirtualColumn()) {
+			// Virtual columns (e.g., row-id for COUNT(*)) don't exist in delta tables.
+			// Map to multiplicity column instead.
+			column_ids.push_back(ColumnIndex(mul_oid));
+		} else {
+			column_ids.push_back(id);
+		}
 	}
 	column_ids.push_back(ColumnIndex(mul_oid));
 	column_ids.push_back(ColumnIndex(ts_oid));

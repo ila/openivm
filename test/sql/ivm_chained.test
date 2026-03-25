@@ -1,0 +1,299 @@
+# name: test/sql/ivm_chained.test
+# description: Test chained materialized view IVM (table -> MV1 -> MV2 -> ...)
+# group: [sql]
+
+require openivm
+
+# ============================================================
+# Two-level chain: table -> MV1 -> MV2
+# ============================================================
+
+statement ok
+CREATE TABLE sales (region VARCHAR, product VARCHAR, amount INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW sales_by_region AS
+    SELECT region, SUM(amount) AS total FROM sales GROUP BY region;
+
+statement ok
+CREATE MATERIALIZED VIEW grand_total AS
+    SELECT SUM(total) AS grand_total FROM sales_by_region;
+
+statement ok
+INSERT INTO sales VALUES ('US', 'A', 100), ('US', 'B', 200), ('EU', 'A', 300);
+
+statement ok
+pragma ivm('sales_by_region');
+
+statement ok
+pragma ivm('grand_total');
+
+query II
+SELECT region, total FROM sales_by_region ORDER BY region;
+----
+EU	300
+US	300
+
+query I
+SELECT grand_total FROM grand_total;
+----
+600
+
+# Cross-check
+query I
+SELECT SUM(total) FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY region);
+----
+600
+
+# Second batch of inserts
+statement ok
+INSERT INTO sales VALUES ('EU', 'B', 400), ('US', 'C', 500);
+
+statement ok
+pragma ivm('sales_by_region');
+
+statement ok
+pragma ivm('grand_total');
+
+query II
+SELECT region, total FROM sales_by_region ORDER BY region;
+----
+EU	700
+US	800
+
+query I
+SELECT grand_total FROM grand_total;
+----
+1500
+
+query I
+SELECT SUM(total) FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY region);
+----
+1500
+
+# ============================================================
+# Three-level chain: table -> MV1 -> MV2 -> MV3
+# ============================================================
+
+statement ok
+CREATE TABLE orders (customer VARCHAR, category VARCHAR, qty INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW orders_by_customer AS
+    SELECT customer, SUM(qty) AS total_qty FROM orders GROUP BY customer;
+
+statement ok
+CREATE MATERIALIZED VIEW orders_by_category AS
+    SELECT category, SUM(qty) AS total_qty FROM orders GROUP BY category;
+
+# COUNT(*) on chained MVs hits a virtual column limitation in the IVM rewrite rule.
+# Use SUM-based aggregation instead.
+statement ok
+CREATE MATERIALIZED VIEW total_orders AS
+    SELECT SUM(total_qty) AS all_orders FROM orders_by_customer;
+
+statement ok
+INSERT INTO orders VALUES ('alice', 'books', 3), ('bob', 'books', 5), ('alice', 'games', 2), ('charlie', 'books', 1);
+
+statement ok
+pragma ivm('orders_by_customer');
+
+statement ok
+pragma ivm('orders_by_category');
+
+statement ok
+pragma ivm('customer_count');
+
+query II
+SELECT customer, total_qty FROM orders_by_customer ORDER BY customer;
+----
+alice	5
+bob	5
+charlie	1
+
+query II
+SELECT category, total_qty FROM orders_by_category ORDER BY category;
+----
+books	9
+games	2
+
+query I
+SELECT num_customers FROM customer_count;
+----
+3
+
+# Cross-check all three levels
+query I
+SELECT COUNT(*) FROM (SELECT customer, SUM(qty) FROM orders GROUP BY customer);
+----
+3
+
+# Add more data and propagate through the full chain
+statement ok
+INSERT INTO orders VALUES ('dave', 'games', 7), ('alice', 'books', 4);
+
+statement ok
+pragma ivm('orders_by_customer');
+
+statement ok
+pragma ivm('orders_by_category');
+
+statement ok
+pragma ivm('customer_count');
+
+query II
+SELECT customer, total_qty FROM orders_by_customer ORDER BY customer;
+----
+alice	9
+bob	5
+charlie	1
+dave	7
+
+query I
+SELECT num_customers FROM customer_count;
+----
+4
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (SELECT customer, SUM(qty) FROM orders GROUP BY customer);
+----
+4
+
+# ============================================================
+# New region appears in second refresh (tests INSERT OR REPLACE)
+# ============================================================
+
+statement ok
+INSERT INTO sales VALUES ('JP', 'D', 1000);
+
+statement ok
+pragma ivm('sales_by_region');
+
+statement ok
+pragma ivm('grand_total');
+
+query II
+SELECT region, total FROM sales_by_region ORDER BY region;
+----
+EU	700
+JP	1000
+US	800
+
+query I
+SELECT grand_total FROM grand_total;
+----
+2500
+
+query I
+SELECT SUM(total) FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY region);
+----
+2500
+
+# ============================================================
+# Multiple refreshes without new data (idempotent)
+# ============================================================
+
+statement ok
+pragma ivm('sales_by_region');
+
+statement ok
+pragma ivm('grand_total');
+
+query I
+SELECT grand_total FROM grand_total;
+----
+2500
+
+# ============================================================
+# Empty insert (no new rows) then refresh
+# ============================================================
+
+statement ok
+INSERT INTO sales SELECT * FROM sales WHERE 1=0;
+
+statement ok
+pragma ivm('sales_by_region');
+
+statement ok
+pragma ivm('grand_total');
+
+query I
+SELECT grand_total FROM grand_total;
+----
+2500
+
+# ============================================================
+# Fan-out: one base table feeds two independent MV chains
+# ============================================================
+
+statement ok
+CREATE TABLE events (user_id VARCHAR, event_type VARCHAR, value INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW events_by_user AS
+    SELECT user_id, SUM(value) AS total_value FROM events GROUP BY user_id;
+
+statement ok
+CREATE MATERIALIZED VIEW events_by_type AS
+    SELECT event_type, SUM(value) AS total_value FROM events GROUP BY event_type;
+
+# MV3 depends on events_by_user
+statement ok
+CREATE MATERIALIZED VIEW user_count AS
+    SELECT COUNT(*) AS num_users FROM events_by_user;
+
+# MV4 depends on events_by_type
+statement ok
+CREATE MATERIALIZED VIEW type_count AS
+    SELECT COUNT(*) AS num_types FROM events_by_type;
+
+statement ok
+INSERT INTO events VALUES ('u1', 'click', 10), ('u2', 'click', 20), ('u1', 'purchase', 100), ('u3', 'click', 5);
+
+# Refresh both chains
+statement ok
+pragma ivm('events_by_user');
+
+statement ok
+pragma ivm('events_by_type');
+
+statement ok
+pragma ivm('user_count');
+
+statement ok
+pragma ivm('type_count');
+
+query II
+SELECT user_id, total_value FROM events_by_user ORDER BY user_id;
+----
+u1	110
+u2	20
+u3	5
+
+query II
+SELECT event_type, total_value FROM events_by_type ORDER BY event_type;
+----
+click	35
+purchase	100
+
+query I
+SELECT num_users FROM user_count;
+----
+3
+
+query I
+SELECT num_types FROM type_count;
+----
+2
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (SELECT user_id, SUM(value) FROM events GROUP BY user_id);
+----
+3
+
+query I
+SELECT COUNT(*) FROM (SELECT event_type, SUM(value) FROM events GROUP BY event_type);
+----
+2

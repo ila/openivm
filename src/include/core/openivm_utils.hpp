@@ -22,7 +22,14 @@ public:
 	static string SQLToLowercase(const string &sql);
 	static void ReplaceCount(string &query);
 	static void ReplaceSum(string &query);
+	static void ReplaceMin(string &query);
+	static void ReplaceMax(string &query);
 	static void RemoveRedundantWhitespaces(string &query);
+	static string DeltaName(const string &name);
+	static string FullName(const string &catalog, const string &schema, const string &table);
+	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
+	static bool IsDelta(const string &name);
+	static string DbPath(ClientContext &context);
 	static string GenerateDeltaTable(string &query);
 };
 

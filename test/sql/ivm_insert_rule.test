@@ -1,0 +1,1034 @@
+# name: test/sql/ivm_insert_rule.test
+# description: Test IVM insert rule (delta table population for INSERT/DELETE/UPDATE)
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE IF NOT EXISTS _duckdb_ivm_views (view_name VARCHAR PRIMARY KEY, sql_string VARCHAR, type TINYINT, last_update TIMESTAMP);
+
+statement ok
+CREATE TABLE IF NOT EXISTS _duckdb_ivm_delta_tables (view_name VARCHAR, table_name VARCHAR, last_update TIMESTAMP, PRIMARY KEY(view_name, table_name));
+
+# ==========================================
+# Setup: base table, MV, delta tables
+# ==========================================
+
+statement ok
+CREATE TABLE staff (id INT, name VARCHAR, dept VARCHAR, salary INT);
+
+statement ok
+INSERT INTO staff VALUES (1, 'Alice', 'eng', 100), (2, 'Bob', 'sales', 200);
+
+# MV: select id, name, dept, salary from staff
+statement ok
+CREATE TABLE mv_staff AS SELECT id, name, dept, salary FROM staff;
+
+statement ok
+CREATE TABLE delta_mv_staff AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_staff LIMIT 0;
+
+statement ok
+CREATE TABLE delta_staff AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM staff LIMIT 0;
+
+statement ok
+INSERT INTO _duckdb_ivm_views VALUES ('mv_staff', 'select id, name, dept, salary from staff', 2, now()::timestamp);
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_staff', 'delta_staff', '1970-01-01');
+
+# Source table for INSERT...SELECT tests
+statement ok
+CREATE TABLE temp_hires (id INT, name VARCHAR, dept VARCHAR, salary INT);
+
+statement ok
+INSERT INTO temp_hires VALUES (6, 'Frank', 'eng', 175), (7, 'Grace', 'sales', 225);
+
+# ==========================================
+# Test 1: INSERT VALUES — single row
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (3, 'Carol', 'eng', 150);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+# MV must match base table after every PRAGMA
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 2: INSERT VALUES — multi-row batch
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (4, 'Dave', 'sales', 250), (5, 'Eve', 'eng', 300);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 3: INSERT...SELECT (subquery path)
+# ==========================================
+
+statement ok
+INSERT INTO staff SELECT * FROM temp_hires;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 4: INSERT...SELECT FROM range() (table function)
+# ==========================================
+
+statement ok
+INSERT INTO staff SELECT i + 100, 'Batch' || i::VARCHAR, 'eng', i * 10 FROM range(1, 4) t(i);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 5: DELETE — single row with WHERE
+# ==========================================
+
+statement ok
+DELETE FROM staff WHERE id = 3;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 6: DELETE — multiple AND conditions
+# ==========================================
+
+statement ok
+DELETE FROM staff WHERE dept = 'sales' AND salary >= 200;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 7: DELETE — all rows (no WHERE)
+# ==========================================
+
+statement ok
+DELETE FROM staff;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM mv_staff;
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+# ==========================================
+# Test 8: UPDATE — constant SET value
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (1, 'Alice', 'eng', 100), (2, 'Bob', 'sales', 200);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+statement ok
+UPDATE staff SET name = 'Alice2' WHERE id = 1;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 9: End-to-end INSERT + IVM
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (10, 'Zara', 'eng', 500);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 10: End-to-end DELETE + IVM
+# ==========================================
+
+statement ok
+DELETE FROM staff WHERE id = 10;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 11: End-to-end UPDATE + IVM
+# ==========================================
+
+statement ok
+UPDATE staff SET name = 'Alice3' WHERE id = 1;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 12: Short table name (prefix check safety)
+# ==========================================
+
+statement ok
+CREATE TABLE ab (id INT, val INT);
+
+statement ok
+CREATE TABLE delta_ab AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM ab LIMIT 0;
+
+statement ok
+INSERT INTO ab VALUES (1, 42);
+
+query I
+SELECT count(*) FROM delta_ab;
+----
+1
+
+# ==========================================
+# Test 13: Mixed INSERT + DELETE + UPDATE without PRAGMA between
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (20, 'Mixed', 'eng', 999);
+
+statement ok
+DELETE FROM staff WHERE id = 2;
+
+statement ok
+UPDATE staff SET salary = 111 WHERE id = 1;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 14: INSERT with NULL values
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (30, NULL, NULL, NULL);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 15: INSERT with single quotes in strings
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (31, 'O''Brien', 'eng', 100);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# STRESS TESTS
+# ==========================================
+
+# ==========================================
+# Stress 1: INSERT empty string and zero
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (40, '', '', 0);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Stress 2: INSERT negative numbers
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (41, 'Negative', 'eng', -999);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Stress 3: INSERT then immediately DELETE same row
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (50, 'Ghost', 'eng', 0);
+
+statement ok
+DELETE FROM staff WHERE id = 50;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Stress 4: UPDATE same row twice before PRAGMA
+# ==========================================
+
+statement ok
+UPDATE staff SET name = 'FirstUpdate' WHERE id = 1;
+
+statement ok
+UPDATE staff SET name = 'SecondUpdate' WHERE id = 1;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Stress 5: DELETE row that doesn't exist
+# ==========================================
+
+statement ok
+DELETE FROM staff WHERE id = 99999;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Stress 6: UPDATE row that doesn't exist
+# ==========================================
+
+statement ok
+UPDATE staff SET name = 'nobody' WHERE id = 99999;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Stress 7: INSERT very long string
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (60, 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'eng', 1);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Stress 8: Rapid-fire INSERT + DELETE alternating
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (70, 'A', 'eng', 1);
+
+statement ok
+INSERT INTO staff VALUES (71, 'B', 'eng', 2);
+
+statement ok
+DELETE FROM staff WHERE id = 70;
+
+statement ok
+INSERT INTO staff VALUES (72, 'C', 'eng', 3);
+
+statement ok
+DELETE FROM staff WHERE id = 71;
+
+statement ok
+DELETE FROM staff WHERE id = 72;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Stress 9: INSERT...SELECT with WHERE filter
+# ==========================================
+
+statement ok
+CREATE TABLE candidates (id INT, name VARCHAR, dept VARCHAR, salary INT);
+
+statement ok
+INSERT INTO candidates VALUES (80, 'Yes', 'eng', 100), (81, 'No', 'fired', 50), (82, 'Also', 'eng', 200);
+
+statement ok
+INSERT INTO staff SELECT * FROM candidates WHERE dept = 'eng';
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Stress 10: Batch UPDATE multiple rows
+# ==========================================
+
+statement ok
+UPDATE staff SET salary = 0 WHERE dept = 'eng';
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# EMPTY DELTA TESTS — operations that produce zero delta rows
+# ==========================================
+
+# Snapshot current MV state for comparison
+query I
+SELECT count(*) FROM mv_staff;
+----
+9
+
+# ==========================================
+# Empty 1: INSERT...SELECT with WHERE that matches nothing
+# ==========================================
+
+statement ok
+INSERT INTO staff SELECT * FROM candidates WHERE dept = 'nonexistent';
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+query I
+SELECT count(*) FROM mv_staff;
+----
+9
+
+# ==========================================
+# Empty 2: DELETE with WHERE that matches nothing
+# ==========================================
+
+statement ok
+DELETE FROM staff WHERE id = -1;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Empty 3: DELETE with complex WHERE that matches nothing
+# ==========================================
+
+statement ok
+DELETE FROM staff WHERE dept = 'eng' AND salary > 999999;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Empty 4: UPDATE with WHERE that matches nothing
+# ==========================================
+
+statement ok
+UPDATE staff SET name = 'ghost' WHERE id = -1;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Empty 5: INSERT...SELECT from empty source table
+# ==========================================
+
+statement ok
+CREATE TABLE empty_source (id INT, name VARCHAR, dept VARCHAR, salary INT);
+
+statement ok
+INSERT INTO staff SELECT * FROM empty_source;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Empty 6: PRAGMA with no changes at all (pure no-op)
+# ==========================================
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Empty 7: Multiple no-op PRAGMAs in a row
+# ==========================================
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# Final row count unchanged
+query I
+SELECT count(*) FROM mv_staff;
+----
+9
+
+# ==========================================
+# COMPLEX QUERY TESTS — test various SQL patterns
+# ==========================================
+
+# ==========================================
+# Complex 1: DELETE with OR condition
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (90, 'OrTest1', 'eng', 10), (91, 'OrTest2', 'sales', 20), (92, 'OrTest3', 'hr', 30);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE id = 90 OR id = 92;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# Only id=91 should remain from the 3 inserted
+query I
+SELECT count(*) FROM mv_staff WHERE id IN (90, 91, 92);
+----
+1
+
+# ==========================================
+# Complex 2: DELETE with IN (...)
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (93, 'InTest1', 'eng', 10), (94, 'InTest2', 'eng', 20), (95, 'InTest3', 'eng', 30);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE id IN (93, 95);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 3: DELETE with BETWEEN
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (100, 'Bet1', 'eng', 10), (101, 'Bet2', 'eng', 20), (102, 'Bet3', 'eng', 30), (103, 'Bet4', 'eng', 40);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE id BETWEEN 101 AND 102;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 4: DELETE with LIKE
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (110, 'LikeAlpha', 'eng', 1), (111, 'LikeBeta', 'eng', 2), (112, 'NoMatch', 'eng', 3);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE name LIKE 'Like%';
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 5: DELETE with IS NULL
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (120, NULL, 'eng', 1), (121, 'NotNull', 'eng', 2);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE name IS NULL;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 6: UPDATE multiple columns at once
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (130, 'Multi', 'eng', 500);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+UPDATE staff SET name = 'Updated', dept = 'sales', salary = 999 WHERE id = 130;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+query IIII
+SELECT id, name, dept, salary FROM mv_staff WHERE id = 130;
+----
+130	Updated	sales	999
+
+# ==========================================
+# Complex 7: INSERT...SELECT with JOIN
+# ==========================================
+
+statement ok
+CREATE TABLE dept_bonus (dept VARCHAR, bonus INT);
+
+statement ok
+INSERT INTO dept_bonus VALUES ('eng', 50), ('sales', 100);
+
+statement ok
+INSERT INTO staff SELECT s.id + 1000, s.name, s.dept, s.salary + d.bonus FROM staff s JOIN dept_bonus d ON s.dept = d.dept WHERE s.id = 130;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 8: INSERT...SELECT with aggregation
+# ==========================================
+
+statement ok
+CREATE TABLE agg_target (id INT, name VARCHAR, dept VARCHAR, salary INT);
+
+statement ok
+CREATE TABLE delta_agg_target AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM agg_target LIMIT 0;
+
+statement ok
+INSERT INTO agg_target SELECT 999, dept, dept, SUM(salary) FROM staff WHERE dept = 'eng' GROUP BY dept;
+
+query I
+SELECT count(*) FROM delta_agg_target;
+----
+1
+
+# ==========================================
+# Complex 9: DELETE with subquery (WHERE id IN (SELECT ...))
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (140, 'Sub1', 'temp', 1), (141, 'Sub2', 'temp', 2), (142, 'Sub3', 'keep', 3);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+# DELETE with subquery not yet supported — should give clean error
+statement error
+DELETE FROM staff WHERE dept IN (SELECT 'temp');
+----
+not yet fully supported
+
+# Clean up manually since the DELETE didn't execute
+statement ok
+DELETE FROM staff WHERE dept = 'temp';
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Complex 10: DELETE with >= and <= (range filter)
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (150, 'Range1', 'eng', 10), (151, 'Range2', 'eng', 20), (152, 'Range3', 'eng', 30);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+statement ok
+DELETE FROM staff WHERE salary >= 10 AND salary <= 20 AND id >= 150;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+query I
+SELECT count(*) FROM mv_staff WHERE id IN (150, 151, 152);
+----
+1

@@ -3,7 +3,8 @@
 namespace duckdb {
 
 string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
-                              vector<string> column_names, bool list_mode) {
+                              vector<string> column_names, const string &view_query_sql, bool has_minmax,
+                              bool list_mode) {
 	auto index_catalog_entry = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
 	auto key_ids = index_catalog_entry->column_ids;
 
@@ -19,6 +20,23 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 		if (keys_set.find(column) == keys_set.end() && column != "_duckdb_ivm_multiplicity") {
 			aggregates.push_back(column);
 		}
+	}
+
+	if (has_minmax) {
+		// Group-recompute strategy for MIN/MAX: delete affected groups, re-insert from original query
+		string keys_tuple;
+		for (size_t i = 0; i < keys.size(); i++) {
+			keys_tuple += keys[i];
+			if (i != keys.size() - 1) {
+				keys_tuple += ", ";
+			}
+		}
+		string delete_query = "delete from " + view_name + " where (" + keys_tuple + ") in (\n" + "  select distinct " +
+		                      keys_tuple + " from delta_" + view_name + "\n);\n";
+		string insert_query = "insert into " + view_name + "\n" + "select * from (" + view_query_sql +
+		                      ") _ivm_recompute\n" + "where (" + keys_tuple + ") in (\n" + "  select distinct " +
+		                      keys_tuple + " from delta_" + view_name + "\n);\n";
+		return delete_query + "\n" + insert_query;
 	}
 
 	// CTE: consolidate deltas per group
@@ -116,7 +134,14 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	return upsert_query;
 }
 
-string CompileSimpleAggregates(string &view_name, const vector<string> &column_names, bool list_mode) {
+string CompileSimpleAggregates(string &view_name, const vector<string> &column_names, const string &view_query_sql,
+                               bool has_minmax, bool list_mode) {
+	if (has_minmax) {
+		string delete_query = "delete from " + view_name + ";\n";
+		string insert_query = "insert into " + view_name + " " + view_query_sql + ";\n";
+		return delete_query + insert_query;
+	}
+
 	string update_query = "update " + view_name + "\nset ";
 	bool first = true;
 	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
@@ -135,9 +160,10 @@ string CompileSimpleAggregates(string &view_name, const vector<string> &column_n
 				update_query +=
 				    column + " = list_transform(list_zip(" + column + ", " + delta + "), lambda x: x[1] + x[2])";
 			} else {
-				update_query += column + " = \n\t" + column + " \n\t\t- coalesce((select " + column + " from delta_" +
-				                view_name + " where _duckdb_ivm_multiplicity = false), 0)\n\t\t+ coalesce((select " +
-				                column + " from delta_" + view_name + " where _duckdb_ivm_multiplicity = true), 0)";
+				update_query += column + " = \n\tcoalesce(" + column + ", 0) \n\t\t- coalesce((select " + column +
+				                " from delta_" + view_name +
+				                " where _duckdb_ivm_multiplicity = false), 0)\n\t\t+ coalesce((select " + column +
+				                " from delta_" + view_name + " where _duckdb_ivm_multiplicity = true), 0)";
 			}
 		}
 	}

@@ -85,6 +85,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
 
+	bool has_minmax = StringUtil::Contains(view_query_sql, "min(") || StringUtil::Contains(view_query_sql, "max(");
+
 	// Adaptive cost model: estimate IVM vs full recompute cost.
 	// Gated by ivm_adaptive setting (default false — always use IVM).
 	Value ivm_adaptive_val;
@@ -144,6 +146,9 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	const ColumnList &delta_view_columns = delta_view_entry->GetColumns();
 
 	auto column_names = delta_view_columns.GetColumnNames();
+	// Remove _duckdb_ivm_timestamp — it's auto-filled by DEFAULT (for chained MV support)
+	column_names.erase(std::remove(column_names.begin(), column_names.end(), string("_duckdb_ivm_timestamp")),
+	                   column_names.end());
 
 	// Detect list mode: use element-wise list operations for LIST-typed aggregate columns
 	bool list_mode = false;
@@ -167,7 +172,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	                                                                    : "UNKNOWN");
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_GROUP: {
-		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, list_mode);
+		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
+		                                      view_query_sql, has_minmax, list_mode);
 		break;
 	}
 
@@ -178,7 +184,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	}
 
 	case IVMType::SIMPLE_AGGREGATE: {
-		upsert_query = CompileSimpleAggregates(view_name, column_names, list_mode);
+		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode);
 		break;
 	}
 		// todo joins
@@ -217,10 +223,40 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// we turn the plan into a string using LogicalPlanToSql (replacement for LogicalPlanToString)
 	LogicalPlanToSql lpts(context, plan);
 	auto cte_list = lpts.LogicalPlanToCteList();
-	ivm_query += LogicalPlanToSql::CteListToSql(cte_list);
+	string raw_ivm_sql = LogicalPlanToSql::CteListToSql(cte_list);
 
-	// we delete everything from the delta view (we don't need the data anymore, it will be inserted in the view)
-	string delete_from_view_query = "delete from delta_" + view_name + ";";
+	// Use explicit column list in INSERT INTO delta_view, excluding _duckdb_ivm_timestamp
+	// so the DEFAULT now() fills it in (for chained MV support)
+	string delta_view_name = "delta_" + view_name;
+	string insert_target = "INSERT INTO " + delta_view_name;
+	auto insert_pos = raw_ivm_sql.find(insert_target);
+	if (insert_pos != string::npos) {
+		string col_list = "(";
+		for (size_t i = 0; i < column_names.size(); i++) {
+			if (i > 0) {
+				col_list += ", ";
+			}
+			col_list += column_names[i];
+		}
+		col_list += ") ";
+		raw_ivm_sql.insert(insert_pos + insert_target.size(), " " + col_list);
+	}
+	ivm_query += raw_ivm_sql;
+
+	// Delete from delta view: timestamp-based if downstream views depend on it, unconditional otherwise
+	auto downstream_check =
+	    con.Query("SELECT COUNT(*) FROM _duckdb_ivm_delta_tables WHERE table_name = '" + delta_view_name + "'");
+	bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
+	                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
+	string delete_from_view_query;
+	if (has_downstream) {
+		delete_from_view_query = "delete from " + delta_view_name +
+		                         " where _duckdb_ivm_timestamp < (select min(last_update) from "
+		                         "_duckdb_ivm_delta_tables where table_name = '" +
+		                         delta_view_name + "');";
+	} else {
+		delete_from_view_query = "delete from " + delta_view_name + ";";
+	}
 	string ivm_result;
 
 	// now we can also delete from the delta table, but only if all the dependent views have been refreshed

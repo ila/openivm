@@ -167,8 +167,47 @@ void OpenIVMUtils::ReplaceSum(string &query) {
 	query = std::regex_replace(query, pattern, "sum($2) as sum_$2");
 }
 
+void OpenIVMUtils::ReplaceMin(string &query) {
+	std::regex pattern("(min\\((\\w+)\\))(?![^()]*\\bas\\b)", std::regex_constants::icase);
+	query = std::regex_replace(query, pattern, "min($2) as min_$2");
+}
+
+void OpenIVMUtils::ReplaceMax(string &query) {
+	std::regex pattern("(max\\((\\w+)\\))(?![^()]*\\bas\\b)", std::regex_constants::icase);
+	query = std::regex_replace(query, pattern, "max($2) as max_$2");
+}
+
 void OpenIVMUtils::RemoveRedundantWhitespaces(string &query) {
 	query = std::regex_replace(query, std::regex("\\s+"), " ");
+}
+
+string OpenIVMUtils::DeltaName(const string &name) {
+	return "delta_" + name;
+}
+
+string OpenIVMUtils::FullName(const string &catalog, const string &schema, const string &table) {
+	return catalog + "." + schema + "." + table;
+}
+
+string OpenIVMUtils::FullDeltaName(const string &catalog, const string &schema, const string &table) {
+	return catalog + "." + schema + ".delta_" + table;
+}
+
+bool OpenIVMUtils::IsDelta(const string &name) {
+	return name.size() >= 6 && name.rfind("delta_", 0) == 0;
+}
+
+string OpenIVMUtils::DbPath(ClientContext &context) {
+	string db_path;
+	if (!context.db->config.options.database_path.empty()) {
+		db_path = context.db->GetFileSystem().GetWorkingDirectory();
+	}
+	Value db_path_value;
+	context.TryGetCurrentSetting("ivm_files_path", db_path_value);
+	if (!db_path_value.IsNull()) {
+		db_path = db_path_value.ToString();
+	}
+	return db_path;
 }
 
 } // namespace duckdb

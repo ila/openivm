@@ -1,7 +1,13 @@
 #include "upsert/openivm_cost_model.hpp"
+#include "core/openivm_constants.hpp"
+#include "core/openivm_metadata.hpp"
+#include "core/openivm_utils.hpp"
 #include "core/openivm_debug.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -23,14 +29,12 @@ static double GetTableRowCount(ClientContext &context, const string &table_name)
 /// Get the number of pending delta rows for a given base delta table and view.
 static double GetDeltaRowCount(ClientContext &context, const string &delta_table_name, const string &view_name) {
 	Connection con(*context.db);
-	auto ts_result = con.Query("SELECT last_update FROM _duckdb_ivm_delta_tables WHERE view_name = '" + view_name +
-	                           "' AND table_name = '" + delta_table_name + "';");
-	if (ts_result->HasError() || ts_result->RowCount() == 0) {
+	auto ts_string = IVMMetadata(con).GetLastUpdate(view_name, delta_table_name);
+	if (ts_string.empty()) {
 		return 0;
 	}
-	auto ts_value = ts_result->GetValue(0, 0);
-	auto count_result = con.Query("SELECT COUNT(*) FROM " + delta_table_name + " WHERE _duckdb_ivm_timestamp >= '" +
-	                              ts_value.ToString() + "';");
+	auto count_result = con.Query("SELECT COUNT(*) FROM " + delta_table_name + " WHERE " + string(ivm::TIMESTAMP_COL) +
+	                              " >= '" + ts_string + "';");
 	if (count_result->HasError()) {
 		return 0;
 	}
@@ -52,7 +56,7 @@ static void CollectTableStats(ClientContext &context, LogicalOperator &op, const
 		if (get.GetTable().get() != nullptr) {
 			TableStats ts;
 			ts.table_name = get.GetTable()->name;
-			ts.delta_table_name = "delta_" + ts.table_name;
+			ts.delta_table_name = OpenIVMUtils::DeltaName(ts.table_name);
 			ts.base_card = get.EstimateCardinality(context);
 			if (ts.base_card == 0) {
 				ts.base_card = 1; // avoid division by zero
@@ -212,6 +216,31 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n", ivm_total < recompute_total ? "IVM" : "RECOMPUTE");
 
 	return {ivm_total, recompute_total};
+}
+
+void IVMCostQuery(ClientContext &context, const FunctionParameters &parameters) {
+	auto view_name = StringValue::Get(parameters.values[0]);
+
+	auto &db = DatabaseInstance::GetDatabase(context);
+	Connection con(db);
+
+	IVMMetadata metadata(con);
+	auto view_query = metadata.GetViewQuery(view_name);
+	if (view_query.empty()) {
+		throw ParserException("View '" + view_name + "' not found in IVM metadata");
+	}
+
+	Parser p;
+	p.ParseQuery(view_query);
+	Planner planner(context);
+	planner.CreatePlan(p.statements[0]->Copy());
+	Optimizer optimizer(*planner.binder, context);
+	auto plan = optimizer.Optimize(std::move(planner.plan));
+
+	auto estimate = EstimateIVMCost(context, *plan, view_name);
+	Printer::Print("IVM cost: " + to_string(estimate.ivm_cost) +
+	               ", Recompute cost: " + to_string(estimate.recompute_cost) +
+	               ", Decision: " + (estimate.ShouldRecompute() ? "RECOMPUTE" : "IVM"));
 }
 
 } // namespace duckdb

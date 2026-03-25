@@ -1,0 +1,393 @@
+# name: test/sql/ivm_metadata.test
+# description: Test that IVM metadata is correctly created and cleaned up
+# group: [sql]
+
+require openivm
+
+load __TEST_DIR__/ivm_metadata_test.db
+
+statement ok
+SET ivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Setup: Create base tables and materialized views
+# ==========================================
+
+statement ok
+CREATE TABLE t1 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t1 VALUES (1, 'a', 10), (2, 'b', 20);
+
+statement ok
+CREATE TABLE t2 (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO t2 VALUES (1, 'alice'), (2, 'bob');
+
+statement ok
+CREATE MATERIALIZED VIEW mv1 AS SELECT grp, sum(val) as total FROM t1 GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW mv2 AS SELECT id, name FROM t2;
+
+# ==========================================
+# Test 1: Metadata tables exist after first MV creation
+# ==========================================
+
+query I
+SELECT count(*) FROM _duckdb_ivm_views;
+----
+2
+
+query I
+SELECT count(*) FROM _duckdb_ivm_delta_tables;
+----
+2
+
+# ==========================================
+# Test 2: _duckdb_ivm_views has correct entries
+# ==========================================
+
+query II
+SELECT view_name, type FROM _duckdb_ivm_views ORDER BY view_name;
+----
+mv1	0
+mv2	2
+
+# type 0 = AGGREGATE_GROUP, type 2 = SIMPLE_PROJECTION
+
+query I
+SELECT sql_string FROM _duckdb_ivm_views WHERE view_name = 'mv1';
+----
+select grp, sum(val) as total from t1 group by grp
+
+# ==========================================
+# Test 3: _duckdb_ivm_delta_tables has correct entries
+# ==========================================
+
+query II
+SELECT view_name, table_name FROM _duckdb_ivm_delta_tables ORDER BY view_name;
+----
+mv1	delta_t1
+mv2	delta_t2
+
+# ==========================================
+# Test 4: Delta tables exist
+# ==========================================
+
+query I
+SELECT count(*) FROM delta_t1;
+----
+0
+
+query I
+SELECT count(*) FROM delta_t2;
+----
+0
+
+query I
+SELECT count(*) FROM delta_mv1;
+----
+0
+
+query I
+SELECT count(*) FROM delta_mv2;
+----
+0
+
+# ==========================================
+# Test 5: last_update timestamps are set
+# ==========================================
+
+query I
+SELECT count(*) FROM _duckdb_ivm_views WHERE last_update IS NOT NULL;
+----
+2
+
+query I
+SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE last_update IS NOT NULL;
+----
+2
+
+# ==========================================
+# Test 6: IVM works before any drops (sanity check)
+# ==========================================
+
+statement ok
+INSERT INTO t1 VALUES (3, 'a', 5);
+
+statement ok
+PRAGMA ivm('mv1');
+
+query II
+SELECT grp, total FROM mv1 ORDER BY grp;
+----
+a	15
+b	20
+
+# ==========================================
+# Test 7: DROP MATERIALIZED VIEW cleans up metadata
+# ==========================================
+
+statement ok
+DROP TABLE mv1;
+
+# Entry should be removed from _duckdb_ivm_views
+query I
+SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv1';
+----
+0
+
+# Entries should be removed from _duckdb_ivm_delta_tables
+query I
+SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv1';
+----
+0
+
+# Delta view for the MV should be dropped
+statement error
+SELECT count(*) FROM delta_mv1;
+----
+does not exist
+
+# delta_t1 should be dropped since no other MV uses t1
+statement error
+SELECT count(*) FROM delta_t1;
+----
+does not exist
+
+# mv2 metadata should be untouched
+query I
+SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv2';
+----
+1
+
+query I
+SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv2';
+----
+1
+
+# ==========================================
+# Test 8: After drop, base table still works normally
+# ==========================================
+
+statement ok
+INSERT INTO t1 VALUES (4, 'c', 100);
+
+query I
+SELECT count(*) FROM t1;
+----
+4
+
+# ==========================================
+# Test 9: Can re-create MV with same name after drop
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv1 AS SELECT grp, sum(val) as total FROM t1 GROUP BY grp;
+
+query II
+SELECT grp, total FROM mv1 ORDER BY grp;
+----
+a	15
+b	20
+c	100
+
+query I
+SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv1';
+----
+1
+
+# ==========================================
+# Test 10: DROP second MV, delta table cleanup
+# ==========================================
+
+# Drop mv2 — delta_t2 should be cleaned up since no other MV uses t2
+statement ok
+DROP TABLE mv2;
+
+query I
+SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv2';
+----
+0
+
+query I
+SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv2';
+----
+0
+
+statement error
+SELECT count(*) FROM delta_mv2;
+----
+does not exist
+
+# delta_t2 should be dropped since no MV depends on t2 anymore
+statement error
+SELECT count(*) FROM delta_t2;
+----
+does not exist
+
+# ==========================================
+# Test 11: Shared base table — delta kept when still needed
+# ==========================================
+
+# Create two MVs on same base table
+statement ok
+CREATE MATERIALIZED VIEW mv_shared1 AS SELECT grp, sum(val) as s FROM t1 GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_shared2 AS SELECT grp, count(val) as c FROM t1 GROUP BY grp;
+
+query I
+SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE table_name = 'delta_t1';
+----
+3
+
+# Drop one — delta_t1 should remain (mv1 and mv_shared2 still use it)
+statement ok
+DROP TABLE mv_shared1;
+
+query I
+SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE table_name = 'delta_t1';
+----
+2
+
+# delta_t1 still exists
+query I
+SELECT count(*) FROM delta_t1;
+----
+0
+
+# mv_shared2 still works
+statement ok
+INSERT INTO t1 VALUES (5, 'a', 7);
+
+statement ok
+PRAGMA ivm('mv_shared2');
+
+query II
+SELECT grp, c FROM mv_shared2 ORDER BY grp;
+----
+a	3
+b	1
+c	1
+
+# ==========================================
+# Test 12: DROP base table with CASCADE drops dependent MVs
+# ==========================================
+
+statement ok
+CREATE TABLE t3 (id INT, val INT);
+
+statement ok
+INSERT INTO t3 VALUES (1, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t3 AS SELECT sum(val) as total FROM t3;
+
+query I
+SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_t3';
+----
+1
+
+# Regular DROP should fail because mv_t3 depends on t3... or DuckDB just drops it.
+# Let's test CASCADE explicitly.
+statement ok
+DROP TABLE t3 CASCADE;
+
+# MV should be gone
+statement error
+SELECT * FROM mv_t3;
+----
+does not exist
+
+# Metadata should be cleaned up
+query I
+SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_t3';
+----
+0
+
+query I
+SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_t3';
+----
+0
+
+# Delta tables should be gone
+statement error
+SELECT count(*) FROM delta_t3;
+----
+does not exist
+
+statement error
+SELECT count(*) FROM delta_mv_t3;
+----
+does not exist
+
+# ==========================================
+# Test 13: PRAGMA ivm on dropped MV gives clear error
+# ==========================================
+
+statement error
+PRAGMA ivm('mv_t3');
+----
+does not exist
+
+# ==========================================
+# Test 14: Drop all MVs — system tables still exist but are empty
+# ==========================================
+
+# Clean up remaining MVs
+statement ok
+DROP TABLE mv1;
+
+statement ok
+DROP TABLE mv_shared2;
+
+query I
+SELECT count(*) FROM _duckdb_ivm_views;
+----
+0
+
+query I
+SELECT count(*) FROM _duckdb_ivm_delta_tables;
+----
+0
+
+# ==========================================
+# Test 15: Create new MV after all previous were dropped
+# ==========================================
+
+statement ok
+CREATE TABLE fresh (id INT, val INT);
+
+statement ok
+INSERT INTO fresh VALUES (1, 42);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_fresh AS SELECT sum(val) as total FROM fresh;
+
+query I
+SELECT total FROM mv_fresh;
+----
+42
+
+query I
+SELECT count(*) FROM _duckdb_ivm_views;
+----
+1
+
+statement ok
+INSERT INTO fresh VALUES (2, 8);
+
+statement ok
+PRAGMA ivm('mv_fresh');
+
+query I
+SELECT total FROM mv_fresh;
+----
+50
+
+# NOTE: DROP MATERIALIZED VIEW syntax is not supported because DuckDB's
+# internal PG parser intercepts it before our extension gets a chance.
+# Use DROP TABLE to drop materialized views instead.

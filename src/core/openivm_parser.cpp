@@ -38,6 +38,8 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 
 	OpenIVMUtils::ReplaceCount(query_lower);
 	OpenIVMUtils::ReplaceSum(query_lower);
+	OpenIVMUtils::ReplaceMin(query_lower);
+	OpenIVMUtils::ReplaceMax(query_lower);
 	OPENIVM_DEBUG_PRINT("[CREATE MV] After rewrite: %s\n", query_lower.c_str());
 
 	Parser p;
@@ -206,7 +208,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		string delta_view = "create table if not exists delta_" + view_name +
-		                    " as select *, true as _duckdb_ivm_multiplicity from " + view_name + " limit 0;\n";
+		                    " as select *, true as _duckdb_ivm_multiplicity, now()::timestamp as "
+		                    "_duckdb_ivm_timestamp from " +
+		                    view_name + " limit 0;\n";
+		delta_view += "alter table delta_" + view_name + " alter _duckdb_ivm_timestamp set default now();\n";
 		OpenIVMUtils::WriteFile(compiled_file_path, true, delta_view);
 
 		if (ivm_type == IVMType::AGGREGATE_GROUP) {

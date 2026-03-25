@@ -1,0 +1,665 @@
+# name: test/sql/ivm_auto_refresh.test
+# description: Test that adaptive cost model correctly handles both IVM and full recompute paths
+# group: [sql]
+
+require openivm
+
+statement ok
+SET ivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Test 1: Projection — small delta → IVM path
+# ==========================================
+
+statement ok
+CREATE TABLE proj_base (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO proj_base SELECT i, 'name_' || i::VARCHAR FROM range(1, 101) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_proj AS SELECT id, name FROM proj_base;
+
+query I
+SELECT count(*) FROM mv_proj;
+----
+100
+
+# Small insert — should take IVM path
+statement ok
+INSERT INTO proj_base VALUES (101, 'new_name');
+
+query III
+PRAGMA ivm_cost('mv_proj');
+----
+incremental	8.643856	401.000000
+
+statement ok
+PRAGMA ivm('mv_proj');
+
+query I
+SELECT count(*) FROM mv_proj;
+----
+101
+
+query II
+SELECT id, name FROM mv_proj WHERE id = 101;
+----
+101	new_name
+
+# ==========================================
+# Test 2: Projection — large delta → recompute path
+# ==========================================
+
+statement ok
+INSERT INTO proj_base SELECT i, 'batch_' || i::VARCHAR FROM range(102, 402) t(i);
+
+query III
+PRAGMA ivm_cost('mv_proj');
+----
+full	2597.463445	704.000000
+
+statement ok
+PRAGMA ivm('mv_proj');
+
+query I
+SELECT count(*) FROM mv_proj;
+----
+401
+
+query II
+SELECT id, name FROM mv_proj WHERE id = 1;
+----
+1	name_1
+
+query II
+SELECT id, name FROM mv_proj WHERE id = 401;
+----
+401	batch_401
+
+# ==========================================
+# Test 3: Aggregate — small delta → IVM path
+# ==========================================
+
+statement ok
+CREATE TABLE agg_base (id INT, grp INT, val INT);
+
+statement ok
+INSERT INTO agg_base SELECT i, i % 10, i * 3 FROM range(1, 201) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg AS SELECT grp, sum(val) as total, count(val) as cnt FROM agg_base GROUP BY grp;
+
+query I
+SELECT count(*) FROM mv_agg;
+----
+10
+
+# Small insert into one group
+statement ok
+INSERT INTO agg_base VALUES (201, 0, 999);
+
+statement ok
+INSERT INTO agg_base VALUES (202, 0, 1);
+
+query III
+PRAGMA ivm_cost('mv_agg');
+----
+incremental	6.000000	232.000000
+
+statement ok
+PRAGMA ivm('mv_agg');
+
+query II
+SELECT total, cnt FROM mv_agg WHERE grp = 0;
+----
+7300	22
+
+query II
+SELECT total, cnt FROM mv_agg WHERE grp = 1;
+----
+5760	20
+
+# ==========================================
+# Test 4: Projection — delete triggers recompute
+# ==========================================
+
+statement ok
+CREATE TABLE del_base (id INT, val INT);
+
+statement ok
+INSERT INTO del_base SELECT i, i * 10 FROM range(1, 101) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_del AS SELECT id, val FROM del_base;
+
+query I
+SELECT count(*) FROM mv_del;
+----
+100
+
+# Delete 80% of the table
+statement ok
+DELETE FROM del_base WHERE id > 20;
+
+query III
+PRAGMA ivm_cost('mv_del');
+----
+full	691.508495	400.000000
+
+statement ok
+PRAGMA ivm('mv_del');
+
+query I
+SELECT count(*) FROM mv_del;
+----
+20
+
+query I
+SELECT max(id) FROM mv_del;
+----
+20
+
+# ==========================================
+# Test 5: Aggregate — delete + recompute correctness
+# ==========================================
+
+statement ok
+CREATE TABLE agg_del (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO agg_del SELECT i, CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END, i FROM range(1, 51) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg_del AS SELECT grp, sum(val) as total, count(val) as cnt FROM agg_del GROUP BY grp;
+
+query III
+SELECT grp, total, cnt FROM mv_agg_del ORDER BY grp;
+----
+even	650	25
+odd	625	25
+
+# Delete all even rows — large delta relative to base
+statement ok
+DELETE FROM agg_del WHERE grp = 'even';
+
+query III
+PRAGMA ivm_cost('mv_agg_del');
+----
+incremental	29.000000	56.000000
+
+statement ok
+PRAGMA ivm('mv_agg_del');
+
+query III
+SELECT grp, total, cnt FROM mv_agg_del ORDER BY grp;
+----
+odd	625	25
+
+# ==========================================
+# Test 6: Multiple refresh cycles with varying delta sizes
+# ==========================================
+
+statement ok
+CREATE TABLE multi (id INT, grp INT, val INT);
+
+statement ok
+INSERT INTO multi SELECT i, i % 5, i FROM range(1, 101) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_multi AS SELECT grp, sum(val) as total FROM multi GROUP BY grp;
+
+# Cycle 1: small delta (IVM)
+statement ok
+INSERT INTO multi VALUES (101, 0, 500);
+
+query III
+PRAGMA ivm_cost('mv_multi');
+----
+incremental	3.000000	116.000000
+
+statement ok
+PRAGMA ivm('mv_multi');
+
+query II
+SELECT grp, total FROM mv_multi WHERE grp = 0;
+----
+0	1550
+
+# Cycle 2: another small delta (IVM)
+statement ok
+INSERT INTO multi VALUES (102, 1, 1000);
+
+query III
+PRAGMA ivm_cost('mv_multi');
+----
+incremental	3.000000	117.000000
+
+statement ok
+PRAGMA ivm('mv_multi');
+
+query II
+SELECT grp, total FROM mv_multi WHERE grp = 1;
+----
+1	1970
+
+# Cycle 3: large batch insert (may trigger recompute)
+statement ok
+INSERT INTO multi SELECT i, i % 5, i * 2 FROM range(200, 500) t(i);
+
+query III
+PRAGMA ivm_cost('mv_multi');
+----
+incremental	310.000000	417.000000
+
+statement ok
+PRAGMA ivm('mv_multi');
+
+query I
+SELECT count(*) FROM multi;
+----
+402
+
+query II
+SELECT grp, total FROM mv_multi ORDER BY grp;
+----
+0	43250
+1	43790
+2	42930
+3	43070
+4	43210
+
+query II
+SELECT grp, sum(val) as total FROM multi GROUP BY grp ORDER BY grp;
+----
+0	43250
+1	43790
+2	42930
+3	43070
+4	43210
+
+# ==========================================
+# Test 7: Empty delta — no-op refresh
+# ==========================================
+
+query III
+PRAGMA ivm_cost('mv_multi');
+----
+incremental	0.000000	417.000000
+
+statement ok
+PRAGMA ivm('mv_multi');
+
+query II
+SELECT grp, total FROM mv_multi ORDER BY grp;
+----
+0	43250
+1	43790
+2	42930
+3	43070
+4	43210
+
+# ==========================================
+# Test 8: Projection with filter — both paths
+# ==========================================
+
+statement ok
+CREATE TABLE filt (id INT, status VARCHAR, val INT);
+
+statement ok
+INSERT INTO filt SELECT i, CASE WHEN i % 3 = 0 THEN 'active' ELSE 'inactive' END, i FROM range(1, 151) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_filt AS SELECT id, val FROM filt WHERE status = 'active';
+
+query I
+SELECT count(*) FROM mv_filt;
+----
+50
+
+# Small insert — IVM path
+statement ok
+INSERT INTO filt VALUES (151, 'active', 151);
+
+query III
+PRAGMA ivm_cost('mv_filt');
+----
+incremental	7.643856	226.000000
+
+statement ok
+PRAGMA ivm('mv_filt');
+
+query I
+SELECT count(*) FROM mv_filt;
+----
+51
+
+# Large insert — recompute path
+statement ok
+INSERT INTO filt SELECT i, 'active', i FROM range(200, 500) t(i);
+
+query III
+PRAGMA ivm_cost('mv_filt');
+----
+full	2301.727603	379.000000
+
+statement ok
+PRAGMA ivm('mv_filt');
+
+query I
+SELECT count(*) FROM mv_filt;
+----
+351
+
+query I
+SELECT count(*) FROM filt WHERE status = 'active';
+----
+351
+
+# ==========================================
+# Test 9: Aggregate with MIN/MAX — both paths preserve correctness
+# ==========================================
+
+statement ok
+CREATE TABLE minmax_base (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO minmax_base SELECT i, CASE WHEN i % 3 = 0 THEN 'a' WHEN i % 3 = 1 THEN 'b' ELSE 'c' END, i FROM range(1, 61) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_minmax AS SELECT grp, min(val) as lo, max(val) as hi, count(val) as cnt FROM minmax_base GROUP BY grp;
+
+query IIII
+SELECT grp, lo, hi, cnt FROM mv_minmax ORDER BY grp;
+----
+a	3	60	20
+b	1	58	20
+c	2	59	20
+
+# Small insert — IVM
+statement ok
+INSERT INTO minmax_base VALUES (61, 'a', 0);
+
+query III
+PRAGMA ivm_cost('mv_minmax');
+----
+incremental	3.000000	70.000000
+
+statement ok
+PRAGMA ivm('mv_minmax');
+
+query IIII
+SELECT grp, lo, hi, cnt FROM mv_minmax ORDER BY grp;
+----
+a	0	60	21
+b	1	58	20
+c	2	59	20
+
+# Delete current min — triggers recompute for MIN
+statement ok
+DELETE FROM minmax_base WHERE id = 61;
+
+query III
+PRAGMA ivm_cost('mv_minmax');
+----
+incremental	3.000000	70.000000
+
+statement ok
+PRAGMA ivm('mv_minmax');
+
+query IIII
+SELECT grp, lo, hi, cnt FROM mv_minmax ORDER BY grp;
+----
+a	3	60	20
+b	1	58	20
+c	2	59	20
+
+# ==========================================
+# Test 10: Cross-check — IVM result always matches full query
+# ==========================================
+
+statement ok
+CREATE TABLE xcheck (id INT, cat VARCHAR, amount INT);
+
+statement ok
+INSERT INTO xcheck SELECT i, chr(65 + (i::INT % 4)), i * 10 FROM range(1, 81) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_xcheck AS SELECT cat, sum(amount) as total, count(amount) as n FROM xcheck GROUP BY cat;
+
+# Refresh 1: small insert
+statement ok
+INSERT INTO xcheck VALUES (81, 'A', 9999);
+
+query III
+PRAGMA ivm_cost('mv_xcheck');
+----
+incremental	3.000000	93.000000
+
+statement ok
+PRAGMA ivm('mv_xcheck');
+
+query III
+SELECT cat, total, n FROM mv_xcheck ORDER BY cat;
+----
+A	18399	21
+B	7800	20
+C	8000	20
+D	8200	20
+
+query III
+SELECT cat, sum(amount), count(amount) FROM xcheck GROUP BY cat ORDER BY cat;
+----
+A	18399	21
+B	7800	20
+C	8000	20
+D	8200	20
+
+# Refresh 2: delete
+statement ok
+DELETE FROM xcheck WHERE cat = 'D';
+
+query III
+PRAGMA ivm_cost('mv_xcheck');
+----
+incremental	28.000000	93.000000
+
+statement ok
+PRAGMA ivm('mv_xcheck');
+
+query III
+SELECT cat, total, n FROM mv_xcheck ORDER BY cat;
+----
+A	18399	21
+B	7800	20
+C	8000	20
+
+query III
+SELECT cat, sum(amount), count(amount) FROM xcheck GROUP BY cat ORDER BY cat;
+----
+A	18399	21
+B	7800	20
+C	8000	20
+
+# Refresh 3: large batch
+statement ok
+INSERT INTO xcheck SELECT i, 'A', 1 FROM range(1, 301) t(i);
+
+query III
+PRAGMA ivm_cost('mv_xcheck');
+----
+incremental	306.000000	370.000000
+
+statement ok
+PRAGMA ivm('mv_xcheck');
+
+query III
+SELECT cat, total, n FROM mv_xcheck ORDER BY cat;
+----
+A	18699	321
+B	7800	20
+C	8000	20
+
+query III
+SELECT cat, sum(amount), count(amount) FROM xcheck GROUP BY cat ORDER BY cat;
+----
+A	18699	321
+B	7800	20
+C	8000	20
+
+# ==========================================
+# Test 11: PRAGMA ivm_cost — verify cost estimator decisions
+# ==========================================
+
+statement ok
+CREATE TABLE cost_base (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO cost_base SELECT i, 'name_' || i::VARCHAR FROM range(1, 101) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cost AS SELECT id, name FROM cost_base;
+
+# No pending delta — IVM should be extremely cheap
+statement ok
+PRAGMA ivm('mv_cost');
+
+query III
+PRAGMA ivm_cost('mv_cost');
+----
+incremental	0.000000	400.000000
+
+# Small delta (1 row on 100-row base) → incremental
+statement ok
+INSERT INTO cost_base VALUES (101, 'x');
+
+query III
+PRAGMA ivm_cost('mv_cost');
+----
+incremental	8.643856	401.000000
+
+statement ok
+PRAGMA ivm('mv_cost');
+
+# Large delta (300 rows on 101-row base) → full recompute
+statement ok
+INSERT INTO cost_base SELECT i, 'batch' FROM range(200, 500) t(i);
+
+query III
+PRAGMA ivm_cost('mv_cost');
+----
+full	2597.463445	704.000000
+
+statement ok
+PRAGMA ivm('mv_cost');
+
+# After refresh, delta is empty — back to incremental
+query III
+PRAGMA ivm_cost('mv_cost');
+----
+incremental	0.000000	1604.000000
+
+# ==========================================
+# Test 12: ivm_refresh_mode = 'full' — force full recompute
+# ==========================================
+
+statement ok
+CREATE TABLE mode_base (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO mode_base SELECT i, CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END, i FROM range(1, 51) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_mode AS SELECT grp, sum(val) as total, count(val) as cnt FROM mode_base GROUP BY grp;
+
+query III
+SELECT grp, total, cnt FROM mv_mode ORDER BY grp;
+----
+even	650	25
+odd	625	25
+
+# Small delta — cost model would pick IVM, but we force full
+statement ok
+SET ivm_refresh_mode = 'full';
+
+statement ok
+INSERT INTO mode_base VALUES (51, 'even', 999);
+
+# Cost model says incremental, but we override
+query III
+PRAGMA ivm_cost('mv_mode');
+----
+incremental	3.000000	57.000000
+
+statement ok
+PRAGMA ivm('mv_mode');
+
+# Result should still be correct regardless of path
+query III
+SELECT grp, total, cnt FROM mv_mode ORDER BY grp;
+----
+even	1649	26
+odd	625	25
+
+query III
+SELECT grp, sum(val), count(val) FROM mode_base GROUP BY grp ORDER BY grp;
+----
+even	1649	26
+odd	625	25
+
+# ==========================================
+# Test 13: ivm_refresh_mode = 'incremental' — force IVM
+# ==========================================
+
+statement ok
+SET ivm_refresh_mode = 'incremental';
+
+# Delta of 300 rows — cost model still picks incremental (304 < 357)
+statement ok
+INSERT INTO mode_base SELECT i, 'odd', 1 FROM range(100, 400) t(i);
+
+query III
+PRAGMA ivm_cost('mv_mode');
+----
+incremental	304.000000	357.000000
+
+statement ok
+PRAGMA ivm('mv_mode');
+
+# Result should still be correct
+query III
+SELECT grp, total, cnt FROM mv_mode ORDER BY grp;
+----
+even	1649	26
+odd	925	325
+
+query III
+SELECT grp, sum(val), count(val) FROM mode_base GROUP BY grp ORDER BY grp;
+----
+even	1649	26
+odd	925	325
+
+# ==========================================
+# Test 14: ivm_refresh_mode = 'auto' — default, cost model decides
+# ==========================================
+
+statement ok
+SET ivm_refresh_mode = 'auto';
+
+statement ok
+INSERT INTO mode_base VALUES (999, 'even', 1);
+
+statement ok
+PRAGMA ivm('mv_mode');
+
+query III
+SELECT grp, total, cnt FROM mv_mode ORDER BY grp;
+----
+even	1650	27
+odd	925	325
+
+query III
+SELECT grp, sum(val), count(val) FROM mode_base GROUP BY grp ORDER BY grp;
+----
+even	1650	27
+odd	925	325
