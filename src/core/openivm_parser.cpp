@@ -22,6 +22,44 @@
 
 namespace duckdb {
 
+// Thread-local storage for passing DDL from plan → bind phase
+// NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
+static thread_local vector<string> g_ivm_pending_ddl;
+// NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
+
+static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto ddl = std::move(g_ivm_pending_ddl);
+	g_ivm_pending_ddl.clear();
+	if (!ddl.empty()) {
+		auto &db = DatabaseInstance::GetDatabase(context);
+		Connection conn(db);
+		for (auto &q : ddl) {
+			if (q.empty()) {
+				continue;
+			}
+			auto r = conn.Query(q);
+			if (r->HasError()) {
+				throw CatalogException("Failed to execute IVM DDL: " + r->GetError());
+			}
+		}
+	}
+	names.emplace_back("MATERIALIZED VIEW CREATION");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	return make_uniq<IVMFunction::IVMBindData>(true);
+}
+
+static void IVMDDLExecuteFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<IVMFunction::IVMBindData>();
+	auto &gdata = dynamic_cast<IVMFunction::IVMGlobalData &>(*data_p.global_state);
+	if (gdata.offset >= 1) {
+		return;
+	}
+	output.SetValue(0, 0, Value::BOOLEAN(bind_data.result));
+	output.SetCardinality(1);
+	gdata.offset++;
+}
+
 ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionInfo *info, const string &query) {
 	auto query_lower = OpenIVMUtils::SQLToLowercase(StringUtil::Replace(query, ";", ""));
 	StringUtil::Trim(query_lower);
@@ -85,12 +123,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		string system_tables_path = db_path + "/ivm_system_tables.sql";
 		auto index_file_path = db_path + "/ivm_index_" + view_name + ".sql";
 
+		// Use con for planning — sees all committed state from previous bind-phase DDL
+		con.BeginTransaction();
 		auto table_names = con.GetTableNames(statement->query);
 
-		Planner planner(context);
-
+		Planner planner(*con.context);
 		planner.CreatePlan(statement->Copy());
-		auto plan = move(planner.plan);
+		auto plan = std::move(planner.plan);
+		con.Rollback();
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] View name: %s\n", view_name.c_str());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] View query: %s\n", view_query.c_str());
@@ -226,50 +266,49 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			OpenIVMUtils::WriteFile(index_file_path, false, index_query_view);
 		}
 
-		auto system_queries = duckdb::OpenIVMUtils::ReadFile(system_tables_path);
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Executing system table queries:\n%s\n", system_queries.c_str());
-		for (auto &query : StringUtil::Split(system_queries, '\n')) {
-			auto r = con.Query(query);
-			if (r->HasError()) {
-				throw Exception(ExceptionType::PARSER, "Could not create system tables: " + r->GetError());
+		// Collect DDL for bind-phase execution
+		auto add_ddl = [](vector<string> &ddl, const string &content) {
+			for (auto &line : StringUtil::Split(content, '\n')) {
+				StringUtil::Trim(line);
+				if (!line.empty()) {
+					ddl.push_back(line);
+				}
 			}
-		}
+		};
 
-		// Execute the view creation query first (with PAC enabled, so the PAC
-		// optimizer can rewrite it), then disable PAC for the delta table queries
-		// which use SELECT * and need to project protected columns outside aggregates.
-		auto queries = duckdb::OpenIVMUtils::ReadFile(compiled_file_path);
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Executing compiled queries:\n%s\n", queries.c_str());
-		auto query_lines = StringUtil::Split(queries, '\n');
+		vector<string> ddl;
+		add_ddl(ddl, duckdb::OpenIVMUtils::ReadFile(system_tables_path));
+
+		// MV creation first (with PAC enabled if loaded)
+		auto compiled = duckdb::OpenIVMUtils::ReadFile(compiled_file_path);
+		auto compiled_lines = StringUtil::Split(compiled, '\n');
 		bool first_query = true;
-		for (auto &query : query_lines) {
-			auto r = con.Query(query);
-			if (r->HasError()) {
-				throw Exception(ExceptionType::PARSER, "Could not create materialized view: " + r->GetError());
+		for (auto &line : compiled_lines) {
+			StringUtil::Trim(line);
+			if (!line.empty()) {
+				ddl.push_back(line);
 			}
-			if (first_query && pac_loaded) {
-				con.Query("SET pac_check = false");
-				con.Query("SET pac_rewrite = false");
+			if (first_query && pac_loaded && !line.empty()) {
+				ddl.push_back("SET pac_check = false");
+				ddl.push_back("SET pac_rewrite = false");
 				first_query = false;
 			}
 		}
 
 		if (ivm_type == IVMType::AGGREGATE_GROUP) {
-			auto index = duckdb::OpenIVMUtils::ReadFile(index_file_path);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Executing index query: %s\n", index.c_str());
-			auto r = con.Query(index);
-			if (r->HasError()) {
-				throw Exception(ExceptionType::PARSER, "Could not create index: " + r->GetError());
-			}
+			add_ddl(ddl, duckdb::OpenIVMUtils::ReadFile(index_file_path));
 		}
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Materialized view '%s' created successfully\n", view_name.c_str());
+
+		g_ivm_pending_ddl = std::move(ddl);
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Compiled %lu DDL queries for bind phase\n",
+		                    (unsigned long)g_ivm_pending_ddl.size());
 	}
 
+	// Return DDL executor table function
 	ParserExtensionPlanResult result;
-	result.function = IVMFunction();
-	result.parameters.push_back(true);
-	result.modified_databases = {};
-	result.requires_valid_transaction = false;
+	result.function =
+	    TableFunction("ivm_ddl_executor", {}, IVMDDLExecuteFunction, IVMDDLBindFunction, IVMFunction::IVMInit);
+	result.requires_valid_transaction = true;
 	result.return_type = StatementReturnType::QUERY_RESULT;
 	return result;
 }

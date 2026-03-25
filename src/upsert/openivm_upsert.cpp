@@ -64,13 +64,17 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 		view_name = StringValue::Get(parameters.values[0]);
 	}
 
+	// Use con's transaction for catalog access — sees all committed state
+	con.BeginTransaction();
+	auto &con_ctx = *con.context;
 	auto delta_view_catalog_entry =
-	    catalog.GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name, "delta_" + view_name,
+	    catalog.GetEntry<TableCatalogEntry>(con_ctx, view_catalog_name, view_schema_name, "delta_" + view_name,
 	                                        OnEntryNotFound::THROW_EXCEPTION, error_context);
 	auto index_delta_view_catalog_entry =
-	    Catalog::GetEntry(context, view_catalog_name, view_schema_name,
+	    Catalog::GetEntry(con_ctx, view_catalog_name, view_schema_name,
 	                      EntryLookupInfo(CatalogType::INDEX_ENTRY, view_name + "_ivm_index", error_context),
 	                      OnEntryNotFound::RETURN_NULL);
+	con.Rollback();
 
 	auto view_query_entry = con.Query("select * from _duckdb_ivm_views where view_name = '" + view_name + "';");
 	if (view_query_entry->HasError()) {
