@@ -21,7 +21,7 @@ struct IVMCostEstimate {
 IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name);
 
 /// Pragma function: returns the IVM cost estimate for a view as a string.
-void IVMCostQuery(ClientContext &context, const FunctionParameters &parameters);
+string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters);
 
 } // namespace duckdb
 

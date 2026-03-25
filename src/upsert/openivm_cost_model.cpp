@@ -218,29 +218,34 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	return {ivm_total, recompute_total};
 }
 
-void IVMCostQuery(ClientContext &context, const FunctionParameters &parameters) {
+string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters) {
 	auto view_name = StringValue::Get(parameters.values[0]);
 
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection con(db);
+	con.BeginTransaction();
 
 	IVMMetadata metadata(con);
 	auto view_query = metadata.GetViewQuery(view_name);
 	if (view_query.empty()) {
+		con.Rollback();
 		throw ParserException("View '" + view_name + "' not found in IVM metadata");
 	}
 
+	auto &con_ctx = *con.context;
 	Parser p;
 	p.ParseQuery(view_query);
-	Planner planner(context);
+	Planner planner(con_ctx);
 	planner.CreatePlan(p.statements[0]->Copy());
-	Optimizer optimizer(*planner.binder, context);
+	Optimizer optimizer(*planner.binder, con_ctx);
 	auto plan = optimizer.Optimize(std::move(planner.plan));
 
-	auto estimate = EstimateIVMCost(context, *plan, view_name);
-	Printer::Print("IVM cost: " + to_string(estimate.ivm_cost) +
-	               ", Recompute cost: " + to_string(estimate.recompute_cost) +
-	               ", Decision: " + (estimate.ShouldRecompute() ? "RECOMPUTE" : "IVM"));
+	auto estimate = EstimateIVMCost(con_ctx, *plan, view_name);
+	con.Rollback();
+
+	string decision = estimate.ShouldRecompute() ? "recompute" : "incremental";
+	return "SELECT '" + decision + "' AS decision, " + to_string(estimate.ivm_cost) + " AS ivm_cost, " +
+	       to_string(estimate.recompute_cost) + " AS recompute_cost";
 }
 
 } // namespace duckdb

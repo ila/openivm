@@ -65,6 +65,7 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 	StringUtil::Trim(query_lower);
 
 	query_lower.erase(remove(query_lower.begin(), query_lower.end(), '\n'), query_lower.end());
+	OpenIVMUtils::RemoveRedundantWhitespaces(query_lower);
 
 	if (!StringUtil::Contains(query_lower, "create materialized view")) {
 		return ParserExtensionParseResult();
