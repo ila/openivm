@@ -81,7 +81,8 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, c
 	Connection con(*context.db);
 	con.SetAutoCommit(false);
 	auto timestamp_query = "select last_update from " + string(ivm::DELTA_TABLES_TABLE) + " where view_name = '" +
-	                       view_name + "' and table_name = '" + table_name + "';";
+	                       OpenIVMUtils::EscapeValue(view_name) + "' and table_name = '" +
+	                       OpenIVMUtils::EscapeValue(table_name) + "';";
 	auto r = con.Query(timestamp_query);
 	if (r->HasError()) {
 		throw InternalException("Error while querying last_update");

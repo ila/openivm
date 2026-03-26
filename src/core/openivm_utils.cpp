@@ -34,21 +34,30 @@ string OpenIVMUtils::ReadFile(const string &file_path) {
 }
 
 string OpenIVMUtils::ExtractTableName(const string &sql) {
+	// Matches: CREATE TABLE [IF NOT EXISTS] name|"quoted name" (AS ...|(...))
 	std::regex table_name_regex(
-	    R"(create\s+table\s+(?:if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))");
+	    R"re(create\s+table\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))re");
 	std::smatch match;
 	if (std::regex_search(sql, match, table_name_regex)) {
-		return match[1].str();
+		auto name = match[1].str();
+		if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
+			name = name.substr(1, name.size() - 2);
+		}
+		return name;
 	}
 	return "";
 }
 
 string OpenIVMUtils::ExtractViewName(const string &sql) {
 	std::regex view_name_regex(
-	    R"(create\s+(?:materialized\s+)?view\s+(?:if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))");
+	    R"re(create\s+(?:materialized\s+)?view\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))re");
 	std::smatch match;
 	if (std::regex_search(sql, match, view_name_regex)) {
-		return match[1].str();
+		auto name = match[1].str();
+		if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
+			name = name.substr(1, name.size() - 2);
+		}
+		return name;
 	}
 	return "";
 }
@@ -72,7 +81,7 @@ void OpenIVMUtils::ReplaceMaterializedView(string &query) {
 
 string OpenIVMUtils::ExtractViewQuery(string &query) {
 	std::regex rgx_create_view(
-	    R"(create\s+(table|materialized view)\s+(?:if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)\s+as\s+(.*))");
+	    R"re(create\s+(table|materialized view)\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)\s+as\s+(.*))re");
 	std::smatch match;
 	if (std::regex_search(query, match, rgx_create_view)) {
 		return match[3].str();
@@ -157,25 +166,71 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 	return output;
 }
 
+/// Sanitize an expression for use as a SQL alias: replace non-alphanumeric chars with '_'.
+static string SanitizeAlias(const string &expr) {
+	string alias;
+	for (char c : expr) {
+		alias += (isalnum(c) || c == '_') ? c : '_';
+	}
+	return alias;
+}
+
 void OpenIVMUtils::ReplaceCount(string &query) {
-	std::regex pattern("(count\\((\\*|\\w+)\\))(?![^()]*\\bas\\b)", std::regex_constants::icase);
-	query = std::regex_replace(query, pattern, "count($2) as count_$2");
-	query = std::regex_replace(query, std::regex("count_\\*"), "count_star");
+	// Match count(expr) where expr can be *, column, or an expression — but NOT already aliased with AS
+	std::regex pattern(R"(count\((\*|[^)]+)\)(?![^()]*\bas\b))", std::regex_constants::icase);
+	std::smatch match;
+	string result;
+	string remaining = query;
+	while (std::regex_search(remaining, match, pattern)) {
+		string arg = match[1].str();
+		string alias = (arg == "*") ? "count_star" : "count_" + SanitizeAlias(arg);
+		result += match.prefix().str() + "count(" + arg + ") as " + alias;
+		remaining = match.suffix().str();
+	}
+	result += remaining;
+	query = result;
 }
 
 void OpenIVMUtils::ReplaceSum(string &query) {
-	std::regex pattern("(sum\\((\\w+)\\))(?![^()]*\\bas\\b)", std::regex_constants::icase);
-	query = std::regex_replace(query, pattern, "sum($2) as sum_$2");
+	std::regex pattern(R"(sum\(([^)]+)\)(?![^()]*\bas\b))", std::regex_constants::icase);
+	std::smatch match;
+	string result;
+	string remaining = query;
+	while (std::regex_search(remaining, match, pattern)) {
+		string arg = match[1].str();
+		result += match.prefix().str() + "sum(" + arg + ") as sum_" + SanitizeAlias(arg);
+		remaining = match.suffix().str();
+	}
+	result += remaining;
+	query = result;
 }
 
 void OpenIVMUtils::ReplaceMin(string &query) {
-	std::regex pattern("(min\\((\\w+)\\))(?![^()]*\\bas\\b)", std::regex_constants::icase);
-	query = std::regex_replace(query, pattern, "min($2) as min_$2");
+	std::regex pattern(R"(min\(([^)]+)\)(?![^()]*\bas\b))", std::regex_constants::icase);
+	std::smatch match;
+	string result;
+	string remaining = query;
+	while (std::regex_search(remaining, match, pattern)) {
+		string arg = match[1].str();
+		result += match.prefix().str() + "min(" + arg + ") as min_" + SanitizeAlias(arg);
+		remaining = match.suffix().str();
+	}
+	result += remaining;
+	query = result;
 }
 
 void OpenIVMUtils::ReplaceMax(string &query) {
-	std::regex pattern("(max\\((\\w+)\\))(?![^()]*\\bas\\b)", std::regex_constants::icase);
-	query = std::regex_replace(query, pattern, "max($2) as max_$2");
+	std::regex pattern(R"(max\(([^)]+)\)(?![^()]*\bas\b))", std::regex_constants::icase);
+	std::smatch match;
+	string result;
+	string remaining = query;
+	while (std::regex_search(remaining, match, pattern)) {
+		string arg = match[1].str();
+		result += match.prefix().str() + "max(" + arg + ") as max_" + SanitizeAlias(arg);
+		remaining = match.suffix().str();
+	}
+	result += remaining;
+	query = result;
 }
 
 void OpenIVMUtils::RemoveRedundantWhitespaces(string &query) {

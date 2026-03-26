@@ -113,7 +113,8 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 	con.Query("SET disabled_optimizers='" + string(ivm::DISABLED_OPTIMIZERS) + "';");
 	con.Commit();
 
-	auto v = con.Query("select sql_string from " + string(ivm::VIEWS_TABLE) + " where view_name = '" + view + "';");
+	auto v = con.Query("select sql_string from " + string(ivm::VIEWS_TABLE) + " where view_name = '" +
+	                   OpenIVMUtils::EscapeValue(view) + "';");
 	if (v->HasError()) {
 		throw InternalException("Error while querying view definition");
 	}

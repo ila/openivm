@@ -2,6 +2,7 @@
 #define OPENIVM_UTILS_HPP
 
 #include "duckdb.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 
 #include <string>
 
@@ -31,6 +32,17 @@ public:
 	static bool IsDelta(const string &name);
 	static string DbPath(ClientContext &context);
 	static string GenerateDeltaTable(string &query);
+
+	/// Quote an identifier for safe use in generated SQL (handles reserved words and special chars).
+	static string QuoteIdentifier(const string &name) {
+		return KeywordHelper::WriteOptionallyQuoted(name);
+	}
+
+	/// Escape a string value for use inside single-quoted SQL literals.
+	/// Use for WHERE view_name = '<escaped>' clauses.
+	static string EscapeValue(const string &val) {
+		return EscapeSingleQuotes(val);
+	}
 };
 
 } // namespace duckdb

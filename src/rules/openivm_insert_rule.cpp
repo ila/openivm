@@ -57,20 +57,22 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		auto table_name = drop_info->name;
 		Connection con(*input.context.db);
 
-		auto view_check =
-		    con.Query("SELECT 1 FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + table_name + "'");
+		auto view_check = con.Query("SELECT 1 FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+		                            OpenIVMUtils::EscapeValue(table_name) + "'");
 		if (!view_check->HasError() && view_check->RowCount() > 0) {
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] DROP TABLE '%s' — cleaning up IVM metadata\n", table_name.c_str());
 			IVMMetadata metadata(con);
 			auto delta_tables = metadata.GetDeltaTables(table_name);
 
-			con.Query("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + table_name + "'");
-			con.Query("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + table_name + "'");
+			con.Query("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+			          OpenIVMUtils::EscapeValue(table_name) + "'");
+			con.Query("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+			          OpenIVMUtils::EscapeValue(table_name) + "'");
 			con.Query("DROP TABLE IF EXISTS " + OpenIVMUtils::DeltaName(table_name));
 
 			for (auto &dt : delta_tables) {
 				auto remaining = con.Query("SELECT count(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-				                           " WHERE table_name = '" + dt + "'");
+				                           " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) + "'");
 				if (!remaining->HasError() && remaining->RowCount() > 0 &&
 				    remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
 					con.Query("DROP TABLE IF EXISTS " + dt);
@@ -79,22 +81,25 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		}
 
 		// Handle CASCADE: drop dependent MVs
-		auto dep_check = con.Query("SELECT DISTINCT view_name FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                           " WHERE table_name = '" + OpenIVMUtils::DeltaName(table_name) + "'");
+		auto dep_check =
+		    con.Query("SELECT DISTINCT view_name FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
+		              OpenIVMUtils::EscapeValue(OpenIVMUtils::DeltaName(table_name)) + "'");
 		if (!dep_check->HasError() && dep_check->RowCount() > 0 && drop_info->cascade) {
 			for (size_t i = 0; i < dep_check->RowCount(); i++) {
 				auto dep_view = dep_check->GetValue(0, i).ToString();
 				IVMMetadata dep_metadata(con);
 				auto dep_delta_tables = dep_metadata.GetDeltaTables(dep_view);
 
-				con.Query("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + dep_view + "'");
-				con.Query("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + dep_view + "'");
+				con.Query("DELETE FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+				          OpenIVMUtils::EscapeValue(dep_view) + "'");
+				con.Query("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+				          OpenIVMUtils::EscapeValue(dep_view) + "'");
 				con.Query("DROP TABLE IF EXISTS " + OpenIVMUtils::DeltaName(dep_view));
 				con.Query("DROP TABLE IF EXISTS " + dep_view);
 
 				for (auto &dt : dep_delta_tables) {
 					auto remaining = con.Query("SELECT count(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-					                           " WHERE table_name = '" + dt + "'");
+					                           " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) + "'");
 					if (!remaining->HasError() && remaining->RowCount() > 0 &&
 					    remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
 						con.Query("DROP TABLE IF EXISTS " + dt);

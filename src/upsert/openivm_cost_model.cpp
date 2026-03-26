@@ -19,7 +19,7 @@ namespace duckdb {
 /// Get the row count of a table by name, returns 0 if table doesn't exist.
 static double GetTableRowCount(ClientContext &context, const string &table_name) {
 	Connection con(*context.db);
-	auto result = con.Query("SELECT COUNT(*) FROM " + table_name + ";");
+	auto result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(table_name) + ";");
 	if (result->HasError()) {
 		return 0;
 	}
@@ -33,8 +33,8 @@ static double GetDeltaRowCount(ClientContext &context, const string &delta_table
 	if (ts_string.empty()) {
 		return 0;
 	}
-	auto count_result = con.Query("SELECT COUNT(*) FROM " + delta_table_name + " WHERE " + string(ivm::TIMESTAMP_COL) +
-	                              " >= '" + ts_string + "';");
+	auto count_result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(delta_table_name) +
+	                              " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" + ts_string + "';");
 	if (count_result->HasError()) {
 		return 0;
 	}

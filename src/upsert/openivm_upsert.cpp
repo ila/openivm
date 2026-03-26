@@ -36,7 +36,7 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
 
 	metadata.UpdateTimestamp(view_name);
 	string update_ts = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_update = now() WHERE view_name = '" +
-	                   view_name + "';\n";
+	                   OpenIVMUtils::EscapeValue(view_name) + "';\n";
 
 	string delta_cleanup;
 	auto delta_tables = metadata.GetDeltaTables(view_name);
@@ -47,7 +47,7 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
 		}
 		delta_cleanup += "DELETE FROM " + resolved + " WHERE " + string(ivm::TIMESTAMP_COL) +
 		                 " < (SELECT min(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                 " WHERE table_name = '" + dt + "');\n";
+		                 " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) + "');\n";
 	}
 
 	return query + update_ts + "\n" + delta_cleanup;
@@ -187,8 +187,9 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// in the current round have timestamps >= this value.
 	string delta_ts_filter;
 	if (has_ts_col) {
-		auto last_update_result = con.Query("SELECT last_update FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                                    " WHERE view_name = '" + view_name + "' LIMIT 1");
+		auto last_update_result =
+		    con.Query("SELECT last_update FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+		              OpenIVMUtils::EscapeValue(view_name) + "' LIMIT 1");
 		if (!last_update_result->HasError() && last_update_result->RowCount() > 0) {
 			auto ts = last_update_result->GetValue(0, 0);
 			if (!ts.IsNull()) {
@@ -229,7 +230,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	string ivm_query;
 
 	// splitting the query in two to make it easier to turn into string (insertions are the same)
-	string do_ivm = "select * from DoIVM('" + view_catalog_name + "','" + view_schema_name + "','" + view_name + "');";
+	string do_ivm = "select * from DoIVM('" + OpenIVMUtils::EscapeValue(view_catalog_name) + "','" +
+	                OpenIVMUtils::EscapeValue(view_schema_name) + "','" + OpenIVMUtils::EscapeValue(view_name) + "');";
 
 	con.BeginTransaction();
 	auto delta_table_names = metadata.GetDeltaTables(view_name);
@@ -273,7 +275,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 
 	// Delete from delta view: timestamp-based if downstream views depend on it, unconditional otherwise
 	auto downstream_check = con.Query("SELECT COUNT(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-	                                  " WHERE table_name = '" + delta_view_name + "'");
+	                                  " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_view_name) + "'");
 	bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
 	                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
 
@@ -327,7 +329,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	if (has_downstream) {
 		delete_from_view_query = "DELETE FROM " + delta_view_name + " WHERE " + string(ivm::TIMESTAMP_COL) +
 		                         " < (SELECT min(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                         " WHERE table_name = '" + delta_view_name + "');";
+		                         " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_view_name) + "');";
 	} else {
 		delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
 	}
@@ -340,7 +342,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	string delete_from_delta_table_query;
 	// firstly we reset the timestamp
 	string update_timestamp_query = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
-	                                " SET last_update = now() WHERE view_name = '" + view_name + "';\n";
+	                                " SET last_update = now() WHERE view_name = '" +
+	                                OpenIVMUtils::EscapeValue(view_name) + "';\n";
 
 	for (auto &dt : delta_table_names) {
 		string resolved = dt;
@@ -349,7 +352,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 		}
 		delete_from_delta_table_query += "DELETE FROM " + resolved + " WHERE " + string(ivm::TIMESTAMP_COL) +
 		                                 " < (SELECT min(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                                 " WHERE table_name = '" + dt + "');\n";
+		                                 " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) + "');\n";
 	}
 
 	// Build the clean SQL (written to file for reference/replay)

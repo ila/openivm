@@ -1,15 +1,18 @@
 #include "core/openivm_metadata.hpp"
 
+#include "core/openivm_utils.hpp"
+
 namespace duckdb {
 
 bool IVMMetadata::IsBaseTable(const string &table_name) {
-	auto result = con.Query("SELECT 1 FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + table_name + "'");
+	auto result = con.Query("SELECT 1 FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(table_name) + "'");
 	return !result->HasError() && result->RowCount() == 0;
 }
 
 string IVMMetadata::GetViewQuery(const string &view_name) {
-	auto result =
-	    con.Query("SELECT sql_string FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + view_name + "'");
+	auto result = con.Query("SELECT sql_string FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0) {
 		return "";
 	}
@@ -17,7 +20,8 @@ string IVMMetadata::GetViewQuery(const string &view_name) {
 }
 
 IVMType IVMMetadata::GetViewType(const string &view_name) {
-	auto result = con.Query("SELECT type FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + view_name + "'");
+	auto result = con.Query("SELECT type FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0) {
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
@@ -26,7 +30,7 @@ IVMType IVMMetadata::GetViewType(const string &view_name) {
 
 vector<string> IVMMetadata::GetDeltaTables(const string &view_name) {
 	auto result = con.Query("SELECT table_name FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                        view_name + "'");
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
 	vector<string> tables;
 	if (!result->HasError()) {
 		for (size_t i = 0; i < result->RowCount(); i++) {
@@ -38,7 +42,8 @@ vector<string> IVMMetadata::GetDeltaTables(const string &view_name) {
 
 string IVMMetadata::GetLastUpdate(const string &view_name, const string &table_name) {
 	auto result = con.Query("SELECT last_update FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                        view_name + "' AND table_name = '" + table_name + "'");
+	                        OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	                        OpenIVMUtils::EscapeValue(table_name) + "'");
 	if (result->HasError() || result->RowCount() == 0) {
 		return "";
 	}
@@ -46,8 +51,9 @@ string IVMMetadata::GetLastUpdate(const string &view_name, const string &table_n
 }
 
 void IVMMetadata::UpdateTimestamp(const string &view_name) {
-	auto result = con.Query("UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
-	                        " SET last_update = now() WHERE view_name = '" + view_name + "'");
+	auto result =
+	    con.Query("UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_update = now() WHERE view_name = '" +
+	              OpenIVMUtils::EscapeValue(view_name) + "'");
 	if (result->HasError()) {
 		throw InternalException("Cannot update IVM metadata timestamp: " + result->GetError());
 	}
