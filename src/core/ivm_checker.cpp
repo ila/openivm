@@ -43,6 +43,7 @@ static bool CheckNode(LogicalOperator *node) {
 
 	case LogicalOperatorType::LOGICAL_FILTER:
 	case LogicalOperatorType::LOGICAL_PROJECTION:
+	case LogicalOperatorType::LOGICAL_UNION:
 		// Check for volatile functions in expressions (e.g., RANDOM(), NOW())
 		if (HasVolatileExpression(node->expressions)) {
 			return false;

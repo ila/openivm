@@ -116,9 +116,10 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
 
-	// AVG, MIN, MAX use group-recompute strategy (not decomposable as simple deltas)
+	// AVG, MIN, MAX, HAVING use group-recompute strategy (not decomposable as simple deltas).
+	// HAVING needs recompute because groups may enter/leave the result set after aggregate changes.
 	bool has_minmax = StringUtil::Contains(view_query_sql, "min(") || StringUtil::Contains(view_query_sql, "max(") ||
-	                  StringUtil::Contains(view_query_sql, "avg(");
+	                  StringUtil::Contains(view_query_sql, "avg(") || StringUtil::Contains(view_query_sql, " having ");
 
 	// Check ivm_refresh_mode: 'full' forces full recompute, skipping the IVM pipeline.
 	Value refresh_mode_val;

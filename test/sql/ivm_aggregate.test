@@ -946,3 +946,90 @@ query I
 SELECT AVG(val) FROM avg_ungrouped;
 ----
 25.0
+
+# ==========================================
+# HAVING clause (optimized to FILTER above AGGREGATE by DuckDB)
+# ==========================================
+
+statement ok
+CREATE TABLE having_test (region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO having_test VALUES ('a', 100), ('a', 200), ('b', 50), ('c', 10);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_having AS SELECT region, SUM(amount) AS total FROM having_test GROUP BY region HAVING SUM(amount) > 60;
+
+query II
+SELECT region, total FROM mv_having ORDER BY region;
+----
+a	300
+
+statement ok
+INSERT INTO having_test VALUES ('b', 100), ('c', 200);
+
+statement ok
+PRAGMA ivm('mv_having');
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(amount) AS total FROM having_test GROUP BY region HAVING SUM(amount) > 60
+    EXCEPT ALL
+    SELECT region, total FROM mv_having
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total FROM mv_having
+    EXCEPT ALL
+    SELECT region, SUM(amount) AS total FROM having_test GROUP BY region HAVING SUM(amount) > 60
+);
+----
+0
+
+# ==========================================
+# CASE WHEN in aggregates
+# ==========================================
+
+statement ok
+CREATE TABLE case_test (category VARCHAR, value INT);
+
+statement ok
+INSERT INTO case_test VALUES ('a', 10), ('a', -5), ('b', 20), ('b', -3);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_case AS SELECT category, SUM(CASE WHEN value > 0 THEN value ELSE 0 END) AS pos_sum FROM case_test GROUP BY category;
+
+query II
+SELECT category, pos_sum FROM mv_case ORDER BY category;
+----
+a	10
+b	20
+
+statement ok
+INSERT INTO case_test VALUES ('a', 30), ('b', -100), ('c', 50);
+
+statement ok
+PRAGMA ivm('mv_case');
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (
+    SELECT category, SUM(CASE WHEN value > 0 THEN value ELSE 0 END) AS pos_sum FROM case_test GROUP BY category
+    EXCEPT ALL
+    SELECT category, pos_sum FROM mv_case
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT category, pos_sum FROM mv_case
+    EXCEPT ALL
+    SELECT category, SUM(CASE WHEN value > 0 THEN value ELSE 0 END) AS pos_sum FROM case_test GROUP BY category
+);
+----
+0

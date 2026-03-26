@@ -188,3 +188,84 @@ query I
 SELECT COUNT(*) FROM (SELECT a, b FROM mv_proj EXCEPT ALL SELECT a, b FROM t1);
 ----
 0
+
+# ==========================================
+# UNION ALL — incremental support
+# ==========================================
+
+statement ok
+CREATE TABLE u1 (id INT, val VARCHAR);
+
+statement ok
+CREATE TABLE u2 (id INT, val VARCHAR);
+
+statement ok
+INSERT INTO u1 VALUES (1, 'a'), (2, 'b');
+
+statement ok
+INSERT INTO u2 VALUES (3, 'c'), (4, 'd');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_union AS SELECT id, val FROM u1 UNION ALL SELECT id, val FROM u2;
+
+query II
+SELECT id, val FROM mv_union ORDER BY id;
+----
+1	a
+2	b
+3	c
+4	d
+
+# Insert into both sides
+statement ok
+INSERT INTO u1 VALUES (5, 'e');
+
+statement ok
+INSERT INTO u2 VALUES (6, 'f');
+
+statement ok
+PRAGMA ivm('mv_union');
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, val FROM u1 UNION ALL SELECT id, val FROM u2)
+    EXCEPT ALL
+    SELECT id, val FROM mv_union
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM mv_union
+    EXCEPT ALL
+    (SELECT id, val FROM u1 UNION ALL SELECT id, val FROM u2)
+);
+----
+0
+
+# Delete from one side
+statement ok
+DELETE FROM u1 WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_union');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, val FROM u1 UNION ALL SELECT id, val FROM u2)
+    EXCEPT ALL
+    SELECT id, val FROM mv_union
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM mv_union
+    EXCEPT ALL
+    (SELECT id, val FROM u1 UNION ALL SELECT id, val FROM u2)
+);
+----
+0

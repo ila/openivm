@@ -5,6 +5,7 @@
 #include "rules/ivm_join_rule.hpp"
 #include "rules/ivm_projection_rule.hpp"
 #include "rules/ivm_scan_rule.hpp"
+#include "rules/ivm_union_rule.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
@@ -78,6 +79,10 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 	}
 	case LogicalOperatorType::LOGICAL_FILTER: {
 		IvmFilterRule rule;
+		return rule.Rewrite(pw);
+	}
+	case LogicalOperatorType::LOGICAL_UNION: {
+		IvmUnionRule rule;
 		return rule.Rewrite(pw);
 	}
 	default:

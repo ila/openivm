@@ -1,0 +1,295 @@
+# name: test/sql/ivm_union.test
+# description: Test IVM with UNION ALL
+# group: [sql]
+
+require openivm
+
+# ==========================================
+# Basic UNION ALL — two tables
+# ==========================================
+
+statement ok
+CREATE TABLE orders_us (id INT, product VARCHAR, amount INT);
+
+statement ok
+CREATE TABLE orders_eu (id INT, product VARCHAR, amount INT);
+
+statement ok
+INSERT INTO orders_us VALUES (1, 'widget', 100), (2, 'gadget', 200);
+
+statement ok
+INSERT INTO orders_eu VALUES (3, 'widget', 150), (4, 'gizmo', 300);
+
+statement ok
+CREATE MATERIALIZED VIEW all_orders AS
+    SELECT id, product, amount FROM orders_us
+    UNION ALL
+    SELECT id, product, amount FROM orders_eu;
+
+query III
+SELECT id, product, amount FROM all_orders ORDER BY id;
+----
+1	widget	100
+2	gadget	200
+3	widget	150
+4	gizmo	300
+
+# Insert into both sides, single refresh
+statement ok
+INSERT INTO orders_us VALUES (5, 'bolt', 50), (6, 'nut', 25);
+
+statement ok
+INSERT INTO orders_eu VALUES (7, 'screw', 75);
+
+statement ok
+PRAGMA ivm('all_orders');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, product, amount FROM orders_us UNION ALL SELECT id, product, amount FROM orders_eu)
+    EXCEPT ALL
+    SELECT id, product, amount FROM all_orders
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, product, amount FROM all_orders
+    EXCEPT ALL
+    (SELECT id, product, amount FROM orders_us UNION ALL SELECT id, product, amount FROM orders_eu)
+);
+----
+0
+
+# Delete from one side
+statement ok
+DELETE FROM orders_us WHERE id = 1;
+
+statement ok
+PRAGMA ivm('all_orders');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, product, amount FROM orders_us UNION ALL SELECT id, product, amount FROM orders_eu)
+    EXCEPT ALL
+    SELECT id, product, amount FROM all_orders
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, product, amount FROM all_orders
+    EXCEPT ALL
+    (SELECT id, product, amount FROM orders_us UNION ALL SELECT id, product, amount FROM orders_eu)
+);
+----
+0
+
+# Delete from both sides + insert, single refresh
+statement ok
+DELETE FROM orders_us WHERE id = 2;
+
+statement ok
+DELETE FROM orders_eu WHERE id = 3;
+
+statement ok
+INSERT INTO orders_eu VALUES (8, 'nail', 10), (8, 'nail', 10);
+
+statement ok
+PRAGMA ivm('all_orders');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, product, amount FROM orders_us UNION ALL SELECT id, product, amount FROM orders_eu)
+    EXCEPT ALL
+    SELECT id, product, amount FROM all_orders
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, product, amount FROM all_orders
+    EXCEPT ALL
+    (SELECT id, product, amount FROM orders_us UNION ALL SELECT id, product, amount FROM orders_eu)
+);
+----
+0
+
+# ==========================================
+# UNION ALL with aggregate on top
+# ==========================================
+
+statement ok
+CREATE TABLE sales_online (region VARCHAR, revenue INT);
+
+statement ok
+CREATE TABLE sales_store (region VARCHAR, revenue INT);
+
+statement ok
+INSERT INTO sales_online VALUES ('US', 100), ('EU', 200);
+
+statement ok
+INSERT INTO sales_store VALUES ('US', 300), ('EU', 400);
+
+statement ok
+CREATE MATERIALIZED VIEW total_by_region AS
+    SELECT region, SUM(revenue) AS total FROM (
+        SELECT region, revenue FROM sales_online
+        UNION ALL
+        SELECT region, revenue FROM sales_store
+    ) combined GROUP BY region;
+
+query II
+SELECT region, total FROM total_by_region ORDER BY region;
+----
+EU	600
+US	400
+
+statement ok
+INSERT INTO sales_online VALUES ('US', 50), ('JP', 1000);
+
+statement ok
+INSERT INTO sales_store VALUES ('EU', 100);
+
+statement ok
+PRAGMA ivm('total_by_region');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(revenue) AS total FROM (
+        SELECT region, revenue FROM sales_online UNION ALL SELECT region, revenue FROM sales_store
+    ) combined GROUP BY region
+    EXCEPT ALL
+    SELECT region, total FROM total_by_region
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total FROM total_by_region
+    EXCEPT ALL
+    SELECT region, SUM(revenue) AS total FROM (
+        SELECT region, revenue FROM sales_online UNION ALL SELECT region, revenue FROM sales_store
+    ) combined GROUP BY region
+);
+----
+0
+
+# ==========================================
+# UNION ALL with JOIN
+# ==========================================
+
+statement ok
+CREATE TABLE products (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE orders_a (product_id INT, qty INT);
+
+statement ok
+CREATE TABLE orders_b (product_id INT, qty INT);
+
+statement ok
+INSERT INTO products VALUES (1, 'Alpha'), (2, 'Beta');
+
+statement ok
+INSERT INTO orders_a VALUES (1, 10), (2, 5);
+
+statement ok
+INSERT INTO orders_b VALUES (1, 20), (2, 15);
+
+statement ok
+CREATE MATERIALIZED VIEW all_product_orders AS
+    SELECT p.name, o.qty FROM products p
+    INNER JOIN (
+        SELECT product_id, qty FROM orders_a
+        UNION ALL
+        SELECT product_id, qty FROM orders_b
+    ) o ON p.id = o.product_id;
+
+query II
+SELECT name, qty FROM all_product_orders ORDER BY name, qty;
+----
+Alpha	10
+Alpha	20
+Beta	5
+Beta	15
+
+statement ok
+INSERT INTO orders_a VALUES (1, 30);
+
+statement ok
+INSERT INTO orders_b VALUES (2, 25);
+
+statement ok
+PRAGMA ivm('all_product_orders');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.name, o.qty FROM products p INNER JOIN (
+        SELECT product_id, qty FROM orders_a UNION ALL SELECT product_id, qty FROM orders_b
+    ) o ON p.id = o.product_id
+    EXCEPT ALL
+    SELECT name, qty FROM all_product_orders
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, qty FROM all_product_orders
+    EXCEPT ALL
+    SELECT p.name, o.qty FROM products p INNER JOIN (
+        SELECT product_id, qty FROM orders_a UNION ALL SELECT product_id, qty FROM orders_b
+    ) o ON p.id = o.product_id
+);
+----
+0
+
+# Delete and verify
+statement ok
+DELETE FROM orders_a WHERE qty = 10;
+
+statement ok
+PRAGMA ivm('all_product_orders');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.name, o.qty FROM products p INNER JOIN (
+        SELECT product_id, qty FROM orders_a UNION ALL SELECT product_id, qty FROM orders_b
+    ) o ON p.id = o.product_id
+    EXCEPT ALL
+    SELECT name, qty FROM all_product_orders
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, qty FROM all_product_orders
+    EXCEPT ALL
+    SELECT p.name, o.qty FROM products p INNER JOIN (
+        SELECT product_id, qty FROM orders_a UNION ALL SELECT product_id, qty FROM orders_b
+    ) o ON p.id = o.product_id
+);
+----
+0
+
+# ==========================================
+# No-op refresh
+# ==========================================
+
+statement ok
+PRAGMA ivm('all_orders');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, product, amount FROM orders_us UNION ALL SELECT id, product, amount FROM orders_eu)
+    EXCEPT ALL
+    SELECT id, product, amount FROM all_orders
+);
+----
+0

@@ -419,3 +419,50 @@ query I
 SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
 ----
 0
+
+# ==========================================
+# Expressions in SELECT (computed columns)
+# ==========================================
+
+statement ok
+CREATE TABLE expr_base (a INT, b INT, c INT);
+
+statement ok
+INSERT INTO expr_base VALUES (1, 10, 100), (2, 20, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_expr AS SELECT a * 2 AS doubled, b + c AS total, c - b AS diff FROM expr_base;
+
+query III
+SELECT doubled, total, diff FROM mv_expr ORDER BY doubled;
+----
+2	110	90
+4	220	180
+
+statement ok
+INSERT INTO expr_base VALUES (3, 30, 300), (4, 40, 400);
+
+statement ok
+DELETE FROM expr_base WHERE a = 1;
+
+statement ok
+PRAGMA ivm('mv_expr');
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (
+    SELECT a * 2 AS doubled, b + c AS total, c - b AS diff FROM expr_base
+    EXCEPT ALL
+    SELECT doubled, total, diff FROM mv_expr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT doubled, total, diff FROM mv_expr
+    EXCEPT ALL
+    SELECT a * 2 AS doubled, b + c AS total, c - b AS diff FROM expr_base
+);
+----
+0

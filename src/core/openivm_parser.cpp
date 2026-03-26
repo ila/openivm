@@ -73,11 +73,24 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 
 	OpenIVMUtils::ReplaceMaterializedView(query_lower);
 
+	// Split at HAVING to avoid rewriting aggregates inside HAVING clause
+	// (adding "AS alias" inside HAVING produces invalid SQL)
+	string having_suffix;
+	auto having_pos = query_lower.find(" having ");
+	if (having_pos != string::npos) {
+		having_suffix = query_lower.substr(having_pos);
+		query_lower = query_lower.substr(0, having_pos);
+	}
+
 	OpenIVMUtils::ReplaceCount(query_lower);
 	OpenIVMUtils::ReplaceSum(query_lower);
 	OpenIVMUtils::ReplaceMin(query_lower);
 	OpenIVMUtils::ReplaceMax(query_lower);
 	OpenIVMUtils::ReplaceAvg(query_lower);
+
+	if (!having_suffix.empty()) {
+		query_lower += having_suffix;
+	}
 	OPENIVM_DEBUG_PRINT("[CREATE MV] After rewrite: %s\n", query_lower.c_str());
 
 	Parser p;

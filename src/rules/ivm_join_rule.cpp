@@ -1,4 +1,5 @@
 #include "rules/ivm_join_rule.hpp"
+#include "rules/openivm_rewrite_rule.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -22,7 +23,8 @@ using duckdb::vector;
 
 struct JoinLeafInfo {
 	vector<size_t> path;
-	LogicalGet *get;
+	LogicalGet *get;       // non-null for simple table scans
+	LogicalOperator *node; // always set; for non-GET leaves, rewrite the subtree
 };
 
 void collect_join_leaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves) {
@@ -34,10 +36,10 @@ void collect_join_leaves(LogicalOperator *node, vector<size_t> path, vector<Join
 		collect_join_leaves(node->children[1].get(), path, leaves);
 		path.pop_back();
 	} else if (node->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
-		leaves.push_back({path, dynamic_cast<LogicalGet *>(node)});
+		leaves.push_back({path, dynamic_cast<LogicalGet *>(node), node});
 	} else {
-		throw duckdb::NotImplementedException("Unexpected node type in join subtree: " +
-		                                      duckdb::LogicalOperatorToString(node->type));
+		// Non-GET, non-JOIN node (e.g., UNION, subquery): treat as opaque subtree leaf
+		leaves.push_back({path, nullptr, node});
 	}
 }
 
@@ -86,8 +88,13 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	size_t N = leaves.size();
 	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Rewriting JOIN node, %zu leaves found\n", N);
 	for (size_t i = 0; i < N; i++) {
-		OPENIVM_DEBUG_PRINT("[IvmJoinRule]   Leaf %zu: table_index=%lu, path_depth=%zu\n", i,
-		                    (unsigned long)leaves[i].get->table_index, leaves[i].path.size());
+		if (leaves[i].get) {
+			OPENIVM_DEBUG_PRINT("[IvmJoinRule]   Leaf %zu: GET table_index=%lu, path_depth=%zu\n", i,
+			                    (unsigned long)leaves[i].get->table_index, leaves[i].path.size());
+		} else {
+			OPENIVM_DEBUG_PRINT("[IvmJoinRule]   Leaf %zu: subtree (%s), path_depth=%zu\n", i,
+			                    LogicalOperatorToString(leaves[i].node->type).c_str(), leaves[i].path.size());
+		}
 	}
 
 	if (N > ivm::MAX_JOIN_TABLES) {
@@ -110,13 +117,24 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building %lu inclusion-exclusion terms\n", (unsigned long)((1ULL << N) - 1));
 	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
 		auto term = pw.plan->Copy(context);
+		LogicalOperator *term_root = term.get();
 		vector<ColumnBinding> mul_bindings;
 
 		for (size_t i = 0; i < N; i++) {
 			if (mask & (1ULL << i)) {
-				DeltaGetResult delta_i = CreateDeltaGetNode(context, leaves[i].get, pw.view);
-				mul_bindings.push_back(delta_i.mul_binding);
-				get_node_at_path(term, leaves[i].path) = std::move(delta_i.node);
+				if (leaves[i].get) {
+					// Simple GET leaf: replace with delta scan
+					DeltaGetResult delta_i = CreateDeltaGetNode(context, leaves[i].get, pw.view);
+					mul_bindings.push_back(delta_i.mul_binding);
+					get_node_at_path(term, leaves[i].path) = std::move(delta_i.node);
+				} else {
+					// Complex subtree leaf (UNION, etc.): rewrite the entire subtree
+					// Use term_root so binding replacements target the copied tree, not the original
+					auto &subtree_ref = get_node_at_path(term, leaves[i].path);
+					auto rewritten = IVMRewriteRule::RewritePlan(pw.input, subtree_ref, pw.view, term_root);
+					mul_bindings.push_back(rewritten.mul_binding);
+					subtree_ref = std::move(rewritten.op);
+				}
 			}
 		}
 
@@ -167,6 +185,21 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 		result = make_uniq<LogicalSetOperation>(union_table_index, types.size(), std::move(result), std::move(terms[i]),
 		                                        LogicalOperatorType::LOGICAL_UNION, true);
 		result->types = types;
+	}
+
+	// 3b. Add a clean projection on top to disambiguate column names for LPTS.
+	// The UNION ALL of inclusion-exclusion terms can produce duplicate column names
+	// (e.g., two "_duckdb_ivm_multiplicity" columns) which confuses name-based SQL generation.
+	{
+		auto union_bindings = result->GetColumnBindings();
+		vector<unique_ptr<Expression>> clean_exprs;
+		for (idx_t i = 0; i < union_bindings.size(); i++) {
+			clean_exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], union_bindings[i]));
+		}
+		auto clean_proj = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(clean_exprs));
+		clean_proj->children.push_back(std::move(result));
+		clean_proj->ResolveOperatorTypes();
+		result = std::move(clean_proj);
 	}
 
 	// 4. Update column bindings in parent
