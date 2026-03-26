@@ -367,13 +367,9 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					throw InternalException("Cannot insert old values in delta table after update! " + r->GetError());
 				}
 				OPENIVM_DEBUG_PRINT("[INSERT RULE] select_new: %s\n", select_new.c_str());
-				{
-					Connection con2(*input.context.db);
-					auto r2 = con2.Query("insert into " + full_delta_table_name + " " + select_new);
-					if (r2->HasError()) {
-						throw InternalException("Cannot insert new values in delta table after update! " +
-						                        r2->GetError());
-					}
+				auto r2 = con.Query("insert into " + full_delta_table_name + " " + select_new);
+				if (r2->HasError()) {
+					throw InternalException("Cannot insert new values in delta table after update! " + r2->GetError());
 				}
 			}
 		}

@@ -17,8 +17,7 @@
 namespace duckdb {
 
 /// Get the row count of a table by name, returns 0 if table doesn't exist.
-static double GetTableRowCount(ClientContext &context, const string &table_name) {
-	Connection con(*context.db);
+static double GetTableRowCount(Connection &con, const string &table_name) {
 	auto result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(table_name) + ";");
 	if (result->HasError()) {
 		return 0;
@@ -27,8 +26,7 @@ static double GetTableRowCount(ClientContext &context, const string &table_name)
 }
 
 /// Get the number of pending delta rows for a given base delta table and view.
-static double GetDeltaRowCount(ClientContext &context, const string &delta_table_name, const string &view_name) {
-	Connection con(*context.db);
+static double GetDeltaRowCount(Connection &con, const string &delta_table_name, const string &view_name) {
 	auto ts_string = IVMMetadata(con).GetLastUpdate(view_name, delta_table_name);
 	if (ts_string.empty()) {
 		return 0;
@@ -49,7 +47,7 @@ struct TableStats {
 };
 
 /// Collect all base table GET nodes from the plan tree.
-static void CollectTableStats(ClientContext &context, LogicalOperator &op, const string &view_name,
+static void CollectTableStats(ClientContext &context, Connection &con, LogicalOperator &op, const string &view_name,
                               vector<TableStats> &stats) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
@@ -61,12 +59,12 @@ static void CollectTableStats(ClientContext &context, LogicalOperator &op, const
 			if (ts.base_card == 0) {
 				ts.base_card = 1; // avoid division by zero
 			}
-			ts.delta_card = GetDeltaRowCount(context, ts.delta_table_name, view_name);
+			ts.delta_card = GetDeltaRowCount(con, ts.delta_table_name, view_name);
 			stats.push_back(ts);
 		}
 	}
 	for (auto &child : op.children) {
-		CollectTableStats(context, *child, view_name, stats);
+		CollectTableStats(context, con, *child, view_name, stats);
 	}
 }
 
@@ -117,9 +115,11 @@ static bool HasAggregate(LogicalOperator &op) {
 }
 
 IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name) {
+	// Single connection for all cardinality queries
+	Connection con(*context.db);
 	// 1. Collect table statistics
 	vector<TableStats> table_stats;
-	CollectTableStats(context, plan, view_name, table_stats);
+	CollectTableStats(context, con, plan, view_name, table_stats);
 
 	size_t N = table_stats.size();
 	if (N == 0) {
@@ -135,7 +135,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		delta_fraction_sum += ts.delta_card / ts.base_card;
 	}
 
-	double mv_card = GetTableRowCount(context, view_name);
+	double mv_card = GetTableRowCount(con, view_name);
 	if (mv_card == 0) {
 		mv_card = 1;
 	}

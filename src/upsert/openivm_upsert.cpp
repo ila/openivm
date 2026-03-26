@@ -106,6 +106,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	                      OnEntryNotFound::RETURN_NULL);
 	con.Rollback();
 
+	// IVMMetadata uses auto-commit queries (no explicit transaction needed)
 	IVMMetadata metadata(con);
 	auto view_query_sql = metadata.GetViewQuery(view_name);
 	if (view_query_sql.empty()) {

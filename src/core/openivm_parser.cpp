@@ -114,16 +114,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		auto view_name = OpenIVMUtils::ExtractTableName(statement->query);
 		auto view_query = OpenIVMUtils::ExtractViewQuery(statement->query);
 
-		string db_path = context.db->GetFileSystem().GetWorkingDirectory();
-		Value db_path_value;
-		context.TryGetCurrentSetting("ivm_files_path", db_path_value);
-		if (!db_path_value.IsNull()) {
-			db_path = db_path_value.ToString();
-		}
-		string compiled_file_path = db_path + "/ivm_compiled_queries_" + view_name + ".sql";
-		string system_tables_path = db_path + "/ivm_system_tables.sql";
-		auto index_file_path = db_path + "/ivm_index_" + view_name + ".sql";
-
 		// Use con for planning — sees all committed state from previous bind-phase DDL
 		con.BeginTransaction();
 		auto table_names = con.GetTableNames(statement->query);
@@ -210,23 +200,33 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 		OPENIVM_DEBUG_PRINT("\n");
 
-		auto system_table = "create table if not exists " + string(ivm::VIEWS_TABLE) +
-		                    " (view_name varchar primary key, sql_string "
-		                    "varchar, type tinyint, last_update timestamp);\n";
-		OpenIVMUtils::WriteFile(system_tables_path, false, system_table);
+		// Build DDL vector directly in memory
+		vector<string> ddl;
 
-		auto delta_tables_table = "create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
-		                          " (view_name varchar, table_name "
-		                          "varchar, last_update timestamp, primary key(view_name, table_name));\n";
-		OpenIVMUtils::WriteFile(system_tables_path, true, delta_tables_table);
+		// --- System tables DDL ---
+		ddl.push_back("create table if not exists " + string(ivm::VIEWS_TABLE) +
+		              " (view_name varchar primary key, sql_string "
+		              "varchar, type tinyint, last_update timestamp)");
 
-		auto ivm_table_insert = "insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name +
-		                        "', '" + OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " +
-		                        to_string((int)ivm_type) + ", now());\n";
-		OpenIVMUtils::WriteFile(system_tables_path, true, ivm_table_insert);
+		ddl.push_back("create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
+		              " (view_name varchar, table_name "
+		              "varchar, last_update timestamp, primary key(view_name, table_name))");
 
-		auto table = "create table " + view_name + " as " + view_query + ";\n";
-		OpenIVMUtils::WriteFile(compiled_file_path, false, table);
+		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
+		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", now())");
+
+		for (const auto &table_name : table_names) {
+			ddl.push_back("insert into " + string(ivm::DELTA_TABLES_TABLE) + " values ('" + view_name + "', '" +
+			              OpenIVMUtils::DeltaName(table_name) + "', now())");
+		}
+
+		// --- Compiled DDL (MV creation, delta tables, delta view) ---
+		// MV creation query (with PAC enabled if loaded)
+		ddl.push_back("create table " + view_name + " as " + view_query);
+		if (pac_loaded) {
+			ddl.push_back("SET pac_check = false");
+			ddl.push_back("SET pac_rewrite = false");
+		}
 
 		for (const auto &table_name : table_names) {
 			Value catalog_value;
@@ -252,23 +252,18 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 			auto catalog_schema = catalog_value.ToString() + "." + schema_value.ToString() + ".";
 
-			auto delta_table = "create table if not exists " + catalog_schema + OpenIVMUtils::DeltaName(table_name) +
-			                   " as select *, true as " + string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
-			                   string(ivm::TIMESTAMP_COL) + " from " + catalog_schema + table_name + " limit 0;\n";
-			OpenIVMUtils::WriteFile(compiled_file_path, true, delta_table);
-
-			auto delta_table_insert = "insert into " + string(ivm::DELTA_TABLES_TABLE) + " values ('" + view_name +
-			                          "', '" + OpenIVMUtils::DeltaName(table_name) + "', now());\n";
-			OpenIVMUtils::WriteFile(system_tables_path, true, delta_table_insert);
+			ddl.push_back("create table if not exists " + catalog_schema + OpenIVMUtils::DeltaName(table_name) +
+			              " as select *, true as " + string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
+			              string(ivm::TIMESTAMP_COL) + " from " + catalog_schema + table_name + " limit 0");
 		}
 
-		string delta_view = "create table if not exists " + OpenIVMUtils::DeltaName(view_name) +
-		                    " as select *, true as " + string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
-		                    string(ivm::TIMESTAMP_COL) + " from " + view_name + " limit 0;\n";
-		delta_view += "alter table " + OpenIVMUtils::DeltaName(view_name) + " alter " + string(ivm::TIMESTAMP_COL) +
-		              " set default now();\n";
-		OpenIVMUtils::WriteFile(compiled_file_path, true, delta_view);
+		ddl.push_back("create table if not exists " + OpenIVMUtils::DeltaName(view_name) + " as select *, true as " +
+		              string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " + string(ivm::TIMESTAMP_COL) + " from " +
+		              view_name + " limit 0");
+		ddl.push_back("alter table " + OpenIVMUtils::DeltaName(view_name) + " alter " + string(ivm::TIMESTAMP_COL) +
+		              " set default now()");
 
+		// --- Index DDL (for aggregate group queries) ---
 		if (ivm_type == IVMType::AGGREGATE_GROUP) {
 			string index_query_view = "create unique index " + view_name + "_ivm_index on " + view_name + "(";
 			for (size_t i = 0; i < aggregate_columns.size(); i++) {
@@ -277,41 +272,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					index_query_view += ", ";
 				}
 			}
-			index_query_view += ");\n";
-			OpenIVMUtils::WriteFile(index_file_path, false, index_query_view);
-		}
-
-		// Collect DDL for bind-phase execution
-		auto add_ddl = [](vector<string> &ddl, const string &content) {
-			for (auto &line : StringUtil::Split(content, '\n')) {
-				StringUtil::Trim(line);
-				if (!line.empty()) {
-					ddl.push_back(line);
-				}
-			}
-		};
-
-		vector<string> ddl;
-		add_ddl(ddl, duckdb::OpenIVMUtils::ReadFile(system_tables_path));
-
-		// MV creation first (with PAC enabled if loaded)
-		auto compiled = duckdb::OpenIVMUtils::ReadFile(compiled_file_path);
-		auto compiled_lines = StringUtil::Split(compiled, '\n');
-		bool first_query = true;
-		for (auto &line : compiled_lines) {
-			StringUtil::Trim(line);
-			if (!line.empty()) {
-				ddl.push_back(line);
-			}
-			if (first_query && pac_loaded && !line.empty()) {
-				ddl.push_back("SET pac_check = false");
-				ddl.push_back("SET pac_rewrite = false");
-				first_query = false;
-			}
-		}
-
-		if (ivm_type == IVMType::AGGREGATE_GROUP) {
-			add_ddl(ddl, duckdb::OpenIVMUtils::ReadFile(index_file_path));
+			index_query_view += ")";
+			ddl.push_back(index_query_view);
 		}
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Compiled %lu DDL queries for bind phase\n", (unsigned long)ddl.size());
