@@ -81,59 +81,55 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 
 	string cte_body = cte_select_string + cte_from_string + cte_group_by_string;
 
-	// UPDATE existing rows: add delta to current MV values.
-	// Uses IS NOT DISTINCT FROM so NULLs in group keys match correctly
-	// (unique indexes don't conflict on NULLs, so INSERT OR REPLACE fails for NULL keys).
+	// MERGE: single-pass upsert — UPDATE existing groups, INSERT new groups.
+	// Uses IS NOT DISTINCT FROM for NULL-safe key matching.
+	string on_clause;
+	for (size_t i = 0; i < keys.size(); i++) {
+		if (i > 0) {
+			on_clause += " AND ";
+		}
+		on_clause += "v." + keys[i] + " IS NOT DISTINCT FROM d." + keys[i];
+	}
+
 	string update_set;
+	string insert_cols, insert_vals;
 	{
 		string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
-		bool first = true;
+		bool first_agg = true;
 		for (auto &column : aggregates) {
-			if (!first) {
+			if (!first_agg) {
 				update_set += ", ";
+				insert_vals += ", ";
 			}
-			first = false;
+			first_agg = false;
 			if (list_mode) {
-				update_set += column + " = list_transform(list_zip(" + view_name + "." + column + ", d." + column +
-				              "), lambda x: x[1] + x[2])";
+				update_set +=
+				    column + " = list_transform(list_zip(v." + column + ", d." + column + "), lambda x: x[1] + x[2])";
 			} else {
-				update_set += column + " = " + view_name + "." + column + " + d." + column;
+				update_set += column + " = v." + column + " + d." + column;
+			}
+			insert_vals += "d." + column;
+		}
+		for (auto &key : keys) {
+			insert_cols += key + ", ";
+		}
+		for (size_t i = 0; i < aggregates.size(); i++) {
+			insert_cols += aggregates[i];
+			if (i < aggregates.size() - 1) {
+				insert_cols += ", ";
 			}
 		}
 	}
-	string update_where;
-	for (size_t i = 0; i < keys.size(); i++) {
-		if (i > 0) {
-			update_where += " AND ";
-		}
-		update_where += view_name + "." + keys[i] + " IS NOT DISTINCT FROM d." + keys[i];
-	}
-	string update_query = "WITH ivm_cte AS (\n" + cte_body + ")\n" + "UPDATE " + view_name + " SET " + update_set +
-	                      "\nFROM ivm_cte d\nWHERE " + update_where + ";\n";
 
-	// INSERT new groups: rows in delta that don't exist in MV yet.
-	string insert_cols;
+	string merge_query = "WITH ivm_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + view_name + " v USING ivm_cte d\n" +
+	                     "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " + update_set + "\n" +
+	                     "WHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (";
 	for (auto &key : keys) {
-		insert_cols += "d." + key + ", ";
+		merge_query += "d." + key + ", ";
 	}
-	for (size_t i = 0; i < aggregates.size(); i++) {
-		insert_cols += "d." + aggregates[i];
-		if (i < aggregates.size() - 1) {
-			insert_cols += ", ";
-		}
-	}
-	string not_exists_cond;
-	for (size_t i = 0; i < keys.size(); i++) {
-		if (i > 0) {
-			not_exists_cond += " AND ";
-		}
-		not_exists_cond += "v." + keys[i] + " IS NOT DISTINCT FROM d." + keys[i];
-	}
-	string insert_query = "WITH ivm_cte AS (\n" + cte_body + ")\n" + "INSERT INTO " + view_name + " SELECT " +
-	                      insert_cols + "\nFROM ivm_cte d\nWHERE NOT EXISTS (SELECT 1 FROM " + view_name + " v WHERE " +
-	                      not_exists_cond + ");\n";
+	merge_query += insert_vals + ");\n";
 
-	string upsert_query = update_query + "\n" + insert_query + "\n";
+	string upsert_query = merge_query + "\n";
 
 	// Delete zero rows
 	string delete_query = "\ndelete from " + view_name + " where ";
@@ -154,69 +150,105 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 string CompileSimpleAggregates(string &view_name, const vector<string> &column_names, const string &view_query_sql,
                                bool has_minmax, bool list_mode, const string &delta_ts_filter) {
 	if (has_minmax) {
-		string delete_query = "delete from " + view_name + ";\n";
-		string insert_query = "insert into " + view_name + " " + view_query_sql + ";\n";
+		string delete_query = "DELETE FROM " + view_name + ";\n";
+		string insert_query = "INSERT INTO " + view_name + " " + view_query_sql + ";\n";
 		return delete_query + insert_query;
 	}
 
-	string ts_and = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
-	string update_query = "update " + view_name + "\nset ";
+	string delta_view = OpenIVMUtils::DeltaName(view_name);
+	string mul = string(ivm::MULTIPLICITY_COL);
+	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+
+	// Single CTE consolidates all delta columns in one pass (avoids 2K correlated subqueries).
+	string cte = "WITH _ivm_delta AS (\n  SELECT ";
+	string update_set;
 	bool first = true;
 	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
+
 	for (auto &column : column_names) {
-		if (column != string(ivm::MULTIPLICITY_COL)) {
-			if (!first) {
-				update_query += ",\n";
-			}
-			first = false;
-			if (list_mode) {
-				string negate_del = "coalesce((select list_transform(" + column + ", lambda x: -x) from " +
-				                    OpenIVMUtils::DeltaName(view_name) + " where " + string(ivm::MULTIPLICITY_COL) +
-				                    " = false" + ts_and + "), " + zeros_list + ")";
-				string ins = "coalesce((select " + column + " from " + OpenIVMUtils::DeltaName(view_name) + " where " +
-				             string(ivm::MULTIPLICITY_COL) + " = true" + ts_and + "), " + zeros_list + ")";
-				string delta = "list_transform(list_zip(" + negate_del + ", " + ins + "), lambda x: x[1] + x[2])";
-				update_query +=
-				    column + " = list_transform(list_zip(" + column + ", " + delta + "), lambda x: x[1] + x[2])";
-			} else {
-				update_query += column + " = \n\tcoalesce(" + column + ", 0) \n\t\t- coalesce((select " + column +
-				                " from " + OpenIVMUtils::DeltaName(view_name) + " where " +
-				                string(ivm::MULTIPLICITY_COL) + " = false" + ts_and + "), 0)\n\t\t+ coalesce((select " +
-				                column + " from " + OpenIVMUtils::DeltaName(view_name) + " where " +
-				                string(ivm::MULTIPLICITY_COL) + " = true" + ts_and + "), 0)";
-			}
+		if (column == mul) {
+			continue;
+		}
+		if (!first) {
+			cte += ",\n    ";
+			update_set += ",\n  ";
+		}
+		first = false;
+		if (list_mode) {
+			// Consolidate list deltas: negate deletions, sum with insertions
+			cte += "list_transform(list_zip("
+			       "COALESCE(SUM(CASE WHEN " +
+			       mul + " = false THEN list_transform(" + column + ", lambda x: -x) ELSE NULL END), " + zeros_list +
+			       "), "
+			       "COALESCE(SUM(CASE WHEN " +
+			       mul + " = true THEN " + column + " ELSE NULL END), " + zeros_list +
+			       ")), lambda x: x[1] + x[2]) AS d_" + column;
+			update_set += column + " = list_transform(list_zip(" + column + ", (SELECT d_" + column +
+			              " FROM _ivm_delta)), lambda x: x[1] + x[2])";
+		} else {
+			cte += "SUM(CASE WHEN " + mul + " = false THEN -" + column + " ELSE " + column + " END) AS d_" + column;
+			update_set +=
+			    column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM _ivm_delta), 0)";
 		}
 	}
-	update_query += ";\n";
-	return update_query;
+	cte += "\n  FROM " + delta_view + ts_where + "\n)\n";
+
+	return cte + "UPDATE " + view_name + " SET\n  " + update_set + ";\n";
 }
 
 string CompileProjectionsFilters(string &view_name, const vector<string> &column_names, const string &delta_ts_filter) {
+	string mul = string(ivm::MULTIPLICITY_COL);
+	string delta_view = OpenIVMUtils::DeltaName(view_name);
+	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+
 	string select_columns;
 	string match_conditions;
 	for (auto &column : column_names) {
-		if (column != string(ivm::MULTIPLICITY_COL)) {
-			match_conditions += view_name + "." + column + " IS NOT DISTINCT FROM net_dels." + column + " and ";
+		if (column != mul) {
+			match_conditions += "v." + column + " IS NOT DISTINCT FROM d." + column + " AND ";
 			select_columns += column + ", ";
 		}
 	}
 	match_conditions.erase(match_conditions.size() - 5, 5);
 	select_columns.erase(select_columns.size() - 2, 2);
 
-	// Consolidate the delta using EXCEPT ALL to cancel out matching insert/delete pairs.
-	// This is needed because the inclusion-exclusion join delta rule can produce
-	// redundant entries that cancel each other in bag arithmetic.
-	string ts_and = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
-	string ins_cte = "SELECT " + select_columns + " FROM " + OpenIVMUtils::DeltaName(view_name) + " WHERE " +
-	                 string(ivm::MULTIPLICITY_COL) + " = true" + ts_and;
-	string dels_cte = "SELECT " + select_columns + " FROM " + OpenIVMUtils::DeltaName(view_name) + " WHERE " +
-	                  string(ivm::MULTIPLICITY_COL) + " = false" + ts_and;
+	// Consolidate deltas into net changes per distinct tuple (1 pass over delta_view).
+	// _net > 0 = net insertions, _net < 0 = net deletions.
+	string cte_body = "SELECT " + select_columns + ",\n    SUM(CASE WHEN " + mul +
+	                  " THEN 1 ELSE -1 END) AS _net\n  FROM " + delta_view + ts_where + "\n  GROUP BY " +
+	                  select_columns + "\n  HAVING SUM(CASE WHEN " + mul + " THEN 1 ELSE -1 END) != 0";
 
-	string delete_query = "WITH net_dels AS (\n  " + dels_cte + "\n  EXCEPT ALL\n  " + ins_cte + "\n)\ndelete from " +
-	                      view_name + " where exists (select 1 from net_dels where " + match_conditions + ");\n\n";
+	// DELETE: remove exactly |_net| copies per tuple using rowid + ROW_NUMBER.
+	// ROW_NUMBER partitions by all columns to number duplicate copies, then we
+	// delete only the first |_net| of them.
+	string delete_query = "WITH _ivm_net AS (\n  " + cte_body +
+	                      "\n)\n"
+	                      "DELETE FROM " +
+	                      view_name +
+	                      " WHERE rowid IN (\n"
+	                      "  SELECT v.rowid FROM (\n"
+	                      "    SELECT rowid, " +
+	                      select_columns +
+	                      ",\n"
+	                      "      ROW_NUMBER() OVER (PARTITION BY " +
+	                      select_columns +
+	                      " ORDER BY rowid) AS _rn\n"
+	                      "    FROM " +
+	                      view_name +
+	                      "\n"
+	                      "  ) v JOIN _ivm_net d ON " +
+	                      match_conditions +
+	                      "\n"
+	                      "  WHERE d._net < 0 AND v._rn <= -d._net\n"
+	                      ");\n\n";
 
-	string insert_query = "WITH net_ins AS (\n  " + ins_cte + "\n  EXCEPT ALL\n  " + dels_cte + "\n)\ninsert into " +
-	                      view_name + " select " + select_columns + " from net_ins;\n";
+	// INSERT: replicate each net-insert tuple _net times using generate_series.
+	// Cast _net to BIGINT because SUM returns HUGEINT and generate_series requires BIGINT.
+	string insert_query = "WITH _ivm_net AS (\n  " + cte_body +
+	                      "\n)\n"
+	                      "INSERT INTO " +
+	                      view_name + " SELECT " + select_columns +
+	                      "\nFROM _ivm_net, generate_series(1, _ivm_net._net::BIGINT)\nWHERE _ivm_net._net > 0;\n";
 
 	return delete_query + insert_query;
 }

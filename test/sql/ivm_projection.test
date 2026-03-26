@@ -165,3 +165,271 @@ SELECT id, name FROM mv_empty_proj ORDER BY id;
 ----
 1	First
 2	Second
+
+# ==========================================
+# Bag semantics stress test: duplicates, mixed DML, edge cases
+# ==========================================
+
+statement ok
+CREATE TABLE stress (id INT, val VARCHAR);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_stress AS SELECT id, val FROM stress;
+
+# --- Round 1: Insert duplicates ---
+statement ok
+INSERT INTO stress VALUES (1, 'a'), (1, 'a'), (1, 'a'), (2, 'b'), (2, 'b');
+
+statement ok
+pragma ivm('mv_stress');
+
+# Exact bag match (EXCEPT ALL checks bag equality)
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM mv_stress;
+----
+5
+
+# --- Round 2: Insert same values again (more duplicates) ---
+statement ok
+INSERT INTO stress VALUES (1, 'a'), (1, 'a'), (3, 'c'), (3, 'c'), (3, 'c');
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM mv_stress;
+----
+10
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+# --- Round 3: Delete ALL of one value ---
+statement ok
+DELETE FROM stress WHERE id = 1;
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM mv_stress WHERE id = 1;
+----
+0
+
+query I
+SELECT COUNT(*) FROM mv_stress;
+----
+5
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+# --- Round 4: Update duplicates (all copies change) ---
+statement ok
+UPDATE stress SET val = 'B' WHERE id = 2;
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM mv_stress WHERE id = 2 AND val = 'B';
+----
+2
+
+query I
+SELECT COUNT(*) FROM mv_stress WHERE id = 2 AND val = 'b';
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+# --- Round 5: Mixed INSERT + DELETE + UPDATE before single refresh ---
+statement ok
+INSERT INTO stress VALUES (4, 'd'), (4, 'd'), (5, 'e');
+
+statement ok
+DELETE FROM stress WHERE id = 3;
+
+statement ok
+UPDATE stress SET val = 'E' WHERE id = 5;
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# --- Round 6: Insert then immediately delete same value (net zero) ---
+statement ok
+INSERT INTO stress VALUES (99, 'temp'), (99, 'temp');
+
+statement ok
+DELETE FROM stress WHERE id = 99;
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM mv_stress WHERE id = 99;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+# --- Round 7: Delete everything ---
+statement ok
+DELETE FROM stress;
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM mv_stress;
+----
+0
+
+# --- Round 8: Re-insert after empty ---
+statement ok
+INSERT INTO stress VALUES (10, 'z'), (10, 'z');
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM mv_stress;
+----
+2
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+# --- Round 9: No-op refresh ---
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM mv_stress;
+----
+2
+
+# --- Round 10: Batch conflicting ops — insert + delete + update + insert same row, SINGLE refresh ---
+# This stresses the delta consolidation: multiple entries for the same tuple cancel out.
+
+statement ok
+INSERT INTO stress VALUES (30, 'conflict'), (30, 'conflict'), (30, 'conflict');
+
+statement ok
+DELETE FROM stress WHERE id = 30;
+
+statement ok
+INSERT INTO stress VALUES (30, 'conflict');
+
+statement ok
+UPDATE stress SET val = 'resolved' WHERE id = 30;
+
+statement ok
+INSERT INTO stress VALUES (30, 'resolved'), (30, 'resolved');
+
+# Before refresh: stress has 3x (30, 'resolved'), mv_stress has (10, 'z') x2
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM mv_stress WHERE id = 30;
+----
+3
+
+# --- Round 11: Insert and delete the SAME row many times, net zero ---
+statement ok
+INSERT INTO stress VALUES (40, 'ghost'), (40, 'ghost'), (40, 'ghost');
+
+statement ok
+DELETE FROM stress WHERE id = 40;
+
+statement ok
+INSERT INTO stress VALUES (40, 'ghost');
+
+statement ok
+DELETE FROM stress WHERE id = 40;
+
+# Net: +3 -3 +1 -1 = 0 for id=40
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM mv_stress WHERE id = 40;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+# --- Round 12: Large batch of duplicates ---
+statement ok
+INSERT INTO stress SELECT 50, 'batch' FROM generate_series(1, 100);
+
+statement ok
+DELETE FROM stress WHERE id = 50;
+
+statement ok
+INSERT INTO stress SELECT 50, 'batch' FROM generate_series(1, 37);
+
+# Net for id=50: +100 -100 +37 = 37
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM mv_stress WHERE id = 50;
+----
+37
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
