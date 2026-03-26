@@ -175,62 +175,43 @@ static string SanitizeAlias(const string &expr) {
 	return alias;
 }
 
-void OpenIVMUtils::ReplaceCount(string &query) {
-	// Match count(expr) where expr can be *, column, or an expression — but NOT already aliased with AS
-	std::regex pattern(R"(count\((\*|[^)]+)\)(?![^()]*\bas\b))", std::regex_constants::icase);
+/// Generic aggregate function alias rewriter.
+/// Matches func_name(expr) that aren't already aliased with AS,
+/// and adds "as func_name_expr" (with sanitized alias).
+static void ReplaceAggregate(string &query, const string &func_name) {
+	string pat = func_name + R"(\(([^)]+)\)(?![^()]*\bas\b))";
+	std::regex pattern(pat, std::regex_constants::icase);
 	std::smatch match;
 	string result;
 	string remaining = query;
 	while (std::regex_search(remaining, match, pattern)) {
 		string arg = match[1].str();
-		string alias = (arg == "*") ? "count_star" : "count_" + SanitizeAlias(arg);
-		result += match.prefix().str() + "count(" + arg + ") as " + alias;
+		string alias = func_name + "_" + SanitizeAlias(arg);
+		result += match.prefix().str() + func_name + "(" + arg + ") as " + alias;
 		remaining = match.suffix().str();
 	}
 	result += remaining;
 	query = result;
+}
+
+void OpenIVMUtils::ReplaceCount(string &query) {
+	// count(*) needs special handling for the alias
+	std::regex star_pattern(R"(count\(\*\)(?![^()]*\bas\b))", std::regex_constants::icase);
+	query = std::regex_replace(query, star_pattern, "count(*) as count_star");
+	// count(expr) uses the generic rewriter
+	ReplaceAggregate(query, "count");
 }
 
 void OpenIVMUtils::ReplaceSum(string &query) {
-	std::regex pattern(R"(sum\(([^)]+)\)(?![^()]*\bas\b))", std::regex_constants::icase);
-	std::smatch match;
-	string result;
-	string remaining = query;
-	while (std::regex_search(remaining, match, pattern)) {
-		string arg = match[1].str();
-		result += match.prefix().str() + "sum(" + arg + ") as sum_" + SanitizeAlias(arg);
-		remaining = match.suffix().str();
-	}
-	result += remaining;
-	query = result;
+	ReplaceAggregate(query, "sum");
 }
 
 void OpenIVMUtils::ReplaceMin(string &query) {
-	std::regex pattern(R"(min\(([^)]+)\)(?![^()]*\bas\b))", std::regex_constants::icase);
-	std::smatch match;
-	string result;
-	string remaining = query;
-	while (std::regex_search(remaining, match, pattern)) {
-		string arg = match[1].str();
-		result += match.prefix().str() + "min(" + arg + ") as min_" + SanitizeAlias(arg);
-		remaining = match.suffix().str();
-	}
-	result += remaining;
-	query = result;
+	ReplaceAggregate(query, "min");
 }
 
 void OpenIVMUtils::ReplaceMax(string &query) {
-	std::regex pattern(R"(max\(([^)]+)\)(?![^()]*\bas\b))", std::regex_constants::icase);
-	std::smatch match;
-	string result;
-	string remaining = query;
-	while (std::regex_search(remaining, match, pattern)) {
-		string arg = match[1].str();
-		result += match.prefix().str() + "max(" + arg + ") as max_" + SanitizeAlias(arg);
-		remaining = match.suffix().str();
-	}
-	result += remaining;
-	query = result;
+	ReplaceAggregate(query, "max");
 }
 
 void OpenIVMUtils::RemoveRedundantWhitespaces(string &query) {

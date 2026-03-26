@@ -74,7 +74,7 @@ static duckdb::unique_ptr<FunctionData> DoIVMBind(ClientContext &context, TableF
 	planner.CreatePlan(statement->Copy());
 	OPENIVM_DEBUG_PRINT("[DoIVM Bind] Plan:\n%s\n", planner.plan->ToString().c_str());
 
-	auto result = make_uniq<DoIVMFunctionData>();
+	auto result = make_uniq<TableFunctionData>();
 	for (size_t i = 0; i < planner.names.size(); i++) {
 		return_types.emplace_back(planner.types[i]);
 		names.emplace_back(planner.names[i]);
@@ -100,11 +100,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &instance = loader.GetDatabaseInstance();
 	auto &db_config = duckdb::DBConfig::GetConfig(instance);
 
-	db_config.AddExtensionOption("ivm_files_path", "path for compiled files", LogicalType::VARCHAR);
-	db_config.AddExtensionOption("ivm_system", "database for cross-system openivm", LogicalType::VARCHAR);
-	db_config.AddExtensionOption("ivm_catalog_name", "catalog name", LogicalType::VARCHAR);
-	db_config.AddExtensionOption("ivm_schema_name", "schema name", LogicalType::VARCHAR);
-	db_config.AddExtensionOption("execute", "whether to execute queries", LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("ivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("ivm_refresh_mode", "refresh strategy: auto, incremental, or full",
 	                             LogicalType::VARCHAR, Value("auto"));
 	db_config.AddExtensionOption("ivm_adaptive", "enable adaptive cost model (when false, always use IVM)",

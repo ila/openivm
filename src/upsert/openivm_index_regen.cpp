@@ -31,16 +31,16 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 			table_reassign[old_gr_idx] = new_gr_idx;
 		}
 		{
-			const idx_t old_ag_idx = agg_ptr->group_index;
+			const idx_t old_ag_idx = agg_ptr->aggregate_index;
 			const idx_t new_ag_idx = binder.GenerateTableIndex();
-			agg_ptr->group_index = new_ag_idx;
+			agg_ptr->aggregate_index = new_ag_idx;
 			table_reassign[old_ag_idx] = new_ag_idx;
 		}
 		{
 			const idx_t old_gs_idx = agg_ptr->groupings_index;
 			if (old_gs_idx != DConstants::INVALID_INDEX) {
 				const idx_t new_gs_idx = binder.GenerateTableIndex();
-				agg_ptr->group_index = new_gs_idx;
+				agg_ptr->groupings_index = new_gs_idx;
 				table_reassign[old_gs_idx] = new_gs_idx;
 			}
 		}
