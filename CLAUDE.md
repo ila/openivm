@@ -123,8 +123,9 @@ MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original
 |---|---|---|---|
 | `ivm_refresh_mode` | VARCHAR | `"auto"` | `"auto"`, `"incremental"`, or `"full"` |
 | `ivm_adaptive` | BOOLEAN | `false` | Enable adaptive cost model |
-| `ivm_check` | BOOLEAN | `true` | Validate MV query IVM compatibility at creation |
 | `ivm_files_path` | VARCHAR | — | Path for compiled query reference files |
+
+Views using unsupported constructs (LEFT JOIN, RANDOM(), STDDEV, etc.) are automatically classified as `FULL_REFRESH` — no setting needed.
 
 ## Debugging
 

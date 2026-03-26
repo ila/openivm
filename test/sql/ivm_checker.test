@@ -1,5 +1,5 @@
 # name: test/sql/ivm_checker.test
-# description: Test IVM compatibility checker (ivm_check setting)
+# description: Test IVM compatibility checker — classifies views as incremental or full refresh
 # group: [sql]
 
 require openivm
@@ -21,69 +21,63 @@ statement ok
 INSERT INTO t2 VALUES (1, 100), (2, 200);
 
 # ==========================================
-# Unsupported joins (ivm_check = true, default)
+# Unsupported joins → auto full refresh (no error)
 # ==========================================
 
-statement error
-CREATE MATERIALIZED VIEW mv_left AS SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a;
-----
-does not support LEFT
-
-# RIGHT JOIN is rewritten to LEFT JOIN by DuckDB's planner
-statement error
-CREATE MATERIALIZED VIEW mv_right AS SELECT t1.a, t1.b, t2.c FROM t1 RIGHT JOIN t2 ON t1.a = t2.a;
-----
-does not support LEFT
-
-statement error
-CREATE MATERIALIZED VIEW mv_full AS SELECT t1.a, t1.b, t2.c FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.a;
-----
-does not support FULL
-
-statement error
-CREATE MATERIALIZED VIEW mv_cross AS SELECT t1.a, t2.c FROM t1 CROSS JOIN t2;
-----
-does not support CROSS
-
-# ==========================================
-# Unsupported aggregates
-# ==========================================
-
-# AVG is supported (uses group-recompute strategy like MIN/MAX)
 statement ok
-CREATE MATERIALIZED VIEW mv_avg AS SELECT a, AVG(b) AS avg_b FROM t1 GROUP BY a;
+CREATE MATERIALIZED VIEW mv_left AS SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a;
 
-statement error
-CREATE MATERIALIZED VIEW mv_stddev AS SELECT a, STDDEV(b) AS sd FROM t1 GROUP BY a;
+query III
+SELECT a, b, c FROM mv_left ORDER BY a;
 ----
-does not support the 'stddev'
+1	10	100
+2	20	200
 
-statement error
-CREATE MATERIALIZED VIEW mv_string_agg AS SELECT STRING_AGG(a::VARCHAR, ',') AS all_a FROM t1;
-----
-does not support the 'string_agg'
+# RIGHT JOIN (rewritten to LEFT by DuckDB)
+statement ok
+CREATE MATERIALIZED VIEW mv_right AS SELECT t1.a, t1.b, t2.c FROM t1 RIGHT JOIN t2 ON t1.a = t2.a;
 
 # ==========================================
-# Supported constructs still work
+# Unsupported aggregates → auto full refresh
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_stddev AS SELECT a, STDDEV(b) AS sd FROM t1 GROUP BY a;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_string_agg AS SELECT STRING_AGG(a::VARCHAR, ',') AS all_a FROM t1;
+
+# ==========================================
+# Non-deterministic functions → auto full refresh
+# ==========================================
+
+statement ok
+CREATE TABLE t3 (x INT);
+
+statement ok
+INSERT INTO t3 VALUES (1), (2), (3);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_random AS SELECT x, RANDOM() AS r FROM t3;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_now AS SELECT x, NOW() AS ts FROM t3;
+
+# ==========================================
+# Supported constructs → incremental
 # ==========================================
 
 statement ok
 CREATE MATERIALIZED VIEW mv_inner AS SELECT t1.a, t1.b, t2.c FROM t1 INNER JOIN t2 ON t1.a = t2.a;
 
-query III
-SELECT a, b, c FROM mv_inner ORDER BY a;
-----
-1	10	100
-2	20	200
-
 statement ok
 CREATE MATERIALIZED VIEW mv_sum AS SELECT a, SUM(b) AS total FROM t1 GROUP BY a;
 
 statement ok
-CREATE MATERIALIZED VIEW mv_count AS SELECT COUNT(*) AS cnt FROM t1;
+CREATE MATERIALIZED VIEW mv_avg AS SELECT a, AVG(b) AS avg_b FROM t1 GROUP BY a;
 
 statement ok
-CREATE MATERIALIZED VIEW mv_minmax AS SELECT MIN(b) AS lo, MAX(b) AS hi FROM t1;
+CREATE MATERIALIZED VIEW mv_count AS SELECT COUNT(*) AS cnt FROM t1;
 
 statement ok
 CREATE MATERIALIZED VIEW mv_proj AS SELECT a, b FROM t1;
@@ -92,28 +86,7 @@ statement ok
 CREATE MATERIALIZED VIEW mv_filter AS SELECT a, b FROM t1 WHERE b > 5;
 
 # ==========================================
-# ivm_check = false: bypass checker
-# ==========================================
-
-statement ok
-SET ivm_check = false;
-
-# LEFT JOIN now creates successfully
-statement ok
-CREATE MATERIALIZED VIEW mv_left_ok AS SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a;
-
-query III
-SELECT a, b, c FROM mv_left_ok ORDER BY a;
-----
-1	10	100
-2	20	200
-
-# Reset to default
-statement ok
-SET ivm_check = true;
-
-# ==========================================
-# Full refresh on bypassed MV
+# Full refresh works for unsupported MVs
 # ==========================================
 
 statement ok
@@ -122,36 +95,63 @@ INSERT INTO t1 VALUES (3, 30);
 statement ok
 INSERT INTO t2 VALUES (3, 300);
 
-# Full refresh mode works for the bypassed LEFT JOIN MV
 statement ok
-SET ivm_refresh_mode = 'full';
+INSERT INTO t3 VALUES (4);
 
+# LEFT JOIN MV: auto full refresh via PRAGMA ivm
 statement ok
-PRAGMA ivm('mv_left_ok');
+PRAGMA ivm('mv_left');
 
 query III
-SELECT a, b, c FROM mv_left_ok ORDER BY a;
+SELECT a, b, c FROM mv_left ORDER BY a;
 ----
 1	10	100
 2	20	200
 3	30	300
 
-# AVG uses incremental group-recompute (not bypassed)
-statement ok
-PRAGMA ivm('mv_avg');
-
-query II
-SELECT a, avg_b FROM mv_avg ORDER BY a;
+# Cross-check
+query III
+SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a ORDER BY t1.a;
 ----
-1	10.0
-2	20.0
-3	30.0
+1	10	100
+2	20	200
+3	30	300
 
-# Reset refresh mode
+# STDDEV MV: auto full refresh
 statement ok
-SET ivm_refresh_mode = 'auto';
+PRAGMA ivm('mv_stddev');
 
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, STDDEV(b) AS sd FROM t1 GROUP BY a
+    EXCEPT ALL
+    SELECT a, sd FROM mv_stddev
+);
+----
+0
+
+# RANDOM() MV: full refresh (values will differ from base query, but row count matches)
+statement ok
+PRAGMA ivm('mv_random');
+
+query I
+SELECT COUNT(*) FROM mv_random;
+----
+4
+
+# NOW() MV: full refresh
+statement ok
+PRAGMA ivm('mv_now');
+
+query I
+SELECT COUNT(*) FROM mv_now;
+----
+4
+
+# ==========================================
 # Incremental refresh still works for supported MVs
+# ==========================================
+
 statement ok
 PRAGMA ivm('mv_sum');
 
@@ -161,3 +161,30 @@ SELECT a, total FROM mv_sum ORDER BY a;
 1	10
 2	20
 3	30
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (SELECT a, SUM(b) AS total FROM t1 GROUP BY a EXCEPT ALL SELECT a, total FROM mv_sum);
+----
+0
+
+statement ok
+PRAGMA ivm('mv_avg');
+
+query I
+SELECT COUNT(*) FROM (SELECT a, AVG(b) AS avg_b FROM t1 GROUP BY a EXCEPT ALL SELECT a, avg_b FROM mv_avg);
+----
+0
+
+statement ok
+PRAGMA ivm('mv_proj');
+
+query I
+SELECT COUNT(*) FROM (SELECT a, b FROM t1 EXCEPT ALL SELECT a, b FROM mv_proj);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT a, b FROM mv_proj EXCEPT ALL SELECT a, b FROM t1);
+----
+0

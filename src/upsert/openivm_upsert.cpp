@@ -130,7 +130,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 		}
 	}
 
-	if (force_full_refresh) {
+	if (force_full_refresh || view_query_type == IVMType::FULL_REFRESH) {
 		return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
 		                           attached_db_schema_name);
 	}

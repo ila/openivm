@@ -6,9 +6,11 @@
 
 namespace duckdb {
 
-/// Walk the logical plan tree and throw NotImplementedException if any
-/// operator, join type, or aggregate function is not supported by IVM.
-void ValidateIVMPlan(LogicalOperator *plan);
+/// Walk the logical plan tree and check if all operators, join types,
+/// aggregate functions, and scalar functions are supported for IVM.
+/// Returns true if the plan is fully IVM-compatible.
+/// Returns false if any unsupported construct is found (caller should use full refresh).
+bool ValidateIVMPlan(LogicalOperator *plan);
 
 } // namespace duckdb
 

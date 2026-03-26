@@ -3,6 +3,7 @@
 #include "core/ivm_checker.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_utils.hpp"
+#include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
@@ -127,15 +128,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		OPENIVM_DEBUG_PRINT("[CREATE MV] View query: %s\n", view_query.c_str());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Logical plan:\n%s\n", plan->ToString().c_str());
 
-		// Validate plan compatibility (unless ivm_check is disabled)
-		Value ivm_check_val;
-		bool ivm_check = true;
-		if (context.TryGetCurrentSetting("ivm_check", ivm_check_val) && !ivm_check_val.IsNull()) {
-			ivm_check = ivm_check_val.GetValue<bool>();
-		}
-		if (ivm_check) {
-			ValidateIVMPlan(plan.get());
-		}
+		// Check if the plan is fully IVM-compatible
+		bool ivm_compatible = ValidateIVMPlan(plan.get());
 
 		std::stack<LogicalOperator *> node_stack;
 		node_stack.push(plan.get());
@@ -178,20 +172,28 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		IVMType ivm_type;
 
-		if (found_aggregation && !aggregate_columns.empty()) {
+		if (!ivm_compatible) {
+			ivm_type = IVMType::FULL_REFRESH;
+			Printer::Print("Warning: materialized view '" + view_name +
+			               "' uses constructs not supported for incremental maintenance. "
+			               "Full refresh will be used.");
+		} else if (found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (found_aggregation && aggregate_columns.empty()) {
 			ivm_type = IVMType::SIMPLE_AGGREGATE;
 		} else if (found_projection && !found_aggregation) {
 			ivm_type = IVMType::SIMPLE_PROJECTION;
 		} else {
-			throw NotImplementedException("IVM does not support this query type yet");
+			ivm_type = IVMType::FULL_REFRESH;
+			Printer::Print("Warning: materialized view '" + view_name +
+			               "' has an unrecognized query pattern. Full refresh will be used.");
 		}
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, projection=%d, group_cols=%zu)\n",
 		                    ivm_type == IVMType::AGGREGATE_GROUP     ? "AGGREGATE_GROUP"
 		                    : ivm_type == IVMType::SIMPLE_AGGREGATE  ? "SIMPLE_AGGREGATE"
 		                    : ivm_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
+		                    : ivm_type == IVMType::FULL_REFRESH      ? "FULL_REFRESH"
 		                                                             : "UNKNOWN",
 		                    (int)found_aggregation, (int)found_projection, aggregate_columns.size());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
