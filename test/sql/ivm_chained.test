@@ -301,3 +301,194 @@ query I
 SELECT COUNT(*) FROM (SELECT event_type, SUM(value) FROM events GROUP BY event_type);
 ----
 2
+
+# ============================================================
+# Chained MV with INNER JOIN: table + table -> join MV -> agg MV
+# ============================================================
+
+statement ok
+CREATE TABLE customers (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE purchases (customer_id INT, product VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+
+statement ok
+CREATE MATERIALIZED VIEW customer_purchases AS
+    SELECT c.name, p.product, p.amount
+    FROM customers c INNER JOIN purchases p ON c.id = p.customer_id;
+
+statement ok
+CREATE MATERIALIZED VIEW spend_by_customer AS
+    SELECT name, SUM(amount) AS total_spend FROM customer_purchases GROUP BY name;
+
+# Initial insert
+statement ok
+INSERT INTO purchases VALUES (1, 'book', 20), (2, 'pen', 5), (1, 'laptop', 1000);
+
+statement ok
+pragma ivm('customer_purchases');
+
+statement ok
+pragma ivm('spend_by_customer');
+
+query III
+SELECT name, product, amount FROM customer_purchases ORDER BY name, product;
+----
+Alice	book	20
+Alice	laptop	1000
+Bob	pen	5
+
+query II
+SELECT name, total_spend FROM spend_by_customer ORDER BY name;
+----
+Alice	1020
+Bob	5
+
+# Cross-check
+query II
+SELECT c.name, SUM(p.amount) FROM customers c INNER JOIN purchases p ON c.id = p.customer_id GROUP BY c.name ORDER BY c.name;
+----
+Alice	1020
+Bob	5
+
+# Second batch — new customer appears, existing customer buys more
+statement ok
+INSERT INTO purchases VALUES (3, 'tablet', 500), (1, 'mouse', 30);
+
+statement ok
+pragma ivm('customer_purchases');
+
+statement ok
+pragma ivm('spend_by_customer');
+
+query II
+SELECT name, total_spend FROM spend_by_customer ORDER BY name;
+----
+Alice	1050
+Bob	5
+Charlie	500
+
+# Cross-check
+query II
+SELECT c.name, SUM(p.amount) FROM customers c INNER JOIN purchases p ON c.id = p.customer_id GROUP BY c.name ORDER BY c.name;
+----
+Alice	1050
+Bob	5
+Charlie	500
+
+# Delete a purchase
+statement ok
+DELETE FROM purchases WHERE product = 'pen';
+
+statement ok
+pragma ivm('customer_purchases');
+
+statement ok
+pragma ivm('spend_by_customer');
+
+query II
+SELECT name, total_spend FROM spend_by_customer ORDER BY name;
+----
+Alice	1050
+Charlie	500
+
+# Cross-check
+query II
+SELECT c.name, SUM(p.amount) FROM customers c INNER JOIN purchases p ON c.id = p.customer_id GROUP BY c.name ORDER BY c.name;
+----
+Alice	1050
+Charlie	500
+
+# ============================================================
+# Join MV -> aggregate MV -> aggregate MV (3-level with join at base)
+# ============================================================
+
+statement ok
+CREATE TABLE departments (id INT, dept_name VARCHAR);
+
+statement ok
+CREATE TABLE employees (id INT, name VARCHAR, dept_id INT, salary INTEGER);
+
+statement ok
+INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Sales');
+
+statement ok
+CREATE MATERIALIZED VIEW emp_dept AS
+    SELECT e.name, d.dept_name, e.salary
+    FROM employees e INNER JOIN departments d ON e.dept_id = d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW dept_totals AS
+    SELECT dept_name, SUM(salary) AS total_salary, COUNT(*) AS headcount
+    FROM emp_dept GROUP BY dept_name;
+
+statement ok
+INSERT INTO employees VALUES (1, 'Alice', 1, 100), (2, 'Bob', 2, 80), (3, 'Charlie', 1, 120);
+
+statement ok
+pragma ivm('emp_dept');
+
+statement ok
+pragma ivm('dept_totals');
+
+query III
+SELECT dept_name, total_salary, headcount FROM dept_totals ORDER BY dept_name;
+----
+Engineering	220	2
+Sales	80	1
+
+# Cross-check
+query III
+SELECT d.dept_name, SUM(e.salary), COUNT(*) FROM employees e INNER JOIN departments d ON e.dept_id = d.id GROUP BY d.dept_name ORDER BY d.dept_name;
+----
+Engineering	220	2
+Sales	80	1
+
+# Add more employees
+statement ok
+INSERT INTO employees VALUES (4, 'Diana', 2, 90), (5, 'Eve', 1, 110);
+
+statement ok
+pragma ivm('emp_dept');
+
+statement ok
+pragma ivm('dept_totals');
+
+query III
+SELECT dept_name, total_salary, headcount FROM dept_totals ORDER BY dept_name;
+----
+Engineering	330	3
+Sales	170	2
+
+# Cross-check
+query III
+SELECT d.dept_name, SUM(e.salary), COUNT(*) FROM employees e INNER JOIN departments d ON e.dept_id = d.id GROUP BY d.dept_name ORDER BY d.dept_name;
+----
+Engineering	330	3
+Sales	170	2
+
+# Delete an employee
+statement ok
+DELETE FROM employees WHERE name = 'Bob';
+
+statement ok
+pragma ivm('emp_dept');
+
+statement ok
+pragma ivm('dept_totals');
+
+query III
+SELECT dept_name, total_salary, headcount FROM dept_totals ORDER BY dept_name;
+----
+Engineering	330	3
+Sales	90	1
+
+# Cross-check
+query III
+SELECT d.dept_name, SUM(e.salary), COUNT(*) FROM employees e INNER JOIN departments d ON e.dept_id = d.id GROUP BY d.dept_name ORDER BY d.dept_name;
+----
+Engineering	330	3
+Sales	90	1
