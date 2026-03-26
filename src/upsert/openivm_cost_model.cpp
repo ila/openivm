@@ -57,7 +57,7 @@ static void CollectTableStats(ClientContext &context, LogicalOperator &op, const
 			TableStats ts;
 			ts.table_name = get.GetTable()->name;
 			ts.delta_table_name = OpenIVMUtils::DeltaName(ts.table_name);
-			ts.base_card = get.EstimateCardinality(context);
+			ts.base_card = static_cast<double>(get.EstimateCardinality(context));
 			if (ts.base_card == 0) {
 				ts.base_card = 1; // avoid division by zero
 			}

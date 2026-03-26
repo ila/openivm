@@ -42,8 +42,8 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
-# Benchmark executable - only build for native platforms
-if(NOT EMSCRIPTEN AND NOT WIN32)
+# Benchmark executable - only build for native platforms with jemalloc
+if(NOT EMSCRIPTEN AND NOT WIN32 AND TARGET jemalloc_extension)
     add_executable(openivm_benchmark benchmarks/openivm_benchmark.cpp)
     target_link_libraries(openivm_benchmark
         duckdb_static

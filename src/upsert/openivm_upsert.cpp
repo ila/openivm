@@ -240,11 +240,11 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	p.ParseQuery(do_ivm);
 
 	Planner planner(*con.context);
-	planner.CreatePlan(move(p.statements[0]));
-	auto plan = move(planner.plan);
+	planner.CreatePlan(std::move(p.statements[0]));
+	auto plan = std::move(planner.plan);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Unoptimized plan:\n%s\n", plan->ToString().c_str());
 	Optimizer optimizer(*planner.binder, *con.context);
-	plan = optimizer.Optimize(move(plan)); // this transforms the plan into an incremental plan
+	plan = optimizer.Optimize(std::move(plan)); // this transforms the plan into an incremental plan
 	OPENIVM_DEBUG_PRINT("[UPSERT] Optimized (incremental) plan:\n%s\n", plan->ToString().c_str());
 	con.Rollback();
 

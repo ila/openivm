@@ -87,7 +87,7 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 	p.ParseQuery(query_lower);
 
 	return ParserExtensionParseResult(
-	    make_uniq_base<ParserExtensionParseData, IVMParseData>(move(p.statements[0]), true));
+	    make_uniq_base<ParserExtensionParseData, IVMParseData>(std::move(p.statements[0]), true));
 }
 
 ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInfo *info, ClientContext &context,
