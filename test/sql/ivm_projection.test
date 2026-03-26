@@ -88,3 +88,80 @@ SELECT id, name FROM emp_names ORDER BY id;
 4	Diana
 5	Eve
 6	Frank
+
+# ==========================================
+# BOOLEAN columns in projection
+# ==========================================
+
+statement ok
+CREATE TABLE flags (id INT, name VARCHAR, active BOOLEAN);
+
+statement ok
+INSERT INTO flags VALUES (1, 'Alice', true), (2, 'Bob', false);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_flags AS SELECT id, name, active FROM flags;
+
+statement ok
+INSERT INTO flags VALUES (3, 'Charlie', true);
+
+statement ok
+pragma ivm('mv_flags');
+
+query III
+SELECT id, name, active FROM mv_flags ORDER BY id;
+----
+1	Alice	true
+2	Bob	false
+3	Charlie	true
+
+statement ok
+DELETE FROM flags WHERE active = false;
+
+statement ok
+pragma ivm('mv_flags');
+
+query III
+SELECT id, name, active FROM mv_flags ORDER BY id;
+----
+1	Alice	true
+3	Charlie	true
+
+# ==========================================
+# Idempotent refresh — no changes
+# ==========================================
+
+statement ok
+pragma ivm('mv_flags');
+
+query III
+SELECT id, name, active FROM mv_flags ORDER BY id;
+----
+1	Alice	true
+3	Charlie	true
+
+# ==========================================
+# Empty table → create MV → insert → refresh
+# ==========================================
+
+statement ok
+CREATE TABLE empty_proj (id INT, name VARCHAR);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_empty_proj AS SELECT id, name FROM empty_proj;
+
+query II
+SELECT id, name FROM mv_empty_proj;
+----
+
+statement ok
+INSERT INTO empty_proj VALUES (1, 'First'), (2, 'Second');
+
+statement ok
+pragma ivm('mv_empty_proj');
+
+query II
+SELECT id, name FROM mv_empty_proj ORDER BY id;
+----
+1	First
+2	Second

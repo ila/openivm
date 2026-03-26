@@ -300,3 +300,71 @@ query I
 SELECT count(*) FROM god_locations WHERE user_name = 'Poseidon';
 ----
 0
+
+# ==========================================
+# Multi-column JOIN condition
+# ==========================================
+
+statement ok
+CREATE TABLE orders_j (region VARCHAR, product VARCHAR, qty INT);
+
+statement ok
+CREATE TABLE prices (region VARCHAR, product VARCHAR, price DECIMAL(10,2));
+
+statement ok
+INSERT INTO prices VALUES ('US', 'A', 10.00), ('US', 'B', 20.00), ('EU', 'A', 12.00);
+
+statement ok
+INSERT INTO orders_j VALUES ('US', 'A', 5), ('US', 'B', 3), ('EU', 'A', 10);
+
+statement ok
+CREATE MATERIALIZED VIEW order_totals AS
+    SELECT o.region, o.product, o.qty, p.price
+    FROM orders_j o INNER JOIN prices p ON o.region = p.region AND o.product = p.product;
+
+query IIII
+SELECT region, product, qty, price FROM order_totals ORDER BY region, product;
+----
+EU	A	10	12.00
+US	A	5	10.00
+US	B	3	20.00
+
+statement ok
+INSERT INTO orders_j VALUES ('US', 'A', 2), ('EU', 'A', 7);
+
+statement ok
+pragma ivm('order_totals');
+
+query IIII
+SELECT region, product, qty, price FROM order_totals ORDER BY region, product, qty;
+----
+EU	A	7	12.00
+EU	A	10	12.00
+US	A	2	10.00
+US	A	5	10.00
+US	B	3	20.00
+
+# Cross-check
+query I
+SELECT count(*) FROM (
+    SELECT o.region, o.product, o.qty, p.price FROM orders_j o INNER JOIN prices p ON o.region = p.region AND o.product = p.product
+    EXCEPT ALL
+    SELECT * FROM order_totals
+);
+----
+0
+
+# Delete from join
+statement ok
+DELETE FROM orders_j WHERE region = 'US' AND product = 'A' AND qty = 5;
+
+statement ok
+pragma ivm('order_totals');
+
+query IIII
+SELECT region, product, qty, price FROM order_totals ORDER BY region, product, qty;
+----
+EU	A	7	12.00
+EU	A	10	12.00
+US	A	2	10.00
+US	B	3	20.00

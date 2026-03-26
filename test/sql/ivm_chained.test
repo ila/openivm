@@ -302,6 +302,157 @@ SELECT COUNT(*) FROM (SELECT event_type, SUM(value) FROM events GROUP BY event_t
 ----
 2
 
+# Second batch for fan-out — test deletes and updates propagating through
+statement ok
+INSERT INTO events VALUES ('u4', 'purchase', 50), ('u1', 'click', 15);
+
+statement ok
+DELETE FROM events WHERE user_id = 'u3';
+
+statement ok
+pragma ivm('events_by_user');
+
+statement ok
+pragma ivm('events_by_type');
+
+statement ok
+pragma ivm('user_count');
+
+statement ok
+pragma ivm('type_count');
+
+query II
+SELECT user_id, total_value FROM events_by_user ORDER BY user_id;
+----
+u1	125
+u2	20
+u4	50
+
+query I
+SELECT num_users FROM user_count;
+----
+3
+
+# Cross-check
+query II
+SELECT user_id, SUM(value) FROM events GROUP BY user_id ORDER BY user_id;
+----
+u1	125
+u2	20
+u4	50
+
+query II
+SELECT event_type, SUM(value) FROM events GROUP BY event_type ORDER BY event_type;
+----
+click	45
+purchase	150
+
+query II
+SELECT event_type, total_value FROM events_by_type ORDER BY event_type;
+----
+click	45
+purchase	150
+
+# ============================================================
+# 4-level chain: table → MV1 → MV2 → MV3 → MV4
+# ============================================================
+
+statement ok
+CREATE TABLE transactions (store VARCHAR, dept VARCHAR, amount INT);
+
+statement ok
+CREATE MATERIALIZED VIEW store_dept_totals AS
+    SELECT store, dept, SUM(amount) AS total FROM transactions GROUP BY store, dept;
+
+statement ok
+CREATE MATERIALIZED VIEW store_totals AS
+    SELECT store, SUM(total) AS grand_total FROM store_dept_totals GROUP BY store;
+
+statement ok
+CREATE MATERIALIZED VIEW chain_grand_total AS
+    SELECT SUM(grand_total) AS all_stores FROM store_totals;
+
+statement ok
+INSERT INTO transactions VALUES
+    ('NYC', 'electronics', 100), ('NYC', 'food', 50),
+    ('LA', 'electronics', 200), ('LA', 'food', 75);
+
+statement ok
+pragma ivm('store_dept_totals');
+
+statement ok
+pragma ivm('store_totals');
+
+statement ok
+pragma ivm('chain_grand_total');
+
+query III
+SELECT store, dept, total FROM store_dept_totals ORDER BY store, dept;
+----
+LA	electronics	200
+LA	food	75
+NYC	electronics	100
+NYC	food	50
+
+query II
+SELECT store, grand_total FROM store_totals ORDER BY store;
+----
+LA	275
+NYC	150
+
+query I
+SELECT all_stores FROM chain_grand_total;
+----
+425
+
+# Cross-check
+query I
+SELECT SUM(amount) FROM transactions;
+----
+425
+
+# Second batch + delete
+statement ok
+INSERT INTO transactions VALUES ('NYC', 'electronics', 300), ('SF', 'food', 500);
+
+statement ok
+DELETE FROM transactions WHERE store = 'LA' AND dept = 'food';
+
+statement ok
+pragma ivm('store_dept_totals');
+
+statement ok
+pragma ivm('store_totals');
+
+statement ok
+pragma ivm('chain_grand_total');
+
+query III
+SELECT store, dept, total FROM store_dept_totals ORDER BY store, dept;
+----
+LA	electronics	200
+NYC	electronics	400
+NYC	food	50
+SF	food	500
+
+query II
+SELECT store, grand_total FROM store_totals ORDER BY store;
+----
+LA	200
+NYC	450
+SF	500
+
+query I
+SELECT all_stores FROM chain_grand_total;
+----
+1150
+
+# Cross-check
+query I
+SELECT SUM(amount) FROM transactions;
+----
+1150
+
 # ============================================================
 # Chained MV with INNER JOIN: table + table -> join MV -> agg MV
 # ============================================================

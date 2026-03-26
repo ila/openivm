@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "make format-fix 2>/dev/null || true",
+            "timeout": 30,
+            "statusMessage": "Running format-fix..."
+          }
+        ]
+      }
+    ]
+  }
+}

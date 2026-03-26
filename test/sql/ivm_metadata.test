@@ -391,3 +391,54 @@ SELECT total FROM mv_fresh;
 # NOTE: DROP MATERIALIZED VIEW syntax is not supported because DuckDB's
 # internal PG parser intercepts it before our extension gets a chance.
 # Use DROP TABLE to drop materialized views instead.
+
+# ==========================================
+# Re-create MV with same name after DROP (different query)
+# ==========================================
+
+statement ok
+CREATE TABLE recreate_base (id INT, val INT, category VARCHAR);
+
+statement ok
+INSERT INTO recreate_base VALUES (1, 10, 'a'), (2, 20, 'b');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_recreate AS SELECT id, val FROM recreate_base;
+
+query II
+SELECT id, val FROM mv_recreate ORDER BY id;
+----
+1	10
+2	20
+
+statement ok
+DROP TABLE mv_recreate;
+
+# Re-create with a completely different query (aggregate instead of projection)
+statement ok
+CREATE MATERIALIZED VIEW mv_recreate AS SELECT category, SUM(val) AS total FROM recreate_base GROUP BY category;
+
+query II
+SELECT category, total FROM mv_recreate ORDER BY category;
+----
+a	10
+b	20
+
+statement ok
+INSERT INTO recreate_base VALUES (3, 30, 'a');
+
+statement ok
+pragma ivm('mv_recreate');
+
+query II
+SELECT category, total FROM mv_recreate ORDER BY category;
+----
+a	40
+b	20
+
+# Cross-check
+query II
+SELECT category, SUM(val) FROM recreate_base GROUP BY category ORDER BY category;
+----
+a	40
+b	20

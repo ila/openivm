@@ -1032,3 +1032,34 @@ query I
 SELECT count(*) FROM mv_staff WHERE id IN (150, 151, 152);
 ----
 1
+
+# ==========================================
+# Mixed INSERT + DELETE + UPDATE before single pragma
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (200, 'Mixed1', 'eng', 100), (201, 'Mixed2', 'sales', 200);
+
+statement ok
+DELETE FROM staff WHERE id = 200;
+
+statement ok
+UPDATE staff SET salary = 999 WHERE id = 201;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT SELECT * FROM mv_staff);
+----
+0
+
+query I
+SELECT salary FROM mv_staff WHERE id = 201;
+----
+999

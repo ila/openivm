@@ -75,53 +75,61 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	}
 	cte_group_by_string.erase(cte_group_by_string.size() - 2, 2);
 
-	cte_string = cte_string + cte_select_string + cte_from_string + cte_group_by_string + ")\n";
+	string cte_body = cte_select_string + cte_from_string + cte_group_by_string;
 
-	// Outer select: merge delta into MV
-	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
-	string select_string = "select ";
-	for (auto &key : keys) {
-		select_string = select_string + "delta_" + view_name + "." + key + ", ";
-	}
-	for (auto &column : aggregates) {
-		if (list_mode) {
-			select_string += "\n\tlist_transform(list_zip("
-			                 "COALESCE(" +
-			                 view_name + "." + column + ", " + zeros_list +
-			                 "), "
-			                 "delta_" +
-			                 view_name + "." + column + "), lambda x: x[1] + x[2]) AS " + column + ", ";
-		} else {
-			select_string = select_string + "\n\tsum(coalesce(" + view_name + "." + column + ", 0) + delta_" +
-			                view_name + "." + column + "), ";
+	// UPDATE existing rows: add delta to current MV values.
+	// Uses IS NOT DISTINCT FROM so NULLs in group keys match correctly
+	// (unique indexes don't conflict on NULLs, so INSERT OR REPLACE fails for NULL keys).
+	string update_set;
+	{
+		string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
+		bool first = true;
+		for (auto &column : aggregates) {
+			if (!first) {
+				update_set += ", ";
+			}
+			first = false;
+			if (list_mode) {
+				update_set += column + " = list_transform(list_zip(" + view_name + "." + column + ", d." + column +
+				              "), lambda x: x[1] + x[2])";
+			} else {
+				update_set += column + " = " + view_name + "." + column + " + d." + column;
+			}
 		}
 	}
-	select_string.erase(select_string.size() - 2, 2);
-	select_string += "\n";
-
-	string from_string = "from ivm_cte as delta_" + view_name + "\n";
-	string join_string = "left join " + view_name + " on ";
-	for (auto &key : keys) {
-		join_string = join_string + view_name + "." + key + " = delta_" + view_name + "." + key + " and ";
-	}
-	join_string.erase(join_string.size() - 5, 5);
-	join_string += "\n";
-
-	string external_query_string;
-	if (list_mode) {
-		// No GROUP BY for list mode — CTE consolidates per group, LEFT JOIN is 1:1
-		external_query_string = select_string + from_string + join_string + ";";
-	} else {
-		string group_by_string = "group by ";
-		for (auto &key : keys) {
-			group_by_string = group_by_string + "delta_" + view_name + "." + key + ", ";
+	string update_where;
+	for (size_t i = 0; i < keys.size(); i++) {
+		if (i > 0) {
+			update_where += " AND ";
 		}
-		group_by_string.erase(group_by_string.size() - 2, 2);
-		external_query_string = select_string + from_string + join_string + group_by_string + ";";
+		update_where += view_name + "." + keys[i] + " IS NOT DISTINCT FROM d." + keys[i];
 	}
+	string update_query = "WITH ivm_cte AS (\n" + cte_body + ")\n" + "UPDATE " + view_name + " SET " + update_set +
+	                      "\nFROM ivm_cte d\nWHERE " + update_where + ";\n";
 
-	string query_string = cte_string + external_query_string;
-	string upsert_query = "insert or replace into " + view_name + "\n" + query_string + "\n";
+	// INSERT new groups: rows in delta that don't exist in MV yet.
+	string insert_cols;
+	for (auto &key : keys) {
+		insert_cols += "d." + key + ", ";
+	}
+	for (size_t i = 0; i < aggregates.size(); i++) {
+		insert_cols += "d." + aggregates[i];
+		if (i < aggregates.size() - 1) {
+			insert_cols += ", ";
+		}
+	}
+	string not_exists_cond;
+	for (size_t i = 0; i < keys.size(); i++) {
+		if (i > 0) {
+			not_exists_cond += " AND ";
+		}
+		not_exists_cond += "v." + keys[i] + " IS NOT DISTINCT FROM d." + keys[i];
+	}
+	string insert_query = "WITH ivm_cte AS (\n" + cte_body + ")\n" + "INSERT INTO " + view_name + " SELECT " +
+	                      insert_cols + "\nFROM ivm_cte d\nWHERE NOT EXISTS (SELECT 1 FROM " + view_name + " v WHERE " +
+	                      not_exists_cond + ");\n";
+
+	string upsert_query = update_query + "\n" + insert_query + "\n";
 
 	// Delete zero rows
 	string delete_query = "\ndelete from " + view_name + " where ";
