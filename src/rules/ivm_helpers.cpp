@@ -1,6 +1,8 @@
 #include "rules/ivm_rule.hpp"
 
+#include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/openivm_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
@@ -23,7 +25,7 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, c
 			delta_table_schema = "public";
 			delta_table_catalog = "p"; // todo
 		} else {
-			delta_table = "delta_" + old_get->GetTable().get()->name;
+			delta_table = OpenIVMUtils::DeltaName(old_get->GetTable().get()->name);
 			delta_table_schema = old_get->GetTable().get()->schema.name;
 			delta_table_catalog = old_get->GetTable().get()->catalog.GetName();
 		}
@@ -42,9 +44,9 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, c
 	vector<ColumnIndex> column_ids = {};
 	idx_t mul_oid = 0, ts_oid = 0, max_oid = 0;
 	for (auto &col : table_entry.GetColumns().Logical()) {
-		if (col.Name() == "_duckdb_ivm_multiplicity") {
+		if (col.Name() == string(ivm::MULTIPLICITY_COL)) {
 			mul_oid = col.Oid();
-		} else if (col.Name() == "_duckdb_ivm_timestamp") {
+		} else if (col.Name() == string(ivm::TIMESTAMP_COL)) {
 			ts_oid = col.Oid();
 		}
 		if (col.Oid() > max_oid) {
@@ -78,8 +80,8 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, c
 	// Timestamp filter
 	Connection con(*context.db);
 	con.SetAutoCommit(false);
-	auto timestamp_query = "select last_update from _duckdb_ivm_delta_tables where view_name = '" + view_name +
-	                       "' and table_name = '" + table_name + "';";
+	auto timestamp_query = "select last_update from " + string(ivm::DELTA_TABLES_TABLE) + " where view_name = '" +
+	                       view_name + "' and table_name = '" + table_name + "';";
 	auto r = con.Query(timestamp_query);
 	if (r->HasError()) {
 		throw InternalException("Error while querying last_update");

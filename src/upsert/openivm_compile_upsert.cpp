@@ -1,5 +1,8 @@
 #include "upsert/openivm_compile_upsert.hpp"
 
+#include "core/openivm_constants.hpp"
+#include "core/openivm_utils.hpp"
+
 namespace duckdb {
 
 string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
@@ -17,7 +20,7 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	unordered_set<std::string> keys_set(keys.begin(), keys.end());
 
 	for (auto &column : column_names) {
-		if (keys_set.find(column) == keys_set.end() && column != "_duckdb_ivm_multiplicity") {
+		if (keys_set.find(column) == keys_set.end() && column != string(ivm::MULTIPLICITY_COL)) {
 			aggregates.push_back(column);
 		}
 	}
@@ -33,10 +36,10 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 		}
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 		string delete_query = "delete from " + view_name + " where (" + keys_tuple + ") in (\n" + "  select distinct " +
-		                      keys_tuple + " from delta_" + view_name + delta_where + "\n);\n";
+		                      keys_tuple + " from " + OpenIVMUtils::DeltaName(view_name) + delta_where + "\n);\n";
 		string insert_query = "insert into " + view_name + "\n" + "select * from (" + view_query_sql +
 		                      ") _ivm_recompute\n" + "where (" + keys_tuple + ") in (\n" + "  select distinct " +
-		                      keys_tuple + " from delta_" + view_name + delta_where + "\n);\n";
+		                      keys_tuple + " from " + OpenIVMUtils::DeltaName(view_name) + delta_where + "\n);\n";
 		return delete_query + "\n" + insert_query;
 	}
 
@@ -48,7 +51,8 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	}
 	for (auto &column : aggregates) {
 		if (list_mode) {
-			cte_select_string += "\n\tlist_reduce(list(CASE WHEN _duckdb_ivm_multiplicity = false "
+			cte_select_string += "\n\tlist_reduce(list(CASE WHEN " + string(ivm::MULTIPLICITY_COL) +
+			                     " = false "
 			                     "THEN list_transform(" +
 			                     column +
 			                     ", lambda x: -x) "
@@ -58,13 +62,13 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 			                     "lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS " +
 			                     column + ", ";
 		} else {
-			cte_select_string = cte_select_string + "\n\tsum(case when _duckdb_ivm_multiplicity = false then -" +
-			                    column + " else " + column + " end) as " + column + ", ";
+			cte_select_string = cte_select_string + "\n\tsum(case when " + string(ivm::MULTIPLICITY_COL) +
+			                    " = false then -" + column + " else " + column + " end) as " + column + ", ";
 		}
 	}
 	cte_select_string.erase(cte_select_string.size() - 2, 2);
 	cte_select_string += "\n";
-	string cte_from_string = "from delta_" + view_name;
+	string cte_from_string = "from " + OpenIVMUtils::DeltaName(view_name);
 	if (!delta_ts_filter.empty()) {
 		cte_from_string += " WHERE " + delta_ts_filter;
 	}
@@ -160,25 +164,26 @@ string CompileSimpleAggregates(string &view_name, const vector<string> &column_n
 	bool first = true;
 	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 	for (auto &column : column_names) {
-		if (column != "_duckdb_ivm_multiplicity") {
+		if (column != string(ivm::MULTIPLICITY_COL)) {
 			if (!first) {
 				update_query += ",\n";
 			}
 			first = false;
 			if (list_mode) {
-				string negate_del = "coalesce((select list_transform(" + column + ", lambda x: -x) from delta_" +
-				                    view_name + " where _duckdb_ivm_multiplicity = false" + ts_and + "), " +
-				                    zeros_list + ")";
-				string ins = "coalesce((select " + column + " from delta_" + view_name +
-				             " where _duckdb_ivm_multiplicity = true" + ts_and + "), " + zeros_list + ")";
+				string negate_del = "coalesce((select list_transform(" + column + ", lambda x: -x) from " +
+				                    OpenIVMUtils::DeltaName(view_name) + " where " + string(ivm::MULTIPLICITY_COL) +
+				                    " = false" + ts_and + "), " + zeros_list + ")";
+				string ins = "coalesce((select " + column + " from " + OpenIVMUtils::DeltaName(view_name) + " where " +
+				             string(ivm::MULTIPLICITY_COL) + " = true" + ts_and + "), " + zeros_list + ")";
 				string delta = "list_transform(list_zip(" + negate_del + ", " + ins + "), lambda x: x[1] + x[2])";
 				update_query +=
 				    column + " = list_transform(list_zip(" + column + ", " + delta + "), lambda x: x[1] + x[2])";
 			} else {
 				update_query += column + " = \n\tcoalesce(" + column + ", 0) \n\t\t- coalesce((select " + column +
-				                " from delta_" + view_name + " where _duckdb_ivm_multiplicity = false" + ts_and +
-				                "), 0)\n\t\t+ coalesce((select " + column + " from delta_" + view_name +
-				                " where _duckdb_ivm_multiplicity = true" + ts_and + "), 0)";
+				                " from " + OpenIVMUtils::DeltaName(view_name) + " where " +
+				                string(ivm::MULTIPLICITY_COL) + " = false" + ts_and + "), 0)\n\t\t+ coalesce((select " +
+				                column + " from " + OpenIVMUtils::DeltaName(view_name) + " where " +
+				                string(ivm::MULTIPLICITY_COL) + " = true" + ts_and + "), 0)";
 			}
 		}
 	}
@@ -190,7 +195,7 @@ string CompileProjectionsFilters(string &view_name, const vector<string> &column
 	string select_columns;
 	string match_conditions;
 	for (auto &column : column_names) {
-		if (column != "_duckdb_ivm_multiplicity") {
+		if (column != string(ivm::MULTIPLICITY_COL)) {
 			match_conditions += view_name + "." + column + " IS NOT DISTINCT FROM net_dels." + column + " and ";
 			select_columns += column + ", ";
 		}
@@ -202,10 +207,10 @@ string CompileProjectionsFilters(string &view_name, const vector<string> &column
 	// This is needed because the inclusion-exclusion join delta rule can produce
 	// redundant entries that cancel each other in bag arithmetic.
 	string ts_and = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
-	string ins_cte =
-	    "SELECT " + select_columns + " FROM delta_" + view_name + " WHERE _duckdb_ivm_multiplicity = true" + ts_and;
-	string dels_cte =
-	    "SELECT " + select_columns + " FROM delta_" + view_name + " WHERE _duckdb_ivm_multiplicity = false" + ts_and;
+	string ins_cte = "SELECT " + select_columns + " FROM " + OpenIVMUtils::DeltaName(view_name) + " WHERE " +
+	                 string(ivm::MULTIPLICITY_COL) + " = true" + ts_and;
+	string dels_cte = "SELECT " + select_columns + " FROM " + OpenIVMUtils::DeltaName(view_name) + " WHERE " +
+	                  string(ivm::MULTIPLICITY_COL) + " = false" + ts_and;
 
 	string delete_query = "WITH net_dels AS (\n  " + dels_cte + "\n  EXCEPT ALL\n  " + ins_cte + "\n)\ndelete from " +
 	                      view_name + " where exists (select 1 from net_dels where " + match_conditions + ");\n\n";

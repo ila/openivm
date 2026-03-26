@@ -1,5 +1,6 @@
 #include "core/openivm_utils.hpp"
 
+#include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
 
 #include <fstream>
@@ -104,7 +105,7 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 	std::regex primary_key_re(R"((primary\s+key\s*\([^\)]+\)))", std::regex::icase);
 	std::regex inline_primary_key_re(R"(([^\s,]+[^\),]*\s+primary\s+key))", std::regex::icase);
 
-	std::string multiplicity_col = "_duckdb_ivm_multiplicity boolean default true";
+	std::string multiplicity_col = string(ivm::MULTIPLICITY_COL) + " boolean default true";
 	std::string timestamp_col = "timestamp timestamp default now()";
 
 	std::smatch match;
@@ -142,9 +143,9 @@ string OpenIVMUtils::GenerateDeltaTable(string &input) {
 		}
 
 		if (!pk_columns.empty()) {
-			pk_columns += ", _duckdb_ivm_multiplicity";
+			pk_columns += ", " + string(ivm::MULTIPLICITY_COL);
 		} else {
-			pk_columns = "_duckdb_ivm_multiplicity";
+			pk_columns = string(ivm::MULTIPLICITY_COL);
 		}
 
 		columns += ", " + multiplicity_col + ", " + timestamp_col;
@@ -182,7 +183,7 @@ void OpenIVMUtils::RemoveRedundantWhitespaces(string &query) {
 }
 
 string OpenIVMUtils::DeltaName(const string &name) {
-	return "delta_" + name;
+	return string(ivm::DELTA_PREFIX) + name;
 }
 
 string OpenIVMUtils::FullName(const string &catalog, const string &schema, const string &table) {

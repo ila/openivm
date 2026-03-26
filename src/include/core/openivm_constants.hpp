@@ -15,6 +15,13 @@ constexpr const char *TIMESTAMP_COL = "_duckdb_ivm_timestamp";
 // Prefixes
 constexpr const char *DELTA_PREFIX = "delta_";
 
+// Limits
+static constexpr idx_t MAX_JOIN_TABLES = 16;
+
+// Optimizer settings disabled during IVM rewrite (these interfere with the delta plan)
+constexpr const char *DISABLED_OPTIMIZERS =
+    "compressed_materialization, column_lifetime, statistics_propagation, expression_rewriter, filter_pushdown";
+
 } // namespace ivm
 
 enum class IVMType : uint8_t { AGGREGATE_GROUP, SIMPLE_AGGREGATE, SIMPLE_PROJECTION };

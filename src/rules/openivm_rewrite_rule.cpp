@@ -5,7 +5,9 @@
 #include "rules/ivm_join_rule.hpp"
 #include "rules/ivm_projection_rule.hpp"
 #include "rules/ivm_scan_rule.hpp"
+#include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/openivm_utils.hpp"
 #include "upsert/openivm_index_regen.hpp"
 
 #include "logical_plan_to_sql.hpp"
@@ -31,9 +33,9 @@ void IVMRewriteRule::AddInsertNode(ClientContext &context, unique_ptr<LogicalOpe
 	OPENIVM_DEBUG_PRINT("\n---end of insert node output---\n");
 #endif
 
-	auto table =
-	    Catalog::GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name, "delta_" + view_name,
-	                                         OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
+	auto table = Catalog::GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name,
+	                                                  OpenIVMUtils::DeltaName(view_name),
+	                                                  OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
 	auto insert_node = make_uniq<LogicalInsert>(*table, 999);
 
 	Value value;
@@ -108,20 +110,10 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 	Connection con(*input.context.db);
 
 	con.BeginTransaction();
-	const bool verify_column_lifetime = false;
-	if (verify_column_lifetime) {
-		for (size_t i = 0; i < 30; ++i) {
-			input.optimizer.binder.GenerateTableIndex();
-		}
-		con.Query("SET disabled_optimizers='compressed_materialization, statistics_propagation, expression_rewriter, "
-		          "filter_pushdown';");
-	} else {
-		con.Query("SET disabled_optimizers='compressed_materialization, column_lifetime, statistics_propagation, "
-		          "expression_rewriter, filter_pushdown';");
-	}
+	con.Query("SET disabled_optimizers='" + string(ivm::DISABLED_OPTIMIZERS) + "';");
 	con.Commit();
 
-	auto v = con.Query("select sql_string from _duckdb_ivm_views where view_name = '" + view + "';");
+	auto v = con.Query("select sql_string from " + string(ivm::VIEWS_TABLE) + " where view_name = '" + view + "';");
 	if (v->HasError()) {
 		throw InternalException("Error while querying view definition");
 	}

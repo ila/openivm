@@ -1,4 +1,5 @@
 #include "rules/ivm_join_rule.hpp"
+#include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -89,7 +90,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 		                    (unsigned long)leaves[i].get->table_index, leaves[i].path.size());
 	}
 
-	if (N > 16) {
+	if (N > ivm::MAX_JOIN_TABLES) {
 		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
 	}
 

@@ -1,9 +1,11 @@
 #include "upsert/openivm_upsert.hpp"
 
-#include "upsert/openivm_cost_model.hpp"
+#include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "upsert/openivm_compile_upsert.hpp"
+#include "core/openivm_metadata.hpp"
 #include "core/openivm_utils.hpp"
+#include "upsert/openivm_compile_upsert.hpp"
+#include "upsert/openivm_cost_model.hpp"
 #include "logical_plan_to_sql.hpp"
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
@@ -25,6 +27,31 @@
 #include "duckdb/optimizer/optimizer.hpp"
 
 namespace duckdb {
+
+static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name, const string &view_query_sql,
+                                  bool cross_system, const string &attached_catalog = "",
+                                  const string &attached_schema = "") {
+	string query = "DELETE FROM " + view_name + ";\n";
+	query += "INSERT INTO " + view_name + " " + view_query_sql + ";\n\n";
+
+	metadata.UpdateTimestamp(view_name);
+	string update_ts = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_update = now() WHERE view_name = '" +
+	                   view_name + "';\n";
+
+	string delta_cleanup;
+	auto delta_tables = metadata.GetDeltaTables(view_name);
+	for (auto &dt : delta_tables) {
+		string resolved = dt;
+		if (cross_system) {
+			resolved = attached_catalog + "." + attached_schema + "." + dt;
+		}
+		delta_cleanup += "DELETE FROM " + resolved + " WHERE " + string(ivm::TIMESTAMP_COL) +
+		                 " < (SELECT min(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+		                 " WHERE table_name = '" + dt + "');\n";
+	}
+
+	return query + update_ts + "\n" + delta_cleanup;
+}
 
 string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &parameters) {
 	// queries to run in order to materialize IVM upserts
@@ -67,25 +94,21 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// Use con's transaction for catalog access — sees all committed state
 	con.BeginTransaction();
 	auto &con_ctx = *con.context;
-	auto delta_view_catalog_entry =
-	    catalog.GetEntry<TableCatalogEntry>(con_ctx, view_catalog_name, view_schema_name, "delta_" + view_name,
-	                                        OnEntryNotFound::THROW_EXCEPTION, error_context);
+	auto delta_view_catalog_entry = catalog.GetEntry<TableCatalogEntry>(
+	    con_ctx, view_catalog_name, view_schema_name, OpenIVMUtils::DeltaName(view_name),
+	    OnEntryNotFound::THROW_EXCEPTION, error_context);
 	auto index_delta_view_catalog_entry =
 	    Catalog::GetEntry(con_ctx, view_catalog_name, view_schema_name,
 	                      EntryLookupInfo(CatalogType::INDEX_ENTRY, view_name + "_ivm_index", error_context),
 	                      OnEntryNotFound::RETURN_NULL);
 	con.Rollback();
 
-	auto view_query_entry = con.Query("select * from _duckdb_ivm_views where view_name = '" + view_name + "';");
-	if (view_query_entry->HasError()) {
-		throw ParserException("Error while querying view definition");
-	}
-	if (view_query_entry->RowCount() == 0) {
+	IVMMetadata metadata(con);
+	auto view_query_sql = metadata.GetViewQuery(view_name);
+	if (view_query_sql.empty()) {
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
-	auto view_query_sql = view_query_entry->GetValue(1, 0).ToString();
-	auto view_query_type_data = view_query_entry->GetValue(2, 0);
-	IVMType view_query_type = static_cast<IVMType>(view_query_type_data.GetValue<int8_t>());
+	IVMType view_query_type = metadata.GetViewType(view_name);
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
 
@@ -102,29 +125,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	}
 
 	if (force_full_refresh) {
-		string recompute_query = "DELETE FROM " + view_name + ";\n";
-		recompute_query += "INSERT INTO " + view_name + " " + view_query_sql + ";\n";
-
-		string update_timestamp_query =
-		    "update _duckdb_ivm_delta_tables set last_update = now() where view_name = '" + view_name + "';\n";
-
-		auto tables =
-		    con.Query("select table_name from _duckdb_ivm_delta_tables where view_name = '" + view_name + "';");
-		string delete_from_delta_table_query;
-		if (!tables->HasError()) {
-			for (size_t i = 0; i < tables->RowCount(); i++) {
-				auto table_name = tables->GetValue(0, i).ToString();
-				if (cross_system) {
-					table_name = attached_db_catalog_name + "." + attached_db_schema_name + "." + table_name;
-				}
-				delete_from_delta_table_query += "delete from " + table_name +
-				                                 " where _duckdb_ivm_timestamp < (select min(last_update) from "
-				                                 "_duckdb_ivm_delta_tables where table_name = '" +
-				                                 table_name + "');\n";
-			}
-		}
-
-		return recompute_query + "\n" + update_timestamp_query + "\n" + delete_from_delta_table_query;
+		return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+		                           attached_db_schema_name);
 	}
 
 	// Adaptive cost model: estimate IVM vs full recompute cost.
@@ -147,35 +149,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 		con.Rollback();
 		if (cost_estimate.ShouldRecompute()) {
 			OPENIVM_DEBUG_PRINT("[ADAPTIVE] Full recompute is cheaper — skipping IVM\n");
-
-			// Build recompute query: delete all from MV, re-insert from original query
-			string recompute_query = "DELETE FROM " + view_name + ";\n";
-			recompute_query += "INSERT INTO " + view_name + " " + view_query_sql + ";\n";
-
-			// Still need to update timestamps and clean up delta tables
-			string update_timestamp_query =
-			    "update _duckdb_ivm_delta_tables set last_update = now() where view_name = '" + view_name + "';\n";
-
-			auto tables =
-			    con.Query("select table_name from _duckdb_ivm_delta_tables where view_name = '" + view_name + "';");
-			string delete_from_delta_table_query;
-			if (!tables->HasError()) {
-				for (size_t i = 0; i < tables->RowCount(); i++) {
-					auto table_name = tables->GetValue(0, i).ToString();
-					if (cross_system) {
-						table_name = attached_db_catalog_name + "." + attached_db_schema_name + "." + table_name;
-					}
-					delete_from_delta_table_query += "delete from " + table_name +
-					                                 " where _duckdb_ivm_timestamp < (select min(last_update) from "
-					                                 "_duckdb_ivm_delta_tables where table_name = '" +
-					                                 table_name + "');\n";
-				}
-			}
-
-			string query = recompute_query + "\n" + update_timestamp_query + "\n" + delete_from_delta_table_query;
-
-			OPENIVM_DEBUG_PRINT("[ADAPTIVE] Recompute query:\n%s\n", query.c_str());
-			return query;
+			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+			                           attached_db_schema_name);
 		}
 	}
 
@@ -188,15 +163,15 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	auto column_names = delta_view_columns.GetColumnNames();
 	// Check if the delta view has a timestamp column (present when created via CREATE MATERIALIZED VIEW)
 	bool has_ts_col =
-	    std::find(column_names.begin(), column_names.end(), "_duckdb_ivm_timestamp") != column_names.end();
+	    std::find(column_names.begin(), column_names.end(), string(ivm::TIMESTAMP_COL)) != column_names.end();
 	// Remove _duckdb_ivm_timestamp — it's auto-filled by DEFAULT (for chained MV support)
-	column_names.erase(std::remove(column_names.begin(), column_names.end(), string("_duckdb_ivm_timestamp")),
+	column_names.erase(std::remove(column_names.begin(), column_names.end(), string(ivm::TIMESTAMP_COL)),
 	                   column_names.end());
 
 	// Detect list mode: use element-wise list operations for LIST-typed aggregate columns
 	bool list_mode = false;
 	for (auto &col : delta_view_columns.Logical()) {
-		if (col.GetName() != "_duckdb_ivm_multiplicity" && col.GetType().id() == LogicalTypeId::LIST) {
+		if (col.GetName() != ivm::MULTIPLICITY_COL && col.GetType().id() == LogicalTypeId::LIST) {
 			list_mode = true;
 			break;
 		}
@@ -212,12 +187,12 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// in the current round have timestamps >= this value.
 	string delta_ts_filter;
 	if (has_ts_col) {
-		auto last_update_result =
-		    con.Query("SELECT last_update FROM _duckdb_ivm_delta_tables WHERE view_name = '" + view_name + "' LIMIT 1");
+		auto last_update_result = con.Query("SELECT last_update FROM " + string(ivm::DELTA_TABLES_TABLE) +
+		                                    " WHERE view_name = '" + view_name + "' LIMIT 1");
 		if (!last_update_result->HasError() && last_update_result->RowCount() > 0) {
 			auto ts = last_update_result->GetValue(0, 0);
 			if (!ts.IsNull()) {
-				delta_ts_filter = "_duckdb_ivm_timestamp >= '" + ts.ToString() + "'::TIMESTAMP";
+				delta_ts_filter = string(ivm::TIMESTAMP_COL) + " >= '" + ts.ToString() + "'::TIMESTAMP";
 			}
 		}
 	} // has_ts_col
@@ -256,14 +231,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// splitting the query in two to make it easier to turn into string (insertions are the same)
 	string do_ivm = "select * from DoIVM('" + view_catalog_name + "','" + view_schema_name + "','" + view_name + "');";
 
-	// we need to check if the view is in fact a MV
 	con.BeginTransaction();
-	// we need the table names since we need to update the metadata tables
-	auto tables = con.Query("select table_name from _duckdb_ivm_delta_tables where view_name = '" + view_name + "';");
-
-	if (tables->HasError()) {
-		throw ParserException("Error while querying _duckdb_ivm_delta_tables");
-	}
+	auto delta_table_names = metadata.GetDeltaTables(view_name);
 
 	// now we can plan the query
 	OPENIVM_DEBUG_PRINT("[UPSERT] Planning DoIVM query: %s\n", do_ivm.c_str());
@@ -286,7 +255,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 
 	// Use explicit column list in INSERT INTO delta_view, excluding _duckdb_ivm_timestamp
 	// so the DEFAULT now() fills it in (for chained MV support)
-	string delta_view_name = "delta_" + view_name;
+	string delta_view_name = OpenIVMUtils::DeltaName(view_name);
 	string insert_target = "INSERT INTO " + delta_view_name;
 	auto insert_pos = raw_ivm_sql.find(insert_target);
 	if (insert_pos != string::npos) {
@@ -303,8 +272,8 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	ivm_query += raw_ivm_sql;
 
 	// Delete from delta view: timestamp-based if downstream views depend on it, unconditional otherwise
-	auto downstream_check =
-	    con.Query("SELECT COUNT(*) FROM _duckdb_ivm_delta_tables WHERE table_name = '" + delta_view_name + "'");
+	auto downstream_check = con.Query("SELECT COUNT(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+	                                  " WHERE table_name = '" + delta_view_name + "'");
 	bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
 	                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
 
@@ -332,7 +301,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 			col_list += col;
 			if (keys_set.count(col)) {
 				val_list += "d." + col;
-			} else if (col == "_duckdb_ivm_multiplicity") {
+			} else if (col == ivm::MULTIPLICITY_COL) {
 				val_list += "false";
 			} else {
 				val_list += "0";
@@ -346,7 +315,7 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 		}
 
 		companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list + " FROM " +
-		                  delta_view_name + " d WHERE d._duckdb_ivm_multiplicity = true";
+		                  delta_view_name + " d WHERE d." + string(ivm::MULTIPLICITY_COL) + " = true";
 		if (!delta_ts_filter.empty()) {
 			companion_query += " AND d." + delta_ts_filter;
 		}
@@ -356,12 +325,11 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 
 	string delete_from_view_query;
 	if (has_downstream) {
-		delete_from_view_query = "delete from " + delta_view_name +
-		                         " where _duckdb_ivm_timestamp < (select min(last_update) from "
-		                         "_duckdb_ivm_delta_tables where table_name = '" +
-		                         delta_view_name + "');";
+		delete_from_view_query = "DELETE FROM " + delta_view_name + " WHERE " + string(ivm::TIMESTAMP_COL) +
+		                         " < (SELECT min(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+		                         " WHERE table_name = '" + delta_view_name + "');";
 	} else {
-		delete_from_view_query = "delete from " + delta_view_name + ";";
+		delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
 	}
 	string ivm_result;
 
@@ -371,19 +339,17 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// to check this, we extract the minimum timestamp from _duckdb_ivm_delta_tables
 	string delete_from_delta_table_query;
 	// firstly we reset the timestamp
-	string update_timestamp_query =
-	    "update _duckdb_ivm_delta_tables set last_update = now() where view_name = '" + view_name + "';\n";
+	string update_timestamp_query = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
+	                                " SET last_update = now() WHERE view_name = '" + view_name + "';\n";
 
-	for (size_t i = 0; i < tables->RowCount(); i++) {
-		auto table_name = tables->GetValue(0, i).ToString();
+	for (auto &dt : delta_table_names) {
+		string resolved = dt;
 		if (cross_system) {
-			table_name = attached_db_catalog_name + "." + attached_db_schema_name + "." + table_name;
+			resolved = attached_db_catalog_name + "." + attached_db_schema_name + "." + dt;
 		}
-		// now we delete anything we don't need anymore
-		delete_from_delta_table_query += "delete from " + table_name +
-		                                 " where _duckdb_ivm_timestamp < (select min(last_update) from "
-		                                 "_duckdb_ivm_delta_tables where table_name = '" +
-		                                 table_name + "');\n";
+		delete_from_delta_table_query += "DELETE FROM " + resolved + " WHERE " + string(ivm::TIMESTAMP_COL) +
+		                                 " < (SELECT min(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+		                                 " WHERE table_name = '" + dt + "');\n";
 	}
 
 	// Build the clean SQL (written to file for reference/replay)

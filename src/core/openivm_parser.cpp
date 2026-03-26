@@ -1,6 +1,7 @@
 #include "core/openivm_parser.hpp"
 
 #include "core/ivm_checker.hpp"
+#include "core/openivm_constants.hpp"
 #include "core/openivm_utils.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
@@ -211,17 +212,19 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 		OPENIVM_DEBUG_PRINT("\n");
 
-		auto system_table = "create table if not exists _duckdb_ivm_views (view_name varchar primary key, sql_string "
+		auto system_table = "create table if not exists " + string(ivm::VIEWS_TABLE) +
+		                    " (view_name varchar primary key, sql_string "
 		                    "varchar, type tinyint, last_update timestamp);\n";
 		OpenIVMUtils::WriteFile(system_tables_path, false, system_table);
 
-		auto delta_tables_table = "create table if not exists _duckdb_ivm_delta_tables (view_name varchar, table_name "
+		auto delta_tables_table = "create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
+		                          " (view_name varchar, table_name "
 		                          "varchar, last_update timestamp, primary key(view_name, table_name));\n";
 		OpenIVMUtils::WriteFile(system_tables_path, true, delta_tables_table);
 
-		auto ivm_table_insert = "insert or replace into _duckdb_ivm_views values ('" + view_name + "', '" +
-		                        OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) +
-		                        ", now());\n";
+		auto ivm_table_insert = "insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name +
+		                        "', '" + OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " +
+		                        to_string((int)ivm_type) + ", now());\n";
 		OpenIVMUtils::WriteFile(system_tables_path, true, ivm_table_insert);
 
 		auto table = "create table " + view_name + " as " + view_query + ";\n";
@@ -248,22 +251,21 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 			auto catalog_schema = catalog_value.ToString() + "." + schema_value.ToString() + ".";
 
-			auto delta_table =
-			    "create table if not exists " + catalog_schema + "delta_" + table_name +
-			    " as select *, true as _duckdb_ivm_multiplicity, now()::timestamp as _duckdb_ivm_timestamp from " +
-			    catalog_schema + table_name + " limit 0;\n";
+			auto delta_table = "create table if not exists " + catalog_schema + OpenIVMUtils::DeltaName(table_name) +
+			                   " as select *, true as " + string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
+			                   string(ivm::TIMESTAMP_COL) + " from " + catalog_schema + table_name + " limit 0;\n";
 			OpenIVMUtils::WriteFile(compiled_file_path, true, delta_table);
 
-			auto delta_table_insert = "insert into _duckdb_ivm_delta_tables values ('" + view_name + "', 'delta_" +
-			                          table_name + "', now());\n";
+			auto delta_table_insert = "insert into " + string(ivm::DELTA_TABLES_TABLE) + " values ('" + view_name +
+			                          "', '" + OpenIVMUtils::DeltaName(table_name) + "', now());\n";
 			OpenIVMUtils::WriteFile(system_tables_path, true, delta_table_insert);
 		}
 
-		string delta_view = "create table if not exists delta_" + view_name +
-		                    " as select *, true as _duckdb_ivm_multiplicity, now()::timestamp as "
-		                    "_duckdb_ivm_timestamp from " +
-		                    view_name + " limit 0;\n";
-		delta_view += "alter table delta_" + view_name + " alter _duckdb_ivm_timestamp set default now();\n";
+		string delta_view = "create table if not exists " + OpenIVMUtils::DeltaName(view_name) +
+		                    " as select *, true as " + string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
+		                    string(ivm::TIMESTAMP_COL) + " from " + view_name + " limit 0;\n";
+		delta_view += "alter table " + OpenIVMUtils::DeltaName(view_name) + " alter " + string(ivm::TIMESTAMP_COL) +
+		              " set default now();\n";
 		OpenIVMUtils::WriteFile(compiled_file_path, true, delta_view);
 
 		if (ivm_type == IVMType::AGGREGATE_GROUP) {
