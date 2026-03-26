@@ -1,5 +1,6 @@
 #include "core/openivm_parser.hpp"
 
+#include "core/ivm_checker.hpp"
 #include "core/openivm_utils.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
@@ -136,6 +137,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		OPENIVM_DEBUG_PRINT("[CREATE MV] View name: %s\n", view_name.c_str());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] View query: %s\n", view_query.c_str());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Logical plan:\n%s\n", plan->ToString().c_str());
+
+		// Validate plan compatibility (unless ivm_check is disabled)
+		Value ivm_check_val;
+		bool ivm_check = true;
+		if (context.TryGetCurrentSetting("ivm_check", ivm_check_val) && !ivm_check_val.IsNull()) {
+			ivm_check = ivm_check_val.GetValue<bool>();
+		}
+		if (ivm_check) {
+			ValidateIVMPlan(plan.get());
+		}
 
 		std::stack<LogicalOperator *> node_stack;
 		node_stack.push(plan.get());

@@ -110,6 +110,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::VARCHAR, Value("auto"));
 	db_config.AddExtensionOption("ivm_adaptive", "enable adaptive cost model (when false, always use IVM)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("ivm_check", "validate MV query IVM compatibility at creation time",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	Connection con(instance);
 	auto ivm_parser = duckdb::IVMParserExtension();

@@ -91,6 +91,42 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 
 	bool has_minmax = StringUtil::Contains(view_query_sql, "min(") || StringUtil::Contains(view_query_sql, "max(");
 
+	// Check ivm_refresh_mode: 'full' forces full recompute, skipping the IVM pipeline.
+	Value refresh_mode_val;
+	bool force_full_refresh = false;
+	if (context.TryGetCurrentSetting("ivm_refresh_mode", refresh_mode_val) && !refresh_mode_val.IsNull()) {
+		auto mode = StringUtil::Lower(refresh_mode_val.ToString());
+		if (mode == "full") {
+			force_full_refresh = true;
+		}
+	}
+
+	if (force_full_refresh) {
+		string recompute_query = "DELETE FROM " + view_name + ";\n";
+		recompute_query += "INSERT INTO " + view_name + " " + view_query_sql + ";\n";
+
+		string update_timestamp_query =
+		    "update _duckdb_ivm_delta_tables set last_update = now() where view_name = '" + view_name + "';\n";
+
+		auto tables =
+		    con.Query("select table_name from _duckdb_ivm_delta_tables where view_name = '" + view_name + "';");
+		string delete_from_delta_table_query;
+		if (!tables->HasError()) {
+			for (size_t i = 0; i < tables->RowCount(); i++) {
+				auto table_name = tables->GetValue(0, i).ToString();
+				if (cross_system) {
+					table_name = attached_db_catalog_name + "." + attached_db_schema_name + "." + table_name;
+				}
+				delete_from_delta_table_query += "delete from " + table_name +
+				                                 " where _duckdb_ivm_timestamp < (select min(last_update) from "
+				                                 "_duckdb_ivm_delta_tables where table_name = '" +
+				                                 table_name + "');\n";
+			}
+		}
+
+		return recompute_query + "\n" + update_timestamp_query + "\n" + delete_from_delta_table_query;
+	}
+
 	// Adaptive cost model: estimate IVM vs full recompute cost.
 	// Gated by ivm_adaptive setting (default false — always use IVM).
 	Value ivm_adaptive_val;

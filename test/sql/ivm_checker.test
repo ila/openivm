@@ -1,0 +1,168 @@
+# name: test/sql/ivm_checker.test
+# description: Test IVM compatibility checker (ivm_check setting)
+# group: [sql]
+
+require openivm
+
+# ==========================================
+# Setup base tables
+# ==========================================
+
+statement ok
+CREATE TABLE t1 (a INT, b INT);
+
+statement ok
+CREATE TABLE t2 (a INT, c INT);
+
+statement ok
+INSERT INTO t1 VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO t2 VALUES (1, 100), (2, 200);
+
+# ==========================================
+# Unsupported joins (ivm_check = true, default)
+# ==========================================
+
+statement error
+CREATE MATERIALIZED VIEW mv_left AS SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a;
+----
+does not support LEFT
+
+# RIGHT JOIN is rewritten to LEFT JOIN by DuckDB's planner
+statement error
+CREATE MATERIALIZED VIEW mv_right AS SELECT t1.a, t1.b, t2.c FROM t1 RIGHT JOIN t2 ON t1.a = t2.a;
+----
+does not support LEFT
+
+statement error
+CREATE MATERIALIZED VIEW mv_full AS SELECT t1.a, t1.b, t2.c FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.a;
+----
+does not support FULL
+
+statement error
+CREATE MATERIALIZED VIEW mv_cross AS SELECT t1.a, t2.c FROM t1 CROSS JOIN t2;
+----
+does not support CROSS
+
+# ==========================================
+# Unsupported aggregates
+# ==========================================
+
+statement error
+CREATE MATERIALIZED VIEW mv_avg AS SELECT a, AVG(b) AS avg_b FROM t1 GROUP BY a;
+----
+does not support the 'avg'
+
+statement error
+CREATE MATERIALIZED VIEW mv_stddev AS SELECT a, STDDEV(b) AS sd FROM t1 GROUP BY a;
+----
+does not support the 'stddev'
+
+statement error
+CREATE MATERIALIZED VIEW mv_string_agg AS SELECT STRING_AGG(a::VARCHAR, ',') AS all_a FROM t1;
+----
+does not support the 'string_agg'
+
+# ==========================================
+# Supported constructs still work
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_inner AS SELECT t1.a, t1.b, t2.c FROM t1 INNER JOIN t2 ON t1.a = t2.a;
+
+query III
+SELECT a, b, c FROM mv_inner ORDER BY a;
+----
+1	10	100
+2	20	200
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum AS SELECT a, SUM(b) AS total FROM t1 GROUP BY a;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_count AS SELECT COUNT(*) AS cnt FROM t1;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_minmax AS SELECT MIN(b) AS lo, MAX(b) AS hi FROM t1;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_proj AS SELECT a, b FROM t1;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_filter AS SELECT a, b FROM t1 WHERE b > 5;
+
+# ==========================================
+# ivm_check = false: bypass checker
+# ==========================================
+
+statement ok
+SET ivm_check = false;
+
+# LEFT JOIN now creates successfully
+statement ok
+CREATE MATERIALIZED VIEW mv_left_ok AS SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a;
+
+query III
+SELECT a, b, c FROM mv_left_ok ORDER BY a;
+----
+1	10	100
+2	20	200
+
+# AVG now creates successfully
+statement ok
+CREATE MATERIALIZED VIEW mv_avg_ok AS SELECT a, AVG(b) AS avg_b FROM t1 GROUP BY a;
+
+# Reset to default
+statement ok
+SET ivm_check = true;
+
+# ==========================================
+# Full refresh on bypassed MV
+# ==========================================
+
+statement ok
+INSERT INTO t1 VALUES (3, 30);
+
+statement ok
+INSERT INTO t2 VALUES (3, 300);
+
+# Full refresh mode works for the bypassed LEFT JOIN MV
+statement ok
+SET ivm_refresh_mode = 'full';
+
+statement ok
+PRAGMA ivm('mv_left_ok');
+
+query III
+SELECT a, b, c FROM mv_left_ok ORDER BY a;
+----
+1	10	100
+2	20	200
+3	30	300
+
+# Full refresh for the bypassed AVG MV
+statement ok
+PRAGMA ivm('mv_avg_ok');
+
+query II
+SELECT a, avg_b FROM mv_avg_ok ORDER BY a;
+----
+1	10.0
+2	20.0
+3	30.0
+
+# Reset refresh mode
+statement ok
+SET ivm_refresh_mode = 'auto';
+
+# Incremental refresh still works for supported MVs
+statement ok
+PRAGMA ivm('mv_sum');
+
+query II
+SELECT a, total FROM mv_sum ORDER BY a;
+----
+1	10
+2	20
+3	30

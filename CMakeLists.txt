@@ -15,6 +15,7 @@ set(EXTENSION_SOURCES
     src/core/openivm_parser.cpp
     src/core/openivm_utils.cpp
     src/core/openivm_metadata.cpp
+    src/core/ivm_checker.cpp
     src/upsert/openivm_upsert.cpp
     src/upsert/openivm_compile_upsert.cpp
     src/upsert/openivm_cost_model.cpp
