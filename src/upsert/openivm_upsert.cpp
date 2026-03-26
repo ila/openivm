@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/openivm_metadata.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "core/openivm_utils.hpp"
 #include "upsert/openivm_compile_upsert.hpp"
 #include "upsert/openivm_cost_model.hpp"
@@ -85,9 +86,11 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 		view_name = StringValue::Get(parameters.values[4]);
 		cross_system = true;
 	} else {
-		// simple ivm, we assume current schema and catalog
-		view_catalog_name = con.Query("select current_catalog();")->GetValue(0, 0).ToString();
-		view_schema_name = con.Query("select current_schema();")->GetValue(0, 0).ToString();
+		// simple ivm, use current catalog and schema from the search path
+		auto &search_path = ClientData::Get(context).catalog_search_path;
+		auto default_entry = search_path->GetDefault();
+		view_catalog_name = default_entry.catalog;
+		view_schema_name = default_entry.schema;
 		view_name = StringValue::Get(parameters.values[0]);
 	}
 

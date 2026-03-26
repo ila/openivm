@@ -105,7 +105,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("ivm_catalog_name", "catalog name", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("ivm_schema_name", "schema name", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("execute", "whether to execute queries", LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	db_config.AddExtensionOption("ivm_done", "whether the query has been parsed", LogicalType::BOOLEAN);
 	db_config.AddExtensionOption("ivm_refresh_mode", "refresh strategy: auto, incremental, or full",
 	                             LogicalType::VARCHAR, Value("auto"));
 	db_config.AddExtensionOption("ivm_adaptive", "enable adaptive cost model (when false, always use IVM)",

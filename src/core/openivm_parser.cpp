@@ -24,19 +24,14 @@
 
 namespace duckdb {
 
-// Thread-local storage for passing DDL from plan → bind phase
-// NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
-static thread_local vector<string> g_ivm_pending_ddl;
-// NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
-
 static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	auto ddl = std::move(g_ivm_pending_ddl);
-	g_ivm_pending_ddl.clear();
-	if (!ddl.empty()) {
+	// DDL statements are passed via result.parameters from the plan function.
+	if (!input.inputs.empty()) {
 		auto &db = DatabaseInstance::GetDatabase(context);
 		Connection conn(db);
-		for (auto &q : ddl) {
+		for (auto &param : input.inputs) {
+			auto q = param.GetValue<string>();
 			if (q.empty()) {
 				continue;
 			}
@@ -94,6 +89,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
                                                               unique_ptr<ParserExtensionParseData> parse_data) {
 	auto &ivm_parse_data = dynamic_cast<IVMParseData &>(*parse_data);
 	auto statement = dynamic_cast<SQLStatement *>(ivm_parse_data.statement.get());
+
+	ParserExtensionPlanResult result;
 
 	if (ivm_parse_data.plan) {
 		Connection con(*context.db.get());
@@ -235,13 +232,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			Value schema_value;
 
 			if (catalog_value.IsNull() && !context.db->config.options.database_path.empty()) {
-				auto catalog_name =
-				    con.Query("select table_catalog from information_schema.tables where table_name = '" + table_name +
-				              "';")
-				        ->Fetch()
-				        ->GetValue(0, 0);
-				catalog_value = catalog_name;
-			} else if (catalog_value.IsNull()) {
+				// Look up the catalog name for this table via Catalog API
+				con.BeginTransaction();
+				auto entry = Catalog::GetEntry<TableCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA,
+				                                                  table_name, OnEntryNotFound::RETURN_NULL);
+				if (entry) {
+					catalog_value = Value(entry->ParentCatalog().GetName());
+				}
+				con.Rollback();
+			}
+			if (catalog_value.IsNull()) {
 				catalog_value = Value("memory");
 			}
 
@@ -313,13 +313,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			add_ddl(ddl, duckdb::OpenIVMUtils::ReadFile(index_file_path));
 		}
 
-		g_ivm_pending_ddl = std::move(ddl);
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Compiled %lu DDL queries for bind phase\n",
-		                    (unsigned long)g_ivm_pending_ddl.size());
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Compiled %lu DDL queries for bind phase\n", (unsigned long)ddl.size());
+
+		// Pass DDL via result.parameters — the bind function receives them as input.inputs.
+		// This replaces the fragile thread-local g_ivm_pending_ddl mechanism.
+		for (auto &q : ddl) {
+			result.parameters.push_back(Value(q));
+		}
 	}
 
 	// Return DDL executor table function
-	ParserExtensionPlanResult result;
 	result.function =
 	    TableFunction("ivm_ddl_executor", {}, IVMDDLExecuteFunction, IVMDDLBindFunction, IVMFunction::IVMInit);
 	result.requires_valid_transaction = true;
