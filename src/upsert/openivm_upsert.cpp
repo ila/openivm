@@ -368,17 +368,12 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	string clean_query = ivm_query + "\n" + companion_query + "\n" + upsert_query + "\n" + update_timestamp_query +
 	                     "\n" + delete_from_view_query + "\n" + ivm_result + "\n" + delete_from_delta_table_query;
 
-	// now also compiling the queries for future usage
-	string db_path;
-	if (!context.db->config.options.database_path.empty()) {
-		db_path = context.db->GetFileSystem().GetWorkingDirectory();
-	} else {
-		Value db_path_value;
-		context.TryGetCurrentSetting("ivm_files_path", db_path_value);
-		db_path = db_path_value.ToString();
+	// Write reference SQL to disk only if ivm_files_path is explicitly set
+	Value files_path_val;
+	if (context.TryGetCurrentSetting("ivm_files_path", files_path_val) && !files_path_val.IsNull()) {
+		string ivm_file_path = files_path_val.ToString() + "/ivm_upsert_queries_" + view_name + ".sql";
+		duckdb::OpenIVMUtils::WriteFile(ivm_file_path, false, clean_query);
 	}
-	string ivm_file_path = db_path + "/ivm_upsert_queries_" + view_name + ".sql";
-	duckdb::OpenIVMUtils::WriteFile(ivm_file_path, false, clean_query);
 
 	OPENIVM_DEBUG_PRINT("[UPSERT] Generated query:\n%s\n", clean_query.c_str());
 

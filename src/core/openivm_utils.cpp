@@ -20,19 +20,6 @@ void OpenIVMUtils::WriteFile(const string &filename, bool append, const string &
 	file.close();
 }
 
-string OpenIVMUtils::ReadFile(const string &file_path) {
-	string content;
-	std::ifstream file(file_path);
-	if (file.is_open()) {
-		string line;
-		while (std::getline(file, line)) {
-			content += line + "\n";
-		}
-		file.close();
-	}
-	return content;
-}
-
 string OpenIVMUtils::ExtractTableName(const string &sql) {
 	// Matches: CREATE TABLE [IF NOT EXISTS] name|"quoted name" (AS ...|(...))
 	std::regex table_name_regex(
@@ -236,19 +223,6 @@ string OpenIVMUtils::FullDeltaName(const string &catalog, const string &schema, 
 
 bool OpenIVMUtils::IsDelta(const string &name) {
 	return name.size() >= 6 && name.rfind("delta_", 0) == 0;
-}
-
-string OpenIVMUtils::DbPath(ClientContext &context) {
-	string db_path;
-	if (!context.db->config.options.database_path.empty()) {
-		db_path = context.db->GetFileSystem().GetWorkingDirectory();
-	}
-	Value db_path_value;
-	context.TryGetCurrentSetting("ivm_files_path", db_path_value);
-	if (!db_path_value.IsNull()) {
-		db_path = db_path_value.ToString();
-	}
-	return db_path;
 }
 
 } // namespace duckdb

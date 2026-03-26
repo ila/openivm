@@ -11,9 +11,7 @@
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/function/pragma_function.hpp"
-#include "duckdb/main/appender.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
@@ -43,10 +41,6 @@ struct DoIVMData : public GlobalTableFunctionState {
 unique_ptr<GlobalTableFunctionState> DoIVMInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto result = make_uniq<DoIVMData>();
 	return std::move(result);
-}
-
-static unique_ptr<TableRef> DoIVM(ClientContext &context, TableFunctionBindInput &input) {
-	return nullptr;
 }
 
 static duckdb::unique_ptr<FunctionData> DoIVMBind(ClientContext &context, TableFunctionBindInput &input,
@@ -121,7 +115,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	con.BeginTransaction();
 	auto &catalog = Catalog::GetSystemCatalog(*con.context);
-	ivm_func.bind_replace = reinterpret_cast<table_function_bind_replace_t>(DoIVM);
 	ivm_func.name = "DoIVM";
 	ivm_func.named_parameters["view_catalog_name"];
 	ivm_func.named_parameters["view_schema_name"];

@@ -14,7 +14,6 @@ namespace duckdb {
 class OpenIVMUtils {
 public:
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
-	static string ReadFile(const string &file_path);
 	static string ExtractTableName(const string &sql);
 	static string EscapeSingleQuotes(const string &input);
 	static void ReplaceMaterializedView(string &query);
@@ -31,7 +30,6 @@ public:
 	static string FullName(const string &catalog, const string &schema, const string &table);
 	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
 	static bool IsDelta(const string &name);
-	static string DbPath(ClientContext &context);
 	static string GenerateDeltaTable(string &query);
 
 	/// Quote an identifier for safe use in generated SQL (handles reserved words and special chars).
