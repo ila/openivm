@@ -14,6 +14,8 @@ Never execute git commands that could lose code. Always ask the user for permiss
 
 - **New features must have tests.** Ask the user whether to create a new test file or extend an existing one in `test/sql/`.
 - **Never remove a failing test to "fix" a failure.** If a test fails, fix the underlying bug. Tests exist for a reason.
+- **Every IVM refresh in a test MUST be cross-checked** with `EXCEPT ALL` in both directions to verify full bag equality between the MV and the base query. Never just check COUNT or specific values.
+- **Stress tests must batch many conflicting DML ops** (INSERT + DELETE + UPDATE on same rows) before a single refresh. Don't do 1 insert → refresh → 1 delete → refresh — that's not testing delta consolidation.
 - **Before implementing anything, search the existing codebase** for similar patterns or solutions. Check if a helper function, utility, or prior approach already addresses the problem. Reuse before reinventing.
 - **Use helper functions.** Factor shared logic into helpers rather than duplicating code. Check `src/include/rules/ivm_rule.hpp`, `src/rules/ivm_helpers.cpp`, and `src/include/core/openivm_utils.hpp` for existing utilities.
 - **Never edit the `duckdb/` submodule.** The DuckDB source is read-only. All IVM logic lives in `src/` and `test/`. If you need DuckDB internals, use the public API or ask the user.
@@ -78,9 +80,8 @@ For N tables, the join rule generates 2^N - 1 terms using inclusion-exclusion:
 - For each non-empty subset S of tables: replace tables in S with their delta scans, keep others as current base table scans
 - Combined multiplicity = XOR of all delta multiplicities (XOR maps ±1 sign to boolean)
 - All terms are combined with UNION ALL
-- The upsert step consolidates canceling entries using EXCEPT ALL on the (small) delta
 
-Only INNER joins are currently supported.
+Only INNER joins are currently supported. Max 16 tables (`ivm::MAX_JOIN_TABLES`).
 
 ### Upsert Compilation
 
@@ -88,9 +89,11 @@ Three compilation paths based on view type (`IVMType`):
 
 | View Type | Function | Strategy |
 |---|---|---|
-| `AGGREGATE_GROUP` | `CompileAggregateGroups()` | Groups delta by key, merges with existing aggregate rows |
-| `SIMPLE_AGGREGATE` | `CompileSimpleAggregates()` | Updates single-row aggregate result |
-| `SIMPLE_PROJECTION` | `CompileProjectionsFilters()` | INSERTs/DELETEs rows directly using EXCEPT ALL consolidation |
+| `AGGREGATE_GROUP` | `CompileAggregateGroups()` | CTE consolidates delta per group, MERGE INTO updates/inserts |
+| `SIMPLE_AGGREGATE` | `CompileSimpleAggregates()` | Single CTE consolidates all columns, UPDATE adds deltas |
+| `SIMPLE_PROJECTION` | `CompileProjectionsFilters()` | Counting-based consolidation (GROUP BY + generate_series/rowid for bag semantics) |
+
+MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original query.
 
 ### Key Architectural Rules
 
@@ -120,9 +123,8 @@ Three compilation paths based on view type (`IVMType`):
 |---|---|---|---|
 | `ivm_refresh_mode` | VARCHAR | `"auto"` | `"auto"`, `"incremental"`, or `"full"` |
 | `ivm_adaptive` | BOOLEAN | `false` | Enable adaptive cost model |
-| `ivm_files_path` | VARCHAR | — | Path for compiled query files |
-| `ivm_system` | VARCHAR | — | Cross-system database support |
-| `execute` | BOOLEAN | `true` | Whether to execute queries |
+| `ivm_check` | BOOLEAN | `true` | Validate MV query IVM compatibility at creation |
+| `ivm_files_path` | VARCHAR | — | Path for compiled query reference files |
 
 ## Debugging
 
