@@ -4,7 +4,7 @@ namespace duckdb {
 
 string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
-                              bool list_mode) {
+                              bool list_mode, const string &delta_ts_filter) {
 	auto index_catalog_entry = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
 	auto key_ids = index_catalog_entry->column_ids;
 
@@ -31,11 +31,12 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 				keys_tuple += ", ";
 			}
 		}
+		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 		string delete_query = "delete from " + view_name + " where (" + keys_tuple + ") in (\n" + "  select distinct " +
-		                      keys_tuple + " from delta_" + view_name + "\n);\n";
+		                      keys_tuple + " from delta_" + view_name + delta_where + "\n);\n";
 		string insert_query = "insert into " + view_name + "\n" + "select * from (" + view_query_sql +
 		                      ") _ivm_recompute\n" + "where (" + keys_tuple + ") in (\n" + "  select distinct " +
-		                      keys_tuple + " from delta_" + view_name + "\n);\n";
+		                      keys_tuple + " from delta_" + view_name + delta_where + "\n);\n";
 		return delete_query + "\n" + insert_query;
 	}
 
@@ -63,7 +64,11 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	}
 	cte_select_string.erase(cte_select_string.size() - 2, 2);
 	cte_select_string += "\n";
-	string cte_from_string = "from delta_" + view_name + "\n";
+	string cte_from_string = "from delta_" + view_name;
+	if (!delta_ts_filter.empty()) {
+		cte_from_string += " WHERE " + delta_ts_filter;
+	}
+	cte_from_string += "\n";
 	string cte_group_by_string = "group by ";
 	for (auto &key : keys) {
 		cte_group_by_string = cte_group_by_string + key + ", ";
@@ -135,13 +140,14 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 }
 
 string CompileSimpleAggregates(string &view_name, const vector<string> &column_names, const string &view_query_sql,
-                               bool has_minmax, bool list_mode) {
+                               bool has_minmax, bool list_mode, const string &delta_ts_filter) {
 	if (has_minmax) {
 		string delete_query = "delete from " + view_name + ";\n";
 		string insert_query = "insert into " + view_name + " " + view_query_sql + ";\n";
 		return delete_query + insert_query;
 	}
 
+	string ts_and = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
 	string update_query = "update " + view_name + "\nset ";
 	bool first = true;
 	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
@@ -153,17 +159,18 @@ string CompileSimpleAggregates(string &view_name, const vector<string> &column_n
 			first = false;
 			if (list_mode) {
 				string negate_del = "coalesce((select list_transform(" + column + ", lambda x: -x) from delta_" +
-				                    view_name + " where _duckdb_ivm_multiplicity = false), " + zeros_list + ")";
+				                    view_name + " where _duckdb_ivm_multiplicity = false" + ts_and + "), " +
+				                    zeros_list + ")";
 				string ins = "coalesce((select " + column + " from delta_" + view_name +
-				             " where _duckdb_ivm_multiplicity = true), " + zeros_list + ")";
+				             " where _duckdb_ivm_multiplicity = true" + ts_and + "), " + zeros_list + ")";
 				string delta = "list_transform(list_zip(" + negate_del + ", " + ins + "), lambda x: x[1] + x[2])";
 				update_query +=
 				    column + " = list_transform(list_zip(" + column + ", " + delta + "), lambda x: x[1] + x[2])";
 			} else {
 				update_query += column + " = \n\tcoalesce(" + column + ", 0) \n\t\t- coalesce((select " + column +
-				                " from delta_" + view_name +
-				                " where _duckdb_ivm_multiplicity = false), 0)\n\t\t+ coalesce((select " + column +
-				                " from delta_" + view_name + " where _duckdb_ivm_multiplicity = true), 0)";
+				                " from delta_" + view_name + " where _duckdb_ivm_multiplicity = false" + ts_and +
+				                "), 0)\n\t\t+ coalesce((select " + column + " from delta_" + view_name +
+				                " where _duckdb_ivm_multiplicity = true" + ts_and + "), 0)";
 			}
 		}
 	}
@@ -171,7 +178,7 @@ string CompileSimpleAggregates(string &view_name, const vector<string> &column_n
 	return update_query;
 }
 
-string CompileProjectionsFilters(string &view_name, const vector<string> &column_names) {
+string CompileProjectionsFilters(string &view_name, const vector<string> &column_names, const string &delta_ts_filter) {
 	string select_columns;
 	string match_conditions;
 	for (auto &column : column_names) {
@@ -186,9 +193,11 @@ string CompileProjectionsFilters(string &view_name, const vector<string> &column
 	// Consolidate the delta using EXCEPT ALL to cancel out matching insert/delete pairs.
 	// This is needed because the inclusion-exclusion join delta rule can produce
 	// redundant entries that cancel each other in bag arithmetic.
-	string ins_cte = "SELECT " + select_columns + " FROM delta_" + view_name + " WHERE _duckdb_ivm_multiplicity = true";
+	string ts_and = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
+	string ins_cte =
+	    "SELECT " + select_columns + " FROM delta_" + view_name + " WHERE _duckdb_ivm_multiplicity = true" + ts_and;
 	string dels_cte =
-	    "SELECT " + select_columns + " FROM delta_" + view_name + " WHERE _duckdb_ivm_multiplicity = false";
+	    "SELECT " + select_columns + " FROM delta_" + view_name + " WHERE _duckdb_ivm_multiplicity = false" + ts_and;
 
 	string delete_query = "WITH net_dels AS (\n  " + dels_cte + "\n  EXCEPT ALL\n  " + ins_cte + "\n)\ndelete from " +
 	                      view_name + " where exists (select 1 from net_dels where " + match_conditions + ");\n\n";

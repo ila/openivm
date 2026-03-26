@@ -150,6 +150,9 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	const ColumnList &delta_view_columns = delta_view_entry->GetColumns();
 
 	auto column_names = delta_view_columns.GetColumnNames();
+	// Check if the delta view has a timestamp column (present when created via CREATE MATERIALIZED VIEW)
+	bool has_ts_col =
+	    std::find(column_names.begin(), column_names.end(), "_duckdb_ivm_timestamp") != column_names.end();
 	// Remove _duckdb_ivm_timestamp — it's auto-filled by DEFAULT (for chained MV support)
 	column_names.erase(std::remove(column_names.begin(), column_names.end(), string("_duckdb_ivm_timestamp")),
 	                   column_names.end());
@@ -166,9 +169,25 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 
 	string upsert_query;
 
+	// Build a timestamp filter for the delta_view reads in the upsert query.
+	// This prevents double-counting when chained MVs accumulate delta_view rows
+	// from multiple refresh rounds (because downstream views haven't consumed them yet).
+	// The filter uses the view's current last_update — rows inserted by the IVM query
+	// in the current round have timestamps >= this value.
+	string delta_ts_filter;
+	if (has_ts_col) {
+		auto last_update_result =
+		    con.Query("SELECT last_update FROM _duckdb_ivm_delta_tables WHERE view_name = '" + view_name + "' LIMIT 1");
+		if (!last_update_result->HasError() && last_update_result->RowCount() > 0) {
+			auto ts = last_update_result->GetValue(0, 0);
+			if (!ts.IsNull()) {
+				delta_ts_filter = "_duckdb_ivm_timestamp >= '" + ts.ToString() + "'::TIMESTAMP";
+			}
+		}
+	} // has_ts_col
+
 	// this is to compile the query to merge the materialized view with its delta version
 	// depending on the query type, this procedure will be done differently
-	// aggregates require an upsert query, while simple filters and projections are an insert
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n",
 	                    view_query_type == IVMType::AGGREGATE_GROUP     ? "AGGREGATE_GROUP"
 	                    : view_query_type == IVMType::SIMPLE_AGGREGATE  ? "SIMPLE_AGGREGATE"
@@ -177,18 +196,19 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_GROUP: {
 		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
-		                                      view_query_sql, has_minmax, list_mode);
+		                                      view_query_sql, has_minmax, list_mode, delta_ts_filter);
 		break;
 	}
 
 	// note: simple_filter removed 2024-12-11
 	case IVMType::SIMPLE_PROJECTION: {
-		upsert_query = CompileProjectionsFilters(view_name, column_names);
+		upsert_query = CompileProjectionsFilters(view_name, column_names, delta_ts_filter);
 		break;
 	}
 
 	case IVMType::SIMPLE_AGGREGATE: {
-		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode);
+		upsert_query =
+		    CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode, delta_ts_filter);
 		break;
 	}
 		// todo joins
@@ -251,6 +271,53 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	    con.Query("SELECT COUNT(*) FROM _duckdb_ivm_delta_tables WHERE table_name = '" + delta_view_name + "'");
 	bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
 	                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
+
+	// For AGGREGATE_GROUP views with downstream consumers: insert companion false/zero
+	// rows for groups that already exist in the MV.  This ensures downstream COUNT(*)
+	// correctly treats aggregate updates as net-zero (+1 true, -1 false) instead of +1.
+	// SUM downstream is unaffected because the false rows carry 0 aggregate values.
+	string companion_query;
+	if (view_query_type == IVMType::AGGREGATE_GROUP && has_downstream && index_delta_view_catalog_entry) {
+		auto *idx = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
+		auto key_ids = idx->column_ids;
+		vector<string> keys;
+		unordered_set<string> keys_set;
+		for (auto &kid : key_ids) {
+			keys.push_back(column_names[kid]);
+			keys_set.insert(column_names[kid]);
+		}
+
+		string col_list, val_list, join_cond;
+		for (auto &col : column_names) {
+			if (!col_list.empty()) {
+				col_list += ", ";
+				val_list += ", ";
+			}
+			col_list += col;
+			if (keys_set.count(col)) {
+				val_list += "d." + col;
+			} else if (col == "_duckdb_ivm_multiplicity") {
+				val_list += "false";
+			} else {
+				val_list += "0";
+			}
+		}
+		for (size_t i = 0; i < keys.size(); i++) {
+			if (i > 0) {
+				join_cond += " AND ";
+			}
+			join_cond += "d." + keys[i] + " IS NOT DISTINCT FROM m." + keys[i];
+		}
+
+		companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list + " FROM " +
+		                  delta_view_name + " d WHERE d._duckdb_ivm_multiplicity = true";
+		if (!delta_ts_filter.empty()) {
+			companion_query += " AND d." + delta_ts_filter;
+		}
+		companion_query += " AND EXISTS (SELECT 1 FROM " + view_name + " m WHERE " + join_cond + ");\n";
+		OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
+	}
+
 	string delete_from_view_query;
 	if (has_downstream) {
 		delete_from_view_query = "delete from " + delta_view_name +
@@ -284,8 +351,11 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	}
 
 	// Build the clean SQL (written to file for reference/replay)
-	string clean_query = ivm_query + "\n\n" + update_timestamp_query + "\n" + upsert_query + "\n" +
-	                     delete_from_view_query + "\n" + ivm_result + "\n" + delete_from_delta_table_query;
+	// Order: IVM query → upsert → update timestamps → cleanup
+	// update_timestamp MUST run after upsert so the delta_ts_filter in the upsert
+	// can correctly distinguish current-round vs old delta_view rows.
+	string clean_query = ivm_query + "\n" + companion_query + "\n" + upsert_query + "\n" + update_timestamp_query +
+	                     "\n" + delete_from_view_query + "\n" + ivm_result + "\n" + delete_from_delta_table_query;
 
 	// now also compiling the queries for future usage
 	string db_path;
