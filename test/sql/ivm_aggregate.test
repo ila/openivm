@@ -1,0 +1,948 @@
+# name: test/sql/ivm_aggregate.test
+# description: Test IVM with all aggregate types (SUM, COUNT, MIN, MAX, AVG, grouped and ungrouped)
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE sales (id INT, region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO sales VALUES (1, 'east', 100), (2, 'west', 200), (3, 'east', 150);
+
+statement ok
+create materialized view sales_summary as (select region, sum(amount) as total, count(amount) as cnt from sales group by region);
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	250	2
+west	200	1
+
+# --- Insert into existing group ---
+statement ok
+INSERT INTO sales VALUES (4, 'east', 50);
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	300	3
+west	200	1
+
+# --- Insert into new group ---
+statement ok
+INSERT INTO sales VALUES (5, 'north', 300);
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	300	3
+north	300	1
+west	200	1
+
+# --- Delete from existing group ---
+statement ok
+DELETE FROM sales WHERE id = 1;
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	200	2
+north	300	1
+west	200	1
+
+# --- Multiple inserts in same group ---
+statement ok
+INSERT INTO sales VALUES (6, 'west', 75), (7, 'west', 25);
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	200	2
+north	300	1
+west	300	3
+
+# --- No-op PRAGMA ---
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	200	2
+north	300	1
+west	300	3
+
+# --- Batch insert into multiple groups at once ---
+statement ok
+INSERT INTO sales VALUES (10, 'south', 100), (11, 'south', 200), (12, 'north', 50);
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary WHERE region IN ('south', 'north') ORDER BY region;
+----
+north	350	2
+south	300	2
+
+# --- Mixed insert + delete in same cycle ---
+statement ok
+INSERT INTO sales VALUES (13, 'west', 100);
+
+statement ok
+DELETE FROM sales WHERE id = 6;
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary WHERE region = 'west';
+----
+west	325	3
+
+# --- Delete ALL rows from a group ---
+statement ok
+DELETE FROM sales WHERE region = 'east';
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary WHERE region != 'east' ORDER BY region;
+----
+north	350	2
+south	300	2
+west	325	3
+
+# ==========================================
+# NULL values as GROUP BY keys
+# ==========================================
+
+statement ok
+CREATE TABLE nullable_grp (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO nullable_grp VALUES ('a', 10), (NULL, 20), ('a', 30), (NULL, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_null_grp AS SELECT grp, SUM(val) AS total FROM nullable_grp GROUP BY grp;
+
+query II
+SELECT grp, total FROM mv_null_grp ORDER BY grp NULLS LAST;
+----
+a	40
+NULL	60
+
+statement ok
+INSERT INTO nullable_grp VALUES (NULL, 5), ('b', 100);
+
+statement ok
+pragma ivm('mv_null_grp');
+
+query II
+SELECT grp, total FROM mv_null_grp ORDER BY grp NULLS LAST;
+----
+a	40
+b	100
+NULL	65
+
+# Cross-check
+query II
+SELECT grp, SUM(val) FROM nullable_grp GROUP BY grp ORDER BY grp NULLS LAST;
+----
+a	40
+b	100
+NULL	65
+
+# Delete all NULLs
+statement ok
+DELETE FROM nullable_grp WHERE grp IS NULL;
+
+statement ok
+pragma ivm('mv_null_grp');
+
+query II
+SELECT grp, total FROM mv_null_grp ORDER BY grp;
+----
+a	40
+b	100
+
+# ==========================================
+# DECIMAL / NUMERIC columns in SUM
+# ==========================================
+
+statement ok
+CREATE TABLE decimals (category VARCHAR, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO decimals VALUES ('x', 10.50), ('x', 20.75), ('y', 100.00);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dec AS SELECT category, SUM(amount) AS total FROM decimals GROUP BY category;
+
+query II
+SELECT category, total FROM mv_dec ORDER BY category;
+----
+x	31.25
+y	100.00
+
+statement ok
+INSERT INTO decimals VALUES ('x', 0.01), ('y', 99.99);
+
+statement ok
+pragma ivm('mv_dec');
+
+query II
+SELECT category, total FROM mv_dec ORDER BY category;
+----
+x	31.26
+y	199.99
+
+# Cross-check
+query II
+SELECT category, SUM(amount) FROM decimals GROUP BY category ORDER BY category;
+----
+x	31.26
+y	199.99
+
+# ==========================================
+# BIGINT columns
+# ==========================================
+
+statement ok
+CREATE TABLE big_nums (grp INT, val BIGINT);
+
+statement ok
+INSERT INTO big_nums VALUES (1, 9223372036854775000), (1, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_big AS SELECT grp, SUM(val) AS total FROM big_nums GROUP BY grp;
+
+query II
+SELECT grp, total FROM mv_big;
+----
+1	9223372036854775100
+
+statement ok
+INSERT INTO big_nums VALUES (1, 500);
+
+statement ok
+pragma ivm('mv_big');
+
+query II
+SELECT grp, total FROM mv_big;
+----
+1	9223372036854775600
+
+# ==========================================
+# DATE columns as GROUP BY keys
+# ==========================================
+
+statement ok
+CREATE TABLE daily_sales (sale_date DATE, amount INT);
+
+statement ok
+INSERT INTO daily_sales VALUES ('2024-01-01', 100), ('2024-01-01', 200), ('2024-01-02', 300);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_daily AS SELECT sale_date, SUM(amount) AS total FROM daily_sales GROUP BY sale_date;
+
+query II
+SELECT sale_date, total FROM mv_daily ORDER BY sale_date;
+----
+2024-01-01	300
+2024-01-02	300
+
+statement ok
+INSERT INTO daily_sales VALUES ('2024-01-02', 50), ('2024-01-03', 400);
+
+statement ok
+pragma ivm('mv_daily');
+
+query II
+SELECT sale_date, total FROM mv_daily ORDER BY sale_date;
+----
+2024-01-01	300
+2024-01-02	350
+2024-01-03	400
+
+# Cross-check
+query II
+SELECT sale_date, SUM(amount) FROM daily_sales GROUP BY sale_date ORDER BY sale_date;
+----
+2024-01-01	300
+2024-01-02	350
+2024-01-03	400
+
+# ==========================================
+# Empty table → CREATE MV → INSERT → refresh
+# ==========================================
+
+statement ok
+CREATE TABLE empty_base (id INT, val INT);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_empty AS SELECT id, SUM(val) AS total FROM empty_base GROUP BY id;
+
+query II
+SELECT id, total FROM mv_empty;
+----
+
+statement ok
+INSERT INTO empty_base VALUES (1, 100), (2, 200);
+
+statement ok
+pragma ivm('mv_empty');
+
+query II
+SELECT id, total FROM mv_empty ORDER BY id;
+----
+1	100
+2	200
+
+# ==========================================
+# Large batch INSERT (1000 rows)
+# ==========================================
+
+statement ok
+CREATE TABLE batch_tbl (grp INT, val INT);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_batch AS SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM batch_tbl GROUP BY grp;
+
+statement ok
+INSERT INTO batch_tbl SELECT i % 10, i FROM range(1000) t(i);
+
+statement ok
+pragma ivm('mv_batch');
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM batch_tbl GROUP BY grp
+    EXCEPT
+    SELECT grp, total, cnt FROM mv_batch
+);
+----
+0
+
+# ==========================================
+# DELETE all rows → MV should be empty
+# ==========================================
+
+statement ok
+CREATE TABLE del_all (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO del_all VALUES ('a', 1), ('b', 2);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_del_all AS SELECT grp, SUM(val) AS total FROM del_all GROUP BY grp;
+
+statement ok
+DELETE FROM del_all;
+
+statement ok
+pragma ivm('mv_del_all');
+
+query II
+SELECT grp, total FROM mv_del_all;
+----
+
+# ==========================================
+# UNGROUPED (SCALAR) AGGREGATES
+# ==========================================
+
+
+statement ok
+CREATE TABLE scores (id INT, value INT, label VARCHAR);
+
+statement ok
+INSERT INTO scores VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c');
+
+statement ok
+create materialized view score_totals as (select sum(value) as total, count(label) as cnt from scores);
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+60	3
+
+# --- Insert ---
+statement ok
+INSERT INTO scores VALUES (4, 40, 'd');
+
+statement ok
+pragma ivm('score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+100	4
+
+# --- Delete ---
+statement ok
+DELETE FROM scores WHERE id = 1;
+
+statement ok
+pragma ivm('score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+90	3
+
+# --- Mixed insert + delete ---
+statement ok
+INSERT INTO scores VALUES (5, 50, 'e');
+
+statement ok
+DELETE FROM scores WHERE id = 2;
+
+statement ok
+pragma ivm('score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+120	3
+
+# --- No-op PRAGMA ---
+statement ok
+pragma ivm('score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+120	3
+
+# --- Batch insert ---
+statement ok
+INSERT INTO scores VALUES (6, 10, 'f'), (7, 20, 'g'), (8, 30, 'h');
+
+statement ok
+pragma ivm('score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+180	6
+
+# --- Delete multiple rows at once ---
+statement ok
+DELETE FROM scores WHERE value <= 20;
+
+statement ok
+pragma ivm('score_totals');
+
+# Remaining: id=3(30), id=4(40), id=5(50), id=8(30) = 150, cnt=4
+query II
+SELECT total, cnt FROM score_totals;
+----
+150	4
+
+# ==========================================
+# MIN / MAX AGGREGATES
+# ==========================================
+
+
+statement ok
+CREATE TABLE IF NOT EXISTS _duckdb_ivm_views (view_name VARCHAR PRIMARY KEY, sql_string VARCHAR, type TINYINT, last_update TIMESTAMP);
+
+statement ok
+CREATE TABLE IF NOT EXISTS _duckdb_ivm_delta_tables (view_name VARCHAR, table_name VARCHAR, last_update TIMESTAMP, PRIMARY KEY(view_name, table_name));
+
+# ==========================================
+# Test 1: MIN with GROUP BY
+# ==========================================
+
+statement ok
+CREATE TABLE t1 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t1 VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 5);
+
+statement ok
+CREATE TABLE mv_min AS SELECT grp, min(val) AS min_val FROM t1 GROUP BY grp;
+
+statement ok
+CREATE TABLE delta_mv_min AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_min LIMIT 0;
+
+statement ok
+CREATE UNIQUE INDEX mv_min_ivm_index ON mv_min (grp);
+
+statement ok
+CREATE TABLE delta_t1 AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM t1 LIMIT 0;
+
+statement ok
+INSERT INTO _duckdb_ivm_views VALUES ('mv_min', 'select grp, min(val) as min_val from t1 group by grp', 0, now()::timestamp);
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_min', 'delta_t1', '1970-01-01');
+
+# Initial state
+query II
+SELECT grp, min_val FROM mv_min ORDER BY grp;
+----
+a	10
+b	5
+
+# Insert new min for group 'a'
+statement ok
+INSERT INTO t1 VALUES (5, 'a', 3);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_min');
+
+query II
+SELECT grp, min_val FROM mv_min ORDER BY grp;
+----
+a	3
+b	5
+
+# Insert non-min value (no change to min)
+statement ok
+INSERT INTO t1 VALUES (6, 'a', 50);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_min');
+
+query II
+SELECT grp, min_val FROM mv_min ORDER BY grp;
+----
+a	3
+b	5
+
+# Delete the current min from group 'a' — next smallest should become min
+statement ok
+DELETE FROM t1 WHERE id = 5;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_min');
+
+query II
+SELECT grp, min_val FROM mv_min ORDER BY grp;
+----
+a	10
+b	5
+
+# Delete non-min value — min unchanged
+statement ok
+DELETE FROM t1 WHERE id = 6;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_min');
+
+query II
+SELECT grp, min_val FROM mv_min ORDER BY grp;
+----
+a	10
+b	5
+
+# ==========================================
+# Test 2: MAX with GROUP BY
+# ==========================================
+
+statement ok
+CREATE TABLE t2 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 100), (2, 'x', 200), (3, 'y', 50), (4, 'y', 75);
+
+statement ok
+CREATE TABLE mv_max AS SELECT grp, max(val) AS max_val FROM t2 GROUP BY grp;
+
+statement ok
+CREATE TABLE delta_mv_max AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_max LIMIT 0;
+
+statement ok
+CREATE UNIQUE INDEX mv_max_ivm_index ON mv_max (grp);
+
+statement ok
+CREATE TABLE delta_t2 AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM t2 LIMIT 0;
+
+statement ok
+INSERT INTO _duckdb_ivm_views VALUES ('mv_max', 'select grp, max(val) as max_val from t2 group by grp', 0, now()::timestamp);
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_max', 'delta_t2', '1970-01-01');
+
+# Initial state
+query II
+SELECT grp, max_val FROM mv_max ORDER BY grp;
+----
+x	200
+y	75
+
+# Insert new max for group 'y'
+statement ok
+INSERT INTO t2 VALUES (5, 'y', 300);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_max');
+
+query II
+SELECT grp, max_val FROM mv_max ORDER BY grp;
+----
+x	200
+y	300
+
+# Delete the current max from group 'y'
+statement ok
+DELETE FROM t2 WHERE id = 5;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_max');
+
+query II
+SELECT grp, max_val FROM mv_max ORDER BY grp;
+----
+x	200
+y	75
+
+# ==========================================
+# Test 3: Mixed aggregates (SUM + MIN + MAX)
+# ==========================================
+
+statement ok
+CREATE TABLE t3 (id INT, grp VARCHAR, a INT, b INT, c INT);
+
+statement ok
+INSERT INTO t3 VALUES (1, 'g1', 10, 100, 1), (2, 'g1', 20, 200, 2), (3, 'g2', 30, 300, 3);
+
+statement ok
+CREATE TABLE mv_mixed AS SELECT grp, sum(a) AS sum_a, min(b) AS min_b, max(c) AS max_c FROM t3 GROUP BY grp;
+
+statement ok
+CREATE TABLE delta_mv_mixed AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_mixed LIMIT 0;
+
+statement ok
+CREATE UNIQUE INDEX mv_mixed_ivm_index ON mv_mixed (grp);
+
+statement ok
+CREATE TABLE delta_t3 AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM t3 LIMIT 0;
+
+statement ok
+INSERT INTO _duckdb_ivm_views VALUES ('mv_mixed', 'select grp, sum(a) as sum_a, min(b) as min_b, max(c) as max_c from t3 group by grp', 0, now()::timestamp);
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_mixed', 'delta_t3', '1970-01-01');
+
+# Initial state
+query IIII
+SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
+----
+g1	30	100	2
+g2	30	300	3
+
+# Insert: affects all aggregates
+statement ok
+INSERT INTO t3 VALUES (4, 'g1', 5, 50, 10);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_mixed');
+
+query IIII
+SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
+----
+g1	35	50	10
+g2	30	300	3
+
+# Delete: removes the new min and max from g1
+statement ok
+DELETE FROM t3 WHERE id = 4;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_mixed');
+
+query IIII
+SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
+----
+g1	30	100	2
+g2	30	300	3
+
+# ==========================================
+# Test 4: Delete all rows from a group
+# ==========================================
+
+statement ok
+DELETE FROM t1 WHERE grp = 'b';
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_min');
+
+query II
+SELECT grp, min_val FROM mv_min ORDER BY grp;
+----
+a	10
+
+# ==========================================
+# Test 5: Ungrouped MIN aggregate
+# ==========================================
+
+statement ok
+CREATE TABLE t5 (id INT, val INT);
+
+statement ok
+INSERT INTO t5 VALUES (1, 100), (2, 50), (3, 200);
+
+statement ok
+CREATE TABLE mv_simple_min AS SELECT min(val) AS min_val FROM t5;
+
+statement ok
+CREATE TABLE delta_mv_simple_min AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_simple_min LIMIT 0;
+
+statement ok
+CREATE TABLE delta_t5 AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM t5 LIMIT 0;
+
+statement ok
+INSERT INTO _duckdb_ivm_views VALUES ('mv_simple_min', 'select min(val) as min_val from t5', 1, now()::timestamp);
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_simple_min', 'delta_t5', '1970-01-01');
+
+# Initial state
+query I
+SELECT min_val FROM mv_simple_min;
+----
+50
+
+# Insert new global min
+statement ok
+INSERT INTO t5 VALUES (4, 10);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_simple_min');
+
+query I
+SELECT min_val FROM mv_simple_min;
+----
+10
+
+# Delete the current global min
+statement ok
+DELETE FROM t5 WHERE id = 4;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_simple_min');
+
+query I
+SELECT min_val FROM mv_simple_min;
+----
+50
+
+# ==========================================
+# Test 6: MIN/MAX with JOIN + GROUP BY
+# ==========================================
+
+statement ok
+CREATE TABLE departments (dept_id INT, dept_name VARCHAR);
+
+statement ok
+INSERT INTO departments VALUES (1, 'engineering'), (2, 'sales');
+
+statement ok
+CREATE TABLE employees (id INT, dept_id INT, salary INT);
+
+statement ok
+INSERT INTO employees VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150), (4, 2, 300);
+
+statement ok
+CREATE TABLE mv_dept_salaries AS
+    SELECT d.dept_name, min(e.salary) AS min_salary, max(e.salary) AS max_salary
+    FROM departments d INNER JOIN employees e ON e.dept_id = d.dept_id
+    GROUP BY d.dept_name;
+
+statement ok
+CREATE TABLE delta_mv_dept_salaries AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_dept_salaries LIMIT 0;
+
+statement ok
+CREATE UNIQUE INDEX mv_dept_salaries_ivm_index ON mv_dept_salaries (dept_name);
+
+statement ok
+CREATE TABLE delta_departments AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM departments LIMIT 0;
+
+statement ok
+CREATE TABLE delta_employees AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM employees LIMIT 0;
+
+statement ok
+INSERT INTO _duckdb_ivm_views VALUES ('mv_dept_salaries', 'select d.dept_name, min(e.salary) as min_salary, max(e.salary) as max_salary from departments as d inner join employees as e on e.dept_id = d.dept_id group by d.dept_name', 0, now()::timestamp);
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_dept_salaries', 'delta_departments', '1970-01-01');
+
+statement ok
+INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_dept_salaries', 'delta_employees', '1970-01-01');
+
+# Initial state
+query III
+SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
+----
+engineering	100	200
+sales	150	300
+
+# Insert new min in engineering
+statement ok
+INSERT INTO employees VALUES (5, 1, 50);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_dept_salaries');
+
+query III
+SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
+----
+engineering	50	200
+sales	150	300
+
+# Delete the current min from engineering
+statement ok
+DELETE FROM employees WHERE id = 5;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_dept_salaries');
+
+query III
+SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
+----
+engineering	100	200
+sales	150	300
+
+# Insert new max in sales
+statement ok
+INSERT INTO employees VALUES (6, 2, 500);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_dept_salaries');
+
+query III
+SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
+----
+engineering	100	200
+sales	150	500
+
+# Delete all employees from sales — group should disappear
+statement ok
+DELETE FROM employees WHERE dept_id = 2;
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_dept_salaries');
+
+query III
+SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
+----
+engineering	100	200
+
+# Insert into a new department (left side of join)
+statement ok
+INSERT INTO departments VALUES (3, 'marketing');
+
+statement ok
+INSERT INTO employees VALUES (7, 3, 75);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_dept_salaries');
+
+query III
+SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
+----
+engineering	100	200
+marketing	75	75
+
+# ==========================================
+# AVG aggregate (group-recompute strategy)
+# ==========================================
+
+statement ok
+CREATE TABLE avg_data (grp VARCHAR, val DOUBLE);
+
+statement ok
+INSERT INTO avg_data VALUES ('a', 10), ('a', 20), ('b', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_avg AS SELECT grp, AVG(val) AS avg_val FROM avg_data GROUP BY grp;
+
+query II
+SELECT grp, avg_val FROM mv_avg ORDER BY grp;
+----
+a	15.0
+b	30.0
+
+statement ok
+INSERT INTO avg_data VALUES ('a', 40), ('c', 100);
+
+statement ok
+pragma ivm('mv_avg');
+
+query II
+SELECT grp, avg_val FROM mv_avg ORDER BY grp;
+----
+a	23.333333333333332
+b	30.0
+c	100.0
+
+# Cross-check
+query II
+SELECT grp, AVG(val) FROM avg_data GROUP BY grp ORDER BY grp;
+----
+a	23.333333333333332
+b	30.0
+c	100.0
+
+# Delete from group
+statement ok
+DELETE FROM avg_data WHERE grp = 'a' AND val = 10;
+
+statement ok
+pragma ivm('mv_avg');
+
+query II
+SELECT grp, avg_val FROM mv_avg ORDER BY grp;
+----
+a	30.0
+b	30.0
+c	100.0
+
+# Ungrouped AVG
+statement ok
+CREATE TABLE avg_ungrouped (val INT);
+
+statement ok
+INSERT INTO avg_ungrouped VALUES (10), (20), (30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_avg_scalar AS SELECT AVG(val) AS avg_val FROM avg_ungrouped;
+
+query I
+SELECT avg_val FROM mv_avg_scalar;
+----
+20.0
+
+statement ok
+INSERT INTO avg_ungrouped VALUES (40);
+
+statement ok
+pragma ivm('mv_avg_scalar');
+
+query I
+SELECT avg_val FROM mv_avg_scalar;
+----
+25.0
+
+# Cross-check
+query I
+SELECT AVG(val) FROM avg_ungrouped;
+----
+25.0

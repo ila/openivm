@@ -214,6 +214,10 @@ void OpenIVMUtils::ReplaceMax(string &query) {
 	ReplaceAggregate(query, "max");
 }
 
+void OpenIVMUtils::ReplaceAvg(string &query) {
+	ReplaceAggregate(query, "avg");
+}
+
 void OpenIVMUtils::RemoveRedundantWhitespaces(string &query) {
 	query = std::regex_replace(query, std::regex("\\s+"), " ");
 }

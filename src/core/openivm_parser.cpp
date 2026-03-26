@@ -76,6 +76,7 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 	OpenIVMUtils::ReplaceSum(query_lower);
 	OpenIVMUtils::ReplaceMin(query_lower);
 	OpenIVMUtils::ReplaceMax(query_lower);
+	OpenIVMUtils::ReplaceAvg(query_lower);
 	OPENIVM_DEBUG_PRINT("[CREATE MV] After rewrite: %s\n", query_lower.c_str());
 
 	Parser p;

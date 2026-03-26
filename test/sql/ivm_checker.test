@@ -49,10 +49,9 @@ does not support CROSS
 # Unsupported aggregates
 # ==========================================
 
-statement error
+# AVG is supported (uses group-recompute strategy like MIN/MAX)
+statement ok
 CREATE MATERIALIZED VIEW mv_avg AS SELECT a, AVG(b) AS avg_b FROM t1 GROUP BY a;
-----
-does not support the 'avg'
 
 statement error
 CREATE MATERIALIZED VIEW mv_stddev AS SELECT a, STDDEV(b) AS sd FROM t1 GROUP BY a;
@@ -109,10 +108,6 @@ SELECT a, b, c FROM mv_left_ok ORDER BY a;
 1	10	100
 2	20	200
 
-# AVG now creates successfully
-statement ok
-CREATE MATERIALIZED VIEW mv_avg_ok AS SELECT a, AVG(b) AS avg_b FROM t1 GROUP BY a;
-
 # Reset to default
 statement ok
 SET ivm_check = true;
@@ -141,12 +136,12 @@ SELECT a, b, c FROM mv_left_ok ORDER BY a;
 2	20	200
 3	30	300
 
-# Full refresh for the bypassed AVG MV
+# AVG uses incremental group-recompute (not bypassed)
 statement ok
-PRAGMA ivm('mv_avg_ok');
+PRAGMA ivm('mv_avg');
 
 query II
-SELECT a, avg_b FROM mv_avg_ok ORDER BY a;
+SELECT a, avg_b FROM mv_avg ORDER BY a;
 ----
 1	10.0
 2	20.0

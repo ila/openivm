@@ -8,7 +8,7 @@
 
 namespace duckdb {
 
-static const unordered_set<string> SUPPORTED_AGGREGATES = {"count_star", "count", "sum", "min", "max", "list"};
+static const unordered_set<string> SUPPORTED_AGGREGATES = {"count_star", "count", "sum", "min", "max", "avg", "list"};
 
 static void ValidateNode(LogicalOperator *node) {
 	switch (node->type) {

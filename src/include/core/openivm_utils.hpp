@@ -25,6 +25,7 @@ public:
 	static void ReplaceSum(string &query);
 	static void ReplaceMin(string &query);
 	static void ReplaceMax(string &query);
+	static void ReplaceAvg(string &query);
 	static void RemoveRedundantWhitespaces(string &query);
 	static string DeltaName(const string &name);
 	static string FullName(const string &catalog, const string &schema, const string &table);
