@@ -221,11 +221,10 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	Optimizer optimizer(*planner.binder, *con.context);
 	plan = optimizer.Optimize(move(plan)); // this transforms the plan into an incremental plan
 	OPENIVM_DEBUG_PRINT("[UPSERT] Optimized (incremental) plan:\n%s\n", plan->ToString().c_str());
-
 	con.Rollback();
 
 	// we turn the plan into a string using LogicalPlanToSql (replacement for LogicalPlanToString)
-	LogicalPlanToSql lpts(context, plan);
+	LogicalPlanToSql lpts(con_ctx, plan);
 	auto cte_list = lpts.LogicalPlanToCteList();
 	string raw_ivm_sql = LogicalPlanToSql::CteListToSql(cte_list);
 

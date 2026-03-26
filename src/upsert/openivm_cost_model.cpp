@@ -243,7 +243,7 @@ string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters
 	auto estimate = EstimateIVMCost(con_ctx, *plan, view_name);
 	con.Rollback();
 
-	string decision = estimate.ShouldRecompute() ? "recompute" : "incremental";
+	string decision = estimate.ShouldRecompute() ? "full" : "incremental";
 	return "SELECT '" + decision + "' AS decision, " + to_string(estimate.ivm_cost) + " AS ivm_cost, " +
 	       to_string(estimate.recompute_cost) + " AS recompute_cost";
 }

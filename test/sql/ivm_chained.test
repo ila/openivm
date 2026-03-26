@@ -86,11 +86,15 @@ statement ok
 CREATE MATERIALIZED VIEW orders_by_category AS
     SELECT category, SUM(qty) AS total_qty FROM orders GROUP BY category;
 
-# COUNT(*) on chained MVs hits a virtual column limitation in the IVM rewrite rule.
-# Use SUM-based aggregation instead.
+# SUM-based chain MV
 statement ok
 CREATE MATERIALIZED VIEW total_orders AS
     SELECT SUM(total_qty) AS all_orders FROM orders_by_customer;
+
+# COUNT-based chain MV (uses virtual column fix in ivm_helpers.cpp)
+statement ok
+CREATE MATERIALIZED VIEW customer_count AS
+    SELECT COUNT(*) AS num_customers FROM orders_by_customer;
 
 statement ok
 INSERT INTO orders VALUES ('alice', 'books', 3), ('bob', 'books', 5), ('alice', 'games', 2), ('charlie', 'books', 1);
