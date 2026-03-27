@@ -52,9 +52,11 @@ static bool CheckNode(LogicalOperator *node) {
 		break;
 
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_JOIN: {
+	case LogicalOperatorType::LOGICAL_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
 		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (join && join->join_type != JoinType::INNER) {
+		if (join && join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT &&
+		    join->join_type != JoinType::RIGHT) {
 			return false;
 		}
 		break;

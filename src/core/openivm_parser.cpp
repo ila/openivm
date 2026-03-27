@@ -70,6 +70,11 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 
 	OpenIVMUtils::ReplaceMaterializedView(query_lower);
 
+	// For LEFT/RIGHT JOIN: add the preserved-side join key as a hidden column _ivm_left_key.
+	// This ensures the partial recompute always has a column to filter on,
+	// even if the user's SELECT doesn't include any left-side columns.
+	OpenIVMUtils::AddLeftJoinKey(query_lower);
+
 	// Rewrite DISTINCT: SELECT DISTINCT cols FROM t → SELECT cols, COUNT(*) AS _ivm_distinct_count FROM t GROUP BY cols
 	// This creates the MV with the hidden count column. The IvmDistinctRule handles the incremental plan.
 	OpenIVMUtils::ReplaceDistinct(query_lower);

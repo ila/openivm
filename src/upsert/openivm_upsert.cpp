@@ -260,6 +260,11 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 		}
 	} // has_ts_col
 
+	// Detect LEFT JOIN: the parser adds _ivm_left_key as a hidden column for LEFT/RIGHT JOIN views.
+	// If the MV has this column, use it for the partial recompute filter.
+	bool has_left_join = std::find(column_names.begin(), column_names.end(), "_ivm_left_key") != column_names.end();
+	OPENIVM_DEBUG_PRINT("[UPSERT] has_left_join=%d\n", has_left_join);
+
 	// this is to compile the query to merge the materialized view with its delta version
 	// depending on the query type, this procedure will be done differently
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n",
@@ -274,7 +279,20 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 		break;
 	}
 	case IVMType::SIMPLE_PROJECTION: {
-		upsert_query = CompileProjectionsFilters(view_name, column_names, delta_ts_filter);
+		if (has_left_join) {
+			// LEFT JOIN: partial recompute on affected left-side keys.
+			// The parser adds _ivm_left_key as a hidden column containing the preserved-side join key.
+			// Delete affected keys from MV and re-insert from original LEFT JOIN query for those keys.
+			string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+			string dv = OpenIVMUtils::DeltaName(view_name);
+			upsert_query = "DELETE FROM " + view_name + " WHERE (_ivm_left_key) IN (\n" +
+			               "  SELECT DISTINCT _ivm_left_key FROM " + dv + delta_where + "\n);\n" + "INSERT INTO " +
+			               view_name + "\nSELECT * FROM (" + view_query_sql +
+			               ") _ivm_lj\nWHERE (_ivm_left_key) IN (\n" + "  SELECT DISTINCT _ivm_left_key FROM " + dv +
+			               delta_where + "\n);\n";
+		} else {
+			upsert_query = CompileProjectionsFilters(view_name, column_names, delta_ts_filter);
+		}
 		break;
 	}
 

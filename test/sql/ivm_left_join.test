@@ -1,0 +1,299 @@
+# name: test/sql/ivm_left_join.test
+# description: Test IVM with LEFT JOIN
+# group: [sql]
+
+require openivm
+
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+# ============================================================
+# Setup
+# ============================================================
+
+statement ok
+CREATE TABLE customers (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE orders (customer_id INT, product VARCHAR, amount INT);
+
+statement ok
+INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+
+statement ok
+INSERT INTO orders VALUES (1, 'Widget', 100), (1, 'Gadget', 200);
+
+statement ok
+CREATE MATERIALIZED VIEW customer_orders AS
+    SELECT c.name, o.product, o.amount
+    FROM customers c LEFT JOIN orders o ON c.id = o.customer_id;
+
+# Initial: Alice has 2 orders, Bob and Charlie have NULL
+query III
+SELECT name, product, amount FROM customer_orders ORDER BY name, product NULLS LAST;
+----
+Alice	Gadget	200
+Alice	Widget	100
+Bob	NULL	NULL
+Charlie	NULL	NULL
+
+# ============================================================
+# Insert into right side: Bob gets an order (NULL row should be replaced)
+# ============================================================
+
+statement ok
+INSERT INTO orders VALUES (2, 'Bolt', 50);
+
+statement ok
+PRAGMA ivm('customer_orders');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
+    EXCEPT ALL
+    SELECT name, product, amount FROM customer_orders
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, product, amount FROM customer_orders
+    EXCEPT ALL
+    SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
+);
+----
+0
+
+# ============================================================
+# Delete from right side: remove Alice's only remaining order
+# (she should get a NULL row back)
+# ============================================================
+
+statement ok
+DELETE FROM orders WHERE customer_id = 1 AND product = 'Widget';
+
+statement ok
+PRAGMA ivm('customer_orders');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
+    EXCEPT ALL
+    SELECT name, product, amount FROM customer_orders
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, product, amount FROM customer_orders
+    EXCEPT ALL
+    SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
+);
+----
+0
+
+# ============================================================
+# Insert into left side (new customer with no orders → NULL extended)
+# ============================================================
+
+statement ok
+INSERT INTO customers VALUES (4, 'Dave');
+
+statement ok
+PRAGMA ivm('customer_orders');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
+    EXCEPT ALL
+    SELECT name, product, amount FROM customer_orders
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, product, amount FROM customer_orders
+    EXCEPT ALL
+    SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
+);
+----
+0
+
+# ============================================================
+# Mixed: insert + delete + update, single refresh
+# ============================================================
+
+statement ok
+INSERT INTO orders VALUES (3, 'Screw', 10), (4, 'Nail', 5);
+
+statement ok
+DELETE FROM orders WHERE customer_id = 2;
+
+statement ok
+PRAGMA ivm('customer_orders');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
+    EXCEPT ALL
+    SELECT name, product, amount FROM customer_orders
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, product, amount FROM customer_orders
+    EXCEPT ALL
+    SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
+);
+----
+0
+
+# ============================================================
+# RIGHT JOIN (DuckDB rewrites to LEFT internally)
+# ============================================================
+
+statement ok
+CREATE TABLE products (id INT, pname VARCHAR);
+
+statement ok
+CREATE TABLE sales (product_id INT, qty INT);
+
+statement ok
+INSERT INTO products VALUES (1, 'Alpha'), (2, 'Beta'), (3, 'Gamma');
+
+statement ok
+INSERT INTO sales VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW product_sales AS
+    SELECT p.pname, s.qty FROM sales s RIGHT JOIN products p ON s.product_id = p.id;
+
+statement ok
+INSERT INTO sales VALUES (2, 20);
+
+statement ok
+PRAGMA ivm('product_sales');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.pname, s.qty FROM sales s RIGHT JOIN products p ON s.product_id = p.id
+    EXCEPT ALL
+    SELECT pname, qty FROM product_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT pname, qty FROM product_sales
+    EXCEPT ALL
+    SELECT p.pname, s.qty FROM sales s RIGHT JOIN products p ON s.product_id = p.id
+);
+----
+0
+
+# ============================================================
+# LEFT JOIN with WHERE filter
+# ============================================================
+
+statement ok
+CREATE TABLE items (id INT, item_name VARCHAR);
+
+statement ok
+CREATE TABLE prices (item_id INT, price INT);
+
+statement ok
+INSERT INTO items VALUES (1, 'A'), (2, 'B'), (3, 'C');
+
+statement ok
+INSERT INTO prices VALUES (1, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW item_prices AS
+    SELECT i.item_name, p.price
+    FROM items i LEFT JOIN prices p ON i.id = p.item_id
+    WHERE i.id > 0;
+
+statement ok
+INSERT INTO prices VALUES (2, 200);
+
+statement ok
+PRAGMA ivm('item_prices');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.item_name, p.price FROM items i LEFT JOIN prices p ON i.id = p.item_id WHERE i.id > 0
+    EXCEPT ALL
+    SELECT item_name, price FROM item_prices
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT item_name, price FROM item_prices
+    EXCEPT ALL
+    SELECT i.item_name, p.price FROM items i LEFT JOIN prices p ON i.id = p.item_id WHERE i.id > 0
+);
+----
+0
+
+# ============================================================
+# Mixed joins: INNER + LEFT in same query
+# ============================================================
+
+statement ok
+CREATE TABLE departments (id INT, dept_name VARCHAR);
+
+statement ok
+CREATE TABLE employees (id INT, dept_id INT, emp_name VARCHAR);
+
+statement ok
+CREATE TABLE bonuses (emp_id INT, bonus INT);
+
+statement ok
+INSERT INTO departments VALUES (1, 'Eng'), (2, 'Sales');
+
+statement ok
+INSERT INTO employees VALUES (1, 1, 'Alice'), (2, 1, 'Bob'), (3, 2, 'Charlie');
+
+statement ok
+INSERT INTO bonuses VALUES (1, 1000);
+
+statement ok
+CREATE MATERIALIZED VIEW emp_bonus AS
+    SELECT e.emp_name, d.dept_name, b.bonus
+    FROM employees e
+    INNER JOIN departments d ON e.dept_id = d.id
+    LEFT JOIN bonuses b ON e.id = b.emp_id;
+
+statement ok
+INSERT INTO bonuses VALUES (2, 500);
+
+statement ok
+PRAGMA ivm('emp_bonus');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT e.emp_name, d.dept_name, b.bonus
+    FROM employees e INNER JOIN departments d ON e.dept_id = d.id LEFT JOIN bonuses b ON e.id = b.emp_id
+    EXCEPT ALL
+    SELECT emp_name, dept_name, bonus FROM emp_bonus
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT emp_name, dept_name, bonus FROM emp_bonus
+    EXCEPT ALL
+    SELECT e.emp_name, d.dept_name, b.bonus
+    FROM employees e INNER JOIN departments d ON e.dept_id = d.id LEFT JOIN bonuses b ON e.id = b.emp_id
+);
+----
+0

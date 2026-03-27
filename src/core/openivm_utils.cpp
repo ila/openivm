@@ -259,6 +259,45 @@ void OpenIVMUtils::ReplaceDistinct(string &query) {
 	}
 }
 
+void OpenIVMUtils::AddLeftJoinKey(string &query) {
+	// For LEFT/RIGHT JOIN: extract the preserved-side join key from the ON clause
+	// and add it as a hidden column to the SELECT list.
+	// Matches: ... left join ... on <left_expr> = <right_expr>
+	// or:      ... right join ... on <left_expr> = <right_expr>
+	std::regex join_re(R"(\b(left|right)\s+join\s+\S+\s+(?:\S+\s+)?on\s+(\S+)\s*=\s*(\S+))",
+	                   std::regex_constants::icase);
+	std::smatch match;
+	if (!std::regex_search(query, match, join_re)) {
+		return;
+	}
+
+	string join_type = match[1].str(); // "left" or "right"
+	string lhs_key = match[2].str();   // e.g., "c.id"
+	string rhs_key = match[3].str();   // e.g., "o.customer_id"
+
+	// For LEFT JOIN, the preserved side is the left (lhs_key).
+	// For RIGHT JOIN, the preserved side is the right (rhs_key).
+	string preserved_key;
+	if (StringUtil::Lower(join_type) == "left") {
+		preserved_key = lhs_key;
+	} else {
+		preserved_key = rhs_key;
+	}
+
+	// Add the preserved key as a hidden column in the SELECT list.
+	// Find the first "select" and insert after the column list.
+	auto select_pos = query.find("select ");
+	if (select_pos == string::npos) {
+		return;
+	}
+	auto from_pos = query.find(" from ", select_pos);
+	if (from_pos == string::npos) {
+		return;
+	}
+	// Insert before " from": ", <preserved_key> as _ivm_left_key"
+	query.insert(from_pos, ", " + preserved_key + " as _ivm_left_key");
+}
+
 void OpenIVMUtils::RemoveRedundantWhitespaces(string &query) {
 	query = std::regex_replace(query, std::regex("\\s+"), " ");
 }
