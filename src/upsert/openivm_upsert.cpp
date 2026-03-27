@@ -54,31 +54,26 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
 	return query + update_ts + "\n" + delta_cleanup;
 }
 
-string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &parameters) {
-	// queries to run in order to materialize IVM upserts
-	// these are executed whenever the pragma ivm_upsert is called
-	auto &catalog = Catalog::GetSystemCatalog(context);
-	QueryErrorContext error_context = QueryErrorContext();
+// Generate refresh SQL for a single view (no cascade logic).
+static string GenerateRefreshSQL(ClientContext &context, string view_catalog_name, string view_schema_name,
+                                 string view_name, bool cross_system, string attached_db_catalog_name,
+                                 string attached_db_schema_name);
 
+string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &parameters) {
 	string view_catalog_name;
 	string view_schema_name;
 	string attached_db_catalog_name;
 	string attached_db_schema_name;
 	string view_name;
-	bool cross_system = false; // to make checks easier
-	// if we are in a cross-system scenario, the tables need to be stored separately
-	// ex. the delta tables are on the attached database, while the delta views on DuckDB
+	bool cross_system = false;
 
-	// extracting the query from the view definition
 	Connection con(*context.db.get());
 
 	if (parameters.values.size() == 3) {
-		// ivm_options was called, so different schema and catalog
 		view_catalog_name = StringValue::Get(parameters.values[0]);
 		view_schema_name = StringValue::Get(parameters.values[1]);
 		view_name = StringValue::Get(parameters.values[2]);
 	} else if (parameters.values.size() == 5) {
-		// ivm_cross_system was called, so different schema and catalog
 		view_catalog_name = StringValue::Get(parameters.values[0]);
 		view_schema_name = StringValue::Get(parameters.values[1]);
 		attached_db_catalog_name = StringValue::Get(parameters.values[2]);
@@ -86,13 +81,56 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 		view_name = StringValue::Get(parameters.values[4]);
 		cross_system = true;
 	} else {
-		// simple ivm, use current catalog and schema from the search path
 		auto &search_path = ClientData::Get(context).catalog_search_path;
 		auto default_entry = search_path->GetDefault();
 		view_catalog_name = default_entry.catalog;
 		view_schema_name = default_entry.schema;
 		view_name = StringValue::Get(parameters.values[0]);
 	}
+
+	// Check cascade mode
+	string cascade_mode = "downstream";
+	Value cascade_val;
+	if (context.TryGetCurrentSetting("ivm_cascade_refresh", cascade_val) && !cascade_val.IsNull()) {
+		cascade_mode = StringUtil::Lower(cascade_val.ToString());
+	}
+
+	IVMMetadata metadata(con);
+	string result;
+
+	// Upstream cascade: refresh ancestors first
+	if (cascade_mode == "upstream" || cascade_mode == "both") {
+		auto upstream = metadata.GetUpstreamViews(view_name);
+		for (auto &dep : upstream) {
+			result += GenerateRefreshSQL(context, view_catalog_name, view_schema_name, dep, cross_system,
+			                             attached_db_catalog_name, attached_db_schema_name);
+			result += "\n";
+		}
+	}
+
+	// Refresh the target view
+	result += GenerateRefreshSQL(context, view_catalog_name, view_schema_name, view_name, cross_system,
+	                             attached_db_catalog_name, attached_db_schema_name);
+
+	// Downstream cascade: refresh dependents after
+	if (cascade_mode == "downstream" || cascade_mode == "both") {
+		auto downstream = metadata.GetDownstreamViews(view_name);
+		for (auto &dep : downstream) {
+			result += "\n";
+			result += GenerateRefreshSQL(context, view_catalog_name, view_schema_name, dep, cross_system,
+			                             attached_db_catalog_name, attached_db_schema_name);
+		}
+	}
+
+	return result;
+}
+
+static string GenerateRefreshSQL(ClientContext &context, string view_catalog_name, string view_schema_name,
+                                 string view_name, bool cross_system, string attached_db_catalog_name,
+                                 string attached_db_schema_name) {
+	auto &catalog = Catalog::GetSystemCatalog(context);
+	QueryErrorContext error_context = QueryErrorContext();
+	Connection con(*context.db.get());
 
 	// Use con's transaction for catalog access — sees all committed state
 	con.BeginTransaction();
@@ -286,12 +324,70 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
 	                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
 
-	// For AGGREGATE_GROUP views with downstream consumers: insert companion false/zero
-	// rows for groups that already exist in the MV.  This ensures downstream COUNT(*)
-	// correctly treats aggregate updates as net-zero (+1 true, -1 false) instead of +1.
-	// SUM downstream is unaffected because the false rows carry 0 aggregate values.
+	// Companion rows for downstream consumers.
+	// When a view has downstream MVs that read its delta, those downstream views need
+	// both the OLD and NEW state to correctly compute their own deltas.
+	// The IVM query produces the NEW state (delta with mul=true).
+	// The companion query records the OLD state (current MV rows with mul=false)
+	// BEFORE the upsert modifies the MV.
 	string companion_query;
-	if (view_query_type == IVMType::AGGREGATE_GROUP && has_downstream && index_delta_view_catalog_entry) {
+
+	// For SIMPLE_AGGREGATE / SIMPLE_PROJECTION with downstream consumers:
+	// The IVM delta represents the CHANGE (+5), but downstream projections need
+	// the ABSOLUTE old and new values to compute their own deltas correctly.
+	// Strategy: record old state (mul=false) BEFORE upsert, then record new state
+	// (mul=true) AFTER upsert. The IVM delta in delta_view is replaced by these
+	// absolute snapshots so downstream sees a clean old→new transition.
+	string pre_companion;  // old MV state → delta_view with false (runs BEFORE IVM+upsert)
+	string post_companion; // new MV state → delta_view with true (runs AFTER upsert)
+
+	if (has_downstream &&
+	    (view_query_type == IVMType::SIMPLE_AGGREGATE || view_query_type == IVMType::SIMPLE_PROJECTION)) {
+		// Save old MV state to a temp table BEFORE the IVM+upsert modifies the MV.
+		// After the upsert, clear IVM delta from delta_view and replace with
+		// old(false) + new(true) absolute snapshots for downstream consumption.
+		string col_list;
+		for (auto &col : column_names) {
+			if (!col_list.empty()) {
+				col_list += ", ";
+			}
+			col_list += col;
+		}
+		string select_false, select_true;
+		bool first = true;
+		for (auto &col : column_names) {
+			if (!first) {
+				select_false += ", ";
+				select_true += ", ";
+			}
+			first = false;
+			if (col == string(ivm::MULTIPLICITY_COL)) {
+				select_false += "false";
+				select_true += "true";
+			} else {
+				select_false += col;
+				select_true += col;
+			}
+		}
+		// Pre: snapshot old state into temp table
+		string temp_name = "_ivm_old_" + view_name;
+		pre_companion = "CREATE TEMP TABLE " + temp_name + " AS SELECT * FROM " + view_name + ";\n";
+		// Post: clear ALL IVM delta rows (both true and false), replace with absolute snapshots
+		post_companion = "DELETE FROM " + delta_view_name + " WHERE 1=1";
+		if (!delta_ts_filter.empty()) {
+			post_companion += " AND " + delta_ts_filter;
+		}
+		post_companion += ";\n";
+		// Old state (false) from temp table
+		post_companion += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + select_false + " FROM " +
+		                  temp_name + ";\n";
+		// New state (true) from updated MV
+		post_companion += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + select_true + " FROM " +
+		                  view_name + ";\n";
+		post_companion += "DROP TABLE " + temp_name + ";\n";
+		OPENIVM_DEBUG_PRINT("[UPSERT] Pre-companion: %s\n", pre_companion.c_str());
+		OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
+	} else if (view_query_type == IVMType::AGGREGATE_GROUP && has_downstream && index_delta_view_catalog_entry) {
 		auto *idx = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
 		auto key_ids = idx->column_ids;
 		vector<string> keys;
@@ -366,8 +462,18 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	// Order: IVM query → upsert → update timestamps → cleanup
 	// update_timestamp MUST run after upsert so the delta_ts_filter in the upsert
 	// can correctly distinguish current-round vs old delta_view rows.
-	string clean_query = ivm_query + "\n" + companion_query + "\n" + upsert_query + "\n" + update_timestamp_query +
-	                     "\n" + delete_from_view_query + "\n" + ivm_result + "\n" + delete_from_delta_table_query;
+	// Assembly order:
+	// 1. pre_companion: snapshot old MV state into delta_view (for downstream old→new)
+	// 2. ivm_query: compute delta, INSERT INTO delta_view
+	// 3. companion_query: (AGGREGATE_GROUP) insert false/zero rows for existing groups
+	// 4. upsert_query: apply delta to MV
+	// 5. post_companion: replace IVM delta in delta_view with absolute new MV state
+	// 6. update_timestamp: mark this refresh
+	// 7. delete_from_view: clean old delta_view rows
+	// 8. delete_from_delta: clean old base delta rows
+	string clean_query = pre_companion + ivm_query + "\n" + companion_query + "\n" + upsert_query + "\n" +
+	                     post_companion + update_timestamp_query + "\n" + delete_from_view_query + "\n" + ivm_result +
+	                     "\n" + delete_from_delta_table_query;
 
 	// Write reference SQL to disk only if ivm_files_path is explicitly set
 	Value files_path_val;

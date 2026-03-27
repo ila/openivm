@@ -1,0 +1,538 @@
+# name: test/sql/ivm_pipeline.test
+# description: Test MV pipeline semantics — chained refresh, out-of-order, skip levels, cascade
+# group: [sql]
+
+require openivm
+
+# Use explicit refresh for correctness tests (no auto-cascade)
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+# ============================================================
+# Setup: 3-level chain  table → mv1 → mv2 → mv3
+# ============================================================
+
+statement ok
+CREATE TABLE events (user_id VARCHAR, event VARCHAR, value INT);
+
+statement ok
+CREATE MATERIALIZED VIEW user_totals AS
+    SELECT user_id, SUM(value) AS total FROM events GROUP BY user_id;
+
+statement ok
+CREATE MATERIALIZED VIEW global_total AS
+    SELECT SUM(total) AS grand_total FROM user_totals;
+
+statement ok
+CREATE MATERIALIZED VIEW user_count AS
+    SELECT COUNT(*) AS num_users FROM user_totals;
+
+# ============================================================
+# A. Baseline: correct ordered refresh
+# ============================================================
+
+statement ok
+INSERT INTO events VALUES ('alice', 'buy', 100), ('bob', 'buy', 200), ('alice', 'sell', 50);
+
+statement ok
+PRAGMA ivm('user_totals');
+
+statement ok
+PRAGMA ivm('global_total');
+
+statement ok
+PRAGMA ivm('user_count');
+
+# Cross-check all levels
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, SUM(value) AS total FROM events GROUP BY user_id
+    EXCEPT ALL
+    SELECT user_id, total FROM user_totals
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand_total FROM (SELECT user_id, SUM(value) AS total FROM events GROUP BY user_id)
+    EXCEPT ALL
+    SELECT grand_total FROM global_total
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT COUNT(*) AS num_users FROM (SELECT user_id FROM events GROUP BY user_id)
+    EXCEPT ALL
+    SELECT num_users FROM user_count
+);
+----
+0
+
+# ============================================================
+# B. Out-of-order: refresh mv3 before mv1
+# ============================================================
+
+statement ok
+INSERT INTO events VALUES ('charlie', 'buy', 300);
+
+# Refresh leaf first (without refreshing upstream)
+statement ok
+PRAGMA ivm('user_count');
+
+# user_count should NOT change — delta_user_totals is empty (user_totals wasn't refreshed)
+query I
+SELECT num_users FROM user_count;
+----
+2
+
+# Now refresh in correct order
+statement ok
+PRAGMA ivm('user_totals');
+
+statement ok
+PRAGMA ivm('global_total');
+
+statement ok
+PRAGMA ivm('user_count');
+
+# Now everything is correct
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, SUM(value) AS total FROM events GROUP BY user_id
+    EXCEPT ALL
+    SELECT user_id, total FROM user_totals
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand_total FROM (SELECT user_id, SUM(value) AS total FROM events GROUP BY user_id)
+    EXCEPT ALL
+    SELECT grand_total FROM global_total
+);
+----
+0
+
+query I
+SELECT num_users FROM user_count;
+----
+3
+
+# ============================================================
+# C. Skip a level: refresh mv1, skip mv2, refresh mv3
+# ============================================================
+
+statement ok
+INSERT INTO events VALUES ('dave', 'buy', 400);
+
+statement ok
+PRAGMA ivm('user_totals');
+
+# Skip global_total, refresh user_count directly
+statement ok
+PRAGMA ivm('user_count');
+
+# user_count is correct (it reads from user_totals which was refreshed)
+query I
+SELECT num_users FROM user_count;
+----
+4
+
+# global_total is STALE (not refreshed)
+query I
+SELECT grand_total FROM global_total;
+----
+650
+
+# Now refresh global_total
+statement ok
+PRAGMA ivm('global_total');
+
+query I
+SELECT grand_total FROM global_total;
+----
+1050
+
+# Cross-check
+query I
+SELECT SUM(value) FROM events;
+----
+1050
+
+# ============================================================
+# D. Refresh leaf without any upstream refresh
+# ============================================================
+
+statement ok
+INSERT INTO events VALUES ('eve', 'buy', 500);
+
+# Only refresh the leaf — upstream not refreshed
+statement ok
+PRAGMA ivm('global_total');
+
+# global_total unchanged (delta_user_totals empty because user_totals wasn't refreshed)
+query I
+SELECT grand_total FROM global_total;
+----
+1050
+
+# Now do proper cascade
+statement ok
+PRAGMA ivm('user_totals');
+
+statement ok
+PRAGMA ivm('global_total');
+
+query I
+SELECT grand_total FROM global_total;
+----
+1550
+
+query I
+SELECT SUM(value) FROM events;
+----
+1550
+
+# ============================================================
+# E. Idempotent double refresh
+# ============================================================
+
+statement ok
+PRAGMA ivm('user_totals');
+
+statement ok
+PRAGMA ivm('user_totals');
+
+statement ok
+PRAGMA ivm('global_total');
+
+statement ok
+PRAGMA ivm('global_total');
+
+# Everything still correct
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, SUM(value) AS total FROM events GROUP BY user_id
+    EXCEPT ALL
+    SELECT user_id, total FROM user_totals
+);
+----
+0
+
+query I
+SELECT grand_total FROM global_total;
+----
+1550
+
+# ============================================================
+# F. Multiple inserts + deletes, then cascade refresh
+# ============================================================
+
+statement ok
+INSERT INTO events VALUES ('alice', 'refund', -50), ('frank', 'buy', 600);
+
+statement ok
+DELETE FROM events WHERE user_id = 'bob';
+
+statement ok
+PRAGMA ivm('user_totals');
+
+statement ok
+PRAGMA ivm('global_total');
+
+statement ok
+PRAGMA ivm('user_count');
+
+# Cross-check all levels
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, SUM(value) AS total FROM events GROUP BY user_id
+    EXCEPT ALL
+    SELECT user_id, total FROM user_totals
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, total FROM user_totals
+    EXCEPT ALL
+    SELECT user_id, SUM(value) AS total FROM events GROUP BY user_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand_total FROM (SELECT user_id, SUM(value) AS total FROM events GROUP BY user_id)
+    EXCEPT ALL
+    SELECT grand_total FROM global_total
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT COUNT(*) AS num_users FROM (SELECT user_id FROM events GROUP BY user_id)
+    EXCEPT ALL
+    SELECT num_users FROM user_count
+);
+----
+0
+
+# ============================================================
+# G. Fan-out: one MV feeds two independent children
+# ============================================================
+
+statement ok
+CREATE TABLE sales (region VARCHAR, amount INT);
+
+statement ok
+CREATE MATERIALIZED VIEW region_totals AS
+    SELECT region, SUM(amount) AS total FROM sales GROUP BY region;
+
+statement ok
+CREATE MATERIALIZED VIEW top_region AS
+    SELECT region, total FROM region_totals;
+
+statement ok
+CREATE MATERIALIZED VIEW overall AS
+    SELECT SUM(total) AS grand FROM region_totals;
+
+statement ok
+INSERT INTO sales VALUES ('US', 100), ('EU', 200), ('US', 300);
+
+statement ok
+PRAGMA ivm('region_totals');
+
+# Refresh one child but not the other
+statement ok
+PRAGMA ivm('top_region');
+
+# top_region is up to date
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total FROM region_totals
+    EXCEPT ALL
+    SELECT region, total FROM top_region
+);
+----
+0
+
+# overall is stale
+statement ok
+PRAGMA ivm('overall');
+
+query I
+SELECT grand FROM overall;
+----
+600
+
+query I
+SELECT SUM(amount) FROM sales;
+----
+600
+
+# Second round — both children refreshed
+statement ok
+INSERT INTO sales VALUES ('JP', 1000);
+
+statement ok
+PRAGMA ivm('region_totals');
+
+statement ok
+PRAGMA ivm('top_region');
+
+statement ok
+PRAGMA ivm('overall');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(amount) AS total FROM sales GROUP BY region
+    EXCEPT ALL
+    SELECT region, total FROM top_region
+);
+----
+0
+
+query I
+SELECT grand FROM overall;
+----
+1600
+
+# ============================================================
+# H. Downstream cascade: refresh root, all descendants auto-refresh
+# ============================================================
+
+statement ok
+SET ivm_cascade_refresh = 'downstream';
+
+statement ok
+CREATE TABLE cascade_base (grp VARCHAR, val INT);
+
+statement ok
+CREATE MATERIALIZED VIEW cascade_l1 AS SELECT grp, SUM(val) AS total FROM cascade_base GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW cascade_l2 AS SELECT SUM(total) AS grand FROM cascade_l1;
+
+statement ok
+INSERT INTO cascade_base VALUES ('a', 10), ('b', 20);
+
+# Single pragma refreshes cascade_l1 AND cascade_l2
+statement ok
+PRAGMA ivm('cascade_l1');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM cascade_base GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM cascade_l1
+);
+----
+0
+
+query I
+SELECT grand FROM cascade_l2;
+----
+30
+
+# Second batch
+statement ok
+INSERT INTO cascade_base VALUES ('a', 5), ('c', 100);
+
+statement ok
+PRAGMA ivm('cascade_l1');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM cascade_base GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM cascade_l1
+);
+----
+0
+
+query I
+SELECT grand FROM cascade_l2;
+----
+135
+
+query I
+SELECT SUM(val) FROM cascade_base;
+----
+135
+
+# ============================================================
+# I. Upstream cascade: refresh leaf, all ancestors auto-refresh first
+# ============================================================
+
+statement ok
+SET ivm_cascade_refresh = 'upstream';
+
+statement ok
+CREATE TABLE up_base (x INT);
+
+statement ok
+CREATE MATERIALIZED VIEW up_l1 AS SELECT SUM(x) AS total FROM up_base;
+
+statement ok
+CREATE MATERIALIZED VIEW up_l2 AS SELECT total * 2 AS doubled FROM up_l1;
+
+statement ok
+INSERT INTO up_base VALUES (10), (20);
+
+# Refresh leaf — should auto-refresh up_l1 first
+statement ok
+PRAGMA ivm('up_l2');
+
+query I
+SELECT total FROM up_l1;
+----
+30
+
+query I
+SELECT doubled FROM up_l2;
+----
+60
+
+statement ok
+INSERT INTO up_base VALUES (5);
+
+statement ok
+PRAGMA ivm('up_l2');
+
+query I
+SELECT total FROM up_l1;
+----
+35
+
+query I
+SELECT doubled FROM up_l2;
+----
+70
+
+# ============================================================
+# J. Both cascade: refresh middle, auto-refresh up AND down
+# ============================================================
+
+statement ok
+SET ivm_cascade_refresh = 'both';
+
+statement ok
+CREATE TABLE both_base (k VARCHAR, v INT);
+
+statement ok
+CREATE MATERIALIZED VIEW both_l1 AS SELECT k, SUM(v) AS total FROM both_base GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW both_l2 AS SELECT SUM(total) AS grand FROM both_l1;
+
+statement ok
+INSERT INTO both_base VALUES ('x', 100);
+
+# Refresh l2 — should auto-refresh l1 first (upstream), then l2
+statement ok
+PRAGMA ivm('both_l2');
+
+query II
+SELECT k, total FROM both_l1;
+----
+x	100
+
+query I
+SELECT grand FROM both_l2;
+----
+100
+
+# ============================================================
+# K. Off mode: no cascade (explicit control)
+# ============================================================
+
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+statement ok
+INSERT INTO cascade_base VALUES ('d', 50);
+
+statement ok
+PRAGMA ivm('cascade_l1');
+
+# cascade_l2 should NOT be refreshed
+query I
+SELECT grand FROM cascade_l2;
+----
+135
+
+# Now manually refresh cascade_l2
+statement ok
+PRAGMA ivm('cascade_l2');
+
+query I
+SELECT grand FROM cascade_l2;
+----
+185

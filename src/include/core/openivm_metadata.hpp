@@ -36,6 +36,14 @@ public:
 
 	// Update the last_update timestamp to now() for all delta tables of a view.
 	void UpdateTimestamp(const string &view_name);
+
+	// Get all upstream MV dependencies in topological order (ancestors first).
+	// For table→mv1→mv2→mv3, GetUpstreamViews("mv3") returns ["mv1", "mv2"].
+	vector<string> GetUpstreamViews(const string &view_name);
+
+	// Get all downstream MV dependents in topological order (closest first).
+	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
+	vector<string> GetDownstreamViews(const string &view_name);
 };
 
 } // namespace duckdb

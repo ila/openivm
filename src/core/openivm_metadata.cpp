@@ -59,4 +59,52 @@ void IVMMetadata::UpdateTimestamp(const string &view_name) {
 	}
 }
 
+vector<string> IVMMetadata::GetUpstreamViews(const string &view_name) {
+	// Walk upstream: for view V, find its delta tables. If a delta table is "delta_X"
+	// and X is a registered MV, then X is an upstream dependency. Recurse.
+	vector<string> result;
+	unordered_set<string> visited;
+
+	std::function<void(const string &)> collect = [&](const string &vn) {
+		auto delta_tables = GetDeltaTables(vn);
+		for (auto &dt : delta_tables) {
+			// delta table name is "delta_<source>"; extract source name
+			if (dt.size() > 6 && dt.substr(0, 6) == string(ivm::DELTA_PREFIX)) {
+				string source = dt.substr(6);
+				if (!IsBaseTable(source) && visited.find(source) == visited.end()) {
+					visited.insert(source);
+					collect(source); // recurse deeper first (ancestors before descendants)
+					result.push_back(source);
+				}
+			}
+		}
+	};
+	collect(view_name);
+	return result; // topological order: ancestors first
+}
+
+vector<string> IVMMetadata::GetDownstreamViews(const string &view_name) {
+	// Find all views that depend on delta_<view_name> as a source.
+	vector<string> result;
+	unordered_set<string> visited;
+
+	std::function<void(const string &)> collect = [&](const string &vn) {
+		string delta_name = OpenIVMUtils::DeltaName(vn);
+		auto dependents = con.Query("SELECT DISTINCT view_name FROM " + string(ivm::DELTA_TABLES_TABLE) +
+		                            " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_name) + "'");
+		if (!dependents->HasError()) {
+			for (size_t i = 0; i < dependents->RowCount(); i++) {
+				string dep = dependents->GetValue(0, i).ToString();
+				if (visited.find(dep) == visited.end()) {
+					visited.insert(dep);
+					result.push_back(dep); // closest first
+					collect(dep);          // then recurse deeper
+				}
+			}
+		}
+	};
+	collect(view_name);
+	return result; // topological order: closest descendants first
+}
+
 } // namespace duckdb

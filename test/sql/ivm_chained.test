@@ -4,6 +4,10 @@
 
 require openivm
 
+# Explicit ordering — tests manage refresh order manually
+statement ok
+SET ivm_cascade_refresh = 'off';
+
 # ============================================================
 # Two-level chain: table -> MV1 -> MV2
 # ============================================================
