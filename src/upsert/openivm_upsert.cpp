@@ -96,6 +96,28 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	}
 
 	IVMMetadata metadata(con);
+
+	// Early exit: skip refresh if all delta tables for the target view are empty.
+	// Only check at top level (not during cascade, since upstream may populate deltas).
+	if (cascade_mode == "off") {
+		auto view_type = metadata.GetViewType(view_name);
+		if (view_type != IVMType::FULL_REFRESH) {
+			auto delta_tables = metadata.GetDeltaTables(view_name);
+			bool all_empty = true;
+			for (auto &dt : delta_tables) {
+				auto count_result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(dt));
+				if (!count_result->HasError() && count_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
+					all_empty = false;
+					break;
+				}
+			}
+			if (all_empty) {
+				OPENIVM_DEBUG_PRINT("[UPSERT] All delta tables empty — skipping refresh for '%s'\n", view_name.c_str());
+				return "SELECT 1;\n";
+			}
+		}
+	}
+
 	string result;
 
 	// Upstream cascade: refresh ancestors first
