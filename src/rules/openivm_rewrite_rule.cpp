@@ -1,6 +1,7 @@
 #include "rules/openivm_rewrite_rule.hpp"
 
 #include "rules/ivm_aggregate_rule.hpp"
+#include "rules/ivm_distinct_rule.hpp"
 #include "rules/ivm_filter_rule.hpp"
 #include "rules/ivm_join_rule.hpp"
 #include "rules/ivm_projection_rule.hpp"
@@ -83,6 +84,10 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 	}
 	case LogicalOperatorType::LOGICAL_UNION: {
 		IvmUnionRule rule;
+		return rule.Rewrite(pw);
+	}
+	case LogicalOperatorType::LOGICAL_DISTINCT: {
+		IvmDistinctRule rule;
 		return rule.Rewrite(pw);
 	}
 	default:

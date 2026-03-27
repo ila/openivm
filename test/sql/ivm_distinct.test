@@ -1,0 +1,155 @@
+# name: test/sql/ivm_distinct.test
+# description: Test IVM with SELECT DISTINCT
+# group: [sql]
+
+require openivm
+
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+# ============================================================
+# Basic DISTINCT
+# ============================================================
+
+statement ok
+CREATE TABLE colors (id INT, color VARCHAR);
+
+statement ok
+INSERT INTO colors VALUES (1, 'red'), (2, 'blue'), (3, 'red'), (4, 'green');
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_colors AS SELECT DISTINCT color FROM colors;
+
+query I
+SELECT color FROM distinct_colors ORDER BY color;
+----
+blue
+green
+red
+
+# Insert duplicate — should not change DISTINCT result
+statement ok
+INSERT INTO colors VALUES (5, 'red'), (6, 'blue');
+
+statement ok
+PRAGMA ivm('distinct_colors');
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT color FROM distinct_colors);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT color FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+----
+0
+
+# Insert new value
+statement ok
+INSERT INTO colors VALUES (7, 'yellow');
+
+statement ok
+PRAGMA ivm('distinct_colors');
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT color FROM distinct_colors);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT color FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+----
+0
+
+# Delete all of one color — should remove from DISTINCT result
+statement ok
+DELETE FROM colors WHERE color = 'green';
+
+statement ok
+PRAGMA ivm('distinct_colors');
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT color FROM distinct_colors);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT color FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+----
+0
+
+# ============================================================
+# DISTINCT with multiple columns
+# ============================================================
+
+statement ok
+CREATE TABLE pairs (a VARCHAR, b INT);
+
+statement ok
+INSERT INTO pairs VALUES ('x', 1), ('x', 2), ('y', 1), ('x', 1);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_pairs AS SELECT DISTINCT a, b FROM pairs;
+
+query II
+SELECT a, b FROM distinct_pairs ORDER BY a, b;
+----
+x	1
+x	2
+y	1
+
+# Insert duplicate pair — no change
+statement ok
+INSERT INTO pairs VALUES ('x', 1), ('y', 1);
+
+statement ok
+PRAGMA ivm('distinct_pairs');
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT a, b FROM pairs EXCEPT ALL SELECT a, b FROM distinct_pairs);
+----
+0
+
+# Delete one copy of a duplicate — should still exist
+statement ok
+DELETE FROM pairs WHERE a = 'x' AND b = 1;
+
+statement ok
+PRAGMA ivm('distinct_pairs');
+
+# x,1 still exists in pairs (was inserted twice before, deleted once)
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT a, b FROM pairs EXCEPT ALL SELECT a, b FROM distinct_pairs);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT a, b FROM distinct_pairs EXCEPT ALL SELECT DISTINCT a, b FROM pairs);
+----
+0
+
+# ============================================================
+# Mixed INSERT + DELETE + INSERT before single refresh
+# ============================================================
+
+statement ok
+INSERT INTO colors VALUES (10, 'purple'), (11, 'purple'), (12, 'orange');
+
+statement ok
+DELETE FROM colors WHERE color = 'yellow';
+
+statement ok
+INSERT INTO colors VALUES (13, 'yellow');
+
+statement ok
+PRAGMA ivm('distinct_colors');
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT color FROM distinct_colors);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT color FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+----
+0

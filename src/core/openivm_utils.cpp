@@ -202,7 +202,61 @@ void OpenIVMUtils::ReplaceMax(string &query) {
 }
 
 void OpenIVMUtils::ReplaceAvg(string &query) {
-	ReplaceAggregate(query, "avg");
+	// Decompose AVG(x) into hidden SUM + COUNT columns + a derived AVG column.
+	// The MERGE updates SUM and COUNT independently; a post-MERGE step recomputes AVG.
+	// Pattern: avg(expr) → sum(expr) as _ivm_sum_avg_expr, count(expr) as _ivm_count_avg_expr,
+	//                       sum(expr)::double / nullif(count(expr), 0) as avg_expr
+	string pat = R"(avg\(([^)]+)\)(?:\s+as\s+(\w+))?)";
+	std::regex pattern(pat, std::regex_constants::icase);
+	std::smatch match;
+	string result;
+	string remaining = query;
+	while (std::regex_search(remaining, match, pattern)) {
+		string arg = match[1].str();
+		string user_alias = match[2].matched ? match[2].str() : ("avg_" + SanitizeAlias(arg));
+		string sum_col = "_ivm_sum_" + user_alias;
+		string count_col = "_ivm_count_" + user_alias;
+		result += match.prefix().str() + "sum(" + arg + ") as " + sum_col + ", count(" + arg + ") as " + count_col +
+		          ", sum(" + arg + ")::double / nullif(count(" + arg + "), 0) as " + user_alias;
+		remaining = match.suffix().str();
+	}
+	result += remaining;
+	query = result;
+}
+
+void OpenIVMUtils::ReplaceDistinct(string &query) {
+	// Rewrite: SELECT DISTINCT col1, col2 FROM t → SELECT col1, col2, COUNT(*) AS _ivm_distinct_count FROM t GROUP BY
+	// col1, col2 Only matches "select distinct" (not "count(distinct ...)")
+	std::regex distinct_re(R"(\bselect\s+distinct\s+)", std::regex_constants::icase);
+	std::smatch match;
+	if (!std::regex_search(query, match, distinct_re)) {
+		return;
+	}
+
+	// Find the column list between "select distinct" and "from"
+	auto select_end = match.position() + match.length();
+	auto from_pos = query.find(" from ", select_end);
+	if (from_pos == string::npos) {
+		return;
+	}
+
+	string columns = query.substr(select_end, from_pos - select_end);
+	string rest = query.substr(from_pos);
+
+	// Strip any existing GROUP BY (shouldn't be there with DISTINCT, but safety)
+	string group_by_suffix;
+	auto group_pos = rest.find(" group by ");
+	if (group_pos != string::npos) {
+		group_by_suffix = rest.substr(group_pos);
+		rest = rest.substr(0, group_pos);
+	}
+
+	// Build the rewritten query: SELECT cols, COUNT(*) AS _ivm_distinct_count FROM ... GROUP BY cols
+	query = query.substr(0, match.position()) + "select " + columns + ", count(*) as _ivm_distinct_count" + rest +
+	        " group by " + columns;
+	if (!group_by_suffix.empty()) {
+		query += group_by_suffix;
+	}
 }
 
 void OpenIVMUtils::RemoveRedundantWhitespaces(string &query) {

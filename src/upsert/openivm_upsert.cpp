@@ -178,8 +178,10 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 
 	// AVG, MIN, MAX, HAVING use group-recompute strategy (not decomposable as simple deltas).
 	// HAVING needs recompute because groups may enter/leave the result set after aggregate changes.
+	// MIN, MAX use group-recompute. AVG is decomposed to SUM+COUNT by the parser (fully incremental).
+	// HAVING needs recompute because groups may enter/leave the result set.
 	bool has_minmax = StringUtil::Contains(view_query_sql, "min(") || StringUtil::Contains(view_query_sql, "max(") ||
-	                  StringUtil::Contains(view_query_sql, "avg(") || StringUtil::Contains(view_query_sql, " having ");
+	                  StringUtil::Contains(view_query_sql, " having ");
 
 	// Check ivm_refresh_mode: 'full' forces full recompute, skipping the IVM pipeline.
 	Value refresh_mode_val;

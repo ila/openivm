@@ -1,0 +1,186 @@
+# name: test/sql/ivm_full_refresh.test
+# description: Test that unsupported operators correctly use full refresh
+# group: [sql]
+
+require openivm
+
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+# ============================================================
+# Setup
+# ============================================================
+
+statement ok
+CREATE TABLE t1 (a INT, b INT);
+
+statement ok
+CREATE TABLE t2 (a INT, c INT);
+
+statement ok
+INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+INSERT INTO t2 VALUES (1, 100), (2, 200);
+
+# ============================================================
+# LEFT JOIN — full refresh
+# ============================================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_left AS SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a;
+
+statement ok
+INSERT INTO t1 VALUES (4, 40);
+
+statement ok
+INSERT INTO t2 VALUES (3, 300);
+
+statement ok
+PRAGMA ivm('mv_left');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a
+    EXCEPT ALL
+    SELECT a, b, c FROM mv_left
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, b, c FROM mv_left
+    EXCEPT ALL
+    SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a
+);
+----
+0
+
+# ============================================================
+# STDDEV — full refresh
+# ============================================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_stddev AS SELECT a, STDDEV(b) AS sd FROM t1 GROUP BY a;
+
+statement ok
+INSERT INTO t1 VALUES (1, 15);
+
+statement ok
+PRAGMA ivm('mv_stddev');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, STDDEV(b) AS sd FROM t1 GROUP BY a
+    EXCEPT ALL
+    SELECT a, sd FROM mv_stddev
+);
+----
+0
+
+# ============================================================
+# STRING_AGG — full refresh
+# ============================================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_string_agg AS SELECT STRING_AGG(a::VARCHAR, ',') AS all_a FROM t1;
+
+statement ok
+INSERT INTO t1 VALUES (5, 50);
+
+statement ok
+PRAGMA ivm('mv_string_agg');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT STRING_AGG(a::VARCHAR, ',') AS all_a FROM t1
+    EXCEPT ALL
+    SELECT all_a FROM mv_string_agg
+);
+----
+0
+
+# ============================================================
+# CAST — transparent (incremental, not full refresh)
+# ============================================================
+
+statement ok
+CREATE TABLE t3 (x INT, y DECIMAL(10,2));
+
+statement ok
+INSERT INTO t3 VALUES (1, 10.5), (2, 20.3);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cast AS SELECT x::VARCHAR AS x_str, y::INT AS y_int FROM t3;
+
+statement ok
+INSERT INTO t3 VALUES (3, 30.7);
+
+statement ok
+PRAGMA ivm('mv_cast');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x::VARCHAR AS x_str, y::INT AS y_int FROM t3
+    EXCEPT ALL
+    SELECT x_str, y_int FROM mv_cast
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x_str, y_int FROM mv_cast
+    EXCEPT ALL
+    SELECT x::VARCHAR AS x_str, y::INT AS y_int FROM t3
+);
+----
+0
+
+# ============================================================
+# DELETE + full refresh — still correct
+# ============================================================
+
+statement ok
+DELETE FROM t1 WHERE a = 1;
+
+statement ok
+PRAGMA ivm('mv_left');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a
+    EXCEPT ALL
+    SELECT a, b, c FROM mv_left
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, b, c FROM mv_left
+    EXCEPT ALL
+    SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a
+);
+----
+0
+
+# ============================================================
+# Multiple full refreshes — idempotent
+# ============================================================
+
+statement ok
+PRAGMA ivm('mv_left');
+
+statement ok
+PRAGMA ivm('mv_left');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a
+    EXCEPT ALL
+    SELECT a, b, c FROM mv_left
+);
+----
+0

@@ -5,6 +5,32 @@
 
 namespace duckdb {
 
+/// Detect AVG decomposition columns from the column list.
+/// AVG(x) is stored as _ivm_sum_<alias>, _ivm_count_<alias>, and <alias>.
+/// Returns: derived_cols (the alias to skip in MERGE), sum_cols (alias→sum_name), count_cols (alias→count_name).
+struct AvgDecomposition {
+	unordered_set<string> derived_cols;
+	unordered_map<string, string> sum_cols;
+	unordered_map<string, string> count_cols;
+};
+
+static AvgDecomposition DetectAvgColumns(const vector<string> &columns) {
+	AvgDecomposition result;
+	for (auto &col : columns) {
+		if (col.size() > 9 && col.substr(0, 9) == "_ivm_sum_") {
+			result.sum_cols[col.substr(9)] = col;
+		} else if (col.size() > 11 && col.substr(0, 11) == "_ivm_count_") {
+			result.count_cols[col.substr(11)] = col;
+		}
+	}
+	for (auto &[alias, sum_col] : result.sum_cols) {
+		if (result.count_cols.count(alias)) {
+			result.derived_cols.insert(alias);
+		}
+	}
+	return result;
+}
+
 string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
                               bool list_mode, const string &delta_ts_filter) {
@@ -91,12 +117,21 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 		on_clause += "v." + keys[i] + " IS NOT DISTINCT FROM d." + keys[i];
 	}
 
+	auto avg = DetectAvgColumns(aggregates);
+	auto &avg_derived_cols = avg.derived_cols;
+	auto &avg_sum_cols = avg.sum_cols;
+	auto &avg_count_cols = avg.count_cols;
+
 	string update_set;
 	string insert_cols, insert_vals;
 	{
 		string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 		bool first_agg = true;
 		for (auto &column : aggregates) {
+			// Skip AVG derived columns in MERGE — they'll be recomputed after
+			if (avg_derived_cols.count(column)) {
+				continue;
+			}
 			if (!first_agg) {
 				update_set += ", ";
 				insert_vals += ", ";
@@ -109,6 +144,24 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 				update_set += column + " = v." + column + " + d." + column;
 			}
 			insert_vals += "d." + column;
+		}
+		// Add AVG derived columns: recompute from updated SUM/COUNT in MERGE
+		for (auto &[alias, sum_col] : avg_sum_cols) {
+			if (!avg_count_cols.count(alias)) {
+				continue;
+			}
+			string count_col = avg_count_cols[alias];
+			if (!update_set.empty()) {
+				update_set += ", ";
+			}
+			if (!insert_vals.empty()) {
+				insert_vals += ", ";
+			}
+			// MATCHED: recompute avg from updated sum and count
+			update_set += alias + " = (v." + sum_col + " + d." + sum_col + ")::DOUBLE / NULLIF(v." + count_col +
+			              " + d." + count_col + ", 0)";
+			// NOT MATCHED: compute avg from delta sum and count
+			insert_vals += "d." + sum_col + "::DOUBLE / NULLIF(d." + count_col + ", 0)";
 		}
 		for (auto &key : keys) {
 			insert_cols += key + ", ";
@@ -131,9 +184,12 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 
 	string upsert_query = merge_query + "\n";
 
-	// Delete zero rows
+	// Delete zero rows — skip AVG derived columns (check sum/count helpers instead)
 	string delete_query = "\ndelete from " + view_name + " where ";
 	for (auto &column : aggregates) {
+		if (avg_derived_cols.count(column)) {
+			continue; // skip avg_x — checking sum/count is sufficient
+		}
 		if (list_mode) {
 			delete_query += "list_reduce(" + column + ", lambda a, b: a + b) = 0.0 and ";
 		} else {
@@ -159,15 +215,20 @@ string CompileSimpleAggregates(string &view_name, const vector<string> &column_n
 	string mul = string(ivm::MULTIPLICITY_COL);
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
-	// Single CTE consolidates all delta columns in one pass (avoids 2K correlated subqueries).
+	auto avg = DetectAvgColumns(column_names);
+	auto &avg_derived = avg.derived_cols;
+	auto &avg_sum = avg.sum_cols;
+	auto &avg_count = avg.count_cols;
+
+	// Single CTE consolidates all delta columns in one pass.
 	string cte = "WITH _ivm_delta AS (\n  SELECT ";
 	string update_set;
 	bool first = true;
 	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 
 	for (auto &column : column_names) {
-		if (column == mul) {
-			continue;
+		if (column == mul || avg_derived.count(column)) {
+			continue; // skip multiplicity and AVG derived columns
 		}
 		if (!first) {
 			cte += ",\n    ";
@@ -175,7 +236,6 @@ string CompileSimpleAggregates(string &view_name, const vector<string> &column_n
 		}
 		first = false;
 		if (list_mode) {
-			// Consolidate list deltas: negate deletions, sum with insertions
 			cte += "list_transform(list_zip("
 			       "COALESCE(SUM(CASE WHEN " +
 			       mul + " = false THEN list_transform(" + column + ", lambda x: -x) ELSE NULL END), " + zeros_list +
@@ -193,7 +253,19 @@ string CompileSimpleAggregates(string &view_name, const vector<string> &column_n
 	}
 	cte += "\n  FROM " + delta_view + ts_where + "\n)\n";
 
-	return cte + "UPDATE " + view_name + " SET\n  " + update_set + ";\n";
+	string result = cte + "UPDATE " + view_name + " SET\n  " + update_set + ";\n";
+
+	// Recompute AVG derived columns from updated SUM and COUNT
+	for (auto &[alias, sum_col] : avg_sum) {
+		if (!avg_count.count(alias)) {
+			continue;
+		}
+		string count_col = avg_count[alias];
+		result +=
+		    "UPDATE " + view_name + " SET " + alias + " = " + sum_col + "::DOUBLE / NULLIF(" + count_col + ", 0);\n";
+	}
+
+	return result;
 }
 
 string CompileProjectionsFilters(string &view_name, const vector<string> &column_names, const string &delta_ts_filter) {

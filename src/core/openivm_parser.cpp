@@ -13,6 +13,7 @@
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/planner.hpp"
@@ -72,6 +73,10 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Intercepted query: %s\n", query_lower.c_str());
 
 	OpenIVMUtils::ReplaceMaterializedView(query_lower);
+
+	// Rewrite DISTINCT: SELECT DISTINCT cols FROM t → SELECT cols, COUNT(*) AS _ivm_distinct_count FROM t GROUP BY cols
+	// This creates the MV with the hidden count column. The IvmDistinctRule handles the incremental plan.
+	OpenIVMUtils::ReplaceDistinct(query_lower);
 
 	// Split at HAVING to avoid rewriting aggregates inside HAVING clause
 	// (adding "AS alias" inside HAVING produces invalid SQL)
@@ -149,13 +154,29 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		bool found_aggregation = false;
 		bool found_projection = false;
+		bool found_distinct = false;
 		vector<string> aggregate_columns;
 
 		while (!node_stack.empty()) {
 			auto current = node_stack.top();
 			node_stack.pop();
 
-			if (current->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+			if (current->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+				found_distinct = true;
+				// DISTINCT columns become group-by keys after IVM rewrite
+				auto *distinct_node = dynamic_cast<LogicalDistinct *>(current);
+				if (!distinct_node->distinct_targets.empty()) {
+					for (auto &target : distinct_node->distinct_targets) {
+						aggregate_columns.emplace_back(target->GetName());
+					}
+				} else {
+					// Plain DISTINCT: all child output columns are keys
+					auto child_bindings = current->children[0]->GetColumnBindings();
+					for (idx_t i = 0; i < current->children[0]->types.size(); i++) {
+						aggregate_columns.emplace_back("col" + to_string(i));
+					}
+				}
+			} else if (current->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 				found_aggregation = true;
 				auto node = dynamic_cast<LogicalAggregate *>(current);
 				for (auto &group : node->groups) {
@@ -190,6 +211,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' uses constructs not supported for incremental maintenance. "
 			               "Full refresh will be used.");
+		} else if (found_distinct) {
+			// DISTINCT is rewritten to GROUP BY + COUNT(*) by IvmDistinctRule
+			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (found_aggregation && aggregate_columns.empty()) {
