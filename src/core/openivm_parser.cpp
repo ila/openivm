@@ -5,9 +5,6 @@
 #include "core/openivm_utils.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
-#include "duckdb/common/serializer/binary_serializer.hpp"
-#include "duckdb/common/serializer/memory_stream.hpp"
-#include "duckdb/parser/group_by_node.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
@@ -20,7 +17,6 @@
 
 #include "core/openivm_debug.hpp"
 
-#include <iostream>
 #include <stack>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 

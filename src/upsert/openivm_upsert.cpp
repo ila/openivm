@@ -11,19 +11,12 @@
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
-#include "duckdb/execution/index/art/art.hpp"
-#include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/parallel/thread_context.hpp"
-#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
-#include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 
@@ -280,8 +273,6 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 		                                      view_query_sql, has_minmax, list_mode, delta_ts_filter);
 		break;
 	}
-
-	// note: simple_filter removed 2024-12-11
 	case IVMType::SIMPLE_PROJECTION: {
 		upsert_query = CompileProjectionsFilters(view_name, column_names, delta_ts_filter);
 		break;

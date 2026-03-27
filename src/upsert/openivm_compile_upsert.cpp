@@ -5,6 +5,9 @@
 
 namespace duckdb {
 
+// Zero-initialized 64-element float list, used as COALESCE default for NULL list aggregates.
+static const string ZEROS_LIST = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
+
 /// Detect AVG decomposition columns from the column list.
 /// AVG(x) is stored as _ivm_sum_<alias>, _ivm_count_<alias>, and <alias>.
 /// Returns: derived_cols (the alias to skip in MERGE), sum_cols (alias→sum_name), count_cols (alias→count_name).
@@ -125,7 +128,7 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	string update_set;
 	string insert_cols, insert_vals;
 	{
-		string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
+		const string &zeros_list = ZEROS_LIST;
 		bool first_agg = true;
 		for (auto &column : aggregates) {
 			// Skip AVG derived columns in MERGE — they'll be recomputed after
