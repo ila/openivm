@@ -16,13 +16,23 @@ PRAGMA ivm('sales_summary');
 
 ## How IVM handles it
 
-The delta table is scanned, grouped by the same keys as the view, and consolidated into net changes per group. A `MERGE INTO` statement atomically updates existing groups and inserts new ones. Groups whose aggregate values reach zero are deleted.
+**Algebraic rule:**
+
+```
+new_MV[key] = old_MV[key] + delta_agg[key]
+```
+
+For each group key, the delta aggregate is computed from the delta table and merged with the existing value. New groups are inserted; groups whose aggregates reach zero are deleted.
+
+The delta table is scanned, grouped by the same keys as the view, and consolidated into net changes per group. A `MERGE INTO` statement atomically updates existing groups and inserts new ones.
 
 ## Compiled SQL
 
 ### IVM query (delta computation)
 
 ```sql
+-- Aggregate the delta rows, preserving multiplicity as a grouping key
+-- This separates insertions from deletions so the upsert can fold them correctly
 WITH scan_0 (...) AS (
     SELECT region, amount, _duckdb_ivm_multiplicity
     FROM delta_sales
@@ -44,6 +54,7 @@ SELECT * FROM projection_2;
 ### Upsert (MERGE)
 
 ```sql
+-- Consolidate delta rows: fold insertions (+) and deletions (-) into a single net delta per group
 WITH ivm_cte AS (
     SELECT region,
         SUM(CASE WHEN _duckdb_ivm_multiplicity = false THEN -total ELSE total END) AS total,
@@ -51,11 +62,16 @@ WITH ivm_cte AS (
     FROM delta_sales_summary
     GROUP BY region
 )
+-- Single-pass MERGE: update existing groups and insert new ones atomically
+-- IS NOT DISTINCT FROM handles NULL group keys correctly (NULL = NULL)
 MERGE INTO sales_summary v USING ivm_cte d
 ON v.region IS NOT DISTINCT FROM d.region
+-- Existing group: add the net delta to the current aggregate values
 WHEN MATCHED THEN UPDATE SET total = v.total + d.total, cnt = v.cnt + d.cnt
+-- New group: insert the delta as the initial value
 WHEN NOT MATCHED THEN INSERT (region, total, cnt) VALUES (d.region, d.total, d.cnt);
 
+-- Remove groups where all rows have been deleted (aggregates sum to zero)
 DELETE FROM sales_summary WHERE total = 0 AND cnt = 0;
 ```
 
@@ -63,12 +79,12 @@ DELETE FROM sales_summary WHERE total = 0 AND cnt = 0;
 
 | Function | Strategy | Notes |
 |----------|----------|-------|
-| `SUM` | Incremental (MERGE) | Delta added to existing value |
-| `COUNT`, `COUNT(*)` | Incremental (MERGE) | Delta added to existing count |
-| `MIN`, `MAX` | Group recompute | Affected groups deleted and re-inserted from the original query |
-| `AVG` | Group recompute | Not decomposable as a simple delta |
-| `HAVING` | Group recompute | Groups may enter or leave the result set after changes |
-| `STDDEV`, `STRING_AGG` | Full refresh | Automatically detected; view uses full recompute |
+| `SUM` | Incremental (MERGE) | Delta added to existing value. |
+| `COUNT`, `COUNT(*)` | Incremental (MERGE) | Delta added to existing count. |
+| `AVG` | Incremental (decomposed) | Parser rewrites to hidden SUM + COUNT columns. MERGE updates both; AVG recomputed as SUM / NULLIF(COUNT, 0). |
+| `MIN`, `MAX` | Group recompute | Affected groups deleted and re-inserted from the original query. Deleting the current min/max requires a full group rescan. |
+| `HAVING` | Group recompute | Groups may enter or leave the result set after changes. |
+| `STDDEV`, `STRING_AGG` | Full refresh | Automatically detected; view uses full recompute. |
 
 ## Expressions
 

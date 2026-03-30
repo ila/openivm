@@ -58,7 +58,7 @@ When `PRAGMA ivm('view_name')` is called:
 
 1. **Optimizer rewrite rules** transform the view's logical plan to read from delta tables instead of base tables
 2. **Upsert compilation** generates SQL to apply the deltas to the materialized view
-3. **Cost model** (when `ivm_adaptive = true`) decides whether IVM or full recompute is cheaper
+3. **Cost model** (when `ivm_adaptive_refresh = true`) decides whether IVM or full recompute is cheaper
 
 ### Operator-Specific Rewrite Rules
 
@@ -122,7 +122,7 @@ MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `ivm_refresh_mode` | VARCHAR | `"auto"` | `"auto"`, `"incremental"`, or `"full"` |
-| `ivm_adaptive` | BOOLEAN | `false` | Enable adaptive cost model |
+| `ivm_adaptive_refresh` | BOOLEAN | `false` | Enable adaptive cost model |
 | `ivm_files_path` | VARCHAR | — | Path for compiled query reference files |
 
 Views using unsupported constructs (LEFT JOIN, RANDOM(), STDDEV, etc.) are automatically classified as `FULL_REFRESH` — no setting needed.

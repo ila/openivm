@@ -65,7 +65,7 @@ delta tracking. Direct manipulation breaks the IVM invariants.
 
 ```sql
 SET ivm_refresh_mode = 'auto';         -- auto (default), incremental, or full
-SET ivm_adaptive = true;               -- enable adaptive cost model
+SET ivm_adaptive_refresh = true;               -- enable adaptive cost model
 SET ivm_files_path = '/tmp/ivm/';      -- path for compiled query files
 ```
 

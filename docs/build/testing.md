@@ -22,6 +22,7 @@ All tests live in `test/sql/*.test` using DuckDB's SQLLogicTest format.
 | `ivm_projection.test` | Column projection, expression projection |
 | `ivm_filter.test` | WHERE clause filtering |
 | `ivm_join.test` | Inner joins, multi-table joins |
+| `ivm_left_join.test` | LEFT JOIN, RIGHT JOIN, mixed INNER+LEFT, NULL keys |
 | `ivm_union.test` | UNION ALL views |
 | `ivm_chained.test` | Chained (multi-level) materialized views |
 | `ivm_checker.test` | Query constraint validation |

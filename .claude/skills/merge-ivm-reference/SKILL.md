@@ -692,7 +692,7 @@ WHERE _duckdb_ivm_timestamp >= '<last_update_ts>'
 DuckDB's MERGE implementation may consume significant memory for large delta
 sets (GitHub Issue #19958). For IVM, delta sets are typically small relative
 to the full table, so this is unlikely to be a practical concern. If memory
-becomes an issue, the adaptive cost model (`ivm_adaptive` setting) can fall
+becomes an issue, the adaptive cost model (`ivm_adaptive_refresh` setting) can fall
 back to full recompute.
 
 ---

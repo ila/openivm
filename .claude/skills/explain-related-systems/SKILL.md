@@ -174,7 +174,7 @@ view evaluated at some past point in time. Provides clean transactional reasonin
 
 **Relevance to OpenIVM:**
 - Snowflake's adaptive refresh (auto = pick incremental vs. full) maps directly to
-  OpenIVM's `ivm_adaptive` cost model
+  OpenIVM's `ivm_adaptive_refresh` cost model
 - Target lag concept relevant for the refresh scheduling question
 - DAG chaining relevant for OpenIVM's chained materialized views
 - The SIGMOD 2025 paper formalizes transaction isolation + IVM interaction
@@ -193,4 +193,4 @@ view evaluated at some past point in time. Provides clean transactional reasonin
 | **Joins** | Inner (inclusion-exclusion) | All (bilinear delta) | All (recursive delta) | Inner + outer (v1.13) | Inner + outer |
 | **Aggregates** | SUM, COUNT (+MIN/MAX partial) | All (linear cheap) | SUM, COUNT, AVG | count, sum, avg, min, max | All standard |
 | **Cross-system** | Yes (SQL output) | No (Feldera only) | No (compiled code) | No (PG only) | No (Snowflake only) |
-| **Adaptive** | Cost model (ivm_adaptive) | No | No | No | Auto mode |
+| **Adaptive** | Cost model (ivm_adaptive_refresh) | No | No | No | Auto mode |

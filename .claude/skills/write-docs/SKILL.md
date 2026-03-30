@@ -250,7 +250,7 @@ Use when: ignoring this causes silent data corruption or wrong results.
 ### Tip — A non-obvious efficiency or convenience trick
 
 ```markdown
-> **Tip:** Set `ivm_adaptive = true` to let OpenIVM automatically choose
+> **Tip:** Set `ivm_adaptive_refresh = true` to let OpenIVM automatically choose
 > between incremental refresh and full recompute based on delta size.
 ```
 
@@ -286,7 +286,7 @@ Use tables for structured reference data. Follow DuckDB's function table pattern
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `ivm_refresh_mode` | VARCHAR | `'auto'` | Refresh strategy |
-| `ivm_adaptive` | BOOLEAN | `false` | Enable adaptive cost model |
+| `ivm_adaptive_refresh` | BOOLEAN | `false` | Enable adaptive cost model |
 ```
 
 - Left-align text columns, right-align numbers

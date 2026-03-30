@@ -52,7 +52,7 @@ SELECT * FROM regional_totals ORDER BY region;
 |---------|------|---------|-------------|---------------|
 | `ivm_cascade_refresh` | VARCHAR | `downstream` | Cascade mode: `off`, `upstream`, `downstream`, `both` | [Pipelines](docs/refresh/pipelines.md) |
 | `ivm_refresh_mode` | VARCHAR | `auto` | Force refresh strategy: `auto`, `incremental`, `full` | [Refresh strategies](docs/refresh/refresh-strategies.md) |
-| `ivm_adaptive` | BOOLEAN | `false` | Enable cost-based strategy selection | [Refresh strategies](docs/refresh/refresh-strategies.md) |
+| `ivm_adaptive_refresh` | BOOLEAN | `false` | Experimental: enable cost-based strategy selection | [Refresh strategies](docs/refresh/refresh-strategies.md) |
 | `ivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files | [Internals](docs/internals/delta-tables.md) |
 
 ## Pragmas
