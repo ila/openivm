@@ -144,7 +144,8 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 				update_set +=
 				    column + " = list_transform(list_zip(v." + column + ", d." + column + "), lambda x: x[1] + x[2])";
 			} else {
-				update_set += column + " = v." + column + " + d." + column;
+				update_set +=
+				    column + " = COALESCE(v." + column + " + d." + column + ", v." + column + ", d." + column + ")";
 			}
 			insert_vals += "d." + column;
 		}
@@ -161,8 +162,9 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 				insert_vals += ", ";
 			}
 			// MATCHED: recompute avg from updated sum and count
-			update_set += alias + " = (v." + sum_col + " + d." + sum_col + ")::DOUBLE / NULLIF(v." + count_col +
-			              " + d." + count_col + ", 0)";
+			update_set += alias + " = COALESCE(v." + sum_col + " + d." + sum_col + ", v." + sum_col + ", d." + sum_col +
+			              ")::DOUBLE / NULLIF(COALESCE(v." + count_col + " + d." + count_col + ", v." + count_col +
+			              ", d." + count_col + "), 0)";
 			// NOT MATCHED: compute avg from delta sum and count
 			insert_vals += "d." + sum_col + "::DOUBLE / NULLIF(d." + count_col + ", 0)";
 		}
@@ -196,7 +198,7 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 		if (list_mode) {
 			delete_query += "list_reduce(" + column + ", lambda a, b: a + b) = 0.0 and ";
 		} else {
-			delete_query += column + " = 0 and ";
+			delete_query += "COALESCE(" + column + ", 0) = 0 and ";
 		}
 	}
 	delete_query.erase(delete_query.size() - 5, 5);

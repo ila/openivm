@@ -368,3 +368,194 @@ EU	A	7	12.00
 EU	A	10	12.00
 US	A	2	10.00
 US	B	3	20.00
+
+# ==========================================
+# INSERT and DELETE same row in one batch (net zero delta)
+# ==========================================
+
+statement ok
+CREATE TABLE jn_left_nz (id INT, val VARCHAR);
+
+statement ok
+CREATE TABLE jn_right_nz (id INT, amount INT);
+
+statement ok
+INSERT INTO jn_left_nz VALUES (1, 'a'), (2, 'b');
+
+statement ok
+INSERT INTO jn_right_nz VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_join_nz AS
+    SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id;
+
+statement ok
+PRAGMA ivm('mv_join_nz');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
+    EXCEPT ALL
+    SELECT val, amount FROM mv_join_nz
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT val, amount FROM mv_join_nz
+    EXCEPT ALL
+    SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
+);
+----
+0
+
+# Insert and delete same row — net zero for the 999 row
+statement ok
+INSERT INTO jn_right_nz VALUES (1, 999);
+
+statement ok
+DELETE FROM jn_right_nz WHERE id = 1 AND amount = 999;
+
+statement ok
+PRAGMA ivm('mv_join_nz');
+
+# MV unchanged
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
+    EXCEPT ALL
+    SELECT val, amount FROM mv_join_nz
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT val, amount FROM mv_join_nz
+    EXCEPT ALL
+    SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
+);
+----
+0
+
+# Insert new row for id=3 (no left match) + delete id=2 from right
+statement ok
+INSERT INTO jn_right_nz VALUES (3, 300);
+
+statement ok
+DELETE FROM jn_right_nz WHERE id = 2;
+
+statement ok
+PRAGMA ivm('mv_join_nz');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
+    EXCEPT ALL
+    SELECT val, amount FROM mv_join_nz
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT val, amount FROM mv_join_nz
+    EXCEPT ALL
+    SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
+);
+----
+0
+
+# ==========================================
+# NULL join keys (should not match in INNER JOIN)
+# ==========================================
+
+statement ok
+CREATE TABLE jn_left_null (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE jn_right_null (id INT, score INT);
+
+statement ok
+INSERT INTO jn_left_null VALUES (1, 'a'), (NULL, 'b'), (3, 'c');
+
+statement ok
+INSERT INTO jn_right_null VALUES (1, 10), (NULL, 20), (3, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_join_null AS
+    SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id;
+
+statement ok
+PRAGMA ivm('mv_join_null');
+
+# Only (a,10) and (c,30) — NULL != NULL in INNER JOIN
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
+    EXCEPT ALL
+    SELECT name, score FROM mv_join_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, score FROM mv_join_null
+    EXCEPT ALL
+    SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
+);
+----
+0
+
+# Insert another NULL on right — still no NULL matches
+statement ok
+INSERT INTO jn_right_null VALUES (NULL, 99);
+
+statement ok
+PRAGMA ivm('mv_join_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
+    EXCEPT ALL
+    SELECT name, score FROM mv_join_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, score FROM mv_join_null
+    EXCEPT ALL
+    SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
+);
+----
+0
+
+# Delete NULL row from left — no change to MV
+statement ok
+DELETE FROM jn_left_null WHERE id IS NULL;
+
+statement ok
+PRAGMA ivm('mv_join_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
+    EXCEPT ALL
+    SELECT name, score FROM mv_join_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, score FROM mv_join_null
+    EXCEPT ALL
+    SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
+);
+----
+0

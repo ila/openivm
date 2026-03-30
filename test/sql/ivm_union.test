@@ -293,3 +293,197 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Both sides empty then repopulated
+# ==========================================
+
+statement ok
+CREATE TABLE u_a (id INT);
+
+statement ok
+CREATE TABLE u_b (id INT);
+
+statement ok
+INSERT INTO u_a VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO u_b VALUES (4), (5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_union_empty AS
+    SELECT id FROM u_a UNION ALL SELECT id FROM u_b;
+
+statement ok
+PRAGMA ivm('mv_union_empty');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id FROM u_a UNION ALL SELECT id FROM u_b)
+    EXCEPT ALL
+    SELECT id FROM mv_union_empty
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM mv_union_empty
+    EXCEPT ALL
+    (SELECT id FROM u_a UNION ALL SELECT id FROM u_b)
+);
+----
+0
+
+# Delete all from both sides
+statement ok
+DELETE FROM u_a;
+
+statement ok
+DELETE FROM u_b;
+
+statement ok
+PRAGMA ivm('mv_union_empty');
+
+# MV should be empty
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id FROM u_a UNION ALL SELECT id FROM u_b)
+    EXCEPT ALL
+    SELECT id FROM mv_union_empty
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM mv_union_empty
+    EXCEPT ALL
+    (SELECT id FROM u_a UNION ALL SELECT id FROM u_b)
+);
+----
+0
+
+# Repopulate both sides
+statement ok
+INSERT INTO u_a VALUES (10), (20);
+
+statement ok
+INSERT INTO u_b VALUES (30), (40), (50);
+
+statement ok
+PRAGMA ivm('mv_union_empty');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id FROM u_a UNION ALL SELECT id FROM u_b)
+    EXCEPT ALL
+    SELECT id FROM mv_union_empty
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM mv_union_empty
+    EXCEPT ALL
+    (SELECT id FROM u_a UNION ALL SELECT id FROM u_b)
+);
+----
+0
+
+# ==========================================
+# Heavy duplicates one side, delete all from other
+# ==========================================
+
+statement ok
+CREATE TABLE u_dup_l (id INT);
+
+statement ok
+CREATE TABLE u_dup_r (id INT);
+
+# Insert 5x id=1 in left, 3x id=1 in right
+statement ok
+INSERT INTO u_dup_l VALUES (1), (1), (1), (1), (1);
+
+statement ok
+INSERT INTO u_dup_r VALUES (1), (1), (1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_union_dup AS
+    SELECT id FROM u_dup_l UNION ALL SELECT id FROM u_dup_r;
+
+statement ok
+PRAGMA ivm('mv_union_dup');
+
+# Cross-check: 8 rows with id=1
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id FROM u_dup_l UNION ALL SELECT id FROM u_dup_r)
+    EXCEPT ALL
+    SELECT id FROM mv_union_dup
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM mv_union_dup
+    EXCEPT ALL
+    (SELECT id FROM u_dup_l UNION ALL SELECT id FROM u_dup_r)
+);
+----
+0
+
+# Delete all from left
+statement ok
+DELETE FROM u_dup_l;
+
+statement ok
+PRAGMA ivm('mv_union_dup');
+
+# Cross-check: 3 rows remain (from right only)
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id FROM u_dup_l UNION ALL SELECT id FROM u_dup_r)
+    EXCEPT ALL
+    SELECT id FROM mv_union_dup
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM mv_union_dup
+    EXCEPT ALL
+    (SELECT id FROM u_dup_l UNION ALL SELECT id FROM u_dup_r)
+);
+----
+0
+
+# Insert 10x id=1 in left
+statement ok
+INSERT INTO u_dup_l SELECT 1 FROM range(10);
+
+statement ok
+PRAGMA ivm('mv_union_dup');
+
+# Cross-check: 13 rows total
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id FROM u_dup_l UNION ALL SELECT id FROM u_dup_r)
+    EXCEPT ALL
+    SELECT id FROM mv_union_dup
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM mv_union_dup
+    EXCEPT ALL
+    (SELECT id FROM u_dup_l UNION ALL SELECT id FROM u_dup_r)
+);
+----
+0

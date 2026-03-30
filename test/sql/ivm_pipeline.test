@@ -536,3 +536,308 @@ query I
 SELECT grand FROM cascade_l2;
 ----
 185
+
+# ============================================================
+# Full cascade through 3 levels where base becomes empty then repopulated
+# ============================================================
+
+statement ok
+SET ivm_cascade_refresh = 'downstream';
+
+statement ok
+CREATE TABLE pipe_empty (user_id VARCHAR, value INT);
+
+statement ok
+INSERT INTO pipe_empty VALUES ('a', 100), ('b', 200);
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_e1 AS
+    SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id;
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_e2 AS
+    SELECT SUM(total) AS grand FROM pipe_e1;
+
+statement ok
+PRAGMA ivm('pipe_e1');
+
+# Cross-check pipe_e1
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id
+    EXCEPT ALL
+    SELECT user_id, total FROM pipe_e1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, total FROM pipe_e1
+    EXCEPT ALL
+    SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id
+);
+----
+0
+
+# Cross-check pipe_e2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id)
+    EXCEPT ALL
+    SELECT grand FROM pipe_e2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM pipe_e2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id)
+);
+----
+0
+
+# Delete all — everything becomes empty
+statement ok
+DELETE FROM pipe_empty;
+
+statement ok
+PRAGMA ivm('pipe_e1');
+
+# Cross-check pipe_e1 (empty)
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id
+    EXCEPT ALL
+    SELECT user_id, total FROM pipe_e1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, total FROM pipe_e1
+    EXCEPT ALL
+    SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id
+);
+----
+0
+
+# Cross-check pipe_e2 (grand should be NULL)
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id)
+    EXCEPT ALL
+    SELECT grand FROM pipe_e2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM pipe_e2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id)
+);
+----
+0
+
+# Repopulate
+statement ok
+INSERT INTO pipe_empty VALUES ('x', 50);
+
+statement ok
+PRAGMA ivm('pipe_e1');
+
+# Cross-check pipe_e1
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id
+    EXCEPT ALL
+    SELECT user_id, total FROM pipe_e1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, total FROM pipe_e1
+    EXCEPT ALL
+    SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id
+);
+----
+0
+
+# Cross-check pipe_e2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id)
+    EXCEPT ALL
+    SELECT grand FROM pipe_e2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM pipe_e2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT user_id, SUM(value) AS total FROM pipe_empty GROUP BY user_id)
+);
+----
+0
+
+# ============================================================
+# Upstream cascade with 3 levels — refresh leaf, all ancestors refresh
+# ============================================================
+
+statement ok
+SET ivm_cascade_refresh = 'upstream';
+
+statement ok
+CREATE TABLE pipe_up (k VARCHAR, v INT);
+
+statement ok
+INSERT INTO pipe_up VALUES ('a', 10);
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_up1 AS
+    SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_up2 AS
+    SELECT SUM(total) AS grand FROM pipe_up1;
+
+# Refresh leaf — should auto-refresh pipe_up1 first, then pipe_up2
+statement ok
+PRAGMA ivm('pipe_up2');
+
+# Cross-check pipe_up1
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k
+    EXCEPT ALL
+    SELECT k, total FROM pipe_up1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, total FROM pipe_up1
+    EXCEPT ALL
+    SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k
+);
+----
+0
+
+# Cross-check pipe_up2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k)
+    EXCEPT ALL
+    SELECT grand FROM pipe_up2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM pipe_up2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k)
+);
+----
+0
+
+# Insert more data
+statement ok
+INSERT INTO pipe_up VALUES ('a', 5), ('b', 20);
+
+statement ok
+PRAGMA ivm('pipe_up2');
+
+# Cross-check pipe_up1
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k
+    EXCEPT ALL
+    SELECT k, total FROM pipe_up1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, total FROM pipe_up1
+    EXCEPT ALL
+    SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k
+);
+----
+0
+
+# Cross-check pipe_up2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k)
+    EXCEPT ALL
+    SELECT grand FROM pipe_up2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM pipe_up2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k)
+);
+----
+0
+
+# Delete group 'a' entirely
+statement ok
+DELETE FROM pipe_up WHERE k = 'a';
+
+statement ok
+PRAGMA ivm('pipe_up2');
+
+# Cross-check pipe_up1 (group 'a' gone)
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k
+    EXCEPT ALL
+    SELECT k, total FROM pipe_up1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, total FROM pipe_up1
+    EXCEPT ALL
+    SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k
+);
+----
+0
+
+# Cross-check pipe_up2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k)
+    EXCEPT ALL
+    SELECT grand FROM pipe_up2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM pipe_up2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT k, SUM(v) AS total FROM pipe_up GROUP BY k)
+);
+----
+0

@@ -297,3 +297,235 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# NULL join keys in LEFT JOIN
+# NULL != NULL in join, so NULL keys never match
+# ============================================================
+
+statement ok
+CREATE TABLE lj_l (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE lj_r (ref_id INT, val INT);
+
+statement ok
+INSERT INTO lj_l VALUES (1, 'a'), (NULL, 'b'), (3, 'c');
+
+statement ok
+INSERT INTO lj_r VALUES (1, 100), (NULL, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW lj_null_keys AS
+    SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id;
+
+statement ok
+PRAGMA ivm('lj_null_keys');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
+    EXCEPT ALL
+    SELECT name, val FROM lj_null_keys
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, val FROM lj_null_keys
+    EXCEPT ALL
+    SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
+);
+----
+0
+
+# Insert into right: ref_id=3 now matches left id=3
+statement ok
+INSERT INTO lj_r VALUES (3, 300);
+
+statement ok
+PRAGMA ivm('lj_null_keys');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
+    EXCEPT ALL
+    SELECT name, val FROM lj_null_keys
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, val FROM lj_null_keys
+    EXCEPT ALL
+    SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
+);
+----
+0
+
+# Delete from right: ref_id=1 removed, name='a' becomes NULL-extended
+statement ok
+DELETE FROM lj_r WHERE ref_id = 1;
+
+statement ok
+PRAGMA ivm('lj_null_keys');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
+    EXCEPT ALL
+    SELECT name, val FROM lj_null_keys
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, val FROM lj_null_keys
+    EXCEPT ALL
+    SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
+);
+----
+0
+
+# Delete from left: remove the NULL-keyed row
+statement ok
+DELETE FROM lj_l WHERE id IS NULL;
+
+statement ok
+PRAGMA ivm('lj_null_keys');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
+    EXCEPT ALL
+    SELECT name, val FROM lj_null_keys
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, val FROM lj_null_keys
+    EXCEPT ALL
+    SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
+);
+----
+0
+
+# ============================================================
+# LEFT JOIN where entire right table is empty
+# ============================================================
+
+statement ok
+CREATE TABLE lj_emp_l (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE lj_emp_r (ref_id INT, score INT);
+
+statement ok
+INSERT INTO lj_emp_l VALUES (1, 'x'), (2, 'y'), (3, 'z');
+
+# lj_emp_r is intentionally empty — all left rows should be NULL-extended
+
+statement ok
+CREATE MATERIALIZED VIEW lj_empty_right AS
+    SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id;
+
+statement ok
+PRAGMA ivm('lj_empty_right');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
+    EXCEPT ALL
+    SELECT name, score FROM lj_empty_right
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, score FROM lj_empty_right
+    EXCEPT ALL
+    SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
+);
+----
+0
+
+# Insert one match — 'x' gets a real score, 'y' and 'z' still NULL-extended
+statement ok
+INSERT INTO lj_emp_r VALUES (1, 10);
+
+statement ok
+PRAGMA ivm('lj_empty_right');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
+    EXCEPT ALL
+    SELECT name, score FROM lj_empty_right
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, score FROM lj_empty_right
+    EXCEPT ALL
+    SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
+);
+----
+0
+
+# Insert matches for all left rows using generate_series
+statement ok
+INSERT INTO lj_emp_r SELECT id, id*10 FROM generate_series(1,3) t(id);
+
+statement ok
+PRAGMA ivm('lj_empty_right');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
+    EXCEPT ALL
+    SELECT name, score FROM lj_empty_right
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, score FROM lj_empty_right
+    EXCEPT ALL
+    SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
+);
+----
+0
+
+# Delete all from right — all rows back to NULL-extended
+statement ok
+DELETE FROM lj_emp_r;
+
+statement ok
+PRAGMA ivm('lj_empty_right');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
+    EXCEPT ALL
+    SELECT name, score FROM lj_empty_right
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, score FROM lj_empty_right
+    EXCEPT ALL
+    SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
+);
+----
+0

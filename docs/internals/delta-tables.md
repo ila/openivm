@@ -34,7 +34,7 @@ The delta table `delta_sales` has the schema:
 
 ## Change tracking
 
-OpenIVM installs an optimizer insert rule that intercepts DML statements on tracked tables and writes corresponding rows to the delta table automatically.
+OpenIVM implements an optimizer insert rule that intercepts DML statements on tracked tables and writes corresponding rows to the delta table automatically.
 
 - **INSERT**: Each inserted row is copied to the delta table with `_duckdb_ivm_multiplicity = true`.
 - **DELETE**: Each deleted row is copied to the delta table with `_duckdb_ivm_multiplicity = false`.

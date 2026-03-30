@@ -1033,3 +1033,177 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# NULL values in aggregate columns with edge case deletions
+# ==========================================
+
+statement ok
+CREATE TABLE agg_null_edge (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO agg_null_edge VALUES ('a', 10), ('a', NULL), ('b', NULL), ('b', NULL), ('c', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg_null_edge AS
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val
+    FROM agg_null_edge GROUP BY grp;
+
+statement ok
+PRAGMA ivm('mv_agg_null_edge');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+);
+----
+0
+
+# Delete all NULL vals — group 'b' loses all rows (cnt becomes 0 → group removed)
+statement ok
+DELETE FROM agg_null_edge WHERE val IS NULL;
+
+statement ok
+PRAGMA ivm('mv_agg_null_edge');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+);
+----
+0
+
+# Insert only NULLs into 'a': SUM unchanged, COUNT(*) increases, COUNT(val) unchanged
+statement ok
+INSERT INTO agg_null_edge VALUES ('a', NULL), ('a', NULL);
+
+statement ok
+PRAGMA ivm('mv_agg_null_edge');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+);
+----
+0
+
+# ==========================================
+# UPDATE that changes GROUP BY key (row moves between groups)
+# ==========================================
+
+statement ok
+CREATE TABLE agg_grp_move (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO agg_grp_move VALUES ('x', 10), ('x', 20), ('y', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg_grp_move AS
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp;
+
+statement ok
+PRAGMA ivm('mv_agg_grp_move');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM mv_agg_grp_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_agg_grp_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+);
+----
+0
+
+# Move row from x to y: UPDATE val=20 row's grp from 'x' to 'y'
+statement ok
+UPDATE agg_grp_move SET grp = 'y' WHERE val = 20;
+
+statement ok
+PRAGMA ivm('mv_agg_grp_move');
+
+# x total: 10, y total: 50
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM mv_agg_grp_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_agg_grp_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+);
+----
+0
+
+# Move row from y to new group z: UPDATE val=30 row's grp from 'y' to 'z'
+statement ok
+UPDATE agg_grp_move SET grp = 'z' WHERE val = 30;
+
+statement ok
+PRAGMA ivm('mv_agg_grp_move');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM mv_agg_grp_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_agg_grp_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+);
+----
+0

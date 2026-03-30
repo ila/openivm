@@ -647,3 +647,319 @@ SELECT d.dept_name, SUM(e.salary), COUNT(*) FROM employees e INNER JOIN departme
 ----
 Engineering	330	3
 Sales	90	1
+
+# ============================================================
+# Chain where intermediate MV becomes completely empty
+# ============================================================
+
+statement ok
+CREATE TABLE ch_empty (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO ch_empty VALUES ('a', 10), ('b', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW ch_l1 AS
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW ch_l2 AS
+    SELECT SUM(total) AS grand FROM ch_l1;
+
+statement ok
+pragma ivm('ch_l1');
+
+statement ok
+pragma ivm('ch_l2');
+
+# Cross-check ch_l1
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM ch_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM ch_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+);
+----
+0
+
+# Cross-check ch_l2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+);
+----
+0
+
+# Delete all data — intermediate MV becomes empty
+statement ok
+DELETE FROM ch_empty;
+
+statement ok
+pragma ivm('ch_l1');
+
+# Cross-check ch_l1 (empty)
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM ch_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM ch_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+);
+----
+0
+
+statement ok
+pragma ivm('ch_l2');
+
+# Cross-check ch_l2 (grand should be NULL — SUM of empty)
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+);
+----
+0
+
+# Repopulate
+statement ok
+INSERT INTO ch_empty VALUES ('x', 100);
+
+statement ok
+pragma ivm('ch_l1');
+
+statement ok
+pragma ivm('ch_l2');
+
+# Cross-check ch_l1
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM ch_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM ch_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+);
+----
+0
+
+# Cross-check ch_l2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+);
+----
+0
+
+# ============================================================
+# 4-level chain with UPDATE that moves data between groups
+# ============================================================
+
+statement ok
+CREATE TABLE ch_update (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO ch_update VALUES ('a', 10), ('a', 20), ('b', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW ch4_l1 AS
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW ch4_l2 AS
+    SELECT SUM(total) AS grand FROM ch4_l1;
+
+statement ok
+pragma ivm('ch4_l1');
+
+statement ok
+pragma ivm('ch4_l2');
+
+# Cross-check ch4_l1
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt FROM ch4_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt FROM ch4_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+);
+----
+0
+
+# Cross-check ch4_l2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch4_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch4_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+);
+----
+0
+
+# UPDATE: move val=20 from group 'a' to group 'b'
+statement ok
+UPDATE ch_update SET grp = 'b' WHERE val = 20;
+
+statement ok
+pragma ivm('ch4_l1');
+
+# Cross-check ch4_l1 (a: total=10 cnt=1, b: total=50 cnt=2)
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt FROM ch4_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt FROM ch4_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+);
+----
+0
+
+statement ok
+pragma ivm('ch4_l2');
+
+# Cross-check ch4_l2 (grand=60)
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch4_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch4_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+);
+----
+0
+
+# UPDATE: move all 'b' rows to group 'c' (b disappears, c appears)
+statement ok
+UPDATE ch_update SET grp = 'c' WHERE grp = 'b';
+
+statement ok
+pragma ivm('ch4_l1');
+
+statement ok
+pragma ivm('ch4_l2');
+
+# Cross-check ch4_l1
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt FROM ch4_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt FROM ch4_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+);
+----
+0
+
+# Cross-check ch4_l2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch4_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch4_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+);
+----
+0

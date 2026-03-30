@@ -21,8 +21,6 @@ Before parsing, the query is lowercased and aggregate functions are given explic
 
 Expressions that already have an explicit `AS` alias are left unchanged. Non-alphanumeric characters in the argument are replaced with underscores in the alias (e.g., `SUM(a + b)` becomes `SUM(a + b) AS sum_a___b`).
 
-## HAVING clause handling
-
 The HAVING clause is split from the SELECT before aggregate aliasing and re-attached afterward. This prevents the rewriter from injecting `AS alias` inside the HAVING expression, which would produce invalid SQL.
 
 ## IVM compatibility classification

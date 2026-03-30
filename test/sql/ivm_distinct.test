@@ -153,3 +153,198 @@ query I
 SELECT COUNT(*) FROM (SELECT color FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
 ----
 0
+
+# ============================================================
+# DISTINCT with all-NULL rows
+# ============================================================
+
+statement ok
+CREATE TABLE dist_all_null (a INT, b VARCHAR);
+
+statement ok
+INSERT INTO dist_all_null VALUES (NULL, NULL), (NULL, NULL), (1, NULL), (NULL, 'x');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dist_all_null AS SELECT DISTINCT a, b FROM dist_all_null;
+
+statement ok
+PRAGMA ivm('mv_dist_all_null');
+
+# Should have 3 distinct rows: (NULL, NULL), (1, NULL), (NULL, 'x')
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT a, b FROM dist_all_null
+    EXCEPT ALL
+    SELECT a, b FROM mv_dist_all_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, b FROM mv_dist_all_null
+    EXCEPT ALL
+    SELECT DISTINCT a, b FROM dist_all_null
+);
+----
+0
+
+# Delete both copies of (NULL, NULL) — it should disappear from DISTINCT
+statement ok
+DELETE FROM dist_all_null WHERE a IS NULL AND b IS NULL;
+
+statement ok
+PRAGMA ivm('mv_dist_all_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT a, b FROM dist_all_null
+    EXCEPT ALL
+    SELECT a, b FROM mv_dist_all_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, b FROM mv_dist_all_null
+    EXCEPT ALL
+    SELECT DISTINCT a, b FROM dist_all_null
+);
+----
+0
+
+# Insert (NULL, NULL) back — it should reappear
+statement ok
+INSERT INTO dist_all_null VALUES (NULL, NULL);
+
+statement ok
+PRAGMA ivm('mv_dist_all_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT a, b FROM dist_all_null
+    EXCEPT ALL
+    SELECT a, b FROM mv_dist_all_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, b FROM mv_dist_all_null
+    EXCEPT ALL
+    SELECT DISTINCT a, b FROM dist_all_null
+);
+----
+0
+
+# ============================================================
+# DISTINCT with expression that collapses values
+# ============================================================
+
+statement ok
+CREATE TABLE dist_collapse (val INT);
+
+statement ok
+INSERT INTO dist_collapse VALUES (-5), (5), (-10), (10), (0), (0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dist_collapse AS SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse;
+
+statement ok
+PRAGMA ivm('mv_dist_collapse');
+
+# Should have 3 distinct abs values: 0, 5, 10
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+    EXCEPT ALL
+    SELECT abs_val FROM mv_dist_collapse
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT abs_val FROM mv_dist_collapse
+    EXCEPT ALL
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+);
+----
+0
+
+# Delete val=-5 — ABS(5) still exists from val=5, so no change in DISTINCT
+statement ok
+DELETE FROM dist_collapse WHERE val = -5;
+
+statement ok
+PRAGMA ivm('mv_dist_collapse');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+    EXCEPT ALL
+    SELECT abs_val FROM mv_dist_collapse
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT abs_val FROM mv_dist_collapse
+    EXCEPT ALL
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+);
+----
+0
+
+# Delete val=5 — now ABS(5) has no source left, should be removed
+statement ok
+DELETE FROM dist_collapse WHERE val = 5;
+
+statement ok
+PRAGMA ivm('mv_dist_collapse');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+    EXCEPT ALL
+    SELECT abs_val FROM mv_dist_collapse
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT abs_val FROM mv_dist_collapse
+    EXCEPT ALL
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+);
+----
+0
+
+# Insert two -5s — ABS(5) comes back
+statement ok
+INSERT INTO dist_collapse VALUES (-5), (-5);
+
+statement ok
+PRAGMA ivm('mv_dist_collapse');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+    EXCEPT ALL
+    SELECT abs_val FROM mv_dist_collapse
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT abs_val FROM mv_dist_collapse
+    EXCEPT ALL
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+);
+----
+0

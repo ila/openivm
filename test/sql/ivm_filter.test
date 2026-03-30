@@ -129,3 +129,204 @@ SELECT id, name, price FROM cheap_products ORDER BY id;
 4	Thingamajig	8
 6	Boundary	19
 8	Cheap	1
+
+# ==========================================
+# NULL in WHERE predicate columns
+# ==========================================
+
+statement ok
+CREATE TABLE filt_null (id INT, price INT, active BOOLEAN);
+
+statement ok
+INSERT INTO filt_null VALUES (1, 10, true), (2, NULL, true), (3, 20, NULL), (4, 15, false);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_filt_null AS
+    SELECT id, price FROM filt_null WHERE price > 5 AND active = true;
+
+statement ok
+PRAGMA ivm('mv_filt_null');
+
+# Cross-check after initial load — only id=1 matches (price=10, active=true)
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, price FROM filt_null WHERE price > 5 AND active = true
+    EXCEPT ALL
+    SELECT id, price FROM mv_filt_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, price FROM mv_filt_null
+    EXCEPT ALL
+    SELECT id, price FROM filt_null WHERE price > 5 AND active = true
+);
+----
+0
+
+# UPDATE: set price = NULL where id = 1 — id=1 removed from MV
+statement ok
+UPDATE filt_null SET price = NULL WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_filt_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, price FROM filt_null WHERE price > 5 AND active = true
+    EXCEPT ALL
+    SELECT id, price FROM mv_filt_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, price FROM mv_filt_null
+    EXCEPT ALL
+    SELECT id, price FROM filt_null WHERE price > 5 AND active = true
+);
+----
+0
+
+# UPDATE: set active = true where id = 4 — id=4 (price=15) now matches filter
+statement ok
+UPDATE filt_null SET active = true WHERE id = 4;
+
+statement ok
+PRAGMA ivm('mv_filt_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, price FROM filt_null WHERE price > 5 AND active = true
+    EXCEPT ALL
+    SELECT id, price FROM mv_filt_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, price FROM mv_filt_null
+    EXCEPT ALL
+    SELECT id, price FROM filt_null WHERE price > 5 AND active = true
+);
+----
+0
+
+# INSERT: (5, NULL, true) — no match (NULL price), (6, 100, NULL) — no match (NULL active)
+statement ok
+INSERT INTO filt_null VALUES (5, NULL, true), (6, 100, NULL);
+
+statement ok
+PRAGMA ivm('mv_filt_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, price FROM filt_null WHERE price > 5 AND active = true
+    EXCEPT ALL
+    SELECT id, price FROM mv_filt_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, price FROM mv_filt_null
+    EXCEPT ALL
+    SELECT id, price FROM filt_null WHERE price > 5 AND active = true
+);
+----
+0
+
+# ==========================================
+# Bulk insert where most rows don't match filter
+# ==========================================
+
+statement ok
+CREATE TABLE filt_bulk (id INT, val INT);
+
+statement ok
+INSERT INTO filt_bulk VALUES (1, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_filt_bulk AS
+    SELECT id, val FROM filt_bulk WHERE val > 50;
+
+statement ok
+PRAGMA ivm('mv_filt_bulk');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM filt_bulk WHERE val > 50
+    EXCEPT ALL
+    SELECT id, val FROM mv_filt_bulk
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM mv_filt_bulk
+    EXCEPT ALL
+    SELECT id, val FROM filt_bulk WHERE val > 50
+);
+----
+0
+
+# Insert 1000 rows with val=1 (none match) + 3 rows with val=999 (all match)
+statement ok
+INSERT INTO filt_bulk SELECT 1000 + i, 1 FROM range(1000) t(i);
+
+statement ok
+INSERT INTO filt_bulk VALUES (9001, 999), (9002, 999), (9003, 999);
+
+statement ok
+PRAGMA ivm('mv_filt_bulk');
+
+# MV gains only 3 rows
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM filt_bulk WHERE val > 50
+    EXCEPT ALL
+    SELECT id, val FROM mv_filt_bulk
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM mv_filt_bulk
+    EXCEPT ALL
+    SELECT id, val FROM filt_bulk WHERE val > 50
+);
+----
+0
+
+# Delete 1000 rows with val=1 — none in MV, MV unchanged
+statement ok
+DELETE FROM filt_bulk WHERE val = 1;
+
+statement ok
+PRAGMA ivm('mv_filt_bulk');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM filt_bulk WHERE val > 50
+    EXCEPT ALL
+    SELECT id, val FROM mv_filt_bulk
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM mv_filt_bulk
+    EXCEPT ALL
+    SELECT id, val FROM filt_bulk WHERE val > 50
+);
+----
+0

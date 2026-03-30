@@ -466,3 +466,206 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Expressions with NULL propagation and type coercion
+# ==========================================
+
+statement ok
+CREATE TABLE proj_null_expr (a INT, b INT, c VARCHAR);
+
+statement ok
+INSERT INTO proj_null_expr VALUES (10, 0, 'hello'), (NULL, 5, 'world'), (20, NULL, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_proj_null_expr AS
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr;
+
+statement ok
+PRAGMA ivm('mv_proj_null_expr');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+    EXCEPT ALL
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+    EXCEPT ALL
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+);
+----
+0
+
+# UPDATE: set a = NULL where a = 10 — product becomes NULL, safe_a becomes -1
+statement ok
+UPDATE proj_null_expr SET a = NULL WHERE a = 10;
+
+statement ok
+PRAGMA ivm('mv_proj_null_expr');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+    EXCEPT ALL
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+    EXCEPT ALL
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+);
+----
+0
+
+# DELETE all rows, then refresh (MV should be empty)
+statement ok
+DELETE FROM proj_null_expr;
+
+statement ok
+PRAGMA ivm('mv_proj_null_expr');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+    EXCEPT ALL
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+    EXCEPT ALL
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+);
+----
+0
+
+# INSERT new rows and refresh
+statement ok
+INSERT INTO proj_null_expr VALUES (100, 2, 'test'), (NULL, NULL, 'abc');
+
+statement ok
+PRAGMA ivm('mv_proj_null_expr');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+    EXCEPT ALL
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+    EXCEPT ALL
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+);
+----
+0
+
+# ==========================================
+# INSERT and DELETE identical rows in same batch (net zero)
+# ==========================================
+
+statement ok
+CREATE TABLE proj_net_zero (x INT, y VARCHAR);
+
+statement ok
+INSERT INTO proj_net_zero VALUES (1, 'a'), (2, 'b');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_proj_net_zero AS SELECT x, y FROM proj_net_zero;
+
+statement ok
+PRAGMA ivm('mv_proj_net_zero');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM mv_proj_net_zero
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM mv_proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM proj_net_zero
+);
+----
+0
+
+# Insert a row then delete it in the same batch — net zero for the new row
+statement ok
+INSERT INTO proj_net_zero VALUES (99, 'tmp');
+
+statement ok
+DELETE FROM proj_net_zero WHERE x = 99;
+
+statement ok
+PRAGMA ivm('mv_proj_net_zero');
+
+# MV should be unchanged (net zero delta for x=99)
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM mv_proj_net_zero
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM mv_proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM proj_net_zero
+);
+----
+0
+
+# Now do a real insert alongside a net-zero insert-delete
+statement ok
+INSERT INTO proj_net_zero VALUES (50, 'keep'), (77, 'gone');
+
+statement ok
+DELETE FROM proj_net_zero WHERE x = 77;
+
+statement ok
+PRAGMA ivm('mv_proj_net_zero');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM mv_proj_net_zero
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM mv_proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM proj_net_zero
+);
+----
+0

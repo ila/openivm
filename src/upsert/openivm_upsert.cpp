@@ -173,8 +173,22 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 	// HAVING needs recompute because groups may enter/leave the result set after aggregate changes.
 	// MIN, MAX use group-recompute. AVG is decomposed to SUM+COUNT by the parser (fully incremental).
 	// HAVING needs recompute because groups may enter/leave the result set.
+	// Aggregates over LEFT JOIN sources also need group-recompute: SUM(NULL) != SUM(0)
+	// but the MERGE delta arithmetic can't distinguish NULL from zero cancellation.
+	bool source_has_left_join = false;
+	{
+		auto delta_tables = metadata.GetDeltaTables(view_name);
+		for (auto &dt : delta_tables) {
+			auto dt_result = con.Query("SELECT 1 FROM information_schema.columns WHERE table_name = '" +
+			                           OpenIVMUtils::EscapeValue(dt) + "' AND column_name = '_ivm_left_key'");
+			if (!dt_result->HasError() && dt_result->RowCount() > 0) {
+				source_has_left_join = true;
+				break;
+			}
+		}
+	}
 	bool has_minmax = StringUtil::Contains(view_query_sql, "min(") || StringUtil::Contains(view_query_sql, "max(") ||
-	                  StringUtil::Contains(view_query_sql, " having ");
+	                  StringUtil::Contains(view_query_sql, " having ") || source_has_left_join;
 
 	// Check ivm_refresh_mode: 'full' forces full recompute, skipping the IVM pipeline.
 	Value refresh_mode_val;
