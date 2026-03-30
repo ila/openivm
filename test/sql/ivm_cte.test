@@ -1,0 +1,219 @@
+# name: test/sql/ivm_cte.test
+# description: Test that MVs defined with CTE-based SQL (from LPTS) work correctly
+# group: [sql]
+
+require openivm
+
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+# ============================================================
+# Basic: MV with aggregate (LPTS generates CTEs internally)
+# ============================================================
+
+statement ok
+CREATE TABLE cte_base (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO cte_base VALUES ('a', 10), ('a', 20), ('b', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW cte_agg AS SELECT grp, SUM(val) AS total FROM cte_base GROUP BY grp;
+
+statement ok
+INSERT INTO cte_base VALUES ('a', 5), ('c', 100);
+
+statement ok
+PRAGMA ivm('cte_agg');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM cte_base GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM cte_agg
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM cte_agg
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM cte_base GROUP BY grp
+);
+----
+0
+
+# ============================================================
+# Multi-table join (LPTS generates nested CTEs)
+# ============================================================
+
+statement ok
+CREATE TABLE cte_users (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE cte_orders (user_id INT, amount INT);
+
+statement ok
+INSERT INTO cte_users VALUES (1, 'Alice'), (2, 'Bob');
+
+statement ok
+INSERT INTO cte_orders VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW cte_joined AS
+    SELECT u.name, o.amount FROM cte_users u INNER JOIN cte_orders o ON u.id = o.user_id;
+
+statement ok
+INSERT INTO cte_orders VALUES (1, 50);
+
+statement ok
+PRAGMA ivm('cte_joined');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT u.name, o.amount FROM cte_users u INNER JOIN cte_orders o ON u.id = o.user_id
+    EXCEPT ALL
+    SELECT name, amount FROM cte_joined
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, amount FROM cte_joined
+    EXCEPT ALL
+    SELECT u.name, o.amount FROM cte_users u INNER JOIN cte_orders o ON u.id = o.user_id
+);
+----
+0
+
+# ============================================================
+# 3-table join (deeply nested CTEs)
+# ============================================================
+
+statement ok
+CREATE TABLE cte_t1 (id INT, val VARCHAR);
+
+statement ok
+CREATE TABLE cte_t2 (t1_id INT, t2_id INT);
+
+statement ok
+CREATE TABLE cte_t3 (id INT, label VARCHAR);
+
+statement ok
+INSERT INTO cte_t1 VALUES (1, 'x'), (2, 'y');
+
+statement ok
+INSERT INTO cte_t2 VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO cte_t3 VALUES (10, 'alpha'), (20, 'beta');
+
+statement ok
+CREATE MATERIALIZED VIEW cte_3way AS
+    SELECT t1.val, t3.label
+    FROM cte_t1 t1
+    INNER JOIN cte_t2 t2 ON t1.id = t2.t1_id
+    INNER JOIN cte_t3 t3 ON t2.t2_id = t3.id;
+
+statement ok
+INSERT INTO cte_t2 VALUES (1, 20);
+
+statement ok
+PRAGMA ivm('cte_3way');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT t1.val, t3.label FROM cte_t1 t1 INNER JOIN cte_t2 t2 ON t1.id = t2.t1_id INNER JOIN cte_t3 t3 ON t2.t2_id = t3.id
+    EXCEPT ALL
+    SELECT val, label FROM cte_3way
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT val, label FROM cte_3way
+    EXCEPT ALL
+    SELECT t1.val, t3.label FROM cte_t1 t1 INNER JOIN cte_t2 t2 ON t1.id = t2.t1_id INNER JOIN cte_t3 t3 ON t2.t2_id = t3.id
+);
+----
+0
+
+# Delete and verify
+statement ok
+DELETE FROM cte_t2 WHERE t1_id = 1 AND t2_id = 10;
+
+statement ok
+PRAGMA ivm('cte_3way');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT t1.val, t3.label FROM cte_t1 t1 INNER JOIN cte_t2 t2 ON t1.id = t2.t1_id INNER JOIN cte_t3 t3 ON t2.t2_id = t3.id
+    EXCEPT ALL
+    SELECT val, label FROM cte_3way
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT val, label FROM cte_3way
+    EXCEPT ALL
+    SELECT t1.val, t3.label FROM cte_t1 t1 INNER JOIN cte_t2 t2 ON t1.id = t2.t1_id INNER JOIN cte_t3 t3 ON t2.t2_id = t3.id
+);
+----
+0
+
+# ============================================================
+# Scalar aggregate (single-row MV via CTE)
+# ============================================================
+
+statement ok
+CREATE TABLE cte_scores (val INT);
+
+statement ok
+INSERT INTO cte_scores VALUES (10), (20), (30);
+
+statement ok
+CREATE MATERIALIZED VIEW cte_total AS SELECT SUM(val) AS total, COUNT(*) AS cnt FROM cte_scores;
+
+statement ok
+INSERT INTO cte_scores VALUES (40);
+
+statement ok
+PRAGMA ivm('cte_total');
+
+query II
+SELECT total, cnt FROM cte_total;
+----
+100	4
+
+# ============================================================
+# DISTINCT via CTE (plan rewrite adds COUNT)
+# ============================================================
+
+statement ok
+CREATE TABLE cte_colors (color VARCHAR);
+
+statement ok
+INSERT INTO cte_colors VALUES ('red'), ('blue'), ('red'), ('green');
+
+statement ok
+CREATE MATERIALIZED VIEW cte_distinct AS SELECT DISTINCT color FROM cte_colors;
+
+statement ok
+INSERT INTO cte_colors VALUES ('red'), ('yellow');
+
+statement ok
+PRAGMA ivm('cte_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT color FROM cte_colors
+    EXCEPT ALL
+    SELECT color FROM cte_distinct
+);
+----
+0

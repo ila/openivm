@@ -11,6 +11,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
 namespace duckdb {
@@ -204,15 +205,97 @@ static void RewriteLeftJoinKey(unique_ptr<LogicalOperator> &plan) {
 	}
 
 	if (!key_in_output) {
-		// The join key is not in the output projection — it was projected away.
-		// We can't add it without propagating through intermediate projections.
-		// For now, fall back — the string-level AddLeftJoinKey would handle this.
-		OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] LEFT JOIN key not in output — skipping _ivm_left_key\n");
-		return;
-	}
+		// Key was projected away. Propagate it through intermediate operators
+		// by adding passthrough expressions (same approach as PAC's PropagateSingleBinding).
 
-	auto key_ref = make_uniq<BoundColumnRefExpression>("_ivm_left_key", key_type, key_binding);
-	proj_exprs.push_back(std::move(key_ref));
+		// Step 1: Find path from plan root to the join that has the key
+		struct PathEntry {
+			LogicalOperator *op;
+			idx_t child_idx;
+		};
+		vector<PathEntry> path;
+		std::function<bool(LogicalOperator *, bool)> find_path = [&](LogicalOperator *n, bool is_root) -> bool {
+			// Check if this node outputs the key binding
+			auto binds = n->GetColumnBindings();
+			for (auto &b : binds) {
+				if (b == key_binding) {
+					return true;
+				}
+			}
+			for (idx_t ci = 0; ci < n->children.size(); ci++) {
+				if (find_path(n->children[ci].get(), false)) {
+					if (!is_root) {
+						path.push_back({n, ci});
+					}
+					return true;
+				}
+			}
+			return false;
+		};
+		find_path(plan.get(), false);
+		// Reverse: path is currently top-down, we need bottom-up
+		std::reverse(path.begin(), path.end());
+
+		// Step 2: Propagate binding through each operator on the path
+		ColumnBinding current = key_binding;
+		for (auto &entry : path) {
+			if (entry.op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+				auto &proj = entry.op->Cast<LogicalProjection>();
+				// Check if already passed through
+				bool found = false;
+				for (idx_t i = 0; i < proj.expressions.size(); i++) {
+					if (proj.expressions[i]->type == ExpressionType::BOUND_COLUMN_REF) {
+						auto &ref = proj.expressions[i]->Cast<BoundColumnRefExpression>();
+						if (ref.binding == current) {
+							current = ColumnBinding(proj.table_index, i);
+							found = true;
+							break;
+						}
+					}
+				}
+				if (!found) {
+					auto col_ref = make_uniq<BoundColumnRefExpression>(key_type, current);
+					proj.expressions.push_back(std::move(col_ref));
+					current = ColumnBinding(proj.table_index, proj.expressions.size() - 1);
+				}
+				proj.ResolveOperatorTypes();
+			} else if (entry.op->type == LogicalOperatorType::LOGICAL_FILTER) {
+				auto &filter = entry.op->Cast<LogicalFilter>();
+				if (!filter.projection_map.empty()) {
+					bool in_map = false;
+					for (auto &idx : filter.projection_map) {
+						if (idx == current.column_index) {
+							in_map = true;
+							break;
+						}
+					}
+					if (!in_map) {
+						filter.projection_map.push_back(current.column_index);
+					}
+				}
+				filter.ResolveOperatorTypes();
+			}
+			// JOINs pass bindings through — no action needed
+		}
+		key_binding = current;
+
+		// After propagation, the key is now in top_bindings. Rebuild proj_exprs
+		// and alias the key column as _ivm_left_key directly (no separate addition).
+		top_bindings = plan->GetColumnBindings();
+		top_types = plan->types;
+		proj_exprs.clear();
+		for (idx_t i = 0; i < top_bindings.size(); i++) {
+			auto expr = make_uniq<BoundColumnRefExpression>(top_types[i], top_bindings[i]);
+			if (top_bindings[i] == key_binding) {
+				expr->alias = "_ivm_left_key";
+			}
+			proj_exprs.push_back(std::move(expr));
+		}
+	} else {
+		// Key was already in output — just add the _ivm_left_key alias on top
+		auto key_ref = make_uniq<BoundColumnRefExpression>("_ivm_left_key", key_type, key_binding);
+		proj_exprs.push_back(std::move(key_ref));
+	}
 
 	// Use a table index that won't conflict (high number)
 	idx_t proj_table_index = 9999;
