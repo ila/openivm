@@ -282,11 +282,18 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 	// this is to compile the query to merge the materialized view with its delta version
 	// depending on the query type, this procedure will be done differently
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n",
-	                    view_query_type == IVMType::AGGREGATE_GROUP     ? "AGGREGATE_GROUP"
+	                    view_query_type == IVMType::AGGREGATE_HAVING    ? "AGGREGATE_HAVING"
+	                    : view_query_type == IVMType::AGGREGATE_GROUP   ? "AGGREGATE_GROUP"
 	                    : view_query_type == IVMType::SIMPLE_AGGREGATE  ? "SIMPLE_AGGREGATE"
 	                    : view_query_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
 	                                                                    : "UNKNOWN");
 	switch (view_query_type) {
+	case IVMType::AGGREGATE_HAVING: {
+		// HAVING: groups may enter/leave the result set. Use group-recompute (same as MIN/MAX).
+		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
+		                                      view_query_sql, /*has_minmax=*/true, list_mode, delta_ts_filter);
+		break;
+	}
 	case IVMType::AGGREGATE_GROUP: {
 		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
 		                                      view_query_sql, has_minmax, list_mode, delta_ts_filter);

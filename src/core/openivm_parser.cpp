@@ -194,6 +194,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		bool found_aggregation = false;
 		bool found_projection = false;
 		bool found_distinct = false;
+		bool found_having = false;
 		vector<string> aggregate_columns;
 
 		while (!node_stack.empty()) {
@@ -245,6 +246,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				found_projection = true;
 			}
 
+			// Detect HAVING: a FILTER above an AGGREGATE
+			if (current->type == LogicalOperatorType::LOGICAL_FILTER && !current->children.empty() &&
+			    current->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+				found_having = true;
+			}
+
 			if (!current->children.empty()) {
 				for (auto it = current->children.rbegin(); it != current->children.rend(); ++it) {
 					node_stack.push(it->get());
@@ -280,8 +287,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			               "' uses constructs not supported for incremental maintenance. "
 			               "Full refresh will be used.");
 		} else if (found_distinct) {
-			// DISTINCT is rewritten to GROUP BY + COUNT(*) by IvmDistinctRule
 			ivm_type = IVMType::AGGREGATE_GROUP;
+		} else if (found_having && found_aggregation && !aggregate_columns.empty()) {
+			ivm_type = IVMType::AGGREGATE_HAVING;
 		} else if (found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (found_aggregation && aggregate_columns.empty()) {
