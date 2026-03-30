@@ -694,7 +694,7 @@ statement ok
 CREATE MATERIALIZED VIEW mv_t27 AS SELECT grp, min(val), max(val), sum(val), count(val) FROM t27 GROUP BY grp;
 
 query IIIII
-SELECT grp, min_val, max_val, sum_val, count_val FROM mv_t27;
+SELECT grp, "min(val)", "max(val)", "sum(val)", "count(val)" FROM mv_t27;
 ----
 a	10	20	30	2
 
@@ -705,7 +705,7 @@ statement ok
 PRAGMA ivm('mv_t27');
 
 query IIIII
-SELECT grp, min_val, max_val, sum_val, count_val FROM mv_t27;
+SELECT grp, "min(val)", "max(val)", "sum(val)", "count(val)" FROM mv_t27;
 ----
 a	5	20	35	3
 
