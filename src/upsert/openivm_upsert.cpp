@@ -205,11 +205,11 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 		                           attached_db_schema_name);
 	}
 
-	// Adaptive cost model: estimate IVM vs full recompute cost.
-	// Gated by ivm_adaptive setting (default false — always use IVM).
+	// Adaptive cost model (experimental): estimate IVM vs full recompute cost.
+	// Gated by ivm_adaptive_refresh setting (default off — always use IVM).
 	Value ivm_adaptive_val;
 	bool ivm_adaptive = false;
-	if (context.TryGetCurrentSetting("ivm_adaptive", ivm_adaptive_val) && !ivm_adaptive_val.IsNull()) {
+	if (context.TryGetCurrentSetting("ivm_adaptive_refresh", ivm_adaptive_val) && !ivm_adaptive_val.IsNull()) {
 		ivm_adaptive = ivm_adaptive_val.GetValue<bool>();
 	}
 	if (ivm_adaptive) {
@@ -297,13 +297,13 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 			// LEFT JOIN: partial recompute on affected left-side keys.
 			// The parser adds _ivm_left_key as a hidden column containing the preserved-side join key.
 			// Delete affected keys from MV and re-insert from original LEFT JOIN query for those keys.
-			string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+			// Use EXISTS + IS NOT DISTINCT FROM (not IN) to handle NULL keys correctly.
+			string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
 			string dv = OpenIVMUtils::DeltaName(view_name);
-			upsert_query = "DELETE FROM " + view_name + " WHERE (_ivm_left_key) IN (\n" +
-			               "  SELECT DISTINCT _ivm_left_key FROM " + dv + delta_where + "\n);\n" + "INSERT INTO " +
-			               view_name + "\nSELECT * FROM (" + view_query_sql +
-			               ") _ivm_lj\nWHERE (_ivm_left_key) IN (\n" + "  SELECT DISTINCT _ivm_left_key FROM " + dv +
-			               delta_where + "\n);\n";
+			string affected = "EXISTS (SELECT 1 FROM " + dv + " _d WHERE _d._ivm_left_key IS NOT DISTINCT FROM ";
+			upsert_query = "DELETE FROM " + view_name + " WHERE " + affected + view_name + "._ivm_left_key" +
+			               delta_where + ");\n" + "INSERT INTO " + view_name + "\nSELECT * FROM (" + view_query_sql +
+			               ") _ivm_lj\nWHERE " + affected + "_ivm_lj._ivm_left_key" + delta_where + ");\n";
 		} else {
 			upsert_query = CompileProjectionsFilters(view_name, column_names, delta_ts_filter);
 		}
@@ -313,6 +313,26 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 	case IVMType::SIMPLE_AGGREGATE: {
 		upsert_query =
 		    CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode, delta_ts_filter);
+		// Fix NULL edge case: incremental UPDATE produces 0 when source becomes empty,
+		// but the correct SQL result is NULL (SUM on empty table). Check source emptiness.
+		if (!has_minmax) {
+			auto source_tables = metadata.GetDeltaTables(view_name);
+			for (auto &dt : source_tables) {
+				string source = dt.size() > 6 ? dt.substr(6) : dt; // strip "delta_"
+				// If ALL source tables are empty, rewrite aggregates to NULL
+				string null_cols;
+				for (auto &col : column_names) {
+					if (col != string(ivm::MULTIPLICITY_COL)) {
+						if (!null_cols.empty()) {
+							null_cols += ", ";
+						}
+						null_cols += col + " = NULL";
+					}
+				}
+				upsert_query += "UPDATE " + view_name + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " +
+				                source + " LIMIT 1);\n";
+			}
+		}
 		break;
 	}
 		// todo joins

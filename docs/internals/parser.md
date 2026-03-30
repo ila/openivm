@@ -22,21 +22,7 @@ The HAVING clause is split from the SELECT before aggregate aliasing and re-atta
 
 ## DISTINCT rewriting
 
-Before planning, the parser rewrites `SELECT DISTINCT` queries into grouped aggregates:
-
-```sql
--- Original
-SELECT DISTINCT region, product FROM sales
-
--- Rewritten (internal)
-SELECT region, product, COUNT(*) AS _ivm_distinct_count
-FROM sales
-GROUP BY region, product
-```
-
-The hidden `_ivm_distinct_count` column tracks how many duplicate source rows map to each distinct output row. The view is classified as `AGGREGATE_GROUP` and maintained incrementally using the same MERGE upsert as any other grouped aggregate.
-
-You never see `_ivm_distinct_count` in query results — it is a hidden column used only by the refresh pipeline. There is no separate `DISTINCT` enum value in `IVMType`.
+The parser rewrites `SELECT DISTINCT` into `GROUP BY` + hidden `COUNT(*)` before planning, classifying it as `AGGREGATE_GROUP`. See [Distinct](../operators/distinct.md) for details.
 
 ## AVG decomposition
 

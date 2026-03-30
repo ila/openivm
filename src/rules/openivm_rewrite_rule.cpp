@@ -10,6 +10,8 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
+#include "duckdb/planner/operator/logical_cte.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "upsert/openivm_index_regen.hpp"
 
 #include "logical_plan_to_sql.hpp"
@@ -90,6 +92,51 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 	case LogicalOperatorType::LOGICAL_DISTINCT: {
 		IvmDistinctRule rule;
 		return rule.Rewrite(pw);
+	}
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
+		// CTE wrapper: children[0] = CTE definition, children[1] = consumer.
+		auto &cte = pw.plan->Cast<LogicalCTE>();
+		idx_t cte_table_index = cte.table_index;
+
+		// 1. Rewrite the CTE definition (contains the actual operators like JOINs).
+		auto def_mul = RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
+		pw.plan->children[0] = std::move(def_mul.op);
+
+		// 2. Update the CTE's column_count to include the new multiplicity column.
+		cte.column_count = pw.plan->children[0]->GetColumnBindings().size();
+
+		// 3. Update all CTE_REF nodes that reference this CTE (by cte_index == table_index).
+		//    Add the multiplicity type and column name so downstream operators see the extra column.
+		std::function<void(LogicalOperator *)> update_matching_refs = [&](LogicalOperator *node) {
+			if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+				auto &ref = node->Cast<LogicalCTERef>();
+				if (ref.cte_index == cte_table_index &&
+				    (ref.bound_columns.empty() || ref.bound_columns.back() != ivm::MULTIPLICITY_COL)) {
+					ref.chunk_types.push_back(pw.mul_type);
+					ref.bound_columns.push_back(ivm::MULTIPLICITY_COL);
+					OPENIVM_DEBUG_PRINT("[CTE] Updated CTE_REF (cte_index=%lu) with mul column\n",
+					                    (unsigned long)ref.cte_index);
+				}
+			}
+			for (auto &child : node->children) {
+				update_matching_refs(child.get());
+			}
+		};
+		// Search the entire tree from this node down
+		update_matching_refs(pw.plan.get());
+
+		// 4. Rewrite the consumer (which reads from CTE_REFs).
+		auto cons_mul = RewritePlan(pw.input, pw.plan->children[1], pw.view, pw.root);
+		pw.plan->children[1] = std::move(cons_mul.op);
+		pw.plan->ResolveOperatorTypes();
+		return {std::move(pw.plan), cons_mul.mul_binding};
+	}
+	case LogicalOperatorType::LOGICAL_CTE_REF: {
+		// CTE reference: leaf that reads from a rewritten CTE definition.
+		// The multiplicity column was added by the MATERIALIZED_CTE handler above.
+		auto bindings = pw.plan->GetColumnBindings();
+		ColumnBinding mul_binding = bindings.back();
+		return {std::move(pw.plan), mul_binding};
 	}
 	default:
 		throw NotImplementedException("Operator type %s not supported", LogicalOperatorToString(plan->type));

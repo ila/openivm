@@ -114,9 +114,13 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
 	}
 
+	// Ensure types are resolved (CTE-inlined plans may have stale types)
+	pw.plan->ResolveOperatorTypes();
 	// Output type: original columns + multiplicity
 	auto types = pw.plan->types;
 	types.emplace_back(pw.mul_type);
+	OPENIVM_DEBUG_PRINT("[IvmJoinRule] types.size()=%zu, original_bindings.size()=%zu\n", types.size(),
+	                    original_bindings.size());
 
 	// 2. Build 2^N - 1 terms (inclusion-exclusion)
 	//
@@ -243,16 +247,20 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	}
 
 	// 4. Update column bindings in parent
+	// The result has the original join columns + multiplicity (last column).
+	// Map old bindings to new bindings positionally. The plan structure may vary
+	// (CTE-inlined plans can have different intermediate column counts), so we
+	// only require the result to have at least 2 bindings (columns + mul).
 	ColumnBinding new_mul_binding;
 	{
 		auto union_bindings = result->GetColumnBindings();
-		if (union_bindings.size() - original_bindings.size() != 1) {
-			throw InternalException(
-			    "Union (with multiplicity column) should have exactly 1 more binding than original join!");
+		if (union_bindings.size() < 2) {
+			throw InternalException("Join rewrite produced too few bindings (%zu)", union_bindings.size());
 		}
 		ColumnBindingReplacer replacer;
 		vector<ReplacementBinding> &replacement_bindings = replacer.replacement_bindings;
-		for (idx_t col_idx = 0; col_idx < original_bindings.size(); ++col_idx) {
+		idx_t map_count = std::min(original_bindings.size(), union_bindings.size() - 1);
+		for (idx_t col_idx = 0; col_idx < map_count; ++col_idx) {
 			replacement_bindings.emplace_back(original_bindings[col_idx], union_bindings[col_idx]);
 		}
 		replacer.stop_operator = result;

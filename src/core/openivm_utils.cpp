@@ -251,9 +251,12 @@ void OpenIVMUtils::ReplaceDistinct(string &query) {
 		rest = rest.substr(0, group_pos);
 	}
 
+	// Strip aliases from GROUP BY (GROUP BY doesn't accept AS ...)
+	string group_columns = std::regex_replace(columns, std::regex(R"(\s+as\s+\w+)", std::regex_constants::icase), "");
+
 	// Build the rewritten query: SELECT cols, COUNT(*) AS _ivm_distinct_count FROM ... GROUP BY cols
 	query = query.substr(0, match.position()) + "select " + columns + ", count(*) as _ivm_distinct_count" + rest +
-	        " group by " + columns;
+	        " group by " + group_columns;
 	if (!group_by_suffix.empty()) {
 		query += group_by_suffix;
 	}

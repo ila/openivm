@@ -34,11 +34,13 @@ static bool HasVolatileExpression(vector<unique_ptr<Expression>> &expressions) {
 /// Recursively check if the plan tree is fully IVM-compatible.
 static bool CheckNode(LogicalOperator *node) {
 	switch (node->type) {
-	// Infrastructure nodes from CREATE TABLE AS SELECT
+	// Infrastructure nodes
 	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
 	case LogicalOperatorType::LOGICAL_INSERT:
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 	case LogicalOperatorType::LOGICAL_GET:
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+	case LogicalOperatorType::LOGICAL_CTE_REF:
 		break;
 
 	case LogicalOperatorType::LOGICAL_FILTER:

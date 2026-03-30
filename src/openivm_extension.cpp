@@ -97,7 +97,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("ivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("ivm_refresh_mode", "refresh strategy: auto, incremental, or full",
 	                             LogicalType::VARCHAR, Value("auto"));
-	db_config.AddExtensionOption("ivm_adaptive", "enable adaptive cost model (when false, always use IVM)",
+	db_config.AddExtensionOption("ivm_adaptive_refresh",
+	                             "experimental: enable adaptive cost model (when off, always use IVM)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("ivm_cascade_refresh", "cascade mode: off, upstream, downstream, or both",
 	                             LogicalType::VARCHAR, Value("downstream"));

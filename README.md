@@ -30,21 +30,18 @@ SELECT * FROM regional_totals ORDER BY region;
 
 ## Supported operators
 
-| Operator | Refresh strategy | Documentation |
-|----------|-----------------|---------------|
-| `SELECT ... FROM` | Incremental | [Projection](docs/operators/projection.md) |
-| `WHERE` | Incremental | [Filter](docs/operators/filter.md) |
-| `GROUP BY` + `SUM`, `COUNT` | Incremental (MERGE) | [Grouped aggregates](docs/operators/grouped-aggregates.md) |
-| `GROUP BY` + `MIN`, `MAX`, `AVG` | Group recompute | [Grouped aggregates](docs/operators/grouped-aggregates.md) |
-| `SUM`, `COUNT` (no GROUP BY) | Incremental (UPDATE) | [Ungrouped aggregates](docs/operators/ungrouped-aggregates.md) |
-| `INNER JOIN` | Incremental (inclusion-exclusion) | [Inner join](docs/operators/inner-join.md) |
-| `UNION ALL` | Incremental | [Union all](docs/operators/union-all.md) |
-| `LIST` aggregates | Incremental (element-wise) | [List aggregates](docs/operators/list-aggregates.md) |
-| `HAVING` | Group recompute | [Filter](docs/operators/filter.md) |
-| Expressions (`a * 2`, `CASE WHEN`) | Incremental | [Projection](docs/operators/projection.md) |
-| `LEFT JOIN`, `CROSS JOIN` | Full refresh | [Inner join](docs/operators/inner-join.md) |
-| `RANDOM()`, `NOW()` | Full refresh | [Refresh strategies](docs/refresh/refresh-strategies.md) |
-| `STDDEV`, `STRING_AGG` | Full refresh | [Grouped aggregates](docs/operators/grouped-aggregates.md) |
+MVs can be created using any SQL construct. Unsupported operators automatically fall back to [full refresh](docs/refresh/refresh-strategies.md).
+
+| Operator                                | Documentation |
+|-----------------------------------------|---------------|
+| `SELECT ... FROM`, `WHERE`, expressions | [Projection & filter](docs/operators/projection-filter.md) |
+| `GROUP BY` + aggregate function         | [Grouped aggregates](docs/operators/grouped-aggregates.md) |
+| `SUM`, `COUNT`, `AVG` (no GROUP BY)     | [Ungrouped aggregates](docs/operators/ungrouped-aggregates.md) |
+| `INNER JOIN`                            | [Inner join](docs/operators/inner-join.md) |
+| `LEFT JOIN`, `RIGHT JOIN`               | [Left join](docs/operators/left-join.md) |
+| `UNION ALL`                             | [Union all](docs/operators/union-all.md) |
+| `DISTINCT`                              | [Distinct](docs/operators/distinct.md) |
+| `LIST` aggregates                       | [List aggregates](docs/operators/list-aggregates.md) |
 
 ## Settings
 

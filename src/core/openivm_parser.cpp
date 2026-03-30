@@ -1,7 +1,9 @@
 #include "core/openivm_parser.hpp"
 
 #include "core/ivm_checker.hpp"
+#include "core/ivm_plan_rewrite.hpp"
 #include "core/openivm_constants.hpp"
+#include "logical_plan_to_sql.hpp"
 #include "core/openivm_utils.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -17,6 +19,7 @@
 
 #include "core/openivm_debug.hpp"
 
+#include <regex>
 #include <stack>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
 
@@ -69,35 +72,9 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Intercepted query: %s\n", query_lower.c_str());
 
 	OpenIVMUtils::ReplaceMaterializedView(query_lower);
-
-	// For LEFT/RIGHT JOIN: add the preserved-side join key as a hidden column _ivm_left_key.
-	// This ensures the partial recompute always has a column to filter on,
-	// even if the user's SELECT doesn't include any left-side columns.
-	OpenIVMUtils::AddLeftJoinKey(query_lower);
-
-	// Rewrite DISTINCT: SELECT DISTINCT cols FROM t → SELECT cols, COUNT(*) AS _ivm_distinct_count FROM t GROUP BY cols
-	// This creates the MV with the hidden count column. The IvmDistinctRule handles the incremental plan.
-	OpenIVMUtils::ReplaceDistinct(query_lower);
-
-	// Split at HAVING to avoid rewriting aggregates inside HAVING clause
-	// (adding "AS alias" inside HAVING produces invalid SQL)
-	string having_suffix;
-	auto having_pos = query_lower.find(" having ");
-	if (having_pos != string::npos) {
-		having_suffix = query_lower.substr(having_pos);
-		query_lower = query_lower.substr(0, having_pos);
-	}
-
-	OpenIVMUtils::ReplaceCount(query_lower);
-	OpenIVMUtils::ReplaceSum(query_lower);
-	OpenIVMUtils::ReplaceMin(query_lower);
-	OpenIVMUtils::ReplaceMax(query_lower);
-	OpenIVMUtils::ReplaceAvg(query_lower);
-
-	if (!having_suffix.empty()) {
-		query_lower += having_suffix;
-	}
-	OPENIVM_DEBUG_PRINT("[CREATE MV] After rewrite: %s\n", query_lower.c_str());
+	// All other rewrites (DISTINCT, AVG, LEFT JOIN key, aggregate aliases) are done
+	// at the plan level in IVMPlanFunction via IVMPlanRewrite + LPTS.
+	OPENIVM_DEBUG_PRINT("[CREATE MV] After structural rewrite: %s\n", query_lower.c_str());
 
 	Parser p;
 	p.ParseQuery(query_lower);
@@ -132,15 +109,40 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		auto view_name = OpenIVMUtils::ExtractTableName(statement->query);
-		auto view_query = OpenIVMUtils::ExtractViewQuery(statement->query);
+		auto original_view_query = OpenIVMUtils::ExtractViewQuery(statement->query);
+		string view_query = original_view_query; // will be overwritten by LPTS for DDL
 
 		// Use con for planning — sees all committed state from previous bind-phase DDL
 		con.BeginTransaction();
 		auto table_names = con.GetTableNames(statement->query);
 
+		// Plan the full CREATE TABLE AS SELECT statement (for plan walking)
 		Planner planner(*con.context);
 		planner.CreatePlan(statement->Copy());
 		auto plan = std::move(planner.plan);
+
+		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
+		{
+			Parser select_parser;
+			select_parser.ParseQuery(original_view_query);
+			Planner select_planner(*con.context);
+			select_planner.CreatePlan(std::move(select_parser.statements[0]));
+			auto select_plan = std::move(select_planner.plan);
+
+			// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
+			IVMPlanRewrite(context, select_plan);
+
+			// Convert modified plan to SQL via LPTS with preserved column names
+			LogicalPlanToSql lpts(*con.context, select_plan, select_planner.names);
+			auto cte_list = lpts.LogicalPlanToCteList();
+			view_query = LogicalPlanToSql::CteListToSql(cte_list);
+			// Strip trailing semicolon — the query is embedded in other SQL statements
+			if (!view_query.empty() && view_query.back() == ';') {
+				view_query.pop_back();
+			}
+			StringUtil::Trim(view_query);
+			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
+		}
 		con.Rollback();
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] View name: %s\n", view_name.c_str());
@@ -186,10 +188,19 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 						aggregate_columns.emplace_back(column->alias);
 					} else if (group->type == ExpressionType::BOUND_FUNCTION) {
 						auto column = dynamic_cast<BoundFunctionExpression *>(group.get());
-						auto function = column->GetName();
-						function = StringUtil::Replace(function, "\"", "\"\"");
-						function = "\"" + function + "\"";
-						aggregate_columns.emplace_back(function);
+						// Use alias if available (e.g., ABS(val) AS abs_val → use "abs_val").
+						// GROUP BY expressions don't carry aliases — check the alias field anyway,
+						// then fall back to the return_type column name from the output.
+						if (!column->alias.empty()) {
+							aggregate_columns.emplace_back(column->alias);
+						} else {
+							// The output column name for this expression comes from the AS clause.
+							// Use GetName() but sanitize: "abs(val)" → quoted identifier.
+							auto function = column->GetName();
+							function = StringUtil::Replace(function, "\"", "\"\"");
+							function = "\"" + function + "\"";
+							aggregate_columns.emplace_back(function);
+						}
 					}
 				}
 			}
@@ -201,6 +212,26 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			if (!current->children.empty()) {
 				for (auto it = current->children.rbegin(); it != current->children.rend(); ++it) {
 					node_stack.push(it->get());
+				}
+			}
+		}
+
+		// Fix expression-based group-by column names: the plan walk may extract
+		// "abs(val)" but the MV table column is "abs_val" (from the AS alias).
+		for (auto &col : aggregate_columns) {
+			if (col.find('(') != string::npos) {
+				string lower_col = StringUtil::Lower(col);
+				if (lower_col.size() >= 2 && lower_col.front() == '"' && lower_col.back() == '"') {
+					lower_col = lower_col.substr(1, lower_col.size() - 2);
+				}
+				auto pos = view_query.find(lower_col);
+				if (pos != string::npos) {
+					auto after = view_query.substr(pos + lower_col.size());
+					std::regex alias_re(R"(^\s+as\s+(\w+))", std::regex_constants::icase);
+					std::smatch m;
+					if (std::regex_search(after, m, alias_re)) {
+						col = m[1].str();
+					}
 				}
 			}
 		}
@@ -252,6 +283,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " (view_name varchar, table_name "
 		              "varchar, last_update timestamp, primary key(view_name, table_name))");
 
+		// Store the LPTS query in metadata — it has hidden columns (DISTINCT count, AVG sum/count,
+		// LEFT JOIN key) and preserves user column names.
 		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
 		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", now())");
 
