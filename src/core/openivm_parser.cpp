@@ -155,20 +155,19 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					name = clean;
 				}
 			}
-			// IVMPlanRewrite may have added extra columns (e.g., _ivm_left_key, _ivm_distinct_count).
-			// Append names for these so LPTS uses them in the final output.
+			// IVMPlanRewrite may have added extra columns (_ivm_left_key, _ivm_distinct_count).
+			// Append names for these from the top projection's expression aliases.
 			auto plan_bindings = select_plan->GetColumnBindings();
-			while (output_names.size() < plan_bindings.size()) {
-				// Use the expression alias if available, otherwise generate a name
-				idx_t idx = output_names.size();
-				if (select_plan->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-					auto &proj = select_plan->Cast<LogicalProjection>();
+			if (select_plan->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+				auto &proj = select_plan->Cast<LogicalProjection>();
+				while (output_names.size() < plan_bindings.size()) {
+					idx_t idx = output_names.size();
 					if (idx < proj.expressions.size() && !proj.expressions[idx]->alias.empty()) {
 						output_names.push_back(proj.expressions[idx]->alias);
-						continue;
+					} else {
+						output_names.push_back("_ivm_col_" + to_string(idx));
 					}
 				}
-				output_names.push_back("_ivm_col_" + to_string(idx));
 			}
 			LogicalPlanToSql lpts(*con.context, select_plan, output_names);
 			auto cte_list = lpts.LogicalPlanToCteList();

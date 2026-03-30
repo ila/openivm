@@ -279,33 +279,17 @@ static void RewriteLeftJoinKey(unique_ptr<LogicalOperator> &plan) {
 		}
 		key_binding = current;
 
-		// After propagation, the key is now in top_bindings. Rebuild proj_exprs
-		// and alias the key column as _ivm_left_key directly (no separate addition).
+		// After propagation, refresh top bindings and rebuild proj_exprs.
 		top_bindings = plan->GetColumnBindings();
 		top_types = plan->types;
 		proj_exprs.clear();
 		for (idx_t i = 0; i < top_bindings.size(); i++) {
-			auto expr = make_uniq<BoundColumnRefExpression>(top_types[i], top_bindings[i]);
-			if (top_bindings[i] == key_binding) {
-				expr->alias = "_ivm_left_key";
-			}
-			proj_exprs.push_back(std::move(expr));
+			proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(top_types[i], top_bindings[i]));
 		}
 	}
 
-	// At this point, proj_exprs has all columns. If _ivm_left_key is not already
-	// aliased (key was in original output), add it as an extra column.
-	bool has_ivm_key = false;
-	for (auto &e : proj_exprs) {
-		if (e->alias == "_ivm_left_key") {
-			has_ivm_key = true;
-			break;
-		}
-	}
-	if (!has_ivm_key) {
-		auto key_ref = make_uniq<BoundColumnRefExpression>("_ivm_left_key", key_type, key_binding);
-		proj_exprs.push_back(std::move(key_ref));
-	}
+	// Always add _ivm_left_key as a separate extra column.
+	proj_exprs.push_back(make_uniq<BoundColumnRefExpression>("_ivm_left_key", key_type, key_binding));
 
 	// Use a table index that won't conflict (high number)
 	idx_t proj_table_index = 9999;
