@@ -7,6 +7,10 @@
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -81,62 +85,79 @@ static void RewriteDistinct(ClientContext &context, unique_ptr<LogicalOperator> 
 	node = std::move(agg_node);
 }
 
-/// Decompose AVG(x) into SUM(x) + COUNT(x) in LOGICAL_AGGREGATE nodes.
-/// The upsert compiler detects _ivm_sum_/_ivm_count_ columns and handles the ratio.
-static void RewriteAvg(ClientContext &context, unique_ptr<LogicalOperator> &node) {
-	for (auto &child : node->children) {
-		RewriteAvg(context, child);
+/// Decompose AVG(x) into SUM(x), COUNT(x), and SUM/COUNT ratio.
+/// Walks top-down: finds AVG in aggregate, replaces it, propagates new bindings
+/// upward through projections, and adds the ratio expression at each projection.
+static void RewriteAvg(ClientContext &context, unique_ptr<LogicalOperator> &plan, Optimizer &opt) {
+	// Recurse into children first (bottom-up ensures aggregates are processed before parents)
+	for (auto &child : plan->children) {
+		RewriteAvg(context, child, opt);
 	}
 
-	if (node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+	if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION) {
 		return;
 	}
-
-	auto &agg = node->Cast<LogicalAggregate>();
+	// Check if the child is an aggregate with AVG
+	if (plan->children.empty() || plan->children[0]->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return;
+	}
+	auto &agg = plan->children[0]->Cast<LogicalAggregate>();
 	bool has_avg = false;
 	for (auto &expr : agg.expressions) {
-		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
-			auto &bound = expr->Cast<BoundAggregateExpression>();
-			if (bound.function.name == "avg") {
-				has_avg = true;
-				break;
-			}
+		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE &&
+		    expr->Cast<BoundAggregateExpression>().function.name == "avg") {
+			has_avg = true;
+			break;
 		}
 	}
 	if (!has_avg) {
 		return;
 	}
 
+	auto &proj = plan->Cast<LogicalProjection>();
+	size_t group_count = agg.groups.size();
+
+	// Step 1: Replace AVG(x) with SUM(x) + COUNT(x) in the aggregate.
+	// Track which old expression index maps to the new SUM/COUNT indices.
+	struct AvgDecomp {
+		string alias;
+		idx_t sum_idx; // index in new_exprs
+		idx_t count_idx;
+		idx_t old_idx; // index in original expressions
+	};
+	vector<AvgDecomp> decomps;
 	vector<unique_ptr<Expression>> new_exprs;
-	for (auto &expr : agg.expressions) {
+	for (idx_t i = 0; i < agg.expressions.size(); i++) {
+		auto &expr = agg.expressions[i];
 		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
 			auto &bound = expr->Cast<BoundAggregateExpression>();
 			if (bound.function.name == "avg" && !bound.children.empty()) {
 				string alias = bound.alias.empty() ? ("avg_" + bound.children[0]->GetName()) : bound.alias;
 				auto arg_type = bound.children[0]->return_type;
 
-				// SUM(x) as _ivm_sum_<alias>
+				AvgDecomp d;
+				d.alias = alias;
+				d.old_idx = i;
+
 				auto sum_func = BindAggregateByName(context, "sum", {arg_type});
 				vector<unique_ptr<Expression>> sum_args;
 				sum_args.push_back(bound.children[0]->Copy());
 				auto sum_expr = make_uniq<BoundAggregateExpression>(std::move(sum_func), std::move(sum_args), nullptr,
 				                                                    nullptr, AggregateType::NON_DISTINCT);
 				sum_expr->alias = "_ivm_sum_" + alias;
+				d.sum_idx = new_exprs.size();
 				new_exprs.push_back(std::move(sum_expr));
 
-				// COUNT(x) as _ivm_count_<alias>
 				auto count_func = BindAggregateByName(context, "count", {arg_type});
 				vector<unique_ptr<Expression>> count_args;
 				count_args.push_back(bound.children[0]->Copy());
 				auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args),
 				                                                      nullptr, nullptr, AggregateType::NON_DISTINCT);
 				count_expr->alias = "_ivm_count_" + alias;
+				d.count_idx = new_exprs.size();
 				new_exprs.push_back(std::move(count_expr));
 
-				// The ratio (SUM/COUNT = AVG) is computed by the upsert compiler
-				// via the _ivm_sum_/_ivm_count_ naming convention.
-				// A proper projection (SUM::DOUBLE / NULLIF(COUNT, 0) AS alias) would be added here
-				// but requires binding division/NULLIF — deferred to upsert compiler.
+				decomps.push_back(std::move(d));
 				continue;
 			}
 		}
@@ -145,7 +166,52 @@ static void RewriteAvg(ClientContext &context, unique_ptr<LogicalOperator> &node
 	agg.expressions = std::move(new_exprs);
 	agg.ResolveOperatorTypes();
 
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] AVG → SUM + COUNT decomposition\n");
+	// Step 2: Update the parent projection.
+	// The old projection referenced AVG's binding. Now we need to:
+	// - Replace the AVG column ref with a SUM/COUNT ratio expression
+	// - Add SUM and COUNT as extra passthrough columns (for the upsert MERGE)
+	auto agg_bindings = plan->children[0]->GetColumnBindings();
+	auto agg_types = plan->children[0]->types;
+
+	for (auto &d : decomps) {
+		// Old AVG binding was at (aggregate_index, old_idx)
+		ColumnBinding old_avg_binding(agg.aggregate_index, d.old_idx);
+
+		// New SUM and COUNT bindings
+		ColumnBinding sum_binding = agg_bindings[group_count + d.sum_idx];
+		ColumnBinding count_binding = agg_bindings[group_count + d.count_idx];
+		LogicalType sum_type = agg_types[group_count + d.sum_idx];
+		LogicalType count_type = agg_types[group_count + d.count_idx];
+
+		// Find the projection expression that referenced the old AVG and replace it with SUM/COUNT ratio
+		for (idx_t pi = 0; pi < proj.expressions.size(); pi++) {
+			if (proj.expressions[pi]->type == ExpressionType::BOUND_COLUMN_REF) {
+				auto &ref = proj.expressions[pi]->Cast<BoundColumnRefExpression>();
+				if (ref.binding == old_avg_binding) {
+					// Replace with SUM / COUNT
+					auto sum_ref = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
+					auto count_ref = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+					auto ratio = opt.BindScalarFunction("/", std::move(sum_ref), std::move(count_ref));
+					ratio->alias = d.alias;
+					proj.expressions[pi] = std::move(ratio);
+					break;
+				}
+			}
+		}
+
+		// Add SUM and COUNT as extra passthrough columns (hidden, for upsert MERGE)
+		auto sum_passthrough = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
+		sum_passthrough->alias = "_ivm_sum_" + d.alias;
+		proj.expressions.push_back(std::move(sum_passthrough));
+
+		auto count_passthrough = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+		count_passthrough->alias = "_ivm_count_" + d.alias;
+		proj.expressions.push_back(std::move(count_passthrough));
+	}
+	proj.ResolveOperatorTypes();
+
+	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] AVG → SUM/COUNT ratio + hidden columns, %zu decompositions\n",
+	                    decomps.size());
 }
 
 /// Add _ivm_left_key projection for LEFT/RIGHT JOINs at the top of the plan.
@@ -305,7 +371,11 @@ void IVMPlanRewrite(ClientContext &context, unique_ptr<LogicalOperator> &plan,
                     const vector<string> & /*planner_names*/) {
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Starting\n");
 	RewriteDistinct(context, plan);
-	RewriteAvg(context, plan);
+	{
+		auto binder = Binder::CreateBinder(context);
+		Optimizer opt(*binder, context);
+		RewriteAvg(context, plan, opt);
+	}
 	RewriteLeftJoinKey(plan);
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Done\n");
 }
