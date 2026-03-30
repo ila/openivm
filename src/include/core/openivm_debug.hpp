@@ -2,7 +2,7 @@
 
 // Set to 1 to enable verbose OpenIVM debug output, 0 to disable.
 // This is separate from DuckDB's DEBUG macro to avoid cluttering test output.
-#define OPENIVM_DEBUG 0
+#define OPENIVM_DEBUG 1
 
 #if OPENIVM_DEBUG
 #include <cstdio>

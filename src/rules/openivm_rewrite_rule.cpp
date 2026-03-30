@@ -107,15 +107,18 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 
 		// 3. Update all CTE_REF nodes that reference this CTE (by cte_index == table_index).
 		//    Add the multiplicity type and column name so downstream operators see the extra column.
+		OPENIVM_DEBUG_PRINT("[CTE] Looking for CTE_REFs with cte_index=%lu\n", (unsigned long)cte_table_index);
 		std::function<void(LogicalOperator *)> update_matching_refs = [&](LogicalOperator *node) {
 			if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 				auto &ref = node->Cast<LogicalCTERef>();
+				OPENIVM_DEBUG_PRINT("[CTE]   Found CTE_REF cte_index=%lu table_index=%lu cols=%zu\n",
+				                    (unsigned long)ref.cte_index, (unsigned long)ref.table_index,
+				                    ref.chunk_types.size());
 				if (ref.cte_index == cte_table_index &&
 				    (ref.bound_columns.empty() || ref.bound_columns.back() != ivm::MULTIPLICITY_COL)) {
 					ref.chunk_types.push_back(pw.mul_type);
 					ref.bound_columns.push_back(ivm::MULTIPLICITY_COL);
-					OPENIVM_DEBUG_PRINT("[CTE] Updated CTE_REF (cte_index=%lu) with mul column\n",
-					                    (unsigned long)ref.cte_index);
+					OPENIVM_DEBUG_PRINT("[CTE]   -> Updated with mul column\n");
 				}
 			}
 			for (auto &child : node->children) {

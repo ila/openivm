@@ -461,7 +461,8 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 		post_companion += "DROP TABLE " + temp_name + ";\n";
 		OPENIVM_DEBUG_PRINT("[UPSERT] Pre-companion: %s\n", pre_companion.c_str());
 		OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
-	} else if (view_query_type == IVMType::AGGREGATE_GROUP && has_downstream && index_delta_view_catalog_entry) {
+	} else if ((view_query_type == IVMType::AGGREGATE_GROUP || view_query_type == IVMType::AGGREGATE_HAVING) &&
+	           has_downstream && index_delta_view_catalog_entry) {
 		auto *idx = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
 		auto key_ids = idx->column_ids;
 		vector<string> keys;

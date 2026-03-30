@@ -381,7 +381,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " set default now()");
 
 		// --- Index DDL (for aggregate group queries) ---
-		if (ivm_type == IVMType::AGGREGATE_GROUP) {
+		if (ivm_type == IVMType::AGGREGATE_GROUP || ivm_type == IVMType::AGGREGATE_HAVING) {
 			string index_query_view = "create unique index " + view_name + "_ivm_index on " + view_name + "(";
 			for (size_t i = 0; i < aggregate_columns.size(); i++) {
 				index_query_view += aggregate_columns[i];
