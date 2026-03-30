@@ -11,8 +11,9 @@ namespace duckdb {
 /// - DISTINCT → AGGREGATE + COUNT(*) as _ivm_distinct_count
 /// - AVG(x) → SUM(x) as _ivm_sum_<alias>, COUNT(x) as _ivm_count_<alias>, SUM/COUNT as <alias>
 /// - LEFT/RIGHT JOIN → add projection with _ivm_left_key column
-/// Returns the modified plan. The caller should use LPTS to convert to SQL.
-void IVMPlanRewrite(ClientContext &context, unique_ptr<LogicalOperator> &plan);
+/// planner_names: column names from Planner.names (user aliases). These are set on
+/// aggregate expressions so LPTS can pick them up. Unaliased aggregates get auto-generated names.
+void IVMPlanRewrite(ClientContext &context, unique_ptr<LogicalOperator> &plan, const vector<string> &planner_names);
 
 } // namespace duckdb
 

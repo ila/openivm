@@ -378,7 +378,7 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 			if (i > 0) {
 				col_list += ", ";
 			}
-			col_list += column_names[i];
+			col_list += OpenIVMUtils::QuoteIdentifier(column_names[i]);
 		}
 		col_list += ") ";
 		raw_ivm_sql.insert(insert_pos + insert_target.size(), " " + col_list);
@@ -418,7 +418,7 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 			if (!col_list.empty()) {
 				col_list += ", ";
 			}
-			col_list += col;
+			col_list += OpenIVMUtils::QuoteIdentifier(col);
 		}
 		string select_false, select_true;
 		bool first = true;
@@ -432,8 +432,8 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 				select_false += "false";
 				select_true += "true";
 			} else {
-				select_false += col;
-				select_true += col;
+				select_false += OpenIVMUtils::QuoteIdentifier(col);
+				select_true += OpenIVMUtils::QuoteIdentifier(col);
 			}
 		}
 		// Pre: snapshot old state into temp table

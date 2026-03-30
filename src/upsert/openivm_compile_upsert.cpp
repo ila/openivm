@@ -8,6 +8,11 @@ namespace duckdb {
 // Zero-initialized 64-element float list, used as COALESCE default for NULL list aggregates.
 static const string ZEROS_LIST = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 
+/// Quote a column name for safe use in generated SQL. Handles special characters like ().
+static string Q(const string &name) {
+	return OpenIVMUtils::QuoteIdentifier(name);
+}
+
 /// Detect AVG decomposition columns from the column list.
 /// AVG(x) is stored as _ivm_sum_<alias>, _ivm_count_<alias>, and <alias>.
 /// Returns: derived_cols (the alias to skip in MERGE), sum_cols (alias→sum_name), count_cols (alias→count_name).
@@ -43,14 +48,14 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	vector<string> keys;
 	vector<string> aggregates;
 	for (size_t i = 0; i < key_ids.size(); i++) {
-		keys.emplace_back(column_names[key_ids[i]]);
+		keys.emplace_back(Q(column_names[key_ids[i]]));
 	}
 
 	unordered_set<std::string> keys_set(keys.begin(), keys.end());
 
 	for (auto &column : column_names) {
-		if (keys_set.find(column) == keys_set.end() && column != string(ivm::MULTIPLICITY_COL)) {
-			aggregates.push_back(column);
+		if (keys_set.find(Q(column)) == keys_set.end() && column != string(ivm::MULTIPLICITY_COL)) {
+			aggregates.push_back(Q(column));
 		}
 	}
 
@@ -231,10 +236,11 @@ string CompileSimpleAggregates(string &view_name, const vector<string> &column_n
 	bool first = true;
 	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 
-	for (auto &column : column_names) {
-		if (column == mul || avg_derived.count(column)) {
+	for (auto &raw_col : column_names) {
+		if (raw_col == mul || avg_derived.count(raw_col)) {
 			continue; // skip multiplicity and AVG derived columns
 		}
+		string column = Q(raw_col);
 		if (!first) {
 			cte += ",\n    ";
 			update_set += ",\n  ";
@@ -280,8 +286,9 @@ string CompileProjectionsFilters(string &view_name, const vector<string> &column
 
 	string select_columns;
 	string match_conditions;
-	for (auto &column : column_names) {
-		if (column != mul) {
+	for (auto &raw_col : column_names) {
+		if (raw_col != mul) {
+			string column = Q(raw_col);
 			match_conditions += "v." + column + " IS NOT DISTINCT FROM d." + column + " AND ";
 			select_columns += column + ", ";
 		}

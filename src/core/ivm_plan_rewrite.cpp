@@ -224,13 +224,11 @@ static void RewriteLeftJoinKey(unique_ptr<LogicalOperator> &plan) {
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Added _ivm_left_key projection\n");
 }
 
-void IVMPlanRewrite(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
+void IVMPlanRewrite(ClientContext &context, unique_ptr<LogicalOperator> &plan,
+                    const vector<string> & /*planner_names*/) {
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Starting\n");
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Step 1: RewriteDistinct\n");
 	RewriteDistinct(context, plan);
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Step 2: RewriteAvg\n");
 	RewriteAvg(context, plan);
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Step 3: RewriteLeftJoinKey\n");
 	RewriteLeftJoinKey(plan);
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Done\n");
 }

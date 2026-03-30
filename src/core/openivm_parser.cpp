@@ -130,10 +130,32 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			auto select_plan = std::move(select_planner.plan);
 
 			// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
-			IVMPlanRewrite(context, select_plan);
+			IVMPlanRewrite(context, select_plan, select_planner.names);
 
-			// Convert modified plan to SQL via LPTS with preserved column names
-			LogicalPlanToSql lpts(*con.context, select_plan, select_planner.names);
+			// Sanitize column names: replace special chars with underscores, collapse runs, trim.
+			// "min(val)" → "min_val", "count_star()" → "count_star", "SUM(x) AS total" → "total"
+			vector<string> output_names = select_planner.names;
+			for (auto &name : output_names) {
+				string clean;
+				bool last_was_underscore = false;
+				for (auto c : name) {
+					if (isalnum(c)) {
+						clean += c;
+						last_was_underscore = false;
+					} else if (!last_was_underscore && !clean.empty()) {
+						clean += '_';
+						last_was_underscore = true;
+					}
+				}
+				// Trim trailing underscore
+				if (!clean.empty() && clean.back() == '_') {
+					clean.pop_back();
+				}
+				if (!clean.empty()) {
+					name = clean;
+				}
+			}
+			LogicalPlanToSql lpts(*con.context, select_plan, output_names);
 			auto cte_list = lpts.LogicalPlanToCteList();
 			view_query = LogicalPlanToSql::CteListToSql(cte_list);
 			// Strip trailing semicolon — the query is embedded in other SQL statements
