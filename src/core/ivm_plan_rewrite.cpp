@@ -291,8 +291,18 @@ static void RewriteLeftJoinKey(unique_ptr<LogicalOperator> &plan) {
 			}
 			proj_exprs.push_back(std::move(expr));
 		}
-	} else {
-		// Key was already in output — just add the _ivm_left_key alias on top
+	}
+
+	// At this point, proj_exprs has all columns. If _ivm_left_key is not already
+	// aliased (key was in original output), add it as an extra column.
+	bool has_ivm_key = false;
+	for (auto &e : proj_exprs) {
+		if (e->alias == "_ivm_left_key") {
+			has_ivm_key = true;
+			break;
+		}
+	}
+	if (!has_ivm_key) {
 		auto key_ref = make_uniq<BoundColumnRefExpression>("_ivm_left_key", key_type, key_binding);
 		proj_exprs.push_back(std::move(key_ref));
 	}
