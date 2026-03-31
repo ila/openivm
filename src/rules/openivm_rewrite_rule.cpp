@@ -29,6 +29,23 @@
 
 namespace duckdb {
 
+/// Update CTE_REF nodes matching the given CTE table_index with the multiplicity column.
+static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, const LogicalType &mul_type) {
+	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		auto &ref = node->Cast<LogicalCTERef>();
+		if (ref.cte_index == cte_table_index &&
+		    (ref.bound_columns.empty() || ref.bound_columns.back() != ivm::MULTIPLICITY_COL)) {
+			ref.chunk_types.push_back(mul_type);
+			ref.bound_columns.push_back(ivm::MULTIPLICITY_COL);
+			OPENIVM_DEBUG_PRINT("[CTE]   Updated CTE_REF cte_index=%lu with mul column\n",
+			                    (unsigned long)cte_table_index);
+		}
+	}
+	for (auto &child : node->children) {
+		UpdateCteRefsWithMul(child.get(), cte_table_index, mul_type);
+	}
+}
+
 void IVMRewriteRule::AddInsertNode(ClientContext &context, unique_ptr<LogicalOperator> &plan, string &view_name,
                                    string &view_catalog_name, string &view_schema_name) {
 #if OPENIVM_DEBUG
@@ -111,25 +128,8 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 		// 3. Update all CTE_REF nodes that reference this CTE (by cte_index == table_index).
 		//    Add the multiplicity type and column name so downstream operators see the extra column.
 		OPENIVM_DEBUG_PRINT("[CTE] Looking for CTE_REFs with cte_index=%lu\n", (unsigned long)cte_table_index);
-		std::function<void(LogicalOperator *)> update_matching_refs = [&](LogicalOperator *node) {
-			if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
-				auto &ref = node->Cast<LogicalCTERef>();
-				OPENIVM_DEBUG_PRINT("[CTE]   Found CTE_REF cte_index=%lu table_index=%lu cols=%zu\n",
-				                    (unsigned long)ref.cte_index, (unsigned long)ref.table_index,
-				                    ref.chunk_types.size());
-				if (ref.cte_index == cte_table_index &&
-				    (ref.bound_columns.empty() || ref.bound_columns.back() != ivm::MULTIPLICITY_COL)) {
-					ref.chunk_types.push_back(pw.mul_type);
-					ref.bound_columns.push_back(ivm::MULTIPLICITY_COL);
-					OPENIVM_DEBUG_PRINT("[CTE]   -> Updated with mul column\n");
-				}
-			}
-			for (auto &child : node->children) {
-				update_matching_refs(child.get());
-			}
-		};
 		// Search the entire tree from this node down
-		update_matching_refs(pw.plan.get());
+		UpdateCteRefsWithMul(pw.plan.get(), cte_table_index, pw.mul_type);
 
 		// 4. Rewrite the consumer (which reads from CTE_REFs).
 		auto cons_mul = RewritePlan(pw.input, pw.plan->children[1], pw.view, pw.root);

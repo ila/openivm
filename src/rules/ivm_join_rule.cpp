@@ -10,7 +10,7 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 
-#include <functional>
+
 
 namespace {
 
@@ -29,7 +29,7 @@ struct JoinLeafInfo {
 	bool is_right_of_left_join; // true if this leaf is on the RIGHT side of a LEFT JOIN
 };
 
-void collect_join_leaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves,
+void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves,
                          bool is_right_of_left = false) {
 	if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	    node->type == duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
@@ -41,10 +41,10 @@ void collect_join_leaves(LogicalOperator *node, vector<size_t> path, vector<Join
 			is_right = (join && join->join_type == duckdb::JoinType::RIGHT);
 		}
 		path.push_back(0);
-		collect_join_leaves(node->children[0].get(), path, leaves, is_right_of_left || is_right);
+		CollectJoinLeaves(node->children[0].get(), path, leaves, is_right_of_left || is_right);
 		path.pop_back();
 		path.push_back(1);
-		collect_join_leaves(node->children[1].get(), path, leaves, is_right_of_left || is_left);
+		CollectJoinLeaves(node->children[1].get(), path, leaves, is_right_of_left || is_left);
 		path.pop_back();
 	} else if (node->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
 		leaves.push_back({path, dynamic_cast<LogicalGet *>(node), node, is_right_of_left});
@@ -53,7 +53,7 @@ void collect_join_leaves(LogicalOperator *node, vector<size_t> path, vector<Join
 	}
 }
 
-unique_ptr<LogicalOperator> &get_node_at_path(unique_ptr<LogicalOperator> &root, const vector<size_t> &path) {
+unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, const vector<size_t> &path) {
 	unique_ptr<LogicalOperator> *current = &root;
 	for (size_t step : path) {
 		current = &((*current)->children[step]);
@@ -61,13 +61,38 @@ unique_ptr<LogicalOperator> &get_node_at_path(unique_ptr<LogicalOperator> &root,
 	return *current;
 }
 
-void resolve_types_bottom_up(unique_ptr<LogicalOperator> &node) {
-	for (auto &child : node->children) {
-		resolve_types_bottom_up(child);
+/// Verify all joins in the subtree are INNER, LEFT, or RIGHT. Returns true if any LEFT/RIGHT found.
+bool VerifyJoinTypes(LogicalOperator *node) {
+	bool has_left = false;
+	if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
+		if (join->join_type == duckdb::JoinType::LEFT || join->join_type == duckdb::JoinType::RIGHT) {
+			has_left = true;
+		} else if (join->join_type != duckdb::JoinType::INNER) {
+			throw duckdb::Exception(duckdb::ExceptionType::OPTIMIZER,
+			                        duckdb::JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM");
+		}
 	}
-	node->ResolveOperatorTypes();
+	for (auto &child : node->children) {
+		if (VerifyJoinTypes(child.get())) {
+			has_left = true;
+		}
+	}
+	return has_left;
 }
 
+/// Demote LEFT/RIGHT JOINs to INNER in a subtree (used when only right-side deltas exist).
+void DemoteLeftJoins(LogicalOperator *node) {
+	if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
+		if (j && (j->join_type == duckdb::JoinType::LEFT || j->join_type == duckdb::JoinType::RIGHT)) {
+			j->join_type = duckdb::JoinType::INNER;
+		}
+	}
+	for (auto &child : node->children) {
+		DemoteLeftJoins(child.get());
+	}
+}
 
 } // namespace
 
@@ -78,28 +103,11 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	Binder &binder = pw.input.optimizer.binder;
 	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
 
-	// Verify all joins are INNER or LEFT
-	bool has_left_join = false;
-	std::function<void(LogicalOperator *)> verify_joins = [&](LogicalOperator *node) {
-		if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-			auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
-			if (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT) {
-				has_left_join = true;
-			} else if (join->join_type != JoinType::INNER) {
-				throw Exception(ExceptionType::OPTIMIZER,
-				                JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM");
-			}
-		}
-		// CROSS_PRODUCT is an unconditional INNER JOIN — always supported
-		for (auto &child : node->children) {
-			verify_joins(child.get());
-		}
-	};
-	verify_joins(pw.plan.get());
+	bool has_left_join = VerifyJoinTypes(pw.plan.get());
 
 	// 1. Collect all leaf GET nodes
 	vector<JoinLeafInfo> leaves;
-	collect_join_leaves(pw.plan.get(), {}, leaves);
+	CollectJoinLeaves(pw.plan.get(), {}, leaves);
 	size_t N = leaves.size();
 	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Rewriting JOIN node, %zu leaves found\n", N);
 	for (size_t i = 0; i < N; i++) {
@@ -154,19 +162,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 				}
 			}
 			if (!has_left_side_delta) {
-				// Only right-side deltas → demote LEFT JOINs to INNER in this term
-				std::function<void(LogicalOperator *)> demote_left = [&](LogicalOperator *node) {
-					if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-						auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
-						if (j && (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT)) {
-							j->join_type = JoinType::INNER;
-						}
-					}
-					for (auto &child : node->children) {
-						demote_left(child.get());
-					}
-				};
-				demote_left(term.get());
+				DemoteLeftJoins(term.get());
 			}
 		}
 
@@ -176,10 +172,10 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 					// Simple GET leaf: replace with delta scan
 					DeltaGetResult delta_i = CreateDeltaGetNode(context, leaves[i].get, pw.view);
 					mul_bindings.push_back(delta_i.mul_binding);
-					get_node_at_path(term, leaves[i].path) = std::move(delta_i.node);
+					GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
 				} else {
 					// Complex subtree leaf (UNION, etc.): rewrite the entire subtree
-					auto &subtree_ref = get_node_at_path(term, leaves[i].path);
+					auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
 					auto rewritten = IVMRewriteRule::RewritePlan(pw.input, subtree_ref, pw.view, term_root);
 					mul_bindings.push_back(rewritten.mul_binding);
 					subtree_ref = std::move(rewritten.op);
@@ -211,7 +207,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 			}
 		}
 
-		resolve_types_bottom_up(term);
+		term->ResolveOperatorTypes();
 
 		// Build projection: original columns + combined multiplicity
 		auto term_bindings = term->GetColumnBindings();
