@@ -1,10 +1,10 @@
 #ifndef IVM_COLUMN_HIDER_HPP
 #define IVM_COLUMN_HIDER_HPP
 
+#include "core/openivm_constants.hpp"
 #include "duckdb/common/string_util.hpp"
 
 #include <string>
-#include <vector>
 
 namespace duckdb {
 
@@ -19,13 +19,18 @@ namespace duckdb {
 struct IVMTableNames {
 	/// Returns the internal data table name for a given user-facing MV name.
 	static std::string DataTableName(const std::string &view_name) {
-		return "_ivm_data_" + view_name;
+		return std::string(ivm::DATA_TABLE_PREFIX) + view_name;
 	}
 
 	/// Returns true if a column name is an internal IVM column that should be
 	/// hidden from users (excluded from the view).
 	static bool IsInternalColumn(const std::string &name) {
 		return StringUtil::StartsWith(name, "_ivm_");
+	}
+
+	/// Returns true if a table name is an IVM data table.
+	static bool IsDataTable(const std::string &name) {
+		return StringUtil::StartsWith(name, ivm::DATA_TABLE_PREFIX);
 	}
 };
 

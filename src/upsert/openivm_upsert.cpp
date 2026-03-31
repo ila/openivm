@@ -284,7 +284,7 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 
 	// Detect LEFT JOIN: the parser adds _ivm_left_key as a hidden column for LEFT/RIGHT JOIN views.
 	// If the MV has this column, use it for the partial recompute filter.
-	bool has_left_join = std::find(column_names.begin(), column_names.end(), "_ivm_left_key") != column_names.end();
+	bool has_left_join = std::find(column_names.begin(), column_names.end(), ivm::LEFT_KEY_COL) != column_names.end();
 	OPENIVM_DEBUG_PRINT("[UPSERT] has_left_join=%d\n", has_left_join);
 
 	// this is to compile the query to merge the materialized view with its delta version

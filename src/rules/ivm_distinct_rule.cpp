@@ -36,7 +36,7 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
 	vector<unique_ptr<Expression>> count_args;
 	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star_func), std::move(count_args), nullptr,
 	                                                      nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = "_ivm_distinct_count";
+	count_expr->alias = ivm::DISTINCT_COUNT_COL;
 
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(std::move(count_expr));

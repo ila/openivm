@@ -1,6 +1,8 @@
 #ifndef OPENIVM_CONSTANTS_HPP
 #define OPENIVM_CONSTANTS_HPP
 
+#include "duckdb.hpp"
+
 namespace duckdb {
 namespace ivm {
 
@@ -14,6 +16,15 @@ constexpr const char *TIMESTAMP_COL = "_duckdb_ivm_timestamp";
 
 // Prefixes
 constexpr const char *DELTA_PREFIX = "delta_";
+constexpr const char *DATA_TABLE_PREFIX = "_ivm_data_";
+
+// Internal column names (added by IVM plan rewrites, hidden from users via VIEW)
+constexpr const char *LEFT_KEY_COL = "_ivm_left_key";
+constexpr const char *DISTINCT_COUNT_COL = "_ivm_distinct_count";
+
+// Internal column prefixes (for AVG decomposition)
+constexpr const char *SUM_COL_PREFIX = "_ivm_sum_";
+constexpr const char *COUNT_COL_PREFIX = "_ivm_count_";
 
 // Limits
 static constexpr idx_t MAX_JOIN_TABLES = 16;

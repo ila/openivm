@@ -131,7 +131,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] INSERT into '%s'\n", insert_table_name.c_str());
 
 		if (OpenIVMUtils::IsDelta(insert_table_name) || insert_table_name.empty() ||
-		    StringUtil::StartsWith(insert_table_name, "_ivm_data_")) {
+		    IVMTableNames::IsDataTable(insert_table_name)) {
 			return;
 		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
@@ -211,7 +211,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		auto delete_node = dynamic_cast<LogicalDelete *>(root);
 		auto delete_table_name = delete_node->table.name;
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] DELETE from '%s'\n", delete_table_name.c_str());
-		if (OpenIVMUtils::IsDelta(delete_table_name) || StringUtil::StartsWith(delete_table_name, "_ivm_data_")) {
+		if (OpenIVMUtils::IsDelta(delete_table_name) || IVMTableNames::IsDataTable(delete_table_name)) {
 			return;
 		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
@@ -285,7 +285,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 	case LogicalOperatorType::LOGICAL_UPDATE: {
 		auto update_node = dynamic_cast<LogicalUpdate *>(root);
 		auto update_table_name = update_node->table.name;
-		if (OpenIVMUtils::IsDelta(update_table_name) || StringUtil::StartsWith(update_table_name, "_ivm_data_")) {
+		if (OpenIVMUtils::IsDelta(update_table_name) || IVMTableNames::IsDataTable(update_table_name)) {
 			return;
 		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(

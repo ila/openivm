@@ -58,7 +58,7 @@ static void RewriteDistinct(ClientContext &context, unique_ptr<LogicalOperator> 
 	vector<unique_ptr<Expression>> count_args;
 	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star), std::move(count_args), nullptr,
 	                                                      nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = "_ivm_distinct_count";
+	count_expr->alias = ivm::DISTINCT_COUNT_COL;
 
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(std::move(count_expr));
@@ -374,7 +374,7 @@ static void RewriteLeftJoinKey(unique_ptr<LogicalOperator> &plan) {
 	}
 
 	// Always add _ivm_left_key as a separate extra column.
-	proj_exprs.push_back(make_uniq<BoundColumnRefExpression>("_ivm_left_key", key_type, key_binding));
+	proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(ivm::LEFT_KEY_COL, key_type, key_binding));
 
 	// Use a table index that won't conflict (high number)
 	idx_t proj_table_index = 9999;
@@ -393,7 +393,7 @@ void IVMPlanRewrite(ClientContext &context, unique_ptr<LogicalOperator> &plan, v
 	                     plan->children[0]->type == LogicalOperatorType::LOGICAL_DISTINCT);
 	RewriteDistinct(context, plan);
 	if (had_distinct) {
-		planner_names.push_back("_ivm_distinct_count");
+		planner_names.push_back(ivm::DISTINCT_COUNT_COL);
 	}
 	{
 		auto binder = Binder::CreateBinder(context);
