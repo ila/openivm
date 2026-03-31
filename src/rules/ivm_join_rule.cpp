@@ -219,16 +219,16 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 
 		vector<unique_ptr<Expression>> proj_exprs;
 
+		// Build hash set for O(1) multiplicity binding lookup
+		unordered_set<uint64_t> mul_set;
+		for (auto &mb : mul_bindings) {
+			mul_set.insert((uint64_t)mb.table_index ^ ((uint64_t)mb.column_index * 0x9e3779b97f4a7c15ULL));
+		}
 		// Add non-multiplicity columns
 		for (idx_t i = 0; i < term_bindings.size(); i++) {
-			bool is_mul = false;
-			for (auto &mb : mul_bindings) {
-				if (term_bindings[i] == mb) {
-					is_mul = true;
-					break;
-				}
-			}
-			if (!is_mul) {
+			uint64_t key =
+			    (uint64_t)term_bindings[i].table_index ^ ((uint64_t)term_bindings[i].column_index * 0x9e3779b97f4a7c15ULL);
+			if (!mul_set.count(key)) {
 				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
 			}
 		}
