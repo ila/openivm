@@ -9,6 +9,7 @@
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -201,6 +202,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		bool found_projection = false;
 		bool found_distinct = false;
 		bool found_having = false;
+		bool found_minmax = false;
+		bool found_left_join = false;
 		vector<string> aggregate_columns;
 
 		while (!node_stack.empty()) {
@@ -225,6 +228,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			} else if (current->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 				found_aggregation = true;
 				auto node = dynamic_cast<LogicalAggregate *>(current);
+				// Detect MIN/MAX aggregates
+				for (auto &expr : node->expressions) {
+					if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
+						auto &agg = expr->Cast<BoundAggregateExpression>();
+						if (agg.function.name == "min" || agg.function.name == "max") {
+							found_minmax = true;
+						}
+					}
+				}
 				for (auto &group : node->groups) {
 					if (group->type == ExpressionType::BOUND_COLUMN_REF) {
 						auto column = dynamic_cast<BoundColumnRefExpression *>(group.get());
@@ -256,6 +268,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			if (current->type == LogicalOperatorType::LOGICAL_FILTER && !current->children.empty() &&
 			    current->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 				found_having = true;
+			}
+
+			// Detect LEFT/RIGHT JOIN
+			if (current->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+				auto *join = dynamic_cast<LogicalComparisonJoin *>(current);
+				if (join && (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT)) {
+					found_left_join = true;
+				}
 			}
 
 			if (!current->children.empty()) {
@@ -326,8 +346,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// --- System tables DDL ---
 		ddl.push_back("create table if not exists " + string(ivm::VIEWS_TABLE) +
-		              " (view_name varchar primary key, sql_string "
-		              "varchar, type tinyint, last_update timestamp)");
+		              " (view_name varchar primary key, sql_string varchar, type tinyint,"
+		              " has_minmax boolean default false, has_left_join boolean default false,"
+		              " last_update timestamp)");
 
 		ddl.push_back("create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
 		              " (view_name varchar, table_name "
@@ -336,7 +357,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Store the LPTS query in metadata — it has hidden columns (DISTINCT count, AVG sum/count,
 		// LEFT JOIN key) and preserves user column names.
 		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
-		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", now())");
+		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", " +
+		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now())");
 
 		for (const auto &table_name : table_names) {
 			ddl.push_back("insert into " + string(ivm::DELTA_TABLES_TABLE) + " values ('" + view_name + "', '" +

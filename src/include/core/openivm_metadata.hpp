@@ -28,6 +28,12 @@ public:
 	// Get the IVM type for a materialized view.
 	IVMType GetViewType(const string &view_name);
 
+	// Check if the view uses MIN/MAX aggregates (requires group-recompute).
+	bool HasMinMax(const string &view_name);
+
+	// Check if the view involves a LEFT/RIGHT JOIN.
+	bool HasLeftJoin(const string &view_name);
+
 	// Get delta table names associated with a view.
 	vector<string> GetDeltaTables(const string &view_name);
 

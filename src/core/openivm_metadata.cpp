@@ -28,6 +28,24 @@ IVMType IVMMetadata::GetViewType(const string &view_name) {
 	return static_cast<IVMType>(result->GetValue(0, 0).GetValue<int8_t>());
 }
 
+bool IVMMetadata::HasMinMax(const string &view_name) {
+	auto result = con.Query("SELECT has_minmax FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	return result->GetValue(0, 0).GetValue<bool>();
+}
+
+bool IVMMetadata::HasLeftJoin(const string &view_name) {
+	auto result = con.Query("SELECT has_left_join FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	return result->GetValue(0, 0).GetValue<bool>();
+}
+
 vector<string> IVMMetadata::GetDeltaTables(const string &view_name) {
 	auto result = con.Query("SELECT table_name FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	                        OpenIVMUtils::EscapeValue(view_name) + "'");

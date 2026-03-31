@@ -177,26 +177,11 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 	// MIN, MAX use group-recompute. AVG is decomposed to SUM+COUNT by the parser (fully incremental).
 	// HAVING needs recompute because groups may enter/leave the result set.
 	// Aggregates over LEFT JOIN sources also need group-recompute: SUM(NULL) != SUM(0)
-	// but the MERGE delta arithmetic can't distinguish NULL from zero cancellation.
-	// Detect LEFT JOIN: check both the _ivm_left_key column in delta tables (for SIMPLE_PROJECTION)
-	// and LEFT JOIN keywords in the view query (for aggregates where _ivm_left_key isn't added).
-	bool source_has_left_join = false;
-	{
-		auto delta_tables = metadata.GetDeltaTables(view_name);
-		for (auto &dt : delta_tables) {
-			auto dt_result = con.Query("SELECT 1 FROM information_schema.columns WHERE table_name = '" +
-			                           OpenIVMUtils::EscapeValue(dt) + "' AND column_name = '_ivm_left_key'");
-			if (!dt_result->HasError() && dt_result->RowCount() > 0) {
-				source_has_left_join = true;
-				break;
-			}
-		}
-	}
-	if (!source_has_left_join) {
-		source_has_left_join = StringUtil::Contains(StringUtil::Lower(view_query_sql), "left join");
-	}
-	bool has_minmax = StringUtil::Contains(view_query_sql, "min(") || StringUtil::Contains(view_query_sql, "max(") ||
-	                  StringUtil::Contains(view_query_sql, " having ") || source_has_left_join;
+	// Read MIN/MAX and LEFT JOIN flags from metadata (set at CREATE MV time).
+	// These determine whether to use incremental MERGE or full group-recompute.
+	bool source_has_left_join = metadata.HasLeftJoin(view_name);
+	bool has_minmax = metadata.HasMinMax(view_name) || view_query_type == IVMType::AGGREGATE_HAVING ||
+	                  source_has_left_join;
 
 	// Check ivm_refresh_mode: 'full' forces full recompute, skipping the IVM pipeline.
 	Value refresh_mode_val;
@@ -312,11 +297,13 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 	case IVMType::SIMPLE_PROJECTION: {
 		if (has_left_join) {
 			string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
-			string dv = OpenIVMUtils::DeltaName(view_name);
-			string affected = "EXISTS (SELECT 1 FROM " + dv + " _d WHERE _d._ivm_left_key IS NOT DISTINCT FROM ";
-			upsert_query = "DELETE FROM " + data_table + " WHERE " + affected + data_table + "._ivm_left_key" +
-			               delta_where + ");\n" + "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql +
-			               ") _ivm_lj\nWHERE " + affected + "_ivm_lj._ivm_left_key" + delta_where + ");\n";
+			string qdt = KeywordHelper::WriteOptionallyQuoted(data_table);
+			string qdv = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+			string lk = KeywordHelper::WriteOptionallyQuoted(string(ivm::LEFT_KEY_COL));
+			string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
+			upsert_query = "DELETE FROM " + qdt + " WHERE " + affected + qdt + "." + lk + delta_where + ");\n" +
+			               "INSERT INTO " + qdt + "\nSELECT * FROM (" + view_query_sql + ") _ivm_lj\nWHERE " +
+			               affected + "_ivm_lj." + lk + delta_where + ");\n";
 		} else {
 			upsert_query = CompileProjectionsFilters(view_name, column_names, delta_ts_filter);
 		}
@@ -329,17 +316,19 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 		if (!has_minmax) {
 			auto source_tables = metadata.GetDeltaTables(view_name);
 			for (auto &dt : source_tables) {
-				string source = dt.size() > 6 ? dt.substr(6) : dt;
+				// Strip "delta_" prefix to get base table name
+				string source = StringUtil::StartsWith(dt, ivm::DELTA_PREFIX) ? dt.substr(strlen(ivm::DELTA_PREFIX)) : dt;
 				string null_cols;
 				for (auto &col : column_names) {
 					if (col != string(ivm::MULTIPLICITY_COL)) {
 						if (!null_cols.empty()) {
 							null_cols += ", ";
 						}
-						null_cols += col + " = NULL";
+						null_cols += KeywordHelper::WriteOptionallyQuoted(col) + " = NULL";
 					}
 				}
-				upsert_query += "UPDATE " + data_table + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " +
+				string qdt = KeywordHelper::WriteOptionallyQuoted(data_table);
+				upsert_query += "UPDATE " + qdt + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " +
 				                source + " LIMIT 1);\n";
 			}
 		}
