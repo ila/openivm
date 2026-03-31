@@ -29,6 +29,18 @@
 
 namespace duckdb {
 
+/// Walk a plan tree and return the highest table_index found in any column binding.
+static idx_t FindMaxTableIndex(LogicalOperator *node) {
+	idx_t max_idx = 0;
+	for (auto &b : node->GetColumnBindings()) {
+		max_idx = std::max(max_idx, b.table_index);
+	}
+	for (auto &child : node->children) {
+		max_idx = std::max(max_idx, FindMaxTableIndex(child.get()));
+	}
+	return max_idx;
+}
+
 /// Update CTE_REF nodes matching the given CTE table_index with the multiplicity column.
 static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, const LogicalType &mul_type) {
 	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
@@ -46,8 +58,8 @@ static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, c
 	}
 }
 
-void IVMRewriteRule::AddInsertNode(ClientContext &context, unique_ptr<LogicalOperator> &plan, string &view_name,
-                                   string &view_catalog_name, string &view_schema_name) {
+void IVMRewriteRule::AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
+                                   string &view_name, string &view_catalog_name, string &view_schema_name) {
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("\nAdd the insert node to the plan...\n");
 	OPENIVM_DEBUG_PRINT("Plan:\n%s\nParameters:", plan->ToString().c_str());
@@ -60,7 +72,7 @@ void IVMRewriteRule::AddInsertNode(ClientContext &context, unique_ptr<LogicalOpe
 	auto table = Catalog::GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name,
 	                                                  OpenIVMUtils::DeltaName(view_name),
 	                                                  OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
-	auto insert_node = make_uniq<LogicalInsert>(*table, 999);
+	auto insert_node = make_uniq<LogicalInsert>(*table, binder.GenerateTableIndex());
 
 	Value value;
 	unique_ptr<BoundConstantExpression> exp;
@@ -158,7 +170,7 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 	while (!child->children.empty()) {
 		child = child->children[0].get();
 	}
-	if (child->GetName().substr(0, 5) != "DOIVM") {
+	if (!StringUtil::StartsWith(child->GetName(), "DOIVM")) {
 		return;
 	}
 
@@ -172,10 +184,7 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 	auto view_schema = child_get->named_parameters["view_schema_name"].ToString();
 
 	Connection con(*input.context.db);
-
-	con.BeginTransaction();
 	con.Query("SET disabled_optimizers='" + string(ivm::DISABLED_OPTIMIZERS) + "';");
-	con.Commit();
 
 	auto v = con.Query("select sql_string from " + string(ivm::VIEWS_TABLE) + " where view_name = '" +
 	                   OpenIVMUtils::EscapeValue(view) + "';");
@@ -212,16 +221,7 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 	// IvmJoinRule uses input.optimizer.binder which may not have been advanced by the
 	// local optimizer. Walk the plan to find the highest table index used.
 	{
-		idx_t max_idx = 0;
-		std::function<void(LogicalOperator *)> FindMaxIndex = [&](LogicalOperator *node) {
-			for (auto &b : node->GetColumnBindings()) {
-				max_idx = std::max(max_idx, b.table_index);
-			}
-			for (auto &child : node->children) {
-				FindMaxIndex(child.get());
-			}
-		};
-		FindMaxIndex(optimized_plan.get());
+		idx_t max_idx = FindMaxTableIndex(optimized_plan.get());
 		while (input.optimizer.binder.GenerateTableIndex() <= max_idx) {
 		}
 	}
@@ -230,7 +230,7 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 	auto root = optimized_plan.get();
 	ModifiedPlan modified_plan = RewritePlan(input, optimized_plan, view, root);
 	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === RewritePlan done, running AddInsertNode ===\n");
-	AddInsertNode(input.context, modified_plan.op, view, view_catalog, view_schema);
+	AddInsertNode(input.context, input.optimizer.binder, modified_plan.op, view, view_catalog, view_schema);
 	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === FINAL PLAN ===\n%s\n", modified_plan.op->ToString().c_str());
 	plan = std::move(modified_plan.op);
 	return;

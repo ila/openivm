@@ -35,10 +35,10 @@ static AggregateFunction BindAggregateByName(ClientContext &context, const strin
 }
 
 /// Replace LOGICAL_DISTINCT with LOGICAL_AGGREGATE + COUNT(*).
-static void RewriteDistinct(ClientContext &context, unique_ptr<LogicalOperator> &node) {
+static void RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node) {
 	if (node->type != LogicalOperatorType::LOGICAL_DISTINCT) {
 		for (auto &child : node->children) {
-			RewriteDistinct(context, child);
+			RewriteDistinct(context, binder, child);
 		}
 		return;
 	}
@@ -63,9 +63,8 @@ static void RewriteDistinct(ClientContext &context, unique_ptr<LogicalOperator> 
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(std::move(count_expr));
 
-	auto table_indices = distinct.GetTableIndex();
-	idx_t group_index = table_indices.empty() ? 9990 : table_indices.front();
-	idx_t aggregate_index = group_index + 1;
+	idx_t group_index = binder.GenerateTableIndex();
+	idx_t aggregate_index = binder.GenerateTableIndex();
 
 	auto agg_node = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
 
@@ -215,7 +214,7 @@ static void RewriteAvg(ClientContext &context, unique_ptr<LogicalOperator> &plan
 }
 
 /// Add _ivm_left_key projection for LEFT/RIGHT JOINs at the top of the plan.
-static void RewriteLeftJoinKey(unique_ptr<LogicalOperator> &plan) {
+static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan) {
 	// Find the first LEFT/RIGHT JOIN and extract the preserved-side key binding
 	bool found = false;
 	ColumnBinding key_binding;
@@ -377,7 +376,7 @@ static void RewriteLeftJoinKey(unique_ptr<LogicalOperator> &plan) {
 	proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(ivm::LEFT_KEY_COL, key_type, key_binding));
 
 	// Use a table index that won't conflict (high number)
-	idx_t proj_table_index = 9999;
+	idx_t proj_table_index = binder.GenerateTableIndex();
 	auto projection = make_uniq<LogicalProjection>(proj_table_index, std::move(proj_exprs));
 	projection->children.push_back(std::move(plan));
 	projection->ResolveOperatorTypes();
@@ -386,21 +385,21 @@ static void RewriteLeftJoinKey(unique_ptr<LogicalOperator> &plan) {
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Added _ivm_left_key projection\n");
 }
 
-void IVMPlanRewrite(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &planner_names) {
+void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
+                    vector<string> &planner_names) {
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Starting\n");
 	bool had_distinct = plan->type == LogicalOperatorType::LOGICAL_DISTINCT ||
 	                    (plan->type == LogicalOperatorType::LOGICAL_PROJECTION && !plan->children.empty() &&
 	                     plan->children[0]->type == LogicalOperatorType::LOGICAL_DISTINCT);
-	RewriteDistinct(context, plan);
+	RewriteDistinct(context, binder, plan);
 	if (had_distinct) {
 		planner_names.push_back(ivm::DISTINCT_COUNT_COL);
 	}
 	{
-		auto binder = Binder::CreateBinder(context);
-		Optimizer opt(*binder, context);
+		Optimizer opt(binder, context);
 		RewriteAvg(context, plan, opt);
 	}
-	RewriteLeftJoinKey(plan);
+	RewriteLeftJoinKey(binder, plan);
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Done\n");
 }
 

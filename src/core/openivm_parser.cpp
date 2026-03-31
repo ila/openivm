@@ -132,7 +132,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			auto select_plan = std::move(select_planner.plan);
 
 			// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
-			IVMPlanRewrite(context, select_plan, select_planner.names);
+			IVMPlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
 
 			// Sanitize column names: replace special chars with underscores, collapse runs, trim.
 			// "min(val)" → "min_val", "count_star()" → "count_star", "SUM(x) AS total" → "total"
