@@ -1,10 +1,13 @@
 #include "upsert/openivm_index_regen.hpp"
 #include "core/openivm_debug.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 
 #include <duckdb/planner/operator/logical_aggregate.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/operator/logical_projection.hpp>
+#include <duckdb/planner/operator/logical_comparison_join.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_set_operation.hpp>
 
@@ -93,41 +96,107 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 	return {std::move(plan), table_reassign, current_bindings};
 }
 
-ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &bindings,
-                                      const std::unordered_map<old_idx, new_idx> &table_mapping) {
-	// Collect ALL unique column indices per table, plus generate replacements
-	// for a generous range to catch bindings in expressions (JOIN conditions, etc.)
-	// that might not appear in GetColumnBindings().
-	std::unordered_map<old_idx, idx_t> max_col_per_table;
-	for (const ColumnBinding col_binding : bindings) {
-		if (table_mapping.find(col_binding.table_index) != table_mapping.end()) {
-			auto &m = max_col_per_table[col_binding.table_index];
-			if (col_binding.column_index + 1 > m) {
-				m = col_binding.column_index + 1;
+// Walk every expression in the operator tree and collect all referenced ColumnBindings.
+static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t> &seen,
+                                std::vector<ColumnBinding> &out) {
+	std::function<void(Expression &)> CollectExpr = [&](Expression &e) {
+		if (e.type == ExpressionType::BOUND_COLUMN_REF) {
+			auto &bcr = e.Cast<BoundColumnRefExpression>();
+			uint64_t key = (uint64_t)bcr.binding.table_index << 32 | bcr.binding.column_index;
+			if (seen.insert(key).second) {
+				out.push_back(bcr.binding);
 			}
 		}
+		ExpressionIterator::EnumerateChildren(e, [&](Expression &child) { CollectExpr(child); });
+	};
+	// GetColumnBindings
+	for (auto &cb : op.GetColumnBindings()) {
+		uint64_t key = (uint64_t)cb.table_index << 32 | cb.column_index;
+		if (seen.insert(key).second) {
+			out.push_back(cb);
+		}
 	}
+	// Standard expressions
+	for (auto &expr : op.expressions) {
+		CollectExpr(*expr);
+	}
+	// COMPARISON_JOIN conditions (stored separately from expressions)
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		for (auto &cond : join.conditions) {
+			CollectExpr(*cond.left);
+			CollectExpr(*cond.right);
+		}
+	}
+	for (auto &child : op.children) {
+		CollectAllBindings(*child, seen, out);
+	}
+}
+
+// Replace bindings in COMPARISON_JOIN conditions (not visited by ColumnBindingReplacer).
+static void RebindJoinConditions(LogicalOperator &op, const std::unordered_map<old_idx, new_idx> &table_mapping) {
+	std::function<void(Expression &)> RebindExpr = [&](Expression &e) {
+		if (e.type == ExpressionType::BOUND_COLUMN_REF) {
+			auto &bcr = e.Cast<BoundColumnRefExpression>();
+			auto it = table_mapping.find(bcr.binding.table_index);
+			if (it != table_mapping.end()) {
+				bcr.binding.table_index = it->second;
+			}
+		}
+		ExpressionIterator::EnumerateChildren(e, [&](Expression &child) { RebindExpr(child); });
+	};
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		// Rebind conditions that ColumnBindingReplacer doesn't visit
+		for (auto &cond : join.conditions) {
+			RebindExpr(*cond.left);
+			RebindExpr(*cond.right);
+		}
+	}
+	for (auto &child : op.children) {
+		RebindJoinConditions(*child, table_mapping);
+	}
+}
+
+ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &bindings,
+                                      const std::unordered_map<old_idx, new_idx> &table_mapping) {
 	ColumnBindingReplacer replacer;
-	for (const auto &pair : table_mapping) {
-		const old_idx old_t = pair.first;
-		const new_idx new_t = pair.second;
-		// Replace up to max observed column index + generous padding for hidden columns
-		idx_t max_col = 32;
-		auto it = max_col_per_table.find(old_t);
-		if (it != max_col_per_table.end() && it->second > max_col) {
-			max_col = it->second + 16;
+	std::unordered_set<uint64_t> seen;
+	for (const ColumnBinding &cb : bindings) {
+		if (table_mapping.find(cb.table_index) == table_mapping.end()) {
+			continue;
 		}
-		for (idx_t col = 0; col < max_col; col++) {
-			replacer.replacement_bindings.emplace_back(ColumnBinding(old_t, col), ColumnBinding(new_t, col));
+		uint64_t key = (uint64_t)cb.table_index << 32 | cb.column_index;
+		if (!seen.insert(key).second) {
+			continue;
 		}
+		new_idx new_t = table_mapping.at(cb.table_index);
+		replacer.replacement_bindings.emplace_back(cb, ColumnBinding(new_t, cb.column_index));
 	}
 	return replacer;
 }
 
 RenumberWrapper renumber_and_rebind_subtree(unique_ptr<LogicalOperator> plan, Binder &binder) {
+	// Collect ALL bindings BEFORE renumbering (we need the old table indices)
+	std::unordered_set<uint64_t> seen;
+	std::vector<ColumnBinding> all_bindings;
+	CollectAllBindings(*plan, seen, all_bindings);
+
 	RenumberWrapper res = renumber_table_indices(std::move(plan), binder);
-	ColumnBindingReplacer replacer = vec_to_replacer(res.column_bindings, res.idx_map);
+
+	// Merge in any bindings from the renumber pass
+	for (auto &cb : res.column_bindings) {
+		uint64_t key = (uint64_t)cb.table_index << 32 | cb.column_index;
+		if (seen.insert(key).second) {
+			all_bindings.push_back(cb);
+		}
+	}
+
+	ColumnBindingReplacer replacer = vec_to_replacer(all_bindings, res.idx_map);
 	replacer.VisitOperator(*res.op);
+
+	// Also rebind COMPARISON_JOIN conditions (not visited by ColumnBindingReplacer)
+	RebindJoinConditions(*res.op, res.idx_map);
 	return res;
 }
 

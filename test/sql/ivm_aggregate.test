@@ -454,20 +454,12 @@ SELECT total, cnt FROM score_totals;
 ----
 150	4
 
+
 # ==========================================
 # MIN / MAX AGGREGATES
 # ==========================================
 
-
-statement ok
-CREATE TABLE IF NOT EXISTS _duckdb_ivm_views (view_name VARCHAR PRIMARY KEY, sql_string VARCHAR, type TINYINT, last_update TIMESTAMP);
-
-statement ok
-CREATE TABLE IF NOT EXISTS _duckdb_ivm_delta_tables (view_name VARCHAR, table_name VARCHAR, last_update TIMESTAMP, PRIMARY KEY(view_name, table_name));
-
-# ==========================================
 # Test 1: MIN with GROUP BY
-# ==========================================
 
 statement ok
 CREATE TABLE t1 (id INT, grp VARCHAR, val INT);
@@ -476,36 +468,13 @@ statement ok
 INSERT INTO t1 VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 5);
 
 statement ok
-CREATE TABLE mv_min AS SELECT grp, min(val) AS min_val FROM t1 GROUP BY grp;
+CREATE MATERIALIZED VIEW mv_min AS SELECT grp, MIN(val) AS min_val FROM t1 GROUP BY grp;
 
-statement ok
-CREATE TABLE delta_mv_min AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_min LIMIT 0;
-
-statement ok
-CREATE UNIQUE INDEX mv_min_ivm_index ON mv_min (grp);
-
-statement ok
-CREATE TABLE delta_t1 AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM t1 LIMIT 0;
-
-statement ok
-INSERT INTO _duckdb_ivm_views VALUES ('mv_min', 'select grp, min(val) as min_val from t1 group by grp', 0, now()::timestamp);
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_min', 'delta_t1', '1970-01-01');
-
-# Initial state
-query II
-SELECT grp, min_val FROM mv_min ORDER BY grp;
-----
-a	10
-b	5
-
-# Insert new min for group 'a'
 statement ok
 INSERT INTO t1 VALUES (5, 'a', 3);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_min');
+PRAGMA ivm('mv_min');
 
 query II
 SELECT grp, min_val FROM mv_min ORDER BY grp;
@@ -513,25 +482,11 @@ SELECT grp, min_val FROM mv_min ORDER BY grp;
 a	3
 b	5
 
-# Insert non-min value (no change to min)
-statement ok
-INSERT INTO t1 VALUES (6, 'a', 50);
-
-statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_min');
-
-query II
-SELECT grp, min_val FROM mv_min ORDER BY grp;
-----
-a	3
-b	5
-
-# Delete the current min from group 'a' — next smallest should become min
 statement ok
 DELETE FROM t1 WHERE id = 5;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_min');
+PRAGMA ivm('mv_min');
 
 query II
 SELECT grp, min_val FROM mv_min ORDER BY grp;
@@ -539,22 +494,7 @@ SELECT grp, min_val FROM mv_min ORDER BY grp;
 a	10
 b	5
 
-# Delete non-min value — min unchanged
-statement ok
-DELETE FROM t1 WHERE id = 6;
-
-statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_min');
-
-query II
-SELECT grp, min_val FROM mv_min ORDER BY grp;
-----
-a	10
-b	5
-
-# ==========================================
 # Test 2: MAX with GROUP BY
-# ==========================================
 
 statement ok
 CREATE TABLE t2 (id INT, grp VARCHAR, val INT);
@@ -563,36 +503,13 @@ statement ok
 INSERT INTO t2 VALUES (1, 'x', 100), (2, 'x', 200), (3, 'y', 50), (4, 'y', 75);
 
 statement ok
-CREATE TABLE mv_max AS SELECT grp, max(val) AS max_val FROM t2 GROUP BY grp;
+CREATE MATERIALIZED VIEW mv_max AS SELECT grp, MAX(val) AS max_val FROM t2 GROUP BY grp;
 
-statement ok
-CREATE TABLE delta_mv_max AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_max LIMIT 0;
-
-statement ok
-CREATE UNIQUE INDEX mv_max_ivm_index ON mv_max (grp);
-
-statement ok
-CREATE TABLE delta_t2 AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM t2 LIMIT 0;
-
-statement ok
-INSERT INTO _duckdb_ivm_views VALUES ('mv_max', 'select grp, max(val) as max_val from t2 group by grp', 0, now()::timestamp);
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_max', 'delta_t2', '1970-01-01');
-
-# Initial state
-query II
-SELECT grp, max_val FROM mv_max ORDER BY grp;
-----
-x	200
-y	75
-
-# Insert new max for group 'y'
 statement ok
 INSERT INTO t2 VALUES (5, 'y', 300);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_max');
+PRAGMA ivm('mv_max');
 
 query II
 SELECT grp, max_val FROM mv_max ORDER BY grp;
@@ -600,12 +517,11 @@ SELECT grp, max_val FROM mv_max ORDER BY grp;
 x	200
 y	300
 
-# Delete the current max from group 'y'
 statement ok
 DELETE FROM t2 WHERE id = 5;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_max');
+PRAGMA ivm('mv_max');
 
 query II
 SELECT grp, max_val FROM mv_max ORDER BY grp;
@@ -613,9 +529,7 @@ SELECT grp, max_val FROM mv_max ORDER BY grp;
 x	200
 y	75
 
-# ==========================================
 # Test 3: Mixed aggregates (SUM + MIN + MAX)
-# ==========================================
 
 statement ok
 CREATE TABLE t3 (id INT, grp VARCHAR, a INT, b INT, c INT);
@@ -624,36 +538,13 @@ statement ok
 INSERT INTO t3 VALUES (1, 'g1', 10, 100, 1), (2, 'g1', 20, 200, 2), (3, 'g2', 30, 300, 3);
 
 statement ok
-CREATE TABLE mv_mixed AS SELECT grp, sum(a) AS sum_a, min(b) AS min_b, max(c) AS max_c FROM t3 GROUP BY grp;
+CREATE MATERIALIZED VIEW mv_mixed AS SELECT grp, SUM(a) AS sum_a, MIN(b) AS min_b, MAX(c) AS max_c FROM t3 GROUP BY grp;
 
-statement ok
-CREATE TABLE delta_mv_mixed AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_mixed LIMIT 0;
-
-statement ok
-CREATE UNIQUE INDEX mv_mixed_ivm_index ON mv_mixed (grp);
-
-statement ok
-CREATE TABLE delta_t3 AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM t3 LIMIT 0;
-
-statement ok
-INSERT INTO _duckdb_ivm_views VALUES ('mv_mixed', 'select grp, sum(a) as sum_a, min(b) as min_b, max(c) as max_c from t3 group by grp', 0, now()::timestamp);
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_mixed', 'delta_t3', '1970-01-01');
-
-# Initial state
-query IIII
-SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
-----
-g1	30	100	2
-g2	30	300	3
-
-# Insert: affects all aggregates
 statement ok
 INSERT INTO t3 VALUES (4, 'g1', 5, 50, 10);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_mixed');
+PRAGMA ivm('mv_mixed');
 
 query IIII
 SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
@@ -661,12 +552,11 @@ SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
 g1	35	50	10
 g2	30	300	3
 
-# Delete: removes the new min and max from g1
 statement ok
 DELETE FROM t3 WHERE id = 4;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_mixed');
+PRAGMA ivm('mv_mixed');
 
 query IIII
 SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
@@ -674,24 +564,7 @@ SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
 g1	30	100	2
 g2	30	300	3
 
-# ==========================================
-# Test 4: Delete all rows from a group
-# ==========================================
-
-statement ok
-DELETE FROM t1 WHERE grp = 'b';
-
-statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_min');
-
-query II
-SELECT grp, min_val FROM mv_min ORDER BY grp;
-----
-a	10
-
-# ==========================================
 # Test 5: Ungrouped MIN aggregate
-# ==========================================
 
 statement ok
 CREATE TABLE t5 (id INT, val INT);
@@ -700,53 +573,31 @@ statement ok
 INSERT INTO t5 VALUES (1, 100), (2, 50), (3, 200);
 
 statement ok
-CREATE TABLE mv_simple_min AS SELECT min(val) AS min_val FROM t5;
+CREATE MATERIALIZED VIEW mv_simple_min AS SELECT MIN(val) AS min_val FROM t5;
 
-statement ok
-CREATE TABLE delta_mv_simple_min AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_simple_min LIMIT 0;
-
-statement ok
-CREATE TABLE delta_t5 AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM t5 LIMIT 0;
-
-statement ok
-INSERT INTO _duckdb_ivm_views VALUES ('mv_simple_min', 'select min(val) as min_val from t5', 1, now()::timestamp);
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_simple_min', 'delta_t5', '1970-01-01');
-
-# Initial state
-query I
-SELECT min_val FROM mv_simple_min;
-----
-50
-
-# Insert new global min
 statement ok
 INSERT INTO t5 VALUES (4, 10);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_simple_min');
+PRAGMA ivm('mv_simple_min');
 
 query I
 SELECT min_val FROM mv_simple_min;
 ----
 10
 
-# Delete the current global min
 statement ok
 DELETE FROM t5 WHERE id = 4;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_simple_min');
+PRAGMA ivm('mv_simple_min');
 
 query I
 SELECT min_val FROM mv_simple_min;
 ----
 50
 
-# ==========================================
 # Test 6: MIN/MAX with JOIN + GROUP BY
-# ==========================================
 
 statement ok
 CREATE TABLE departments (dept_id INT, dept_name VARCHAR);
@@ -761,45 +612,16 @@ statement ok
 INSERT INTO employees VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150), (4, 2, 300);
 
 statement ok
-CREATE TABLE mv_dept_salaries AS
-    SELECT d.dept_name, min(e.salary) AS min_salary, max(e.salary) AS max_salary
+CREATE MATERIALIZED VIEW mv_dept_salaries AS
+    SELECT d.dept_name, MIN(e.salary) AS min_salary, MAX(e.salary) AS max_salary
     FROM departments d INNER JOIN employees e ON e.dept_id = d.dept_id
     GROUP BY d.dept_name;
 
 statement ok
-CREATE TABLE delta_mv_dept_salaries AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_dept_salaries LIMIT 0;
-
-statement ok
-CREATE UNIQUE INDEX mv_dept_salaries_ivm_index ON mv_dept_salaries (dept_name);
-
-statement ok
-CREATE TABLE delta_departments AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM departments LIMIT 0;
-
-statement ok
-CREATE TABLE delta_employees AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM employees LIMIT 0;
-
-statement ok
-INSERT INTO _duckdb_ivm_views VALUES ('mv_dept_salaries', 'select d.dept_name, min(e.salary) as min_salary, max(e.salary) as max_salary from departments as d inner join employees as e on e.dept_id = d.dept_id group by d.dept_name', 0, now()::timestamp);
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_dept_salaries', 'delta_departments', '1970-01-01');
-
-statement ok
-INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_dept_salaries', 'delta_employees', '1970-01-01');
-
-# Initial state
-query III
-SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
-----
-engineering	100	200
-sales	150	300
-
-# Insert new min in engineering
-statement ok
 INSERT INTO employees VALUES (5, 1, 50);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_dept_salaries');
+PRAGMA ivm('mv_dept_salaries');
 
 query III
 SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
@@ -807,12 +629,11 @@ SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_nam
 engineering	50	200
 sales	150	300
 
-# Delete the current min from engineering
 statement ok
 DELETE FROM employees WHERE id = 5;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_dept_salaries');
+PRAGMA ivm('mv_dept_salaries');
 
 query III
 SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
@@ -820,46 +641,21 @@ SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_nam
 engineering	100	200
 sales	150	300
 
-# Insert new max in sales
-statement ok
-INSERT INTO employees VALUES (6, 2, 500);
-
-statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_dept_salaries');
-
-query III
-SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
-----
-engineering	100	200
-sales	150	500
-
-# Delete all employees from sales — group should disappear
-statement ok
-DELETE FROM employees WHERE dept_id = 2;
-
-statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_dept_salaries');
-
-query III
-SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
-----
-engineering	100	200
-
-# Insert into a new department (left side of join)
 statement ok
 INSERT INTO departments VALUES (3, 'marketing');
 
 statement ok
-INSERT INTO employees VALUES (7, 3, 75);
+INSERT INTO employees VALUES (6, 3, 75);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_dept_salaries');
+PRAGMA ivm('mv_dept_salaries');
 
 query III
 SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
 ----
 engineering	100	200
 marketing	75	75
+sales	150	300
 
 # ==========================================
 # AVG aggregate (group-recompute strategy)

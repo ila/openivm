@@ -208,10 +208,11 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 		throw NotImplementedException("Plan contains single node, this is not supported");
 	}
 
-	// Advance the binder's table index counter past all indices in the plan.
-	// CTE-based plans can use many table indices; ensure new indices don't collide.
+	// Advance the MAIN binder's table index counter past all indices in the plan.
+	// IvmJoinRule uses input.optimizer.binder (the main DuckDB optimizer's binder),
+	// not the local optimizer's binder. Ensure new indices don't collide with plan indices.
 	for (int i = 0; i < 200; i++) {
-		optimizer.binder.GenerateTableIndex();
+		input.optimizer.binder.GenerateTableIndex();
 	}
 
 	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === Starting RewritePlan ===\n");

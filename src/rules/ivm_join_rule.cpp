@@ -137,6 +137,8 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building %lu inclusion-exclusion terms\n", (unsigned long)((1ULL << N) - 1));
 	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
 		auto term = pw.plan->Copy(context);
+		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
+		term = std::move(renumbered.op);
 		LogicalOperator *term_root = term.get();
 		vector<ColumnBinding> mul_bindings;
 
