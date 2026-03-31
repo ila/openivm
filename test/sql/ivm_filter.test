@@ -330,3 +330,62 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# UPDATE moves row from inside to outside filter
+# ==========================================
+
+statement ok
+CREATE TABLE filter_update (id INT, price INT);
+
+statement ok
+INSERT INTO filter_update VALUES (1, 10), (2, 15), (3, 25);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_filter_update AS SELECT id, price FROM filter_update WHERE price < 20;
+
+# Initial: ids 1, 2 match
+statement ok
+UPDATE filter_update SET price = 30 WHERE id = 2;
+
+statement ok
+PRAGMA ivm('mv_filter_update');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, price FROM filter_update WHERE price < 20
+    EXCEPT ALL SELECT * FROM mv_filter_update
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_filter_update
+    EXCEPT ALL SELECT id, price FROM filter_update WHERE price < 20
+);
+----
+0
+
+# UPDATE moves row back inside
+statement ok
+UPDATE filter_update SET price = 5 WHERE id = 3;
+
+statement ok
+PRAGMA ivm('mv_filter_update');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, price FROM filter_update WHERE price < 20
+    EXCEPT ALL SELECT * FROM mv_filter_update
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_filter_update
+    EXCEPT ALL SELECT id, price FROM filter_update WHERE price < 20
+);
+----
+0

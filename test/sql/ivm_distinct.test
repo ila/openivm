@@ -21,7 +21,7 @@ statement ok
 CREATE MATERIALIZED VIEW distinct_colors AS SELECT DISTINCT color FROM colors;
 
 query I
-SELECT color FROM distinct_colors ORDER BY color;
+SELECT * FROM distinct_colors ORDER BY color;
 ----
 blue
 green
@@ -35,12 +35,12 @@ statement ok
 PRAGMA ivm('distinct_colors');
 
 query I
-SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT color FROM distinct_colors);
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
 ----
 0
 
 query I
-SELECT COUNT(*) FROM (SELECT color FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+SELECT COUNT(*) FROM (SELECT * FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
 ----
 0
 
@@ -52,12 +52,12 @@ statement ok
 PRAGMA ivm('distinct_colors');
 
 query I
-SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT color FROM distinct_colors);
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
 ----
 0
 
 query I
-SELECT COUNT(*) FROM (SELECT color FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+SELECT COUNT(*) FROM (SELECT * FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
 ----
 0
 
@@ -69,12 +69,12 @@ statement ok
 PRAGMA ivm('distinct_colors');
 
 query I
-SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT color FROM distinct_colors);
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
 ----
 0
 
 query I
-SELECT COUNT(*) FROM (SELECT color FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+SELECT COUNT(*) FROM (SELECT * FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
 ----
 0
 
@@ -145,12 +145,12 @@ statement ok
 PRAGMA ivm('distinct_colors');
 
 query I
-SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT color FROM distinct_colors);
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
 ----
 0
 
 query I
-SELECT COUNT(*) FROM (SELECT color FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+SELECT COUNT(*) FROM (SELECT * FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
 ----
 0
 
@@ -260,14 +260,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
     EXCEPT ALL
-    SELECT abs_val FROM mv_dist_collapse
+    SELECT * FROM mv_dist_collapse
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT abs_val FROM mv_dist_collapse
+    SELECT * FROM mv_dist_collapse
     EXCEPT ALL
     SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
 );
@@ -285,14 +285,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
     EXCEPT ALL
-    SELECT abs_val FROM mv_dist_collapse
+    SELECT * FROM mv_dist_collapse
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT abs_val FROM mv_dist_collapse
+    SELECT * FROM mv_dist_collapse
     EXCEPT ALL
     SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
 );
@@ -310,14 +310,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
     EXCEPT ALL
-    SELECT abs_val FROM mv_dist_collapse
+    SELECT * FROM mv_dist_collapse
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT abs_val FROM mv_dist_collapse
+    SELECT * FROM mv_dist_collapse
     EXCEPT ALL
     SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
 );
@@ -335,14 +335,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
     EXCEPT ALL
-    SELECT abs_val FROM mv_dist_collapse
+    SELECT * FROM mv_dist_collapse
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT abs_val FROM mv_dist_collapse
+    SELECT * FROM mv_dist_collapse
     EXCEPT ALL
     SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
 );
@@ -370,7 +370,7 @@ CREATE MATERIALIZED VIEW mv_dist_join AS
     SELECT DISTINCT p.category FROM dist_j_orders o INNER JOIN dist_j_products p ON o.product = p.name;
 
 query I
-SELECT category FROM mv_dist_join ORDER BY 1;
+SELECT * FROM mv_dist_join ORDER BY 1;
 ----
 X
 Y

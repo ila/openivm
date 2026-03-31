@@ -443,3 +443,82 @@ SELECT category, SUM(val) FROM recreate_base GROUP BY category ORDER BY category
 ----
 a	40
 b	20
+
+# ==========================================
+# VIEW wrapper: SELECT * hides internal columns
+# ==========================================
+
+statement ok
+CREATE TABLE view_test (id INT, val INT);
+
+statement ok
+INSERT INTO view_test VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_view_test AS SELECT DISTINCT val FROM view_test;
+
+# The MV is a VIEW over _ivm_data_mv_view_test. Internal columns should be hidden.
+# SELECT * should return only user-facing columns (val), not _ivm_distinct_count.
+query I
+SELECT COUNT(*) FROM (SELECT * FROM mv_view_test);
+----
+2
+
+# Verify the data table exists separately
+query I
+SELECT COUNT(*) FROM _ivm_data_mv_view_test;
+----
+2
+
+# ==========================================
+# DROP VIEW cleans up data table + delta + metadata
+# ==========================================
+
+statement ok
+CREATE TABLE drop_test (id INT, val INT);
+
+statement ok
+INSERT INTO drop_test VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_drop_test AS SELECT val FROM drop_test;
+
+# Verify everything exists
+query I
+SELECT COUNT(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_drop_test';
+----
+1
+
+query I
+SELECT COUNT(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_drop_test';
+----
+1
+
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '_ivm_data_mv_drop_test';
+----
+1
+
+# DROP VIEW should clean up everything
+statement ok
+DROP VIEW mv_drop_test;
+
+query I
+SELECT COUNT(*) FROM _duckdb_ivm_views WHERE view_name = 'mv_drop_test';
+----
+0
+
+query I
+SELECT COUNT(*) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_drop_test';
+----
+0
+
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '_ivm_data_mv_drop_test';
+----
+0
+
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'delta_mv_drop_test';
+----
+0

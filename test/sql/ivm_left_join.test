@@ -30,7 +30,7 @@ CREATE MATERIALIZED VIEW customer_orders AS
 
 # Initial: Alice has 2 orders, Bob and Charlie have NULL
 query III
-SELECT name, product, amount FROM customer_orders ORDER BY name, product NULLS LAST;
+SELECT * FROM customer_orders ORDER BY name, product NULLS LAST;
 ----
 Alice	Gadget	200
 Alice	Widget	100
@@ -51,14 +51,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
     EXCEPT ALL
-    SELECT name, product, amount FROM customer_orders
+    SELECT * FROM customer_orders
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, product, amount FROM customer_orders
+    SELECT * FROM customer_orders
     EXCEPT ALL
     SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
 );
@@ -80,14 +80,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
     EXCEPT ALL
-    SELECT name, product, amount FROM customer_orders
+    SELECT * FROM customer_orders
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, product, amount FROM customer_orders
+    SELECT * FROM customer_orders
     EXCEPT ALL
     SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
 );
@@ -108,14 +108,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
     EXCEPT ALL
-    SELECT name, product, amount FROM customer_orders
+    SELECT * FROM customer_orders
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, product, amount FROM customer_orders
+    SELECT * FROM customer_orders
     EXCEPT ALL
     SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
 );
@@ -139,14 +139,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
     EXCEPT ALL
-    SELECT name, product, amount FROM customer_orders
+    SELECT * FROM customer_orders
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, product, amount FROM customer_orders
+    SELECT * FROM customer_orders
     EXCEPT ALL
     SELECT c.name, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
 );
@@ -326,14 +326,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
     EXCEPT ALL
-    SELECT name, val FROM lj_null_keys
+    SELECT * FROM lj_null_keys
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, val FROM lj_null_keys
+    SELECT * FROM lj_null_keys
     EXCEPT ALL
     SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
 );
@@ -351,14 +351,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
     EXCEPT ALL
-    SELECT name, val FROM lj_null_keys
+    SELECT * FROM lj_null_keys
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, val FROM lj_null_keys
+    SELECT * FROM lj_null_keys
     EXCEPT ALL
     SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
 );
@@ -376,14 +376,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
     EXCEPT ALL
-    SELECT name, val FROM lj_null_keys
+    SELECT * FROM lj_null_keys
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, val FROM lj_null_keys
+    SELECT * FROM lj_null_keys
     EXCEPT ALL
     SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
 );
@@ -401,14 +401,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
     EXCEPT ALL
-    SELECT name, val FROM lj_null_keys
+    SELECT * FROM lj_null_keys
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, val FROM lj_null_keys
+    SELECT * FROM lj_null_keys
     EXCEPT ALL
     SELECT l.name, r.val FROM lj_l l LEFT JOIN lj_r r ON l.id = r.ref_id
 );
@@ -441,14 +441,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
     EXCEPT ALL
-    SELECT name, score FROM lj_empty_right
+    SELECT * FROM lj_empty_right
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, score FROM lj_empty_right
+    SELECT * FROM lj_empty_right
     EXCEPT ALL
     SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
 );
@@ -466,14 +466,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
     EXCEPT ALL
-    SELECT name, score FROM lj_empty_right
+    SELECT * FROM lj_empty_right
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, score FROM lj_empty_right
+    SELECT * FROM lj_empty_right
     EXCEPT ALL
     SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
 );
@@ -491,14 +491,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
     EXCEPT ALL
-    SELECT name, score FROM lj_empty_right
+    SELECT * FROM lj_empty_right
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, score FROM lj_empty_right
+    SELECT * FROM lj_empty_right
     EXCEPT ALL
     SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
 );
@@ -516,16 +516,82 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
     EXCEPT ALL
-    SELECT name, score FROM lj_empty_right
+    SELECT * FROM lj_empty_right
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, score FROM lj_empty_right
+    SELECT * FROM lj_empty_right
     EXCEPT ALL
     SELECT l.name, r.score FROM lj_emp_l l LEFT JOIN lj_emp_r r ON l.id = r.ref_id
+);
+----
+0
+
+# ==========================================
+# Right side empty → repopulated with different values
+# ==========================================
+
+statement ok
+CREATE TABLE lj_repop_l (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE lj_repop_r (ref_id INT, score INT);
+
+statement ok
+INSERT INTO lj_repop_l VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+
+statement ok
+INSERT INTO lj_repop_r VALUES (1, 100), (2, 200), (3, 300);
+
+statement ok
+CREATE MATERIALIZED VIEW lj_repop AS
+    SELECT l.name, r.score FROM lj_repop_l l LEFT JOIN lj_repop_r r ON l.id = r.ref_id;
+
+# DELETE all right side → all NULL-extended
+statement ok
+DELETE FROM lj_repop_r;
+
+statement ok
+PRAGMA ivm('lj_repop');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.score FROM lj_repop_l l LEFT JOIN lj_repop_r r ON l.id = r.ref_id
+    EXCEPT ALL SELECT * FROM lj_repop
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM lj_repop
+    EXCEPT ALL SELECT l.name, r.score FROM lj_repop_l l LEFT JOIN lj_repop_r r ON l.id = r.ref_id
+);
+----
+0
+
+# Repopulate with DIFFERENT matches (only ids 1 and 3, not 2)
+statement ok
+INSERT INTO lj_repop_r VALUES (1, 999), (3, 777);
+
+statement ok
+PRAGMA ivm('lj_repop');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.name, r.score FROM lj_repop_l l LEFT JOIN lj_repop_r r ON l.id = r.ref_id
+    EXCEPT ALL SELECT * FROM lj_repop
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM lj_repop
+    EXCEPT ALL SELECT l.name, r.score FROM lj_repop_l l LEFT JOIN lj_repop_r r ON l.id = r.ref_id
 );
 ----
 0

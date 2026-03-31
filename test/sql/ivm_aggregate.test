@@ -1117,3 +1117,151 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# GROUP disappears entirely (single-row group deleted)
+# ==========================================
+
+statement ok
+CREATE TABLE agg_vanish (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO agg_vanish VALUES ('p', 10), ('q', 20), ('r', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg_vanish AS
+    SELECT grp, SUM(val) AS total FROM agg_vanish GROUP BY grp;
+
+statement ok
+PRAGMA ivm('mv_agg_vanish');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM agg_vanish GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_agg_vanish
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_agg_vanish
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM agg_vanish GROUP BY grp
+);
+----
+0
+
+# Delete the only row in group 'q' — group should vanish
+statement ok
+DELETE FROM agg_vanish WHERE grp = 'q';
+
+statement ok
+PRAGMA ivm('mv_agg_vanish');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM agg_vanish GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_agg_vanish
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_agg_vanish
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM agg_vanish GROUP BY grp
+);
+----
+0
+
+# ==========================================
+# UPDATE moves rows between groups (changes GROUP BY key)
+# ==========================================
+
+statement ok
+CREATE TABLE agg_key_move (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO agg_key_move VALUES ('m', 10), ('m', 20), ('n', 30), ('n', 40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg_key_move AS
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp;
+
+statement ok
+PRAGMA ivm('mv_agg_key_move');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_agg_key_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_agg_key_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+);
+----
+0
+
+# Move val=20 from 'm' to 'n'
+statement ok
+UPDATE agg_key_move SET grp = 'n' WHERE val = 20;
+
+statement ok
+PRAGMA ivm('mv_agg_key_move');
+
+# m: total=10 cnt=1, n: total=90 cnt=3
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_agg_key_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_agg_key_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+);
+----
+0
+
+# Move remaining 'm' row to brand-new group 'o' — 'm' vanishes, 'o' appears
+statement ok
+UPDATE agg_key_move SET grp = 'o' WHERE grp = 'm';
+
+statement ok
+PRAGMA ivm('mv_agg_key_move');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_agg_key_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_agg_key_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+);
+----
+0

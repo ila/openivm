@@ -397,14 +397,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
     EXCEPT ALL
-    SELECT val, amount FROM mv_join_nz
+    SELECT * FROM mv_join_nz
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT val, amount FROM mv_join_nz
+    SELECT * FROM mv_join_nz
     EXCEPT ALL
     SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
 );
@@ -426,14 +426,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
     EXCEPT ALL
-    SELECT val, amount FROM mv_join_nz
+    SELECT * FROM mv_join_nz
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT val, amount FROM mv_join_nz
+    SELECT * FROM mv_join_nz
     EXCEPT ALL
     SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
 );
@@ -454,14 +454,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
     EXCEPT ALL
-    SELECT val, amount FROM mv_join_nz
+    SELECT * FROM mv_join_nz
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT val, amount FROM mv_join_nz
+    SELECT * FROM mv_join_nz
     EXCEPT ALL
     SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id
 );
@@ -496,14 +496,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
     EXCEPT ALL
-    SELECT name, score FROM mv_join_null
+    SELECT * FROM mv_join_null
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, score FROM mv_join_null
+    SELECT * FROM mv_join_null
     EXCEPT ALL
     SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
 );
@@ -521,14 +521,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
     EXCEPT ALL
-    SELECT name, score FROM mv_join_null
+    SELECT * FROM mv_join_null
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, score FROM mv_join_null
+    SELECT * FROM mv_join_null
     EXCEPT ALL
     SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
 );
@@ -546,14 +546,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
     EXCEPT ALL
-    SELECT name, score FROM mv_join_null
+    SELECT * FROM mv_join_null
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT name, score FROM mv_join_null
+    SELECT * FROM mv_join_null
     EXCEPT ALL
     SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id
 );

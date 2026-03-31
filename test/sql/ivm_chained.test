@@ -963,3 +963,64 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Empty upstream delta (INSERT then DELETE cancels out)
+# ==========================================
+
+statement ok
+CREATE TABLE ch_noop_base (id INT, val INT);
+
+statement ok
+INSERT INTO ch_noop_base VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW ch_noop_l1 AS SELECT id, SUM(val) AS total FROM ch_noop_base GROUP BY id;
+
+statement ok
+CREATE MATERIALIZED VIEW ch_noop_l2 AS SELECT SUM(total) AS grand FROM ch_noop_l1;
+
+# INSERT then DELETE same row — net zero delta
+statement ok
+INSERT INTO ch_noop_base VALUES (3, 999);
+
+statement ok
+DELETE FROM ch_noop_base WHERE id = 3;
+
+statement ok
+PRAGMA ivm('ch_noop_l1');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, SUM(val) AS total FROM ch_noop_base GROUP BY id
+    EXCEPT ALL SELECT * FROM ch_noop_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ch_noop_l1
+    EXCEPT ALL SELECT id, SUM(val) AS total FROM ch_noop_base GROUP BY id
+);
+----
+0
+
+statement ok
+PRAGMA ivm('ch_noop_l2');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM ch_noop_l1
+    EXCEPT ALL SELECT * FROM ch_noop_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ch_noop_l2
+    EXCEPT ALL SELECT SUM(total) AS grand FROM ch_noop_l1
+);
+----
+0
