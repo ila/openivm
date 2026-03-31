@@ -209,41 +209,9 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 	}
 
 	// Advance the binder's table index counter past all indices in the plan.
-	// Without this, IvmJoinRule's per-term projections can collide with indices
-	// from Copy'd plan nodes (the optimizer may not advance the counter past all
-	// planner-assigned indices).
-	{
-		idx_t max_idx = 0;
-		auto check = [&](idx_t idx) {
-			if (idx != DConstants::INVALID_INDEX && idx > max_idx) {
-				max_idx = idx;
-			}
-		};
-		std::function<void(LogicalOperator *)> find_max = [&](LogicalOperator *node) {
-			for (auto &binding : node->GetColumnBindings()) {
-				check(binding.table_index);
-			}
-			if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-				check(node->Cast<LogicalProjection>().table_index);
-			} else if (node->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-				auto &agg = node->Cast<LogicalAggregate>();
-				check(agg.group_index);
-				check(agg.aggregate_index);
-				check(agg.groupings_index);
-			} else if (node->type == LogicalOperatorType::LOGICAL_GET) {
-				check(node->Cast<LogicalGet>().table_index);
-			}
-			for (auto &child : node->children) {
-				find_max(child.get());
-			}
-		};
-		find_max(optimized_plan.get());
-		OPENIVM_DEBUG_PRINT("[IVM Rewrite] max table_index in plan: %lu\n", (unsigned long)max_idx);
-		idx_t next_idx;
-		while ((next_idx = optimizer.binder.GenerateTableIndex()) <= max_idx) {
-			OPENIVM_DEBUG_PRINT("[IVM Rewrite]   skipping table_index %lu\n", (unsigned long)next_idx);
-		}
-		OPENIVM_DEBUG_PRINT("[IVM Rewrite] binder now at: %lu\n", (unsigned long)next_idx);
+	// CTE-based plans can use many table indices; ensure new indices don't collide.
+	for (int i = 0; i < 200; i++) {
+		optimizer.binder.GenerateTableIndex();
 	}
 
 	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === Starting RewritePlan ===\n");

@@ -95,21 +95,30 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 
 ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &bindings,
                                       const std::unordered_map<old_idx, new_idx> &table_mapping) {
-	std::unordered_map<old_idx, std::unordered_set<col_idx>> to_replace;
+	// Collect ALL unique column indices per table, plus generate replacements
+	// for a generous range to catch bindings in expressions (JOIN conditions, etc.)
+	// that might not appear in GetColumnBindings().
+	std::unordered_map<old_idx, idx_t> max_col_per_table;
 	for (const ColumnBinding col_binding : bindings) {
-		idx_t table_index = col_binding.table_index;
-		if (table_mapping.find(table_index) != table_mapping.end()) {
-			to_replace[table_index].insert(col_binding.column_index);
+		if (table_mapping.find(col_binding.table_index) != table_mapping.end()) {
+			auto &m = max_col_per_table[col_binding.table_index];
+			if (col_binding.column_index + 1 > m) {
+				m = col_binding.column_index + 1;
+			}
 		}
 	}
 	ColumnBindingReplacer replacer;
-	for (const auto &pair : to_replace) {
+	for (const auto &pair : table_mapping) {
 		const old_idx old_t = pair.first;
-		const new_idx new_t = table_mapping.at(old_t);
-		for (const col_idx col : pair.second) {
-			const auto old_binding = ColumnBinding(old_t, col);
-			const auto new_binding = ColumnBinding(new_t, col);
-			replacer.replacement_bindings.emplace_back(old_binding, new_binding);
+		const new_idx new_t = pair.second;
+		// Replace up to max observed column index + generous padding for hidden columns
+		idx_t max_col = 32;
+		auto it = max_col_per_table.find(old_t);
+		if (it != max_col_per_table.end() && it->second > max_col) {
+			max_col = it->second + 16;
+		}
+		for (idx_t col = 0; col < max_col; col++) {
+			replacer.replacement_bindings.emplace_back(ColumnBinding(old_t, col), ColumnBinding(new_t, col));
 		}
 	}
 	return replacer;
