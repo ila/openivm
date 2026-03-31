@@ -669,3 +669,81 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# JOIN + FILTER + PROJECTION (computed expressions on filtered join)
+# ==========================================
+
+statement ok
+CREATE TABLE jfp_items (id INT, name VARCHAR, weight DOUBLE);
+
+statement ok
+CREATE TABLE jfp_prices (item_id INT, unit_price DOUBLE);
+
+statement ok
+INSERT INTO jfp_items VALUES (1, 'Bolt', 0.5), (2, 'Nut', 0.1), (3, 'Beam', 50.0);
+
+statement ok
+INSERT INTO jfp_prices VALUES (1, 2.0), (2, 0.5), (3, 100.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_jfp AS
+    SELECT i.name, i.weight * p.unit_price AS cost
+    FROM jfp_items i INNER JOIN jfp_prices p ON i.id = p.item_id
+    WHERE i.weight < 10.0;
+
+# Only Bolt and Nut match (weight < 10). Bolt cost=1.0, Nut cost=0.05
+statement ok
+INSERT INTO jfp_items VALUES (4, 'Washer', 0.02);
+
+statement ok
+INSERT INTO jfp_prices VALUES (4, 0.1);
+
+statement ok
+PRAGMA ivm('mv_jfp');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.name, i.weight * p.unit_price
+    FROM jfp_items i INNER JOIN jfp_prices p ON i.id = p.item_id WHERE i.weight < 10.0
+    EXCEPT ALL SELECT * FROM mv_jfp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_jfp
+    EXCEPT ALL SELECT i.name, i.weight * p.unit_price
+    FROM jfp_items i INNER JOIN jfp_prices p ON i.id = p.item_id WHERE i.weight < 10.0
+);
+----
+0
+
+# Delete Bolt from items + update Beam weight to be under threshold
+statement ok
+DELETE FROM jfp_items WHERE id = 1;
+
+statement ok
+UPDATE jfp_items SET weight = 5.0 WHERE id = 3;
+
+statement ok
+PRAGMA ivm('mv_jfp');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.name, i.weight * p.unit_price
+    FROM jfp_items i INNER JOIN jfp_prices p ON i.id = p.item_id WHERE i.weight < 10.0
+    EXCEPT ALL SELECT * FROM mv_jfp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_jfp
+    EXCEPT ALL SELECT i.name, i.weight * p.unit_price
+    FROM jfp_items i INNER JOIN jfp_prices p ON i.id = p.item_id WHERE i.weight < 10.0
+);
+----
+0

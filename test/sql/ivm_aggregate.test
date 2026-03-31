@@ -1265,3 +1265,88 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# LEFT JOIN + AGGREGATE (SUM over NULL-extended rows)
+# ==========================================
+
+statement ok
+CREATE TABLE lja_customers (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE lja_orders (cust_id INT, amount INT);
+
+statement ok
+INSERT INTO lja_customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+
+statement ok
+INSERT INTO lja_orders VALUES (1, 100), (1, 200), (2, 50);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cust_totals AS
+    SELECT c.name, SUM(o.amount) AS total, COUNT(o.amount) AS cnt
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id
+    GROUP BY c.name;
+
+# Carol has no orders → total=NULL, cnt=0
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id GROUP BY c.name
+    EXCEPT ALL SELECT * FROM mv_cust_totals
+);
+----
+0
+
+# Add order for Carol + delete all orders for Alice
+statement ok
+INSERT INTO lja_orders VALUES (3, 75);
+
+statement ok
+DELETE FROM lja_orders WHERE cust_id = 1;
+
+statement ok
+PRAGMA ivm('mv_cust_totals');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id GROUP BY c.name
+    EXCEPT ALL SELECT * FROM mv_cust_totals
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cust_totals
+    EXCEPT ALL SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id GROUP BY c.name
+);
+----
+0
+
+# Delete all orders — everyone NULL-extended
+statement ok
+DELETE FROM lja_orders;
+
+statement ok
+PRAGMA ivm('mv_cust_totals');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id GROUP BY c.name
+    EXCEPT ALL SELECT * FROM mv_cust_totals
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cust_totals
+    EXCEPT ALL SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id GROUP BY c.name
+);
+----
+0

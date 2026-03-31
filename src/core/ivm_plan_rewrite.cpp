@@ -247,6 +247,25 @@ static void RewriteLeftJoinKey(unique_ptr<LogicalOperator> &plan) {
 		return;
 	}
 
+	// Skip _ivm_left_key for plans with AGGREGATE above the LEFT JOIN.
+	// These use group-recompute (not partial LEFT JOIN recompute), so the key isn't needed
+	// and can't pass through the AGGREGATE node anyway.
+	bool has_aggregate = false;
+	std::function<void(LogicalOperator *)> check_agg = [&](LogicalOperator *n) {
+		if (n->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+			has_aggregate = true;
+		}
+		for (auto &child : n->children) {
+			if (!has_aggregate) {
+				check_agg(child.get());
+			}
+		}
+	};
+	check_agg(plan.get());
+	if (has_aggregate) {
+		return;
+	}
+
 	// Ensure types are resolved before accessing them
 	plan->ResolveOperatorTypes();
 	// Add projection: all existing columns + _ivm_left_key

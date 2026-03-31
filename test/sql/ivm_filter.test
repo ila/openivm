@@ -389,3 +389,63 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# DISTINCT + FILTER
+# ==========================================
+
+statement ok
+CREATE TABLE df_data (category VARCHAR, score INT);
+
+statement ok
+INSERT INTO df_data VALUES ('A', 10), ('A', 20), ('B', 30), ('B', 30), ('C', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_df AS
+    SELECT DISTINCT category, score FROM df_data WHERE score > 10;
+
+# Insert duplicate (no DISTINCT change) + new matching row
+statement ok
+INSERT INTO df_data VALUES ('B', 30), ('C', 50);
+
+statement ok
+PRAGMA ivm('mv_df');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT category, score FROM df_data WHERE score > 10
+    EXCEPT ALL SELECT * FROM mv_df
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_df
+    EXCEPT ALL SELECT DISTINCT category, score FROM df_data WHERE score > 10
+);
+----
+0
+
+# Delete rows that cross the filter boundary
+statement ok
+DELETE FROM df_data WHERE category = 'A' AND score = 20;
+
+statement ok
+PRAGMA ivm('mv_df');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT category, score FROM df_data WHERE score > 10
+    EXCEPT ALL SELECT * FROM mv_df
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_df
+    EXCEPT ALL SELECT DISTINCT category, score FROM df_data WHERE score > 10
+);
+----
+0

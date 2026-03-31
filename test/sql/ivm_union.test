@@ -553,3 +553,109 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# UNION ALL + AGGREGATE (aggregate on top of union)
+# ==========================================
+
+statement ok
+CREATE TABLE ua_online (product VARCHAR, qty INT);
+
+statement ok
+CREATE TABLE ua_store (product VARCHAR, qty INT);
+
+statement ok
+INSERT INTO ua_online VALUES ('Widget', 10), ('Gadget', 20);
+
+statement ok
+INSERT INTO ua_store VALUES ('Widget', 5), ('Widget', 3), ('Gadget', 7);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_total_sales AS
+    SELECT product, SUM(qty) AS total
+    FROM (SELECT product, qty FROM ua_online UNION ALL SELECT product, qty FROM ua_store)
+    GROUP BY product;
+
+# Insert into both sides + delete from one
+statement ok
+INSERT INTO ua_online VALUES ('Widget', 100);
+
+statement ok
+DELETE FROM ua_store WHERE product = 'Gadget';
+
+statement ok
+PRAGMA ivm('mv_total_sales');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT product, SUM(qty) FROM (SELECT product, qty FROM ua_online UNION ALL SELECT product, qty FROM ua_store) GROUP BY product
+    EXCEPT ALL SELECT * FROM mv_total_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_total_sales
+    EXCEPT ALL SELECT product, SUM(qty) FROM (SELECT product, qty FROM ua_online UNION ALL SELECT product, qty FROM ua_store) GROUP BY product
+);
+----
+0
+
+# ==========================================
+# Multi-table JOIN + UNION (different joins unioned)
+# ==========================================
+
+statement ok
+CREATE TABLE mu_emp (id INT, name VARCHAR, dept_id INT);
+
+statement ok
+CREATE TABLE mu_dept (id INT, dname VARCHAR);
+
+statement ok
+CREATE TABLE mu_contractor (id INT, name VARCHAR, dept_id INT);
+
+statement ok
+INSERT INTO mu_dept VALUES (1, 'Eng'), (2, 'Sales');
+
+statement ok
+INSERT INTO mu_emp VALUES (1, 'Alice', 1), (2, 'Bob', 2);
+
+statement ok
+INSERT INTO mu_contractor VALUES (10, 'Xander', 1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_all_staff AS
+    SELECT e.name, d.dname FROM mu_emp e INNER JOIN mu_dept d ON e.dept_id = d.id
+    UNION ALL
+    SELECT c.name, d.dname FROM mu_contractor c INNER JOIN mu_dept d ON c.dept_id = d.id;
+
+statement ok
+INSERT INTO mu_contractor VALUES (11, 'Yara', 2);
+
+statement ok
+DELETE FROM mu_emp WHERE id = 2;
+
+statement ok
+PRAGMA ivm('mv_all_staff');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT e.name, d.dname FROM mu_emp e INNER JOIN mu_dept d ON e.dept_id = d.id
+     UNION ALL
+     SELECT c.name, d.dname FROM mu_contractor c INNER JOIN mu_dept d ON c.dept_id = d.id)
+    EXCEPT ALL SELECT * FROM mv_all_staff
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_all_staff
+    EXCEPT ALL
+    (SELECT e.name, d.dname FROM mu_emp e INNER JOIN mu_dept d ON e.dept_id = d.id
+     UNION ALL
+     SELECT c.name, d.dname FROM mu_contractor c INNER JOIN mu_dept d ON c.dept_id = d.id)
+);
+----
+0

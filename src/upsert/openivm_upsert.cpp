@@ -178,6 +178,8 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 	// HAVING needs recompute because groups may enter/leave the result set.
 	// Aggregates over LEFT JOIN sources also need group-recompute: SUM(NULL) != SUM(0)
 	// but the MERGE delta arithmetic can't distinguish NULL from zero cancellation.
+	// Detect LEFT JOIN: check both the _ivm_left_key column in delta tables (for SIMPLE_PROJECTION)
+	// and LEFT JOIN keywords in the view query (for aggregates where _ivm_left_key isn't added).
 	bool source_has_left_join = false;
 	{
 		auto delta_tables = metadata.GetDeltaTables(view_name);
@@ -189,6 +191,9 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 				break;
 			}
 		}
+	}
+	if (!source_has_left_join) {
+		source_has_left_join = StringUtil::Contains(view_query_sql, "LEFT JOIN");
 	}
 	bool has_minmax = StringUtil::Contains(view_query_sql, "min(") || StringUtil::Contains(view_query_sql, "max(") ||
 	                  StringUtil::Contains(view_query_sql, " having ") || source_has_left_join;

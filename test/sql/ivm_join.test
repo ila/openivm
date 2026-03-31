@@ -779,3 +779,141 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# JOIN + FILTER (WHERE on joined result)
+# ==========================================
+
+statement ok
+CREATE TABLE jf_products (id INT, name VARCHAR, price INT);
+
+statement ok
+CREATE TABLE jf_sales (product_id INT, qty INT);
+
+statement ok
+INSERT INTO jf_products VALUES (1, 'Widget', 10), (2, 'Gadget', 50), (3, 'Doohickey', 5);
+
+statement ok
+INSERT INTO jf_sales VALUES (1, 100), (2, 20), (3, 200), (1, 50);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_expensive_sales AS
+    SELECT p.name, s.qty, p.price
+    FROM jf_products p INNER JOIN jf_sales s ON p.id = s.product_id
+    WHERE p.price > 8;
+
+# Insert sale for cheap product (filtered out) + expensive product
+statement ok
+INSERT INTO jf_sales VALUES (3, 10), (2, 5);
+
+statement ok
+PRAGMA ivm('mv_expensive_sales');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.name, s.qty, p.price FROM jf_products p INNER JOIN jf_sales s ON p.id = s.product_id WHERE p.price > 8
+    EXCEPT ALL SELECT * FROM mv_expensive_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_expensive_sales
+    EXCEPT ALL SELECT p.name, s.qty, p.price FROM jf_products p INNER JOIN jf_sales s ON p.id = s.product_id WHERE p.price > 8
+);
+----
+0
+
+# Delete from both sides simultaneously
+statement ok
+DELETE FROM jf_sales WHERE product_id = 1 AND qty = 100;
+
+statement ok
+DELETE FROM jf_products WHERE id = 3;
+
+statement ok
+PRAGMA ivm('mv_expensive_sales');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.name, s.qty, p.price FROM jf_products p INNER JOIN jf_sales s ON p.id = s.product_id WHERE p.price > 8
+    EXCEPT ALL SELECT * FROM mv_expensive_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_expensive_sales
+    EXCEPT ALL SELECT p.name, s.qty, p.price FROM jf_products p INNER JOIN jf_sales s ON p.id = s.product_id WHERE p.price > 8
+);
+----
+0
+
+# ==========================================
+# JOIN + DISTINCT
+# ==========================================
+
+statement ok
+CREATE TABLE jd_tags (item_id INT, tag VARCHAR);
+
+statement ok
+CREATE TABLE jd_items (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO jd_items VALUES (1, 'Foo'), (2, 'Bar');
+
+statement ok
+INSERT INTO jd_tags VALUES (1, 'hot'), (1, 'new'), (2, 'hot'), (2, 'hot');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_unique_tags AS
+    SELECT DISTINCT i.name, t.tag
+    FROM jd_items i INNER JOIN jd_tags t ON i.id = t.item_id;
+
+# Insert duplicate tag (shouldn't change DISTINCT result)
+statement ok
+INSERT INTO jd_tags VALUES (1, 'hot');
+
+statement ok
+PRAGMA ivm('mv_unique_tags');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT i.name, t.tag FROM jd_items i INNER JOIN jd_tags t ON i.id = t.item_id
+    EXCEPT ALL SELECT * FROM mv_unique_tags
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_unique_tags
+    EXCEPT ALL SELECT DISTINCT i.name, t.tag FROM jd_items i INNER JOIN jd_tags t ON i.id = t.item_id
+);
+----
+0
+
+# Delete all 'hot' tags for Bar — (Bar, hot) should disappear
+statement ok
+DELETE FROM jd_tags WHERE item_id = 2;
+
+statement ok
+PRAGMA ivm('mv_unique_tags');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT i.name, t.tag FROM jd_items i INNER JOIN jd_tags t ON i.id = t.item_id
+    EXCEPT ALL SELECT * FROM mv_unique_tags
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_unique_tags
+    EXCEPT ALL SELECT DISTINCT i.name, t.tag FROM jd_items i INNER JOIN jd_tags t ON i.id = t.item_id
+);
+----
+0
