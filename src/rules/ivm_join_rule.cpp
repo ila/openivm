@@ -56,6 +56,7 @@ void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLe
 unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, const vector<size_t> &path) {
 	unique_ptr<LogicalOperator> *current = &root;
 	for (size_t step : path) {
+		D_ASSERT(step < (*current)->children.size());
 		current = &((*current)->children[step]);
 	}
 	return *current;
@@ -120,6 +121,9 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 		}
 	}
 
+	if (N == 0) {
+		throw InternalException("IvmJoinRule: no leaves found in join tree");
+	}
 	if (N > ivm::MAX_JOIN_TABLES) {
 		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
 	}

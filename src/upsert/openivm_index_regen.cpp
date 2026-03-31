@@ -97,12 +97,17 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 }
 
 // Walk every expression in the operator tree and collect all referenced ColumnBindings.
+static uint64_t HashBinding(const ColumnBinding &b) {
+	// Mix both indices to avoid collisions for large table indices
+	return std::hash<idx_t>()(b.table_index) ^ (std::hash<idx_t>()(b.column_index) * 0x9e3779b97f4a7c15ULL);
+}
+
 static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t> &seen,
                                 std::vector<ColumnBinding> &out) {
 	std::function<void(Expression &)> CollectExpr = [&](Expression &e) {
 		if (e.type == ExpressionType::BOUND_COLUMN_REF) {
 			auto &bcr = e.Cast<BoundColumnRefExpression>();
-			uint64_t key = (uint64_t)bcr.binding.table_index << 32 | bcr.binding.column_index;
+			uint64_t key = HashBinding(bcr.binding);
 			if (seen.insert(key).second) {
 				out.push_back(bcr.binding);
 			}
@@ -111,7 +116,7 @@ static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t>
 	};
 	// GetColumnBindings
 	for (auto &cb : op.GetColumnBindings()) {
-		uint64_t key = (uint64_t)cb.table_index << 32 | cb.column_index;
+		uint64_t key = HashBinding(cb);
 		if (seen.insert(key).second) {
 			out.push_back(cb);
 		}
@@ -166,7 +171,7 @@ ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &bindings
 		if (table_mapping.find(cb.table_index) == table_mapping.end()) {
 			continue;
 		}
-		uint64_t key = (uint64_t)cb.table_index << 32 | cb.column_index;
+		uint64_t key = HashBinding(cb);
 		if (!seen.insert(key).second) {
 			continue;
 		}
@@ -186,7 +191,7 @@ RenumberWrapper renumber_and_rebind_subtree(unique_ptr<LogicalOperator> plan, Bi
 
 	// Merge in any bindings from the renumber pass
 	for (auto &cb : res.column_bindings) {
-		uint64_t key = (uint64_t)cb.table_index << 32 | cb.column_index;
+		uint64_t key = HashBinding(cb);
 		if (seen.insert(key).second) {
 			all_bindings.push_back(cb);
 		}

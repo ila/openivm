@@ -158,8 +158,9 @@ void OpenIVMUtils::RemoveRedundantWhitespaces(string &query) {
 }
 
 string OpenIVMUtils::DeltaName(const string &name) {
-	// Strip _ivm_data_ prefix: delta tables use the user-facing view name,
-	// not the internal data table name.
+	// Delta tables use the user-facing view name, not the internal data table name.
+	// Strip _ivm_data_ prefix if present (handles LPTS-generated SQL that references
+	// the data table directly via VIEW expansion).
 	static const string data_prefix(ivm::DATA_TABLE_PREFIX);
 	if (name.size() > data_prefix.size() && name.rfind(data_prefix, 0) == 0) {
 		return string(ivm::DELTA_PREFIX) + name.substr(data_prefix.size());

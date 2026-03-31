@@ -193,7 +193,7 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 		}
 	}
 	if (!source_has_left_join) {
-		source_has_left_join = StringUtil::Contains(view_query_sql, "LEFT JOIN");
+		source_has_left_join = StringUtil::Contains(StringUtil::Lower(view_query_sql), "left join");
 	}
 	bool has_minmax = StringUtil::Contains(view_query_sql, "min(") || StringUtil::Contains(view_query_sql, "max(") ||
 	                  StringUtil::Contains(view_query_sql, " having ") || source_has_left_join;

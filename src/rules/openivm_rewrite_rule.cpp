@@ -208,11 +208,22 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 		throw NotImplementedException("Plan contains single node, this is not supported");
 	}
 
-	// Advance the MAIN binder's table index counter past all indices in the plan.
-	// IvmJoinRule uses input.optimizer.binder (the main DuckDB optimizer's binder),
-	// not the local optimizer's binder. Ensure new indices don't collide with plan indices.
-	for (int i = 0; i < 200; i++) {
-		input.optimizer.binder.GenerateTableIndex();
+	// Advance the main binder past all table indices in the plan to prevent collisions.
+	// IvmJoinRule uses input.optimizer.binder which may not have been advanced by the
+	// local optimizer. Walk the plan to find the highest table index used.
+	{
+		idx_t max_idx = 0;
+		std::function<void(LogicalOperator *)> FindMaxIndex = [&](LogicalOperator *node) {
+			for (auto &b : node->GetColumnBindings()) {
+				max_idx = std::max(max_idx, b.table_index);
+			}
+			for (auto &child : node->children) {
+				FindMaxIndex(child.get());
+			}
+		};
+		FindMaxIndex(optimized_plan.get());
+		while (input.optimizer.binder.GenerateTableIndex() <= max_idx) {
+		}
 	}
 
 	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === Starting RewritePlan ===\n");
