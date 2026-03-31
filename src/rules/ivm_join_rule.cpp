@@ -10,8 +10,6 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 
-
-
 namespace {
 
 using duckdb::ColumnBinding;
@@ -30,7 +28,7 @@ struct JoinLeafInfo {
 };
 
 void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves,
-                         bool is_right_of_left = false) {
+                        bool is_right_of_left = false) {
 	if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	    node->type == duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
 		bool is_left = false;
@@ -95,55 +93,43 @@ void DemoteLeftJoins(LogicalOperator *node) {
 	}
 }
 
+/// Update the parent JOIN's projection map to include the new multiplicity column
+/// after a subtree replacement. Without this, the mul binding gets silently dropped.
+void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf) {
+	if (leaf.path.empty()) {
+		return;
+	}
+	size_t child_side = leaf.path.back();
+	unique_ptr<LogicalOperator> *parent = &term;
+	for (size_t s = 0; s + 1 < leaf.path.size(); s++) {
+		parent = &((*parent)->children[leaf.path[s]]);
+	}
+	if ((*parent)->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto *join = dynamic_cast<LogicalComparisonJoin *>((*parent).get());
+		if (join) {
+			auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
+			if (!proj_map.empty()) {
+				duckdb::idx_t mul_idx = leaf.node->GetColumnBindings().size();
+				proj_map.push_back(mul_idx);
+				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
+				                    child_side == 0 ? "left" : "right");
+			}
+		}
+	}
+}
+
 } // namespace
 
 namespace duckdb {
 
-ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
-	ClientContext &context = pw.input.context;
-	Binder &binder = pw.input.optimizer.binder;
-	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
-
-	bool has_left_join = VerifyJoinTypes(pw.plan.get());
-
-	// 1. Collect all leaf GET nodes
-	vector<JoinLeafInfo> leaves;
-	CollectJoinLeaves(pw.plan.get(), {}, leaves);
+// ============================================================================
+// BuildInclusionExclusionTerms: create 2^N - 1 delta terms
+// ============================================================================
+static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrapper &pw, ClientContext &context,
+                                                                         Binder &binder,
+                                                                         const vector<JoinLeafInfo> &leaves,
+                                                                         bool has_left_join) {
 	size_t N = leaves.size();
-	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Rewriting JOIN node, %zu leaves found\n", N);
-	for (size_t i = 0; i < N; i++) {
-		if (leaves[i].get) {
-			OPENIVM_DEBUG_PRINT("[IvmJoinRule]   Leaf %zu: GET table_index=%lu, path_depth=%zu\n", i,
-			                    (unsigned long)leaves[i].get->table_index, leaves[i].path.size());
-		} else {
-			OPENIVM_DEBUG_PRINT("[IvmJoinRule]   Leaf %zu: subtree (%s), path_depth=%zu\n", i,
-			                    LogicalOperatorToString(leaves[i].node->type).c_str(), leaves[i].path.size());
-		}
-	}
-
-	if (N == 0) {
-		throw InternalException("IvmJoinRule: no leaves found in join tree");
-	}
-	if (N > ivm::MAX_JOIN_TABLES) {
-		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
-	}
-
-	// Build output types: original join columns + multiplicity.
-	// ResolveOperatorTypes clears and rebuilds correctly (base class clears first).
-	pw.plan->ResolveOperatorTypes();
-	auto types = pw.plan->types;
-	D_ASSERT(types.size() == original_bindings.size());
-	types.emplace_back(pw.mul_type);
-	OPENIVM_DEBUG_PRINT("[IvmJoinRule] types.size()=%zu, original_bindings.size()=%zu\n", types.size(),
-	                    original_bindings.size());
-
-	// 2. Build 2^N - 1 terms (inclusion-exclusion)
-	//
-	// For each non-empty subset S of {0..N-1}:
-	//   - Replace leaf i with delta(T_i) for i in S
-	//   - Keep T_new for leaves not in S
-	//   - Combined multiplicity = XOR of all delta multiplicities
-	//     (this accounts for the (-1)^(|S|-1) sign in inclusion-exclusion)
 	vector<unique_ptr<LogicalOperator>> terms;
 
 	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building %lu inclusion-exclusion terms\n", (unsigned long)((1ULL << N) - 1));
@@ -154,9 +140,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 		LogicalOperator *term_root = term.get();
 		vector<ColumnBinding> mul_bindings;
 
-		// For LEFT JOINs: determine if ONLY right-side leaves are in this term's mask.
-		// If so, change LEFT→INNER to avoid spurious NULL-extended rows from `R LEFT JOIN delta_S`.
-		// LEFT JOIN semantics only apply when the LEFT side has delta rows.
+		// For LEFT JOINs: demote to INNER when only right-side leaves have deltas
 		if (has_left_join) {
 			bool has_left_side_delta = false;
 			for (size_t i = 0; i < N; i++) {
@@ -170,44 +154,20 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 			}
 		}
 
+		// Replace delta leaves
 		for (size_t i = 0; i < N; i++) {
 			if (mask & (1ULL << i)) {
 				if (leaves[i].get) {
-					// Simple GET leaf: replace with delta scan
 					DeltaGetResult delta_i = CreateDeltaGetNode(context, leaves[i].get, pw.view);
 					mul_bindings.push_back(delta_i.mul_binding);
 					GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
 				} else {
-					// Complex subtree leaf (UNION, etc.): rewrite the entire subtree
 					auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
 					auto rewritten = IVMRewriteRule::RewritePlan(pw.input, subtree_ref, pw.view, term_root);
 					mul_bindings.push_back(rewritten.mul_binding);
 					subtree_ref = std::move(rewritten.op);
 				}
-				// The rewritten subtree has 1 extra column (multiplicity) at the end.
-				// If the parent is a COMPARISON_JOIN with a projection map, the map won't
-				// include this new column — add it so the mul binding flows through the join.
-				if (!leaves[i].path.empty()) {
-					size_t child_side = leaves[i].path.back();
-					unique_ptr<LogicalOperator> *parent = &term;
-					for (size_t s = 0; s + 1 < leaves[i].path.size(); s++) {
-						parent = &((*parent)->children[leaves[i].path[s]]);
-					}
-					if ((*parent)->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-						auto *join = dynamic_cast<LogicalComparisonJoin *>((*parent).get());
-						if (join) {
-							auto &proj_map = (child_side == 0) ? join->left_projection_map
-							                                    : join->right_projection_map;
-							if (!proj_map.empty()) {
-								idx_t mul_idx = leaves[i].node->GetColumnBindings().size();
-								proj_map.push_back(mul_idx);
-								OPENIVM_DEBUG_PRINT("[IvmJoinRule] Added mul col %lu to %s proj_map\n",
-								                    (unsigned long)mul_idx,
-								                    child_side == 0 ? "left" : "right");
-							}
-						}
-					}
-				}
+				UpdateParentProjectionMap(term, leaves[i]);
 			}
 		}
 
@@ -216,27 +176,22 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 		// Build projection: original columns + combined multiplicity
 		auto term_bindings = term->GetColumnBindings();
 		auto term_types = term->types;
-
 		vector<unique_ptr<Expression>> proj_exprs;
 
-		// Build hash set for O(1) multiplicity binding lookup
+		// Filter out multiplicity columns (O(1) lookup via hash set)
 		unordered_set<uint64_t> mul_set;
 		for (auto &mb : mul_bindings) {
 			mul_set.insert((uint64_t)mb.table_index ^ ((uint64_t)mb.column_index * 0x9e3779b97f4a7c15ULL));
 		}
-		// Add non-multiplicity columns
 		for (idx_t i = 0; i < term_bindings.size(); i++) {
-			uint64_t key =
-			    (uint64_t)term_bindings[i].table_index ^ ((uint64_t)term_bindings[i].column_index * 0x9e3779b97f4a7c15ULL);
+			uint64_t key = (uint64_t)term_bindings[i].table_index ^
+			               ((uint64_t)term_bindings[i].column_index * 0x9e3779b97f4a7c15ULL);
 			if (!mul_set.count(key)) {
 				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
 			}
 		}
 
-		// Build combined multiplicity: XOR chain of all delta multiplicities
-		// XOR(a, b) for booleans = (a != b)
-		// This naturally handles the inclusion-exclusion sign:
-		//   sign * product(mul_i) in {+1,-1} space = XOR(mul_i) in boolean space
+		// Combined multiplicity: XOR chain (a != b for booleans)
 		unique_ptr<Expression> combined_mul = make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[0]);
 		for (size_t i = 1; i < mul_bindings.size(); i++) {
 			auto next = make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[i]);
@@ -250,8 +205,14 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 		projection->ResolveOperatorTypes();
 		terms.push_back(std::move(projection));
 	}
+	return terms;
+}
 
-	// 3. UNION ALL all terms
+// ============================================================================
+// AssembleUnionAll: combine terms with UNION ALL + clean projection
+// ============================================================================
+static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
+                                                     const vector<LogicalType> &types, Binder &binder) {
 	auto result = std::move(terms[0]);
 	for (size_t i = 1; i < terms.size(); i++) {
 		auto union_table_index = binder.GenerateTableIndex();
@@ -260,49 +221,75 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 		result->types = types;
 	}
 
-	// 3b. Add a clean projection on top to disambiguate column names for LPTS.
-	// The UNION ALL of inclusion-exclusion terms can produce duplicate column names
-	// (e.g., two "_duckdb_ivm_multiplicity" columns) which confuses name-based SQL generation.
-	{
-		auto union_bindings = result->GetColumnBindings();
-		vector<unique_ptr<Expression>> clean_exprs;
-		for (idx_t i = 0; i < union_bindings.size(); i++) {
-			clean_exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], union_bindings[i]));
-		}
-		auto clean_proj = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(clean_exprs));
-		clean_proj->children.push_back(std::move(result));
-		clean_proj->ResolveOperatorTypes();
-		result = std::move(clean_proj);
+	// Clean projection to disambiguate column names for LPTS
+	auto union_bindings = result->GetColumnBindings();
+	vector<unique_ptr<Expression>> clean_exprs;
+	for (idx_t i = 0; i < union_bindings.size(); i++) {
+		clean_exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], union_bindings[i]));
+	}
+	auto clean_proj = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(clean_exprs));
+	clean_proj->children.push_back(std::move(result));
+	clean_proj->ResolveOperatorTypes();
+	return std::move(clean_proj);
+}
+
+// ============================================================================
+// ReplaceOutputBindings: map original bindings to new UNION ALL output
+// ============================================================================
+static ColumnBinding ReplaceOutputBindings(const vector<ColumnBinding> &original_bindings,
+                                            unique_ptr<LogicalOperator> &result, LogicalOperator &root) {
+	auto union_bindings = result->GetColumnBindings();
+	if (union_bindings.size() < 2) {
+		throw InternalException("Join rewrite produced too few bindings (%zu)", union_bindings.size());
+	}
+	ColumnBindingReplacer replacer;
+	idx_t map_count = std::min(original_bindings.size(), union_bindings.size() - 1);
+	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Binding replacement: %zu mappings (original=%zu, union=%zu)\n", map_count,
+	                    original_bindings.size(), union_bindings.size());
+	for (idx_t col_idx = 0; col_idx < map_count; ++col_idx) {
+		replacer.replacement_bindings.emplace_back(original_bindings[col_idx], union_bindings[col_idx]);
+	}
+	replacer.stop_operator = result;
+	replacer.VisitOperator(root);
+	return union_bindings.back();
+}
+
+// ============================================================================
+// IvmJoinRule::Rewrite — main entry point
+// ============================================================================
+ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
+	ClientContext &context = pw.input.context;
+	Binder &binder = pw.input.optimizer.binder;
+	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
+
+	// 1. Verify + collect
+	bool has_left_join = VerifyJoinTypes(pw.plan.get());
+	vector<JoinLeafInfo> leaves;
+	CollectJoinLeaves(pw.plan.get(), {}, leaves);
+	size_t N = leaves.size();
+	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Rewriting JOIN node, %zu leaves found\n", N);
+
+	if (N == 0) {
+		throw InternalException("IvmJoinRule: no leaves found in join tree");
+	}
+	if (N > ivm::MAX_JOIN_TABLES) {
+		throw NotImplementedException("Inclusion-exclusion IVM not supported for joins with more than 16 tables");
 	}
 
-	// 4. Update column bindings in parent
-	// The result has the original join columns + multiplicity (last column).
-	// Map old bindings to new bindings positionally. The plan structure may vary
-	// (CTE-inlined plans can have different intermediate column counts), so we
-	// only require the result to have at least 2 bindings (columns + mul).
-	ColumnBinding new_mul_binding;
-	{
-		auto union_bindings = result->GetColumnBindings();
-		if (union_bindings.size() < 2) {
-			throw InternalException("Join rewrite produced too few bindings (%zu)", union_bindings.size());
-		}
-		ColumnBindingReplacer replacer;
-		vector<ReplacementBinding> &replacement_bindings = replacer.replacement_bindings;
-		idx_t map_count = std::min(original_bindings.size(), union_bindings.size() - 1);
-		OPENIVM_DEBUG_PRINT("[IvmJoinRule] Binding replacement: %zu mappings (original=%zu, union=%zu)\n",
-		                    map_count, original_bindings.size(), union_bindings.size());
-		for (idx_t col_idx = 0; col_idx < map_count; ++col_idx) {
-			OPENIVM_DEBUG_PRINT("[IvmJoinRule]   [%zu] (%lu,%lu) → (%lu,%lu)\n", col_idx,
-			                    (unsigned long)original_bindings[col_idx].table_index,
-			                    (unsigned long)original_bindings[col_idx].column_index,
-			                    (unsigned long)union_bindings[col_idx].table_index,
-			                    (unsigned long)union_bindings[col_idx].column_index);
-			replacement_bindings.emplace_back(original_bindings[col_idx], union_bindings[col_idx]);
-		}
-		replacer.stop_operator = result;
-		replacer.VisitOperator(*pw.root);
-		new_mul_binding = union_bindings.back();
-	}
+	// 2. Output types
+	pw.plan->ResolveOperatorTypes();
+	auto types = pw.plan->types;
+	D_ASSERT(types.size() == original_bindings.size());
+	types.emplace_back(pw.mul_type);
+
+	// 3. Build terms
+	auto terms = BuildInclusionExclusionTerms(pw, context, binder, leaves, has_left_join);
+
+	// 4. UNION ALL
+	auto result = AssembleUnionAll(terms, types, binder);
+
+	// 5. Rebind parent references
+	ColumnBinding new_mul_binding = ReplaceOutputBindings(original_bindings, result, *pw.root);
 
 	pw.plan = std::move(result);
 	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Done, %zu terms unioned, mul_binding: table=%lu col=%lu\n", terms.size(),
