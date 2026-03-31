@@ -132,7 +132,7 @@ b	20
 # ==========================================
 
 statement ok
-DROP TABLE mv1;
+DROP VIEW mv1;
 
 # Entry should be removed from _duckdb_ivm_views
 query I
@@ -206,7 +206,7 @@ SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv1';
 
 # Drop mv2 — delta_t2 should be cleaned up since no other MV uses t2
 statement ok
-DROP TABLE mv2;
+DROP VIEW mv2;
 
 query I
 SELECT count(*) FROM _duckdb_ivm_views WHERE view_name = 'mv2';
@@ -247,7 +247,7 @@ SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE table_name = 'delta_t1';
 
 # Drop one — delta_t1 should remain (mv1 and mv_shared2 still use it)
 statement ok
-DROP TABLE mv_shared1;
+DROP VIEW mv_shared1;
 
 query I
 SELECT count(*) FROM _duckdb_ivm_delta_tables WHERE table_name = 'delta_t1';
@@ -340,10 +340,10 @@ does not exist
 
 # Clean up remaining MVs
 statement ok
-DROP TABLE mv1;
+DROP VIEW mv1;
 
 statement ok
-DROP TABLE mv_shared2;
+DROP VIEW mv_shared2;
 
 query I
 SELECT count(*) FROM _duckdb_ivm_views;
@@ -391,7 +391,7 @@ SELECT total FROM mv_fresh;
 
 # NOTE: DROP MATERIALIZED VIEW syntax is not supported because DuckDB's
 # internal PG parser intercepts it before our extension gets a chance.
-# Use DROP TABLE to drop materialized views instead.
+# Use DROP VIEW to drop materialized views (the user-facing name is a VIEW).
 
 # ==========================================
 # Re-create MV with same name after DROP (different query)
@@ -413,7 +413,7 @@ SELECT id, val FROM mv_recreate ORDER BY id;
 2	20
 
 statement ok
-DROP TABLE mv_recreate;
+DROP VIEW mv_recreate;
 
 # Re-create with a completely different query (aggregate instead of projection)
 statement ok

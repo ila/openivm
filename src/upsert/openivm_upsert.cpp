@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/openivm_metadata.hpp"
+#include "rules/ivm_column_hider.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "core/openivm_utils.hpp"
 #include "upsert/openivm_compile_upsert.hpp"
@@ -25,8 +26,9 @@ namespace duckdb {
 static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name, const string &view_query_sql,
                                   bool cross_system, const string &attached_catalog = "",
                                   const string &attached_schema = "") {
-	string query = "DELETE FROM " + view_name + ";\n";
-	query += "INSERT INTO " + view_name + " " + view_query_sql + ";\n\n";
+	string data_table = IVMTableNames::DataTableName(view_name);
+	string query = "DELETE FROM " + data_table + ";\n";
+	query += "INSERT INTO " + data_table + " " + view_query_sql + ";\n\n";
 
 	metadata.UpdateTimestamp(view_name);
 	string update_ts = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_update = now() WHERE view_name = '" +
@@ -146,6 +148,7 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 	auto &catalog = Catalog::GetSystemCatalog(context);
 	QueryErrorContext error_context = QueryErrorContext();
 	Connection con(*context.db.get());
+	string data_table = IVMTableNames::DataTableName(view_name);
 
 	// Use con's transaction for catalog access — sees all committed state
 	con.BeginTransaction();
@@ -155,7 +158,7 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 	    OnEntryNotFound::THROW_EXCEPTION, error_context);
 	auto index_delta_view_catalog_entry =
 	    Catalog::GetEntry(con_ctx, view_catalog_name, view_schema_name,
-	                      EntryLookupInfo(CatalogType::INDEX_ENTRY, view_name + "_ivm_index", error_context),
+	                      EntryLookupInfo(CatalogType::INDEX_ENTRY, data_table + "_ivm_index", error_context),
 	                      OnEntryNotFound::RETURN_NULL);
 	con.Rollback();
 
@@ -287,9 +290,11 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 	                    : view_query_type == IVMType::SIMPLE_AGGREGATE  ? "SIMPLE_AGGREGATE"
 	                    : view_query_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
 	                                                                    : "UNKNOWN");
+	// All DML (INSERT, DELETE, UPDATE, MERGE) targets the physical data table,
+	// not the user-facing VIEW which excludes internal _ivm_* columns.
+	// The compile functions receive view_name and compute data_table internally.
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_HAVING: {
-		// HAVING: groups may enter/leave the result set. Use group-recompute (same as MIN/MAX).
 		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
 		                                      view_query_sql, /*has_minmax=*/true, list_mode, delta_ts_filter);
 		break;
@@ -301,15 +306,11 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 	}
 	case IVMType::SIMPLE_PROJECTION: {
 		if (has_left_join) {
-			// LEFT JOIN: partial recompute on affected left-side keys.
-			// The parser adds _ivm_left_key as a hidden column containing the preserved-side join key.
-			// Delete affected keys from MV and re-insert from original LEFT JOIN query for those keys.
-			// Use EXISTS + IS NOT DISTINCT FROM (not IN) to handle NULL keys correctly.
 			string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
 			string dv = OpenIVMUtils::DeltaName(view_name);
 			string affected = "EXISTS (SELECT 1 FROM " + dv + " _d WHERE _d._ivm_left_key IS NOT DISTINCT FROM ";
-			upsert_query = "DELETE FROM " + view_name + " WHERE " + affected + view_name + "._ivm_left_key" +
-			               delta_where + ");\n" + "INSERT INTO " + view_name + "\nSELECT * FROM (" + view_query_sql +
+			upsert_query = "DELETE FROM " + data_table + " WHERE " + affected + data_table + "._ivm_left_key" +
+			               delta_where + ");\n" + "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql +
 			               ") _ivm_lj\nWHERE " + affected + "_ivm_lj._ivm_left_key" + delta_where + ");\n";
 		} else {
 			upsert_query = CompileProjectionsFilters(view_name, column_names, delta_ts_filter);
@@ -320,13 +321,10 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 	case IVMType::SIMPLE_AGGREGATE: {
 		upsert_query =
 		    CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode, delta_ts_filter);
-		// Fix NULL edge case: incremental UPDATE produces 0 when source becomes empty,
-		// but the correct SQL result is NULL (SUM on empty table). Check source emptiness.
 		if (!has_minmax) {
 			auto source_tables = metadata.GetDeltaTables(view_name);
 			for (auto &dt : source_tables) {
-				string source = dt.size() > 6 ? dt.substr(6) : dt; // strip "delta_"
-				// If ALL source tables are empty, rewrite aggregates to NULL
+				string source = dt.size() > 6 ? dt.substr(6) : dt;
 				string null_cols;
 				for (auto &col : column_names) {
 					if (col != string(ivm::MULTIPLICITY_COL)) {
@@ -336,13 +334,12 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 						null_cols += col + " = NULL";
 					}
 				}
-				upsert_query += "UPDATE " + view_name + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " +
+				upsert_query += "UPDATE " + data_table + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " +
 				                source + " LIMIT 1);\n";
 			}
 		}
 		break;
 	}
-		// todo joins
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] Upsert query:\n%s\n", upsert_query.c_str());
 	// DoIVM is a table function (root of the tree)
@@ -445,7 +442,7 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 		}
 		// Pre: snapshot old state into temp table
 		string temp_name = "_ivm_old_" + view_name;
-		pre_companion = "CREATE TEMP TABLE " + temp_name + " AS SELECT * FROM " + view_name + ";\n";
+		pre_companion = "CREATE TEMP TABLE " + temp_name + " AS SELECT * FROM " + data_table + ";\n";
 		// Post: clear ALL IVM delta rows (both true and false), replace with absolute snapshots
 		post_companion = "DELETE FROM " + delta_view_name + " WHERE 1=1";
 		if (!delta_ts_filter.empty()) {
@@ -457,7 +454,7 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 		                  temp_name + ";\n";
 		// New state (true) from updated MV
 		post_companion += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + select_true + " FROM " +
-		                  view_name + ";\n";
+		                  data_table + ";\n";
 		post_companion += "DROP TABLE " + temp_name + ";\n";
 		OPENIVM_DEBUG_PRINT("[UPSERT] Pre-companion: %s\n", pre_companion.c_str());
 		OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
@@ -499,7 +496,7 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 		if (!delta_ts_filter.empty()) {
 			companion_query += " AND d." + delta_ts_filter;
 		}
-		companion_query += " AND EXISTS (SELECT 1 FROM " + view_name + " m WHERE " + join_cond + ");\n";
+		companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + ");\n";
 		OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
 	}
 

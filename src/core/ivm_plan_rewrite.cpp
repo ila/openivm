@@ -367,10 +367,15 @@ static void RewriteLeftJoinKey(unique_ptr<LogicalOperator> &plan) {
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Added _ivm_left_key projection\n");
 }
 
-void IVMPlanRewrite(ClientContext &context, unique_ptr<LogicalOperator> &plan,
-                    const vector<string> & /*planner_names*/) {
+void IVMPlanRewrite(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &planner_names) {
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Starting\n");
+	bool had_distinct = plan->type == LogicalOperatorType::LOGICAL_DISTINCT ||
+	                    (plan->type == LogicalOperatorType::LOGICAL_PROJECTION && !plan->children.empty() &&
+	                     plan->children[0]->type == LogicalOperatorType::LOGICAL_DISTINCT);
 	RewriteDistinct(context, plan);
+	if (had_distinct) {
+		planner_names.push_back("_ivm_distinct_count");
+	}
 	{
 		auto binder = Binder::CreateBinder(context);
 		Optimizer opt(*binder, context);

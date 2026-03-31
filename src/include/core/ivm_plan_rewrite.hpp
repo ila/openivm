@@ -13,7 +13,7 @@ namespace duckdb {
 /// - LEFT/RIGHT JOIN → add projection with _ivm_left_key column
 /// planner_names: column names from Planner.names (user aliases). These are set on
 /// aggregate expressions so LPTS can pick them up. Unaliased aggregates get auto-generated names.
-void IVMPlanRewrite(ClientContext &context, unique_ptr<LogicalOperator> &plan, const vector<string> &planner_names);
+void IVMPlanRewrite(ClientContext &context, unique_ptr<LogicalOperator> &plan, vector<string> &planner_names);
 
 } // namespace duckdb
 

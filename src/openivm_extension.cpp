@@ -3,6 +3,7 @@
 #include "core/openivm_extension.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_metadata.hpp"
+#include "rules/ivm_column_hider.hpp"
 #include "upsert/openivm_cost_model.hpp"
 #include "upsert/openivm_upsert.hpp"
 

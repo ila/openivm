@@ -31,6 +31,7 @@ set(EXTENSION_SOURCES
     src/rules/ivm_join_rule.cpp
     src/rules/ivm_union_rule.cpp
     src/rules/ivm_distinct_rule.cpp
+    src/rules/ivm_column_hider.cpp
     ${LPTS_DIR}/src/logical_plan_to_sql.cpp
     ${LPTS_DIR}/src/lpts_helpers.cpp
     ${LPTS_DIR}/src/lpts_ast.cpp

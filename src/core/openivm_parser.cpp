@@ -5,6 +5,7 @@
 #include "core/openivm_constants.hpp"
 #include "logical_plan_to_sql.hpp"
 #include "core/openivm_utils.hpp"
+#include "rules/ivm_column_hider.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -122,6 +123,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		auto plan = std::move(planner.plan);
 
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
+		vector<string> output_names;
 		{
 			Parser select_parser;
 			select_parser.ParseQuery(original_view_query);
@@ -134,8 +136,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 			// Sanitize column names: replace special chars with underscores, collapse runs, trim.
 			// "min(val)" → "min_val", "count_star()" → "count_star", "SUM(x) AS total" → "total"
-			vector<string> output_names = select_planner.names;
+			output_names = select_planner.names;
 			for (auto &name : output_names) {
+				// Don't sanitize internal IVM column names — they need the _ivm_ prefix
+				if (IVMTableNames::IsInternalColumn(name)) {
+					continue;
+				}
 				string clean;
 				bool last_was_underscore = false;
 				for (auto c : name) {
@@ -338,11 +344,35 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---
-		// MV creation query (with PAC enabled if loaded)
-		ddl.push_back("create table " + view_name + " as " + view_query);
+		// Physical data table stores all columns (including _ivm_* internal cols)
+		string data_table = IVMTableNames::DataTableName(view_name);
+		ddl.push_back("create table " + data_table + " as " + view_query);
 		if (pac_loaded) {
 			ddl.push_back("SET pac_check = false");
 			ddl.push_back("SET pac_rewrite = false");
+		}
+
+		// User-facing VIEW hides internal _ivm_* columns via EXCLUDE
+		{
+			// Collect internal column names from the LPTS output
+			vector<string> internal_cols;
+			for (auto &name : output_names) {
+				if (IVMTableNames::IsInternalColumn(name)) {
+					internal_cols.push_back(name);
+				}
+			}
+			if (internal_cols.empty()) {
+				ddl.push_back("create view " + view_name + " as select * from " + data_table);
+			} else {
+				string exclude_list;
+				for (size_t i = 0; i < internal_cols.size(); i++) {
+					if (i > 0)
+						exclude_list += ", ";
+					exclude_list += internal_cols[i];
+				}
+				ddl.push_back("create view " + view_name + " as select * exclude (" + exclude_list + ") from " +
+				              data_table);
+			}
 		}
 
 		for (const auto &table_name : table_names) {
@@ -374,15 +404,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			              string(ivm::TIMESTAMP_COL) + " from " + catalog_schema + table_name + " limit 0");
 		}
 
+		// Delta table for the MV — based on the DATA table (has all columns)
 		ddl.push_back("create table if not exists " + OpenIVMUtils::DeltaName(view_name) + " as select *, true as " +
 		              string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " + string(ivm::TIMESTAMP_COL) + " from " +
-		              view_name + " limit 0");
+		              data_table + " limit 0");
 		ddl.push_back("alter table " + OpenIVMUtils::DeltaName(view_name) + " alter " + string(ivm::TIMESTAMP_COL) +
 		              " set default now()");
 
 		// --- Index DDL (for aggregate group queries) ---
 		if (ivm_type == IVMType::AGGREGATE_GROUP || ivm_type == IVMType::AGGREGATE_HAVING) {
-			string index_query_view = "create unique index " + view_name + "_ivm_index on " + view_name + "(";
+			string index_query_view = "create unique index " + data_table + "_ivm_index on " + data_table + "(";
 			for (size_t i = 0; i < aggregate_columns.size(); i++) {
 				index_query_view += aggregate_columns[i];
 				if (i != aggregate_columns.size() - 1) {

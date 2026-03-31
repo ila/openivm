@@ -4,6 +4,7 @@
 #include "core/openivm_metadata.hpp"
 #include "core/openivm_parser.hpp"
 #include "core/openivm_utils.hpp"
+#include "rules/ivm_column_hider.hpp"
 
 #include "logical_plan_to_sql.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -43,14 +44,15 @@ IVMInsertRule::IVMInsertRule() {
 void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb::unique_ptr<LogicalOperator> &plan) {
 	auto root = plan.get();
 
-	// Handle DROP TABLE: clean up IVM metadata if the dropped table is an IVM view
+	// Handle DROP TABLE/VIEW: clean up IVM metadata if the dropped object is an IVM view
 	if (root->type == LogicalOperatorType::LOGICAL_DROP) {
 		auto *simple = dynamic_cast<LogicalSimple *>(root);
 		if (!simple) {
 			return;
 		}
 		auto *drop_info = dynamic_cast<DropInfo *>(simple->info.get());
-		if (!drop_info || drop_info->type != CatalogType::TABLE_ENTRY) {
+		if (!drop_info ||
+		    (drop_info->type != CatalogType::TABLE_ENTRY && drop_info->type != CatalogType::VIEW_ENTRY)) {
 			return;
 		}
 
@@ -69,6 +71,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 			con.Query("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 			          OpenIVMUtils::EscapeValue(table_name) + "'");
 			con.Query("DROP TABLE IF EXISTS " + OpenIVMUtils::DeltaName(table_name));
+			con.Query("DROP TABLE IF EXISTS " + IVMTableNames::DataTableName(table_name));
 
 			for (auto &dt : delta_tables) {
 				auto remaining = con.Query("SELECT count(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
@@ -95,7 +98,8 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				con.Query("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 				          OpenIVMUtils::EscapeValue(dep_view) + "'");
 				con.Query("DROP TABLE IF EXISTS " + OpenIVMUtils::DeltaName(dep_view));
-				con.Query("DROP TABLE IF EXISTS " + dep_view);
+				con.Query("DROP TABLE IF EXISTS " + IVMTableNames::DataTableName(dep_view));
+				con.Query("DROP VIEW IF EXISTS " + dep_view);
 
 				for (auto &dt : dep_delta_tables) {
 					auto remaining = con.Query("SELECT count(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
@@ -126,7 +130,8 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		auto insert_table_name = insert_node->table.name;
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] INSERT into '%s'\n", insert_table_name.c_str());
 
-		if (OpenIVMUtils::IsDelta(insert_table_name) || insert_table_name.empty()) {
+		if (OpenIVMUtils::IsDelta(insert_table_name) || insert_table_name.empty() ||
+		    StringUtil::StartsWith(insert_table_name, "_ivm_data_")) {
 			return;
 		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
@@ -206,7 +211,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		auto delete_node = dynamic_cast<LogicalDelete *>(root);
 		auto delete_table_name = delete_node->table.name;
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] DELETE from '%s'\n", delete_table_name.c_str());
-		if (OpenIVMUtils::IsDelta(delete_table_name)) {
+		if (OpenIVMUtils::IsDelta(delete_table_name) || StringUtil::StartsWith(delete_table_name, "_ivm_data_")) {
 			return;
 		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
@@ -280,7 +285,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 	case LogicalOperatorType::LOGICAL_UPDATE: {
 		auto update_node = dynamic_cast<LogicalUpdate *>(root);
 		auto update_table_name = update_node->table.name;
-		if (OpenIVMUtils::IsDelta(update_table_name)) {
+		if (OpenIVMUtils::IsDelta(update_table_name) || StringUtil::StartsWith(update_table_name, "_ivm_data_")) {
 			return;
 		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(

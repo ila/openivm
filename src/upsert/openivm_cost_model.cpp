@@ -3,6 +3,7 @@
 #include "core/openivm_metadata.hpp"
 #include "core/openivm_utils.hpp"
 #include "core/openivm_debug.hpp"
+#include "rules/ivm_column_hider.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -135,7 +136,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		delta_fraction_sum += ts.delta_card / ts.base_card;
 	}
 
-	double mv_card = GetTableRowCount(con, view_name);
+	double mv_card = GetTableRowCount(con, IVMTableNames::DataTableName(view_name));
 	if (mv_card == 0) {
 		mv_card = 1;
 	}

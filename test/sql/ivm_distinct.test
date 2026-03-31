@@ -348,3 +348,75 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# DISTINCT on a 2-table join
+# ==========================================
+
+statement ok
+CREATE TABLE dist_j_orders (id INT, product VARCHAR);
+
+statement ok
+CREATE TABLE dist_j_products (name VARCHAR, category VARCHAR);
+
+statement ok
+INSERT INTO dist_j_products VALUES ('A', 'X'), ('B', 'X'), ('C', 'Y');
+
+statement ok
+INSERT INTO dist_j_orders VALUES (1, 'A'), (2, 'A'), (3, 'B'), (4, 'C');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dist_join AS
+    SELECT DISTINCT p.category FROM dist_j_orders o INNER JOIN dist_j_products p ON o.product = p.name;
+
+query I
+SELECT category FROM mv_dist_join ORDER BY 1;
+----
+X
+Y
+
+# Insert more orders for same categories — DISTINCT should not change
+statement ok
+INSERT INTO dist_j_orders VALUES (5, 'B'), (6, 'A');
+
+statement ok
+PRAGMA ivm('mv_dist_join');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT p.category FROM dist_j_orders o INNER JOIN dist_j_products p ON o.product = p.name
+    EXCEPT ALL SELECT * FROM mv_dist_join
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_dist_join
+    EXCEPT ALL SELECT DISTINCT p.category FROM dist_j_orders o INNER JOIN dist_j_products p ON o.product = p.name
+);
+----
+0
+
+# Delete all orders for category Y — it should disappear
+statement ok
+DELETE FROM dist_j_orders WHERE product = 'C';
+
+statement ok
+PRAGMA ivm('mv_dist_join');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT p.category FROM dist_j_orders o INNER JOIN dist_j_products p ON o.product = p.name
+    EXCEPT ALL SELECT * FROM mv_dist_join
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_dist_join
+    EXCEPT ALL SELECT DISTINCT p.category FROM dist_j_orders o INNER JOIN dist_j_products p ON o.product = p.name
+);
+----
+0

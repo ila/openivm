@@ -14,6 +14,7 @@ Never execute git commands that could lose code. Always ask the user for permiss
 
 - **New features must have tests.** Ask the user whether to create a new test file or extend an existing one in `test/sql/`.
 - **Never remove a failing test to "fix" a failure.** If a test fails, fix the underlying bug. Tests exist for a reason.
+- **Never weaken tests to match current behavior.** If a test exposes a bug, the test stays and the bug gets fixed. Never limit test scope to avoid known failures, skip broken scenarios, or mark tests as expected-fail. Write the test for the correct behavior, then make the code pass it.
 - **Every IVM refresh in a test MUST be cross-checked** with `EXCEPT ALL` in both directions to verify full bag equality between the MV and the base query. Never just check COUNT or specific values.
 - **Stress tests must batch many conflicting DML ops** (INSERT + DELETE + UPDATE on same rows) before a single refresh. Don't do 1 insert → refresh → 1 delete → refresh — that's not testing delta consolidation.
 - **Before implementing anything, search the existing codebase** for similar patterns or solutions. Check if a helper function, utility, or prior approach already addresses the problem. Reuse before reinventing.

@@ -6,6 +6,7 @@
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/operator/logical_projection.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
+#include <duckdb/planner/operator/logical_set_operation.hpp>
 
 namespace duckdb {
 
@@ -69,6 +70,17 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 		table_reassign[current_idx] = new_idx;
 		proj_ptr->children = std::move(rec_children);
 		return {std::move(proj_ptr), table_reassign, current_bindings};
+	}
+	case LogicalOperatorType::LOGICAL_UNION:
+	case LogicalOperatorType::LOGICAL_EXCEPT:
+	case LogicalOperatorType::LOGICAL_INTERSECT: {
+		auto &setop = plan->Cast<LogicalSetOperation>();
+		const idx_t current_idx = setop.table_index;
+		const idx_t new_idx = binder.GenerateTableIndex();
+		setop.table_index = new_idx;
+		table_reassign[current_idx] = new_idx;
+		plan->children = std::move(rec_children);
+		return {std::move(plan), table_reassign, current_bindings};
 	}
 	default: {
 #if OPENIVM_DEBUG

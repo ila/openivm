@@ -1207,3 +1207,116 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# JOIN + GROUP BY + HAVING
+# ==========================================
+
+statement ok
+CREATE TABLE ajh_orders (id INT, cust_id INT, amount INT);
+
+statement ok
+CREATE TABLE ajh_customers (id INT, region VARCHAR);
+
+statement ok
+INSERT INTO ajh_customers VALUES (1, 'US'), (2, 'EU'), (3, 'US');
+
+statement ok
+INSERT INTO ajh_orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150), (4, 3, 50);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_big_regions AS
+    SELECT c.region, SUM(o.amount) AS total, COUNT(*) AS cnt
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region
+    HAVING SUM(o.amount) > 200;
+
+# Only US qualifies (350 > 200), EU has 150
+query III
+SELECT region, total, cnt FROM mv_big_regions ORDER BY region;
+----
+US	350	3
+
+# Add orders to EU so it crosses the threshold
+statement ok
+INSERT INTO ajh_orders VALUES (5, 2, 200);
+
+statement ok
+PRAGMA ivm('mv_big_regions');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+    EXCEPT ALL SELECT * FROM mv_big_regions
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_big_regions
+    EXCEPT ALL SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+);
+----
+0
+
+# Delete enough from US to drop below threshold
+statement ok
+DELETE FROM ajh_orders WHERE cust_id = 1 AND amount = 200;
+
+statement ok
+PRAGMA ivm('mv_big_regions');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+    EXCEPT ALL SELECT * FROM mv_big_regions
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_big_regions
+    EXCEPT ALL SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+);
+----
+0
+
+# Insert new customer + orders in one batch
+statement ok
+INSERT INTO ajh_customers VALUES (4, 'APAC');
+
+statement ok
+INSERT INTO ajh_orders VALUES (6, 4, 500), (7, 4, 100);
+
+statement ok
+PRAGMA ivm('mv_big_regions');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+    EXCEPT ALL SELECT * FROM mv_big_regions
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_big_regions
+    EXCEPT ALL SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+);
+----
+0

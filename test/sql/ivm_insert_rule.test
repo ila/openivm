@@ -21,11 +21,15 @@ statement ok
 INSERT INTO staff VALUES (1, 'Alice', 'eng', 100), (2, 'Bob', 'sales', 200);
 
 # MV: select id, name, dept, salary from staff
+# The physical data table is _ivm_data_mv_staff; mv_staff is a view on top.
 statement ok
-CREATE TABLE mv_staff AS SELECT id, name, dept, salary FROM staff;
+CREATE TABLE _ivm_data_mv_staff AS SELECT id, name, dept, salary FROM staff;
 
 statement ok
-CREATE TABLE delta_mv_staff AS SELECT *, true AS _duckdb_ivm_multiplicity FROM mv_staff LIMIT 0;
+CREATE VIEW mv_staff AS SELECT * FROM _ivm_data_mv_staff;
+
+statement ok
+CREATE TABLE delta_mv_staff AS SELECT *, true AS _duckdb_ivm_multiplicity FROM _ivm_data_mv_staff LIMIT 0;
 
 statement ok
 CREATE TABLE delta_staff AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM staff LIMIT 0;
