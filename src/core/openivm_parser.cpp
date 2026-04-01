@@ -368,7 +368,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---
 		// Physical data table stores all columns (including _ivm_* internal cols)
 		string data_table = IVMTableNames::DataTableName(view_name);
-		ddl.push_back("create table " + data_table + " as " + view_query);
+		string qdt = KeywordHelper::WriteOptionallyQuoted(data_table);
+		string qvn = KeywordHelper::WriteOptionallyQuoted(view_name);
+		ddl.push_back("create table " + qdt + " as " + view_query);
 		if (pac_loaded) {
 			ddl.push_back("SET pac_check = false");
 			ddl.push_back("SET pac_rewrite = false");
@@ -384,7 +386,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 			}
 			if (internal_cols.empty()) {
-				ddl.push_back("create view " + view_name + " as select * from " + data_table);
+				ddl.push_back("create view " + qvn + " as select * from " + qdt);
 			} else {
 				string exclude_list;
 				for (size_t i = 0; i < internal_cols.size(); i++) {
@@ -393,8 +395,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					}
 					exclude_list += internal_cols[i];
 				}
-				ddl.push_back("create view " + view_name + " as select * exclude (" + exclude_list + ") from " +
-				              data_table);
+				ddl.push_back("create view " + qvn + " as select * exclude (" + exclude_list + ") from " + qdt);
 			}
 		}
 
@@ -428,17 +429,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		// Delta table for the MV — based on the DATA table (has all columns)
-		ddl.push_back("create table if not exists " + OpenIVMUtils::DeltaName(view_name) + " as select *, true as " +
-		              string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " + string(ivm::TIMESTAMP_COL) + " from " +
-		              data_table + " limit 0");
-		ddl.push_back("alter table " + OpenIVMUtils::DeltaName(view_name) + " alter " + string(ivm::TIMESTAMP_COL) +
-		              " set default now()");
+		string qdv = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+		ddl.push_back("create table if not exists " + qdv + " as select *, true as " + string(ivm::MULTIPLICITY_COL) +
+		              ", now()::timestamp as " + string(ivm::TIMESTAMP_COL) + " from " + qdt + " limit 0");
+		ddl.push_back("alter table " + qdv + " alter " + string(ivm::TIMESTAMP_COL) + " set default now()");
 
 		// --- Index DDL (for aggregate group queries) ---
 		if (ivm_type == IVMType::AGGREGATE_GROUP || ivm_type == IVMType::AGGREGATE_HAVING) {
-			string index_query_view = "create unique index " + data_table + "_ivm_index on " + data_table + "(";
+			string index_query_view = "create unique index " + qdt + "_ivm_index on " + qdt + "(";
 			for (size_t i = 0; i < aggregate_columns.size(); i++) {
-				index_query_view += aggregate_columns[i];
+				index_query_view += KeywordHelper::WriteOptionallyQuoted(aggregate_columns[i]);
 				if (i != aggregate_columns.size() - 1) {
 					index_query_view += ", ";
 				}

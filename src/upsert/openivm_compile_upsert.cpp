@@ -25,11 +25,13 @@ struct AvgDecomposition {
 
 static AvgDecomposition DetectAvgColumns(const vector<string> &columns) {
 	AvgDecomposition result;
+	static const string sum_prefix(ivm::SUM_COL_PREFIX);
+	static const string count_prefix(ivm::COUNT_COL_PREFIX);
 	for (auto &col : columns) {
-		if (col.size() > 9 && col.substr(0, 9) == "_ivm_sum_") {
-			result.sum_cols[col.substr(9)] = col;
-		} else if (col.size() > 11 && col.substr(0, 11) == "_ivm_count_") {
-			result.count_cols[col.substr(11)] = col;
+		if (col.size() > sum_prefix.size() && col.substr(0, sum_prefix.size()) == sum_prefix) {
+			result.sum_cols[col.substr(sum_prefix.size())] = col;
+		} else if (col.size() > count_prefix.size() && col.substr(0, count_prefix.size()) == count_prefix) {
+			result.count_cols[col.substr(count_prefix.size())] = col;
 		}
 	}
 	for (auto &entry : result.sum_cols) {
@@ -74,11 +76,11 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		}
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 		string delete_query = "delete from " + Q(data_table) + " where (" + keys_tuple + ") in (\n" +
-		                      "  select distinct " + keys_tuple + " from " + OpenIVMUtils::DeltaName(view_name) +
+		                      "  select distinct " + keys_tuple + " from " + Q(OpenIVMUtils::DeltaName(view_name)) +
 		                      delta_where + "\n);\n";
 		string insert_query = "insert into " + Q(data_table) + "\n" + "select * from (" + view_query_sql +
 		                      ") _ivm_recompute\n" + "where (" + keys_tuple + ") in (\n" + "  select distinct " +
-		                      keys_tuple + " from " + OpenIVMUtils::DeltaName(view_name) + delta_where + "\n);\n";
+		                      keys_tuple + " from " + Q(OpenIVMUtils::DeltaName(view_name)) + delta_where + "\n);\n";
 		return delete_query + "\n" + insert_query;
 	}
 
@@ -107,7 +109,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	}
 	cte_select_string.erase(cte_select_string.size() - 2, 2);
 	cte_select_string += "\n";
-	string cte_from_string = "from " + OpenIVMUtils::DeltaName(view_name);
+	string cte_from_string = "from " + Q(OpenIVMUtils::DeltaName(view_name));
 	if (!delta_ts_filter.empty()) {
 		cte_from_string += " WHERE " + delta_ts_filter;
 	}
@@ -271,7 +273,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 			    column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM _ivm_delta), 0)";
 		}
 	}
-	cte += "\n  FROM " + delta_view + ts_where + "\n)\n";
+	cte += "\n  FROM " + Q(delta_view) + ts_where + "\n)\n";
 
 	string result = cte + "UPDATE " + Q(data_table) + " SET\n  " + update_set + ";\n";
 
@@ -312,7 +314,7 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	// Consolidate deltas into net changes per distinct tuple (1 pass over delta_view).
 	// _net > 0 = net insertions, _net < 0 = net deletions.
 	string cte_body = "SELECT " + select_columns + ",\n    SUM(CASE WHEN " + mul +
-	                  " THEN 1 ELSE -1 END) AS _net\n  FROM " + delta_view + ts_where + "\n  GROUP BY " +
+	                  " THEN 1 ELSE -1 END) AS _net\n  FROM " + Q(delta_view) + ts_where + "\n  GROUP BY " +
 	                  select_columns + "\n  HAVING SUM(CASE WHEN " + mul + " THEN 1 ELSE -1 END) != 0";
 
 	// DELETE: remove exactly |_net| copies per tuple using rowid + ROW_NUMBER.

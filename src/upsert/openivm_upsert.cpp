@@ -27,8 +27,9 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
                                   bool cross_system, const string &attached_catalog = "",
                                   const string &attached_schema = "") {
 	string data_table = IVMTableNames::DataTableName(view_name);
-	string query = "DELETE FROM " + data_table + ";\n";
-	query += "INSERT INTO " + data_table + " " + view_query_sql + ";\n\n";
+	string qdt = KeywordHelper::WriteOptionallyQuoted(data_table);
+	string query = "DELETE FROM " + qdt + ";\n";
+	query += "INSERT INTO " + qdt + " " + view_query_sql + ";\n\n";
 
 	metadata.UpdateTimestamp(view_name);
 	string update_ts = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_update = now() WHERE view_name = '" +
@@ -41,9 +42,10 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
 		if (cross_system) {
 			resolved = attached_catalog + "." + attached_schema + "." + dt;
 		}
-		delta_cleanup += "DELETE FROM " + resolved + " WHERE " + string(ivm::TIMESTAMP_COL) +
-		                 " < (SELECT min(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                 " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) + "');\n";
+		delta_cleanup += "DELETE FROM " + KeywordHelper::WriteOptionallyQuoted(resolved) + " WHERE " +
+		                 string(ivm::TIMESTAMP_COL) + " < (SELECT min(last_update) FROM " +
+		                 string(ivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) +
+		                 "');\n";
 	}
 
 	return query + update_ts + "\n" + delta_cleanup;
@@ -441,20 +443,19 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		}
 		// Pre: snapshot old state into temp table
 		string temp_name = "_ivm_old_" + view_name;
-		pre_companion = "CREATE TEMP TABLE " + temp_name + " AS SELECT * FROM " + data_table + ";\n";
+		string qt = KeywordHelper::WriteOptionallyQuoted(temp_name);
+		string qdvn = KeywordHelper::WriteOptionallyQuoted(delta_view_name);
+		string qdt2 = KeywordHelper::WriteOptionallyQuoted(data_table);
+		pre_companion = "CREATE TEMP TABLE " + qt + " AS SELECT * FROM " + qdt2 + ";\n";
 		// Post: clear ALL IVM delta rows (both true and false), replace with absolute snapshots
-		post_companion = "DELETE FROM " + delta_view_name + " WHERE 1=1";
+		post_companion = "DELETE FROM " + qdvn + " WHERE 1=1";
 		if (!delta_ts_filter.empty()) {
 			post_companion += " AND " + delta_ts_filter;
 		}
 		post_companion += ";\n";
-		// Old state (false) from temp table
-		post_companion += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + select_false + " FROM " +
-		                  temp_name + ";\n";
-		// New state (true) from updated MV
-		post_companion += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + select_true + " FROM " +
-		                  data_table + ";\n";
-		post_companion += "DROP TABLE " + temp_name + ";\n";
+		post_companion += "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_false + " FROM " + qt + ";\n";
+		post_companion += "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_true + " FROM " + qdt2 + ";\n";
+		post_companion += "DROP TABLE " + qt + ";\n";
 		OPENIVM_DEBUG_PRINT("[UPSERT] Pre-companion: %s\n", pre_companion.c_str());
 		OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
 	} else if ((view_query_type == IVMType::AGGREGATE_GROUP || view_query_type == IVMType::AGGREGATE_HAVING) &&
@@ -500,12 +501,13 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	}
 
 	string delete_from_view_query;
+	string qdvn_cleanup = KeywordHelper::WriteOptionallyQuoted(delta_view_name);
 	if (has_downstream) {
-		delete_from_view_query = "DELETE FROM " + delta_view_name + " WHERE " + string(ivm::TIMESTAMP_COL) +
+		delete_from_view_query = "DELETE FROM " + qdvn_cleanup + " WHERE " + string(ivm::TIMESTAMP_COL) +
 		                         " < (SELECT min(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
 		                         " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_view_name) + "');";
 	} else {
-		delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
+		delete_from_view_query = "DELETE FROM " + qdvn_cleanup + ";";
 	}
 	string ivm_result;
 
