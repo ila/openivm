@@ -51,8 +51,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 			return;
 		}
 		auto *drop_info = dynamic_cast<DropInfo *>(simple->info.get());
-		if (!drop_info ||
-		    (drop_info->type != CatalogType::TABLE_ENTRY && drop_info->type != CatalogType::VIEW_ENTRY)) {
+		if (!drop_info || (drop_info->type != CatalogType::TABLE_ENTRY && drop_info->type != CatalogType::VIEW_ENTRY)) {
 			return;
 		}
 

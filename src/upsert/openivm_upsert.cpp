@@ -180,8 +180,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// Read MIN/MAX and LEFT JOIN flags from metadata (set at CREATE MV time).
 	// These determine whether to use incremental MERGE or full group-recompute.
 	bool source_has_left_join = metadata.HasLeftJoin(view_name);
-	bool has_minmax = metadata.HasMinMax(view_name) || view_query_type == IVMType::AGGREGATE_HAVING ||
-	                  source_has_left_join;
+	bool has_minmax =
+	    metadata.HasMinMax(view_name) || view_query_type == IVMType::AGGREGATE_HAVING || source_has_left_join;
 
 	// Check ivm_refresh_mode: 'full' forces full recompute, skipping the IVM pipeline.
 	Value refresh_mode_val;
@@ -317,7 +317,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			auto source_tables = metadata.GetDeltaTables(view_name);
 			for (auto &dt : source_tables) {
 				// Strip "delta_" prefix to get base table name
-				string source = StringUtil::StartsWith(dt, ivm::DELTA_PREFIX) ? dt.substr(strlen(ivm::DELTA_PREFIX)) : dt;
+				string source =
+				    StringUtil::StartsWith(dt, ivm::DELTA_PREFIX) ? dt.substr(strlen(ivm::DELTA_PREFIX)) : dt;
 				string null_cols;
 				for (auto &col : column_names) {
 					if (col != string(ivm::MULTIPLICITY_COL)) {
@@ -328,8 +329,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 					}
 				}
 				string qdt = KeywordHelper::WriteOptionallyQuoted(data_table);
-				upsert_query += "UPDATE " + qdt + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " +
-				                source + " LIMIT 1);\n";
+				upsert_query += "UPDATE " + qdt + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " + source +
+				                " LIMIT 1);\n";
 			}
 		}
 		break;

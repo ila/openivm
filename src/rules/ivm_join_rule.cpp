@@ -28,7 +28,7 @@ struct JoinLeafInfo {
 };
 
 void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves,
-                        bool is_right_of_left = false) {
+                       bool is_right_of_left = false) {
 	if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	    node->type == duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
 		bool is_left = false;
@@ -126,9 +126,9 @@ namespace duckdb {
 // BuildInclusionExclusionTerms: create 2^N - 1 delta terms
 // ============================================================================
 static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrapper &pw, ClientContext &context,
-                                                                         Binder &binder,
-                                                                         const vector<JoinLeafInfo> &leaves,
-                                                                         bool has_left_join) {
+                                                                        Binder &binder,
+                                                                        const vector<JoinLeafInfo> &leaves,
+                                                                        bool has_left_join) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
@@ -212,7 +212,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 // AssembleUnionAll: combine terms with UNION ALL + clean projection
 // ============================================================================
 static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
-                                                     const vector<LogicalType> &types, Binder &binder) {
+                                                    const vector<LogicalType> &types, Binder &binder) {
 	auto result = std::move(terms[0]);
 	for (size_t i = 1; i < terms.size(); i++) {
 		auto union_table_index = binder.GenerateTableIndex();
@@ -237,7 +237,7 @@ static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOpe
 // ReplaceOutputBindings: map original bindings to new UNION ALL output
 // ============================================================================
 static ColumnBinding ReplaceOutputBindings(const vector<ColumnBinding> &original_bindings,
-                                            unique_ptr<LogicalOperator> &result, LogicalOperator &root) {
+                                           unique_ptr<LogicalOperator> &result, LogicalOperator &root) {
 	auto union_bindings = result->GetColumnBindings();
 	if (union_bindings.size() < 2) {
 		throw InternalException("Join rewrite produced too few bindings (%zu)", union_bindings.size());

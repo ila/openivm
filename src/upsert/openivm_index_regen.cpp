@@ -103,7 +103,7 @@ static uint64_t HashBinding(const ColumnBinding &b) {
 }
 
 static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t> &seen,
-                                std::vector<ColumnBinding> &out) {
+                               std::vector<ColumnBinding> &out) {
 	std::function<void(Expression &)> CollectExpr = [&](Expression &e) {
 		if (e.type == ExpressionType::BOUND_COLUMN_REF) {
 			auto &bcr = e.Cast<BoundColumnRefExpression>();
