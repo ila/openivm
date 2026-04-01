@@ -10,12 +10,12 @@
 
 namespace duckdb {
 
-string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
+string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql = "", bool has_minmax = false,
                               bool list_mode = false, const string &delta_ts_filter = "");
-string CompileSimpleAggregates(string &view_name, const vector<string> &column_names, const string &view_query_sql = "",
+string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names, const string &view_query_sql = "",
                                bool has_minmax = false, bool list_mode = false, const string &delta_ts_filter = "");
-string CompileProjectionsFilters(string &view_name, const vector<string> &column_names,
+string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
                                  const string &delta_ts_filter = "");
 
 } // namespace duckdb

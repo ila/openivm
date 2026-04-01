@@ -50,9 +50,9 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
 }
 
 // Generate refresh SQL for a single view (no cascade logic).
-static string GenerateRefreshSQL(ClientContext &context, string view_catalog_name, string view_schema_name,
-                                 string view_name, bool cross_system, string attached_db_catalog_name,
-                                 string attached_db_schema_name);
+static string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name,
+                                 const string &view_schema_name, const string &view_name, bool cross_system,
+                                 const string &attached_db_catalog_name, const string &attached_db_schema_name);
 
 string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &parameters) {
 	string view_catalog_name;
@@ -142,9 +142,9 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	return result;
 }
 
-static string GenerateRefreshSQL(ClientContext &context, string view_catalog_name, string view_schema_name,
-                                 string view_name, bool cross_system, string attached_db_catalog_name,
-                                 string attached_db_schema_name) {
+static string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name,
+                                 const string &view_schema_name, const string &view_name, bool cross_system,
+                                 const string &attached_db_catalog_name, const string &attached_db_schema_name) {
 	auto &catalog = Catalog::GetSystemCatalog(context);
 	QueryErrorContext error_context = QueryErrorContext();
 	Connection con(*context.db.get());
@@ -333,6 +333,10 @@ static string GenerateRefreshSQL(ClientContext &context, string view_catalog_nam
 			}
 		}
 		break;
+	}
+	case IVMType::FULL_REFRESH: {
+		// Should not reach here — full refresh is handled earlier via BuildRecomputeQuery.
+		throw InternalException("FULL_REFRESH views should not reach incremental upsert compilation");
 	}
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] Upsert query:\n%s\n", upsert_query.c_str());

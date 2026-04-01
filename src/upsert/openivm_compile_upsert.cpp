@@ -32,7 +32,9 @@ static AvgDecomposition DetectAvgColumns(const vector<string> &columns) {
 			result.count_cols[col.substr(11)] = col;
 		}
 	}
-	for (auto &[alias, sum_col] : result.sum_cols) {
+	for (auto &entry : result.sum_cols) {
+		auto &alias = entry.first;
+		auto &sum_col = entry.second;
 		if (result.count_cols.count(alias)) {
 			result.derived_cols.insert(alias);
 		}
@@ -40,7 +42,7 @@ static AvgDecomposition DetectAvgColumns(const vector<string> &columns) {
 	return result;
 }
 
-string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
+string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
                               bool list_mode, const string &delta_ts_filter) {
 	string data_table = IVMTableNames::DataTableName(view_name);
@@ -157,7 +159,9 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 			insert_vals += "d." + column;
 		}
 		// Add AVG derived columns: recompute from updated SUM/COUNT in MERGE
-		for (auto &[alias, sum_col] : avg_sum_cols) {
+		for (auto &entry : avg_sum_cols) {
+		auto &alias = entry.first;
+		auto &sum_col = entry.second;
 			if (!avg_count_cols.count(alias)) {
 				continue;
 			}
@@ -215,7 +219,7 @@ string CompileAggregateGroups(string &view_name, optional_ptr<CatalogEntry> inde
 	return upsert_query;
 }
 
-string CompileSimpleAggregates(string &view_name, const vector<string> &column_names, const string &view_query_sql,
+string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names, const string &view_query_sql,
                                bool has_minmax, bool list_mode, const string &delta_ts_filter) {
 	string data_table = IVMTableNames::DataTableName(view_name);
 	if (has_minmax) {
@@ -270,7 +274,9 @@ string CompileSimpleAggregates(string &view_name, const vector<string> &column_n
 	string result = cte + "UPDATE " + Q(data_table) + " SET\n  " + update_set + ";\n";
 
 	// Recompute AVG derived columns from updated SUM and COUNT
-	for (auto &[alias, sum_col] : avg_sum) {
+	for (auto &entry : avg_sum) {
+		auto &alias = entry.first;
+		auto &sum_col = entry.second;
 		if (!avg_count.count(alias)) {
 			continue;
 		}
@@ -282,7 +288,7 @@ string CompileSimpleAggregates(string &view_name, const vector<string> &column_n
 	return result;
 }
 
-string CompileProjectionsFilters(string &view_name, const vector<string> &column_names, const string &delta_ts_filter) {
+string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names, const string &delta_ts_filter) {
 	string data_table = IVMTableNames::DataTableName(view_name);
 	string mul = string(ivm::MULTIPLICITY_COL);
 	string delta_view = OpenIVMUtils::DeltaName(view_name);

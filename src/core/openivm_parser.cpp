@@ -388,8 +388,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			} else {
 				string exclude_list;
 				for (size_t i = 0; i < internal_cols.size(); i++) {
-					if (i > 0)
+					if (i > 0) {
 						exclude_list += ", ";
+					}
 					exclude_list += internal_cols[i];
 				}
 				ddl.push_back("create view " + view_name + " as select * exclude (" + exclude_list + ") from " +
