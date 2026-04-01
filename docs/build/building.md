@@ -54,3 +54,13 @@ git commit -m "Bump DuckDB to v1.X.0"
 ```
 
 Replace `v1.X.0` with the target version tag. See [UPDATING.md](../UPDATING.md) for details on handling DuckDB API changes.
+
+## Updating Shared Claude Code Skills
+
+Shared Claude Code skills live in `.claude/skills/shared/` (a git submodule from [duckdb-claude-skills](https://github.com/ila/duckdb-claude-skills)). To pull the latest:
+
+```bash
+git submodule update --remote .claude/skills/shared
+git add .claude/skills/shared
+git commit -m "Update shared Claude Code skills"
+```
