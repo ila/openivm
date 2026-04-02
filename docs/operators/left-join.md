@@ -57,7 +57,7 @@ The upsert uses **partial recompute** instead of counting-based consolidation:
 
 This avoids the complexity of tracking NULL↔non-NULL transitions incrementally. The cost is proportional to the number of affected left keys, not the total table size.
 
-The parser injects a hidden `_ivm_left_key` column containing the preserved-side join key (see [Parser: LEFT JOIN key injection](../internals/parser.md#left-join-key-injection)).
+The parser injects a hidden `_ivm_left_key` column containing the preserved-side join key (see [Metadata Columns](../internals/metadata-columns.md#_ivm_left_key)).
 
 ## Compiled SQL (2-table join, 3 terms)
 

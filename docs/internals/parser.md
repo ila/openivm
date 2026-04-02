@@ -26,39 +26,11 @@ The parser rewrites `SELECT DISTINCT` into `GROUP BY` + hidden `COUNT(*)` before
 
 ## AVG decomposition
 
-The parser decomposes `AVG(x)` into hidden `SUM` and `COUNT` columns:
-
-```sql
--- Original
-SELECT region, AVG(amount) AS avg_amount FROM sales GROUP BY region
-
--- Rewritten (internal)
-SELECT region,
-    SUM(amount) AS _ivm_sum_avg_amount,
-    COUNT(amount) AS _ivm_count_avg_amount,
-    AVG(amount) AS avg_amount
-FROM sales GROUP BY region
-```
-
-During refresh, the upsert updates `_ivm_sum_*` and `_ivm_count_*` independently via MERGE, then recomputes `avg_amount = _ivm_sum / NULLIF(_ivm_count, 0)`. This makes AVG fully incremental — no group recompute needed.
+The parser decomposes `AVG(x)` into hidden `_ivm_sum_*` and `_ivm_count_*` columns so that AVG can be maintained incrementally via MERGE. See [Metadata Columns](metadata-columns.md#_ivm_sum_-and-_ivm_count_) for details.
 
 ## LEFT JOIN key injection
 
-For `LEFT JOIN` or `RIGHT JOIN` queries, the parser adds a hidden column `_ivm_left_key` containing the preserved-side join key:
-
-```sql
--- Original
-SELECT c.name, o.amount
-FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
-
--- Rewritten (internal)
-SELECT c.name, o.amount, c.id AS _ivm_left_key
-FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
-```
-
-For `RIGHT JOIN`, DuckDB internally rewrites it to `LEFT JOIN` (swapping the table order), so the preserved side is always the left table after rewriting.
-
-The upsert uses `_ivm_left_key` for partial recompute — see [Left Join](../operators/left-join.md).
+For `LEFT JOIN` or `RIGHT JOIN` queries, the parser adds a hidden `_ivm_left_key` column containing the preserved-side join key, used by the upsert for partial recompute. For `RIGHT JOIN`, DuckDB internally rewrites it to `LEFT JOIN` (swapping the table order), so the preserved side is always the left table after rewriting. See [Metadata Columns](metadata-columns.md#_ivm_left_key) for details.
 
 ## IVM compatibility classification
 
