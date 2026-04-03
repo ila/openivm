@@ -46,6 +46,21 @@ private:
 	static std::unordered_map<string, unique_ptr<std::mutex>> delta_mutexes_;
 };
 
+// RAII guard for delta-table locks. Automatically unlocks on scope exit (including exceptions).
+class DeltaLockGuard {
+	string name_;
+
+public:
+	explicit DeltaLockGuard(const string &delta_table_name) : name_(delta_table_name) {
+		IVMRefreshLocks::LockDelta(name_);
+	}
+	~DeltaLockGuard() {
+		IVMRefreshLocks::UnlockDelta(name_);
+	}
+	DeltaLockGuard(const DeltaLockGuard &) = delete;
+	DeltaLockGuard &operator=(const DeltaLockGuard &) = delete;
+};
+
 } // namespace duckdb
 
 #endif // OPENIVM_REFRESH_LOCKS_HPP

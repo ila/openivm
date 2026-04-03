@@ -193,6 +193,9 @@ int64_t OpenIVMUtils::ParseRefreshInterval(const string &interval_str) {
 		                      "'. Expected format: '<N> <minutes|hours|days>'");
 	}
 	int64_t value = std::stoll(match[1].str());
+	if (value <= 0) {
+		throw ParserException("REFRESH EVERY interval must be a positive number (got " + to_string(value) + ")");
+	}
 	string unit = StringUtil::Lower(match[2].str());
 	int64_t seconds;
 	if (unit == "second" || unit == "seconds") {

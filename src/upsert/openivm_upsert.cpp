@@ -57,7 +57,28 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
                                  const string &view_schema_name, const string &view_name, bool cross_system,
                                  const string &attached_db_catalog_name, const string &attached_db_schema_name);
 
-string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &parameters) {
+// Generate and execute refresh SQL for a single view under its per-view lock.
+static void RefreshViewLocked(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
+                              const string &vn, bool cross_system, const string &attached_db_catalog_name,
+                              const string &attached_db_schema_name) {
+	IVMRefreshLocks::LockView(vn);
+	try {
+		string sql = GenerateRefreshSQL(context, view_catalog_name, view_schema_name, vn, cross_system,
+		                                attached_db_catalog_name, attached_db_schema_name);
+		Connection exec_con(*context.db.get());
+		auto result = exec_con.Query(sql);
+		if (result->HasError()) {
+			IVMRefreshLocks::UnlockView(vn);
+			throw InternalException("IVM refresh of '" + vn + "' failed: " + result->GetError());
+		}
+	} catch (...) {
+		IVMRefreshLocks::UnlockView(vn);
+		throw;
+	}
+	IVMRefreshLocks::UnlockView(vn);
+}
+
+void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters) {
 	string view_catalog_name;
 	string view_schema_name;
 	string attached_db_catalog_name;
@@ -96,7 +117,6 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 	IVMMetadata metadata(con);
 
 	// Early exit: skip refresh if all delta tables for the target view are empty.
-	// Only check at top level (not during cascade, since upstream may populate deltas).
 	if (cascade_mode == "off") {
 		auto view_type = metadata.GetViewType(view_name);
 		if (view_type != IVMType::FULL_REFRESH) {
@@ -111,38 +131,35 @@ string UpsertDeltaQueries(ClientContext &context, const FunctionParameters &para
 			}
 			if (all_empty) {
 				OPENIVM_DEBUG_PRINT("[UPSERT] All delta tables empty — skipping refresh for '%s'\n", view_name.c_str());
-				return "SELECT 1;\n";
+				return;
 			}
 		}
 	}
 
-	string result;
+	// Each view is generated + executed under its own per-view lock.
+	// This ensures cascaded views are also protected from concurrent refresh.
 
 	// Upstream cascade: refresh ancestors first
 	if (cascade_mode == "upstream" || cascade_mode == "both") {
 		auto upstream = metadata.GetUpstreamViews(view_name);
 		for (auto &dep : upstream) {
-			result += GenerateRefreshSQL(context, view_catalog_name, view_schema_name, dep, cross_system,
-			                             attached_db_catalog_name, attached_db_schema_name);
-			result += "\n";
+			RefreshViewLocked(context, view_catalog_name, view_schema_name, dep, cross_system, attached_db_catalog_name,
+			                  attached_db_schema_name);
 		}
 	}
 
 	// Refresh the target view
-	result += GenerateRefreshSQL(context, view_catalog_name, view_schema_name, view_name, cross_system,
-	                             attached_db_catalog_name, attached_db_schema_name);
+	RefreshViewLocked(context, view_catalog_name, view_schema_name, view_name, cross_system, attached_db_catalog_name,
+	                  attached_db_schema_name);
 
 	// Downstream cascade: refresh dependents after
 	if (cascade_mode == "downstream" || cascade_mode == "both") {
 		auto downstream = metadata.GetDownstreamViews(view_name);
 		for (auto &dep : downstream) {
-			result += "\n";
-			result += GenerateRefreshSQL(context, view_catalog_name, view_schema_name, dep, cross_system,
-			                             attached_db_catalog_name, attached_db_schema_name);
+			RefreshViewLocked(context, view_catalog_name, view_schema_name, dep, cross_system, attached_db_catalog_name,
+			                  attached_db_schema_name);
 		}
 	}
-
-	return result;
 }
 
 static string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name,
@@ -255,8 +272,6 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// Build a timestamp filter for the delta_view reads in the upsert query.
 	// This prevents double-counting when chained MVs accumulate delta_view rows
 	// from multiple refresh rounds (because downstream views haven't consumed them yet).
-	// The per-delta-table lock in the insert rule narrows the race window where
-	// concurrent DML deltas could be skipped (see IVMRefreshLocks).
 	string delta_ts_filter;
 	if (has_ts_col) {
 		auto last_update_result =
@@ -558,35 +573,6 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	OPENIVM_DEBUG_PRINT("[UPSERT] Generated query:\n%s\n", clean_query.c_str());
 
 	return clean_query;
-}
-
-void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters) {
-	// Extract view name for locking (same logic as UpsertDeltaQueries)
-	string view_name;
-	if (parameters.values.size() == 3) {
-		view_name = StringValue::Get(parameters.values[2]);
-	} else if (parameters.values.size() == 5) {
-		view_name = StringValue::Get(parameters.values[4]);
-	} else {
-		view_name = StringValue::Get(parameters.values[0]);
-	}
-
-	// Acquire the per-view lock BEFORE generating SQL, hold it through execution.
-	// This prevents concurrent refresh of the same view from double-applying deltas.
-	IVMRefreshLocks::LockView(view_name);
-	try {
-		string sql = UpsertDeltaQueries(context, parameters);
-		Connection con(*context.db.get());
-		auto result = con.Query(sql);
-		if (result->HasError()) {
-			IVMRefreshLocks::UnlockView(view_name);
-			throw InternalException("IVM refresh failed: " + result->GetError());
-		}
-	} catch (...) {
-		IVMRefreshLocks::UnlockView(view_name);
-		throw;
-	}
-	IVMRefreshLocks::UnlockView(view_name);
 }
 
 } // namespace duckdb
