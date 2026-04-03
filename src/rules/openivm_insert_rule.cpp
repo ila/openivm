@@ -3,6 +3,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/openivm_metadata.hpp"
 #include "core/openivm_parser.hpp"
+#include "core/openivm_refresh_locks.hpp"
 #include "core/openivm_utils.hpp"
 #include "rules/ivm_column_hider.hpp"
 
@@ -183,7 +184,10 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						insert_query += subquery_string + ")";
 					}
 					OPENIVM_DEBUG_PRINT("[INSERT RULE] insert_query: %s\n", insert_query.c_str());
+					string delta_lock_name = OpenIVMUtils::DeltaName(insert_table_name);
+					IVMRefreshLocks::LockDelta(delta_lock_name);
 					auto r = con.Query(insert_query);
+					IVMRefreshLocks::UnlockDelta(delta_lock_name);
 					if (r->HasError()) {
 						throw InternalException("Cannot insert in delta table after insertion! " + r->GetError());
 					}
@@ -196,11 +200,14 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						    "Only CSV file imports (read_csv) are supported for IVM delta tracking "
 						    "via LOGICAL_GET. Other table functions are not yet supported.");
 					}
+					string delta_lock_name = OpenIVMUtils::DeltaName(insert_table_name);
 					auto files = bind_data->file_list->GetAllFiles();
 					for (auto &file : files) {
 						auto query = "insert into " + full_delta_table_name +
 						             " select *, true, now()::timestamp from read_csv('" + file.path + "');";
+						IVMRefreshLocks::LockDelta(delta_lock_name);
 						auto r = con.Query(query);
+						IVMRefreshLocks::UnlockDelta(delta_lock_name);
 						if (r->HasError()) {
 							throw InternalException("Cannot insert in delta table! " + r->GetError());
 						}
@@ -277,7 +284,10 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					}
 				}
 
+				string delta_lock_name = OpenIVMUtils::DeltaName(delete_table_name);
+				IVMRefreshLocks::LockDelta(delta_lock_name);
 				auto r = con.Query(insert_string);
+				IVMRefreshLocks::UnlockDelta(delta_lock_name);
 				if (r->HasError()) {
 					throw InternalException("Cannot insert in delta table after deletion! " + r->GetError());
 				}
@@ -370,12 +380,16 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				}
 				select_new += "true, now()::timestamp from " + full_table_name + where_string;
 
+				string delta_lock_name = OpenIVMUtils::DeltaName(update_table_name);
+				IVMRefreshLocks::LockDelta(delta_lock_name);
 				auto r = con.Query("insert into " + full_delta_table_name + " " + select_old);
 				if (r->HasError()) {
+					IVMRefreshLocks::UnlockDelta(delta_lock_name);
 					throw InternalException("Cannot insert old values in delta table after update! " + r->GetError());
 				}
 				OPENIVM_DEBUG_PRINT("[INSERT RULE] select_new: %s\n", select_new.c_str());
 				auto r2 = con.Query("insert into " + full_delta_table_name + " " + select_new);
+				IVMRefreshLocks::UnlockDelta(delta_lock_name);
 				if (r2->HasError()) {
 					throw InternalException("Cannot insert new values in delta table after update! " + r2->GetError());
 				}

@@ -45,16 +45,20 @@ struct IVMParseData : ParserExtensionParseData {
 
 	unique_ptr<SQLStatement> statement;
 	bool plan = false;
+	int64_t refresh_interval = -1; // seconds, -1 = not specified (manual only)
 
 	unique_ptr<ParserExtensionParseData> Copy() const override {
-		return make_uniq_base<ParserExtensionParseData, IVMParseData>(statement->Copy(), false);
+		auto copy = make_uniq_base<ParserExtensionParseData, IVMParseData>(statement->Copy(), false);
+		dynamic_cast<IVMParseData &>(*copy).refresh_interval = refresh_interval;
+		return copy;
 	}
 
 	string ToString() const override {
 		return statement->ToString();
 	}
 
-	explicit IVMParseData(unique_ptr<SQLStatement> statement, bool plan) : statement(std::move(statement)), plan(plan) {
+	explicit IVMParseData(unique_ptr<SQLStatement> statement, bool plan, int64_t refresh_interval = -1)
+	    : statement(std::move(statement)), plan(plan), refresh_interval(refresh_interval) {
 	}
 };
 

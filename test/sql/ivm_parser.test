@@ -750,3 +750,113 @@ a	5	20	35	3
 # PRAGMA ivm with large delta tables causes a segfault in the LPTS module
 # when using a file-based database. This is a pre-existing issue unrelated
 # to MIN/MAX support.
+
+# ==========================================
+# Test 31: REFRESH EVERY — valid intervals
+# ==========================================
+
+statement ok
+CREATE TABLE t31 (id INT, val INT);
+
+statement ok
+INSERT INTO t31 VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t31_5min REFRESH EVERY '5 minutes' AS
+    SELECT val, COUNT(*) AS cnt FROM t31 GROUP BY val;
+
+# refresh_interval should be 300 seconds
+query I
+SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_5min';
+----
+300
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t31_2hr REFRESH EVERY '2 hours' AS
+    SELECT val, SUM(val) AS total FROM t31 GROUP BY val;
+
+query I
+SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_2hr';
+----
+7200
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t31_1day REFRESH EVERY '1 day' AS
+    SELECT id, val FROM t31;
+
+query I
+SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_1day';
+----
+86400
+
+# ==========================================
+# Test 32: REFRESH EVERY — no interval (default NULL)
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t31_manual AS
+    SELECT val, COUNT(*) AS cnt FROM t31 GROUP BY val;
+
+query I
+SELECT refresh_interval IS NULL FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_manual';
+----
+true
+
+# ==========================================
+# Test 33: REFRESH EVERY — interval too short (< 1 minute)
+# ==========================================
+
+statement error
+CREATE MATERIALIZED VIEW mv_t31_bad REFRESH EVERY '30 seconds' AS
+    SELECT val FROM t31;
+----
+at least 1 minute
+
+# ==========================================
+# Test 34: REFRESH EVERY — invalid format
+# ==========================================
+
+statement error
+CREATE MATERIALIZED VIEW mv_t31_bad2 REFRESH EVERY 'banana' AS
+    SELECT val FROM t31;
+----
+Invalid REFRESH EVERY interval
+
+# ==========================================
+# Test 35: REFRESH EVERY — MV still works normally with IVM
+# ==========================================
+
+statement ok
+INSERT INTO t31 VALUES (2, 20);
+
+statement ok
+PRAGMA ivm('mv_t31_5min');
+
+query II
+SELECT val, cnt FROM mv_t31_5min ORDER BY val;
+----
+10	1
+20	1
+
+# Cross-check
+query I
+SELECT count(*) FROM (
+    SELECT val, cnt FROM mv_t31_5min
+    EXCEPT ALL
+    SELECT val, COUNT(*) AS cnt FROM t31 GROUP BY val
+);
+----
+0
+
+# ==========================================
+# Test 36: REFRESH EVERY — 1 minute (minimum allowed)
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t31_1min REFRESH EVERY '1 minute' AS
+    SELECT id FROM t31;
+
+query I
+SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_1min';
+----
+60

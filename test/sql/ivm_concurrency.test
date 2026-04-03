@@ -1,0 +1,181 @@
+# name: test/sql/ivm_concurrency.test
+# description: Test MV reads, DML, and refresh under concurrency
+# group: [sql]
+
+require openivm
+
+statement ok
+SET ivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Test 1: Read aggregate MV while refresh is running
+# One thread inserts + refreshes, others read
+# Validates: MVCC allows concurrent reads during MV writes
+# ==========================================
+
+statement ok
+CREATE TABLE sales (region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO sales SELECT 'region_' || (i % 10)::VARCHAR, i FROM range(1, 1001) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sales AS
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
+    FROM sales GROUP BY region;
+
+query I
+SELECT count(*) FROM mv_sales;
+----
+10
+
+concurrentloop threadid 0 4
+
+loop k 0 5
+
+onlyif threadid=0
+statement ok
+INSERT INTO sales SELECT 'region_' || (i % 10)::VARCHAR, i FROM range(1001 + ${k} * 100, 1101 + ${k} * 100) t(i);
+
+onlyif threadid=0
+statement ok
+PRAGMA ivm('mv_sales');
+
+endloop
+
+onlyif threadid>=1
+loop k 0 10
+
+onlyif threadid>=1
+statement ok
+SELECT region, total, cnt FROM mv_sales ORDER BY region;
+
+onlyif threadid>=1
+statement ok
+SELECT count(*) FROM mv_sales;
+
+endloop
+
+endloop
+
+query I
+SELECT count(*) FROM mv_sales;
+----
+10
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM mv_sales
+    EXCEPT ALL
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales GROUP BY region
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales GROUP BY region
+    EXCEPT ALL
+    SELECT region, total, cnt FROM mv_sales
+);
+----
+0
+
+# ==========================================
+# Test 2: Concurrent refresh of SAME view — per-view mutex serializes them
+# Before the mutex fix, this caused TransactionContext Error: Conflict on tuple deletion
+# Now both threads wait their turn and the MV stays correct
+# ==========================================
+
+statement ok
+CREATE TABLE items (id INT, val INT);
+
+statement ok
+INSERT INTO items SELECT i, i * 10 FROM range(1, 101) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_items AS
+    SELECT val, COUNT(*) AS cnt FROM items GROUP BY val;
+
+statement ok
+INSERT INTO items SELECT i, i * 10 FROM range(101, 201) t(i);
+
+# Both threads refresh — per-view lock ensures only one runs at a time
+concurrentloop threadid 0 2
+
+statement ok
+PRAGMA ivm('mv_items');
+
+endloop
+
+query I
+SELECT count(*) FROM (
+    SELECT val, cnt FROM mv_items
+    EXCEPT ALL
+    SELECT val, COUNT(*) AS cnt FROM items GROUP BY val
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT val, COUNT(*) AS cnt FROM items GROUP BY val
+    EXCEPT ALL
+    SELECT val, cnt FROM mv_items
+);
+----
+0
+
+# ==========================================
+# Test 3: Projection MV — concurrent read + refresh
+# ==========================================
+
+statement ok
+CREATE TABLE employees (id INT, name VARCHAR, dept VARCHAR);
+
+statement ok
+INSERT INTO employees SELECT i, 'emp_' || i::VARCHAR, 'dept_' || (i % 3)::VARCHAR FROM range(1, 501) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_emp AS SELECT id, name FROM employees;
+
+concurrentloop threadid 0 3
+
+loop k 0 5
+
+onlyif threadid=0
+statement ok
+INSERT INTO employees SELECT i, 'new_' || i::VARCHAR, 'dept_0' FROM range(1000 + ${k}, 1001 + ${k}) t(i);
+
+onlyif threadid=0
+statement ok
+PRAGMA ivm('mv_emp');
+
+onlyif threadid>=1
+statement ok
+SELECT count(*) FROM mv_emp;
+
+endloop
+
+endloop
+
+statement ok
+PRAGMA ivm('mv_emp');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, name FROM mv_emp
+    EXCEPT ALL
+    SELECT id, name FROM employees
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, name FROM employees
+    EXCEPT ALL
+    SELECT id, name FROM mv_emp
+);
+----
+0

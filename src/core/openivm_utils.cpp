@@ -185,4 +185,44 @@ bool OpenIVMUtils::IsDelta(const string &name) {
 	return name.size() >= 6 && name.rfind("delta_", 0) == 0;
 }
 
+int64_t OpenIVMUtils::ParseRefreshInterval(const string &interval_str) {
+	std::regex interval_re(R"((\d+)\s*(second|seconds|minute|minutes|min|hour|hours|day|days))", std::regex::icase);
+	std::smatch match;
+	if (!std::regex_match(interval_str, match, interval_re)) {
+		throw ParserException("Invalid REFRESH EVERY interval: '" + interval_str +
+		                      "'. Expected format: '<N> <minutes|hours|days>'");
+	}
+	int64_t value = std::stoll(match[1].str());
+	string unit = StringUtil::Lower(match[2].str());
+	int64_t seconds;
+	if (unit == "second" || unit == "seconds") {
+		seconds = value;
+	} else if (unit == "minute" || unit == "minutes" || unit == "min") {
+		seconds = value * 60;
+	} else if (unit == "hour" || unit == "hours") {
+		seconds = value * 3600;
+	} else if (unit == "day" || unit == "days") {
+		seconds = value * 86400;
+	} else {
+		throw ParserException("Unknown time unit: '" + unit + "'");
+	}
+	if (seconds < 60) {
+		throw ParserException("REFRESH EVERY interval must be at least 1 minute (got " + to_string(seconds) + "s)");
+	}
+	return seconds;
+}
+
+int64_t OpenIVMUtils::ExtractRefreshInterval(string &query) {
+	std::regex refresh_re(R"(refresh\s+every\s+'([^']+)')", std::regex::icase);
+	std::smatch match;
+	if (!std::regex_search(query, match, refresh_re)) {
+		return -1;
+	}
+	string interval_str = match[1].str();
+	// Strip the REFRESH EVERY clause from the query
+	query = std::regex_replace(query, refresh_re, "");
+	OpenIVMUtils::RemoveRedundantWhitespaces(query);
+	return ParseRefreshInterval(interval_str);
+}
+
 } // namespace duckdb

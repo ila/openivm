@@ -73,6 +73,10 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Intercepted query: %s\n", query_lower.c_str());
 
+	// Extract REFRESH EVERY clause before structural rewrite (strips it from the query)
+	int64_t refresh_interval = OpenIVMUtils::ExtractRefreshInterval(query_lower);
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Refresh interval: %lld seconds\n", (long long)refresh_interval);
+
 	OpenIVMUtils::ReplaceMaterializedView(query_lower);
 	// All other rewrites (DISTINCT, AVG, LEFT JOIN key, aggregate aliases) are done
 	// at the plan level in IVMPlanFunction via IVMPlanRewrite + LPTS.
@@ -82,7 +86,7 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 	p.ParseQuery(query_lower);
 
 	return ParserExtensionParseResult(
-	    make_uniq_base<ParserExtensionParseData, IVMParseData>(std::move(p.statements[0]), true));
+	    make_uniq_base<ParserExtensionParseData, IVMParseData>(std::move(p.statements[0]), true, refresh_interval));
 }
 
 ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInfo *info, ClientContext &context,
@@ -348,7 +352,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		ddl.push_back("create table if not exists " + string(ivm::VIEWS_TABLE) +
 		              " (view_name varchar primary key, sql_string varchar, type tinyint,"
 		              " has_minmax boolean default false, has_left_join boolean default false,"
-		              " last_update timestamp)");
+		              " last_update timestamp, refresh_interval bigint default null)");
 
 		ddl.push_back("create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
 		              " (view_name varchar, table_name "
@@ -356,9 +360,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// Store the LPTS query in metadata — it has hidden columns (DISTINCT count, AVG sum/count,
 		// LEFT JOIN key) and preserves user column names.
+		string refresh_val = ivm_parse_data.refresh_interval > 0 ? to_string(ivm_parse_data.refresh_interval) : "null";
 		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
 		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", " +
-		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now())");
+		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now(), " +
+		              refresh_val + ")");
 
 		for (const auto &table_name : table_names) {
 			ddl.push_back("insert into " + string(ivm::DELTA_TABLES_TABLE) + " values ('" + view_name + "', '" +

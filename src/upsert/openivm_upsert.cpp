@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/openivm_metadata.hpp"
+#include "core/openivm_refresh_locks.hpp"
 #include "rules/ivm_column_hider.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "core/openivm_utils.hpp"
@@ -254,8 +255,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// Build a timestamp filter for the delta_view reads in the upsert query.
 	// This prevents double-counting when chained MVs accumulate delta_view rows
 	// from multiple refresh rounds (because downstream views haven't consumed them yet).
-	// The filter uses the view's current last_update — rows inserted by the IVM query
-	// in the current round have timestamps >= this value.
+	// The per-delta-table lock in the insert rule narrows the race window where
+	// concurrent DML deltas could be skipped (see IVMRefreshLocks).
 	string delta_ts_filter;
 	if (has_ts_col) {
 		auto last_update_result =
@@ -516,7 +517,6 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// if both A and B have been refreshed (up to some timestamp)
 	// to check this, we extract the minimum timestamp from _duckdb_ivm_delta_tables
 	string delete_from_delta_table_query;
-	// firstly we reset the timestamp
 	string update_timestamp_query = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
 	                                " SET last_update = now() WHERE view_name = '" +
 	                                OpenIVMUtils::EscapeValue(view_name) + "';\n";
@@ -558,6 +558,35 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	OPENIVM_DEBUG_PRINT("[UPSERT] Generated query:\n%s\n", clean_query.c_str());
 
 	return clean_query;
+}
+
+void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters) {
+	// Extract view name for locking (same logic as UpsertDeltaQueries)
+	string view_name;
+	if (parameters.values.size() == 3) {
+		view_name = StringValue::Get(parameters.values[2]);
+	} else if (parameters.values.size() == 5) {
+		view_name = StringValue::Get(parameters.values[4]);
+	} else {
+		view_name = StringValue::Get(parameters.values[0]);
+	}
+
+	// Acquire the per-view lock BEFORE generating SQL, hold it through execution.
+	// This prevents concurrent refresh of the same view from double-applying deltas.
+	IVMRefreshLocks::LockView(view_name);
+	try {
+		string sql = UpsertDeltaQueries(context, parameters);
+		Connection con(*context.db.get());
+		auto result = con.Query(sql);
+		if (result->HasError()) {
+			IVMRefreshLocks::UnlockView(view_name);
+			throw InternalException("IVM refresh failed: " + result->GetError());
+		}
+	} catch (...) {
+		IVMRefreshLocks::UnlockView(view_name);
+		throw;
+	}
+	IVMRefreshLocks::UnlockView(view_name);
 }
 
 } // namespace duckdb

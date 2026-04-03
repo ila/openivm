@@ -27,6 +27,14 @@ public:
 	static bool IsDelta(const string &name);
 	static string GenerateDeltaTable(string &query);
 
+	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.
+	/// Returns -1 if no interval clause found. Throws on invalid format or < 60 seconds.
+	static int64_t ParseRefreshInterval(const string &interval_str);
+
+	/// Extract and strip the REFRESH EVERY clause from a CREATE MATERIALIZED VIEW query.
+	/// Returns the parsed interval in seconds, or -1 if not present.
+	static int64_t ExtractRefreshInterval(string &query);
+
 	/// Quote an identifier for safe use in generated SQL (handles reserved words and special chars).
 	static string QuoteIdentifier(const string &name) {
 		return KeywordHelper::WriteOptionallyQuoted(name);

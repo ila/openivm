@@ -105,6 +105,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::VARCHAR, Value("downstream"));
 
 	Connection con(instance);
+
+	// Migration: add refresh_interval column to existing _duckdb_ivm_views tables
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS refresh_interval BIGINT DEFAULT NULL");
+
 	auto ivm_parser = duckdb::IVMParserExtension();
 
 	auto ivm_rewrite_rule = duckdb::IVMRewriteRule();
@@ -127,15 +132,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	catalog.CreateTableFunction(*con.context, &ivm_func_info);
 	con.Commit();
 
-	auto ivm_options = PragmaFunction::PragmaCall("ivm_options", UpsertDeltaQueries,
+	// Use the locked pragma_function_t variant: generates SQL and executes it under a
+	// per-view mutex, preventing concurrent refresh from double-applying deltas.
+	auto ivm_options = PragmaFunction::PragmaCall("ivm_options", UpsertDeltaQueriesLocked,
 	                                              {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(ivm_options);
-	auto ivm = PragmaFunction::PragmaCall("ivm", UpsertDeltaQueries, {LogicalType::VARCHAR});
+	auto ivm = PragmaFunction::PragmaCall("ivm", UpsertDeltaQueriesLocked, {LogicalType::VARCHAR});
 	loader.RegisterFunction(ivm);
 	auto ivm_cost = PragmaFunction::PragmaCall("ivm_cost", IVMCostQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(ivm_cost);
 	auto ivm_cross_system = PragmaFunction::PragmaCall(
-	    "ivm_cross_system", UpsertDeltaQueries,
+	    "ivm_cross_system", UpsertDeltaQueriesLocked,
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(ivm_cross_system);
 }
