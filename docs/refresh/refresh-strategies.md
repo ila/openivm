@@ -26,6 +26,23 @@ SET ivm_refresh_mode = 'full';
 PRAGMA ivm('monthly_totals');
 ```
 
+## Upsert compilation by view type
+
+The incremental refresh compiles different SQL depending on the view's `IVMType` (see [Parser: IVM compatibility classification](../internals/parser.md#ivm-compatibility-classification)).
+
+| View type | Strategy | Why |
+|---|---|---|
+| `AGGREGATE_GROUP` | `MERGE INTO` on GROUP BY keys | Each group is a unique row. MERGE updates existing groups and inserts new ones in a single pass. |
+| `SIMPLE_AGGREGATE` | `UPDATE` (single row) | No GROUP BY means the MV always has exactly one row (SQL guarantees ungrouped aggregates return one row, even on empty input). A plain UPDATE is sufficient. |
+| `SIMPLE_PROJECTION` | `DELETE` (rowid + ROW_NUMBER) then `INSERT` (generate_series) | No keys at all — the MV is a bag of tuples with valid duplicates. MERGE cannot target specific duplicate copies, so row-level addressing via rowid is required. |
+
+For views containing `MIN`, `MAX`, or `HAVING`, a **group-recompute** strategy is used instead: affected groups are deleted and re-inserted from the original query.
+
+MERGE requires a key to match source and target rows. `AGGREGATE_GROUP` views have natural keys (the GROUP BY columns), but the other two types do not:
+
+- **Simple aggregates** have a single row with no key columns. MERGE would work (match on a dummy condition, always UPDATE), but adds complexity over a plain UPDATE for no benefit.
+- **Projections/filters** allow duplicate rows. MERGE cannot express "delete exactly 3 copies of tuple (a, b) out of 7" — that requires rowid-based targeting.
+
 ## Adaptive cost model (experimental)
 
 > **Note:** This feature is experimental. The cost model heuristics may change in future releases.
