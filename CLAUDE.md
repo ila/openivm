@@ -117,6 +117,8 @@ MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original
 - `src/upsert/openivm_compile_upsert.cpp` — generates upsert SQL queries
 - `src/upsert/openivm_cost_model.cpp` — IVM vs recompute cost estimation
 - `src/upsert/openivm_index_regen.cpp` — table index renumbering for plan copies
+- `src/core/openivm_refresh_locks.cpp` — per-view and per-delta-table mutexes for concurrent refresh safety
+- `src/core/openivm_refresh_daemon.cpp` — background thread for automatic REFRESH EVERY
 
 ## Configuration Options
 
@@ -124,9 +126,11 @@ MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original
 |---|---|---|---|
 | `ivm_refresh_mode` | VARCHAR | `"auto"` | `"auto"`, `"incremental"`, or `"full"` |
 | `ivm_adaptive_refresh` | BOOLEAN | `false` | Enable adaptive cost model |
+| `ivm_cascade_refresh` | VARCHAR | `"downstream"` | Cascade mode: `"off"`, `"upstream"`, `"downstream"`, `"both"` |
+| `ivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh exceeds interval |
 | `ivm_files_path` | VARCHAR | — | Path for compiled query reference files |
 
-Views using unsupported constructs (LEFT JOIN, RANDOM(), STDDEV, etc.) are automatically classified as `FULL_REFRESH` — no setting needed.
+Views using unsupported constructs (RANDOM(), STDDEV, etc.) are automatically classified as `FULL_REFRESH` — no setting needed.
 
 ## Debugging
 
@@ -135,16 +139,19 @@ Set `#define OPENIVM_DEBUG 1` in `src/include/core/openivm_debug.hpp` for stderr
 ## IVM DDL examples
 
 ```sql
--- Create a materialized view
-CREATE MATERIALIZED VIEW product_sales AS
+-- Create a materialized view with automatic refresh
+CREATE MATERIALIZED VIEW product_sales REFRESH EVERY '5 minutes' AS
   SELECT product_name, SUM(amount) as total, COUNT(*) as cnt
   FROM orders GROUP BY product_name;
 
 -- Insert new data into the base table (automatically tracked in delta_orders)
 INSERT INTO orders VALUES ('Widget', 100);
 
--- Refresh the materialized view incrementally
+-- Or refresh manually at any time
 PRAGMA ivm('product_sales');
+
+-- Check refresh status (interval, last refresh, next refresh)
+PRAGMA ivm_status('product_sales');
 
 -- Check cost estimate (IVM vs full recompute)
 PRAGMA ivm_cost('product_sales');

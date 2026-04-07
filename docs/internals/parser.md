@@ -32,6 +32,17 @@ The parser decomposes `AVG(x)` into hidden `_ivm_sum_*` and `_ivm_count_*` colum
 
 For `LEFT JOIN` or `RIGHT JOIN` queries, the parser adds a hidden `_ivm_left_key` column containing the preserved-side join key, used by the upsert for partial recompute. For `RIGHT JOIN`, DuckDB internally rewrites it to `LEFT JOIN` (swapping the table order), so the preserved side is always the left table after rewriting. See [Metadata Columns](metadata-columns.md#_ivm_left_key) for details.
 
+## REFRESH EVERY
+
+The parser extracts an optional `REFRESH EVERY '<interval>'` clause before the `AS` keyword. The clause is stripped from the query (so DuckDB's parser doesn't see it) and the interval is parsed into seconds. Minimum is 1 minute.
+
+```sql
+CREATE MATERIALIZED VIEW mv REFRESH EVERY '5 minutes' AS
+    SELECT region, SUM(amount) FROM sales GROUP BY region;
+```
+
+The parsed interval (300 seconds) is stored in the `refresh_interval` column of `_duckdb_ivm_views`. When omitted, `refresh_interval` is `NULL` (manual refresh only). See [Automatic Refresh](../refresh/automatic-refresh.md) for how the daemon uses this.
+
 ## IVM compatibility classification
 
 After rewriting, the parser plans the query and walks the logical plan to classify the view into one of four types:
@@ -67,14 +78,18 @@ Stores one row per materialized view.
 | `view_name` | `VARCHAR` (PK) | Name of the materialized view. |
 | `sql_string` | `VARCHAR` | The original SELECT query defining the view. |
 | `type` | `TINYINT` | View classification (see IVM compatibility classification above). |
+| `has_minmax` | `BOOLEAN` | Whether the view uses MIN/MAX aggregates (requires group-recompute). |
+| `has_left_join` | `BOOLEAN` | Whether the view involves a LEFT/RIGHT JOIN. |
 | `last_update` | `TIMESTAMP` | When the view was last created or replaced. |
+| `refresh_interval` | `BIGINT` | Automatic refresh interval in seconds. `NULL` = manual only. See [Automatic Refresh](../refresh/automatic-refresh.md). |
+| `refresh_in_progress` | `BOOLEAN` | Crash safety flag — `true` while a refresh is in flight. See [Automatic Refresh: Crash safety](../refresh/automatic-refresh.md#crash-safety). |
 
 Example content:
 
-| view_name | sql_string | type | last_update |
-|---|---|---|---|
-| `mv_grouped` | `select region, sum(amount) as sum_amount, count(*) as count_star from sales group by region` | 0 | 2026-03-27 10:00:00 |
-| `mv_projection` | `select id, name from customers` | 2 | 2026-03-27 10:01:00 |
+| view_name | sql_string | type | has_minmax | has_left_join | last_update | refresh_interval | refresh_in_progress |
+|---|---|---|---|---|---|---|---|
+| `mv_grouped` | `select region, sum(amount) ...` | 0 | false | false | 2026-03-27 10:00:00 | 300 | false |
+| `mv_projection` | `select id, name from customers` | 2 | false | false | 2026-03-27 10:01:00 | NULL | false |
 
 ### `_duckdb_ivm_delta_tables`
 
