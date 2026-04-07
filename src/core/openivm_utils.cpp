@@ -186,7 +186,7 @@ bool OpenIVMUtils::IsDelta(const string &name) {
 }
 
 int64_t OpenIVMUtils::ParseRefreshInterval(const string &interval_str) {
-	std::regex interval_re(R"((\d+)\s*(second|seconds|minute|minutes|min|hour|hours|day|days))", std::regex::icase);
+	std::regex interval_re(R"((\d+)\s*(minute|minutes|min|hour|hours|day|days))", std::regex::icase);
 	std::smatch match;
 	if (!std::regex_match(interval_str, match, interval_re)) {
 		throw ParserException("Invalid REFRESH EVERY interval: '" + interval_str +
@@ -198,9 +198,7 @@ int64_t OpenIVMUtils::ParseRefreshInterval(const string &interval_str) {
 	}
 	string unit = StringUtil::Lower(match[2].str());
 	int64_t seconds;
-	if (unit == "second" || unit == "seconds") {
-		seconds = value;
-	} else if (unit == "minute" || unit == "minutes" || unit == "min") {
+	if (unit == "minute" || unit == "minutes" || unit == "min") {
 		seconds = value * 60;
 	} else if (unit == "hour" || unit == "hours") {
 		seconds = value * 3600;
@@ -208,9 +206,6 @@ int64_t OpenIVMUtils::ParseRefreshInterval(const string &interval_str) {
 		seconds = value * 86400;
 	} else {
 		throw ParserException("Unknown time unit: '" + unit + "'");
-	}
-	if (seconds < 60) {
-		throw ParserException("REFRESH EVERY interval must be at least 1 minute (got " + to_string(seconds) + "s)");
 	}
 	return seconds;
 }

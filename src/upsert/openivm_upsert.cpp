@@ -68,7 +68,6 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		Connection exec_con(*context.db.get());
 		auto result = exec_con.Query(sql);
 		if (result->HasError()) {
-			IVMRefreshLocks::UnlockView(vn);
 			throw InternalException("IVM refresh of '" + vn + "' failed: " + result->GetError());
 		}
 	} catch (...) {
@@ -541,7 +540,6 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	} else {
 		delete_from_view_query = "DELETE FROM " + qdvn_cleanup + ";";
 	}
-	string ivm_result;
 
 	// now we can also delete from the delta table, but only if all the dependent views have been refreshed
 	// example: if two views A and B are on the same table T, we can only remove tuples from T
@@ -585,7 +583,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// 9. delete_from_delta: clean old base delta rows
 	string clean_query = set_in_progress + pre_companion + ivm_query + "\n" + companion_query + "\n" + upsert_query +
 	                     "\n" + post_companion + update_timestamp_query + "\n" + clear_in_progress +
-	                     delete_from_view_query + "\n" + ivm_result + "\n" + delete_from_delta_table_query;
+	                     delete_from_view_query + "\n" + delete_from_delta_table_query;
 
 	// Write reference SQL to disk only if ivm_files_path is explicitly set
 	Value files_path_val;

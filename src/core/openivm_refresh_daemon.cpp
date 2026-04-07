@@ -78,6 +78,13 @@ void IVMRefreshDaemon::Run() {
 
 		try {
 			Connection con(*db);
+
+			// Read the ivm_adaptive_backoff setting from the database config
+			Value backoff_val;
+			if (con.context->TryGetCurrentSetting("ivm_adaptive_backoff", backoff_val) && !backoff_val.IsNull()) {
+				adaptive_backoff_ = backoff_val.GetValue<bool>();
+			}
+
 			IVMMetadata metadata(con);
 			auto scheduled = metadata.GetScheduledViews();
 

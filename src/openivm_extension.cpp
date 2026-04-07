@@ -25,7 +25,6 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
-#include "upsert/openivm_upsert.hpp"
 #include "core/openivm_parser.hpp"
 #include "rules/openivm_rewrite_rule.hpp"
 #include "rules/openivm_insert_rule.hpp"

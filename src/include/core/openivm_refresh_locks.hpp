@@ -59,6 +59,8 @@ public:
 	}
 	DeltaLockGuard(const DeltaLockGuard &) = delete;
 	DeltaLockGuard &operator=(const DeltaLockGuard &) = delete;
+	DeltaLockGuard(DeltaLockGuard &&) = delete;
+	DeltaLockGuard &operator=(DeltaLockGuard &&) = delete;
 };
 
 } // namespace duckdb

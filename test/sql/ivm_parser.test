@@ -810,7 +810,7 @@ statement error
 CREATE MATERIALIZED VIEW mv_t31_bad REFRESH EVERY '30 seconds' AS
     SELECT val FROM t31;
 ----
-at least 1 minute
+Invalid REFRESH EVERY interval
 
 # ==========================================
 # Test 34: REFRESH EVERY — invalid format
