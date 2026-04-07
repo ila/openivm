@@ -124,7 +124,7 @@ MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `ivm_refresh_mode` | VARCHAR | `"auto"` | `"auto"`, `"incremental"`, or `"full"` |
+| `ivm_refresh_mode` | VARCHAR | `"incremental"` | `"incremental"`, `"full"`, or `"auto"` |
 | `ivm_adaptive_refresh` | BOOLEAN | `false` | Enable adaptive cost model |
 | `ivm_cascade_refresh` | VARCHAR | `"downstream"` | Cascade mode: `"off"`, `"upstream"`, `"downstream"`, `"both"` |
 | `ivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh exceeds interval |

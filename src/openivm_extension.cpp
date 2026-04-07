@@ -104,8 +104,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &db_config = duckdb::DBConfig::GetConfig(instance);
 
 	db_config.AddExtensionOption("ivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
-	db_config.AddExtensionOption("ivm_refresh_mode", "refresh strategy: auto, incremental, or full",
-	                             LogicalType::VARCHAR, Value("auto"));
+	db_config.AddExtensionOption("ivm_refresh_mode", "refresh strategy: incremental, full, or auto",
+	                             LogicalType::VARCHAR, Value("incremental"));
 	db_config.AddExtensionOption("ivm_adaptive_refresh",
 	                             "experimental: enable adaptive cost model (when off, always use IVM)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));

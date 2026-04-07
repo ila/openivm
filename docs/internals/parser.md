@@ -45,7 +45,7 @@ The parsed interval (300 seconds) is stored in the `refresh_interval` column of 
 
 ## IVM compatibility classification
 
-After rewriting, the parser plans the query and walks the logical plan to classify the view into one of four types:
+After rewriting, the parser plans the query and walks the logical plan to classify the view into one of five types:
 
 | Type | Code | Condition |
 |---|---|---|
@@ -53,6 +53,7 @@ After rewriting, the parser plans the query and walks the logical plan to classi
 | `SIMPLE_AGGREGATE` | 1 | Aggregation without GROUP BY (global aggregate). |
 | `SIMPLE_PROJECTION` | 2 | Projection or filter, no aggregation. |
 | `FULL_REFRESH` | 3 | Contains unsupported constructs. |
+| `AGGREGATE_HAVING` | 4 | Aggregation with GROUP BY and HAVING clause. Uses group-recompute since groups may enter/leave the result set. |
 
 The IVM compatibility checker validates the entire plan tree, flagging unsupported join types (only INNER, LEFT, and RIGHT are supported), unsupported aggregate functions (anything outside `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `LIST`), and non-deterministic functions (e.g., `RANDOM()`, `NOW()`). If any unsupported construct is found, the view is classified as `FULL_REFRESH` and a warning is printed.
 

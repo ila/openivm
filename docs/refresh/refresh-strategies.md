@@ -13,12 +13,12 @@ The `ivm_refresh_mode` setting controls which strategy is used at refresh time.
 | `full`          | Forces a complete DELETE + INSERT recomputation, regardless of whether the view supports IVM. |
 
 ```sql
--- Use the default (auto) strategy
-SET ivm_refresh_mode = 'auto';
+-- Use incremental refresh (default)
+SET ivm_refresh_mode = 'incremental';
 PRAGMA ivm('monthly_totals');
 
--- Force incremental refresh
-SET ivm_refresh_mode = 'incremental';
+-- Let the system decide (incremental when supported, full otherwise)
+SET ivm_refresh_mode = 'auto';
 PRAGMA ivm('monthly_totals');
 
 -- Force full recomputation
