@@ -205,10 +205,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Start the refresh daemon. It sleeps and periodically checks for views with
 	// REFRESH EVERY set. If none exist, it just sleeps — negligible overhead.
-	// Non-owning shared_ptr: the daemon holds a weak_ptr and exits when the DB is destroyed.
 	global_daemon = make_shared_ptr<IVMRefreshDaemon>();
-	shared_ptr<DatabaseInstance> db_ptr(&instance, [](DatabaseInstance *) {});
-	global_daemon->Start(db_ptr);
+	global_daemon->Start(instance);
 }
 
 void OpenivmExtension::Load(ExtensionLoader &loader) {

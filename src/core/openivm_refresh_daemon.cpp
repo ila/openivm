@@ -3,19 +3,21 @@
 #include "core/openivm_debug.hpp"
 #include "core/openivm_metadata.hpp"
 #include "core/openivm_refresh_locks.hpp"
+#include "core/openivm_utils.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/connection.hpp"
 
 #include <chrono>
+#include <unordered_set>
 
 namespace duckdb {
 
-void IVMRefreshDaemon::Start(shared_ptr<DatabaseInstance> db) {
+void IVMRefreshDaemon::Start(DatabaseInstance &db) {
 	bool expected = false;
 	if (!started_.compare_exchange_strong(expected, true)) {
 		return; // already started
 	}
-	db_weak_ = db;
+	db_ = &db;
 	shutdown_ = false;
 	thread_ = std::thread(&IVMRefreshDaemon::Run, this);
 }
@@ -50,14 +52,6 @@ bool IVMRefreshDaemon::IsRefreshing(const string &view_name) const {
 	return currently_refreshing_ == view_name;
 }
 
-void IVMRefreshDaemon::SetAdaptiveBackoff(bool enabled) {
-	adaptive_backoff_ = enabled;
-	if (!enabled) {
-		std::lock_guard<std::mutex> guard(backoff_mutex_);
-		effective_intervals_.clear();
-	}
-}
-
 void IVMRefreshDaemon::Run() {
 	OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Started\n");
 
@@ -70,16 +64,17 @@ void IVMRefreshDaemon::Run() {
 			break;
 		}
 
-		auto db = db_weak_.lock();
-		if (!db) {
-			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Database destroyed, exiting\n");
-			break;
-		}
-
 		try {
-			Connection con(*db);
+			Connection con(*db_);
 
-			// Read the ivm_adaptive_backoff setting from the database config
+			// Read cascade setting from the DB config
+			string cascade_mode = "downstream";
+			Value cascade_val;
+			if (con.context->TryGetCurrentSetting("ivm_cascade_refresh", cascade_val) && !cascade_val.IsNull()) {
+				cascade_mode = StringUtil::Lower(cascade_val.ToString());
+			}
+
+			// Read adaptive backoff setting
 			Value backoff_val;
 			if (con.context->TryGetCurrentSetting("ivm_adaptive_backoff", backoff_val) && !backoff_val.IsNull()) {
 				adaptive_backoff_ = backoff_val.GetValue<bool>();
@@ -88,9 +83,17 @@ void IVMRefreshDaemon::Run() {
 			IVMMetadata metadata(con);
 			auto scheduled = metadata.GetScheduledViews();
 
+			// Track views already refreshed this cycle (directly or via cascade) to avoid double work
+			std::unordered_set<string> refreshed_this_cycle;
+
 			for (auto &sv : scheduled) {
 				if (shutdown_.load()) {
 					break;
+				}
+
+				// Skip if already refreshed via cascade from an earlier view in this cycle
+				if (refreshed_this_cycle.count(sv.view_name)) {
+					continue;
 				}
 
 				// Determine effective interval (may be backed off)
@@ -107,7 +110,8 @@ void IVMRefreshDaemon::Run() {
 				if (!sv.last_update.empty()) {
 					auto elapsed_result =
 					    con.Query("SELECT EXTRACT(EPOCH FROM (now() - '" + sv.last_update + "'::TIMESTAMP))");
-					if (!elapsed_result->HasError() && elapsed_result->RowCount() > 0) {
+					if (!elapsed_result->HasError() && elapsed_result->RowCount() > 0 &&
+					    !elapsed_result->GetValue(0, 0).IsNull()) {
 						auto elapsed_seconds = elapsed_result->GetValue(0, 0).GetValue<double>();
 						if (elapsed_seconds < static_cast<double>(interval)) {
 							continue; // not due yet
@@ -116,8 +120,6 @@ void IVMRefreshDaemon::Run() {
 				}
 
 				// Quick check if the view is already being refreshed (non-blocking).
-				// If TryLock succeeds, release immediately — the actual locking is done
-				// inside UpsertDeltaQueriesLocked called by PRAGMA ivm().
 				if (!IVMRefreshLocks::TryLockView(sv.view_name)) {
 					OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Skipping '%s' — refresh already in progress\n",
 					                    sv.view_name.c_str());
@@ -134,8 +136,8 @@ void IVMRefreshDaemon::Run() {
 				auto before = std::chrono::steady_clock::now();
 
 				try {
-					Connection refresh_con(*db);
-					auto result = refresh_con.Query("PRAGMA ivm('" + sv.view_name + "')");
+					Connection refresh_con(*db_);
+					auto result = refresh_con.Query("PRAGMA ivm('" + OpenIVMUtils::EscapeValue(sv.view_name) + "')");
 					if (result->HasError()) {
 						Printer::Print("Warning: auto-refresh of '" + sv.view_name + "' failed: " + result->GetError());
 					}
@@ -148,11 +150,23 @@ void IVMRefreshDaemon::Run() {
 					currently_refreshing_.clear();
 				}
 
+				// Mark this view and any cascaded views as done for this cycle
+				refreshed_this_cycle.insert(sv.view_name);
+				if (cascade_mode == "downstream" || cascade_mode == "both") {
+					for (auto &dep : metadata.GetDownstreamViews(sv.view_name)) {
+						refreshed_this_cycle.insert(dep);
+					}
+				}
+				if (cascade_mode == "upstream" || cascade_mode == "both") {
+					for (auto &dep : metadata.GetUpstreamViews(sv.view_name)) {
+						refreshed_this_cycle.insert(dep);
+					}
+				}
+
 				auto after = std::chrono::steady_clock::now();
 				auto duration_seconds = std::chrono::duration_cast<std::chrono::seconds>(after - before).count();
 
-				// Adaptive backoff: if refresh took longer than the configured interval,
-				// double the effective interval (capped at 24h). Resets when refresh fits.
+				// Adaptive backoff
 				if (adaptive_backoff_.load() && duration_seconds > sv.interval_seconds) {
 					std::lock_guard<std::mutex> guard(backoff_mutex_);
 					int64_t current = sv.interval_seconds;

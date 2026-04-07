@@ -12,13 +12,13 @@
 namespace duckdb {
 
 // Background thread that periodically refreshes materialized views with a REFRESH EVERY interval.
-// Uses a weak_ptr to DatabaseInstance so the DB can shut down without waiting for the daemon.
-// The daemon wakes every 30 seconds, checks which views are due, and refreshes them under a
-// per-view lock (TryLock — skip if busy, e.g. manual PRAGMA ivm() is running).
+// Holds a raw pointer to DatabaseInstance (valid for the lifetime of the extension).
+// The daemon wakes every 30 seconds, checks which views are due, and refreshes them.
+// Views already being refreshed (manual PRAGMA or cascade) are skipped via TryLockView.
 class IVMRefreshDaemon {
 public:
 	// Start the daemon thread. Safe to call multiple times (only starts once).
-	void Start(shared_ptr<DatabaseInstance> db);
+	void Start(DatabaseInstance &db);
 
 	// Stop the daemon and join the thread. Called on destruction or explicit shutdown.
 	void Stop();
@@ -31,13 +31,10 @@ public:
 	// Check if a view is currently being refreshed by the daemon.
 	bool IsRefreshing(const string &view_name) const;
 
-	// Enable/disable adaptive backoff. When disabled, the daemon retries at the original interval.
-	void SetAdaptiveBackoff(bool enabled);
-
 private:
 	void Run();
 
-	weak_ptr<DatabaseInstance> db_weak_;
+	DatabaseInstance *db_ = nullptr;
 	std::thread thread_;
 	std::atomic<bool> shutdown_ {false};
 	std::atomic<bool> started_ {false};

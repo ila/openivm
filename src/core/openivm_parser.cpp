@@ -67,6 +67,40 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 	query_lower.erase(remove(query_lower.begin(), query_lower.end(), '\n'), query_lower.end());
 	OpenIVMUtils::RemoveRedundantWhitespaces(query_lower);
 
+	// Handle ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' | SET REFRESH MANUAL
+	if (StringUtil::Contains(query_lower, "alter materialized view")) {
+		std::regex alter_re("alter\\s+materialized\\s+view\\s+(\"(?:[^\"]+)\"|[a-zA-Z0-9_.]+)\\s+set\\s+refresh\\s+("
+		                    "every\\s+'([^']+)'|manual)",
+		                    std::regex::icase);
+		std::smatch match;
+		if (!std::regex_search(query_lower, match, alter_re)) {
+			throw ParserException("Invalid ALTER MATERIALIZED VIEW syntax. "
+			                      "Expected: ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' "
+			                      "or ALTER MATERIALIZED VIEW <name> SET REFRESH MANUAL");
+		}
+		string alter_view_name = match[1].str();
+		if (alter_view_name.size() >= 2 && alter_view_name.front() == '"' && alter_view_name.back() == '"') {
+			alter_view_name = alter_view_name.substr(1, alter_view_name.size() - 2);
+		}
+		string refresh_type = StringUtil::Lower(match[2].str());
+		string update_sql;
+		if (refresh_type == "manual") {
+			update_sql = "UPDATE " + string(ivm::VIEWS_TABLE) + " SET refresh_interval = NULL WHERE view_name = '" +
+			             OpenIVMUtils::EscapeSingleQuotes(alter_view_name) + "'";
+		} else {
+			int64_t interval = OpenIVMUtils::ParseRefreshInterval(match[3].str());
+			update_sql = "UPDATE " + string(ivm::VIEWS_TABLE) + " SET refresh_interval = " + to_string(interval) +
+			             " WHERE view_name = '" + OpenIVMUtils::EscapeSingleQuotes(alter_view_name) + "'";
+		}
+		// Pass the UPDATE SQL through IVMParseData; IVMPlanFunction will execute it
+		Parser alter_parser;
+		alter_parser.ParseQuery("SELECT 1");
+		auto parse_data =
+		    make_uniq_base<ParserExtensionParseData, IVMParseData>(std::move(alter_parser.statements[0]), true);
+		dynamic_cast<IVMParseData &>(*parse_data).alter_sql = update_sql;
+		return ParserExtensionParseResult(std::move(parse_data));
+	}
+
 	if (!StringUtil::Contains(query_lower, "create materialized view")) {
 		return ParserExtensionParseResult();
 	}
@@ -98,6 +132,20 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 	if (ivm_parse_data.plan) {
 		Connection con(*context.db.get());
+
+		// Handle ALTER MATERIALIZED VIEW — just execute the metadata UPDATE
+		if (!ivm_parse_data.alter_sql.empty()) {
+			auto r = con.Query(ivm_parse_data.alter_sql);
+			if (r->HasError()) {
+				throw CatalogException("Failed to alter materialized view: " + r->GetError());
+			}
+			// Return via the DDL executor with no DDL to run (the UPDATE already executed)
+			result.function =
+			    TableFunction("ivm_ddl_executor", {}, IVMDDLExecuteFunction, IVMDDLBindFunction, IVMFunction::IVMInit);
+			result.requires_valid_transaction = true;
+			result.return_type = StatementReturnType::QUERY_RESULT;
+			return result;
+		}
 
 		// Check if PAC extension is loaded (needed later for delta table queries).
 		// If so, forward PAC settings to the internal connection so that PAC

@@ -62,6 +62,8 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		auto view_check = con.Query("SELECT 1 FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
 		                            OpenIVMUtils::EscapeValue(table_name) + "'");
 		if (!view_check->HasError() && view_check->RowCount() > 0) {
+			// Acquire view lock to prevent cleanup during an in-flight refresh
+			IVMRefreshLocks::LockView(table_name);
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] DROP TABLE '%s' — cleaning up IVM metadata\n", table_name.c_str());
 			IVMMetadata metadata(con);
 			auto delta_tables = metadata.GetDeltaTables(table_name);
@@ -83,6 +85,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					con.Query("DROP TABLE IF EXISTS " + KeywordHelper::WriteOptionallyQuoted(dt));
 				}
 			}
+			IVMRefreshLocks::UnlockView(table_name);
 		}
 
 		// Handle CASCADE: drop dependent MVs
@@ -92,6 +95,8 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		if (!dep_check->HasError() && dep_check->RowCount() > 0 && drop_info->cascade) {
 			for (size_t i = 0; i < dep_check->RowCount(); i++) {
 				auto dep_view = dep_check->GetValue(0, i).ToString();
+				// Lock each dependent view before dropping
+				IVMRefreshLocks::LockView(dep_view);
 				IVMMetadata dep_metadata(con);
 				auto dep_delta_tables = dep_metadata.GetDeltaTables(dep_view);
 
@@ -113,6 +118,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						con.Query("DROP TABLE IF EXISTS " + KeywordHelper::WriteOptionallyQuoted(dt));
 					}
 				}
+				IVMRefreshLocks::UnlockView(dep_view);
 			}
 		}
 

@@ -68,6 +68,11 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		Connection exec_con(*context.db.get());
 		auto result = exec_con.Query(sql);
 		if (result->HasError()) {
+			// Clear the crash-safety flag — this is a SQL error, not a process crash.
+			// Without this, the next refresh would unnecessarily do a full recompute.
+			exec_con.Query("UPDATE " + string(ivm::VIEWS_TABLE) +
+			               " SET refresh_in_progress = false WHERE view_name = '" + OpenIVMUtils::EscapeValue(vn) +
+			               "'");
 			throw InternalException("IVM refresh of '" + vn + "' failed: " + result->GetError());
 		}
 	} catch (...) {
