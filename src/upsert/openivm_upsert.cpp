@@ -192,6 +192,22 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
 
+	// Crash recovery: if a previous refresh was interrupted (process died between MERGE and
+	// last_update), the flag is still true. Recover via full recompute to avoid double-applying deltas.
+	{
+		auto flag_result = con.Query("SELECT refresh_in_progress FROM " + string(ivm::VIEWS_TABLE) +
+		                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "'");
+		if (!flag_result->HasError() && flag_result->RowCount() > 0 && !flag_result->GetValue(0, 0).IsNull() &&
+		    flag_result->GetValue(0, 0).GetValue<bool>()) {
+			Printer::Print("Warning: recovering '" + view_name + "' from interrupted refresh via full recompute.");
+			// Clear the flag and do a full refresh
+			con.Query("UPDATE " + string(ivm::VIEWS_TABLE) + " SET refresh_in_progress = false WHERE view_name = '" +
+			          OpenIVMUtils::EscapeValue(view_name) + "'");
+			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+			                           attached_db_schema_name);
+		}
+	}
+
 	// AVG, MIN, MAX, HAVING use group-recompute strategy (not decomposable as simple deltas).
 	// HAVING needs recompute because groups may enter/leave the result set after aggregate changes.
 	// MIN, MAX use group-recompute. AVG is decomposed to SUM+COUNT by the parser (fully incremental).
@@ -546,22 +562,30 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		                                 " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) + "');\n";
 	}
 
-	// Build the clean SQL (written to file for reference/replay)
-	// Order: IVM query → upsert → update timestamps → cleanup
-	// update_timestamp MUST run after upsert so the delta_ts_filter in the upsert
-	// can correctly distinguish current-round vs old delta_view rows.
+	// Crash safety: set flag before the critical section, clear after last_update is set.
+	// If the process crashes between these two points, the next refresh detects the flag
+	// and recovers via full recompute (see check at the top of GenerateRefreshSQL).
+	string set_in_progress = "UPDATE " + string(ivm::VIEWS_TABLE) +
+	                         " SET refresh_in_progress = true WHERE view_name = '" +
+	                         OpenIVMUtils::EscapeValue(view_name) + "';\n";
+	string clear_in_progress = "UPDATE " + string(ivm::VIEWS_TABLE) +
+	                           " SET refresh_in_progress = false WHERE view_name = '" +
+	                           OpenIVMUtils::EscapeValue(view_name) + "';\n";
+
 	// Assembly order:
+	// 0. set_in_progress: mark refresh as in-flight (crash safety)
 	// 1. pre_companion: snapshot old MV state into delta_view (for downstream old→new)
 	// 2. ivm_query: compute delta, INSERT INTO delta_view
 	// 3. companion_query: (AGGREGATE_GROUP) insert false/zero rows for existing groups
 	// 4. upsert_query: apply delta to MV
 	// 5. post_companion: replace IVM delta in delta_view with absolute new MV state
-	// 6. update_timestamp: mark this refresh
-	// 7. delete_from_view: clean old delta_view rows
-	// 8. delete_from_delta: clean old base delta rows
-	string clean_query = pre_companion + ivm_query + "\n" + companion_query + "\n" + upsert_query + "\n" +
-	                     post_companion + update_timestamp_query + "\n" + delete_from_view_query + "\n" + ivm_result +
-	                     "\n" + delete_from_delta_table_query;
+	// 6. update_timestamp: mark this refresh complete
+	// 7. clear_in_progress: crash safety — flag cleared after timestamp is set
+	// 8. delete_from_view: clean old delta_view rows
+	// 9. delete_from_delta: clean old base delta rows
+	string clean_query = set_in_progress + pre_companion + ivm_query + "\n" + companion_query + "\n" + upsert_query +
+	                     "\n" + post_companion + update_timestamp_query + "\n" + clear_in_progress +
+	                     delete_from_view_query + "\n" + ivm_result + "\n" + delete_from_delta_table_query;
 
 	// Write reference SQL to disk only if ivm_files_path is explicitly set
 	Value files_path_val;

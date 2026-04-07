@@ -5,7 +5,7 @@
 require openivm
 
 statement ok
-CREATE TABLE IF NOT EXISTS _duckdb_ivm_views (view_name VARCHAR PRIMARY KEY, sql_string VARCHAR, type TINYINT, last_update TIMESTAMP);
+CREATE TABLE IF NOT EXISTS _duckdb_ivm_views (view_name VARCHAR PRIMARY KEY, sql_string VARCHAR, type TINYINT, has_minmax BOOLEAN DEFAULT false, has_left_join BOOLEAN DEFAULT false, last_update TIMESTAMP, refresh_interval BIGINT DEFAULT NULL, refresh_in_progress BOOLEAN DEFAULT false);
 
 statement ok
 CREATE TABLE IF NOT EXISTS _duckdb_ivm_delta_tables (view_name VARCHAR, table_name VARCHAR, last_update TIMESTAMP, PRIMARY KEY(view_name, table_name));
@@ -35,7 +35,7 @@ statement ok
 CREATE TABLE delta_staff AS SELECT *, true AS _duckdb_ivm_multiplicity, now()::timestamp AS _duckdb_ivm_timestamp FROM staff LIMIT 0;
 
 statement ok
-INSERT INTO _duckdb_ivm_views VALUES ('mv_staff', 'select id, name, dept, salary from staff', 2, now()::timestamp);
+INSERT INTO _duckdb_ivm_views VALUES ('mv_staff', 'select id, name, dept, salary from staff', 2, false, false, now()::timestamp, null, false);
 
 statement ok
 INSERT INTO _duckdb_ivm_delta_tables VALUES ('mv_staff', 'delta_staff', '1970-01-01');

@@ -117,9 +117,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	Connection con(instance);
 
-	// Migration: add refresh_interval column to existing _duckdb_ivm_views tables
+	// Migration: add new columns to existing _duckdb_ivm_views tables
 	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS refresh_interval BIGINT DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS refresh_in_progress BOOLEAN DEFAULT false");
 
 	auto ivm_parser = duckdb::IVMParserExtension();
 

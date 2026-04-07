@@ -352,7 +352,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		ddl.push_back("create table if not exists " + string(ivm::VIEWS_TABLE) +
 		              " (view_name varchar primary key, sql_string varchar, type tinyint,"
 		              " has_minmax boolean default false, has_left_join boolean default false,"
-		              " last_update timestamp, refresh_interval bigint default null)");
+		              " last_update timestamp, refresh_interval bigint default null,"
+		              " refresh_in_progress boolean default false)");
 
 		ddl.push_back("create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
 		              " (view_name varchar, table_name "
@@ -364,7 +365,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
 		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", " +
 		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now(), " +
-		              refresh_val + ")");
+		              refresh_val + ", false)");
 
 		for (const auto &table_name : table_names) {
 			ddl.push_back("insert into " + string(ivm::DELTA_TABLES_TABLE) + " values ('" + view_name + "', '" +
