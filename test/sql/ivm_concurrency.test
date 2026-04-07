@@ -179,3 +179,126 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 4: DROP VIEW while another thread refreshes a different view
+# Both operations should complete without error
+# ==========================================
+
+statement ok
+CREATE TABLE t4a (id INT, val INT);
+
+statement ok
+INSERT INTO t4a SELECT i, i FROM range(1, 101) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_drop_target AS
+    SELECT val, COUNT(*) AS cnt FROM t4a GROUP BY val;
+
+statement ok
+CREATE TABLE t4b (id INT, val INT);
+
+statement ok
+INSERT INTO t4b SELECT i, i FROM range(1, 101) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_keep AS
+    SELECT val, COUNT(*) AS cnt FROM t4b GROUP BY val;
+
+statement ok
+INSERT INTO t4b SELECT i, i FROM range(101, 201) t(i);
+
+concurrentloop threadid 0 2
+
+# Thread 0: refresh mv_keep repeatedly
+onlyif threadid=0
+loop k 0 3
+
+onlyif threadid=0
+statement ok
+PRAGMA ivm('mv_keep');
+
+endloop
+
+# Thread 1: drop mv_drop_target
+onlyif threadid=1
+statement ok
+DROP VIEW mv_drop_target;
+
+endloop
+
+# mv_drop_target should be gone
+statement error
+SELECT * FROM mv_drop_target;
+----
+does not exist
+
+# mv_keep should still be correct
+query I
+SELECT count(*) FROM (
+    SELECT val, cnt FROM mv_keep
+    EXCEPT ALL
+    SELECT val, COUNT(*) AS cnt FROM t4b GROUP BY val
+);
+----
+0
+
+# ==========================================
+# Test 5: Stress test — batch INSERT + DELETE + UPDATE then refresh
+# Multiple threads do conflicting DML, then single-thread refresh
+# ==========================================
+
+statement ok
+CREATE TABLE stress (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO stress SELECT i, 'g' || (i % 5)::VARCHAR, i * 10 FROM range(1, 101) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_stress AS
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt
+    FROM stress GROUP BY grp;
+
+# Batch conflicting DML from multiple threads
+concurrentloop threadid 0 3
+
+loop k 0 3
+
+onlyif threadid=0
+statement ok
+INSERT INTO stress SELECT 1000 + ${k}, 'g0', 100 FROM range(1, 2) t(i);
+
+onlyif threadid=1
+statement ok
+INSERT INTO stress SELECT 2000 + ${k}, 'g1', 200 FROM range(1, 2) t(i);
+
+onlyif threadid=2
+statement ok
+INSERT INTO stress SELECT 3000 + ${k}, 'g2', 300 FROM range(1, 2) t(i);
+
+endloop
+
+endloop
+
+# Single refresh after all DML
+statement ok
+PRAGMA ivm('mv_stress');
+
+# Cross-check
+query I
+SELECT count(*) FROM (
+    SELECT grp, total, cnt FROM mv_stress
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM stress GROUP BY grp
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM stress GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt FROM mv_stress
+);
+----
+0

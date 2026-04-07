@@ -126,3 +126,122 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 7: Crash recovery — refresh_in_progress flag
+# Simulate a crash by manually setting the flag to true.
+# Next refresh should detect it and do a full recompute.
+# ==========================================
+
+statement ok
+CREATE TABLE crash_test (id INT, val INT);
+
+statement ok
+INSERT INTO crash_test SELECT i, i * 10 FROM range(1, 11) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_crash AS
+    SELECT val, COUNT(*) AS cnt FROM crash_test GROUP BY val;
+
+statement ok
+INSERT INTO crash_test SELECT i, i * 10 FROM range(11, 21) t(i);
+
+# Simulate a crash: set the flag without actually refreshing
+statement ok
+UPDATE _duckdb_ivm_views SET refresh_in_progress = true WHERE view_name = 'mv_crash';
+
+# Verify flag is set
+query I
+SELECT refresh_in_progress FROM _duckdb_ivm_views WHERE view_name = 'mv_crash';
+----
+true
+
+# Next refresh should detect the flag and do full recompute
+statement ok
+PRAGMA ivm('mv_crash');
+
+# Flag should be cleared
+query I
+SELECT refresh_in_progress FROM _duckdb_ivm_views WHERE view_name = 'mv_crash';
+----
+false
+
+# MV should be correct (full recompute recovers from any inconsistency)
+query I
+SELECT count(*) FROM (
+    SELECT val, cnt FROM mv_crash
+    EXCEPT ALL
+    SELECT val, COUNT(*) AS cnt FROM crash_test GROUP BY val
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT val, COUNT(*) AS cnt FROM crash_test GROUP BY val
+    EXCEPT ALL
+    SELECT val, cnt FROM mv_crash
+);
+----
+0
+
+# ==========================================
+# Test 8: Normal refresh clears the flag correctly
+# ==========================================
+
+statement ok
+INSERT INTO crash_test SELECT i, i * 10 FROM range(21, 31) t(i);
+
+statement ok
+PRAGMA ivm('mv_crash');
+
+# Flag should be false after a normal refresh
+query I
+SELECT refresh_in_progress FROM _duckdb_ivm_views WHERE view_name = 'mv_crash';
+----
+false
+
+query I
+SELECT count(*) FROM (
+    SELECT val, cnt FROM mv_crash
+    EXCEPT ALL
+    SELECT val, COUNT(*) AS cnt FROM crash_test GROUP BY val
+);
+----
+0
+
+# ==========================================
+# Test 9: ALTER MATERIALIZED VIEW changes interval in metadata
+# ==========================================
+
+statement ok
+ALTER MATERIALIZED VIEW mv_auto SET REFRESH EVERY '10 minutes';
+
+query I
+SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_auto';
+----
+600
+
+statement ok
+ALTER MATERIALIZED VIEW mv_auto SET REFRESH MANUAL;
+
+query I
+SELECT refresh_interval IS NULL FROM _duckdb_ivm_views WHERE view_name = 'mv_auto';
+----
+true
+
+# Manual PRAGMA still works after disabling auto-refresh
+statement ok
+INSERT INTO sales VALUES ('north', 500);
+
+statement ok
+PRAGMA ivm('mv_auto');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM mv_auto
+    EXCEPT ALL
+    SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region
+);
+----
+0

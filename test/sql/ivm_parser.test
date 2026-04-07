@@ -860,3 +860,59 @@ query I
 SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_1min';
 ----
 60
+
+# ==========================================
+# Test 37: ALTER MATERIALIZED VIEW SET REFRESH EVERY
+# ==========================================
+
+statement ok
+ALTER MATERIALIZED VIEW mv_t31_5min SET REFRESH EVERY '10 minutes';
+
+query I
+SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_5min';
+----
+600
+
+# ==========================================
+# Test 38: ALTER MATERIALIZED VIEW SET REFRESH MANUAL
+# ==========================================
+
+statement ok
+ALTER MATERIALIZED VIEW mv_t31_5min SET REFRESH MANUAL;
+
+query I
+SELECT refresh_interval IS NULL FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_5min';
+----
+true
+
+# ==========================================
+# Test 39: ALTER MATERIALIZED VIEW — invalid syntax
+# ==========================================
+
+statement error
+ALTER MATERIALIZED VIEW mv_t31_5min SET REFRESH EVERY 'banana';
+----
+Invalid REFRESH EVERY interval
+
+# ==========================================
+# Test 40: ALTER MATERIALIZED VIEW — IVM still works after interval change
+# ==========================================
+
+statement ok
+ALTER MATERIALIZED VIEW mv_t31_1min SET REFRESH EVERY '2 hours';
+
+query I
+SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t31_1min';
+----
+7200
+
+statement ok
+INSERT INTO t31 VALUES (3, 30);
+
+statement ok
+PRAGMA ivm('mv_t31_1min');
+
+query I
+SELECT count(*) FROM mv_t31_1min;
+----
+3
