@@ -50,6 +50,18 @@ public:
 	// Get all downstream MV dependents in topological order (closest first).
 	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
 	vector<string> GetDownstreamViews(const string &view_name);
+
+	// Get refresh_interval in seconds for a view. Returns -1 if not set (manual only).
+	int64_t GetRefreshInterval(const string &view_name);
+
+	// Get all views with a non-null refresh_interval.
+	// Returns tuples of (view_name, interval_seconds, last_update_timestamp_string).
+	struct ScheduledView {
+		string view_name;
+		int64_t interval_seconds;
+		string last_update;
+	};
+	vector<ScheduledView> GetScheduledViews();
 };
 
 } // namespace duckdb

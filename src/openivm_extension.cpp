@@ -3,6 +3,9 @@
 #include "core/openivm_extension.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_metadata.hpp"
+#include "core/openivm_refresh_daemon.hpp"
+#include "core/openivm_refresh_locks.hpp"
+#include "core/openivm_utils.hpp"
 #include "rules/ivm_column_hider.hpp"
 #include "upsert/openivm_cost_model.hpp"
 #include "upsert/openivm_upsert.hpp"
@@ -29,8 +32,13 @@
 #include "core/openivm_debug.hpp"
 
 #include <map>
+#include <mutex>
 
 namespace duckdb {
+
+// Global daemon instance — started unconditionally at extension load.
+// The daemon sleeps and periodically checks for scheduled views; no work if none exist.
+static shared_ptr<IVMRefreshDaemon> global_daemon;
 
 struct DoIVMData : public GlobalTableFunctionState {
 	DoIVMData() : offset(0) {
@@ -103,6 +111,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("ivm_cascade_refresh", "cascade mode: off, upstream, downstream, or both",
 	                             LogicalType::VARCHAR, Value("downstream"));
+	db_config.AddExtensionOption("ivm_adaptive_backoff",
+	                             "auto-increase refresh interval when refresh takes longer than the interval",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	Connection con(instance);
 
@@ -145,6 +156,58 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "ivm_cross_system", UpsertDeltaQueriesLocked,
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(ivm_cross_system);
+
+	// PRAGMA ivm_status('view_name') — returns refresh status for a materialized view.
+	auto ivm_status = PragmaFunction::PragmaCall(
+	    "ivm_status",
+	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
+		    string view_name = StringValue::Get(parameters.values[0]);
+		    Connection con(*context.db.get());
+		    IVMMetadata metadata(con);
+
+		    auto interval = metadata.GetRefreshInterval(view_name);
+		    string interval_str = interval > 0 ? to_string(interval) : "NULL";
+
+		    // Get the earliest last_update across all delta tables for this view
+		    auto last_update_result = con.Query("SELECT MIN(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+		                                        " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "'");
+		    string last_refresh = "NULL";
+		    string next_refresh = "NULL";
+		    if (!last_update_result->HasError() && last_update_result->RowCount() > 0 &&
+		        !last_update_result->GetValue(0, 0).IsNull()) {
+			    last_refresh = "'" + last_update_result->GetValue(0, 0).ToString() + "'";
+			    if (interval > 0) {
+				    next_refresh = "'" + last_update_result->GetValue(0, 0).ToString() + "'::TIMESTAMP + INTERVAL '" +
+				                   to_string(interval) + " seconds'";
+			    }
+		    }
+
+		    // Check daemon status
+		    string status = "'idle'";
+		    string effective_interval = interval_str;
+		    if (global_daemon) {
+			    if (global_daemon->IsRefreshing(view_name)) {
+				    status = "'refreshing'";
+			    }
+			    auto eff = global_daemon->GetEffectiveInterval(view_name);
+			    if (eff > 0) {
+				    effective_interval = to_string(eff);
+			    }
+		    }
+
+		    return "SELECT '" + OpenIVMUtils::EscapeValue(view_name) + "' AS view_name, " + interval_str +
+		           " AS refresh_interval, " + last_refresh + " AS last_refresh, " + next_refresh +
+		           " AS next_refresh, " + status + " AS status, " + effective_interval + " AS effective_interval;";
+	    },
+	    {LogicalType::VARCHAR});
+	loader.RegisterFunction(ivm_status);
+
+	// Start the refresh daemon. It sleeps and periodically checks for views with
+	// REFRESH EVERY set. If none exist, it just sleeps — negligible overhead.
+	// Non-owning shared_ptr: the daemon holds a weak_ptr and exits when the DB is destroyed.
+	global_daemon = make_shared_ptr<IVMRefreshDaemon>();
+	shared_ptr<DatabaseInstance> db_ptr(&instance, [](DatabaseInstance *) {});
+	global_daemon->Start(db_ptr);
 }
 
 void OpenivmExtension::Load(ExtensionLoader &loader) {

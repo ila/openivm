@@ -125,4 +125,33 @@ vector<string> IVMMetadata::GetDownstreamViews(const string &view_name) {
 	return result; // topological order: closest descendants first
 }
 
+int64_t IVMMetadata::GetRefreshInterval(const string &view_name) {
+	auto result = con.Query("SELECT refresh_interval FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return -1;
+	}
+	return result->GetValue(0, 0).GetValue<int64_t>();
+}
+
+vector<IVMMetadata::ScheduledView> IVMMetadata::GetScheduledViews() {
+	auto result = con.Query("SELECT v.view_name, v.refresh_interval, "
+	                        "(SELECT MIN(d.last_update) FROM " +
+	                        string(ivm::DELTA_TABLES_TABLE) +
+	                        " d WHERE d.view_name = v.view_name) AS last_update "
+	                        "FROM " +
+	                        string(ivm::VIEWS_TABLE) + " v WHERE v.refresh_interval IS NOT NULL");
+	vector<ScheduledView> views;
+	if (!result->HasError()) {
+		for (size_t i = 0; i < result->RowCount(); i++) {
+			ScheduledView sv;
+			sv.view_name = result->GetValue(0, i).ToString();
+			sv.interval_seconds = result->GetValue(1, i).GetValue<int64_t>();
+			sv.last_update = result->GetValue(2, i).IsNull() ? "" : result->GetValue(2, i).ToString();
+			views.push_back(sv);
+		}
+	}
+	return views;
+}
+
 } // namespace duckdb

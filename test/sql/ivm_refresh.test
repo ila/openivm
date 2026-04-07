@@ -1,0 +1,128 @@
+# name: test/sql/ivm_refresh.test
+# description: Test REFRESH EVERY metadata, PRAGMA ivm_status, and manual refresh coexistence
+# group: [sql]
+
+require openivm
+
+statement ok
+SET ivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Test 1: REFRESH EVERY stores interval in metadata
+# ==========================================
+
+statement ok
+CREATE TABLE sales (region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO sales VALUES ('east', 100), ('west', 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_auto REFRESH EVERY '5 minutes' AS
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
+    FROM sales GROUP BY region;
+
+query I
+SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_auto';
+----
+300
+
+# ==========================================
+# Test 2: Manual refresh still works alongside REFRESH EVERY config
+# ==========================================
+
+statement ok
+INSERT INTO sales VALUES ('east', 50);
+
+statement ok
+PRAGMA ivm('mv_auto');
+
+query III
+SELECT region, total, cnt FROM mv_auto ORDER BY region;
+----
+east	150	2
+west	200	1
+
+# Cross-check
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM mv_auto
+    EXCEPT ALL
+    SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region
+);
+----
+0
+
+# ==========================================
+# Test 3: PRAGMA ivm_status returns correct metadata (non-timestamp columns)
+# ==========================================
+
+# ivm_status returns 6 columns; we verify the pragma doesn't error out
+statement ok
+PRAGMA ivm_status('mv_auto');
+
+# ==========================================
+# Test 4: View without REFRESH EVERY has NULL interval
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW mv_manual AS
+    SELECT region, SUM(amount) AS total FROM sales GROUP BY region;
+
+query I
+SELECT refresh_interval IS NULL FROM _duckdb_ivm_views WHERE view_name = 'mv_manual';
+----
+true
+
+statement ok
+PRAGMA ivm_status('mv_manual');
+
+# ==========================================
+# Test 5: Multiple views with different intervals
+# ==========================================
+
+statement ok
+CREATE TABLE orders (id INT, qty INT);
+
+statement ok
+INSERT INTO orders VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_fast REFRESH EVERY '1 minute' AS
+    SELECT SUM(qty) AS total, COUNT(*) AS cnt FROM orders;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_slow REFRESH EVERY '1 hour' AS
+    SELECT id, qty FROM orders;
+
+query II
+SELECT view_name, refresh_interval FROM _duckdb_ivm_views
+    WHERE refresh_interval IS NOT NULL ORDER BY refresh_interval;
+----
+mv_fast	60
+mv_auto	300
+mv_slow	3600
+
+# ==========================================
+# Test 6: Manual PRAGMA ivm on scheduled view works correctly
+# ==========================================
+
+statement ok
+INSERT INTO orders VALUES (3, 30);
+
+statement ok
+PRAGMA ivm('mv_fast');
+
+query II
+SELECT total, cnt FROM mv_fast;
+----
+60	3
+
+query I
+SELECT count(*) FROM (
+    SELECT total, cnt FROM mv_fast
+    EXCEPT ALL
+    SELECT SUM(qty), COUNT(*) FROM orders
+);
+----
+0
