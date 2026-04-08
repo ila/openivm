@@ -154,4 +154,15 @@ vector<IVMMetadata::ScheduledView> IVMMetadata::GetScheduledViews() {
 	return views;
 }
 
+void IVMMetadata::SetRefreshInProgress(const string &view_name, bool in_progress) {
+	con.Query("UPDATE " + string(ivm::VIEWS_TABLE) + " SET refresh_in_progress = " + (in_progress ? "true" : "false") +
+	          " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "'");
+}
+
+string IVMMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key) {
+	return "DELETE FROM " + KeywordHelper::WriteOptionallyQuoted(target) + " WHERE " + string(ivm::TIMESTAMP_COL) +
+	       " < (SELECT MIN(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
+	       OpenIVMUtils::EscapeValue(metadata_key) + "');\n";
+}
+
 } // namespace duckdb

@@ -43,10 +43,7 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
 		if (cross_system) {
 			resolved = attached_catalog + "." + attached_schema + "." + dt;
 		}
-		delta_cleanup += "DELETE FROM " + KeywordHelper::WriteOptionallyQuoted(resolved) + " WHERE " +
-		                 string(ivm::TIMESTAMP_COL) + " < (SELECT min(last_update) FROM " +
-		                 string(ivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) +
-		                 "');\n";
+		delta_cleanup += IVMMetadata::BuildDeltaCleanupSQL(resolved, dt);
 	}
 
 	return query + update_ts + "\n" + delta_cleanup;
@@ -70,9 +67,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		if (result->HasError()) {
 			// Clear the crash-safety flag — this is a SQL error, not a process crash.
 			// Without this, the next refresh would unnecessarily do a full recompute.
-			exec_con.Query("UPDATE " + string(ivm::VIEWS_TABLE) +
-			               " SET refresh_in_progress = false WHERE view_name = '" + OpenIVMUtils::EscapeValue(vn) +
-			               "'");
+			IVMMetadata(exec_con).SetRefreshInProgress(vn, false);
 			throw InternalException("IVM refresh of '" + vn + "' failed: " + result->GetError());
 		}
 	} catch (...) {
@@ -209,7 +204,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	    OnEntryNotFound::THROW_EXCEPTION, error_context);
 	auto index_delta_view_catalog_entry =
 	    Catalog::GetEntry(con_ctx, view_catalog_name, view_schema_name,
-	                      EntryLookupInfo(CatalogType::INDEX_ENTRY, data_table + "_ivm_index", error_context),
+	                      EntryLookupInfo(CatalogType::INDEX_ENTRY, data_table + ivm::INDEX_SUFFIX, error_context),
 	                      OnEntryNotFound::RETURN_NULL);
 	con.Rollback();
 
@@ -231,9 +226,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		if (!flag_result->HasError() && flag_result->RowCount() > 0 && !flag_result->GetValue(0, 0).IsNull() &&
 		    flag_result->GetValue(0, 0).GetValue<bool>()) {
 			Printer::Print("Warning: recovering '" + view_name + "' from interrupted refresh via full recompute.");
-			// Clear the flag and do a full refresh
-			con.Query("UPDATE " + string(ivm::VIEWS_TABLE) + " SET refresh_in_progress = false WHERE view_name = '" +
-			          OpenIVMUtils::EscapeValue(view_name) + "'");
+			metadata.SetRefreshInProgress(view_name, false);
 			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
 			                           attached_db_schema_name);
 		}
@@ -505,7 +498,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			}
 		}
 		// Pre: snapshot old state into temp table
-		string temp_name = "_ivm_old_" + view_name;
+		string temp_name = string(ivm::TEMP_TABLE_PREFIX) + view_name;
 		string qt = KeywordHelper::WriteOptionallyQuoted(temp_name);
 		string qdvn = KeywordHelper::WriteOptionallyQuoted(delta_view_name);
 		string qdt2 = KeywordHelper::WriteOptionallyQuoted(data_table);
@@ -564,13 +557,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	}
 
 	string delete_from_view_query;
-	string qdvn_cleanup = KeywordHelper::WriteOptionallyQuoted(delta_view_name);
 	if (has_downstream) {
-		delete_from_view_query = "DELETE FROM " + qdvn_cleanup + " WHERE " + string(ivm::TIMESTAMP_COL) +
-		                         " < (SELECT min(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                         " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_view_name) + "');";
+		delete_from_view_query = IVMMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name);
 	} else {
-		delete_from_view_query = "DELETE FROM " + qdvn_cleanup + ";";
+		delete_from_view_query = "DELETE FROM " + KeywordHelper::WriteOptionallyQuoted(delta_view_name) + ";";
 	}
 
 	// now we can also delete from the delta table, but only if all the dependent views have been refreshed
@@ -587,9 +577,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		if (cross_system) {
 			resolved = attached_db_catalog_name + "." + attached_db_schema_name + "." + dt;
 		}
-		delete_from_delta_table_query += "DELETE FROM " + resolved + " WHERE " + string(ivm::TIMESTAMP_COL) +
-		                                 " < (SELECT min(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                                 " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) + "');\n";
+		delete_from_delta_table_query += IVMMetadata::BuildDeltaCleanupSQL(resolved, dt);
 	}
 
 	// Crash safety: set flag before the critical section, clear after last_update is set.

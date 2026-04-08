@@ -38,6 +38,14 @@
 
 namespace duckdb {
 
+// Disable PAC extension checks if loaded (prevents PAC from interfering with delta writes).
+static void DisablePACIfLoaded(ClientContext &context, Connection &con) {
+	Value pac_val;
+	if (context.TryGetCurrentSetting("pac_check", pac_val)) {
+		con.Query("SET pac_check = false");
+	}
+}
+
 // Build the data column list from a delta table catalog entry, excluding metadata columns.
 // Returns e.g. "id, name, val" (quoted) — the base table columns only.
 static string BuildDeltaDataColumns(TableCatalogEntry &delta_entry) {
@@ -313,10 +321,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 
 		if (delta_table_catalog_entry) {
 			Connection con(*input.context.db);
-			Value pac_val;
-			if (input.context.TryGetCurrentSetting("pac_check", pac_val)) {
-				con.Query("SET pac_check = false");
-			}
+			DisablePACIfLoaded(input.context, con);
 			IVMMetadata metadata(con);
 			if (metadata.IsBaseTable(insert_table_name)) {
 				string full_delta_table_name = OpenIVMUtils::FullDeltaName(
@@ -405,10 +410,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 			auto full_delta_table_name = OpenIVMUtils::FullDeltaName(
 			    delete_node->table.catalog.GetName(), delete_node->table.schema.name, delete_node->table.name);
 			Connection con(*input.context.db);
-			Value pac_val;
-			if (input.context.TryGetCurrentSetting("pac_check", pac_val)) {
-				con.Query("SET pac_check = false");
-			}
+			DisablePACIfLoaded(input.context, con);
 			IVMMetadata metadata(con);
 			if (metadata.IsBaseTable(delete_table_name)) {
 				auto &delta_entry_del = delta_table_catalog_entry->Cast<TableCatalogEntry>();
@@ -479,10 +481,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 
 		if (delta_table_catalog_entry) {
 			Connection con(*input.context.db);
-			Value pac_val;
-			if (input.context.TryGetCurrentSetting("pac_check", pac_val)) {
-				con.Query("SET pac_check = false");
-			}
+			DisablePACIfLoaded(input.context, con);
 			IVMMetadata metadata(con);
 			if (!metadata.IsBaseTable(update_table_name)) {
 				break;

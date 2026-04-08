@@ -62,6 +62,14 @@ public:
 		string last_update;
 	};
 	vector<ScheduledView> GetScheduledViews();
+
+	// Set/clear the refresh_in_progress flag for crash safety.
+	void SetRefreshInProgress(const string &view_name, bool in_progress);
+
+	// Build SQL to delete old delta rows that all dependent views have already consumed.
+	// target: the (possibly schema-qualified) table to delete from.
+	// metadata_key: the name used in _duckdb_ivm_delta_tables (unqualified delta name).
+	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key);
 };
 
 } // namespace duckdb

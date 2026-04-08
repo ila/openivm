@@ -435,7 +435,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// --- Index DDL (for aggregate group queries) ---
 		if (ivm_type == IVMType::AGGREGATE_GROUP || ivm_type == IVMType::AGGREGATE_HAVING) {
-			string index_query_view = "create unique index " + qdt + "_ivm_index on " + qdt + "(";
+			string index_query_view = "create unique index " + qdt + ivm::INDEX_SUFFIX + " on " + qdt + "(";
 			for (size_t i = 0; i < aggregate_columns.size(); i++) {
 				index_query_view += KeywordHelper::WriteOptionallyQuoted(aggregate_columns[i]);
 				if (i != aggregate_columns.size() - 1) {

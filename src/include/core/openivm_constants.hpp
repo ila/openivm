@@ -26,6 +26,12 @@ constexpr const char *DISTINCT_COUNT_COL = "_ivm_distinct_count";
 constexpr const char *SUM_COL_PREFIX = "_ivm_sum_";
 constexpr const char *COUNT_COL_PREFIX = "_ivm_count_";
 
+// Index suffix for GROUP BY unique index on MV data tables
+constexpr const char *INDEX_SUFFIX = "_ivm_index";
+
+// Temporary table prefix for companion row snapshots
+constexpr const char *TEMP_TABLE_PREFIX = "_ivm_old_";
+
 // Limits
 static constexpr idx_t MAX_JOIN_TABLES = 16;
 
