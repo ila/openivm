@@ -1,0 +1,392 @@
+# name: test/sql/ivm_join_fk.test
+# description: Test FK-aware inclusion-exclusion pruning for IVM joins
+# group: [sql]
+
+require openivm
+
+# ==========================================
+# Star schema: 1 fact table, 2 dimension tables with FKs
+# ==========================================
+
+statement ok
+CREATE TABLE dim_product(product_id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE dim_region(region_id INTEGER PRIMARY KEY, region_name VARCHAR);
+
+statement ok
+CREATE TABLE fact_sales(sale_id INTEGER, product_id INTEGER REFERENCES dim_product(product_id), region_id INTEGER REFERENCES dim_region(region_id), amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO dim_product VALUES (1, 'Widget'), (2, 'Gadget'), (3, 'Doohickey');
+
+statement ok
+INSERT INTO dim_region VALUES (10, 'North'), (20, 'South');
+
+statement ok
+INSERT INTO fact_sales VALUES (1, 1, 10, 100.0), (2, 2, 20, 200.0), (3, 1, 20, 150.0);
+
+statement ok
+CREATE MATERIALIZED VIEW fk_star AS
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f
+    JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id
+    GROUP BY p.name, r.region_name;
+
+# ==========================================
+# Test 1: INSERT into dimension only (insert-only, FK pruning applies)
+# New PK value has no FK references — join with fact produces nothing.
+# ==========================================
+
+statement ok
+INSERT INTO dim_product VALUES (4, 'Thingamajig');
+
+statement ok
+PRAGMA ivm('fk_star');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+    EXCEPT ALL SELECT * FROM fk_star
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM fk_star
+    EXCEPT ALL
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+);
+----
+0
+
+# ==========================================
+# Test 2: INSERT into fact referencing the new dimension value
+# ==========================================
+
+statement ok
+INSERT INTO fact_sales VALUES (4, 4, 10, 300.0);
+
+statement ok
+PRAGMA ivm('fk_star');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+    EXCEPT ALL SELECT * FROM fk_star
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM fk_star
+    EXCEPT ALL
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+);
+----
+0
+
+# Verify the new row appeared
+query II
+SELECT name, region_name FROM fk_star WHERE name = 'Thingamajig';
+----
+Thingamajig	North
+
+# ==========================================
+# Test 3: UPDATE dimension (delete+insert in delta, FK pruning must NOT apply)
+# ==========================================
+
+statement ok
+UPDATE dim_product SET name = 'SuperWidget' WHERE product_id = 1;
+
+statement ok
+PRAGMA ivm('fk_star');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+    EXCEPT ALL SELECT * FROM fk_star
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM fk_star
+    EXCEPT ALL
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+);
+----
+0
+
+# Verify rename propagated
+query I
+SELECT COUNT(*) FROM fk_star WHERE name = 'Widget';
+----
+0
+
+query I
+SELECT COUNT(*) FROM fk_star WHERE name = 'SuperWidget';
+----
+2
+
+# ==========================================
+# Test 4: DELETE from dimension (FK pruning must NOT apply)
+# ==========================================
+
+statement ok
+DELETE FROM fact_sales WHERE product_id = 3;
+
+statement ok
+DELETE FROM dim_product WHERE product_id = 3;
+
+statement ok
+PRAGMA ivm('fk_star');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+    EXCEPT ALL SELECT * FROM fk_star
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM fk_star
+    EXCEPT ALL
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+);
+----
+0
+
+# ==========================================
+# Test 5: Simultaneous fact + dimension inserts (both insert-only)
+# New dim value AND new fact referencing it in the same batch.
+# ==========================================
+
+statement ok
+INSERT INTO dim_region VALUES (30, 'East');
+
+statement ok
+INSERT INTO fact_sales VALUES (5, 2, 30, 500.0);
+
+statement ok
+PRAGMA ivm('fk_star');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+    EXCEPT ALL SELECT * FROM fk_star
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM fk_star
+    EXCEPT ALL
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+);
+----
+0
+
+# Verify new cross-reference appeared
+query II
+SELECT name, region_name FROM fk_star WHERE region_name = 'East';
+----
+Gadget	East
+
+# ==========================================
+# Test 6: Stress — batch of mixed DML on fact + insert-only dims
+# ==========================================
+
+statement ok
+INSERT INTO dim_product VALUES (5, 'Gizmo'), (6, 'Contraption');
+
+statement ok
+INSERT INTO dim_region VALUES (40, 'West');
+
+statement ok
+INSERT INTO fact_sales VALUES
+    (10, 5, 10, 50.0), (11, 5, 20, 75.0), (12, 6, 30, 200.0),
+    (13, 2, 40, 125.0), (14, 4, 40, 350.0);
+
+statement ok
+DELETE FROM fact_sales WHERE sale_id = 2;
+
+statement ok
+UPDATE fact_sales SET amount = 999.0 WHERE sale_id = 1;
+
+statement ok
+PRAGMA ivm('fk_star');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+    EXCEPT ALL SELECT * FROM fk_star
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM fk_star
+    EXCEPT ALL
+    SELECT p.name, r.region_name, SUM(f.amount) as total, COUNT(*) as cnt
+    FROM fact_sales f JOIN dim_product p ON f.product_id = p.product_id
+    JOIN dim_region r ON f.region_id = r.region_id GROUP BY p.name, r.region_name
+);
+----
+0
+
+# ==========================================
+# Test 7: 2-table join with FK (simpler case)
+# ==========================================
+
+statement ok
+CREATE TABLE departments(dept_id INTEGER PRIMARY KEY, dept_name VARCHAR);
+
+statement ok
+CREATE TABLE employees(emp_id INTEGER, dept_id INTEGER REFERENCES departments(dept_id), salary INTEGER);
+
+statement ok
+INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Sales');
+
+statement ok
+INSERT INTO employees VALUES (1, 1, 100000), (2, 1, 120000), (3, 2, 80000);
+
+statement ok
+CREATE MATERIALIZED VIEW dept_costs AS
+    SELECT d.dept_name, SUM(e.salary) as total_salary, COUNT(*) as headcount
+    FROM employees e JOIN departments d ON e.dept_id = d.dept_id
+    GROUP BY d.dept_name;
+
+# Insert-only dimension change — FK pruning should apply
+statement ok
+INSERT INTO departments VALUES (3, 'Marketing');
+
+statement ok
+PRAGMA ivm('dept_costs');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT d.dept_name, SUM(e.salary) as total_salary, COUNT(*) as headcount
+    FROM employees e JOIN departments d ON e.dept_id = d.dept_id GROUP BY d.dept_name
+    EXCEPT ALL SELECT * FROM dept_costs
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM dept_costs
+    EXCEPT ALL
+    SELECT d.dept_name, SUM(e.salary) as total_salary, COUNT(*) as headcount
+    FROM employees e JOIN departments d ON e.dept_id = d.dept_id GROUP BY d.dept_name
+);
+----
+0
+
+# Now insert an employee in the new department
+statement ok
+INSERT INTO employees VALUES (4, 3, 90000);
+
+statement ok
+PRAGMA ivm('dept_costs');
+
+query III
+SELECT * FROM dept_costs ORDER BY dept_name;
+----
+Engineering	220000	2
+Marketing	90000	1
+Sales	80000	1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT d.dept_name, SUM(e.salary) as total_salary, COUNT(*) as headcount
+    FROM employees e JOIN departments d ON e.dept_id = d.dept_id GROUP BY d.dept_name
+    EXCEPT ALL SELECT * FROM dept_costs
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM dept_costs
+    EXCEPT ALL
+    SELECT d.dept_name, SUM(e.salary) as total_salary, COUNT(*) as headcount
+    FROM employees e JOIN departments d ON e.dept_id = d.dept_id GROUP BY d.dept_name
+);
+----
+0
+
+# ==========================================
+# Test 8: Join WITHOUT FK — no pruning, still correct
+# ==========================================
+
+statement ok
+CREATE TABLE t_left(a INTEGER, b INTEGER);
+
+statement ok
+CREATE TABLE t_right(b INTEGER, c INTEGER);
+
+statement ok
+INSERT INTO t_left VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO t_right VALUES (10, 100), (20, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_no_fk AS SELECT t_left.a, t_right.c FROM t_left JOIN t_right ON t_left.b = t_right.b;
+
+statement ok
+INSERT INTO t_right VALUES (30, 300);
+
+statement ok
+INSERT INTO t_left VALUES (3, 30);
+
+statement ok
+PRAGMA ivm('mv_no_fk');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT t_left.a, t_right.c FROM t_left JOIN t_right ON t_left.b = t_right.b
+    EXCEPT ALL SELECT * FROM mv_no_fk
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_no_fk
+    EXCEPT ALL
+    SELECT t_left.a, t_right.c FROM t_left JOIN t_right ON t_left.b = t_right.b
+);
+----
+0

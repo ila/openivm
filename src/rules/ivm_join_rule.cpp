@@ -2,7 +2,12 @@
 #include "rules/openivm_rewrite_rule.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/openivm_utils.hpp"
 #include "upsert/openivm_index_regen.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/parser/constraint.hpp"
+#include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -49,6 +54,22 @@ void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLe
 	} else {
 		leaves.push_back({path, nullptr, node, is_right_of_left});
 	}
+}
+
+/// Walk down a single-child subtree to find the underlying LogicalGet (if any).
+/// Join leaves may be wrapped in projections or filters by the optimizer.
+LogicalGet *FindGetInSubtree(LogicalOperator *node) {
+	while (node) {
+		if (node->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+			return dynamic_cast<LogicalGet *>(node);
+		}
+		if (node->children.size() == 1) {
+			node = node->children[0].get();
+		} else {
+			break;
+		}
+	}
+	return nullptr;
 }
 
 unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, const vector<size_t> &path) {
@@ -123,6 +144,133 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 namespace duckdb {
 
 // ============================================================================
+// FK-aware term pruning: detect which inclusion-exclusion terms are redundant
+// ============================================================================
+
+/// For each leaf, check if its delta table is insert-only (no multiplicity=false rows).
+/// Returns a bitmask where bit i = 1 means leaf i's delta has no deletes (insert-only or empty).
+static uint64_t DetectInsertOnlyDeltas(ClientContext &context, const string &view_name,
+                                       const vector<JoinLeafInfo> &leaves) {
+	uint64_t insert_only_mask = 0;
+	Connection con(*context.db);
+	con.SetAutoCommit(false);
+
+	for (size_t i = 0; i < leaves.size(); i++) {
+		LogicalGet *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+		if (!get) {
+			continue;
+		}
+		auto table_ref = get->GetTable();
+		if (table_ref.get() == nullptr) {
+			continue;
+		}
+		string delta_name = OpenIVMUtils::DeltaName(table_ref.get()->name);
+
+		// Get last_update timestamp for this view+table pair
+		auto ts_result = con.Query("SELECT last_update FROM " + string(ivm::DELTA_TABLES_TABLE) +
+		                           " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+		                           "' AND table_name = '" + OpenIVMUtils::EscapeValue(delta_name) + "'");
+		if (ts_result->HasError() || ts_result->RowCount() == 0) {
+			continue;
+		}
+		string last_update = ts_result->GetValue(0, 0).ToString();
+
+		// Check for any delete rows (multiplicity = false) since last_update
+		auto result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(delta_name) + " WHERE " +
+		                        string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(last_update) +
+		                        "'::TIMESTAMP AND " + string(ivm::MULTIPLICITY_COL) + " = false");
+		if (!result->HasError() && result->GetValue(0, 0).GetValue<int64_t>() == 0) {
+			insert_only_mask |= (1ULL << i);
+			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (%s) has insert-only delta\n", i,
+			                    table_ref.get()->name.c_str());
+		}
+	}
+	return insert_only_mask;
+}
+
+/// Build a set of FK relationships between join leaves.
+/// Returns pairs (fk_leaf_idx, pk_leaf_idx) where leaf fk_leaf_idx has a FK referencing leaf pk_leaf_idx,
+/// AND the join condition between them uses the FK/PK columns.
+struct FKRelation {
+	size_t fk_leaf; // leaf index of the referencing (FK) table
+	size_t pk_leaf; // leaf index of the referenced (PK) table
+};
+
+static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector<JoinLeafInfo> &leaves,
+                                            LogicalOperator *join_root) {
+	vector<FKRelation> relations;
+
+	// Build map: table_name -> leaf index (for matching FK targets to leaves)
+	unordered_map<string, size_t> table_to_leaf;
+	for (size_t i = 0; i < leaves.size(); i++) {
+		LogicalGet *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+		if (!get) {
+			continue;
+		}
+		auto table_ref = get->GetTable();
+		if (table_ref.get() == nullptr) {
+			continue;
+		}
+		table_to_leaf[table_ref.get()->name] = i;
+	}
+
+	// For each leaf, check its constraints for FK references to other leaves
+	for (size_t i = 0; i < leaves.size(); i++) {
+		LogicalGet *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+		if (!get) {
+			continue;
+		}
+		auto table_ref = get->GetTable();
+		if (table_ref.get() == nullptr) {
+			continue;
+		}
+
+		auto &constraints = table_ref->Cast<TableCatalogEntry>().GetConstraints();
+		for (auto &constraint : constraints) {
+			if (constraint->type != ConstraintType::FOREIGN_KEY) {
+				continue;
+			}
+			auto &fk = constraint->Cast<ForeignKeyConstraint>();
+			// FK_TYPE_FOREIGN_KEY_TABLE means this table is the referencing side
+			if (fk.info.type != ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE) {
+				continue;
+			}
+			// Check if the referenced table is also a leaf in this join
+			auto it = table_to_leaf.find(fk.info.table);
+			if (it == table_to_leaf.end()) {
+				continue;
+			}
+			size_t pk_leaf = it->second;
+			relations.push_back({i, pk_leaf});
+			OPENIVM_DEBUG_PRINT("[IvmJoinRule] FK relation: leaf %zu (%s) -> leaf %zu (%s)\n", i,
+			                    table_ref.get()->name.c_str(), pk_leaf, fk.info.table.c_str());
+		}
+	}
+	return relations;
+}
+
+/// Compute a bitmask of PK leaves whose delta terms can be skipped entirely.
+///
+/// For FK relation (fk_leaf -> pk_leaf): when pk_leaf's delta is insert-only, ALL terms
+/// that have pk_leaf's bit set produce zero net contribution. This is because the terms
+/// with the PK bit cancel algebraically via XOR:
+///
+///   Term {PK}:        R_current ⋈ ΔS⁺ = (R_old + ΔR) ⋈ ΔS⁺ = R_old⋈ΔS⁺ + ΔR⋈ΔS⁺
+///   Term {FK,PK}:     ΔR ⋈ ΔS⁺ with XOR sign (= -1)         = -ΔR⋈ΔS⁺
+///   Net:              R_old ⋈ ΔS⁺ = ∅  (FK integrity: no old FK row references new PKs)
+///
+/// Works regardless of whether ΔR is empty or not — the ΔR⋈ΔS⁺ parts cancel exactly.
+static uint64_t ComputeSkipBits(const vector<FKRelation> &fk_relations, uint64_t insert_only_mask) {
+	uint64_t skip_bits = 0;
+	for (auto &fk : fk_relations) {
+		if (insert_only_mask & (1ULL << fk.pk_leaf)) {
+			skip_bits |= (1ULL << fk.pk_leaf);
+		}
+	}
+	return skip_bits;
+}
+
+// ============================================================================
 // BuildInclusionExclusionTerms: create 2^N - 1 delta terms
 // ============================================================================
 static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrapper &pw, ClientContext &context,
@@ -132,8 +280,26 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
-	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building %lu inclusion-exclusion terms\n", (unsigned long)((1ULL << N) - 1));
+	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
+	auto fk_relations = DetectFKRelations(context, leaves, pw.plan.get());
+	uint64_t skip_bits = 0;
+	if (!fk_relations.empty()) {
+		uint64_t insert_only_mask = DetectInsertOnlyDeltas(context, pw.view, leaves);
+		skip_bits = ComputeSkipBits(fk_relations, insert_only_mask);
+	}
+
+	uint64_t pruned_count = 0;
+	uint64_t total_terms = (1ULL << N) - 1;
+	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building inclusion-exclusion terms (%lu total, %zu FK relations)\n",
+	                    (unsigned long)total_terms, fk_relations.size());
 	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
+		// FK pruning: skip any term whose mask overlaps with insert-only PK leaves.
+		// All such terms cancel algebraically via XOR (see ComputeSkipBits).
+		if (skip_bits && (mask & skip_bits)) {
+			pruned_count++;
+			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Pruned term mask=%lu (FK insert-only PK)\n", (unsigned long)mask);
+			continue;
+		}
 		auto term = pw.plan->Copy(context);
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);
@@ -204,6 +370,10 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 		projection->children.push_back(std::move(term));
 		projection->ResolveOperatorTypes();
 		terms.push_back(std::move(projection));
+	}
+	if (pruned_count > 0) {
+		OPENIVM_DEBUG_PRINT("[IvmJoinRule] FK pruning: %lu/%lu terms pruned, %lu remaining\n",
+		                    (unsigned long)pruned_count, (unsigned long)total_terms, (unsigned long)terms.size());
 	}
 	return terms;
 }
