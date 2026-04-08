@@ -47,10 +47,19 @@ struct TableStats {
 	double delta_card; // |ΔT|
 };
 
-/// Collect all base table GET nodes from the plan tree.
-static void CollectTableStats(ClientContext &context, Connection &con, LogicalOperator &op, const string &view_name,
-                              vector<TableStats> &stats) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+/// Aggregated plan statistics collected in a single tree walk.
+struct PlanStats {
+	vector<TableStats> table_stats;
+	idx_t join_leaf_count = 0;
+	bool has_join = false;
+	bool has_aggregate = false;
+};
+
+/// Walk the plan tree once, collecting table stats, join info, and aggregate presence.
+static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, LogicalOperator &op,
+                                      const string &view_name, PlanStats &stats) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET: {
 		auto &get = op.Cast<LogicalGet>();
 		if (get.GetTable().get() != nullptr) {
 			TableStats ts;
@@ -58,70 +67,37 @@ static void CollectTableStats(ClientContext &context, Connection &con, LogicalOp
 			ts.delta_table_name = OpenIVMUtils::DeltaName(ts.table_name);
 			ts.base_card = static_cast<double>(get.EstimateCardinality(context));
 			if (ts.base_card == 0) {
-				ts.base_card = 1; // avoid division by zero
+				ts.base_card = 1;
 			}
 			ts.delta_card = GetDeltaRowCount(con, ts.delta_table_name, view_name);
-			stats.push_back(ts);
+			stats.table_stats.push_back(ts);
 		}
+		stats.join_leaf_count++;
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_JOIN:
+		stats.has_join = true;
+		break;
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		stats.has_aggregate = true;
+		break;
+	default:
+		break;
 	}
 	for (auto &child : op.children) {
-		CollectTableStats(context, con, *child, view_name, stats);
+		CollectPlanStatsRecursive(context, con, *child, view_name, stats);
 	}
-}
-
-/// Count join nodes in the plan tree.
-static idx_t CountJoinLeaves(LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		return 1;
-	}
-	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		idx_t count = 0;
-		for (auto &child : op.children) {
-			count += CountJoinLeaves(*child);
-		}
-		return count;
-	}
-	// For other operators (filter, projection, etc.), recurse into children
-	idx_t count = 0;
-	for (auto &child : op.children) {
-		count += CountJoinLeaves(*child);
-	}
-	return count;
-}
-
-/// Check if the plan contains a join operator.
-static bool HasJoin(LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_JOIN) {
-		return true;
-	}
-	for (auto &child : op.children) {
-		if (HasJoin(*child)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-/// Check if the plan contains an aggregate operator.
-static bool HasAggregate(LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		return true;
-	}
-	for (auto &child : op.children) {
-		if (HasAggregate(*child)) {
-			return true;
-		}
-	}
-	return false;
 }
 
 IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name) {
 	// Single connection for all cardinality queries
 	Connection con(*context.db);
-	// 1. Collect table statistics
-	vector<TableStats> table_stats;
-	CollectTableStats(context, con, plan, view_name, table_stats);
+	// 1. Collect all plan statistics in one tree walk
+	PlanStats plan_stats;
+	CollectPlanStatsRecursive(context, con, plan, view_name, plan_stats);
 
+	auto &table_stats = plan_stats.table_stats;
 	size_t N = table_stats.size();
 	if (N == 0) {
 		// No base tables found — shouldn't happen, but default to IVM
@@ -141,8 +117,8 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		mv_card = 1;
 	}
 
-	bool has_join = HasJoin(plan);
-	bool has_aggregate = HasAggregate(plan);
+	bool has_join = plan_stats.has_join;
+	bool has_aggregate = plan_stats.has_aggregate;
 
 	// 3. Estimate IVM cost
 	//
@@ -160,7 +136,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	double estimated_delta_result;
 
 	if (has_join) {
-		idx_t join_leaves = CountJoinLeaves(plan);
+		idx_t join_leaves = plan_stats.join_leaf_count;
 		double scan_multiplier = static_cast<double>(1ULL << (join_leaves - 1)); // 2^(N-1)
 
 		ivm_compute = scan_multiplier * total_base_scan;

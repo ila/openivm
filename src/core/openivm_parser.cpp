@@ -9,21 +9,14 @@
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
-#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/planner/operator/logical_distinct.hpp"
-#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/planner.hpp"
 
 #include "core/openivm_debug.hpp"
 
 #include <regex>
-#include <stack>
-#include <duckdb/planner/expression/bound_function_expression.hpp>
 
 namespace duckdb {
 
@@ -257,98 +250,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		OPENIVM_DEBUG_PRINT("[CREATE MV] View query: %s\n", view_query.c_str());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Logical plan:\n%s\n", plan->ToString().c_str());
 
-		// Check if the plan is fully IVM-compatible
-		bool ivm_compatible = ValidateIVMPlan(plan.get());
-
-		std::stack<LogicalOperator *> node_stack;
-		node_stack.push(plan.get());
-
-		bool found_aggregation = false;
-		bool found_projection = false;
-		bool found_distinct = false;
-		bool found_having = false;
-		bool found_minmax = false;
-		bool found_left_join = false;
-		vector<string> aggregate_columns;
-
-		while (!node_stack.empty()) {
-			auto current = node_stack.top();
-			node_stack.pop();
-
-			if (current->type == LogicalOperatorType::LOGICAL_DISTINCT) {
-				found_distinct = true;
-				// DISTINCT columns become group-by keys after IVM rewrite
-				auto *distinct_node = dynamic_cast<LogicalDistinct *>(current);
-				if (!distinct_node->distinct_targets.empty()) {
-					for (auto &target : distinct_node->distinct_targets) {
-						aggregate_columns.emplace_back(target->GetName());
-					}
-				} else {
-					// Plain DISTINCT: all child output columns are keys
-					auto child_bindings = current->children[0]->GetColumnBindings();
-					for (idx_t i = 0; i < current->children[0]->types.size(); i++) {
-						aggregate_columns.emplace_back("col" + to_string(i));
-					}
-				}
-			} else if (current->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-				found_aggregation = true;
-				auto node = dynamic_cast<LogicalAggregate *>(current);
-				// Detect MIN/MAX aggregates
-				for (auto &expr : node->expressions) {
-					if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
-						auto &agg = expr->Cast<BoundAggregateExpression>();
-						if (agg.function.name == "min" || agg.function.name == "max") {
-							found_minmax = true;
-						}
-					}
-				}
-				for (auto &group : node->groups) {
-					if (group->type == ExpressionType::BOUND_COLUMN_REF) {
-						auto column = dynamic_cast<BoundColumnRefExpression *>(group.get());
-						aggregate_columns.emplace_back(column->alias);
-					} else if (group->type == ExpressionType::BOUND_FUNCTION) {
-						auto column = dynamic_cast<BoundFunctionExpression *>(group.get());
-						// Use alias if available (e.g., ABS(val) AS abs_val → use "abs_val").
-						// GROUP BY expressions don't carry aliases — check the alias field anyway,
-						// then fall back to the return_type column name from the output.
-						if (!column->alias.empty()) {
-							aggregate_columns.emplace_back(column->alias);
-						} else {
-							// The output column name for this expression comes from the AS clause.
-							// Use GetName() but sanitize: "abs(val)" → quoted identifier.
-							auto function = column->GetName();
-							function = StringUtil::Replace(function, "\"", "\"\"");
-							function = "\"" + function + "\"";
-							aggregate_columns.emplace_back(function);
-						}
-					}
-				}
-			}
-
-			if (current->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-				found_projection = true;
-			}
-
-			// Detect HAVING: a FILTER above an AGGREGATE
-			if (current->type == LogicalOperatorType::LOGICAL_FILTER && !current->children.empty() &&
-			    current->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-				found_having = true;
-			}
-
-			// Detect LEFT/RIGHT JOIN
-			if (current->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-				auto *join = dynamic_cast<LogicalComparisonJoin *>(current);
-				if (join && (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT)) {
-					found_left_join = true;
-				}
-			}
-
-			if (!current->children.empty()) {
-				for (auto it = current->children.rbegin(); it != current->children.rend(); ++it) {
-					node_stack.push(it->get());
-				}
-			}
-		}
+		// Single-pass plan analysis: validates IVM compatibility AND extracts metadata
+		auto analysis = AnalyzePlan(plan.get());
+		bool ivm_compatible = analysis.ivm_compatible;
+		bool found_aggregation = analysis.found_aggregation;
+		bool found_projection = analysis.found_projection;
+		bool found_distinct = analysis.found_distinct;
+		bool found_having = analysis.found_having;
+		bool found_minmax = analysis.found_minmax;
+		bool found_left_join = analysis.found_left_join;
+		auto aggregate_columns = std::move(analysis.aggregate_columns);
 
 		// Fix expression-based group-by column names: the plan walk may extract
 		// "abs(val)" but the MV table column is "abs_val" (from the AS alias).
@@ -415,6 +326,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " has_minmax boolean default false, has_left_join boolean default false,"
 		              " last_update timestamp, refresh_interval bigint default null,"
 		              " refresh_in_progress boolean default false)");
+
+		// Refresh hooks: extensions can register custom SQL to run on MV refresh
+		// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
+		ddl.push_back("create table if not exists _duckdb_ivm_refresh_hooks"
+		              " (view_name varchar primary key, hook_sql varchar not null,"
+		              " mode varchar not null default 'after')");
 
 		ddl.push_back("create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
 		              " (view_name varchar, table_name "

@@ -137,9 +137,40 @@ void IVMRefreshDaemon::Run() {
 
 				try {
 					Connection refresh_con(*db_);
-					auto result = refresh_con.Query("PRAGMA ivm('" + OpenIVMUtils::EscapeValue(sv.view_name) + "')");
-					if (result->HasError()) {
-						Printer::Print("Warning: auto-refresh of '" + sv.view_name + "' failed: " + result->GetError());
+
+					// Check for refresh hooks
+					auto hook_r =
+					    refresh_con.Query("SELECT hook_sql, mode FROM _duckdb_ivm_refresh_hooks WHERE view_name = '" +
+					                      OpenIVMUtils::EscapeValue(sv.view_name) + "'");
+					string hook_sql;
+					string hook_mode;
+					if (!hook_r->HasError() && hook_r->RowCount() > 0) {
+						hook_sql = hook_r->GetValue(0, 0).ToString();
+						hook_mode = StringUtil::Lower(hook_r->GetValue(1, 0).ToString());
+					}
+
+					if (!hook_sql.empty() && hook_mode == "before") {
+						auto hr = refresh_con.Query(hook_sql);
+						if (hr->HasError()) {
+							Printer::Print("Warning: before-hook for '" + sv.view_name + "' failed: " + hr->GetError());
+						}
+					}
+
+					if (hook_mode != "replace") {
+						auto result =
+						    refresh_con.Query("PRAGMA ivm('" + OpenIVMUtils::EscapeValue(sv.view_name) + "')");
+						if (result->HasError()) {
+							Printer::Print("Warning: auto-refresh of '" + sv.view_name +
+							               "' failed: " + result->GetError());
+						}
+					}
+
+					if (!hook_sql.empty() && (hook_mode == "after" || hook_mode == "replace")) {
+						auto hr = refresh_con.Query(hook_sql);
+						if (hr->HasError()) {
+							Printer::Print("Warning: " + hook_mode + "-hook for '" + sv.view_name +
+							               "' failed: " + hr->GetError());
+						}
 					}
 				} catch (std::exception &e) {
 					Printer::Print("Warning: auto-refresh of '" + sv.view_name + "' failed: " + string(e.what()));
