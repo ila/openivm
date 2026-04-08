@@ -152,9 +152,36 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		}
 	}
 
-	// Refresh the target view
-	RefreshViewLocked(context, view_catalog_name, view_schema_name, view_name, cross_system, attached_db_catalog_name,
-	                  attached_db_schema_name);
+	// Check for refresh hooks (custom SQL to run before/after/instead of IVM)
+	string hook_sql;
+	string hook_mode;
+	{
+		auto hook_r = con.Query("SELECT hook_sql, mode FROM _duckdb_ivm_refresh_hooks WHERE view_name = '" +
+		                        OpenIVMUtils::EscapeValue(view_name) + "'");
+		if (!hook_r->HasError() && hook_r->RowCount() > 0) {
+			hook_sql = hook_r->GetValue(0, 0).ToString();
+			hook_mode = StringUtil::Lower(hook_r->GetValue(1, 0).ToString());
+		}
+	}
+
+	if (!hook_sql.empty() && hook_mode == "before") {
+		auto hr = con.Query(hook_sql);
+		if (hr->HasError()) {
+			Printer::Print("Warning: before-hook for '" + view_name + "' failed: " + hr->GetError());
+		}
+	}
+
+	if (hook_mode != "replace") {
+		RefreshViewLocked(context, view_catalog_name, view_schema_name, view_name, cross_system,
+		                  attached_db_catalog_name, attached_db_schema_name);
+	}
+
+	if (!hook_sql.empty() && (hook_mode == "after" || hook_mode == "replace")) {
+		auto hr = con.Query(hook_sql);
+		if (hr->HasError()) {
+			Printer::Print("Warning: " + hook_mode + "-hook for '" + view_name + "' failed: " + hr->GetError());
+		}
+	}
 
 	// Downstream cascade: refresh dependents after
 	if (cascade_mode == "downstream" || cascade_mode == "both") {

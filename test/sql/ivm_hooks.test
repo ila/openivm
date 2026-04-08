@@ -1,0 +1,136 @@
+# name: test/sql/ivm_hooks.test
+# description: Test refresh hooks (custom SQL on MV refresh)
+# group: [sql]
+
+require openivm
+
+# ============================================================
+# Setup
+# ============================================================
+
+statement ok
+CREATE TABLE t (id INT, val INT);
+
+statement ok
+CREATE MATERIALIZED VIEW mv AS SELECT SUM(val) AS total FROM t;
+
+statement ok
+INSERT INTO t VALUES (1, 100);
+
+statement ok
+PRAGMA ivm('mv');
+
+query I
+SELECT total FROM mv;
+----
+100
+
+# ============================================================
+# Test 1: After-hook (runs after IVM refresh)
+# ============================================================
+
+# Create a log table to verify hooks run
+statement ok
+CREATE TABLE hook_log (msg VARCHAR);
+
+statement ok
+INSERT INTO _duckdb_ivm_refresh_hooks VALUES ('mv', 'INSERT INTO hook_log VALUES(''after-hook ran'')', 'after');
+
+statement ok
+INSERT INTO t VALUES (2, 200);
+
+statement ok
+PRAGMA ivm('mv');
+
+# MV should be updated
+query I
+SELECT total FROM mv;
+----
+300
+
+# Hook should have run
+query I
+SELECT msg FROM hook_log;
+----
+after-hook ran
+
+# ============================================================
+# Test 2: Before-hook
+# ============================================================
+
+statement ok
+DELETE FROM hook_log;
+
+statement ok
+UPDATE _duckdb_ivm_refresh_hooks SET hook_sql = 'INSERT INTO hook_log VALUES(''before-hook ran'')', mode = 'before' WHERE view_name = 'mv';
+
+statement ok
+INSERT INTO t VALUES (3, 300);
+
+statement ok
+PRAGMA ivm('mv');
+
+# MV updated (IVM still runs)
+query I
+SELECT total FROM mv;
+----
+600
+
+# Hook ran
+query I
+SELECT msg FROM hook_log;
+----
+before-hook ran
+
+# ============================================================
+# Test 3: Replace-hook (runs INSTEAD of IVM)
+# ============================================================
+
+statement ok
+DELETE FROM hook_log;
+
+statement ok
+UPDATE _duckdb_ivm_refresh_hooks SET hook_sql = 'INSERT INTO hook_log VALUES(''replace-hook ran'')', mode = 'replace' WHERE view_name = 'mv';
+
+statement ok
+INSERT INTO t VALUES (4, 400);
+
+statement ok
+PRAGMA ivm('mv');
+
+# MV should NOT be updated (IVM was replaced)
+query I
+SELECT total FROM mv;
+----
+600
+
+# Hook ran instead
+query I
+SELECT msg FROM hook_log;
+----
+replace-hook ran
+
+# ============================================================
+# Test 4: No hook (default behavior)
+# ============================================================
+
+statement ok
+DELETE FROM _duckdb_ivm_refresh_hooks WHERE view_name = 'mv';
+
+statement ok
+DELETE FROM hook_log;
+
+statement ok
+PRAGMA ivm('mv');
+
+# MV should now be updated (hook removed, IVM runs normally)
+query I
+SELECT total FROM mv;
+----
+1000
+
+# No hook logged
+query I
+SELECT COUNT(*) FROM hook_log;
+----
+0
