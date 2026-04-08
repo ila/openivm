@@ -38,6 +38,7 @@
 
 namespace duckdb {
 
+// TODO: Remove PAC coupling — delta writes should not need to know about PAC.
 // Disable PAC extension checks if loaded (prevents PAC from interfering with delta writes).
 static void DisablePACIfLoaded(ClientContext &context, Connection &con) {
 	Value pac_val;

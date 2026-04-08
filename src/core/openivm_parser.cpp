@@ -153,6 +153,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			return result;
 		}
 
+		// TODO: Remove PAC coupling — IVM should not need to forward PAC settings.
 		// Check if PAC extension is loaded (needed later for delta table queries).
 		// If so, forward PAC settings to the internal connection so that PAC
 		// compilation (noise, seeds, etc.) behaves the same as the user's session.
