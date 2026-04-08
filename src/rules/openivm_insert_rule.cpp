@@ -14,6 +14,7 @@
 #include "duckdb/function/table/read_csv.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
@@ -36,6 +37,35 @@
 #include <map>
 
 namespace duckdb {
+
+// Build the data column list from a delta table catalog entry, excluding metadata columns.
+// Returns e.g. "id, name, val" (quoted) — the base table columns only.
+static string BuildDeltaDataColumns(TableCatalogEntry &delta_entry) {
+	string cols;
+	for (auto &col : delta_entry.GetColumns().Logical()) {
+		if (col.GetName() == ivm::MULTIPLICITY_COL || col.GetName() == ivm::TIMESTAMP_COL) {
+			continue;
+		}
+		if (!cols.empty()) {
+			cols += ", ";
+		}
+		cols += KeywordHelper::WriteOptionallyQuoted(col.GetName());
+	}
+	return cols;
+}
+
+// Build "INSERT INTO delta_t (col1, col2, ..., mul, ts)" prefix for delta writes.
+static string BuildDeltaInsertPrefix(const string &full_delta_table_name, TableCatalogEntry &delta_entry) {
+	string col_list = BuildDeltaDataColumns(delta_entry);
+	return "INSERT INTO " + full_delta_table_name + " (" + col_list + ", " + string(ivm::MULTIPLICITY_COL) + ", " +
+	       string(ivm::TIMESTAMP_COL) + ")";
+}
+
+// Build "SELECT col1, col2, ..., <mul_val>, now()::timestamp FROM <source>" for delta writes.
+static string BuildDeltaSelectFrom(TableCatalogEntry &delta_entry, const string &mul_val, const string &source) {
+	string cols = BuildDeltaDataColumns(delta_entry);
+	return "SELECT " + cols + ", " + mul_val + ", now()::timestamp FROM " + source;
+}
 
 IVMInsertRule::IVMInsertRule() {
 	optimize_function = IVMInsertRuleFunction;
@@ -125,6 +155,139 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		return;
 	}
 
+	// Handle ALTER TABLE: sync delta table schema or block if referenced column is affected
+	if (root->type == LogicalOperatorType::LOGICAL_ALTER) {
+		auto *simple = dynamic_cast<LogicalSimple *>(root);
+		if (!simple) {
+			return;
+		}
+		auto *alter_info = dynamic_cast<AlterTableInfo *>(simple->info.get());
+		if (!alter_info) {
+			return;
+		}
+
+		string table_name = alter_info->name;
+		string delta_name = OpenIVMUtils::DeltaName(table_name);
+		string qdelta = KeywordHelper::WriteOptionallyQuoted(delta_name);
+
+		Connection con(*input.context.db);
+		// Check if a delta table exists for this base table (i.e., it's tracked by IVM)
+		auto delta_check = con.Query("SELECT 1 FROM information_schema.tables WHERE table_name = '" +
+		                             OpenIVMUtils::EscapeValue(delta_name) + "'");
+		if (delta_check->HasError() || delta_check->RowCount() == 0) {
+			return; // not an IVM-tracked table
+		}
+
+		// Helper: check if a column is referenced by any MV that depends on this base table.
+		// Plans each MV's stored query and walks LOGICAL_GET nodes for the target table.
+		auto column_referenced_by_mv = [&](const string &col_name) -> string {
+			IVMMetadata metadata(con);
+			auto mvs = con.Query("SELECT DISTINCT d.view_name FROM " + string(ivm::DELTA_TABLES_TABLE) +
+			                     " d WHERE d.table_name = '" + OpenIVMUtils::EscapeValue(delta_name) + "'");
+			if (mvs->HasError()) {
+				return "";
+			}
+			for (size_t i = 0; i < mvs->RowCount(); i++) {
+				string view_name = mvs->GetValue(0, i).ToString();
+				string sql = metadata.GetViewQuery(view_name);
+				if (sql.empty()) {
+					continue;
+				}
+				try {
+					con.BeginTransaction();
+					Parser p;
+					p.ParseQuery(sql);
+					Planner planner(*con.context);
+					planner.CreatePlan(p.statements[0]->Copy());
+					auto view_plan = std::move(planner.plan);
+					con.Rollback();
+
+					// Walk the plan tree looking for LOGICAL_GET on the target table
+					std::function<bool(LogicalOperator &)> check_plan = [&](LogicalOperator &op) -> bool {
+						if (op.type == LogicalOperatorType::LOGICAL_GET) {
+							auto &get = op.Cast<LogicalGet>();
+							auto tbl = get.GetTable();
+							if (tbl.get() && tbl->name == table_name) {
+								for (auto &cid : get.GetColumnIds()) {
+									if (get.GetColumnName(cid) == col_name) {
+										return true;
+									}
+								}
+							}
+						}
+						for (auto &child : op.children) {
+							if (check_plan(*child)) {
+								return true;
+							}
+						}
+						return false;
+					};
+
+					if (check_plan(*view_plan)) {
+						return view_name;
+					}
+				} catch (...) {
+					con.Rollback();
+				}
+			}
+			return "";
+		};
+
+		switch (alter_info->alter_table_type) {
+		case AlterTableType::ADD_COLUMN: {
+			auto *add_info = dynamic_cast<AddColumnInfo *>(alter_info);
+			if (!add_info) {
+				break;
+			}
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE ADD COLUMN '%s' — syncing delta table\n",
+			                    add_info->new_column.Name().c_str());
+			con.Query("ALTER TABLE " + qdelta + " ADD COLUMN IF NOT EXISTS " +
+			          KeywordHelper::WriteOptionallyQuoted(add_info->new_column.Name()) + " " +
+			          add_info->new_column.Type().ToString());
+			break;
+		}
+		case AlterTableType::REMOVE_COLUMN: {
+			auto *remove_info = dynamic_cast<RemoveColumnInfo *>(alter_info);
+			if (!remove_info) {
+				break;
+			}
+			string col_name = remove_info->removed_column;
+			string referencing_mv = column_referenced_by_mv(col_name);
+			if (!referencing_mv.empty()) {
+				throw CatalogException("Cannot drop column '" + col_name +
+				                       "': it is referenced by materialized view '" + referencing_mv +
+				                       "'. Drop the view first.");
+			}
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE DROP COLUMN '%s' — syncing delta table\n", col_name.c_str());
+			con.Query("ALTER TABLE " + qdelta + " DROP COLUMN IF EXISTS " +
+			          KeywordHelper::WriteOptionallyQuoted(col_name));
+			break;
+		}
+		case AlterTableType::RENAME_COLUMN: {
+			auto *rename_info = dynamic_cast<RenameColumnInfo *>(alter_info);
+			if (!rename_info) {
+				break;
+			}
+			string old_name = rename_info->old_name;
+			string new_name = rename_info->new_name;
+			string referencing_mv = column_referenced_by_mv(old_name);
+			if (!referencing_mv.empty()) {
+				throw CatalogException("Cannot rename column '" + old_name +
+				                       "': it is referenced by materialized view '" + referencing_mv +
+				                       "'. Drop the view first.");
+			}
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE RENAME COLUMN '%s' → '%s' — syncing delta table\n",
+			                    old_name.c_str(), new_name.c_str());
+			con.Query("ALTER TABLE " + qdelta + " RENAME COLUMN " + KeywordHelper::WriteOptionallyQuoted(old_name) +
+			          " TO " + KeywordHelper::WriteOptionallyQuoted(new_name));
+			break;
+		}
+		default:
+			break;
+		}
+		return;
+	}
+
 	if (plan->children.empty()) {
 		return;
 	}
@@ -159,11 +322,12 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				string full_delta_table_name = OpenIVMUtils::FullDeltaName(
 				    insert_node->table.catalog.GetName(), insert_node->table.schema.name, insert_node->table.name);
 				if (insert_node->children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-					string insert_query = "insert into " + full_delta_table_name;
+					auto &delta_entry_ins = delta_table_catalog_entry->Cast<TableCatalogEntry>();
+					string insert_query = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_ins);
 
 					auto projection = dynamic_cast<LogicalProjection *>(insert_node->children[0].get());
 					if (projection->children[0]->type == LogicalOperatorType::LOGICAL_EXPRESSION_GET) {
-						insert_query += " values ";
+						insert_query += " VALUES ";
 						auto expression_get = dynamic_cast<LogicalExpressionGet *>(projection->children[0].get());
 						for (auto &expression : expression_get->expressions) {
 							string values = "(";
@@ -180,14 +344,15 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						}
 						insert_query.pop_back();
 					} else {
-						insert_query += " select *, true, now()::timestamp from (";
+						auto &delta_entry = delta_table_catalog_entry->Cast<TableCatalogEntry>();
+						string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
 						LogicalPlanToSql lpts(*con.context, insert_node->children[0]);
 						auto cte_list = lpts.LogicalPlanToCteList();
 						string subquery_string = LogicalPlanToSql::CteListToSql(cte_list);
 						if (!subquery_string.empty() && subquery_string.back() == ';') {
 							subquery_string.pop_back();
 						}
-						insert_query += subquery_string + ")";
+						insert_query = prefix + " SELECT *, true, now()::timestamp FROM (" + subquery_string + ")";
 					}
 					OPENIVM_DEBUG_PRINT("[INSERT RULE] insert_query: %s\n", insert_query.c_str());
 					{
@@ -206,10 +371,12 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						    "Only CSV file imports (read_csv) are supported for IVM delta tracking "
 						    "via LOGICAL_GET. Other table functions are not yet supported.");
 					}
+					auto &delta_entry_csv = delta_table_catalog_entry->Cast<TableCatalogEntry>();
+					string prefix_csv = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_csv);
 					auto files = bind_data->file_list->GetAllFiles();
 					for (auto &file : files) {
-						auto query = "insert into " + full_delta_table_name +
-						             " select *, true, now()::timestamp from read_csv('" + file.path + "');";
+						auto query =
+						    prefix_csv + " SELECT *, true, now()::timestamp FROM read_csv('" + file.path + "');";
 						DeltaLockGuard guard(OpenIVMUtils::DeltaName(insert_table_name));
 						auto r = con.Query(query);
 						if (r->HasError()) {
@@ -244,8 +411,9 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 			}
 			IVMMetadata metadata(con);
 			if (metadata.IsBaseTable(delete_table_name)) {
-				string insert_string = "insert into " + full_delta_table_name +
-				                       " select *, false, now()::timestamp from " + full_table_name;
+				auto &delta_entry_del = delta_table_catalog_entry->Cast<TableCatalogEntry>();
+				string insert_string = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del) + " " +
+				                       BuildDeltaSelectFrom(delta_entry_del, "false", full_table_name);
 				if (plan->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
 					auto filter = dynamic_cast<LogicalFilter *>(plan->children[0].get());
 					insert_string += " where ";
@@ -273,15 +441,15 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					return;
 				} else {
 					try {
-						insert_string =
-						    "insert into " + full_delta_table_name + " select *, false, now()::timestamp from (";
+						string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
 						LogicalPlanToSql lpts(*con.context, plan->children[0]);
 						auto cte_list = lpts.LogicalPlanToCteList();
 						string subquery_string = LogicalPlanToSql::CteListToSql(cte_list);
 						if (!subquery_string.empty() && subquery_string.back() == ';') {
 							subquery_string.pop_back();
 						}
-						insert_string += subquery_string + ")";
+						insert_string =
+						    prefix_del + " SELECT *, false, now()::timestamp FROM (" + subquery_string + ")";
 					} catch (...) {
 						throw NotImplementedException(
 						    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");
@@ -372,27 +540,39 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					throw NotImplementedException("Only simple UPDATE statements are supported in IVM!");
 				}
 
-				string select_old = "select *, false, now()::timestamp from " + full_table_name + where_string;
-				string select_new = "select ";
-				auto columns = update_node->table.GetColumns().GetColumnNames();
-				for (size_t i = 0; i < columns.size(); i++) {
-					if (update_values.find(to_string(i)) != update_values.end()) {
-						select_new += update_values[to_string(i)] + ", ";
-					} else {
-						select_new += columns[i] + ", ";
+				auto &delta_entry_upd = delta_table_catalog_entry->Cast<TableCatalogEntry>();
+				string prefix_upd = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_upd);
+				string select_old = BuildDeltaSelectFrom(delta_entry_upd, "false", full_table_name) + where_string;
+				// For select_new: use the update_values map to replace modified columns
+				string select_new = "SELECT ";
+				for (auto &col : delta_entry_upd.GetColumns().Logical()) {
+					if (col.GetName() == ivm::MULTIPLICITY_COL || col.GetName() == ivm::TIMESTAMP_COL) {
+						continue;
+					}
+					// Find the column's positional index in the base table
+					auto base_columns = update_node->table.GetColumns().GetColumnNames();
+					for (size_t i = 0; i < base_columns.size(); i++) {
+						if (base_columns[i] == col.GetName()) {
+							if (update_values.find(to_string(i)) != update_values.end()) {
+								select_new += update_values[to_string(i)] + ", ";
+							} else {
+								select_new += KeywordHelper::WriteOptionallyQuoted(col.GetName()) + ", ";
+							}
+							break;
+						}
 					}
 				}
-				select_new += "true, now()::timestamp from " + full_table_name + where_string;
+				select_new += "true, now()::timestamp FROM " + full_table_name + where_string;
 
 				{
 					DeltaLockGuard guard(OpenIVMUtils::DeltaName(update_table_name));
-					auto r = con.Query("insert into " + full_delta_table_name + " " + select_old);
+					auto r = con.Query(prefix_upd + " " + select_old);
 					if (r->HasError()) {
 						throw InternalException("Cannot insert old values in delta table after update! " +
 						                        r->GetError());
 					}
 					OPENIVM_DEBUG_PRINT("[INSERT RULE] select_new: %s\n", select_new.c_str());
-					auto r2 = con.Query("insert into " + full_delta_table_name + " " + select_new);
+					auto r2 = con.Query(prefix_upd + " " + select_new);
 					if (r2->HasError()) {
 						throw InternalException("Cannot insert new values in delta table after update! " +
 						                        r2->GetError());

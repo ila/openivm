@@ -36,6 +36,8 @@ CREATE OR REPLACE MATERIALIZED VIEW regional_totals REFRESH EVERY '10 minutes' A
     SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales GROUP BY region;
 ```
 
+Base table schema changes (ADD/DROP/RENAME COLUMN) are handled automatically — delta tables are synced and IVM continues to work. Dropping or renaming a column referenced by an MV is blocked with an error.
+
 ## Supported operators
 
 MVs can be created using any SQL construct. Unsupported operators automatically fall back to [full refresh](docs/refresh/refresh-strategies.md).

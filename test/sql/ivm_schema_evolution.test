@@ -1,0 +1,165 @@
+# name: test/sql/ivm_schema_evolution.test
+# description: Test ALTER TABLE handling — delta table sync and column reference blocking
+# group: [sql]
+
+require openivm
+
+statement ok
+SET ivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Setup
+# ==========================================
+
+statement ok
+CREATE TABLE t (id INT, val INT, extra INT);
+
+statement ok
+INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 10, 300);
+
+statement ok
+CREATE MATERIALIZED VIEW mv AS
+    SELECT val, SUM(val) AS total, COUNT(*) AS cnt FROM t GROUP BY val;
+
+query III
+SELECT val, total, cnt FROM mv ORDER BY val;
+----
+10	20	2
+20	20	1
+
+# ==========================================
+# Test 1: ADD COLUMN — delta synced, IVM works
+# ==========================================
+
+statement ok
+ALTER TABLE t ADD COLUMN bonus INT;
+
+statement ok
+INSERT INTO t VALUES (4, 30, 400, 50);
+
+statement ok
+PRAGMA ivm('mv');
+
+query III
+SELECT val, total, cnt FROM mv ORDER BY val;
+----
+10	20	2
+20	20	1
+30	30	1
+
+query I
+SELECT count(*) FROM (
+    SELECT val, total, cnt FROM mv
+    EXCEPT ALL
+    SELECT val, SUM(val), COUNT(*) FROM t GROUP BY val
+);
+----
+0
+
+# ==========================================
+# Test 2: DROP unreferenced column — delta synced, IVM works
+# ==========================================
+
+statement ok
+ALTER TABLE t DROP COLUMN bonus;
+
+statement ok
+INSERT INTO t VALUES (5, 10, 500);
+
+statement ok
+PRAGMA ivm('mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT val, total, cnt FROM mv
+    EXCEPT ALL
+    SELECT val, SUM(val), COUNT(*) FROM t GROUP BY val
+);
+----
+0
+
+# ==========================================
+# Test 3: DROP referenced column — blocked with error
+# ==========================================
+
+statement error
+ALTER TABLE t DROP COLUMN val;
+----
+referenced by materialized view
+
+# ==========================================
+# Test 4: RENAME unreferenced column — delta synced, IVM works
+# ==========================================
+
+statement ok
+ALTER TABLE t RENAME COLUMN extra TO metadata;
+
+statement ok
+INSERT INTO t VALUES (6, 20, 600);
+
+statement ok
+PRAGMA ivm('mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT val, total, cnt FROM mv
+    EXCEPT ALL
+    SELECT val, SUM(val), COUNT(*) FROM t GROUP BY val
+);
+----
+0
+
+# ==========================================
+# Test 5: RENAME referenced column — blocked with error
+# ==========================================
+
+statement error
+ALTER TABLE t RENAME COLUMN val TO amount;
+----
+referenced by materialized view
+
+# ==========================================
+# Test 6: ADD + DROP cycle — multiple schema changes, IVM stays correct
+# ==========================================
+
+statement ok
+ALTER TABLE t ADD COLUMN temp1 INT;
+
+statement ok
+ALTER TABLE t ADD COLUMN temp2 VARCHAR;
+
+statement ok
+INSERT INTO t VALUES (7, 10, 700, 1, 'hello');
+
+statement ok
+PRAGMA ivm('mv');
+
+statement ok
+ALTER TABLE t DROP COLUMN temp1;
+
+statement ok
+ALTER TABLE t DROP COLUMN temp2;
+
+statement ok
+INSERT INTO t VALUES (8, 20, 800);
+
+statement ok
+PRAGMA ivm('mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT val, total, cnt FROM mv
+    EXCEPT ALL
+    SELECT val, SUM(val), COUNT(*) FROM t GROUP BY val
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT val, SUM(val), COUNT(*) FROM t GROUP BY val
+    EXCEPT ALL
+    SELECT val, total, cnt FROM mv
+);
+----
+0
