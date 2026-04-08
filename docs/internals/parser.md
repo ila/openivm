@@ -1,7 +1,7 @@
 # Parser
 
-OpenIVM intercepts `CREATE MATERIALIZED VIEW` statements through a DuckDB parser extension. The parser rewrites the statement into a sequence of DDL operations that set up the materialized view, its delta tables, and its metadata.
-The original statement is rewritten to `CREATE TABLE IF NOT EXISTS <name> AS <query>`, which materializes the query result into a regular DuckDB table.
+OpenIVM intercepts `CREATE MATERIALIZED VIEW`, `CREATE OR REPLACE MATERIALIZED VIEW`, and `ALTER MATERIALIZED VIEW` statements through a DuckDB parser extension. The parser rewrites CREATE statements into a sequence of DDL operations that set up the materialized view, its delta tables, and its metadata.
+The original statement is rewritten to `CREATE TABLE IF NOT EXISTS <name> AS <query>`, which materializes the query result into a regular DuckDB table. `CREATE OR REPLACE` drops the old MV (view, data table, delta tables, metadata) before creating the new one.
 
 ## Aggregate function aliasing
 

@@ -46,12 +46,14 @@ struct IVMParseData : ParserExtensionParseData {
 	unique_ptr<SQLStatement> statement;
 	bool plan = false;
 	int64_t refresh_interval = -1; // seconds, -1 = not specified (manual only)
+	bool is_replace = false;       // CREATE OR REPLACE: drop old MV before creating
 	string alter_sql;              // non-empty for ALTER MATERIALIZED VIEW (executed directly in plan function)
 
 	unique_ptr<ParserExtensionParseData> Copy() const override {
 		auto copy = make_uniq_base<ParserExtensionParseData, IVMParseData>(statement->Copy(), false);
 		auto &data = dynamic_cast<IVMParseData &>(*copy);
 		data.refresh_interval = refresh_interval;
+		data.is_replace = is_replace;
 		data.alter_sql = alter_sql;
 		return copy;
 	}

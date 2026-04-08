@@ -101,11 +101,22 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 		return ParserExtensionParseResult(std::move(parse_data));
 	}
 
-	if (!StringUtil::Contains(query_lower, "create materialized view")) {
+	if (!StringUtil::Contains(query_lower, "create materialized view") &&
+	    !StringUtil::Contains(query_lower, "create or replace materialized view")) {
 		return ParserExtensionParseResult();
 	}
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Intercepted query: %s\n", query_lower.c_str());
+
+	// Detect CREATE OR REPLACE MATERIALIZED VIEW
+	bool is_replace = false;
+	std::regex or_replace_re("\\bcreate\\s+or\\s+replace\\s+materialized\\s+view\\b", std::regex::icase);
+	if (std::regex_search(query_lower, or_replace_re)) {
+		is_replace = true;
+		// Strip "or replace" so the rest of the pipeline sees "create materialized view"
+		query_lower = std::regex_replace(query_lower, std::regex("\\bor\\s+replace\\s+"), "");
+		OpenIVMUtils::RemoveRedundantWhitespaces(query_lower);
+	}
 
 	// Extract REFRESH EVERY clause before structural rewrite (strips it from the query)
 	int64_t refresh_interval = OpenIVMUtils::ExtractRefreshInterval(query_lower);
@@ -119,8 +130,10 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 	Parser p;
 	p.ParseQuery(query_lower);
 
-	return ParserExtensionParseResult(
-	    make_uniq_base<ParserExtensionParseData, IVMParseData>(std::move(p.statements[0]), true, refresh_interval));
+	auto parse_data =
+	    make_uniq_base<ParserExtensionParseData, IVMParseData>(std::move(p.statements[0]), true, refresh_interval);
+	dynamic_cast<IVMParseData &>(*parse_data).is_replace = is_replace;
+	return ParserExtensionParseResult(std::move(parse_data));
 }
 
 ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInfo *info, ClientContext &context,
@@ -406,6 +419,20 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		ddl.push_back("create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
 		              " (view_name varchar, table_name "
 		              "varchar, last_update timestamp, primary key(view_name, table_name))");
+
+		// --- OR REPLACE: drop old MV if it exists ---
+		if (ivm_parse_data.is_replace) {
+			string qvn_drop = KeywordHelper::WriteOptionallyQuoted(view_name);
+			string qdt_drop = KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(view_name));
+			string qdv_drop = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+			// Drop the user-facing VIEW, data table, and delta view table
+			ddl.push_back("DROP VIEW IF EXISTS " + qvn_drop);
+			ddl.push_back("DROP TABLE IF EXISTS " + qdt_drop);
+			ddl.push_back("DROP TABLE IF EXISTS " + qdv_drop);
+			// Clean metadata (the INSERT OR REPLACE below handles _duckdb_ivm_views)
+			ddl.push_back("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+		}
 
 		// Store the LPTS query in metadata — it has hidden columns (DISTINCT count, AVG sum/count,
 		// LEFT JOIN key) and preserves user column names.

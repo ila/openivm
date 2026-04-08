@@ -916,3 +916,100 @@ query I
 SELECT count(*) FROM mv_t31_1min;
 ----
 3
+
+# ==========================================
+# Test 41: CREATE OR REPLACE MATERIALIZED VIEW — replace existing view
+# ==========================================
+
+statement ok
+CREATE TABLE t41 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t41 VALUES (1, 'a', 10), (2, 'b', 20), (3, 'a', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t41 AS
+    SELECT grp, SUM(val) AS total FROM t41 GROUP BY grp;
+
+query II
+SELECT grp, total FROM mv_t41 ORDER BY grp;
+----
+a	40
+b	20
+
+# Replace with a different query (add COUNT)
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW mv_t41 AS
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM t41 GROUP BY grp;
+
+query III
+SELECT grp, total, cnt FROM mv_t41 ORDER BY grp;
+----
+a	40	2
+b	20	1
+
+# IVM still works on the replaced view
+statement ok
+INSERT INTO t41 VALUES (4, 'c', 50);
+
+statement ok
+PRAGMA ivm('mv_t41');
+
+query III
+SELECT grp, total, cnt FROM mv_t41 ORDER BY grp;
+----
+a	40	2
+b	20	1
+c	50	1
+
+# Cross-check
+query I
+SELECT count(*) FROM (
+    SELECT grp, total, cnt FROM mv_t41
+    EXCEPT ALL
+    SELECT grp, SUM(val), COUNT(*) FROM t41 GROUP BY grp
+);
+----
+0
+
+# ==========================================
+# Test 42: CREATE OR REPLACE — view doesn't exist yet (acts as CREATE)
+# ==========================================
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW mv_t41_new AS
+    SELECT id, val FROM t41;
+
+query I
+SELECT count(*) FROM mv_t41_new;
+----
+4
+
+# ==========================================
+# Test 43: CREATE OR REPLACE — with REFRESH EVERY
+# ==========================================
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW mv_t41 REFRESH EVERY '3 hours' AS
+    SELECT grp, SUM(val) AS total FROM t41 GROUP BY grp;
+
+query I
+SELECT refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_t41';
+----
+10800
+
+# IVM works after replace with interval
+statement ok
+INSERT INTO t41 VALUES (5, 'a', 100);
+
+statement ok
+PRAGMA ivm('mv_t41');
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, total FROM mv_t41
+    EXCEPT ALL
+    SELECT grp, SUM(val) FROM t41 GROUP BY grp
+);
+----
+0

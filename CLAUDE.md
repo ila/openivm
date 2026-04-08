@@ -156,6 +156,11 @@ PRAGMA ivm_status('product_sales');
 -- Check cost estimate (IVM vs full recompute)
 PRAGMA ivm_cost('product_sales');
 
+-- Replace an existing MV with a new definition
+CREATE OR REPLACE MATERIALIZED VIEW product_sales REFRESH EVERY '10 minutes' AS
+  SELECT product_name, SUM(amount) as total, COUNT(*) as cnt, AVG(amount) as avg_amount
+  FROM orders GROUP BY product_name;
+
 -- Force full recompute
 SET ivm_refresh_mode = 'full';
 PRAGMA ivm('product_sales');

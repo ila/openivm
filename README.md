@@ -28,6 +28,14 @@ SELECT * FROM regional_totals ORDER BY region;
 -- US  | 150
 ```
 
+### Replacing a view
+
+```sql
+-- Replace an existing MV with a new definition (drops and recreates atomically)
+CREATE OR REPLACE MATERIALIZED VIEW regional_totals REFRESH EVERY '10 minutes' AS
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales GROUP BY region;
+```
+
 ## Supported operators
 
 MVs can be created using any SQL construct. Unsupported operators automatically fall back to [full refresh](docs/refresh/refresh-strategies.md).
