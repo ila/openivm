@@ -165,4 +165,40 @@ string IVMMetadata::BuildDeltaCleanupSQL(const string &target, const string &met
 	       OpenIVMUtils::EscapeValue(metadata_key) + "');\n";
 }
 
+// --- DuckLake support ---
+
+string IVMMetadata::GetCatalogType(const string &view_name, const string &table_name) {
+	auto result = con.Query("SELECT catalog_type FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	                        OpenIVMUtils::EscapeValue(table_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return "duckdb";
+	}
+	return result->GetValue(0, 0).ToString();
+}
+
+bool IVMMetadata::IsDuckLakeTable(const string &view_name, const string &table_name) {
+	return GetCatalogType(view_name, table_name) == "ducklake";
+}
+
+int64_t IVMMetadata::GetLastSnapshotId(const string &view_name, const string &table_name) {
+	auto result = con.Query("SELECT last_snapshot_id FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	                        OpenIVMUtils::EscapeValue(table_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return -1;
+	}
+	return result->GetValue(0, 0).GetValue<int64_t>();
+}
+
+void IVMMetadata::UpdateSnapshotId(const string &view_name, const string &table_name, int64_t snapshot_id) {
+	auto result =
+	    con.Query("UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = " + to_string(snapshot_id) +
+	              " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	              OpenIVMUtils::EscapeValue(table_name) + "'");
+	if (result->HasError()) {
+		throw InternalException("Cannot update DuckLake snapshot ID: " + result->GetError());
+	}
+}
+
 } // namespace duckdb

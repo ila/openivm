@@ -8,6 +8,7 @@
 #include "rules/ivm_column_hider.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
@@ -335,8 +336,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " mode varchar not null default 'after')");
 
 		ddl.push_back("create table if not exists " + string(ivm::DELTA_TABLES_TABLE) +
-		              " (view_name varchar, table_name "
-		              "varchar, last_update timestamp, primary key(view_name, table_name))");
+		              " (view_name varchar, table_name varchar, last_update timestamp,"
+		              " catalog_type varchar default 'duckdb', last_snapshot_id bigint default null,"
+		              " primary key(view_name, table_name))");
 
 		// --- OR REPLACE: drop old MV if it exists ---
 		if (ivm_parse_data.is_replace) {
@@ -360,9 +362,60 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now(), " +
 		              refresh_val + ", false)");
 
+		// Classify each base table by catalog type (duckdb vs ducklake).
+		// DuckLake tables use native change tracking; DuckDB tables use delta tables.
+		unordered_set<string> ducklake_tables;
 		for (const auto &table_name : table_names) {
+			string catalog_type = "duckdb";
+			string snapshot_val = "null";
+			string meta_table_name = OpenIVMUtils::DeltaName(table_name);
+
+			// Look up the table in all available catalogs to detect its type.
+			// GetTableNames() returns unqualified names, so we search the catalog path
+			// and also check attached catalogs explicitly.
+			con.BeginTransaction();
+			auto entry = Catalog::GetEntry<TableCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA, table_name,
+			                                                  OnEntryNotFound::RETURN_NULL);
+			// If not found in default search path, search all attached catalogs
+			if (!entry) {
+				auto &db_manager = DatabaseManager::Get(*con.context);
+				auto databases = db_manager.GetDatabases(*con.context);
+				for (auto &db : databases) {
+					if (entry) {
+						break;
+					}
+					auto &cat_name = db->GetName();
+					auto found = Catalog::GetEntry<TableCatalogEntry>(*con.context, cat_name, DEFAULT_SCHEMA,
+					                                                  table_name, OnEntryNotFound::RETURN_NULL);
+					if (found) {
+						entry = found;
+					}
+				}
+			}
+			if (entry) {
+				string cat_type = entry->ParentCatalog().GetCatalogType();
+				if (cat_type == "ducklake") {
+					catalog_type = "ducklake";
+					meta_table_name = table_name; // no delta table — store base table name
+					ducklake_tables.insert(table_name);
+
+					// Get current snapshot ID from DuckLake catalog
+					string cat_name = entry->ParentCatalog().GetName();
+					con.Rollback();
+					auto snap_result = con.Query("SELECT id FROM " + cat_name + ".current_snapshot()");
+					if (!snap_result->HasError() && snap_result->RowCount() > 0) {
+						snapshot_val = snap_result->GetValue(0, 0).ToString();
+					}
+				} else {
+					con.Rollback();
+				}
+			} else {
+				con.Rollback();
+			}
+
 			ddl.push_back("insert into " + string(ivm::DELTA_TABLES_TABLE) + " values ('" + view_name + "', '" +
-			              OpenIVMUtils::DeltaName(table_name) + "', now())");
+			              OpenIVMUtils::EscapeSingleQuotes(meta_table_name) + "', now(), '" + catalog_type + "', " +
+			              snapshot_val + ")");
 		}
 
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---
@@ -400,6 +453,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		for (const auto &table_name : table_names) {
+			// DuckLake tables don't need delta tables — change tracking is native
+			if (ducklake_tables.count(table_name)) {
+				OPENIVM_DEBUG_PRINT("[CREATE MV] Skipping delta table for DuckLake table '%s'\n", table_name.c_str());
+				continue;
+			}
+
 			Value catalog_value;
 			Value schema_value;
 
@@ -448,6 +507,26 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Compiled %lu DDL queries for bind phase\n", (unsigned long)ddl.size());
+
+		// Write reference SQL files if ivm_files_path is set
+		Value files_path_val;
+		if (context.TryGetCurrentSetting("ivm_files_path", files_path_val) && !files_path_val.IsNull()) {
+			string base_path = files_path_val.ToString();
+			// System tables DDL (first 3 statements: _duckdb_ivm_views, _duckdb_ivm_refresh_hooks,
+			// _duckdb_ivm_delta_tables)
+			string system_tables_sql;
+			// Compiled queries (everything after the system tables)
+			string compiled_sql;
+			for (size_t i = 0; i < ddl.size(); i++) {
+				if (i < 3) {
+					system_tables_sql += ddl[i] + ";\n\n";
+				} else {
+					compiled_sql += ddl[i] + ";\n\n";
+				}
+			}
+			OpenIVMUtils::WriteFile(base_path + "/ivm_system_tables.sql", false, system_tables_sql);
+			OpenIVMUtils::WriteFile(base_path + "/ivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
+		}
 
 		// Pass DDL via result.parameters — the bind function receives them as input.inputs.
 		// This replaces the fragile thread-local g_ivm_pending_ddl mechanism.

@@ -117,6 +117,10 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 			          KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(table_name)));
 
 			for (auto &dt : delta_tables) {
+				// DuckLake entries store the base table name — never drop it
+				if (metadata.IsDuckLakeTable(table_name, dt)) {
+					continue;
+				}
 				auto remaining = con.Query("SELECT count(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
 				                           " WHERE table_name = '" + OpenIVMUtils::EscapeValue(dt) + "'");
 				if (!remaining->HasError() && remaining->RowCount() > 0 &&
@@ -316,6 +320,11 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		    IVMTableNames::IsDataTable(insert_table_name)) {
 			return;
 		}
+		// DuckLake tables have native change tracking — no delta writes needed
+		if (insert_node->table.catalog.GetCatalogType() == "ducklake") {
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] Skipping delta for DuckLake table '%s'\n", insert_table_name.c_str());
+			return;
+		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
 		    input.context, insert_node->table.catalog.GetName(), insert_node->table.schema.name,
 		    OpenIVMUtils::DeltaName(insert_table_name), OnEntryNotFound::RETURN_NULL);
@@ -401,6 +410,10 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		if (OpenIVMUtils::IsDelta(delete_table_name) || IVMTableNames::IsDataTable(delete_table_name)) {
 			return;
 		}
+		if (delete_node->table.catalog.GetCatalogType() == "ducklake") {
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] Skipping delta for DuckLake table '%s'\n", delete_table_name.c_str());
+			return;
+		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
 		    input.context, delete_node->table.catalog.GetName(), delete_node->table.schema.name,
 		    OpenIVMUtils::DeltaName(delete_table_name), OnEntryNotFound::RETURN_NULL);
@@ -474,6 +487,10 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 		auto update_node = dynamic_cast<LogicalUpdate *>(root);
 		auto update_table_name = update_node->table.name;
 		if (OpenIVMUtils::IsDelta(update_table_name) || IVMTableNames::IsDataTable(update_table_name)) {
+			return;
+		}
+		if (update_node->table.catalog.GetCatalogType() == "ducklake") {
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] Skipping delta for DuckLake table '%s'\n", update_table_name.c_str());
 			return;
 		}
 		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(

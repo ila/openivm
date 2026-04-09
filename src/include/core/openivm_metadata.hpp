@@ -70,6 +70,20 @@ public:
 	// target: the (possibly schema-qualified) table to delete from.
 	// metadata_key: the name used in _duckdb_ivm_delta_tables (unqualified delta name).
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key);
+
+	// --- DuckLake support ---
+
+	// Get the catalog type for a base table entry ('duckdb' or 'ducklake').
+	string GetCatalogType(const string &view_name, const string &table_name);
+
+	// Check if a base table entry is backed by DuckLake.
+	bool IsDuckLakeTable(const string &view_name, const string &table_name);
+
+	// Get the DuckLake snapshot ID at last refresh. Returns -1 if not set.
+	int64_t GetLastSnapshotId(const string &view_name, const string &table_name);
+
+	// Update the DuckLake snapshot ID after refresh.
+	void UpdateSnapshotId(const string &view_name, const string &table_name, int64_t snapshot_id);
 };
 
 } // namespace duckdb

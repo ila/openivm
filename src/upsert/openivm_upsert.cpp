@@ -122,6 +122,12 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 			auto delta_tables = metadata.GetDeltaTables(view_name);
 			bool all_empty = true;
 			for (auto &dt : delta_tables) {
+				if (metadata.IsDuckLakeTable(view_name, dt)) {
+					// DuckLake tables: conservatively assume changes exist.
+					// TODO(milestone 2): use table_changes() to check for actual changes.
+					all_empty = false;
+					break;
+				}
 				auto count_result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(dt));
 				if (!count_result->HasError() && count_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
 					all_empty = false;
