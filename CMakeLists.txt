@@ -8,7 +8,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 set(LPTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lpts")
-include_directories(src/include ${LPTS_DIR}/src/include)
+include_directories(src/include ${LPTS_DIR}/src/include ${LPTS_DIR}/third_party/ducklake/src/include)
 
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
@@ -34,7 +34,7 @@ set(EXTENSION_SOURCES
     src/rules/ivm_column_hider.cpp
     src/core/openivm_refresh_locks.cpp
     src/core/openivm_refresh_daemon.cpp
-    ${LPTS_DIR}/src/logical_plan_to_sql.cpp
+    ${LPTS_DIR}/src/cte_nodes.cpp
     ${LPTS_DIR}/src/lpts_helpers.cpp
     ${LPTS_DIR}/src/lpts_ast.cpp
     ${LPTS_DIR}/src/lpts_pipeline.cpp)

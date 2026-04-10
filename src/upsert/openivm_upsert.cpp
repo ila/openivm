@@ -9,10 +9,11 @@
 #include "core/openivm_utils.hpp"
 #include "upsert/openivm_compile_upsert.hpp"
 #include "upsert/openivm_cost_model.hpp"
-#include "logical_plan_to_sql.hpp"
+#include "lpts_pipeline.hpp"
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -26,9 +27,8 @@ namespace duckdb {
 
 static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name, const string &view_query_sql,
                                   bool cross_system, const string &attached_catalog = "",
-                                  const string &attached_schema = "") {
-	string data_table = IVMTableNames::DataTableName(view_name);
-	string qdt = KeywordHelper::WriteOptionallyQuoted(data_table);
+                                  const string &attached_schema = "", const string &catalog_prefix = "") {
+	string qdt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(view_name));
 	string query = "DELETE FROM " + qdt + ";\n";
 	query += "INSERT INTO " + qdt + " " + view_query_sql + ";\n\n";
 
@@ -39,6 +39,9 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
 	string delta_cleanup;
 	auto delta_tables = metadata.GetDeltaTables(view_name);
 	for (auto &dt : delta_tables) {
+		if (metadata.IsDuckLakeTable(view_name, dt)) {
+			continue;
+		}
 		string resolved = dt;
 		if (cross_system) {
 			resolved = attached_catalog + "." + attached_schema + "." + dt;
@@ -104,6 +107,30 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		view_catalog_name = default_entry.catalog;
 		view_schema_name = default_entry.schema;
 		view_name = StringValue::Get(parameters.values[0]);
+
+		// If the view doesn't exist in the default catalog, search attached catalogs.
+		// This handles DuckLake MVs created as "dl.mv_name" where the view lives in "dl".
+		{
+			QueryErrorContext err_ctx;
+			auto entry = Catalog::GetEntry(context, view_catalog_name, view_schema_name,
+			                               EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, err_ctx),
+			                               OnEntryNotFound::RETURN_NULL);
+			if (!entry) {
+				auto &db_manager = DatabaseManager::Get(context);
+				auto databases = db_manager.GetDatabases(context);
+				for (auto &db : databases) {
+					auto &cat_name = db->GetName();
+					auto found = Catalog::GetEntry(context, cat_name, DEFAULT_SCHEMA,
+					                               EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, err_ctx),
+					                               OnEntryNotFound::RETURN_NULL);
+					if (found) {
+						view_catalog_name = cat_name;
+						view_schema_name = DEFAULT_SCHEMA;
+						break;
+					}
+				}
+			}
+		}
 	}
 
 	// Check cascade mode
@@ -200,7 +227,15 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	auto &catalog = Catalog::GetSystemCatalog(context);
 	QueryErrorContext error_context = QueryErrorContext();
 	Connection con(*context.db.get());
-	string data_table = IVMTableNames::DataTableName(view_name);
+	// Catalog-qualified prefix for SQL references (e.g. "dl.main." or "" for default).
+	// Only add the prefix when the catalog is non-default (e.g. DuckLake attached DB).
+	string catalog_prefix;
+	if (!view_catalog_name.empty() && view_catalog_name != "memory" && view_catalog_name != INVALID_CATALOG) {
+		catalog_prefix = view_catalog_name + "." + view_schema_name + ".";
+	}
+	// Bare table names for catalog lookups; qualified names for SQL
+	string data_table_bare = IVMTableNames::DataTableName(view_name);
+	string data_table = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table_bare);
 
 	// Use con's transaction for catalog access — sees all committed state
 	con.BeginTransaction();
@@ -210,7 +245,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	    OnEntryNotFound::THROW_EXCEPTION, error_context);
 	auto index_delta_view_catalog_entry =
 	    Catalog::GetEntry(con_ctx, view_catalog_name, view_schema_name,
-	                      EntryLookupInfo(CatalogType::INDEX_ENTRY, data_table + ivm::INDEX_SUFFIX, error_context),
+	                      EntryLookupInfo(CatalogType::INDEX_ENTRY, data_table_bare + ivm::INDEX_SUFFIX, error_context),
 	                      OnEntryNotFound::RETURN_NULL);
 	con.Rollback();
 
@@ -234,7 +269,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			Printer::Print("Warning: recovering '" + view_name + "' from interrupted refresh via full recompute.");
 			metadata.SetRefreshInProgress(view_name, false);
 			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-			                           attached_db_schema_name);
+			                           attached_db_schema_name, catalog_prefix);
 		}
 	}
 
@@ -261,7 +296,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 
 	if (force_full_refresh || view_query_type == IVMType::FULL_REFRESH) {
 		return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-		                           attached_db_schema_name);
+		                           attached_db_schema_name, catalog_prefix);
 	}
 
 	// Adaptive cost model (experimental): estimate IVM vs full recompute cost.
@@ -285,7 +320,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		if (cost_estimate.ShouldRecompute()) {
 			OPENIVM_DEBUG_PRINT("[ADAPTIVE] Full recompute is cheaper — skipping IVM\n");
 			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-			                           attached_db_schema_name);
+			                           attached_db_schema_name, catalog_prefix);
 		}
 	}
 
@@ -361,7 +396,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	case IVMType::SIMPLE_PROJECTION: {
 		if (has_left_join) {
 			string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
-			string qdt = KeywordHelper::WriteOptionallyQuoted(data_table);
+			string qdt = data_table;
 			string qdv = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
 			string lk = KeywordHelper::WriteOptionallyQuoted(string(ivm::LEFT_KEY_COL));
 			string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
@@ -392,7 +427,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 						null_cols += KeywordHelper::WriteOptionallyQuoted(col) + " = NULL";
 					}
 				}
-				string qdt = KeywordHelper::WriteOptionallyQuoted(data_table);
+				string qdt = data_table;
 				upsert_query += "UPDATE " + qdt + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " + source +
 				                " LIMIT 1);\n";
 			}
@@ -429,15 +464,15 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	OPENIVM_DEBUG_PRINT("[UPSERT] Optimized (incremental) plan:\n%s\n", plan->ToString().c_str());
 	con.Rollback();
 
-	// we turn the plan into a string using LogicalPlanToSql (replacement for LogicalPlanToString)
-	LogicalPlanToSql lpts(con_ctx, plan);
-	auto cte_list = lpts.LogicalPlanToCteList();
-	string raw_ivm_sql = LogicalPlanToSql::CteListToSql(cte_list);
+	// Convert the rewritten plan to SQL via the AST pipeline
+	auto ast = LogicalPlanToAst(con_ctx, plan);
+	auto cte_list = AstToCteList(*ast);
+	string raw_ivm_sql = cte_list->ToQuery(false);
 
 	// Use explicit column list in INSERT INTO delta_view, excluding _duckdb_ivm_timestamp
 	// so the DEFAULT now() fills it in (for chained MV support)
-	string delta_view_name = OpenIVMUtils::DeltaName(view_name);
-	string insert_target = "INSERT INTO " + delta_view_name;
+	string delta_view_name = catalog_prefix + OpenIVMUtils::DeltaName(view_name);
+	string insert_target = "INSERT INTO " + OpenIVMUtils::DeltaName(view_name);
 	auto insert_pos = raw_ivm_sql.find(insert_target);
 	if (insert_pos != string::npos) {
 		string col_list = "(";
@@ -507,7 +542,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		string temp_name = string(ivm::TEMP_TABLE_PREFIX) + view_name;
 		string qt = KeywordHelper::WriteOptionallyQuoted(temp_name);
 		string qdvn = KeywordHelper::WriteOptionallyQuoted(delta_view_name);
-		string qdt2 = KeywordHelper::WriteOptionallyQuoted(data_table);
+		string qdt2 = data_table;
 		pre_companion = "CREATE TEMP TABLE " + qt + " AS SELECT * FROM " + qdt2 + ";\n";
 		// Post: clear ALL IVM delta rows (both true and false), replace with absolute snapshots
 		post_companion = "DELETE FROM " + qdvn + " WHERE 1=1";
@@ -579,6 +614,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	                                OpenIVMUtils::EscapeValue(view_name) + "';\n";
 
 	for (auto &dt : delta_table_names) {
+		// DuckLake tables have no delta tables to clean up
+		if (metadata.IsDuckLakeTable(view_name, dt)) {
+			continue;
+		}
 		string resolved = dt;
 		if (cross_system) {
 			resolved = attached_db_catalog_name + "." + attached_db_schema_name + "." + dt;

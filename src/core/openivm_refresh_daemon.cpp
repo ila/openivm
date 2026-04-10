@@ -6,6 +6,7 @@
 #include "core/openivm_utils.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
 
 #include <chrono>
 #include <unordered_set>
@@ -66,6 +67,47 @@ void IVMRefreshDaemon::Run() {
 
 		try {
 			Connection con(*db_);
+			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Woke up\n");
+
+			// Resolve the default catalog dynamically each cycle.
+			// Extensions load into the system catalog, but user tables live in the
+			// file-based catalog (e.g. "mydb"). SetDefaultDatabase is the C++ API
+			// behind DuckDB's USE command.
+			// Resolve the default catalog dynamically each cycle.
+			// Extensions load into the system catalog, but user tables live in the
+			// file-based catalog (e.g. "mydb"). We query current_database() which
+			// resolves DatabaseManager::default_database, then call SetDefaultDatabase
+			// to switch this connection to that catalog.
+			// Resolve the default catalog dynamically each cycle.
+			// Extensions load into the system catalog, but user tables live in the
+			// file-based catalog (e.g. "mydb"). USE is the SQL equivalent of
+			// SetDefaultDatabase and handles its own transaction.
+			{
+				auto &db_manager = DatabaseManager::Get(*db_);
+				if (db_manager.HasDefaultDatabase()) {
+					auto cat_r = con.Query("SELECT current_database()");
+					if (!cat_r->HasError() && cat_r->RowCount() > 0) {
+						auto catalog = cat_r->GetValue(0, 0).ToString();
+						OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Before USE: current_database='%s'\n", catalog.c_str());
+						if (!catalog.empty()) {
+							auto use_r = con.Query("USE " + catalog);
+							OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] USE result: %s\n",
+							                    use_r->HasError() ? use_r->GetError().c_str() : "OK");
+							// Verify
+							auto verify = con.Query("SELECT current_database()");
+							if (!verify->HasError() && verify->RowCount() > 0) {
+								OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] After USE: current_database='%s'\n",
+								                    verify->GetValue(0, 0).ToString().c_str());
+							}
+							// Also try direct table query
+							auto test = con.Query("SELECT count(*) FROM _duckdb_ivm_views");
+							OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Direct query: %s\n",
+							                    test->HasError() ? test->GetError().c_str()
+							                                     : test->GetValue(0, 0).ToString().c_str());
+						}
+					}
+				}
+			}
 
 			// Read cascade setting from the DB config
 			string cascade_mode = "downstream";
@@ -82,6 +124,7 @@ void IVMRefreshDaemon::Run() {
 
 			IVMMetadata metadata(con);
 			auto scheduled = metadata.GetScheduledViews();
+			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Scheduled views: %lu\n", (unsigned long)scheduled.size());
 
 			// Track views already refreshed this cycle (directly or via cascade) to avoid double work
 			std::unordered_set<string> refreshed_this_cycle;

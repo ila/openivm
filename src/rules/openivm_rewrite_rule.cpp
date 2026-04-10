@@ -14,7 +14,7 @@
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "upsert/openivm_index_regen.hpp"
 
-#include "logical_plan_to_sql.hpp"
+#include "lpts_pipeline.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"

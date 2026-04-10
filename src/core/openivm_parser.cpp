@@ -3,7 +3,7 @@
 #include "core/ivm_checker.hpp"
 #include "core/ivm_plan_rewrite.hpp"
 #include "core/openivm_constants.hpp"
-#include "logical_plan_to_sql.hpp"
+#include "lpts_pipeline.hpp"
 #include "core/openivm_utils.hpp"
 #include "rules/ivm_column_hider.hpp"
 #include "duckdb/common/printer.hpp"
@@ -170,8 +170,20 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 
-		auto view_name = OpenIVMUtils::ExtractTableName(statement->query);
+		auto full_view_name = OpenIVMUtils::ExtractTableName(statement->query);
 		auto original_view_query = OpenIVMUtils::ExtractViewQuery(statement->query);
+
+		// Split catalog-qualified name (e.g. "dl.mv_totals") into prefix and bare name.
+		// The prefix (e.g. "dl.") is used to create internal tables in the same catalog.
+		string view_catalog_prefix; // e.g. "dl." or "" for default catalog
+		string view_name;           // bare name without catalog, e.g. "mv_totals"
+		auto dot_pos = full_view_name.rfind('.');
+		if (dot_pos != string::npos) {
+			view_catalog_prefix = full_view_name.substr(0, dot_pos + 1); // includes the dot
+			view_name = full_view_name.substr(dot_pos + 1);
+		} else {
+			view_name = full_view_name;
+		}
 		string view_query = original_view_query; // will be overwritten by LPTS for DDL
 
 		// Use con for planning — sees all committed state from previous bind-phase DDL
@@ -236,9 +248,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					}
 				}
 			}
-			LogicalPlanToSql lpts(*con.context, select_plan, output_names);
-			auto cte_list = lpts.LogicalPlanToCteList();
-			view_query = LogicalPlanToSql::CteListToSql(cte_list);
+			auto ast = LogicalPlanToAst(*con.context, select_plan);
+			auto cte_list = AstToCteList(*ast);
+			view_query = cte_list->ToQuery(true, output_names);
 			// Strip trailing semicolon — the query is embedded in other SQL statements
 			if (!view_query.empty() && view_query.back() == ';') {
 				view_query.pop_back();
@@ -342,9 +354,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// --- OR REPLACE: drop old MV if it exists ---
 		if (ivm_parse_data.is_replace) {
-			string qvn_drop = KeywordHelper::WriteOptionallyQuoted(view_name);
-			string qdt_drop = KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(view_name));
-			string qdv_drop = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+			string qvn_drop = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
+			string qdt_drop =
+			    view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(view_name));
+			string qdv_drop =
+			    view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
 			// Drop the user-facing VIEW, data table, and delta view table
 			ddl.push_back("DROP VIEW IF EXISTS " + qvn_drop);
 			ddl.push_back("DROP TABLE IF EXISTS " + qdt_drop);
@@ -419,10 +433,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---
-		// Physical data table stores all columns (including _ivm_* internal cols)
+		// Physical data table stores all columns (including _ivm_* internal cols).
+		// All internal tables are created in the same catalog as the MV.
 		string data_table = IVMTableNames::DataTableName(view_name);
-		string qdt = KeywordHelper::WriteOptionallyQuoted(data_table);
-		string qvn = KeywordHelper::WriteOptionallyQuoted(view_name);
+		string qdt = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
+		string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
 		ddl.push_back("create table " + qdt + " as " + view_query);
 		if (pac_loaded) {
 			ddl.push_back("SET pac_check = false");
@@ -488,14 +503,17 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		// Delta table for the MV — based on the DATA table (has all columns)
-		string qdv = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+		string qdv = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
 		ddl.push_back("create table if not exists " + qdv + " as select *, true as " + string(ivm::MULTIPLICITY_COL) +
 		              ", now()::timestamp as " + string(ivm::TIMESTAMP_COL) + " from " + qdt + " limit 0");
 		ddl.push_back("alter table " + qdv + " alter " + string(ivm::TIMESTAMP_COL) + " set default now()");
 
 		// --- Index DDL (for aggregate group queries) ---
-		if (ivm_type == IVMType::AGGREGATE_GROUP || ivm_type == IVMType::AGGREGATE_HAVING) {
-			string index_query_view = "create unique index " + qdt + ivm::INDEX_SUFFIX + " on " + qdt + "(";
+		// DuckLake does not support indexes, so skip for DuckLake-backed MVs.
+		if ((ivm_type == IVMType::AGGREGATE_GROUP || ivm_type == IVMType::AGGREGATE_HAVING) &&
+		    ducklake_tables.empty()) {
+			string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + ivm::INDEX_SUFFIX);
+			string index_query_view = "create unique index " + index_name + " on " + qdt + "(";
 			for (size_t i = 0; i < aggregate_columns.size(); i++) {
 				index_query_view += KeywordHelper::WriteOptionallyQuoted(aggregate_columns[i]);
 				if (i != aggregate_columns.size() - 1) {

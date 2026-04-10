@@ -1,5 +1,6 @@
 #include "core/openivm_metadata.hpp"
 
+#include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
 
 namespace duckdb {
@@ -142,6 +143,9 @@ vector<IVMMetadata::ScheduledView> IVMMetadata::GetScheduledViews() {
 	                        "FROM " +
 	                        string(ivm::VIEWS_TABLE) + " v WHERE v.refresh_interval IS NOT NULL");
 	vector<ScheduledView> views;
+	if (result->HasError()) {
+		OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] GetScheduledViews query error: %s\n", result->GetError().c_str());
+	}
 	if (!result->HasError()) {
 		for (size_t i = 0; i < result->RowCount(); i++) {
 			ScheduledView sv;

@@ -16,6 +16,7 @@
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
@@ -113,6 +114,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("ivm_adaptive_backoff",
 	                             "auto-increase refresh interval when refresh takes longer than the interval",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("ivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	Connection con(instance);
 
@@ -203,10 +206,32 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {LogicalType::VARCHAR});
 	loader.RegisterFunction(ivm_status);
 
-	// Start the refresh daemon. It sleeps and periodically checks for views with
-	// REFRESH EVERY set. If none exist, it just sleeps — negligible overhead.
-	global_daemon = make_shared_ptr<IVMRefreshDaemon>();
-	global_daemon->Start(instance);
+	// PRAGMA ivm_start_daemon — (re)start the daemon on the caller's DB instance.
+	auto ivm_start_daemon =
+	    PragmaFunction::PragmaCall("ivm_start_daemon",
+	                               [](ClientContext &context, const FunctionParameters &) -> string {
+		                               if (global_daemon) {
+			                               global_daemon->Stop();
+		                               }
+		                               global_daemon = make_shared_ptr<IVMRefreshDaemon>();
+		                               global_daemon->Start(*context.db);
+		                               return "SELECT true AS started;";
+	                               },
+	                               {});
+	loader.RegisterFunction(ivm_start_daemon);
+
+	// Start the refresh daemon unless disabled (e.g. shadow/compile-only DBs).
+	bool daemon_disabled = false;
+	{
+		Value disable_val;
+		if (con.context->TryGetCurrentSetting("ivm_disable_daemon", disable_val) && !disable_val.IsNull()) {
+			daemon_disabled = disable_val.GetValue<bool>();
+		}
+	}
+	if (!daemon_disabled) {
+		global_daemon = make_shared_ptr<IVMRefreshDaemon>();
+		global_daemon->Start(instance);
+	}
 }
 
 void OpenivmExtension::Load(ExtensionLoader &loader) {

@@ -7,7 +7,7 @@
 #include "core/openivm_utils.hpp"
 #include "rules/ivm_column_hider.hpp"
 
-#include "logical_plan_to_sql.hpp"
+#include "lpts_pipeline.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/column_index.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
@@ -361,9 +361,9 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					} else {
 						auto &delta_entry = delta_table_catalog_entry->Cast<TableCatalogEntry>();
 						string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
-						LogicalPlanToSql lpts(*con.context, insert_node->children[0]);
-						auto cte_list = lpts.LogicalPlanToCteList();
-						string subquery_string = LogicalPlanToSql::CteListToSql(cte_list);
+						auto ast = LogicalPlanToAst(*con.context, insert_node->children[0]);
+						auto cte_list = AstToCteList(*ast);
+						string subquery_string = cte_list->ToQuery(false);
 						if (!subquery_string.empty() && subquery_string.back() == ';') {
 							subquery_string.pop_back();
 						}
@@ -458,9 +458,9 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				} else {
 					try {
 						string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
-						LogicalPlanToSql lpts(*con.context, plan->children[0]);
-						auto cte_list = lpts.LogicalPlanToCteList();
-						string subquery_string = LogicalPlanToSql::CteListToSql(cte_list);
+						auto ast = LogicalPlanToAst(*con.context, plan->children[0]);
+						auto cte_list = AstToCteList(*ast);
+						string subquery_string = cte_list->ToQuery(false);
 						if (!subquery_string.empty() && subquery_string.back() == ';') {
 							subquery_string.pop_back();
 						}

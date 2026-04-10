@@ -5,11 +5,116 @@
 #include "core/openivm_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 
 namespace duckdb {
 
+// ============================================================================
+// DuckLake delta scan: plan SQL fragments for table_insertions + table_deletions
+// ============================================================================
+
+/// Build a DuckLake delta scan by planning a SQL fragment that calls
+/// ducklake_table_insertions/deletions with a multiplicity column, then
+/// extracting the plan tree. DuckDB handles the table function expansion.
+static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, LogicalGet *old_get, const string &view_name) {
+	auto table_ref = old_get->GetTable();
+	string catalog_name = table_ref->ParentCatalog().GetName();
+	string schema_name = table_ref->schema.name;
+	string table_name = table_ref.get()->name;
+
+	OPENIVM_DEBUG_PRINT("[DuckLake] Creating delta node for '%s.%s.%s'\n", catalog_name.c_str(), schema_name.c_str(),
+	                    table_name.c_str());
+
+	// Get snapshot range from metadata
+	Connection con(*context.db);
+	con.SetAutoCommit(false);
+	auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(ivm::DELTA_TABLES_TABLE) +
+	                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+	                             "' AND table_name = '" + OpenIVMUtils::EscapeValue(table_name) + "'");
+	if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
+		throw InternalException("No snapshot ID found for DuckLake table '%s' in view '%s'", table_name, view_name);
+	}
+	int64_t last_snap = snap_result->GetValue(0, 0).GetValue<int64_t>();
+
+	auto cur_snap_result = con.Query("SELECT id FROM " + catalog_name + ".current_snapshot()");
+	if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0) {
+		throw InternalException("Cannot get current DuckLake snapshot for catalog '%s'", catalog_name);
+	}
+	int64_t cur_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
+
+	OPENIVM_DEBUG_PRINT("[DuckLake] Snapshot range: %ld -> %ld\n", (long)last_snap, (long)cur_snap);
+
+	// Build column list from old_get's projected columns
+	string col_list;
+	auto &col_ids = old_get->GetColumnIds();
+	for (idx_t i = 0; i < col_ids.size(); i++) {
+		if (i > 0) {
+			col_list += ", ";
+		}
+		idx_t idx = col_ids[i].GetPrimaryIndex();
+		col_list += OpenIVMUtils::QuoteIdentifier(old_get->names[idx]);
+	}
+
+	// Construct the delta SQL: insertions (mul=true) UNION ALL deletions (mul=false)
+	string ins_sql = "SELECT " + col_list + ", true AS " + string(ivm::MULTIPLICITY_COL) +
+	                 " FROM ducklake_table_insertions('" + OpenIVMUtils::EscapeValue(catalog_name) + "', '" +
+	                 OpenIVMUtils::EscapeValue(schema_name) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
+	                 to_string(last_snap) + ", " + to_string(cur_snap) + ")";
+	string del_sql = "SELECT " + col_list + ", false AS " + string(ivm::MULTIPLICITY_COL) +
+	                 " FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(catalog_name) + "', '" +
+	                 OpenIVMUtils::EscapeValue(schema_name) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
+	                 to_string(last_snap) + ", " + to_string(cur_snap) + ")";
+	string delta_sql = ins_sql + " UNION ALL " + del_sql;
+
+	OPENIVM_DEBUG_PRINT("[DuckLake] Delta SQL: %s\n", delta_sql.c_str());
+
+	// Plan the SQL fragment to get the plan tree
+	Parser parser;
+	parser.ParseQuery(delta_sql);
+	Planner planner(context);
+	planner.CreatePlan(parser.statements[0]->Copy());
+	auto plan = std::move(planner.plan);
+	plan->ResolveOperatorTypes();
+
+	// Wrap in a projection that remaps output bindings to old_get->table_index.
+	// The planned SQL fragment has its own table indices (starting from 0) which
+	// don't match the parent plan's expectations.
+	auto bindings = plan->GetColumnBindings();
+	auto types = plan->types;
+
+	vector<unique_ptr<Expression>> remap_exprs;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		remap_exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], bindings[i]));
+	}
+
+	auto remap_proj = make_uniq<LogicalProjection>(old_get->table_index, std::move(remap_exprs));
+	remap_proj->children.push_back(std::move(plan));
+	remap_proj->ResolveOperatorTypes();
+
+	// Multiplicity binding: last column at the remapped table_index
+	ColumnBinding mul_binding(old_get->table_index, bindings.size() - 1);
+
+	OPENIVM_DEBUG_PRINT("[DuckLake] Delta plan built: %zu output cols, mul_binding: table=%lu col=%lu\n",
+	                    bindings.size(), (unsigned long)mul_binding.table_index,
+	                    (unsigned long)mul_binding.column_index);
+
+	return {std::move(remap_proj), mul_binding};
+}
+
+// ============================================================================
+// Standard DuckDB delta scan (existing logic)
+// ============================================================================
+
 DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, const string &view_name) {
+	// DuckLake tables: use native change tracking via table_insertions/table_deletions
+	auto table_ref = old_get->GetTable();
+	if (table_ref.get() && table_ref->ParentCatalog().GetCatalogType() == "ducklake") {
+		return CreateDuckLakeDeltaNode(context, old_get, view_name);
+	}
 	unique_ptr<LogicalGet> delta_get_node;
 	ColumnBinding new_mul_binding;
 	string table_name;
