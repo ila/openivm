@@ -6,7 +6,11 @@
 
 #if OPENIVM_DEBUG
 #include <cstdio>
-#define OPENIVM_DEBUG_PRINT(...) printf(__VA_ARGS__)
+#define OPENIVM_DEBUG_PRINT(...)                                                                                       \
+	do {                                                                                                               \
+		fprintf(stderr, __VA_ARGS__);                                                                                  \
+		fflush(stderr);                                                                                                \
+	} while (0)
 #else
 #define OPENIVM_DEBUG_PRINT(...) ((void)0)
 #endif

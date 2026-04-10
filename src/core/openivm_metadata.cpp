@@ -2,6 +2,7 @@
 
 #include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
+#include <sstream>
 
 namespace duckdb {
 
@@ -124,6 +125,25 @@ vector<string> IVMMetadata::GetDownstreamViews(const string &view_name) {
 	};
 	collect(view_name);
 	return result; // topological order: closest descendants first
+}
+
+vector<string> IVMMetadata::GetGroupColumns(const string &view_name) {
+	auto result = con.Query("SELECT group_columns FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+	vector<string> cols;
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return cols;
+	}
+	string raw = result->GetValue(0, 0).ToString();
+	// Split comma-separated column names
+	std::istringstream ss(raw);
+	string token;
+	while (std::getline(ss, token, ',')) {
+		if (!token.empty()) {
+			cols.push_back(token);
+		}
+	}
+	return cols;
 }
 
 int64_t IVMMetadata::GetRefreshInterval(const string &view_name) {

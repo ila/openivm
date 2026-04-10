@@ -199,7 +199,9 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 	parser.ParseQuery(view_query);
 	auto statement = parser.statements[0].get();
 
+	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
 	planner.CreatePlan(statement->Copy());
+	OPENIVM_DEBUG_PRINT("[REWRITE] CreatePlan done\n");
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Unoptimized plan: \n%s\n", planner.plan->ToString().c_str());
 #endif

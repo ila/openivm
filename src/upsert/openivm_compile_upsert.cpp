@@ -46,19 +46,28 @@ static AvgDecomposition DetectAvgColumns(const vector<string> &columns) {
 
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
-                              bool list_mode, const string &delta_ts_filter) {
-	string data_table = IVMTableNames::DataTableName(view_name);
-	auto index_catalog_entry = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
-	auto key_ids = index_catalog_entry->column_ids;
+                              bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
+                              const string &catalog_prefix) {
+	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
+	string delta_view = catalog_prefix + Q(OpenIVMUtils::DeltaName(view_name));
 
+	// Extract GROUP BY keys: from index (standard path) or from metadata (DuckLake fallback)
 	vector<string> keys;
-	vector<string> aggregates;
-	for (size_t i = 0; i < key_ids.size(); i++) {
-		keys.emplace_back(Q(column_names[key_ids[i]]));
+	if (index_delta_view_catalog_entry) {
+		auto index_catalog_entry = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
+		auto key_ids = index_catalog_entry->column_ids;
+		for (size_t i = 0; i < key_ids.size(); i++) {
+			keys.emplace_back(Q(column_names[key_ids[i]]));
+		}
+	} else {
+		// No index (e.g. DuckLake) — use group column names from metadata
+		for (auto &col : group_column_names) {
+			keys.emplace_back(Q(col));
+		}
 	}
 
 	unordered_set<std::string> keys_set(keys.begin(), keys.end());
-
+	vector<string> aggregates;
 	for (auto &column : column_names) {
 		if (keys_set.find(Q(column)) == keys_set.end() && column != string(ivm::MULTIPLICITY_COL)) {
 			aggregates.push_back(Q(column));
@@ -75,12 +84,11 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			}
 		}
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-		string delete_query = "delete from " + Q(data_table) + " where (" + keys_tuple + ") in (\n" +
-		                      "  select distinct " + keys_tuple + " from " + Q(OpenIVMUtils::DeltaName(view_name)) +
-		                      delta_where + "\n);\n";
-		string insert_query = "insert into " + Q(data_table) + "\n" + "select * from (" + view_query_sql +
+		string delete_query = "delete from " + data_table + " where (" + keys_tuple + ") in (\n" +
+		                      "  select distinct " + keys_tuple + " from " + delta_view + delta_where + "\n);\n";
+		string insert_query = "insert into " + data_table + "\n" + "select * from (" + view_query_sql +
 		                      ") _ivm_recompute\n" + "where (" + keys_tuple + ") in (\n" + "  select distinct " +
-		                      keys_tuple + " from " + Q(OpenIVMUtils::DeltaName(view_name)) + delta_where + "\n);\n";
+		                      keys_tuple + " from " + delta_view + delta_where + "\n);\n";
 		return delete_query + "\n" + insert_query;
 	}
 
@@ -109,7 +117,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	}
 	cte_select_string.erase(cte_select_string.size() - 2, 2);
 	cte_select_string += "\n";
-	string cte_from_string = "from " + Q(OpenIVMUtils::DeltaName(view_name));
+	string cte_from_string = "from " + delta_view;
 	if (!delta_ts_filter.empty()) {
 		cte_from_string += " WHERE " + delta_ts_filter;
 	}
@@ -193,7 +201,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		}
 	}
 
-	string merge_query = "WITH ivm_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + Q(data_table) +
+	string merge_query = "WITH ivm_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table +
 	                     " v USING ivm_cte d\n" + "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " +
 	                     update_set + "\n" + "WHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (";
 	for (auto &key : keys) {
@@ -204,7 +212,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	string upsert_query = merge_query + "\n";
 
 	// Delete zero rows — skip AVG derived columns (check sum/count helpers instead)
-	string delete_query = "\ndelete from " + Q(data_table) + " where ";
+	string delete_query = "\ndelete from " + data_table + " where ";
 	for (auto &column : aggregates) {
 		if (avg_derived_cols.count(column)) {
 			continue; // skip avg_x — checking sum/count is sufficient
@@ -227,12 +235,12 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
                                const string &delta_ts_filter) {
 	string data_table = IVMTableNames::DataTableName(view_name);
 	if (has_minmax) {
-		string delete_query = "DELETE FROM " + Q(data_table) + ";\n";
-		string insert_query = "INSERT INTO " + Q(data_table) + " " + view_query_sql + ";\n";
+		string delete_query = "DELETE FROM " + data_table + ";\n";
+		string insert_query = "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 		return delete_query + insert_query;
 	}
 
-	string delta_view = OpenIVMUtils::DeltaName(view_name);
+	string delta_view = Q(OpenIVMUtils::DeltaName(view_name));
 	string mul = string(ivm::MULTIPLICITY_COL);
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
@@ -273,9 +281,9 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 			    column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM _ivm_delta), 0)";
 		}
 	}
-	cte += "\n  FROM " + Q(delta_view) + ts_where + "\n)\n";
+	cte += "\n  FROM " + delta_view + ts_where + "\n)\n";
 
-	string result = cte + "UPDATE " + Q(data_table) + " SET\n  " + update_set + ";\n";
+	string result = cte + "UPDATE " + data_table + " SET\n  " + update_set + ";\n";
 
 	// Recompute AVG derived columns from updated SUM and COUNT
 	for (auto &entry : avg_sum) {
@@ -285,8 +293,8 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 			continue;
 		}
 		string count_col = avg_count[alias];
-		result += "UPDATE " + Q(data_table) + " SET " + alias + " = " + sum_col + "::DOUBLE / NULLIF(" + count_col +
-		          ", 0);\n";
+		result +=
+		    "UPDATE " + data_table + " SET " + alias + " = " + sum_col + "::DOUBLE / NULLIF(" + count_col + ", 0);\n";
 	}
 
 	return result;
@@ -314,7 +322,7 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	// Consolidate deltas into net changes per distinct tuple (1 pass over delta_view).
 	// _net > 0 = net insertions, _net < 0 = net deletions.
 	string cte_body = "SELECT " + select_columns + ",\n    SUM(CASE WHEN " + mul +
-	                  " THEN 1 ELSE -1 END) AS _net\n  FROM " + Q(delta_view) + ts_where + "\n  GROUP BY " +
+	                  " THEN 1 ELSE -1 END) AS _net\n  FROM " + delta_view + ts_where + "\n  GROUP BY " +
 	                  select_columns + "\n  HAVING SUM(CASE WHEN " + mul + " THEN 1 ELSE -1 END) != 0";
 
 	// DELETE: remove exactly |_net| copies per tuple using rowid + ROW_NUMBER.
@@ -323,7 +331,7 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	string delete_query = "WITH _ivm_net AS (\n  " + cte_body +
 	                      "\n)\n"
 	                      "DELETE FROM " +
-	                      Q(data_table) +
+	                      data_table +
 	                      " WHERE rowid IN (\n"
 	                      "  SELECT v.rowid FROM (\n"
 	                      "    SELECT rowid, " +
@@ -333,7 +341,7 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	                      select_columns +
 	                      " ORDER BY rowid) AS _rn\n"
 	                      "    FROM " +
-	                      Q(data_table) +
+	                      data_table +
 	                      "\n"
 	                      "  ) v JOIN _ivm_net d ON " +
 	                      match_conditions +
@@ -346,7 +354,7 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	string insert_query = "WITH _ivm_net AS (\n  " + cte_body +
 	                      "\n)\n"
 	                      "INSERT INTO " +
-	                      Q(data_table) + " SELECT " + select_columns +
+	                      data_table + " SELECT " + select_columns +
 	                      "\nFROM _ivm_net, generate_series(1, _ivm_net._net::BIGINT)\nWHERE _ivm_net._net > 0;\n";
 
 	return delete_query + insert_query;

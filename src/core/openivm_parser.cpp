@@ -339,7 +339,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " (view_name varchar primary key, sql_string varchar, type tinyint,"
 		              " has_minmax boolean default false, has_left_join boolean default false,"
 		              " last_update timestamp, refresh_interval bigint default null,"
-		              " refresh_in_progress boolean default false)");
+		              " refresh_in_progress boolean default false,"
+		              " group_columns varchar default null)");
 
 		// Refresh hooks: extensions can register custom SQL to run on MV refresh
 		// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
@@ -371,10 +372,22 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Store the LPTS query in metadata — it has hidden columns (DISTINCT count, AVG sum/count,
 		// LEFT JOIN key) and preserves user column names.
 		string refresh_val = ivm_parse_data.refresh_interval > 0 ? to_string(ivm_parse_data.refresh_interval) : "null";
+		// Store GROUP BY columns so CompileAggregateGroups can work without an index (e.g. DuckLake)
+		string group_cols_val = "null";
+		if (!aggregate_columns.empty()) {
+			group_cols_val = "'";
+			for (size_t i = 0; i < aggregate_columns.size(); i++) {
+				if (i > 0) {
+					group_cols_val += ",";
+				}
+				group_cols_val += OpenIVMUtils::EscapeSingleQuotes(aggregate_columns[i]);
+			}
+			group_cols_val += "'";
+		}
 		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
 		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", " +
 		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now(), " +
-		              refresh_val + ", false)");
+		              refresh_val + ", false, " + group_cols_val + ")");
 
 		// Classify each base table by catalog type (duckdb vs ducklake).
 		// DuckLake tables use native change tracking; DuckDB tables use delta tables.
@@ -522,6 +535,26 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 			index_query_view += ")";
 			ddl.push_back(index_query_view);
+		}
+
+		// After all tables are created and populated, update DuckLake snapshot IDs
+		// to the current snapshot. This ensures the first refresh only sees changes
+		// made AFTER the MV was created (not the initial data load).
+		for (const auto &table_name : table_names) {
+			if (ducklake_tables.count(table_name)) {
+				string cat_name = view_catalog_prefix.empty()
+				                      ? "memory"
+				                      : view_catalog_prefix.substr(0, view_catalog_prefix.size() - 1);
+				// Remove trailing dot and extract catalog name
+				auto dot = cat_name.rfind('.');
+				if (dot != string::npos) {
+					cat_name = cat_name.substr(0, dot);
+				}
+				ddl.push_back("UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = (SELECT id FROM " +
+				              cat_name + ".current_snapshot()) WHERE view_name = '" +
+				              OpenIVMUtils::EscapeSingleQuotes(view_name) + "' AND table_name = '" +
+				              OpenIVMUtils::EscapeSingleQuotes(table_name) + "'");
+			}
 		}
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Compiled %lu DDL queries for bind phase\n", (unsigned long)ddl.size());

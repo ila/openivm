@@ -66,6 +66,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		string sql = GenerateRefreshSQL(context, view_catalog_name, view_schema_name, vn, cross_system,
 		                                attached_db_catalog_name, attached_db_schema_name);
 		Connection exec_con(*context.db.get());
+		OPENIVM_DEBUG_PRINT("[UPSERT] Executing refresh SQL:\n%s\n", sql.c_str());
 		auto result = exec_con.Query(sql);
 		if (result->HasError()) {
 			// Clear the crash-safety flag — this is a SQL error, not a process crash.
@@ -81,6 +82,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 }
 
 void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters) {
+	OPENIVM_DEBUG_PRINT("[UPSERT] UpsertDeltaQueriesLocked START\n");
 	string view_catalog_name;
 	string view_schema_name;
 	string attached_db_catalog_name;
@@ -108,6 +110,8 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		view_schema_name = default_entry.schema;
 		view_name = StringValue::Get(parameters.values[0]);
 
+		OPENIVM_DEBUG_PRINT("[UPSERT] Default catalog=%s, schema=%s, view=%s\n", view_catalog_name.c_str(),
+		                    view_schema_name.c_str(), view_name.c_str());
 		// If the view doesn't exist in the default catalog, search attached catalogs.
 		// This handles DuckLake MVs created as "dl.mv_name" where the view lives in "dl".
 		{
@@ -115,21 +119,27 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 			auto entry = Catalog::GetEntry(context, view_catalog_name, view_schema_name,
 			                               EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, err_ctx),
 			                               OnEntryNotFound::RETURN_NULL);
+			OPENIVM_DEBUG_PRINT("[UPSERT] Default catalog entry: %s\n", entry ? "found" : "not found");
 			if (!entry) {
 				auto &db_manager = DatabaseManager::Get(context);
 				auto databases = db_manager.GetDatabases(context);
+				OPENIVM_DEBUG_PRINT("[UPSERT] Searching %zu databases...\n", databases.size());
 				for (auto &db : databases) {
 					auto &cat_name = db->GetName();
+					OPENIVM_DEBUG_PRINT("[UPSERT] Checking catalog '%s'...\n", cat_name.c_str());
 					auto found = Catalog::GetEntry(context, cat_name, DEFAULT_SCHEMA,
 					                               EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, err_ctx),
 					                               OnEntryNotFound::RETURN_NULL);
 					if (found) {
 						view_catalog_name = cat_name;
 						view_schema_name = DEFAULT_SCHEMA;
+						OPENIVM_DEBUG_PRINT("[UPSERT] Found view in catalog '%s'\n", cat_name.c_str());
 						break;
 					}
 				}
 			}
+			OPENIVM_DEBUG_PRINT("[UPSERT] Resolved catalog='%s', schema='%s'\n", view_catalog_name.c_str(),
+			                    view_schema_name.c_str());
 		}
 	}
 
@@ -237,17 +247,26 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string data_table_bare = IVMTableNames::DataTableName(view_name);
 	string data_table = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table_bare);
 
-	// Use con's transaction for catalog access — sees all committed state
-	con.BeginTransaction();
-	auto &con_ctx = *con.context;
-	auto delta_view_catalog_entry = catalog.GetEntry<TableCatalogEntry>(
-	    con_ctx, view_catalog_name, view_schema_name, OpenIVMUtils::DeltaName(view_name),
-	    OnEntryNotFound::THROW_EXCEPTION, error_context);
-	auto index_delta_view_catalog_entry =
-	    Catalog::GetEntry(con_ctx, view_catalog_name, view_schema_name,
-	                      EntryLookupInfo(CatalogType::INDEX_ENTRY, data_table_bare + ivm::INDEX_SUFFIX, error_context),
-	                      OnEntryNotFound::RETURN_NULL);
-	con.Rollback();
+	// Look up delta view and index.
+	OPENIVM_DEBUG_PRINT("[UPSERT] Looking up delta view '%s' in catalog '%s.%s'\n",
+	                    OpenIVMUtils::DeltaName(view_name).c_str(), view_catalog_name.c_str(),
+	                    view_schema_name.c_str());
+	optional_ptr<TableCatalogEntry> delta_view_catalog_entry;
+	optional_ptr<CatalogEntry> index_delta_view_catalog_entry;
+	if (catalog_prefix.empty()) {
+		// Standard catalog: use Catalog API directly
+		con.BeginTransaction();
+		delta_view_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
+		    *con.context, view_catalog_name, view_schema_name, OpenIVMUtils::DeltaName(view_name),
+		    OnEntryNotFound::THROW_EXCEPTION, error_context);
+		index_delta_view_catalog_entry = Catalog::GetEntry(
+		    *con.context, view_catalog_name, view_schema_name,
+		    EntryLookupInfo(CatalogType::INDEX_ENTRY, data_table_bare + ivm::INDEX_SUFFIX, error_context),
+		    OnEntryNotFound::RETURN_NULL);
+		con.Rollback();
+	}
+	// DuckLake: skip Catalog API (requires DuckLake transaction). Column names and
+	// group columns come from metadata instead. delta_view_catalog_entry stays null.
 
 	// IVMMetadata uses auto-commit queries (no explicit transaction needed)
 	IVMMetadata metadata(con);
@@ -326,26 +345,41 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 
 	// IVM path: proceed with incremental maintenance
 
-	// first of all we need to understand the keys
-	auto delta_view_entry = dynamic_cast<TableCatalogEntry *>(delta_view_catalog_entry.get());
-	const ColumnList &delta_view_columns = delta_view_entry->GetColumns();
+	// Get column names from the delta view table.
+	vector<string> column_names;
+	bool list_mode = false;
+	if (delta_view_catalog_entry) {
+		// Standard catalog: use catalog entry directly
+		auto delta_view_entry = dynamic_cast<TableCatalogEntry *>(delta_view_catalog_entry.get());
+		const ColumnList &delta_view_columns = delta_view_entry->GetColumns();
+		column_names = delta_view_columns.GetColumnNames();
+		for (auto &col : delta_view_columns.Logical()) {
+			if (col.GetName() != ivm::MULTIPLICITY_COL && col.GetType().id() == LogicalTypeId::LIST) {
+				list_mode = true;
+				break;
+			}
+		}
+	} else {
+		// DuckLake: get column names via SQL
+		string delta_full = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+		auto col_result =
+		    con.Query("SELECT column_name FROM information_schema.columns WHERE table_catalog = '" +
+		              OpenIVMUtils::EscapeValue(view_catalog_name) + "' AND table_schema = '" +
+		              OpenIVMUtils::EscapeValue(view_schema_name) + "' AND table_name = '" +
+		              OpenIVMUtils::EscapeValue(OpenIVMUtils::DeltaName(view_name)) + "' ORDER BY ordinal_position");
+		if (!col_result->HasError()) {
+			for (idx_t i = 0; i < col_result->RowCount(); i++) {
+				column_names.push_back(col_result->GetValue(0, i).ToString());
+			}
+		}
+	}
 
-	auto column_names = delta_view_columns.GetColumnNames();
 	// Check if the delta view has a timestamp column (present when created via CREATE MATERIALIZED VIEW)
 	bool has_ts_col =
 	    std::find(column_names.begin(), column_names.end(), string(ivm::TIMESTAMP_COL)) != column_names.end();
 	// Remove _duckdb_ivm_timestamp — it's auto-filled by DEFAULT (for chained MV support)
 	column_names.erase(std::remove(column_names.begin(), column_names.end(), string(ivm::TIMESTAMP_COL)),
 	                   column_names.end());
-
-	// Detect list mode: use element-wise list operations for LIST-typed aggregate columns
-	bool list_mode = false;
-	for (auto &col : delta_view_columns.Logical()) {
-		if (col.GetName() != ivm::MULTIPLICITY_COL && col.GetType().id() == LogicalTypeId::LIST) {
-			list_mode = true;
-			break;
-		}
-	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] List mode: %s\n", list_mode ? "true" : "false");
 
 	string upsert_query;
@@ -382,15 +416,19 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// All DML (INSERT, DELETE, UPDATE, MERGE) targets the physical data table,
 	// not the user-facing VIEW which excludes internal _ivm_* columns.
 	// The compile functions receive view_name and compute data_table internally.
+	// GROUP BY columns: from index (standard) or metadata (DuckLake fallback).
+	auto group_cols = metadata.GetGroupColumns(view_name);
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_HAVING: {
-		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
-		                                      view_query_sql, /*has_minmax=*/true, list_mode, delta_ts_filter);
+		upsert_query =
+		    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
+		                           /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols, catalog_prefix);
 		break;
 	}
 	case IVMType::AGGREGATE_GROUP: {
-		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
-		                                      view_query_sql, has_minmax, list_mode, delta_ts_filter);
+		upsert_query =
+		    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
+		                           has_minmax, list_mode, delta_ts_filter, group_cols, catalog_prefix);
 		break;
 	}
 	case IVMType::SIMPLE_PROJECTION: {
@@ -447,7 +485,6 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string do_ivm = "select * from DoIVM('" + OpenIVMUtils::EscapeValue(view_catalog_name) + "','" +
 	                OpenIVMUtils::EscapeValue(view_schema_name) + "','" + OpenIVMUtils::EscapeValue(view_name) + "');";
 
-	con.BeginTransaction();
 	auto delta_table_names = metadata.GetDeltaTables(view_name);
 
 	// now we can plan the query
@@ -455,13 +492,17 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	Parser p;
 	p.ParseQuery(do_ivm);
 
-	Planner planner(*con.context);
+	con.BeginTransaction();
+	auto &con_ctx = *con.context;
+	OPENIVM_DEBUG_PRINT("[UPSERT] Creating planner...\n");
+	Planner planner(con_ctx);
+	OPENIVM_DEBUG_PRINT("[UPSERT] CreatePlan...\n");
 	planner.CreatePlan(std::move(p.statements[0]));
 	auto plan = std::move(planner.plan);
-	OPENIVM_DEBUG_PRINT("[UPSERT] Unoptimized plan:\n%s\n", plan->ToString().c_str());
-	Optimizer optimizer(*planner.binder, *con.context);
+	OPENIVM_DEBUG_PRINT("[UPSERT] Plan created. Running optimizer...\n");
+	Optimizer optimizer(*planner.binder, con_ctx);
 	plan = optimizer.Optimize(std::move(plan)); // this transforms the plan into an incremental plan
-	OPENIVM_DEBUG_PRINT("[UPSERT] Optimized (incremental) plan:\n%s\n", plan->ToString().c_str());
+	OPENIVM_DEBUG_PRINT("[UPSERT] Optimizer done.\n");
 	con.Rollback();
 
 	// Convert the rewritten plan to SQL via the AST pipeline
@@ -472,9 +513,14 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// Use explicit column list in INSERT INTO delta_view, excluding _duckdb_ivm_timestamp
 	// so the DEFAULT now() fills it in (for chained MV support)
 	string delta_view_name = catalog_prefix + OpenIVMUtils::DeltaName(view_name);
-	string insert_target = "INSERT INTO " + OpenIVMUtils::DeltaName(view_name);
-	auto insert_pos = raw_ivm_sql.find(insert_target);
+	string insert_target_bare = "INSERT INTO " + OpenIVMUtils::DeltaName(view_name);
+	auto insert_pos = raw_ivm_sql.find(insert_target_bare);
 	if (insert_pos != string::npos) {
+		// Replace bare delta table name with catalog-qualified version
+		if (!catalog_prefix.empty()) {
+			raw_ivm_sql.replace(insert_pos, insert_target_bare.size(), "INSERT INTO " + delta_view_name);
+			insert_pos = raw_ivm_sql.find("INSERT INTO " + delta_view_name);
+		}
 		string col_list = "(";
 		for (size_t i = 0; i < column_names.size(); i++) {
 			if (i > 0) {
@@ -483,7 +529,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			col_list += OpenIVMUtils::QuoteIdentifier(column_names[i]);
 		}
 		col_list += ") ";
-		raw_ivm_sql.insert(insert_pos + insert_target.size(), " " + col_list);
+		string full_insert = "INSERT INTO " + delta_view_name;
+		raw_ivm_sql.insert(insert_pos + full_insert.size(), " " + col_list);
 	}
 	ivm_query += raw_ivm_sql;
 
@@ -601,7 +648,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	if (has_downstream) {
 		delete_from_view_query = IVMMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name);
 	} else {
-		delete_from_view_query = "DELETE FROM " + KeywordHelper::WriteOptionallyQuoted(delta_view_name) + ";";
+		delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
 	}
 
 	// now we can also delete from the delta table, but only if all the dependent views have been refreshed
@@ -612,6 +659,20 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string update_timestamp_query = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
 	                                " SET last_update = now() WHERE view_name = '" +
 	                                OpenIVMUtils::EscapeValue(view_name) + "';\n";
+
+	// Update DuckLake snapshot IDs so the next refresh only sees new changes.
+	string snapshot_update_query;
+	for (auto &dt : delta_table_names) {
+		if (metadata.IsDuckLakeTable(view_name, dt)) {
+			// Find the catalog name for this DuckLake table from the view query
+			// (the table name in metadata is the bare name, e.g. "products")
+			string cat_name = view_catalog_name; // default to view's catalog
+			snapshot_update_query += "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
+			                         " SET last_snapshot_id = (SELECT id FROM " + cat_name + ".current_snapshot())" +
+			                         " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+			                         "' AND table_name = '" + OpenIVMUtils::EscapeValue(dt) + "';\n";
+		}
+	}
 
 	for (auto &dt : delta_table_names) {
 		// DuckLake tables have no delta tables to clean up
@@ -647,8 +708,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// 8. delete_from_view: clean old delta_view rows
 	// 9. delete_from_delta: clean old base delta rows
 	string clean_query = set_in_progress + pre_companion + ivm_query + "\n" + companion_query + "\n" + upsert_query +
-	                     "\n" + post_companion + update_timestamp_query + "\n" + clear_in_progress +
-	                     delete_from_view_query + "\n" + delete_from_delta_table_query;
+	                     "\n" + post_companion + update_timestamp_query + snapshot_update_query + "\n" +
+	                     clear_in_progress + delete_from_view_query + "\n" + delete_from_delta_table_query;
 
 	// Write reference SQL to disk only if ivm_files_path is explicitly set
 	Value files_path_val;

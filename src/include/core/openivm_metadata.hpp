@@ -71,6 +71,9 @@ public:
 	// metadata_key: the name used in _duckdb_ivm_delta_tables (unqualified delta name).
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key);
 
+	// Get GROUP BY column names for a view. Returns empty vector if not stored.
+	vector<string> GetGroupColumns(const string &view_name);
+
 	// --- DuckLake support ---
 
 	// Get the catalog type for a base table entry ('duckdb' or 'ducklake').

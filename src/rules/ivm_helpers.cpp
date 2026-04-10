@@ -29,9 +29,11 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, LogicalGet
 	OPENIVM_DEBUG_PRINT("[DuckLake] Creating delta node for '%s.%s.%s'\n", catalog_name.c_str(), schema_name.c_str(),
 	                    table_name.c_str());
 
-	// Get snapshot range from metadata
+	// Get snapshot range from metadata.
+	// Use auto-commit to avoid deadlocking with the outer optimizer transaction.
+	OPENIVM_DEBUG_PRINT("[DuckLake] About to create connection for metadata queries\n");
 	Connection con(*context.db);
-	con.SetAutoCommit(false);
+	OPENIVM_DEBUG_PRINT("[DuckLake] Connection created, querying snapshot...\n");
 	auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(ivm::DELTA_TABLES_TABLE) +
 	                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
 	                             "' AND table_name = '" + OpenIVMUtils::EscapeValue(table_name) + "'");
@@ -72,13 +74,16 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, LogicalGet
 
 	OPENIVM_DEBUG_PRINT("[DuckLake] Delta SQL: %s\n", delta_sql.c_str());
 
-	// Plan the SQL fragment to get the plan tree
+	// Plan the SQL fragment on a separate connection to avoid deadlocking
+	// with the optimizer's active transaction on the main context.
+	con.BeginTransaction();
 	Parser parser;
 	parser.ParseQuery(delta_sql);
-	Planner planner(context);
+	Planner planner(*con.context);
 	planner.CreatePlan(parser.statements[0]->Copy());
 	auto plan = std::move(planner.plan);
 	plan->ResolveOperatorTypes();
+	con.Rollback();
 
 	// Wrap in a projection that remaps output bindings to old_get->table_index.
 	// The planned SQL fragment has its own table indices (starting from 0) which
