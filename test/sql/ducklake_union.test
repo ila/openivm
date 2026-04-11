@@ -1,0 +1,116 @@
+# name: test/sql/ducklake_union.test
+# description: Test IVM with UNION ALL on DuckLake base tables
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+# ==========================================
+# Basic UNION ALL
+# ==========================================
+
+statement ok
+CREATE TABLE dl.sales_online (id INTEGER, product VARCHAR, amount DECIMAL(10,2));
+
+statement ok
+CREATE TABLE dl.sales_store (id INTEGER, product VARCHAR, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO dl.sales_online VALUES (1, 'Widget', 10.00), (2, 'Gadget', 20.00);
+
+statement ok
+INSERT INTO dl.sales_store VALUES (1, 'Widget', 15.00), (2, 'Gizmo', 30.00);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_all_sales AS
+  SELECT product, SUM(amount) as total, COUNT(*) as cnt
+  FROM (SELECT product, amount FROM dl.sales_online UNION ALL SELECT product, amount FROM dl.sales_store)
+  GROUP BY product;
+
+query III rowsort
+SELECT * FROM dl.mv_all_sales ORDER BY product;
+----
+Gadget	20.00	1
+Gizmo	30.00	1
+Widget	25.00	2
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (
+  SELECT product, total, cnt FROM dl.mv_all_sales
+  EXCEPT ALL
+  SELECT product, SUM(amount), COUNT(*) FROM (SELECT product, amount FROM dl.sales_online UNION ALL SELECT product, amount FROM dl.sales_store) GROUP BY product
+);
+----
+0
+
+# --- Insert into one source ---
+statement ok
+INSERT INTO dl.sales_online VALUES (3, 'Widget', 5.00);
+
+statement ok
+PRAGMA ivm('mv_all_sales');
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (
+  SELECT product, total, cnt FROM dl.mv_all_sales
+  EXCEPT ALL
+  SELECT product, SUM(amount), COUNT(*) FROM (SELECT product, amount FROM dl.sales_online UNION ALL SELECT product, amount FROM dl.sales_store) GROUP BY product
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT product, SUM(amount), COUNT(*) FROM (SELECT product, amount FROM dl.sales_online UNION ALL SELECT product, amount FROM dl.sales_store) GROUP BY product
+  EXCEPT ALL
+  SELECT product, total, cnt FROM dl.mv_all_sales
+);
+----
+0
+
+# ==========================================
+# Stress: batch ops on both sources
+# ==========================================
+
+statement ok
+INSERT INTO dl.sales_store VALUES (3, 'Gadget', 40.00);
+
+statement ok
+DELETE FROM dl.sales_online WHERE id = 2;
+
+statement ok
+INSERT INTO dl.sales_online VALUES (4, 'Gizmo', 12.00);
+
+statement ok
+PRAGMA ivm('mv_all_sales');
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (
+  SELECT product, total, cnt FROM dl.mv_all_sales
+  EXCEPT ALL
+  SELECT product, SUM(amount), COUNT(*) FROM (SELECT product, amount FROM dl.sales_online UNION ALL SELECT product, amount FROM dl.sales_store) GROUP BY product
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT product, SUM(amount), COUNT(*) FROM (SELECT product, amount FROM dl.sales_online UNION ALL SELECT product, amount FROM dl.sales_store) GROUP BY product
+  EXCEPT ALL
+  SELECT product, total, cnt FROM dl.mv_all_sales
+);
+----
+0

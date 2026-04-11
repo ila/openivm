@@ -16,9 +16,9 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               const vector<string> &group_column_names = {}, const string &catalog_prefix = "");
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql = "", bool has_minmax = false, bool list_mode = false,
-                               const string &delta_ts_filter = "");
+                               const string &delta_ts_filter = "", const string &catalog_prefix = "");
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
-                                 const string &delta_ts_filter = "");
+                                 const string &delta_ts_filter = "", const string &catalog_prefix = "");
 
 } // namespace duckdb
 

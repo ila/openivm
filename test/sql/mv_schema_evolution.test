@@ -1,4 +1,4 @@
-# name: test/sql/ivm_schema_evolution.test
+# name: test/sql/mv_schema_evolution.test
 # description: Test ALTER TABLE handling — delta table sync and column reference blocking
 # group: [sql]
 

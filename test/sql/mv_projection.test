@@ -1,4 +1,4 @@
-# name: test/sql/ivm_projection.test
+# name: test/sql/mv_projection.test
 # description: Test IVM with simple projections (no aggregation)
 # group: [sql]
 

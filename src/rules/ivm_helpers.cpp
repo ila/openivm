@@ -14,6 +14,81 @@
 namespace duckdb {
 
 // ============================================================================
+// Stub/restore for non-serializable scans (DuckLake)
+//
+// Before LogicalOperator::Copy(), replace DuckLake scans with serializable
+// stubs. After Copy, restore the real function/bind_data into both trees.
+// ============================================================================
+
+// SavedScanInfo is defined in ivm_rule.hpp
+
+static void CollectNonSerializableScans(LogicalOperator &op, vector<LogicalGet *> &scans) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		// Check if this is a DuckLake scan (or any scan that might fail serialization)
+		bool is_ducklake = get.function.name == "ducklake_scan";
+		OPENIVM_DEBUG_PRINT("[StubScans] GET '%s' table_index=%lu serialize=%d ducklake=%d\n",
+		                    get.function.name.c_str(), (unsigned long)get.table_index,
+		                    (int)get.function.HasSerializationCallbacks(), (int)is_ducklake);
+		if (is_ducklake) {
+			scans.push_back(&get);
+		}
+	}
+	for (auto &child : op.children) {
+		CollectNonSerializableScans(*child, scans);
+	}
+}
+
+static void FindGetsByTableIndex(LogicalOperator &op, idx_t table_index, vector<LogicalGet *> &result) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		if (get.table_index == table_index) {
+			result.push_back(&get);
+		}
+	}
+	for (auto &child : op.children) {
+		FindGetsByTableIndex(*child, table_index, result);
+	}
+}
+
+vector<SavedScanInfo> StubNonSerializableScans(LogicalOperator &op) {
+	vector<LogicalGet *> scans;
+	CollectNonSerializableScans(op, scans);
+	vector<SavedScanInfo> saved;
+	for (auto *get : scans) {
+		SavedScanInfo info;
+		info.table_index = get->table_index;
+		// Save the serialize/deserialize callbacks and bind_data
+		info.saved_function = get->function; // shallow copy of TableFunction struct
+		info.saved_bind_data = std::move(get->bind_data);
+		info.saved_function_info = get->function.function_info;
+		// Keep serialize/deserialize intact — just move bind_data out so it doesn't interfere.
+		// The Copy will serialize+deserialize using the DuckLake callbacks.
+		get->bind_data = nullptr;
+		saved.push_back(std::move(info));
+	}
+	return saved;
+}
+
+void RestoreScans(LogicalOperator &op, vector<SavedScanInfo> &saved) {
+	for (auto &info : saved) {
+		vector<LogicalGet *> gets;
+		FindGetsByTableIndex(op, info.table_index, gets);
+		for (auto *get : gets) {
+			// Restore the serialize/deserialize callbacks
+			get->function.serialize = info.saved_function.serialize;
+			get->function.deserialize = info.saved_function.deserialize;
+			get->function.function_info = info.saved_function_info;
+			// Restore bind_data if it was nulled (original tree).
+			// For copies, the deserializer re-created bind_data via re-binding.
+			if (!get->bind_data && info.saved_bind_data) {
+				get->bind_data = std::move(info.saved_bind_data);
+			}
+		}
+	}
+}
+
+// ============================================================================
 // DuckLake delta scan: plan SQL fragments for table_insertions + table_deletions
 // ============================================================================
 
@@ -50,15 +125,23 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, LogicalGet
 
 	OPENIVM_DEBUG_PRINT("[DuckLake] Snapshot range: %ld -> %ld\n", (long)last_snap, (long)cur_snap);
 
-	// Build column list from old_get's projected columns
+	// Build column list from old_get's projected columns.
+	// Skip virtual columns (ROWID etc.) — they don't exist in ducklake_table_insertions/deletions.
+	// For COUNT(*) scans with no real columns, emit "1" as a dummy.
 	string col_list;
 	auto &col_ids = old_get->GetColumnIds();
 	for (idx_t i = 0; i < col_ids.size(); i++) {
-		if (i > 0) {
+		if (col_ids[i].IsVirtualColumn()) {
+			continue;
+		}
+		if (!col_list.empty()) {
 			col_list += ", ";
 		}
 		idx_t idx = col_ids[i].GetPrimaryIndex();
 		col_list += OpenIVMUtils::QuoteIdentifier(old_get->names[idx]);
+	}
+	if (col_list.empty()) {
+		col_list = "1 AS _dummy";
 	}
 
 	// Construct the delta SQL: insertions (mul=true) UNION ALL deletions (mul=false)

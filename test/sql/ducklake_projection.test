@@ -1,0 +1,327 @@
+# name: test/sql/ducklake_projection.test
+# description: Test IVM projections with DuckLake base tables
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+# ==========================================
+# 1. Simple SELECT projection
+# ==========================================
+
+statement ok
+CREATE TABLE dl.employees (id INT, name VARCHAR, dept VARCHAR);
+
+statement ok
+INSERT INTO dl.employees VALUES (1, 'Alice', 'eng'), (2, 'Bob', 'sales'), (3, 'Charlie', 'eng');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_emp AS SELECT id, name FROM dl.employees;
+
+# --- INSERT propagation ---
+statement ok
+INSERT INTO dl.employees VALUES (4, 'Diana', 'ops');
+
+statement ok
+PRAGMA ivm('mv_emp');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name FROM dl.employees
+    EXCEPT ALL
+    SELECT id, name FROM dl.mv_emp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name FROM dl.mv_emp
+    EXCEPT ALL
+    SELECT id, name FROM dl.employees
+);
+----
+0
+
+# --- DELETE propagation ---
+statement ok
+DELETE FROM dl.employees WHERE id = 2;
+
+statement ok
+PRAGMA ivm('mv_emp');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name FROM dl.employees
+    EXCEPT ALL
+    SELECT id, name FROM dl.mv_emp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name FROM dl.mv_emp
+    EXCEPT ALL
+    SELECT id, name FROM dl.employees
+);
+----
+0
+
+# ==========================================
+# 2. Multi-column projection with expressions
+# ==========================================
+
+statement ok
+CREATE TABLE dl.products (id INT, name VARCHAR, price DOUBLE, qty INT);
+
+statement ok
+INSERT INTO dl.products VALUES (1, 'Widget', 9.99, 100), (2, 'Gadget', 24.50, 50);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_prod AS
+    SELECT name, price * qty AS total_value, qty > 75 AS high_stock FROM dl.products;
+
+statement ok
+INSERT INTO dl.products VALUES (3, 'Gizmo', 5.00, 200);
+
+statement ok
+DELETE FROM dl.products WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_prod');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, price * qty AS total_value, qty > 75 AS high_stock FROM dl.products
+    EXCEPT ALL
+    SELECT name, total_value, high_stock FROM dl.mv_prod
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, total_value, high_stock FROM dl.mv_prod
+    EXCEPT ALL
+    SELECT name, price * qty AS total_value, qty > 75 AS high_stock FROM dl.products
+);
+----
+0
+
+# UPDATE a product and refresh
+statement ok
+UPDATE dl.products SET price = 30.00 WHERE id = 2;
+
+statement ok
+PRAGMA ivm('mv_prod');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, price * qty AS total_value, qty > 75 AS high_stock FROM dl.products
+    EXCEPT ALL
+    SELECT name, total_value, high_stock FROM dl.mv_prod
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, total_value, high_stock FROM dl.mv_prod
+    EXCEPT ALL
+    SELECT name, price * qty AS total_value, qty > 75 AS high_stock FROM dl.products
+);
+----
+0
+
+# ==========================================
+# 3. Stress test: batch INSERT + DELETE + UPDATE before single refresh
+# ==========================================
+
+statement ok
+CREATE TABLE dl.stress (id INT, val VARCHAR);
+
+statement ok
+INSERT INTO dl.stress VALUES (1, 'a'), (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_stress AS SELECT id, val FROM dl.stress;
+
+# --- Round 1: Mixed INSERT + DELETE + UPDATE, single refresh ---
+statement ok
+INSERT INTO dl.stress VALUES (4, 'd'), (4, 'd'), (5, 'e');
+
+statement ok
+DELETE FROM dl.stress WHERE id = 2;
+
+statement ok
+UPDATE dl.stress SET val = 'A' WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM dl.stress
+    EXCEPT ALL
+    SELECT id, val FROM dl.mv_stress
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM dl.mv_stress
+    EXCEPT ALL
+    SELECT id, val FROM dl.stress
+);
+----
+0
+
+# --- Round 2: Insert + delete same rows (net zero) alongside real changes ---
+statement ok
+INSERT INTO dl.stress VALUES (99, 'ghost'), (99, 'ghost');
+
+statement ok
+DELETE FROM dl.stress WHERE id = 99;
+
+statement ok
+INSERT INTO dl.stress VALUES (6, 'f');
+
+statement ok
+DELETE FROM dl.stress WHERE id = 3;
+
+statement ok
+PRAGMA ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM dl.stress
+    EXCEPT ALL
+    SELECT id, val FROM dl.mv_stress
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM dl.mv_stress
+    EXCEPT ALL
+    SELECT id, val FROM dl.stress
+);
+----
+0
+
+# --- Round 3: Conflicting ops on same row ---
+statement ok
+INSERT INTO dl.stress VALUES (30, 'x'), (30, 'x'), (30, 'x');
+
+statement ok
+DELETE FROM dl.stress WHERE id = 30;
+
+statement ok
+INSERT INTO dl.stress VALUES (30, 'y');
+
+statement ok
+UPDATE dl.stress SET val = 'z' WHERE id = 30;
+
+statement ok
+INSERT INTO dl.stress VALUES (30, 'z');
+
+statement ok
+PRAGMA ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM dl.stress
+    EXCEPT ALL
+    SELECT id, val FROM dl.mv_stress
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM dl.mv_stress
+    EXCEPT ALL
+    SELECT id, val FROM dl.stress
+);
+----
+0
+
+# --- Round 4: Delete everything, refresh, re-insert ---
+statement ok
+DELETE FROM dl.stress;
+
+statement ok
+PRAGMA ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM dl.mv_stress;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM dl.stress
+    EXCEPT ALL
+    SELECT id, val FROM dl.mv_stress
+);
+----
+0
+
+statement ok
+INSERT INTO dl.stress VALUES (10, 'new'), (10, 'new'), (11, 'also');
+
+statement ok
+PRAGMA ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM dl.stress
+    EXCEPT ALL
+    SELECT id, val FROM dl.mv_stress
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM dl.mv_stress
+    EXCEPT ALL
+    SELECT id, val FROM dl.stress
+);
+----
+0
+
+# --- Round 5: No-op refresh (no changes) ---
+statement ok
+PRAGMA ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM dl.stress
+    EXCEPT ALL
+    SELECT id, val FROM dl.mv_stress
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM dl.mv_stress
+    EXCEPT ALL
+    SELECT id, val FROM dl.stress
+);
+----
+0

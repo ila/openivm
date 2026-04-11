@@ -232,15 +232,15 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql, bool has_minmax, bool list_mode,
-                               const string &delta_ts_filter) {
-	string data_table = IVMTableNames::DataTableName(view_name);
+                               const string &delta_ts_filter, const string &catalog_prefix) {
+	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	if (has_minmax) {
 		string delete_query = "DELETE FROM " + data_table + ";\n";
 		string insert_query = "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 		return delete_query + insert_query;
 	}
 
-	string delta_view = Q(OpenIVMUtils::DeltaName(view_name));
+	string delta_view = catalog_prefix + Q(OpenIVMUtils::DeltaName(view_name));
 	string mul = string(ivm::MULTIPLICITY_COL);
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
@@ -301,10 +301,10 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 }
 
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
-                                 const string &delta_ts_filter) {
-	string data_table = IVMTableNames::DataTableName(view_name);
+                                 const string &delta_ts_filter, const string &catalog_prefix) {
+	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	string mul = string(ivm::MULTIPLICITY_COL);
-	string delta_view = OpenIVMUtils::DeltaName(view_name);
+	string delta_view = catalog_prefix + Q(OpenIVMUtils::DeltaName(view_name));
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
 	string select_columns;

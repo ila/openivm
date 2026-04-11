@@ -1,4 +1,4 @@
-# name: test/sql/ivm_aggregate.test
+# name: test/sql/mv_aggregate.test
 # description: Test IVM with all aggregate types (SUM, COUNT, MIN, MAX, AVG, grouped and ungrouped)
 # group: [sql]
 

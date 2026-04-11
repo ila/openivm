@@ -1,4 +1,4 @@
-# name: test/sql/ivm_join.test
+# name: test/sql/mv_inner_join.test
 # description: Test IVM with inner joins
 # group: [sql]
 

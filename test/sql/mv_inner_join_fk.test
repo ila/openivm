@@ -1,4 +1,4 @@
-# name: test/sql/ivm_join_fk.test
+# name: test/sql/mv_inner_join_fk.test
 # description: Test FK-aware inclusion-exclusion pruning for IVM joins
 # group: [sql]
 

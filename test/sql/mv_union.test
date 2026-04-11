@@ -1,4 +1,4 @@
-# name: test/sql/ivm_union.test
+# name: test/sql/mv_union.test
 # description: Test IVM with UNION ALL
 # group: [sql]
 

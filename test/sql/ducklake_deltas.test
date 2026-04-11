@@ -1,0 +1,209 @@
+# name: test/sql/ducklake_deltas.test
+# description: Test DuckLake-specific delta mechanics: snapshot tracking, time travel, multi-batch, deletes
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+# ==========================================
+# Section 1: Snapshot tracking
+# Verify last_snapshot_id advances after each refresh
+# ==========================================
+
+statement ok
+CREATE TABLE dl.snap_test (id INTEGER, grp VARCHAR, val INTEGER);
+
+statement ok
+INSERT INTO dl.snap_test VALUES (1, 'A', 10), (2, 'A', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_snap AS SELECT grp, SUM(val) as total, COUNT(*) as cnt FROM dl.snap_test GROUP BY grp;
+
+# Snapshot should be set after CREATE MV
+query I
+SELECT last_snapshot_id IS NOT NULL FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_snap';
+----
+true
+
+# Record the initial snapshot (value varies, just check it's positive)
+query I
+SELECT last_snapshot_id > 0 FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_snap';
+----
+true
+
+statement ok
+INSERT INTO dl.snap_test VALUES (3, 'A', 30);
+
+# Save pre-refresh snapshot for comparison
+statement ok
+CREATE TEMP TABLE snap_before AS SELECT last_snapshot_id AS snap FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_snap';
+
+statement ok
+PRAGMA ivm('mv_snap');
+
+# Snapshot should have advanced after refresh
+query I
+SELECT last_snapshot_id > (SELECT snap FROM snap_before) FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_snap';
+----
+true
+
+statement ok
+DROP TABLE snap_before;
+
+# MV should be correct
+query III
+SELECT grp, total, cnt FROM dl.mv_snap;
+----
+A	60	3
+
+# EXCEPT ALL check
+query I
+SELECT count(*) FROM (SELECT grp, total, cnt FROM dl.mv_snap EXCEPT ALL SELECT grp, SUM(val), COUNT(*) FROM dl.snap_test GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, SUM(val), COUNT(*) FROM dl.snap_test GROUP BY grp EXCEPT ALL SELECT grp, total, cnt FROM dl.mv_snap);
+----
+0
+
+# ==========================================
+# Section 2: Time travel
+# MV definition should NOT contain AT VERSION
+# ==========================================
+
+query I
+SELECT sql_string NOT LIKE '%AT (VERSION%' FROM _duckdb_ivm_views WHERE view_name = 'mv_snap';
+----
+true
+
+# Catalog type should be ducklake
+query I
+SELECT catalog_type FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_snap';
+----
+ducklake
+
+# ==========================================
+# Section 3: Multi-batch deltas
+# Multiple INSERTs between refreshes, single refresh picks up all
+# ==========================================
+
+statement ok
+CREATE TABLE dl.multi (id INTEGER, name VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO dl.multi VALUES (1, 'A', 100);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_multi AS SELECT name, SUM(amount) as total, COUNT(*) as cnt FROM dl.multi GROUP BY name;
+
+# Batch 1
+statement ok
+INSERT INTO dl.multi VALUES (2, 'A', 50);
+
+# Batch 2 (separate DuckLake snapshot)
+statement ok
+INSERT INTO dl.multi VALUES (3, 'B', 200);
+
+# Batch 3
+statement ok
+INSERT INTO dl.multi VALUES (4, 'A', 25);
+
+# Single refresh picks up all 3 batches
+statement ok
+PRAGMA ivm('mv_multi');
+
+query III rowsort
+SELECT name, total, cnt FROM dl.mv_multi ORDER BY name;
+----
+A	175	3
+B	200	1
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (SELECT name, total, cnt FROM dl.mv_multi EXCEPT ALL SELECT name, SUM(amount), COUNT(*) FROM dl.multi GROUP BY name);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT name, SUM(amount), COUNT(*) FROM dl.multi GROUP BY name EXCEPT ALL SELECT name, total, cnt FROM dl.mv_multi);
+----
+0
+
+# ==========================================
+# Section 4: Delete propagation
+# DELETE from base table, refresh, verify removal
+# ==========================================
+
+statement ok
+CREATE TABLE dl.del_test (id INTEGER, category VARCHAR, price DECIMAL(10,2));
+
+statement ok
+INSERT INTO dl.del_test VALUES (1, 'X', 10.00), (2, 'X', 20.00), (3, 'Y', 30.00);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_del AS SELECT category, SUM(price) as total, COUNT(*) as cnt FROM dl.del_test GROUP BY category;
+
+query III rowsort
+SELECT * FROM dl.mv_del ORDER BY category;
+----
+X	30.00	2
+Y	30.00	1
+
+# Delete one row
+statement ok
+DELETE FROM dl.del_test WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_del');
+
+query III rowsort
+SELECT * FROM dl.mv_del ORDER BY category;
+----
+X	20.00	1
+Y	30.00	1
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (SELECT category, total, cnt FROM dl.mv_del EXCEPT ALL SELECT category, SUM(price), COUNT(*) FROM dl.del_test GROUP BY category);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT category, SUM(price), COUNT(*) FROM dl.del_test GROUP BY category EXCEPT ALL SELECT category, total, cnt FROM dl.mv_del);
+----
+0
+
+# Delete all from a group
+statement ok
+DELETE FROM dl.del_test WHERE category = 'Y';
+
+statement ok
+PRAGMA ivm('mv_del');
+
+# Y group should be gone
+query III
+SELECT * FROM dl.mv_del ORDER BY category;
+----
+X	20.00	1
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (SELECT category, total, cnt FROM dl.mv_del EXCEPT ALL SELECT category, SUM(price), COUNT(*) FROM dl.del_test GROUP BY category);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT category, SUM(price), COUNT(*) FROM dl.del_test GROUP BY category EXCEPT ALL SELECT category, total, cnt FROM dl.mv_del);
+----
+0

@@ -1,4 +1,4 @@
-# name: test/sql/ivm_pipeline.test
+# name: test/sql/mv_pipeline.test
 # description: Test MV pipeline semantics — chained refresh, out-of-order, skip levels, cascade
 # group: [sql]
 

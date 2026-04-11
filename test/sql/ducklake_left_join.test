@@ -1,0 +1,141 @@
+# name: test/sql/ducklake_left_join.test
+# description: Test IVM left joins with DuckLake base tables
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+# TODO: DuckLake incremental join IVM fails because DuckLakeScan is not serializable.
+# Using full refresh as workaround until DuckDB/DuckLake adds serialization support.
+statement ok
+SET ivm_refresh_mode = 'full';
+
+# ==========================================
+# Basic LEFT JOIN
+# ==========================================
+
+statement ok
+CREATE TABLE dl.customers (id INTEGER, name VARCHAR);
+
+statement ok
+CREATE TABLE dl.orders (id INTEGER, cust_id INTEGER, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO dl.customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+
+statement ok
+INSERT INTO dl.orders VALUES (1, 1, 100.00), (2, 1, 50.00), (3, 2, 75.00);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_cust_orders AS
+  SELECT c.name, SUM(o.amount) as total, COUNT(o.amount) as cnt
+  FROM dl.customers c LEFT JOIN dl.orders o ON c.id = o.cust_id
+  GROUP BY c.name;
+
+query III rowsort
+SELECT * FROM dl.mv_cust_orders ORDER BY name;
+----
+Alice	150.00	2
+Bob	75.00	1
+Carol	NULL	0
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (
+  SELECT name, total, cnt FROM dl.mv_cust_orders
+  EXCEPT ALL
+  SELECT c.name, SUM(o.amount), COUNT(o.amount) FROM dl.customers c LEFT JOIN dl.orders o ON c.id = o.cust_id GROUP BY c.name
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT c.name, SUM(o.amount), COUNT(o.amount) FROM dl.customers c LEFT JOIN dl.orders o ON c.id = o.cust_id GROUP BY c.name
+  EXCEPT ALL
+  SELECT name, total, cnt FROM dl.mv_cust_orders
+);
+----
+0
+
+# --- Insert order for customer with no orders ---
+statement ok
+INSERT INTO dl.orders VALUES (4, 3, 200.00);
+
+statement ok
+PRAGMA ivm('mv_cust_orders');
+
+query III rowsort
+SELECT * FROM dl.mv_cust_orders ORDER BY name;
+----
+Alice	150.00	2
+Bob	75.00	1
+Carol	200.00	1
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (
+  SELECT name, total, cnt FROM dl.mv_cust_orders
+  EXCEPT ALL
+  SELECT c.name, SUM(o.amount), COUNT(o.amount) FROM dl.customers c LEFT JOIN dl.orders o ON c.id = o.cust_id GROUP BY c.name
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT c.name, SUM(o.amount), COUNT(o.amount) FROM dl.customers c LEFT JOIN dl.orders o ON c.id = o.cust_id GROUP BY c.name
+  EXCEPT ALL
+  SELECT name, total, cnt FROM dl.mv_cust_orders
+);
+----
+0
+
+# ==========================================
+# Stress: batch INSERT + DELETE on both sides
+# ==========================================
+
+# Add new customer + order, delete existing order, add another order
+statement ok
+INSERT INTO dl.customers VALUES (4, 'Dave');
+
+statement ok
+INSERT INTO dl.orders VALUES (5, 4, 300.00);
+
+statement ok
+DELETE FROM dl.orders WHERE id = 2;
+
+statement ok
+INSERT INTO dl.orders VALUES (6, 1, 25.00);
+
+statement ok
+PRAGMA ivm('mv_cust_orders');
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (
+  SELECT name, total, cnt FROM dl.mv_cust_orders
+  EXCEPT ALL
+  SELECT c.name, SUM(o.amount), COUNT(o.amount) FROM dl.customers c LEFT JOIN dl.orders o ON c.id = o.cust_id GROUP BY c.name
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT c.name, SUM(o.amount), COUNT(o.amount) FROM dl.customers c LEFT JOIN dl.orders o ON c.id = o.cust_id GROUP BY c.name
+  EXCEPT ALL
+  SELECT name, total, cnt FROM dl.mv_cust_orders
+);
+----
+0

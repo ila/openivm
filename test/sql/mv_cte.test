@@ -1,4 +1,4 @@
-# name: test/sql/ivm_cte.test
+# name: test/sql/mv_cte.test
 # description: Test that MVs defined with CTE-based SQL (from LPTS) work correctly
 # group: [sql]
 

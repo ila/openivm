@@ -1,0 +1,104 @@
+# name: test/sql/ducklake_distinct.test
+# description: Test IVM with SELECT DISTINCT on DuckLake base tables
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+# ==========================================
+# Basic DISTINCT
+# ==========================================
+
+statement ok
+CREATE TABLE dl.tags (id INTEGER, tag VARCHAR);
+
+statement ok
+INSERT INTO dl.tags VALUES (1, 'red'), (2, 'blue'), (3, 'red'), (4, 'green');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_tags AS SELECT DISTINCT tag FROM dl.tags;
+
+query I rowsort
+SELECT * FROM dl.mv_tags ORDER BY tag;
+----
+blue
+green
+red
+
+# Insert duplicate — should not change MV
+statement ok
+INSERT INTO dl.tags VALUES (5, 'red');
+
+statement ok
+PRAGMA ivm('mv_tags');
+
+query I rowsort
+SELECT * FROM dl.mv_tags ORDER BY tag;
+----
+blue
+green
+red
+
+# Insert new distinct value
+statement ok
+INSERT INTO dl.tags VALUES (6, 'yellow');
+
+statement ok
+PRAGMA ivm('mv_tags');
+
+query I rowsort
+SELECT * FROM dl.mv_tags ORDER BY tag;
+----
+blue
+green
+red
+yellow
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (SELECT DISTINCT tag FROM dl.tags EXCEPT ALL SELECT tag FROM dl.mv_tags);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT tag FROM dl.mv_tags EXCEPT ALL SELECT DISTINCT tag FROM dl.tags);
+----
+0
+
+# ==========================================
+# Stress: batch INSERT + DELETE
+# ==========================================
+
+# Delete all 'red' entries, insert 'purple', add another 'blue'
+statement ok
+DELETE FROM dl.tags WHERE tag = 'red';
+
+statement ok
+INSERT INTO dl.tags VALUES (7, 'purple');
+
+statement ok
+INSERT INTO dl.tags VALUES (8, 'blue');
+
+statement ok
+PRAGMA ivm('mv_tags');
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (SELECT DISTINCT tag FROM dl.tags EXCEPT ALL SELECT tag FROM dl.mv_tags);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT tag FROM dl.mv_tags EXCEPT ALL SELECT DISTINCT tag FROM dl.tags);
+----
+0

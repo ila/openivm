@@ -1,0 +1,245 @@
+# name: test/sql/ducklake_aggregate.test
+# description: Test IVM aggregates with DuckLake base tables
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+# ==========================================
+# SUM + COUNT grouped aggregate
+# ==========================================
+
+statement ok
+CREATE TABLE dl.sales (id INT, region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO dl.sales VALUES (1, 'east', 100), (2, 'west', 200), (3, 'east', 150);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.sales_summary AS
+    SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt
+    FROM dl.sales GROUP BY region;
+
+query III
+SELECT region, total, cnt FROM dl.sales_summary ORDER BY region;
+----
+east	250	2
+west	200	1
+
+# --- Insert into existing group ---
+statement ok
+INSERT INTO dl.sales VALUES (4, 'east', 50);
+
+statement ok
+PRAGMA ivm('sales_summary');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt FROM dl.sales GROUP BY region
+    EXCEPT ALL SELECT region, total, cnt FROM dl.sales_summary
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM dl.sales_summary
+    EXCEPT ALL SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt FROM dl.sales GROUP BY region
+);
+----
+0
+
+# --- Insert into new group ---
+statement ok
+INSERT INTO dl.sales VALUES (5, 'north', 300);
+
+statement ok
+PRAGMA ivm('sales_summary');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt FROM dl.sales GROUP BY region
+    EXCEPT ALL SELECT region, total, cnt FROM dl.sales_summary
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM dl.sales_summary
+    EXCEPT ALL SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt FROM dl.sales GROUP BY region
+);
+----
+0
+
+# --- Delete from existing group ---
+statement ok
+DELETE FROM dl.sales WHERE id = 1;
+
+statement ok
+PRAGMA ivm('sales_summary');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt FROM dl.sales GROUP BY region
+    EXCEPT ALL SELECT region, total, cnt FROM dl.sales_summary
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM dl.sales_summary
+    EXCEPT ALL SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt FROM dl.sales GROUP BY region
+);
+----
+0
+
+# --- Update: change amount within same group ---
+statement ok
+UPDATE dl.sales SET amount = 500 WHERE id = 2;
+
+statement ok
+PRAGMA ivm('sales_summary');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt FROM dl.sales GROUP BY region
+    EXCEPT ALL SELECT region, total, cnt FROM dl.sales_summary
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM dl.sales_summary
+    EXCEPT ALL SELECT region, SUM(amount) AS total, COUNT(amount) AS cnt FROM dl.sales GROUP BY region
+);
+----
+0
+
+# ==========================================
+# COUNT(*) ungrouped (simple/scalar aggregate)
+# ==========================================
+
+# TODO: ungrouped COUNT(*) crashes with DuckLake (index -2 error in delta scan)
+# Tracked as known limitation — needs fix for ungrouped/scalar aggregates
+
+# ==========================================
+# Stress test: batch many conflicting DML ops
+# before a single refresh
+# ==========================================
+
+statement ok
+CREATE TABLE dl.stress (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO dl.stress VALUES
+    (1, 'a', 10), (2, 'a', 20), (3, 'b', 30),
+    (4, 'b', 40), (5, 'c', 50), (6, 'c', 60);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.stress_agg AS
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt
+    FROM dl.stress GROUP BY grp;
+
+# Verify initial state
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dl.stress GROUP BY grp
+    EXCEPT ALL SELECT grp, total, cnt FROM dl.stress_agg
+);
+----
+0
+
+# Batch conflicting ops: insert + delete + update on overlapping rows
+# All before a single refresh
+statement ok
+INSERT INTO dl.stress VALUES (7, 'a', 100), (8, 'd', 200);
+
+statement ok
+DELETE FROM dl.stress WHERE id = 2;
+
+statement ok
+UPDATE dl.stress SET val = 999 WHERE id = 3;
+
+statement ok
+INSERT INTO dl.stress VALUES (9, 'b', 5), (10, 'b', 5);
+
+statement ok
+DELETE FROM dl.stress WHERE id = 5;
+
+statement ok
+UPDATE dl.stress SET grp = 'a' WHERE id = 4;
+
+statement ok
+INSERT INTO dl.stress VALUES (11, 'c', 1);
+
+statement ok
+DELETE FROM dl.stress WHERE id = 8;
+
+# Single refresh after all the batched DML
+statement ok
+PRAGMA ivm('stress_agg');
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dl.stress GROUP BY grp
+    EXCEPT ALL SELECT grp, total, cnt FROM dl.stress_agg
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, total, cnt FROM dl.stress_agg
+    EXCEPT ALL SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dl.stress GROUP BY grp
+);
+----
+0
+
+# Second round of stress: more conflicting ops on the same table
+statement ok
+DELETE FROM dl.stress WHERE grp = 'b';
+
+statement ok
+INSERT INTO dl.stress VALUES (12, 'e', 500), (13, 'e', 500);
+
+statement ok
+UPDATE dl.stress SET val = 0 WHERE grp = 'a';
+
+statement ok
+INSERT INTO dl.stress VALUES (14, 'a', 1);
+
+statement ok
+DELETE FROM dl.stress WHERE id = 11;
+
+# Single refresh
+statement ok
+PRAGMA ivm('stress_agg');
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dl.stress GROUP BY grp
+    EXCEPT ALL SELECT grp, total, cnt FROM dl.stress_agg
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, total, cnt FROM dl.stress_agg
+    EXCEPT ALL SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dl.stress GROUP BY grp
+);
+----
+0

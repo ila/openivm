@@ -1,0 +1,117 @@
+# name: test/sql/ducklake_cte.test
+# description: Test LPTS CTE generation for DuckLake MVs — no AT VERSION, correct catalog refs
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+# ==========================================
+# MV definition should NOT contain AT VERSION
+# ==========================================
+
+statement ok
+CREATE TABLE dl.products (id INTEGER, name VARCHAR, price DECIMAL(10,2));
+
+statement ok
+INSERT INTO dl.products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_prices AS
+  SELECT name, SUM(price) as total, COUNT(*) as cnt FROM dl.products GROUP BY name;
+
+# The stored view query should reference dl.main.products without AT VERSION
+query I
+SELECT sql_string LIKE '%dl.main.products%' FROM _duckdb_ivm_views WHERE view_name = 'mv_prices';
+----
+true
+
+query I
+SELECT sql_string NOT LIKE '%AT (VERSION%' FROM _duckdb_ivm_views WHERE view_name = 'mv_prices';
+----
+true
+
+# ==========================================
+# Verify incremental refresh produces correct results
+# (tests that the CTE SQL round-trips correctly)
+# ==========================================
+
+statement ok
+INSERT INTO dl.products VALUES (3, 'Widget', 5.00);
+
+statement ok
+PRAGMA ivm('mv_prices');
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (
+  SELECT name, total, cnt FROM dl.mv_prices
+  EXCEPT ALL
+  SELECT name, SUM(price), COUNT(*) FROM dl.products GROUP BY name
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT name, SUM(price), COUNT(*) FROM dl.products GROUP BY name
+  EXCEPT ALL
+  SELECT name, total, cnt FROM dl.mv_prices
+);
+----
+0
+
+# ==========================================
+# Combined operators: filter + aggregate over DuckLake
+# ==========================================
+
+statement ok
+CREATE TABLE dl.orders (id INTEGER, region VARCHAR, amount INTEGER, status VARCHAR);
+
+statement ok
+INSERT INTO dl.orders VALUES (1, 'east', 100, 'active'), (2, 'west', 200, 'active'), (3, 'east', 150, 'cancelled');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_active AS
+  SELECT region, SUM(amount) as total, COUNT(*) as cnt
+  FROM dl.orders WHERE status = 'active' GROUP BY region;
+
+query III rowsort
+SELECT * FROM dl.mv_active ORDER BY region;
+----
+east	100	1
+west	200	1
+
+statement ok
+INSERT INTO dl.orders VALUES (4, 'east', 50, 'active'), (5, 'west', 75, 'cancelled');
+
+statement ok
+PRAGMA ivm('mv_active');
+
+# EXCEPT ALL
+query I
+SELECT count(*) FROM (
+  SELECT region, total, cnt FROM dl.mv_active
+  EXCEPT ALL
+  SELECT region, SUM(amount), COUNT(*) FROM dl.orders WHERE status = 'active' GROUP BY region
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, SUM(amount), COUNT(*) FROM dl.orders WHERE status = 'active' GROUP BY region
+  EXCEPT ALL
+  SELECT region, total, cnt FROM dl.mv_active
+);
+----
+0

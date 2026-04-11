@@ -1,4 +1,4 @@
-# name: test/sql/ivm_list.test
+# name: test/sql/mv_list.test
 # description: Test IVM with LIST-typed aggregate columns
 # group: [sql]
 

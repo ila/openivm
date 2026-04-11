@@ -1,4 +1,4 @@
-# name: test/sql/ivm_distinct.test
+# name: test/sql/mv_distinct.test
 # description: Test IVM with SELECT DISTINCT
 # group: [sql]
 

@@ -300,6 +300,12 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Pruned term mask=%lu (FK insert-only PK)\n", (unsigned long)mask);
 			continue;
 		}
+		// TODO(DuckLake): Copy() uses Serialize which fails for DuckLake scans
+		// (installed DuckLake binary throws "DuckLakeScan not implemented").
+		// DuckLake joins currently fall back to full refresh. Fix options:
+		//   1. Update DuckLake extension to support serialization
+		//   2. Build terms without Copy (construct fresh trees from view SQL)
+		//   3. Implement ClonePlanTree that bypasses serialization
 		auto term = pw.plan->Copy(context);
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);

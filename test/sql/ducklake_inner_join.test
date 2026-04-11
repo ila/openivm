@@ -1,0 +1,316 @@
+# name: test/sql/ducklake_inner_join.test
+# description: Test IVM inner joins with DuckLake base tables
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+# TODO: DuckLake incremental join IVM fails because DuckLakeScan is not serializable.
+# Using full refresh as workaround until DuckDB/DuckLake adds serialization support.
+statement ok
+SET ivm_refresh_mode = 'full';
+
+# ==========================================
+# Test 1: 2-table INNER JOIN — INSERT left, then right
+# ==========================================
+
+statement ok
+CREATE TABLE dl.customers (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE dl.purchases (cust_id INT, item VARCHAR, price INT);
+
+statement ok
+INSERT INTO dl.customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+
+statement ok
+INSERT INTO dl.purchases VALUES (1, 'Widget', 10), (2, 'Gadget', 25);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.customer_purchases AS
+    SELECT c.name, p.item, p.price
+    FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id;
+
+statement ok
+PRAGMA ivm('customer_purchases');
+
+# Cross-check after full refresh
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, p.item, p.price FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id
+    EXCEPT ALL
+    SELECT name, item, price FROM dl.customer_purchases
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, item, price FROM dl.customer_purchases
+    EXCEPT ALL
+    SELECT c.name, p.item, p.price FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id
+);
+----
+0
+
+# INSERT on right side (purchases)
+statement ok
+INSERT INTO dl.purchases VALUES (1, 'Doohickey', 5), (3, 'Gizmo', 50);
+
+statement ok
+PRAGMA ivm('customer_purchases');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, p.item, p.price FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id
+    EXCEPT ALL
+    SELECT name, item, price FROM dl.customer_purchases
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, item, price FROM dl.customer_purchases
+    EXCEPT ALL
+    SELECT c.name, p.item, p.price FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id
+);
+----
+0
+
+# INSERT on left side (customers) — new customer with existing purchase match
+statement ok
+INSERT INTO dl.customers VALUES (4, 'Diana');
+
+statement ok
+INSERT INTO dl.purchases VALUES (4, 'Thingamajig', 15);
+
+statement ok
+PRAGMA ivm('customer_purchases');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, p.item, p.price FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id
+    EXCEPT ALL
+    SELECT name, item, price FROM dl.customer_purchases
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, item, price FROM dl.customer_purchases
+    EXCEPT ALL
+    SELECT c.name, p.item, p.price FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id
+);
+----
+0
+
+# ==========================================
+# Test 2: Aggregate over join (SUM + COUNT + GROUP BY)
+# ==========================================
+
+statement ok
+CREATE TABLE dl.products (pid INT, pname VARCHAR);
+
+statement ok
+CREATE TABLE dl.sales (pid INT, qty INT, revenue INT);
+
+statement ok
+INSERT INTO dl.products VALUES (1, 'Alpha'), (2, 'Beta'), (3, 'Gamma');
+
+statement ok
+INSERT INTO dl.sales VALUES (1, 10, 100), (1, 5, 50), (2, 20, 400);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.product_summary AS
+    SELECT p.pname, SUM(s.revenue) AS total_rev, COUNT(*) AS sale_count
+    FROM dl.products p INNER JOIN dl.sales s ON p.pid = s.pid
+    GROUP BY p.pname;
+
+statement ok
+PRAGMA ivm('product_summary');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.pname, SUM(s.revenue), COUNT(*)
+    FROM dl.products p INNER JOIN dl.sales s ON p.pid = s.pid GROUP BY p.pname
+    EXCEPT ALL
+    SELECT pname, total_rev, sale_count FROM dl.product_summary
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT pname, total_rev, sale_count FROM dl.product_summary
+    EXCEPT ALL
+    SELECT p.pname, SUM(s.revenue), COUNT(*)
+    FROM dl.products p INNER JOIN dl.sales s ON p.pid = s.pid GROUP BY p.pname
+);
+----
+0
+
+# Add sales for existing product + new product with sales
+statement ok
+INSERT INTO dl.sales VALUES (2, 3, 60), (3, 7, 140);
+
+statement ok
+PRAGMA ivm('product_summary');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.pname, SUM(s.revenue), COUNT(*)
+    FROM dl.products p INNER JOIN dl.sales s ON p.pid = s.pid GROUP BY p.pname
+    EXCEPT ALL
+    SELECT pname, total_rev, sale_count FROM dl.product_summary
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT pname, total_rev, sale_count FROM dl.product_summary
+    EXCEPT ALL
+    SELECT p.pname, SUM(s.revenue), COUNT(*)
+    FROM dl.products p INNER JOIN dl.sales s ON p.pid = s.pid GROUP BY p.pname
+);
+----
+0
+
+# Delete a sale row — group total should adjust
+statement ok
+DELETE FROM dl.sales WHERE pid = 1 AND qty = 10;
+
+statement ok
+PRAGMA ivm('product_summary');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.pname, SUM(s.revenue), COUNT(*)
+    FROM dl.products p INNER JOIN dl.sales s ON p.pid = s.pid GROUP BY p.pname
+    EXCEPT ALL
+    SELECT pname, total_rev, sale_count FROM dl.product_summary
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT pname, total_rev, sale_count FROM dl.product_summary
+    EXCEPT ALL
+    SELECT p.pname, SUM(s.revenue), COUNT(*)
+    FROM dl.products p INNER JOIN dl.sales s ON p.pid = s.pid GROUP BY p.pname
+);
+----
+0
+
+# ==========================================
+# Test 3: Stress — batch INSERT into both tables + DELETE before single refresh
+# ==========================================
+
+statement ok
+CREATE TABLE dl.departments (did INT, dname VARCHAR);
+
+statement ok
+CREATE TABLE dl.employees (eid INT, did INT, salary INT);
+
+statement ok
+INSERT INTO dl.departments VALUES (1, 'Engineering'), (2, 'Sales'), (3, 'Marketing');
+
+statement ok
+INSERT INTO dl.employees VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150), (4, 2, 300), (5, 3, 80);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.dept_roster AS
+    SELECT d.dname, e.eid, e.salary
+    FROM dl.departments d INNER JOIN dl.employees e ON d.did = e.did;
+
+statement ok
+PRAGMA ivm('dept_roster');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT d.dname, e.eid, e.salary FROM dl.departments d INNER JOIN dl.employees e ON d.did = e.did
+    EXCEPT ALL
+    SELECT dname, eid, salary FROM dl.dept_roster
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT dname, eid, salary FROM dl.dept_roster
+    EXCEPT ALL
+    SELECT d.dname, e.eid, e.salary FROM dl.departments d INNER JOIN dl.employees e ON d.did = e.did
+);
+----
+0
+
+# Batch: INSERT into both tables, DELETE from both, conflicting ops
+# Add new department + employees for it
+statement ok
+INSERT INTO dl.departments VALUES (4, 'Legal');
+
+statement ok
+INSERT INTO dl.employees VALUES (6, 4, 250), (7, 4, 300);
+
+# Add more employees to existing departments
+statement ok
+INSERT INTO dl.employees VALUES (8, 1, 500), (9, 2, 175);
+
+# Delete employees from existing departments (some in MV)
+statement ok
+DELETE FROM dl.employees WHERE eid = 2;
+
+statement ok
+DELETE FROM dl.employees WHERE eid = 3;
+
+# Delete a department that has employees (cascading removal from MV)
+statement ok
+DELETE FROM dl.departments WHERE did = 3;
+
+# Insert employee for deleted department (no join match, should not appear)
+statement ok
+INSERT INTO dl.employees VALUES (10, 3, 999);
+
+# Insert and then delete same new employee (net zero for eid=11)
+statement ok
+INSERT INTO dl.employees VALUES (11, 1, 50);
+
+statement ok
+DELETE FROM dl.employees WHERE eid = 11;
+
+# Single refresh after all batched operations
+statement ok
+PRAGMA ivm('dept_roster');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT d.dname, e.eid, e.salary FROM dl.departments d INNER JOIN dl.employees e ON d.did = e.did
+    EXCEPT ALL
+    SELECT dname, eid, salary FROM dl.dept_roster
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT dname, eid, salary FROM dl.dept_roster
+    EXCEPT ALL
+    SELECT d.dname, e.eid, e.salary FROM dl.departments d INNER JOIN dl.employees e ON d.did = e.did
+);
+----
+0

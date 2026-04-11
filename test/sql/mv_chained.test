@@ -1,4 +1,4 @@
-# name: test/sql/ivm_chained.test
+# name: test/sql/mv_chained.test
 # description: Test chained materialized view IVM (table -> MV1 -> MV2 -> ...)
 # group: [sql]
 

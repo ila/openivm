@@ -442,14 +442,14 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			               "INSERT INTO " + qdt + "\nSELECT * FROM (" + view_query_sql + ") _ivm_lj\nWHERE " +
 			               affected + "_ivm_lj." + lk + delta_where + ");\n";
 		} else {
-			upsert_query = CompileProjectionsFilters(view_name, column_names, delta_ts_filter);
+			upsert_query = CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix);
 		}
 		break;
 	}
 
 	case IVMType::SIMPLE_AGGREGATE: {
-		upsert_query =
-		    CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode, delta_ts_filter);
+		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode,
+		                                       delta_ts_filter, catalog_prefix);
 		if (!has_minmax) {
 			auto source_tables = metadata.GetDeltaTables(view_name);
 			for (auto &dt : source_tables) {

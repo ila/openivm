@@ -1,0 +1,220 @@
+# name: test/sql/ducklake_filter.test
+# description: Test IVM filters with DuckLake base tables
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+# ==========================================
+# Test 1: MV with WHERE clause, INSERT matching/not-matching filter
+# ==========================================
+
+statement ok
+CREATE TABLE dl.sensors (id INT, reading INT, status VARCHAR);
+
+statement ok
+INSERT INTO dl.sensors VALUES (1, 80, 'ok'), (2, 150, 'warn'), (3, 45, 'ok');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.high_readings AS
+    SELECT id, reading, status FROM dl.sensors WHERE reading > 100;
+
+# Insert matching row
+statement ok
+INSERT INTO dl.sensors VALUES (4, 200, 'critical');
+
+statement ok
+PRAGMA ivm('high_readings');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, reading, status FROM dl.sensors WHERE reading > 100
+    EXCEPT ALL
+    SELECT id, reading, status FROM dl.high_readings
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, reading, status FROM dl.high_readings
+    EXCEPT ALL
+    SELECT id, reading, status FROM dl.sensors WHERE reading > 100
+);
+----
+0
+
+# Insert non-matching row (reading <= 100)
+statement ok
+INSERT INTO dl.sensors VALUES (5, 30, 'ok');
+
+statement ok
+PRAGMA ivm('high_readings');
+
+# MV unchanged — filtered out
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, reading, status FROM dl.sensors WHERE reading > 100
+    EXCEPT ALL
+    SELECT id, reading, status FROM dl.high_readings
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, reading, status FROM dl.high_readings
+    EXCEPT ALL
+    SELECT id, reading, status FROM dl.sensors WHERE reading > 100
+);
+----
+0
+
+# ==========================================
+# Test 2: Filtered aggregate (WHERE + GROUP BY)
+# ==========================================
+
+statement ok
+CREATE TABLE dl.orders (id INT, region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO dl.orders VALUES (1, 'US', 500), (2, 'EU', 100), (3, 'US', 300), (4, 'EU', 50);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.big_orders_by_region AS
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
+    FROM dl.orders WHERE amount >= 100
+    GROUP BY region;
+
+statement ok
+PRAGMA ivm('big_orders_by_region');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.orders WHERE amount >= 100 GROUP BY region
+    EXCEPT ALL
+    SELECT region, total, cnt FROM dl.big_orders_by_region
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total, cnt FROM dl.big_orders_by_region
+    EXCEPT ALL
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.orders WHERE amount >= 100 GROUP BY region
+);
+----
+0
+
+# Insert: one matching, one not
+statement ok
+INSERT INTO dl.orders VALUES (5, 'EU', 200), (6, 'US', 10);
+
+statement ok
+PRAGMA ivm('big_orders_by_region');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.orders WHERE amount >= 100 GROUP BY region
+    EXCEPT ALL
+    SELECT region, total, cnt FROM dl.big_orders_by_region
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total, cnt FROM dl.big_orders_by_region
+    EXCEPT ALL
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.orders WHERE amount >= 100 GROUP BY region
+);
+----
+0
+
+# ==========================================
+# Test 3: Stress — batch INSERT + DELETE before single refresh
+# ==========================================
+
+statement ok
+CREATE TABLE dl.events (id INT, score INT, category VARCHAR);
+
+statement ok
+INSERT INTO dl.events VALUES (1, 90, 'A'), (2, 40, 'B'), (3, 70, 'A'), (4, 110, 'B'), (5, 55, 'A');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.hot_events AS
+    SELECT id, score, category FROM dl.events WHERE score > 50;
+
+statement ok
+PRAGMA ivm('hot_events');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score, category FROM dl.events WHERE score > 50
+    EXCEPT ALL
+    SELECT id, score, category FROM dl.hot_events
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score, category FROM dl.hot_events
+    EXCEPT ALL
+    SELECT id, score, category FROM dl.events WHERE score > 50
+);
+----
+0
+
+# Batch: INSERT rows that match filter, rows that do NOT match, DELETE rows in and out of MV
+statement ok
+INSERT INTO dl.events VALUES (6, 200, 'A'), (7, 10, 'B'), (8, 75, 'A'), (9, 5, 'B'), (10, 300, 'C');
+
+statement ok
+DELETE FROM dl.events WHERE id = 1;
+
+statement ok
+DELETE FROM dl.events WHERE id = 2;
+
+statement ok
+DELETE FROM dl.events WHERE id = 4;
+
+statement ok
+INSERT INTO dl.events VALUES (11, 60, 'B'), (12, 999, 'C');
+
+statement ok
+DELETE FROM dl.events WHERE id = 5;
+
+# Single refresh after all the batched operations
+statement ok
+PRAGMA ivm('hot_events');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score, category FROM dl.events WHERE score > 50
+    EXCEPT ALL
+    SELECT id, score, category FROM dl.hot_events
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score, category FROM dl.hot_events
+    EXCEPT ALL
+    SELECT id, score, category FROM dl.events WHERE score > 50
+);
+----
+0

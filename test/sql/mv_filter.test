@@ -1,4 +1,4 @@
-# name: test/sql/ivm_filter.test
+# name: test/sql/mv_filter.test
 # description: Test IVM with filters
 # group: [sql]
 
