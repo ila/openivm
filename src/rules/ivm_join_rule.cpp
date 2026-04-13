@@ -197,9 +197,10 @@ static unique_ptr<FunctionData> IvmDuckLakeScanDeserialize(Deserializer &deseria
 	return bind_data;
 }
 
-/// Walk the plan tree and ensure DuckLake scan nodes have working
-/// serialize/deserialize callbacks so Copy() succeeds.
 /// Ensure ducklake_scan can be serialized and found during deserialization.
+/// TODO: Remove this once the installed DuckLake binary registers
+/// serialize/deserialize callbacks and the ducklake_scan catalog entry
+/// natively (the submodule version already does both).
 /// Patches serialize/deserialize callbacks AND registers the function in the
 /// system catalog if not already present (older DuckLake binaries don't do this).
 static void PatchDuckLakeScanSerialization(LogicalOperator &op, ClientContext &context) {
