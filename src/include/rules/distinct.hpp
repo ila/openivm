@@ -1,7 +1,7 @@
 #ifndef IVM_DISTINCT_RULE_HPP
 #define IVM_DISTINCT_RULE_HPP
 
-#include "rules/ivm_rule.hpp"
+#include "rules/rule.hpp"
 
 namespace duckdb {
 

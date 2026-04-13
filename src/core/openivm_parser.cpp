@@ -5,7 +5,7 @@
 #include "core/openivm_constants.hpp"
 #include "lpts_pipeline.hpp"
 #include "core/openivm_utils.hpp"
-#include "rules/ivm_column_hider.hpp"
+#include "rules/column_hider.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/main/database_manager.hpp"

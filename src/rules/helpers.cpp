@@ -1,4 +1,4 @@
-#include "rules/ivm_rule.hpp"
+#include "rules/rule.hpp"
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
@@ -30,7 +30,8 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 
 	OPENIVM_DEBUG_PRINT("[DuckLake] Creating delta node for '%s.%s'\n", catalog_name.c_str(), table_name.c_str());
 
-	// Get last snapshot from IVM metadata.
+	// Get last snapshot from IVM metadata. Uses a separate connection because
+	// the optimizer holds a lock on the main context during plan rewriting.
 	Connection con(*context.db);
 	auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(ivm::DELTA_TABLES_TABLE) +
 	                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +

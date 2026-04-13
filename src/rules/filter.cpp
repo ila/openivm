@@ -1,4 +1,4 @@
-#include "rules/ivm_filter_rule.hpp"
+#include "rules/filter.hpp"
 #include "core/openivm_debug.hpp"
 #include "rules/openivm_rewrite_rule.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"

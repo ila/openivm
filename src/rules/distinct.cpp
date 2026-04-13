@@ -1,4 +1,4 @@
-#include "rules/ivm_distinct_rule.hpp"
+#include "rules/distinct.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "rules/openivm_rewrite_rule.hpp"

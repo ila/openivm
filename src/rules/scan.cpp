@@ -1,4 +1,4 @@
-#include "rules/ivm_scan_rule.hpp"
+#include "rules/scan.hpp"
 #include "core/openivm_debug.hpp"
 
 namespace duckdb {

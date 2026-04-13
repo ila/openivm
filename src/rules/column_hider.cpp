@@ -8,7 +8,7 @@
 // The parser (openivm_parser.cpp) creates the view during CREATE MATERIALIZED VIEW,
 // and the insert rule (openivm_insert_rule.cpp) drops it during DROP TABLE.
 
-#include "rules/ivm_column_hider.hpp"
+#include "rules/column_hider.hpp"
 
 namespace duckdb {
 // All logic is in the header (IVMTableNames is header-only).

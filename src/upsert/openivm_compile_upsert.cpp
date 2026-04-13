@@ -2,7 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_utils.hpp"
-#include "rules/ivm_column_hider.hpp"
+#include "rules/column_hider.hpp"
 
 namespace duckdb {
 

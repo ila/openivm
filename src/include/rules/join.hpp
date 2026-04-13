@@ -1,7 +1,7 @@
 #ifndef IVM_JOIN_RULE_HPP
 #define IVM_JOIN_RULE_HPP
 
-#include "rules/ivm_rule.hpp"
+#include "rules/rule.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 
 namespace duckdb {

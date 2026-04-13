@@ -4,7 +4,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/openivm_metadata.hpp"
 #include "core/openivm_refresh_locks.hpp"
-#include "rules/ivm_column_hider.hpp"
+#include "rules/column_hider.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "core/openivm_utils.hpp"
 #include "upsert/openivm_compile_upsert.hpp"

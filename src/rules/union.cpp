@@ -1,4 +1,4 @@
-#include "rules/ivm_union_rule.hpp"
+#include "rules/union.hpp"
 #include "core/openivm_debug.hpp"
 #include "rules/openivm_rewrite_rule.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"

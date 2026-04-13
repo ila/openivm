@@ -3,7 +3,7 @@
 #include "core/openivm_metadata.hpp"
 #include "core/openivm_utils.hpp"
 #include "core/openivm_debug.hpp"
-#include "rules/ivm_column_hider.hpp"
+#include "rules/column_hider.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/optimizer/optimizer.hpp"

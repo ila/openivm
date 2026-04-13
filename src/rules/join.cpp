@@ -1,4 +1,4 @@
-#include "rules/ivm_join_rule.hpp"
+#include "rules/join.hpp"
 #include "rules/openivm_rewrite_rule.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"

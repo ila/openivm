@@ -23,15 +23,15 @@ set(EXTENSION_SOURCES
     src/upsert/openivm_index_regen.cpp
     src/rules/openivm_rewrite_rule.cpp
     src/rules/openivm_insert_rule.cpp
-    src/rules/ivm_helpers.cpp
-    src/rules/ivm_scan_rule.cpp
-    src/rules/ivm_filter_rule.cpp
-    src/rules/ivm_projection_rule.cpp
-    src/rules/ivm_aggregate_rule.cpp
-    src/rules/ivm_join_rule.cpp
-    src/rules/ivm_union_rule.cpp
-    src/rules/ivm_distinct_rule.cpp
-    src/rules/ivm_column_hider.cpp
+    src/rules/helpers.cpp
+    src/rules/scan.cpp
+    src/rules/filter.cpp
+    src/rules/projection.cpp
+    src/rules/aggregate.cpp
+    src/rules/join.cpp
+    src/rules/union.cpp
+    src/rules/distinct.cpp
+    src/rules/column_hider.cpp
     src/core/openivm_refresh_locks.cpp
     src/core/openivm_refresh_daemon.cpp
     ${LPTS_DIR}/src/cte_nodes.cpp

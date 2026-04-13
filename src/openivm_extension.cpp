@@ -6,7 +6,7 @@
 #include "core/openivm_refresh_daemon.hpp"
 #include "core/openivm_refresh_locks.hpp"
 #include "core/openivm_utils.hpp"
-#include "rules/ivm_column_hider.hpp"
+#include "rules/column_hider.hpp"
 #include "upsert/openivm_cost_model.hpp"
 #include "upsert/openivm_upsert.hpp"
 

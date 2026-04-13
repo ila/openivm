@@ -5,7 +5,7 @@
 #include "core/openivm_parser.hpp"
 #include "core/openivm_refresh_locks.hpp"
 #include "core/openivm_utils.hpp"
-#include "rules/ivm_column_hider.hpp"
+#include "rules/column_hider.hpp"
 
 #include "lpts_pipeline.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
