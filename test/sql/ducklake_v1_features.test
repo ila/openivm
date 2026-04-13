@@ -1,0 +1,330 @@
+# name: test/sql/ducklake_v1_features.test
+# description: Test IVM with DuckLake v1.0 features: sorted tables, bucket partitioning, deletion vectors
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+# ==========================================
+# Section 1: Sorted tables
+# Tables with SET SORTED BY should work with IVM delta scans
+# ==========================================
+
+statement ok
+CREATE TABLE dl.sorted_sales (id INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+ALTER TABLE dl.sorted_sales SET SORTED BY (region, id);
+
+statement ok
+INSERT INTO dl.sorted_sales VALUES (1, 'east', 100), (2, 'east', 200), (3, 'west', 150);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.sorted_summary AS
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
+    FROM dl.sorted_sales GROUP BY region;
+
+# Insert into sorted table, then refresh
+statement ok
+INSERT INTO dl.sorted_sales VALUES (4, 'west', 250), (5, 'north', 300);
+
+statement ok
+PRAGMA ivm('sorted_summary');
+
+# EXCEPT ALL both directions
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.sorted_sales GROUP BY region
+    EXCEPT ALL SELECT region, total, cnt FROM dl.sorted_summary
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM dl.sorted_summary
+    EXCEPT ALL SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.sorted_sales GROUP BY region
+);
+----
+0
+
+# Delete from sorted table
+statement ok
+DELETE FROM dl.sorted_sales WHERE id = 1;
+
+statement ok
+PRAGMA ivm('sorted_summary');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.sorted_sales GROUP BY region
+    EXCEPT ALL SELECT region, total, cnt FROM dl.sorted_summary
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM dl.sorted_summary
+    EXCEPT ALL SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.sorted_sales GROUP BY region
+);
+----
+0
+
+# Update in sorted table
+statement ok
+UPDATE dl.sorted_sales SET amount = 999 WHERE id = 3;
+
+statement ok
+PRAGMA ivm('sorted_summary');
+
+query I
+SELECT count(*) FROM (
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.sorted_sales GROUP BY region
+    EXCEPT ALL SELECT region, total, cnt FROM dl.sorted_summary
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT region, total, cnt FROM dl.sorted_summary
+    EXCEPT ALL SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.sorted_sales GROUP BY region
+);
+----
+0
+
+# ==========================================
+# Section 2: Sorted table with join
+# ==========================================
+
+statement ok
+CREATE TABLE dl.sorted_products (id INTEGER, name VARCHAR);
+
+statement ok
+ALTER TABLE dl.sorted_products SET SORTED BY (id);
+
+statement ok
+INSERT INTO dl.sorted_products VALUES (1, 'Widget'), (2, 'Gadget');
+
+statement ok
+CREATE TABLE dl.sorted_orders (prod_id INTEGER, qty INTEGER);
+
+statement ok
+ALTER TABLE dl.sorted_orders SET SORTED BY (prod_id);
+
+statement ok
+INSERT INTO dl.sorted_orders VALUES (1, 10), (2, 5);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.sorted_join AS
+    SELECT p.name, o.qty FROM dl.sorted_products p
+    JOIN dl.sorted_orders o ON p.id = o.prod_id;
+
+statement ok
+INSERT INTO dl.sorted_products VALUES (3, 'Doohickey');
+
+statement ok
+INSERT INTO dl.sorted_orders VALUES (3, 20);
+
+statement ok
+PRAGMA ivm('sorted_join');
+
+query I
+SELECT count(*) FROM (
+    SELECT p.name, o.qty FROM dl.sorted_products p JOIN dl.sorted_orders o ON p.id = o.prod_id
+    EXCEPT ALL SELECT name, qty FROM dl.sorted_join
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT name, qty FROM dl.sorted_join
+    EXCEPT ALL SELECT p.name, o.qty FROM dl.sorted_products p JOIN dl.sorted_orders o ON p.id = o.prod_id
+);
+----
+0
+
+# ==========================================
+# Section 3: Bucket partitioning
+# Tables partitioned by bucket hash should work with IVM
+# ==========================================
+
+statement ok
+CREATE TABLE dl.bucketed (id INTEGER, category VARCHAR, value INTEGER);
+
+statement ok
+ALTER TABLE dl.bucketed SET PARTITIONED BY (bucket(4, id));
+
+statement ok
+INSERT INTO dl.bucketed VALUES (1, 'A', 10), (2, 'B', 20), (3, 'A', 30), (4, 'B', 40);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.bucketed_agg AS
+    SELECT category, SUM(value) AS total, COUNT(*) AS cnt
+    FROM dl.bucketed GROUP BY category;
+
+# Insert across different buckets
+statement ok
+INSERT INTO dl.bucketed VALUES (5, 'A', 50), (6, 'C', 60), (100, 'B', 70);
+
+statement ok
+PRAGMA ivm('bucketed_agg');
+
+query I
+SELECT count(*) FROM (
+    SELECT category, SUM(value) AS total, COUNT(*) AS cnt FROM dl.bucketed GROUP BY category
+    EXCEPT ALL SELECT category, total, cnt FROM dl.bucketed_agg
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT category, total, cnt FROM dl.bucketed_agg
+    EXCEPT ALL SELECT category, SUM(value) AS total, COUNT(*) AS cnt FROM dl.bucketed GROUP BY category
+);
+----
+0
+
+# Delete from bucketed table
+statement ok
+DELETE FROM dl.bucketed WHERE id = 2;
+
+statement ok
+PRAGMA ivm('bucketed_agg');
+
+query I
+SELECT count(*) FROM (
+    SELECT category, SUM(value) AS total, COUNT(*) AS cnt FROM dl.bucketed GROUP BY category
+    EXCEPT ALL SELECT category, total, cnt FROM dl.bucketed_agg
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT category, total, cnt FROM dl.bucketed_agg
+    EXCEPT ALL SELECT category, SUM(value) AS total, COUNT(*) AS cnt FROM dl.bucketed GROUP BY category
+);
+----
+0
+
+# ==========================================
+# Section 4: Bucket partitioning + join
+# ==========================================
+
+statement ok
+CREATE TABLE dl.bp_customers (id INTEGER, name VARCHAR);
+
+statement ok
+ALTER TABLE dl.bp_customers SET PARTITIONED BY (bucket(2, id));
+
+statement ok
+CREATE TABLE dl.bp_orders (cust_id INTEGER, item VARCHAR);
+
+statement ok
+ALTER TABLE dl.bp_orders SET PARTITIONED BY (bucket(2, cust_id));
+
+statement ok
+INSERT INTO dl.bp_customers VALUES (1, 'Alice'), (2, 'Bob');
+
+statement ok
+INSERT INTO dl.bp_orders VALUES (1, 'Widget'), (2, 'Gadget');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.bp_join AS
+    SELECT c.name, o.item FROM dl.bp_customers c
+    JOIN dl.bp_orders o ON c.id = o.cust_id;
+
+statement ok
+INSERT INTO dl.bp_customers VALUES (3, 'Carol');
+
+statement ok
+INSERT INTO dl.bp_orders VALUES (3, 'Doohickey');
+
+statement ok
+PRAGMA ivm('bp_join');
+
+query I
+SELECT count(*) FROM (
+    SELECT c.name, o.item FROM dl.bp_customers c JOIN dl.bp_orders o ON c.id = o.cust_id
+    EXCEPT ALL SELECT name, item FROM dl.bp_join
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT name, item FROM dl.bp_join
+    EXCEPT ALL SELECT c.name, o.item FROM dl.bp_customers c JOIN dl.bp_orders o ON c.id = o.cust_id
+);
+----
+0
+
+# ==========================================
+# Section 5: Mixed batch DML on sorted + bucketed tables
+# Stress test: INSERT + DELETE + UPDATE before a single refresh
+# ==========================================
+
+statement ok
+CREATE TABLE dl.stress (id INTEGER, grp VARCHAR, val INTEGER);
+
+statement ok
+ALTER TABLE dl.stress SET SORTED BY (grp, id);
+
+statement ok
+ALTER TABLE dl.stress SET PARTITIONED BY (bucket(2, id));
+
+statement ok
+INSERT INTO dl.stress VALUES (1, 'X', 10), (2, 'X', 20), (3, 'Y', 30), (4, 'Y', 40), (5, 'Z', 50);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.stress_agg AS
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dl.stress GROUP BY grp;
+
+# Batch conflicting DML ops before a single refresh
+statement ok
+INSERT INTO dl.stress VALUES (6, 'X', 60), (7, 'W', 70);
+
+statement ok
+DELETE FROM dl.stress WHERE id = 2;
+
+statement ok
+UPDATE dl.stress SET val = 999 WHERE id = 3;
+
+statement ok
+INSERT INTO dl.stress VALUES (8, 'Y', 80);
+
+statement ok
+DELETE FROM dl.stress WHERE id = 5;
+
+statement ok
+PRAGMA ivm('stress_agg');
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dl.stress GROUP BY grp
+    EXCEPT ALL SELECT grp, total, cnt FROM dl.stress_agg
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, total, cnt FROM dl.stress_agg
+    EXCEPT ALL SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dl.stress GROUP BY grp
+);
+----
+0
