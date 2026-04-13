@@ -1,0 +1,292 @@
+# name: test/sql/ducklake_chained.test
+# description: Test chained MVs (table → mv1 → mv2) with DuckLake base tables
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+# Disable auto cascade — refresh each MV explicitly in order
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+# ==========================================
+# 2-level chain: dl.sales → dl.mv_region → dl.mv_top
+# ==========================================
+
+statement ok
+CREATE TABLE dl.sales (id INT, region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO dl.sales VALUES (1, 'east', 100), (2, 'west', 200), (3, 'east', 150), (4, 'south', 50);
+
+# Level 1: aggregate per region
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_region AS
+  SELECT region, SUM(amount) as total, COUNT(*) as cnt
+  FROM dl.sales GROUP BY region;
+
+# Level 2: filter top regions
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_top AS
+  SELECT region, total, cnt FROM dl.mv_region WHERE total > 100;
+
+# Initial state
+query III rowsort
+SELECT * FROM dl.mv_region ORDER BY region;
+----
+east	250	2
+south	50	1
+west	200	1
+
+query III rowsort
+SELECT * FROM dl.mv_top ORDER BY region;
+----
+east	250	2
+west	200	1
+
+# --- Insert: boost south above threshold ---
+statement ok
+INSERT INTO dl.sales VALUES (5, 'south', 200);
+
+statement ok
+PRAGMA ivm('mv_region');
+
+statement ok
+PRAGMA ivm('mv_top');
+
+# EXCEPT ALL for level 1
+query I
+SELECT count(*) FROM (
+  SELECT region, total, cnt FROM dl.mv_region
+  EXCEPT ALL
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region
+  EXCEPT ALL
+  SELECT region, total, cnt FROM dl.mv_region
+);
+----
+0
+
+# EXCEPT ALL for level 2
+query I
+SELECT count(*) FROM (
+  SELECT region, total, cnt FROM dl.mv_top
+  EXCEPT ALL
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
+  EXCEPT ALL
+  SELECT region, total, cnt FROM dl.mv_top
+);
+----
+0
+
+# --- Delete: drop east below threshold ---
+statement ok
+DELETE FROM dl.sales WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_region');
+
+statement ok
+PRAGMA ivm('mv_top');
+
+# EXCEPT ALL for level 1
+query I
+SELECT count(*) FROM (
+  SELECT region, total, cnt FROM dl.mv_region
+  EXCEPT ALL
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region
+  EXCEPT ALL
+  SELECT region, total, cnt FROM dl.mv_region
+);
+----
+0
+
+# EXCEPT ALL for level 2
+query I
+SELECT count(*) FROM (
+  SELECT region, total, cnt FROM dl.mv_top
+  EXCEPT ALL
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
+  EXCEPT ALL
+  SELECT region, total, cnt FROM dl.mv_top
+);
+----
+0
+
+# ==========================================
+# Stress: batch ops, then refresh chain
+# ==========================================
+
+statement ok
+INSERT INTO dl.sales VALUES (6, 'north', 500);
+
+statement ok
+DELETE FROM dl.sales WHERE id = 4;
+
+statement ok
+INSERT INTO dl.sales VALUES (7, 'west', 100);
+
+statement ok
+PRAGMA ivm('mv_region');
+
+statement ok
+PRAGMA ivm('mv_top');
+
+# EXCEPT ALL for both levels
+query I
+SELECT count(*) FROM (
+  SELECT region, total, cnt FROM dl.mv_region
+  EXCEPT ALL
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region
+  EXCEPT ALL
+  SELECT region, total, cnt FROM dl.mv_region
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, total, cnt FROM dl.mv_top
+  EXCEPT ALL
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
+  EXCEPT ALL
+  SELECT region, total, cnt FROM dl.mv_top
+);
+----
+0
+
+# ==========================================
+# Cascade mode: downstream
+# Refreshing mv_region should auto-refresh mv_top
+# ==========================================
+
+statement ok
+SET ivm_cascade_refresh = 'downstream';
+
+statement ok
+INSERT INTO dl.sales VALUES (8, 'east', 1000);
+
+# Only refresh level 1 — level 2 should cascade automatically
+statement ok
+PRAGMA ivm('mv_region');
+
+# Both levels should be correct
+query I
+SELECT count(*) FROM (
+  SELECT region, total, cnt FROM dl.mv_region
+  EXCEPT ALL
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, total, cnt FROM dl.mv_top
+  EXCEPT ALL
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
+  EXCEPT ALL
+  SELECT region, total, cnt FROM dl.mv_top
+);
+----
+0
+
+# ==========================================
+# Cascade mode: upstream
+# Refreshing mv_top should auto-refresh mv_region first
+# ==========================================
+
+statement ok
+SET ivm_cascade_refresh = 'upstream';
+
+statement ok
+INSERT INTO dl.sales VALUES (9, 'west', 300);
+
+# Only refresh level 2 — level 1 should be refreshed first
+statement ok
+PRAGMA ivm('mv_top');
+
+query I
+SELECT count(*) FROM (
+  SELECT region, total, cnt FROM dl.mv_region
+  EXCEPT ALL
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, total, cnt FROM dl.mv_top
+  EXCEPT ALL
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 100
+  EXCEPT ALL
+  SELECT region, total, cnt FROM dl.mv_top
+);
+----
+0

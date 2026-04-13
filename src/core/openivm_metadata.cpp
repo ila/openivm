@@ -2,6 +2,7 @@
 
 #include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
+#include "rules/ivm_column_hider.hpp"
 #include <sstream>
 
 namespace duckdb {
@@ -88,14 +89,20 @@ vector<string> IVMMetadata::GetUpstreamViews(const string &view_name) {
 	std::function<void(const string &)> collect = [&](const string &vn) {
 		auto delta_tables = GetDeltaTables(vn);
 		for (auto &dt : delta_tables) {
-			// delta table name is "delta_<source>"; extract source name
-			if (dt.size() > 6 && dt.substr(0, 6) == string(ivm::DELTA_PREFIX)) {
-				string source = dt.substr(6);
-				if (!IsBaseTable(source) && visited.find(source) == visited.end()) {
-					visited.insert(source);
-					collect(source); // recurse deeper first (ancestors before descendants)
-					result.push_back(source);
-				}
+			// Extract source MV name from delta table name.
+			// Standard: "delta_<source>", DuckLake: "_ivm_data_<source>"
+			string source;
+			static const string delta_prefix(ivm::DELTA_PREFIX);
+			static const string data_prefix(ivm::DATA_TABLE_PREFIX);
+			if (dt.size() > delta_prefix.size() && dt.substr(0, delta_prefix.size()) == delta_prefix) {
+				source = dt.substr(delta_prefix.size());
+			} else if (dt.size() > data_prefix.size() && dt.substr(0, data_prefix.size()) == data_prefix) {
+				source = dt.substr(data_prefix.size());
+			}
+			if (!source.empty() && !IsBaseTable(source) && visited.find(source) == visited.end()) {
+				visited.insert(source);
+				collect(source); // recurse deeper first (ancestors before descendants)
+				result.push_back(source);
 			}
 		}
 	};
@@ -104,14 +111,17 @@ vector<string> IVMMetadata::GetUpstreamViews(const string &view_name) {
 }
 
 vector<string> IVMMetadata::GetDownstreamViews(const string &view_name) {
-	// Find all views that depend on delta_<view_name> as a source.
+	// Find all views that depend on delta_<view_name> or _ivm_data_<view_name> as a source.
+	// DuckLake chained MVs use _ivm_data_* (data table) instead of delta_* (delta table).
 	vector<string> result;
 	unordered_set<string> visited;
 
 	std::function<void(const string &)> collect = [&](const string &vn) {
 		string delta_name = OpenIVMUtils::DeltaName(vn);
+		string data_name = IVMTableNames::DataTableName(vn);
 		auto dependents = con.Query("SELECT DISTINCT view_name FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		                            " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_name) + "'");
+		                            " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_name) +
+		                            "' OR table_name = '" + OpenIVMUtils::EscapeValue(data_name) + "'");
 		if (!dependents->HasError()) {
 			for (size_t i = 0; i < dependents->RowCount(); i++) {
 				string dep = dependents->GetValue(0, i).ToString();
