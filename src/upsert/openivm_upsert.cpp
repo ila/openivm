@@ -509,6 +509,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	auto ast = LogicalPlanToAst(con_ctx, plan);
 	auto cte_list = AstToCteList(*ast);
 	string raw_ivm_sql = cte_list->ToQuery(false);
+	OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_ivm_sql.c_str());
 
 	// Use explicit column list in INSERT INTO delta_view, excluding _duckdb_ivm_timestamp
 	// so the DEFAULT now() fills it in (for chained MV support)

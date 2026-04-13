@@ -29,6 +29,7 @@ set(EXTENSION_SOURCES
     src/rules/projection.cpp
     src/rules/aggregate.cpp
     src/rules/join.cpp
+    src/rules/ducklake_join.cpp
     src/rules/union.cpp
     src/rules/distinct.cpp
     src/rules/column_hider.cpp

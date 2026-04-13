@@ -1,4 +1,5 @@
 #include "rules/join.hpp"
+#include "rules/ducklake_join.hpp"
 #include "rules/openivm_rewrite_rule.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
@@ -15,33 +16,18 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 
-namespace {
-
-using duckdb::ColumnBinding;
-using duckdb::Expression;
-using duckdb::LogicalComparisonJoin;
-using duckdb::LogicalGet;
-using duckdb::LogicalOperator;
-using duckdb::unique_ptr;
-using duckdb::vector;
-
-struct JoinLeafInfo {
-	vector<size_t> path;
-	LogicalGet *get;            // non-null for simple table scans
-	LogicalOperator *node;      // always set; for non-GET leaves, rewrite the subtree
-	bool is_right_of_left_join; // true if this leaf is on the RIGHT side of a LEFT JOIN
-};
+namespace duckdb {
 
 void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves,
-                       bool is_right_of_left = false) {
-	if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-	    node->type == duckdb::LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+                       bool is_right_of_left) {
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	    node->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
 		bool is_left = false;
 		bool is_right = false;
-		if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 			auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
-			is_left = (join && join->join_type == duckdb::JoinType::LEFT);
-			is_right = (join && join->join_type == duckdb::JoinType::RIGHT);
+			is_left = (join && join->join_type == JoinType::LEFT);
+			is_right = (join && join->join_type == JoinType::RIGHT);
 		}
 		path.push_back(0);
 		CollectJoinLeaves(node->children[0].get(), path, leaves, is_right_of_left || is_right);
@@ -49,18 +35,16 @@ void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLe
 		path.push_back(1);
 		CollectJoinLeaves(node->children[1].get(), path, leaves, is_right_of_left || is_left);
 		path.pop_back();
-	} else if (node->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+	} else if (node->type == LogicalOperatorType::LOGICAL_GET) {
 		leaves.push_back({path, dynamic_cast<LogicalGet *>(node), node, is_right_of_left});
 	} else {
 		leaves.push_back({path, nullptr, node, is_right_of_left});
 	}
 }
 
-/// Walk down a single-child subtree to find the underlying LogicalGet (if any).
-/// Join leaves may be wrapped in projections or filters by the optimizer.
 LogicalGet *FindGetInSubtree(LogicalOperator *node) {
 	while (node) {
-		if (node->type == duckdb::LogicalOperatorType::LOGICAL_GET) {
+		if (node->type == LogicalOperatorType::LOGICAL_GET) {
 			return dynamic_cast<LogicalGet *>(node);
 		}
 		if (node->children.size() == 1) {
@@ -82,15 +66,15 @@ unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, co
 }
 
 /// Verify all joins in the subtree are INNER, LEFT, or RIGHT. Returns true if any LEFT/RIGHT found.
-bool VerifyJoinTypes(LogicalOperator *node) {
+static bool VerifyJoinTypes(LogicalOperator *node) {
 	bool has_left = false;
-	if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (join->join_type == duckdb::JoinType::LEFT || join->join_type == duckdb::JoinType::RIGHT) {
+		if (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT) {
 			has_left = true;
-		} else if (join->join_type != duckdb::JoinType::INNER) {
-			throw duckdb::Exception(duckdb::ExceptionType::OPTIMIZER,
-			                        duckdb::JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM");
+		} else if (join->join_type != JoinType::INNER) {
+			throw Exception(ExceptionType::OPTIMIZER,
+			                JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM");
 		}
 	}
 	for (auto &child : node->children) {
@@ -101,12 +85,11 @@ bool VerifyJoinTypes(LogicalOperator *node) {
 	return has_left;
 }
 
-/// Demote LEFT/RIGHT JOINs to INNER in a subtree (used when only right-side deltas exist).
 void DemoteLeftJoins(LogicalOperator *node) {
-	if (node->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (j && (j->join_type == duckdb::JoinType::LEFT || j->join_type == duckdb::JoinType::RIGHT)) {
-			j->join_type = duckdb::JoinType::INNER;
+		if (j && (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT)) {
+			j->join_type = JoinType::INNER;
 		}
 	}
 	for (auto &child : node->children) {
@@ -114,8 +97,6 @@ void DemoteLeftJoins(LogicalOperator *node) {
 	}
 }
 
-/// Update the parent JOIN's projection map to include the new multiplicity column
-/// after a subtree replacement. Without this, the mul binding gets silently dropped.
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf) {
 	if (leaf.path.empty()) {
 		return;
@@ -125,12 +106,12 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 	for (size_t s = 0; s + 1 < leaf.path.size(); s++) {
 		parent = &((*parent)->children[leaf.path[s]]);
 	}
-	if ((*parent)->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	if ((*parent)->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *join = dynamic_cast<LogicalComparisonJoin *>((*parent).get());
 		if (join) {
 			auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
 			if (!proj_map.empty()) {
-				duckdb::idx_t mul_idx = leaf.node->GetColumnBindings().size();
+				idx_t mul_idx = leaf.node->GetColumnBindings().size();
 				proj_map.push_back(mul_idx);
 				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
 				                    child_side == 0 ? "left" : "right");
@@ -138,10 +119,6 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 		}
 	}
 }
-
-} // namespace
-
-namespace duckdb {
 
 // ============================================================================
 // FK-aware term pruning: detect which inclusion-exclusion terms are redundant
@@ -452,8 +429,18 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	D_ASSERT(types.size() == original_bindings.size());
 	types.emplace_back(pw.mul_type);
 
-	// 3. Build terms
-	auto terms = BuildInclusionExclusionTerms(pw, context, binder, leaves, has_left_join);
+	// 3. Build terms — use DuckLake N-term path when all leaves are DuckLake scans
+	bool all_ducklake = true;
+	for (size_t i = 0; i < N; i++) {
+		auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+		if (!get || get->function.name != "ducklake_scan") {
+			all_ducklake = false;
+			break;
+		}
+	}
+
+	auto terms = all_ducklake ? BuildDuckLakeJoinTerms(pw, context, binder, leaves, has_left_join)
+	                          : BuildInclusionExclusionTerms(pw, context, binder, leaves, has_left_join);
 
 	// 4. UNION ALL
 	auto result = AssembleUnionAll(terms, types, binder);
