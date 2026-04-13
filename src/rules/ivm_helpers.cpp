@@ -5,110 +5,33 @@
 #include "core/openivm_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/parser/parser.hpp"
-#include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_set_operation.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "storage/ducklake_scan.hpp"
 
 namespace duckdb {
 
 // ============================================================================
-// Stub/restore for non-serializable scans (DuckLake)
-//
-// Before LogicalOperator::Copy(), replace DuckLake scans with serializable
-// stubs. After Copy, restore the real function/bind_data into both trees.
+// DuckLake delta scan: direct plan construction using native catalog types
 // ============================================================================
 
-// SavedScanInfo is defined in ivm_rule.hpp
-
-static void CollectNonSerializableScans(LogicalOperator &op, vector<LogicalGet *> &scans) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op.Cast<LogicalGet>();
-		// Check if this is a DuckLake scan (or any scan that might fail serialization)
-		bool is_ducklake = get.function.name == "ducklake_scan";
-		OPENIVM_DEBUG_PRINT("[StubScans] GET '%s' table_index=%lu serialize=%d ducklake=%d\n",
-		                    get.function.name.c_str(), (unsigned long)get.table_index,
-		                    (int)get.function.HasSerializationCallbacks(), (int)is_ducklake);
-		if (is_ducklake) {
-			scans.push_back(&get);
-		}
-	}
-	for (auto &child : op.children) {
-		CollectNonSerializableScans(*child, scans);
-	}
-}
-
-static void FindGetsByTableIndex(LogicalOperator &op, idx_t table_index, vector<LogicalGet *> &result) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op.Cast<LogicalGet>();
-		if (get.table_index == table_index) {
-			result.push_back(&get);
-		}
-	}
-	for (auto &child : op.children) {
-		FindGetsByTableIndex(*child, table_index, result);
-	}
-}
-
-vector<SavedScanInfo> StubNonSerializableScans(LogicalOperator &op) {
-	vector<LogicalGet *> scans;
-	CollectNonSerializableScans(op, scans);
-	vector<SavedScanInfo> saved;
-	for (auto *get : scans) {
-		SavedScanInfo info;
-		info.table_index = get->table_index;
-		// Save the serialize/deserialize callbacks and bind_data
-		info.saved_function = get->function; // shallow copy of TableFunction struct
-		info.saved_bind_data = std::move(get->bind_data);
-		info.saved_function_info = get->function.function_info;
-		// Keep serialize/deserialize intact — just move bind_data out so it doesn't interfere.
-		// The Copy will serialize+deserialize using the DuckLake callbacks.
-		get->bind_data = nullptr;
-		saved.push_back(std::move(info));
-	}
-	return saved;
-}
-
-void RestoreScans(LogicalOperator &op, vector<SavedScanInfo> &saved) {
-	for (auto &info : saved) {
-		vector<LogicalGet *> gets;
-		FindGetsByTableIndex(op, info.table_index, gets);
-		for (auto *get : gets) {
-			// Restore the serialize/deserialize callbacks
-			get->function.serialize = info.saved_function.serialize;
-			get->function.deserialize = info.saved_function.deserialize;
-			get->function.function_info = info.saved_function_info;
-			// Restore bind_data if it was nulled (original tree).
-			// For copies, the deserializer re-created bind_data via re-binding.
-			if (!get->bind_data && info.saved_bind_data) {
-				get->bind_data = std::move(info.saved_bind_data);
-			}
-		}
-	}
-}
-
-// ============================================================================
-// DuckLake delta scan: plan SQL fragments for table_insertions + table_deletions
-// ============================================================================
-
-/// Build a DuckLake delta scan by planning a SQL fragment that calls
-/// ducklake_table_insertions/deletions with a multiplicity column, then
-/// extracting the plan tree. DuckDB handles the table function expansion.
-static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, LogicalGet *old_get, const string &view_name) {
+/// Build a DuckLake delta scan by directly constructing LogicalGet nodes
+/// with SCAN_INSERTIONS / SCAN_DELETIONS, avoiding SQL string round-trips.
+static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &binder, LogicalGet *old_get,
+                                              const string &view_name) {
 	auto table_ref = old_get->GetTable();
 	string catalog_name = table_ref->ParentCatalog().GetName();
 	string schema_name = table_ref->schema.name;
 	string table_name = table_ref.get()->name;
 
-	OPENIVM_DEBUG_PRINT("[DuckLake] Creating delta node for '%s.%s.%s'\n", catalog_name.c_str(), schema_name.c_str(),
-	                    table_name.c_str());
+	OPENIVM_DEBUG_PRINT("[DuckLake] Creating delta node for '%s.%s'\n", catalog_name.c_str(), table_name.c_str());
 
-	// Get snapshot range from metadata.
-	// Use auto-commit to avoid deadlocking with the outer optimizer transaction.
-	OPENIVM_DEBUG_PRINT("[DuckLake] About to create connection for metadata queries\n");
+	// Get last snapshot from IVM metadata.
 	Connection con(*context.db);
-	OPENIVM_DEBUG_PRINT("[DuckLake] Connection created, querying snapshot...\n");
 	auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(ivm::DELTA_TABLES_TABLE) +
 	                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
 	                             "' AND table_name = '" + OpenIVMUtils::EscapeValue(table_name) + "'");
@@ -117,77 +40,100 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, LogicalGet
 	}
 	int64_t last_snap = snap_result->GetValue(0, 0).GetValue<int64_t>();
 
-	auto cur_snap_result = con.Query("SELECT id FROM " + catalog_name + ".current_snapshot()");
-	if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0) {
-		throw InternalException("Cannot get current DuckLake snapshot for catalog '%s'", catalog_name);
-	}
-	int64_t cur_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
+	// Get current snapshot from the old_get's existing DuckLake scan info (no SQL needed).
+	auto &old_func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
+	int64_t cur_snap = static_cast<int64_t>(old_func_info.snapshot.snapshot_id);
 
 	OPENIVM_DEBUG_PRINT("[DuckLake] Snapshot range: %ld -> %ld\n", (long)last_snap, (long)cur_snap);
 
-	// Build column list from old_get's projected columns.
-	// Skip virtual columns (ROWID etc.) — they don't exist in ducklake_table_insertions/deletions.
-	// For COUNT(*) scans with no real columns, emit "1" as a dummy.
-	string col_list;
-	auto &col_ids = old_get->GetColumnIds();
-	for (idx_t i = 0; i < col_ids.size(); i++) {
-		if (col_ids[i].IsVirtualColumn()) {
-			continue;
+	// Build a start snapshot for the change tracking range [last_snap, cur_snap].
+	// Only snapshot_id is used by DuckLake's file selection logic.
+	DuckLakeSnapshot start_snapshot(static_cast<idx_t>(last_snap), DConstants::INVALID_INDEX, DConstants::INVALID_INDEX,
+	                                DConstants::INVALID_INDEX);
+
+	// Determine column IDs from old_get, skipping virtual columns (ROWID etc.)
+	// that don't exist in DuckLake change scans.
+	vector<ColumnIndex> delta_col_ids;
+	for (auto &id : old_get->GetColumnIds()) {
+		if (!id.IsVirtualColumn()) {
+			delta_col_ids.push_back(id);
 		}
-		if (!col_list.empty()) {
-			col_list += ", ";
-		}
-		idx_t idx = col_ids[i].GetPrimaryIndex();
-		col_list += OpenIVMUtils::QuoteIdentifier(old_get->names[idx]);
 	}
-	if (col_list.empty()) {
-		col_list = "1 AS _dummy";
+	if (delta_col_ids.empty()) {
+		delta_col_ids.push_back(ColumnIndex(0));
 	}
 
-	// Construct the delta SQL: insertions (mul=true) UNION ALL deletions (mul=false)
-	string ins_sql = "SELECT " + col_list + ", true AS " + string(ivm::MULTIPLICITY_COL) +
-	                 " FROM ducklake_table_insertions('" + OpenIVMUtils::EscapeValue(catalog_name) + "', '" +
-	                 OpenIVMUtils::EscapeValue(schema_name) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
-	                 to_string(last_snap) + ", " + to_string(cur_snap) + ")";
-	string del_sql = "SELECT " + col_list + ", false AS " + string(ivm::MULTIPLICITY_COL) +
-	                 " FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(catalog_name) + "', '" +
-	                 OpenIVMUtils::EscapeValue(schema_name) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
-	                 to_string(last_snap) + ", " + to_string(cur_snap) + ")";
-	string delta_sql = ins_sql + " UNION ALL " + del_sql;
+	// Helper: create a LogicalGet configured as a DuckLake change scan.
+	auto make_change_scan = [&](DuckLakeScanType scan_type, idx_t table_idx) -> unique_ptr<LogicalGet> {
+		unique_ptr<FunctionData> bind_data;
+		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table_name, QueryErrorContext());
+		auto scan_fn = table_ref->Cast<TableCatalogEntry>().GetScanFunction(context, bind_data, lookup);
 
-	OPENIVM_DEBUG_PRINT("[DuckLake] Delta SQL: %s\n", delta_sql.c_str());
+		auto &func_info = scan_fn.function_info->Cast<DuckLakeFunctionInfo>();
+		func_info.scan_type = scan_type;
+		func_info.start_snapshot = make_uniq<DuckLakeSnapshot>(start_snapshot);
 
-	// Plan the SQL fragment on a separate connection to avoid deadlocking
-	// with the optimizer's active transaction on the main context.
-	con.BeginTransaction();
-	Parser parser;
-	parser.ParseQuery(delta_sql);
-	Planner planner(*con.context);
-	planner.CreatePlan(parser.statements[0]->Copy());
-	auto plan = std::move(planner.plan);
-	plan->ResolveOperatorTypes();
-	con.Rollback();
+		// Capture column metadata before moving scan_fn into the LogicalGet.
+		auto col_types = func_info.column_types;
+		auto col_names = func_info.column_names;
 
-	// Wrap in a projection that remaps output bindings to old_get->table_index.
-	// The planned SQL fragment has its own table indices (starting from 0) which
-	// don't match the parent plan's expectations.
-	auto bindings = plan->GetColumnBindings();
-	auto types = plan->types;
+		auto get = make_uniq<LogicalGet>(table_idx, std::move(scan_fn), std::move(bind_data), std::move(col_types),
+		                                 std::move(col_names));
+		get->SetColumnIds(vector<ColumnIndex>(delta_col_ids));
 
+		// Set parameters so LPTS can reconstruct the ducklake_table_insertions/deletions SQL.
+		get->parameters = {Value(catalog_name), Value(schema_name), Value(table_name), Value::BIGINT(last_snap),
+		                   Value::BIGINT(cur_snap)};
+
+		get->ResolveOperatorTypes();
+		return get;
+	};
+
+	auto ins_get = make_change_scan(DuckLakeScanType::SCAN_INSERTIONS, binder.GenerateTableIndex());
+	auto del_get = make_change_scan(DuckLakeScanType::SCAN_DELETIONS, binder.GenerateTableIndex());
+
+	// Helper: wrap a scan in a projection that appends a constant multiplicity column.
+	auto add_mul_projection = [&](unique_ptr<LogicalOperator> scan, bool mul_value) -> unique_ptr<LogicalProjection> {
+		auto bindings = scan->GetColumnBindings();
+		auto types = scan->types;
+
+		vector<unique_ptr<Expression>> exprs;
+		for (idx_t i = 0; i < bindings.size(); i++) {
+			exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], bindings[i]));
+		}
+		exprs.push_back(make_uniq<BoundConstantExpression>(Value::BOOLEAN(mul_value)));
+
+		auto proj = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(exprs));
+		proj->children.push_back(std::move(scan));
+		proj->ResolveOperatorTypes();
+		return proj;
+	};
+
+	auto ins_proj = add_mul_projection(std::move(ins_get), true);
+	auto del_proj = add_mul_projection(std::move(del_get), false);
+
+	// UNION ALL the insertions and deletions.
+	auto union_types = ins_proj->types;
+	idx_t n_output_cols = union_types.size();
+	auto union_op =
+	    make_uniq<LogicalSetOperation>(binder.GenerateTableIndex(), n_output_cols, std::move(ins_proj),
+	                                   std::move(del_proj), LogicalOperatorType::LOGICAL_UNION, true /* setop_all */);
+	union_op->types = union_types;
+
+	// Outer projection to remap output bindings to old_get->table_index.
+	auto union_bindings = union_op->GetColumnBindings();
 	vector<unique_ptr<Expression>> remap_exprs;
-	for (idx_t i = 0; i < bindings.size(); i++) {
-		remap_exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], bindings[i]));
+	for (idx_t i = 0; i < union_bindings.size(); i++) {
+		remap_exprs.push_back(make_uniq<BoundColumnRefExpression>(union_types[i], union_bindings[i]));
 	}
-
 	auto remap_proj = make_uniq<LogicalProjection>(old_get->table_index, std::move(remap_exprs));
-	remap_proj->children.push_back(std::move(plan));
+	remap_proj->children.push_back(std::move(union_op));
 	remap_proj->ResolveOperatorTypes();
 
-	// Multiplicity binding: last column at the remapped table_index
-	ColumnBinding mul_binding(old_get->table_index, bindings.size() - 1);
+	ColumnBinding mul_binding(old_get->table_index, union_bindings.size() - 1);
 
 	OPENIVM_DEBUG_PRINT("[DuckLake] Delta plan built: %zu output cols, mul_binding: table=%lu col=%lu\n",
-	                    bindings.size(), (unsigned long)mul_binding.table_index,
+	                    union_bindings.size(), (unsigned long)mul_binding.table_index,
 	                    (unsigned long)mul_binding.column_index);
 
 	return {std::move(remap_proj), mul_binding};
@@ -197,11 +143,12 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, LogicalGet
 // Standard DuckDB delta scan (existing logic)
 // ============================================================================
 
-DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, const string &view_name) {
-	// DuckLake tables: use native change tracking via table_insertions/table_deletions
+DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, LogicalGet *old_get,
+                                  const string &view_name) {
+	// DuckLake tables: use native change tracking via direct plan construction
 	auto table_ref = old_get->GetTable();
 	if (table_ref.get() && table_ref->ParentCatalog().GetCatalogType() == "ducklake") {
-		return CreateDuckLakeDeltaNode(context, old_get, view_name);
+		return CreateDuckLakeDeltaNode(context, binder, old_get, view_name);
 	}
 	unique_ptr<LogicalGet> delta_get_node;
 	ColumnBinding new_mul_binding;

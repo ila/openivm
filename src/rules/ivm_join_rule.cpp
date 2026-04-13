@@ -330,7 +330,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 		for (size_t i = 0; i < N; i++) {
 			if (mask & (1ULL << i)) {
 				if (leaves[i].get) {
-					DeltaGetResult delta_i = CreateDeltaGetNode(context, leaves[i].get, pw.view);
+					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, pw.view);
 					mul_bindings.push_back(delta_i.mul_binding);
 					GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
 				} else {

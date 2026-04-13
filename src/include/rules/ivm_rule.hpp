@@ -54,16 +54,7 @@ public:
 // Shared helpers used by multiple rules
 //==============================================================================
 
-DeltaGetResult CreateDeltaGetNode(ClientContext &context, LogicalGet *old_get, const string &view_name);
-
-struct SavedScanInfo {
-	idx_t table_index;
-	TableFunction saved_function;
-	unique_ptr<FunctionData> saved_bind_data;
-	shared_ptr<TableFunctionInfo> saved_function_info;
-};
-vector<SavedScanInfo> StubNonSerializableScans(LogicalOperator &op);
-void RestoreScans(LogicalOperator &op, vector<SavedScanInfo> &saved);
+DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, LogicalGet *old_get, const string &view_name);
 
 } // namespace duckdb
 
