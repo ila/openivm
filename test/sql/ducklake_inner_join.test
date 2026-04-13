@@ -15,11 +15,6 @@ LOAD ducklake;
 statement ok
 ATTACH ':memory:' AS dl (TYPE ducklake);
 
-# TODO: DuckLake incremental join IVM fails because DuckLakeScan is not serializable.
-# Using full refresh as workaround until DuckDB/DuckLake adds serialization support.
-statement ok
-SET ivm_refresh_mode = 'full';
-
 # ==========================================
 # Test 1: 2-table INNER JOIN — INSERT left, then right
 # ==========================================

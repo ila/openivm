@@ -14,6 +14,14 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "storage/ducklake_scan.hpp"
+#include "storage/ducklake_table_entry.hpp"
 
 namespace {
 
@@ -142,6 +150,115 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 } // namespace
 
 namespace duckdb {
+
+// ============================================================================
+// DuckLake scan serialization patch for Copy()
+//
+// The installed DuckLake binary may not register serialize/deserialize
+// callbacks on ducklake_scan, causing LogicalOperator::Copy() to fail.
+// We provide our own callbacks that match the submodule's wire format,
+// using only DuckLake header types for serialization and virtual dispatch
+// (GetScanFunction) for deserialization.
+// ============================================================================
+
+static void IvmDuckLakeScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+                                     const TableFunction &function) {
+	auto &func_info = function.function_info->Cast<DuckLakeFunctionInfo>();
+	auto &catalog = func_info.table.ParentCatalog();
+	serializer.WriteProperty(100, "catalog_name", catalog.GetName());
+	serializer.WriteProperty(101, "schema_name", func_info.table.ParentSchema().name);
+	serializer.WriteProperty(102, "table_name", func_info.table_name);
+	serializer.WriteObject(103, "snapshot", [&](Serializer &obj) {
+		obj.WriteProperty(100, "snapshot_id", func_info.snapshot.snapshot_id);
+		obj.WriteProperty(101, "schema_version", func_info.snapshot.schema_version);
+		obj.WriteProperty(102, "next_catalog_id", func_info.snapshot.next_catalog_id);
+		obj.WriteProperty(103, "next_file_id", func_info.snapshot.next_file_id);
+	});
+}
+
+static unique_ptr<FunctionData> IvmDuckLakeScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+	auto &context = deserializer.Get<ClientContext &>();
+	auto catalog_name = deserializer.ReadProperty<string>(100, "catalog_name");
+	auto schema_name = deserializer.ReadProperty<string>(101, "schema_name");
+	auto table_name = deserializer.ReadProperty<string>(102, "table_name");
+	DuckLakeSnapshot snapshot;
+	deserializer.ReadObject(103, "snapshot", [&](Deserializer &obj) {
+		snapshot.snapshot_id = obj.ReadProperty<idx_t>(100, "snapshot_id");
+		snapshot.schema_version = obj.ReadProperty<idx_t>(101, "schema_version");
+		snapshot.next_catalog_id = obj.ReadProperty<idx_t>(102, "next_catalog_id");
+		snapshot.next_file_id = obj.ReadProperty<idx_t>(103, "next_file_id");
+	});
+
+	// Look up the table and get a fresh scan function via virtual dispatch.
+	auto &table_entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog_name, schema_name, table_name);
+	unique_ptr<FunctionData> bind_data;
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table_name, QueryErrorContext());
+	function = table_entry.GetScanFunction(context, bind_data, lookup);
+	return bind_data;
+}
+
+/// Walk the plan tree and ensure DuckLake scan nodes have working
+/// serialize/deserialize callbacks so Copy() succeeds.
+/// Ensure ducklake_scan can be serialized and found during deserialization.
+/// Patches serialize/deserialize callbacks AND registers the function in the
+/// system catalog if not already present (older DuckLake binaries don't do this).
+static void PatchDuckLakeScanSerialization(LogicalOperator &op, ClientContext &context) {
+	bool found_ducklake = false;
+	// Patch serialize/deserialize on all ducklake_scan GETs.
+	std::function<void(LogicalOperator &)> walk = [&](LogicalOperator &node) {
+		if (node.type == LogicalOperatorType::LOGICAL_GET) {
+			auto &get = node.Cast<LogicalGet>();
+			if (get.function.name == "ducklake_scan") {
+				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Patching DuckLake scan serialization for table_index=%lu\n",
+				                    (unsigned long)get.table_index);
+				get.function.serialize = IvmDuckLakeScanSerialize;
+				get.function.deserialize = IvmDuckLakeScanDeserialize;
+				found_ducklake = true;
+			}
+		}
+		for (auto &child : node.children) {
+			walk(*child);
+		}
+	};
+	walk(op);
+
+	if (!found_ducklake) {
+		return;
+	}
+
+	// Ensure ducklake_scan is registered as a catalog function so Copy()'s
+	// deserializer can find it. Older DuckLake binaries don't register it.
+	auto entry = Catalog::GetEntry<TableFunctionCatalogEntry>(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, "ducklake_scan",
+	                                                          OnEntryNotFound::RETURN_NULL);
+	if (!entry) {
+		OPENIVM_DEBUG_PRINT("[IvmJoinRule] ducklake_scan not in catalog, registering...\n");
+		// Grab the function from a DuckLake GET node and register it.
+		std::function<TableFunction *(LogicalOperator &)> find_fn = [&](LogicalOperator &node) -> TableFunction * {
+			if (node.type == LogicalOperatorType::LOGICAL_GET) {
+				auto &get = node.Cast<LogicalGet>();
+				if (get.function.name == "ducklake_scan") {
+					return &get.function;
+				}
+			}
+			for (auto &child : node.children) {
+				auto *r = find_fn(*child);
+				if (r) {
+					return r;
+				}
+			}
+			return nullptr;
+		};
+		auto *func = find_fn(op);
+		if (func) {
+			auto &sys_catalog = Catalog::GetSystemCatalog(context);
+			CreateTableFunctionInfo info(*func);
+			info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+			auto &schema = sys_catalog.GetSchema(context, DEFAULT_SCHEMA);
+			auto transaction = sys_catalog.GetCatalogTransaction(context);
+			schema.CreateTableFunction(transaction, info);
+		}
+	}
+}
 
 // ============================================================================
 // FK-aware term pruning: detect which inclusion-exclusion terms are redundant
@@ -288,6 +405,12 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 		skip_bits = ComputeSkipBits(fk_relations, insert_only_mask);
 	}
 
+	// Patch DuckLake scan serialization: the installed DuckLake binary may not
+	// register serialize/deserialize callbacks, causing Copy() to fail. We
+	// provide our own callbacks that replicate the submodule's protocol, using
+	// only header types and virtual dispatch (GetScanFunction) for deserialization.
+	PatchDuckLakeScanSerialization(*pw.plan, context);
+
 	uint64_t pruned_count = 0;
 	uint64_t total_terms = (1ULL << N) - 1;
 	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building inclusion-exclusion terms (%lu total, %zu FK relations)\n",
@@ -300,12 +423,6 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Pruned term mask=%lu (FK insert-only PK)\n", (unsigned long)mask);
 			continue;
 		}
-		// TODO(DuckLake): Copy() uses Serialize which fails for DuckLake scans
-		// (installed DuckLake binary throws "DuckLakeScan not implemented").
-		// DuckLake joins currently fall back to full refresh. Fix options:
-		//   1. Update DuckLake extension to support serialization
-		//   2. Build terms without Copy (construct fresh trees from view SQL)
-		//   3. Implement ClonePlanTree that bypasses serialization
 		auto term = pw.plan->Copy(context);
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);
