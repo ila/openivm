@@ -13,11 +13,13 @@ CREATE MATERIALIZED VIEW mv AS
 --   ART index on mv(key)
 ```
 
-The index is used by the `MERGE` (upsert) statement during refresh to perform fast
-key lookups. This avoids a full table scan of the materialized view on every delta
-application.
+The index enforces uniqueness on the GROUP BY key combination. DuckDB's `MERGE INTO`
+statement uses hash joins internally for key matching, so the ART index primarily serves
+as a correctness guard rather than a lookup accelerator. No user action is required.
 
-No user action is required. The index is created and maintained automatically.
+**DuckLake tables:** ART index creation is skipped for DuckLake-backed views because
+DuckLake does not support DuckDB-native index types. Group column identification falls
+back to metadata stored in `_duckdb_ivm_views`.
 
 ## Zone Maps on `_duckdb_ivm_timestamp`
 

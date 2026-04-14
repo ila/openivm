@@ -71,9 +71,8 @@ pruned. Deletes make the delta non-insert-only, disabling this optimization.
 
 ### Why DuckDB Cannot Do This
 
-DuckDB's query optimizer does not use foreign key constraints for optimization
-(`join_elimination.cpp` has an explicit TODO for FK-based reasoning). The optimizer
-cannot determine that the net contribution of terms involving an insert-only PK
+DuckDB's query optimizer does not use foreign key constraints for join optimization.
+It cannot determine that the net contribution of terms involving an insert-only PK
 delta is zero.
 
 ## Pruning Rule
@@ -112,17 +111,20 @@ build + hash join probe + UNION ALL branch.
 - PK-side delta contains deletes or updates (multiplicity = false)
 - LEFT/RIGHT joins (FK semantics don't guarantee empty results)
 - Self-referencing FKs (both sides are the same table)
+- **DuckLake tables**: DuckLake does not support `FOREIGN KEY` constraints. For DuckLake
+  joins, the [N-term telescoping](../ducklake.md#n-term-telescoping-join-rule) rule is used
+  instead, with [empty-delta term skipping](empty-delta-skip.md) covering the common case of
+  unchanged dimension tables.
 
-## Implementation
+## How it works
 
-- **FK detection:** `DetectFKRelations()` in `ivm_join_rule.cpp` walks join leaves,
-  resolves `LogicalGet` nodes from subtrees via `FindGetInSubtree()`, queries
-  `TableCatalogEntry::GetConstraints()` for `FOREIGN_KEY` constraints.
-- **Insert-only check:** `DetectInsertOnlyDeltas()` queries each delta table for
-  `COUNT(*) WHERE multiplicity = false AND timestamp >= last_update`.
-- **Skip bits:** `ComputeSkipBits()` ORs the bits of all insert-only PK leaves.
-- **Pruning:** In the mask loop of `BuildInclusionExclusionTerms()`:
-  `if (mask & skip_bits) continue`.
+1. **FK detection:** Walk the join tree, inspect each base table's declared constraints
+   for `FOREIGN KEY` references to other tables in the join.
+2. **Insert-only check:** For each referenced (PK-side) table, check whether its delta
+   contains any deletions since the last refresh. If not, the delta is insert-only.
+3. **Skip bits:** Build a bitmask of all insert-only PK leaves.
+4. **Pruning:** Any inclusion-exclusion term whose bitmask overlaps with the skip bits
+   is discarded — a single bitmask check per term.
 
 ## Example
 

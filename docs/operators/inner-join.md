@@ -64,6 +64,17 @@ SELECT name, amount, mul FROM union_13;
 
 The join result is a projection, so the upsert uses [counting-based consolidation](projection-filter.md).
 
+## DuckLake tables
+
+When all join leaves are DuckLake scans, OpenIVM uses the **N-term telescoping** formula
+instead of inclusion-exclusion. This produces exactly N terms instead of 2^N - 1 by
+leveraging DuckLake's time travel (`AT VERSION`) to read the old state of non-delta tables.
+
+Additionally, terms for unchanged tables (where `last_snapshot_id == current_snapshot_id`)
+are skipped at plan time via [empty-delta term skipping](../optimizations/empty-delta-skip.md).
+
+See [DuckLake IVM integration](../ducklake.md) for details.
+
 ## Upsert (counting consolidation)
 
 The join delta is a projection (no aggregation), so the upsert uses counting-based consolidation — identical to [projection-filter](projection-filter.md).

@@ -183,14 +183,225 @@ view evaluated at some past point in time. Provides clean transactional reasonin
 
 ### Comparison Table
 
-| | OpenIVM | DBSP/Feldera | DBToaster | pg_ivm | Snowflake DT |
-|---|---|---|---|---|---|
-| **Approach** | SQL-to-SQL compiler | Streaming dataflow | Compiled triggers | DB triggers | Cloud service |
-| **IVM order** | First-order | First-order | Higher-order | First-order | First-order |
-| **Runtime** | Any SQL engine | Feldera runtime | Standalone C++/Scala | PostgreSQL | Snowflake |
-| **Change tracking** | Delta tables + optimizer | Streams (Z-sets) | Trigger functions | Transition tables | Micro-partition streams |
-| **Refresh** | Lazy (PRAGMA) or eager | Continuous streaming | Per-tuple triggers | Immediate (in-txn) | Scheduled (target lag) |
-| **Joins** | Inner (inclusion-exclusion) | All (bilinear delta) | All (recursive delta) | Inner + outer (v1.13) | Inner + outer |
-| **Aggregates** | SUM, COUNT (+MIN/MAX partial) | All (linear cheap) | SUM, COUNT, AVG | count, sum, avg, min, max | All standard |
-| **Cross-system** | Yes (SQL output) | No (Feldera only) | No (compiled code) | No (PG only) | No (Snowflake only) |
-| **Adaptive** | Cost model (ivm_adaptive_refresh) | No | No | No | Auto mode |
+| | OpenIVM | DBSP/Feldera | DBToaster | pg_ivm | Snowflake DT | Databricks Enzyme | Flink SQL | Materialize | RisingWave |
+|---|---|---|---|---|---|---|---|---|---|
+| **Approach** | SQL-to-SQL compiler | Streaming dataflow | Compiled triggers | DB triggers | Cloud service | Engine-internal (Spark) | Retraction streams | Shared arrangements | Streaming DB |
+| **IVM order** | First-order | First-order | Higher-order | First-order | First-order | First-order | First-order | First-order | First-order |
+| **Runtime** | Any SQL engine | Feldera runtime | Standalone C++/Scala | PostgreSQL | Snowflake | Spark | Flink | Materialize | RisingWave |
+| **Change tracking** | Delta tables / DuckLake snapshots | Streams (Z-sets) | Trigger functions | Transition tables | Micro-partition streams | Delta Lake CDF | Changelog (+I/-U/+U/-D) | Shared arrangements | Barrier checkpoints |
+| **Refresh** | Lazy (PRAGMA) or scheduled daemon | Continuous | Per-tuple triggers | Immediate (in-txn) | Scheduled (target lag) | Batch or streaming | Continuous | Continuous | Continuous |
+| **Joins** | Inner + LEFT (inclusion-exclusion / N-term) | All (bilinear delta) | All (recursive delta) | Inner + outer | Inner + outer | Inner + outer (2-term) | All types | Arbitrary N-way | All incl. anti/semi |
+| **Aggregates** | SUM, COUNT, AVG (+MIN/MAX partial) | All (linear cheap) | SUM, COUNT, AVG | count, sum, avg, min, max | All standard | All + partition-level window | All + LISTAGG | All via hierarchical reduction | All + APPROX_COUNT_DISTINCT |
+| **Window funcs** | Not yet (FULL_REFRESH) | Yes (delay operators) | No | No | Yes (partition recompute) | Yes (partition overwrite) | Yes (full support) | Temporal filters only | Yes (OVER windows) |
+| **Cross-system** | Yes (SQL output) | No | No | No | No | No | No | No | No |
+| **Adaptive** | Cost model | No | No | No | Auto mode | Learned cost model (87.5% accuracy) | No | No | No |
+
+---
+
+### Databricks Enzyme
+
+**"Enzyme: Incremental View Maintenance for Data Engineering"**
+Databricks, arXiv:2603.27775, March 2026. Powers Delta Live Tables (DLT).
+
+**Architecture:** Engine-internal Spark optimizer extension. Traverses the logical plan
+bottom-up producing three outputs per operator: previous state (psi), updated state
+(psi'), and change representation (Delta-psi).
+
+**Key innovations:**
+
+- **Learned cost model:** Fingerprints query plans, retrieves execution time/rows/memory
+  from historical executions. Scores multiple strategies (row-based IVM, partition overwrite,
+  full recompute). 87.5% accuracy in choosing optimal strategy.
+- **Query decomposition into maintenance units:** Sub-expressions refreshed independently
+  with different strategies — not all-or-nothing IVM vs recompute.
+- **Partition-level window function maintenance:** When input and MV share partition columns,
+  overwrites only affected partitions.
+- **Effectivized changesets:** Compacts CDF by grouping rows by all columns, summing change
+  types (+1/-1), keeping only non-zero net changes (analogous to OpenIVM's delta consolidation CTE).
+- **2-term join formula:** Delta(L join R) = (Delta-L join R) + (L' join Delta-R). Simpler
+  than inclusion-exclusion but requires materializing L' (full current state).
+- **Delta Lake CDF:** Row-level changes with `_change_type` (insert/update_preimage/update_postimage/delete),
+  `_commit_version`, `_commit_timestamp`. Similar to DuckLake snapshots.
+
+**Relevance to OpenIVM:** Learned cost model directly applicable (store refresh metrics in metadata).
+Partition-level window IVM is the practical path for window function support.
+Enzyme's 2-term formula vs OpenIVM's N-term inclusion-exclusion is a tradeoff: simpler but
+requires full-state materialization for non-delta sides.
+
+---
+
+### Apache Flink SQL
+
+**"Apache Flink: Stream and Batch Processing in a Single Engine"**
+Carbone et al., IEEE Data Eng. Bulletin, 2015. Flink SQL uses retraction-based IVM.
+
+**Refresh model:** Continuous streaming. 4-message changelog (+I = insert, -U = update before,
++U = update after, -D = delete). More expressive than OpenIVM's boolean multiplicity.
+
+**Supported operators:** All join types (inner, outer, semi, anti, temporal, interval).
+All standard aggregates including LISTAGG, FIRST_VALUE, LAST_VALUE. Full window support
+(tumbling, sliding, session, cumulative, OVER windows). Mini-batch aggregation for throughput.
+
+**Relevance to OpenIVM:** Flink's retraction model (-U/+U pair for updates) avoids
+the need for MERGE — potentially simpler upsert logic. Mini-batch aggregation (buffer
+deltas, apply in batch) is exactly what OpenIVM does with lazy refresh.
+
+---
+
+### RisingWave
+
+**"RisingWave: A Distributed SQL Streaming Database"**
+SIGMOD 2024 (industry track). PostgreSQL wire-compatible streaming database.
+
+**Key features:** All join types including anti/semi. APPROX_COUNT_DISTINCT. Barrier-based
+checkpointing. Cloud-native (S3-backed state). Decoupled compute/storage.
+
+**Relevance to OpenIVM:** PostgreSQL compatibility shows viability of streaming IVM behind
+a standard SQL interface. Outer join maintenance with NULL-matching state tracking is relevant.
+
+---
+
+### Materialize (details beyond comparison table)
+
+**"Shared Arrangements: Practical Inter-Query Sharing for Streaming Dataflows"**
+McSherry, Lattuada, Schwarzkopf, Roscoe. PVLDB 13(10), 2020.
+
+**Key innovation: Shared arrangements.** An "arrangement" is an indexed, maintained Z-set
+shared across multiple operators. When base data changes, the arrangement is updated once;
+all queries see the update. Uses hierarchical batch merge (LSM-tree-like).
+
+For delta joins: each of N relations is the "delta source" in turn, remaining N-1
+read from shared arrangements. Gives N terms (not 2^N-1) with zero intermediate state.
+This is conceptually similar to DuckLake N-term telescoping but uses in-memory indexes
+instead of time travel.
+
+---
+
+### Oracle Materialized View Fast Refresh
+
+Industry's oldest production IVM system (since Oracle 8i, ~1998).
+
+**Change tracking:** Materialized view logs on base tables (row-level change capture,
+analogous to delta tables). Stores rowid + changed columns + timestamps.
+
+**Fast refresh:** ON COMMIT or ON DEMAND. Supports SUM, COUNT, AVG, STDDEV, VARIANCE
+with fast refresh (COUNT must be included alongside SUM for correct maintenance — same
+pattern as OpenIVM's aggregate rewriting). MIN/MAX require full refresh.
+
+**PCT (Partition Change Tracking):** Refresh only affected partitions. Directly relevant
+to DuckLake integration where micro-partitions are tracked per-snapshot.
+
+---
+
+### Microsoft SQL Server Indexed Views
+
+Immediate maintenance (on every DML). Extremely restricted: inner joins only, no subqueries,
+no outer joins, SUM/COUNT_BIG only, deterministic expressions only. The restrictions guarantee
+correctness for immediate maintenance without complex delta reasoning.
+
+**Relevance:** Shows what's feasible for guaranteed-correct immediate IVM. Azure Stream
+Analytics (separate product) provides full streaming SQL with temporal joins and all window types.
+
+---
+
+### Google BigQuery Materialized Views
+
+Auto-refreshed on ~30min schedule. Limited to single-table aggregations with inner joins.
+COUNT, SUM, AVG, APPROX_COUNT_DISTINCT (HyperLogLog). Star schema restriction.
+Any deletion in base table forces full refresh.
+
+**Relevance:** Transparent query rewriting: optimizer routes queries through stale MV + live
+delta. This "MV query rewriting" approach could complement OpenIVM for read-path optimization.
+
+---
+
+### Alibaba Streaming View
+
+**Zhang et al.** "Streaming View: An Efficient Data Processing Engine for Modern Real-Time
+Data Warehouse." PVLDB 18(12), 2025.
+
+Native IVM inside AnalyticDB warehouse. Replaces Lambda/Kappa external stream processing.
+Supports complex ETL pipelines incrementally. Production deployment at Alibaba Cloud.
+
+---
+
+### Noria / ReadySet
+
+**Gjengset et al.** "Noria: Dynamic, Partially-Stateful Data-Flow for High-Performance
+Web Applications." OSDI 2018.
+
+**Key innovation: Partially-stateful dataflow.** Operators don't need to materialize all state.
+Hot paths stay materialized; cold state evicted and reconstructed on demand via "upqueries."
+For MIN/MAX: upquery re-fetches from base table on deletion (similar to group-recompute
+but only for accessed keys).
+
+**Relevance:** Maps to selective materialization of intermediate results — only cache
+hot groups for auxiliary views. Directly relevant for adaptive materialization (C4).
+
+---
+
+### ksqlDB (Confluent)
+
+**Jafarpour et al.** "ksqlDB: A Stream-Relational Database System." EDBT 2024 (industry).
+
+Kafka-native streaming SQL. Table-table join (both sides changelog-driven) is conceptually
+closest to OpenIVM's delta-delta join terms. RocksDB-backed state.
+Grace period concept for late-arriving data relevant for event-time semantics.
+
+---
+
+### Apache Calcite
+
+**Begoli et al.** "Apache Calcite: A Foundational Framework for Optimized Query Processing
+Over Heterogeneous Data Sources." SIGMOD 2018.
+
+Not a runtime — a query planning framework. Lattice framework for MV selection: which MVs
+to create given a workload. Lattice tiles represent pre-aggregated join results. MV
+substitution rules rewrite queries to use existing MVs.
+
+**Relevance:** Calcite's lattice framework could guide automatic auxiliary MV selection
+for higher-order IVM.
+
+---
+
+### TUM Systems
+
+**Split Maintenance of Continuous Views**
+Winter, Schmidt, Neumann, Kemper. PVLDB 2020.
+Splits view maintenance between insert time (eager: filtering, projection) and query time
+(lazy: aggregation finalization). Up to 10x higher insert throughput than traditional IVM.
+
+**InkFuse: Incremental Fusion**
+Wagner, Neumann. ICDE 2024.
+Pre-compiled sub-operators assembled at runtime for zero-latency query startup. The
+sub-operator library concept is applicable: delta query pipelines could be assembled
+from pre-compiled fragments.
+
+**ART (Adaptive Radix Tree)**
+Leis, Kemper, Neumann. ICDE 2013. Synchronization: DaMoN 2016 (OLC).
+Default index in HyPer/Umbra/DuckDB. Adapts node sizes (Node4/16/48/256).
+For OpenIVM: ART is used for unique constraint enforcement on MV GROUP BY keys.
+DuckDB's MERGE INTO uses hash joins internally, NOT ART lookups.
+
+---
+
+### Redshift AutoMV
+
+ML-based automatic creation of materialized views from observed query workload patterns.
+No user intervention required. Auto-refresh on staleness detection.
+
+---
+
+### Timeplus/Proton, Arroyo, DeltaStream
+
+Smaller streaming SQL engines. **Proton**: open-source, built on ClickHouse, unified
+historical+streaming queries. **Arroyo**: Rust-based, segment trees for sliding window
+aggregation (O(1) incremental updates). **DeltaStream**: cloud-native streaming SQL over Kafka/Kinesis.
+
+---
+
+### ClickHouse Materialized Views
+
+Insert-time trigger (block-level). Single-table only (no join MVs). AggregatingMergeTree
+stores partial aggregates merged at query time. Extremely high throughput for append-only
+workloads. Not truly incremental for deletes/updates.

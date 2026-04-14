@@ -38,6 +38,25 @@ CREATE OR REPLACE MATERIALIZED VIEW regional_totals REFRESH EVERY '10 minutes' A
 
 Base table schema changes (ADD/DROP/RENAME COLUMN) are handled automatically — delta tables are synced and IVM continues to work. Dropping or renaming a column referenced by an MV is blocked with an error.
 
+## DuckLake integration
+
+OpenIVM supports materialized views over [DuckLake](https://ducklake.select/) tables. DuckLake's snapshot-based time travel replaces delta tables with native change tracking, and enables a more efficient join rule (N terms instead of 2^N - 1). See [DuckLake IVM integration](docs/ducklake.md).
+
+```sql
+INSTALL ducklake;
+LOAD ducklake;
+ATTACH ':memory:' AS dl (TYPE ducklake);
+
+CREATE TABLE dl.orders (id INT, product VARCHAR, amount INT);
+INSERT INTO dl.orders VALUES (1, 'Widget', 100), (2, 'Gadget', 200);
+
+CREATE MATERIALIZED VIEW dl.order_totals AS
+    SELECT product, SUM(amount) AS total FROM dl.orders GROUP BY product;
+
+INSERT INTO dl.orders VALUES (3, 'Widget', 50);
+PRAGMA ivm('order_totals');
+```
+
 ## Supported operators
 
 MVs can be created using any SQL construct. Unsupported operators automatically fall back to [full refresh](docs/refresh/refresh-strategies.md).
@@ -52,6 +71,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `UNION ALL`                             | [Union all](docs/operators/union-all.md) |
 | `DISTINCT`                              | [Distinct](docs/operators/distinct.md) |
 | `LIST` aggregates                       | [List aggregates](docs/operators/list-aggregates.md) |
+| `WITH` (CTEs), subqueries              | [CTEs & subqueries](docs/operators/cte-subquery.md) |
 
 ## Settings
 
@@ -74,8 +94,10 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 
 ## Documentation
 
+- **[DuckLake integration](docs/ducklake.md)** — IVM over DuckLake tables with native change tracking
 - **[Operators](docs/operators/)** — How each SQL operator is incrementalized
 - **[Refresh](docs/refresh/)** — Refresh strategies and MV pipelines
-- **[Optimizations](docs/optimizations/)** — Delta consolidation, MERGE, indexing
-- **[Internals](docs/internals/)** — Delta tables, parser, system tables
+- **[Optimizations](docs/optimizations/)** — Delta consolidation, FK pruning, empty-delta skip, indexing
+- **[Internals](docs/internals/)** — Delta tables, parser, concurrency
+- **[Limitations](docs/limitations.md)** — Unsupported operators, known restrictions
 - **[Build](docs/build/)** — Building, testing, benchmarks

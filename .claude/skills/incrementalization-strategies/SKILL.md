@@ -208,6 +208,25 @@ tractable if static relations sufficiently constrain the dynamic ones.
 **For OpenIVM:** At refresh time, check which base tables have empty delta tables.
 Skip inclusion-exclusion terms involving only delta-empty tables.
 
+### 4.3.1 DuckDB Optimizer and Empty Delta Scans
+
+**Finding (verified 2026-04-14):** DuckDB's optimizer does NOT automatically skip
+empty delta branches. Specifically:
+
+- DuckDB has `empty_result_pullup.cpp` that eliminates joins when a child is a
+  `LogicalEmptyResult` node. But DuckLake delta scans are `LogicalGet` nodes with
+  table function bindings — they do NOT produce `LogicalEmptyResult` at plan time.
+- DuckLake's `SCAN_INSERTIONS`/`SCAN_DELETIONS` do NOT short-circuit when
+  `start_snapshot == end_snapshot` — they still execute metadata queries.
+- All plan-level work in `BuildDuckLakeJoinTerms` (plan Copy, renumber_and_rebind,
+  CollectJoinLeaves, CreateDeltaGetNode, ResolveOperatorTypes, projection creation)
+  is done eagerly for ALL N terms before execution begins.
+- LPTS SQL generation also processes all N UNION ALL'd terms regardless of emptiness.
+
+**Implication:** Empty-delta term skipping MUST be implemented explicitly in OpenIVM's
+join rule code by comparing `last_snapshot_id` with the current snapshot at plan time.
+DuckDB cannot infer this from the plan structure alone.
+
 ### 4.4 Insert-Only Optimization
 
 **Kara, Nikolic, Olteanu, Zhang.** "Insert-Only versus Insert-Delete in Dynamic
@@ -511,7 +530,229 @@ reduction / GROUP BY SUM) is particularly well-suited to GPU.
 
 ---
 
-## 9. Summary: Speedup Potential Over First-Order IVM
+## 9. IVM for Specific SQL Operators
+
+### 9.1 OUTER JOIN IVM
+
+**Larson, Zhou.** "Efficient Maintenance of Materialized Outer-Join Views." ICDE 2007.
+**Gupta, Mumick.** "Incremental Maintenance of Aggregate and Outerjoin Expressions." Information Systems, 2006.
+
+The key insight is decomposing maintenance into:
+- **Primary deltas** (direct changes, same as inner join deltas)
+- **Secondary deltas** (NULL-padded tuples that must be inserted or removed)
+
+When a new matching tuple arrives for a LEFT JOIN, a previously NULL-padded tuple must be
+deleted and replaced with a properly joined tuple. The algorithm uses Join-Disjunctive
+Normal Form (JDNF) to systematically enumerate all affected tuples.
+
+Supports LEFT, RIGHT, and FULL OUTER JOIN. OpenIVM currently uses group-recompute for
+LEFT JOIN aggregates — incremental outer join IVM would eliminate this.
+
+### 9.2 Window Functions
+
+**Research gap.** No dedicated paper on incremental ROW_NUMBER, RANK, LEAD/LAG, or
+running aggregates exists. The difficulty: a single insertion can cascade changes across
+an entire partition.
+
+**Practical approach (Enzyme, Snowflake):** Partition-level recompute. Identify affected
+partitions from delta, delete those partitions from MV, re-insert from base query filtered
+to those partitions. Same pattern as OpenIVM's MIN/MAX group-recompute but for partitions.
+
+```sql
+DELETE FROM mv WHERE partition_key IN (SELECT DISTINCT partition_key FROM delta);
+INSERT INTO mv SELECT ... FROM base_query WHERE partition_key IN (...);
+```
+
+For partition-level aggregates (SUM/COUNT OVER PARTITION), treat each partition as a
+separate grouped aggregate — fully incremental. For positional functions (ROW_NUMBER,
+LEAD/LAG), partition-level recompute is the best known approach.
+
+**Sliding window aggregation:**
+- Tangwongsan et al. (PVLDB 2015, 2019, 2023): O(1) amortized for arbitrary aggregate functions.
+- Arroyo uses segment trees for O(1) incremental sliding window updates.
+- Scotty (Traub et al., ICDE 2018): stream slicing for efficient multi-window aggregation.
+
+### 9.3 COUNT(DISTINCT) / SUM(DISTINCT)
+
+DBToaster supports COUNT(DISTINCT) via per-group auxiliary maps tracking per-value multiplicity.
+When a value's count drops to 0, it leaves the distinct set; when rising from 0, it enters.
+
+**Implementation:** Auxiliary table `(group_key, distinct_value, count_of_value)`. Maintained
+as a normal AGGREGATE_GROUP MV. COUNT(DISTINCT) = COUNT(*) from aux WHERE count > 0.
+Requires O(distinct_values) auxiliary storage per group.
+
+**Approximate:** HyperLogLog for COUNT(DISTINCT) — DuckDB has `approx_count_distinct`.
+Not incrementally mergeable in standard form, but Google BigQuery uses HLL for MV maintenance.
+
+### 9.4 Set Operations (UNION, INTERSECT, EXCEPT)
+
+DBSP provides clean algebraic treatment:
+- **UNION ALL:** Delta passes through (linear). Free.
+- **UNION (set):** Requires duplicate tracking (same as DISTINCT — counting column).
+- **INTERSECT:** Track counts from both sides. Tuple in result only if count > 0 on both.
+- **EXCEPT:** Track counts similarly. Result = left side minus right side counts.
+
+All modeled as Z-set operations — straightforward in the counting/multiplicity framework.
+
+### 9.5 Correlated Subqueries (EXISTS, IN, scalar)
+
+Standard approach: **decorrelation** — convert to joins before applying IVM.
+- EXISTS → semi-join
+- NOT EXISTS → anti-join  
+- IN → semi-join
+- Scalar subquery → left join + aggregate
+
+Once decorrelated, normal join + aggregate delta rules apply. Materialize documents
+decorrelation strategies. pg_ivm supports EXISTS in WHERE (with restrictions: no OR/NOT).
+
+**Abeysinghe, He, Rompf.** "Efficient Incrementialization of Correlated Nested Aggregate
+Queries using RPAI." SIGMOD 2022. Tree-based index for O(log n) range shifts and aggregate
+queries for correlated nested aggregate subqueries.
+
+### 9.6 LATERAL Join
+
+**Research gap.** No paper addresses delta rules for LATERAL/APPLY specifically.
+LATERAL can often be decorrelated to a join (DuckDB and Materialize both do this).
+Once decorrelated, standard join IVM applies. When decorrelation is impossible
+(e.g., table-valued functions), no known IVM technique exists.
+
+### 9.7 GROUPING SETS / CUBE / ROLLUP
+
+**Research gap for IVM specifically.** These are syntactic sugar for UNION ALL of
+multiple GROUP BY queries at different granularities. Decompose CUBE into 2^n separate
+grouped aggregates, maintain each independently. Opportunity: share delta computation
+across grouping levels (a delta row's contribution to GROUP BY (A,B) implies its
+contribution to GROUP BY (A)).
+
+### 9.8 Top-K (ORDER BY + LIMIT)
+
+**Yi, Yu, Yang, Xia, Chen.** "Efficient Maintenance of Materialized Top-k Views."
+ICDE 2003. Extended: Distributed and Parallel Databases 2009.
+
+Maintain a top-k' view where k' > k, creating a buffer zone. Deletions from the view
+can be satisfied from the buffer without hitting the base table. Expected amortized
+refill cost is O(1). Insertions are cheap (compare against k'-th element).
+
+### 9.9 Recursive CTEs
+
+Semi-naive evaluation from Datalog: `delta_T(k) = pi(delta_T(k-1) join R) - T(k-1)`.
+DBSP extends to non-monotonic recursion over Z-sets. Feldera implements this.
+
+**Nishikawa et al.** "Dynamic Pruning for Recursive Joins." SIGMOD 2025. Generates pruning
+filters dynamically during recursive execution, 135x speedup for manufacturing traceability.
+
+**Ammar et al.** "Optimizing Differentially-Maintained Recursive Queries on Dynamic Graphs."
+PVLDB 15(11), 2022. Selectively drops operator differences and recomputes when memory overhead
+of differential computation becomes too high.
+
+### 9.10 STRING_AGG / LISTAGG
+
+**Research gap.** Order-dependent, non-decomposable. Inserting in the middle requires
+reconstructing the string. Only known approach: group-recompute (delete group, rebuild
+from base). No incremental delta rule exists.
+
+### 9.11 MEDIAN / Percentiles
+
+Holistic (non-decomposable) aggregates. Exact = store all values per group (group-recompute).
+Approximate = t-digest or similar sketch structures (incrementally mergeable).
+
+### 9.12 HAVING
+
+Not a separate operator for IVM. Strategy: maintain all groups (including those failing
+HAVING) in the data table, with a hidden flag or by maintaining full aggregates. After
+MERGE, apply HAVING as post-step: `DELETE FROM mv WHERE NOT (having_predicate)`.
+Eliminates group-recompute for HAVING views.
+
+### 9.13 STDDEV / VARIANCE
+
+Decomposable: STDDEV = sqrt((SUM(x^2)*COUNT - SUM(x)^2) / (COUNT*(COUNT-1))).
+Maintain hidden SUM(x), SUM(x^2), COUNT columns. Same decomposition pattern as AVG.
+Recompute STDDEV from maintained components post-MERGE.
+
+---
+
+## 10. Additional Papers (2015-2026)
+
+### 10.1 Theoretical Foundations
+
+**Berkholz, Keppeler, Schweikardt.** "Answering Conjunctive Queries under Updates." PODS 2017.
+Proves q-hierarchical CQs are exactly the class admitting constant update time and
+constant-delay enumeration. The theoretical foundation for all subsequent IVM complexity work.
+
+**Idris, Ugarte, Vansummeren.** "The Dynamic Yannakakis Algorithm." SIGMOD 2017.
+Dynamic Constant-delay Linear Representations (DCLRs) for free-connex acyclic CQs.
+Linear-time updates, constant-delay enumeration, constant-time lookups, linear space.
+
+**Hu, Wang.** "Towards Update-Dependent Analysis of Query Maintenance." PODS 2025 (Distinguished Paper).
+IVM under realistic (non-worst-case) update patterns. Many queries requiring sqrt(|DB|) time
+under arbitrary updates can be maintained in constant amortized time under insert-only or FIFO.
+
+### 10.2 Join Processing for IVM
+
+**Freitag, Bandle, Schmidt, Kemper, Neumann.** "Adopting Worst-Case Optimal Joins in
+Relational Database Systems." PVLDB 13(11), 2020. First practical WCO joins in a full
+relational DBMS (Umbra). Relevant because WCO joins avoid large intermediates for cyclic deltas.
+
+**Birler, Kemper, Neumann.** "Robust Join Processing with Diamond Hardened Joins."
+PVLDB 17(11), 2024. Lookup & Expand (L&E) decomposition for robust join processing.
+
+**Bekkers, Neven, Vansummeren, Wang.** "Instance-Optimal Acyclic Join Processing Without
+Regret." PVLDB 18(8), 2025. Shredded Yannakakis achieves 62.5x speedups on 85.3% of queries.
+
+**Fent, Neumann.** "A Practical Approach to Groupjoin and Nested Aggregates." PVLDB 14(11), 2021.
+
+### 10.3 Adaptive / Autonomous Materialization
+
+**Ahmed, Bello, Witkowski, Kumar.** "Automated Generation of Materialized Views in Oracle."
+PVLDB 13(12), 2020. ECSE algorithm for workload-driven MV generation.
+
+**Han, Chai, Liu, Li, Wei, Zhan.** "Dynamic Materialized View Management using Graph Neural
+Network." ICDE 2023. GNN predicts view utility under shifting workloads.
+
+**Mirjafari et al.** "Adaptive Materialization with Deep Reinforcement Learning." ICDE 2022.
+Deep RL to decide when to materialize vs recompute.
+
+**Xu, Wang, Xue et al.** "UniView: A Unified Autonomous Materialized View Management System."
+PVLDB 17(12), 2024. Cross-platform (Spark SQL, PostgreSQL, ClickHouse) MV management.
+
+**Jindal, Karanasos, Rao, Patel.** "Selecting Subexpressions to Materialize at Datacenter Scale."
+PVLDB 11(7), 2018. BigSubs algorithm for shared sub-expression selection across thousands of jobs.
+
+### 10.4 Compilation and Execution for IVM
+
+**Winter, Schmidt, Neumann, Kemper.** "Meet Me Halfway: Split Maintenance of Continuous Views."
+PVLDB 2020. Split maintenance between insert-time (eager) and query-time (lazy). 10x higher
+insert throughput than traditional IVM.
+
+**Kohn, Leis, Neumann.** "Adaptive Execution of Compiled Queries." ICDE 2018. Dynamic switching
+between JIT compilation and interpretation at morsel granularity. For IVM: interpret small deltas,
+compile large ones.
+
+**Koch, Lupei, Tannen.** "Incremental View Maintenance for Collection Programming." PODS 2016.
+Efficient incrementalization of positive nested relational calculus (NRC+) on bags.
+
+**Nikolic, Dashti, Koch.** "How to Win a Hot Dog Eating Contest: Distributed Incremental View
+Maintenance with Batch Updates." SIGMOD 2016. Batch vs tuple-at-a-time tradeoffs.
+
+### 10.5 Consistency and Distribution
+
+**Power, Achalla, Cottone, Macasaet, Hellerstein.** "Wrapping Rings in Lattices: An Algebraic
+Symbiosis of IVM and Eventual Consistency." PaPoC@EuroSys 2024. Bridges CRDT lattice algebra
+with IVM ring algebra for eventually-consistent incremental computation.
+
+### 10.6 Graph and Non-Relational IVM
+
+**Szarnyas.** "Incremental View Maintenance for Property Graph Queries." SIGMOD 2018 (PhD symposium).
+Reduces property graph queries to nested relational algebra for incremental evaluation.
+
+**Pang, Zou, Yu, Yang.** "Materialized View Selection & View-Based Query Planning for Regular
+Path Queries." SIGMOD 2024. First MV selection for graph database path queries.
+
+**Zhao, Rusu, Dong, Wu, Nugent.** "Incremental View Maintenance over Array Data." SIGMOD 2017.
+
+---
+
+## 11. Summary: Speedup Potential
 
 | Innovation | Current OpenIVM | With Innovation | Speedup |
 |---|---|---|---|
@@ -526,7 +767,7 @@ reduction / GROUP BY SUM) is particularly well-suited to GPU.
 | Shared arrangements | Independent per-view | Shared intermediates | # shared tables |
 | Pre-compiled plans | Re-parse SQL per refresh | Cached plans | Parse/plan overhead |
 
-## 10. Recommended Reading Order
+## 12. Recommended Reading Order
 
 1. **Olteanu, "Recent Increments in IVM"** (PODS Gems 2024) — the survey that maps the field
 2. **Ahmad et al., DBToaster** (VLDB Journal 2014) — higher-order IVM foundation
@@ -539,30 +780,63 @@ reduction / GROUP BY SUM) is particularly well-suited to GPU.
 9. **Shaikhha et al., SDQL** (OOPSLA 2022) — semiring dictionary compilation
 10. **DBSP** (VLDB 2023) — the algebraic framework OpenIVM builds on
 
-## 11. Key References
+## 13. Key References
 
+### Core IVM Theory
 - DBToaster: [arXiv:1207.0137](https://arxiv.org/abs/1207.0137)
 - Koch, Ring of Databases: [ACM DL](https://dl.acm.org/doi/abs/10.1145/1807085.1807100)
 - F-IVM: [arXiv:1703.07484](https://arxiv.org/abs/1703.07484) | [GitHub](https://github.com/fdbresearch/FIVM)
 - CROWN: [arXiv:2301.04003](https://arxiv.org/abs/2301.04003) | [GitHub](https://github.com/hkustDB/CROWN)
+- DBSP: [arXiv:2203.16684](https://arxiv.org/abs/2203.16684)
+- Olteanu survey: [arXiv:2404.17679](https://arxiv.org/abs/2404.17679)
+- Berkholz et al. (q-hierarchical): [PODS 2017](https://dl.acm.org/doi/10.1145/3034786.3034789)
+- Dynamic Yannakakis: [SIGMOD 2017](https://dl.acm.org/doi/10.1145/3035918.3064027)
+- Hu & Wang (update-dependent): [PODS 2025](https://2025.sigmod.org/pods_papers.shtml)
+
+### Constraint Exploitation
 - FK optimization: [ACM DL](https://dl.acm.org/doi/10.1145/3588720)
 - IVM-epsilon: [arXiv:1804.02780](https://arxiv.org/abs/1804.02780)
 - Static/Dynamic: [arXiv:2404.16224](https://arxiv.org/abs/2404.16224)
 - Insert-Only vs Delete: [arXiv:2312.09331](https://arxiv.org/abs/2312.09331)
+- ID-Based IVM: [SIGMOD 2015](https://dl.acm.org/doi/10.1145/2723372.2723731)
+
+### Cost Models & Adaptive
 - Tempura: [ACM DL](https://dl.acm.org/doi/10.14778/3421424.3421427)
 - Enzyme: [arXiv:2603.27775](https://arxiv.org/abs/2603.27775)
 - Agamotto: [PVLDB 18(6)](https://dl.acm.org/doi/10.14778/3749672.3749679)
-- Olteanu survey: [arXiv:2404.17679](https://arxiv.org/abs/2404.17679)
+- Oracle Auto MV: [PVLDB 13(12)](https://dl.acm.org/doi/10.14778/3415478.3415533)
+- UniView: [PVLDB 17(12)](https://dl.acm.org/doi/abs/10.14778/3685800.3685873)
+
+### Compilation & Execution
 - SDQL: [arXiv:2103.06376](https://arxiv.org/abs/2103.06376)
 - Compiler architecture: [ACM DL](https://dl.acm.org/doi/10.1145/2882903.2882906)
-- DBSP: [arXiv:2203.16684](https://arxiv.org/abs/2203.16684)
-- Shared Arrangements: [ACM DL](https://dl.acm.org/doi/10.14778/3401960.3401974)
+- Compiled vs Vectorized: [PVLDB 11(13)](https://dl.acm.org/doi/10.14778/3275366.3284966)
+- InkFuse: [ICDE 2024](https://doi.org/10.1109/ICDE60146.2024.00029)
+- Split Maintenance (TUM): [PVLDB 2020](https://www.vldb.org/pvldb/vol13/p2620-winter.pdf)
+- Adaptive Execution (TUM): [ICDE 2018](https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf)
+
+### Join Processing
 - Free Join: [arXiv:2301.10841](https://arxiv.org/abs/2301.10841)
-- Provenance Semirings: [ACM DL](https://dl.acm.org/doi/10.1145/2380776.2380778)
+- Diamond Hardened Joins: [PVLDB 17(11)](https://dl.acm.org/doi/10.14778/3681954.3681995)
+- Shredded Yannakakis: [PVLDB 18(8)](https://doi.org/10.14778/3742728.3742737)
+- WCO Joins in RDBMS: [PVLDB 13(11)](https://dl.acm.org/doi/10.14778/3407790.3407800)
 - Leapfrog Triejoin: [ICDT 2014](https://openproceedings.org/ICDT/2014/paper_13.pdf)
+
+### Operator-Specific IVM
+- Outer Join IVM (Larson & Zhou): [ICDE 2007](http://www.cs.columbia.edu/~jrzhou/pub/OJViewMaintenance.pdf)
+- Aggregate & Outerjoin (Gupta & Mumick): [Info Systems](https://www3.cs.stonybrook.edu/~hgupta/ps/aggr-is.pdf)
+- Top-K Views: [ICDE 2003](http://publish.illinois.edu/yuguo/files/2012/12/icde031.pdf)
 - RPAI (correlated subqueries): [ACM DL](https://dl.acm.org/doi/abs/10.1145/3514221.3517889)
+- Sliding Window Aggregation: [PVLDB 8(7), 2015](https://dl.acm.org/doi/10.14778/2752939.2752940)
+- Scotty (window slicing): [ICDE 2018](https://ieeexplore.ieee.org/document/8509356/)
+- Dynamic Pruning (recursive joins): [SIGMOD 2025](https://dl.acm.org/doi/10.1145/3722212.3724434)
+
+### Systems
+- Shared Arrangements: [ACM DL](https://dl.acm.org/doi/10.14778/3401960.3401974)
+- Provenance Sketches: [EDBT 2026](https://www.cs.uic.edu/~bglavic/dbgroup/2025/06/04/EDBT-incremental.html)
 - Streaming View (Alibaba): [PVLDB 18(12)](https://dl.acm.org/doi/10.14778/3750601.3750634)
 - Noria: [OSDI 2018](https://www.usenix.org/conference/osdi18/presentation/gjengset)
 - Differential Dataflow: [CIDR 2013](https://www.cidrdb.org/cidr2013/Papers/CIDR13_Paper111.pdf)
-- Compiled vs Vectorized: [PVLDB 11(13)](https://dl.acm.org/doi/10.14778/3275366.3284966)
-- InkFuse: [ICDE 2024](https://doi.org/10.1109/ICDE60146.2024.00029)
+- Rings in Lattices (CRDT+IVM): [PaPoC 2024](https://doi.org/10.1145/3642976.3653030)
+- Snowflake Dynamic Tables: [arXiv:2504.10438](https://arxiv.org/abs/2504.10438)
+- ART: [ICDE 2013](https://db.in.tum.de/~leis/papers/ART.pdf)
