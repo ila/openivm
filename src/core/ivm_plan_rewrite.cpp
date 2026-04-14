@@ -12,6 +12,8 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
@@ -401,6 +403,111 @@ void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOp
 	}
 	RewriteLeftJoinKey(binder, plan);
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Done\n");
+}
+
+// ============================================================================
+// StripHavingFilter: remove HAVING filter, return predicate using output aliases
+// ============================================================================
+
+/// Convert a FILTER condition to SQL using output column aliases.
+static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64_t, string> &binding_to_alias) {
+	switch (expr.expression_class) {
+	case ExpressionClass::BOUND_COLUMN_REF: {
+		auto &col = expr.Cast<BoundColumnRefExpression>();
+		uint64_t key = (uint64_t)col.binding.table_index * 100000 + col.binding.column_index;
+		auto it = binding_to_alias.find(key);
+		return (it != binding_to_alias.end()) ? it->second : col.ToString();
+	}
+	case ExpressionClass::BOUND_COMPARISON: {
+		auto &comp = expr.Cast<BoundComparisonExpression>();
+		return "(" + HavingExprToSQL(*comp.left, binding_to_alias) + " " + ExpressionTypeToOperator(comp.type) + " " +
+		       HavingExprToSQL(*comp.right, binding_to_alias) + ")";
+	}
+	case ExpressionClass::BOUND_CONSTANT: {
+		return expr.Cast<BoundConstantExpression>().value.ToString();
+	}
+	case ExpressionClass::BOUND_CAST: {
+		return HavingExprToSQL(*expr.Cast<BoundCastExpression>().child, binding_to_alias);
+	}
+	case ExpressionClass::BOUND_CONJUNCTION: {
+		auto &conj = expr.Cast<BoundConjunctionExpression>();
+		string op = (conj.type == ExpressionType::CONJUNCTION_AND) ? " AND " : " OR ";
+		string result;
+		for (idx_t i = 0; i < conj.children.size(); i++) {
+			if (i > 0) {
+				result += op;
+			}
+			result += "(" + HavingExprToSQL(*conj.children[i], binding_to_alias) + ")";
+		}
+		return result;
+	}
+	default:
+		return expr.ToString();
+	}
+}
+
+string StripHavingFilter(unique_ptr<LogicalOperator> &plan, const vector<string> &output_names) {
+	// Find PROJECTION → FILTER → AGGREGATE pattern.
+	LogicalOperator *parent = nullptr;
+	LogicalOperator *filter_node = nullptr;
+
+	std::function<bool(LogicalOperator *, LogicalOperator *)> find_filter;
+	find_filter = [&](LogicalOperator *node, LogicalOperator *par) -> bool {
+		if (node->type == LogicalOperatorType::LOGICAL_FILTER && !node->children.empty() &&
+		    node->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+			parent = par;
+			filter_node = node;
+			return true;
+		}
+		for (auto &child : node->children) {
+			if (find_filter(child.get(), node)) {
+				return true;
+			}
+		}
+		return false;
+	};
+
+	if (!find_filter(plan.get(), nullptr)) {
+		return "";
+	}
+
+	// Build binding → alias map from the PROJECTION above the FILTER.
+	unordered_map<uint64_t, string> binding_to_alias;
+	if (parent && parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &proj = parent->Cast<LogicalProjection>();
+		for (idx_t i = 0; i < proj.expressions.size() && i < output_names.size(); i++) {
+			if (proj.expressions[i]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+				auto &col = proj.expressions[i]->Cast<BoundColumnRefExpression>();
+				uint64_t key = (uint64_t)col.binding.table_index * 100000 + col.binding.column_index;
+				binding_to_alias[key] = output_names[i];
+			}
+		}
+	}
+
+	// Extract HAVING predicate as SQL.
+	auto &filter = filter_node->Cast<LogicalFilter>();
+	string having_sql;
+	for (idx_t i = 0; i < filter.expressions.size(); i++) {
+		if (i > 0) {
+			having_sql += " AND ";
+		}
+		having_sql += HavingExprToSQL(*filter.expressions[i], binding_to_alias);
+	}
+
+	// Remove the FILTER node from the plan.
+	if (parent) {
+		for (auto &child : parent->children) {
+			if (child.get() == filter_node) {
+				child = std::move(filter_node->children[0]);
+				break;
+			}
+		}
+	} else {
+		plan = std::move(filter_node->children[0]);
+	}
+
+	OPENIVM_DEBUG_PRINT("[StripHavingFilter] Extracted HAVING predicate: %s\n", having_sql.c_str());
+	return having_sql;
 }
 
 } // namespace duckdb

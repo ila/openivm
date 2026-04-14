@@ -133,6 +133,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("ivm_minmax_incremental", "use GREATEST/LEAST for MIN/MAX when deltas are insert-only",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("ivm_having_merge",
+	                             "use MERGE for HAVING views (store all groups, VIEW filters) "
+	                             "instead of group-recompute",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	Connection con(instance);
 

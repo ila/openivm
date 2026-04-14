@@ -197,6 +197,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 		vector<string> output_names;
+		string having_predicate; // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 		{
 			Parser select_parser;
 			select_parser.ParseQuery(original_view_query);
@@ -248,10 +249,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					}
 				}
 			}
+			// Strip HAVING filter from plan — data table stores all groups.
+			// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
+			having_predicate = StripHavingFilter(select_plan, output_names);
+
 			auto ast = LogicalPlanToAst(*con.context, select_plan);
 			auto cte_list = AstToCteList(*ast);
 			view_query = cte_list->ToQuery(true, output_names);
-			// Strip trailing semicolon — the query is embedded in other SQL statements
 			if (!view_query.empty() && view_query.back() == ';') {
 				view_query.pop_back();
 			}
@@ -342,7 +346,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " last_update timestamp, refresh_interval bigint default null,"
 		              " refresh_in_progress boolean default false,"
 		              " group_columns varchar default null,"
-		              " aggregate_types varchar default null)");
+		              " aggregate_types varchar default null,"
+		              " having_predicate varchar default null)");
 
 		// Refresh hooks: extensions can register custom SQL to run on MV refresh
 		// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
@@ -398,10 +403,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 			agg_types_val += "'";
 		}
+		string having_val =
+		    having_predicate.empty() ? "null" : "'" + OpenIVMUtils::EscapeSingleQuotes(having_predicate) + "'";
 		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
 		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", " +
 		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now(), " +
-		              refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ")");
+		              refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ", " + having_val + ")");
 
 		// Classify each base table by catalog type (duckdb vs ducklake).
 		// DuckLake tables use native change tracking; DuckDB tables use delta tables.
@@ -480,8 +487,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					internal_cols.push_back(name);
 				}
 			}
+			string having_where = having_predicate.empty() ? "" : " where " + having_predicate;
 			if (internal_cols.empty()) {
-				ddl.push_back("create view " + qvn + " as select * from " + qdt);
+				ddl.push_back("create view " + qvn + " as select * from " + qdt + having_where);
 			} else {
 				string exclude_list;
 				for (size_t i = 0; i < internal_cols.size(); i++) {
@@ -490,7 +498,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					}
 					exclude_list += internal_cols[i];
 				}
-				ddl.push_back("create view " + qvn + " as select * exclude (" + exclude_list + ") from " + qdt);
+				ddl.push_back("create view " + qvn + " as select * exclude (" + exclude_list + ") from " + qdt +
+				              having_where);
 			}
 		}
 

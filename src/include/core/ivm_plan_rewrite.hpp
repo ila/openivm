@@ -16,6 +16,11 @@ namespace duckdb {
 void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                     vector<string> &planner_names);
 
+/// Strip the HAVING filter (FILTER above AGGREGATE) from the plan.
+/// Returns the HAVING predicate as SQL using output column aliases, or empty if no HAVING.
+/// The plan is modified in place: the FILTER node is removed.
+string StripHavingFilter(unique_ptr<LogicalOperator> &plan, const vector<string> &output_names);
+
 } // namespace duckdb
 
 #endif // IVM_PLAN_REWRITE_HPP

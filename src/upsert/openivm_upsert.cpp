@@ -548,12 +548,24 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	auto agg_types = metadata.GetAggregateTypes(view_name);
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_HAVING: {
-		// HAVING requires group-recompute: the HAVING predicate depends on the full aggregate
-		// value, not just the delta. Even with insert-only, groups may newly satisfy HAVING.
-		upsert_query =
-		    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-		                           /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols, catalog_prefix,
-		                           /*insert_only=*/false, agg_types);
+		// When ivm_having_merge is enabled, the data table stores ALL groups (HAVING filter
+		// is in the VIEW). Use standard MERGE — same as AGGREGATE_GROUP.
+		// When disabled, fall back to group-recompute (has_minmax=true forces delete+re-insert).
+		Value having_merge_val;
+		bool having_merge = true;
+		if (context.TryGetCurrentSetting("ivm_having_merge", having_merge_val) && !having_merge_val.IsNull()) {
+			having_merge = having_merge_val.GetValue<bool>();
+		}
+		if (having_merge) {
+			bool effective_insert_only = has_minmax ? minmax_incremental : skip_agg_delete;
+			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
+			                                      view_query_sql, has_minmax, list_mode, delta_ts_filter, group_cols,
+			                                      catalog_prefix, effective_insert_only, agg_types);
+		} else {
+			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
+			                                      view_query_sql, /*has_minmax=*/true, list_mode, delta_ts_filter,
+			                                      group_cols, catalog_prefix, /*insert_only=*/false, agg_types);
+		}
 		break;
 	}
 	case IVMType::AGGREGATE_GROUP: {
