@@ -26,7 +26,7 @@ IVMType IVMMetadata::GetViewType(const string &view_name) {
 	auto result = con.Query("SELECT type FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        OpenIVMUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0) {
-		throw ParserException("View not found! Please call IVM with a materialized view.");
+		throw ParserException("Materialized view '%s' does not exist in IVM metadata.", view_name);
 	}
 	return static_cast<IVMType>(result->GetValue(0, 0).GetValue<int8_t>());
 }

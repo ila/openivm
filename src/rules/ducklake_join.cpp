@@ -62,9 +62,31 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 		old_snapshots[i] = snap_result->GetValue(0, 0).GetValue<int64_t>();
 	}
 
-	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building %zu N-term telescoping delta terms\n", N);
+	// Get current snapshot ID from the first leaf's DuckLakeFunctionInfo.
+	// The plan was just bound for this refresh, so this reflects the current state.
+	int64_t current_snapshot = -1;
+	{
+		auto *first_get = leaves[0].get ? leaves[0].get : FindGetInSubtree(leaves[0].node);
+		D_ASSERT(first_get);
+		if (first_get->function.name == "ducklake_scan" && first_get->function.function_info) {
+			auto &func_info = first_get->function.function_info->Cast<DuckLakeFunctionInfo>();
+			current_snapshot = static_cast<int64_t>(func_info.snapshot.snapshot_id);
+		}
+	}
+
+	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building N-term telescoping delta terms (%zu leaves, current_snapshot=%ld)\n",
+	                    N, (long)current_snapshot);
 
 	for (size_t i = 0; i < N; i++) {
+		// Skip term if this table has no changes since last refresh.
+		// Safety: always generate at least one term to avoid empty UNION ALL.
+		bool is_last_chance = (i == N - 1) && terms.empty();
+		if (!is_last_chance && current_snapshot >= 0 && old_snapshots[i] == current_snapshot) {
+			OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Skipping term %zu: no changes (snapshot %ld == current)\n", i,
+			                    (long)old_snapshots[i]);
+			continue;
+		}
+
 		auto term = pw.plan->Copy(context);
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);

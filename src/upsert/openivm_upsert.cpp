@@ -152,18 +152,52 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 
 	IVMMetadata metadata(con);
 
-	// Early exit: skip refresh if all delta tables for the target view are empty.
-	if (cascade_mode == "off") {
+	// Each view is generated + executed under its own per-view lock.
+	// This ensures cascaded views are also protected from concurrent refresh.
+
+	// Upstream cascade: refresh ancestors first (this may populate our delta tables).
+	if (cascade_mode == "upstream" || cascade_mode == "both") {
+		auto upstream = metadata.GetUpstreamViews(view_name);
+		for (auto &dep : upstream) {
+			RefreshViewLocked(context, view_catalog_name, view_schema_name, dep, cross_system, attached_db_catalog_name,
+			                  attached_db_schema_name);
+		}
+	}
+
+	// Early exit: skip refresh if all delta tables are empty.
+	// Placed AFTER upstream cascade so that upstream refreshes have a chance to populate
+	// our delta tables before we check.
+	{
 		auto view_type = metadata.GetViewType(view_name);
 		if (view_type != IVMType::FULL_REFRESH) {
 			auto delta_tables = metadata.GetDeltaTables(view_name);
 			bool all_empty = true;
+
+			// For DuckLake tables, get the current snapshot ID once (shared across all tables).
+			int64_t ducklake_current_snap = -1;
+			bool ducklake_snap_queried = false;
+
 			for (auto &dt : delta_tables) {
 				if (metadata.IsDuckLakeTable(view_name, dt)) {
-					// DuckLake tables: conservatively assume changes exist.
-					// TODO(milestone 2): use table_changes() to check for actual changes.
-					all_empty = false;
-					break;
+					// DuckLake tables: compare last_snapshot_id with current snapshot.
+					if (!ducklake_snap_queried) {
+						auto cur_snap_result = con.Query("SELECT id FROM " + view_catalog_name + ".current_snapshot()");
+						if (!cur_snap_result->HasError() && cur_snap_result->RowCount() > 0) {
+							ducklake_current_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
+						}
+						ducklake_snap_queried = true;
+					}
+					if (ducklake_current_snap < 0) {
+						// Can't determine current snapshot — conservatively assume changes.
+						all_empty = false;
+						break;
+					}
+					auto last_snap = metadata.GetLastSnapshotId(view_name, dt);
+					if (last_snap != ducklake_current_snap) {
+						all_empty = false;
+						break;
+					}
+					continue;
 				}
 				auto count_result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(dt));
 				if (!count_result->HasError() && count_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
@@ -175,18 +209,6 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 				OPENIVM_DEBUG_PRINT("[UPSERT] All delta tables empty — skipping refresh for '%s'\n", view_name.c_str());
 				return;
 			}
-		}
-	}
-
-	// Each view is generated + executed under its own per-view lock.
-	// This ensures cascaded views are also protected from concurrent refresh.
-
-	// Upstream cascade: refresh ancestors first
-	if (cascade_mode == "upstream" || cascade_mode == "both") {
-		auto upstream = metadata.GetUpstreamViews(view_name);
-		for (auto &dep : upstream) {
-			RefreshViewLocked(context, view_catalog_name, view_schema_name, dep, cross_system, attached_db_catalog_name,
-			                  attached_db_schema_name);
 		}
 	}
 

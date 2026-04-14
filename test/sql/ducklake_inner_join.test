@@ -309,3 +309,108 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 4: Empty delta — refresh with no changes (all terms should be skipped)
+# ==========================================
+
+# Refresh immediately after last refresh — all deltas empty, should be a no-op
+statement ok
+PRAGMA ivm('dept_roster');
+
+# MV should be unchanged
+query I
+SELECT COUNT(*) FROM (
+    SELECT d.dname, e.eid, e.salary FROM dl.departments d INNER JOIN dl.employees e ON d.did = e.did
+    EXCEPT ALL
+    SELECT dname, eid, salary FROM dl.dept_roster
+);
+----
+0
+
+# Also test empty delta on aggregate join view
+statement ok
+PRAGMA ivm('product_summary');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.pname, SUM(s.revenue), COUNT(*)
+    FROM dl.products p INNER JOIN dl.sales s ON p.pid = s.pid GROUP BY p.pname
+    EXCEPT ALL
+    SELECT pname, total_rev, sale_count FROM dl.product_summary
+);
+----
+0
+
+# Multiple consecutive no-op refreshes should be safe
+statement ok
+PRAGMA ivm('customer_purchases');
+
+statement ok
+PRAGMA ivm('customer_purchases');
+
+statement ok
+PRAGMA ivm('customer_purchases');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, p.item, p.price FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id
+    EXCEPT ALL
+    SELECT name, item, price FROM dl.customer_purchases
+);
+----
+0
+
+# ==========================================
+# Test 5: Partial empty delta — only one table changes in a 2-table join
+# ==========================================
+
+# Insert only into purchases (customers unchanged — its term should be skipped)
+statement ok
+INSERT INTO dl.purchases VALUES (2, 'Sprocket', 30);
+
+statement ok
+PRAGMA ivm('customer_purchases');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, p.item, p.price FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id
+    EXCEPT ALL
+    SELECT name, item, price FROM dl.customer_purchases
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, item, price FROM dl.customer_purchases
+    EXCEPT ALL
+    SELECT c.name, p.item, p.price FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id
+);
+----
+0
+
+# Insert only into customers (purchases unchanged), new customer with no purchases
+statement ok
+INSERT INTO dl.customers VALUES (5, 'Eve');
+
+statement ok
+PRAGMA ivm('customer_purchases');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, p.item, p.price FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id
+    EXCEPT ALL
+    SELECT name, item, price FROM dl.customer_purchases
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT name, item, price FROM dl.customer_purchases
+    EXCEPT ALL
+    SELECT c.name, p.item, p.price FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id
+);
+----
+0
