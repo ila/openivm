@@ -427,8 +427,90 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	bool has_left_join = std::find(column_names.begin(), column_names.end(), ivm::LEFT_KEY_COL) != column_names.end();
 	OPENIVM_DEBUG_PRINT("[UPSERT] has_left_join=%d\n", has_left_join);
 
-	// this is to compile the query to merge the materialized view with its delta version
-	// depending on the query type, this procedure will be done differently
+	// Detect insert-only deltas: when the delta view contains only insert rows,
+	// we can skip the zero-row DELETE (aggregates) and the DELETE+consolidation (projections).
+	//
+	// Safety rules:
+	// - Non-join views: safe if all base deltas are insert-only
+	// - DuckLake join views: safe if all base deltas are insert-only (N-term telescoping
+	//   has no XOR cross-terms, so insert-only base = insert-only delta view)
+	// - Standard join views: safe only if exactly ONE table changed AND it's insert-only
+	//   (no cross-terms fire when other deltas are empty, so no XOR)
+	bool insert_only = false;
+	{
+		auto delta_table_names = metadata.GetDeltaTables(view_name);
+		bool has_join =
+		    (view_query_sql.find(" JOIN ") != string::npos || view_query_sql.find(" join ") != string::npos);
+
+		// Per-table analysis: is each delta empty, insert-only, or has deletes?
+		idx_t tables_with_changes = 0;
+		bool any_has_deletes = false;
+		bool all_ducklake = true;
+
+		for (auto &dt : delta_table_names) {
+			if (metadata.IsDuckLakeTable(view_name, dt)) {
+				auto last_snap = metadata.GetLastSnapshotId(view_name, dt);
+				auto cur_snap_result = con.Query("SELECT id FROM " + view_catalog_name + ".current_snapshot()");
+				if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0) {
+					any_has_deletes = true; // conservative
+					tables_with_changes++;
+					continue;
+				}
+				auto cur_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
+				if (last_snap == cur_snap) {
+					continue; // no changes — empty delta
+				}
+				tables_with_changes++;
+				auto del_result = con.Query("SELECT COUNT(*) FROM ducklake_table_deletions('" +
+				                            OpenIVMUtils::EscapeValue(view_catalog_name) + "', 'main', '" +
+				                            OpenIVMUtils::EscapeValue(dt) + "', " + to_string(last_snap) + ", " +
+				                            to_string(cur_snap) + ")");
+				if (!del_result->HasError() && del_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
+					any_has_deletes = true;
+				}
+			} else {
+				all_ducklake = false;
+				auto ts_string = metadata.GetLastUpdate(view_name, dt);
+				if (ts_string.empty()) {
+					continue;
+				}
+				// Check if delta has any rows at all
+				auto total_result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(dt) + " WHERE " +
+				                              string(ivm::TIMESTAMP_COL) + " >= '" +
+				                              OpenIVMUtils::EscapeValue(ts_string) + "'::TIMESTAMP");
+				if (total_result->HasError() || total_result->GetValue(0, 0).GetValue<int64_t>() == 0) {
+					continue; // empty delta
+				}
+				tables_with_changes++;
+				// Check for deletes
+				auto del_result =
+				    con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(dt) + " WHERE " +
+				              string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(ts_string) +
+				              "'::TIMESTAMP AND " + string(ivm::MULTIPLICITY_COL) + " = false");
+				if (!del_result->HasError() && del_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
+					any_has_deletes = true;
+				}
+			}
+		}
+
+		if (any_has_deletes) {
+			insert_only = false;
+		} else if (!has_join) {
+			// Non-join views: safe whenever all deltas are insert-only
+			insert_only = true;
+		} else if (all_ducklake) {
+			// DuckLake join views: N-term telescoping has no XOR, always safe
+			insert_only = true;
+		} else if (tables_with_changes <= 1 && delta_table_names.size() > 1) {
+			// Standard join views: safe when only one table changed AND there are
+			// multiple distinct delta tables (rules out self-joins, where 1 delta
+			// table maps to multiple join leaves that all change together).
+			insert_only = true;
+		}
+	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] insert_only=%d\n", insert_only);
+
+	// Compile the upsert query based on view type
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n",
 	                    view_query_type == IVMType::AGGREGATE_HAVING    ? "AGGREGATE_HAVING"
 	                    : view_query_type == IVMType::AGGREGATE_GROUP   ? "AGGREGATE_GROUP"
@@ -442,15 +524,15 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	auto group_cols = metadata.GetGroupColumns(view_name);
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_HAVING: {
-		upsert_query =
-		    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-		                           /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols, catalog_prefix);
+		upsert_query = CompileAggregateGroups(
+		    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
+		    /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols, catalog_prefix, insert_only);
 		break;
 	}
 	case IVMType::AGGREGATE_GROUP: {
 		upsert_query =
 		    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-		                           has_minmax, list_mode, delta_ts_filter, group_cols, catalog_prefix);
+		                           has_minmax, list_mode, delta_ts_filter, group_cols, catalog_prefix, insert_only);
 		break;
 	}
 	case IVMType::SIMPLE_PROJECTION: {
@@ -464,14 +546,15 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			               "INSERT INTO " + qdt + "\nSELECT * FROM (" + view_query_sql + ") _ivm_lj\nWHERE " +
 			               affected + "_ivm_lj." + lk + delta_where + ");\n";
 		} else {
-			upsert_query = CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix);
+			upsert_query =
+			    CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, insert_only);
 		}
 		break;
 	}
 
 	case IVMType::SIMPLE_AGGREGATE: {
 		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode,
-		                                       delta_ts_filter, catalog_prefix);
+		                                       delta_ts_filter, catalog_prefix, insert_only);
 		if (!has_minmax) {
 			auto source_tables = metadata.GetDeltaTables(view_name);
 			for (auto &dt : source_tables) {

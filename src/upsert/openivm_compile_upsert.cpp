@@ -47,7 +47,7 @@ static AvgDecomposition DetectAvgColumns(const vector<string> &columns) {
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
                               bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
-                              const string &catalog_prefix) {
+                              const string &catalog_prefix, bool insert_only) {
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + Q(OpenIVMUtils::DeltaName(view_name));
 
@@ -211,28 +211,30 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 
 	string upsert_query = merge_query + "\n";
 
-	// Delete zero rows — skip AVG derived columns (check sum/count helpers instead)
-	string delete_query = "\ndelete from " + data_table + " where ";
-	for (auto &column : aggregates) {
-		if (avg_derived_cols.count(column)) {
-			continue; // skip avg_x — checking sum/count is sufficient
+	// Delete zero rows — skip when insert_only (groups can't reach zero from inserts alone)
+	if (!insert_only) {
+		string delete_query = "\ndelete from " + data_table + " where ";
+		for (auto &column : aggregates) {
+			if (avg_derived_cols.count(column)) {
+				continue; // skip avg_x — checking sum/count is sufficient
+			}
+			if (list_mode) {
+				delete_query += "list_reduce(" + column + ", lambda a, b: a + b) = 0.0 and ";
+			} else {
+				delete_query += "COALESCE(" + column + ", 0) = 0 and ";
+			}
 		}
-		if (list_mode) {
-			delete_query += "list_reduce(" + column + ", lambda a, b: a + b) = 0.0 and ";
-		} else {
-			delete_query += "COALESCE(" + column + ", 0) = 0 and ";
-		}
+		delete_query.erase(delete_query.size() - 5, 5);
+		delete_query += ";\n";
+		upsert_query += delete_query;
 	}
-	delete_query.erase(delete_query.size() - 5, 5);
-	delete_query += ";\n";
-	upsert_query += delete_query;
 
 	return upsert_query;
 }
 
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql, bool has_minmax, bool list_mode,
-                               const string &delta_ts_filter, const string &catalog_prefix) {
+                               const string &delta_ts_filter, const string &catalog_prefix, bool /*insert_only*/) {
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	if (has_minmax) {
 		string delete_query = "DELETE FROM " + data_table + ";\n";
@@ -301,7 +303,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 }
 
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
-                                 const string &delta_ts_filter, const string &catalog_prefix) {
+                                 const string &delta_ts_filter, const string &catalog_prefix, bool insert_only) {
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	string mul = string(ivm::MULTIPLICITY_COL);
 	string delta_view = catalog_prefix + Q(OpenIVMUtils::DeltaName(view_name));
@@ -319,6 +321,15 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	match_conditions.erase(match_conditions.size() - 5, 5);
 	select_columns.erase(select_columns.size() - 2, 2);
 
+	if (insert_only) {
+		// Insert-only fast path: all deltas are inserts, just INSERT directly.
+		// No consolidation or DELETE needed.
+		string mul_filter = delta_ts_filter.empty() ? "WHERE " + mul + " = true" : ts_where + " AND " + mul + " = true";
+		string insert_query = "INSERT INTO " + data_table + " SELECT " + select_columns + "\nFROM " + delta_view +
+		                      "\n" + mul_filter + ";\n";
+		return insert_query;
+	}
+
 	// Consolidate deltas into net changes per distinct tuple (1 pass over delta_view).
 	// _net > 0 = net insertions, _net < 0 = net deletions.
 	string cte_body = "SELECT " + select_columns + ",\n    SUM(CASE WHEN " + mul +
@@ -326,8 +337,6 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	                  select_columns + "\n  HAVING SUM(CASE WHEN " + mul + " THEN 1 ELSE -1 END) != 0";
 
 	// DELETE: remove exactly |_net| copies per tuple using rowid + ROW_NUMBER.
-	// ROW_NUMBER partitions by all columns to number duplicate copies, then we
-	// delete only the first |_net| of them.
 	string delete_query = "WITH _ivm_net AS (\n  " + cte_body +
 	                      "\n)\n"
 	                      "DELETE FROM " +
@@ -350,7 +359,6 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	                      ");\n\n";
 
 	// INSERT: replicate each net-insert tuple _net times using generate_series.
-	// Cast _net to BIGINT because SUM returns HUGEINT and generate_series requires BIGINT.
 	string insert_query = "WITH _ivm_net AS (\n  " + cte_body +
 	                      "\n)\n"
 	                      "INSERT INTO " +
