@@ -118,6 +118,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 					if (bound_agg.function.name == "min" || bound_agg.function.name == "max") {
 						result.found_minmax = true;
 					}
+					result.aggregate_types.push_back(bound_agg.function.name);
 				}
 			}
 			if (HasVolatileExpression(agg->groups)) {

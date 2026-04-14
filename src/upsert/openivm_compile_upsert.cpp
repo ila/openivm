@@ -47,7 +47,7 @@ static AvgDecomposition DetectAvgColumns(const vector<string> &columns) {
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
                               bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
-                              const string &catalog_prefix, bool insert_only) {
+                              const string &catalog_prefix, bool insert_only, const vector<string> &aggregate_types) {
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + Q(OpenIVMUtils::DeltaName(view_name));
 
@@ -74,8 +74,26 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		}
 	}
 
-	if (has_minmax) {
-		// Group-recompute strategy for MIN/MAX: delete affected groups, re-insert from original query
+	auto avg = DetectAvgColumns(aggregates);
+
+	// Build per-column aggregate type map from metadata (for insert-only MIN/MAX).
+	// aggregate_types aligns with aggregate expressions in the rewritten plan.
+	unordered_map<string, string> col_agg_type;
+	if (!aggregate_types.empty()) {
+		idx_t type_idx = 0;
+		for (auto &column : aggregates) {
+			if (avg.derived_cols.count(column)) {
+				continue; // AVG-derived columns aren't aggregate expressions
+			}
+			if (type_idx < aggregate_types.size()) {
+				col_agg_type[column] = aggregate_types[type_idx++];
+			}
+		}
+	}
+
+	if (has_minmax && !insert_only) {
+		// Group-recompute strategy for MIN/MAX: delete affected groups, re-insert from original query.
+		// When insert_only, we can use GREATEST/LEAST instead — fall through to MERGE path below.
 		string keys_tuple;
 		for (size_t i = 0; i < keys.size(); i++) {
 			keys_tuple += keys[i];
@@ -99,7 +117,14 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		cte_select_string = cte_select_string + key + ", ";
 	}
 	for (auto &column : aggregates) {
-		if (list_mode) {
+		string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
+		if (insert_only && agg_type == "min") {
+			// Insert-only MIN: consolidate with MIN (new min can only be <= current)
+			cte_select_string += "\n\tmin(" + column + ") as " + column + ", ";
+		} else if (insert_only && agg_type == "max") {
+			// Insert-only MAX: consolidate with MAX (new max can only be >= current)
+			cte_select_string += "\n\tmax(" + column + ") as " + column + ", ";
+		} else if (list_mode) {
 			cte_select_string += "\n\tlist_reduce(list(CASE WHEN " + string(ivm::MULTIPLICITY_COL) +
 			                     " = false "
 			                     "THEN list_transform(" +
@@ -140,7 +165,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		on_clause += "v." + keys[i] + " IS NOT DISTINCT FROM d." + keys[i];
 	}
 
-	auto avg = DetectAvgColumns(aggregates);
 	auto &avg_derived_cols = avg.derived_cols;
 	auto &avg_sum_cols = avg.sum_cols;
 	auto &avg_count_cols = avg.count_cols;
@@ -160,7 +184,14 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				insert_vals += ", ";
 			}
 			first_agg = false;
-			if (list_mode) {
+
+			// Determine update expression based on aggregate type
+			string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
+			if (insert_only && agg_type == "min") {
+				update_set += column + " = LEAST(v." + column + ", d." + column + ")";
+			} else if (insert_only && agg_type == "max") {
+				update_set += column + " = GREATEST(v." + column + ", d." + column + ")";
+			} else if (list_mode) {
 				update_set +=
 				    column + " = list_transform(list_zip(v." + column + ", d." + column + "), lambda x: x[1] + x[2])";
 			} else {

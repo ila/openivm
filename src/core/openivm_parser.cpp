@@ -274,6 +274,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		bool found_minmax = analysis.found_minmax;
 		bool found_left_join = analysis.found_left_join;
 		auto aggregate_columns = std::move(analysis.aggregate_columns);
+		auto aggregate_types = std::move(analysis.aggregate_types);
 
 		// Fix expression-based group-by column names: the plan walk may extract
 		// "abs(val)" but the MV table column is "abs_val" (from the AS alias).
@@ -340,7 +341,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " has_minmax boolean default false, has_left_join boolean default false,"
 		              " last_update timestamp, refresh_interval bigint default null,"
 		              " refresh_in_progress boolean default false,"
-		              " group_columns varchar default null)");
+		              " group_columns varchar default null,"
+		              " aggregate_types varchar default null)");
 
 		// Refresh hooks: extensions can register custom SQL to run on MV refresh
 		// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
@@ -384,10 +386,22 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 			group_cols_val += "'";
 		}
+		// Store per-column aggregate types for insert-only MIN/MAX optimization
+		string agg_types_val = "null";
+		if (!aggregate_types.empty()) {
+			agg_types_val = "'";
+			for (size_t i = 0; i < aggregate_types.size(); i++) {
+				if (i > 0) {
+					agg_types_val += ",";
+				}
+				agg_types_val += aggregate_types[i];
+			}
+			agg_types_val += "'";
+		}
 		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
 		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", " +
 		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now(), " +
-		              refresh_val + ", false, " + group_cols_val + ")");
+		              refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ")");
 
 		// Classify each base table by catalog type (duckdb vs ducklake).
 		// DuckLake tables use native change tracking; DuckDB tables use delta tables.

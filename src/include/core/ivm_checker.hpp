@@ -16,6 +16,7 @@ struct PlanAnalysis {
 	bool found_minmax = false;
 	bool found_left_join = false;
 	vector<string> aggregate_columns;
+	vector<string> aggregate_types; // per-column: "min", "max", "sum", "count_star", "count", "avg", "list"
 };
 
 /// Walk the logical plan tree once, validating IVM compatibility AND extracting

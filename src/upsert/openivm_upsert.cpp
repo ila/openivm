@@ -522,17 +522,21 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// The compile functions receive view_name and compute data_table internally.
 	// GROUP BY columns: from index (standard) or metadata (DuckLake fallback).
 	auto group_cols = metadata.GetGroupColumns(view_name);
+	auto agg_types = metadata.GetAggregateTypes(view_name);
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_HAVING: {
-		upsert_query = CompileAggregateGroups(
-		    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-		    /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols, catalog_prefix, insert_only);
+		// HAVING requires group-recompute: the HAVING predicate depends on the full aggregate
+		// value, not just the delta. Even with insert-only, groups may newly satisfy HAVING.
+		upsert_query =
+		    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
+		                           /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols, catalog_prefix,
+		                           /*insert_only=*/false, agg_types);
 		break;
 	}
 	case IVMType::AGGREGATE_GROUP: {
-		upsert_query =
-		    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-		                           has_minmax, list_mode, delta_ts_filter, group_cols, catalog_prefix, insert_only);
+		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
+		                                      view_query_sql, has_minmax, list_mode, delta_ts_filter, group_cols,
+		                                      catalog_prefix, insert_only, agg_types);
 		break;
 	}
 	case IVMType::SIMPLE_PROJECTION: {

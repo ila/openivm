@@ -241,7 +241,27 @@ whose overhead may exceed what's saved by skipping plan copies for small N.
 **Decision:** Empty-delta term skipping for standard joins (1.2) is deferred —
 DuckDB handles the common case reasonably well, and the detection cost is non-trivial.
 Implemented for DuckLake only (1.1) where DuckDB cannot optimize and snapshot
-comparison is a metadata-only O(1) check.
+comparison is a metadata-only O(1) check. Standard empty-delta detection IS used for
+the insert-only fast path (detecting single-table-changed joins).
+
+### 4.3.2 DuckDB MERGE and IS NOT DISTINCT FROM
+
+**Finding (verified 2026-04-14):** MERGE INTO translates the ON clause into a standard
+hash join. Both `=` and `IS NOT DISTINCT FROM` are treated as equality predicates in
+DuckDB's `JoinHashTable`. The difference:
+
+- `=`: NULL rows filtered out before hashing
+- `IS NOT DISTINCT FROM`: NULL rows included, with NULL-aware comparison
+
+The per-row comparison is branch-free (inlined template operations). The NULL check
+is a single `&&`/`||` — overhead is negligible compared to I/O and hashing.
+
+DuckDB has NO optimizer rule to simplify `IS NOT DISTINCT FROM` to `=` when columns
+have NOT NULL constraints.
+
+**Decision:** NOT-NULL MERGE optimization (1.5) is skipped — the overhead of
+`IS NOT DISTINCT FROM` is negligible in DuckDB's hash join implementation. Adding
+metadata tracking + conditional SQL generation is not worth the complexity.
 
 ### 4.4 Insert-Only Optimization
 

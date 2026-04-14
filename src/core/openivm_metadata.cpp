@@ -156,6 +156,24 @@ vector<string> IVMMetadata::GetGroupColumns(const string &view_name) {
 	return cols;
 }
 
+vector<string> IVMMetadata::GetAggregateTypes(const string &view_name) {
+	auto result = con.Query("SELECT aggregate_types FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+	vector<string> types;
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return types;
+	}
+	string raw = result->GetValue(0, 0).ToString();
+	std::istringstream ss(raw);
+	string token;
+	while (std::getline(ss, token, ',')) {
+		if (!token.empty()) {
+			types.push_back(token);
+		}
+	}
+	return types;
+}
+
 int64_t IVMMetadata::GetRefreshInterval(const string &view_name) {
 	auto result = con.Query("SELECT refresh_interval FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        OpenIVMUtils::EscapeValue(view_name) + "'");

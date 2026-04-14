@@ -74,6 +74,9 @@ public:
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);
 
+	// Get per-column aggregate function types (min, max, sum, count_star, etc.).
+	vector<string> GetAggregateTypes(const string &view_name);
+
 	// --- DuckLake support ---
 
 	// Get the catalog type for a base table entry ('duckdb' or 'ducklake').
