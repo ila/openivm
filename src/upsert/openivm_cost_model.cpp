@@ -141,6 +141,18 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name) {
 	// Single connection for all cardinality queries
 	Connection con(*context.db);
+
+	// Read operational flags — cost model reflects what actually happens at refresh time.
+	Value nterm_val, fk_val;
+	bool nterm_enabled = true;
+	bool fk_enabled = true;
+	if (context.TryGetCurrentSetting("ivm_ducklake_nterm", nterm_val) && !nterm_val.IsNull()) {
+		nterm_enabled = nterm_val.GetValue<bool>();
+	}
+	if (context.TryGetCurrentSetting("ivm_fk_pruning", fk_val) && !fk_val.IsNull()) {
+		fk_enabled = fk_val.GetValue<bool>();
+	}
+
 	// 1. Collect all plan statistics in one tree walk
 	PlanStats plan_stats;
 	CollectPlanStatsRecursive(context, con, plan, view_name, plan_stats);
@@ -171,7 +183,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	// 2b. For standard joins, detect FK constraints to estimate term reduction.
 	// Count PK-side leaves whose terms can be pruned by FK-aware optimization.
 	idx_t fk_pk_leaf_count = 0;
-	if (has_join && !plan_stats.all_ducklake && N > 1) {
+	if (fk_enabled && has_join && !plan_stats.all_ducklake && N > 1) {
 		// Build table name -> index map
 		unordered_map<string, size_t> table_to_idx;
 		for (size_t i = 0; i < N; i++) {
@@ -228,7 +240,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	if (has_join) {
 		idx_t join_leaves = plan_stats.join_leaf_count;
 		double scan_multiplier;
-		if (plan_stats.all_ducklake) {
+		if (nterm_enabled && plan_stats.all_ducklake) {
 			// DuckLake N-term telescoping: exactly N terms
 			scan_multiplier = static_cast<double>(join_leaves);
 		} else if (fk_pk_leaf_count > 0) {

@@ -84,6 +84,9 @@ This is algebraically equivalent to inclusion-exclusion but avoids the exponenti
 | 4 | 15 | 4 |
 | 5 | 31 | 5 |
 
+N-term telescoping can be disabled with `SET ivm_ducklake_nterm = false`, which falls
+back to the standard 2^N - 1 inclusion-exclusion rule (also works with DuckLake tables).
+
 ### Empty-delta term skipping
 
 When a table hasn't changed since the last refresh (`last_snapshot_id == current_snapshot_id`), its delta is empty and its term produces zero rows. OpenIVM detects this at plan time by comparing snapshot IDs and skips generating that term entirely — avoiding the cost of plan copying, renumbering, delta scan creation, and SQL generation.

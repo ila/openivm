@@ -83,6 +83,19 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `ivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh takes longer than interval | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `ivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files | [Internals](docs/internals/delta-tables.md) |
 
+### Optimization flags
+
+All default to `true`. Set to `false` to disable an optimization and fall back to the traditional IVM path.
+
+| Setting | Description | Documentation |
+|---------|-------------|---------------|
+| `ivm_skip_empty_deltas` | Skip refresh or join terms when deltas are empty | [Empty delta skip](docs/optimizations/empty-delta-skip.md) |
+| `ivm_ducklake_nterm` | N-term telescoping for DuckLake joins (vs 2^N-1 inclusion-exclusion) | [DuckLake](docs/ducklake.md) |
+| `ivm_fk_pruning` | Prune inclusion-exclusion join terms using FK constraints | [FK pruning](docs/optimizations/fk-aware-pruning.md) |
+| `ivm_skip_aggregate_delete` | Skip zero-row DELETE for aggregates when insert-only | [Append-only](docs/optimizations/append-only.md) |
+| `ivm_skip_projection_delete` | Skip DELETE+consolidation for projections when insert-only | [Append-only](docs/optimizations/append-only.md) |
+| `ivm_minmax_incremental` | Use GREATEST/LEAST for MIN/MAX when insert-only | [Append-only](docs/optimizations/append-only.md) |
+
 ## Pragmas
 
 | Pragma | Description |

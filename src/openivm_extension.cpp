@@ -117,6 +117,23 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("ivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
+	// Per-optimization flags (default: all enabled)
+	db_config.AddExtensionOption("ivm_skip_empty_deltas", "skip refresh or join terms when deltas are empty",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("ivm_ducklake_nterm",
+	                             "use N-term telescoping for DuckLake joins (vs 2^N-1 inclusion-exclusion)",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("ivm_fk_pruning", "prune inclusion-exclusion join terms using FK constraints",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("ivm_skip_aggregate_delete",
+	                             "skip zero-row DELETE for grouped aggregates when deltas are insert-only",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("ivm_skip_projection_delete",
+	                             "skip DELETE and consolidation for projections when deltas are insert-only",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("ivm_minmax_incremental", "use GREATEST/LEAST for MIN/MAX when deltas are insert-only",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	Connection con(instance);
 
 	// Migration: add new columns to existing _duckdb_ivm_views tables

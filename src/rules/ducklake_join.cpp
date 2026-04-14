@@ -62,6 +62,13 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 		old_snapshots[i] = snap_result->GetValue(0, 0).GetValue<int64_t>();
 	}
 
+	// Check if empty-delta term skipping is enabled.
+	bool skip_empty_enabled = true;
+	Value skip_empty_val;
+	if (context.TryGetCurrentSetting("ivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
+		skip_empty_enabled = skip_empty_val.GetValue<bool>();
+	}
+
 	// Get current snapshot ID from the first leaf's DuckLakeFunctionInfo.
 	// The plan was just bound for this refresh, so this reflects the current state.
 	int64_t current_snapshot = -1;
@@ -81,7 +88,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 		// Skip term if this table has no changes since last refresh.
 		// Safety: always generate at least one term to avoid empty UNION ALL.
 		bool is_last_chance = (i == N - 1) && terms.empty();
-		if (!is_last_chance && current_snapshot >= 0 && old_snapshots[i] == current_snapshot) {
+		if (skip_empty_enabled && !is_last_chance && current_snapshot >= 0 && old_snapshots[i] == current_snapshot) {
 			OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Skipping term %zu: no changes (snapshot %ld == current)\n", i,
 			                    (long)old_snapshots[i]);
 			continue;

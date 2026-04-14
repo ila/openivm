@@ -258,17 +258,24 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	vector<unique_ptr<LogicalOperator>> terms;
 
 	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
-	auto fk_relations = DetectFKRelations(context, leaves, pw.plan.get());
+	Value fk_pruning_val;
+	bool fk_pruning_enabled = true;
+	if (context.TryGetCurrentSetting("ivm_fk_pruning", fk_pruning_val) && !fk_pruning_val.IsNull()) {
+		fk_pruning_enabled = fk_pruning_val.GetValue<bool>();
+	}
 	uint64_t skip_bits = 0;
-	if (!fk_relations.empty()) {
-		uint64_t insert_only_mask = DetectInsertOnlyDeltas(context, pw.view, leaves);
-		skip_bits = ComputeSkipBits(fk_relations, insert_only_mask);
+	if (fk_pruning_enabled) {
+		auto fk_relations = DetectFKRelations(context, leaves, pw.plan.get());
+		if (!fk_relations.empty()) {
+			uint64_t insert_only_mask = DetectInsertOnlyDeltas(context, pw.view, leaves);
+			skip_bits = ComputeSkipBits(fk_relations, insert_only_mask);
+		}
 	}
 
 	uint64_t pruned_count = 0;
 	uint64_t total_terms = (1ULL << N) - 1;
-	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building inclusion-exclusion terms (%lu total, %zu FK relations)\n",
-	                    (unsigned long)total_terms, fk_relations.size());
+	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building inclusion-exclusion terms (%lu total, skip_bits=%lu)\n",
+	                    (unsigned long)total_terms, (unsigned long)skip_bits);
 	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
 		// FK pruning: skip any term whose mask overlaps with insert-only PK leaves.
 		// All such terms cancel algebraically via XOR (see ComputeSkipBits).
@@ -430,12 +437,19 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 	types.emplace_back(pw.mul_type);
 
 	// 3. Build terms — use DuckLake N-term path when all leaves are DuckLake scans
+	// Check if all leaves are DuckLake scans AND N-term telescoping is enabled.
 	bool all_ducklake = true;
-	for (size_t i = 0; i < N; i++) {
-		auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
-		if (!get || get->function.name != "ducklake_scan") {
-			all_ducklake = false;
-			break;
+	Value nterm_val;
+	if (context.TryGetCurrentSetting("ivm_ducklake_nterm", nterm_val) && !nterm_val.IsNull() &&
+	    !nterm_val.GetValue<bool>()) {
+		all_ducklake = false; // forced to inclusion-exclusion
+	} else {
+		for (size_t i = 0; i < N; i++) {
+			auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+			if (!get || get->function.name != "ducklake_scan") {
+				all_ducklake = false;
+				break;
+			}
 		}
 	}
 

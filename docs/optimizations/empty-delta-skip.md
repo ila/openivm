@@ -40,7 +40,18 @@ A safety fallback ensures at least one term is always generated to avoid an empt
 | SQL generation for INSERT/DELETE/MERGE | Yes |
 | Downstream cascade trigger | Yes |
 
+## Setting
+
+| Setting | Default | Description |
+|---|---|---|
+| `ivm_skip_empty_deltas` | `true` | Enable empty-delta skipping (early-exit + per-term DuckLake skip) |
+
+```sql
+SET ivm_skip_empty_deltas = false;  -- disable: always run full refresh pipeline
+```
+
 ## When It Does Not Apply
 
 - At least one delta table contains rows (standard) or snapshot IDs differ (DuckLake)
 - View type is `FULL_REFRESH` (unsupported operators always recompute)
+- `ivm_skip_empty_deltas` is set to `false`

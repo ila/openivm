@@ -1,4 +1,4 @@
-# Insert-Only Fast Path
+# Append-Only Optimizations
 
 ## Behavior
 
@@ -12,6 +12,25 @@ cleanup steps during refresh:
 - **Projection/filter views**: Skips the DELETE phase entirely (the ROW_NUMBER window +
   JOIN that removes net-deleted tuples) and the GROUP BY consolidation. Instead, inserts
   delta rows directly into the MV.
+
+- **MIN/MAX aggregates**: Uses `GREATEST(old, new)` for MAX and `LEAST(old, new)` for MIN
+  instead of the full group-recompute strategy (delete affected groups, re-query from base).
+  Adding elements can only extend the range, never invalidate the current extremum.
+
+## Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `ivm_skip_aggregate_delete` | `true` | Skip zero-row DELETE for grouped aggregates when insert-only |
+| `ivm_skip_projection_delete` | `true` | Skip DELETE and consolidation for projections when insert-only |
+| `ivm_minmax_incremental` | `true` | Use GREATEST/LEAST for MIN/MAX when insert-only |
+
+Set to `false` to disable and fall back to the traditional IVM path:
+```sql
+SET ivm_skip_aggregate_delete = false;
+SET ivm_skip_projection_delete = false;
+SET ivm_minmax_incremental = false;
+```
 
 ## When it applies
 
@@ -57,10 +76,11 @@ then query `ducklake_table_deletions()` to check for deletes.
 
 ## What is avoided
 
-| Step | Normal path | Insert-only path |
+| Step | Normal path | Append-only path |
 |---|---|---|
 | CTE consolidation (aggregates) | `SUM(CASE WHEN mul THEN col ELSE -col END)` | Same (DuckDB handles CASE WHEN efficiently) |
 | Zero-row DELETE (aggregates) | Full MV scan: `DELETE WHERE COALESCE(col, 0) = 0` | **Skipped** |
+| MIN/MAX group-recompute | Delete affected groups + re-query from base | **MERGE with GREATEST/LEAST** |
 | Net consolidation (projections) | `GROUP BY all_cols HAVING SUM(...) != 0` | **Skipped** |
 | ROW_NUMBER DELETE (projections) | Window function + JOIN to find rows to remove | **Skipped** |
 | INSERT (projections) | `generate_series(1, _net)` for net-insert tuples | Direct `INSERT FROM delta WHERE mul = true` |

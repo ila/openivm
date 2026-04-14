@@ -167,7 +167,12 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	// Early exit: skip refresh if all delta tables are empty.
 	// Placed AFTER upstream cascade so that upstream refreshes have a chance to populate
 	// our delta tables before we check.
-	{
+	Value skip_empty_val;
+	bool skip_empty_enabled = true;
+	if (context.TryGetCurrentSetting("ivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
+		skip_empty_enabled = skip_empty_val.GetValue<bool>();
+	}
+	if (skip_empty_enabled) {
 		auto view_type = metadata.GetViewType(view_name);
 		if (view_type != IVMType::FULL_REFRESH) {
 			auto delta_tables = metadata.GetDeltaTables(view_name);
@@ -210,7 +215,7 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 				return;
 			}
 		}
-	}
+	} // skip_empty_enabled
 
 	// Check for refresh hooks (custom SQL to run before/after/instead of IVM)
 	string hook_sql;
@@ -507,8 +512,26 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			// table maps to multiple join leaves that all change together).
 			insert_only = true;
 		}
+	} // append_only_enabled
+	// Read per-optimization flags to gate insert-only fast paths independently.
+	Value skip_agg_del_val, skip_proj_del_val, minmax_incr_val;
+	bool skip_agg_delete = insert_only;
+	bool skip_proj_delete = insert_only;
+	bool minmax_incremental = insert_only;
+	if (context.TryGetCurrentSetting("ivm_skip_aggregate_delete", skip_agg_del_val) && !skip_agg_del_val.IsNull() &&
+	    !skip_agg_del_val.GetValue<bool>()) {
+		skip_agg_delete = false;
 	}
-	OPENIVM_DEBUG_PRINT("[UPSERT] insert_only=%d\n", insert_only);
+	if (context.TryGetCurrentSetting("ivm_skip_projection_delete", skip_proj_del_val) && !skip_proj_del_val.IsNull() &&
+	    !skip_proj_del_val.GetValue<bool>()) {
+		skip_proj_delete = false;
+	}
+	if (context.TryGetCurrentSetting("ivm_minmax_incremental", minmax_incr_val) && !minmax_incr_val.IsNull() &&
+	    !minmax_incr_val.GetValue<bool>()) {
+		minmax_incremental = false;
+	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] insert_only=%d, skip_agg_delete=%d, skip_proj_delete=%d, minmax_incremental=%d\n",
+	                    insert_only, skip_agg_delete, skip_proj_delete, minmax_incremental);
 
 	// Compile the upsert query based on view type
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n",
@@ -534,9 +557,12 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		break;
 	}
 	case IVMType::AGGREGATE_GROUP: {
+		// For MIN/MAX views, use minmax_incremental (gated by ivm_minmax_incremental).
+		// For non-MIN/MAX views, use skip_agg_delete (gated by ivm_skip_aggregate_delete).
+		bool effective_insert_only = has_minmax ? minmax_incremental : skip_agg_delete;
 		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
 		                                      view_query_sql, has_minmax, list_mode, delta_ts_filter, group_cols,
-		                                      catalog_prefix, insert_only, agg_types);
+		                                      catalog_prefix, effective_insert_only, agg_types);
 		break;
 	}
 	case IVMType::SIMPLE_PROJECTION: {
@@ -551,7 +577,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			               affected + "_ivm_lj." + lk + delta_where + ");\n";
 		} else {
 			upsert_query =
-			    CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, insert_only);
+			    CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete);
 		}
 		break;
 	}

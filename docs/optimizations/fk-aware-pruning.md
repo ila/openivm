@@ -115,6 +115,13 @@ build + hash join probe + UNION ALL branch.
   joins, the [N-term telescoping](../ducklake.md#n-term-telescoping-join-rule) rule is used
   instead, with [empty-delta term skipping](empty-delta-skip.md) covering the common case of
   unchanged dimension tables.
+- `ivm_fk_pruning` is set to `false`
+
+## Setting
+
+| Setting | Default | Description |
+|---|---|---|
+| `ivm_fk_pruning` | `true` | Prune inclusion-exclusion join terms using FK constraints |
 
 ## How it works
 
