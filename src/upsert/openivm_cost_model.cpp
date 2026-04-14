@@ -1,4 +1,5 @@
 #include "upsert/openivm_cost_model.hpp"
+#include <unordered_set>
 #include "core/openivm_constants.hpp"
 #include "core/openivm_metadata.hpp"
 #include "core/openivm_utils.hpp"
@@ -186,35 +187,36 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	if (fk_enabled && has_join && !plan_stats.all_ducklake && N > 1) {
 		// Build table name -> index map
 		unordered_map<string, size_t> table_to_idx;
+		string in_list;
 		for (size_t i = 0; i < N; i++) {
 			table_to_idx[table_stats[i].table_name] = i;
-		}
-		// Track which PK-side leaves have been counted (avoid double-counting)
-		unordered_set<size_t> pruned_pk_leaves;
-		for (size_t i = 0; i < N; i++) {
-			// Use IVM metadata to check for FK constraints
-			IVMMetadata metadata(con);
-			auto result = con.Query("SELECT constraint_text FROM duckdb_constraints() WHERE table_name = '" +
-			                        OpenIVMUtils::EscapeValue(table_stats[i].table_name) +
-			                        "' AND constraint_type = 'FOREIGN KEY'");
-			if (result->HasError() || result->RowCount() == 0) {
-				continue;
+			if (i > 0) {
+				in_list += ", ";
 			}
-			// If this table has FK constraints referencing other join tables
-			// with empty/insert-only deltas, those PK leaves can be pruned.
+			in_list += "'" + OpenIVMUtils::EscapeValue(table_stats[i].table_name) + "'";
+		}
+		// Batch query: get all FK constraints for join tables in one call.
+		unordered_set<size_t> pruned_pk_leaves;
+		auto result = con.Query("SELECT table_name, constraint_text FROM duckdb_constraints() "
+		                        "WHERE constraint_type = 'FOREIGN KEY' AND table_name IN (" +
+		                        in_list + ")");
+		if (!result->HasError()) {
 			for (idx_t r = 0; r < result->RowCount(); r++) {
-				string fk_text = result->GetValue(0, r).ToString();
-				// Check if any PK table in our join has empty delta
+				string fk_table = result->GetValue(0, r).ToString();
+				string fk_text = result->GetValue(1, r).ToString();
+				auto fk_it = table_to_idx.find(fk_table);
+				if (fk_it == table_to_idx.end()) {
+					continue;
+				}
+				// Check if any PK table in our join has empty delta.
+				// Match by "REFERENCES <table_name>" to avoid substring false positives.
 				for (auto &kv : table_to_idx) {
-					auto &tname = kv.first;
-					auto tidx = kv.second;
-					if (tidx == i) {
+					if (kv.second == fk_it->second) {
 						continue;
 					}
-					// Heuristic: if the FK constraint text references this table name
-					// and the PK table has empty delta, it's prunable
-					if (fk_text.find(tname) != string::npos && table_stats[tidx].delta_card == 0) {
-						pruned_pk_leaves.insert(tidx);
+					string ref_pattern = "REFERENCES " + kv.first;
+					if (fk_text.find(ref_pattern) != string::npos && table_stats[kv.second].delta_card == 0) {
+						pruned_pk_leaves.insert(kv.second);
 					}
 				}
 			}

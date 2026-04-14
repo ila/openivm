@@ -452,16 +452,26 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		bool any_has_deletes = false;
 		bool all_ducklake = true;
 
+		// Cache DuckLake current snapshot (queried at most once).
+		int64_t ducklake_cur_snap = -1;
+		bool ducklake_snap_queried = false;
+
 		for (auto &dt : delta_table_names) {
 			if (metadata.IsDuckLakeTable(view_name, dt)) {
+				if (!ducklake_snap_queried) {
+					auto cur_snap_result = con.Query("SELECT id FROM " + view_catalog_name + ".current_snapshot()");
+					if (!cur_snap_result->HasError() && cur_snap_result->RowCount() > 0) {
+						ducklake_cur_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
+					}
+					ducklake_snap_queried = true;
+				}
 				auto last_snap = metadata.GetLastSnapshotId(view_name, dt);
-				auto cur_snap_result = con.Query("SELECT id FROM " + view_catalog_name + ".current_snapshot()");
-				if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0) {
+				if (ducklake_cur_snap < 0) {
 					any_has_deletes = true; // conservative
 					tables_with_changes++;
 					continue;
 				}
-				auto cur_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
+				auto cur_snap = ducklake_cur_snap;
 				if (last_snap == cur_snap) {
 					continue; // no changes — empty delta
 				}

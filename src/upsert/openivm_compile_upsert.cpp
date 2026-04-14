@@ -1,6 +1,7 @@
 #include "upsert/openivm_compile_upsert.hpp"
 
 #include "core/openivm_constants.hpp"
+#include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
 #include "rules/column_hider.hpp"
 
@@ -77,18 +78,21 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	auto avg = DetectAvgColumns(aggregates);
 
 	// Build per-column aggregate type map from metadata (for insert-only MIN/MAX).
-	// aggregate_types aligns with aggregate expressions in the rewritten plan.
+	// aggregate_types aligns with aggregate expressions in the rewritten plan:
+	// one entry per BoundAggregateExpression (excludes AVG-derived cols which are projections).
 	unordered_map<string, string> col_agg_type;
 	if (!aggregate_types.empty()) {
 		idx_t type_idx = 0;
 		for (auto &column : aggregates) {
 			if (avg.derived_cols.count(column)) {
-				continue; // AVG-derived columns aren't aggregate expressions
+				continue;
 			}
 			if (type_idx < aggregate_types.size()) {
 				col_agg_type[column] = aggregate_types[type_idx++];
 			}
 		}
+		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] agg_type map: %zu entries from %zu types, %zu aggregates\n",
+		                    col_agg_type.size(), aggregate_types.size(), aggregates.size());
 	}
 
 	if (has_minmax && !insert_only) {

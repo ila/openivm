@@ -414,7 +414,7 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 	switch (expr.expression_class) {
 	case ExpressionClass::BOUND_COLUMN_REF: {
 		auto &col = expr.Cast<BoundColumnRefExpression>();
-		uint64_t key = (uint64_t)col.binding.table_index * 100000 + col.binding.column_index;
+		uint64_t key = (uint64_t)col.binding.table_index ^ ((uint64_t)col.binding.column_index * 0x9e3779b97f4a7c15ULL);
 		auto it = binding_to_alias.find(key);
 		return (it != binding_to_alias.end()) ? it->second : col.ToString();
 	}
@@ -478,7 +478,8 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, const vector<string>
 		for (idx_t i = 0; i < proj.expressions.size() && i < output_names.size(); i++) {
 			if (proj.expressions[i]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
 				auto &col = proj.expressions[i]->Cast<BoundColumnRefExpression>();
-				uint64_t key = (uint64_t)col.binding.table_index * 100000 + col.binding.column_index;
+				uint64_t key =
+				    (uint64_t)col.binding.table_index ^ ((uint64_t)col.binding.column_index * 0x9e3779b97f4a7c15ULL);
 				binding_to_alias[key] = output_names[i];
 			}
 		}
