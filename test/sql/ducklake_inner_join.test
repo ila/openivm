@@ -414,3 +414,32 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 6: Cost model for DuckLake joins
+# ==========================================
+
+# After refresh, deltas are empty — IVM cost should be 0, decision = incremental
+statement ok
+PRAGMA ivm_cost('product_summary');
+
+# Insert data into one table, verify cost model doesn't error with DuckLake delta cardinality
+statement ok
+INSERT INTO dl.sales VALUES (3, 1, 999);
+
+statement ok
+PRAGMA ivm_cost('product_summary');
+
+# Refresh to apply the delta
+statement ok
+PRAGMA ivm('product_summary');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.pname, SUM(s.revenue), COUNT(*)
+    FROM dl.products p INNER JOIN dl.sales s ON p.pid = s.pid GROUP BY p.pname
+    EXCEPT ALL
+    SELECT pname, total_rev, sale_count FROM dl.product_summary
+);
+----
+0

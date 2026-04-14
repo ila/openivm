@@ -227,6 +227,22 @@ empty delta branches. Specifically:
 join rule code by comparing `last_snapshot_id` with the current snapshot at plan time.
 DuckDB cannot infer this from the plan structure alone.
 
+**Standard DuckDB tables (verified 2026-04-14):** The situation is different. DuckDB's
+`TableScanCardinality()` returns actual row counts for standard tables, and the
+statistics propagator CAN convert a scan on a 0-row table to `LogicalEmptyResult`.
+With the timestamp WHERE clause, detection depends on min/max column statistics.
+At runtime, building a hash table on 0 rows is essentially free.
+
+However, OpenIVM's plan-level overhead (plan Copy, renumber, CreateDeltaGetNode per
+term) happens BEFORE DuckDB's statistics propagation runs in the optimizer pipeline.
+Detecting empty deltas from OpenIVM's side requires N SQL queries (one per leaf),
+whose overhead may exceed what's saved by skipping plan copies for small N.
+
+**Decision:** Empty-delta term skipping for standard joins (1.2) is deferred —
+DuckDB handles the common case reasonably well, and the detection cost is non-trivial.
+Implemented for DuckLake only (1.1) where DuckDB cannot optimize and snapshot
+comparison is a metadata-only O(1) check.
+
 ### 4.4 Insert-Only Optimization
 
 **Kara, Nikolic, Olteanu, Zhang.** "Insert-Only versus Insert-Delete in Dynamic

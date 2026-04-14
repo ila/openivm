@@ -4,10 +4,13 @@
 #include "core/openivm_utils.hpp"
 #include "core/openivm_debug.hpp"
 #include "rules/column_hider.hpp"
+#include "storage/ducklake_scan.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/constraint.hpp"
+#include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -43,8 +46,9 @@ static double GetDeltaRowCount(Connection &con, const string &delta_table_name, 
 struct TableStats {
 	string table_name;
 	string delta_table_name;
-	double base_card;  // |T|
-	double delta_card; // |ΔT|
+	double base_card;    // |T|
+	double delta_card;   // |ΔT|
+	bool has_fk = false; // table has FK referencing another table in the join
 };
 
 /// Aggregated plan statistics collected in a single tree walk.
@@ -53,7 +57,40 @@ struct PlanStats {
 	idx_t join_leaf_count = 0;
 	bool has_join = false;
 	bool has_aggregate = false;
+	bool all_ducklake = true; // true until a non-DuckLake leaf is found
 };
+
+/// Get delta cardinality for a DuckLake table by counting changes between snapshots.
+static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_name, const string &schema_name,
+                                       const string &table_name, const string &view_name) {
+	IVMMetadata metadata(con);
+	auto last_snap = metadata.GetLastSnapshotId(view_name, table_name);
+	auto cur_snap_result = con.Query("SELECT id FROM " + catalog_name + ".current_snapshot()");
+	if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0) {
+		return 0;
+	}
+	auto cur_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
+	if (last_snap == cur_snap) {
+		return 0;
+	}
+
+	double count = 0;
+	auto ins_result =
+	    con.Query("SELECT COUNT(*) FROM ducklake_table_insertions('" + OpenIVMUtils::EscapeValue(catalog_name) +
+	              "', '" + OpenIVMUtils::EscapeValue(schema_name) + "', '" + OpenIVMUtils::EscapeValue(table_name) +
+	              "', " + to_string(last_snap) + ", " + to_string(cur_snap) + ")");
+	if (!ins_result->HasError() && ins_result->RowCount() > 0) {
+		count += ins_result->GetValue(0, 0).GetValue<double>();
+	}
+	auto del_result =
+	    con.Query("SELECT COUNT(*) FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(catalog_name) + "', '" +
+	              OpenIVMUtils::EscapeValue(schema_name) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
+	              to_string(last_snap) + ", " + to_string(cur_snap) + ")");
+	if (!del_result->HasError() && del_result->RowCount() > 0) {
+		count += del_result->GetValue(0, 0).GetValue<double>();
+	}
+	return count;
+}
 
 /// Walk the plan tree once, collecting table stats, join info, and aggregate presence.
 static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, LogicalOperator &op,
@@ -64,12 +101,23 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 		if (get.GetTable().get() != nullptr) {
 			TableStats ts;
 			ts.table_name = get.GetTable()->name;
-			ts.delta_table_name = OpenIVMUtils::DeltaName(ts.table_name);
 			ts.base_card = static_cast<double>(get.EstimateCardinality(context));
 			if (ts.base_card == 0) {
 				ts.base_card = 1;
 			}
-			ts.delta_card = GetDeltaRowCount(con, ts.delta_table_name, view_name);
+
+			// DuckLake vs standard delta cardinality
+			if (get.function.name == "ducklake_scan" && get.function.function_info) {
+				string cat_name = get.GetTable()->ParentCatalog().GetName();
+				string schema_name = get.GetTable()->schema.name;
+				ts.delta_table_name = ts.table_name; // DuckLake stores bare name
+				ts.delta_card = GetDuckLakeDeltaRowCount(con, cat_name, schema_name, ts.table_name, view_name);
+			} else {
+				stats.all_ducklake = false;
+				ts.delta_table_name = OpenIVMUtils::DeltaName(ts.table_name);
+				ts.delta_card = GetDeltaRowCount(con, ts.delta_table_name, view_name);
+			}
+
 			stats.table_stats.push_back(ts);
 		}
 		stats.join_leaf_count++;
@@ -120,15 +168,57 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	bool has_join = plan_stats.has_join;
 	bool has_aggregate = plan_stats.has_aggregate;
 
+	// 2b. For standard joins, detect FK constraints to estimate term reduction.
+	// Count PK-side leaves whose terms can be pruned by FK-aware optimization.
+	idx_t fk_pk_leaf_count = 0;
+	if (has_join && !plan_stats.all_ducklake && N > 1) {
+		// Build table name -> index map
+		unordered_map<string, size_t> table_to_idx;
+		for (size_t i = 0; i < N; i++) {
+			table_to_idx[table_stats[i].table_name] = i;
+		}
+		// Track which PK-side leaves have been counted (avoid double-counting)
+		unordered_set<size_t> pruned_pk_leaves;
+		for (size_t i = 0; i < N; i++) {
+			// Use IVM metadata to check for FK constraints
+			IVMMetadata metadata(con);
+			auto result = con.Query("SELECT constraint_text FROM duckdb_constraints() WHERE table_name = '" +
+			                        OpenIVMUtils::EscapeValue(table_stats[i].table_name) +
+			                        "' AND constraint_type = 'FOREIGN KEY'");
+			if (result->HasError() || result->RowCount() == 0) {
+				continue;
+			}
+			// If this table has FK constraints referencing other join tables
+			// with empty/insert-only deltas, those PK leaves can be pruned.
+			for (idx_t r = 0; r < result->RowCount(); r++) {
+				string fk_text = result->GetValue(0, r).ToString();
+				// Check if any PK table in our join has empty delta
+				for (auto &kv : table_to_idx) {
+					auto &tname = kv.first;
+					auto tidx = kv.second;
+					if (tidx == i) {
+						continue;
+					}
+					// Heuristic: if the FK constraint text references this table name
+					// and the PK table has empty delta, it's prunable
+					if (fk_text.find(tname) != string::npos && table_stats[tidx].delta_card == 0) {
+						pruned_pk_leaves.insert(tidx);
+					}
+				}
+			}
+		}
+		fk_pk_leaf_count = pruned_pk_leaves.size();
+	}
+
 	// 3. Estimate IVM cost
 	//
 	// IVM compute cost:
-	//   - For joins: 2^(N-1) base table scans per table (inclusion-exclusion terms)
+	//   - For DuckLake joins: N terms (N-term telescoping)
+	//   - For standard joins: 2^(N-1) terms (inclusion-exclusion), reduced by FK pruning
 	//   - For non-joins: just scan the delta (very cheap)
-	//   - Filter/projection: negligible overhead
 	//
 	// IVM upsert cost:
-	//   - Estimated delta result size × merge overhead
+	//   - Estimated delta result size x merge overhead
 	//   - For aggregates: merge cost depends on affected groups
 	//   - For projections/filters: targeted insert/delete
 
@@ -137,7 +227,21 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 
 	if (has_join) {
 		idx_t join_leaves = plan_stats.join_leaf_count;
-		double scan_multiplier = static_cast<double>(1ULL << (join_leaves - 1)); // 2^(N-1)
+		double scan_multiplier;
+		if (plan_stats.all_ducklake) {
+			// DuckLake N-term telescoping: exactly N terms
+			scan_multiplier = static_cast<double>(join_leaves);
+		} else if (fk_pk_leaf_count > 0) {
+			// FK pruning: surviving terms = 2^(N - pruned_pks) - 1
+			idx_t effective_leaves = join_leaves - fk_pk_leaf_count;
+			scan_multiplier = static_cast<double>((1ULL << effective_leaves) - 1);
+			if (scan_multiplier < 1) {
+				scan_multiplier = 1;
+			}
+		} else {
+			// Standard inclusion-exclusion: 2^(N-1) average scans per table
+			scan_multiplier = static_cast<double>(1ULL << (join_leaves - 1));
+		}
 
 		ivm_compute = scan_multiplier * total_base_scan;
 
@@ -180,8 +284,9 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	double recompute_replace = mv_card * 2.0;             // delete all + insert all
 	double recompute_total = recompute_compute + recompute_replace;
 
-	OPENIVM_DEBUG_PRINT("[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s\n", N, has_join ? "yes" : "no",
-	                    has_aggregate ? "yes" : "no");
+	OPENIVM_DEBUG_PRINT("[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s, DuckLake: %s, FK pruned PKs: %lu\n", N,
+	                    has_join ? "yes" : "no", has_aggregate ? "yes" : "no", plan_stats.all_ducklake ? "yes" : "no",
+	                    (unsigned long)fk_pk_leaf_count);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Base scan total: %.0f, Delta fraction sum: %.4f\n", total_base_scan,
 	                    delta_fraction_sum);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] MV cardinality: %.0f, Est. delta result: %.0f\n", mv_card,
