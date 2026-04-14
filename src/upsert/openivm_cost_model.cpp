@@ -47,7 +47,8 @@ static double GetDeltaRowCount(Connection &con, const string &delta_table_name, 
 struct TableStats {
 	string table_name;
 	string delta_table_name;
-	double base_card;    // |T|
+	double base_card;    // |T| (may reflect pushed-down filter selectivity)
+	double actual_card;  // actual unfiltered table row count
 	double delta_card;   // |ΔT|
 	bool has_fk = false; // table has FK referencing another table in the join
 };
@@ -58,7 +59,8 @@ struct PlanStats {
 	idx_t join_leaf_count = 0;
 	bool has_join = false;
 	bool has_aggregate = false;
-	bool all_ducklake = true; // true until a non-DuckLake leaf is found
+	bool all_ducklake = true;        // true until a non-DuckLake leaf is found
+	double filter_selectivity = 1.0; // cumulative selectivity from non-pushed-down LOGICAL_FILTER nodes
 };
 
 /// Get delta cardinality for a DuckLake table by counting changes between snapshots.
@@ -107,6 +109,14 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 				ts.base_card = 1;
 			}
 
+			// Actual (unfiltered) table row count — for filter selectivity estimation.
+			// base_card from EstimateCardinality may reflect pushed-down filters, so
+			// actual_card / base_card gives us the filter selectivity ratio.
+			ts.actual_card = GetTableRowCount(con, ts.table_name);
+			if (ts.actual_card == 0) {
+				ts.actual_card = 1;
+			}
+
 			// DuckLake vs standard delta cardinality
 			if (get.function.name == "ducklake_scan" && get.function.function_info) {
 				string cat_name = get.GetTable()->ParentCatalog().GetName();
@@ -131,6 +141,19 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
 		stats.has_aggregate = true;
 		break;
+	case LogicalOperatorType::LOGICAL_FILTER: {
+		// Filters that weren't pushed down into the scan — estimate their selectivity
+		// from the cardinality ratio between the filter output and its child input.
+		double filter_card = static_cast<double>(op.EstimateCardinality(context));
+		double child_card = 0;
+		if (!op.children.empty()) {
+			child_card = static_cast<double>(op.children[0]->EstimateCardinality(context));
+		}
+		if (child_card > 0 && filter_card < child_card) {
+			stats.filter_selectivity *= (filter_card / child_card);
+		}
+		break;
+	}
 	default:
 		break;
 	}
@@ -259,20 +282,29 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 
 		ivm_compute = scan_multiplier * total_base_scan;
 
-		// Estimate delta result: each delta row fans out by MV/base_card
+		// Estimate delta result: each delta row fans out by MV/actual_card.
+		// Use actual_card (unfiltered) instead of base_card to avoid inflated fanout
+		// when filters are pushed into the scan (base_card reflects post-filter estimate).
 		estimated_delta_result = 0;
 		for (auto &ts : table_stats) {
-			double fanout = mv_card / ts.base_card;
+			double fanout = mv_card / ts.actual_card;
 			estimated_delta_result += ts.delta_card * fanout;
 		}
+		// Apply selectivity from any non-pushed-down filter nodes
+		estimated_delta_result *= plan_stats.filter_selectivity;
 	} else {
-		// Unary operators: just scan deltas
+		// Unary operators: scan cost is the full delta (filter doesn't reduce scan cost)
 		double total_delta = 0;
+		double filtered_delta = 0;
 		for (auto &ts : table_stats) {
 			total_delta += ts.delta_card;
+			// Selectivity from pushed-down filters: base_card / actual_card
+			double selectivity = std::min(1.0, ts.base_card / ts.actual_card);
+			filtered_delta += ts.delta_card * selectivity;
 		}
 		ivm_compute = total_delta;
-		estimated_delta_result = total_delta;
+		// Apply both pushed-down selectivity and non-pushed-down filter selectivity
+		estimated_delta_result = filtered_delta * plan_stats.filter_selectivity;
 	}
 
 	double ivm_upsert;
@@ -301,8 +333,8 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s, DuckLake: %s, FK pruned PKs: %lu\n", N,
 	                    has_join ? "yes" : "no", has_aggregate ? "yes" : "no", plan_stats.all_ducklake ? "yes" : "no",
 	                    (unsigned long)fk_pk_leaf_count);
-	OPENIVM_DEBUG_PRINT("[COST MODEL] Base scan total: %.0f, Delta fraction sum: %.4f\n", total_base_scan,
-	                    delta_fraction_sum);
+	OPENIVM_DEBUG_PRINT("[COST MODEL] Base scan total: %.0f, Delta fraction sum: %.4f, Filter selectivity: %.4f\n",
+	                    total_base_scan, delta_fraction_sum, plan_stats.filter_selectivity);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] MV cardinality: %.0f, Est. delta result: %.0f\n", mv_card,
 	                    estimated_delta_result);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] IVM cost: %.0f (compute: %.0f, upsert: %.0f)\n", ivm_total, ivm_compute,

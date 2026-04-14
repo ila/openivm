@@ -324,7 +324,7 @@ INSERT INTO filt VALUES (151, 'active', 151);
 query III
 PRAGMA ivm_cost('mv_filt');
 ----
-incremental	7.643856	226.000000
+incremental	4.343928	226.000000
 
 statement ok
 PRAGMA ivm('mv_filt');
@@ -341,7 +341,7 @@ INSERT INTO filt SELECT i, 'active', i FROM range(200, 500) t(i);
 query III
 PRAGMA ivm_cost('mv_filt');
 ----
-full	2301.727603	379.000000
+full	1303.083011	379.000000
 
 statement ok
 PRAGMA ivm('mv_filt');
@@ -663,3 +663,112 @@ SELECT grp, sum(val), count(val) FROM mode_base GROUP BY grp ORDER BY grp;
 ----
 even	1650	27
 odd	925	325
+
+# ==========================================
+# Test 15: Filter selectivity — cost model accounts for selective filters
+# ==========================================
+
+statement ok
+CREATE TABLE sel_base (id INT, val INT);
+
+statement ok
+INSERT INTO sel_base SELECT i, i FROM range(1, 10001) t(i);
+
+# Highly selective: WHERE val > 9900 keeps ~1% of rows
+statement ok
+CREATE MATERIALIZED VIEW mv_selfilt AS SELECT id, val FROM sel_base WHERE val > 9900;
+
+query I
+SELECT count(*) FROM mv_selfilt;
+----
+100
+
+# Insert 100 rows that all pass the filter
+statement ok
+INSERT INTO sel_base SELECT i, i FROM range(10001, 10101) t(i);
+
+# IVM cost should be reduced by filter selectivity (~1% selectivity)
+query III
+PRAGMA ivm_cost('mv_selfilt');
+----
+incremental	252.877124	2320.000000
+
+statement ok
+PRAGMA ivm('mv_selfilt');
+
+query I
+SELECT count(*) FROM mv_selfilt;
+----
+200
+
+# Cross-check: EXCEPT ALL both directions
+query II
+SELECT * FROM mv_selfilt EXCEPT ALL SELECT id, val FROM sel_base WHERE val > 9900;
+----
+
+query II
+SELECT id, val FROM sel_base WHERE val > 9900 EXCEPT ALL SELECT * FROM mv_selfilt;
+----
+
+# ==========================================
+# Test 16: Filter selectivity — non-matching inserts are cheap
+# ==========================================
+
+# Insert 200 rows that do NOT pass the filter (val = 0)
+statement ok
+INSERT INTO sel_base SELECT i, 0 FROM range(20001, 20201) t(i);
+
+# Despite 200 delta rows, filter selectivity keeps IVM cost manageable
+query III
+PRAGMA ivm_cost('mv_selfilt');
+----
+incremental	545.754248	2660.000000
+
+statement ok
+PRAGMA ivm('mv_selfilt');
+
+# Count unchanged — filter rejects all new rows
+query I
+SELECT count(*) FROM mv_selfilt;
+----
+200
+
+# Cross-check
+query II
+SELECT * FROM mv_selfilt EXCEPT ALL SELECT id, val FROM sel_base WHERE val > 9900;
+----
+
+query II
+SELECT id, val FROM sel_base WHERE val > 9900 EXCEPT ALL SELECT * FROM mv_selfilt;
+----
+
+# ==========================================
+# Test 17: Filter selectivity — mixed DML correctness
+# ==========================================
+
+# Insert passing row, insert non-passing row, delete a passing row
+statement ok
+INSERT INTO sel_base VALUES (30001, 99999);
+
+statement ok
+INSERT INTO sel_base VALUES (30002, 1);
+
+statement ok
+DELETE FROM sel_base WHERE id = 9901;
+
+statement ok
+PRAGMA ivm('mv_selfilt');
+
+query I
+SELECT count(*) FROM mv_selfilt;
+----
+200
+
+# Cross-check
+query II
+SELECT * FROM mv_selfilt EXCEPT ALL SELECT id, val FROM sel_base WHERE val > 9900;
+----
+
+query II
+SELECT id, val FROM sel_base WHERE val > 9900 EXCEPT ALL SELECT * FROM mv_selfilt;
+----
