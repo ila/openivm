@@ -664,9 +664,11 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		if (!has_minmax) {
 			auto source_tables = metadata.GetDeltaTables(view_name);
 			for (auto &dt : source_tables) {
-				// Strip "delta_" prefix to get base table name
-				string source =
+				// Strip "delta_" prefix to get base table name (standard tables only;
+				// DuckLake tables are stored without the prefix)
+				string base_name =
 				    StringUtil::StartsWith(dt, ivm::DELTA_PREFIX) ? dt.substr(strlen(ivm::DELTA_PREFIX)) : dt;
+				string source = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(base_name);
 				string null_cols;
 				for (auto &col : column_names) {
 					if (col != string(ivm::MULTIPLICITY_COL)) {
@@ -676,9 +678,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 						null_cols += KeywordHelper::WriteOptionallyQuoted(col) + " = NULL";
 					}
 				}
-				string qdt = data_table;
-				upsert_query += "UPDATE " + qdt + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " + source +
-				                " LIMIT 1);\n";
+				upsert_query += "UPDATE " + data_table + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " +
+				                source + " LIMIT 1);\n";
 			}
 		}
 		break;

@@ -132,8 +132,53 @@ SELECT count(*) FROM (
 # COUNT(*) ungrouped (simple/scalar aggregate)
 # ==========================================
 
-# TODO: ungrouped COUNT(*) crashes with DuckLake (index -2 error in delta scan)
-# Tracked as known limitation — needs fix for ungrouped/scalar aggregates
+statement ok
+CREATE TABLE dl.counter (id INT, val INT);
+
+statement ok
+INSERT INTO dl.counter VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_counter AS SELECT COUNT(*) as cnt FROM dl.counter;
+
+query I
+SELECT cnt FROM dl.mv_counter;
+----
+3
+
+statement ok
+INSERT INTO dl.counter VALUES (4, 40), (5, 50);
+
+statement ok
+PRAGMA ivm('mv_counter');
+
+query I
+SELECT cnt FROM dl.mv_counter;
+----
+5
+
+# Cross-check
+query I
+SELECT count(*) FROM (SELECT COUNT(*) as cnt FROM dl.counter EXCEPT ALL SELECT cnt FROM dl.mv_counter);
+----
+0
+
+# Delete some rows
+statement ok
+DELETE FROM dl.counter WHERE id <= 2;
+
+statement ok
+PRAGMA ivm('mv_counter');
+
+query I
+SELECT cnt FROM dl.mv_counter;
+----
+3
+
+query I
+SELECT count(*) FROM (SELECT COUNT(*) as cnt FROM dl.counter EXCEPT ALL SELECT cnt FROM dl.mv_counter);
+----
+0
 
 # ==========================================
 # Stress test: batch many conflicting DML ops
