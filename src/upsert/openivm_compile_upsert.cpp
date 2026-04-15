@@ -52,26 +52,43 @@ static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &col
 
 	for (auto &col : columns) {
 		// Check sum-of-squares prefixes BEFORE sum (they start with _ivm_sum_ or _ivm_var_)
+		// Assignments moved out of if-conditions to satisfy bugprone-assignment-in-if-condition.
 		string alias;
-		if (!(alias = MatchPrefix(col, sum_sqp_prefix)).empty()) {
+		alias = MatchPrefix(col, sum_sqp_prefix);
+		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = true;
 			result.is_population[alias] = true;
-		} else if (!(alias = MatchPrefix(col, var_sqp_prefix)).empty()) {
+			continue;
+		}
+		alias = MatchPrefix(col, var_sqp_prefix);
+		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = false;
 			result.is_population[alias] = true;
-		} else if (!(alias = MatchPrefix(col, sum_sq_prefix)).empty()) {
+			continue;
+		}
+		alias = MatchPrefix(col, sum_sq_prefix);
+		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = true;
 			result.is_population[alias] = false;
-		} else if (!(alias = MatchPrefix(col, var_sq_prefix)).empty()) {
+			continue;
+		}
+		alias = MatchPrefix(col, var_sq_prefix);
+		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = false;
 			result.is_population[alias] = false;
-		} else if (!(alias = MatchPrefix(col, sum_prefix)).empty()) {
+			continue;
+		}
+		alias = MatchPrefix(col, sum_prefix);
+		if (!alias.empty()) {
 			result.sum_cols[alias] = col;
-		} else if (!(alias = MatchPrefix(col, count_prefix)).empty()) {
+			continue;
+		}
+		alias = MatchPrefix(col, count_prefix);
+		if (!alias.empty()) {
 			result.count_cols[alias] = col;
 		}
 	}
@@ -119,12 +136,22 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// Build per-column aggregate type map from metadata (for insert-only MIN/MAX).
 	// aggregate_types aligns with aggregate expressions in the rewritten plan:
 	// one entry per BoundAggregateExpression (excludes AVG/STDDEV-derived cols which are projections).
+	// Build per-column aggregate type map from aggregate_types metadata.
+	// aggregate_types has one entry per ORIGINAL aggregate expression (before plan rewrites).
+	// Decomposed aggregates (avg, stddev, variance) are replaced by hidden columns in the
+	// plan rewrite, so we skip their entries to keep the mapping aligned with user-visible columns.
+	static const unordered_set<string> DECOMPOSED_TYPES = {"avg",      "stddev",   "stddev_samp", "stddev_pop",
+	                                                       "variance", "var_samp", "var_pop"};
 	unordered_map<string, string> col_agg_type;
 	if (!aggregate_types.empty()) {
 		idx_t type_idx = 0;
 		for (auto &column : aggregates) {
-			if (decomp.derived_cols.count(column)) {
+			if (decomp.derived_cols.count(column) || column.find("_ivm_") != string::npos) {
 				continue;
+			}
+			// Skip decomposed aggregate_types entries (avg → SUM+COUNT hidden cols)
+			while (type_idx < aggregate_types.size() && DECOMPOSED_TYPES.count(aggregate_types[type_idx])) {
+				type_idx++;
 			}
 			if (type_idx < aggregate_types.size()) {
 				col_agg_type[column] = aggregate_types[type_idx++];
@@ -323,8 +350,12 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			if (col == match_count_col) {
 				lj_update_set += col + " = " + mc_new;
 			} else {
+				// Determine if this column should be 0 (count-like) or NULL (sum-like) when unmatched.
+				// Check both the aggregate_types metadata AND the hidden column prefix
+				// (hidden _ivm_count_* columns from AVG/STDDEV decomposition don't have agg_type entries).
 				string agg_type = col_agg_type.count(col) ? col_agg_type.at(col) : "";
-				bool is_count = (agg_type == "count" || agg_type == "count_star");
+				bool is_count =
+				    (agg_type == "count" || agg_type == "count_star" || col.find(string(ivm::COUNT_COL_PREFIX)) == 0);
 				string null_val = is_count ? "0" : "NULL";
 				lj_update_set +=
 				    col + " = CASE WHEN " + mc_new + " > 0 THEN " + updated_col(col) + " ELSE " + null_val + " END";
@@ -342,7 +373,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				cond_insert_vals += "d." + match_count_col;
 			} else {
 				string agg_type = col_agg_type.count(aggregates[i]) ? col_agg_type.at(aggregates[i]) : "";
-				bool is_count = (agg_type == "count" || agg_type == "count_star");
+				bool is_count = (agg_type == "count" || agg_type == "count_star" ||
+				                 aggregates[i].find(string(ivm::COUNT_COL_PREFIX)) == 0);
 				string null_val = is_count ? "0" : "NULL";
 				cond_insert_vals +=
 				    "CASE WHEN d." + match_count_col + " > 0 THEN d." + aggregates[i] + " ELSE " + null_val + " END";

@@ -321,7 +321,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// Catalog-qualified prefix for SQL references (e.g. "dl.main." or "" for default).
 	// Only add the prefix when the catalog is non-default (e.g. DuckLake attached DB).
 	string catalog_prefix;
-	if (!view_catalog_name.empty() && view_catalog_name != "memory" && view_catalog_name != INVALID_CATALOG) {
+	if (!view_catalog_name.empty() && view_catalog_name != "memory") {
 		catalog_prefix = view_catalog_name + "." + view_schema_name + ".";
 	}
 	// Bare table names for catalog lookups; qualified names for SQL
@@ -648,7 +648,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	case IVMType::SIMPLE_PROJECTION: {
 		if (has_left_join) {
 			string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
-			string qdt = data_table;
+			const string &qdt = data_table;
 			string qdv = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
 			string lk = KeywordHelper::WriteOptionallyQuoted(string(ivm::LEFT_KEY_COL));
 			string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
@@ -821,7 +821,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			string temp_name = string(ivm::TEMP_TABLE_PREFIX) + view_name;
 			string qt = KeywordHelper::WriteOptionallyQuoted(temp_name);
 			string qdvn = KeywordHelper::WriteOptionallyQuoted(delta_view_name);
-			string qdt2 = data_table;
+			const string &qdt2 = data_table;
 			pre_companion = "CREATE TEMP TABLE " + qt + " AS SELECT * FROM " + qdt2 + ";\n";
 			// Post: clear ALL IVM delta rows (both true and false), replace with absolute snapshots
 			post_companion = "DELETE FROM " + qdvn + " WHERE 1=1";
@@ -901,7 +901,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
 			// Find the catalog name for this DuckLake table from the view query
 			// (the table name in metadata is the bare name, e.g. "products")
-			string cat_name = view_catalog_name; // default to view's catalog
+			const string &cat_name = view_catalog_name; // default to view's catalog
 			snapshot_update_query += "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
 			                         " SET last_snapshot_id = (SELECT id FROM " + cat_name + ".current_snapshot())" +
 			                         " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
