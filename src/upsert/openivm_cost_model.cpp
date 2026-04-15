@@ -1,4 +1,5 @@
 #include "upsert/openivm_cost_model.hpp"
+#include <cmath>
 #include <unordered_set>
 #include "core/openivm_constants.hpp"
 #include "core/openivm_metadata.hpp"
@@ -162,6 +163,188 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 	}
 }
 
+// ============================================================================
+// Learned cost model: weighted NNLS ridge regression
+// ============================================================================
+
+struct RegressionWeights {
+	double w_compute;   // >= 0 (NNLS constraint)
+	double w_upsert;    // >= 0 (NNLS constraint)
+	double w_intercept; // unconstrained
+	bool calibrated;    // false if insufficient data
+};
+
+/// Solve a 2x2 linear system Ax = b. Returns false if singular.
+static bool Solve2x2(double a00, double a01, double a10, double a11, double b0, double b1, double &x0, double &x1) {
+	double det = a00 * a11 - a01 * a10;
+	if (std::abs(det) < 1e-15) {
+		return false;
+	}
+	x0 = (a11 * b0 - a01 * b1) / det;
+	x1 = (a00 * b1 - a10 * b0) / det;
+	return true;
+}
+
+/// Solve a 3x3 linear system Ax = b. Returns false if singular.
+static bool Solve3x3(const double A[3][3], const double b[3], double x[3]) {
+	// Gaussian elimination with partial pivoting for a 3x3 system.
+	double M[3][4]; // augmented matrix
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			M[i][j] = A[i][j];
+		}
+		M[i][3] = b[i];
+	}
+	for (int col = 0; col < 3; col++) {
+		// Partial pivoting
+		int max_row = col;
+		for (int row = col + 1; row < 3; row++) {
+			if (std::abs(M[row][col]) > std::abs(M[max_row][col])) {
+				max_row = row;
+			}
+		}
+		if (max_row != col) {
+			for (int j = 0; j < 4; j++) {
+				std::swap(M[col][j], M[max_row][j]);
+			}
+		}
+		if (std::abs(M[col][col]) < 1e-15) {
+			return false;
+		}
+		// Eliminate below
+		for (int row = col + 1; row < 3; row++) {
+			double factor = M[row][col] / M[col][col];
+			for (int j = col; j < 4; j++) {
+				M[row][j] -= factor * M[col][j];
+			}
+		}
+	}
+	// Back substitution
+	for (int i = 2; i >= 0; i--) {
+		x[i] = M[i][3];
+		for (int j = i + 1; j < 3; j++) {
+			x[i] -= M[i][j] * x[j];
+		}
+		x[i] /= M[i][i];
+	}
+	return std::isfinite(x[0]) && std::isfinite(x[1]) && std::isfinite(x[2]);
+}
+
+/// Fit weighted NNLS ridge regression from execution history.
+/// Returns calibrated weights or uncalibrated fallback.
+static RegressionWeights FitRegression(const vector<IVMMetadata::RefreshHistoryEntry> &history, double decay,
+                                       double ridge_lambda, idx_t min_samples) {
+	RegressionWeights result = {1.0, 1.0, 0.0, false};
+	idx_t n = history.size();
+	if (n < min_samples) {
+		return result; // cold start — use static model
+	}
+
+	// Build weighted normal equations: (X'WX + λI) w = X'Wy
+	// X columns: [compute_est, upsert_est, 1.0]
+	// Decay weights: most recent = 1.0, oldest = decay^(n-1)
+	double XtWX[3][3] = {};
+	double XtWy[3] = {};
+	double weighted_sum_y = 0;
+	double weight_sum = 0;
+
+	for (idx_t i = 0; i < n; i++) {
+		double w = std::pow(decay, static_cast<double>(n - 1 - i));
+		double x[3] = {history[i].compute_est, history[i].upsert_est, 1.0};
+		double y = history[i].actual_ms;
+		for (int r = 0; r < 3; r++) {
+			for (int c = 0; c < 3; c++) {
+				XtWX[r][c] += w * x[r] * x[c];
+			}
+			XtWy[r] += w * x[r] * y;
+		}
+		weighted_sum_y += w * y;
+		weight_sum += w;
+	}
+
+	// Add ridge regularization
+	for (int i = 0; i < 3; i++) {
+		XtWX[i][i] += ridge_lambda;
+	}
+
+	double w_vec[3];
+	if (!Solve3x3(XtWX, XtWy, w_vec)) {
+		// Singular — fall back to weighted mean
+		result.w_compute = 0.0;
+		result.w_upsert = 0.0;
+		result.w_intercept = (weight_sum > 0) ? weighted_sum_y / weight_sum : 0.0;
+		result.calibrated = true;
+		return result;
+	}
+
+	// NNLS: clamp negative slope coefficients, re-fit with reduced features
+	if (w_vec[0] < 0 && w_vec[1] < 0) {
+		// Both slopes negative — use weighted mean
+		result.w_compute = 0.0;
+		result.w_upsert = 0.0;
+		result.w_intercept = (weight_sum > 0) ? weighted_sum_y / weight_sum : 0.0;
+		result.calibrated = true;
+		return result;
+	}
+
+	if (w_vec[0] < 0) {
+		// Remove compute, re-fit with (upsert, intercept)
+		double A[2][2] = {};
+		double b2[2] = {};
+		for (idx_t i = 0; i < n; i++) {
+			double w = std::pow(decay, static_cast<double>(n - 1 - i));
+			double x[2] = {history[i].upsert_est, 1.0};
+			double y = history[i].actual_ms;
+			for (int r = 0; r < 2; r++) {
+				for (int c = 0; c < 2; c++) {
+					A[r][c] += w * x[r] * x[c];
+				}
+				b2[r] += w * x[r] * y;
+			}
+		}
+		A[0][0] += ridge_lambda;
+		A[1][1] += ridge_lambda;
+		double w2_0, w2_1;
+		if (Solve2x2(A[0][0], A[0][1], A[1][0], A[1][1], b2[0], b2[1], w2_0, w2_1) && w2_0 >= 0) {
+			result = {0.0, w2_0, w2_1, true};
+		} else {
+			result = {0.0, 0.0, (weight_sum > 0) ? weighted_sum_y / weight_sum : 0.0, true};
+		}
+		return result;
+	}
+
+	if (w_vec[1] < 0) {
+		// Remove upsert, re-fit with (compute, intercept)
+		double A[2][2] = {};
+		double b2[2] = {};
+		for (idx_t i = 0; i < n; i++) {
+			double w = std::pow(decay, static_cast<double>(n - 1 - i));
+			double x[2] = {history[i].compute_est, 1.0};
+			double y = history[i].actual_ms;
+			for (int r = 0; r < 2; r++) {
+				for (int c = 0; c < 2; c++) {
+					A[r][c] += w * x[r] * x[c];
+				}
+				b2[r] += w * x[r] * y;
+			}
+		}
+		A[0][0] += ridge_lambda;
+		A[1][1] += ridge_lambda;
+		double w2_0, w2_1;
+		if (Solve2x2(A[0][0], A[0][1], A[1][0], A[1][1], b2[0], b2[1], w2_0, w2_1) && w2_0 >= 0) {
+			result = {w2_0, 0.0, w2_1, true};
+		} else {
+			result = {0.0, 0.0, (weight_sum > 0) ? weighted_sum_y / weight_sum : 0.0, true};
+		}
+		return result;
+	}
+
+	result = {w_vec[0], w_vec[1], w_vec[2], true};
+	return result;
+}
+
+// ============================================================================
+
 IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name) {
 	// Single connection for all cardinality queries
 	Connection con(*context.db);
@@ -185,7 +368,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	size_t N = table_stats.size();
 	if (N == 0) {
 		// No base tables found — shouldn't happen, but default to IVM
-		return {0.0, 1.0};
+		return {0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, false};
 	}
 
 	// 2. Compute basic metrics
@@ -330,6 +513,54 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	double recompute_replace = mv_card * 2.0;             // delete all + insert all
 	double recompute_total = recompute_compute + recompute_replace;
 
+	// 5. Learned cost model: calibrate predictions using execution history
+	//    Gated by ivm_adaptive_refresh (same gate as the cost model decision).
+	double ivm_predicted_ms = ivm_total;
+	double recompute_predicted_ms = recompute_total;
+	bool calibrated = false;
+
+	Value adaptive_val;
+	bool adaptive_on = false;
+	if (context.TryGetCurrentSetting("ivm_adaptive_refresh", adaptive_val) && !adaptive_val.IsNull()) {
+		adaptive_on = adaptive_val.GetValue<bool>();
+	}
+
+	if (adaptive_on) {
+		// Read decay setting
+		double decay = 0.9;
+		Value decay_val;
+		if (context.TryGetCurrentSetting("ivm_cost_decay", decay_val) && !decay_val.IsNull()) {
+			decay = decay_val.GetValue<double>();
+			if (decay < 0.0 || decay > 1.0) {
+				decay = 0.9;
+			}
+		}
+
+		IVMMetadata metadata(con);
+		constexpr double RIDGE_LAMBDA = 1e-4;
+		constexpr idx_t MIN_SAMPLES = 3;
+
+		auto ivm_history = metadata.GetRefreshHistory(view_name, "incremental");
+		auto ivm_reg = FitRegression(ivm_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
+		if (ivm_reg.calibrated) {
+			ivm_predicted_ms =
+			    std::max(0.0, ivm_reg.w_compute * ivm_compute + ivm_reg.w_upsert * ivm_upsert + ivm_reg.w_intercept);
+			calibrated = true;
+			OPENIVM_DEBUG_PRINT("[COST MODEL] IVM regression: w_compute=%.4f, w_upsert=%.4f, intercept=%.1f\n",
+			                    ivm_reg.w_compute, ivm_reg.w_upsert, ivm_reg.w_intercept);
+		}
+
+		auto rc_history = metadata.GetRefreshHistory(view_name, "full");
+		auto rc_reg = FitRegression(rc_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
+		if (rc_reg.calibrated) {
+			recompute_predicted_ms = std::max(0.0, rc_reg.w_compute * recompute_compute +
+			                                           rc_reg.w_upsert * recompute_replace + rc_reg.w_intercept);
+			calibrated = true;
+			OPENIVM_DEBUG_PRINT("[COST MODEL] Recompute regression: w_compute=%.4f, w_replace=%.4f, intercept=%.1f\n",
+			                    rc_reg.w_compute, rc_reg.w_upsert, rc_reg.w_intercept);
+		}
+	}
+
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s, DuckLake: %s, FK pruned PKs: %lu\n", N,
 	                    has_join ? "yes" : "no", has_aggregate ? "yes" : "no", plan_stats.all_ducklake ? "yes" : "no",
 	                    (unsigned long)fk_pk_leaf_count);
@@ -341,9 +572,23 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	                    ivm_upsert);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Recompute cost: %.0f (compute: %.0f, replace: %.0f)\n", recompute_total,
 	                    recompute_compute, recompute_replace);
-	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n", ivm_total < recompute_total ? "IVM" : "RECOMPUTE");
+	if (calibrated) {
+		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: IVM=%.0fms, Recompute=%.0fms\n", ivm_predicted_ms,
+		                    recompute_predicted_ms);
+	}
+	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n", ivm_predicted_ms < recompute_predicted_ms ? "IVM" : "RECOMPUTE");
 
-	return {ivm_total, recompute_total};
+	IVMCostEstimate estimate;
+	estimate.ivm_compute = ivm_compute;
+	estimate.ivm_upsert = ivm_upsert;
+	estimate.recompute_compute = recompute_compute;
+	estimate.recompute_replace = recompute_replace;
+	estimate.ivm_cost = ivm_total;
+	estimate.recompute_cost = recompute_total;
+	estimate.ivm_predicted_ms = ivm_predicted_ms;
+	estimate.recompute_predicted_ms = recompute_predicted_ms;
+	estimate.calibrated = calibrated;
+	return estimate;
 }
 
 string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters) {
@@ -351,6 +596,17 @@ string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters
 
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection con(db);
+
+	// Propagate user session settings to the cost estimation connection.
+	// The new connection has defaults, so settings like ivm_adaptive_refresh
+	// must be copied from the calling context for calibration to activate.
+	for (auto &setting_name : {"ivm_adaptive_refresh", "ivm_cost_decay", "ivm_ducklake_nterm", "ivm_fk_pruning"}) {
+		Value v;
+		if (context.TryGetCurrentSetting(setting_name, v) && !v.IsNull()) {
+			con.Query("SET " + string(setting_name) + " = " + v.ToString());
+		}
+	}
+
 	con.BeginTransaction();
 
 	IVMMetadata metadata(con);
@@ -361,6 +617,7 @@ string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters
 	}
 
 	auto &con_ctx = *con.context;
+
 	Parser p;
 	p.ParseQuery(view_query);
 	Planner planner(con_ctx);
@@ -373,7 +630,18 @@ string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters
 
 	string decision = estimate.ShouldRecompute() ? "full" : "incremental";
 	return "SELECT '" + decision + "' AS decision, " + to_string(estimate.ivm_cost) + " AS ivm_cost, " +
-	       to_string(estimate.recompute_cost) + " AS recompute_cost";
+	       to_string(estimate.recompute_cost) + " AS recompute_cost, " + to_string(estimate.ivm_predicted_ms) +
+	       " AS ivm_predicted_ms, " + to_string(estimate.recompute_predicted_ms) + " AS recompute_predicted_ms, " +
+	       (estimate.calibrated ? "true" : "false") + " AS calibrated";
+}
+
+string IVMCostHistoryQuery(ClientContext &context, const FunctionParameters &parameters) {
+	auto view_name = StringValue::Get(parameters.values[0]);
+	return "SELECT view_name, refresh_timestamp, method, ivm_compute_est, ivm_upsert_est,"
+	       " recompute_compute_est, recompute_replace_est, actual_duration_ms"
+	       " FROM " +
+	       string(ivm::HISTORY_TABLE) + " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+	       "' ORDER BY refresh_timestamp DESC LIMIT 20";
 }
 
 } // namespace duckdb

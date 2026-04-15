@@ -29,10 +29,10 @@ SELECT count(*) FROM mv_proj;
 statement ok
 INSERT INTO proj_base VALUES (101, 'new_name');
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_proj');
 ----
-incremental	8.643856	401.000000
+incremental	8.643856	401.000000	8.643856	401.000000	false
 
 statement ok
 PRAGMA ivm('mv_proj');
@@ -54,10 +54,10 @@ SELECT id, name FROM mv_proj WHERE id = 101;
 statement ok
 INSERT INTO proj_base SELECT i, 'batch_' || i::VARCHAR FROM range(102, 402) t(i);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_proj');
 ----
-full	2597.463445	704.000000
+full	2597.463445	704.000000	2597.463445	704.000000	false
 
 statement ok
 PRAGMA ivm('mv_proj');
@@ -102,10 +102,10 @@ INSERT INTO agg_base VALUES (201, 0, 999);
 statement ok
 INSERT INTO agg_base VALUES (202, 0, 1);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_agg');
 ----
-incremental	6.000000	232.000000
+incremental	6.000000	232.000000	6.000000	232.000000	false
 
 statement ok
 PRAGMA ivm('mv_agg');
@@ -142,10 +142,10 @@ SELECT count(*) FROM mv_del;
 statement ok
 DELETE FROM del_base WHERE id > 20;
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_del');
 ----
-full	691.508495	400.000000
+full	691.508495	400.000000	691.508495	400.000000	false
 
 statement ok
 PRAGMA ivm('mv_del');
@@ -183,10 +183,10 @@ odd	625	25
 statement ok
 DELETE FROM agg_del WHERE grp = 'even';
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_agg_del');
 ----
-incremental	29.000000	56.000000
+incremental	29.000000	56.000000	29.000000	56.000000	false
 
 statement ok
 PRAGMA ivm('mv_agg_del');
@@ -213,10 +213,10 @@ CREATE MATERIALIZED VIEW mv_multi AS SELECT grp, sum(val) as total FROM multi GR
 statement ok
 INSERT INTO multi VALUES (101, 0, 500);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_multi');
 ----
-incremental	3.000000	116.000000
+incremental	3.000000	116.000000	3.000000	116.000000	false
 
 statement ok
 PRAGMA ivm('mv_multi');
@@ -230,10 +230,10 @@ SELECT grp, total FROM mv_multi WHERE grp = 0;
 statement ok
 INSERT INTO multi VALUES (102, 1, 1000);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_multi');
 ----
-incremental	3.000000	117.000000
+incremental	3.000000	117.000000	3.000000	117.000000	false
 
 statement ok
 PRAGMA ivm('mv_multi');
@@ -247,10 +247,10 @@ SELECT grp, total FROM mv_multi WHERE grp = 1;
 statement ok
 INSERT INTO multi SELECT i, i % 5, i * 2 FROM range(200, 500) t(i);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_multi');
 ----
-incremental	310.000000	417.000000
+incremental	310.000000	417.000000	310.000000	417.000000	false
 
 statement ok
 PRAGMA ivm('mv_multi');
@@ -282,10 +282,10 @@ SELECT grp, sum(val) as total FROM multi GROUP BY grp ORDER BY grp;
 # Test 7: Empty delta — no-op refresh
 # ==========================================
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_multi');
 ----
-incremental	0.000000	417.000000
+incremental	0.000000	417.000000	0.000000	417.000000	false
 
 statement ok
 PRAGMA ivm('mv_multi');
@@ -321,10 +321,10 @@ SELECT count(*) FROM mv_filt;
 statement ok
 INSERT INTO filt VALUES (151, 'active', 151);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_filt');
 ----
-incremental	4.343928	226.000000
+incremental	4.343928	226.000000	4.343928	226.000000	false
 
 statement ok
 PRAGMA ivm('mv_filt');
@@ -338,10 +338,10 @@ SELECT count(*) FROM mv_filt;
 statement ok
 INSERT INTO filt SELECT i, 'active', i FROM range(200, 500) t(i);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_filt');
 ----
-full	1303.083011	379.000000
+full	1303.083011	379.000000	1303.083011	379.000000	false
 
 statement ok
 PRAGMA ivm('mv_filt');
@@ -380,10 +380,10 @@ c	2	59	20
 statement ok
 INSERT INTO minmax_base VALUES (61, 'a', 0);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_minmax');
 ----
-incremental	3.000000	70.000000
+incremental	3.000000	70.000000	3.000000	70.000000	false
 
 statement ok
 PRAGMA ivm('mv_minmax');
@@ -399,10 +399,10 @@ c	2	59	20
 statement ok
 DELETE FROM minmax_base WHERE id = 61;
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_minmax');
 ----
-incremental	3.000000	70.000000
+incremental	3.000000	70.000000	3.000000	70.000000	false
 
 statement ok
 PRAGMA ivm('mv_minmax');
@@ -431,10 +431,10 @@ CREATE MATERIALIZED VIEW mv_xcheck AS SELECT cat, sum(amount) as total, count(am
 statement ok
 INSERT INTO xcheck VALUES (81, 'A', 9999);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_xcheck');
 ----
-incremental	3.000000	93.000000
+incremental	3.000000	93.000000	3.000000	93.000000	false
 
 statement ok
 PRAGMA ivm('mv_xcheck');
@@ -459,10 +459,10 @@ D	8200	20
 statement ok
 DELETE FROM xcheck WHERE cat = 'D';
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_xcheck');
 ----
-incremental	28.000000	93.000000
+incremental	28.000000	93.000000	28.000000	93.000000	false
 
 statement ok
 PRAGMA ivm('mv_xcheck');
@@ -485,10 +485,10 @@ C	8000	20
 statement ok
 INSERT INTO xcheck SELECT i, 'A', 1 FROM range(1, 301) t(i);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_xcheck');
 ----
-incremental	306.000000	370.000000
+incremental	306.000000	370.000000	306.000000	370.000000	false
 
 statement ok
 PRAGMA ivm('mv_xcheck');
@@ -524,19 +524,19 @@ CREATE MATERIALIZED VIEW mv_cost AS SELECT id, name FROM cost_base;
 statement ok
 PRAGMA ivm('mv_cost');
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_cost');
 ----
-incremental	0.000000	400.000000
+incremental	0.000000	400.000000	0.000000	400.000000	false
 
 # Small delta (1 row on 100-row base) → incremental
 statement ok
 INSERT INTO cost_base VALUES (101, 'x');
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_cost');
 ----
-incremental	8.643856	401.000000
+incremental	8.643856	401.000000	8.643856	401.000000	false
 
 statement ok
 PRAGMA ivm('mv_cost');
@@ -545,19 +545,19 @@ PRAGMA ivm('mv_cost');
 statement ok
 INSERT INTO cost_base SELECT i, 'batch' FROM range(200, 500) t(i);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_cost');
 ----
-full	2597.463445	704.000000
+full	2597.463445	704.000000	2597.463445	704.000000	false
 
 statement ok
 PRAGMA ivm('mv_cost');
 
 # After refresh, delta is empty — back to incremental
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_cost');
 ----
-incremental	0.000000	1604.000000
+incremental	0.000000	1604.000000	0.000000	1604.000000	false
 
 # ==========================================
 # Test 12: ivm_refresh_mode = 'full' — force full recompute
@@ -586,10 +586,10 @@ statement ok
 INSERT INTO mode_base VALUES (51, 'even', 999);
 
 # Cost model says incremental, but we override
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_mode');
 ----
-incremental	3.000000	57.000000
+incremental	3.000000	57.000000	3.000000	57.000000	false
 
 statement ok
 PRAGMA ivm('mv_mode');
@@ -618,10 +618,10 @@ SET ivm_refresh_mode = 'incremental';
 statement ok
 INSERT INTO mode_base SELECT i, 'odd', 1 FROM range(100, 400) t(i);
 
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_mode');
 ----
-incremental	304.000000	357.000000
+incremental	304.000000	357.000000	304.000000	357.000000	false
 
 statement ok
 PRAGMA ivm('mv_mode');
@@ -688,10 +688,10 @@ statement ok
 INSERT INTO sel_base SELECT i, i FROM range(10001, 10101) t(i);
 
 # IVM cost should be reduced by filter selectivity (~1% selectivity)
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_selfilt');
 ----
-incremental	252.877124	2320.000000
+incremental	252.877124	2320.000000	252.877124	2320.000000	false
 
 statement ok
 PRAGMA ivm('mv_selfilt');
@@ -719,10 +719,10 @@ statement ok
 INSERT INTO sel_base SELECT i, 0 FROM range(20001, 20201) t(i);
 
 # Despite 200 delta rows, filter selectivity keeps IVM cost manageable
-query III
+query IIIIII
 PRAGMA ivm_cost('mv_selfilt');
 ----
-incremental	545.754248	2660.000000
+incremental	545.754248	2660.000000	545.754248	2660.000000	false
 
 statement ok
 PRAGMA ivm('mv_selfilt');
@@ -772,3 +772,95 @@ SELECT * FROM mv_selfilt EXCEPT ALL SELECT id, val FROM sel_base WHERE val > 990
 query II
 SELECT id, val FROM sel_base WHERE val > 9900 EXCEPT ALL SELECT * FROM mv_selfilt;
 ----
+
+# ==========================================
+# Test 18: Learned cost model — history recording and correctness
+# ==========================================
+
+statement ok
+SET ivm_adaptive_refresh = true;
+
+statement ok
+CREATE TABLE lt (id INT, grp INT, val INT);
+
+statement ok
+INSERT INTO lt SELECT i, i % 5, i FROM range(1, 101) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lt AS SELECT grp, sum(val) as total FROM lt GROUP BY grp;
+
+# 3 refreshes with varying delta sizes
+statement ok
+INSERT INTO lt VALUES (101, 0, 500);
+
+statement ok
+PRAGMA ivm('mv_lt');
+
+statement ok
+INSERT INTO lt VALUES (102, 1, 500);
+
+statement ok
+PRAGMA ivm('mv_lt');
+
+statement ok
+INSERT INTO lt SELECT i, i % 5, i FROM range(200, 210) t(i);
+
+statement ok
+PRAGMA ivm('mv_lt');
+
+# History recorded: 3 incremental entries with non-negative durations
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_history WHERE view_name = 'mv_lt' AND method = 'incremental' AND actual_duration_ms >= 0;
+----
+3
+
+# Correctness preserved through learned cost model
+query II
+SELECT grp, total FROM mv_lt EXCEPT ALL SELECT grp, sum(val) FROM lt GROUP BY grp;
+----
+
+query II
+SELECT grp, sum(val) FROM lt GROUP BY grp EXCEPT ALL SELECT grp, total FROM mv_lt;
+----
+
+# ==========================================
+# Test 19: Learned cost model — cold start is uncalibrated
+# ==========================================
+
+statement ok
+CREATE TABLE cold_base (id INT, val INT);
+
+statement ok
+INSERT INTO cold_base SELECT i, i FROM range(1, 101) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cold AS SELECT id, val FROM cold_base;
+
+statement ok
+INSERT INTO cold_base VALUES (101, 101);
+
+# No history — predicted_ms equals static cost, calibrated = false
+query IIIIII
+PRAGMA ivm_cost('mv_cold');
+----
+incremental	8.643856	401.000000	8.643856	401.000000	false
+
+# ==========================================
+# Test 20: Learned cost model — history cleanup on REPLACE
+# ==========================================
+
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_history WHERE view_name = 'mv_lt';
+----
+3
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW mv_lt AS SELECT grp, sum(val) as total FROM lt GROUP BY grp;
+
+query I
+SELECT count(*) FROM _duckdb_ivm_refresh_history WHERE view_name = 'mv_lt';
+----
+0
+
+statement ok
+SET ivm_adaptive_refresh = false;

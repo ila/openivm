@@ -90,6 +90,23 @@ public:
 
 	// Update the DuckLake snapshot ID after refresh.
 	void UpdateSnapshotId(const string &view_name, const string &table_name, int64_t snapshot_id);
+
+	// --- Refresh history (learned cost model) ---
+
+	// Record a refresh execution in the history table. Prunes entries beyond the window.
+	void RecordRefreshHistory(const string &view_name, const string &method, double ivm_compute_est,
+	                          double ivm_upsert_est, double recompute_compute_est, double recompute_replace_est,
+	                          int64_t actual_duration_ms, idx_t max_history = 20);
+
+	// Refresh history entry for regression fitting.
+	struct RefreshHistoryEntry {
+		double compute_est; // ivm_compute_est or recompute_compute_est (depending on method)
+		double upsert_est;  // ivm_upsert_est or recompute_replace_est
+		double actual_ms;
+	};
+
+	// Get the last N history entries for a given method ('incremental' or 'full').
+	vector<RefreshHistoryEntry> GetRefreshHistory(const string &view_name, const string &method, idx_t limit = 20);
 };
 
 } // namespace duckdb

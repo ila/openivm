@@ -360,6 +360,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " catalog_type varchar default 'duckdb', last_snapshot_id bigint default null,"
 		              " primary key(view_name, table_name))");
 
+		// Refresh history: stores execution stats for learned cost model calibration
+		ddl.push_back("create table if not exists " + string(ivm::HISTORY_TABLE) +
+		              " (view_name varchar, refresh_timestamp timestamp default current_timestamp,"
+		              " method varchar, ivm_compute_est double, ivm_upsert_est double,"
+		              " recompute_compute_est double, recompute_replace_est double,"
+		              " actual_duration_ms bigint,"
+		              " primary key(view_name, refresh_timestamp))");
+
 		// --- OR REPLACE: drop old MV if it exists ---
 		if (ivm_parse_data.is_replace) {
 			string qvn_drop = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
@@ -373,6 +381,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			ddl.push_back("DROP TABLE IF EXISTS " + qdv_drop);
 			// Clean metadata (the INSERT OR REPLACE below handles _duckdb_ivm_views)
 			ddl.push_back("DELETE FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+			ddl.push_back("DELETE FROM " + string(ivm::HISTORY_TABLE) + " WHERE view_name = '" +
 			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
 		}
 

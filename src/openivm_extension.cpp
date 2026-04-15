@@ -138,6 +138,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "instead of group-recompute",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
+	// Learned cost model
+	db_config.AddExtensionOption("ivm_cost_decay",
+	                             "decay factor for learned cost model regression (0.0-1.0, higher = slower adaptation)",
+	                             LogicalType::DOUBLE, Value::DOUBLE(0.9));
+
 	Connection con(instance);
 
 	// Migration: add new columns to existing _duckdb_ivm_views tables
@@ -145,6 +150,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " ADD COLUMN IF NOT EXISTS refresh_interval BIGINT DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS refresh_in_progress BOOLEAN DEFAULT false");
+
+	// Migration: create refresh history table for learned cost model
+	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::HISTORY_TABLE) +
+	          " (view_name VARCHAR, refresh_timestamp TIMESTAMP DEFAULT current_timestamp,"
+	          " method VARCHAR, ivm_compute_est DOUBLE, ivm_upsert_est DOUBLE,"
+	          " recompute_compute_est DOUBLE, recompute_replace_est DOUBLE,"
+	          " actual_duration_ms BIGINT,"
+	          " PRIMARY KEY(view_name, refresh_timestamp))");
 
 	auto ivm_parser = duckdb::IVMParserExtension();
 
@@ -177,6 +190,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(ivm);
 	auto ivm_cost = PragmaFunction::PragmaCall("ivm_cost", IVMCostQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(ivm_cost);
+	auto ivm_history = PragmaFunction::PragmaCall("ivm_history", IVMCostHistoryQuery, {LogicalType::VARCHAR});
+	loader.RegisterFunction(ivm_history);
 	auto ivm_cross_system = PragmaFunction::PragmaCall(
 	    "ivm_cross_system", UpsertDeltaQueriesLocked,
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});

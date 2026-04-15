@@ -22,6 +22,7 @@
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include <chrono>
 
 namespace duckdb {
 
@@ -58,21 +59,74 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
                                  const string &attached_db_catalog_name, const string &attached_db_schema_name);
 
 // Generate and execute refresh SQL for a single view under its per-view lock.
+// When ivm_adaptive_refresh is on, also computes a cost estimate before execution
+// and records execution history for the learned cost model.
 static void RefreshViewLocked(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                               const string &vn, bool cross_system, const string &attached_db_catalog_name,
                               const string &attached_db_schema_name) {
 	IVMRefreshLocks::LockView(vn);
 	try {
+		// Check if adaptive cost model is active — if so, compute estimate for history recording.
+		bool record_history = false;
+		IVMCostEstimate cost_estimate = {};
+		Value adaptive_val;
+		if (context.TryGetCurrentSetting("ivm_adaptive_refresh", adaptive_val) && !adaptive_val.IsNull() &&
+		    adaptive_val.GetValue<bool>()) {
+			// Compute cost estimate before refresh (for history recording).
+			// GenerateRefreshSQL also computes this when adaptive is on, but we need
+			// the estimate here to record alongside the actual execution time.
+			Connection cost_con(*context.db.get());
+			cost_con.BeginTransaction();
+			IVMMetadata cost_meta(cost_con);
+			auto vq = cost_meta.GetViewQuery(vn);
+			if (!vq.empty()) {
+				Parser cp;
+				cp.ParseQuery(vq);
+				Planner pl(*cost_con.context);
+				pl.CreatePlan(cp.statements[0]->Copy());
+				Optimizer opt(*pl.binder, *cost_con.context);
+				auto plan = opt.Optimize(std::move(pl.plan));
+				cost_estimate = EstimateIVMCost(*cost_con.context, *plan, vn);
+				record_history = true;
+			}
+			cost_con.Rollback();
+		}
+
 		string sql = GenerateRefreshSQL(context, view_catalog_name, view_schema_name, vn, cross_system,
 		                                attached_db_catalog_name, attached_db_schema_name);
 		Connection exec_con(*context.db.get());
 		OPENIVM_DEBUG_PRINT("[UPSERT] Executing refresh SQL:\n%s\n", sql.c_str());
+
+		auto start = std::chrono::steady_clock::now();
 		auto result = exec_con.Query(sql);
+		auto end = std::chrono::steady_clock::now();
+
 		if (result->HasError()) {
-			// Clear the crash-safety flag — this is a SQL error, not a process crash.
-			// Without this, the next refresh would unnecessarily do a full recompute.
 			IVMMetadata(exec_con).SetRefreshInProgress(vn, false);
 			throw InternalException("IVM refresh of '" + vn + "' failed: " + result->GetError());
+		}
+
+		// Record execution history for the learned cost model.
+		if (record_history) {
+			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+			// Determine which method was used: if the cost model said recompute AND adaptive is on,
+			// then full; otherwise incremental (unless force_full, but that's already in the SQL).
+			string method = cost_estimate.ShouldRecompute() ? "full" : "incremental";
+
+			// Check if force_full_refresh overrides (ivm_refresh_mode = 'full')
+			Value mode_val;
+			if (context.TryGetCurrentSetting("ivm_refresh_mode", mode_val) && !mode_val.IsNull()) {
+				auto mode = StringUtil::Lower(mode_val.ToString());
+				if (mode == "full") {
+					method = "full";
+				}
+			}
+
+			IVMMetadata(exec_con).RecordRefreshHistory(vn, method, cost_estimate.ivm_compute, cost_estimate.ivm_upsert,
+			                                           cost_estimate.recompute_compute, cost_estimate.recompute_replace,
+			                                           duration_ms);
+			OPENIVM_DEBUG_PRINT("[HISTORY] Recorded: view=%s, method=%s, duration=%ldms\n", vn.c_str(), method.c_str(),
+			                    (long)duration_ms);
 		}
 	} catch (...) {
 		IVMRefreshLocks::UnlockView(vn);

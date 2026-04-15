@@ -253,4 +253,56 @@ void IVMMetadata::UpdateSnapshotId(const string &view_name, const string &table_
 	}
 }
 
+// --- Refresh history (learned cost model) ---
+
+void IVMMetadata::RecordRefreshHistory(const string &view_name, const string &method, double ivm_compute_est,
+                                       double ivm_upsert_est, double recompute_compute_est,
+                                       double recompute_replace_est, int64_t actual_duration_ms, idx_t max_history) {
+	auto result = con.Query("INSERT INTO " + string(ivm::HISTORY_TABLE) +
+	                        " (view_name, method, ivm_compute_est, ivm_upsert_est,"
+	                        " recompute_compute_est, recompute_replace_est, actual_duration_ms)"
+	                        " VALUES ('" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "', '" + OpenIVMUtils::EscapeValue(method) + "', " +
+	                        to_string(ivm_compute_est) + ", " + to_string(ivm_upsert_est) + ", " +
+	                        to_string(recompute_compute_est) + ", " + to_string(recompute_replace_est) + ", " +
+	                        to_string(actual_duration_ms) + ")");
+	if (result->HasError()) {
+		OPENIVM_DEBUG_PRINT("[HISTORY] Failed to record: %s\n", result->GetError().c_str());
+		return;
+	}
+
+	// Prune old entries beyond the window
+	con.Query("DELETE FROM " + string(ivm::HISTORY_TABLE) + " WHERE view_name = '" +
+	          OpenIVMUtils::EscapeValue(view_name) + "' AND refresh_timestamp NOT IN (SELECT refresh_timestamp FROM " +
+	          string(ivm::HISTORY_TABLE) + " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+	          "' ORDER BY refresh_timestamp DESC LIMIT " + to_string(max_history) + ")");
+}
+
+vector<IVMMetadata::RefreshHistoryEntry> IVMMetadata::GetRefreshHistory(const string &view_name, const string &method,
+                                                                        idx_t limit) {
+	// Select the cost components for the given method:
+	// - For 'incremental': use ivm_compute_est, ivm_upsert_est
+	// - For 'full': use recompute_compute_est, recompute_replace_est
+	string col1 = (method == "incremental") ? "ivm_compute_est" : "recompute_compute_est";
+	string col2 = (method == "incremental") ? "ivm_upsert_est" : "recompute_replace_est";
+
+	auto result =
+	    con.Query("SELECT " + col1 + ", " + col2 + ", actual_duration_ms FROM " + string(ivm::HISTORY_TABLE) +
+	              " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND method = '" +
+	              OpenIVMUtils::EscapeValue(method) + "' ORDER BY refresh_timestamp ASC LIMIT " + to_string(limit));
+
+	vector<RefreshHistoryEntry> entries;
+	if (result->HasError() || result->RowCount() == 0) {
+		return entries;
+	}
+	for (idx_t i = 0; i < result->RowCount(); i++) {
+		RefreshHistoryEntry entry;
+		entry.compute_est = result->GetValue(0, i).GetValue<double>();
+		entry.upsert_est = result->GetValue(1, i).GetValue<double>();
+		entry.actual_ms = result->GetValue(2, i).GetValue<double>();
+		entries.push_back(entry);
+	}
+	return entries;
+}
+
 } // namespace duckdb
