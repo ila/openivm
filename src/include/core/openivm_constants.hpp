@@ -23,8 +23,12 @@ constexpr const char *DATA_TABLE_PREFIX = "_ivm_data_";
 constexpr const char *LEFT_KEY_COL = "_ivm_left_key";
 constexpr const char *DISTINCT_COUNT_COL = "_ivm_distinct_count";
 
-// Internal column prefixes (for AVG decomposition)
+// Internal column prefixes (for AVG and STDDEV/VARIANCE decomposition)
 constexpr const char *SUM_COL_PREFIX = "_ivm_sum_";
+constexpr const char *SUM_SQ_COL_PREFIX = "_ivm_sum_sq_";   // STDDEV: apply sqrt in upsert
+constexpr const char *VAR_SQ_COL_PREFIX = "_ivm_var_sq_";   // VARIANCE: no sqrt in upsert
+constexpr const char *SUM_SQP_COL_PREFIX = "_ivm_sum_sqp_"; // STDDEV_POP: sqrt + population denominator
+constexpr const char *VAR_SQP_COL_PREFIX = "_ivm_var_sqp_"; // VAR_POP: no sqrt + population denominator
 constexpr const char *COUNT_COL_PREFIX = "_ivm_count_";
 
 // Index suffix for GROUP BY unique index on MV data tables

@@ -12,7 +12,9 @@
 
 namespace duckdb {
 
-static const unordered_set<string> SUPPORTED_AGGREGATES = {"count_star", "count", "sum", "min", "max", "avg", "list"};
+static const unordered_set<string> SUPPORTED_AGGREGATES = {
+    "count_star", "count",       "sum",        "min",      "max",      "avg",    "list",
+    "stddev",     "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop"};
 
 /// Check if any expression in the given list contains a non-deterministic function.
 static bool HasVolatileExpression(vector<unique_ptr<Expression>> &expressions) {

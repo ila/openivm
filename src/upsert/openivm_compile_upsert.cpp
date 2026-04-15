@@ -15,31 +15,70 @@ static string Q(const string &name) {
 	return OpenIVMUtils::QuoteIdentifier(name);
 }
 
-/// Detect AVG decomposition columns from the column list.
+/// Detect AVG and STDDEV/VARIANCE decomposition columns from the column list.
 /// AVG(x) is stored as _ivm_sum_<alias>, _ivm_count_<alias>, and <alias>.
-/// Returns: derived_cols (the alias to skip in MERGE), sum_cols (alias→sum_name), count_cols (alias→count_name).
-struct AvgDecomposition {
-	unordered_set<string> derived_cols;
-	unordered_map<string, string> sum_cols;
-	unordered_map<string, string> count_cols;
+/// STDDEV/VARIANCE(x) adds a sum-of-squares column with a prefix encoding the function type:
+///   _ivm_sum_sq_  = stddev_samp (apply sqrt, denominator N-1)
+///   _ivm_var_sq_  = var_samp    (no sqrt, denominator N-1)
+///   _ivm_sum_sqp_ = stddev_pop  (apply sqrt, denominator N)
+///   _ivm_var_sqp_ = var_pop     (no sqrt, denominator N)
+struct DerivedAggDecomposition {
+	unordered_set<string> derived_cols;        // aliases to skip in MERGE
+	unordered_map<string, string> sum_cols;    // alias → _ivm_sum_<alias>
+	unordered_map<string, string> sum_sq_cols; // alias → _ivm_*_sq*_<alias>
+	unordered_map<string, string> count_cols;  // alias → _ivm_count_<alias>
+	// Per-alias flags decoded from the sum_sq prefix
+	unordered_map<string, bool> needs_sqrt;    // alias → true if stddev (not variance)
+	unordered_map<string, bool> is_population; // alias → true if population variant
 };
 
-static AvgDecomposition DetectAvgColumns(const vector<string> &columns) {
-	AvgDecomposition result;
+/// Try to match a column against a prefix. Returns the alias suffix if matched, empty string otherwise.
+static string MatchPrefix(const string &col, const string &prefix) {
+	if (col.size() > prefix.size() && col.substr(0, prefix.size()) == prefix) {
+		return col.substr(prefix.size());
+	}
+	return "";
+}
+
+static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &columns) {
+	DerivedAggDecomposition result;
 	static const string sum_prefix(ivm::SUM_COL_PREFIX);
 	static const string count_prefix(ivm::COUNT_COL_PREFIX);
+	// Sum-of-squares prefixes (check longer ones first to avoid false matches)
+	static const string sum_sqp_prefix(ivm::SUM_SQP_COL_PREFIX); // stddev_pop
+	static const string var_sqp_prefix(ivm::VAR_SQP_COL_PREFIX); // var_pop
+	static const string sum_sq_prefix(ivm::SUM_SQ_COL_PREFIX);   // stddev_samp
+	static const string var_sq_prefix(ivm::VAR_SQ_COL_PREFIX);   // var_samp
+
 	for (auto &col : columns) {
-		if (col.size() > sum_prefix.size() && col.substr(0, sum_prefix.size()) == sum_prefix) {
-			result.sum_cols[col.substr(sum_prefix.size())] = col;
-		} else if (col.size() > count_prefix.size() && col.substr(0, count_prefix.size()) == count_prefix) {
-			result.count_cols[col.substr(count_prefix.size())] = col;
+		// Check sum-of-squares prefixes BEFORE sum (they start with _ivm_sum_ or _ivm_var_)
+		string alias;
+		if (!(alias = MatchPrefix(col, sum_sqp_prefix)).empty()) {
+			result.sum_sq_cols[alias] = col;
+			result.needs_sqrt[alias] = true;
+			result.is_population[alias] = true;
+		} else if (!(alias = MatchPrefix(col, var_sqp_prefix)).empty()) {
+			result.sum_sq_cols[alias] = col;
+			result.needs_sqrt[alias] = false;
+			result.is_population[alias] = true;
+		} else if (!(alias = MatchPrefix(col, sum_sq_prefix)).empty()) {
+			result.sum_sq_cols[alias] = col;
+			result.needs_sqrt[alias] = true;
+			result.is_population[alias] = false;
+		} else if (!(alias = MatchPrefix(col, var_sq_prefix)).empty()) {
+			result.sum_sq_cols[alias] = col;
+			result.needs_sqrt[alias] = false;
+			result.is_population[alias] = false;
+		} else if (!(alias = MatchPrefix(col, sum_prefix)).empty()) {
+			result.sum_cols[alias] = col;
+		} else if (!(alias = MatchPrefix(col, count_prefix)).empty()) {
+			result.count_cols[alias] = col;
 		}
 	}
+	// A column is derived if it has at least SUM + COUNT
 	for (auto &entry : result.sum_cols) {
-		auto &alias = entry.first;
-		auto &sum_col = entry.second;
-		if (result.count_cols.count(alias)) {
-			result.derived_cols.insert(alias);
+		if (result.count_cols.count(entry.first)) {
+			result.derived_cols.insert(entry.first);
 		}
 	}
 	return result;
@@ -75,16 +114,16 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		}
 	}
 
-	auto avg = DetectAvgColumns(aggregates);
+	auto decomp = DetectDerivedAggColumns(aggregates);
 
 	// Build per-column aggregate type map from metadata (for insert-only MIN/MAX).
 	// aggregate_types aligns with aggregate expressions in the rewritten plan:
-	// one entry per BoundAggregateExpression (excludes AVG-derived cols which are projections).
+	// one entry per BoundAggregateExpression (excludes AVG/STDDEV-derived cols which are projections).
 	unordered_map<string, string> col_agg_type;
 	if (!aggregate_types.empty()) {
 		idx_t type_idx = 0;
 		for (auto &column : aggregates) {
-			if (avg.derived_cols.count(column)) {
+			if (decomp.derived_cols.count(column)) {
 				continue;
 			}
 			if (type_idx < aggregate_types.size()) {
@@ -169,61 +208,81 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		on_clause += "v." + keys[i] + " IS NOT DISTINCT FROM d." + keys[i];
 	}
 
-	auto &avg_derived_cols = avg.derived_cols;
-	auto &avg_sum_cols = avg.sum_cols;
-	auto &avg_count_cols = avg.count_cols;
+	auto &derived_cols = decomp.derived_cols;
+	auto &d_sum_cols = decomp.sum_cols;
+	auto &d_sum_sq_cols = decomp.sum_sq_cols;
+	auto &d_count_cols = decomp.count_cols;
+
+	// Helper: generate SQL to compute updated SUM from MERGE (COALESCE handles NULLs)
+	auto updated_col = [](const string &col) -> string {
+		return "COALESCE(v." + col + " + d." + col + ", v." + col + ", d." + col + ")";
+	};
 
 	string update_set;
 	string insert_cols, insert_vals;
 	{
 		const string &zeros_list = ZEROS_LIST;
 		bool first_agg = true;
+
+		// Build update_set and insert_vals in the SAME column order as aggregates.
+		// Derived columns (AVG, STDDEV, VARIANCE) get their formula inline rather
+		// than being appended at the end — this ensures INSERT column/value alignment.
 		for (auto &column : aggregates) {
-			// Skip AVG derived columns in MERGE — they'll be recomputed after
-			if (avg_derived_cols.count(column)) {
-				continue;
-			}
 			if (!first_agg) {
 				update_set += ", ";
 				insert_vals += ", ";
 			}
 			first_agg = false;
 
-			// Determine update expression based on aggregate type
-			string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
-			if (insert_only && agg_type == "min") {
-				update_set += column + " = LEAST(v." + column + ", d." + column + ")";
-			} else if (insert_only && agg_type == "max") {
-				update_set += column + " = GREATEST(v." + column + ", d." + column + ")";
-			} else if (list_mode) {
-				update_set +=
-				    column + " = list_transform(list_zip(v." + column + ", d." + column + "), lambda x: x[1] + x[2])";
+			if (derived_cols.count(column)) {
+				// Derived column: compute from hidden columns
+				string sum_col = d_sum_cols.count(column) ? d_sum_cols.at(column) : "";
+				string count_col = d_count_cols.count(column) ? d_count_cols.at(column) : "";
+				if (sum_col.empty() || count_col.empty()) {
+					update_set += column + " = " + updated_col(column);
+					insert_vals += "d." + column;
+					continue;
+				}
+				bool has_sum_sq = d_sum_sq_cols.count(column) > 0;
+				if (has_sum_sq) {
+					// STDDEV/VARIANCE
+					string sum_sq_col = d_sum_sq_cols.at(column);
+					string new_sum = updated_col(sum_col);
+					string new_sq = updated_col(sum_sq_col);
+					string new_n = updated_col(count_col);
+					bool is_pop = decomp.is_population.count(column) && decomp.is_population.at(column);
+					bool do_sqrt = decomp.needs_sqrt.count(column) && decomp.needs_sqrt.at(column);
+
+					string denom = is_pop ? "NULLIF(" + new_n + ", 0)" : "NULLIF(" + new_n + " - 1, 0)";
+					string var_expr =
+					    "((" + new_sq + ") - (" + new_sum + ") * (" + new_sum + ") / (" + new_n + ")) / " + denom;
+					update_set += column + " = " + (do_sqrt ? "sqrt(" + var_expr + ")" : var_expr);
+
+					string d_denom = is_pop ? "NULLIF(d." + count_col + ", 0)" : "NULLIF(d." + count_col + " - 1, 0)";
+					string d_var = "((d." + sum_sq_col + ") - (d." + sum_col + ") * (d." + sum_col + ") / (d." +
+					               count_col + ")) / " + d_denom;
+					insert_vals += do_sqrt ? "sqrt(" + d_var + ")" : d_var;
+				} else {
+					// AVG
+					update_set +=
+					    column + " = " + updated_col(sum_col) + "::DOUBLE / NULLIF(" + updated_col(count_col) + ", 0)";
+					insert_vals += "d." + sum_col + "::DOUBLE / NULLIF(d." + count_col + ", 0)";
+				}
 			} else {
-				update_set +=
-				    column + " = COALESCE(v." + column + " + d." + column + ", v." + column + ", d." + column + ")";
+				// Regular aggregate column
+				string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
+				if (insert_only && agg_type == "min") {
+					update_set += column + " = LEAST(v." + column + ", d." + column + ")";
+				} else if (insert_only && agg_type == "max") {
+					update_set += column + " = GREATEST(v." + column + ", d." + column + ")";
+				} else if (list_mode) {
+					update_set += column + " = list_transform(list_zip(v." + column + ", d." + column +
+					              "), lambda x: x[1] + x[2])";
+				} else {
+					update_set += column + " = " + updated_col(column);
+				}
+				insert_vals += "d." + column;
 			}
-			insert_vals += "d." + column;
-		}
-		// Add AVG derived columns: recompute from updated SUM/COUNT in MERGE
-		for (auto &entry : avg_sum_cols) {
-			auto &alias = entry.first;
-			auto &sum_col = entry.second;
-			if (!avg_count_cols.count(alias)) {
-				continue;
-			}
-			string count_col = avg_count_cols[alias];
-			if (!update_set.empty()) {
-				update_set += ", ";
-			}
-			if (!insert_vals.empty()) {
-				insert_vals += ", ";
-			}
-			// MATCHED: recompute avg from updated sum and count
-			update_set += alias + " = COALESCE(v." + sum_col + " + d." + sum_col + ", v." + sum_col + ", d." + sum_col +
-			              ")::DOUBLE / NULLIF(COALESCE(v." + count_col + " + d." + count_col + ", v." + count_col +
-			              ", d." + count_col + "), 0)";
-			// NOT MATCHED: compute avg from delta sum and count
-			insert_vals += "d." + sum_col + "::DOUBLE / NULLIF(d." + count_col + ", 0)";
 		}
 		for (auto &key : keys) {
 			insert_cols += key + ", ";
@@ -250,8 +309,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	if (!insert_only) {
 		string delete_query = "\ndelete from " + data_table + " where ";
 		for (auto &column : aggregates) {
-			if (avg_derived_cols.count(column)) {
-				continue; // skip avg_x — checking sum/count is sufficient
+			if (derived_cols.count(column)) {
+				continue; // skip derived cols (avg, stddev) — checking sum/count is sufficient
 			}
 			if (list_mode) {
 				delete_query += "list_reduce(" + column + ", lambda a, b: a + b) = 0.0 and ";
@@ -281,10 +340,11 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 	string mul = string(ivm::MULTIPLICITY_COL);
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
-	auto avg = DetectAvgColumns(column_names);
-	auto &avg_derived = avg.derived_cols;
-	auto &avg_sum = avg.sum_cols;
-	auto &avg_count = avg.count_cols;
+	auto decomp = DetectDerivedAggColumns(column_names);
+	auto &d_derived = decomp.derived_cols;
+	auto &d_sum = decomp.sum_cols;
+	auto &d_sum_sq = decomp.sum_sq_cols;
+	auto &d_count = decomp.count_cols;
 
 	// Single CTE consolidates all delta columns in one pass.
 	string cte = "WITH _ivm_delta AS (\n  SELECT ";
@@ -293,8 +353,8 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 
 	for (auto &raw_col : column_names) {
-		if (raw_col == mul || avg_derived.count(raw_col)) {
-			continue; // skip multiplicity and AVG derived columns
+		if (raw_col == mul || d_derived.count(raw_col)) {
+			continue; // skip multiplicity and derived columns (AVG, STDDEV, VARIANCE)
 		}
 		string column = Q(raw_col);
 		if (!first) {
@@ -322,16 +382,30 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 
 	string result = cte + "UPDATE " + data_table + " SET\n  " + update_set + ";\n";
 
-	// Recompute AVG derived columns from updated SUM and COUNT
-	for (auto &entry : avg_sum) {
+	// Recompute derived columns (AVG, STDDEV/VARIANCE) from updated hidden columns
+	for (auto &entry : d_sum) {
 		auto &alias = entry.first;
 		auto &sum_col = entry.second;
-		if (!avg_count.count(alias)) {
+		if (!d_count.count(alias)) {
 			continue;
 		}
-		string count_col = avg_count[alias];
-		result +=
-		    "UPDATE " + data_table + " SET " + alias + " = " + sum_col + "::DOUBLE / NULLIF(" + count_col + ", 0);\n";
+		string count_col = d_count[alias];
+
+		if (d_sum_sq.count(alias)) {
+			// STDDEV/VARIANCE: recompute from sum, sum_sq, count
+			string sum_sq_col = d_sum_sq.at(alias);
+			bool is_pop = decomp.is_population.count(alias) && decomp.is_population.at(alias);
+			bool do_sqrt = decomp.needs_sqrt.count(alias) && decomp.needs_sqrt.at(alias);
+			string denom = is_pop ? "NULLIF(" + count_col + ", 0)" : "NULLIF(" + count_col + " - 1, 0)";
+			string var_expr =
+			    "((" + sum_sq_col + ") - (" + sum_col + ") * (" + sum_col + ") / (" + count_col + ")) / " + denom;
+			string formula = do_sqrt ? "sqrt(" + var_expr + ")" : var_expr;
+			result += "UPDATE " + data_table + " SET " + alias + " = " + formula + ";\n";
+		} else {
+			// AVG: recompute from sum/count
+			result += "UPDATE " + data_table + " SET " + alias + " = " + sum_col + "::DOUBLE / NULLIF(" + count_col +
+			          ", 0);\n";
+		}
 	}
 
 	return result;

@@ -7,6 +7,7 @@
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -86,133 +87,246 @@ static void RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 	node = std::move(agg_node);
 }
 
-/// Decompose AVG(x) into SUM(x), COUNT(x), and SUM/COUNT ratio.
-/// Walks top-down: finds AVG in aggregate, replaces it, propagates new bindings
-/// upward through projections, and adds the ratio expression at each projection.
-static void RewriteAvg(ClientContext &context, unique_ptr<LogicalOperator> &plan, Optimizer &opt) {
-	// Recurse into children first (bottom-up ensures aggregates are processed before parents)
+static bool IsStddevOrVariance(const string &name) {
+	return name == "stddev" || name == "stddev_samp" || name == "stddev_pop" || name == "variance" ||
+	       name == "var_samp" || name == "var_pop";
+}
+
+static bool IsPopulationVariant(const string &name) {
+	return name == "stddev_pop" || name == "var_pop";
+}
+
+static bool IsStddevVariant(const string &name) {
+	return name == "stddev" || name == "stddev_samp" || name == "stddev_pop";
+}
+
+/// Pick the SUM_SQ hidden column prefix based on the original function.
+/// Encodes both stddev-vs-variance (sqrt) and sample-vs-population (denominator).
+static const char *SumSqPrefix(const string &func_name) {
+	if (func_name == "stddev_pop") {
+		return ivm::SUM_SQP_COL_PREFIX;
+	}
+	if (func_name == "var_pop") {
+		return ivm::VAR_SQP_COL_PREFIX;
+	}
+	if (func_name == "variance" || func_name == "var_samp") {
+		return ivm::VAR_SQ_COL_PREFIX;
+	}
+	return ivm::SUM_SQ_COL_PREFIX; // stddev, stddev_samp
+}
+
+/// Decompose AVG and STDDEV/VARIANCE aggregates into incrementalizable components.
+/// Handles both in a SINGLE PASS to keep aggregate expression indices consistent.
+/// - AVG(x)      → SUM(x), COUNT(x) + SUM/COUNT ratio in projection
+/// - STDDEV(x)   → SUM(x), SUM(x*x), COUNT(x) + variance formula in projection
+/// - VARIANCE(x) → same, without sqrt
+static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator> &plan, Optimizer &opt) {
 	for (auto &child : plan->children) {
-		RewriteAvg(context, child, opt);
+		RewriteDerivedAggregates(context, child, opt);
 	}
 
 	if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION) {
 		return;
 	}
-	// Check if the child is an aggregate with AVG
 	if (plan->children.empty() || plan->children[0]->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		return;
 	}
 	auto &agg = plan->children[0]->Cast<LogicalAggregate>();
-	bool has_avg = false;
+
+	// Check if there's anything to decompose
+	bool has_derived = false;
 	for (auto &expr : agg.expressions) {
-		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE &&
-		    expr->Cast<BoundAggregateExpression>().function.name == "avg") {
-			has_avg = true;
-			break;
+		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
+			auto &name = expr->Cast<BoundAggregateExpression>().function.name;
+			if (name == "avg" || IsStddevOrVariance(name)) {
+				has_derived = true;
+				break;
+			}
 		}
 	}
-	if (!has_avg) {
+	if (!has_derived) {
 		return;
 	}
 
 	auto &proj = plan->Cast<LogicalProjection>();
 	size_t group_count = agg.groups.size();
 
-	// Step 1: Replace AVG(x) with SUM(x) + COUNT(x) in the aggregate.
-	// Track which old expression index maps to the new SUM/COUNT indices.
-	struct AvgDecomp {
-		string alias;
-		idx_t sum_idx; // index in new_exprs
+	// Unified decomposition record for both AVG and STDDEV/VARIANCE
+	enum class DecompKind { AVG, STDDEV };
+	struct Decomp {
+		DecompKind kind;
+		string alias;      // internal alias for hidden column suffixes
+		string user_alias; // user-facing alias (from projection expression), set in step 2
+		string func_name;  // original function name
+		idx_t sum_idx;
+		idx_t sum_sq_idx; // only for STDDEV
 		idx_t count_idx;
-		idx_t old_idx; // index in original expressions
+		idx_t old_idx; // index in ORIGINAL expressions array
 	};
-	vector<AvgDecomp> decomps;
+	vector<Decomp> decomps;
 	vector<unique_ptr<Expression>> new_exprs;
+
 	for (idx_t i = 0; i < agg.expressions.size(); i++) {
 		auto &expr = agg.expressions[i];
-		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
-			auto &bound = expr->Cast<BoundAggregateExpression>();
-			if (bound.function.name == "avg" && !bound.children.empty()) {
-				string alias = bound.alias.empty() ? ("avg_" + bound.children[0]->GetName()) : bound.alias;
-				auto arg_type = bound.children[0]->return_type;
-
-				AvgDecomp d;
-				d.alias = alias;
-				d.old_idx = i;
-
-				auto sum_func = BindAggregateByName(context, "sum", {arg_type});
-				vector<unique_ptr<Expression>> sum_args;
-				sum_args.push_back(bound.children[0]->Copy());
-				auto sum_expr = make_uniq<BoundAggregateExpression>(std::move(sum_func), std::move(sum_args), nullptr,
-				                                                    nullptr, AggregateType::NON_DISTINCT);
-				sum_expr->alias = "_ivm_sum_" + alias;
-				d.sum_idx = new_exprs.size();
-				new_exprs.push_back(std::move(sum_expr));
-
-				auto count_func = BindAggregateByName(context, "count", {arg_type});
-				vector<unique_ptr<Expression>> count_args;
-				count_args.push_back(bound.children[0]->Copy());
-				auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args),
-				                                                      nullptr, nullptr, AggregateType::NON_DISTINCT);
-				count_expr->alias = "_ivm_count_" + alias;
-				d.count_idx = new_exprs.size();
-				new_exprs.push_back(std::move(count_expr));
-
-				decomps.push_back(std::move(d));
-				continue;
-			}
+		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			new_exprs.push_back(std::move(expr));
+			continue;
 		}
-		new_exprs.push_back(std::move(expr));
+		auto &bound = expr->Cast<BoundAggregateExpression>();
+		if (bound.children.empty()) {
+			new_exprs.push_back(std::move(expr));
+			continue;
+		}
+
+		bool is_avg = (bound.function.name == "avg");
+		bool is_stddev = IsStddevOrVariance(bound.function.name);
+		if (!is_avg && !is_stddev) {
+			new_exprs.push_back(std::move(expr));
+			continue;
+		}
+
+		string alias = bound.alias.empty() ? (bound.function.name + "_" + bound.children[0]->GetName()) : bound.alias;
+		auto arg_type = bound.children[0]->return_type;
+
+		Decomp d;
+		d.kind = is_avg ? DecompKind::AVG : DecompKind::STDDEV;
+		d.alias = alias;
+		d.func_name = bound.function.name;
+		d.old_idx = i;
+
+		// SUM(x) — both AVG and STDDEV need this
+		auto sum_func = BindAggregateByName(context, "sum", {arg_type});
+		vector<unique_ptr<Expression>> sum_args;
+		sum_args.push_back(bound.children[0]->Copy());
+		auto sum_expr = make_uniq<BoundAggregateExpression>(std::move(sum_func), std::move(sum_args), nullptr, nullptr,
+		                                                    AggregateType::NON_DISTINCT);
+		sum_expr->alias = string(ivm::SUM_COL_PREFIX) + alias;
+		d.sum_idx = new_exprs.size();
+		new_exprs.push_back(std::move(sum_expr));
+
+		// SUM(x * x) — STDDEV/VARIANCE only
+		if (is_stddev) {
+			auto sq_arg = opt.BindScalarFunction("*", bound.children[0]->Copy(), bound.children[0]->Copy());
+			auto sum_sq_func = BindAggregateByName(context, "sum", {sq_arg->return_type});
+			vector<unique_ptr<Expression>> sum_sq_args;
+			sum_sq_args.push_back(std::move(sq_arg));
+			auto sum_sq_expr = make_uniq<BoundAggregateExpression>(std::move(sum_sq_func), std::move(sum_sq_args),
+			                                                       nullptr, nullptr, AggregateType::NON_DISTINCT);
+			sum_sq_expr->alias = string(SumSqPrefix(bound.function.name)) + alias;
+			d.sum_sq_idx = new_exprs.size();
+			new_exprs.push_back(std::move(sum_sq_expr));
+		}
+
+		// COUNT(x) — both AVG and STDDEV need this
+		auto count_func = BindAggregateByName(context, "count", {arg_type});
+		vector<unique_ptr<Expression>> count_args;
+		count_args.push_back(bound.children[0]->Copy());
+		auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
+		                                                      nullptr, AggregateType::NON_DISTINCT);
+		count_expr->alias = string(ivm::COUNT_COL_PREFIX) + alias;
+		d.count_idx = new_exprs.size();
+		new_exprs.push_back(std::move(count_expr));
+
+		decomps.push_back(std::move(d));
 	}
 	agg.expressions = std::move(new_exprs);
 	agg.ResolveOperatorTypes();
 
-	// Step 2: Update the parent projection.
-	// The old projection referenced AVG's binding. Now we need to:
-	// - Replace the AVG column ref with a SUM/COUNT ratio expression
-	// - Add SUM and COUNT as extra passthrough columns (for the upsert MERGE)
+	// Step 2: Update projection — replace derived column refs with formulas
 	auto agg_bindings = plan->children[0]->GetColumnBindings();
 	auto agg_types = plan->children[0]->types;
 
 	for (auto &d : decomps) {
-		// Old AVG binding was at (aggregate_index, old_idx)
-		ColumnBinding old_avg_binding(agg.aggregate_index, d.old_idx);
-
-		// New SUM and COUNT bindings
+		ColumnBinding old_binding(agg.aggregate_index, d.old_idx);
 		ColumnBinding sum_binding = agg_bindings[group_count + d.sum_idx];
 		ColumnBinding count_binding = agg_bindings[group_count + d.count_idx];
 		LogicalType sum_type = agg_types[group_count + d.sum_idx];
 		LogicalType count_type = agg_types[group_count + d.count_idx];
 
-		// Find the projection expression that referenced the old AVG and replace it with SUM/COUNT ratio
+		// Find and replace the projection expression for this aggregate.
+		// Capture the user's alias from the original projection expression (e.g., "my_avg" from
+		// "avg(val) AS my_avg") — this is the column name in the data table. We use it for
+		// hidden column naming so DetectDerivedAggColumns can match them in the upsert compiler.
 		for (idx_t pi = 0; pi < proj.expressions.size(); pi++) {
-			if (proj.expressions[pi]->type == ExpressionType::BOUND_COLUMN_REF) {
-				auto &ref = proj.expressions[pi]->Cast<BoundColumnRefExpression>();
-				if (ref.binding == old_avg_binding) {
-					// Replace with SUM / COUNT
-					auto sum_ref = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
-					auto count_ref = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-					auto ratio = opt.BindScalarFunction("/", std::move(sum_ref), std::move(count_ref));
-					ratio->alias = d.alias;
-					proj.expressions[pi] = std::move(ratio);
-					break;
-				}
+			if (proj.expressions[pi]->type != ExpressionType::BOUND_COLUMN_REF) {
+				continue;
 			}
+			auto &ref = proj.expressions[pi]->Cast<BoundColumnRefExpression>();
+			if (ref.binding != old_binding) {
+				continue;
+			}
+
+			// Capture user's alias BEFORE replacing the expression
+			d.user_alias = ref.alias.empty() ? d.alias : ref.alias;
+
+			unique_ptr<Expression> result;
+			if (d.kind == DecompKind::AVG) {
+				auto sum_ref = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
+				auto count_ref = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+				result = opt.BindScalarFunction("/", std::move(sum_ref), std::move(count_ref));
+			} else {
+				ColumnBinding sum_sq_binding = agg_bindings[group_count + d.sum_sq_idx];
+				LogicalType sum_sq_type = agg_types[group_count + d.sum_sq_idx];
+
+				auto s1 = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
+				auto s2 = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
+				auto sq = make_uniq<BoundColumnRefExpression>(sum_sq_type, sum_sq_binding);
+				auto n = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+
+				auto sum_sq_over_n =
+				    opt.BindScalarFunction("/", opt.BindScalarFunction("*", std::move(s1), std::move(s2)),
+				                           make_uniq<BoundColumnRefExpression>(count_type, count_binding));
+				auto numerator = opt.BindScalarFunction("-", std::move(sq), std::move(sum_sq_over_n));
+
+				unique_ptr<Expression> denom;
+				if (IsPopulationVariant(d.func_name)) {
+					denom = std::move(n);
+				} else {
+					denom =
+					    opt.BindScalarFunction("-", std::move(n), make_uniq<BoundConstantExpression>(Value::BIGINT(1)));
+				}
+				auto var_expr = opt.BindScalarFunction("/", std::move(numerator), std::move(denom));
+				auto formula = IsStddevVariant(d.func_name) ? opt.BindScalarFunction("sqrt", std::move(var_expr))
+				                                            : std::move(var_expr);
+
+				// Wrap in CASE WHEN count > threshold THEN formula ELSE NULL END
+				// to produce NULL instead of nan for groups with insufficient rows.
+				// Sample (stddev/variance): need count > 1; Population: need count > 0.
+				int64_t threshold = IsPopulationVariant(d.func_name) ? 0 : 1;
+				auto count_check = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+				auto when_expr =
+				    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, std::move(count_check),
+				                                         make_uniq<BoundConstantExpression>(Value::BIGINT(threshold)));
+				auto else_expr = make_uniq<BoundConstantExpression>(Value(formula->return_type));
+				result = make_uniq<BoundCaseExpression>(std::move(when_expr), std::move(formula), std::move(else_expr));
+			}
+			result->alias = d.user_alias;
+			proj.expressions[pi] = std::move(result);
+			break;
 		}
 
-		// Add SUM and COUNT as extra passthrough columns (hidden, for upsert MERGE)
-		auto sum_passthrough = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
-		sum_passthrough->alias = "_ivm_sum_" + d.alias;
-		proj.expressions.push_back(std::move(sum_passthrough));
+		// Add hidden columns as passthroughs. Use user_alias so that
+		// DetectDerivedAggColumns in the upsert compiler can match them.
+		string col_suffix = d.user_alias.empty() ? d.alias : d.user_alias;
+		auto sum_pt = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
+		sum_pt->alias = string(ivm::SUM_COL_PREFIX) + col_suffix;
+		proj.expressions.push_back(std::move(sum_pt));
 
-		auto count_passthrough = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-		count_passthrough->alias = "_ivm_count_" + d.alias;
-		proj.expressions.push_back(std::move(count_passthrough));
+		if (d.kind == DecompKind::STDDEV) {
+			ColumnBinding sum_sq_binding = agg_bindings[group_count + d.sum_sq_idx];
+			LogicalType sum_sq_type = agg_types[group_count + d.sum_sq_idx];
+			auto sum_sq_pt = make_uniq<BoundColumnRefExpression>(sum_sq_type, sum_sq_binding);
+			sum_sq_pt->alias = string(SumSqPrefix(d.func_name)) + col_suffix;
+			proj.expressions.push_back(std::move(sum_sq_pt));
+		}
+
+		auto count_pt = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+		count_pt->alias = string(ivm::COUNT_COL_PREFIX) + col_suffix;
+		proj.expressions.push_back(std::move(count_pt));
 	}
 	proj.ResolveOperatorTypes();
 
-	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] AVG → SUM/COUNT ratio + hidden columns, %zu decompositions\n",
-	                    decomps.size());
+	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Derived aggregates → hidden columns, %zu decompositions\n", decomps.size());
 }
 
 /// Add _ivm_left_key projection for LEFT/RIGHT JOINs at the top of the plan.
@@ -399,7 +513,7 @@ void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOp
 	}
 	{
 		Optimizer opt(binder, context);
-		RewriteAvg(context, plan, opt);
+		RewriteDerivedAggregates(context, plan, opt);
 	}
 	RewriteLeftJoinKey(binder, plan);
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Done\n");

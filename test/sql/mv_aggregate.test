@@ -1350,3 +1350,86 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# STDDEV and VARIANCE decomposition
+# ==========================================
+
+statement ok
+CREATE TABLE sd_base (id INT, grp VARCHAR, val DOUBLE);
+
+statement ok
+INSERT INTO sd_base VALUES (1,'a',10), (2,'a',20), (3,'a',30), (4,'b',5), (5,'b',15), (6,'b',25);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_stddev AS
+    SELECT grp, stddev(val) as sd, variance(val) as vr, stddev_pop(val) as sdp, var_pop(val) as vrp
+    FROM sd_base GROUP BY grp;
+
+# Cross-check initial
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, round(sd,6), round(vr,6), round(sdp,6), round(vrp,6) FROM mv_stddev
+    EXCEPT ALL
+    SELECT grp, round(stddev(val),6), round(variance(val),6), round(stddev_pop(val),6), round(var_pop(val),6)
+    FROM sd_base GROUP BY grp
+);
+----
+0
+
+# --- INSERT into existing groups + new group ---
+statement ok
+INSERT INTO sd_base VALUES (7,'a',40), (8,'b',35), (9,'c',100);
+
+statement ok
+PRAGMA ivm('mv_stddev');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, round(sd,6), round(vr,6), round(sdp,6), round(vrp,6) FROM mv_stddev
+    EXCEPT ALL
+    SELECT grp, round(stddev(val),6), round(variance(val),6), round(stddev_pop(val),6), round(var_pop(val),6)
+    FROM sd_base GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, round(stddev(val),6), round(variance(val),6), round(stddev_pop(val),6), round(var_pop(val),6)
+    FROM sd_base GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, round(sd,6), round(vr,6), round(sdp,6), round(vrp,6) FROM mv_stddev
+);
+----
+0
+
+# --- DELETE + mixed DML ---
+statement ok
+DELETE FROM sd_base WHERE id IN (1, 4);
+
+statement ok
+INSERT INTO sd_base VALUES (10,'c',200), (11,'a',50);
+
+statement ok
+PRAGMA ivm('mv_stddev');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, round(sd,6), round(vr,6), round(sdp,6), round(vrp,6) FROM mv_stddev
+    EXCEPT ALL
+    SELECT grp, round(stddev(val),6), round(variance(val),6), round(stddev_pop(val),6), round(var_pop(val),6)
+    FROM sd_base GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, round(stddev(val),6), round(variance(val),6), round(stddev_pop(val),6), round(var_pop(val),6)
+    FROM sd_base GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, round(sd,6), round(vr,6), round(sdp,6), round(vrp,6) FROM mv_stddev
+);
+----
+0
