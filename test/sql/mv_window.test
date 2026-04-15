@@ -1,0 +1,212 @@
+# name: test/sql/mv_window.test
+# description: Test IVM for window functions via partition-level recompute
+# group: [sql]
+
+require openivm
+
+statement ok
+SET ivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Test 1: ROW_NUMBER with PARTITION BY
+# ==========================================
+
+statement ok
+CREATE TABLE wt (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO wt VALUES (1,'a',10), (2,'a',30), (3,'a',20), (4,'b',5), (5,'b',15), (6,'b',25);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_rn AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) as rn FROM wt;
+
+query I
+SELECT count(*) FROM mv_rn;
+----
+6
+
+# Insert into group 'a' only — group 'b' should be unaffected
+statement ok
+INSERT INTO wt VALUES (7,'a',25);
+
+statement ok
+PRAGMA ivm('mv_rn');
+
+query I
+SELECT count(*) FROM mv_rn;
+----
+7
+
+# Cross-check both directions
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) as rn FROM wt
+    EXCEPT ALL SELECT * FROM mv_rn
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_rn
+    EXCEPT ALL SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) as rn FROM wt
+);
+----
+0
+
+# ==========================================
+# Test 2: RANK with DELETE
+# ==========================================
+
+statement ok
+DELETE FROM wt WHERE id = 2;
+
+statement ok
+PRAGMA ivm('mv_rn');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) as rn FROM wt
+    EXCEPT ALL SELECT * FROM mv_rn
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_rn
+    EXCEPT ALL SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) as rn FROM wt
+);
+----
+0
+
+# ==========================================
+# Test 3: SUM() OVER (PARTITION BY) — window aggregate
+# ==========================================
+
+statement ok
+CREATE TABLE wt2 (id INT, dept VARCHAR, salary INT);
+
+statement ok
+INSERT INTO wt2 VALUES (1,'eng',100), (2,'eng',200), (3,'hr',150), (4,'hr',250);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_wsum AS
+    SELECT id, dept, salary, SUM(salary) OVER (PARTITION BY dept) as dept_total FROM wt2;
+
+# Cross-check initial
+query I
+SELECT count(*) FROM (
+    SELECT id, dept, salary, SUM(salary) OVER (PARTITION BY dept) FROM wt2
+    EXCEPT ALL SELECT * FROM mv_wsum
+);
+----
+0
+
+# Insert into 'eng' only
+statement ok
+INSERT INTO wt2 VALUES (5,'eng',300);
+
+statement ok
+PRAGMA ivm('mv_wsum');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, dept, salary, SUM(salary) OVER (PARTITION BY dept) FROM wt2
+    EXCEPT ALL SELECT * FROM mv_wsum
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_wsum
+    EXCEPT ALL SELECT id, dept, salary, SUM(salary) OVER (PARTITION BY dept) FROM wt2
+);
+----
+0
+
+# ==========================================
+# Test 4: Mixed DML — insert + delete + update in single refresh
+# ==========================================
+
+statement ok
+INSERT INTO wt2 VALUES (6,'hr',50);
+
+statement ok
+DELETE FROM wt2 WHERE id = 3;
+
+statement ok
+UPDATE wt2 SET salary = 999 WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_wsum');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, dept, salary, SUM(salary) OVER (PARTITION BY dept) FROM wt2
+    EXCEPT ALL SELECT * FROM mv_wsum
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_wsum
+    EXCEPT ALL SELECT id, dept, salary, SUM(salary) OVER (PARTITION BY dept) FROM wt2
+);
+----
+0
+
+# ==========================================
+# Test 5: Window function WITHOUT PARTITION BY — degenerates to full recompute
+# ==========================================
+
+statement ok
+CREATE TABLE wt3 (id INT, val INT);
+
+statement ok
+INSERT INTO wt3 VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_nopart AS
+    SELECT id, val, ROW_NUMBER() OVER (ORDER BY val) as rn FROM wt3;
+
+statement ok
+INSERT INTO wt3 VALUES (4, 15);
+
+statement ok
+PRAGMA ivm('mv_nopart');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, val, ROW_NUMBER() OVER (ORDER BY val) as rn FROM wt3
+    EXCEPT ALL SELECT * FROM mv_nopart
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_nopart
+    EXCEPT ALL SELECT id, val, ROW_NUMBER() OVER (ORDER BY val) as rn FROM wt3
+);
+----
+0
+
+# ==========================================
+# Test 6: Empty delta — no-op refresh
+# ==========================================
+
+statement ok
+PRAGMA ivm('mv_rn');
+
+# Should still be correct (no changes, no-op)
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) as rn FROM wt
+    EXCEPT ALL SELECT * FROM mv_rn
+);
+----
+0

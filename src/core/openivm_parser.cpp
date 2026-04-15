@@ -253,14 +253,21 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 			having_predicate = StripHavingFilter(select_plan, output_names);
 
-			auto ast = LogicalPlanToAst(*con.context, select_plan);
-			auto cte_list = AstToCteList(*ast);
-			view_query = cte_list->ToQuery(true, output_names);
-			if (!view_query.empty() && view_query.back() == ';') {
-				view_query.pop_back();
+			try {
+				auto ast = LogicalPlanToAst(*con.context, select_plan);
+				auto cte_list = AstToCteList(*ast);
+				view_query = cte_list->ToQuery(true, output_names);
+				if (!view_query.empty() && view_query.back() == ';') {
+					view_query.pop_back();
+				}
+				StringUtil::Trim(view_query);
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
+			} catch (...) {
+				// LPTS doesn't support all operators (e.g., WINDOW). Fall back to original SQL.
+				// This is fine for partition-recompute views that don't need LPTS-rewritten queries.
+				view_query = original_view_query;
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback to original query: %s\n", view_query.c_str());
 			}
-			StringUtil::Trim(view_query);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
 		}
 		con.Rollback();
 
@@ -277,8 +284,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		bool found_having = analysis.found_having;
 		bool found_minmax = analysis.found_minmax;
 		bool found_left_join = analysis.found_left_join;
+		bool found_window = analysis.found_window;
 		auto aggregate_columns = std::move(analysis.aggregate_columns);
 		auto aggregate_types = std::move(analysis.aggregate_types);
+		auto window_partition_columns = std::move(analysis.window_partition_columns);
 
 		// Fix expression-based group-by column names: the plan walk may extract
 		// "abs(val)" but the MV table column is "abs_val" (from the AS alias).
@@ -302,7 +311,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		IVMType ivm_type;
 
-		if (!ivm_compatible) {
+		if (found_window) {
+			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
+			ivm_type = IVMType::WINDOW_PARTITION;
+		} else if (!ivm_compatible) {
 			ivm_type = IVMType::FULL_REFRESH;
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' uses constructs not supported for incremental maintenance. "
@@ -328,6 +340,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		                    : ivm_type == IVMType::SIMPLE_AGGREGATE  ? "SIMPLE_AGGREGATE"
 		                    : ivm_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
 		                    : ivm_type == IVMType::FULL_REFRESH      ? "FULL_REFRESH"
+		                    : ivm_type == IVMType::WINDOW_PARTITION  ? "WINDOW_PARTITION"
 		                                                             : "UNKNOWN",
 		                    (int)found_aggregation, (int)found_projection, aggregate_columns.size());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
@@ -389,15 +402,18 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Store the LPTS query in metadata — it has hidden columns (DISTINCT count, AVG sum/count,
 		// LEFT JOIN key) and preserves user column names.
 		string refresh_val = ivm_parse_data.refresh_interval > 0 ? to_string(ivm_parse_data.refresh_interval) : "null";
-		// Store GROUP BY columns so CompileAggregateGroups can work without an index (e.g. DuckLake)
+		// Store GROUP BY or PARTITION BY columns (mutually exclusive in our type system).
+		// For WINDOW_PARTITION, store the PARTITION BY columns so the upsert compiler
+		// can identify affected partitions from deltas.
 		string group_cols_val = "null";
-		if (!aggregate_columns.empty()) {
+		auto &cols_to_store = found_window ? window_partition_columns : aggregate_columns;
+		if (!cols_to_store.empty()) {
 			group_cols_val = "'";
-			for (size_t i = 0; i < aggregate_columns.size(); i++) {
+			for (size_t i = 0; i < cols_to_store.size(); i++) {
 				if (i > 0) {
 					group_cols_val += ",";
 				}
-				group_cols_val += OpenIVMUtils::EscapeSingleQuotes(aggregate_columns[i]);
+				group_cols_val += OpenIVMUtils::EscapeSingleQuotes(cols_to_store[i]);
 			}
 			group_cols_val += "'";
 		}

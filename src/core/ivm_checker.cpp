@@ -7,6 +7,8 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
+#include "duckdb/planner/operator/logical_window.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 
 #include <unordered_set>
 
@@ -146,6 +148,40 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 						}
 					}
 				}
+			}
+		}
+		break;
+	}
+
+	case LogicalOperatorType::LOGICAL_WINDOW: {
+		result.found_window = true;
+		auto &window = node->Cast<LogicalWindow>();
+		// Extract PARTITION BY column names from the first window expression.
+		// All window functions in the same OVER clause share the same PARTITION BY.
+		for (auto &expr : window.expressions) {
+			if (expr->expression_class == ExpressionClass::BOUND_WINDOW) {
+				auto &win_expr = expr->Cast<BoundWindowExpression>();
+				for (auto &part : win_expr.partitions) {
+					string col_name;
+					if (part->type == ExpressionType::BOUND_COLUMN_REF) {
+						col_name = part->Cast<BoundColumnRefExpression>().alias;
+					}
+					if (col_name.empty()) {
+						col_name = part->GetName();
+					}
+					// Avoid duplicates
+					bool found = false;
+					for (auto &existing : result.window_partition_columns) {
+						if (existing == col_name) {
+							found = true;
+							break;
+						}
+					}
+					if (!found) {
+						result.window_partition_columns.push_back(col_name);
+					}
+				}
+				break; // only need partitions from the first window expression
 			}
 		}
 		break;

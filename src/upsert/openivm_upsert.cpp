@@ -684,6 +684,18 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		}
 		break;
 	}
+	case IVMType::WINDOW_PARTITION: {
+		// Window functions: partition-level recompute — delete+re-insert affected partitions.
+		// Skip DoIVM entirely — window views use base delta tables directly (not the delta view)
+		// because the IVM rewrite rule doesn't support LOGICAL_WINDOW.
+		auto partition_cols = metadata.GetGroupColumns(view_name); // reuses group_columns field
+		auto delta_tables = metadata.GetDeltaTables(view_name);
+		upsert_query = CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, catalog_prefix,
+		                                      partition_cols, delta_tables);
+		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols)\n",
+		                    partition_cols.size());
+		break;
+	}
 	case IVMType::FULL_REFRESH: {
 		// Should not reach here — full refresh is handled earlier via BuildRecomputeQuery.
 		throw InternalException("FULL_REFRESH views should not reach incremental upsert compilation");
@@ -692,177 +704,193 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	OPENIVM_DEBUG_PRINT("[UPSERT] Upsert query:\n%s\n", upsert_query.c_str());
 	// DoIVM is a table function (root of the tree)
 	string ivm_query;
-
-	// splitting the query in two to make it easier to turn into string (insertions are the same)
-	string do_ivm = "select * from DoIVM('" + OpenIVMUtils::EscapeValue(view_catalog_name) + "','" +
-	                OpenIVMUtils::EscapeValue(view_schema_name) + "','" + OpenIVMUtils::EscapeValue(view_name) + "');";
+	string companion_query;
+	string pre_companion;
+	string post_companion;
+	string delete_from_view_query;
 
 	auto delta_table_names = metadata.GetDeltaTables(view_name);
 
-	// now we can plan the query
-	OPENIVM_DEBUG_PRINT("[UPSERT] Planning DoIVM query: %s\n", do_ivm.c_str());
-	Parser p;
-	p.ParseQuery(do_ivm);
-
-	con.BeginTransaction();
-	auto &con_ctx = *con.context;
-	OPENIVM_DEBUG_PRINT("[UPSERT] Creating planner...\n");
-	Planner planner(con_ctx);
-	OPENIVM_DEBUG_PRINT("[UPSERT] CreatePlan...\n");
-	planner.CreatePlan(std::move(p.statements[0]));
-	auto plan = std::move(planner.plan);
-	OPENIVM_DEBUG_PRINT("[UPSERT] Plan created. Running optimizer...\n");
-	Optimizer optimizer(*planner.binder, con_ctx);
-	plan = optimizer.Optimize(std::move(plan)); // this transforms the plan into an incremental plan
-	OPENIVM_DEBUG_PRINT("[UPSERT] Optimizer done.\n");
-	con.Rollback();
-
-	// Convert the rewritten plan to SQL via the AST pipeline
-	auto ast = LogicalPlanToAst(con_ctx, plan);
-	auto cte_list = AstToCteList(*ast);
-	string raw_ivm_sql = cte_list->ToQuery(false);
-	OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_ivm_sql.c_str());
-
-	// Use explicit column list in INSERT INTO delta_view, excluding _duckdb_ivm_timestamp
-	// so the DEFAULT now() fills it in (for chained MV support)
-	string delta_view_name = catalog_prefix + OpenIVMUtils::DeltaName(view_name);
-	string insert_target_bare = "INSERT INTO " + OpenIVMUtils::DeltaName(view_name);
-	auto insert_pos = raw_ivm_sql.find(insert_target_bare);
-	if (insert_pos != string::npos) {
-		// Replace bare delta table name with catalog-qualified version
-		if (!catalog_prefix.empty()) {
-			raw_ivm_sql.replace(insert_pos, insert_target_bare.size(), "INSERT INTO " + delta_view_name);
-			insert_pos = raw_ivm_sql.find("INSERT INTO " + delta_view_name);
-		}
-		string col_list = "(";
-		for (size_t i = 0; i < column_names.size(); i++) {
-			if (i > 0) {
-				col_list += ", ";
-			}
-			col_list += OpenIVMUtils::QuoteIdentifier(column_names[i]);
-		}
-		col_list += ") ";
-		string full_insert = "INSERT INTO " + delta_view_name;
-		raw_ivm_sql.insert(insert_pos + full_insert.size(), " " + col_list);
-	}
-	ivm_query += raw_ivm_sql;
-
-	// Delete from delta view: timestamp-based if downstream views depend on it, unconditional otherwise
-	auto downstream_check = con.Query("SELECT COUNT(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-	                                  " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_view_name) + "'");
-	bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
-	                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
-
-	// Companion rows for downstream consumers.
-	// When a view has downstream MVs that read its delta, those downstream views need
-	// both the OLD and NEW state to correctly compute their own deltas.
-	// The IVM query produces the NEW state (delta with mul=true).
-	// The companion query records the OLD state (current MV rows with mul=false)
-	// BEFORE the upsert modifies the MV.
-	string companion_query;
-
-	// For SIMPLE_AGGREGATE / SIMPLE_PROJECTION with downstream consumers:
-	// The IVM delta represents the CHANGE (+5), but downstream projections need
-	// the ABSOLUTE old and new values to compute their own deltas correctly.
-	// Strategy: record old state (mul=false) BEFORE upsert, then record new state
-	// (mul=true) AFTER upsert. The IVM delta in delta_view is replaced by these
-	// absolute snapshots so downstream sees a clean old→new transition.
-	string pre_companion;  // old MV state → delta_view with false (runs BEFORE IVM+upsert)
-	string post_companion; // new MV state → delta_view with true (runs AFTER upsert)
-
-	if (has_downstream &&
-	    (view_query_type == IVMType::SIMPLE_AGGREGATE || view_query_type == IVMType::SIMPLE_PROJECTION)) {
-		// Save old MV state to a temp table BEFORE the IVM+upsert modifies the MV.
-		// After the upsert, clear IVM delta from delta_view and replace with
-		// old(false) + new(true) absolute snapshots for downstream consumption.
-		string col_list;
-		for (auto &col : column_names) {
-			if (!col_list.empty()) {
-				col_list += ", ";
-			}
-			col_list += OpenIVMUtils::QuoteIdentifier(col);
-		}
-		string select_false, select_true;
-		bool first = true;
-		for (auto &col : column_names) {
-			if (!first) {
-				select_false += ", ";
-				select_true += ", ";
-			}
-			first = false;
-			if (col == string(ivm::MULTIPLICITY_COL)) {
-				select_false += "false";
-				select_true += "true";
-			} else {
-				select_false += OpenIVMUtils::QuoteIdentifier(col);
-				select_true += OpenIVMUtils::QuoteIdentifier(col);
-			}
-		}
-		// Pre: snapshot old state into temp table
-		string temp_name = string(ivm::TEMP_TABLE_PREFIX) + view_name;
-		string qt = KeywordHelper::WriteOptionallyQuoted(temp_name);
-		string qdvn = KeywordHelper::WriteOptionallyQuoted(delta_view_name);
-		string qdt2 = data_table;
-		pre_companion = "CREATE TEMP TABLE " + qt + " AS SELECT * FROM " + qdt2 + ";\n";
-		// Post: clear ALL IVM delta rows (both true and false), replace with absolute snapshots
-		post_companion = "DELETE FROM " + qdvn + " WHERE 1=1";
-		if (!delta_ts_filter.empty()) {
-			post_companion += " AND " + delta_ts_filter;
-		}
-		post_companion += ";\n";
-		post_companion += "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_false + " FROM " + qt + ";\n";
-		post_companion += "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_true + " FROM " + qdt2 + ";\n";
-		post_companion += "DROP TABLE " + qt + ";\n";
-		OPENIVM_DEBUG_PRINT("[UPSERT] Pre-companion: %s\n", pre_companion.c_str());
-		OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
-	} else if ((view_query_type == IVMType::AGGREGATE_GROUP || view_query_type == IVMType::AGGREGATE_HAVING) &&
-	           has_downstream && index_delta_view_catalog_entry) {
-		auto *idx = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
-		auto key_ids = idx->column_ids;
-		vector<string> keys;
-		unordered_set<string> keys_set;
-		for (auto &kid : key_ids) {
-			keys.push_back(column_names[kid]);
-			keys_set.insert(column_names[kid]);
-		}
-
-		string col_list, val_list, join_cond;
-		for (auto &col : column_names) {
-			if (!col_list.empty()) {
-				col_list += ", ";
-				val_list += ", ";
-			}
-			col_list += col;
-			if (keys_set.count(col)) {
-				val_list += "d." + col;
-			} else if (col == ivm::MULTIPLICITY_COL) {
-				val_list += "false";
-			} else {
-				val_list += "0";
-			}
-		}
-		for (size_t i = 0; i < keys.size(); i++) {
-			if (i > 0) {
-				join_cond += " AND ";
-			}
-			join_cond += "d." + keys[i] + " IS NOT DISTINCT FROM m." + keys[i];
-		}
-
-		companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list + " FROM " +
-		                  delta_view_name + " d WHERE d." + string(ivm::MULTIPLICITY_COL) + " = true";
-		if (!delta_ts_filter.empty()) {
-			companion_query += " AND d." + delta_ts_filter;
-		}
-		companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + ");\n";
-		OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
-	}
-
-	string delete_from_view_query;
-	if (has_downstream) {
-		delete_from_view_query = IVMMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name);
+	if (view_query_type == IVMType::WINDOW_PARTITION) {
+		// Window views skip DoIVM entirely — they use base delta tables directly
+		// for partition identification, not the delta view. The IVM rewrite rule
+		// doesn't support LOGICAL_WINDOW, so we bypass the plan rewrite.
+		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping DoIVM for WINDOW_PARTITION view\n");
+		ivm_query = ""; // no delta view population
 	} else {
-		delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
-	}
+		// splitting the query in two to make it easier to turn into string (insertions are the same)
+		string do_ivm = "select * from DoIVM('" + OpenIVMUtils::EscapeValue(view_catalog_name) + "','" +
+		                OpenIVMUtils::EscapeValue(view_schema_name) + "','" + OpenIVMUtils::EscapeValue(view_name) +
+		                "');";
+
+		// now we can plan the query
+		OPENIVM_DEBUG_PRINT("[UPSERT] Planning DoIVM query: %s\n", do_ivm.c_str());
+		Parser p;
+		p.ParseQuery(do_ivm);
+
+		con.BeginTransaction();
+		auto &con_ctx = *con.context;
+		OPENIVM_DEBUG_PRINT("[UPSERT] Creating planner...\n");
+		Planner planner(con_ctx);
+		OPENIVM_DEBUG_PRINT("[UPSERT] CreatePlan...\n");
+		planner.CreatePlan(std::move(p.statements[0]));
+		auto plan = std::move(planner.plan);
+		OPENIVM_DEBUG_PRINT("[UPSERT] Plan created. Running optimizer...\n");
+		Optimizer optimizer(*planner.binder, con_ctx);
+		plan = optimizer.Optimize(std::move(plan)); // this transforms the plan into an incremental plan
+		OPENIVM_DEBUG_PRINT("[UPSERT] Optimizer done.\n");
+		con.Rollback();
+
+		// Convert the rewritten plan to SQL via the AST pipeline
+		auto ast = LogicalPlanToAst(con_ctx, plan);
+		auto cte_list = AstToCteList(*ast);
+		string raw_ivm_sql = cte_list->ToQuery(false);
+		OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_ivm_sql.c_str());
+
+		// Use explicit column list in INSERT INTO delta_view, excluding _duckdb_ivm_timestamp
+		// so the DEFAULT now() fills it in (for chained MV support)
+		string delta_view_name = catalog_prefix + OpenIVMUtils::DeltaName(view_name);
+		string insert_target_bare = "INSERT INTO " + OpenIVMUtils::DeltaName(view_name);
+		auto insert_pos = raw_ivm_sql.find(insert_target_bare);
+		if (insert_pos != string::npos) {
+			// Replace bare delta table name with catalog-qualified version
+			if (!catalog_prefix.empty()) {
+				raw_ivm_sql.replace(insert_pos, insert_target_bare.size(), "INSERT INTO " + delta_view_name);
+				insert_pos = raw_ivm_sql.find("INSERT INTO " + delta_view_name);
+			}
+			string col_list = "(";
+			for (size_t i = 0; i < column_names.size(); i++) {
+				if (i > 0) {
+					col_list += ", ";
+				}
+				col_list += OpenIVMUtils::QuoteIdentifier(column_names[i]);
+			}
+			col_list += ") ";
+			string full_insert = "INSERT INTO " + delta_view_name;
+			raw_ivm_sql.insert(insert_pos + full_insert.size(), " " + col_list);
+		}
+		ivm_query += raw_ivm_sql;
+
+		// Delete from delta view: timestamp-based if downstream views depend on it, unconditional otherwise
+		auto downstream_check = con.Query("SELECT COUNT(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+		                                  " WHERE table_name = '" + OpenIVMUtils::EscapeValue(delta_view_name) + "'");
+		bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
+		                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
+
+		// Companion rows for downstream consumers.
+		// When a view has downstream MVs that read its delta, those downstream views need
+		// both the OLD and NEW state to correctly compute their own deltas.
+		// The IVM query produces the NEW state (delta with mul=true).
+		// The companion query records the OLD state (current MV rows with mul=false)
+		// BEFORE the upsert modifies the MV.
+		string companion_query;
+
+		// For SIMPLE_AGGREGATE / SIMPLE_PROJECTION with downstream consumers:
+		// The IVM delta represents the CHANGE (+5), but downstream projections need
+		// the ABSOLUTE old and new values to compute their own deltas correctly.
+		// Strategy: record old state (mul=false) BEFORE upsert, then record new state
+		// (mul=true) AFTER upsert. The IVM delta in delta_view is replaced by these
+		// absolute snapshots so downstream sees a clean old→new transition.
+		string pre_companion;  // old MV state → delta_view with false (runs BEFORE IVM+upsert)
+		string post_companion; // new MV state → delta_view with true (runs AFTER upsert)
+
+		if (has_downstream &&
+		    (view_query_type == IVMType::SIMPLE_AGGREGATE || view_query_type == IVMType::SIMPLE_PROJECTION)) {
+			// Save old MV state to a temp table BEFORE the IVM+upsert modifies the MV.
+			// After the upsert, clear IVM delta from delta_view and replace with
+			// old(false) + new(true) absolute snapshots for downstream consumption.
+			string col_list;
+			for (auto &col : column_names) {
+				if (!col_list.empty()) {
+					col_list += ", ";
+				}
+				col_list += OpenIVMUtils::QuoteIdentifier(col);
+			}
+			string select_false, select_true;
+			bool first = true;
+			for (auto &col : column_names) {
+				if (!first) {
+					select_false += ", ";
+					select_true += ", ";
+				}
+				first = false;
+				if (col == string(ivm::MULTIPLICITY_COL)) {
+					select_false += "false";
+					select_true += "true";
+				} else {
+					select_false += OpenIVMUtils::QuoteIdentifier(col);
+					select_true += OpenIVMUtils::QuoteIdentifier(col);
+				}
+			}
+			// Pre: snapshot old state into temp table
+			string temp_name = string(ivm::TEMP_TABLE_PREFIX) + view_name;
+			string qt = KeywordHelper::WriteOptionallyQuoted(temp_name);
+			string qdvn = KeywordHelper::WriteOptionallyQuoted(delta_view_name);
+			string qdt2 = data_table;
+			pre_companion = "CREATE TEMP TABLE " + qt + " AS SELECT * FROM " + qdt2 + ";\n";
+			// Post: clear ALL IVM delta rows (both true and false), replace with absolute snapshots
+			post_companion = "DELETE FROM " + qdvn + " WHERE 1=1";
+			if (!delta_ts_filter.empty()) {
+				post_companion += " AND " + delta_ts_filter;
+			}
+			post_companion += ";\n";
+			post_companion +=
+			    "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_false + " FROM " + qt + ";\n";
+			post_companion +=
+			    "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_true + " FROM " + qdt2 + ";\n";
+			post_companion += "DROP TABLE " + qt + ";\n";
+			OPENIVM_DEBUG_PRINT("[UPSERT] Pre-companion: %s\n", pre_companion.c_str());
+			OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
+		} else if ((view_query_type == IVMType::AGGREGATE_GROUP || view_query_type == IVMType::AGGREGATE_HAVING) &&
+		           has_downstream && index_delta_view_catalog_entry) {
+			auto *idx = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
+			auto key_ids = idx->column_ids;
+			vector<string> keys;
+			unordered_set<string> keys_set;
+			for (auto &kid : key_ids) {
+				keys.push_back(column_names[kid]);
+				keys_set.insert(column_names[kid]);
+			}
+
+			string col_list, val_list, join_cond;
+			for (auto &col : column_names) {
+				if (!col_list.empty()) {
+					col_list += ", ";
+					val_list += ", ";
+				}
+				col_list += col;
+				if (keys_set.count(col)) {
+					val_list += "d." + col;
+				} else if (col == ivm::MULTIPLICITY_COL) {
+					val_list += "false";
+				} else {
+					val_list += "0";
+				}
+			}
+			for (size_t i = 0; i < keys.size(); i++) {
+				if (i > 0) {
+					join_cond += " AND ";
+				}
+				join_cond += "d." + keys[i] + " IS NOT DISTINCT FROM m." + keys[i];
+			}
+
+			companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list + " FROM " +
+			                  delta_view_name + " d WHERE d." + string(ivm::MULTIPLICITY_COL) + " = true";
+			if (!delta_ts_filter.empty()) {
+				companion_query += " AND d." + delta_ts_filter;
+			}
+			companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + ");\n";
+			OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
+		}
+
+		string delete_from_view_query;
+		if (has_downstream) {
+			delete_from_view_query = IVMMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name);
+		} else {
+			delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
+		}
+
+	} // end of DoIVM block (skipped for WINDOW_PARTITION)
 
 	// now we can also delete from the delta table, but only if all the dependent views have been refreshed
 	// example: if two views A and B are on the same table T, we can only remove tuples from T

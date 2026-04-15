@@ -15,8 +15,10 @@ struct PlanAnalysis {
 	bool found_distinct = false;
 	bool found_minmax = false;
 	bool found_left_join = false;
+	bool found_window = false;
 	vector<string> aggregate_columns;
-	vector<string> aggregate_types; // per-column: "min", "max", "sum", "count_star", "count", "avg", "list"
+	vector<string> aggregate_types;          // per-column: "min", "max", "sum", "count_star", "count", "avg", "list"
+	vector<string> window_partition_columns; // PARTITION BY columns from window functions
 };
 
 /// Walk the logical plan tree once, validating IVM compatibility AND extracting

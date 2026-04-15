@@ -477,4 +477,44 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	return delete_query + insert_query;
 }
 
+string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter,
+                              const string &catalog_prefix, const vector<string> &partition_columns,
+                              const vector<string> &delta_table_names) {
+	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
+	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+
+	if (partition_columns.empty()) {
+		// No PARTITION BY → full recompute (same as FULL_REFRESH but through the IVM pipeline)
+		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
+	}
+
+	// Build partition key tuple
+	string keys_tuple;
+	for (size_t i = 0; i < partition_columns.size(); i++) {
+		if (i > 0) {
+			keys_tuple += ", ";
+		}
+		keys_tuple += Q(partition_columns[i]);
+	}
+
+	// Build UNION ALL of affected partition keys from all base delta tables.
+	// Window views use base delta tables directly (not the delta view) because
+	// the IVM rewrite rule doesn't support LOGICAL_WINDOW.
+	string affected_partitions;
+	for (size_t i = 0; i < delta_table_names.size(); i++) {
+		if (i > 0) {
+			affected_partitions += " UNION ";
+		}
+		affected_partitions += "SELECT DISTINCT " + keys_tuple + " FROM " + Q(delta_table_names[i]) + delta_where;
+	}
+
+	string delete_query =
+	    "DELETE FROM " + data_table + " WHERE (" + keys_tuple + ") IN (\n  " + affected_partitions + "\n);\n";
+	string insert_query = "INSERT INTO " + data_table + "\n" + "SELECT * FROM (" + view_query_sql +
+	                      ") _ivm_recompute\n" + "WHERE (" + keys_tuple + ") IN (\n  " + affected_partitions + "\n);\n";
+
+	OPENIVM_DEBUG_PRINT("[CompileWindowRecompute] Partition keys: %s\n", keys_tuple.c_str());
+	return delete_query + "\n" + insert_query;
+}
+
 } // namespace duckdb

@@ -46,7 +46,14 @@ constexpr const char *DISABLED_OPTIMIZERS =
 
 } // namespace ivm
 
-enum class IVMType : uint8_t { AGGREGATE_GROUP, SIMPLE_AGGREGATE, SIMPLE_PROJECTION, FULL_REFRESH, AGGREGATE_HAVING };
+enum class IVMType : uint8_t {
+	AGGREGATE_GROUP,
+	SIMPLE_AGGREGATE,
+	SIMPLE_PROJECTION,
+	FULL_REFRESH,
+	AGGREGATE_HAVING,
+	WINDOW_PARTITION // window functions — partition-level recompute
+};
 
 } // namespace duckdb
 
