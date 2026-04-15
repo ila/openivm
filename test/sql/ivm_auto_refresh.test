@@ -864,3 +864,81 @@ SELECT count(*) FROM _duckdb_ivm_refresh_history WHERE view_name = 'mv_lt';
 
 statement ok
 SET ivm_adaptive_refresh = false;
+
+# ==========================================
+# Test 21: Empty-delta term skipping — 3-way join, only 1 table changes
+# ==========================================
+
+statement ok
+CREATE TABLE ed_a (id INT PRIMARY KEY, val INT);
+
+statement ok
+CREATE TABLE ed_b (id INT PRIMARY KEY, label VARCHAR);
+
+statement ok
+CREATE TABLE ed_c (id INT PRIMARY KEY, tag VARCHAR);
+
+statement ok
+INSERT INTO ed_a SELECT i, i * 10 FROM range(1, 51) t(i);
+
+statement ok
+INSERT INTO ed_b SELECT i, 'b_' || i::VARCHAR FROM range(1, 51) t(i);
+
+statement ok
+INSERT INTO ed_c SELECT i, 'c_' || i::VARCHAR FROM range(1, 51) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ed AS SELECT a.val, b.label, c.tag FROM ed_a a JOIN ed_b b ON a.id = b.id JOIN ed_c c ON a.id = c.id;
+
+query I
+SELECT count(*) FROM mv_ed;
+----
+50
+
+# Insert into only table A — tables B and C have empty deltas
+statement ok
+INSERT INTO ed_a VALUES (51, 510);
+
+statement ok
+INSERT INTO ed_b VALUES (51, 'b_51');
+
+statement ok
+INSERT INTO ed_c VALUES (51, 'c_51');
+
+statement ok
+PRAGMA ivm('mv_ed');
+
+# Cross-check: MV matches base query
+query III
+SELECT val, label, tag FROM mv_ed WHERE val = 510;
+----
+510	b_51	c_51
+
+query I
+SELECT count(*) FROM (SELECT a.val, b.label, c.tag FROM ed_a a JOIN ed_b b ON a.id = b.id JOIN ed_c c ON a.id = c.id EXCEPT ALL SELECT * FROM mv_ed);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_ed EXCEPT ALL SELECT a.val, b.label, c.tag FROM ed_a a JOIN ed_b b ON a.id = b.id JOIN ed_c c ON a.id = c.id);
+----
+0
+
+# Now insert into ONLY table A (B and C have empty deltas)
+statement ok
+INSERT INTO ed_a VALUES (52, 999);
+
+statement ok
+PRAGMA ivm('mv_ed');
+
+# Row 52 exists in A but not in B/C — no join match, MV unchanged
+query I
+SELECT count(*) FROM mv_ed;
+----
+51
+
+# Cross-check still holds
+query I
+SELECT count(*) FROM (SELECT a.val, b.label, c.tag FROM ed_a a JOIN ed_b b ON a.id = b.id JOIN ed_c c ON a.id = c.id EXCEPT ALL SELECT * FROM mv_ed);
+----
+0

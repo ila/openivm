@@ -124,11 +124,17 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 // FK-aware term pruning: detect which inclusion-exclusion terms are redundant
 // ============================================================================
 
-/// For each leaf, check if its delta table is insert-only (no multiplicity=false rows).
-/// Returns a bitmask where bit i = 1 means leaf i's delta has no deletes (insert-only or empty).
-static uint64_t DetectInsertOnlyDeltas(ClientContext &context, const string &view_name,
-                                       const vector<JoinLeafInfo> &leaves) {
-	uint64_t insert_only_mask = 0;
+/// Delta status for join leaves: which have insert-only deltas, which are completely empty.
+struct DeltaStatus {
+	uint64_t insert_only_mask; // bit i=1: leaf i has no delete rows (insert-only or empty)
+	uint64_t empty_mask;       // bit i=1: leaf i has zero pending delta rows
+};
+
+/// For each leaf, detect delta status in a single query per table.
+/// Returns both insert_only_mask (no deletes) and empty_mask (no rows at all).
+static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_name,
+                                     const vector<JoinLeafInfo> &leaves) {
+	DeltaStatus status = {0, 0};
 	Connection con(*context.db);
 	con.SetAutoCommit(false);
 
@@ -152,17 +158,28 @@ static uint64_t DetectInsertOnlyDeltas(ClientContext &context, const string &vie
 		}
 		string last_update = ts_result->GetValue(0, 0).ToString();
 
-		// Check for any delete rows (multiplicity = false) since last_update
-		auto result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(delta_name) + " WHERE " +
-		                        string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(last_update) +
-		                        "'::TIMESTAMP AND " + string(ivm::MULTIPLICITY_COL) + " = false");
-		if (!result->HasError() && result->GetValue(0, 0).GetValue<int64_t>() == 0) {
-			insert_only_mask |= (1ULL << i);
+		// Single query: get total row count and delete count since last_update
+		auto result =
+		    con.Query("SELECT COUNT(*), COUNT(*) FILTER (WHERE " + string(ivm::MULTIPLICITY_COL) + " = false) FROM " +
+		              OpenIVMUtils::QuoteIdentifier(delta_name) + " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" +
+		              OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP");
+		if (result->HasError()) {
+			continue;
+		}
+		int64_t total_count = result->GetValue(0, 0).GetValue<int64_t>();
+		int64_t delete_count = result->GetValue(1, 0).GetValue<int64_t>();
+
+		if (total_count == 0) {
+			status.empty_mask |= (1ULL << i);
+			status.insert_only_mask |= (1ULL << i); // empty is trivially insert-only
+			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (%s) has empty delta\n", i, table_ref.get()->name.c_str());
+		} else if (delete_count == 0) {
+			status.insert_only_mask |= (1ULL << i);
 			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (%s) has insert-only delta\n", i,
 			                    table_ref.get()->name.c_str());
 		}
 	}
-	return insert_only_mask;
+	return status;
 }
 
 /// Build a set of FK relationships between join leaves.
@@ -257,6 +274,10 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
+	// Detect delta status for all leaves (single query per table: total + delete count).
+	// Used by both FK pruning and empty-delta skipping.
+	DeltaStatus delta_status = DetectDeltaStatus(context, pw.view, leaves);
+
 	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
 	Value fk_pruning_val;
 	bool fk_pruning_enabled = true;
@@ -267,21 +288,40 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	if (fk_pruning_enabled) {
 		auto fk_relations = DetectFKRelations(context, leaves, pw.plan.get());
 		if (!fk_relations.empty()) {
-			uint64_t insert_only_mask = DetectInsertOnlyDeltas(context, pw.view, leaves);
-			skip_bits = ComputeSkipBits(fk_relations, insert_only_mask);
+			skip_bits = ComputeSkipBits(fk_relations, delta_status.insert_only_mask);
 		}
 	}
 
+	// Empty-delta skipping: skip terms where any table in the mask has zero delta rows.
+	// A join with an empty input always produces zero rows.
+	Value skip_empty_val;
+	bool skip_empty_enabled = true;
+	if (context.TryGetCurrentSetting("ivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
+		skip_empty_enabled = skip_empty_val.GetValue<bool>();
+	}
+	uint64_t empty_mask = skip_empty_enabled ? delta_status.empty_mask : 0;
+
 	uint64_t pruned_count = 0;
 	uint64_t total_terms = (1ULL << N) - 1;
-	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building inclusion-exclusion terms (%lu total, skip_bits=%lu)\n",
-	                    (unsigned long)total_terms, (unsigned long)skip_bits);
+	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building inclusion-exclusion terms (%lu total, skip_bits=%lu, empty_mask=%lu)\n",
+	                    (unsigned long)total_terms, (unsigned long)skip_bits, (unsigned long)empty_mask);
 	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
+		// Safety: always generate at least one term to avoid empty UNION ALL.
+		// The last mask (all bits set) is the fallback — even if it produces zero rows.
+		bool is_last_chance = (mask == total_terms) && terms.empty();
+
 		// FK pruning: skip any term whose mask overlaps with insert-only PK leaves.
 		// All such terms cancel algebraically via XOR (see ComputeSkipBits).
-		if (skip_bits && (mask & skip_bits)) {
+		if (!is_last_chance && skip_bits && (mask & skip_bits)) {
 			pruned_count++;
 			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Pruned term mask=%lu (FK insert-only PK)\n", (unsigned long)mask);
+			continue;
+		}
+		// Empty-delta skipping: if any table in the mask has zero delta rows,
+		// the join term produces zero rows (join with empty input = empty).
+		if (!is_last_chance && empty_mask && (mask & empty_mask)) {
+			pruned_count++;
+			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Skipped term mask=%lu (empty delta)\n", (unsigned long)mask);
 			continue;
 		}
 		auto term = pw.plan->Copy(context);
