@@ -31,6 +31,22 @@ In a 5-table star schema where only the fact table changed, 4 of 5 terms are ski
 
 A safety fallback ensures at least one term is always generated to avoid an empty UNION ALL.
 
+## Per-Term Skipping (Standard Joins)
+
+For standard (non-DuckLake) joins using inclusion-exclusion, empty-delta detection also
+skips individual terms. Each inclusion-exclusion term is a join where some tables use delta
+scans. If **any** table in a term's bitmask has zero pending delta rows, the entire join
+term produces zero rows (a join with an empty input is always empty) and is skipped.
+
+Detection queries each delta table's row count (filtered by timestamp since last refresh)
+in the same pass as the insert-only detection used by FK pruning. Together with FK-aware
+pruning, this can eliminate the majority of terms in multi-table joins where only one
+table changed.
+
+For example, in a 3-table join where only table A changed, 6 of the 7 inclusion-exclusion
+terms contain either B's or C's empty delta and are skipped — only the 1 term with A's
+delta alone is generated.
+
 ## What Is Avoided
 
 | Step | Skipped |

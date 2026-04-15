@@ -81,8 +81,11 @@ For N tables, the join rule generates 2^N - 1 terms using inclusion-exclusion:
 - For each non-empty subset S of tables: replace tables in S with their delta scans, keep others as current base table scans
 - Combined multiplicity = XOR of all delta multiplicities (XOR maps ±1 sign to boolean)
 - All terms are combined with UNION ALL
+- Terms are pruned by FK-aware optimization and empty-delta skipping
 
-Only INNER joins are currently supported. Max 16 tables (`ivm::MAX_JOIN_TABLES`).
+For DuckLake tables, the join rule uses N-term telescoping instead (exactly N terms, using snapshot-based time travel). See `docs/ducklake.md`.
+
+INNER and LEFT/RIGHT joins are supported. LEFT JOIN aggregates use group-recompute. Max 16 tables (`ivm::MAX_JOIN_TABLES`).
 
 ### Upsert Compilation
 
@@ -101,7 +104,7 @@ MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original
 - **Multiplicity column** (`_duckdb_ivm_multiplicity`): BOOLEAN — `true` = insert, `false` = delete
 - **Delta tables** are named `delta_<base_table>` and include a timestamp column for tracking when changes occurred
 - **LPTS** (LogicalPlanToString, in `third_party/lpts/`) converts logical plans back to SQL for compilation
-- **Cost model** (`src/upsert/openivm_cost_model.cpp`) compares estimated IVM cost vs full recompute cost based on table and delta cardinalities
+- **Cost model** (`src/upsert/openivm_cost_model.cpp`) compares estimated IVM cost vs full recompute cost. Includes filter selectivity estimation and learned regression from execution history (when `ivm_adaptive_refresh` is enabled)
 
 ## Key Source Files
 
@@ -112,6 +115,7 @@ MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original
 - `src/rules/openivm_rewrite_rule.cpp` — rule dispatcher (routes to operator-specific rules)
 - `src/rules/openivm_insert_rule.cpp` — adds INSERT operators to inject deltas into views
 - `src/rules/ivm_join_rule.cpp` — join incrementalization (inclusion-exclusion)
+- `src/rules/ducklake_join.cpp` — DuckLake N-term telescoping join rule
 - `src/rules/ivm_helpers.cpp` — shared rule utilities (CreateDeltaGetNode)
 - `src/upsert/openivm_upsert.cpp` — PRAGMA ivm() handler, orchestrates delta computation
 - `src/upsert/openivm_compile_upsert.cpp` — generates upsert SQL queries
@@ -125,10 +129,19 @@ MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `ivm_refresh_mode` | VARCHAR | `"incremental"` | `"incremental"`, `"full"`, or `"auto"` |
-| `ivm_adaptive_refresh` | BOOLEAN | `false` | Enable adaptive cost model |
+| `ivm_adaptive_refresh` | BOOLEAN | `false` | Enable adaptive cost model (learned regression + IVM vs recompute decision) |
 | `ivm_cascade_refresh` | VARCHAR | `"downstream"` | Cascade mode: `"off"`, `"upstream"`, `"downstream"`, `"both"` |
 | `ivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh exceeds interval |
+| `ivm_disable_daemon` | BOOLEAN | `false` | Disable the background refresh daemon |
 | `ivm_files_path` | VARCHAR | — | Path for compiled query reference files |
+| `ivm_cost_decay` | DOUBLE | `0.9` | Decay factor for learned cost model regression (0.0–1.0) |
+| `ivm_skip_empty_deltas` | BOOLEAN | `true` | Skip refresh or join terms when deltas are empty |
+| `ivm_ducklake_nterm` | BOOLEAN | `true` | N-term telescoping for DuckLake joins (vs 2^N-1) |
+| `ivm_fk_pruning` | BOOLEAN | `true` | Prune inclusion-exclusion join terms using FK constraints |
+| `ivm_skip_aggregate_delete` | BOOLEAN | `true` | Skip DELETE for insert-only aggregate deltas |
+| `ivm_skip_projection_delete` | BOOLEAN | `true` | Skip DELETE/consolidation for insert-only projection deltas |
+| `ivm_minmax_incremental` | BOOLEAN | `true` | Use GREATEST/LEAST for MIN/MAX when deltas are insert-only |
+| `ivm_having_merge` | BOOLEAN | `true` | Use MERGE for HAVING views instead of group-recompute |
 
 Views using unsupported constructs (RANDOM(), STDDEV, etc.) are automatically classified as `FULL_REFRESH` — no setting needed.
 
