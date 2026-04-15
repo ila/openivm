@@ -31,6 +31,9 @@ constexpr const char *SUM_SQP_COL_PREFIX = "_ivm_sum_sqp_"; // STDDEV_POP: sqrt 
 constexpr const char *VAR_SQP_COL_PREFIX = "_ivm_var_sqp_"; // VAR_POP: no sqrt + population denominator
 constexpr const char *COUNT_COL_PREFIX = "_ivm_count_";
 
+// Match count column for LEFT JOIN incremental MERGE (Larson & Zhou algorithm)
+constexpr const char *MATCH_COUNT_COL = "_ivm_match_count";
+
 // Index suffix for GROUP BY unique index on MV data tables
 constexpr const char *INDEX_SUFFIX = "_ivm_index";
 

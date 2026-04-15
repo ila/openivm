@@ -377,12 +377,15 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// HAVING needs recompute because groups may enter/leave the result set after aggregate changes.
 	// MIN, MAX use group-recompute. AVG is decomposed to SUM+COUNT by the parser (fully incremental).
 	// HAVING needs recompute because groups may enter/leave the result set.
-	// Aggregates over LEFT JOIN sources also need group-recompute: SUM(NULL) != SUM(0)
-	// Read MIN/MAX and LEFT JOIN flags from metadata (set at CREATE MV time).
-	// These determine whether to use incremental MERGE or full group-recompute.
+	// LEFT JOIN aggregates: group-recompute unless ivm_left_join_merge is on (Larson & Zhou).
 	bool source_has_left_join = metadata.HasLeftJoin(view_name);
-	bool has_minmax =
-	    metadata.HasMinMax(view_name) || view_query_type == IVMType::AGGREGATE_HAVING || source_has_left_join;
+	bool left_join_merge = false;
+	Value lj_merge_val;
+	if (context.TryGetCurrentSetting("ivm_left_join_merge", lj_merge_val) && !lj_merge_val.IsNull()) {
+		left_join_merge = lj_merge_val.GetValue<bool>();
+	}
+	bool has_minmax = metadata.HasMinMax(view_name) || view_query_type == IVMType::AGGREGATE_HAVING ||
+	                  (source_has_left_join && !left_join_merge);
 
 	// Check ivm_refresh_mode: 'full' forces full recompute, skipping the IVM pipeline.
 	Value refresh_mode_val;

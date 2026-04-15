@@ -501,6 +501,87 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Added _ivm_left_key projection\n");
 }
 
+/// For LEFT JOIN aggregate views: add COUNT(null_side_key) AS _ivm_match_count.
+/// This hidden aggregate tracks how many R rows match each L group key.
+/// When match_count=0, aggregate columns should be NULL (Larson & Zhou).
+static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
+	// Find the LEFT/RIGHT JOIN and extract the null-supplying side's key
+	bool found = false;
+	ColumnBinding null_side_binding;
+	LogicalType null_side_type;
+
+	std::function<void(LogicalOperator *)> find = [&](LogicalOperator *n) {
+		if (found) {
+			return;
+		}
+		if (n->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+			auto &join = n->Cast<LogicalComparisonJoin>();
+			if ((join.join_type == JoinType::LEFT || join.join_type == JoinType::RIGHT) && !join.conditions.empty()) {
+				found = true;
+				// Null-supplying side is the OPPOSITE of the preserved side
+				auto &null_side = join.join_type == JoinType::LEFT ? join.conditions[0].right : join.conditions[0].left;
+				if (null_side->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+					auto &ref = null_side->Cast<BoundColumnRefExpression>();
+					null_side_binding = ref.binding;
+					null_side_type = ref.return_type;
+				}
+			}
+		}
+		for (auto &child : n->children) {
+			find(child.get());
+		}
+	};
+	find(plan.get());
+
+	if (!found) {
+		return;
+	}
+
+	// Only applies to aggregate plans (PROJECTION → AGGREGATE → ...).
+	// For SIMPLE_PROJECTION LEFT JOINs, match count isn't needed (partial recompute via _ivm_left_key).
+	if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+		return;
+	}
+	LogicalOperator *agg_search = plan->children.empty() ? nullptr : plan->children[0].get();
+	// Walk through possible intermediate projections to find the aggregate
+	while (agg_search && agg_search->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		agg_search = agg_search->children.empty() ? nullptr : agg_search->children[0].get();
+	}
+	if (!agg_search || agg_search->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return;
+	}
+	auto &agg = agg_search->Cast<LogicalAggregate>();
+
+	// Add COUNT(null_side_key) as a hidden aggregate expression.
+	// COUNT(col) counts non-NULL values — for a LEFT JOIN, the null-supplying side's key
+	// is NULL when there's no match, so COUNT(r.key) = 0 for unmatched groups.
+	auto count_func = BindAggregateByName(context, "count", {null_side_type});
+	vector<unique_ptr<Expression>> count_args;
+	count_args.push_back(make_uniq<BoundColumnRefExpression>(null_side_type, null_side_binding));
+	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
+	                                                      nullptr, AggregateType::NON_DISTINCT);
+	count_expr->alias = string(ivm::MATCH_COUNT_COL);
+	idx_t match_count_idx = agg.expressions.size();
+	agg.expressions.push_back(std::move(count_expr));
+	agg.ResolveOperatorTypes();
+
+	// Add passthrough in the top projection
+	auto &proj = plan->Cast<LogicalProjection>();
+	auto agg_bindings = agg_search->GetColumnBindings();
+	auto agg_types = agg_search->types;
+	idx_t group_count = agg.groups.size();
+
+	ColumnBinding match_binding = agg_bindings[group_count + match_count_idx];
+	LogicalType match_type = agg_types[group_count + match_count_idx];
+
+	auto match_pt = make_uniq<BoundColumnRefExpression>(match_type, match_binding);
+	match_pt->alias = string(ivm::MATCH_COUNT_COL);
+	proj.expressions.push_back(std::move(match_pt));
+	proj.ResolveOperatorTypes();
+
+	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Added _ivm_match_count for LEFT JOIN aggregate\n");
+}
+
 void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                     vector<string> &planner_names) {
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Starting\n");
@@ -516,6 +597,7 @@ void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOp
 		RewriteDerivedAggregates(context, plan, opt);
 	}
 	RewriteLeftJoinKey(binder, plan);
+	RewriteLeftJoinMatchCount(context, binder, plan);
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Done\n");
 }
 

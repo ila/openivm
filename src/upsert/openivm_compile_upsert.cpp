@@ -218,6 +218,18 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		return "COALESCE(v." + col + " + d." + col + ", v." + col + ", d." + col + ")";
 	};
 
+	// Detect _ivm_match_count for LEFT JOIN incremental MERGE (Larson & Zhou).
+	// When present, use COALESCE(v.col, 0) for aggregate updates to handle NULL→value transitions.
+	string match_count_col;
+	bool has_match_count = false;
+	for (auto &col : aggregates) {
+		if (col == Q(string(ivm::MATCH_COUNT_COL))) {
+			has_match_count = true;
+			match_count_col = col;
+			break;
+		}
+	}
+
 	string update_set;
 	string insert_cols, insert_vals;
 	{
@@ -295,18 +307,70 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		}
 	}
 
-	string merge_query = "WITH ivm_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table +
-	                     " v USING ivm_cte d\n" + "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " +
-	                     update_set + "\n" + "WHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (";
-	for (auto &key : keys) {
-		merge_query += "d." + key + ", ";
+	string merge_query;
+	if (has_match_count) {
+		// Larson & Zhou LEFT JOIN MERGE: single WHEN MATCHED with CASE WHEN expressions.
+		// Each aggregate uses CASE WHEN new_match_count > 0 THEN normal_update ELSE null_or_zero END.
+		// This works with DuckLake's single-action MERGE (no multiple WHEN MATCHED branches).
+		string mc_new = "(COALESCE(v." + match_count_col + ", 0) + d." + match_count_col + ")";
+		string lj_update_set;
+		bool first_lj = true;
+		for (auto &col : aggregates) {
+			if (!first_lj) {
+				lj_update_set += ", ";
+			}
+			first_lj = false;
+			if (col == match_count_col) {
+				lj_update_set += col + " = " + mc_new;
+			} else {
+				string agg_type = col_agg_type.count(col) ? col_agg_type.at(col) : "";
+				bool is_count = (agg_type == "count" || agg_type == "count_star");
+				string null_val = is_count ? "0" : "NULL";
+				lj_update_set +=
+				    col + " = CASE WHEN " + mc_new + " > 0 THEN " + updated_col(col) + " ELSE " + null_val + " END";
+			}
+		}
+		// Conditional INSERT values: NULL/0 when match count <= 0 (COUNT→0, SUM→NULL)
+		string cond_insert_vals;
+		bool first_ins = true;
+		for (size_t i = 0; i < aggregates.size(); i++) {
+			if (!first_ins) {
+				cond_insert_vals += ", ";
+			}
+			first_ins = false;
+			if (aggregates[i] == match_count_col) {
+				cond_insert_vals += "d." + match_count_col;
+			} else {
+				string agg_type = col_agg_type.count(aggregates[i]) ? col_agg_type.at(aggregates[i]) : "";
+				bool is_count = (agg_type == "count" || agg_type == "count_star");
+				string null_val = is_count ? "0" : "NULL";
+				cond_insert_vals +=
+				    "CASE WHEN d." + match_count_col + " > 0 THEN d." + aggregates[i] + " ELSE " + null_val + " END";
+			}
+		}
+		merge_query = "WITH ivm_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table + " v USING ivm_cte d\n" +
+		              "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " + lj_update_set + "\n" +
+		              "WHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (";
+		for (auto &key : keys) {
+			merge_query += "d." + key + ", ";
+		}
+		merge_query += cond_insert_vals + ");\n";
+	} else {
+		merge_query = "WITH ivm_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table + " v USING ivm_cte d\n" +
+		              "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " + update_set + "\n" +
+		              "WHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (";
+		for (auto &key : keys) {
+			merge_query += "d." + key + ", ";
+		}
+		merge_query += insert_vals + ");\n";
 	}
-	merge_query += insert_vals + ");\n";
 
 	string upsert_query = merge_query + "\n";
 
-	// Delete zero rows — skip when insert_only (groups can't reach zero from inserts alone)
-	if (!insert_only) {
+	// Delete zero rows — skip when insert_only (groups can't reach zero from inserts alone).
+	// Also skip when _ivm_match_count is present: LEFT JOIN groups with match_count=0
+	// are valid (unmatched preserved-side rows with NULL aggregates, not deleted groups).
+	if (!insert_only && !has_match_count) {
 		string delete_query = "\ndelete from " + data_table + " where ";
 		for (auto &column : aggregates) {
 			if (derived_cols.count(column)) {

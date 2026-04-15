@@ -138,6 +138,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "instead of group-recompute",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
+	db_config.AddExtensionOption("ivm_left_join_merge",
+	                             "use incremental MERGE for LEFT JOIN aggregates (Larson & Zhou) "
+	                             "instead of group-recompute",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	// Learned cost model
 	db_config.AddExtensionOption("ivm_cost_decay",
 	                             "decay factor for learned cost model regression (0.0-1.0, higher = slower adaptation)",

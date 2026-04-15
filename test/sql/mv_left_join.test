@@ -595,3 +595,142 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# LEFT JOIN aggregate: incremental MERGE (Larson & Zhou)
+# Tests NULL↔value transitions with _ivm_match_count
+# ==========================================
+
+statement ok
+CREATE TABLE lj_cust (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE lj_ord (id INT, cust_id INT, amount INT);
+
+statement ok
+INSERT INTO lj_cust VALUES (1,'Alice'), (2,'Bob'), (3,'Carol');
+
+statement ok
+INSERT INTO lj_ord VALUES (1,1,100), (2,1,200), (3,2,150);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lj_agg AS
+    SELECT c.name, SUM(o.amount) as total, COUNT(o.amount) as cnt
+    FROM lj_cust c LEFT JOIN lj_ord o ON c.id = o.cust_id
+    GROUP BY c.name;
+
+# Initial: Carol has NULL total, cnt=0 (no orders)
+query III
+SELECT name, total, cnt FROM mv_lj_agg ORDER BY name;
+----
+Alice	300	2
+Bob	150	1
+Carol	NULL	0
+
+# --- NULL→value transition: insert order for Carol ---
+statement ok
+INSERT INTO lj_ord VALUES (4,3,500);
+
+statement ok
+PRAGMA ivm('mv_lj_agg');
+
+query I
+SELECT count(*) FROM (
+    SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lj_cust c LEFT JOIN lj_ord o ON c.id = o.cust_id GROUP BY c.name
+    EXCEPT ALL SELECT * FROM mv_lj_agg
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_lj_agg
+    EXCEPT ALL SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lj_cust c LEFT JOIN lj_ord o ON c.id = o.cust_id GROUP BY c.name
+);
+----
+0
+
+# --- value→NULL transition: delete Carol's orders ---
+statement ok
+DELETE FROM lj_ord WHERE cust_id = 3;
+
+statement ok
+PRAGMA ivm('mv_lj_agg');
+
+# Carol should still exist with NULL/0
+query III
+SELECT name, total, cnt FROM mv_lj_agg ORDER BY name;
+----
+Alice	300	2
+Bob	150	1
+Carol	NULL	0
+
+query I
+SELECT count(*) FROM (
+    SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lj_cust c LEFT JOIN lj_ord o ON c.id = o.cust_id GROUP BY c.name
+    EXCEPT ALL SELECT * FROM mv_lj_agg
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_lj_agg
+    EXCEPT ALL SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lj_cust c LEFT JOIN lj_ord o ON c.id = o.cust_id GROUP BY c.name
+);
+----
+0
+
+# --- Mixed DML: inserts + deletes on both sides ---
+statement ok
+INSERT INTO lj_ord VALUES (5,1,50), (6,3,200), (7,2,300);
+
+statement ok
+DELETE FROM lj_ord WHERE id = 2;
+
+statement ok
+PRAGMA ivm('mv_lj_agg');
+
+query I
+SELECT count(*) FROM (
+    SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lj_cust c LEFT JOIN lj_ord o ON c.id = o.cust_id GROUP BY c.name
+    EXCEPT ALL SELECT * FROM mv_lj_agg
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_lj_agg
+    EXCEPT ALL SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lj_cust c LEFT JOIN lj_ord o ON c.id = o.cust_id GROUP BY c.name
+);
+----
+0
+
+# --- Fallback: disable flag, should use group-recompute ---
+statement ok
+SET ivm_left_join_merge = false;
+
+statement ok
+INSERT INTO lj_ord VALUES (8,3,100);
+
+statement ok
+PRAGMA ivm('mv_lj_agg');
+
+query I
+SELECT count(*) FROM (
+    SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lj_cust c LEFT JOIN lj_ord o ON c.id = o.cust_id GROUP BY c.name
+    EXCEPT ALL SELECT * FROM mv_lj_agg
+);
+----
+0
+
+statement ok
+SET ivm_left_join_merge = true;
