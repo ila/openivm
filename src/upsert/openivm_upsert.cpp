@@ -495,9 +495,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	//   has no XOR cross-terms, so insert-only base = insert-only delta view)
 	// - Standard join views: safe only if exactly ONE table changed AND it's insert-only
 	//   (no cross-terms fire when other deltas are empty, so no XOR)
+	auto delta_table_names = metadata.GetDeltaTables(view_name);
 	bool insert_only = false;
 	{
-		auto delta_table_names = metadata.GetDeltaTables(view_name);
 		bool has_join =
 		    (view_query_sql.find(" JOIN ") != string::npos || view_query_sql.find(" join ") != string::npos);
 
@@ -597,14 +597,13 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	OPENIVM_DEBUG_PRINT("[UPSERT] insert_only=%d, skip_agg_delete=%d, skip_proj_delete=%d, minmax_incremental=%d\n",
 	                    insert_only, skip_agg_delete, skip_proj_delete, minmax_incremental);
 
-	auto delta_table_names = metadata.GetDeltaTables(view_name);
-
 	// Compile the upsert query based on view type
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n",
 	                    view_query_type == IVMType::AGGREGATE_HAVING    ? "AGGREGATE_HAVING"
 	                    : view_query_type == IVMType::AGGREGATE_GROUP   ? "AGGREGATE_GROUP"
 	                    : view_query_type == IVMType::SIMPLE_AGGREGATE  ? "SIMPLE_AGGREGATE"
 	                    : view_query_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
+	                    : view_query_type == IVMType::WINDOW_PARTITION  ? "WINDOW_PARTITION"
 	                                                                    : "UNKNOWN");
 	// All DML (INSERT, DELETE, UPDATE, MERGE) targets the physical data table,
 	// not the user-facing VIEW which excludes internal _ivm_* columns.
