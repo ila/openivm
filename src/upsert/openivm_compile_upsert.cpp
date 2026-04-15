@@ -497,9 +497,9 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		keys_tuple += Q(partition_columns[i]);
 	}
 
-	// Build UNION ALL of affected partition keys from all base delta tables.
-	// Window views use base delta tables directly (not the delta view) because
-	// the IVM rewrite rule doesn't support LOGICAL_WINDOW.
+	// Identify affected partitions from base delta tables.
+	// Window views skip DoIVM (LPTS doesn't support WINDOW), so the delta view isn't populated.
+	// Instead, query base delta tables directly for affected partition keys.
 	string affected_partitions;
 	for (size_t i = 0; i < delta_table_names.size(); i++) {
 		if (i > 0) {

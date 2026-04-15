@@ -597,6 +597,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	OPENIVM_DEBUG_PRINT("[UPSERT] insert_only=%d, skip_agg_delete=%d, skip_proj_delete=%d, minmax_incremental=%d\n",
 	                    insert_only, skip_agg_delete, skip_proj_delete, minmax_incremental);
 
+	auto delta_table_names = metadata.GetDeltaTables(view_name);
+
 	// Compile the upsert query based on view type
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n",
 	                    view_query_type == IVMType::AGGREGATE_HAVING    ? "AGGREGATE_HAVING"
@@ -686,12 +688,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	}
 	case IVMType::WINDOW_PARTITION: {
 		// Window functions: partition-level recompute — delete+re-insert affected partitions.
-		// Skip DoIVM entirely — window views use base delta tables directly (not the delta view)
-		// because the IVM rewrite rule doesn't support LOGICAL_WINDOW.
 		auto partition_cols = metadata.GetGroupColumns(view_name); // reuses group_columns field
-		auto delta_tables = metadata.GetDeltaTables(view_name);
 		upsert_query = CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, catalog_prefix,
-		                                      partition_cols, delta_tables);
+		                                      partition_cols, delta_table_names);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols)\n",
 		                    partition_cols.size());
 		break;
@@ -709,14 +708,12 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string post_companion;
 	string delete_from_view_query;
 
-	auto delta_table_names = metadata.GetDeltaTables(view_name);
-
 	if (view_query_type == IVMType::WINDOW_PARTITION) {
-		// Window views skip DoIVM entirely — they use base delta tables directly
-		// for partition identification, not the delta view. The IVM rewrite rule
-		// doesn't support LOGICAL_WINDOW, so we bypass the plan rewrite.
-		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping DoIVM for WINDOW_PARTITION view\n");
-		ivm_query = ""; // no delta view population
+		// Window views skip the DoIVM/LPTS path because LPTS doesn't support WINDOW.
+		// The partition-recompute upsert reads partition keys from base delta tables directly.
+		// The delta view is not populated — downstream MVs refresh from the updated data table.
+		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping DoIVM for WINDOW_PARTITION (LPTS limitation)\n");
+		ivm_query = "";
 	} else {
 		// splitting the query in two to make it easier to turn into string (insertions are the same)
 		string do_ivm = "select * from DoIVM('" + OpenIVMUtils::EscapeValue(view_catalog_name) + "','" +
@@ -783,16 +780,12 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		// The IVM query produces the NEW state (delta with mul=true).
 		// The companion query records the OLD state (current MV rows with mul=false)
 		// BEFORE the upsert modifies the MV.
-		string companion_query;
-
 		// For SIMPLE_AGGREGATE / SIMPLE_PROJECTION with downstream consumers:
 		// The IVM delta represents the CHANGE (+5), but downstream projections need
 		// the ABSOLUTE old and new values to compute their own deltas correctly.
 		// Strategy: record old state (mul=false) BEFORE upsert, then record new state
 		// (mul=true) AFTER upsert. The IVM delta in delta_view is replaced by these
 		// absolute snapshots so downstream sees a clean old→new transition.
-		string pre_companion;  // old MV state → delta_view with false (runs BEFORE IVM+upsert)
-		string post_companion; // new MV state → delta_view with true (runs AFTER upsert)
 
 		if (has_downstream &&
 		    (view_query_type == IVMType::SIMPLE_AGGREGATE || view_query_type == IVMType::SIMPLE_PROJECTION)) {
@@ -883,14 +876,13 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
 		}
 
-		string delete_from_view_query;
 		if (has_downstream) {
 			delete_from_view_query = IVMMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name);
 		} else {
 			delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
 		}
 
-	} // end of DoIVM block (skipped for WINDOW_PARTITION)
+	} // end of DoIVM block (skipped for WINDOW_PARTITION — LPTS doesn't support WINDOW)
 
 	// now we can also delete from the delta table, but only if all the dependent views have been refreshed
 	// example: if two views A and B are on the same table T, we can only remove tuples from T

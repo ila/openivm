@@ -210,3 +210,143 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 7: Window over JOIN
+# ==========================================
+
+statement ok
+CREATE TABLE w_orders (id INT, cust_id INT, amount INT);
+
+statement ok
+CREATE TABLE w_customers (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO w_customers VALUES (1,'Alice'), (2,'Bob'), (3,'Carol');
+
+statement ok
+INSERT INTO w_orders VALUES (1,1,100), (2,1,200), (3,2,150), (4,2,50), (5,3,300);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_wjoin AS
+    SELECT o.id, c.name, o.amount,
+        ROW_NUMBER() OVER (PARTITION BY c.name ORDER BY o.amount DESC) as rn
+    FROM w_orders o JOIN w_customers c ON o.cust_id = c.id;
+
+statement ok
+INSERT INTO w_orders VALUES (6,1,500), (7,3,10);
+
+statement ok
+PRAGMA ivm('mv_wjoin');
+
+query I
+SELECT count(*) FROM (
+    SELECT o.id, c.name, o.amount, ROW_NUMBER() OVER (PARTITION BY c.name ORDER BY o.amount DESC) FROM w_orders o JOIN w_customers c ON o.cust_id = c.id
+    EXCEPT ALL SELECT * FROM mv_wjoin
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_wjoin
+    EXCEPT ALL SELECT o.id, c.name, o.amount, ROW_NUMBER() OVER (PARTITION BY c.name ORDER BY o.amount DESC) FROM w_orders o JOIN w_customers c ON o.cust_id = c.id
+);
+----
+0
+
+# ==========================================
+# Test 8: Composite PARTITION BY (two columns)
+# ==========================================
+
+statement ok
+CREATE TABLE w_comp (id INT, dept VARCHAR, team VARCHAR, val INT);
+
+statement ok
+INSERT INTO w_comp VALUES (1,'eng','be',10), (2,'eng','be',20), (3,'eng','fe',30), (4,'hr','rec',40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_comp AS
+    SELECT id, dept, team, val, ROW_NUMBER() OVER (PARTITION BY dept, team ORDER BY val) as rn FROM w_comp;
+
+statement ok
+INSERT INTO w_comp VALUES (5,'eng','be',15);
+
+statement ok
+PRAGMA ivm('mv_comp');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, dept, team, val, ROW_NUMBER() OVER (PARTITION BY dept, team ORDER BY val) FROM w_comp
+    EXCEPT ALL SELECT * FROM mv_comp
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_comp
+    EXCEPT ALL SELECT id, dept, team, val, ROW_NUMBER() OVER (PARTITION BY dept, team ORDER BY val) FROM w_comp
+);
+----
+0
+
+# ==========================================
+# Test 9: Chained — table → window MV → aggregate MV
+# ==========================================
+
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE w_emp (id INT, dept VARCHAR, salary INT);
+
+statement ok
+INSERT INTO w_emp VALUES (1,'eng',100), (2,'eng',200), (3,'eng',150), (4,'hr',90), (5,'hr',120);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ranked AS
+    SELECT id, dept, salary, RANK() OVER (PARTITION BY dept ORDER BY salary DESC) as rnk FROM w_emp;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_top2 AS
+    SELECT dept, count(*) as top_count FROM mv_ranked WHERE rnk <= 2 GROUP BY dept;
+
+query II
+SELECT * FROM mv_top2 ORDER BY dept;
+----
+eng	2
+hr	2
+
+statement ok
+INSERT INTO w_emp VALUES (6,'eng',300), (7,'hr',200);
+
+statement ok
+PRAGMA ivm('mv_ranked');
+
+statement ok
+PRAGMA ivm('mv_top2');
+
+# Window MV correct
+query I
+SELECT count(*) FROM (
+    SELECT id, dept, salary, RANK() OVER (PARTITION BY dept ORDER BY salary DESC) FROM w_emp
+    EXCEPT ALL SELECT * FROM mv_ranked
+);
+----
+0
+
+# Downstream aggregate MV correct
+query II
+SELECT * FROM mv_top2 ORDER BY dept;
+----
+eng	2
+hr	2
+
+query I
+SELECT count(*) FROM (
+    SELECT dept, count(*) FROM (SELECT dept, RANK() OVER (PARTITION BY dept ORDER BY salary DESC) as rnk FROM w_emp) WHERE rnk <= 2 GROUP BY dept
+    EXCEPT ALL SELECT * FROM mv_top2
+);
+----
+0

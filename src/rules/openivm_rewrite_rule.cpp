@@ -7,6 +7,7 @@
 #include "rules/projection.hpp"
 #include "rules/scan.hpp"
 #include "rules/union.hpp"
+#include "rules/window.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
@@ -123,6 +124,10 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 	}
 	case LogicalOperatorType::LOGICAL_DISTINCT: {
 		IvmDistinctRule rule;
+		return rule.Rewrite(pw);
+	}
+	case LogicalOperatorType::LOGICAL_WINDOW: {
+		IvmWindowRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
