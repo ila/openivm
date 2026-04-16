@@ -12,3 +12,6 @@
 [submodule ".claude/skills/shared"]
 	path = .claude/skills/shared
 	url = https://github.com/ila/duckdb-claude-skills.git
+[submodule "third_party/benchbase"]
+	path = third_party/benchbase
+	url = https://github.com/cmu-db/benchbase.git
