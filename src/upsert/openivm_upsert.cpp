@@ -238,7 +238,15 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 					if (found) {
 						view_catalog_name = cat_name;
 						view_schema_name = DEFAULT_SCHEMA;
-						OPENIVM_DEBUG_PRINT("[UPSERT] Found view in catalog '%s'\n", cat_name.c_str());
+						// Non-default catalog (e.g. DuckLake attached DB): the MV data lives in a
+						// different database than the metadata tables (which are in "memory").
+						// DuckDB forbids writing to two databases in one transaction, so set
+						// cross_system to skip the transaction wrapper in RefreshViewLocked.
+						if (cat_name != "memory") {
+							cross_system = true;
+						}
+						OPENIVM_DEBUG_PRINT("[UPSERT] Found view in catalog '%s' (cross_system=%d)\n", cat_name.c_str(),
+						                    cross_system);
 						break;
 					}
 				}
@@ -543,7 +551,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		if (!last_update_result->HasError() && last_update_result->RowCount() > 0) {
 			auto ts = last_update_result->GetValue(0, 0);
 			if (!ts.IsNull()) {
-				delta_ts_filter = string(ivm::TIMESTAMP_COL) + " >= '" + ts.ToString() + "'::TIMESTAMP";
+				delta_ts_filter = string(ivm::TIMESTAMP_COL) + " > '" + ts.ToString() + "'::TIMESTAMP";
 			}
 		}
 	} // has_ts_col

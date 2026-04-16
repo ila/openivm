@@ -50,16 +50,32 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
-# Benchmark executable - only build for native platforms with jemalloc
-if(NOT EMSCRIPTEN AND NOT WIN32 AND TARGET jemalloc_extension)
-    add_executable(openivm_benchmark benchmarks/openivm_benchmark.cpp)
-    target_link_libraries(openivm_benchmark
+# Test and benchmark tools - only build for native platforms
+if(NOT EMSCRIPTEN AND NOT WIN32)
+    set(OPENIVM_LINK_LIBS
         duckdb_static
         duckdb_generated_extension_loader
         ${EXTENSION_NAME}
         core_functions_extension
         parquet_extension
-        jemalloc_extension
         duckdb_static)
+
+    if(DUCKDB_EXTENSION_JEMALLOC_SHOULD_LINK)
+        list(APPEND OPENIVM_LINK_LIBS jemalloc_extension)
+    endif()
+
+    # Benchmark executable
+    add_executable(openivm_benchmark benchmarks/openivm_benchmark.cpp)
+    target_link_libraries(openivm_benchmark ${OPENIVM_LINK_LIBS})
     target_include_directories(openivm_benchmark PUBLIC benchmarks)
+
+    # TPC-C data generation tool
+    add_executable(tpcc_setup benchmark/src/tpcc_setup.cpp)
+    target_link_libraries(tpcc_setup ${OPENIVM_LINK_LIBS})
+    target_include_directories(tpcc_setup PUBLIC benchmark)
+
+    # IVM query benchmark harness
+    add_executable(rewriter_benchmark benchmark/src/rewriter_benchmark.cpp)
+    target_link_libraries(rewriter_benchmark ${OPENIVM_LINK_LIBS})
+    target_include_directories(rewriter_benchmark PUBLIC benchmark)
 endif()

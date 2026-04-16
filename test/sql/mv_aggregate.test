@@ -1433,3 +1433,55 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# --- AVG without explicit alias (column name sanitization) ---
+# Regression test: DuckDB auto-sets bound.alias = "avg(col)" for unaliased AVG.
+# Before fix, this produced _ivm_sum_avg(col) — invalid SQL identifier in EXCLUDE clause.
+
+statement ok
+CREATE TABLE avg_noalias (val DECIMAL(10,2));
+
+statement ok
+INSERT INTO avg_noalias VALUES (10.0),(20.0),(30.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_avg_noalias AS SELECT AVG(val) FROM avg_noalias;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_avg_noalias EXCEPT ALL SELECT AVG(val) FROM avg_noalias
+    UNION ALL
+    SELECT AVG(val) FROM avg_noalias EXCEPT ALL SELECT * FROM mv_avg_noalias
+);
+----
+0
+
+statement ok
+INSERT INTO avg_noalias VALUES (40.0);
+
+statement ok
+PRAGMA ivm('mv_avg_noalias');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_avg_noalias EXCEPT ALL SELECT AVG(val) FROM avg_noalias
+    UNION ALL
+    SELECT AVG(val) FROM avg_noalias EXCEPT ALL SELECT * FROM mv_avg_noalias
+);
+----
+0
+
+statement ok
+DELETE FROM avg_noalias WHERE val = 10.0;
+
+statement ok
+PRAGMA ivm('mv_avg_noalias');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_avg_noalias EXCEPT ALL SELECT AVG(val) FROM avg_noalias
+    UNION ALL
+    SELECT AVG(val) FROM avg_noalias EXCEPT ALL SELECT * FROM mv_avg_noalias
+);
+----
+0

@@ -186,6 +186,30 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 		}
 
 		string alias = bound.alias.empty() ? (bound.function.name + "_" + bound.children[0]->GetName()) : bound.alias;
+		// Sanitize alias for use as a SQL identifier. DuckDB auto-sets alias to the expression
+		// string (e.g. "avg(C_BALANCE)") for unaliased aggregates. Parens and other non-identifier
+		// characters break column names like _ivm_sum_avg(C_BALANCE) in SELECT * EXCLUDE (...).
+		// Use same algorithm as openivm_parser.cpp output_names sanitization so that helper column
+		// suffixes (e.g. "avg_C_BALANCE") match the sanitized visible column name.
+		{
+			string clean;
+			bool last_under = false;
+			for (unsigned char c : alias) {
+				if (std::isalnum(c) || c == '_') {
+					clean += static_cast<char>(c);
+					last_under = (c == '_');
+				} else if (!last_under && !clean.empty()) {
+					clean += '_';
+					last_under = true;
+				}
+			}
+			if (!clean.empty() && clean.back() == '_') {
+				clean.pop_back();
+			}
+			if (!clean.empty()) {
+				alias = std::move(clean);
+			}
+		}
 		auto arg_type = bound.children[0]->return_type;
 
 		Decomp d;
@@ -307,7 +331,28 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 
 		// Add hidden columns as passthroughs. Use user_alias so that
 		// DetectDerivedAggColumns in the upsert compiler can match them.
-		string col_suffix = d.user_alias.empty() ? d.alias : d.user_alias;
+		// Sanitize with same algorithm as openivm_parser.cpp output_names loop so that the
+		// key derived by DetectDerivedAggColumns matches the sanitized visible column name.
+		string col_suffix;
+		{
+			const string &raw = d.user_alias.empty() ? d.alias : d.user_alias;
+			bool last_under = false;
+			for (unsigned char c : raw) {
+				if (std::isalnum(c) || c == '_') {
+					col_suffix += static_cast<char>(c);
+					last_under = (c == '_');
+				} else if (!last_under && !col_suffix.empty()) {
+					col_suffix += '_';
+					last_under = true;
+				}
+			}
+			if (!col_suffix.empty() && col_suffix.back() == '_') {
+				col_suffix.pop_back();
+			}
+			if (col_suffix.empty()) {
+				col_suffix = d.alias; // fallback: already sanitized at line 188
+			}
+		}
 		auto sum_pt = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
 		sum_pt->alias = string(ivm::SUM_COL_PREFIX) + col_suffix;
 		proj.expressions.push_back(std::move(sum_pt));
