@@ -3,6 +3,7 @@
 #include "core/openivm_debug.hpp"
 #include "rules/openivm_rewrite_rule.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
+#include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -14,6 +15,11 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
 	auto *distinct_node = dynamic_cast<LogicalDistinct *>(pw.plan.get());
 	OPENIVM_DEBUG_PRINT("[IvmDistinctRule] Rewriting DISTINCT node, %zu targets\n",
 	                    distinct_node->distinct_targets.size());
+
+	// Save the DISTINCT's output bindings before rewrite — these are what parent operators
+	// currently reference via BoundColumnRefExpression. After we replace DISTINCT with
+	// AGGREGATE, the aggregate uses fresh group_index/aggregate_index, so we must remap.
+	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
 
 	// 1. Recurse into child first (gets delta with multiplicity)
 	auto child_mul = IVMRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
@@ -69,6 +75,28 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
 
 	agg_node->children.push_back(std::move(rewritten_child));
 	agg_node->ResolveOperatorTypes();
+
+	// Remap parent references: each original DISTINCT output binding (child's i-th binding)
+	// is replaced with the new aggregate's group output binding (group_index, group_position).
+	// Parent projections/filters holding BCRs to the old bindings will now resolve to the
+	// aggregate's new group columns.
+	//
+	// Stop the walk at the old DISTINCT node itself (still in the tree — the caller will
+	// swap it out for our new aggregate after we return). This prevents the replacer from
+	// descending into the already-rewritten UNION subtree below, where the same bindings
+	// are still valid (they are the UNION's genuine output bindings).
+	ColumnBindingReplacer replacer;
+	idx_t group_position = 0;
+	for (idx_t i = 0; i < original_bindings.size(); i++) {
+		if (child_bindings[i] == input_mul_binding) {
+			continue; // multiplicity is not in the parent's original bindings
+		}
+		ColumnBinding new_binding(group_index, group_position);
+		replacer.replacement_bindings.emplace_back(original_bindings[i], new_binding);
+		group_position++;
+	}
+	replacer.stop_operator = pw.plan.get();
+	replacer.VisitOperator(*pw.root);
 
 	OPENIVM_DEBUG_PRINT("[IvmDistinctRule] Done, replaced with AGGREGATE (%zu groups + 1 count), mul_binding: "
 	                    "table=%lu col=%lu\n",
