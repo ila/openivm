@@ -26,6 +26,43 @@
 
 namespace duckdb {
 
+/// Parsed FULL OUTER JOIN metadata: table and column names for both sides.
+struct FojJoinInfo {
+	string left_table, left_col, right_table, right_col;
+	string dt_left_name, dt_right_name; // delta table names
+
+	static FojJoinInfo Parse(IVMMetadata &metadata, const string &view_name, const vector<string> &delta_table_names) {
+		FojJoinInfo info;
+		string raw = metadata.GetFullOuterJoinCols(view_name);
+		auto comma_pos = raw.find(',');
+		if (comma_pos != string::npos) {
+			string left_part = raw.substr(0, comma_pos);
+			string right_part = raw.substr(comma_pos + 1);
+			auto lc = left_part.find(':');
+			if (lc != string::npos) {
+				info.left_table = left_part.substr(0, lc);
+				info.left_col = left_part.substr(lc + 1);
+			}
+			auto rc = right_part.find(':');
+			if (rc != string::npos) {
+				info.right_table = right_part.substr(0, rc);
+				info.right_col = right_part.substr(rc + 1);
+			}
+		}
+		for (auto &dt_name : delta_table_names) {
+			string base = StringUtil::StartsWith(dt_name, ivm::DELTA_PREFIX) ? dt_name.substr(strlen(ivm::DELTA_PREFIX))
+			                                                                 : dt_name;
+			if (base == info.left_table) {
+				info.dt_left_name = dt_name;
+			}
+			if (base == info.right_table) {
+				info.dt_right_name = dt_name;
+			}
+		}
+		return info;
+	}
+};
+
 static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name, const string &view_query_sql,
                                   bool cross_system, const string &attached_catalog = "",
                                   const string &attached_schema = "", const string &catalog_prefix = "") {
@@ -664,56 +701,24 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				}
 			}
 
-			// Parse FOJ join condition metadata: "left_table:left_col,right_table:right_col"
-			string foj_cols = metadata.GetFullOuterJoinCols(view_name);
-			string left_table, left_col, right_table, right_col;
-			auto comma_pos = foj_cols.find(',');
-			if (comma_pos != string::npos) {
-				string left_part = foj_cols.substr(0, comma_pos);
-				string right_part = foj_cols.substr(comma_pos + 1);
-				auto lcolon = left_part.find(':');
-				if (lcolon != string::npos) {
-					left_table = left_part.substr(0, lcolon);
-					left_col = left_part.substr(lcolon + 1);
-				}
-				auto rcolon = right_part.find(':');
-				if (rcolon != string::npos) {
-					right_table = right_part.substr(0, rcolon);
-					right_col = right_part.substr(rcolon + 1);
-				}
-			}
-
-			// Resolve delta table names to their qualified forms
-			string dt_left_name, dt_right_name;
-			for (auto &dt_name : delta_table_names) {
-				string base_name = StringUtil::StartsWith(dt_name, ivm::DELTA_PREFIX)
-				                       ? dt_name.substr(strlen(ivm::DELTA_PREFIX))
-				                       : dt_name;
-				if (base_name == left_table) {
-					dt_left_name = dt_name;
-				}
-				if (base_name == right_table) {
-					dt_right_name = dt_name;
-				}
-			}
-			string q_dt_left = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(dt_left_name);
-			string q_dt_right = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(dt_right_name);
-			string q_left_base = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(left_table);
-			string q_left_col = KeywordHelper::WriteOptionallyQuoted(left_col);
-			string q_right_col = KeywordHelper::WriteOptionallyQuoted(right_col);
+			auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
+			string q_dt_left = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_left_name);
+			string q_dt_right = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_right_name);
+			string q_left_base = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.left_table);
+			string q_left_col = KeywordHelper::WriteOptionallyQuoted(foj.left_col);
+			string q_right_col = KeywordHelper::WriteOptionallyQuoted(foj.right_col);
 			string qdv = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
 
 			// Source 1: delta view — matched-row changes (INNER-demoted delta has group keys)
 			string affected = "SELECT DISTINCT " + keys_tuple + " FROM " + qdv + delta_where;
 
 			// Source 2: left delta table — directly has group columns (unmatched-left changes)
-			if (!dt_left_name.empty()) {
+			if (!foj.dt_left_name.empty()) {
 				affected += "\n  UNION\n  SELECT DISTINCT " + keys_tuple + " FROM " + q_dt_left + delta_where;
 			}
 
 			// Source 3: left base table lookup — map right-side join keys to group keys
-			// (right insert matches existing left row → group key comes from left table)
-			if (!dt_right_name.empty() && !left_table.empty()) {
+			if (!foj.dt_right_name.empty() && !foj.left_table.empty()) {
 				affected += "\n  UNION\n  SELECT DISTINCT " + keys_tuple + " FROM " + q_left_base + " WHERE " +
 				            q_left_col + " IN (" + "SELECT DISTINCT " + q_right_col + " FROM " + q_dt_right +
 				            delta_where + ")";
@@ -733,9 +738,68 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			upsert_query = "DELETE FROM " + data_table + " WHERE " + where_clause + ";\n" + "INSERT INTO " +
 			               data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_recompute\nWHERE " +
 			               where_clause + ";\n";
+		} else if (source_has_full_outer && full_outer_merge) {
+			// Zhang & Larson MERGE for FULL OUTER JOIN aggregates:
+			// Phase 1: MERGE handles matched-row changes via _ivm_match_count
+			//          (same as LEFT JOIN MERGE — INNER-demoted delta view)
+			// Phase 2: Recompute groups affected by UNMATCHED changes
+			//          (left delta table + right→left join key mapping + NULL group)
+			bool effective_insert_only = skip_agg_delete;
+			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
+			                                      view_query_sql, /*has_minmax=*/false, list_mode, delta_ts_filter,
+			                                      group_cols, catalog_prefix, effective_insert_only, agg_types);
+
+			// Phase 2: recompute groups affected by unmatched changes
+			string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+			string keys_tuple;
+			for (size_t i = 0; i < group_cols.size(); i++) {
+				keys_tuple += KeywordHelper::WriteOptionallyQuoted(group_cols[i]);
+				if (i < group_cols.size() - 1) {
+					keys_tuple += ", ";
+				}
+			}
+
+			auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
+
+			// Unmatched-affected groups: left delta (source 2) + base table lookup (source 3)
+			string unmatched_affected;
+			if (!foj.dt_left_name.empty()) {
+				string q_dt_left = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_left_name);
+				unmatched_affected = "SELECT DISTINCT " + keys_tuple + " FROM " + q_dt_left + delta_where;
+			}
+			if (!foj.dt_right_name.empty() && !foj.left_table.empty()) {
+				string q_dt_right = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_right_name);
+				string q_left_base = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.left_table);
+				if (!unmatched_affected.empty()) {
+					unmatched_affected += "\n  UNION\n  ";
+				}
+				unmatched_affected += "SELECT DISTINCT " + keys_tuple + " FROM " + q_left_base + " WHERE " +
+				                      KeywordHelper::WriteOptionallyQuoted(foj.left_col) + " IN (SELECT DISTINCT " +
+				                      KeywordHelper::WriteOptionallyQuoted(foj.right_col) + " FROM " + q_dt_right +
+				                      delta_where + ")";
+			}
+
+			// Build NULL check for source 4
+			string null_check;
+			for (size_t i = 0; i < group_cols.size(); i++) {
+				if (i > 0) {
+					null_check += " AND ";
+				}
+				null_check += KeywordHelper::WriteOptionallyQuoted(group_cols[i]) + " IS NULL";
+			}
+
+			if (!unmatched_affected.empty()) {
+				string where = "(" + keys_tuple + ") IN (\n  " + unmatched_affected + "\n) OR (" + null_check + ")";
+				upsert_query += "DELETE FROM " + data_table + " WHERE " + where + ";\n";
+				upsert_query += "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql +
+				                ") _ivm_unmatched\nWHERE " + where + ";\n";
+			} else {
+				upsert_query += "DELETE FROM " + data_table + " WHERE " + null_check + ";\n";
+				upsert_query += "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql +
+				                ") _ivm_null_recompute\nWHERE " + null_check + ";\n";
+			}
 		} else {
-			// For MIN/MAX views, use minmax_incremental (gated by ivm_minmax_incremental).
-			// For non-MIN/MAX views, use skip_agg_delete (gated by ivm_skip_aggregate_delete).
+			// Standard path: MIN/MAX group-recompute or incremental MERGE
 			bool effective_insert_only = has_minmax ? minmax_incremental : skip_agg_delete;
 			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
 			                                      view_query_sql, has_minmax, list_mode, delta_ts_filter, group_cols,
@@ -752,47 +816,22 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			string lk = KeywordHelper::WriteOptionallyQuoted(string(ivm::LEFT_KEY_COL));
 			string rk = KeywordHelper::WriteOptionallyQuoted(string(ivm::RIGHT_KEY_COL));
 
-			// Parse "left_table:left_col,right_table:right_col"
-			string foj_cols = metadata.GetFullOuterJoinCols(view_name);
-			string left_table, left_col, right_table, right_col;
-			auto comma_pos = foj_cols.find(',');
-			if (comma_pos != string::npos) {
-				string left_part = foj_cols.substr(0, comma_pos);
-				string right_part = foj_cols.substr(comma_pos + 1);
-				auto lcolon = left_part.find(':');
-				if (lcolon != string::npos) {
-					left_table = left_part.substr(0, lcolon);
-					left_col = left_part.substr(lcolon + 1);
-				}
-				auto rcolon = right_part.find(':');
-				if (rcolon != string::npos) {
-					right_table = right_part.substr(0, rcolon);
-					right_col = right_part.substr(rcolon + 1);
-				}
-			}
+			auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
 
 			// Build affected-keys CTE: query each delta table for its join column
 			string union_parts;
-			for (auto &dt_name : delta_table_names) {
-				// Match delta table to its base table name
-				string base_name = StringUtil::StartsWith(dt_name, ivm::DELTA_PREFIX)
-				                       ? dt_name.substr(strlen(ivm::DELTA_PREFIX))
-				                       : dt_name;
-				string dt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(dt_name);
-				if (base_name == left_table && !left_col.empty()) {
-					if (!union_parts.empty()) {
-						union_parts += "\n  UNION\n  ";
-					}
-					union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(left_col) +
-					               " AS _k FROM " + dt + delta_where;
+			if (!foj.dt_left_name.empty() && !foj.left_col.empty()) {
+				string dt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_left_name);
+				union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.left_col) +
+				               " AS _k FROM " + dt + delta_where;
+			}
+			if (!foj.dt_right_name.empty() && !foj.right_col.empty()) {
+				if (!union_parts.empty()) {
+					union_parts += "\n  UNION\n  ";
 				}
-				if (base_name == right_table && !right_col.empty()) {
-					if (!union_parts.empty()) {
-						union_parts += "\n  UNION\n  ";
-					}
-					union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(right_col) +
-					               " AS _k FROM " + dt + delta_where;
-				}
+				string dt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_right_name);
+				union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.right_col) +
+				               " AS _k FROM " + dt + delta_where;
 			}
 
 			string where_clause;

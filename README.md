@@ -73,6 +73,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | Ungrouped aggregates | Incremental | [Ungrouped aggregates](docs/operators/ungrouped-aggregates.md) |
 | `INNER JOIN` | Incremental | [Inner join](docs/operators/inner-join.md) |
 | `LEFT JOIN`, `RIGHT JOIN` | Incremental | [Left join](docs/operators/left-join.md) |
+| `FULL OUTER JOIN` | Incremental (MERGE + recompute) | [Full outer join](docs/operators/full-outer-join.md) |
 | `UNION ALL` | Incremental | [Union all](docs/operators/union-all.md) |
 | `DISTINCT` | Incremental | [Distinct](docs/operators/distinct.md) |
 | Window functions (`ROW_NUMBER`, `RANK`, etc.) | Partition-level recompute | [Window functions](docs/operators/window-functions.md) |

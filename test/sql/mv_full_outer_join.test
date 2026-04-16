@@ -389,3 +389,717 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# MERGE mode: Zhang & Larson incremental MERGE (ivm_full_outer_merge)
+# ============================================================
+
+statement ok
+SET ivm_full_outer_merge = true;
+
+statement ok
+CREATE TABLE items (id INT, category VARCHAR);
+
+statement ok
+CREATE TABLE sales (id INT, item_id INT, amount INT);
+
+statement ok
+INSERT INTO items VALUES (1, 'A'), (2, 'B'), (3, 'C');
+
+statement ok
+INSERT INTO sales VALUES (1, 1, 100), (2, 1, 200), (3, 5, 300);
+
+statement ok
+CREATE MATERIALIZED VIEW cat_sales AS
+    SELECT i.category, SUM(s.amount) AS total, COUNT(s.amount) AS cnt
+    FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id
+    GROUP BY i.category;
+
+# Initial check
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+    EXCEPT ALL
+    SELECT * FROM cat_sales
+);
+----
+0
+
+# --- MERGE: insert sale matching B (unmatched-left → matched) ---
+statement ok
+INSERT INTO sales VALUES (4, 2, 150);
+
+statement ok
+PRAGMA ivm('cat_sales');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+    EXCEPT ALL
+    SELECT * FROM cat_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cat_sales
+    EXCEPT ALL
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+);
+----
+0
+
+# --- MERGE: insert unmatched-right sale (NULL group grows) ---
+statement ok
+INSERT INTO sales VALUES (5, 99, 400);
+
+statement ok
+PRAGMA ivm('cat_sales');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+    EXCEPT ALL
+    SELECT * FROM cat_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cat_sales
+    EXCEPT ALL
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+);
+----
+0
+
+# --- MERGE: delete all sales for A (matched → unmatched-left, aggregates → NULL) ---
+statement ok
+DELETE FROM sales WHERE item_id = 1;
+
+statement ok
+PRAGMA ivm('cat_sales');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+    EXCEPT ALL
+    SELECT * FROM cat_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cat_sales
+    EXCEPT ALL
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+);
+----
+0
+
+# --- MERGE: delete unmatched-right sale (NULL group shrinks) ---
+statement ok
+DELETE FROM sales WHERE id = 3;
+
+statement ok
+PRAGMA ivm('cat_sales');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+    EXCEPT ALL
+    SELECT * FROM cat_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cat_sales
+    EXCEPT ALL
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+);
+----
+0
+
+# --- MERGE: cross-group transfer (add item matching unmatched-right sale) ---
+statement ok
+INSERT INTO items VALUES (99, 'X');
+
+statement ok
+PRAGMA ivm('cat_sales');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+    EXCEPT ALL
+    SELECT * FROM cat_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cat_sales
+    EXCEPT ALL
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+);
+----
+0
+
+# --- MERGE: batch mixed DML ---
+statement ok
+INSERT INTO items VALUES (5, 'D');
+
+statement ok
+INSERT INTO sales VALUES (6, 3, 250), (7, 88, 500);
+
+statement ok
+DELETE FROM sales WHERE id = 4;
+
+statement ok
+DELETE FROM items WHERE id = 2;
+
+statement ok
+PRAGMA ivm('cat_sales');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+    EXCEPT ALL
+    SELECT * FROM cat_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cat_sales
+    EXCEPT ALL
+    SELECT i.category, SUM(s.amount), COUNT(s.amount) FROM items i FULL OUTER JOIN sales s ON i.id = s.item_id GROUP BY i.category
+);
+----
+0
+
+# ============================================================
+# STRESS TESTS
+# ============================================================
+
+# ============================================================
+# Test: Both tables empty initially
+# ============================================================
+
+statement ok
+CREATE TABLE empty_l (id INT, grp VARCHAR);
+
+statement ok
+CREATE TABLE empty_r (id INT, lid INT, val INT);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_empty AS
+    SELECT l.grp, SUM(r.val) AS total, COUNT(r.val) AS cnt
+    FROM empty_l l FULL OUTER JOIN empty_r r ON l.id = r.lid
+    GROUP BY l.grp;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM empty_l l FULL OUTER JOIN empty_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_empty
+);
+----
+0
+
+# Insert into right only (all unmatched-right, NULL group)
+statement ok
+INSERT INTO empty_r VALUES (1, 10, 100), (2, 20, 200);
+
+statement ok
+PRAGMA ivm('mv_empty');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM empty_l l FULL OUTER JOIN empty_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_empty
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_empty EXCEPT ALL
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM empty_l l FULL OUTER JOIN empty_r r ON l.id = r.lid GROUP BY l.grp
+);
+----
+0
+
+# Insert into left, some matching right
+statement ok
+INSERT INTO empty_l VALUES (10, 'X'), (30, 'Y');
+
+statement ok
+PRAGMA ivm('mv_empty');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM empty_l l FULL OUTER JOIN empty_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_empty
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_empty EXCEPT ALL
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM empty_l l FULL OUTER JOIN empty_r r ON l.id = r.lid GROUP BY l.grp
+);
+----
+0
+
+# ============================================================
+# Test: NULL join keys (never match in equijoin)
+# ============================================================
+
+statement ok
+CREATE TABLE nullk_l (id INT, grp VARCHAR);
+
+statement ok
+CREATE TABLE nullk_r (id INT, lid INT, val INT);
+
+statement ok
+INSERT INTO nullk_l VALUES (1, 'A'), (NULL, 'NULLKEY');
+
+statement ok
+INSERT INTO nullk_r VALUES (1, 1, 50), (2, NULL, 75);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_nullkeys AS
+    SELECT l.grp, SUM(r.val) AS total, COUNT(r.val) AS cnt
+    FROM nullk_l l FULL OUTER JOIN nullk_r r ON l.id = r.lid
+    GROUP BY l.grp;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM nullk_l l FULL OUTER JOIN nullk_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_nullkeys
+);
+----
+0
+
+# Insert another NULL-keyed row on each side
+statement ok
+INSERT INTO nullk_l VALUES (NULL, 'NULLKEY2');
+
+statement ok
+INSERT INTO nullk_r VALUES (3, NULL, 125);
+
+statement ok
+PRAGMA ivm('mv_nullkeys');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM nullk_l l FULL OUTER JOIN nullk_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_nullkeys
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_nullkeys EXCEPT ALL
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM nullk_l l FULL OUTER JOIN nullk_r r ON l.id = r.lid GROUP BY l.grp
+);
+----
+0
+
+# ============================================================
+# Test: Insert then delete same row before refresh (cancels out)
+# ============================================================
+
+statement ok
+CREATE TABLE cancel_l (id INT, grp VARCHAR);
+
+statement ok
+CREATE TABLE cancel_r (id INT, lid INT, val INT);
+
+statement ok
+INSERT INTO cancel_l VALUES (1, 'A'), (2, 'B');
+
+statement ok
+INSERT INTO cancel_r VALUES (1, 1, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cancel AS
+    SELECT l.grp, SUM(r.val) AS total, COUNT(r.val) AS cnt
+    FROM cancel_l l FULL OUTER JOIN cancel_r r ON l.id = r.lid
+    GROUP BY l.grp;
+
+# Insert and delete same row before refresh — should be no-op
+statement ok
+INSERT INTO cancel_r VALUES (2, 2, 500);
+
+statement ok
+DELETE FROM cancel_r WHERE id = 2;
+
+statement ok
+PRAGMA ivm('mv_cancel');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM cancel_l l FULL OUTER JOIN cancel_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_cancel
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cancel EXCEPT ALL
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM cancel_l l FULL OUTER JOIN cancel_r r ON l.id = r.lid GROUP BY l.grp
+);
+----
+0
+
+# Insert and delete on left side too — cancel out
+statement ok
+INSERT INTO cancel_l VALUES (5, 'E');
+
+statement ok
+DELETE FROM cancel_l WHERE id = 5;
+
+statement ok
+PRAGMA ivm('mv_cancel');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM cancel_l l FULL OUTER JOIN cancel_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_cancel
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cancel EXCEPT ALL
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM cancel_l l FULL OUTER JOIN cancel_r r ON l.id = r.lid GROUP BY l.grp
+);
+----
+0
+
+# ============================================================
+# Test: All 8 transitions in a single refresh
+# {insert,delete} × {left,right} × {matched,unmatched}
+# ============================================================
+
+statement ok
+CREATE TABLE trans_l (id INT, grp VARCHAR);
+
+statement ok
+CREATE TABLE trans_r (id INT, lid INT, val INT);
+
+statement ok
+INSERT INTO trans_l VALUES (1, 'A'), (2, 'B'), (3, 'C'), (4, 'D');
+
+statement ok
+INSERT INTO trans_r VALUES (1, 1, 10), (2, 2, 20), (3, 50, 30), (4, 60, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_trans AS
+    SELECT l.grp, SUM(r.val) AS total, COUNT(r.val) AS cnt
+    FROM trans_l l FULL OUTER JOIN trans_r r ON l.id = r.lid
+    GROUP BY l.grp;
+
+# 1. INSERT LEFT MATCHED: insert left id=50, matches right lid=50
+# 2. INSERT LEFT UNMATCHED: insert left id=99, no right match
+# 3. DELETE LEFT MATCHED: delete left id=1, right lid=1 becomes unmatched
+# 4. DELETE LEFT UNMATCHED: delete left id=3, was unmatched-left
+# 5. INSERT RIGHT MATCHED: insert right lid=2, adds to B
+# 6. INSERT RIGHT UNMATCHED: insert right lid=200, no left match
+# 7. DELETE RIGHT MATCHED: delete right lid=2 (id=2), B loses its match
+# 8. DELETE RIGHT UNMATCHED: delete right lid=60 (id=4), shrinks NULL group
+statement ok
+INSERT INTO trans_l VALUES (50, 'E');
+
+statement ok
+INSERT INTO trans_l VALUES (99, 'Z');
+
+statement ok
+DELETE FROM trans_l WHERE id = 1;
+
+statement ok
+DELETE FROM trans_l WHERE id = 3;
+
+statement ok
+INSERT INTO trans_r VALUES (5, 2, 25);
+
+statement ok
+INSERT INTO trans_r VALUES (6, 200, 60);
+
+statement ok
+DELETE FROM trans_r WHERE id = 2;
+
+statement ok
+DELETE FROM trans_r WHERE id = 4;
+
+statement ok
+PRAGMA ivm('mv_trans');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM trans_l l FULL OUTER JOIN trans_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_trans
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_trans EXCEPT ALL
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM trans_l l FULL OUTER JOIN trans_r r ON l.id = r.lid GROUP BY l.grp
+);
+----
+0
+
+# ============================================================
+# Test: Large batch with many conflicting INSERT+DELETE
+# ============================================================
+
+statement ok
+CREATE TABLE batch_l (id INT, grp VARCHAR);
+
+statement ok
+CREATE TABLE batch_r (id INT, lid INT, val INT);
+
+statement ok
+INSERT INTO batch_l VALUES (1, 'A'), (2, 'B'), (3, 'C'), (4, 'D'), (5, 'E');
+
+statement ok
+INSERT INTO batch_r VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 6, 40), (5, 7, 50);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_batch AS
+    SELECT l.grp, SUM(r.val) AS total, COUNT(r.val) AS cnt
+    FROM batch_l l FULL OUTER JOIN batch_r r ON l.id = r.lid
+    GROUP BY l.grp;
+
+# Batch: many conflicting ops
+statement ok
+DELETE FROM batch_r WHERE lid = 1;
+
+statement ok
+INSERT INTO batch_r VALUES (6, 3, 60), (7, 4, 70);
+
+statement ok
+DELETE FROM batch_l WHERE id = 2;
+
+statement ok
+INSERT INTO batch_l VALUES (6, 'F');
+
+statement ok
+INSERT INTO batch_r VALUES (8, 99, 80), (9, 100, 90);
+
+statement ok
+INSERT INTO batch_r VALUES (10, 5, 999);
+
+statement ok
+DELETE FROM batch_r WHERE id = 10;
+
+statement ok
+DELETE FROM batch_r WHERE id = 5;
+
+statement ok
+INSERT INTO batch_r VALUES (11, 7, 500);
+
+statement ok
+PRAGMA ivm('mv_batch');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM batch_l l FULL OUTER JOIN batch_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_batch
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_batch EXCEPT ALL
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM batch_l l FULL OUTER JOIN batch_r r ON l.id = r.lid GROUP BY l.grp
+);
+----
+0
+
+# Second batch
+statement ok
+INSERT INTO batch_l VALUES (7, 'G'), (100, 'H');
+
+statement ok
+DELETE FROM batch_l WHERE id = 3;
+
+statement ok
+INSERT INTO batch_r VALUES (12, 1, 15), (13, 1, 25);
+
+statement ok
+DELETE FROM batch_r WHERE lid = 4;
+
+statement ok
+DELETE FROM batch_l WHERE id = 6;
+
+statement ok
+INSERT INTO batch_r VALUES (14, 5, 55);
+
+statement ok
+PRAGMA ivm('mv_batch');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM batch_l l FULL OUTER JOIN batch_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_batch
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_batch EXCEPT ALL
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM batch_l l FULL OUTER JOIN batch_r r ON l.id = r.lid GROUP BY l.grp
+);
+----
+0
+
+# ============================================================
+# Test: Simultaneous same-key inserts in both deltas
+# ============================================================
+
+statement ok
+CREATE TABLE simul_l (id INT, grp VARCHAR);
+
+statement ok
+CREATE TABLE simul_r (id INT, lid INT, val INT);
+
+statement ok
+INSERT INTO simul_l VALUES (1, 'A');
+
+statement ok
+INSERT INTO simul_r VALUES (1, 1, 50);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_simul AS
+    SELECT l.grp, SUM(r.val) AS total, COUNT(r.val) AS cnt
+    FROM simul_l l FULL OUTER JOIN simul_r r ON l.id = r.lid
+    GROUP BY l.grp;
+
+# Both sides insert with same join key simultaneously
+statement ok
+INSERT INTO simul_l VALUES (10, 'NEW');
+
+statement ok
+INSERT INTO simul_r VALUES (2, 10, 200), (3, 10, 300);
+
+statement ok
+PRAGMA ivm('mv_simul');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM simul_l l FULL OUTER JOIN simul_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_simul
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_simul EXCEPT ALL
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM simul_l l FULL OUTER JOIN simul_r r ON l.id = r.lid GROUP BY l.grp
+);
+----
+0
+
+# Both sides delete with same join key simultaneously
+statement ok
+DELETE FROM simul_l WHERE id = 10;
+
+statement ok
+DELETE FROM simul_r WHERE lid = 10;
+
+statement ok
+PRAGMA ivm('mv_simul');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM simul_l l FULL OUTER JOIN simul_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_simul
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_simul EXCEPT ALL
+    SELECT l.grp, SUM(r.val), COUNT(r.val) FROM simul_l l FULL OUTER JOIN simul_r r ON l.id = r.lid GROUP BY l.grp
+);
+----
+0
+
+# ============================================================
+# Test: Multiple aggregates (SUM + COUNT + AVG)
+# ============================================================
+
+statement ok
+CREATE TABLE multi_l (id INT, grp VARCHAR);
+
+statement ok
+CREATE TABLE multi_r (id INT, lid INT, val INT);
+
+statement ok
+INSERT INTO multi_l VALUES (1, 'A'), (2, 'B'), (3, 'C');
+
+statement ok
+INSERT INTO multi_r VALUES (1, 1, 100), (2, 1, 200), (3, 5, 300);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_multi_agg AS
+    SELECT l.grp, SUM(r.val) AS total, COUNT(r.val) AS cnt, AVG(r.val) AS avg_val
+    FROM multi_l l FULL OUTER JOIN multi_r r ON l.id = r.lid
+    GROUP BY l.grp;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val), AVG(r.val) FROM multi_l l FULL OUTER JOIN multi_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_multi_agg
+);
+----
+0
+
+statement ok
+INSERT INTO multi_r VALUES (4, 2, 150);
+
+statement ok
+INSERT INTO multi_r VALUES (5, 99, 400);
+
+statement ok
+DELETE FROM multi_r WHERE lid = 1;
+
+statement ok
+INSERT INTO multi_l VALUES (5, 'D');
+
+statement ok
+PRAGMA ivm('mv_multi_agg');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, SUM(r.val), COUNT(r.val), AVG(r.val) FROM multi_l l FULL OUTER JOIN multi_r r ON l.id = r.lid GROUP BY l.grp
+    EXCEPT ALL SELECT * FROM mv_multi_agg
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_multi_agg EXCEPT ALL
+    SELECT l.grp, SUM(r.val), COUNT(r.val), AVG(r.val) FROM multi_l l FULL OUTER JOIN multi_r r ON l.id = r.lid GROUP BY l.grp
+);
+----
+0
