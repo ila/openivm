@@ -56,6 +56,8 @@ PRAGMA ivm('monthly_totals');
 
 The cost model compares estimated cardinalities of the delta tables against the base tables. When `ivm_adaptive_refresh` is `false` (the default), the system always uses IVM for views that support it.
 
+For FULL OUTER JOIN views, the static model applies higher upsert cost multipliers (3x for aggregates, 1.5x for projections) to account for the additional recompute phases (unmatched-row key extraction, NULL group recompute). The learned regression model self-corrects from execution history after a few refreshes.
+
 ### Inspecting the cost estimate
 
 `PRAGMA ivm_cost('view_name')` returns the cost model's recommendation without performing a refresh.
@@ -90,15 +92,14 @@ CREATE MATERIALIZED VIEW sampled AS
 
 ### Unsupported operators
 
-Views that use operators not yet supported for IVM are classified as `FULL_REFRESH` with a warning printed at creation time. Unsupported constructs include `FULL OUTER JOIN`, window functions, and aggregate functions outside the supported set.
+Views that use operators not yet supported for IVM are classified as `FULL_REFRESH` with a warning printed at creation time. Unsupported constructs include window functions (over joins) and aggregate functions outside the supported set.
 
-`INNER JOIN`, `LEFT JOIN`, and `RIGHT JOIN` are all supported for incremental maintenance.
+`INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, and `FULL OUTER JOIN` are all supported for incremental maintenance.
 
 ```sql
 -- Prints a warning; subsequent PRAGMA ivm() uses full refresh
-CREATE MATERIALIZED VIEW with_full_outer AS
-  SELECT a.id, b.name
-  FROM orders a FULL OUTER JOIN customers b ON a.cid = b.id;
+CREATE MATERIALIZED VIEW with_unsupported AS
+  SELECT MEDIAN(amount) FROM orders;
 ```
 
 Supported aggregate functions: `COUNT`, `COUNT(*)`, `SUM`, `MIN`, `MAX`, `AVG`, `LIST`.
