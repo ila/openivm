@@ -1,0 +1,238 @@
+# name: test/sql/mv_update_computed.test
+# description: Test IVM with computed SET expressions in UPDATE (col = col + 1, col * 2, etc.)
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE comp_upd (id INT, val INT, price DECIMAL, label VARCHAR);
+
+statement ok
+INSERT INTO comp_upd VALUES (1, 10, 100.0, 'alpha'), (2, 20, 200.0, 'beta'), (3, 30, 300.0, 'gamma');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_comp_upd AS SELECT id, val, price, label FROM comp_upd;
+
+# --- col + constant ---
+statement ok
+UPDATE comp_upd SET val = val + 5 WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_comp_upd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val, price, label FROM comp_upd
+    EXCEPT ALL SELECT * FROM mv_comp_upd
+) d;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_comp_upd
+    EXCEPT ALL SELECT id, val, price, label FROM comp_upd
+) d;
+----
+0
+
+query I
+SELECT val FROM mv_comp_upd WHERE id = 1;
+----
+15
+
+# --- col - constant ---
+statement ok
+UPDATE comp_upd SET val = val - 3 WHERE id = 2;
+
+statement ok
+PRAGMA ivm('mv_comp_upd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val, price, label FROM comp_upd
+    EXCEPT ALL SELECT * FROM mv_comp_upd
+) d;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_comp_upd
+    EXCEPT ALL SELECT id, val, price, label FROM comp_upd
+) d;
+----
+0
+
+query I
+SELECT val FROM mv_comp_upd WHERE id = 2;
+----
+17
+
+# --- col * constant ---
+statement ok
+UPDATE comp_upd SET val = val * 2 WHERE id = 3;
+
+statement ok
+PRAGMA ivm('mv_comp_upd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val, price, label FROM comp_upd
+    EXCEPT ALL SELECT * FROM mv_comp_upd
+) d;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_comp_upd
+    EXCEPT ALL SELECT id, val, price, label FROM comp_upd
+) d;
+----
+0
+
+query I
+SELECT val FROM mv_comp_upd WHERE id = 3;
+----
+60
+
+# --- multi-column computed update ---
+statement ok
+UPDATE comp_upd SET val = val + 1, price = price - 10.0 WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_comp_upd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val, price, label FROM comp_upd
+    EXCEPT ALL SELECT * FROM mv_comp_upd
+) d;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_comp_upd
+    EXCEPT ALL SELECT id, val, price, label FROM comp_upd
+) d;
+----
+0
+
+query II
+SELECT val, price FROM mv_comp_upd WHERE id = 1;
+----
+16	90.000
+
+# --- computed update on all rows (no WHERE) ---
+statement ok
+UPDATE comp_upd SET val = val + 100;
+
+statement ok
+PRAGMA ivm('mv_comp_upd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val, price, label FROM comp_upd
+    EXCEPT ALL SELECT * FROM mv_comp_upd
+) d;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_comp_upd
+    EXCEPT ALL SELECT id, val, price, label FROM comp_upd
+) d;
+----
+0
+
+# --- mix: computed update + constant update + delete + insert before single refresh ---
+statement ok
+INSERT INTO comp_upd VALUES (4, 40, 400.0, 'delta');
+
+statement ok
+UPDATE comp_upd SET val = val - 50 WHERE id = 1;
+
+statement ok
+UPDATE comp_upd SET label = 'BETA' WHERE id = 2;
+
+statement ok
+DELETE FROM comp_upd WHERE id = 3;
+
+statement ok
+PRAGMA ivm('mv_comp_upd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val, price, label FROM comp_upd
+    EXCEPT ALL SELECT * FROM mv_comp_upd
+) d;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_comp_upd
+    EXCEPT ALL SELECT id, val, price, label FROM comp_upd
+) d;
+----
+0
+
+# --- computed update moves row across filter boundary ---
+statement ok
+CREATE TABLE filt_upd (id INT, val INT);
+
+statement ok
+INSERT INTO filt_upd VALUES (1, 10), (2, 50), (3, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_filt_upd AS SELECT id, val FROM filt_upd WHERE val > 40;
+
+# val=1 is outside (10 <= 40), val=2 and val=3 are inside
+# UPDATE id=1: val = val + 35 = 45 → enters MV
+statement ok
+UPDATE filt_upd SET val = val + 35 WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_filt_upd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM filt_upd WHERE val > 40
+    EXCEPT ALL SELECT * FROM mv_filt_upd
+) d;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_filt_upd
+    EXCEPT ALL SELECT id, val FROM filt_upd WHERE val > 40
+) d;
+----
+0
+
+# UPDATE id=2: val = val - 20 = 30 → leaves MV
+statement ok
+UPDATE filt_upd SET val = val - 20 WHERE id = 2;
+
+statement ok
+PRAGMA ivm('mv_filt_upd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, val FROM filt_upd WHERE val > 40
+    EXCEPT ALL SELECT * FROM mv_filt_upd
+) d;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_filt_upd
+    EXCEPT ALL SELECT id, val FROM filt_upd WHERE val > 40
+) d;
+----
+0

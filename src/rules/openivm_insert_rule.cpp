@@ -520,12 +520,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				string where_string;
 				for (size_t i = 0; i < update_node->columns.size(); i++) {
 					auto column = update_node->columns[i].index;
-					auto *value = dynamic_cast<BoundConstantExpression *>(projection->expressions[i].get());
-					if (!value) {
-						throw NotImplementedException("UPDATE with computed SET expressions (e.g., SET col = col + 1) "
-						                              "is not yet supported for IVM delta tracking!");
-					}
-					update_values[to_string(column)] = value->value.ToSQLString();
+					update_values[to_string(column)] = projection->expressions[i]->ToString();
 				}
 
 				if (projection->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
