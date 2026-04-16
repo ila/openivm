@@ -60,6 +60,7 @@ struct PlanStats {
 	idx_t join_leaf_count = 0;
 	bool has_join = false;
 	bool has_aggregate = false;
+	bool has_full_outer = false;
 	bool all_ducklake = true;        // true until a non-DuckLake leaf is found
 	double filter_selectivity = 1.0; // cumulative selectivity from non-pushed-down LOGICAL_FILTER nodes
 };
@@ -136,9 +137,16 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_JOIN:
+	case LogicalOperatorType::LOGICAL_JOIN: {
 		stats.has_join = true;
+		if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+			auto *join = dynamic_cast<LogicalComparisonJoin *>(&op);
+			if (join && join->join_type == JoinType::OUTER) {
+				stats.has_full_outer = true;
+			}
+		}
 		break;
+	}
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
 		stats.has_aggregate = true;
 		break;
@@ -496,10 +504,18 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		// Merge cost is proportional to affected groups, not full MV
 		double affected_groups = std::min(estimated_delta_result, mv_card);
 		ivm_upsert = affected_groups * 2.0; // read + write per group
+		if (plan_stats.has_full_outer) {
+			// FULL OUTER: MERGE + targeted unmatched recompute + NULL group recompute
+			ivm_upsert *= 3.0;
+		}
 	} else {
 		// Projection/filter: targeted insert/delete
 		// EXISTS subquery cost ≈ delta_result × log(MV) for each delete
 		ivm_upsert = estimated_delta_result * (1.0 + std::log2(std::max(mv_card, 1.0)));
+		if (plan_stats.has_full_outer) {
+			// Bidirectional key CTE queries both delta tables
+			ivm_upsert *= 1.5;
+		}
 	}
 
 	double ivm_total = ivm_compute + ivm_upsert;
@@ -561,9 +577,10 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		}
 	}
 
-	OPENIVM_DEBUG_PRINT("[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s, DuckLake: %s, FK pruned PKs: %lu\n", N,
-	                    has_join ? "yes" : "no", has_aggregate ? "yes" : "no", plan_stats.all_ducklake ? "yes" : "no",
-	                    (unsigned long)fk_pk_leaf_count);
+	OPENIVM_DEBUG_PRINT(
+	    "[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s, FullOuter: %s, DuckLake: %s, FK pruned PKs: %lu\n", N,
+	    has_join ? "yes" : "no", has_aggregate ? "yes" : "no", plan_stats.has_full_outer ? "yes" : "no",
+	    plan_stats.all_ducklake ? "yes" : "no", (unsigned long)fk_pk_leaf_count);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Base scan total: %.0f, Delta fraction sum: %.4f, Filter selectivity: %.4f\n",
 	                    total_base_scan, delta_fraction_sum, plan_stats.filter_selectivity);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] MV cardinality: %.0f, Est. delta result: %.0f\n", mv_card,
