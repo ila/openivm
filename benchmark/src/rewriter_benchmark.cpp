@@ -373,18 +373,18 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		}
 
 		// Clean up any leftover mv_q* views and orphaned data tables from a previous crashed child.
-		// Two passes:
-		//   1. Drop views registered in _duckdb_ivm_views (DROP MV handles metadata + view + data table)
-		//   2. Drop any orphaned _ivm_data_mv_q* tables whose crash happened before the metadata commit
+		// DROP VIEW (not DROP MATERIALIZED VIEW — DuckDB intercepts that before OpenIVM) performs
+		// the full cleanup: user-facing view, data table, delta view, and metadata entries.
+		// Pass 2 catches orphaned data tables for crashes that happened before metadata was committed.
 		{
 			auto leftover = con.Query("SELECT view_name FROM _duckdb_ivm_views WHERE view_name LIKE 'mv_q%'");
 			if (leftover && !leftover->HasError()) {
 				for (idx_t r = 0; r < leftover->RowCount(); r++) {
 					string vn = leftover->GetValue(0, r).ToString();
-					con.Query("DROP MATERIALIZED VIEW IF EXISTS " + vn);
+					con.Query("DROP VIEW IF EXISTS " + vn);
 				}
 			}
-			// Drop orphaned data tables not caught by DROP MATERIALIZED VIEW
+			// Drop orphaned data tables not caught by DROP VIEW
 			auto orphaned =
 			    con.Query("SELECT table_name FROM information_schema.tables "
 			              "WHERE table_name LIKE '_ivm_data_mv_q%' AND table_schema = 'main'");
@@ -521,8 +521,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						}
 					}
 
-					// Cleanup
-					con.Query("DROP MATERIALIZED VIEW IF EXISTS " + mv_name);
+					// Cleanup — use DROP VIEW (not DROP MATERIALIZED VIEW; DuckDB intercepts
+					// that before OpenIVM, so it silently fails to clean metadata).
+					con.Query("DROP VIEW IF EXISTS " + mv_name);
 
 				} catch (std::exception &e) {
 					error = e.what();
