@@ -584,32 +584,24 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 	}
 
-	// Build partition key tuple
-	string keys_tuple;
+	// Single-table window views: identify affected partitions from the base delta table.
+	// OR-based per-column filtering handles multiple PARTITION BY columns from different
+	// OVER clauses — a change in dept affects ALL rows in that dept regardless of team.
+	// (Window+join views have empty partition_columns → caught by full recompute above.)
+	string affected_filter;
 	for (size_t i = 0; i < partition_columns.size(); i++) {
 		if (i > 0) {
-			keys_tuple += ", ";
+			affected_filter += " OR ";
 		}
-		keys_tuple += Q(partition_columns[i]);
+		string col = Q(partition_columns[i]);
+		affected_filter += col + " IN (SELECT DISTINCT " + col + " FROM " + Q(delta_table_names[0]) + delta_where + ")";
 	}
 
-	// Identify affected partitions from base delta tables.
-	// Window views skip DoIVM (LPTS doesn't support WINDOW), so the delta view isn't populated.
-	// Instead, query base delta tables directly for affected partition keys.
-	string affected_partitions;
-	for (size_t i = 0; i < delta_table_names.size(); i++) {
-		if (i > 0) {
-			affected_partitions += " UNION ";
-		}
-		affected_partitions += "SELECT DISTINCT " + keys_tuple + " FROM " + Q(delta_table_names[i]) + delta_where;
-	}
-
-	string delete_query =
-	    "DELETE FROM " + data_table + " WHERE (" + keys_tuple + ") IN (\n  " + affected_partitions + "\n);\n";
+	string delete_query = "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
 	string insert_query = "INSERT INTO " + data_table + "\n" + "SELECT * FROM (" + view_query_sql +
-	                      ") _ivm_recompute\n" + "WHERE (" + keys_tuple + ") IN (\n  " + affected_partitions + "\n);\n";
+	                      ") _ivm_recompute\n" + "WHERE " + affected_filter + ";\n";
 
-	OPENIVM_DEBUG_PRINT("[CompileWindowRecompute] Partition keys: %s\n", keys_tuple.c_str());
+	OPENIVM_DEBUG_PRINT("[CompileWindowRecompute] Partition columns: %zu\n", partition_columns.size());
 	return delete_query + "\n" + insert_query;
 }
 

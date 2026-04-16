@@ -285,9 +285,18 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		bool found_minmax = analysis.found_minmax;
 		bool found_left_join = analysis.found_left_join;
 		bool found_window = analysis.found_window;
+		bool found_join = analysis.found_join;
 		auto aggregate_columns = std::move(analysis.aggregate_columns);
 		auto aggregate_types = std::move(analysis.aggregate_types);
 		auto window_partition_columns = std::move(analysis.window_partition_columns);
+
+		// Window over join: partition columns may come from a joined table whose delta
+		// doesn't have that column. We can't resolve joins at refresh time without LPTS
+		// support for WINDOW. Fall back to full recompute for window+join views.
+		// Single-table window views keep partition-level recompute.
+		if (found_window && found_join) {
+			window_partition_columns.clear();
+		}
 
 		// Fix expression-based group-by column names: the plan walk may extract
 		// "abs(val)" but the MV table column is "abs_val" (from the AS alias).

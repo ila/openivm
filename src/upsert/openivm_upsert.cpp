@@ -712,8 +712,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 
 	if (view_query_type == IVMType::WINDOW_PARTITION) {
 		// Window views skip the DoIVM/LPTS path because LPTS doesn't support WINDOW.
-		// The partition-recompute upsert reads partition keys from base delta tables directly.
-		// The delta view is not populated — downstream MVs refresh from the updated data table.
+		// Partition detection uses base delta tables directly via CompileWindowRecompute.
 		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping DoIVM for WINDOW_PARTITION (LPTS limitation)\n");
 		ivm_query = "";
 	} else {
@@ -883,8 +882,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		} else {
 			delete_from_view_query = "DELETE FROM " + delta_view_name + ";";
 		}
-
-	} // end of DoIVM block (skipped for WINDOW_PARTITION — LPTS doesn't support WINDOW)
+	}
 
 	// now we can also delete from the delta table, but only if all the dependent views have been refreshed
 	// example: if two views A and B are on the same table T, we can only remove tuples from T

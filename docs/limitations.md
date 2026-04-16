@@ -10,7 +10,7 @@ on each `PRAGMA ivm()` call). This page consolidates all known limitations.
 |---|---|---|
 | `STDDEV`, `VARIANCE` | Incremental | Decomposed to SUM + SUM(x^2) + COUNT |
 | `COUNT(DISTINCT x)` | Full refresh | Requires auxiliary per-value tracking |
-| Window functions (`ROW_NUMBER`, `RANK`, etc.) | Partition recompute | [Affected partitions recomputed](operators/window-functions.md) |
+| Window functions (`ROW_NUMBER`, `RANK`, etc.) | Partition recompute | [Single-table: partition recompute. Over JOIN: full recompute](operators/window-functions.md) |
 | `FULL OUTER JOIN` | Not supported | View creation fails |
 | `GROUPING SETS`, `CUBE`, `ROLLUP` | Full refresh | Decomposable to UNION ALL of GROUP BYs |
 | Recursive CTEs | Full refresh | Semi-naive evaluation not yet implemented |

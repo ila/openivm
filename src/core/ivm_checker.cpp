@@ -96,6 +96,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 	case LogicalOperatorType::LOGICAL_JOIN:
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
+		result.found_join = true;
 		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
 		if (join) {
 			if (join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT &&
@@ -156,8 +157,9 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_WINDOW: {
 		result.found_window = true;
 		auto &window = node->Cast<LogicalWindow>();
-		// Extract PARTITION BY column names from the first window expression.
-		// All window functions in the same OVER clause share the same PARTITION BY.
+		// Extract PARTITION BY column names from ALL window expressions.
+		// Different window functions may use different PARTITION BY clauses —
+		// collect the union of all partition columns so any change triggers recompute.
 		for (auto &expr : window.expressions) {
 			if (expr->expression_class == ExpressionClass::BOUND_WINDOW) {
 				auto &win_expr = expr->Cast<BoundWindowExpression>();
@@ -181,7 +183,6 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 						result.window_partition_columns.push_back(col_name);
 					}
 				}
-				break; // only need partitions from the first window expression
 			}
 		}
 		break;

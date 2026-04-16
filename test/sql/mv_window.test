@@ -350,3 +350,61 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 10: Multiple window functions with DIFFERENT PARTITION BY columns
+# ==========================================
+
+statement ok
+CREATE TABLE w_multi_part (id INT, dept VARCHAR, team VARCHAR, val INT);
+
+statement ok
+INSERT INTO w_multi_part VALUES (1,'eng','be',10), (2,'eng','fe',20), (3,'hr','rec',30), (4,'hr','ops',40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_multi_part AS
+    SELECT id, dept, team, val,
+        ROW_NUMBER() OVER (PARTITION BY dept ORDER BY val) as dept_rn,
+        ROW_NUMBER() OVER (PARTITION BY team ORDER BY val) as team_rn
+    FROM w_multi_part;
+
+# Cross-check initial
+query I
+SELECT count(*) FROM (
+    SELECT id, dept, team, val,
+        ROW_NUMBER() OVER (PARTITION BY dept ORDER BY val),
+        ROW_NUMBER() OVER (PARTITION BY team ORDER BY val)
+    FROM w_multi_part
+    EXCEPT ALL SELECT * FROM mv_multi_part
+);
+----
+0
+
+# Insert into dept='eng', team='be' — both partitions should recompute
+statement ok
+INSERT INTO w_multi_part VALUES (5,'eng','be',15);
+
+statement ok
+PRAGMA ivm('mv_multi_part');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, dept, team, val,
+        ROW_NUMBER() OVER (PARTITION BY dept ORDER BY val),
+        ROW_NUMBER() OVER (PARTITION BY team ORDER BY val)
+    FROM w_multi_part
+    EXCEPT ALL SELECT * FROM mv_multi_part
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_multi_part
+    EXCEPT ALL SELECT id, dept, team, val,
+        ROW_NUMBER() OVER (PARTITION BY dept ORDER BY val),
+        ROW_NUMBER() OVER (PARTITION BY team ORDER BY val)
+    FROM w_multi_part
+);
+----
+0

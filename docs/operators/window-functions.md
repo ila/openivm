@@ -54,7 +54,7 @@ still benefits from empty-delta skipping — no-op when nothing changed.
 Window functions work with other operators:
 
 - **Window over JOIN:** `SELECT ..., ROW_NUMBER() OVER (...) FROM t1 JOIN t2 ON ...` — 
-  partitions are identified from all base delta tables involved in the join.
+  uses full recompute (partition-level recompute not available for joins, see limitations).
 - **Window with WHERE:** `SELECT ..., RANK() OVER (...) FROM t WHERE active = true` —
   the filter is part of the base query used for partition recompute.
 - **Composite PARTITION BY:** Multiple columns are supported:
@@ -85,6 +85,10 @@ refresh is a full recompute of the downstream query, not incremental.
 
 ## Limitations
 
+- **Window over JOIN uses full recompute.** When a window view involves a JOIN,
+  partition columns may come from a joined table whose delta doesn't contain them.
+  Without LPTS support for WINDOW, we cannot resolve partition values through the join
+  at refresh time. Single-table window views use efficient partition-level recompute.
 - **No insert-only optimization.** Unlike grouped aggregates, window functions always
   require full partition recompute regardless of delta type. A single insertion can
   change the numbering of all rows in the partition.
