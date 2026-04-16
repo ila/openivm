@@ -503,6 +503,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 
 	// Get column names from the delta view table.
 	vector<string> column_names;
+	vector<LogicalType> column_types;
 	bool list_mode = false;
 	if (delta_view_catalog_entry) {
 		// Standard catalog: use catalog entry directly
@@ -510,22 +511,28 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		const ColumnList &delta_view_columns = delta_view_entry->GetColumns();
 		column_names = delta_view_columns.GetColumnNames();
 		for (auto &col : delta_view_columns.Logical()) {
+			column_types.push_back(col.GetType());
 			if (col.GetName() != ivm::MULTIPLICITY_COL && col.GetType().id() == LogicalTypeId::LIST) {
 				list_mode = true;
-				break;
 			}
 		}
 	} else {
-		// DuckLake: get column names via SQL
+		// DuckLake: get column names + types via SQL
 		string delta_full = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
 		auto col_result =
-		    con.Query("SELECT column_name FROM information_schema.columns WHERE table_catalog = '" +
+		    con.Query("SELECT column_name, data_type FROM information_schema.columns WHERE table_catalog = '" +
 		              OpenIVMUtils::EscapeValue(view_catalog_name) + "' AND table_schema = '" +
 		              OpenIVMUtils::EscapeValue(view_schema_name) + "' AND table_name = '" +
 		              OpenIVMUtils::EscapeValue(OpenIVMUtils::DeltaName(view_name)) + "' ORDER BY ordinal_position");
 		if (!col_result->HasError()) {
 			for (idx_t i = 0; i < col_result->RowCount(); i++) {
 				column_names.push_back(col_result->GetValue(0, i).ToString());
+				try {
+					column_types.push_back(
+					    TransformStringToLogicalType(col_result->GetValue(1, i).ToString(), context));
+				} catch (...) {
+					column_types.push_back(LogicalType::VARCHAR);
+				}
 			}
 		}
 	}
@@ -533,9 +540,18 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// Check if the delta view has a timestamp column (present when created via CREATE MATERIALIZED VIEW)
 	bool has_ts_col =
 	    std::find(column_names.begin(), column_names.end(), string(ivm::TIMESTAMP_COL)) != column_names.end();
-	// Remove _duckdb_ivm_timestamp — it's auto-filled by DEFAULT (for chained MV support)
-	column_names.erase(std::remove(column_names.begin(), column_names.end(), string(ivm::TIMESTAMP_COL)),
-	                   column_names.end());
+	// Remove _duckdb_ivm_timestamp — it's auto-filled by DEFAULT (for chained MV support).
+	// Keep column_names and column_types aligned: drop the type at the same position.
+	for (size_t i = 0; i < column_names.size(); /* conditional increment */) {
+		if (column_names[i] == string(ivm::TIMESTAMP_COL)) {
+			column_names.erase(column_names.begin() + i);
+			if (i < column_types.size()) {
+				column_types.erase(column_types.begin() + i);
+			}
+		} else {
+			i++;
+		}
+	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] List mode: %s\n", list_mode ? "true" : "false");
 
 	string upsert_query;
@@ -702,11 +718,11 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			bool effective_insert_only = has_minmax ? minmax_incremental : skip_agg_delete;
 			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
 			                                      view_query_sql, has_minmax, list_mode, delta_ts_filter, group_cols,
-			                                      catalog_prefix, effective_insert_only, agg_types);
+			                                      catalog_prefix, effective_insert_only, agg_types, column_types);
 		} else {
-			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
-			                                      view_query_sql, /*has_minmax=*/true, list_mode, delta_ts_filter,
-			                                      group_cols, catalog_prefix, /*insert_only=*/false, agg_types);
+			upsert_query = CompileAggregateGroups(
+			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, /*has_minmax=*/true,
+			    list_mode, delta_ts_filter, group_cols, catalog_prefix, /*insert_only=*/false, agg_types, column_types);
 		}
 		break;
 	}
@@ -767,9 +783,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			// Phase 2: Recompute groups affected by UNMATCHED changes
 			//          (left delta table + right→left join key mapping + NULL group)
 			bool effective_insert_only = skip_agg_delete;
-			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
-			                                      view_query_sql, /*has_minmax=*/false, list_mode, delta_ts_filter,
-			                                      group_cols, catalog_prefix, effective_insert_only, agg_types);
+			upsert_query = CompileAggregateGroups(
+			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, /*has_minmax=*/false,
+			    list_mode, delta_ts_filter, group_cols, catalog_prefix, effective_insert_only, agg_types, column_types);
 
 			// Phase 2: recompute groups affected by unmatched changes
 			string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
@@ -825,7 +841,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			bool effective_insert_only = has_minmax ? minmax_incremental : skip_agg_delete;
 			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
 			                                      view_query_sql, has_minmax, list_mode, delta_ts_filter, group_cols,
-			                                      catalog_prefix, effective_insert_only, agg_types);
+			                                      catalog_prefix, effective_insert_only, agg_types, column_types);
 		}
 		break;
 	}
@@ -889,7 +905,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 
 	case IVMType::SIMPLE_AGGREGATE: {
 		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode,
-		                                       delta_ts_filter, catalog_prefix, insert_only);
+		                                       delta_ts_filter, catalog_prefix, insert_only, column_types);
 		if (!has_minmax) {
 			auto source_tables = metadata.GetDeltaTables(view_name);
 			for (auto &dt : source_tables) {

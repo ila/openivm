@@ -101,10 +101,34 @@ static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &col
 	return result;
 }
 
+// Types that can be added/subtracted in `sum(case mult=false then -<col> else <col> end)`.
+// Anything else (VARCHAR, BOOLEAN, LIST, STRUCT, MAP, ...) breaks the delta path.
+static bool IsSummableType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+		return true;
+	default:
+		return false;
+	}
+}
+
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
                               bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
-                              const string &catalog_prefix, bool insert_only, const vector<string> &aggregate_types) {
+                              const string &catalog_prefix, bool insert_only, const vector<string> &aggregate_types,
+                              const vector<LogicalType> &column_types) {
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + Q(OpenIVMUtils::DeltaName(view_name));
 
@@ -125,11 +149,24 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 
 	unordered_set<std::string> keys_set(keys.begin(), keys.end());
 	vector<string> aggregates;
-	for (auto &column : column_names) {
+	// Parallel: true if the matching aggregate column has a non-summable delta type
+	// (VARCHAR CASE output, 'GC' literal, UPPER(group_col), LIST(col), etc.).
+	bool has_non_summable_col = false;
+	for (size_t i = 0; i < column_names.size(); i++) {
+		const auto &column = column_names[i];
 		if (keys_set.find(Q(column)) == keys_set.end() && column != string(ivm::MULTIPLICITY_COL)) {
 			aggregates.push_back(Q(column));
+			if (i < column_types.size() && !IsSummableType(column_types[i])) {
+				has_non_summable_col = true;
+			}
 		}
 	}
+	// A non-summable non-key column can't be maintained by the delta-sum MERGE path.
+	// Fall back to group-recompute: delete affected groups, re-insert from view query.
+	// This is correct for VARCHAR literals, string functions of group keys, LIST
+	// aggregates, and CASE over aggregates alike. Slower than MERGE, faster than
+	// full recompute (only affected groups are re-evaluated).
+	bool needs_group_recompute = has_non_summable_col;
 
 	auto decomp = DetectDerivedAggColumns(aggregates);
 
@@ -161,9 +198,14 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		                    col_agg_type.size(), aggregate_types.size(), aggregates.size());
 	}
 
-	if (has_minmax && !insert_only) {
-		// Group-recompute strategy for MIN/MAX: delete affected groups, re-insert from original query.
-		// When insert_only, we can use GREATEST/LEAST instead — fall through to MERGE path below.
+	if (needs_group_recompute || (has_minmax && !insert_only)) {
+		// Group-recompute strategy: delete affected groups, re-insert from original query.
+		// Always triggered by non-summable columns (LIST aggregates, VARCHAR literals,
+		// CASE results, etc.) — even in insert-only mode, the MERGE path emits
+		// `sum(case mult=false then -<col> else <col> end)` which fails type-checking
+		// for VARCHAR etc. regardless of whether the negative branch is reached.
+		// For MIN/MAX without non-summable cols, insert_only uses GREATEST/LEAST in
+		// the MERGE path below.
 		string keys_tuple;
 		for (size_t i = 0; i < keys.size(); i++) {
 			keys_tuple += keys[i];
@@ -424,9 +466,26 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql, bool has_minmax, bool list_mode,
-                               const string &delta_ts_filter, const string &catalog_prefix, bool /*insert_only*/) {
+                               const string &delta_ts_filter, const string &catalog_prefix, bool /*insert_only*/,
+                               const vector<LogicalType> &column_types) {
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
-	if (has_minmax) {
+
+	// Any non-summable column (VARCHAR literal, CASE result, LIST) forces a full
+	// MV recompute — the `sum(case mult=false then -<col> else <col> end)` path
+	// can't type-check negation or list-zip element-wise for these types.
+	// SIMPLE_AGGREGATE has no GROUP BY, so recompute the whole MV.
+	bool has_non_summable_col = false;
+	for (size_t i = 0; i < column_names.size() && i < column_types.size(); i++) {
+		if (column_names[i] == string(ivm::MULTIPLICITY_COL) || column_names[i] == string(ivm::TIMESTAMP_COL)) {
+			continue;
+		}
+		if (!IsSummableType(column_types[i])) {
+			has_non_summable_col = true;
+			break;
+		}
+	}
+
+	if (has_minmax || has_non_summable_col) {
 		string delete_query = "DELETE FROM " + data_table + ";\n";
 		string insert_query = "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 		return delete_query + insert_query;

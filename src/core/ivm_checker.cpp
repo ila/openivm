@@ -127,6 +127,14 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 					if (bound_agg.function.name == "min" || bound_agg.function.name == "max") {
 						result.found_minmax = true;
 					}
+					// LIST aggregates aren't element-wise summable — different deltas
+					// produce lists of different lengths/contents. Mark the view so the
+					// upsert compiler uses group-recompute (delete affected groups,
+					// re-insert from the original query) rather than the failing
+					// list_reduce/lambda path.
+					if (bound_agg.function.name == "list") {
+						result.found_list = true;
+					}
 					result.aggregate_types.push_back(bound_agg.function.name);
 				}
 			}

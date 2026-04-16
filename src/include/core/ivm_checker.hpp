@@ -14,6 +14,7 @@ struct PlanAnalysis {
 	bool found_having = false;
 	bool found_distinct = false;
 	bool found_minmax = false;
+	bool found_list = false;
 	bool found_left_join = false;
 	bool found_full_outer = false;
 	bool found_join = false;

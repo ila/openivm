@@ -1485,3 +1485,221 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# Non-summable columns in aggregate MVs — the delta MERGE path
+# emits `sum(case mult=false then -<col> else <col> end)` for
+# every non-key column, which fails type-checking for VARCHAR /
+# BOOLEAN / LIST columns and gives wrong results for CASE over
+# aggregates. These cases must fall back to group-recompute:
+# delete affected groups, re-insert from the view query.
+# ============================================================
+
+# UPPER(group_key) — VARCHAR column deterministic in the group key
+statement ok
+CREATE TABLE nonadd_cust (w_id INT, state VARCHAR, bal DECIMAL(10,2));
+
+statement ok
+INSERT INTO nonadd_cust VALUES (1, 'ca', 100), (1, 'ca', 200), (1, 'ny', 150);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_upper_state AS
+    SELECT w_id, state, UPPER(state) AS state_upper, COUNT(*) AS cnt
+    FROM nonadd_cust GROUP BY w_id, state;
+
+statement ok
+INSERT INTO nonadd_cust VALUES (1, 'ca', 300), (2, 'tx', 400);
+
+statement ok
+DELETE FROM nonadd_cust WHERE state = 'ny';
+
+statement ok
+PRAGMA ivm('mv_upper_state');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_upper_state
+    EXCEPT ALL
+    SELECT w_id, state, UPPER(state), COUNT(*) FROM nonadd_cust GROUP BY w_id, state
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, state, UPPER(state), COUNT(*) FROM nonadd_cust GROUP BY w_id, state
+    EXCEPT ALL
+    SELECT * FROM mv_upper_state
+);
+----
+0
+
+# VARCHAR literal column (common in UNION-ALL-of-aggregates)
+statement ok
+CREATE TABLE tag_events (kind VARCHAR, amount INT);
+
+statement ok
+INSERT INTO tag_events VALUES ('click', 5), ('click', 7), ('view', 3);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_literal_tag AS
+    SELECT 'stat' AS label, kind, SUM(amount) AS total, COUNT(*) AS n
+    FROM tag_events GROUP BY kind;
+
+statement ok
+INSERT INTO tag_events VALUES ('click', 10), ('view', 5);
+
+statement ok
+DELETE FROM tag_events WHERE kind = 'click' AND amount = 5;
+
+statement ok
+PRAGMA ivm('mv_literal_tag');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_literal_tag
+    EXCEPT ALL
+    SELECT 'stat', kind, SUM(amount), COUNT(*) FROM tag_events GROUP BY kind
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT 'stat', kind, SUM(amount), COUNT(*) FROM tag_events GROUP BY kind
+    EXCEPT ALL SELECT * FROM mv_literal_tag
+);
+----
+0
+
+# CASE over aggregate — value changes whenever the aggregate state changes,
+# so neither summing deltas nor pass-through is correct. Group-recompute is.
+statement ok
+CREATE TABLE case_sales (region VARCHAR, rev INT);
+
+statement ok
+INSERT INTO case_sales VALUES ('EU', 100), ('EU', 500), ('US', 200), ('US', 900);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_tier AS
+    SELECT region,
+           SUM(rev) AS total,
+           COUNT(*) AS n,
+           CASE WHEN SUM(rev) > 1000 THEN 'high' ELSE 'low' END AS tier
+    FROM case_sales GROUP BY region;
+
+# Push EU past the 1000 threshold, push US below by deleting the big row
+statement ok
+INSERT INTO case_sales VALUES ('EU', 500);
+
+statement ok
+DELETE FROM case_sales WHERE region = 'US' AND rev = 900;
+
+statement ok
+PRAGMA ivm('mv_tier');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_tier
+    EXCEPT ALL
+    SELECT region, SUM(rev), COUNT(*),
+           CASE WHEN SUM(rev) > 1000 THEN 'high' ELSE 'low' END
+    FROM case_sales GROUP BY region
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(rev), COUNT(*),
+           CASE WHEN SUM(rev) > 1000 THEN 'high' ELSE 'low' END
+    FROM case_sales GROUP BY region
+    EXCEPT ALL SELECT * FROM mv_tier
+);
+----
+0
+
+# Verify the CASE value actually flipped for both groups
+query TT
+SELECT region, tier FROM mv_tier ORDER BY region;
+----
+EU	high
+US	low
+
+# LIST aggregate — lists are not element-wise summable, must re-list per group
+statement ok
+CREATE TABLE list_events (user_id INT, item_id INT);
+
+statement ok
+INSERT INTO list_events VALUES (1, 100), (1, 101), (2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_user_items AS
+    SELECT user_id, LIST(item_id ORDER BY item_id) AS items, COUNT(*) AS cnt
+    FROM list_events GROUP BY user_id;
+
+statement ok
+INSERT INTO list_events VALUES (1, 102), (2, 201), (3, 300);
+
+statement ok
+DELETE FROM list_events WHERE item_id = 101;
+
+statement ok
+PRAGMA ivm('mv_user_items');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_user_items
+    EXCEPT ALL
+    SELECT user_id, LIST(item_id ORDER BY item_id), COUNT(*)
+    FROM list_events GROUP BY user_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, LIST(item_id ORDER BY item_id), COUNT(*)
+    FROM list_events GROUP BY user_id
+    EXCEPT ALL SELECT * FROM mv_user_items
+);
+----
+0
+
+# Simple aggregate (no GROUP BY) with VARCHAR literal — SIMPLE_AGGREGATE path
+statement ok
+CREATE TABLE simple_events (amount INT);
+
+statement ok
+INSERT INTO simple_events VALUES (10), (20), (30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_simple_literal AS
+    SELECT 'all' AS bucket, COUNT(*) AS n, SUM(amount) AS total
+    FROM simple_events;
+
+statement ok
+INSERT INTO simple_events VALUES (40);
+
+statement ok
+DELETE FROM simple_events WHERE amount = 10;
+
+statement ok
+PRAGMA ivm('mv_simple_literal');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_simple_literal
+    EXCEPT ALL
+    SELECT 'all', COUNT(*), SUM(amount) FROM simple_events
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT 'all', COUNT(*), SUM(amount) FROM simple_events
+    EXCEPT ALL SELECT * FROM mv_simple_literal
+);
+----
+0
