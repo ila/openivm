@@ -76,6 +76,10 @@ DELETE + re-INSERT only the affected groups.
 |---|---|---|
 | `ivm_full_outer_merge` | `false` | Use incremental MERGE for aggregate views instead of group-recompute |
 
+## Cost model
+
+The adaptive cost model (`ivm_adaptive_refresh = true`) accounts for the extra overhead of FULL OUTER JOIN maintenance. The static model applies a 3x upsert cost multiplier for aggregate views (MERGE + unmatched recompute + NULL group) and 1.5x for projection views (bidirectional key CTE). The learned regression model self-corrects from execution history after a few refreshes.
+
 ## Limitations
 
 - Maximum 16 tables in a join (same as all joins)
