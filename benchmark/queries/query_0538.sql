@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK"}
+WITH stock_value AS (SELECT S_W_ID, S_I_ID, S_QUANTITY, I_PRICE, S_QUANTITY * I_PRICE AS value FROM STOCK JOIN ITEM ON S_I_ID = I_ID) SELECT S_W_ID, SUM(value) AS total_value, COUNT(*) AS items, AVG(value) AS avg_value FROM stock_value GROUP BY S_W_ID;

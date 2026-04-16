@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,FILTER,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "openivm_verified": true}
+WITH ranked AS (SELECT i.I_ID, i.I_NAME, SUM(ol.OL_AMOUNT) AS rev, RANK() OVER (ORDER BY SUM(ol.OL_AMOUNT) DESC) AS rnk FROM ITEM i LEFT JOIN ORDER_LINE ol ON i.I_ID = ol.OL_I_ID GROUP BY i.I_ID, i.I_NAME) SELECT I_ID, I_NAME, rev, rnk FROM ranked WHERE rnk <= 20;

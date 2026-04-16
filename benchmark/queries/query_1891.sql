@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK", "openivm_verified": true}
+WITH stock_val AS (SELECT s.S_W_ID, s.S_I_ID, s.S_QUANTITY * i.I_PRICE AS val FROM STOCK s JOIN ITEM i ON s.S_I_ID = i.I_ID), per_wh AS (SELECT S_W_ID, SUM(val) AS tot_val, AVG(val) AS avg_val FROM stock_val GROUP BY S_W_ID) SELECT pw.S_W_ID, pw.tot_val, pw.avg_val, RANK() OVER (ORDER BY pw.tot_val DESC) AS rnk FROM per_wh pw;

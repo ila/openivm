@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER"}
+SELECT d.D_W_ID, d.D_ID, d.D_NAME, COALESCE(cs.cnt, 0) AS cust_cnt FROM DISTRICT d LEFT JOIN (SELECT C_W_ID, C_D_ID, COUNT(*) AS cnt FROM CUSTOMER GROUP BY C_W_ID, C_D_ID) cs ON d.D_W_ID = cs.C_W_ID AND d.D_ID = cs.C_D_ID;

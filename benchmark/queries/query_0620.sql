@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE", "complexity": "low", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "non_incr_reason": "fn:BOOL_OR"}
+SELECT c.C_STATE, COUNT(*) AS cnt, SUM(c.C_BALANCE) AS total_bal, SUM(c.C_YTD_PAYMENT) AS total_payments, AVG(c.C_DISCOUNT) AS avg_discount, BOOL_OR(c.C_BALANCE < 0) AS any_negative FROM CUSTOMER c GROUP BY c.C_STATE;

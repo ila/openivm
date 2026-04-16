@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER"}
+SELECT CASE WHEN C_BALANCE < 0 THEN 'overdue' WHEN C_BALANCE < 1000 THEN 'low' WHEN C_BALANCE < 5000 THEN 'mid' ELSE 'high' END AS tier, COUNT(*) AS cnt, AVG(C_YTD_PAYMENT) AS avg_pay FROM CUSTOMER GROUP BY CASE WHEN C_BALANCE < 0 THEN 'overdue' WHEN C_BALANCE < 1000 THEN 'low' WHEN C_BALANCE < 5000 THEN 'mid' ELSE 'high' END;

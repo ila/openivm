@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE", "complexity": "low", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER", "non_incr_reason": "fn:BOOL_OR"}
+SELECT c.C_W_ID, c.C_CREDIT, COUNT(*) AS n, AVG(c.C_BALANCE) AS avg_b, STDDEV(c.C_BALANCE) AS std_b, SUM(CASE WHEN c.C_BALANCE < 0 THEN 1 ELSE 0 END) AS negatives, BOOL_OR(c.C_BALANCE > 5000) AS has_vip FROM CUSTOMER c GROUP BY c.C_W_ID, c.C_CREDIT;

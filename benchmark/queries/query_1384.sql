@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "openivm_verified": true}
+WITH per_w AS (SELECT C_W_ID, C_STATE, COUNT(*) AS cnt, AVG(C_BALANCE) AS avg_b FROM CUSTOMER GROUP BY C_W_ID, C_STATE) SELECT p.C_W_ID, p.C_STATE, p.cnt, p.avg_b, RANK() OVER (PARTITION BY p.C_W_ID ORDER BY p.cnt DESC) AS state_rank FROM per_w p;

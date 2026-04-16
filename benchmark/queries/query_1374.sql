@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "ITEM,STOCK", "openivm_verified": true}
+SELECT s.S_W_ID, COUNT(*) AS items, AVG(s.S_QUANTITY) AS avg_qty, STDDEV(s.S_QUANTITY) AS std_qty, SUM(s.S_QUANTITY * i.I_PRICE) AS total_value, COUNT(CASE WHEN s.S_QUANTITY < 20 THEN 1 END) AS low_stock_items FROM STOCK s JOIN ITEM i ON s.S_I_ID = i.I_ID GROUP BY s.S_W_ID;

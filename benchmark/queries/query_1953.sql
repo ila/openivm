@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "medium", "is_incremental": false, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "non_incr_reason": "op:SUBQUERY_FILTER"}
+SELECT o.O_W_ID, o.O_ID, (SELECT COUNT(*) FROM ORDER_LINE WHERE OL_O_ID = o.O_ID AND OL_W_ID = o.O_W_ID AND OL_DELIVERY_D IS NULL) AS pending_lines FROM OORDER o WHERE o.O_CARRIER_ID IS NULL;

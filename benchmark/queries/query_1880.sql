@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,ORDER,WINDOW,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "openivm_verified": true}
+SELECT top.w_id, top.tot, top.rn FROM (SELECT C_W_ID AS w_id, SUM(C_BALANCE) AS tot, ROW_NUMBER() OVER (ORDER BY SUM(C_BALANCE) DESC) AS rn FROM CUSTOMER GROUP BY C_W_ID) top WHERE top.rn <= 5;

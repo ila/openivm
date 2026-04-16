@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,CORRELATED_SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,ORDER_LINE", "non_incr_reason": "op:CORRELATED_SUBQUERY"}
+SELECT w.W_ID, w.W_NAME, stats.total_rev FROM WAREHOUSE w JOIN (SELECT ol.OL_W_ID, SUM(ol.OL_AMOUNT) AS total_rev FROM ORDER_LINE ol GROUP BY ol.OL_W_ID HAVING SUM(ol.OL_AMOUNT) > 100) stats ON w.W_ID = stats.OL_W_ID;

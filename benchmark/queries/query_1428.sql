@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": true, "has_case": false, "tables": "WAREHOUSE,DISTRICT,CUSTOMER,HISTORY"}
+SELECT w.W_ID, d.D_ID, COUNT(DISTINCT CAST((w.W_ID) AS VARCHAR)) AS uniq, COUNT(*) AS cnt FROM WAREHOUSE w JOIN DISTRICT d ON w.W_ID = d.D_W_ID JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID JOIN HISTORY h ON c.C_ID = h.H_C_ID AND c.C_W_ID = h.H_C_W_ID GROUP BY w.W_ID, d.D_ID;

@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,ORDER,WINDOW", "complexity": "high", "is_incremental": false, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "OORDER,NEW_ORDER", "non_incr_reason": "op:ORDER"}
+SELECT COALESCE(o.O_W_ID, no.NO_W_ID) AS w_id, o.O_ID, ROW_NUMBER() OVER (PARTITION BY COALESCE(o.O_W_ID, no.NO_W_ID) ORDER BY o.O_ID) AS rn FROM OORDER o FULL OUTER JOIN NEW_ORDER no ON o.O_ID = no.NO_O_ID AND o.O_W_ID = no.NO_W_ID;

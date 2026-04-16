@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": true, "has_case": false, "tables": "WAREHOUSE,DISTRICT,OORDER,ORDER_LINE"}
+SELECT w.W_ID, d.D_ID, COUNT(DISTINCT CAST((w.W_ID) AS VARCHAR)) AS uniq, COUNT(*) AS cnt FROM WAREHOUSE w JOIN DISTRICT d ON w.W_ID = d.D_W_ID JOIN OORDER o ON d.D_W_ID = o.O_W_ID AND d.D_ID = o.O_D_ID JOIN ORDER_LINE ol ON o.O_ID = ol.OL_O_ID AND o.O_W_ID = ol.OL_W_ID GROUP BY w.W_ID, d.D_ID;

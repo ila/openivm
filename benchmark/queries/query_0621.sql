@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE"}
+SELECT i.I_ID, i.I_NAME, i.I_PRICE, COALESCE(SUM(ol.OL_AMOUNT), 0) AS total_revenue, COALESCE(COUNT(ol.OL_NUMBER), 0) AS times_ordered FROM ITEM i LEFT JOIN ORDER_LINE ol ON i.I_ID = ol.OL_I_ID GROUP BY i.I_ID, i.I_NAME, i.I_PRICE;

@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER"}
+WITH dist_info AS (SELECT D_W_ID, D_ID, D_NAME, D_TAX FROM DISTRICT) SELECT di.D_W_ID, di.D_ID, di.D_NAME, COUNT(c.C_ID) AS cust_count FROM dist_info di LEFT JOIN CUSTOMER c ON di.D_W_ID = c.C_W_ID AND di.D_ID = c.C_D_ID GROUP BY di.D_W_ID, di.D_ID, di.D_NAME;

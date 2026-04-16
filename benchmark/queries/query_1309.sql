@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE"}
+WITH item_revenue AS (SELECT OL_I_ID, SUM(OL_AMOUNT) AS rev FROM ORDER_LINE GROUP BY OL_I_ID HAVING SUM(OL_AMOUNT) > 100) SELECT i.I_ID, i.I_NAME, i.I_PRICE, ir.rev FROM ITEM i JOIN item_revenue ir ON i.I_ID = ir.OL_I_ID;

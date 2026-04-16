@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE"}
+SELECT EXTRACT(YEAR FROM o.O_ENTRY_D) AS yr, EXTRACT(MONTH FROM o.O_ENTRY_D) AS mo, COUNT(*) AS orders, SUM(ol.OL_AMOUNT) AS revenue FROM OORDER o JOIN ORDER_LINE ol ON o.O_ID = ol.OL_O_ID AND o.O_W_ID = ol.OL_W_ID GROUP BY EXTRACT(YEAR FROM o.O_ENTRY_D), EXTRACT(MONTH FROM o.O_ENTRY_D);

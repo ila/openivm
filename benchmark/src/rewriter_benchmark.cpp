@@ -55,6 +55,24 @@ static string FormatNumber(double v) {
 	return s;
 }
 
+// Parse is_incremental from the query file's first-line metadata comment.
+// Returns 1 if metadata says incremental, 0 if FULL_REFRESH, -1 if missing/unparseable.
+static int ParseIsIncrementalFromQueryFile(const string &query_sql) {
+	// Look at the first line for "-- {...}" and find "is_incremental": true|false
+	size_t nl = query_sql.find('\n');
+	string first_line = (nl == string::npos) ? query_sql : query_sql.substr(0, nl);
+	if (first_line.rfind("-- ", 0) != 0) return -1;
+	size_t pos = first_line.find("\"is_incremental\"");
+	if (pos == string::npos) return -1;
+	pos = first_line.find(':', pos);
+	if (pos == string::npos) return -1;
+	// Skip whitespace
+	while (pos + 1 < first_line.size() && (first_line[pos + 1] == ' ' || first_line[pos + 1] == '\t')) pos++;
+	if (first_line.compare(pos + 1, 4, "true") == 0) return 1;
+	if (first_line.compare(pos + 1, 5, "false") == 0) return 0;
+	return -1;
+}
+
 static bool FileExists(const string &path) {
 	struct stat buffer;
 	return (stat(path.c_str(), &buffer) == 0);
@@ -305,6 +323,16 @@ struct RewriterStats {
 	std::map<string, vector<string>> error_queries;
 	vector<string> crash_queries;
 	vector<string> incorrect_queries;
+
+	// Metadata-vs-OpenIVM confusion matrix (only counted among mv_creation_ok).
+	// meta_X_actual_Y: metadata says X, OpenIVM actually did Y.
+	int meta_true_actual_true = 0;   // correctly predicted incremental
+	int meta_true_actual_false = 0;  // predicted incremental but OpenIVM fell back to FULL_REFRESH
+	int meta_false_actual_true = 0;  // predicted FULL_REFRESH but OpenIVM handled incrementally (surprising)
+	int meta_false_actual_false = 0; // correctly predicted FULL_REFRESH
+	int meta_missing = 0;            // query file had no is_incremental metadata
+	vector<string> mismatch_true_actual_false_queries;
+	vector<string> mismatch_false_actual_true_queries;
 };
 
 static void PrintErrorBreakdown(const RewriterStats &stats, int total) {
@@ -743,6 +771,49 @@ struct ForkWorker {
 
 // ===== Main Benchmark Logic =====
 
+static void PrintIncrementalityMatrix(const RewriterStats &stats) {
+	// Confusion matrix: metadata prediction vs OpenIVM's actual classification
+	int mt_at = stats.meta_true_actual_true;
+	int mt_af = stats.meta_true_actual_false;
+	int mf_at = stats.meta_false_actual_true;
+	int mf_af = stats.meta_false_actual_false;
+	int total = mt_at + mt_af + mf_at + mf_af;
+	int correct = mt_at + mf_af;
+	int wrong = mt_af + mf_at;
+
+	Log("");
+	Log("=== Metadata vs OpenIVM — Incrementalizable Classification ===");
+	Log("(over " + std::to_string(total) + " queries where MV creation succeeded)");
+	Log("");
+	Log("                          | OpenIVM:  INCREMENTAL  |  OpenIVM:  FULL_REFRESH |");
+	Log("  ------------------------+------------------------+-------------------------+");
+	Log("  Metadata: INCREMENTAL   |  correct:   " + std::to_string(mt_at) + string(10 - std::min<size_t>(10, std::to_string(mt_at).size()), ' ') +
+	    "|  mismatch:  " + std::to_string(mt_af) + string(11 - std::min<size_t>(11, std::to_string(mt_af).size()), ' ') + "|");
+	Log("  Metadata: FULL_REFRESH  |  mismatch:  " + std::to_string(mf_at) + string(10 - std::min<size_t>(10, std::to_string(mf_at).size()), ' ') +
+	    "|  correct:   " + std::to_string(mf_af) + string(11 - std::min<size_t>(11, std::to_string(mf_af).size()), ' ') + "|");
+	Log("");
+	if (total > 0) {
+		Log("  Correctly classified by metadata: " + std::to_string(correct) + " (" +
+		    FormatNumber(100.0 * correct / total) + "%)");
+		Log("  Mismatched (metadata wrong):      " + std::to_string(wrong) + " (" +
+		    FormatNumber(100.0 * wrong / total) + "%)");
+	}
+	if (stats.meta_missing > 0) {
+		Log("  Queries without is_incremental metadata: " + std::to_string(stats.meta_missing));
+	}
+
+	if (!stats.mismatch_true_actual_false_queries.empty()) {
+		Log("");
+		Log("  Metadata=true but OpenIVM=FULL_REFRESH (metadata too optimistic):");
+		Log("    " + FormatQueryList(stats.mismatch_true_actual_false_queries, 20));
+	}
+	if (!stats.mismatch_false_actual_true_queries.empty()) {
+		Log("");
+		Log("  Metadata=false but OpenIVM=incremental (metadata too pessimistic):");
+		Log("    " + FormatQueryList(stats.mismatch_false_actual_true_queries, 20));
+	}
+}
+
 static void PrintStats(const string &label, const RewriterStats &stats, int total) {
 	Log("--- " + label + " ---");
 	Log("  Total:   " + std::to_string(total));
@@ -762,7 +833,7 @@ static void PrintStats(const string &label, const RewriterStats &stats, int tota
 
 static vector<string> RunBenchmark(const string &queries_dir, const string &db_path, int scale_factor, double timeout_s) {
 	vector<string> csv_lines;
-	csv_lines.push_back("query_name,phase_reached,is_incremental,is_correct,time_select_ms,time_mv_ms,time_refresh_ms,time_verify_ms,error");
+	csv_lines.push_back("query_name,phase_reached,meta_is_incremental,actual_is_incremental,is_correct,time_select_ms,time_mv_ms,time_refresh_ms,time_verify_ms,error");
 
 	if (!FileExists(db_path)) {
 		Log("Creating TPC-C database: " + db_path);
@@ -811,9 +882,12 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 
 		if (query_sql.empty()) {
 			stats.validation_fail++;
-			csv_lines.push_back(query_name + ",1,0,0,0,0,0,0,empty file");
+			csv_lines.push_back(query_name + ",1,0,0,0,0,0,0,,,empty file");
 			continue;
 		}
+
+		// Parse metadata is_incremental prediction before running
+		int meta_incremental = ParseIsIncrementalFromQueryFile(query_sql);
 
 		worker.Submit(query_sql, timeout_s);
 
@@ -903,16 +977,46 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 			last_internal_error_query.clear();
 		}
 
-		// Build CSV line
+		// Metadata-vs-OpenIVM confusion matrix: only count queries where MV creation succeeded
+		// (so we have a real ivm_type to compare against).
+		if (phase == 3 || phase == 4 || phase == 5 || phase == 6) {
+			bool actual_incr = (worker.result_incremental != 0);
+			if (meta_incremental < 0) {
+				stats.meta_missing++;
+			} else if (meta_incremental == 1 && actual_incr) {
+				stats.meta_true_actual_true++;
+			} else if (meta_incremental == 1 && !actual_incr) {
+				stats.meta_true_actual_false++;
+				stats.mismatch_true_actual_false_queries.push_back(query_name);
+			} else if (meta_incremental == 0 && actual_incr) {
+				stats.meta_false_actual_true++;
+				stats.mismatch_false_actual_true_queries.push_back(query_name);
+			} else {
+				stats.meta_false_actual_false++;
+			}
+		}
+
+		// Build CSV line — meta_is_incremental column is blank when metadata is missing
+		string meta_str = (meta_incremental < 0) ? "" : std::to_string(meta_incremental);
 		std::ostringstream csv_line;
 		csv_line << query_name << "," << std::to_string(phase) << ","
-		         << std::to_string(worker.result_incremental) << "," << std::to_string(worker.result_correct) << ","
+		         << meta_str << "," << std::to_string(worker.result_incremental) << ","
+		         << std::to_string(worker.result_correct) << ","
 		         << FormatNumber(worker.result_time_select_ms) << "," << FormatNumber(worker.result_time_mv_ms) << ","
 		         << FormatNumber(worker.result_time_refresh_ms) << "," << FormatNumber(worker.result_time_verify_ms) << ",\"" << error_msg << "\"";
 		csv_lines.push_back(csv_line.str());
 
 		if ((i + 1) % log_interval == 0 || i + 1 == total) {
-			Log("[" + std::to_string(i + 1) + "/" + std::to_string(total) + "] val=" + std::to_string(stats.validation_ok) + " mv=" + std::to_string(stats.mv_creation_ok) + " incr=" + std::to_string(stats.incremental) + " refresh=" + std::to_string(stats.refresh_ok) + " correct=" + std::to_string(stats.correct) + " crash=" + std::to_string(stats.crashed));
+			Log("[" + std::to_string(i + 1) + "/" + std::to_string(total) + "] val=" + std::to_string(stats.validation_ok) +
+			    " mv=" + std::to_string(stats.mv_creation_ok) +
+			    " incr=" + std::to_string(stats.incremental) +
+			    " refresh=" + std::to_string(stats.refresh_ok) +
+			    " correct=" + std::to_string(stats.correct) +
+			    " crash=" + std::to_string(stats.crashed) +
+			    " | meta[T/T=" + std::to_string(stats.meta_true_actual_true) +
+			    " T/F=" + std::to_string(stats.meta_true_actual_false) +
+			    " F/T=" + std::to_string(stats.meta_false_actual_true) +
+			    " F/F=" + std::to_string(stats.meta_false_actual_false) + "]");
 		}
 	}
 
@@ -920,6 +1024,7 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 
 	Log("");
 	PrintStats("Rewriter Benchmark Results", stats, total);
+	PrintIncrementalityMatrix(stats);
 	PrintErrorBreakdown(stats, total);
 
 	if (!stats.incorrect_queries.empty()) {

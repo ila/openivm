@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,ORDER,WINDOW", "complexity": "medium", "is_incremental": false, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "HISTORY", "non_incr_reason": "op:ORDER"}
+SELECT H_W_ID, H_DATE, H_AMOUNT, COUNT(*) OVER (PARTITION BY H_W_ID ORDER BY H_DATE RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS rolling_30d FROM HISTORY WHERE H_DATE IS NOT NULL;

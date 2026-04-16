@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER,HISTORY"}
+WITH pay AS (SELECT H_W_ID, SUM(H_AMOUNT) AS tot FROM HISTORY GROUP BY H_W_ID), bal AS (SELECT C_W_ID, SUM(C_BALANCE) AS tot FROM CUSTOMER GROUP BY C_W_ID) SELECT w.W_ID, w.W_NAME, COALESCE(p.tot, 0) AS payments, COALESCE(b.tot, 0) AS balance FROM WAREHOUSE w LEFT JOIN pay p ON w.W_ID = p.H_W_ID LEFT JOIN bal b ON w.W_ID = b.C_W_ID;

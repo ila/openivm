@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER"}
+WITH bad AS (SELECT C_W_ID, COUNT(*) AS n FROM CUSTOMER WHERE C_CREDIT = 'BC' GROUP BY C_W_ID), good AS (SELECT C_W_ID, COUNT(*) AS n FROM CUSTOMER WHERE C_CREDIT = 'GC' GROUP BY C_W_ID) SELECT COALESCE(b.C_W_ID, g.C_W_ID) AS w_id, COALESCE(b.n, 0) AS bad_cnt, COALESCE(g.n, 0) AS good_cnt FROM bad b FULL OUTER JOIN good g ON b.C_W_ID = g.C_W_ID;

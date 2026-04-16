@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "openivm_verified": true}
+WITH per_state AS (SELECT C_STATE, COUNT(*) AS cnt, AVG(C_BALANCE) AS avg_bal FROM CUSTOMER GROUP BY C_STATE) SELECT C_STATE, cnt, avg_bal, DENSE_RANK() OVER (ORDER BY cnt DESC) AS state_rank, LAG(cnt) OVER (ORDER BY cnt DESC) AS prev_cnt FROM per_state;

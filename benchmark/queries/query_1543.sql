@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,DISTINCT", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE"}
+SELECT i.I_IM_ID, COUNT(DISTINCT i.I_ID) AS items, SUM(ol.OL_AMOUNT) AS rev FROM ITEM i JOIN ORDER_LINE ol ON i.I_ID = ol.OL_I_ID GROUP BY i.I_IM_ID HAVING COUNT(DISTINCT i.I_ID) > 2 AND SUM(ol.OL_AMOUNT) > 50;

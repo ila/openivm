@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "HISTORY"}
+WITH hist_by_type AS (SELECT H_W_ID, CASE WHEN H_AMOUNT > 100 THEN 'big' ELSE 'small' END AS kind, COUNT(*) AS n FROM HISTORY GROUP BY H_W_ID, CASE WHEN H_AMOUNT > 100 THEN 'big' ELSE 'small' END) SELECT H_W_ID, SUM(CASE WHEN kind = 'big' THEN n ELSE 0 END) AS big_n, SUM(CASE WHEN kind = 'small' THEN n ELSE 0 END) AS small_n FROM hist_by_type GROUP BY H_W_ID;

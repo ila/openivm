@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,OORDER"}
+WITH o_cnt AS (SELECT O_W_ID, O_D_ID, COUNT(*) AS cnt FROM OORDER GROUP BY O_W_ID, O_D_ID) SELECT d.D_W_ID, d.D_ID, d.D_NAME, COALESCE(oc.cnt, 0) AS orders FROM DISTRICT d LEFT JOIN o_cnt oc ON d.D_W_ID = oc.O_W_ID AND d.D_ID = oc.O_D_ID;

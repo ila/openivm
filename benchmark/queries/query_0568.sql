@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "non_incr_reason": "op:LATERAL"}
+SELECT c.C_W_ID, c.C_ID, c.C_LAST, lat.num_orders FROM CUSTOMER c JOIN LATERAL (SELECT COUNT(*) AS num_orders FROM OORDER WHERE O_C_ID = c.C_ID AND O_W_ID = c.C_W_ID) lat ON true WHERE lat.num_orders > 0;

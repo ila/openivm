@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,ORDER,WINDOW,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "OORDER", "openivm_verified": true}
+SELECT yr, mo, orders, SUM(orders) OVER (ORDER BY yr, mo ROWS UNBOUNDED PRECEDING) AS cumulative FROM (SELECT EXTRACT(YEAR FROM O_ENTRY_D) AS yr, EXTRACT(MONTH FROM O_ENTRY_D) AS mo, COUNT(*) AS orders FROM OORDER WHERE O_ENTRY_D IS NOT NULL GROUP BY EXTRACT(YEAR FROM O_ENTRY_D), EXTRACT(MONTH FROM O_ENTRY_D)) t;

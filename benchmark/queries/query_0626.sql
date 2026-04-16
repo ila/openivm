@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE", "complexity": "low", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK", "non_incr_reason": "fn:BOOL_AND"}
+SELECT s.S_W_ID, COUNT(*) AS items, SUM(s.S_QUANTITY) AS total_qty, AVG(s.S_QUANTITY) AS avg_qty, STDDEV(s.S_QUANTITY) AS std_qty, MIN(s.S_QUANTITY) AS min_qty, MAX(s.S_QUANTITY) AS max_qty, BOOL_AND(s.S_QUANTITY > 0) AS all_in_stock FROM STOCK s GROUP BY s.S_W_ID;

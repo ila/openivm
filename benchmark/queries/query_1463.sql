@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,CORRELATED_SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,ORDER_LINE", "non_incr_reason": "op:CORRELATED_SUBQUERY,LATERAL"}
+SELECT w.W_ID, w.W_NAME, lat.tot_rev FROM WAREHOUSE w JOIN LATERAL (SELECT SUM(ol.OL_AMOUNT) AS tot_rev FROM ORDER_LINE ol WHERE ol.OL_W_ID = w.W_ID) lat ON TRUE;

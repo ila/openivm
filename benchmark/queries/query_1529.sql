@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,ORDER,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "openivm_verified": true}
+SELECT c.C_W_ID, c.C_ID, o.O_ID, o.O_ENTRY_D, ROW_NUMBER() OVER (PARTITION BY c.C_W_ID, c.C_ID ORDER BY o.O_ENTRY_D DESC) AS order_rn FROM CUSTOMER c JOIN OORDER o ON c.C_ID = o.O_C_ID AND c.C_W_ID = o.O_W_ID;

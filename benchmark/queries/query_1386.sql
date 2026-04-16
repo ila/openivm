@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE"}
+WITH tp AS (SELECT i.I_ID, i.I_NAME, i.I_PRICE, SUM(ol.OL_QUANTITY) AS qty FROM ITEM i JOIN ORDER_LINE ol ON i.I_ID = ol.OL_I_ID GROUP BY i.I_ID, i.I_NAME, i.I_PRICE HAVING SUM(ol.OL_QUANTITY) > 0) SELECT tp.I_NAME, tp.I_PRICE, tp.qty, tp.qty * tp.I_PRICE AS revenue FROM tp;

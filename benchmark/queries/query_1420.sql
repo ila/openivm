@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": true, "has_case": false, "tables": "ITEM,STOCK,OORDER,ORDER_LINE"}
+SELECT o.O_W_ID, o.O_ID, COUNT(DISTINCT CAST((o.O_W_ID) AS VARCHAR)) AS uniq, COUNT(*) AS cnt FROM OORDER o JOIN ORDER_LINE ol ON o.O_ID = ol.OL_O_ID AND o.O_W_ID = ol.OL_W_ID JOIN ITEM i ON ol.OL_I_ID = i.I_ID JOIN STOCK s ON i.I_ID = s.S_I_ID AND s.S_W_ID = ol.OL_SUPPLY_W_ID GROUP BY o.O_W_ID, o.O_ID;

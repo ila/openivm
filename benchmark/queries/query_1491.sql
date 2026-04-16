@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "openivm_verified": true}
+SELECT d.D_W_ID, d.D_ID, COUNT(c.C_ID) AS cust_cnt, SUM(c.C_BALANCE) AS bal_tot, AVG(c.C_BALANCE) AS bal_avg, STDDEV(c.C_BALANCE) AS bal_std FROM DISTRICT d JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID GROUP BY d.D_W_ID, d.D_ID;

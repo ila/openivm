@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,OORDER,NEW_ORDER"}
+SELECT w.W_ID, w.W_NAME, COUNT(DISTINCT o.O_ID) AS total_orders, COUNT(DISTINCT no.NO_O_ID) AS new_orders FROM WAREHOUSE w LEFT JOIN OORDER o ON w.W_ID = o.O_W_ID LEFT JOIN NEW_ORDER no ON o.O_ID = no.NO_O_ID AND o.O_W_ID = no.NO_W_ID GROUP BY w.W_ID, w.W_NAME;

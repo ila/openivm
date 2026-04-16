@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE", "openivm_verified": true}
+WITH item_rev AS (SELECT OL_I_ID, SUM(OL_AMOUNT) AS rev, COUNT(*) AS sales FROM ORDER_LINE GROUP BY OL_I_ID) SELECT OL_I_ID, rev, sales, NTILE(10) OVER (ORDER BY rev) AS decile FROM item_rev;

@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,CORRELATED_SUBQUERY", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE", "non_incr_reason": "op:CORRELATED_SUBQUERY"}
+SELECT ol.OL_W_ID, ol.OL_O_ID FROM ORDER_LINE ol WHERE ol.OL_AMOUNT > (SELECT AVG(ol2.OL_AMOUNT) FROM ORDER_LINE ol2 WHERE ol2.OL_W_ID = ol.OL_W_ID);

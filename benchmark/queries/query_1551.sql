@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,ORDER,HAVING,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "openivm_verified": true}
+WITH joined AS (SELECT o.O_W_ID, o.O_D_ID, o.O_ID, SUM(ol.OL_AMOUNT) AS tot FROM OORDER o JOIN ORDER_LINE ol ON o.O_ID = ol.OL_O_ID AND o.O_W_ID = ol.OL_W_ID GROUP BY o.O_W_ID, o.O_D_ID, o.O_ID HAVING SUM(ol.OL_AMOUNT) > 10) SELECT O_W_ID, O_D_ID, O_ID, tot, RANK() OVER (PARTITION BY O_W_ID, O_D_ID ORDER BY tot DESC) AS rnk FROM joined;

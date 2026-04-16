@@ -1,0 +1,2 @@
+-- {"operators": "ORDER,WINDOW", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE", "openivm_verified": true}
+SELECT OL_W_ID, OL_O_ID, OL_NUMBER, OL_AMOUNT, FIRST_VALUE(OL_AMOUNT) OVER (PARTITION BY OL_W_ID, OL_O_ID ORDER BY OL_NUMBER) AS first_amt, LAST_VALUE(OL_AMOUNT) OVER (PARTITION BY OL_W_ID, OL_O_ID ORDER BY OL_NUMBER ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_amt FROM ORDER_LINE;

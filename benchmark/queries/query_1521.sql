@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,ORDER,WINDOW", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "non_incr_reason": "op:ORDER"}
+SELECT c.C_W_ID, c.C_ID, c.C_BALANCE, ROW_NUMBER() OVER (PARTITION BY c.C_W_ID ORDER BY c.C_BALANCE DESC) AS rn, o.O_ID FROM CUSTOMER c LEFT JOIN OORDER o ON c.C_ID = o.O_C_ID AND c.C_W_ID = o.O_W_ID;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK", "openivm_verified": true}
+SELECT s.S_W_ID, COUNT(*) AS items, SUM(s.S_QUANTITY * i.I_PRICE) AS inventory_value, AVG(s.S_QUANTITY * i.I_PRICE) AS avg_item_value, MAX(s.S_QUANTITY * i.I_PRICE) AS max_item_value, STDDEV(s.S_QUANTITY * i.I_PRICE) AS val_stddev FROM STOCK s JOIN ITEM i ON s.S_I_ID = i.I_ID GROUP BY s.S_W_ID;

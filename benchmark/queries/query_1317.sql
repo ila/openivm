@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "HISTORY"}
+WITH h_per AS (SELECT H_W_ID, H_D_ID, DATE_TRUNC('month', H_DATE) AS mo, SUM(H_AMOUNT) AS tot FROM HISTORY WHERE H_DATE IS NOT NULL GROUP BY H_W_ID, H_D_ID, DATE_TRUNC('month', H_DATE)) SELECT H_W_ID, mo, SUM(tot) AS total FROM h_per GROUP BY H_W_ID, mo;

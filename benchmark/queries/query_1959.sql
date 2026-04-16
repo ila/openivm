@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER", "complexity": "low", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ORDER_LINE", "openivm_verified": true}
+SELECT OL_W_ID, SUM(OL_AMOUNT) FILTER (WHERE OL_DELIVERY_D IS NOT NULL) AS delivered_amt, SUM(OL_AMOUNT) FILTER (WHERE OL_DELIVERY_D IS NULL) AS pending_amt, COUNT(*) FILTER (WHERE OL_AMOUNT > 100) AS big_lines FROM ORDER_LINE GROUP BY OL_W_ID;

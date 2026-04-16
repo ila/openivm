@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER"}
+SELECT top5.c_id, top5.bal, ord.cnt FROM (SELECT C_ID AS c_id, C_BALANCE AS bal, C_W_ID FROM CUSTOMER WHERE C_BALANCE > 3000) top5 LEFT JOIN (SELECT O_C_ID, O_W_ID, COUNT(*) AS cnt FROM OORDER GROUP BY O_C_ID, O_W_ID) ord ON top5.c_id = ord.O_C_ID AND top5.C_W_ID = ord.O_W_ID;

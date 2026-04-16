@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT"}
+WITH warehouse_summary AS (SELECT W_ID, W_NAME, W_YTD, W_TAX FROM WAREHOUSE), district_summary AS (SELECT D_W_ID, COUNT(*) AS num_districts, AVG(D_YTD) AS avg_ytd FROM DISTRICT GROUP BY D_W_ID) SELECT ws.W_ID, ws.W_NAME, ws.W_YTD, COALESCE(ds.num_districts, 0) AS num_districts, ds.avg_ytd FROM warehouse_summary ws LEFT JOIN district_summary ds ON ws.W_ID = ds.D_W_ID;

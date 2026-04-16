@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,UNION", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ORDER_LINE"}
+SELECT 'delivered' AS status, OL_W_ID, SUM(OL_AMOUNT) AS tot FROM ORDER_LINE WHERE OL_DELIVERY_D IS NOT NULL GROUP BY OL_W_ID UNION ALL SELECT 'pending', OL_W_ID, SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_DELIVERY_D IS NULL GROUP BY OL_W_ID;

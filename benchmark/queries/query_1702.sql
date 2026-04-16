@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY"}
+SELECT COALESCE(c.C_ID, h.H_AMOUNT) AS gk, COUNT(*) AS n, SUM(COALESCE(h.H_AMOUNT, 0)) AS tot FROM CUSTOMER c FULL OUTER JOIN HISTORY h ON c.C_ID = h.H_C_ID AND c.C_W_ID = h.H_C_W_ID GROUP BY COALESCE(c.C_ID, h.H_AMOUNT);

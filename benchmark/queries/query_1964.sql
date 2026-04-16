@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT,CUSTOMER,OORDER"}
+SELECT w.W_ID, d.D_ID, COUNT(DISTINCT c.C_ID) AS cust, COUNT(DISTINCT o.O_ID) AS ord FROM WAREHOUSE w JOIN DISTRICT d ON w.W_ID = d.D_W_ID LEFT JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID LEFT JOIN OORDER o ON o.O_W_ID = d.D_W_ID AND o.O_D_ID = d.D_ID AND o.O_C_ID = c.C_ID GROUP BY w.W_ID, d.D_ID;

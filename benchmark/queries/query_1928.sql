@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "openivm_verified": true}
+WITH item_popularity AS (SELECT OL_I_ID, COUNT(*) AS sales, RANK() OVER (ORDER BY COUNT(*) DESC) AS rnk FROM ORDER_LINE GROUP BY OL_I_ID) SELECT i.I_ID, i.I_NAME, i.I_PRICE, ip.sales, ip.rnk FROM ITEM i LEFT JOIN item_popularity ip ON i.I_ID = ip.OL_I_ID;

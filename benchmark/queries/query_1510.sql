@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE,DISTINCT", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE"}
+SELECT COALESCE(o.O_W_ID, ol.OL_W_ID) AS w_id, COUNT(DISTINCT o.O_ID) AS orders, COUNT(ol.OL_NUMBER) AS lines, SUM(COALESCE(ol.OL_AMOUNT, 0)) AS revenue FROM OORDER o FULL OUTER JOIN ORDER_LINE ol ON o.O_ID = ol.OL_O_ID AND o.O_W_ID = ol.OL_W_ID GROUP BY COALESCE(o.O_W_ID, ol.OL_W_ID);

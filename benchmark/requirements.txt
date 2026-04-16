@@ -1,0 +1,3 @@
+# OpenIVM Benchmark Script Dependencies
+anthropic>=0.25.0
+duckdb>=1.0.0

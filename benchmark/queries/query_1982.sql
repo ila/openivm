@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,DISTINCT,SUBQUERY_FILTER", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK,ORDER_LINE", "non_incr_reason": "op:SUBQUERY_FILTER"}
+SELECT i.I_ID, i.I_NAME, i.I_PRICE, (SELECT SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_I_ID = i.I_ID) AS revenue, (SELECT COUNT(DISTINCT OL_W_ID) FROM ORDER_LINE WHERE OL_I_ID = i.I_ID) AS warehouses, (SELECT AVG(S_QUANTITY) FROM STOCK WHERE S_I_ID = i.I_ID) AS avg_stock FROM ITEM i;

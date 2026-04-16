@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "non_incr_reason": "fn:BOOL_AND"}
+SELECT d.D_W_ID, d.D_ID, d.D_NAME, COUNT(c.C_ID) AS cust, SUM(c.C_BALANCE) AS bal, SUM(c.C_YTD_PAYMENT) AS pay, SUM(c.C_PAYMENT_CNT) AS pay_cnt, BOOL_AND(c.C_BALANCE >= 0) AS all_positive FROM DISTRICT d LEFT JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID GROUP BY d.D_W_ID, d.D_ID, d.D_NAME;

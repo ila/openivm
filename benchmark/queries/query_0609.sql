@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK,ORDER_LINE"}
+SELECT i.I_ID, i.I_NAME, s.S_W_ID, s.S_QUANTITY, SUM(ol.OL_QUANTITY) AS qty_ordered FROM ITEM i JOIN STOCK s ON i.I_ID = s.S_I_ID LEFT JOIN ORDER_LINE ol ON ol.OL_I_ID = i.I_ID AND ol.OL_SUPPLY_W_ID = s.S_W_ID GROUP BY i.I_ID, i.I_NAME, s.S_W_ID, s.S_QUANTITY;

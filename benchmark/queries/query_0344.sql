@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,FILTER,ORDER,LIMIT,HAVING,DISTINCT", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT", "non_incr_reason": "op:LIMIT,ORDER"}
+SELECT w.W_ID, COUNT(DISTINCT d.D_ID) as dist_cnt, SUM(d.D_YTD) as dist_ytd, AVG(d.D_YTD) as avg_ytd FROM WAREHOUSE w LEFT JOIN DISTRICT d ON w.W_ID = d.D_W_ID WHERE w.W_TAX > 0.03 AND d.D_YTD > 100 GROUP BY w.W_ID HAVING COUNT(DISTINCT d.D_ID) > 0 AND SUM(d.D_YTD) > 500 ORDER BY dist_cnt DESC, dist_ytd DESC LIMIT 10;

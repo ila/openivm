@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "non_incr_reason": "fn:BOOL_AND"}
+SELECT o.O_W_ID, o.O_D_ID, BOOL_AND(o.O_ALL_LOCAL = 1) AS all_local, COUNT(*) AS orders, SUM(ol.OL_AMOUNT) AS total_amount FROM OORDER o JOIN ORDER_LINE ol ON o.O_ID = ol.OL_O_ID AND o.O_W_ID = ol.OL_W_ID GROUP BY o.O_W_ID, o.O_D_ID HAVING BOOL_AND(o.O_ALL_LOCAL = 1);

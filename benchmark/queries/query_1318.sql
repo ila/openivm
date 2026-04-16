@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER,OORDER"}
+WITH warehouse_cust AS (SELECT C_W_ID, COUNT(*) AS cust FROM CUSTOMER GROUP BY C_W_ID), warehouse_ord AS (SELECT O_W_ID, COUNT(*) AS ord FROM OORDER GROUP BY O_W_ID) SELECT w.W_ID, w.W_NAME, COALESCE(wc.cust, 0) AS customers, COALESCE(wo.ord, 0) AS orders FROM WAREHOUSE w LEFT JOIN warehouse_cust wc ON w.W_ID = wc.C_W_ID LEFT JOIN warehouse_ord wo ON w.W_ID = wo.O_W_ID;

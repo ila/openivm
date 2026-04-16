@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,HAVING", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER"}
+SELECT c.C_W_ID, c.C_D_ID, c.C_CREDIT, COUNT(*) AS cust, SUM(c.C_BALANCE) AS bal, CASE WHEN SUM(c.C_BALANCE) > 10000 THEN 'profitable' WHEN SUM(c.C_BALANCE) > 0 THEN 'neutral' ELSE 'loss' END AS health FROM CUSTOMER c GROUP BY c.C_W_ID, c.C_D_ID, c.C_CREDIT HAVING COUNT(*) > 1;

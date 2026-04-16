@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK,ORDER_LINE", "non_incr_reason": "op:SUBQUERY_FILTER"}
+SELECT i.I_ID, i.I_NAME, i.I_PRICE, (SELECT SUM(S_QUANTITY) FROM STOCK WHERE S_I_ID = i.I_ID) AS total_stock, (SELECT COUNT(*) FROM ORDER_LINE WHERE OL_I_ID = i.I_ID) AS times_ordered FROM ITEM i;

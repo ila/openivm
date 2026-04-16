@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "openivm_verified": true}
+SELECT d.D_W_ID, d.D_ID, d.D_YTD, c.C_BALANCE, c.C_BALANCE / NULLIF(SUM(c.C_BALANCE) OVER (PARTITION BY d.D_W_ID, d.D_ID), 0) AS pct FROM DISTRICT d JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID;

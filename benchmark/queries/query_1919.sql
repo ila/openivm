@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,LATERAL,FILTER,LIMIT,CORRELATED_SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "openivm_verified": true}
+SELECT d.D_W_ID, d.D_ID, first_cust.c_id, first_cust.c_last FROM DISTRICT d JOIN LATERAL (SELECT C_ID AS c_id, C_LAST AS c_last FROM CUSTOMER WHERE C_W_ID = d.D_W_ID AND C_D_ID = d.D_ID LIMIT 1) first_cust ON TRUE;

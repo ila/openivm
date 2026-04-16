@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT,CUSTOMER", "non_incr_reason": "op:LATERAL,SUBQUERY_FILTER"}
+SELECT w.W_ID, w.W_NAME, stats.cust_cnt, stats.dist_cnt FROM WAREHOUSE w JOIN LATERAL (SELECT (SELECT COUNT(*) FROM CUSTOMER WHERE C_W_ID = w.W_ID) AS cust_cnt, (SELECT COUNT(*) FROM DISTRICT WHERE D_W_ID = w.W_ID) AS dist_cnt) stats ON TRUE;

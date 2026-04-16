@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "openivm_verified": true}
+WITH cust AS (SELECT C_W_ID, C_D_ID, C_ID, C_BALANCE, C_PAYMENT_CNT FROM CUSTOMER), ranked AS (SELECT cust.*, ROW_NUMBER() OVER (PARTITION BY C_W_ID, C_D_ID ORDER BY C_BALANCE DESC) AS bal_rn FROM cust) SELECT C_W_ID, C_D_ID, AVG(C_BALANCE) AS avg_top, COUNT(*) AS top3_cnt FROM ranked WHERE bal_rn <= 3 GROUP BY C_W_ID, C_D_ID;

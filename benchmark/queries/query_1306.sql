@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER"}
+WITH per_cust AS (SELECT C_W_ID, C_ID, C_LAST, C_BALANCE FROM CUSTOMER WHERE C_BALANCE > 0), orders_c AS (SELECT O_C_ID, O_W_ID, COUNT(*) AS n FROM OORDER GROUP BY O_C_ID, O_W_ID) SELECT pc.*, oc.n FROM per_cust pc LEFT JOIN orders_c oc ON pc.C_ID = oc.O_C_ID AND pc.C_W_ID = oc.O_W_ID;

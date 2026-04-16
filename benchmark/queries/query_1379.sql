@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER"}
+WITH top AS (SELECT C_W_ID, C_ID, C_BALANCE FROM CUSTOMER WHERE C_BALANCE > 1000), orders AS (SELECT O_C_ID, O_W_ID, COUNT(*) AS n, SUM(O_OL_CNT) AS tot_lines FROM OORDER GROUP BY O_C_ID, O_W_ID) SELECT t.C_W_ID, t.C_ID, t.C_BALANCE, COALESCE(o.n, 0) AS orders, COALESCE(o.tot_lines, 0) AS lines FROM top t LEFT JOIN orders o ON t.C_ID = o.O_C_ID AND t.C_W_ID = o.O_W_ID;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,STOCK", "non_incr_reason": "op:LATERAL"}
+SELECT w.W_ID, w.W_NAME, stock_stats.total_qty, stock_stats.item_count FROM WAREHOUSE w JOIN LATERAL (SELECT SUM(S_QUANTITY) AS total_qty, COUNT(*) AS item_count FROM STOCK WHERE S_W_ID = w.W_ID) stock_stats ON true;

@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE"}
+WITH order_line_summary AS (SELECT OL_W_ID, OL_O_ID, COUNT(*) AS line_cnt, SUM(OL_AMOUNT) AS total FROM ORDER_LINE GROUP BY OL_W_ID, OL_O_ID) SELECT o.O_W_ID, o.O_D_ID, o.O_OL_CNT, ols.line_cnt, ols.total FROM OORDER o LEFT JOIN order_line_summary ols ON o.O_W_ID = ols.OL_W_ID AND o.O_ID = ols.OL_O_ID WHERE o.O_OL_CNT != ols.line_cnt OR ols.line_cnt IS NULL;

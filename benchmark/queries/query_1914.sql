@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "non_incr_reason": "op:LATERAL"}
+SELECT d.D_W_ID, d.D_ID, d.D_NAME, cust.top_bal, cust.top_cust_id FROM DISTRICT d JOIN LATERAL (SELECT MAX(C_BALANCE) AS top_bal, MAX(C_ID) AS top_cust_id FROM CUSTOMER WHERE C_W_ID = d.D_W_ID AND C_D_ID = d.D_ID) cust ON TRUE;

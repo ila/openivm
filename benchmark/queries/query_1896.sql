@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER"}
+SELECT m.name, COUNT(o.O_ID) AS orders FROM (VALUES (1, 'Jan'), (2, 'Feb'), (3, 'Mar'), (4, 'Apr'), (5, 'May'), (6, 'Jun'), (7, 'Jul'), (8, 'Aug'), (9, 'Sep'), (10, 'Oct'), (11, 'Nov'), (12, 'Dec')) AS m(num, name) LEFT JOIN OORDER o ON EXTRACT(MONTH FROM o.O_ENTRY_D) = m.num GROUP BY m.num, m.name;

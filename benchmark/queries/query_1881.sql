@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER"}
+WITH cust_per_state AS (SELECT C_STATE, COUNT(*) AS n FROM CUSTOMER GROUP BY C_STATE), wh_per_state AS (SELECT W_STATE, COUNT(*) AS n FROM WAREHOUSE GROUP BY W_STATE) SELECT COALESCE(c.C_STATE, w.W_STATE) AS state, COALESCE(c.n, 0) AS cust, COALESCE(w.n, 0) AS wh FROM cust_per_state c FULL OUTER JOIN wh_per_state w ON c.C_STATE = w.W_STATE;

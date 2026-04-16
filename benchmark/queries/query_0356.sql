@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE"}
+WITH orders_by_warehouse AS (SELECT O_W_ID, COUNT(*) as order_count FROM OORDER GROUP BY O_W_ID), lines_by_warehouse AS (SELECT OL_W_ID, SUM(OL_AMOUNT) as line_amount FROM ORDER_LINE GROUP BY OL_W_ID), joined AS (SELECT o.O_W_ID, o.order_count, l.line_amount FROM orders_by_warehouse o LEFT JOIN lines_by_warehouse l ON o.O_W_ID = l.OL_W_ID) SELECT * FROM joined;

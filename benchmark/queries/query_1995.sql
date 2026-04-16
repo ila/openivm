@@ -1,0 +1,2 @@
+-- {"operators": "LATERAL,AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER,OORDER,ORDER_LINE", "non_incr_reason": "op:LATERAL,SUBQUERY_FILTER"}
+SELECT w.W_ID, lat.cust_count, lat.order_count, lat.revenue FROM WAREHOUSE w, LATERAL (SELECT (SELECT COUNT(*) FROM CUSTOMER WHERE C_W_ID = w.W_ID) AS cust_count, (SELECT COUNT(*) FROM OORDER WHERE O_W_ID = w.W_ID) AS order_count, (SELECT SUM(OL_AMOUNT) FROM ORDER_LINE WHERE OL_W_ID = w.W_ID) AS revenue) lat;

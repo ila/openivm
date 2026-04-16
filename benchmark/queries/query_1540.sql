@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,ORDER,LIMIT,CTE,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "non_incr_reason": "op:LIMIT,ORDER"}
+WITH top_items AS (SELECT OL_I_ID, SUM(OL_AMOUNT) AS rev FROM ORDER_LINE GROUP BY OL_I_ID ORDER BY rev DESC LIMIT 20) SELECT i.I_ID, i.I_NAME, i.I_PRICE, ti.rev FROM ITEM i JOIN top_items ti ON i.I_ID = ti.OL_I_ID;

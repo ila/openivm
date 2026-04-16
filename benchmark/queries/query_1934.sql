@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,DISTINCT,CTE,SUBQUERY_FILTER", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY", "non_incr_reason": "op:SUBQUERY_FILTER"}
+WITH paying_cust AS (SELECT DISTINCT H_C_ID, H_C_W_ID FROM HISTORY), no_pay AS (SELECT C_W_ID, C_ID, C_LAST, C_BALANCE FROM CUSTOMER WHERE (C_ID, C_W_ID) NOT IN (SELECT H_C_ID, H_C_W_ID FROM paying_cust)) SELECT COUNT(*) AS non_paying, AVG(C_BALANCE) AS avg_bal FROM no_pay;
