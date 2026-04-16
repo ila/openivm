@@ -134,13 +134,27 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		Connection exec_con(*context.db.get());
 		OPENIVM_DEBUG_PRINT("[UPSERT] Executing refresh SQL:\n%s\n", sql.c_str());
 
+		// Wrap the entire refresh in a transaction so that a failed refresh leaves the MV
+		// and delta tables in a clean state (atomically rolled back). The refresh_in_progress
+		// flag is inside the same transaction, so it also rolls back on failure — WAL recovery
+		// handles the crash case automatically.
+		// DuckLake (cross_system) skips this: DuckDB forbids writing to two attached databases
+		// (memory + dl) within a single transaction.
+		if (!cross_system) {
+			exec_con.BeginTransaction();
+		}
 		auto start = std::chrono::steady_clock::now();
 		auto result = exec_con.Query(sql);
 		auto end = std::chrono::steady_clock::now();
 
 		if (result->HasError()) {
-			IVMMetadata(exec_con).SetRefreshInProgress(vn, false);
+			if (!cross_system) {
+				exec_con.Rollback();
+			}
 			throw InternalException("IVM refresh of '" + vn + "' failed: " + result->GetError());
+		}
+		if (!cross_system) {
+			exec_con.Commit();
 		}
 
 		// Record execution history for the learned cost model.
