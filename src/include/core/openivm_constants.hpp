@@ -21,6 +21,7 @@ constexpr const char *DATA_TABLE_PREFIX = "_ivm_data_";
 
 // Internal column names (added by IVM plan rewrites, hidden from users via VIEW)
 constexpr const char *LEFT_KEY_COL = "_ivm_left_key";
+constexpr const char *RIGHT_KEY_COL = "_ivm_right_key";
 constexpr const char *DISTINCT_COUNT_COL = "_ivm_distinct_count";
 
 // Internal column prefixes (for AVG and STDDEV/VARIANCE decomposition)
@@ -31,8 +32,9 @@ constexpr const char *SUM_SQP_COL_PREFIX = "_ivm_sum_sqp_"; // STDDEV_POP: sqrt 
 constexpr const char *VAR_SQP_COL_PREFIX = "_ivm_var_sqp_"; // VAR_POP: no sqrt + population denominator
 constexpr const char *COUNT_COL_PREFIX = "_ivm_count_";
 
-// Match count column for LEFT JOIN incremental MERGE (Larson & Zhou algorithm)
+// Match count columns for outer join incremental MERGE (Larson & Zhou / Zhang & Larson)
 constexpr const char *MATCH_COUNT_COL = "_ivm_match_count";
+constexpr const char *RIGHT_MATCH_COUNT_COL = "_ivm_right_match_count";
 
 // Index suffix for GROUP BY unique index on MV data tables
 constexpr const char *INDEX_SUFFIX = "_ivm_index";

@@ -100,11 +100,15 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
 		if (join) {
 			if (join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT &&
-			    join->join_type != JoinType::RIGHT) {
+			    join->join_type != JoinType::RIGHT && join->join_type != JoinType::OUTER) {
 				result.ivm_compatible = false;
 			}
-			if (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT) {
+			if (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT ||
+			    join->join_type == JoinType::OUTER) {
 				result.found_left_join = true;
+			}
+			if (join->join_type == JoinType::OUTER) {
+				result.found_full_outer = true;
 			}
 		}
 		break;

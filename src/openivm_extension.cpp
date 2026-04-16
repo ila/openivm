@@ -142,6 +142,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "use incremental MERGE for LEFT JOIN aggregates (Larson & Zhou) "
 	                             "instead of group-recompute",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("ivm_full_outer_merge",
+	                             "use incremental MERGE for FULL OUTER JOIN aggregates (Zhang & Larson) "
+	                             "instead of group-recompute",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Learned cost model
 	db_config.AddExtensionOption("ivm_cost_decay",

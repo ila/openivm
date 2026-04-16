@@ -1,0 +1,391 @@
+# name: test/sql/mv_full_outer_join.test
+# description: Test IVM with FULL OUTER JOIN (Zhang & Larson bidirectional recompute)
+# group: [sql]
+
+require openivm
+
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+# ============================================================
+# Setup
+# ============================================================
+
+statement ok
+CREATE TABLE employees (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE projects (id INT, emp_id INT, title VARCHAR);
+
+statement ok
+INSERT INTO employees VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+
+statement ok
+INSERT INTO projects VALUES (10, 1, 'Alpha'), (20, 1, 'Beta'), (30, 4, 'Gamma');
+
+# ============================================================
+# Basic FULL OUTER JOIN projection
+# ============================================================
+
+statement ok
+CREATE MATERIALIZED VIEW emp_projects AS
+    SELECT e.name, p.title
+    FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id;
+
+# Initial: Alice matched (2 projects), Bob/Charlie unmatched-left, Gamma unmatched-right
+query II
+SELECT * FROM emp_projects ORDER BY name NULLS LAST, title NULLS LAST;
+----
+Alice	Alpha
+Alice	Beta
+Bob	NULL
+Charlie	NULL
+NULL	Gamma
+
+# EXCEPT ALL both directions
+query I
+SELECT COUNT(*) FROM (
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+    EXCEPT ALL
+    SELECT * FROM emp_projects
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM emp_projects
+    EXCEPT ALL
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+);
+----
+0
+
+# ============================================================
+# Insert into right side: Bob gets a project (unmatched-left -> matched)
+# ============================================================
+
+statement ok
+INSERT INTO projects VALUES (40, 2, 'Delta');
+
+statement ok
+PRAGMA ivm('emp_projects');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+    EXCEPT ALL
+    SELECT * FROM emp_projects
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM emp_projects
+    EXCEPT ALL
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+);
+----
+0
+
+# ============================================================
+# Insert into right side with no match: new unmatched-right row
+# ============================================================
+
+statement ok
+INSERT INTO projects VALUES (50, 99, 'Epsilon');
+
+statement ok
+PRAGMA ivm('emp_projects');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+    EXCEPT ALL
+    SELECT * FROM emp_projects
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM emp_projects
+    EXCEPT ALL
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+);
+----
+0
+
+# ============================================================
+# Delete from right side: remove Alice's last project on Alpha
+# (matched pair removed; Alice still has Beta)
+# ============================================================
+
+statement ok
+DELETE FROM projects WHERE id = 10;
+
+statement ok
+PRAGMA ivm('emp_projects');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+    EXCEPT ALL
+    SELECT * FROM emp_projects
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM emp_projects
+    EXCEPT ALL
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+);
+----
+0
+
+# ============================================================
+# Delete from right side: remove Alice's last project (Beta)
+# She should become unmatched-left (Alice, NULL)
+# ============================================================
+
+statement ok
+DELETE FROM projects WHERE id = 20;
+
+statement ok
+PRAGMA ivm('emp_projects');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+    EXCEPT ALL
+    SELECT * FROM emp_projects
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM emp_projects
+    EXCEPT ALL
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+);
+----
+0
+
+# ============================================================
+# Insert into left side: new employee with no project (unmatched-left)
+# ============================================================
+
+statement ok
+INSERT INTO employees VALUES (5, 'Eve');
+
+statement ok
+PRAGMA ivm('emp_projects');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+    EXCEPT ALL
+    SELECT * FROM emp_projects
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM emp_projects
+    EXCEPT ALL
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+);
+----
+0
+
+# ============================================================
+# Delete unmatched-right: remove Gamma (emp_id=4, no matching employee)
+# ============================================================
+
+statement ok
+DELETE FROM projects WHERE id = 30;
+
+statement ok
+PRAGMA ivm('emp_projects');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+    EXCEPT ALL
+    SELECT * FROM emp_projects
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM emp_projects
+    EXCEPT ALL
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+);
+----
+0
+
+# ============================================================
+# Stress: batch mixed DML on both sides before single refresh
+# ============================================================
+
+statement ok
+INSERT INTO employees VALUES (6, 'Frank');
+
+statement ok
+INSERT INTO projects VALUES (60, 6, 'Zeta'), (70, 5, 'Eta'), (80, 100, 'Theta');
+
+statement ok
+DELETE FROM employees WHERE id = 2;
+
+statement ok
+DELETE FROM projects WHERE id = 50;
+
+statement ok
+PRAGMA ivm('emp_projects');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+    EXCEPT ALL
+    SELECT * FROM emp_projects
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM emp_projects
+    EXCEPT ALL
+    SELECT e.name, p.title FROM employees e FULL OUTER JOIN projects p ON e.id = p.emp_id
+);
+----
+0
+
+# ============================================================
+# FULL OUTER JOIN aggregate with GROUP BY (group-recompute mode)
+# ============================================================
+
+statement ok
+CREATE TABLE departments (id INT, dept VARCHAR);
+
+statement ok
+CREATE TABLE staff (id INT, dept_id INT, salary INT);
+
+statement ok
+INSERT INTO departments VALUES (1, 'Eng'), (2, 'Sales'), (3, 'HR');
+
+statement ok
+INSERT INTO staff VALUES (1, 1, 100), (2, 1, 200), (3, 4, 300);
+
+statement ok
+CREATE MATERIALIZED VIEW dept_stats AS
+    SELECT d.dept, SUM(s.salary) AS total_sal, COUNT(s.salary) AS cnt
+    FROM departments d FULL OUTER JOIN staff s ON d.id = s.dept_id
+    GROUP BY d.dept;
+
+# Initial check
+query I
+SELECT COUNT(*) FROM (
+    SELECT d.dept, SUM(s.salary), COUNT(s.salary) FROM departments d FULL OUTER JOIN staff s ON d.id = s.dept_id GROUP BY d.dept
+    EXCEPT ALL
+    SELECT * FROM dept_stats
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM dept_stats
+    EXCEPT ALL
+    SELECT d.dept, SUM(s.salary), COUNT(s.salary) FROM departments d FULL OUTER JOIN staff s ON d.id = s.dept_id GROUP BY d.dept
+);
+----
+0
+
+# Insert staff into Sales (was unmatched-left, now matched)
+statement ok
+INSERT INTO staff VALUES (4, 2, 150);
+
+statement ok
+PRAGMA ivm('dept_stats');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT d.dept, SUM(s.salary), COUNT(s.salary) FROM departments d FULL OUTER JOIN staff s ON d.id = s.dept_id GROUP BY d.dept
+    EXCEPT ALL
+    SELECT * FROM dept_stats
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM dept_stats
+    EXCEPT ALL
+    SELECT d.dept, SUM(s.salary), COUNT(s.salary) FROM departments d FULL OUTER JOIN staff s ON d.id = s.dept_id GROUP BY d.dept
+);
+----
+0
+
+# Delete all staff from Eng (matched -> unmatched-left)
+statement ok
+DELETE FROM staff WHERE dept_id = 1;
+
+statement ok
+PRAGMA ivm('dept_stats');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT d.dept, SUM(s.salary), COUNT(s.salary) FROM departments d FULL OUTER JOIN staff s ON d.id = s.dept_id GROUP BY d.dept
+    EXCEPT ALL
+    SELECT * FROM dept_stats
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM dept_stats
+    EXCEPT ALL
+    SELECT d.dept, SUM(s.salary), COUNT(s.salary) FROM departments d FULL OUTER JOIN staff s ON d.id = s.dept_id GROUP BY d.dept
+);
+----
+0
+
+# Batch DML on both sides
+statement ok
+INSERT INTO departments VALUES (4, 'Legal');
+
+statement ok
+INSERT INTO staff VALUES (5, 3, 250), (6, 99, 400);
+
+statement ok
+DELETE FROM staff WHERE id = 3;
+
+statement ok
+PRAGMA ivm('dept_stats');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT d.dept, SUM(s.salary), COUNT(s.salary) FROM departments d FULL OUTER JOIN staff s ON d.id = s.dept_id GROUP BY d.dept
+    EXCEPT ALL
+    SELECT * FROM dept_stats
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM dept_stats
+    EXCEPT ALL
+    SELECT d.dept, SUM(s.salary), COUNT(s.salary) FROM departments d FULL OUTER JOIN staff s ON d.id = s.dept_id GROUP BY d.dept
+);
+----
+0

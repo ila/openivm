@@ -49,6 +49,24 @@ bool IVMMetadata::HasLeftJoin(const string &view_name) {
 	return result->GetValue(0, 0).GetValue<bool>();
 }
 
+bool IVMMetadata::HasFullOuter(const string &view_name) {
+	auto result = con.Query("SELECT has_full_outer FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	return result->GetValue(0, 0).GetValue<bool>();
+}
+
+string IVMMetadata::GetFullOuterJoinCols(const string &view_name) {
+	auto result = con.Query("SELECT full_outer_join_cols FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return "";
+	}
+	return result->GetValue(0, 0).ToString();
+}
+
 vector<string> IVMMetadata::GetDeltaTables(const string &view_name) {
 	auto result = con.Query("SELECT table_name FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	                        OpenIVMUtils::EscapeValue(view_name) + "'");

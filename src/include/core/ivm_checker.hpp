@@ -15,6 +15,7 @@ struct PlanAnalysis {
 	bool found_distinct = false;
 	bool found_minmax = false;
 	bool found_left_join = false;
+	bool found_full_outer = false;
 	bool found_join = false;
 	bool found_window = false;
 	vector<string> aggregate_columns;

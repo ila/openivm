@@ -85,7 +85,7 @@ For N tables, the join rule generates 2^N - 1 terms using inclusion-exclusion:
 
 For DuckLake tables, the join rule uses N-term telescoping instead (exactly N terms, using snapshot-based time travel). See `docs/ducklake.md`.
 
-INNER and LEFT/RIGHT joins are supported. LEFT JOIN aggregates use group-recompute. Max 16 tables (`ivm::MAX_JOIN_TABLES`).
+INNER, LEFT/RIGHT, and FULL OUTER joins are supported. LEFT JOIN aggregates use group-recompute. FULL OUTER projection views use bidirectional key-based partial recompute (Zhang & Larson); FULL OUTER aggregates use full recompute (MERGE via `ivm_full_outer_merge` planned). Max 16 tables (`ivm::MAX_JOIN_TABLES`).
 
 ### Upsert Compilation
 
@@ -142,6 +142,7 @@ MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original
 | `ivm_skip_projection_delete` | BOOLEAN | `true` | Skip DELETE/consolidation for insert-only projection deltas |
 | `ivm_minmax_incremental` | BOOLEAN | `true` | Use GREATEST/LEAST for MIN/MAX when deltas are insert-only |
 | `ivm_having_merge` | BOOLEAN | `true` | Use MERGE for HAVING views instead of group-recompute |
+| `ivm_full_outer_merge` | BOOLEAN | `false` | Use MERGE for FULL OUTER JOIN aggregates (Zhang & Larson) instead of full recompute |
 
 Views using unsupported constructs (RANDOM(), STDDEV, etc.) are automatically classified as `FULL_REFRESH` — no setting needed.
 

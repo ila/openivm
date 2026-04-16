@@ -11,7 +11,7 @@ on each `PRAGMA ivm()` call). This page consolidates all known limitations.
 | `STDDEV`, `VARIANCE` | Incremental | Decomposed to SUM + SUM(x^2) + COUNT |
 | `COUNT(DISTINCT x)` | Full refresh | Requires auxiliary per-value tracking |
 | Window functions (`ROW_NUMBER`, `RANK`, etc.) | Partition recompute | [Single-table: partition recompute. Over JOIN: full recompute](operators/window-functions.md) |
-| `FULL OUTER JOIN` | Not supported | View creation fails |
+| `FULL OUTER JOIN` | Partial recompute | Projection: bidirectional key recompute. Aggregate: full recompute (Zhang & Larson) |
 | `GROUPING SETS`, `CUBE`, `ROLLUP` | Full refresh | Decomposable to UNION ALL of GROUP BYs |
 | Recursive CTEs | Full refresh | Semi-naive evaluation not yet implemented |
 | `RANDOM()`, `UUID()`, non-deterministic functions | Full refresh | Result depends on evaluation time |
@@ -21,7 +21,8 @@ on each `PRAGMA ivm()` call). This page consolidates all known limitations.
 ## Join limitations
 
 - Maximum **16 tables** in a single join (inclusion-exclusion bitmask limit)
-- `FULL OUTER JOIN` is not supported (view creation fails)
+- `FULL OUTER JOIN` projection views: bidirectional key-based partial recompute (Zhang & Larson)
+- `FULL OUTER JOIN` aggregate views: full recompute (MERGE via `ivm_full_outer_merge` planned)
 - `CROSS JOIN` is supported (treated as a join with no condition)
 - For [LEFT/RIGHT JOIN](operators/left-join.md), aggregates use group-recompute instead of
   incremental MERGE

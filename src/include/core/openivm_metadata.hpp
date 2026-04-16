@@ -34,6 +34,12 @@ public:
 	// Check if the view involves a LEFT/RIGHT JOIN.
 	bool HasLeftJoin(const string &view_name);
 
+	// Check if the view involves a FULL OUTER JOIN.
+	bool HasFullOuter(const string &view_name);
+
+	// Get the join condition column names for FULL OUTER JOIN ("left_col,right_col").
+	string GetFullOuterJoinCols(const string &view_name);
+
 	// Get delta table names associated with a view.
 	vector<string> GetDeltaTables(const string &view_name);
 

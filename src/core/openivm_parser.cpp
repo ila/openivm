@@ -12,6 +12,9 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/planner.hpp"
 
@@ -284,6 +287,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		bool found_having = analysis.found_having;
 		bool found_minmax = analysis.found_minmax;
 		bool found_left_join = analysis.found_left_join;
+		bool found_full_outer = analysis.found_full_outer;
 		bool found_window = analysis.found_window;
 		bool found_join = analysis.found_join;
 		auto aggregate_columns = std::move(analysis.aggregate_columns);
@@ -369,7 +373,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " refresh_in_progress boolean default false,"
 		              " group_columns varchar default null,"
 		              " aggregate_types varchar default null,"
-		              " having_predicate varchar default null)");
+		              " having_predicate varchar default null,"
+		              " has_full_outer boolean default false,"
+		              " full_outer_join_cols varchar default null)");
 
 		// Refresh hooks: extensions can register custom SQL to run on MV refresh
 		// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
@@ -440,10 +446,71 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 		string having_val =
 		    having_predicate.empty() ? "null" : "'" + OpenIVMUtils::EscapeSingleQuotes(having_predicate) + "'";
+
+		// Extract FULL OUTER JOIN condition: "left_table:left_col,right_table:right_col"
+		string full_outer_join_cols_val = "null";
+		if (found_full_outer) {
+			// Helper: find the table name from a LogicalGet in a subtree
+			std::function<string(LogicalOperator *)> find_table_name = [&](LogicalOperator *n) -> string {
+				if (n->type == LogicalOperatorType::LOGICAL_GET) {
+					auto *get = dynamic_cast<LogicalGet *>(n);
+					if (get && get->GetTable().get()) {
+						return get->GetTable().get()->name;
+					}
+				}
+				for (auto &child : n->children) {
+					string name = find_table_name(child.get());
+					if (!name.empty()) {
+						return name;
+					}
+				}
+				return "";
+			};
+
+			std::function<void(LogicalOperator *)> extract_foj_cols = [&](LogicalOperator *n) {
+				if (full_outer_join_cols_val != "null") {
+					return;
+				}
+				if (n->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+					auto *join = dynamic_cast<LogicalComparisonJoin *>(n);
+					if (join && join->join_type == JoinType::OUTER && !join->conditions.empty()) {
+						auto &left_expr = join->conditions[0].left;
+						auto &right_expr = join->conditions[0].right;
+						string left_col_name, right_col_name;
+						if (left_expr->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+							auto *lref = dynamic_cast<BoundColumnRefExpression *>(left_expr.get());
+							if (lref) {
+								left_col_name = lref->GetName();
+							}
+						}
+						if (right_expr->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+							auto *rref = dynamic_cast<BoundColumnRefExpression *>(right_expr.get());
+							if (rref) {
+								right_col_name = rref->GetName();
+							}
+						}
+						// Get table names from each side of the join
+						string left_table = join->children.size() > 0 ? find_table_name(join->children[0].get()) : "";
+						string right_table = join->children.size() > 1 ? find_table_name(join->children[1].get()) : "";
+						if (!left_col_name.empty() && !right_col_name.empty() && !left_table.empty() &&
+						    !right_table.empty()) {
+							string val = left_table + ":" + left_col_name + "," + right_table + ":" + right_col_name;
+							full_outer_join_cols_val = "'" + OpenIVMUtils::EscapeSingleQuotes(val) + "'";
+						}
+					}
+				}
+				for (auto &child : n->children) {
+					extract_foj_cols(child.get());
+				}
+			};
+			extract_foj_cols(plan.get());
+		}
+
 		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
 		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", " +
 		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now(), " +
-		              refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ", " + having_val + ")");
+		              refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
+		              (found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
 
 		// Classify each base table by catalog type (duckdb vs ducklake).
 		// DuckLake tables use native change tracking; DuckDB tables use delta tables.

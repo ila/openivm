@@ -24,16 +24,18 @@ void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLe
 	    node->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
 		bool is_left = false;
 		bool is_right = false;
+		bool is_full_outer = false;
 		if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 			auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
 			is_left = (join && join->join_type == JoinType::LEFT);
 			is_right = (join && join->join_type == JoinType::RIGHT);
+			is_full_outer = (join && join->join_type == JoinType::OUTER);
 		}
 		path.push_back(0);
-		CollectJoinLeaves(node->children[0].get(), path, leaves, is_right_of_left || is_right);
+		CollectJoinLeaves(node->children[0].get(), path, leaves, is_right_of_left || is_right || is_full_outer);
 		path.pop_back();
 		path.push_back(1);
-		CollectJoinLeaves(node->children[1].get(), path, leaves, is_right_of_left || is_left);
+		CollectJoinLeaves(node->children[1].get(), path, leaves, is_right_of_left || is_left || is_full_outer);
 		path.pop_back();
 	} else if (node->type == LogicalOperatorType::LOGICAL_GET) {
 		leaves.push_back({path, dynamic_cast<LogicalGet *>(node), node, is_right_of_left});
@@ -65,12 +67,13 @@ unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, co
 	return *current;
 }
 
-/// Verify all joins in the subtree are INNER, LEFT, or RIGHT. Returns true if any LEFT/RIGHT found.
+/// Verify all joins in the subtree are INNER, LEFT, RIGHT, or OUTER. Returns true if any LEFT/RIGHT/OUTER found.
 static bool VerifyJoinTypes(LogicalOperator *node) {
 	bool has_left = false;
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT) {
+		if (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT ||
+		    join->join_type == JoinType::OUTER) {
 			has_left = true;
 		} else if (join->join_type != JoinType::INNER) {
 			throw Exception(ExceptionType::OPTIMIZER,
@@ -88,7 +91,8 @@ static bool VerifyJoinTypes(LogicalOperator *node) {
 void DemoteLeftJoins(LogicalOperator *node) {
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (j && (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT)) {
+		if (j &&
+		    (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT || j->join_type == JoinType::OUTER)) {
 			j->join_type = JoinType::INNER;
 		}
 	}

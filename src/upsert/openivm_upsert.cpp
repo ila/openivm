@@ -378,14 +378,27 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// MIN, MAX use group-recompute. AVG is decomposed to SUM+COUNT by the parser (fully incremental).
 	// HAVING needs recompute because groups may enter/leave the result set.
 	// LEFT JOIN aggregates: group-recompute unless ivm_left_join_merge is on (Larson & Zhou).
+	// FULL OUTER JOIN aggregates: group-recompute unless ivm_full_outer_merge is on (Zhang & Larson).
 	bool source_has_left_join = metadata.HasLeftJoin(view_name);
+	// Only query has_full_outer when the view has an outer join (avoids extra SQL for INNER-only views)
+	bool source_has_full_outer = source_has_left_join && metadata.HasFullOuter(view_name);
 	bool left_join_merge = false;
 	Value lj_merge_val;
-	if (context.TryGetCurrentSetting("ivm_left_join_merge", lj_merge_val) && !lj_merge_val.IsNull()) {
-		left_join_merge = lj_merge_val.GetValue<bool>();
+	if (source_has_left_join && !source_has_full_outer) {
+		if (context.TryGetCurrentSetting("ivm_left_join_merge", lj_merge_val) && !lj_merge_val.IsNull()) {
+			left_join_merge = lj_merge_val.GetValue<bool>();
+		}
+	}
+	bool full_outer_merge = false;
+	if (source_has_full_outer) {
+		Value foj_merge_val;
+		if (context.TryGetCurrentSetting("ivm_full_outer_merge", foj_merge_val) && !foj_merge_val.IsNull()) {
+			full_outer_merge = foj_merge_val.GetValue<bool>();
+		}
 	}
 	bool has_minmax = metadata.HasMinMax(view_name) || view_query_type == IVMType::AGGREGATE_HAVING ||
-	                  (source_has_left_join && !left_join_merge);
+	                  (source_has_left_join && !source_has_full_outer && !left_join_merge) ||
+	                  (source_has_full_outer && !full_outer_merge);
 
 	// Check ivm_refresh_mode: 'full' forces full recompute, skipping the IVM pipeline.
 	Value refresh_mode_val;
@@ -487,7 +500,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// Detect LEFT JOIN: the parser adds _ivm_left_key as a hidden column for LEFT/RIGHT JOIN views.
 	// If the MV has this column, use it for the partial recompute filter.
 	bool has_left_join = std::find(column_names.begin(), column_names.end(), ivm::LEFT_KEY_COL) != column_names.end();
-	OPENIVM_DEBUG_PRINT("[UPSERT] has_left_join=%d\n", has_left_join);
+	// Detect FULL OUTER JOIN: the parser also adds _ivm_right_key for bidirectional recompute.
+	bool has_full_outer = std::find(column_names.begin(), column_names.end(), ivm::RIGHT_KEY_COL) != column_names.end();
+	OPENIVM_DEBUG_PRINT("[UPSERT] has_left_join=%d has_full_outer=%d\n", has_left_join, has_full_outer);
 
 	// Detect insert-only deltas: when the delta view contains only insert rows,
 	// we can skip the zero-row DELETE (aggregates) and the DELETE+consolidation (projections).
@@ -637,16 +652,165 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		break;
 	}
 	case IVMType::AGGREGATE_GROUP: {
-		// For MIN/MAX views, use minmax_incremental (gated by ivm_minmax_incremental).
-		// For non-MIN/MAX views, use skip_agg_delete (gated by ivm_skip_aggregate_delete).
-		bool effective_insert_only = has_minmax ? minmax_incremental : skip_agg_delete;
-		upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
-		                                      view_query_sql, has_minmax, list_mode, delta_ts_filter, group_cols,
-		                                      catalog_prefix, effective_insert_only, agg_types);
+		if (source_has_full_outer && !full_outer_merge) {
+			// FULL OUTER JOIN aggregate group-recompute (Zhang & Larson):
+			// 4 sources of affected group keys to cover all change types.
+			string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+			string keys_tuple;
+			for (size_t i = 0; i < group_cols.size(); i++) {
+				keys_tuple += KeywordHelper::WriteOptionallyQuoted(group_cols[i]);
+				if (i < group_cols.size() - 1) {
+					keys_tuple += ", ";
+				}
+			}
+
+			// Parse FOJ join condition metadata: "left_table:left_col,right_table:right_col"
+			string foj_cols = metadata.GetFullOuterJoinCols(view_name);
+			string left_table, left_col, right_table, right_col;
+			auto comma_pos = foj_cols.find(',');
+			if (comma_pos != string::npos) {
+				string left_part = foj_cols.substr(0, comma_pos);
+				string right_part = foj_cols.substr(comma_pos + 1);
+				auto lcolon = left_part.find(':');
+				if (lcolon != string::npos) {
+					left_table = left_part.substr(0, lcolon);
+					left_col = left_part.substr(lcolon + 1);
+				}
+				auto rcolon = right_part.find(':');
+				if (rcolon != string::npos) {
+					right_table = right_part.substr(0, rcolon);
+					right_col = right_part.substr(rcolon + 1);
+				}
+			}
+
+			// Resolve delta table names to their qualified forms
+			string dt_left_name, dt_right_name;
+			for (auto &dt_name : delta_table_names) {
+				string base_name = StringUtil::StartsWith(dt_name, ivm::DELTA_PREFIX)
+				                       ? dt_name.substr(strlen(ivm::DELTA_PREFIX))
+				                       : dt_name;
+				if (base_name == left_table) {
+					dt_left_name = dt_name;
+				}
+				if (base_name == right_table) {
+					dt_right_name = dt_name;
+				}
+			}
+			string q_dt_left = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(dt_left_name);
+			string q_dt_right = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(dt_right_name);
+			string q_left_base = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(left_table);
+			string q_left_col = KeywordHelper::WriteOptionallyQuoted(left_col);
+			string q_right_col = KeywordHelper::WriteOptionallyQuoted(right_col);
+			string qdv = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+
+			// Source 1: delta view — matched-row changes (INNER-demoted delta has group keys)
+			string affected = "SELECT DISTINCT " + keys_tuple + " FROM " + qdv + delta_where;
+
+			// Source 2: left delta table — directly has group columns (unmatched-left changes)
+			if (!dt_left_name.empty()) {
+				affected += "\n  UNION\n  SELECT DISTINCT " + keys_tuple + " FROM " + q_dt_left + delta_where;
+			}
+
+			// Source 3: left base table lookup — map right-side join keys to group keys
+			// (right insert matches existing left row → group key comes from left table)
+			if (!dt_right_name.empty() && !left_table.empty()) {
+				affected += "\n  UNION\n  SELECT DISTINCT " + keys_tuple + " FROM " + q_left_base + " WHERE " +
+				            q_left_col + " IN (" + "SELECT DISTINCT " + q_right_col + " FROM " + q_dt_right +
+				            delta_where + ")";
+			}
+
+			// Source 4: NULL group — always recompute (unmatched-right changes)
+			// SQL IN doesn't match NULL, so use OR ... IS NULL
+			string null_check;
+			for (size_t i = 0; i < group_cols.size(); i++) {
+				if (i > 0) {
+					null_check += " AND ";
+				}
+				null_check += KeywordHelper::WriteOptionallyQuoted(group_cols[i]) + " IS NULL";
+			}
+
+			string where_clause = "(" + keys_tuple + ") IN (\n  " + affected + "\n) OR (" + null_check + ")";
+			upsert_query = "DELETE FROM " + data_table + " WHERE " + where_clause + ";\n" + "INSERT INTO " +
+			               data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_recompute\nWHERE " +
+			               where_clause + ";\n";
+		} else {
+			// For MIN/MAX views, use minmax_incremental (gated by ivm_minmax_incremental).
+			// For non-MIN/MAX views, use skip_agg_delete (gated by ivm_skip_aggregate_delete).
+			bool effective_insert_only = has_minmax ? minmax_incremental : skip_agg_delete;
+			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
+			                                      view_query_sql, has_minmax, list_mode, delta_ts_filter, group_cols,
+			                                      catalog_prefix, effective_insert_only, agg_types);
+		}
 		break;
 	}
 	case IVMType::SIMPLE_PROJECTION: {
-		if (has_left_join) {
+		if (has_full_outer) {
+			// FULL OUTER JOIN bidirectional partial recompute (Zhang & Larson):
+			// Metadata format: "left_table:left_col,right_table:right_col"
+			string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+			const string &qdt = data_table;
+			string lk = KeywordHelper::WriteOptionallyQuoted(string(ivm::LEFT_KEY_COL));
+			string rk = KeywordHelper::WriteOptionallyQuoted(string(ivm::RIGHT_KEY_COL));
+
+			// Parse "left_table:left_col,right_table:right_col"
+			string foj_cols = metadata.GetFullOuterJoinCols(view_name);
+			string left_table, left_col, right_table, right_col;
+			auto comma_pos = foj_cols.find(',');
+			if (comma_pos != string::npos) {
+				string left_part = foj_cols.substr(0, comma_pos);
+				string right_part = foj_cols.substr(comma_pos + 1);
+				auto lcolon = left_part.find(':');
+				if (lcolon != string::npos) {
+					left_table = left_part.substr(0, lcolon);
+					left_col = left_part.substr(lcolon + 1);
+				}
+				auto rcolon = right_part.find(':');
+				if (rcolon != string::npos) {
+					right_table = right_part.substr(0, rcolon);
+					right_col = right_part.substr(rcolon + 1);
+				}
+			}
+
+			// Build affected-keys CTE: query each delta table for its join column
+			string union_parts;
+			for (auto &dt_name : delta_table_names) {
+				// Match delta table to its base table name
+				string base_name = StringUtil::StartsWith(dt_name, ivm::DELTA_PREFIX)
+				                       ? dt_name.substr(strlen(ivm::DELTA_PREFIX))
+				                       : dt_name;
+				string dt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(dt_name);
+				if (base_name == left_table && !left_col.empty()) {
+					if (!union_parts.empty()) {
+						union_parts += "\n  UNION\n  ";
+					}
+					union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(left_col) +
+					               " AS _k FROM " + dt + delta_where;
+				}
+				if (base_name == right_table && !right_col.empty()) {
+					if (!union_parts.empty()) {
+						union_parts += "\n  UNION\n  ";
+					}
+					union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(right_col) +
+					               " AS _k FROM " + dt + delta_where;
+				}
+			}
+
+			string where_clause;
+			string affected_ctes;
+			if (!union_parts.empty()) {
+				affected_ctes = "WITH _ivm_affected AS (\n  " + union_parts + "\n)\n";
+				where_clause =
+				    lk + " IN (SELECT _k FROM _ivm_affected) OR " + rk + " IN (SELECT _k FROM _ivm_affected)";
+			} else {
+				// Fallback: full recompute
+				where_clause = "TRUE";
+			}
+
+			// CTEs are per-statement — include in both DELETE and INSERT
+			upsert_query = affected_ctes + "DELETE FROM " + qdt + " WHERE " + where_clause + ";\n" + affected_ctes +
+			               "INSERT INTO " + qdt + "\nSELECT * FROM (" + view_query_sql + ") _ivm_foj\nWHERE " +
+			               where_clause + ";\n";
+		} else if (has_left_join) {
 			string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
 			const string &qdt = data_table;
 			string qdv = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
