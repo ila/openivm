@@ -334,16 +334,34 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 		LogicalOperator *term_root = term.get();
 		vector<ColumnBinding> mul_bindings;
 
-		// For LEFT JOINs: demote to INNER when only right-side leaves have deltas
+		// LEFT JOIN delta rule: demote to INNER in two cases.
+		//
+		// (1) Only right-side leaves have deltas (no left-side bit set): there's
+		//     no delta on the left, so the NULL-padding semantics don't apply to
+		//     this term at all — the left rows are all already in current_A.
+		//
+		// (2) Both a left-side AND the right-side-of-a-LEFT-JOIN bit are set.
+		//     The NULL-padding for an unmatched dA row is emitted by the
+		//     "dA LEFT JOIN current_B" term already — keeping LEFT JOIN here
+		//     would produce a second NULL-padded row (dA LJ dB for rows in dA
+		//     with no match in dB), double-counting the unmatched delta rows.
+		//     Demoting this term to INNER JOIN drops those NULL-padded rows so
+		//     only the dA IJ dB intersection remains (which is the correction
+		//     term in inclusion-exclusion).
 		if (has_left_join) {
 			bool has_left_side_delta = false;
+			bool has_right_of_lj_delta = false;
 			for (size_t i = 0; i < N; i++) {
-				if ((mask & (1ULL << i)) && !leaves[i].is_right_of_left_join) {
+				if (!(mask & (1ULL << i))) {
+					continue;
+				}
+				if (!leaves[i].is_right_of_left_join) {
 					has_left_side_delta = true;
-					break;
+				} else {
+					has_right_of_lj_delta = true;
 				}
 			}
-			if (!has_left_side_delta) {
+			if (!has_left_side_delta || has_right_of_lj_delta) {
 				DemoteLeftJoins(term.get());
 			}
 		}
@@ -385,7 +403,13 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 			}
 		}
 
-		// Combined multiplicity: XOR chain (a != b for booleans)
+		// Combined multiplicity: XOR chain (a != b for booleans). This is the
+		// existing IVM convention — delta rows whose signs differ produce insert
+		// output, matching signs produce delete. Changed interpretation from naive
+		// Z-set product gave wrong results on the existing inner_join tests; the
+		// LEFT JOIN incorrectness is tracked separately (the fundamental issue is
+		// the Larson & Zhou MERGE doesn't handle match_count transitions across 0
+		// for the NULL-padding path, not the combined-multiplicity encoding).
 		unique_ptr<Expression> combined_mul = make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[0]);
 		for (size_t i = 1; i < mul_bindings.size(); i++) {
 			auto next = make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_bindings[i]);
