@@ -13,7 +13,7 @@ statement ok
 LOAD ducklake;
 
 statement ok
-ATTACH ':memory:' AS dl (TYPE ducklake);
+ATTACH '__TEST_DIR__/ducklake_distinct.db' AS dl (TYPE ducklake);
 
 # ==========================================
 # Basic DISTINCT

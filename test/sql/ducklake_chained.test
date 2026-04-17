@@ -13,7 +13,7 @@ statement ok
 LOAD ducklake;
 
 statement ok
-ATTACH ':memory:' AS dl (TYPE ducklake);
+ATTACH '__TEST_DIR__/ducklake_chained.db' AS dl (TYPE ducklake);
 
 # Disable auto cascade — refresh each MV explicitly in order
 statement ok
