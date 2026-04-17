@@ -105,6 +105,7 @@ MIN/MAX/AVG use group-recompute: delete affected groups, re-insert from original
 - **Delta tables** are named `delta_<base_table>` and include a timestamp column for tracking when changes occurred
 - **LPTS** (LogicalPlanToString, in `third_party/lpts/`) converts logical plans back to SQL for compilation
 - **Cost model** (`src/upsert/openivm_cost_model.cpp`) compares estimated IVM cost vs full recompute cost. Includes filter selectivity estimation and learned regression from execution history (when `ivm_adaptive_refresh` is enabled)
+- **AVG on DECIMAL columns drifts 1–2 ULPs vs native `AVG`.** DuckDB's native `AVG(DECIMAL)` uses internal compensated arithmetic that no `SUM(x)/COUNT(x)` decomposition can reproduce bit-exactly. The MV's stored value is semantically correct but not bit-identical to the base query (e.g. MV has `47.989999999999994884` vs base `47.99000000000000199`). The `rewriter_benchmark` verify rounds `DOUBLE`/`FLOAT` columns to 10 decimals before `EXCEPT ALL`; unit tests in `test/sql/` stay strict, so test authors should use `DOUBLE` base columns or cast `AVG(val::DOUBLE)` when exercising AVG on DECIMAL. Full write-up in `docs/limitations.md`.
 
 ## Key Source Files
 

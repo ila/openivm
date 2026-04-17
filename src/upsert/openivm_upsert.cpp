@@ -542,14 +542,12 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	    std::find(column_names.begin(), column_names.end(), string(ivm::TIMESTAMP_COL)) != column_names.end();
 	// Remove _duckdb_ivm_timestamp — it's auto-filled by DEFAULT (for chained MV support).
 	// Keep column_names and column_types aligned: drop the type at the same position.
-	for (size_t i = 0; i < column_names.size(); /* conditional increment */) {
-		if (column_names[i] == string(ivm::TIMESTAMP_COL)) {
-			column_names.erase(column_names.begin() + i);
-			if (i < column_types.size()) {
-				column_types.erase(column_types.begin() + i);
-			}
-		} else {
-			i++;
+	auto it = std::find(column_names.begin(), column_names.end(), string(ivm::TIMESTAMP_COL));
+	if (it != column_names.end()) {
+		auto offset = it - column_names.begin();
+		column_names.erase(it);
+		if (offset < static_cast<decltype(offset)>(column_types.size())) {
+			column_types.erase(column_types.begin() + offset);
 		}
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] List mode: %s\n", list_mode ? "true" : "false");

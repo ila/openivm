@@ -41,7 +41,7 @@ on each `PRAGMA ivm()` call). This page consolidates all known limitations.
 |---|---|---|
 | `SUM` | Yes | Delta addition via MERGE |
 | `COUNT`, `COUNT(*)` | Yes | Delta addition via MERGE |
-| `AVG` | Yes | Decomposed to hidden SUM + COUNT; recomputed post-MERGE |
+| `AVG` | Yes (1–2 ULP drift on DECIMAL) | Decomposed to hidden SUM + COUNT; recomputed post-MERGE. DuckDB's native `AVG(DECIMAL)` uses internal compensated arithmetic that no `SUM/COUNT` decomposition reproduces bit-exactly — MV values can differ from the base query in the last 1–2 ULPs (e.g. `47.989999999999994884` vs `47.99000000000000199`). Results are semantically correct; the rewriter benchmark rounds `DOUBLE`/`FLOAT` columns to 10 decimal places before `EXCEPT ALL`. Unit tests stay strict — use a DOUBLE base column or cast `AVG(val::DOUBLE)` if a test exercises AVG on DECIMAL. |
 | `MIN`, `MAX` | Partial | Insert-only groups: incremental. Groups with deletes: recompute affected groups |
 | `LIST` (numeric) | Yes | Element-wise list operations |
 | `HAVING` | Partial | Group-recompute for affected groups |

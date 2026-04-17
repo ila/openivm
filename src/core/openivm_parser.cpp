@@ -490,7 +490,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 							}
 						}
 						// Get table names from each side of the join
-						string left_table = join->children.size() > 0 ? find_table_name(join->children[0].get()) : "";
+						string left_table = !join->children.empty() ? find_table_name(join->children[0].get()) : "";
 						string right_table = join->children.size() > 1 ? find_table_name(join->children[1].get()) : "";
 						if (!left_col_name.empty() && !right_col_name.empty() && !left_table.empty() &&
 						    !right_table.empty()) {

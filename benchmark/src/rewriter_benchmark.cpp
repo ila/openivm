@@ -55,6 +55,60 @@ static string FormatNumber(double v) {
 	return s;
 }
 
+// Normalized verify helper: returns a synthetic column-name list (`c1, c2, ...`) and
+// a projection (`ROUND(c1, 10) AS c1, c2, ROUND(c3, 10) AS c3, ...`) that rounds
+// DOUBLE/FLOAT columns to 10 decimal places. The synthetic names let us rename both
+// the MV and the base-query results into a common column-name space so EXCEPT ALL
+// can compare apples to apples — the base query's output names (e.g.
+// `count(d.D_ID)`) don't match the MV's sanitized names (`count_d_d_id`), but
+// positions always agree.
+//
+// The 10-digit tolerance absorbs ULP drift from DuckDB's internal AVG on DECIMAL
+// inputs (observed drift ~1e-14 near values of O(50); 10-digit rounding gives
+// ~1000x headroom while staying >>1e5x tighter than any algebraic-error magnitude).
+// Non-float types (INTEGER, BIGINT, DECIMAL, VARCHAR, DATE, TIMESTAMP, BOOLEAN,
+// LIST, STRUCT, MAP, ARRAY) pass through verbatim so algebraic errors still surface.
+//
+// If schema lookup fails, column_list is empty and normalized is "*" — caller
+// falls back to the strict SELECT * compare.
+struct NormalizedVerify {
+	string column_list;     // e.g. "c1, c2, c3" — used in WITH cte(<column_list>) AS ...
+	string normalized;      // e.g. "c1, ROUND(c2, 10) AS c2, c3"
+	bool has_float = false; // any DOUBLE/FLOAT/REAL column present — if false, fall back
+	                        // to the strict `SELECT *` verify (avoids reshaping SQL for
+	                        // queries that don't need tolerance, e.g. NTILE/ROW_NUMBER
+	                        // whose output can subtly shift under CTE materialization).
+};
+
+static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const string &rel_name) {
+	NormalizedVerify result;
+	// Escape single quotes in relation name for the PRAGMA string literal.
+	string escaped;
+	for (char c : rel_name) {
+		escaped += c;
+		if (c == '\'') escaped += '\'';
+	}
+	auto info = con.Query("PRAGMA table_info('" + escaped + "')");
+	if (!info || info->HasError() || info->RowCount() == 0) {
+		result.normalized = "*";
+		return result;
+	}
+	for (duckdb::idx_t r = 0; r < info->RowCount(); r++) {
+		string type = info->GetValue(2, r).ToString();
+		string cname = "c" + std::to_string(r);
+		if (!result.column_list.empty()) result.column_list += ", ";
+		result.column_list += cname;
+		if (!result.normalized.empty()) result.normalized += ", ";
+		if (type == "DOUBLE" || type == "FLOAT" || type == "REAL") {
+			result.normalized += "ROUND(" + cname + ", 10) AS " + cname;
+			result.has_float = true;
+		} else {
+			result.normalized += cname;
+		}
+	}
+	return result;
+}
+
 // Parse is_incremental from the query file's first-line metadata comment.
 // Returns 1 if metadata says incremental, 0 if FULL_REFRESH, -1 if missing/unparseable.
 static int ParseIsIncrementalFromQueryFile(const string &query_sql) {
@@ -529,13 +583,41 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							time_refresh_ms = std::chrono::duration<double, std::milli>(end_refresh - start).count();
 							phase_reached = 5;
 
-							// Phase 5: EXCEPT ALL verification (wrap in subqueries to handle ORDER BY/CTEs)
+							// Phase 5: EXCEPT ALL verification (wrap in subqueries to handle ORDER BY/CTEs).
+							// Rename both sides to synthetic column names (c0, c1, ...) so EXCEPT ALL
+							// compares by position — the MV's sanitized column names (e.g. count_d_d_id)
+							// don't match the base query's unsanitized output names (count(d.D_ID)).
+							// Round DOUBLE/FLOAT columns to 10 decimals to tolerate ULP drift on
+							// AVG-over-DECIMAL MVs (DuckDB's native AVG uses compensated arithmetic
+							// we can't reproduce via SUM/COUNT). See docs/limitations.md.
 							start = std::chrono::steady_clock::now();
-							string verify_query = "SELECT COUNT(*) FROM ("
-								"SELECT * FROM " + mv_name + " EXCEPT ALL SELECT * FROM (" + query + ") __a"
-								" UNION ALL "
-								"SELECT * FROM (" + query + ") __b EXCEPT ALL SELECT * FROM " + mv_name +
-								") __diff";
+							auto nv = BuildNormalizedVerify(con, mv_name);
+							string verify_query;
+							if (nv.column_list.empty() || !nv.has_float) {
+								// Strict compare: no DOUBLE/FLOAT columns (so tolerance is
+								// unnecessary) or schema lookup failed. Keeps the SQL byte-
+								// identical to the historical verify so queries whose output
+								// is order-sensitive under CTE materialization (NTILE, etc.)
+								// aren't perturbed.
+								verify_query = "SELECT COUNT(*) FROM ("
+									"SELECT * FROM " + mv_name + " EXCEPT ALL SELECT * FROM (" + query + ") __a"
+									" UNION ALL "
+									"SELECT * FROM (" + query + ") __b EXCEPT ALL SELECT * FROM " + mv_name +
+									") __diff";
+							} else {
+								verify_query =
+									"WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " + mv_name + "), "
+									"gt_r(" + nv.column_list + ") AS (SELECT * FROM (" + query + ") __gt) "
+									"SELECT COUNT(*) FROM ("
+									"SELECT " + nv.normalized + " FROM mv_r "
+									"EXCEPT ALL "
+									"SELECT " + nv.normalized + " FROM gt_r "
+									"UNION ALL "
+									"SELECT " + nv.normalized + " FROM gt_r "
+									"EXCEPT ALL "
+									"SELECT " + nv.normalized + " FROM mv_r"
+									") __diff";
+							}
 							auto verify_result = con.Query(verify_query);
 							if (verify_result && !verify_result->HasError() && verify_result->RowCount() > 0) {
 								int64_t mismatch_count = verify_result->GetValue(0, 0).GetValue<int64_t>();
