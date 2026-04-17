@@ -326,23 +326,37 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				}
 				bool has_sum_sq = d_sum_sq_cols.count(column) > 0;
 				if (has_sum_sq) {
-					// STDDEV/VARIANCE
+					// STDDEV/VARIANCE. Must match the CASE-WHEN + clamp semantics that the
+					// CREATE-MV formula in RewriteDerivedAggregates already applies; the raw
+					// algebraic formula alone can (a) produce a numeric result for groups
+					// with count <= threshold (pop: 0, sample: 1) where the base query
+					// yields NULL, and (b) feed sqrt() a tiny negative value after
+					// INSERT+DELETE on flat-valued data where floating-point reassociation
+					// of (sum_sq - sum²/count) drifts below zero — crashing the refresh.
 					string sum_sq_col = d_sum_sq_cols.at(column);
 					string new_sum = updated_col(sum_col);
 					string new_sq = updated_col(sum_sq_col);
 					string new_n = updated_col(count_col);
 					bool is_pop = decomp.is_population.count(column) && decomp.is_population.at(column);
 					bool do_sqrt = decomp.needs_sqrt.count(column) && decomp.needs_sqrt.at(column);
+					int threshold = is_pop ? 0 : 1;
 
 					string denom = is_pop ? "NULLIF(" + new_n + ", 0)" : "NULLIF(" + new_n + " - 1, 0)";
-					string var_expr =
+					string var_raw =
 					    "((" + new_sq + ") - (" + new_sum + ") * (" + new_sum + ") / (" + new_n + ")) / " + denom;
-					update_set += column + " = " + (do_sqrt ? "sqrt(" + var_expr + ")" : var_expr);
+					// 0::DOUBLE so GREATEST binds to DOUBLE, not INTEGER (would up-cast silently).
+					string var_safe = "GREATEST(" + var_raw + ", 0::DOUBLE)";
+					string formula = do_sqrt ? "sqrt(" + var_safe + ")" : var_safe;
+					update_set += column + " = CASE WHEN " + new_n + " > " + std::to_string(threshold) + " THEN " +
+					              formula + " ELSE NULL END";
 
 					string d_denom = is_pop ? "NULLIF(d." + count_col + ", 0)" : "NULLIF(d." + count_col + " - 1, 0)";
-					string d_var = "((d." + sum_sq_col + ") - (d." + sum_col + ") * (d." + sum_col + ") / (d." +
-					               count_col + ")) / " + d_denom;
-					insert_vals += do_sqrt ? "sqrt(" + d_var + ")" : d_var;
+					string d_var_raw = "((d." + sum_sq_col + ") - (d." + sum_col + ") * (d." + sum_col + ") / (d." +
+					                   count_col + ")) / " + d_denom;
+					string d_var_safe = "GREATEST(" + d_var_raw + ", 0::DOUBLE)";
+					string d_formula = do_sqrt ? "sqrt(" + d_var_safe + ")" : d_var_safe;
+					insert_vals += "CASE WHEN d." + count_col + " > " + std::to_string(threshold) + " THEN " +
+					               d_formula + " ELSE NULL END";
 				} else {
 					// AVG
 					update_set +=

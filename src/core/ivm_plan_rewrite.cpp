@@ -169,15 +169,22 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 	};
 	vector<Decomp> decomps;
 	vector<unique_ptr<Expression>> new_exprs;
+	// Track the new position of each non-decomposed aggregate so we can remap
+	// projection BCRs that still point to the ORIGINAL position. A bare COUNT(*)
+	// at original index 4 can move to new index 12 after four STDDEV/VARIANCE
+	// decompositions each insert 3 hidden columns ahead of it.
+	std::map<idx_t, idx_t> nondecomposed_remap;
 
 	for (idx_t i = 0; i < agg.expressions.size(); i++) {
 		auto &expr = agg.expressions[i];
 		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			nondecomposed_remap[i] = new_exprs.size();
 			new_exprs.push_back(std::move(expr));
 			continue;
 		}
 		auto &bound = expr->Cast<BoundAggregateExpression>();
 		if (bound.children.empty()) {
+			nondecomposed_remap[i] = new_exprs.size();
 			new_exprs.push_back(std::move(expr));
 			continue;
 		}
@@ -185,6 +192,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 		bool is_avg = (bound.function.name == "avg");
 		bool is_stddev = IsStddevOrVariance(bound.function.name);
 		if (!is_avg && !is_stddev) {
+			nondecomposed_remap[i] = new_exprs.size();
 			new_exprs.push_back(std::move(expr));
 			continue;
 		}
@@ -259,6 +267,32 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 	}
 	agg.expressions = std::move(new_exprs);
 	agg.ResolveOperatorTypes();
+
+	// Step 1.5: Remap projection BCRs that point to non-decomposed aggregates
+	// (e.g. COUNT(*), SUM(x)) whose positions in agg.expressions shifted because
+	// STDDEV/VARIANCE decompositions inserted hidden SUM/SUM_SQ/COUNT entries
+	// ahead of them. Without this, a BCR like COUNT(*) at old position 4 would
+	// now resolve to (agg_index, 4) — which after decomposition is SUM_SQ of an
+	// earlier STDDEV aggregate, producing visually swapped columns in the MV.
+	// Must run BEFORE decomp-based substitute_nested so the decomps' old_binding
+	// matching still sees the original positions.
+	if (!nondecomposed_remap.empty()) {
+		std::function<void(unique_ptr<Expression> &)> apply_remap = [&](unique_ptr<Expression> &expr) {
+			if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+				auto &bcr = expr->Cast<BoundColumnRefExpression>();
+				if (bcr.binding.table_index == agg.aggregate_index) {
+					auto it = nondecomposed_remap.find(bcr.binding.column_index);
+					if (it != nondecomposed_remap.end() && it->second != bcr.binding.column_index) {
+						bcr.binding.column_index = it->second;
+					}
+				}
+			}
+			ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) { apply_remap(child); });
+		};
+		for (auto &pexpr : proj.expressions) {
+			apply_remap(pexpr);
+		}
+	}
 
 	// Step 2: Update projection — replace derived column refs with formulas.
 	// Across decomps, track projection slots that we have directly replaced with a
