@@ -118,10 +118,27 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		result.found_aggregation = true;
 		auto *agg = dynamic_cast<LogicalAggregate *>(node);
 		if (agg) {
+			// GROUPING SETS / ROLLUP / CUBE produce multiple grouping_sets entries.
+			// Our delta path groups once; can't produce the cross-grouped rows.
+			if (agg->grouping_sets.size() > 1) {
+				result.ivm_compatible = false;
+			}
 			for (auto &expr : agg->expressions) {
 				if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
 					auto &bound_agg = expr->Cast<BoundAggregateExpression>();
 					if (SUPPORTED_AGGREGATES.find(bound_agg.function.name) == SUPPORTED_AGGREGATES.end()) {
+						result.ivm_compatible = false;
+					}
+					// COUNT(DISTINCT x) can't be maintained by summing delta counts — a
+					// delta row's value might already be in the MV (no change) or not
+					// (+1). Deciding requires auxiliary per-value state.
+					if (bound_agg.IsDistinct()) {
+						result.ivm_compatible = false;
+					}
+					// FILTER (WHERE predicate) aggregates aren't captured by the delta
+					// path either — the FILTER predicate interacts with delta rows in
+					// ways the delta-sum formula can't reproduce.
+					if (bound_agg.filter) {
 						result.ivm_compatible = false;
 					}
 					if (bound_agg.function.name == "min" || bound_agg.function.name == "max") {

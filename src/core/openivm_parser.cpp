@@ -13,6 +13,7 @@
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -270,6 +271,38 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				// This is fine for partition-recompute views that don't need LPTS-rewritten queries.
 				view_query = original_view_query;
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback to original query: %s\n", view_query.c_str());
+			}
+			// For views that LPTS silently mis-serializes (GROUPING SETS / ROLLUP / CUBE
+			// → plain GROUP BY; STRUCT_PACK field names → tN_col aliases; etc.), detect
+			// structurally and prefer the original SQL. Those constructs never need the
+			// LPTS-rewritten form anyway — they're classified FULL_REFRESH and the
+			// rewriter-rule path (which needs LPTS) isn't used.
+			{
+				bool needs_original = false;
+				// Walk the plan looking for GROUPING SETS / ROLLUP / CUBE — any aggregate
+				// with more than one grouping_set entry triggers fallback.
+				std::function<void(LogicalOperator *)> walk = [&](LogicalOperator *op) {
+					if (needs_original || !op) {
+						return;
+					}
+					if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+						auto *agg = dynamic_cast<LogicalAggregate *>(op);
+						if (agg && agg->grouping_sets.size() > 1) {
+							needs_original = true;
+							return;
+						}
+					}
+					for (auto &child : op->children) {
+						walk(child.get());
+					}
+				};
+				walk(select_plan.get());
+				if (needs_original) {
+					view_query = original_view_query;
+					OPENIVM_DEBUG_PRINT(
+					    "[CREATE MV] LPTS can't round-trip GROUPING SETS/ROLLUP/CUBE — using original SQL: %s\n",
+					    view_query.c_str());
+				}
 			}
 		}
 		con.Rollback();

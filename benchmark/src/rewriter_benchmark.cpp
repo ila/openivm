@@ -56,16 +56,21 @@ static string FormatNumber(double v) {
 }
 
 // Normalized verify helper: returns a synthetic column-name list (`c1, c2, ...`) and
-// a projection (`ROUND(c1, 10) AS c1, c2, ROUND(c3, 10) AS c3, ...`) that rounds
-// DOUBLE/FLOAT columns to 10 decimal places. The synthetic names let us rename both
-// the MV and the base-query results into a common column-name space so EXCEPT ALL
-// can compare apples to apples — the base query's output names (e.g.
-// `count(d.D_ID)`) don't match the MV's sanitized names (`count_d_d_id`), but
-// positions always agree.
+// a projection that formats DOUBLE/FLOAT columns with `printf('%.12g', ...)` — 12
+// significant digits. The synthetic names let us rename both the MV and the base-
+// query results into a common column-name space so EXCEPT ALL can compare by
+// position — the base query's output names (e.g. `count(d.D_ID)`) don't match the
+// MV's sanitized names (`count_d_d_id`), but positions always agree.
 //
-// The 10-digit tolerance absorbs ULP drift from DuckDB's internal AVG on DECIMAL
-// inputs (observed drift ~1e-14 near values of O(50); 10-digit rounding gives
-// ~1000x headroom while staying >>1e5x tighter than any algebraic-error magnitude).
+// Why %.12g (significant digits) instead of ROUND(x, N) (decimal places):
+//   DuckDB's internal AVG / VARIANCE compensation can drift 1 ULP. DOUBLE ULP is
+//   ~2^-52 of the magnitude — absolute 1e-15 for values near 1, absolute 1e-9 for
+//   values near 1e7, etc. A fixed decimal-place rounding fails for large values
+//   (e.g. VARIANCE ≈ 1.76e7 drifts by 4e-9, outside ROUND(x,10)'s 1e-10 window).
+//   12 significant digits leaves ~3–4 orders of magnitude headroom relative to
+//   DOUBLE's ~16 significant digits regardless of magnitude, while still catching
+//   any algebraic error larger than 1e-12 relative.
+//
 // Non-float types (INTEGER, BIGINT, DECIMAL, VARCHAR, DATE, TIMESTAMP, BOOLEAN,
 // LIST, STRUCT, MAP, ARRAY) pass through verbatim so algebraic errors still surface.
 //
@@ -100,7 +105,10 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 		result.column_list += cname;
 		if (!result.normalized.empty()) result.normalized += ", ";
 		if (type == "DOUBLE" || type == "FLOAT" || type == "REAL") {
-			result.normalized += "ROUND(" + cname + ", 10) AS " + cname;
+			// Format with 12 significant digits (relative precision, not absolute).
+			// NULLs stay as NULL — DuckDB's printf('%.12g', NULL) returns NULL, and
+			// EXCEPT ALL treats NULL-rows as equal on both sides.
+			result.normalized += "printf('%.12g', " + cname + ") AS " + cname;
 			result.has_float = true;
 		} else {
 			result.normalized += cname;
