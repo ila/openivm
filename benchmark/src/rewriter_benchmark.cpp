@@ -894,11 +894,22 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		uint8_t phase = worker.result_phase;
 		string error_msg = worker.result_error;
 
+		// If the child died (crash OR SIGKILL'd timeout), delete the WAL before the
+		// next child opens the DB. A SIGKILL'd child never flushes its WAL, and
+		// DuckDB's WAL replay can then fail with "Calling DatabaseManager::
+		// GetDefaultDatabase with no default database set", killing every subsequent
+		// query. Timeouts surface as phase=2 with error=="timeout"; actual crashes
+		// as phase=99.
+		bool child_died = (phase == 99) || (phase == 2 && error_msg == "timeout");
+		if (child_died) {
+			string wal_path = db_path + ".wal";
+			if (FileExists(wal_path)) {
+				std::remove(wal_path.c_str());
+			}
+		}
+
 		// Handle crash: attribute to root-cause query if INTERNAL error preceded it
 		if (phase == 99) {
-			// Delete the WAL so the next child can open the DB cleanly
-			string wal_path = db_path + ".wal";
-			if (FileExists(wal_path)) { std::remove(wal_path.c_str()); }
 			worker.Stop();
 
 			if (!last_internal_error_query.empty()) {
