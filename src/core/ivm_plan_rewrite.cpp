@@ -10,6 +10,7 @@
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -20,6 +21,9 @@
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+
+#include <functional>
+#include <set>
 
 namespace duckdb {
 
@@ -256,9 +260,20 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 	agg.expressions = std::move(new_exprs);
 	agg.ResolveOperatorTypes();
 
-	// Step 2: Update projection — replace derived column refs with formulas
+	// Step 2: Update projection — replace derived column refs with formulas.
+	// Across decomps, track projection slots that we have directly replaced with a
+	// formula. We must NOT let later decomps' substitute_nested descend into these:
+	// an earlier decomp's STDDEV formula contains BCRs to (agg_index, sum_sq_idx) and
+	// (agg_index, count_idx) — and a later decomp's old_binding = (agg_index, its_old_idx)
+	// may collide with those slots, causing spurious re-replacement and wrong arithmetic.
 	auto agg_bindings = plan->children[0]->GetColumnBindings();
 	auto agg_types = plan->children[0]->types;
+	std::set<idx_t> replaced_slots;
+	// Original projection width before we start appending hidden pass-through columns.
+	// Those appended columns are BCRs at (aggregate_index, sum_idx/sum_sq_idx/count_idx)
+	// which can coincidentally equal a later decomp's old_binding — so restrict direct
+	// matching and nested substitution to slots that existed before any appends.
+	const idx_t original_proj_size = proj.expressions.size();
 
 	for (auto &d : decomps) {
 		ColumnBinding old_binding(agg.aggregate_index, d.old_idx);
@@ -267,66 +282,105 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 		LogicalType sum_type = agg_types[group_count + d.sum_idx];
 		LogicalType count_type = agg_types[group_count + d.count_idx];
 
-		// Find and replace the projection expression for this aggregate.
-		// Capture the user's alias from the original projection expression (e.g., "my_avg" from
-		// "avg(val) AS my_avg") — this is the column name in the data table. We use it for
-		// hidden column naming so DetectDerivedAggColumns can match them in the upsert compiler.
-		for (idx_t pi = 0; pi < proj.expressions.size(); pi++) {
-			if (proj.expressions[pi]->type != ExpressionType::BOUND_COLUMN_REF) {
-				continue;
-			}
-			auto &ref = proj.expressions[pi]->Cast<BoundColumnRefExpression>();
-			if (ref.binding != old_binding) {
-				continue;
-			}
-
-			// Capture user's alias BEFORE replacing the expression
-			d.user_alias = ref.alias.empty() ? d.alias : ref.alias;
-
-			unique_ptr<Expression> result;
+		// Build the replacement expression (SUM/COUNT or the variance formula) that
+		// supplies the value of the decomposed aggregate. Used both to replace the
+		// direct BCR projection output AND to substitute any nested BCR inside other
+		// projection expressions (e.g. CASE WHEN AVG(x) > 1000 THEN ...).
+		auto build_replacement = [&]() -> unique_ptr<Expression> {
 			if (d.kind == DecompKind::AVG) {
 				auto sum_ref = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
 				auto count_ref = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-				result = opt.BindScalarFunction("/", std::move(sum_ref), std::move(count_ref));
-			} else {
-				ColumnBinding sum_sq_binding = agg_bindings[group_count + d.sum_sq_idx];
-				LogicalType sum_sq_type = agg_types[group_count + d.sum_sq_idx];
-
-				auto s1 = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
-				auto s2 = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
-				auto sq = make_uniq<BoundColumnRefExpression>(sum_sq_type, sum_sq_binding);
-				auto n = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-
-				auto sum_sq_over_n =
-				    opt.BindScalarFunction("/", opt.BindScalarFunction("*", std::move(s1), std::move(s2)),
-				                           make_uniq<BoundColumnRefExpression>(count_type, count_binding));
-				auto numerator = opt.BindScalarFunction("-", std::move(sq), std::move(sum_sq_over_n));
-
-				unique_ptr<Expression> denom;
-				if (IsPopulationVariant(d.func_name)) {
-					denom = std::move(n);
-				} else {
-					denom =
-					    opt.BindScalarFunction("-", std::move(n), make_uniq<BoundConstantExpression>(Value::BIGINT(1)));
-				}
-				auto var_expr = opt.BindScalarFunction("/", std::move(numerator), std::move(denom));
-				auto formula = IsStddevVariant(d.func_name) ? opt.BindScalarFunction("sqrt", std::move(var_expr))
-				                                            : std::move(var_expr);
-
-				// Wrap in CASE WHEN count > threshold THEN formula ELSE NULL END
-				// to produce NULL instead of nan for groups with insufficient rows.
-				// Sample (stddev/variance): need count > 1; Population: need count > 0.
-				int64_t threshold = IsPopulationVariant(d.func_name) ? 0 : 1;
-				auto count_check = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-				auto when_expr =
-				    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, std::move(count_check),
-				                                         make_uniq<BoundConstantExpression>(Value::BIGINT(threshold)));
-				auto else_expr = make_uniq<BoundConstantExpression>(Value(formula->return_type));
-				result = make_uniq<BoundCaseExpression>(std::move(when_expr), std::move(formula), std::move(else_expr));
+				return opt.BindScalarFunction("/", std::move(sum_ref), std::move(count_ref));
 			}
-			result->alias = d.user_alias;
-			proj.expressions[pi] = std::move(result);
-			break;
+			ColumnBinding sum_sq_binding = agg_bindings[group_count + d.sum_sq_idx];
+			LogicalType sum_sq_type = agg_types[group_count + d.sum_sq_idx];
+			auto s1 = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
+			auto s2 = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
+			auto sq = make_uniq<BoundColumnRefExpression>(sum_sq_type, sum_sq_binding);
+			auto n = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+			auto sum_sq_over_n = opt.BindScalarFunction("/", opt.BindScalarFunction("*", std::move(s1), std::move(s2)),
+			                                            make_uniq<BoundColumnRefExpression>(count_type, count_binding));
+			auto numerator = opt.BindScalarFunction("-", std::move(sq), std::move(sum_sq_over_n));
+			unique_ptr<Expression> denom;
+			if (IsPopulationVariant(d.func_name)) {
+				denom = std::move(n);
+			} else {
+				denom = opt.BindScalarFunction("-", std::move(n), make_uniq<BoundConstantExpression>(Value::BIGINT(1)));
+			}
+			auto var_expr = opt.BindScalarFunction("/", std::move(numerator), std::move(denom));
+			auto formula = IsStddevVariant(d.func_name) ? opt.BindScalarFunction("sqrt", std::move(var_expr))
+			                                            : std::move(var_expr);
+			int64_t threshold = IsPopulationVariant(d.func_name) ? 0 : 1;
+			auto count_check = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+			auto when_expr =
+			    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, std::move(count_check),
+			                                         make_uniq<BoundConstantExpression>(Value::BIGINT(threshold)));
+			auto else_expr = make_uniq<BoundConstantExpression>(Value(formula->return_type));
+			return make_uniq<BoundCaseExpression>(std::move(when_expr), std::move(formula), std::move(else_expr));
+		};
+
+		// Recursively substitute BCRs matching the old aggregate binding inside a
+		// projection expression. Needed for cases like
+		//   CASE WHEN AVG(x) > 1000 THEN 'big' ELSE 'small' END
+		// where the AVG reference is nested inside a CASE rather than being the
+		// top-level expression — without this, the nested BCR would continue pointing
+		// at the decomposed aggregate's SUM slot (producing SUM > 1000 instead of
+		// AVG > 1000).
+		std::function<void(unique_ptr<Expression> &)> substitute_nested = [&](unique_ptr<Expression> &expr) {
+			if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+				auto &bcr = expr->Cast<BoundColumnRefExpression>();
+				if (bcr.binding == old_binding) {
+					auto replacement = build_replacement();
+					replacement->alias = bcr.alias;
+					expr = std::move(replacement);
+					return;
+				}
+			}
+			ExpressionIterator::EnumerateChildren(*expr,
+			                                      [&](unique_ptr<Expression> &child) { substitute_nested(child); });
+		};
+
+		// Replace every reference to the old aggregate binding in the projection.
+		// Top-level BCRs become the formula directly (preserving the user's alias so
+		// the MV column keeps its name). Nested BCRs inside larger expressions
+		// (CASE, arithmetic, etc.) are substituted in place. Crucially, we skip any
+		// slot we've already rewritten — the replacement formula itself contains a
+		// BCR at (aggregate_index, d.old_idx) (now the SUM slot), which would
+		// otherwise be matched again and double-apply.
+		bool direct_ref_found = false;
+		for (idx_t pi = 0; pi < original_proj_size; pi++) {
+			// Skip slots another decomp already rewrote — its formula's internal BCRs
+			// may accidentally collide with our old_binding (a later decomp's old_idx
+			// can equal an earlier decomp's sum_sq_idx or count_idx).
+			if (replaced_slots.count(pi)) {
+				continue;
+			}
+			if (proj.expressions[pi]->type == ExpressionType::BOUND_COLUMN_REF) {
+				auto &ref = proj.expressions[pi]->Cast<BoundColumnRefExpression>();
+				if (ref.binding == old_binding) {
+					d.user_alias = ref.alias.empty() ? d.alias : ref.alias;
+					auto result = build_replacement();
+					result->alias = d.user_alias;
+					proj.expressions[pi] = std::move(result);
+					direct_ref_found = true;
+					replaced_slots.insert(pi);
+					continue; // do NOT walk into the formula we just inserted
+				}
+			}
+			// Not a direct BCR match — substitute any nested references (e.g. CASE).
+			// If this substitution replaces the top-level expression, record the slot
+			// too so subsequent decomps don't recurse into our new formula.
+			bool was_bcr_before = (proj.expressions[pi]->type == ExpressionType::BOUND_COLUMN_REF);
+			substitute_nested(proj.expressions[pi]);
+			if (was_bcr_before && proj.expressions[pi]->type != ExpressionType::BOUND_COLUMN_REF) {
+				replaced_slots.insert(pi);
+			}
+		}
+		if (!direct_ref_found) {
+			// No direct BCR output — the aggregate is only referenced inside a larger
+			// expression (CASE, arithmetic, etc.). Use the internal alias for hidden-
+			// column naming below; DetectDerivedAggColumns matches on the prefix.
+			d.user_alias = d.alias;
 		}
 
 		// Add hidden columns as passthroughs. Use user_alias so that

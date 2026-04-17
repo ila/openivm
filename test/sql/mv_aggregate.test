@@ -1703,3 +1703,308 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Multiple non-additive columns in one MV
+statement ok
+CREATE TABLE multi_nonadd (dept VARCHAR, region VARCHAR, salary INT);
+
+statement ok
+INSERT INTO multi_nonadd VALUES ('eng', 'us', 100000), ('eng', 'eu', 90000), ('sales', 'us', 80000);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_multi_nonadd AS
+    SELECT dept, region,
+           UPPER(dept) AS dept_upper,
+           LOWER(region) AS region_lower,
+           'live' AS label,
+           SUM(salary) AS total_sal,
+           COUNT(*) AS cnt
+    FROM multi_nonadd GROUP BY dept, region;
+
+statement ok
+INSERT INTO multi_nonadd VALUES ('eng', 'us', 120000), ('sales', 'eu', 70000);
+
+statement ok
+DELETE FROM multi_nonadd WHERE dept='eng' AND region='eu';
+
+statement ok
+PRAGMA ivm('mv_multi_nonadd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_multi_nonadd
+    EXCEPT ALL
+    SELECT dept, region, UPPER(dept), LOWER(region), 'live', SUM(salary), COUNT(*)
+    FROM multi_nonadd GROUP BY dept, region
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT dept, region, UPPER(dept), LOWER(region), 'live', SUM(salary), COUNT(*)
+    FROM multi_nonadd GROUP BY dept, region
+    EXCEPT ALL SELECT * FROM mv_multi_nonadd
+);
+----
+0
+
+# Group key becomes empty (all rows for a group deleted) then repopulated
+statement ok
+DELETE FROM multi_nonadd WHERE dept='sales';
+
+statement ok
+PRAGMA ivm('mv_multi_nonadd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_multi_nonadd
+    EXCEPT ALL
+    SELECT dept, region, UPPER(dept), LOWER(region), 'live', SUM(salary), COUNT(*)
+    FROM multi_nonadd GROUP BY dept, region
+);
+----
+0
+
+statement ok
+INSERT INTO multi_nonadd VALUES ('sales', 'apac', 60000), ('sales', 'apac', 65000);
+
+statement ok
+PRAGMA ivm('mv_multi_nonadd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_multi_nonadd
+    EXCEPT ALL
+    SELECT dept, region, UPPER(dept), LOWER(region), 'live', SUM(salary), COUNT(*)
+    FROM multi_nonadd GROUP BY dept, region
+);
+----
+0
+
+# CASE over AVG — aggregate state changes across the threshold repeatedly
+statement ok
+CREATE TABLE case_avg (grp INT, v DECIMAL(10,2));
+
+statement ok
+INSERT INTO case_avg VALUES (1, 100), (1, 200), (2, 1500), (2, 2500);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_case_avg AS
+    SELECT grp,
+           AVG(v) AS avg_v,
+           COUNT(*) AS n,
+           CASE WHEN AVG(v) > 1000 THEN 'big' ELSE 'small' END AS tier
+    FROM case_avg GROUP BY grp;
+
+query TT
+SELECT grp, tier FROM mv_case_avg ORDER BY grp;
+----
+1	small
+2	big
+
+# Batch 1: flip grp=1 above threshold by adding a huge row
+statement ok
+INSERT INTO case_avg VALUES (1, 5000);
+
+statement ok
+PRAGMA ivm('mv_case_avg');
+
+query TT
+SELECT grp, tier FROM mv_case_avg ORDER BY grp;
+----
+1	big
+2	big
+
+# Batch 2: remove the huge row in grp=1, push grp=2 below threshold
+statement ok
+DELETE FROM case_avg WHERE grp=1 AND v=5000;
+
+statement ok
+INSERT INTO case_avg VALUES (2, 100), (2, 100), (2, 100), (2, 100), (2, 100);
+
+statement ok
+PRAGMA ivm('mv_case_avg');
+
+query TT
+SELECT grp, tier FROM mv_case_avg ORDER BY grp;
+----
+1	small
+2	small
+
+# LIST<VARCHAR> with ORDER BY — element order in the list must match the order
+# produced by the view query (LIST(col ORDER BY another_col)).
+statement ok
+CREATE TABLE list_varchar (cat VARCHAR, name VARCHAR, rank INT);
+
+statement ok
+INSERT INTO list_varchar VALUES
+    ('fruit', 'apple', 1), ('fruit', 'banana', 2), ('fruit', 'cherry', 3),
+    ('veg', 'broccoli', 1), ('veg', 'carrot', 2);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_list_varchar AS
+    SELECT cat, LIST(name ORDER BY rank) AS names, COUNT(*) AS n
+    FROM list_varchar GROUP BY cat;
+
+statement ok
+INSERT INTO list_varchar VALUES ('fruit', 'date', 4), ('veg', 'asparagus', 0);
+
+statement ok
+DELETE FROM list_varchar WHERE name = 'banana';
+
+statement ok
+PRAGMA ivm('mv_list_varchar');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_varchar
+    EXCEPT ALL
+    SELECT cat, LIST(name ORDER BY rank), COUNT(*) FROM list_varchar GROUP BY cat
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT cat, LIST(name ORDER BY rank), COUNT(*) FROM list_varchar GROUP BY cat
+    EXCEPT ALL SELECT * FROM mv_list_varchar
+);
+----
+0
+
+# BOOLEAN scalar in projection above aggregate
+statement ok
+CREATE TABLE bool_check (grp INT, v INT);
+
+statement ok
+INSERT INTO bool_check VALUES (1, 5), (1, 10), (2, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_bool_tier AS
+    SELECT grp,
+           SUM(v) AS total,
+           (SUM(v) > 50) AS is_big,
+           COUNT(*) AS n
+    FROM bool_check GROUP BY grp;
+
+statement ok
+INSERT INTO bool_check VALUES (1, 100), (2, 5);
+
+statement ok
+DELETE FROM bool_check WHERE grp = 2 AND v = 100;
+
+statement ok
+PRAGMA ivm('mv_bool_tier');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_bool_tier
+    EXCEPT ALL
+    SELECT grp, SUM(v), (SUM(v) > 50), COUNT(*) FROM bool_check GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(v), (SUM(v) > 50), COUNT(*) FROM bool_check GROUP BY grp
+    EXCEPT ALL SELECT * FROM mv_bool_tier
+);
+----
+0
+
+# Verify the boolean flipped
+query IT
+SELECT grp, is_big FROM mv_bool_tier ORDER BY grp;
+----
+1	true
+2	false
+
+# UNION-ALL-of-aggregates-with-literals — exercises SIMPLE_AGGREGATE
+# (each branch has its own literal tag and an aggregate)
+statement ok
+CREATE TABLE ua_events (status VARCHAR, amount INT);
+
+statement ok
+INSERT INTO ua_events VALUES ('open', 10), ('open', 20), ('closed', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ua_counts AS
+    SELECT 'open' AS kind, COUNT(*) AS n FROM ua_events WHERE status = 'open'
+    UNION ALL
+    SELECT 'closed', COUNT(*) FROM ua_events WHERE status = 'closed'
+    UNION ALL
+    SELECT 'total', COUNT(*) FROM ua_events;
+
+statement ok
+INSERT INTO ua_events VALUES ('open', 40), ('closed', 50);
+
+statement ok
+DELETE FROM ua_events WHERE status='open' AND amount=10;
+
+statement ok
+PRAGMA ivm('mv_ua_counts');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_ua_counts
+    EXCEPT ALL
+    SELECT * FROM (
+        SELECT 'open', COUNT(*) FROM ua_events WHERE status='open'
+        UNION ALL SELECT 'closed', COUNT(*) FROM ua_events WHERE status='closed'
+        UNION ALL SELECT 'total', COUNT(*) FROM ua_events
+    ) q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        SELECT 'open', COUNT(*) FROM ua_events WHERE status='open'
+        UNION ALL SELECT 'closed', COUNT(*) FROM ua_events WHERE status='closed'
+        UNION ALL SELECT 'total', COUNT(*) FROM ua_events
+    ) q
+    EXCEPT ALL SELECT * FROM mv_ua_counts
+);
+----
+0
+
+# LIST with large batch of mixed inserts/deletes
+statement ok
+CREATE TABLE list_heavy (bucket INT, token VARCHAR);
+
+statement ok
+INSERT INTO list_heavy SELECT i % 3, 'tok' || i FROM range(1, 20) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_list_heavy AS
+    SELECT bucket, LIST(token ORDER BY token) AS toks, COUNT(*) AS n
+    FROM list_heavy GROUP BY bucket;
+
+statement ok
+DELETE FROM list_heavy WHERE token IN ('tok5', 'tok10', 'tok15');
+
+statement ok
+INSERT INTO list_heavy VALUES (0, 'new_a'), (1, 'new_b'), (2, 'new_c'), (0, 'new_d');
+
+statement ok
+PRAGMA ivm('mv_list_heavy');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_heavy
+    EXCEPT ALL
+    SELECT bucket, LIST(token ORDER BY token), COUNT(*) FROM list_heavy GROUP BY bucket
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT bucket, LIST(token ORDER BY token), COUNT(*) FROM list_heavy GROUP BY bucket
+    EXCEPT ALL SELECT * FROM mv_list_heavy
+);
+----
+0
