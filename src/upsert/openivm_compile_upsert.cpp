@@ -431,8 +431,20 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			// (hidden _ivm_count_* columns from AVG/STDDEV decomposition don't have agg_type entries).
 			bool is_count = (agg_type == "count" || col.find(string(ivm::COUNT_COL_PREFIX)) == 0);
 			string null_val = is_count ? "0" : "NULL";
-			lj_update_set +=
-			    col + " = CASE WHEN " + mc_new + " > 0 THEN " + updated_col(col) + " ELSE " + null_val + " END";
+			// Three-way CASE:
+			//   mc_new > 0: group has matches (now or after delta). Normal aggregate update.
+			//   v.match_count = 0: group was unmatched and stays unmatched (mc_new implied 0).
+			//     Preserve v.col — the CREATE-time value already reflects the NULL-padded row
+			//     semantics for this column, including any projection-folded constants like
+			//     SUM(COALESCE(x, 0)) = 0 or COUNT(right_col) = 0. Resetting to null_val would
+			//     wipe legitimate folded values (q1686 SUM(COALESCE(o.x,0)) stored 0 at CREATE
+			//     but would become NULL after any zero-net delta pass).
+			//   else: transition from matched to unmatched (v.mc > 0, d.mc = -v.mc). Right-side
+			//     data is gone; reset to null_val. This remains imperfect for folded projections
+			//     (a transitioning group whose stored COALESCE'd column was 0 resets to NULL)
+			//     — a known limitation.
+			lj_update_set += col + " = CASE WHEN " + mc_new + " > 0 THEN " + updated_col(col) + " WHEN COALESCE(v." +
+			                 match_count_col + ", 0) = 0 THEN v." + col + " ELSE " + null_val + " END";
 		}
 		// INSERT values: mirror the UPDATE classification above.
 		//   count_star → d.count_star (always, no CASE)
