@@ -18,6 +18,8 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/cte_inlining.hpp"
 
 #include "core/openivm_debug.hpp"
 
@@ -209,6 +211,38 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			select_planner.CreatePlan(std::move(select_parser.statements[0]));
 			auto select_plan = std::move(select_planner.plan);
 
+			// Inline CTEs so LPTS (which doesn't implement LOGICAL_CTE_REF) sees a flat
+			// plan. Query-bound CTEs become LOGICAL_MATERIALIZED_CTE + LOGICAL_CTE_REF
+			// nodes in the bound plan; CTEInlining rewrites small/non-recursive ones
+			// into direct subqueries. Running the full DuckDB optimizer here would
+			// also reorder joins / push filters, which conflicts with IVM's subsequent
+			// plan rewrites — so we run only the CTE-inlining pass, and only when a
+			// CTE reference actually appears in the plan (the optimizer isn't always
+			// a no-op on CTE-free plans — e.g. it can rewrite DISTINCT subqueries in
+			// ways that confuse the downstream structural rewrites).
+			{
+				std::function<bool(LogicalOperator *)> has_cte = [&](LogicalOperator *op) {
+					if (!op) {
+						return false;
+					}
+					if (op->type == LogicalOperatorType::LOGICAL_CTE_REF ||
+					    op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+						return true;
+					}
+					for (auto &c : op->children) {
+						if (has_cte(c.get())) {
+							return true;
+						}
+					}
+					return false;
+				};
+				if (has_cte(select_plan.get())) {
+					Optimizer cte_opt(*select_planner.binder, context);
+					CTEInlining cte_inlining(cte_opt);
+					select_plan = cte_inlining.Optimize(std::move(select_plan));
+				}
+			}
+
 			// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 			IVMPlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
 
@@ -266,11 +300,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 				StringUtil::Trim(view_query);
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
-			} catch (...) {
+			} catch (const std::exception &e) {
 				// LPTS doesn't support all operators (e.g., WINDOW). Fall back to original SQL.
 				// This is fine for partition-recompute views that don't need LPTS-rewritten queries.
 				view_query = original_view_query;
-				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback to original query: %s\n", view_query.c_str());
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (%s) to original query: %s\n", e.what(),
+				                    view_query.c_str());
+			} catch (...) {
+				view_query = original_view_query;
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to original query: %s\n",
+				                    view_query.c_str());
 			}
 			// For views that LPTS silently mis-serializes (GROUPING SETS / ROLLUP / CUBE
 			// → plain GROUP BY; STRUCT_PACK field names → tN_col aliases; etc.), detect

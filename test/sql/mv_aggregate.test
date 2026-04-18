@@ -2124,3 +2124,58 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# --- HAVING AVG(x) > k decomposes AVG (q0929 regression) ---
+# Bug: RewriteDerivedAggregates only fired when plan->children[0] was directly
+# LOGICAL_AGGREGATE_AND_GROUP_BY, but HAVING sits PROJECTION → FILTER → AGGREGATE,
+# so AVG wasn't decomposed. The MV stored raw avg() and the delta CTE tried to
+# SUM per-group averages, producing drift on any delta that touched the agg'd
+# column.
+# Fix: walk through a single LOGICAL_FILTER at the top level to reach the agg.
+
+statement ok
+CREATE TABLE hva_t(grp INT, v INT);
+
+statement ok
+INSERT INTO hva_t VALUES (1,10), (1,20), (2,-5), (2,-15), (3,100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hva AS
+    SELECT grp, AVG(v) AS a FROM hva_t GROUP BY grp HAVING AVG(v) > 0;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_hva
+    EXCEPT ALL SELECT grp, AVG(v) FROM hva_t GROUP BY grp HAVING AVG(v) > 0
+);
+----
+0
+
+# MV should have hidden sum+count columns (decomposition succeeded).
+query I
+SELECT count(*) FROM pragma_table_info('_ivm_data_mv_hva') WHERE name LIKE '_ivm_sum_%';
+----
+1
+
+# Delta: push an existing group over the HAVING threshold and add a new group.
+statement ok
+INSERT INTO hva_t VALUES (2, 100), (4, 50);
+
+statement ok
+PRAGMA ivm('mv_hva');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_hva
+    EXCEPT ALL SELECT grp, AVG(v) FROM hva_t GROUP BY grp HAVING AVG(v) > 0
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, AVG(v) FROM hva_t GROUP BY grp HAVING AVG(v) > 0
+    EXCEPT ALL SELECT * FROM mv_hva
+);
+----
+0

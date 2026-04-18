@@ -124,18 +124,47 @@ static const char *SumSqPrefix(const string &func_name) {
 /// - AVG(x)      → SUM(x), COUNT(x) + SUM/COUNT ratio in projection
 /// - STDDEV(x)   → SUM(x), SUM(x*x), COUNT(x) + variance formula in projection
 /// - VARIANCE(x) → same, without sqrt
-static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator> &plan, Optimizer &opt) {
+static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator> &plan, Optimizer &opt,
+                                     bool is_top = true) {
+	// Only recurse when we're NOT the top-level call: the top call's own walk below
+	// handles the PROJECTION → [FILTER] → AGGREGATE pattern. Recursing first and
+	// letting inner PROJECTIONs self-decompose breaks LIMIT/ORDER-wrapped HAVING
+	// queries: the inner PROJECTION → FILTER → AGG matches the pattern but the
+	// HAVING SQL extraction later finds a BCR whose meaning has shifted after
+	// decomposition, producing invalid `avg(col)` predicates against a column-less
+	// data table (see benchmark query_0431).
 	for (auto &child : plan->children) {
-		RewriteDerivedAggregates(context, child, opt);
+		RewriteDerivedAggregates(context, child, opt, false);
 	}
 
 	if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION) {
 		return;
 	}
-	if (plan->children.empty() || plan->children[0]->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+	// Walk down through at most one LOGICAL_FILTER (HAVING) to reach the aggregate.
+	// `SELECT ... GROUP BY ... HAVING AVG(x) > 0` sits PROJECTION → FILTER → AGGREGATE,
+	// and FILTER is pass-through (no column rebind), so `proj.expressions`' BCRs still
+	// point at the aggregate's bindings — the substitution below works unchanged. This
+	// walk only fires at the top level; HAVING sitting below a LIMIT/ORDER wrapper is
+	// not safe to decompose because the extracted HAVING SQL won't be rewritten.
+	//
+	// We also do NOT walk through intermediate LOGICAL_PROJECTION nodes (e.g. those
+	// from CTE expansion): they REBIND outputs to fresh column indices, so the top
+	// projection's BCRs reference the middle projection's bindings, not the agg's.
+	// CTE queries are handled upstream via CTE inlining instead.
+	LogicalOperator *agg_search = nullptr;
+	if (!plan->children.empty()) {
+		auto *c0 = plan->children[0].get();
+		if (c0->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+			agg_search = c0;
+		} else if (is_top && c0->type == LogicalOperatorType::LOGICAL_FILTER && !c0->children.empty() &&
+		           c0->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+			agg_search = c0->children[0].get();
+		}
+	}
+	if (!agg_search) {
 		return;
 	}
-	auto &agg = plan->children[0]->Cast<LogicalAggregate>();
+	auto &agg = agg_search->Cast<LogicalAggregate>();
 
 	// Check if there's anything to decompose
 	bool has_derived = false;
@@ -300,8 +329,10 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 	// an earlier decomp's STDDEV formula contains BCRs to (agg_index, sum_sq_idx) and
 	// (agg_index, count_idx) — and a later decomp's old_binding = (agg_index, its_old_idx)
 	// may collide with those slots, causing spurious re-replacement and wrong arithmetic.
-	auto agg_bindings = plan->children[0]->GetColumnBindings();
-	auto agg_types = plan->children[0]->types;
+	// Use agg_search (the aggregate we walked down to), not plan->children[0], because
+	// HAVING/CTE queries interpose a FILTER/PROJECTION layer between plan and the agg.
+	auto agg_bindings = agg_search->GetColumnBindings();
+	auto agg_types = agg_search->types;
 	std::set<idx_t> replaced_slots;
 	// Original projection width before we start appending hidden pass-through columns.
 	// Those appended columns are BCRs at (aggregate_index, sum_idx/sum_sq_idx/count_idx)

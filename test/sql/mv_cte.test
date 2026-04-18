@@ -298,3 +298,57 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# --- CTE-wrapped AVG decomposes correctly (q0535 regression) ---
+# Bug: LPTS can't serialize LOGICAL_CTE_REF, so the CTE-wrapped plan fell back to
+# the original SQL at CREATE time — meaning the data table stored the raw avg()
+# column with no hidden sum/count, and the delta CTE tried to SUM the averages
+# during refresh, yielding wildly incorrect group averages after any delta.
+# Fix: inline the CTE at plan level before IVM rewrites so LPTS sees a flat
+# PROJECTION → AGGREGATE plan and RewriteDerivedAggregates can decompose AVG.
+
+statement ok
+CREATE TABLE cte_avg_t(id INT, tier VARCHAR, bal INT);
+
+statement ok
+INSERT INTO cte_avg_t VALUES
+    (1, 'A', 100), (2, 'A', 200), (3, 'B', 50), (4, 'B', 150), (5, 'C', 300);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cte_avg AS
+    WITH tiers AS (SELECT id, tier, bal FROM cte_avg_t)
+    SELECT tier, COUNT(*) AS cnt, AVG(bal) AS avg_bal FROM tiers GROUP BY tier;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_cte_avg
+    EXCEPT ALL SELECT tier, COUNT(*), AVG(bal) FROM cte_avg_t GROUP BY tier
+);
+----
+0
+
+# Delta: update values so AVG changes.
+statement ok
+UPDATE cte_avg_t SET bal = bal + 1000 WHERE tier = 'A';
+
+statement ok
+INSERT INTO cte_avg_t VALUES (6, 'B', 250);
+
+statement ok
+PRAGMA ivm('mv_cte_avg');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_cte_avg
+    EXCEPT ALL SELECT tier, COUNT(*), AVG(bal) FROM cte_avg_t GROUP BY tier
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT tier, COUNT(*), AVG(bal) FROM cte_avg_t GROUP BY tier
+    EXCEPT ALL SELECT * FROM mv_cte_avg
+);
+----
+0
