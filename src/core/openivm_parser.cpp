@@ -203,7 +203,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 		vector<string> output_names;
-		string having_predicate; // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
+		string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
+		bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
 		{
 			Parser select_parser;
 			select_parser.ParseQuery(original_view_query);
@@ -304,10 +305,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				// LPTS doesn't support all operators (e.g., WINDOW). Fall back to original SQL.
 				// This is fine for partition-recompute views that don't need LPTS-rewritten queries.
 				view_query = original_view_query;
+				lpts_fallback = true;
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (%s) to original query: %s\n", e.what(),
 				                    view_query.c_str());
 			} catch (...) {
 				view_query = original_view_query;
+				lpts_fallback = true;
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to original query: %s\n",
 				                    view_query.c_str());
 			}
@@ -338,6 +341,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				walk(select_plan.get());
 				if (needs_original) {
 					view_query = original_view_query;
+					lpts_fallback = true;
 					OPENIVM_DEBUG_PRINT(
 					    "[CREATE MV] LPTS can't round-trip GROUPING SETS/ROLLUP/CUBE — using original SQL: %s\n",
 					    view_query.c_str());
@@ -652,13 +656,19 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			ddl.push_back("SET pac_rewrite = false");
 		}
 
-		// User-facing VIEW hides internal _ivm_* columns via EXCLUDE
+		// User-facing VIEW hides internal _ivm_* columns via EXCLUDE.
+		// If LPTS fell back to the original SQL, the data table has only the
+		// user-visible columns — no `_ivm_*` columns even if the rewritten plan
+		// would have added them via AVG/STDDEV decomposition. Skip the EXCLUDE
+		// list in that case; otherwise CREATE VIEW fails on nonexistent columns.
 		{
 			// Collect internal column names from the LPTS output
 			vector<string> internal_cols;
-			for (auto &name : output_names) {
-				if (IVMTableNames::IsInternalColumn(name)) {
-					internal_cols.push_back(name);
+			if (!lpts_fallback) {
+				for (auto &name : output_names) {
+					if (IVMTableNames::IsInternalColumn(name)) {
+						internal_cols.push_back(name);
+					}
 				}
 			}
 			string having_where = having_predicate.empty() ? "" : " where " + having_predicate;
