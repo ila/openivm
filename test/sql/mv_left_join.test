@@ -734,3 +734,89 @@ SELECT count(*) FROM (
 
 statement ok
 SET ivm_left_join_merge = true;
+
+# --- COUNT(*) on unmatched groups survives no-op UPDATE (q0059 regression) ---
+# Bug: the LJ MERGE applied `CASE mc_new > 0 THEN update ELSE null_val` to
+# count_star, zeroing it on unmatched groups. But count_star counts the
+# NULL-padded LJ output rows and is left-side-driven — it must not be reset
+# when match_count stays at 0. Ensures an UPDATE on an unmatched left-side
+# row's non-key column doesn't zero count_star.
+
+statement ok
+CREATE TABLE lj_left (k INT, extra INT);
+
+statement ok
+CREATE TABLE lj_right (k INT, v INT);
+
+statement ok
+INSERT INTO lj_left VALUES (1,10), (2,20), (3,30);
+
+statement ok
+INSERT INTO lj_right VALUES (1,100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lj_cstar AS
+    SELECT l.k, COUNT(*) AS n
+    FROM lj_left l LEFT JOIN lj_right r ON l.k = r.k
+    GROUP BY l.k;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_lj_cstar
+    EXCEPT ALL SELECT l.k, COUNT(*) FROM lj_left l LEFT JOIN lj_right r ON l.k = r.k GROUP BY l.k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT l.k, COUNT(*) FROM lj_left l LEFT JOIN lj_right r ON l.k = r.k GROUP BY l.k
+    EXCEPT ALL SELECT * FROM mv_lj_cstar
+);
+----
+0
+
+statement ok
+UPDATE lj_left SET extra = 200 WHERE k = 2;
+
+statement ok
+PRAGMA ivm('mv_lj_cstar');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_lj_cstar
+    EXCEPT ALL SELECT l.k, COUNT(*) FROM lj_left l LEFT JOIN lj_right r ON l.k = r.k GROUP BY l.k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT l.k, COUNT(*) FROM lj_left l LEFT JOIN lj_right r ON l.k = r.k GROUP BY l.k
+    EXCEPT ALL SELECT * FROM mv_lj_cstar
+);
+----
+0
+
+statement ok
+UPDATE lj_left SET extra = 300 WHERE k = 1;
+
+statement ok
+PRAGMA ivm('mv_lj_cstar');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_lj_cstar
+    EXCEPT ALL SELECT l.k, COUNT(*) FROM lj_left l LEFT JOIN lj_right r ON l.k = r.k GROUP BY l.k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT l.k, COUNT(*) FROM lj_left l LEFT JOIN lj_right r ON l.k = r.k GROUP BY l.k
+    EXCEPT ALL SELECT * FROM mv_lj_cstar
+);
+----
+0
+

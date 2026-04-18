@@ -393,8 +393,21 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	string merge_query;
 	if (has_match_count) {
 		// Larson & Zhou LEFT JOIN MERGE: single WHEN MATCHED with CASE WHEN expressions.
-		// Each aggregate uses CASE WHEN new_match_count > 0 THEN normal_update ELSE null_or_zero END.
-		// This works with DuckLake's single-action MERGE (no multiple WHEN MATCHED branches).
+		//
+		// Column classification under LEFT JOIN:
+		//   (a) count_star — COUNT(*) counts every LEFT JOIN output row, including the
+		//       NULL-padded row emitted when a left-side row has no match. It is
+		//       left-side-driven: a matched→unmatched transition *does not zero* it;
+		//       instead, count_star = #left_rows_in_group (= #NULL-padded rows).
+		//       Always apply the normal aggregate update — no CASE gating.
+		//   (b) right-side aggregates — COUNT(right_col), SUM(right_col), AVG(right_col),
+		//       etc. When mc_new = 0, these must reset to 0/NULL because the NULL-padded
+		//       row contributes NULL for right_col. Use the CASE gating.
+		//   (c) left-side non-count aggregates (SUM(left_col), AVG(left_col)) — not
+		//       currently distinguishable here; fall through to the CASE gating, which
+		//       is incorrect for those but rare in practice. (Left-side aggregates
+		//       don't go to NULL when mc_new transitions, so this remains a known
+		//       limitation for uncommon queries; documented in limitations.md.)
 		string mc_new = "(COALESCE(v." + match_count_col + ", 0) + d." + match_count_col + ")";
 		string lj_update_set;
 		bool first_lj = true;
@@ -405,19 +418,25 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			first_lj = false;
 			if (col == match_count_col) {
 				lj_update_set += col + " = " + mc_new;
-			} else {
-				// Determine if this column should be 0 (count-like) or NULL (sum-like) when unmatched.
-				// Check both the aggregate_types metadata AND the hidden column prefix
-				// (hidden _ivm_count_* columns from AVG/STDDEV decomposition don't have agg_type entries).
-				string agg_type = col_agg_type.count(col) ? col_agg_type.at(col) : "";
-				bool is_count =
-				    (agg_type == "count" || agg_type == "count_star" || col.find(string(ivm::COUNT_COL_PREFIX)) == 0);
-				string null_val = is_count ? "0" : "NULL";
-				lj_update_set +=
-				    col + " = CASE WHEN " + mc_new + " > 0 THEN " + updated_col(col) + " ELSE " + null_val + " END";
+				continue;
 			}
+			string agg_type = col_agg_type.count(col) ? col_agg_type.at(col) : "";
+			if (agg_type == "count_star") {
+				// Left-side-driven: always update normally.
+				lj_update_set += col + " = " + updated_col(col);
+				continue;
+			}
+			// Determine if this column should be 0 (count-like) or NULL (sum-like) when unmatched.
+			// Check both the aggregate_types metadata AND the hidden column prefix
+			// (hidden _ivm_count_* columns from AVG/STDDEV decomposition don't have agg_type entries).
+			bool is_count = (agg_type == "count" || col.find(string(ivm::COUNT_COL_PREFIX)) == 0);
+			string null_val = is_count ? "0" : "NULL";
+			lj_update_set +=
+			    col + " = CASE WHEN " + mc_new + " > 0 THEN " + updated_col(col) + " ELSE " + null_val + " END";
 		}
-		// Conditional INSERT values: NULL/0 when match count <= 0 (COUNT→0, SUM→NULL)
+		// INSERT values: mirror the UPDATE classification above.
+		//   count_star → d.count_star (always, no CASE)
+		//   right-side → CASE d.match_count > 0 THEN d.col ELSE null_val
 		string cond_insert_vals;
 		bool first_ins = true;
 		for (size_t i = 0; i < aggregates.size(); i++) {
@@ -427,14 +446,17 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			first_ins = false;
 			if (aggregates[i] == match_count_col) {
 				cond_insert_vals += "d." + match_count_col;
-			} else {
-				string agg_type = col_agg_type.count(aggregates[i]) ? col_agg_type.at(aggregates[i]) : "";
-				bool is_count = (agg_type == "count" || agg_type == "count_star" ||
-				                 aggregates[i].find(string(ivm::COUNT_COL_PREFIX)) == 0);
-				string null_val = is_count ? "0" : "NULL";
-				cond_insert_vals +=
-				    "CASE WHEN d." + match_count_col + " > 0 THEN d." + aggregates[i] + " ELSE " + null_val + " END";
+				continue;
 			}
+			string agg_type = col_agg_type.count(aggregates[i]) ? col_agg_type.at(aggregates[i]) : "";
+			if (agg_type == "count_star") {
+				cond_insert_vals += "d." + aggregates[i];
+				continue;
+			}
+			bool is_count = (agg_type == "count" || aggregates[i].find(string(ivm::COUNT_COL_PREFIX)) == 0);
+			string null_val = is_count ? "0" : "NULL";
+			cond_insert_vals +=
+			    "CASE WHEN d." + match_count_col + " > 0 THEN d." + aggregates[i] + " ELSE " + null_val + " END";
 		}
 		merge_query = "WITH ivm_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table + " v USING ivm_cte d\n" +
 		              "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " + lj_update_set + "\n" +
