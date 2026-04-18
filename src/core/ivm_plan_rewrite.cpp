@@ -297,32 +297,6 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 	agg.expressions = std::move(new_exprs);
 	agg.ResolveOperatorTypes();
 
-	// Step 1.5: Remap projection BCRs that point to non-decomposed aggregates
-	// (e.g. COUNT(*), SUM(x)) whose positions in agg.expressions shifted because
-	// STDDEV/VARIANCE decompositions inserted hidden SUM/SUM_SQ/COUNT entries
-	// ahead of them. Without this, a BCR like COUNT(*) at old position 4 would
-	// now resolve to (agg_index, 4) — which after decomposition is SUM_SQ of an
-	// earlier STDDEV aggregate, producing visually swapped columns in the MV.
-	// Must run BEFORE decomp-based substitute_nested so the decomps' old_binding
-	// matching still sees the original positions.
-	if (!nondecomposed_remap.empty()) {
-		std::function<void(unique_ptr<Expression> &)> apply_remap = [&](unique_ptr<Expression> &expr) {
-			if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
-				auto &bcr = expr->Cast<BoundColumnRefExpression>();
-				if (bcr.binding.table_index == agg.aggregate_index) {
-					auto it = nondecomposed_remap.find(bcr.binding.column_index);
-					if (it != nondecomposed_remap.end() && it->second != bcr.binding.column_index) {
-						bcr.binding.column_index = it->second;
-					}
-				}
-			}
-			ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) { apply_remap(child); });
-		};
-		for (auto &pexpr : proj.expressions) {
-			apply_remap(pexpr);
-		}
-	}
-
 	// Step 2: Update projection — replace derived column refs with formulas.
 	// Use agg_search (the aggregate we walked down to), not plan->children[0], because
 	// HAVING/CTE queries interpose a FILTER/PROJECTION layer between plan and the agg.
@@ -409,37 +383,41 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 		uint64_t key = (uint64_t)agg.aggregate_index ^ ((uint64_t)d.old_idx * 0x9e3779b97f4a7c15ULL);
 		old_binding_to_decomp[key] = &d;
 	}
-	std::function<void(unique_ptr<Expression> &)> substitute_all = [&](unique_ptr<Expression> &expr) {
+	// Combined single-pass walk: for each BCR in the ORIGINAL projection tree,
+	//   1. If (agg_index, column_index) matches a decomp's old_binding, replace
+	//      with that decomp's formula and RETURN (don't descend into the fresh
+	//      formula — its internal BCRs already use NEW column positions).
+	//   2. Else if the column_index is in nondecomposed_remap, rewrite it to the
+	//      post-decomposition position (e.g. MAX moved from old 3 → new 4).
+	//   3. Else leave alone.
+	// The RETURN on substitute is what prevents a remapped non-decomp position
+	// (e.g. new 4 for MAX) from later matching a decomp's old-idx (e.g. STDDEV's
+	// old idx 4) — we never visit the same BCR twice, and BCRs we insert are
+	// skipped by the return.
+	std::function<void(unique_ptr<Expression> &)> walk = [&](unique_ptr<Expression> &expr) {
 		if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
 			auto &bcr = expr->Cast<BoundColumnRefExpression>();
 			if (bcr.binding.table_index == agg.aggregate_index) {
 				uint64_t key =
 				    (uint64_t)bcr.binding.table_index ^ ((uint64_t)bcr.binding.column_index * 0x9e3779b97f4a7c15ULL);
-				auto it = old_binding_to_decomp.find(key);
-				if (it != old_binding_to_decomp.end()) {
-					auto replacement = build_replacement(*it->second);
+				auto dit = old_binding_to_decomp.find(key);
+				if (dit != old_binding_to_decomp.end()) {
+					auto replacement = build_replacement(*dit->second);
 					replacement->alias = bcr.alias;
 					expr = std::move(replacement);
 					return; // do NOT descend into the replacement
 				}
+				auto rit = nondecomposed_remap.find(bcr.binding.column_index);
+				if (rit != nondecomposed_remap.end() && rit->second != bcr.binding.column_index) {
+					bcr.binding.column_index = rit->second;
+				}
 			}
 		}
-		ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) { substitute_all(child); });
+		ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) { walk(child); });
 	};
 	for (idx_t pi = 0; pi < original_proj_size; pi++) {
-		// Preserve user alias on direct-BCR slots: substitute_all inherits the BCR's
-		// alias, which is the user's alias for direct slots (e.g. "avg_bal"). For
-		// nested slots, inherited alias is the inner BCR's (probably empty) — doesn't
-		// matter for projection output.
-		substitute_all(proj.expressions[pi]);
+		walk(proj.expressions[pi]);
 	}
-	// Re-attach user aliases on slots that are now (post-substitution) top-level
-	// formulas matching a decomp. The substitution preserved the original BCR's
-	// alias on the outer replacement, but if the BCR was wrapped in ROUND/CASE/
-	// arithmetic, the outer expression already has the user's alias from the
-	// parser. So no extra work here — the substitution's alias inheritance
-	// covers the direct-BCR case, and the user-alias search above covers
-	// nested/wrapped cases for hidden-column naming.
 
 	// Add hidden columns as passthroughs. Use user_alias so that
 	// DetectDerivedAggColumns in the upsert compiler can match them.
