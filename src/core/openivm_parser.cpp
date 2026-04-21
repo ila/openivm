@@ -379,15 +379,20 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// DISTINCT: checker populated aggregate_columns from distinct_targets
 			aggregate_columns = std::move(analysis.aggregate_columns);
 		} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
-			// Walk plan to find the PROJECTION that references (group_index, i) bindings
-			// and collect the aliases — these are the actual column names in the data table.
-			// For HAVING views the structure is PROJECTION→FILTER→AGGREGATE, so we match on
-			// group_index rather than requiring a direct AGGREGATE child.
+			// Walk plan to find the outermost PROJECTION that references (group_index, i) bindings.
+			// Stopping at the first PROJECTION found (rather than recursing deeper) ensures we
+			// only match the top-level aggregate — aggregates nested inside UNION branches or
+			// CTE bodies are correctly ignored.
+			// For HAVING the structure is PROJECTION→FILTER→AGGREGATE: the top PROJECTION still
+			// holds group_index refs, so this works correctly.
+			// For CTE nodes, only the outer-query child (children[1]) is visited, mirroring
+			// the same restriction applied in AnalyzeNode.
 			vector<string> group_names(group_count);
 			std::function<bool(LogicalOperator *)> find_group_cols = [&](LogicalOperator *op) -> bool {
 				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+					// This is the outermost projection we encounter — check it and stop DFS.
+					// If it doesn't have group_index refs, aggregate is nested (CTE/UNION): leave empty.
 					auto &proj = op->Cast<LogicalProjection>();
-					bool matched_any = false;
 					for (auto &expr : proj.expressions) {
 						if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
 							auto &bcr = expr->Cast<BoundColumnRefExpression>();
@@ -396,14 +401,18 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 								string col_name = expr->alias.empty() ? bcr.GetName() : expr->alias;
 								if (!IVMTableNames::IsInternalColumn(col_name)) {
 									group_names[bcr.binding.column_index] = col_name;
-									matched_any = true;
 								}
 							}
 						}
 					}
-					if (matched_any) {
-						return true;
+					return true; // stop DFS regardless of match
+				}
+				if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+					// Only recurse into outer query (children[1]), skip CTE body (children[0]).
+					if (op->children.size() >= 2) {
+						return find_group_cols(op->children[1].get());
 					}
+					return false;
 				}
 				for (auto &child : op->children) {
 					if (find_group_cols(child.get())) {

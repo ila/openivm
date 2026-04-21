@@ -45,9 +45,16 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_INSERT:
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 	case LogicalOperatorType::LOGICAL_GET:
-	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
 	case LogicalOperatorType::LOGICAL_CTE_REF:
 		break;
+
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+		// Only analyze the outer query (children[1]), not the CTE body (children[0]).
+		// CTE body aggregates are internal and must not affect the outer IVM classification.
+		if (node->children.size() >= 2) {
+			AnalyzeNode(node->children[1].get(), result);
+		}
+		return;
 
 	case LogicalOperatorType::LOGICAL_FILTER:
 		// Check for volatile functions
