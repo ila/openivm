@@ -391,7 +391,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					for (auto &expr : proj.expressions) {
 						if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
 							auto &bcr = expr->Cast<BoundColumnRefExpression>();
-							if (bcr.binding.table_index == group_index && bcr.binding.column_index < group_count) {
+							if (bcr.binding.table_index == group_index &&
+							    bcr.binding.column_index < (idx_t)group_count) {
 								string col_name = expr->alias.empty() ? bcr.GetName() : expr->alias;
 								if (!IVMTableNames::IsInternalColumn(col_name)) {
 									group_names[bcr.binding.column_index] = col_name;
