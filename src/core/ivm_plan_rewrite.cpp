@@ -469,6 +469,70 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Derived aggregates → hidden columns, %zu decompositions\n", decomps.size());
 }
 
+/// Returns true if `alias` is one of the reserved IVM-hidden-column prefixes
+/// added by DecomposeAvgStddev. Used to decide whether to propagate a child
+/// projection's expression up through a pass-through parent projection.
+static bool IsHiddenAggregateAlias(const string &alias) {
+	return alias.find(ivm::SUM_COL_PREFIX) == 0 || alias.find(ivm::COUNT_COL_PREFIX) == 0 ||
+	       alias.find(ivm::SUM_SQ_COL_PREFIX) == 0 || alias.find(ivm::SUM_SQP_COL_PREFIX) == 0;
+}
+
+/// Propagate hidden aggregate columns (_ivm_sum_*, _ivm_count_*, …) added by
+/// DecomposeAvgStddev up through any chain of pass-through PROJECTIONs that
+/// sits between the decomposed projection and the plan root.
+///
+/// Why: CTE inlining + projection stacking can leave a plan like
+///   PROJECTION (user SELECT: ROUND(avg_bal, 2), cnt, …)   <- top
+///     PROJECTION (pass-through BCRs)                       <- middle
+///       PROJECTION (CTE body, holds _ivm_sum_* from decomp) <- inner
+///         AGGREGATE
+/// Without propagation, middle and top strip the hidden columns, so the MV
+/// data table stores only the final AVG and the MERGE computes `v.avg + d.avg`
+/// — wrong for non-summable aggregates. Propagation lets CompileAggregateGroups
+/// see the hidden SUM/COUNT columns and maintain them separately.
+static void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
+	for (auto &child : plan->children) {
+		PropagateHiddenAggregateColumns(child);
+	}
+	if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION || plan->children.empty() ||
+	    plan->children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+		return;
+	}
+	auto &proj = plan->Cast<LogicalProjection>();
+	auto &child_proj = plan->children[0]->Cast<LogicalProjection>();
+
+	std::set<string> already_present;
+	for (auto &expr : proj.expressions) {
+		if (IsHiddenAggregateAlias(expr->alias)) {
+			already_present.insert(expr->alias);
+		}
+	}
+
+	plan->children[0]->ResolveOperatorTypes();
+	auto child_types = plan->children[0]->types;
+	auto child_bindings = plan->children[0]->GetColumnBindings();
+
+	bool added = false;
+	for (idx_t i = 0; i < child_proj.expressions.size(); i++) {
+		const string &child_alias = child_proj.expressions[i]->alias;
+		if (!IsHiddenAggregateAlias(child_alias) || already_present.count(child_alias)) {
+			continue;
+		}
+		if (i >= child_bindings.size() || i >= child_types.size()) {
+			continue;
+		}
+		auto bcr = make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]);
+		bcr->alias = child_alias;
+		proj.expressions.push_back(std::move(bcr));
+		added = true;
+		OPENIVM_DEBUG_PRINT("[PropagateHidden] Added '%s' to parent projection (table_index=%llu)\n",
+		                    child_alias.c_str(), (unsigned long long)proj.table_index);
+	}
+	if (added) {
+		proj.ResolveOperatorTypes();
+	}
+}
+
 /// Add _ivm_left_key (and _ivm_right_key for FULL OUTER) projection at the top of the plan.
 static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan) {
 	// Find the first LEFT/RIGHT/OUTER JOIN and extract key bindings
@@ -838,6 +902,7 @@ void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOp
 		Optimizer opt(binder, context);
 		RewriteDerivedAggregates(context, plan, opt);
 	}
+	PropagateHiddenAggregateColumns(plan);
 	RewriteLeftJoinKey(binder, plan);
 	RewriteLeftJoinMatchCount(context, binder, plan);
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Done\n");

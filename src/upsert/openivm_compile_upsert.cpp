@@ -170,6 +170,117 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 
 	auto decomp = DetectDerivedAggColumns(aggregates);
 
+	// Detect AVG/STDDEV-derived columns that can't be maintained incrementally.
+	//
+	// Case 1 — "orphan derived": hidden _ivm_sum_<alias> + _ivm_count_<alias> exist
+	// but no user-visible column has that alias. Happens when the user wraps
+	// AVG/STDDEV in a non-pass-through expression at the top SELECT so the
+	// top-level alias diverges from the CTE's alias (query_0540 shape:
+	// CTE `avg_bal` → top `ROUND(avg_bal, 2) AS avg`). The MERGE formula
+	// `avg = _ivm_sum_avg / _ivm_count_avg` can't reconstruct ROUND without
+	// re-deriving.
+	//
+	// Case 2 — "computed over derived": the view has derived aggregates AND a
+	// non-derived, non-hidden, non-key, non-multiplicity column with no matching
+	// aggregate_types entry. That column is a pure SELECT-list expression over
+	// the aggregates (query_1307 shape: `ROUND(avg_b / NULLIF(std_b, 0), 4) AS cv`).
+	// There is no aggregate function producing it, so summing deltas is wrong.
+	//
+	// Group-recompute (delete affected groups, re-insert via the full view query)
+	// is correct in both cases because it preserves the expression semantics.
+	unordered_set<string> aggregate_set(aggregates.begin(), aggregates.end());
+	bool has_orphan_derived = false;
+	for (auto &alias : decomp.derived_cols) {
+		if (!aggregate_set.count(Q(alias)) && !aggregate_set.count(alias)) {
+			has_orphan_derived = true;
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] Orphan derived alias '%s' → group-recompute\n",
+			                    alias.c_str());
+			break;
+		}
+	}
+	// Case 2 — "computed over aggregates": the plan has MORE aggregate expressions
+	// than the view has user-visible aggregate columns (excluding keys, hidden,
+	// derived, multiplicity). Happens when SELECT-list expressions *consume*
+	// aggregates without exposing them directly — e.g. query_1307
+	// (`ROUND(avg_b / NULLIF(std_b, 0), 4) AS cv` alongside avg_b and std_b) or
+	// query_1987 (`ROUND(SUM(C_BALANCE) / NULLIF(COUNT(C_ID), 0), 2) AS avg_bal`,
+	// one output column but two underlying aggregates).
+	//
+	// Detection: count non-key, non-hidden, non-derived columns vs. the number of
+	// aggregate_types entries that are NOT decomposed (AVG/STDDEV become hidden
+	// columns, so those entries do not correspond to user columns). If the type
+	// count exceeds the column count, at least one aggregate is consumed inside a
+	// computed expression — sum-of-deltas is wrong for that expression.
+	bool has_computed_over_derived = false;
+	if (!aggregate_types.empty()) {
+		static const unordered_set<string> DECOMPOSED_TYPES_CHK = {"avg",      "stddev",   "stddev_samp", "stddev_pop",
+		                                                           "variance", "var_samp", "var_pop"};
+		// Pass 1 — "type excess": more non-decomposed aggregate types than
+		// aggregate columns (INCLUDING hidden helpers like _ivm_match_count and
+		// _ivm_*) means at least one aggregate is consumed inside a computed
+		// expression (query_1987 `ROUND(SUM(x) / COUNT(y), 2) AS avg_bal`, two
+		// underlying aggregates but one output column). Hidden helper columns get
+		// counted because they DO correspond to aggregate_types entries (e.g.
+		// RewriteLeftJoinMatchCount adds a real COUNT to the plan).
+		idx_t non_decomposed_type_count = 0;
+		for (auto &t : aggregate_types) {
+			if (!DECOMPOSED_TYPES_CHK.count(t)) {
+				non_decomposed_type_count++;
+			}
+		}
+		idx_t total_agg_col_count = 0;
+		for (auto &column : aggregates) {
+			if (decomp.derived_cols.count(column)) {
+				// Derived user columns (avg_b, std_b) don't consume aggregate_types slots —
+				// their hidden _ivm_sum_* / _ivm_count_* companions do.
+				continue;
+			}
+			if (column.find(string(ivm::SUM_COL_PREFIX)) == 0 || column.find(string(ivm::SUM_SQ_COL_PREFIX)) == 0 ||
+			    column.find(string(ivm::SUM_SQP_COL_PREFIX)) == 0) {
+				// Decomposed aggregate hidden columns are counted against the decomposed
+				// aggregate_types entries (avg, stddev) which we *did not* count above.
+				continue;
+			}
+			if (column.find(string(ivm::COUNT_COL_PREFIX)) == 0) {
+				// Same — the COUNT half of an AVG/STDDEV decomposition.
+				continue;
+			}
+			total_agg_col_count++;
+		}
+		if (non_decomposed_type_count > total_agg_col_count) {
+			has_computed_over_derived = true;
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] %llu non-decomposed aggregate types > %llu agg columns "
+			                    "→ group-recompute\n",
+			                    (unsigned long long)non_decomposed_type_count, (unsigned long long)total_agg_col_count);
+		}
+		// Pass 2 — "column orphan": when derived aggregates exist, any non-derived,
+		// non-hidden column that has no aggregate_types entry to consume (after
+		// skipping decomposed ones) is a computed expression over the derived
+		// aggregates (query_1307 `ROUND(avg_b / NULLIF(std_b, 0), 4) AS cv`).
+		if (!has_computed_over_derived && !decomp.derived_cols.empty()) {
+			idx_t probe_idx = 0;
+			for (auto &column : aggregates) {
+				if (decomp.derived_cols.count(column) || column.find("_ivm_") != string::npos) {
+					continue;
+				}
+				while (probe_idx < aggregate_types.size() && DECOMPOSED_TYPES_CHK.count(aggregate_types[probe_idx])) {
+					probe_idx++;
+				}
+				if (probe_idx >= aggregate_types.size()) {
+					has_computed_over_derived = true;
+					OPENIVM_DEBUG_PRINT(
+					    "[CompileAggregateGroups] Column orphan '%s' over derived aggregates → group-recompute\n",
+					    column.c_str());
+					break;
+				}
+				probe_idx++;
+			}
+		}
+	}
+	if (has_orphan_derived || has_computed_over_derived) {
+		needs_group_recompute = true;
+	}
+
 	// Build per-column aggregate type map from metadata (for insert-only MIN/MAX).
 	// aggregate_types aligns with aggregate expressions in the rewritten plan:
 	// one entry per BoundAggregateExpression (excludes AVG/STDDEV-derived cols which are projections).

@@ -2289,3 +2289,106 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Fix B: CTE with AVG/STDDEV + non-pass-through expression in outer SELECT.
+# The CTE alias (avg_bal) differs from the top-level alias (avg after ROUND),
+# so the hidden _ivm_sum_avg_bal / _ivm_count_avg_bal columns can't directly
+# reconstruct `avg`. CompileAggregateGroups detects the orphan derived alias
+# and falls back to group-recompute (delete affected groups, re-insert via the
+# full view query).
+statement ok
+CREATE TABLE fixb_customer (c_w_id INT, c_balance DECIMAL(12,2));
+
+statement ok
+INSERT INTO fixb_customer VALUES (1, 10.00), (1, 20.00), (2, 30.00);
+
+statement ok
+CREATE MATERIALIZED VIEW fixb_mv AS WITH per_warehouse AS (SELECT c_w_id, AVG(c_balance) AS avg_bal, STDDEV(c_balance) AS std_bal, COUNT(*) AS cnt FROM fixb_customer GROUP BY c_w_id) SELECT c_w_id, ROUND(avg_bal, 2) AS avg_r, ROUND(std_bal, 2) AS std_r, cnt, ROUND(avg_bal / NULLIF(std_bal, 0), 4) AS cv FROM per_warehouse;
+
+# Batched DML before refresh — INSERT + DELETE + UPDATE on the same rows.
+statement ok
+INSERT INTO fixb_customer VALUES (1, 40.00), (2, 50.00), (3, 100.00);
+
+statement ok
+UPDATE fixb_customer SET c_balance = 15.00 WHERE c_w_id = 1 AND c_balance = 20.00;
+
+statement ok
+DELETE FROM fixb_customer WHERE c_w_id = 1 AND c_balance = 10.00;
+
+statement ok
+PRAGMA ivm('fixb_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM fixb_mv EXCEPT ALL SELECT c_w_id, ROUND(AVG(c_balance), 2), ROUND(STDDEV(c_balance), 2), COUNT(*), ROUND(AVG(c_balance) / NULLIF(STDDEV(c_balance), 0), 4) FROM fixb_customer GROUP BY c_w_id);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT c_w_id, ROUND(AVG(c_balance), 2), ROUND(STDDEV(c_balance), 2), COUNT(*), ROUND(AVG(c_balance) / NULLIF(STDDEV(c_balance), 0), 4) FROM fixb_customer GROUP BY c_w_id EXCEPT ALL SELECT * FROM fixb_mv);
+----
+0
+
+# Fix B variant: outer SELECT exposes AVG/STDDEV directly AS avg_b and std_b,
+# but adds a computed `cv` column that references both. `cv` has no direct
+# aggregate in the plan, so the orphan detection switches to group-recompute.
+statement ok
+CREATE MATERIALIZED VIEW fixb_cv AS WITH stats AS (SELECT c_w_id, AVG(c_balance) AS avg_b, STDDEV(c_balance) AS std_b FROM fixb_customer GROUP BY c_w_id) SELECT c_w_id, avg_b, std_b, ROUND(avg_b / NULLIF(std_b, 0), 4) AS cv FROM stats;
+
+statement ok
+INSERT INTO fixb_customer VALUES (1, 60.00), (3, 200.00);
+
+statement ok
+UPDATE fixb_customer SET c_balance = 80.00 WHERE c_w_id = 2 AND c_balance = 50.00;
+
+statement ok
+DELETE FROM fixb_customer WHERE c_w_id = 3 AND c_balance = 100.00;
+
+statement ok
+PRAGMA ivm('fixb_cv');
+
+# Use printf('%.12g', …) to absorb 1-ULP AVG(DECIMAL) drift — we only care
+# that the MV matches the base query within double precision.
+query I
+SELECT count(*) FROM (SELECT c_w_id, printf('%.12g', avg_b), printf('%.12g', std_b), printf('%.12g', cv) FROM fixb_cv EXCEPT ALL SELECT c_w_id, printf('%.12g', AVG(c_balance)::DOUBLE), printf('%.12g', STDDEV(c_balance)), printf('%.12g', ROUND(AVG(c_balance)::DOUBLE / NULLIF(STDDEV(c_balance), 0), 4)) FROM fixb_customer GROUP BY c_w_id);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT c_w_id, printf('%.12g', AVG(c_balance)::DOUBLE), printf('%.12g', STDDEV(c_balance)), printf('%.12g', ROUND(AVG(c_balance)::DOUBLE / NULLIF(STDDEV(c_balance), 0), 4)) FROM fixb_customer GROUP BY c_w_id EXCEPT ALL SELECT c_w_id, printf('%.12g', avg_b), printf('%.12g', std_b), printf('%.12g', cv) FROM fixb_cv);
+----
+0
+
+# Fix B variant: ROUND(SUM(x) / NULLIF(COUNT(y), 0), N) — no AVG but two raw
+# aggregates consumed in one computed column. The "type excess" detection
+# (more aggregate_types entries than aggregate columns) triggers
+# group-recompute.
+statement ok
+CREATE TABLE fixb_pay (w INT, d INT, c_bal DECIMAL(12,2), ytd DECIMAL(12,2), pay_cnt INT);
+
+statement ok
+INSERT INTO fixb_pay VALUES (1, 1, 10, 50, 2), (1, 1, 20, 60, 3), (1, 2, 30, 70, 1), (2, 1, 100, 120, 4);
+
+statement ok
+CREATE MATERIALIZED VIEW fixb_pay_mv AS SELECT w, d, COUNT(c_bal) AS cust, ROUND(SUM(c_bal) / NULLIF(COUNT(c_bal), 0), 2) AS avg_bal, ROUND(SUM(ytd) / NULLIF(SUM(pay_cnt), 0), 2) AS avg_pay FROM fixb_pay GROUP BY w, d;
+
+statement ok
+INSERT INTO fixb_pay VALUES (1, 1, 40, 80, 2), (2, 1, 50, 90, 1);
+
+statement ok
+UPDATE fixb_pay SET c_bal = 5, ytd = 15, pay_cnt = 1 WHERE w = 1 AND d = 2;
+
+statement ok
+DELETE FROM fixb_pay WHERE w = 1 AND d = 1 AND c_bal = 10;
+
+statement ok
+PRAGMA ivm('fixb_pay_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM fixb_pay_mv EXCEPT ALL SELECT w, d, COUNT(c_bal), ROUND(SUM(c_bal) / NULLIF(COUNT(c_bal), 0), 2), ROUND(SUM(ytd) / NULLIF(SUM(pay_cnt), 0), 2) FROM fixb_pay GROUP BY w, d);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT w, d, COUNT(c_bal), ROUND(SUM(c_bal) / NULLIF(COUNT(c_bal), 0), 2), ROUND(SUM(ytd) / NULLIF(SUM(pay_cnt), 0), 2) FROM fixb_pay GROUP BY w, d EXCEPT ALL SELECT * FROM fixb_pay_mv);
+----
+0

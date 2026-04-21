@@ -518,6 +518,45 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// still outputs the column twice; both positions materialize in the data
 			// table and the MERGE needs both as group keys).
 			vector<string> group_names_list;
+			// Build an index of every LOGICAL_PROJECTION in the plan, keyed by its
+			// table_index. This lets a BCR at any level be traced through a chain of
+			// pass-through projections (e.g. DecomposeAvgStddev + CTE inlining can
+			// stack 2-3 PROJECTIONs between the top SELECT and the AGGREGATE).
+			std::unordered_map<idx_t, LogicalProjection *> projections_by_index;
+			std::function<void(LogicalOperator *)> collect_projections = [&](LogicalOperator *op) {
+				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+					auto &proj = op->Cast<LogicalProjection>();
+					projections_by_index[proj.table_index] = &proj;
+				}
+				for (auto &child : op->children) {
+					collect_projections(child.get());
+				}
+			};
+			collect_projections(plan.get());
+			// Resolve (tidx, cidx) through BCR pass-throughs in any projection chain.
+			// Returns true iff the binding ultimately refers to a raw group column.
+			std::function<bool(idx_t, idx_t, int)> resolves_to_group = [&](idx_t tidx, idx_t cidx, int depth) -> bool {
+				if (depth > 16) {
+					return false;
+				}
+				if (tidx == group_index) {
+					return cidx < (idx_t)group_count;
+				}
+				auto it = projections_by_index.find(tidx);
+				if (it == projections_by_index.end()) {
+					return false;
+				}
+				auto &proj = *it->second;
+				if (cidx >= proj.expressions.size()) {
+					return false;
+				}
+				auto &expr = proj.expressions[cidx];
+				if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+					return false;
+				}
+				auto &bcr = expr->Cast<BoundColumnRefExpression>();
+				return resolves_to_group(bcr.binding.table_index, bcr.binding.column_index, depth + 1);
+			};
 			std::function<bool(LogicalOperator *)> find_group_cols = [&](LogicalOperator *op) -> bool {
 				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 					// Stop at the first PROJECTION. Return `matched` (true iff any expression
@@ -532,8 +571,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					for (auto &expr : proj.expressions) {
 						if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
 							auto &bcr = expr->Cast<BoundColumnRefExpression>();
-							if (bcr.binding.table_index == group_index &&
-							    bcr.binding.column_index < (idx_t)group_count) {
+							// Trace through any stack of pass-through projections — the
+							// top-level SELECT may reference the group column indirectly
+							// through 1-N intermediate projections (CTE inlining, AVG
+							// decomposition, etc.).
+							if (resolves_to_group(bcr.binding.table_index, bcr.binding.column_index, 0)) {
 								string col_name = expr->alias.empty() ? bcr.GetName() : expr->alias;
 								if (!IVMTableNames::IsInternalColumn(col_name)) {
 									group_names_list.push_back(col_name);
