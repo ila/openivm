@@ -917,3 +917,113 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# LOGICAL_ANY_JOIN — join where the condition can't decompose
+# into a pure conjunction of comparisons. DuckDB plans patterns
+# like `FROM A CROSS JOIN B WHERE cond`, `CROSS JOIN table_func`,
+# or `A JOIN B ON f(a.x, b.y)` as LOGICAL_ANY_JOIN. The rewrite
+# dispatcher must route it to IvmJoinRule; CollectJoinLeaves
+# must descend through it; LPTS must serialize it back as a
+# regular JOIN with the opaque condition.
+# ============================================================
+
+statement ok
+CREATE TABLE any_w (W_ID INT);
+
+statement ok
+CREATE TABLE any_d (D_ID INT, D_W_ID INT);
+
+statement ok
+INSERT INTO any_w VALUES (1), (2);
+
+statement ok
+INSERT INTO any_d VALUES (10, 1), (20, 1), (30, 2);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_any_join AS
+    SELECT w.W_ID, d.D_ID FROM any_w w CROSS JOIN any_d d WHERE d.D_W_ID = w.W_ID;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_any_join
+    EXCEPT ALL SELECT w.W_ID, d.D_ID FROM any_w w CROSS JOIN any_d d WHERE d.D_W_ID = w.W_ID
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w.W_ID, d.D_ID FROM any_w w CROSS JOIN any_d d WHERE d.D_W_ID = w.W_ID
+    EXCEPT ALL SELECT * FROM mv_any_join
+);
+----
+0
+
+# Batched DML
+statement ok
+INSERT INTO any_w VALUES (3);
+
+statement ok
+INSERT INTO any_d VALUES (40, 3), (50, 2);
+
+statement ok
+DELETE FROM any_d WHERE D_ID = 10;
+
+statement ok
+PRAGMA ivm('mv_any_join');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_any_join
+    EXCEPT ALL SELECT w.W_ID, d.D_ID FROM any_w w CROSS JOIN any_d d WHERE d.D_W_ID = w.W_ID
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w.W_ID, d.D_ID FROM any_w w CROSS JOIN any_d d WHERE d.D_W_ID = w.W_ID
+    EXCEPT ALL SELECT * FROM mv_any_join
+);
+----
+0
+
+# Plain CROSS JOIN (no WHERE) — also planned as ANY_JOIN in some cases.
+statement ok
+CREATE MATERIALIZED VIEW mv_cross_join AS
+    SELECT w.W_ID, d.D_ID FROM any_w w CROSS JOIN any_d d;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cross_join EXCEPT ALL SELECT w.W_ID, d.D_ID FROM any_w w CROSS JOIN any_d d
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w.W_ID, d.D_ID FROM any_w w CROSS JOIN any_d d EXCEPT ALL SELECT * FROM mv_cross_join
+);
+----
+0
+
+statement ok
+INSERT INTO any_w VALUES (4);
+
+statement ok
+PRAGMA ivm('mv_cross_join');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cross_join EXCEPT ALL SELECT w.W_ID, d.D_ID FROM any_w w CROSS JOIN any_d d
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w.W_ID, d.D_ID FROM any_w w CROSS JOIN any_d d EXCEPT ALL SELECT * FROM mv_cross_join
+);
+----
+0

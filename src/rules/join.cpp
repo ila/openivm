@@ -12,7 +12,9 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 
@@ -21,12 +23,15 @@ namespace duckdb {
 void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves,
                        bool is_right_of_left) {
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-	    node->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+	    node->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT ||
+	    node->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
 		bool is_left = false;
 		bool is_right = false;
 		bool is_full_outer = false;
-		if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-			auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
+		if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+		    node->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+			// LogicalAnyJoin inherits from LogicalJoin — join_type lives at that level.
+			auto *join = dynamic_cast<LogicalJoin *>(node);
 			is_left = (join && join->join_type == JoinType::LEFT);
 			is_right = (join && join->join_type == JoinType::RIGHT);
 			is_full_outer = (join && join->join_type == JoinType::OUTER);
