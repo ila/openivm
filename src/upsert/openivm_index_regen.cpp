@@ -138,8 +138,10 @@ static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t>
 	}
 }
 
-// Replace bindings in COMPARISON_JOIN conditions (not visited by ColumnBindingReplacer).
-static void RebindJoinConditions(LogicalOperator &op, const std::unordered_map<old_idx, new_idx> &table_mapping) {
+// Replace bindings in expressions that ColumnBindingReplacer skips:
+//   - COMPARISON_JOIN conditions (stored outside op.expressions)
+//   - LogicalAggregate::groups (GROUP BY expressions, also outside op.expressions)
+static void RebindSkippedExpressions(LogicalOperator &op, const std::unordered_map<old_idx, new_idx> &table_mapping) {
 	std::function<void(Expression &)> RebindExpr = [&](Expression &e) {
 		if (e.type == ExpressionType::BOUND_COLUMN_REF) {
 			auto &bcr = e.Cast<BoundColumnRefExpression>();
@@ -152,14 +154,19 @@ static void RebindJoinConditions(LogicalOperator &op, const std::unordered_map<o
 	};
 	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &join = op.Cast<LogicalComparisonJoin>();
-		// Rebind conditions that ColumnBindingReplacer doesn't visit
 		for (auto &cond : join.conditions) {
 			RebindExpr(*cond.left);
 			RebindExpr(*cond.right);
 		}
 	}
+	if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &agg = op.Cast<LogicalAggregate>();
+		for (auto &group : agg.groups) {
+			RebindExpr(*group);
+		}
+	}
 	for (auto &child : op.children) {
-		RebindJoinConditions(*child, table_mapping);
+		RebindSkippedExpressions(*child, table_mapping);
 	}
 }
 
@@ -200,8 +207,8 @@ RenumberWrapper renumber_and_rebind_subtree(unique_ptr<LogicalOperator> plan, Bi
 	ColumnBindingReplacer replacer = vec_to_replacer(all_bindings, res.idx_map);
 	replacer.VisitOperator(*res.op);
 
-	// Also rebind COMPARISON_JOIN conditions (not visited by ColumnBindingReplacer)
-	RebindJoinConditions(*res.op, res.idx_map);
+	// Also rebind expressions that ColumnBindingReplacer skips (JOIN conditions, AGGREGATE groups)
+	RebindSkippedExpressions(*res.op, res.idx_map);
 	return res;
 }
 
