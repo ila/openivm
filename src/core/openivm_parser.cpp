@@ -38,6 +38,7 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 			if (q.empty()) {
 				continue;
 			}
+			OPENIVM_DEBUG_PRINT("[IVMDDLBindFunction] Executing DDL: %s\n", q.c_str());
 			auto r = conn.Query(q);
 			if (r->HasError()) {
 				throw CatalogException("Failed to execute IVM DDL: " + r->GetError());
@@ -366,7 +367,58 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		bool found_full_outer = analysis.found_full_outer;
 		bool found_window = analysis.found_window;
 		bool found_join = analysis.found_join;
-		auto aggregate_columns = std::move(analysis.aggregate_columns);
+		// Derive GROUP BY column names by walking the plan's projection above the aggregate.
+		// The projection maps GROUP BY bindings (group_index, i) to SELECT-list aliases — these
+		// aliases are the actual column names in the data table. Plan-walk aliases on agg.groups
+		// are unreliable for CASE/COALESCE expressions.
+		// For DISTINCT views, the checker already extracts aggregate_columns from distinct_targets.
+		size_t group_count = analysis.group_count;
+		idx_t group_index = analysis.group_index;
+		vector<string> aggregate_columns;
+		if (analysis.found_distinct) {
+			// DISTINCT: checker populated aggregate_columns from distinct_targets
+			aggregate_columns = std::move(analysis.aggregate_columns);
+		} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
+			// Walk plan to find the PROJECTION that references (group_index, i) bindings
+			// and collect the aliases — these are the actual column names in the data table.
+			// For HAVING views the structure is PROJECTION→FILTER→AGGREGATE, so we match on
+			// group_index rather than requiring a direct AGGREGATE child.
+			vector<string> group_names(group_count);
+			std::function<bool(LogicalOperator *)> find_group_cols = [&](LogicalOperator *op) -> bool {
+				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+					auto &proj = op->Cast<LogicalProjection>();
+					bool matched_any = false;
+					for (auto &expr : proj.expressions) {
+						if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+							auto &bcr = expr->Cast<BoundColumnRefExpression>();
+							if (bcr.binding.table_index == group_index && bcr.binding.column_index < group_count) {
+								string col_name = expr->alias.empty() ? bcr.GetName() : expr->alias;
+								if (!IVMTableNames::IsInternalColumn(col_name)) {
+									group_names[bcr.binding.column_index] = col_name;
+									matched_any = true;
+								}
+							}
+						}
+					}
+					if (matched_any) {
+						return true;
+					}
+				}
+				for (auto &child : op->children) {
+					if (find_group_cols(child.get())) {
+						return true;
+					}
+				}
+				return false;
+			};
+			find_group_cols(plan.get());
+			// Only keep entries that were found; skip empty (unresolved) names
+			for (auto &name : group_names) {
+				if (!name.empty()) {
+					aggregate_columns.push_back(name);
+				}
+			}
+		}
 		auto aggregate_types = std::move(analysis.aggregate_types);
 		auto window_partition_columns = std::move(analysis.window_partition_columns);
 
@@ -376,26 +428,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Single-table window views keep partition-level recompute.
 		if (found_window && found_join) {
 			window_partition_columns.clear();
-		}
-
-		// Fix expression-based group-by column names: the plan walk may extract
-		// "abs(val)" but the MV table column is "abs_val" (from the AS alias).
-		for (auto &col : aggregate_columns) {
-			if (col.find('(') != string::npos) {
-				string lower_col = StringUtil::Lower(col);
-				if (lower_col.size() >= 2 && lower_col.front() == '"' && lower_col.back() == '"') {
-					lower_col = lower_col.substr(1, lower_col.size() - 2);
-				}
-				auto pos = view_query.find(lower_col);
-				if (pos != string::npos) {
-					auto after = view_query.substr(pos + lower_col.size());
-					std::regex alias_re(R"(^\s+as\s+(\w+))", std::regex_constants::icase);
-					std::smatch m;
-					if (std::regex_search(after, m, alias_re)) {
-						col = m[1].str();
-					}
-				}
-			}
 		}
 
 		IVMType ivm_type;

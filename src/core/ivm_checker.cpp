@@ -158,27 +158,10 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 			if (HasVolatileExpression(agg->groups)) {
 				result.ivm_compatible = false;
 			}
-			// Extract group-by column names
-			for (auto &group : agg->groups) {
-				if (group->type == ExpressionType::BOUND_COLUMN_REF) {
-					auto *column = dynamic_cast<BoundColumnRefExpression *>(group.get());
-					if (column) {
-						result.aggregate_columns.emplace_back(column->alias);
-					}
-				} else if (group->type == ExpressionType::BOUND_FUNCTION) {
-					auto *column = dynamic_cast<BoundFunctionExpression *>(group.get());
-					if (column) {
-						if (!column->alias.empty()) {
-							result.aggregate_columns.emplace_back(column->alias);
-						} else {
-							auto function = column->GetName();
-							function = StringUtil::Replace(function, "\"", "\"\"");
-							function = "\"" + function + "\"";
-							result.aggregate_columns.emplace_back(function);
-						}
-					}
-				}
-			}
+			// Record group count and group_index — caller walks the plan's projection to extract
+			// the final column names for GROUP BY columns (SELECT list order != GROUP BY order).
+			result.group_count = agg->groups.size();
+			result.group_index = agg->group_index;
 		}
 		break;
 	}
