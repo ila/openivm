@@ -747,3 +747,65 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# POSITION(x IN y) and other keyword-syntax function calls.
+# DuckDB's parser treats `position(x, y)` as invalid — the `position` identifier
+# is reserved for the `POSITION(x IN y)` form — but accepts `"position"(x, y)`
+# as a regular function call. LPTS emits the quoted form so view_query round-
+# trips through the binder.
+# ============================================================
+
+statement ok
+CREATE TABLE pos_t (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO pos_t VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry'), (4, 'date');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_pos AS
+    SELECT id, POSITION('a' IN name) AS pos_a FROM pos_t;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_pos
+    EXCEPT ALL SELECT id, POSITION('a' IN name) AS pos_a FROM pos_t
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, POSITION('a' IN name) AS pos_a FROM pos_t
+    EXCEPT ALL SELECT * FROM mv_pos
+);
+----
+0
+
+statement ok
+INSERT INTO pos_t VALUES (5, 'apricot'), (6, 'fig');
+
+statement ok
+DELETE FROM pos_t WHERE id = 4;
+
+statement ok
+UPDATE pos_t SET name = 'pear' WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_pos');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_pos
+    EXCEPT ALL SELECT id, POSITION('a' IN name) AS pos_a FROM pos_t
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, POSITION('a' IN name) AS pos_a FROM pos_t
+    EXCEPT ALL SELECT * FROM mv_pos
+);
+----
+0

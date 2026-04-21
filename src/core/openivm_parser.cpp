@@ -16,6 +16,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -202,6 +203,48 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		planner.CreatePlan(statement->Copy());
 		auto plan = std::move(planner.plan);
 
+		// Inline CTEs in this plan too so AnalyzePlan / find_group_cols / HasLeftJoin
+		// walks see the folded structure. DuckDB's binder defaults to
+		// CTE_MATERIALIZE_ALWAYS, which makes CTEInlining bail — relax to DEFAULT first.
+		// (The SELECT-only `select_plan` below does the same for LPTS serialization.)
+		{
+			std::function<bool(LogicalOperator *)> has_cte = [&](LogicalOperator *op) {
+				if (!op) {
+					return false;
+				}
+				if (op->type == LogicalOperatorType::LOGICAL_CTE_REF ||
+				    op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+					return true;
+				}
+				for (auto &c : op->children) {
+					if (has_cte(c.get())) {
+						return true;
+					}
+				}
+				return false;
+			};
+			if (has_cte(plan.get())) {
+				std::function<void(LogicalOperator *)> relax_cte = [&](LogicalOperator *op) {
+					if (!op) {
+						return;
+					}
+					if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+						auto &cte = op->Cast<LogicalMaterializedCTE>();
+						if (cte.materialize == CTEMaterialize::CTE_MATERIALIZE_ALWAYS) {
+							cte.materialize = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
+						}
+					}
+					for (auto &c : op->children) {
+						relax_cte(c.get());
+					}
+				};
+				relax_cte(plan.get());
+				Optimizer outer_cte_opt(*planner.binder, context);
+				CTEInlining outer_cte_inlining(outer_cte_opt);
+				plan = outer_cte_inlining.Optimize(std::move(plan));
+			}
+		}
+
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 		vector<string> output_names;
 		string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
@@ -239,6 +282,30 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					return false;
 				};
 				if (has_cte(select_plan.get())) {
+					// DuckDB's binder sets LogicalMaterializedCTE::materialize to
+					// CTE_MATERIALIZE_ALWAYS by default. CTEInlining bails early on ALWAYS
+					// and leaves the CTE as a materialized node. IVM can't maintain views
+					// whose plan still contains LOGICAL_CTE_REF — LPTS has no serializer
+					// for it and the refresh path has no delta-consolidation rule. Relax
+					// every CTE to CTE_MATERIALIZE_DEFAULT before inlining so CTEInlining
+					// folds them into the outer plan. Single-ref CTEs always inline; multi-
+					// ref CTEs inline when they're cheap and don't end in an aggregate that
+					// would be wastefully re-materialized.
+					std::function<void(LogicalOperator *)> relax_cte = [&](LogicalOperator *op) {
+						if (!op) {
+							return;
+						}
+						if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+							auto &cte = op->Cast<LogicalMaterializedCTE>();
+							if (cte.materialize == CTEMaterialize::CTE_MATERIALIZE_ALWAYS) {
+								cte.materialize = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
+							}
+						}
+						for (auto &c : op->children) {
+							relax_cte(c.get());
+						}
+					};
+					relax_cte(select_plan.get());
 					Optimizer cte_opt(*select_planner.binder, context);
 					CTEInlining cte_inlining(cte_opt);
 					select_plan = cte_inlining.Optimize(std::move(select_plan));
@@ -276,17 +343,74 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 			}
 			// IVMPlanRewrite may have added extra columns (_ivm_left_key, _ivm_distinct_count).
-			// Append names for these from the top projection's expression aliases.
+			// Append names for these from the top-most node's expression aliases. Walk through
+			// ORDER BY / LIMIT / DISTINCT / FILTER wrappers; accept either a PROJECTION or an
+			// AGGREGATE at the top. For AGGREGATE the group-count positions reuse existing
+			// output_names (which match the original SELECT list); aggregate-expression positions
+			// after that use each aggregate's alias (e.g. `_ivm_distinct_count`).
 			auto plan_bindings = select_plan->GetColumnBindings();
-			if (select_plan->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-				auto &proj = select_plan->Cast<LogicalProjection>();
+			LogicalProjection *top_proj = nullptr;
+			LogicalAggregate *top_agg = nullptr;
+			for (LogicalOperator *walk = select_plan.get(); walk;) {
+				if (walk->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+					top_proj = &walk->Cast<LogicalProjection>();
+					break;
+				}
+				if (walk->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+					top_agg = &walk->Cast<LogicalAggregate>();
+					break;
+				}
+				if ((walk->type == LogicalOperatorType::LOGICAL_ORDER_BY ||
+				     walk->type == LogicalOperatorType::LOGICAL_LIMIT ||
+				     walk->type == LogicalOperatorType::LOGICAL_DISTINCT ||
+				     walk->type == LogicalOperatorType::LOGICAL_FILTER) &&
+				    !walk->children.empty()) {
+					walk = walk->children[0].get();
+					continue;
+				}
+				break;
+			}
+			if (top_proj) {
 				while (output_names.size() < plan_bindings.size()) {
 					idx_t idx = output_names.size();
-					if (idx < proj.expressions.size() && !proj.expressions[idx]->alias.empty()) {
-						output_names.push_back(proj.expressions[idx]->alias);
+					if (idx < top_proj->expressions.size() && !top_proj->expressions[idx]->alias.empty()) {
+						output_names.push_back(top_proj->expressions[idx]->alias);
 					} else {
 						output_names.push_back("_ivm_col_" + to_string(idx));
 					}
+				}
+			} else if (top_agg) {
+				idx_t group_count_local = top_agg->groups.size();
+				while (output_names.size() < plan_bindings.size()) {
+					idx_t idx = output_names.size();
+					if (idx >= group_count_local) {
+						idx_t expr_idx = idx - group_count_local;
+						if (expr_idx < top_agg->expressions.size() && !top_agg->expressions[expr_idx]->alias.empty()) {
+							output_names.push_back(top_agg->expressions[expr_idx]->alias);
+							continue;
+						}
+					}
+					output_names.push_back("_ivm_col_" + to_string(idx));
+				}
+			}
+			// Deduplicate output names — `SELECT W_ID, W_ID FROM …` or `SELECT col, COUNT(*), col`
+			// produce duplicate names that break `CREATE TABLE _ivm_data_mv AS <view_query>`
+			// (DuckDB rejects duplicate column names in a CREATE TABLE column list). Internal
+			// IVM columns (e.g. `_ivm_left_key`) must keep their canonical name — rewrite rules
+			// look them up by exact string.
+			{
+				unordered_set<string> seen;
+				for (auto &name : output_names) {
+					if (IVMTableNames::IsInternalColumn(name)) {
+						continue;
+					}
+					string candidate = name;
+					idx_t suffix = 1;
+					while (seen.count(candidate)) {
+						candidate = name + "_" + to_string(suffix++);
+					}
+					seen.insert(candidate);
+					name = candidate;
 				}
 			}
 			// Strip HAVING filter from plan — data table stores all groups.
@@ -387,12 +511,24 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// holds group_index refs, so this works correctly.
 			// For CTE nodes, only the outer-query child (children[1]) is visited, mirroring
 			// the same restriction applied in AnalyzeNode.
-			vector<string> group_names(group_count);
+			// Ordered list of projection expressions that reference (group_index, *).
+			// Not keyed by column_index because a column can be referenced multiple times
+			// (e.g. `SELECT w_tax, w_tax, COUNT(*) GROUP BY w_tax, w_tax` — DuckDB
+			// collapses GROUP BY w_tax, w_tax to a single group, but the projection
+			// still outputs the column twice; both positions materialize in the data
+			// table and the MERGE needs both as group keys).
+			vector<string> group_names_list;
 			std::function<bool(LogicalOperator *)> find_group_cols = [&](LogicalOperator *op) -> bool {
 				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-					// This is the outermost projection we encounter — check it and stop DFS.
-					// If it doesn't have group_index refs, aggregate is nested (CTE/UNION): leave empty.
+					// Stop at the first PROJECTION. Return `matched` (true iff any expression
+					// references group_index) so the MATERIALIZED_CTE case below can tell
+					// "outer matched" from "outer missed — try body". For non-CTE plans a
+					// top-projection miss ends the search; we must NOT descend into JOIN
+					// branches where the aggregate's group key is a subquery-internal column
+					// that isn't in the MV's user-facing output — that would yield a unique
+					// index on a column absent from the data table.
 					auto &proj = op->Cast<LogicalProjection>();
+					bool matched = false;
 					for (auto &expr : proj.expressions) {
 						if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
 							auto &bcr = expr->Cast<BoundColumnRefExpression>();
@@ -400,17 +536,28 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 							    bcr.binding.column_index < (idx_t)group_count) {
 								string col_name = expr->alias.empty() ? bcr.GetName() : expr->alias;
 								if (!IVMTableNames::IsInternalColumn(col_name)) {
-									group_names[bcr.binding.column_index] = col_name;
+									group_names_list.push_back(col_name);
+									matched = true;
 								}
 							}
 						}
 					}
-					return true; // stop DFS regardless of match
+					return matched;
+				}
+				// UNION mixes rows from independent aggregates — the key may repeat across
+				// branches. Refuse to populate aggregate_columns from either branch so the
+				// view drops down to SIMPLE_AGGREGATE and no unique index is installed.
+				if (op->type == LogicalOperatorType::LOGICAL_UNION) {
+					return false;
 				}
 				if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-					// Only recurse into outer query (children[1]), skip CTE body (children[0]).
+					// Outer first (handles outer re-aggregate / reshape); if that misses,
+					// dive into the CTE body (handles pass-through `SELECT * FROM cte`).
 					if (op->children.size() >= 2) {
-						return find_group_cols(op->children[1].get());
+						if (find_group_cols(op->children[1].get())) {
+							return true;
+						}
+						return find_group_cols(op->children[0].get());
 					}
 					return false;
 				}
@@ -422,11 +569,31 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				return false;
 			};
 			find_group_cols(plan.get());
-			// Only keep entries that were found; skip empty (unresolved) names
-			for (auto &name : group_names) {
-				if (!name.empty()) {
-					aggregate_columns.push_back(name);
+			for (auto &name : group_names_list) {
+				aggregate_columns.push_back(name);
+			}
+		}
+
+		// Deduplicate aggregate_columns the same way we deduped output_names above.
+		// When the user writes `SELECT DISTINCT w_id, w_id` (or groups twice on the
+		// same column), the data table has columns `w_id, w_id_1` after the output_names
+		// dedup — the unique index and MERGE ON/UPDATE SET clauses read group names
+		// from aggregate_columns, so they must match the data table's deduped names.
+		// Without this, the second occurrence gets treated as an aggregate column in
+		// `UPDATE SET w_id_1 = v.w_id_1 + d.w_id_1` and values are summed instead of matched.
+		{
+			unordered_set<string> seen_group;
+			for (auto &name : aggregate_columns) {
+				if (IVMTableNames::IsInternalColumn(name)) {
+					continue;
 				}
+				string candidate = name;
+				idx_t suffix = 1;
+				while (seen_group.count(candidate)) {
+					candidate = name + "_" + to_string(suffix++);
+				}
+				seen_group.insert(candidate);
+				name = candidate;
 			}
 		}
 		auto aggregate_types = std::move(analysis.aggregate_types);

@@ -151,6 +151,14 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	if (table_ref.get() && table_ref->ParentCatalog().GetCatalogType() == "ducklake") {
 		return CreateDuckLakeDeltaNode(context, binder, old_get, view_name);
 	}
+	// Table functions (generate_series, range, etc.) have no catalog-backing table
+	// and therefore no delta table. Their output is constant across refreshes, so
+	// the delta is always empty — the inclusion-exclusion pruner in join.cpp's
+	// DetectDeltaStatus marks these leaves as empty, skipping every term where
+	// this leaf's bit is in the delta mask. By the time we reach CreateDeltaGetNode
+	// for a join-backed view, this branch shouldn't fire — but keep it as a clear
+	// error for direct (non-join) use cases, where a materialized view defined
+	// only on a table function has no delta to compute incrementally.
 	unique_ptr<LogicalGet> delta_get_node;
 	ColumnBinding new_mul_binding;
 	string table_name;

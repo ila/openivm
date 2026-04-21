@@ -18,8 +18,12 @@ void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOp
 
 /// Strip the HAVING filter (FILTER above AGGREGATE) from the plan.
 /// Returns the HAVING predicate as SQL using output column aliases, or empty if no HAVING.
-/// The plan is modified in place: the FILTER node is removed.
-string StripHavingFilter(unique_ptr<LogicalOperator> &plan, const vector<string> &output_names);
+/// The plan is modified in place: the FILTER node is removed. If the HAVING predicate
+/// references aggregates not in the SELECT list (e.g. `SUM(COALESCE(x, 0))` when only
+/// `SUM(x)` is selected), those aggregates are added to the PROJECTION as hidden columns
+/// (named `_ivm_having_N`) and `output_names` is extended accordingly — the predicate
+/// references the hidden column names instead of re-rendering the aggregate expression.
+string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &output_names);
 
 } // namespace duckdb
 

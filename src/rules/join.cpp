@@ -149,6 +149,17 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 		}
 		auto table_ref = get->GetTable();
 		if (table_ref.get() == nullptr) {
+			// Table function (generate_series, range, etc.) has no catalog-backing
+			// table, so no delta table exists. Its output is constant across
+			// refreshes — the "delta" is always empty. Mark it as empty so the
+			// inclusion-exclusion pruner drops every term where this leaf's bit
+			// is set: only the term that keeps the table function as its original
+			// scan on the "full" side contributes rows, matching the semantics of
+			// a non-changing input.
+			status.empty_mask |= (1ULL << i);
+			status.insert_only_mask |= (1ULL << i);
+			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (table function '%s') has empty delta\n", i,
+			                    get->function.name.c_str());
 			continue;
 		}
 		string delta_name = OpenIVMUtils::DeltaName(table_ref.get()->name);

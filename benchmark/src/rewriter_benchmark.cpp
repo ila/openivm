@@ -630,6 +630,51 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							if (verify_result && !verify_result->HasError() && verify_result->RowCount() > 0) {
 								int64_t mismatch_count = verify_result->GetValue(0, 0).GetValue<int64_t>();
 								is_correct = (mismatch_count == 0) ? 1 : 0;
+								if (!is_correct && getenv("OPENIVM_DUMP_DIFF")) {
+									// Dump the diff rows to stderr for post-mortem analysis.
+									// Use two separate queries to avoid UNION ALL column-name alignment issues
+									// when mv and gt have mismatched output schemas.
+									fprintf(stderr, "[DIFF %s] mismatch_count=%lld\n", mv_name.c_str(),
+									        static_cast<long long>(mismatch_count));
+									string mv_only_q, gt_only_q;
+									if (nv.column_list.empty() || !nv.has_float) {
+										mv_only_q = "SELECT * FROM " + mv_name + " EXCEPT ALL SELECT * FROM (" +
+										            query + ") __a LIMIT 10";
+										gt_only_q = "SELECT * FROM (" + query + ") __b EXCEPT ALL SELECT * FROM " +
+										            mv_name + " LIMIT 10";
+									} else {
+										string ctes = "WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " + mv_name +
+										              "), gt_r(" + nv.column_list + ") AS (SELECT * FROM (" + query +
+										              ") __gt) ";
+										mv_only_q = ctes + "SELECT " + nv.normalized + " FROM mv_r EXCEPT ALL SELECT " +
+										            nv.normalized + " FROM gt_r LIMIT 10";
+										gt_only_q = ctes + "SELECT " + nv.normalized + " FROM gt_r EXCEPT ALL SELECT " +
+										            nv.normalized + " FROM mv_r LIMIT 10";
+									}
+									auto dump_side = [&](const string &label, const string &q) {
+										auto rows = con.Query(q);
+										if (!rows || rows->HasError()) {
+											fprintf(stderr, "[DIFF %s]   %s: ERROR %s\n", mv_name.c_str(), label.c_str(),
+											        rows ? rows->GetError().c_str() : "(null)");
+											return;
+										}
+										if (rows->RowCount() == 0) {
+											return;
+										}
+										for (idx_t r = 0; r < rows->RowCount(); r++) {
+											string row;
+											for (idx_t c = 0; c < rows->ColumnCount(); c++) {
+												if (c > 0) row += " | ";
+												row += rows->GetValue(c, r).ToString();
+											}
+											fprintf(stderr, "[DIFF %s]   %s: %s\n", mv_name.c_str(), label.c_str(),
+											        row.c_str());
+										}
+									};
+									dump_side("mv_only", mv_only_q);
+									dump_side("gt_only", gt_only_q);
+									fflush(stderr);
+								}
 							} else if (verify_result && verify_result->HasError()) {
 								error = verify_result->GetError();
 							}

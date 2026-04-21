@@ -49,10 +49,16 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		break;
 
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-		// Only analyze the outer query (children[1]), not the CTE body (children[0]).
-		// CTE body aggregates are internal and must not affect the outer IVM classification.
+		// After the parser runs CTEInlining (with CTE_MATERIALIZE_ALWAYS → DEFAULT), most
+		// query-bound CTEs get inlined into the outer plan. Any MATERIALIZED_CTE remaining
+		// here couldn't be inlined (recursive, multi-ref with aggregate, etc.). Analyze
+		// the outer first; inherit the CTE body's aggregate only when the outer is a pure
+		// pass-through, otherwise classify from the outer alone.
 		if (node->children.size() >= 2) {
 			AnalyzeNode(node->children[1].get(), result);
+			if (!result.found_aggregation && !result.found_distinct && !result.found_join) {
+				AnalyzeNode(node->children[0].get(), result);
+			}
 		}
 		return;
 

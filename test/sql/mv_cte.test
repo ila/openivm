@@ -352,3 +352,155 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# HAVING inside a CTE body.
+# The outer uses the CTE in a JOIN; HAVING belongs to the CTE's own aggregate,
+# not the MV's output. Two things must work:
+#   1. StripHavingFilter must not strip a FILTER that sits under a MATERIALIZED_CTE
+#      — otherwise it extracts the predicate with bindings that don't line up with
+#      the view's top-level column names, producing a view WHERE like
+#      `(I_NAME > 100)` on a VARCHAR column.
+#   2. The parser must relax CTE_MATERIALIZE_ALWAYS → CTE_MATERIALIZE_DEFAULT before
+#      calling CTEInlining. DuckDB's binder defaults to ALWAYS, which makes
+#      CTEInlining bail out and keep LOGICAL_MATERIALIZED_CTE in the plan — but IVM
+#      has no delta-consolidation rule for LOGICAL_CTE_REF. Relaxing the flag lets
+#      the CTE body fold into the outer plan so the whole view becomes a regular
+#      AGGREGATE_HAVING view and incrementally refreshes correctly.
+# ============================================================
+
+statement ok
+CREATE TABLE cte_hav_item (i_id INT, i_name VARCHAR, i_price DECIMAL(18,3));
+
+statement ok
+CREATE TABLE cte_hav_ol (ol_i_id INT, ol_amount DECIMAL(18,3));
+
+statement ok
+INSERT INTO cte_hav_item VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+
+statement ok
+INSERT INTO cte_hav_ol VALUES (1, 50), (1, 60), (2, 30), (3, 40), (3, 60), (3, 50);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cte_having AS
+    WITH item_revenue AS (
+        SELECT ol_i_id, SUM(ol_amount) AS rev FROM cte_hav_ol GROUP BY ol_i_id
+        HAVING SUM(ol_amount) > 100
+    )
+    SELECT i.i_id, i.i_name, i.i_price, ir.rev
+    FROM cte_hav_item i JOIN item_revenue ir ON i.i_id = ir.ol_i_id;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_cte_having
+    EXCEPT ALL
+    (WITH item_revenue AS (SELECT ol_i_id, SUM(ol_amount) AS rev FROM cte_hav_ol GROUP BY ol_i_id HAVING SUM(ol_amount) > 100)
+     SELECT i.i_id, i.i_name, i.i_price, ir.rev FROM cte_hav_item i JOIN item_revenue ir ON i.i_id = ir.ol_i_id)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (WITH item_revenue AS (SELECT ol_i_id, SUM(ol_amount) AS rev FROM cte_hav_ol GROUP BY ol_i_id HAVING SUM(ol_amount) > 100)
+     SELECT i.i_id, i.i_name, i.i_price, ir.rev FROM cte_hav_item i JOIN item_revenue ir ON i.i_id = ir.ol_i_id)
+    EXCEPT ALL SELECT * FROM mv_cte_having
+);
+----
+0
+
+# Batched DML: flip one item below threshold, push another above
+statement ok
+DELETE FROM cte_hav_ol WHERE ol_i_id = 1 AND ol_amount = 60;
+
+statement ok
+INSERT INTO cte_hav_ol VALUES (2, 80);
+
+statement ok
+INSERT INTO cte_hav_item VALUES (4, 'd', 40);
+
+statement ok
+INSERT INTO cte_hav_ol VALUES (4, 150);
+
+statement ok
+PRAGMA ivm('mv_cte_having');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_cte_having
+    EXCEPT ALL
+    (WITH item_revenue AS (SELECT ol_i_id, SUM(ol_amount) AS rev FROM cte_hav_ol GROUP BY ol_i_id HAVING SUM(ol_amount) > 100)
+     SELECT i.i_id, i.i_name, i.i_price, ir.rev FROM cte_hav_item i JOIN item_revenue ir ON i.i_id = ir.ol_i_id)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (WITH item_revenue AS (SELECT ol_i_id, SUM(ol_amount) AS rev FROM cte_hav_ol GROUP BY ol_i_id HAVING SUM(ol_amount) > 100)
+     SELECT i.i_id, i.i_name, i.i_price, ir.rev FROM cte_hav_item i JOIN item_revenue ir ON i.i_id = ir.ol_i_id)
+    EXCEPT ALL SELECT * FROM mv_cte_having
+);
+----
+0
+
+# ============================================================
+# Duplicate column names in SELECT.
+# `SELECT W_ID, W_ID …` and `SELECT col, col, COUNT(*) GROUP BY col, col`
+# generate LPTS output with duplicate output columns; without dedup,
+# `CREATE TABLE _ivm_data_mv AS <view_query>` rejects duplicates.
+# Both output_names AND aggregate_columns get `_N` suffixes so:
+#   1. The data table has unique columns.
+#   2. The unique index and MERGE ON/UPDATE SET clauses reference the deduped
+#      names — otherwise the second occurrence gets treated as an aggregate
+#      column and the MERGE adds values instead of matching them.
+# ============================================================
+
+statement ok
+CREATE TABLE dup_t (w_id INT, w_tax DECIMAL(10,3));
+
+statement ok
+INSERT INTO dup_t VALUES (1, 0.1), (2, 0.2), (3, 0.1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dup_distinct AS SELECT DISTINCT w_id, w_id FROM dup_t;
+
+query II
+SELECT * FROM mv_dup_distinct ORDER BY w_id;
+----
+1	1
+2	2
+3	3
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dup_agg AS SELECT w_tax, w_tax, COUNT(*) FROM dup_t GROUP BY w_tax, w_tax;
+
+query III
+SELECT w_tax, w_tax_1, count_star FROM mv_dup_agg ORDER BY w_tax;
+----
+0.100	0.100	2
+0.200	0.200	1
+
+statement ok
+INSERT INTO dup_t VALUES (4, 0.2), (1, 0.3);
+
+statement ok
+PRAGMA ivm('mv_dup_distinct');
+
+statement ok
+PRAGMA ivm('mv_dup_agg');
+
+query II
+SELECT * FROM mv_dup_distinct ORDER BY w_id;
+----
+1	1
+2	2
+3	3
+4	4
+
+query III
+SELECT w_tax, w_tax_1, count_star FROM mv_dup_agg ORDER BY w_tax;
+----
+0.100	0.100	2
+0.200	0.200	2
+0.300	0.300	1

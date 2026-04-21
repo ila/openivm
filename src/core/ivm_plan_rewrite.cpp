@@ -884,8 +884,24 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 	}
 }
 
-string StripHavingFilter(unique_ptr<LogicalOperator> &plan, const vector<string> &output_names) {
-	// Find PROJECTION → FILTER → AGGREGATE pattern.
+/// Collect every BOUND_COLUMN_REF binding referenced by the expression tree.
+static void CollectFilterBindings(Expression &expr, std::set<pair<idx_t, idx_t>> &out) {
+	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &col = expr.Cast<BoundColumnRefExpression>();
+		out.insert({col.binding.table_index, col.binding.column_index});
+		return;
+	}
+	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) { CollectFilterBindings(child, out); });
+}
+
+string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &output_names) {
+	// Find PROJECTION → FILTER → AGGREGATE pattern. Only descend through transparent
+	// operators (PROJECTION, FILTER, ORDER, LIMIT, DISTINCT) and — for MATERIALIZED_CTE —
+	// the outer query (children[1]) only. Stripping a FILTER that's nested inside a
+	// MATERIALIZED_CTE body, a UNION branch, or below a JOIN would extract a predicate
+	// whose bindings and output_names don't line up with the view's top-level columns
+	// (e.g. the CTE's internal SUM output would be aliased to the outer's I_NAME column,
+	// producing a view WHERE clause like `(I_NAME > 100)` on a VARCHAR).
 	LogicalOperator *parent = nullptr;
 	LogicalOperator *filter_node = nullptr;
 
@@ -896,6 +912,21 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, const vector<string>
 			parent = par;
 			filter_node = node;
 			return true;
+		}
+		// Materialized CTE: only descend into the outer query (children[1]); a FILTER
+		// in the CTE body is the CTE's own HAVING and must stay where it is.
+		if (node->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+			if (node->children.size() >= 2) {
+				return find_filter(node->children[1].get(), node);
+			}
+			return false;
+		}
+		// Only descend through transparent operators. Stop at JOIN, UNION, GET, etc.
+		if (node->type != LogicalOperatorType::LOGICAL_PROJECTION &&
+		    node->type != LogicalOperatorType::LOGICAL_FILTER && node->type != LogicalOperatorType::LOGICAL_ORDER_BY &&
+		    node->type != LogicalOperatorType::LOGICAL_LIMIT && node->type != LogicalOperatorType::LOGICAL_DISTINCT &&
+		    node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+			return false;
 		}
 		for (auto &child : node->children) {
 			if (find_filter(child.get(), node)) {
@@ -911,11 +942,12 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, const vector<string>
 
 	// Build binding → alias map from the PROJECTION above the FILTER.
 	unordered_map<uint64_t, string> binding_to_alias;
+	LogicalProjection *proj_ptr = nullptr;
 	if (parent && parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &proj = parent->Cast<LogicalProjection>();
-		for (idx_t i = 0; i < proj.expressions.size() && i < output_names.size(); i++) {
-			if (proj.expressions[i]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-				auto &col = proj.expressions[i]->Cast<BoundColumnRefExpression>();
+		proj_ptr = &parent->Cast<LogicalProjection>();
+		for (idx_t i = 0; i < proj_ptr->expressions.size() && i < output_names.size(); i++) {
+			if (proj_ptr->expressions[i]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+				auto &col = proj_ptr->expressions[i]->Cast<BoundColumnRefExpression>();
 				uint64_t key =
 				    (uint64_t)col.binding.table_index ^ ((uint64_t)col.binding.column_index * 0x9e3779b97f4a7c15ULL);
 				binding_to_alias[key] = output_names[i];
@@ -923,8 +955,45 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, const vector<string>
 		}
 	}
 
-	// Extract HAVING predicate as SQL.
+	// Expose aggregate outputs referenced by the HAVING predicate but missing from
+	// the SELECT list (e.g. HAVING COUNT(*) > N when COUNT(*) isn't in SELECT, or
+	// HAVING SUM(COALESCE(x, 0)) > ... when only SUM(x) is selected). Without this
+	// the predicate SQL falls back to the raw aggregate text, which re-references
+	// base-table columns that aren't in the data table.
 	auto &filter = filter_node->Cast<LogicalFilter>();
+	if (proj_ptr && !filter_node->children.empty() &&
+	    filter_node->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &agg_child = filter_node->children[0]->Cast<LogicalAggregate>();
+		std::set<pair<idx_t, idx_t>> filter_bindings;
+		for (auto &expr : filter.expressions) {
+			CollectFilterBindings(*expr, filter_bindings);
+		}
+		idx_t next_hidden = 0;
+		for (auto &b : filter_bindings) {
+			uint64_t key = (uint64_t)b.first ^ ((uint64_t)b.second * 0x9e3779b97f4a7c15ULL);
+			if (binding_to_alias.find(key) != binding_to_alias.end()) {
+				continue;
+			}
+			// Only expose aggregate-output bindings. Group bindings should already be in
+			// the projection; a raw column ref here would indicate an unexpected plan.
+			if (b.first != agg_child.aggregate_index) {
+				continue;
+			}
+			if (b.second >= agg_child.expressions.size()) {
+				continue;
+			}
+			string hidden_name = "_ivm_having_" + std::to_string(next_hidden++);
+			auto col_type = agg_child.expressions[b.second]->return_type;
+			auto hidden_expr =
+			    make_uniq<BoundColumnRefExpression>(hidden_name, col_type, ColumnBinding(b.first, b.second));
+			hidden_expr->alias = hidden_name;
+			proj_ptr->expressions.push_back(std::move(hidden_expr));
+			output_names.push_back(hidden_name);
+			binding_to_alias[key] = hidden_name;
+		}
+	}
+
+	// Extract HAVING predicate as SQL.
 	string having_sql;
 	for (idx_t i = 0; i < filter.expressions.size(); i++) {
 		if (i > 0) {

@@ -5,6 +5,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 
 #include <duckdb/planner/operator/logical_aggregate.hpp>
+#include <duckdb/planner/operator/logical_empty_result.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
 #include <duckdb/planner/operator/logical_projection.hpp>
 #include <duckdb/planner/operator/logical_comparison_join.hpp>
@@ -82,6 +83,32 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 		const idx_t new_idx = binder.GenerateTableIndex();
 		setop.table_index = new_idx;
 		table_reassign[current_idx] = new_idx;
+		plan->children = std::move(rec_children);
+		return {std::move(plan), table_reassign, current_bindings};
+	}
+	case LogicalOperatorType::LOGICAL_EMPTY_RESULT: {
+		// LogicalEmptyResult stores a `bindings` vector directly (no single
+		// table_index member). Remap each distinct old table_index to a fresh
+		// index so its bindings don't collide with a renumbered LogicalGet
+		// elsewhere in the plan (e.g. inclusion-exclusion terms where the
+		// same source table appears as both full and delta).
+		auto &empty = plan->Cast<LogicalEmptyResult>();
+		std::unordered_map<old_idx, new_idx> local_remap;
+		for (auto &cb : empty.bindings) {
+			auto it = local_remap.find(cb.table_index);
+			idx_t new_t;
+			if (it == local_remap.end()) {
+				new_t = binder.GenerateTableIndex();
+				local_remap[cb.table_index] = new_t;
+				table_reassign[cb.table_index] = new_t;
+#if OPENIVM_DEBUG
+				OPENIVM_DEBUG_PRINT("Index regen LOGICAL_EMPTY_RESULT: Change %zu -> %zu\n", cb.table_index, new_t);
+#endif
+			} else {
+				new_t = it->second;
+			}
+			cb.table_index = new_t;
+		}
 		plan->children = std::move(rec_children);
 		return {std::move(plan), table_reassign, current_bindings};
 	}

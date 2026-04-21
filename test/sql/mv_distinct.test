@@ -522,3 +522,100 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# DISTINCT with parent operators that referenced the pre-rewrite bindings.
+# IVMPlanRewrite replaces LogicalDistinct with LogicalAggregate, but parent
+# nodes (ORDER BY, MARK JOIN, FILTER) keep their original column bindings
+# because DISTINCT was a pass-through. LPTS must re-resolve these through
+# the aggregate's new group-output column names — otherwise the generated
+# CTE SQL references the pre-aggregate CTE alias (e.g. t1_col) and the
+# binder reports "column not found".
+# ============================================================
+
+# DISTINCT + ORDER BY — stale ORDER BY binding
+statement ok
+CREATE TABLE dist_order (w_id INT, d_id INT, local INT);
+
+statement ok
+INSERT INTO dist_order VALUES (1, 1, 1), (1, 2, 0), (2, 1, 1), (1, 1, 1), (3, 2, 1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dist_order AS
+    SELECT DISTINCT w_id, d_id FROM dist_order WHERE local = 1 ORDER BY w_id;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT w_id, d_id FROM dist_order WHERE local = 1
+    EXCEPT ALL SELECT w_id, d_id FROM mv_dist_order
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, d_id FROM mv_dist_order
+    EXCEPT ALL SELECT DISTINCT w_id, d_id FROM dist_order WHERE local = 1
+);
+----
+0
+
+# Apply a batch of conflicting DML ops before a single refresh
+statement ok
+INSERT INTO dist_order VALUES (4, 3, 1), (5, 1, 1), (5, 1, 1);
+
+statement ok
+DELETE FROM dist_order WHERE w_id = 1 AND d_id = 1;
+
+statement ok
+INSERT INTO dist_order VALUES (1, 1, 1);
+
+statement ok
+UPDATE dist_order SET local = 0 WHERE w_id = 2;
+
+statement ok
+PRAGMA ivm('mv_dist_order');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT w_id, d_id FROM dist_order WHERE local = 1
+    EXCEPT ALL SELECT w_id, d_id FROM mv_dist_order
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, d_id FROM mv_dist_order
+    EXCEPT ALL SELECT DISTINCT w_id, d_id FROM dist_order WHERE local = 1
+);
+----
+0
+
+# IN (SELECT DISTINCT ...) — stale MARK JOIN condition binding
+statement ok
+CREATE TABLE dist_mark (w_id INT);
+
+statement ok
+INSERT INTO dist_mark VALUES (1), (2), (3), (3), (5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dist_mark AS
+    SELECT n FROM generate_series(1, 10) t(n) WHERE n IN (SELECT DISTINCT w_id FROM dist_mark);
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT n FROM generate_series(1, 10) t(n) WHERE n IN (SELECT DISTINCT w_id FROM dist_mark)
+    EXCEPT ALL SELECT n FROM mv_dist_mark
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT n FROM mv_dist_mark
+    EXCEPT ALL
+    SELECT n FROM generate_series(1, 10) t(n) WHERE n IN (SELECT DISTINCT w_id FROM dist_mark)
+);
+----
+0
