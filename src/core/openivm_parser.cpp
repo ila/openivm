@@ -12,7 +12,10 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -647,6 +650,101 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Single-table window views keep partition-level recompute.
 		if (found_window && found_join) {
 			window_partition_columns.clear();
+		}
+
+		// LEFT/RIGHT/OUTER JOIN aggregate with a non-trivial aggregate argument
+		// (e.g. `SUM(COALESCE(h.x, 0))`, `AVG(1)`, `SUM(CASE …)`) or a non-BCR
+		// projection wrapping an aggregate output (e.g. `COALESCE(SUM(…), 0)`)
+		// breaks the Larson & Zhou MERGE logic: the NULL-semantics shortcut that
+		// resets right-side aggregates to NULL when match_count=0 produces the
+		// wrong value when the stored expression would evaluate to the COALESCE
+		// default (0). Route these to group-recompute by setting found_minmax so
+		// the view is compiled with has_minmax=true. Detection runs only when
+		// the view already has a LEFT/RIGHT/OUTER JOIN and an AGGREGATE.
+		//   query_1502: COALESCE(SUM(ol.OL_QUANTITY), 0) AS ordered
+		//   query_1696/1699: SUM(COALESCE(h.H_AMOUNT, 0))
+		//   query_1746/1749: SUM(COALESCE(1, 0)), AVG(1)
+		if ((found_left_join || found_full_outer) && found_aggregation) {
+			bool needs_recompute = false;
+			std::function<bool(const Expression *)> is_pure_pass_through = [&](const Expression *expr) -> bool {
+				// A pure pass-through is a BCR or a cast of a BCR. Anything else
+				// (functions, CASE, COALESCE, arithmetic, constants) is "computed".
+				if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+					return true;
+				}
+				if (expr->expression_class == ExpressionClass::BOUND_CAST) {
+					auto &cast = expr->Cast<BoundCastExpression>();
+					return is_pure_pass_through(cast.child.get());
+				}
+				return false;
+			};
+			std::function<void(LogicalOperator *)> walk = [&](LogicalOperator *op) {
+				if (needs_recompute) {
+					return;
+				}
+				if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+					auto &agg = op->Cast<LogicalAggregate>();
+					for (auto &expr : agg.expressions) {
+						if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+							continue;
+						}
+						auto &bound = expr->Cast<BoundAggregateExpression>();
+						// count_star() has no children — trivially safe.
+						for (auto &child : bound.children) {
+							if (!is_pure_pass_through(child.get())) {
+								needs_recompute = true;
+								return;
+							}
+						}
+					}
+				}
+				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+					auto &proj = op->Cast<LogicalProjection>();
+					for (auto &expr : proj.expressions) {
+						// A projection expression over an aggregate output is
+						// "computed" if it's not a pure BCR. If its BCR refers to
+						// the AGGREGATE's table_index, it's a pass-through; any
+						// other structure (COALESCE/CASE/function over BCR) is a
+						// wrapper that breaks MERGE semantics.
+						if (!is_pure_pass_through(expr.get())) {
+							// Only flag if this expression references an
+							// aggregate output (not just a group column).
+							bool refs_agg = false;
+							std::function<void(const Expression *)> check = [&](const Expression *e) {
+								if (refs_agg) {
+									return;
+								}
+								if (e->type == ExpressionType::BOUND_COLUMN_REF) {
+									auto &bcr = e->Cast<BoundColumnRefExpression>();
+									// Find the AGGREGATE's binding index to compare.
+									// Conservatively flag any non-group BCR as aggregate ref.
+									if (bcr.binding.table_index != analysis.group_index) {
+										refs_agg = true;
+									}
+									return;
+								}
+								ExpressionIterator::EnumerateChildren(
+								    const_cast<Expression &>(*e), [&](unique_ptr<Expression> &c) { check(c.get()); });
+							};
+							check(expr.get());
+							if (refs_agg) {
+								needs_recompute = true;
+								return;
+							}
+						}
+					}
+				}
+				for (auto &child : op->children) {
+					walk(child.get());
+				}
+			};
+			walk(plan.get());
+			if (needs_recompute) {
+				OPENIVM_DEBUG_PRINT(
+				    "[CREATE MV] LEFT/OUTER JOIN aggregate with computed aggregate or projection wrapper — "
+				    "using group-recompute (found_minmax=true)\n");
+				found_minmax = true;
+			}
 		}
 
 		IVMType ivm_type;

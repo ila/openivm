@@ -820,3 +820,94 @@ SELECT count(*) FROM (
 ----
 0
 
+# Fix E — LEFT/RIGHT/OUTER JOIN aggregate with COALESCE-wrapped aggregate or
+# non-pass-through projection. The Larson & Zhou MERGE assumes raw
+# SUM(NULL)=NULL semantics when match_count=0, which produces the wrong value
+# for SUM(COALESCE(x, 0)) (expects 0) or COALESCE(SUM(x), 0) (expects 0 at
+# the wrapper). The parser detects non-BCR aggregate arguments or non-BCR
+# projection expressions over aggregate output and routes these to
+# group-recompute (found_minmax=true).
+
+# query_1502 shape: COALESCE wraps the SUM in the projection.
+statement ok
+CREATE TABLE fixe_stock (sw INT, si INT, sq INT);
+
+statement ok
+INSERT INTO fixe_stock VALUES (1, 100, 10), (1, 200, 20), (2, 100, 30);
+
+statement ok
+CREATE TABLE fixe_ol (olw INT, oli INT, oln INT, olq INT);
+
+statement ok
+INSERT INTO fixe_ol VALUES (1, 100, 1, 5), (1, 100, 2, 3);
+
+statement ok
+CREATE MATERIALIZED VIEW fixe_mv AS SELECT s.sw, s.si, s.sq, COUNT(ol.oln) AS sales, COALESCE(SUM(ol.olq), 0) AS ordered FROM fixe_stock s LEFT JOIN fixe_ol ol ON s.si = ol.oli AND s.sw = ol.olw GROUP BY s.sw, s.si, s.sq;
+
+statement ok
+INSERT INTO fixe_ol VALUES (2, 100, 1, 100);
+
+statement ok
+INSERT INTO fixe_stock VALUES (1, 300, 40);
+
+statement ok
+UPDATE fixe_ol SET olq = 7 WHERE oli = 100 AND olw = 1 AND oln = 1;
+
+statement ok
+DELETE FROM fixe_ol WHERE oli = 100 AND olw = 1 AND oln = 2;
+
+statement ok
+PRAGMA ivm('fixe_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM fixe_mv EXCEPT ALL SELECT s.sw, s.si, s.sq, COUNT(ol.oln), COALESCE(SUM(ol.olq), 0) FROM fixe_stock s LEFT JOIN fixe_ol ol ON s.si = ol.oli AND s.sw = ol.olw GROUP BY s.sw, s.si, s.sq);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT s.sw, s.si, s.sq, COUNT(ol.oln), COALESCE(SUM(ol.olq), 0) FROM fixe_stock s LEFT JOIN fixe_ol ol ON s.si = ol.oli AND s.sw = ol.olw GROUP BY s.sw, s.si, s.sq EXCEPT ALL SELECT * FROM fixe_mv);
+----
+0
+
+# query_1696/1699 shape: SUM(COALESCE(h.col, 0)) + AVG(h.col) — COALESCE
+# inside the aggregate argument, plus AVG on the same null-padded column.
+statement ok
+CREATE TABLE fixe_c (cid INT, cw INT);
+
+statement ok
+INSERT INTO fixe_c VALUES (100, 1), (101, 1), (200, 2);
+
+statement ok
+CREATE TABLE fixe_h (hcid INT, hcw INT, hamt DECIMAL(6,2));
+
+statement ok
+INSERT INTO fixe_h VALUES (100, 1, 50), (100, 1, 25);
+
+statement ok
+CREATE MATERIALIZED VIEW fixe_mv2 AS SELECT c.cid, COUNT(*) AS n, SUM(COALESCE(h.hamt, 0)) AS tot, AVG(h.hamt) AS avg_val FROM fixe_c c LEFT JOIN fixe_h h ON c.cid = h.hcid AND c.cw = h.hcw GROUP BY c.cid;
+
+statement ok
+INSERT INTO fixe_h VALUES (101, 1, 30);
+
+statement ok
+INSERT INTO fixe_c VALUES (201, 2);
+
+statement ok
+UPDATE fixe_h SET hamt = 60 WHERE hcid = 100 AND hamt = 50;
+
+statement ok
+DELETE FROM fixe_h WHERE hcid = 100 AND hamt = 25;
+
+statement ok
+PRAGMA ivm('fixe_mv2');
+
+query I
+SELECT count(*) FROM (SELECT * FROM fixe_mv2 EXCEPT ALL SELECT c.cid, COUNT(*), SUM(COALESCE(h.hamt, 0))::DECIMAL(38,2), AVG(h.hamt)::DOUBLE FROM fixe_c c LEFT JOIN fixe_h h ON c.cid = h.hcid AND c.cw = h.hcw GROUP BY c.cid);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT c.cid, COUNT(*), SUM(COALESCE(h.hamt, 0))::DECIMAL(38,2), AVG(h.hamt)::DOUBLE FROM fixe_c c LEFT JOIN fixe_h h ON c.cid = h.hcid AND c.cw = h.hcw GROUP BY c.cid EXCEPT ALL SELECT * FROM fixe_mv2);
+----
+0
+
