@@ -70,9 +70,16 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
 	string query = "DELETE FROM " + qdt + ";\n";
 	query += "INSERT INTO " + qdt + " " + view_query_sql + ";\n\n";
 
+	// metadata.UpdateTimestamp runs on the native-catalog metadata connection immediately.
+	// For cross_system (DuckLake), do NOT include update_ts in the returned string — exec_con
+	// will have already modified dl, and writing to the physical-default catalog in the same
+	// implicit transaction is forbidden by DuckDB's cross-catalog write restriction.
 	metadata.UpdateTimestamp(view_name);
-	string update_ts = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_update = now() WHERE view_name = '" +
-	                   OpenIVMUtils::EscapeValue(view_name) + "';\n";
+	string update_ts;
+	if (!cross_system) {
+		update_ts = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_update = now() WHERE view_name = '" +
+		            OpenIVMUtils::EscapeValue(view_name) + "';\n";
+	}
 
 	string delta_cleanup;
 	auto delta_tables = metadata.GetDeltaTables(view_name);
@@ -93,7 +100,8 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
 // Generate refresh SQL for a single view (no cascade logic).
 static string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name,
                                  const string &view_schema_name, const string &view_name, bool cross_system,
-                                 const string &attached_db_catalog_name, const string &attached_db_schema_name);
+                                 const string &attached_db_catalog_name, const string &attached_db_schema_name,
+                                 string *out_pre_meta = nullptr, string *out_post_meta = nullptr);
 
 // Generate and execute refresh SQL for a single view under its per-view lock.
 // When ivm_adaptive_refresh is on, also computes a cost estimate before execution
@@ -129,8 +137,12 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 			cost_con.Rollback();
 		}
 
-		string sql = GenerateRefreshSQL(context, view_catalog_name, view_schema_name, vn, cross_system,
-		                                attached_db_catalog_name, attached_db_schema_name);
+		// For cross_system (DuckLake) MVs, split the refresh SQL into data ops (dl catalog)
+		// and metadata ops (physical-default catalog) to avoid the cross-catalog write error.
+		string meta_pre_sql, meta_post_sql;
+		string sql = GenerateRefreshSQL(
+		    context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
+		    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr, cross_system ? &meta_post_sql : nullptr);
 		Connection exec_con(*context.db.get());
 		OPENIVM_DEBUG_PRINT("[UPSERT] Executing refresh SQL:\n%s\n", sql.c_str());
 
@@ -139,9 +151,13 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		// flag is inside the same transaction, so it also rolls back on failure — WAL recovery
 		// handles the crash case automatically.
 		// DuckLake (cross_system) skips this: DuckDB forbids writing to two attached databases
-		// (memory + dl) within a single transaction.
+		// (metadata catalog + dl) within a single transaction. Instead, we run metadata ops on
+		// a separate meta_con (physical-default catalog) and data ops on exec_con (dl catalog).
 		if (!cross_system) {
 			exec_con.BeginTransaction();
+		} else if (!meta_pre_sql.empty()) {
+			Connection meta_con(*context.db.get());
+			meta_con.Query(meta_pre_sql);
 		}
 		auto start = std::chrono::steady_clock::now();
 		auto result = exec_con.Query(sql);
@@ -155,6 +171,9 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		}
 		if (!cross_system) {
 			exec_con.Commit();
+		} else if (!meta_post_sql.empty()) {
+			Connection meta_con(*context.db.get());
+			meta_con.Query(meta_post_sql);
 		}
 
 		// Record execution history for the learned cost model.
@@ -253,6 +272,22 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 			}
 			OPENIVM_DEBUG_PRINT("[UPSERT] Resolved catalog='%s', schema='%s'\n", view_catalog_name.c_str(),
 			                    view_schema_name.c_str());
+		}
+	}
+
+	// cross_system detection: the view's catalog differs from the fresh connection's physical
+	// default. Metadata tables (_duckdb_ivm_views etc.) live in the physical default; data/view
+	// tables live in view_catalog_name. DuckDB forbids cross-catalog writes in one transaction,
+	// so RefreshViewLocked must split the refresh SQL into data ops and metadata ops.
+	if (!view_catalog_name.empty()) {
+		Connection probe(*context.db.get());
+		string probe_default;
+		auto res = probe.Query("SELECT current_database()");
+		if (!res->HasError() && res->RowCount() > 0) {
+			probe_default = res->GetValue(0, 0).ToString();
+		}
+		if (!probe_default.empty() && view_catalog_name != probe_default) {
+			cross_system = true;
 		}
 	}
 
@@ -371,14 +406,23 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	}
 }
 
+// When cross_system is true (DuckLake MVs), the refresh SQL touches two catalogs:
+// data ops write to dl.main.*, metadata ops write to the physical default.
+// DuckDB forbids cross-catalog writes in one transaction. We split the SQL into
+// three parts: pre-metadata (set_in_progress), data ops, post-metadata (timestamps).
+// out_pre_meta / out_post_meta receive those parts; the return value is data-only.
+// When cross_system is false (or out_pre_meta is null), returns the combined SQL.
 static string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name,
                                  const string &view_schema_name, const string &view_name, bool cross_system,
-                                 const string &attached_db_catalog_name, const string &attached_db_schema_name) {
+                                 const string &attached_db_catalog_name, const string &attached_db_schema_name,
+                                 string *out_pre_meta, string *out_post_meta) {
 	auto &catalog = Catalog::GetSystemCatalog(context);
 	QueryErrorContext error_context = QueryErrorContext();
 	Connection con(*context.db.get());
 	// Catalog-qualified prefix for SQL references (e.g. "dl.main." or "" for default).
 	// Only add the prefix when the catalog is non-default (e.g. DuckLake attached DB).
+	// Metadata tables (_duckdb_ivm_views etc.) are always unqualified — they live in the
+	// physical default catalog, resolved via the fresh connection without any USE.
 	string catalog_prefix;
 	if (!view_catalog_name.empty() && view_catalog_name != "memory") {
 		catalog_prefix = view_catalog_name + "." + view_schema_name + ".";
@@ -1179,9 +1223,23 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// 7. clear_in_progress: crash safety — flag cleared after timestamp is set
 	// 8. delete_from_view: clean old delta_view rows
 	// 9. delete_from_delta: clean old base delta rows
-	string clean_query = set_in_progress + pre_companion + ivm_query + "\n" + companion_query + "\n" + upsert_query +
-	                     "\n" + post_companion + update_timestamp_query + snapshot_update_query + "\n" +
-	                     clear_in_progress + delete_from_view_query + "\n" + delete_from_delta_table_query;
+	//
+	// For cross_system (DuckLake) MVs, steps 0 and 6-7 write to the physical-default catalog
+	// (metadata tables) while steps 1-5 and 8-9 write to dl. DuckDB forbids cross-catalog
+	// writes in one transaction. When out_pre_meta/out_post_meta are provided, we split them.
+	string data_sql = pre_companion + ivm_query + "\n" + companion_query + "\n" + upsert_query + "\n" + post_companion +
+	                  delete_from_view_query + "\n" + delete_from_delta_table_query;
+	string meta_pre_sql = set_in_progress;
+	string meta_post_sql = update_timestamp_query + snapshot_update_query + "\n" + clear_in_progress;
+
+	string clean_query;
+	if (cross_system && out_pre_meta != nullptr && out_post_meta != nullptr) {
+		*out_pre_meta = meta_pre_sql;
+		*out_post_meta = meta_post_sql;
+		clean_query = data_sql;
+	} else {
+		clean_query = meta_pre_sql + data_sql + meta_post_sql;
+	}
 
 	// Write reference SQL to disk only if ivm_files_path is explicitly set
 	Value files_path_val;

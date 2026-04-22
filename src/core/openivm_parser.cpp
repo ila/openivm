@@ -8,6 +8,7 @@
 #include "rules/column_hider.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -26,6 +27,7 @@
 #include "duckdb/optimizer/cte_inlining.hpp"
 
 #include "core/openivm_debug.hpp"
+#include "storage/ducklake_scan.hpp"
 
 #include <regex>
 
@@ -151,6 +153,29 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 	if (ivm_parse_data.plan) {
 		Connection con(*context.db.get());
 
+		// Capture the current catalog/schema from the originating context. IVMDDLBindFunction
+		// creates a fresh Connection that reflects the DatabaseInstance's physical default
+		// catalog (not the session's USE setting). We only inject "USE catalog.schema" when
+		// the session's active catalog differs from that physical default — e.g. when DuckLake
+		// ("dl") is active but the file DB ("rewriter_benchmark_sf1") is the physical default.
+		string current_catalog;
+		string current_schema;
+		{
+			auto &sp = ClientData::Get(context).catalog_search_path;
+			auto def = sp->GetDefault();
+			current_catalog = def.catalog;
+			current_schema = def.schema.empty() ? "main" : def.schema;
+		}
+		// Query the physical default by running SELECT current_database() on the fresh `con`
+		// (created above without any USE, so it reflects the DB's true default, not the session).
+		string default_db;
+		{
+			auto res = con.Query("SELECT current_database()");
+			if (!res->HasError() && res->RowCount() > 0) {
+				default_db = res->GetValue(0, 0).ToString();
+			}
+		}
+
 		// Handle ALTER MATERIALIZED VIEW — just execute the metadata UPDATE
 		if (!ivm_parse_data.alter_sql.empty()) {
 			auto r = con.Query(ivm_parse_data.alter_sql);
@@ -194,6 +219,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			view_name = full_view_name.substr(dot_pos + 1);
 		} else {
 			view_name = full_view_name;
+			// When the MV name is unqualified but the session is in a non-default catalog
+			// (e.g. USE dl.main), explicitly qualify so data/view tables land in dl rather
+			// than the physical default. Metadata tables (unqualified) stay in the physical
+			// default — PRAGMA ivm() always uses a fresh connection without USE.
+			if (!current_catalog.empty() && current_catalog != default_db) {
+				view_catalog_prefix = current_catalog + "." + current_schema + ".";
+			}
 		}
 		string view_query = original_view_query; // will be overwritten by LPTS for DDL
 
@@ -939,61 +971,69 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// Classify each base table by catalog type (duckdb vs ducklake).
 		// DuckLake tables use native change tracking; DuckDB tables use delta tables.
+		//
+		// Catalog::GetEntry inside BeginTransaction() cannot see DuckLake entries:
+		// DuckLake requires its own transaction protocol. Walk the logical plan's
+		// DUCKLAKE_SCAN nodes instead — same approach used in ducklake_join.cpp.
+		struct DuckLakeTableInfo {
+			string table_name;   // actual name as stored in DuckLake (case-preserved)
+			string catalog_name; // DuckLake catalog name (e.g., "dl")
+		};
+		unordered_map<string, DuckLakeTableInfo> dl_table_info; // keyed by lowercased name
+		{
+			std::function<void(LogicalOperator *)> collect_dl = [&](LogicalOperator *op) {
+				if (!op) {
+					return;
+				}
+				if (op->type == LogicalOperatorType::LOGICAL_GET) {
+					auto &get = op->Cast<LogicalGet>();
+					if (get.function.name == "ducklake_scan" && get.function.function_info) {
+						auto &info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
+						string lc = info.table_name;
+						std::transform(lc.begin(), lc.end(), lc.begin(),
+						               [](unsigned char c) { return std::tolower(c); });
+						if (dl_table_info.find(lc) == dl_table_info.end()) {
+							string cat = current_catalog.empty() ? "dl" : current_catalog;
+							dl_table_info[lc] = {info.table_name, cat};
+						}
+					}
+				}
+				for (auto &child : op->children) {
+					collect_dl(child.get());
+				}
+			};
+			collect_dl(plan.get());
+		}
+
 		unordered_set<string> ducklake_tables;
+		// Single snapshot query per DuckLake catalog (all tables share the same snapshot).
+		string dl_snapshot_val = "null";
+		if (!dl_table_info.empty()) {
+			// Use the first entry's catalog — all source tables in one MV share one catalog.
+			string cat = dl_table_info.begin()->second.catalog_name;
+			auto snap_result = con.Query("SELECT id FROM " + cat + ".current_snapshot()");
+			if (!snap_result->HasError() && snap_result->RowCount() > 0) {
+				dl_snapshot_val = snap_result->GetValue(0, 0).ToString();
+			}
+		}
+
 		for (const auto &table_name : table_names) {
 			string catalog_type = "duckdb";
 			string snapshot_val = "null";
 			string meta_table_name = OpenIVMUtils::DeltaName(table_name);
 
-			// Look up the table in all available catalogs to detect its type.
-			// GetTableNames() returns unqualified names, so we search the catalog path
-			// and also check attached catalogs explicitly.
-			con.BeginTransaction();
-			auto entry = Catalog::GetEntry<TableCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA, table_name,
-			                                                  OnEntryNotFound::RETURN_NULL);
-			// If not found in default search path, search all attached catalogs
-			if (!entry) {
-				auto &db_manager = DatabaseManager::Get(*con.context);
-				auto databases = db_manager.GetDatabases(*con.context);
-				for (auto &db : databases) {
-					if (entry) {
-						break;
-					}
-					auto &cat_name = db->GetName();
-					auto found = Catalog::GetEntry<TableCatalogEntry>(*con.context, cat_name, DEFAULT_SCHEMA,
-					                                                  table_name, OnEntryNotFound::RETURN_NULL);
-					if (found) {
-						entry = found;
-					}
-				}
-			}
-			if (entry) {
-				string cat_type = entry->ParentCatalog().GetCatalogType();
-				if (cat_type == "ducklake") {
-					catalog_type = "ducklake";
-					// Use the catalog's actual table name (entry->name), not the
-					// unquoted form from GetTableNames — the DuckLake join rule
-					// looks up metadata by `get->GetTable()->name`, which is the
-					// catalog-stored case.
-					meta_table_name = entry->name;
-					ducklake_tables.insert(entry->name);
-					// Also cache the SQL-parsed name so the delta-table skip loop
-					// below still matches when GetTableNames lowercased the SQL
-					// text but entry->name kept the original catalog case.
-					ducklake_tables.insert(table_name);
-
-					// Get current snapshot ID from DuckLake catalog
-					string cat_name = entry->ParentCatalog().GetName();
-					con.Rollback();
-					auto snap_result = con.Query("SELECT id FROM " + cat_name + ".current_snapshot()");
-					if (!snap_result->HasError() && snap_result->RowCount() > 0) {
-						snapshot_val = snap_result->GetValue(0, 0).ToString();
-					}
-				} else {
-					con.Rollback();
-				}
-			} else {
-				con.Rollback();
+			string table_lc = table_name;
+			std::transform(table_lc.begin(), table_lc.end(), table_lc.begin(),
+			               [](unsigned char c) { return std::tolower(c); });
+			auto it = dl_table_info.find(table_lc);
+			if (it != dl_table_info.end()) {
+				catalog_type = "ducklake";
+				meta_table_name = it->second.table_name; // case-preserved name
+				ducklake_tables.insert(it->second.table_name);
+				ducklake_tables.insert(table_name); // also insert SQL-parsed name
+				snapshot_val = dl_snapshot_val;
+				OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake table '%s' → meta_name='%s', snap=%s\n", table_name.c_str(),
+				                    meta_table_name.c_str(), snapshot_val.c_str());
 			}
 
 			ddl.push_back("insert into " + string(ivm::DELTA_TABLES_TABLE) + " values ('" + view_name + "', '" +
@@ -1070,7 +1110,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				con.Rollback();
 			}
 			if (catalog_value.IsNull()) {
-				catalog_value = Value("memory");
+				catalog_value = Value(current_catalog.empty() ? "memory" : current_catalog);
 			}
 
 			if (schema_value.IsNull()) {
@@ -1091,9 +1131,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		ddl.push_back("alter table " + qdv + " alter " + string(ivm::TIMESTAMP_COL) + " set default now()");
 
 		// --- Index DDL (for aggregate group queries) ---
-		// DuckLake does not support indexes, so skip for DuckLake-backed MVs.
+		// DuckLake does not support indexes. Skip when: (a) any source table is DuckLake, OR
+		// (b) view_catalog_prefix is non-empty, meaning the data table lands in a non-default
+		// catalog (which is always DuckLake when set via the current_catalog != default_db path).
 		if ((ivm_type == IVMType::AGGREGATE_GROUP || ivm_type == IVMType::AGGREGATE_HAVING) &&
-		    ducklake_tables.empty()) {
+		    ducklake_tables.empty() && view_catalog_prefix.empty()) {
 			string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + ivm::INDEX_SUFFIX);
 			string index_query_view = "create unique index " + index_name + " on " + qdt + "(";
 			for (size_t i = 0; i < aggregate_columns.size(); i++) {
@@ -1112,7 +1154,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		for (const auto &table_name : table_names) {
 			if (ducklake_tables.count(table_name)) {
 				string cat_name = view_catalog_prefix.empty()
-				                      ? "memory"
+				                      ? (current_catalog.empty() ? "memory" : current_catalog)
 				                      : view_catalog_prefix.substr(0, view_catalog_prefix.size() - 1);
 				// Remove trailing dot and extract catalog name
 				auto dot = cat_name.rfind('.');

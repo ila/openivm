@@ -160,7 +160,22 @@ static vector<string> CollectQueryFiles(const string &dir) {
 		}
 	}
 	closedir(d);
-	std::sort(files.begin(), files.end());
+	// Sort: native `query_*` first, DuckLake `ducklake_*` last. DuckLake queries
+	// can trigger INTERNAL errors that invalidate the DB and force the parent to
+	// delete the WAL. If DuckLake runs first (alphabetical), that WAL deletion
+	// wipes the native TPC-C tables before any native query runs. Reverse order
+	// so native runs on a clean DB, then DuckLake runs against the same DB.
+	std::sort(files.begin(), files.end(), [](const string &a, const string &b) {
+		auto basename = [](const string &p) {
+			auto pos = p.find_last_of('/');
+			return pos != string::npos ? p.substr(pos + 1) : p;
+		};
+		string ba = basename(a), bb = basename(b);
+		bool a_dl = ba.rfind("ducklake_", 0) == 0;
+		bool b_dl = bb.rfind("ducklake_", 0) == 0;
+		if (a_dl != b_dl) return !a_dl; // native (non-ducklake) first
+		return ba < bb;
+	});
 	return files;
 }
 
@@ -462,6 +477,19 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			_exit(2);
 		}
 
+		// Figure out the default (native) catalog name so we can switch back
+		// after a ducklake query. When `db_path` is a file like
+		// `rewriter_benchmark_sf1.db`, DuckDB names the catalog
+		// `rewriter_benchmark_sf1` — not `memory`.
+		string native_catalog = "memory";
+		{
+			auto cur = con.Query("SELECT current_database()");
+			if (cur && !cur->HasError() && cur->RowCount() > 0) {
+				native_catalog = cur->GetValue(0, 0).ToString();
+			}
+		}
+		string native_use = "USE " + native_catalog + ".main";
+
 		// Attach a DuckLake catalog alongside native tables. Queries whose filename
 		// starts with `ducklake_` will be run after `USE dl.main` so their
 		// unqualified table references resolve to the DuckLake copy of TPC-C.
@@ -477,47 +505,58 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				if (at && !at->HasError()) {
 					ducklake_ok = true;
 					// Populate TPC-C tables in the DuckLake catalog on first attach.
+					// Use LOWER() to handle DuckLake's uppercase table names (e.g. 'WAREHOUSE').
 					auto have = con.Query("SELECT COUNT(*) FROM information_schema.tables "
-					                      "WHERE table_catalog = 'dl' AND table_name = 'warehouse'");
+					                      "WHERE table_catalog = 'dl' AND LOWER(table_name) = 'warehouse'");
 					bool needs_init =
 					    !have || have->HasError() || have->RowCount() == 0 || have->GetValue(0, 0).GetValue<int64_t>() == 0;
 					if (needs_init) {
 						con.Query("USE dl.main");
 						CreateTPCCSchema(con);
-						// Copy data from native tables into DuckLake tables so both
-						// catalogs start with identical state.
+						// Copy data from the native catalog (captured above into
+						// `native_catalog`) into DuckLake so both start identical.
 						for (const char *t : {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM", "STOCK", "OORDER",
 						                      "NEW_ORDER", "ORDER_LINE", "HISTORY"}) {
-							con.Query(string("INSERT INTO ") + t + " SELECT * FROM memory.main." + t);
+							con.Query(string("INSERT INTO ") + t + " SELECT * FROM " + native_catalog + ".main." + t);
 						}
-						con.Query("USE memory.main");
+						con.Query(native_use);
+					} else {
+						// Ensure we're always in the native catalog context after DuckLake check.
+						con.Query(native_use);
 					}
 				}
 			}
 		}
 
 		// Clean up any leftover mv_q* views and orphaned data tables from a previous crashed child.
-		// DROP VIEW (not DROP MATERIALIZED VIEW — DuckDB intercepts that before OpenIVM) performs
-		// the full cleanup: user-facing view, data table, delta view, and metadata entries.
-		// Pass 2 catches orphaned data tables for crashes that happened before metadata was committed.
+		// DuckLake MVs (created with USE dl.main) land in dl.main.*, so we use catalog-qualified
+		// drops via information_schema which spans all catalogs.
 		{
-			auto leftover = con.Query("SELECT view_name FROM _duckdb_ivm_views WHERE view_name LIKE 'mv_q%'");
+			// Drop views from all catalogs
+			auto leftover = con.Query("SELECT table_catalog, table_name FROM information_schema.views "
+			                          "WHERE table_name LIKE 'mv_q%' AND table_schema = 'main'");
 			if (leftover && !leftover->HasError()) {
 				for (idx_t r = 0; r < leftover->RowCount(); r++) {
-					string vn = leftover->GetValue(0, r).ToString();
-					con.Query("DROP VIEW IF EXISTS " + vn);
+					string cat = leftover->GetValue(0, r).ToString();
+					string vn = leftover->GetValue(1, r).ToString();
+					con.Query("DROP VIEW IF EXISTS " + cat + ".main." + vn);
 				}
 			}
-			// Drop orphaned data tables not caught by DROP VIEW
+			// Drop orphaned data/delta tables from all catalogs
 			auto orphaned =
-			    con.Query("SELECT table_name FROM information_schema.tables "
-			              "WHERE table_name LIKE '_ivm_data_mv_q%' AND table_schema = 'main'");
+			    con.Query("SELECT table_catalog, table_name FROM information_schema.tables "
+			              "WHERE (table_name LIKE '_ivm_data_mv_q%' OR table_name LIKE 'delta_mv_q%'"
+			              "    OR table_name LIKE 'ivm_delta_mv_q%') AND table_schema = 'main'");
 			if (orphaned && !orphaned->HasError()) {
 				for (idx_t r = 0; r < orphaned->RowCount(); r++) {
-					string tn = orphaned->GetValue(0, r).ToString();
-					con.Query("DROP TABLE IF EXISTS " + tn);
+					string cat = orphaned->GetValue(0, r).ToString();
+					string tn = orphaned->GetValue(1, r).ToString();
+					con.Query("DROP TABLE IF EXISTS " + cat + ".main." + tn);
 				}
 			}
+			// Clean metadata tables (always in native catalog, unqualified)
+			con.Query("DELETE FROM _duckdb_ivm_views WHERE view_name LIKE 'mv_q%'");
+			con.Query("DELETE FROM _duckdb_ivm_delta_tables WHERE view_name LIKE 'mv_q%'");
 		}
 
 		int delta_idx = 0;
@@ -582,7 +621,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			if (is_ducklake_query) {
 				con.Query("USE dl.main");
 			} else {
-				con.Query("USE memory.main");
+				con.Query(native_use);
 			}
 
 			uint8_t phase_reached = 0;  // 1=duckdb_fail, 2=mv_fail, 3=delta_fail, 4=refresh_fail, 5=verify_fail, 6=ok, 99=crash

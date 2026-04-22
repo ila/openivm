@@ -986,11 +986,14 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 			}
 			return false;
 		}
-		// Only descend through transparent operators. Stop at JOIN, UNION, GET, etc.
+		// Only descend through transparent operators. Stop at JOIN, UNION, GET, AGGREGATE, etc.
+		// AGGREGATE is intentionally excluded: HAVING is always a FILTER *above* its AGGREGATE,
+		// never inside it. Descending into AGGREGATE children would find a nested HAVING from
+		// an inner subquery or a DISTINCT-rewrite-introduced outer AGGREGATE, and erroneously
+		// expose _ivm_having_N columns that are invisible in the outer output.
 		if (node->type != LogicalOperatorType::LOGICAL_PROJECTION &&
 		    node->type != LogicalOperatorType::LOGICAL_FILTER && node->type != LogicalOperatorType::LOGICAL_ORDER_BY &&
-		    node->type != LogicalOperatorType::LOGICAL_LIMIT && node->type != LogicalOperatorType::LOGICAL_DISTINCT &&
-		    node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		    node->type != LogicalOperatorType::LOGICAL_LIMIT && node->type != LogicalOperatorType::LOGICAL_DISTINCT) {
 			return false;
 		}
 		for (auto &child : node->children) {
