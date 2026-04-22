@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER", "non_incr_reason": "op:SUBQUERY_FILTER", "ducklake": true}
+SELECT o.O_W_ID, o.O_D_ID, AVG(o.O_OL_CNT) AS avg_lines FROM dl.OORDER o WHERE o.O_OL_CNT > (SELECT AVG(O_OL_CNT) / 2 FROM dl.OORDER) GROUP BY o.O_W_ID, o.O_D_ID;

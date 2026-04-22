@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER,OORDER,ORDER_LINE", "ducklake": true}
+SELECT o.O_W_ID, o.O_ID, c.C_CREDIT, SUM(CASE WHEN c.C_CREDIT = 'GC' THEN ol.OL_AMOUNT * 0.95 ELSE ol.OL_AMOUNT END) AS adjusted_total FROM CUSTOMER c JOIN OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID GROUP BY o.O_W_ID, o.O_ID, c.C_CREDIT;

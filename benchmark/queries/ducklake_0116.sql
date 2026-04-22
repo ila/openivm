@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT", "ducklake": true}
+WITH w_big AS (SELECT W_ID, W_NAME, W_YTD FROM dl.WAREHOUSE WHERE W_YTD > 0), d_active AS (SELECT D_W_ID, D_ID, D_NAME FROM dl.DISTRICT WHERE D_YTD > 0) SELECT w.W_ID AS wid, w.W_NAME AS wname, d.D_ID AS did, d.D_NAME AS dname FROM w_big w JOIN d_active d ON w.W_ID = d.D_W_ID;

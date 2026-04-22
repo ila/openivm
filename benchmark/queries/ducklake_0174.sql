@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,FILTER,DISTINCT", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "ducklake": true}
+SELECT DISTINCT o.O_W_ID AS w, o.O_D_ID AS d, o.O_C_ID AS cust, o.O_CARRIER_ID AS carrier FROM dl.OORDER o JOIN dl.CUSTOMER c ON o.O_W_ID = c.C_W_ID AND o.O_D_ID = c.C_D_ID AND o.O_C_ID = c.C_ID WHERE o.O_CARRIER_ID IS NOT NULL;

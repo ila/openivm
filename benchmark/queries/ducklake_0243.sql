@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,DISTINCT", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "ducklake": true}
+SELECT COALESCE(c.C_W_ID, -1) AS w, COUNT(DISTINCT c.C_D_ID) AS districts_count, SUM(COALESCE(c.C_BALANCE, 0)) AS total_bal FROM dl.CUSTOMER c JOIN dl.DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID GROUP BY c.C_W_ID;

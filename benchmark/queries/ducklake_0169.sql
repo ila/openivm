@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN", "complexity": "low", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": true, "tables": "DISTRICT,CUSTOMER", "ducklake": true}
+SELECT c.C_W_ID, c.C_ID, c.C_BALANCE, c.C_YTD_PAYMENT, COALESCE(c.C_BALANCE, 0) + COALESCE(c.C_YTD_PAYMENT, 0) AS combined, CASE WHEN c.C_BALANCE < 0 THEN ABS(c.C_BALANCE) ELSE 0 END AS debt FROM dl.CUSTOMER c JOIN dl.DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID;

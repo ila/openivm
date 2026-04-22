@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "non_incr_reason": "op:ORDER", "ducklake": true}
+WITH cte AS (SELECT c.C_W_ID, c.C_D_ID, c.C_ID, c.C_BALANCE FROM dl.CUSTOMER c JOIN dl.DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID) SELECT C_W_ID, C_ID, C_BALANCE, LAG(C_BALANCE) OVER (PARTITION BY C_W_ID, C_D_ID ORDER BY C_ID) AS prev_bal FROM cte;

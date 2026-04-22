@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER,OORDER,ORDER_LINE", "ducklake": true}
+SELECT o.O_W_ID, o.O_ID, SUM(ol.OL_AMOUNT) AS total, CASE WHEN SUM(ol.OL_AMOUNT) > 100 THEN 'big' ELSE 'small' END AS size FROM OORDER o JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID JOIN CUSTOMER c ON o.O_W_ID = c.C_W_ID AND o.O_D_ID = c.C_D_ID AND o.O_C_ID = c.C_ID GROUP BY o.O_W_ID, o.O_ID HAVING SUM(ol.OL_AMOUNT) > 50;

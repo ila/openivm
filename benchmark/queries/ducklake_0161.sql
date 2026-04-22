@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "OORDER,NEW_ORDER", "ducklake": true}
+SELECT COALESCE(o.O_W_ID, no.NO_W_ID) AS w, COALESCE(o.O_D_ID, no.NO_D_ID) AS d, SUM(o.O_OL_CNT) AS sum_ol, COUNT(no.NO_O_ID) AS cnt_no FROM dl.OORDER o FULL OUTER JOIN dl.NEW_ORDER no ON o.O_W_ID = no.NO_W_ID AND o.O_D_ID = no.NO_D_ID AND o.O_ID = no.NO_O_ID GROUP BY COALESCE(o.O_W_ID, no.NO_W_ID), COALESCE(o.O_D_ID, no.NO_D_ID);

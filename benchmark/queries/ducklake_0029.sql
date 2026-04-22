@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "non_incr_reason": "op:SUBQUERY_FILTER", "ducklake": true}
+SELECT o.O_W_ID, o.O_D_ID, COUNT(*) AS bigord FROM dl.OORDER o JOIN dl.CUSTOMER c ON o.O_W_ID = c.C_W_ID AND o.O_D_ID = c.C_D_ID AND o.O_C_ID = c.C_ID WHERE o.O_OL_CNT > (SELECT AVG(O_OL_CNT) FROM dl.OORDER) GROUP BY o.O_W_ID, o.O_D_ID;

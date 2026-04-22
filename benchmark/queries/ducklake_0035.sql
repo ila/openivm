@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK,ORDER_LINE", "ducklake": true}
+SELECT i.I_ID, i.I_NAME, SUM(ol.OL_QUANTITY) AS total_qty, AVG(i.I_PRICE) AS avg_price FROM ITEM i JOIN STOCK s ON i.I_ID = s.S_I_ID JOIN ORDER_LINE ol ON s.S_I_ID = ol.OL_I_ID AND s.S_W_ID = ol.OL_SUPPLY_W_ID GROUP BY i.I_ID, i.I_NAME;

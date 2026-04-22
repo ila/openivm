@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY", "ducklake": true}
+WITH h_totals AS (SELECT H_C_W_ID, H_C_D_ID, H_C_ID, SUM(H_AMOUNT) AS total FROM dl.HISTORY GROUP BY H_C_W_ID, H_C_D_ID, H_C_ID HAVING SUM(H_AMOUNT) > 100) SELECT c.C_W_ID, c.C_D_ID, c.C_ID, c.C_LAST, ht.total FROM dl.CUSTOMER c JOIN h_totals ht ON c.C_W_ID = ht.H_C_W_ID AND c.C_D_ID = ht.H_C_D_ID AND c.C_ID = ht.H_C_ID;

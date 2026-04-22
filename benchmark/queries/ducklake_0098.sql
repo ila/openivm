@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER,OORDER", "ducklake": true}
+SELECT c.C_W_ID, c.C_ID, c.C_CREDIT, COUNT(o.O_ID) AS orders, CASE WHEN c.C_CREDIT = 'BC' AND COUNT(o.O_ID) = 0 THEN 'no_activity' WHEN c.C_CREDIT = 'BC' THEN 'bc_active' WHEN c.C_CREDIT = 'GC' THEN 'gc_active' ELSE 'other' END AS tag FROM CUSTOMER c LEFT JOIN OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID GROUP BY c.C_W_ID, c.C_ID, c.C_CREDIT;

@@ -1,0 +1,2 @@
+-- {"operators": "FILTER,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "non_incr_reason": "op:ORDER", "ducklake": true}
+WITH big_cust AS (SELECT C_W_ID, C_ID, C_BALANCE, C_CREDIT_LIM FROM dl.CUSTOMER WHERE C_CREDIT_LIM > 0) SELECT C_W_ID, C_ID, C_BALANCE, C_CREDIT_LIM, (C_BALANCE / C_CREDIT_LIM) AS util, RANK() OVER (PARTITION BY C_W_ID ORDER BY C_BALANCE / C_CREDIT_LIM DESC) AS util_rank FROM big_cust;

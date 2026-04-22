@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER,HISTORY", "ducklake": true}
+SELECT h.H_C_W_ID, h.H_C_ID, COUNT(*) AS pay_count, SUM(h.H_AMOUNT) AS total, AVG(h.H_AMOUNT) AS avg_amt, CASE WHEN SUM(h.H_AMOUNT) > c.C_CREDIT_LIM THEN 'over_limit' ELSE 'within' END AS flag FROM dl.CUSTOMER c JOIN dl.HISTORY h ON c.C_W_ID = h.H_C_W_ID AND c.C_D_ID = h.H_C_D_ID AND c.C_ID = h.H_C_ID GROUP BY h.H_C_W_ID, h.H_C_ID, c.C_CREDIT_LIM;

@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": true, "tables": "OORDER", "ducklake": true}
+WITH shipping_status AS (SELECT o.O_W_ID, o.O_D_ID, o.O_ID, CASE WHEN o.O_CARRIER_ID IS NULL THEN 'pending' ELSE 'shipped' END AS status FROM dl.OORDER o) SELECT O_W_ID, status, COUNT(*) FROM shipping_status GROUP BY O_W_ID, status;

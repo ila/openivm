@@ -1,0 +1,2 @@
+-- {"operators": "ORDER,WINDOW", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "non_incr_reason": "op:ORDER", "ducklake": true}
+SELECT C_W_ID, C_ID, C_BALANCE, FIRST_VALUE(C_ID) OVER (PARTITION BY C_W_ID ORDER BY C_BALANCE DESC) AS top_cust, LAST_VALUE(C_ID) OVER (PARTITION BY C_W_ID ORDER BY C_BALANCE DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS bottom_cust FROM dl.CUSTOMER;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,ORDER,WINDOW", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "non_incr_reason": "op:ORDER", "ducklake": true}
+SELECT o.O_W_ID, o.O_ID, SUM(ol.OL_AMOUNT) AS order_total, RANK() OVER (PARTITION BY o.O_W_ID ORDER BY SUM(ol.OL_AMOUNT) DESC) AS order_rank FROM dl.OORDER o JOIN dl.ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID GROUP BY o.O_W_ID, o.O_ID;

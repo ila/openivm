@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "ducklake": true}
+SELECT c1.C_W_ID, c1.C_ID, c2.C_ID AS same_district_cust, (c1.C_BALANCE - c2.C_BALANCE) AS diff FROM dl.CUSTOMER c1 JOIN dl.CUSTOMER c2 ON c1.C_W_ID = c2.C_W_ID AND c1.C_D_ID = c2.C_D_ID AND c1.C_ID < c2.C_ID WHERE ABS(c1.C_BALANCE - c2.C_BALANCE) > 10;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "ducklake": true}
+WITH item_costs AS (SELECT ol.OL_W_ID, ol.OL_I_ID, SUM(ol.OL_QUANTITY) AS qty, SUM(ol.OL_AMOUNT) AS amt FROM dl.ORDER_LINE ol GROUP BY ol.OL_W_ID, ol.OL_I_ID) SELECT ic.OL_W_ID, ic.OL_I_ID, i.I_NAME, ic.qty, ic.amt, (ic.amt / NULLIF(ic.qty, 0)) AS avg_unit_price FROM item_costs ic JOIN dl.ITEM i ON ic.OL_I_ID = i.I_ID;

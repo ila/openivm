@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,FILTER", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK", "ducklake": true}
+SELECT s1.S_W_ID, s1.S_I_ID, s2.S_I_ID AS other_item, i1.I_NAME, i2.I_NAME AS other_name, (s1.S_QUANTITY - s2.S_QUANTITY) AS qty_diff FROM STOCK s1 JOIN STOCK s2 ON s1.S_W_ID = s2.S_W_ID AND s1.S_I_ID <> s2.S_I_ID JOIN ITEM i1 ON s1.S_I_ID = i1.I_ID JOIN ITEM i2 ON s2.S_I_ID = i2.I_ID WHERE s1.S_I_ID < s2.S_I_ID;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "ducklake": true}
+WITH pending AS (SELECT O_W_ID, O_D_ID, O_ID FROM dl.OORDER WHERE O_CARRIER_ID IS NULL) SELECT p.O_W_ID, p.O_D_ID, COUNT(ol.OL_NUMBER) AS pending_lines, SUM(ol.OL_AMOUNT) AS pending_value FROM pending p JOIN dl.ORDER_LINE ol ON p.O_W_ID = ol.OL_W_ID AND p.O_D_ID = ol.OL_D_ID AND p.O_ID = ol.OL_O_ID GROUP BY p.O_W_ID, p.O_D_ID;

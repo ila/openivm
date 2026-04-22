@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "DISTRICT,CUSTOMER", "ducklake": true}
+SELECT c.C_W_ID, c.C_D_ID, c.C_ID, c.C_BALANCE, c.C_YTD_PAYMENT, (c.C_BALANCE + c.C_YTD_PAYMENT * 0.1) AS projected, CASE WHEN c.C_BALANCE + c.C_YTD_PAYMENT * 0.1 > c.C_CREDIT_LIM THEN 'over' ELSE 'ok' END AS flag FROM dl.CUSTOMER c JOIN dl.DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID;

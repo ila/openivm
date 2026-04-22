@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "ducklake": true}
+SELECT c.C_W_ID, c.C_ID, c.C_LAST, sub.order_cnt FROM dl.CUSTOMER c LEFT JOIN (SELECT O_W_ID, O_D_ID, O_C_ID, COUNT(*) AS order_cnt FROM dl.OORDER GROUP BY O_W_ID, O_D_ID, O_C_ID) sub ON c.C_W_ID = sub.O_W_ID AND c.C_D_ID = sub.O_D_ID AND c.C_ID = sub.O_C_ID;

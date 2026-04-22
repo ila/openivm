@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,HAVING,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": true, "tables": "WAREHOUSE,CUSTOMER", "ducklake": true}
+SELECT w.W_ID, COUNT(DISTINCT c.C_ID) AS custs, SUM(c.C_BALANCE) AS total_bal, CASE WHEN SUM(c.C_BALANCE) > 0 THEN 'surplus' ELSE 'deficit' END AS status FROM dl.WAREHOUSE w JOIN dl.CUSTOMER c ON w.W_ID = c.C_W_ID WHERE c.C_CREDIT IS NOT NULL GROUP BY w.W_ID HAVING COUNT(*) > 5;

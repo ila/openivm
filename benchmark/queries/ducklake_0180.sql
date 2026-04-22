@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,CTE,SUBQUERY,VALUES_ONLY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "non_incr_reason": "op:VALUES_ONLY", "ducklake": true}
+WITH tiers AS (SELECT * FROM (VALUES (0, 100, 'small'), (100, 500, 'medium'), (500, 99999999, 'large')) AS t(lo, hi, label)) SELECT t.label, COUNT(*) AS cnt FROM dl.CUSTOMER c JOIN tiers t ON c.C_CREDIT_LIM >= t.lo AND c.C_CREDIT_LIM < t.hi GROUP BY t.label;

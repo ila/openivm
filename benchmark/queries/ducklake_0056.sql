@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "ducklake": true}
+WITH heavy_buyers AS (SELECT C_W_ID, C_D_ID, C_ID FROM dl.CUSTOMER WHERE C_BALANCE > 50) SELECT hb.C_W_ID, hb.C_ID, o.O_ID, o.O_OL_CNT FROM heavy_buyers hb JOIN dl.OORDER o ON hb.C_W_ID = o.O_W_ID AND hb.C_D_ID = o.O_D_ID AND hb.C_ID = o.O_C_ID;

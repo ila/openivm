@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK,ORDER_LINE", "ducklake": true}
+SELECT s.S_W_ID, i.I_ID, SUM(ol.OL_QUANTITY) AS ordered, MIN(s.S_QUANTITY) AS current_stock FROM dl.STOCK s JOIN dl.ITEM i ON s.S_I_ID = i.I_ID JOIN dl.ORDER_LINE ol ON s.S_W_ID = ol.OL_SUPPLY_W_ID AND s.S_I_ID = ol.OL_I_ID GROUP BY s.S_W_ID, i.I_ID;

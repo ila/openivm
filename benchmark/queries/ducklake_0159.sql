@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,UNION,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "ducklake": true}
+WITH a AS (SELECT C_W_ID AS w, C_ID AS id, COUNT(*) AS n FROM dl.CUSTOMER GROUP BY C_W_ID, C_ID), b AS (SELECT O_W_ID AS w, O_C_ID AS id, COUNT(*) AS n FROM dl.OORDER GROUP BY O_W_ID, O_C_ID) SELECT w, id, n, 'cust' AS src FROM a UNION ALL SELECT w, id, n, 'ord' AS src FROM b;

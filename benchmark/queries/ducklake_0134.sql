@@ -1,0 +1,2 @@
+-- {"operators": "CTE,SUBQUERY", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "non_incr_reason": "kw:INTERSECT", "ducklake": true}
+WITH cust_keys AS (SELECT C_W_ID, C_D_ID, C_ID FROM dl.CUSTOMER), order_keys AS (SELECT O_W_ID, O_D_ID, O_C_ID FROM dl.OORDER) SELECT * FROM cust_keys INTERSECT SELECT * FROM order_keys;

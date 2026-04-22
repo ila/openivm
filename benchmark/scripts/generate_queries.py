@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
-TPC-C Query Generator for OpenIVM Testing
+TPC-C Query Validator for OpenIVM Testing
 
-Generates 2000+ diverse SQL queries using Claude API, validates them in DuckDB,
-and saves to benchmark/queries/ directory.
+Validates hand-written SQL queries against the TPC-C schema (and optionally a
+DuckLake catalog for `ducklake_*.sql` files), extracts structural metadata,
+and rewrites the leading `-- {JSON}` header used by the benchmark harness.
+
+The Claude API calls that used to live here have been removed — new queries
+are added by hand to benchmark/queries/ (or via the manual_queries() /
+programmatic_queries() / composite_queries() builder helpers kept below for
+reference).
 """
 
 import os
 import sys
 import re
 import json
-import time
 import argparse
 import duckdb
 from pathlib import Path
 from datetime import datetime
-from anthropic import Anthropic
 
 def log(msg: str):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -33,171 +37,8 @@ TPCC_SCHEMA = """
 - HISTORY(H_C_ID INT, H_C_D_ID INT, H_C_W_ID INT, H_D_ID INT, H_W_ID INT, H_DATE TIMESTAMP, H_AMOUNT DECIMAL(6,2), H_DATA VARCHAR(24))
 """
 
-# Features/operators that get their own targeted generation pass
-TARGETED_FEATURES = [
-    "window_functions",
-    "cte",
-    "full_outer_join",
-    "correlated_subquery",
-    "uncorrelated_subquery",
-    "table_functions",
-    "lateral_join",
-    "tpch_style",
-]
-
-# Prompts for targeted generation
-TARGETED_PROMPTS = {
-    "window_functions": f"""Generate {{n}} SQL queries that use window functions over TPC-C tables.
-
-TPC-C schema:{TPCC_SCHEMA}
-
-Requirements:
-- Every query MUST use at least one window function with OVER (...)
-- Use a variety: ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...), RANK(), DENSE_RANK(), LAG(), LEAD(), SUM() OVER (...), AVG() OVER (...), COUNT() OVER (...), NTILE(n) OVER (...), FIRST_VALUE(), LAST_VALUE(), PERCENT_RANK(), CUME_DIST()
-- Mix partition clauses: some with PARTITION BY, some without (whole table as one partition)
-- Mix frame clauses: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, RANGE BETWEEN ... etc.
-- Some queries may combine window functions with GROUP BY (i.e., outer query groups over windowed inner)
-- Each query on ONE line (no newlines). End with semicolon. No comments.
-
-Examples:
-SELECT C_W_ID, C_ID, C_BALANCE, ROW_NUMBER() OVER (PARTITION BY C_W_ID ORDER BY C_BALANCE DESC) AS rn FROM CUSTOMER;
-SELECT OL_W_ID, OL_O_ID, OL_AMOUNT, SUM(OL_AMOUNT) OVER (PARTITION BY OL_W_ID ORDER BY OL_O_ID ROWS UNBOUNDED PRECEDING) AS running_total FROM ORDER_LINE;
-SELECT W_ID, W_YTD, LAG(W_YTD, 1) OVER (ORDER BY W_ID) AS prev_ytd, LEAD(W_YTD, 1) OVER (ORDER BY W_ID) AS next_ytd FROM WAREHOUSE;
-
-Generate {{n}} queries now:""",
-
-    "cte": f"""Generate {{n}} SQL queries using Common Table Expressions (CTEs) over TPC-C tables.
-
-TPC-C schema:{TPCC_SCHEMA}
-
-Requirements:
-- Every query MUST start with WITH and define at least one CTE
-- Variety: single CTE, multiple CTEs (2-4), recursive-looking patterns (non-recursive is fine)
-- CTEs can compute aggregates, filter rows, join tables — use them to build up complex queries
-- Main SELECT must reference the CTE(s)
-- Some CTEs should contain: GROUP BY, JOIN, HAVING, DISTINCT
-- Some queries should use multiple CTEs that reference each other
-- Each query on ONE line (no newlines). End with semicolon. No comments.
-
-Examples:
-WITH cust_avg AS (SELECT C_W_ID, AVG(C_BALANCE) AS avg_bal FROM CUSTOMER GROUP BY C_W_ID) SELECT c.C_W_ID, c.C_ID, c.C_BALANCE, ca.avg_bal FROM CUSTOMER c JOIN cust_avg ca ON c.C_W_ID = ca.C_W_ID WHERE c.C_BALANCE > ca.avg_bal;
-WITH top_items AS (SELECT I_ID, I_PRICE FROM ITEM WHERE I_PRICE > 50), stocked AS (SELECT S_I_ID, SUM(S_QUANTITY) AS total_qty FROM STOCK WHERE S_I_ID IN (SELECT I_ID FROM top_items) GROUP BY S_I_ID) SELECT ti.I_ID, ti.I_PRICE, s.total_qty FROM top_items ti JOIN stocked s ON ti.I_ID = s.S_I_ID;
-
-Generate {{n}} queries now:""",
-
-    "full_outer_join": f"""Generate {{n}} SQL queries using FULL OUTER JOIN over TPC-C tables.
-
-TPC-C schema:{TPCC_SCHEMA}
-
-Requirements:
-- Every query MUST use FULL OUTER JOIN (write it as "FULL OUTER JOIN", not "FULL JOIN")
-- Mix: simple 2-table FULL OUTER JOIN, FULL OUTER JOIN with GROUP BY/aggregates, FULL OUTER JOIN with COALESCE for null handling
-- Some queries can chain LEFT JOIN + FULL OUTER JOIN together
-- COALESCE is recommended to handle NULLs from the outer join
-- Each query on ONE line (no newlines). End with semicolon. No comments.
-
-Examples:
-SELECT COALESCE(w.W_ID, d.D_W_ID) AS wid, w.W_NAME, COUNT(d.D_ID) AS num_districts FROM WAREHOUSE w FULL OUTER JOIN DISTRICT d ON w.W_ID = d.D_W_ID GROUP BY COALESCE(w.W_ID, d.D_W_ID), w.W_NAME;
-SELECT i.I_ID, i.I_NAME, COALESCE(s.S_QUANTITY, 0) AS qty FROM ITEM i FULL OUTER JOIN STOCK s ON i.I_ID = s.S_I_ID;
-
-Generate {{n}} queries now:""",
-
-    "correlated_subquery": f"""Generate {{n}} SQL queries with correlated subqueries over TPC-C tables.
-
-TPC-C schema:{TPCC_SCHEMA}
-
-Requirements:
-- Every query MUST have a subquery in WHERE or SELECT that references a column from the outer query
-- Patterns to use: WHERE col > (SELECT AVG(col) FROM t2 WHERE t2.key = outer.key), WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.fk = outer.pk), WHERE col IN (SELECT col FROM t2 WHERE t2.key = outer.key)
-- Variety: EXISTS, NOT EXISTS, IN, NOT IN, scalar comparison with correlated aggregate
-- Each query on ONE line (no newlines). End with semicolon. No comments.
-
-Examples:
-SELECT c.C_ID, c.C_BALANCE FROM CUSTOMER c WHERE c.C_BALANCE > (SELECT AVG(c2.C_BALANCE) FROM CUSTOMER c2 WHERE c2.C_W_ID = c.C_W_ID);
-SELECT o.O_ID, o.O_W_ID FROM OORDER o WHERE EXISTS (SELECT 1 FROM ORDER_LINE ol WHERE ol.OL_O_ID = o.O_ID AND ol.OL_AMOUNT > 100);
-SELECT s.S_W_ID, s.S_I_ID FROM STOCK s WHERE s.S_QUANTITY < (SELECT AVG(s2.S_QUANTITY) FROM STOCK s2 WHERE s2.S_W_ID = s.S_W_ID);
-
-Generate {{n}} queries now:""",
-
-    "uncorrelated_subquery": f"""Generate {{n}} SQL queries with uncorrelated subqueries over TPC-C tables.
-
-TPC-C schema:{TPCC_SCHEMA}
-
-Requirements:
-- Every query MUST have a subquery that does NOT reference the outer query's columns (self-contained)
-- Patterns: WHERE col IN (SELECT col FROM t2 WHERE ...), WHERE col > (SELECT MAX/AVG/MIN FROM t2), scalar subquery in SELECT list
-- Variety: IN, NOT IN, EXISTS (with no outer reference), scalar in SELECT, FROM subquery (inline view)
-- Each query on ONE line (no newlines). End with semicolon. No comments.
-
-Examples:
-SELECT C_ID, C_BALANCE FROM CUSTOMER WHERE C_W_ID IN (SELECT W_ID FROM WAREHOUSE WHERE W_TAX > 0.1);
-SELECT I_ID, I_NAME, I_PRICE FROM ITEM WHERE I_PRICE > (SELECT AVG(I_PRICE) FROM ITEM);
-SELECT o.O_ID, o.O_W_ID FROM OORDER o JOIN (SELECT OL_O_ID, SUM(OL_AMOUNT) AS total FROM ORDER_LINE GROUP BY OL_O_ID) ol ON o.O_ID = ol.OL_O_ID WHERE ol.total > 500;
-
-Generate {{n}} queries now:""",
-
-    "table_functions": f"""Generate {{n}} SQL queries using DuckDB table functions over TPC-C tables.
-
-TPC-C schema:{TPCC_SCHEMA}
-
-Requirements:
-- Use DuckDB table-generating functions: range(), generate_series(), unnest()
-- Patterns:
-  * SELECT ... FROM CUSTOMER, range(1, 5) r WHERE C_W_ID = r -- cross join with range
-  * SELECT unnest(list_value(C_LAST, C_FIRST)) AS name_part FROM CUSTOMER -- unnest a list
-  * SELECT s FROM generate_series(1, 10) t(s) WHERE s IN (SELECT S_W_ID FROM STOCK)
-  * LATERAL joins: SELECT c.C_ID, h.H_AMOUNT FROM CUSTOMER c, LATERAL (SELECT H_AMOUNT FROM HISTORY WHERE H_C_ID = c.C_ID LIMIT 1) h
-  * Cross join with range to generate synthetic data ranges: SELECT W_ID, r.n FROM WAREHOUSE, range(1, 11) r(n)
-- Keep queries syntactically valid in DuckDB
-- Each query on ONE line (no newlines). End with semicolon. No comments.
-
-Examples:
-SELECT W_ID, r.n AS slot FROM WAREHOUSE, range(1, 11) r(n);
-SELECT C_W_ID, COUNT(*) AS cnt FROM CUSTOMER WHERE C_W_ID IN (SELECT * FROM generate_series(1, 5)) GROUP BY C_W_ID;
-SELECT unnest(['BC', 'GC']) AS credit_type, COUNT(*) AS cnt FROM CUSTOMER WHERE C_CREDIT = unnest(['BC', 'GC']);
-
-Generate {{n}} queries now:""",
-
-    "lateral_join": f"""Generate {{n}} SQL queries using LATERAL joins (JOIN LATERAL or comma-lateral) over TPC-C tables.
-
-TPC-C schema:{TPCC_SCHEMA}
-
-Requirements:
-- Every query MUST use LATERAL: either "JOIN LATERAL (...) alias" or "CROSS JOIN LATERAL" or ", LATERAL (...) alias"
-- The lateral subquery must reference a column from the outer table
-- Patterns:
-  * SELECT c.C_ID, lat.* FROM CUSTOMER c JOIN LATERAL (SELECT H_AMOUNT FROM HISTORY WHERE H_C_ID = c.C_ID ORDER BY H_DATE DESC LIMIT 1) lat ON true
-  * SELECT w.W_ID, d_stats.* FROM WAREHOUSE w JOIN LATERAL (SELECT COUNT(*) AS cnt, AVG(D_YTD) AS avg_ytd FROM DISTRICT WHERE D_W_ID = w.W_ID) d_stats ON true
-  * SELECT o.O_ID, lat.total FROM OORDER o, LATERAL (SELECT SUM(OL_AMOUNT) AS total FROM ORDER_LINE WHERE OL_O_ID = o.O_ID AND OL_W_ID = o.O_W_ID) lat
-- Each query on ONE line (no newlines). End with semicolon. No comments.
-
-Generate {{n}} queries now:""",
-
-    "tpch_style": f"""Generate {{n}} complex SQL queries in TPC-H style over TPC-C tables — queries that combine many operators.
-
-TPC-C schema:{TPCC_SCHEMA}
-
-Requirements:
-- These should be complex, multi-operator queries in the spirit of TPC-H benchmark queries
-- Each query should combine 3 or more of: multi-table JOIN, GROUP BY with multiple aggregates, HAVING, CASE WHEN, CTEs, subqueries, COALESCE, date arithmetic, DISTINCT, UNION
-- Typical shapes:
-  * 3-way or 4-way JOIN + GROUP BY + multiple aggregates (SUM, COUNT, AVG) + HAVING + CASE WHEN in SELECT
-  * CTE computing intermediate aggregate + outer join + HAVING
-  * Subquery in WHERE + JOIN + GROUP BY + ORDER BY (OK to include ORDER BY for realism)
-  * UNION ALL of two queries with GROUP BY each
-  * FULL OUTER JOIN with COALESCE + aggregate + HAVING
-  * Window function partitioned by join key over joined table
-  * DATE_TRUNC grouping + SUM/COUNT + HAVING + CASE WHEN for categorization
-- Use all 9 TPC-C tables — spread across queries
-- Use realistic business logic (e.g., "top customers by balance", "warehouse revenue summary", "items with low stock", "order fulfillment rates")
-- Each query on ONE line (no newlines). End with semicolon. No comments.
-
-Examples:
-SELECT c.C_W_ID, c.C_D_ID, COUNT(*) AS num_cust, SUM(c.C_BALANCE) AS total_bal, AVG(c.C_BALANCE) AS avg_bal, CASE WHEN AVG(c.C_BALANCE) > 1000 THEN 'high' WHEN AVG(c.C_BALANCE) > 0 THEN 'medium' ELSE 'low' END AS tier FROM CUSTOMER c JOIN OORDER o ON c.C_ID = o.O_C_ID AND c.C_W_ID = o.O_W_ID GROUP BY c.C_W_ID, c.C_D_ID HAVING COUNT(*) > 5;
-WITH warehouse_revenue AS (SELECT ol.OL_W_ID, SUM(ol.OL_AMOUNT) AS revenue FROM ORDER_LINE ol JOIN OORDER o ON ol.OL_O_ID = o.O_ID AND ol.OL_W_ID = o.O_W_ID GROUP BY ol.OL_W_ID), warehouse_info AS (SELECT w.W_ID, w.W_NAME, w.W_TAX FROM WAREHOUSE w) SELECT wi.W_NAME, ROUND(wr.revenue, 2) AS revenue, ROUND(wr.revenue * wi.W_TAX, 2) AS tax FROM warehouse_revenue wr JOIN warehouse_info wi ON wr.OL_W_ID = wi.W_ID ORDER BY revenue DESC;
-
-Generate {{n}} queries now:""",
-}
+# Note: the Claude-API-driven TARGETED_PROMPTS / TARGETED_FEATURES blocks that
+# used to sit here have been removed. New queries are added by hand.
 
 
 def manual_queries() -> list[str]:
@@ -1577,21 +1418,45 @@ def filler_queries() -> list[str]:
 
 
 class QueryGenerator:
-    def __init__(self, output_dir: str = "benchmark/queries", total_queries: int = 2000):
+    def __init__(self, output_dir: str = "benchmark/queries", ducklake: bool = False):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.total_queries = total_queries
         self.generated = 0
         self.valid = 0
         self.invalid = 0
         self.rejection_reasons = {}
-        self.client = Anthropic()
+        self.ducklake_enabled = ducklake
 
         self.db = duckdb.connect(":memory:")
         self._create_tpcc_schema()
+        if ducklake:
+            self._attach_ducklake()
 
-    def _create_tpcc_schema(self):
-        log("Creating TPC-C schema in DuckDB for validation...")
+    def _attach_ducklake(self):
+        """Attach a DuckLake catalog and mirror TPC-C tables into it.
+        Needed to validate `ducklake_*.sql` queries that reference `dl.<table>`."""
+        try:
+            self.db.execute("INSTALL ducklake")
+            self.db.execute("LOAD ducklake")
+            dl_path = "/tmp/openivm_validator_ducklake.db"
+            self.db.execute(f"ATTACH IF NOT EXISTS '{dl_path}' AS dl (TYPE ducklake)")
+            # Recreate schema + empty tables each run. Validation only needs the
+            # schema to resolve columns; no data is required.
+            have = self.db.execute(
+                "SELECT COUNT(*) FROM information_schema.tables "
+                "WHERE table_catalog = 'dl' AND table_name = 'warehouse'"
+            ).fetchone()
+            if not have or have[0] == 0:
+                self.db.execute("USE dl.main")
+                self._create_tpcc_schema(skip_log=True)
+                self.db.execute("USE memory.main")
+        except Exception as e:
+            log(f"WARNING: could not attach DuckLake catalog: {e}")
+            self.ducklake_enabled = False
+
+    def _create_tpcc_schema(self, skip_log: bool = False):
+        if not skip_log:
+            log("Creating TPC-C schema in DuckDB for validation...")
 
         self.db.execute("""
             CREATE TABLE WAREHOUSE (
@@ -1909,13 +1774,14 @@ class QueryGenerator:
             result["non_incr_reason"] = reason
         return result
 
-    def retag_existing(self):
+    def retag_existing(self, include_ducklake: bool = True):
         """Re-extract metadata for all existing query files and rewrite their first line.
-        Preserves benchmark-verified flags (openivm_verified, openivm_lies) from the
-        previous metadata — if a query has been empirically verified, don't overwrite
-        is_incremental based on the heuristic alone."""
-        import json
+        Preserves benchmark-verified flags (openivm_verified, openivm_lies) and the
+        `ducklake` tag from the previous metadata — if a query has been empirically
+        verified, don't overwrite is_incremental based on the heuristic alone."""
         files = sorted(self.output_dir.glob("query_*.sql"))
+        if include_ducklake:
+            files += sorted(self.output_dir.glob("ducklake_*.sql"))
         log(f"Retagging {len(files)} existing query files...")
 
         updated = 0
@@ -1926,16 +1792,18 @@ class QueryGenerator:
                 if not lines:
                     continue
 
-                # Preserve benchmark-verified flags from existing metadata
+                # Preserve benchmark-verified flags and the ducklake tag.
                 prev_verified = False
                 prev_lies = False
                 prev_is_incremental = None
+                prev_ducklake = False
                 if lines[0].startswith("-- {"):
                     try:
                         prev_meta = json.loads(lines[0][3:])
                         prev_verified = prev_meta.get("openivm_verified", False)
                         prev_lies = prev_meta.get("openivm_lies", False)
                         prev_is_incremental = prev_meta.get("is_incremental", None)
+                        prev_ducklake = prev_meta.get("ducklake", False)
                     except Exception:
                         pass
 
@@ -1955,6 +1823,8 @@ class QueryGenerator:
                     if prev_lies:
                         metadata["openivm_lies"] = True
                     metadata.pop("non_incr_reason", None)
+                if prev_ducklake or f.name.startswith("ducklake_"):
+                    metadata["ducklake"] = True
                 new_content = "-- " + json.dumps(metadata) + "\n" + query + "\n"
                 f.write_text(new_content)
                 updated += 1
@@ -1993,114 +1863,75 @@ class QueryGenerator:
         log(f"  Pruned {removed} low-complexity queries (kept {keep_max})")
         return removed
 
-    def renumber_queries(self):
-        """Renumber all query files to be sequential starting from 0001."""
-        files = sorted(self.output_dir.glob("query_*.sql"))
-        log(f"Renumbering {len(files)} query files...")
+    def renumber_queries(self, prefix: str = "query"):
+        """Renumber `<prefix>_*.sql` files to be sequential starting from 0001.
+        `ducklake_*.sql` files are renumbered independently so native and
+        DuckLake suites don't collide."""
+        files = sorted(self.output_dir.glob(f"{prefix}_*.sql"))
+        log(f"Renumbering {len(files)} {prefix}_*.sql files...")
+        if not files:
+            return
 
         # Write to temp names first to avoid conflicts
+        tmp_tag = f"_tmp_{prefix}_"
         for i, f in enumerate(files, 1):
-            tmp = f.parent / f"_tmp_{i:04d}.sql"
+            tmp = f.parent / f"{tmp_tag}{i:04d}.sql"
             f.rename(tmp)
 
-        for i, tmp in enumerate(sorted(f.parent.glob("_tmp_*.sql")), 1):
-            target = tmp.parent / f"query_{i:04d}.sql"
+        for i, tmp in enumerate(sorted(files[0].parent.glob(f"{tmp_tag}*.sql")), 1):
+            target = tmp.parent / f"{prefix}_{i:04d}.sql"
             tmp.rename(target)
 
         log(f"  Renumbered {len(files)} files")
 
-    def _next_query_id(self) -> int:
-        """Find the next available query ID."""
-        files = list(self.output_dir.glob("query_*.sql"))
+    def validate_all(self, prefix: str = None):
+        """Run every existing query through the DuckDB validator and report
+        which fail to parse/bind. `prefix` filters (e.g. 'ducklake')."""
+        patterns = [f"{prefix}_*.sql"] if prefix else ["query_*.sql", "ducklake_*.sql"]
+        files = []
+        for p in patterns:
+            files += sorted(self.output_dir.glob(p))
+        log(f"Validating {len(files)} files...")
+
+        ok = 0
+        bad = []
+        for f in files:
+            try:
+                lines = f.read_text().splitlines()
+                query_lines = [l for l in lines if not l.startswith("--")]
+                query = " ".join(query_lines).strip().rstrip(";")
+                if not query:
+                    continue
+                is_valid, reason = self._validate_query(query)
+                if is_valid:
+                    ok += 1
+                else:
+                    bad.append((f.name, reason))
+            except Exception as e:
+                bad.append((f.name, f"exception: {e}"))
+
+        log(f"  {ok} OK, {len(bad)} failed")
+        for name, reason in bad[:20]:
+            log(f"    {name}: {reason[:120]}")
+        if len(bad) > 20:
+            log(f"    ... and {len(bad) - 20} more")
+        return len(bad) == 0
+
+    def _next_query_id(self, prefix: str = "query") -> int:
+        """Find the next available id for files named `<prefix>_NNNN.sql`."""
+        files = list(self.output_dir.glob(f"{prefix}_*.sql"))
         if not files:
             return 1
         nums = []
+        pat = re.compile(rf'{re.escape(prefix)}_(\d+)\.sql')
         for f in files:
-            m = re.match(r'query_(\d+)\.sql', f.name)
+            m = pat.match(f.name)
             if m:
                 nums.append(int(m.group(1)))
         return max(nums) + 1 if nums else 1
 
-    def generate_batch(self, batch_num: int, queries_per_batch: int) -> list[str]:
-        """Generate a batch of general diverse queries using Claude API."""
-        log(f"Generating general batch {batch_num} ({queries_per_batch} queries)...")
-
-        prompt = f"""Generate {queries_per_batch} diverse SQL SELECT queries for TPC-C database testing.
-
-TPC-C schema:{TPCC_SCHEMA}
-
-Requirements:
-1. All queries must be valid DuckDB SQL (correct column names from schema above)
-2. Target operator mix (roughly):
-   - 15% pure SCAN/FILTER (simple projections and filters, no aggregation)
-   - 25% AGGREGATE with GROUP BY (SUM, COUNT, AVG, MIN, MAX, STDDEV, VARIANCE, BOOL_AND, BOOL_OR)
-   - 10% simple aggregates without GROUP BY (COUNT(*), SUM, AVG over whole table)
-   - 15% JOIN queries (INNER JOIN, LEFT JOIN — 2-way to 4-way)
-   - 10% HAVING, DISTINCT, UNION queries
-   - 10% complex: CTEs, subqueries, CASE WHEN, CAST, date/timestamp arithmetic
-   - 5% FULL OUTER JOIN queries
-   - 5% window function queries
-   - 5% correlated or uncorrelated subqueries
-   - 5% lateral joins or table functions (range(), generate_series(), unnest())
-3. Complexity mix: 20% low, 50% medium, 30% high
-4. Feature coverage — include at least some queries with each:
-   - STDDEV(col), VARIANCE(col), STDDEV_POP(col), VAR_POP(col)
-   - BOOL_AND(expr), BOOL_OR(expr)
-   - COALESCE, NULLIF, IS NULL, IS NOT NULL
-   - CAST(col AS DECIMAL), CAST(col AS VARCHAR), col::DATE
-   - CASE WHEN ... THEN ... ELSE ... END
-   - EXTRACT(YEAR FROM col), DATE_TRUNC('month', col)
-   - ABS, ROUND, FLOOR, CEIL, POWER on numeric columns
-   - FULL OUTER JOIN
-   - CTEs (WITH ... AS (...) SELECT ...)
-   - Subqueries in WHERE: WHERE col IN (SELECT ...) or correlated WHERE col > (SELECT AVG(...) WHERE outer.key = inner.key)
-   - Window functions: ROW_NUMBER() OVER (...), RANK(), SUM() OVER (...), LAG(), LEAD()
-   - LATERAL joins
-5. Each query on ONE line (no newlines within a query)
-6. Do NOT include comments, numbering, or explanations — just the SQL
-7. End each query with a semicolon
-
-Generate {queries_per_batch} queries now:"""
-
-        try:
-            response = self.client.messages.create(
-                model="claude-opus-4-6",
-                max_tokens=8000,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            text = response.content[0].text
-            queries = [q.strip() for q in text.split('\n')
-                       if q.strip() and not q.strip().startswith('--') and 'SELECT' in q.upper()]
-            return queries
-        except Exception as e:
-            log(f"  Error calling Claude API: {e}")
-            return []
-
-    def generate_targeted(self, feature: str, count: int) -> list[str]:
-        """Generate queries targeting a specific feature using a focused prompt."""
-        if feature not in TARGETED_PROMPTS:
-            log(f"  Unknown feature: {feature}")
-            return []
-
-        log(f"Generating {count} targeted queries for feature: {feature}...")
-        prompt = TARGETED_PROMPTS[feature].format(n=count)
-
-        try:
-            response = self.client.messages.create(
-                model="claude-opus-4-6",
-                max_tokens=8000,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            text = response.content[0].text
-            queries = [q.strip() for q in text.split('\n')
-                       if q.strip() and not q.strip().startswith('--') and 'SELECT' in q.upper()]
-            return queries
-        except Exception as e:
-            log(f"  Error calling Claude API: {e}")
-            return []
-
-    def process_query(self, query: str, query_id: int) -> bool:
-        """Validate, extract metadata, and save a single query."""
+    def process_query(self, query: str, query_id: int, prefix: str = "query") -> bool:
+        """Validate, extract metadata, and save a single query as `<prefix>_NNNN.sql`."""
         is_valid, reason = self._validate_query(query)
         if not is_valid:
             self.invalid += 1
@@ -2108,8 +1939,10 @@ Generate {queries_per_batch} queries now:"""
             return False
 
         metadata = self._extract_metadata(query)
+        if prefix == "ducklake":
+            metadata["ducklake"] = True
 
-        query_file = self.output_dir / f"query_{query_id:04d}.sql"
+        query_file = self.output_dir / f"{prefix}_{query_id:04d}.sql"
         with open(query_file, 'w') as f:
             f.write("-- " + json.dumps(metadata) + "\n")
             f.write(query + "\n")
@@ -2117,141 +1950,16 @@ Generate {queries_per_batch} queries now:"""
         self.valid += 1
         return True
 
-    def gap_fill(self, target_total: int):
-        """Generate targeted queries for under-represented features until target is reached."""
-        log("Starting gap-fill generation for targeted features...")
-
-        # Count per-feature in existing queries
-        files = list(self.output_dir.glob("query_*.sql"))
-        existing = len(files)
-        log(f"  Existing queries: {existing}, target: {target_total}")
-
-        if existing >= target_total:
-            log("  Already at or above target — done")
-            return
-
-        # Count existing feature coverage
-        feature_counts = {f: 0 for f in TARGETED_FEATURES}
-        for f in files:
-            try:
-                first_line = f.read_text().split('\n')[0]
-                if first_line.startswith("-- "):
-                    m = json.loads(first_line[3:])
-                    ops = m.get("operators", "").split(",")
-                    op_set = set(op.strip().upper() for op in ops)
-                    if "WINDOW" in op_set:
-                        feature_counts["window_functions"] += 1
-                    if "CTE" in op_set:
-                        feature_counts["cte"] += 1
-                    if "FULL_OUTER_JOIN" in op_set:
-                        feature_counts["full_outer_join"] += 1
-                    if "CORRELATED_SUBQUERY" in op_set:
-                        feature_counts["correlated_subquery"] += 1
-                    if "SUBQUERY" in op_set:
-                        feature_counts["uncorrelated_subquery"] += 1
-                    if "TABLE_FUNCTION" in op_set:
-                        feature_counts["table_functions"] += 1
-                    if "LATERAL" in op_set:
-                        feature_counts["lateral_join"] += 1
-            except Exception:
-                pass
-
-        log("  Current feature coverage:")
-        for feat, cnt in feature_counts.items():
-            log(f"    {feat}: {cnt}")
-
-        # Target ~100 per feature minimum
-        per_feature_target = max(100, (target_total - existing) // len(TARGETED_FEATURES))
-
-        query_id = self._next_query_id()
-        total_added = 0
-
-        for feature in TARGETED_FEATURES:
-            need = max(0, per_feature_target - feature_counts[feature])
-            if existing + total_added >= target_total:
-                break
-            need = min(need, target_total - existing - total_added)
-            if need <= 0:
-                log(f"  {feature}: already has {feature_counts[feature]} >= {per_feature_target}, skipping")
-                continue
-
-            # Generate in batches of 30
-            added_for_feature = 0
-            while added_for_feature < need:
-                batch_size = min(30, need - added_for_feature)
-                queries = self.generate_targeted(feature, batch_size)
-                self.generated += len(queries)
-
-                for q in queries:
-                    if added_for_feature >= need:
-                        break
-                    if self.process_query(q, query_id):
-                        query_id += 1
-                        added_for_feature += 1
-                        total_added += 1
-
-                log(f"    {feature}: {added_for_feature}/{need} added")
-
-                if not queries:
-                    break  # API error, skip feature
-
-        log(f"Gap-fill complete: {total_added} queries added")
-
-    def run(self, start_id: int = None):
-        """Main generation loop for general queries."""
-        log(f"╔════════════════════════════════════════════════════════╗")
-        log(f"║     TPC-C Query Generator for OpenIVM Testing           ║")
-        log(f"╚════════════════════════════════════════════════════════╝")
-        log(f"Target: {self.total_queries} queries")
-        log(f"Output: {self.output_dir}")
-
-        batch_size = 50
-        query_id = start_id if start_id else self._next_query_id()
-        existing_count = query_id - 1
-        need = self.total_queries - existing_count
-        if need <= 0:
-            log(f"Already have {existing_count} queries — done")
-            return True
-
-        num_batches = (need + batch_size - 1) // batch_size
-        log(f"Generating {need} more queries in {num_batches} batches...")
-
-        for batch_num in range(1, num_batches + 1):
-            queries = self.generate_batch(batch_num, batch_size)
-            self.generated += len(queries)
-
-            for query in queries:
-                if self.valid >= need:
-                    break
-                if self.process_query(query, query_id):
-                    query_id += 1
-
-            current = existing_count + self.valid
-            pct = (current * 100) // self.total_queries
-            log(f"  Batch {batch_num}/{num_batches}: {current}/{self.total_queries} ({pct}%)")
-
-            if self.valid >= need:
-                break
-
-        log("")
-        log("Generation complete:")
-        log(f"  Valid new: {self.valid}, Invalid: {self.invalid}")
-        if self.rejection_reasons:
-            log("  Rejection reasons (top 5):")
-            for reason, count in sorted(self.rejection_reasons.items(), key=lambda x: -x[1])[:5]:
-                log(f"    {count}x: {reason}")
-
-        return self.valid >= need
-
     def print_stats(self):
-        """Print stats about the current query set."""
+        """Print stats about the current query set (native + DuckLake)."""
         import collections
-        files = sorted(self.output_dir.glob("query_*.sql"))
+        native = sorted(self.output_dir.glob("query_*.sql"))
+        ducklake = sorted(self.output_dir.glob("ducklake_*.sql"))
         complexity = collections.Counter()
         operators = collections.Counter()
         is_incr = collections.Counter()
 
-        for f in files:
+        for f in native + ducklake:
             try:
                 first_line = f.read_text().split('\n')[0]
                 if first_line.startswith("-- "):
@@ -2263,7 +1971,8 @@ Generate {queries_per_batch} queries now:"""
             except Exception:
                 pass
 
-        log(f"Total queries: {len(files)}")
+        log(f"Total queries: {len(native) + len(ducklake)} "
+            f"({len(native)} native + {len(ducklake)} ducklake)")
         log(f"Complexity: {dict(complexity)}")
         log(f"Incremental: {dict(is_incr)}")
         log("Operators (top 20):")
@@ -2271,186 +1980,102 @@ Generate {queries_per_batch} queries now:"""
             log(f"  {op}: {cnt}")
 
 
-def load_api_key() -> str:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
-        return api_key
-
-    env_file = Path("benchmark/.env.local")
-    if env_file.exists():
-        with open(env_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and line.startswith("ANTHROPIC_API_KEY="):
-                    return line.split("=", 1)[1].strip('"').strip("'")
-
-    home_file = Path.home() / ".anthropic_api_key"
-    if home_file.exists():
-        key = home_file.read_text().strip()
-        if key:
-            return key
-
-    raise ValueError("API key not found. Set ANTHROPIC_API_KEY env var, create benchmark/.env.local, or ~/.anthropic_api_key")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate TPC-C SQL queries for OpenIVM testing")
-    parser.add_argument("--total", type=int, default=2000, help="Target total queries (default: 2000)")
-    parser.add_argument("--output", type=str, default="benchmark/queries", help="Output directory")
-    parser.add_argument("--batch-size", type=int, default=50, help="Queries per general API call")
+    parser = argparse.ArgumentParser(
+        description="Validate TPC-C queries and maintain their metadata headers. "
+                    "Query generation via LLM has been removed — all queries are hand-written "
+                    "in benchmark/queries/ (named query_NNNN.sql or ducklake_NNNN.sql)."
+    )
+    parser.add_argument("--output", default="benchmark/queries",
+                        help="Queries directory (default: benchmark/queries)")
+    parser.add_argument("--ducklake", action="store_true",
+                        help="Attach a DuckLake catalog for validating ducklake_*.sql files")
 
     # Modes
-    parser.add_argument("--retag", action="store_true", help="Re-extract metadata for all existing queries and exit")
-    parser.add_argument("--prune-low", type=int, metavar="N", help="Remove low-complexity queries keeping max N, then exit")
-    parser.add_argument("--renumber", action="store_true", help="Renumber query files sequentially and exit")
-    parser.add_argument("--gap-fill", action="store_true", help="Generate targeted queries for under-represented features")
-    parser.add_argument("--add-manual", action="store_true", help="Add hand-crafted queries covering all operators and exit")
-    parser.add_argument("--programmatic", action="store_true", help="Add programmatically-generated queries from templates and exit")
-    parser.add_argument("--composite", action="store_true", help="Add composite-operator queries (agg-on-join, window-on-join, etc.) and exit")
-    parser.add_argument("--composite-extra", action="store_true", help="Add extra systematic composite queries (FK-pair variations + data-type coverage)")
-    parser.add_argument("--composite-final", action="store_true", help="Add final composite queries (more correlated subq, LATERAL, CROSS JOIN, TPC-H)")
-    parser.add_argument("--filler", action="store_true", help="Add filler queries to push total over 2000")
-    parser.add_argument("--stats", action="store_true", help="Print query set statistics and exit")
-    parser.add_argument("--feature", type=str, help="Generate targeted queries for a single feature (for testing)")
-    parser.add_argument("--feature-count", type=int, default=30, help="Number of queries for --feature mode")
+    parser.add_argument("--retag", action="store_true",
+                        help="Re-extract metadata for existing queries (including ducklake_*.sql)")
+    parser.add_argument("--renumber", action="store_true",
+                        help="Renumber query_*.sql files sequentially starting at 0001")
+    parser.add_argument("--renumber-ducklake", action="store_true",
+                        help="Renumber ducklake_*.sql files sequentially starting at 0001")
+    parser.add_argument("--prune-low", type=int, metavar="N",
+                        help="Remove low-complexity queries beyond N, then exit")
+    parser.add_argument("--validate", action="store_true",
+                        help="Validate every query parses/binds against TPC-C (requires --ducklake to include ducklake_*.sql)")
+    parser.add_argument("--validate-ducklake", action="store_true",
+                        help="Validate only ducklake_*.sql (implies --ducklake)")
+    parser.add_argument("--stats", action="store_true",
+                        help="Print query-set statistics")
+
+    # Bulk-add modes (run the hand-written builder helpers in this file)
+    parser.add_argument("--add-manual", action="store_true",
+                        help="Run manual_queries() and write each to query_NNNN.sql")
+    parser.add_argument("--programmatic", action="store_true",
+                        help="Run programmatic_queries()")
+    parser.add_argument("--composite", action="store_true", help="Run composite_queries()")
+    parser.add_argument("--composite-extra", action="store_true", help="Run composite_extra_queries()")
+    parser.add_argument("--composite-final", action="store_true", help="Run composite_final_queries()")
+    parser.add_argument("--filler", action="store_true", help="Run filler_queries()")
+    parser.add_argument("--prefix", default="query",
+                        help="Filename prefix for bulk-add modes (default: query; use 'ducklake' for DuckLake queries)")
 
     args = parser.parse_args()
 
-    no_api_modes = args.retag or args.renumber or args.stats or (args.prune_low is not None) or args.add_manual or args.programmatic or args.composite or args.composite_extra or args.composite_final or args.filler
-    try:
-        api_key = load_api_key()
-        os.environ["ANTHROPIC_API_KEY"] = api_key
-    except ValueError as e:
-        if not no_api_modes:
-            print(f"Error: {e}")
-            return 1
-
-    generator = QueryGenerator(output_dir=args.output, total_queries=args.total)
+    # Enable DuckLake attach if the user asked for a DuckLake-aware mode.
+    need_ducklake = args.ducklake or args.validate_ducklake or args.prefix == "ducklake"
+    generator = QueryGenerator(output_dir=args.output, ducklake=need_ducklake)
 
     if args.stats:
         generator.print_stats()
         return 0
-
-    if args.add_manual:
-        queries = manual_queries()
-        qid = generator._next_query_id()
-        saved = 0
-        for q in queries:
-            if generator.process_query(q, qid):
-                qid += 1
-                saved += 1
-        log(f"Added {saved}/{len(queries)} manual queries (valid/total)")
-        return 0
-
-    if args.programmatic:
-        queries = programmatic_queries()
-        log(f"Constructed {len(queries)} template-based queries, validating...")
-        qid = generator._next_query_id()
-        saved = 0
-        for q in queries:
-            if generator.process_query(q, qid):
-                qid += 1
-                saved += 1
-        log(f"Added {saved}/{len(queries)} programmatic queries (valid/total)")
-        if generator.rejection_reasons:
-            log("Top rejection reasons:")
-            for reason, count in sorted(generator.rejection_reasons.items(), key=lambda x: -x[1])[:5]:
-                log(f"    {count}x: {reason}")
-        return 0
-
-    if args.composite:
-        queries = composite_queries()
-        log(f"Constructed {len(queries)} composite queries, validating...")
-        qid = generator._next_query_id()
-        saved = 0
-        for q in queries:
-            if generator.process_query(q, qid):
-                qid += 1
-                saved += 1
-        log(f"Added {saved}/{len(queries)} composite queries (valid/total)")
-        if generator.rejection_reasons:
-            log("Top rejection reasons:")
-            for reason, count in sorted(generator.rejection_reasons.items(), key=lambda x: -x[1])[:5]:
-                log(f"    {count}x: {reason}")
-        return 0
-
-    if args.composite_extra:
-        queries = composite_extra_queries()
-        log(f"Constructed {len(queries)} extra composite queries, validating...")
-        qid = generator._next_query_id()
-        saved = 0
-        for q in queries:
-            if generator.process_query(q, qid):
-                qid += 1
-                saved += 1
-        log(f"Added {saved}/{len(queries)} composite_extra queries (valid/total)")
-        if generator.rejection_reasons:
-            log("Top rejection reasons:")
-            for reason, count in sorted(generator.rejection_reasons.items(), key=lambda x: -x[1])[:5]:
-                log(f"    {count}x: {reason}")
-        return 0
-
-    if args.composite_final:
-        queries = composite_final_queries()
-        log(f"Constructed {len(queries)} final composite queries, validating...")
-        qid = generator._next_query_id()
-        saved = 0
-        for q in queries:
-            if generator.process_query(q, qid):
-                qid += 1
-                saved += 1
-        log(f"Added {saved}/{len(queries)} composite_final queries (valid/total)")
-        if generator.rejection_reasons:
-            log("Top rejection reasons:")
-            for reason, count in sorted(generator.rejection_reasons.items(), key=lambda x: -x[1])[:5]:
-                log(f"    {count}x: {reason}")
-        return 0
-
-    if args.filler:
-        queries = filler_queries()
-        log(f"Constructed {len(queries)} filler queries, validating...")
-        qid = generator._next_query_id()
-        saved = 0
-        for q in queries:
-            if generator.process_query(q, qid):
-                qid += 1
-                saved += 1
-        log(f"Added {saved}/{len(queries)} filler queries (valid/total)")
-        if generator.rejection_reasons:
-            log("Top rejection reasons:")
-            for reason, count in sorted(generator.rejection_reasons.items(), key=lambda x: -x[1])[:5]:
-                log(f"    {count}x: {reason}")
-        return 0
-
     if args.retag:
         generator.retag_existing()
         return 0
-
+    if args.renumber:
+        generator.renumber_queries(prefix="query")
+        return 0
+    if args.renumber_ducklake:
+        generator.renumber_queries(prefix="ducklake")
+        return 0
     if args.prune_low is not None:
         generator.prune_low_complexity(keep_max=args.prune_low)
         return 0
+    if args.validate_ducklake:
+        ok = generator.validate_all(prefix="ducklake")
+        return 0 if ok else 1
+    if args.validate:
+        ok = generator.validate_all()
+        return 0 if ok else 1
 
-    if args.renumber:
-        generator.renumber_queries()
-        return 0
+    bulk_modes = [
+        ("add_manual", manual_queries),
+        ("programmatic", programmatic_queries),
+        ("composite", composite_queries),
+        ("composite_extra", composite_extra_queries),
+        ("composite_final", composite_final_queries),
+        ("filler", filler_queries),
+    ]
+    for attr, fn in bulk_modes:
+        if getattr(args, attr, False):
+            queries = fn()
+            log(f"Running {fn.__name__} — {len(queries)} queries")
+            qid = generator._next_query_id(prefix=args.prefix)
+            saved = 0
+            for q in queries:
+                if generator.process_query(q, qid, prefix=args.prefix):
+                    qid += 1
+                    saved += 1
+            log(f"Added {saved}/{len(queries)} {args.prefix}_*.sql queries")
+            if generator.rejection_reasons:
+                log("Top rejection reasons:")
+                for reason, count in sorted(generator.rejection_reasons.items(), key=lambda x: -x[1])[:5]:
+                    log(f"    {count}x: {reason}")
+            return 0
 
-    if args.feature:
-        queries = generator.generate_targeted(args.feature, args.feature_count)
-        log(f"Generated {len(queries)} raw queries for feature '{args.feature}'")
-        qid = generator._next_query_id()
-        for q in queries:
-            if generator.process_query(q, qid):
-                qid += 1
-        log(f"Saved {generator.valid} valid queries")
-        return 0
-
-    if args.gap_fill:
-        generator.gap_fill(target_total=args.total)
-        return 0
-
-    # Default: generate general queries to reach target
-    success = generator.run()
-    return 0 if success else 1
+    parser.print_help()
+    return 0
 
 
 if __name__ == "__main__":

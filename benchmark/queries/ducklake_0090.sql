@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,ORDER,WINDOW", "complexity": "high", "is_incremental": false, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "non_incr_reason": "op:ORDER", "ducklake": true}
+SELECT d.D_W_ID, d.D_ID, c.C_ID, c.C_BALANCE, NTILE(3) OVER (PARTITION BY d.D_W_ID ORDER BY COALESCE(c.C_BALANCE, 0)) AS tier FROM dl.DISTRICT d LEFT JOIN dl.CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID;

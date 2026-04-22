@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "ducklake": true}
+SELECT COALESCE(c.C_W_ID, o.O_W_ID) AS w, COALESCE(c.C_ID, o.O_C_ID) AS id, COUNT(c.C_BALANCE) AS cust_rows, COUNT(o.O_ID) AS order_rows FROM dl.CUSTOMER c FULL OUTER JOIN dl.OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID GROUP BY COALESCE(c.C_W_ID, o.O_W_ID), COALESCE(c.C_ID, o.O_C_ID);

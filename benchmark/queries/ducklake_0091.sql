@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "ducklake": true}
+SELECT c1.C_W_ID, c1.C_ID AS cust1, c2.C_ID AS cust2, (c1.C_BALANCE + c2.C_BALANCE) AS combined_bal FROM dl.CUSTOMER c1 JOIN dl.CUSTOMER c2 ON c1.C_W_ID = c2.C_W_ID AND c1.C_D_ID = c2.C_D_ID AND c1.C_ID < c2.C_ID WHERE c1.C_CREDIT = c2.C_CREDIT;

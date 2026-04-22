@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "ducklake": true}
+SELECT c.C_W_ID, c.C_ID, c.C_BALANCE, COUNT(o.O_ID) OVER (PARTITION BY c.C_W_ID) AS w_orders, COUNT(*) OVER () AS total_rows FROM dl.CUSTOMER c LEFT JOIN dl.OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID;

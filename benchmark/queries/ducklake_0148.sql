@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,ORDER,WINDOW,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "non_incr_reason": "op:ORDER", "ducklake": true}
+SELECT sub.O_W_ID, sub.O_ID, sub.total, RANK() OVER (PARTITION BY sub.O_W_ID ORDER BY sub.total DESC) AS rk FROM (SELECT o.O_W_ID, o.O_ID, SUM(ol.OL_AMOUNT) AS total FROM dl.OORDER o JOIN dl.ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID GROUP BY o.O_W_ID, o.O_ID) sub;

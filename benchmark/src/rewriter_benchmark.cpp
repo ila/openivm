@@ -462,6 +462,40 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			_exit(2);
 		}
 
+		// Attach a DuckLake catalog alongside native tables. Queries whose filename
+		// starts with `ducklake_` will be run after `USE dl.main` so their
+		// unqualified table references resolve to the DuckLake copy of TPC-C.
+		// Fully-qualified `dl.<table>` references also work.
+		bool ducklake_ok = false;
+		{
+			string dl_path = db_path + ".ducklake.db";
+			auto inst = con.Query("INSTALL ducklake");
+			auto ld = con.Query("LOAD ducklake");
+			if ((!inst || !inst->HasError()) && (!ld || !ld->HasError())) {
+				string attach_sql = "ATTACH IF NOT EXISTS '" + dl_path + "' AS dl (TYPE ducklake)";
+				auto at = con.Query(attach_sql);
+				if (at && !at->HasError()) {
+					ducklake_ok = true;
+					// Populate TPC-C tables in the DuckLake catalog on first attach.
+					auto have = con.Query("SELECT COUNT(*) FROM information_schema.tables "
+					                      "WHERE table_catalog = 'dl' AND table_name = 'warehouse'");
+					bool needs_init =
+					    !have || have->HasError() || have->RowCount() == 0 || have->GetValue(0, 0).GetValue<int64_t>() == 0;
+					if (needs_init) {
+						con.Query("USE dl.main");
+						CreateTPCCSchema(con);
+						// Copy data from native tables into DuckLake tables so both
+						// catalogs start with identical state.
+						for (const char *t : {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM", "STOCK", "OORDER",
+						                      "NEW_ORDER", "ORDER_LINE", "HISTORY"}) {
+							con.Query(string("INSERT INTO ") + t + " SELECT * FROM memory.main." + t);
+						}
+						con.Query("USE memory.main");
+					}
+				}
+			}
+		}
+
 		// Clean up any leftover mv_q* views and orphaned data tables from a previous crashed child.
 		// DROP VIEW (not DROP MATERIALIZED VIEW — DuckDB intercepts that before OpenIVM) performs
 		// the full cleanup: user-facing view, data table, delta view, and metadata entries.
@@ -498,10 +532,37 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			string query(query_len, '\0');
 			if (!ReadAllBytes(read_fd, &query[0], query_len)) break;
 
-			// Strip metadata comment (first line starting with --)
-			auto newline_pos = query.find('\n');
-			if (newline_pos != string::npos && query[0] == '-' && query[1] == '-') {
-				query = query.substr(newline_pos + 1);
+			// First line is `-- <query_name>` (injected by the parent via Submit)
+			// so the child knows which query it's processing. We use the name to
+			// decide catalog context: filenames starting with `ducklake_` run
+			// against the DuckLake copy of TPC-C; everything else runs against
+			// native tables. Subsequent `-- …` lines (e.g. the `{JSON metadata}`
+			// header shipped inside each query file) are stripped next.
+			string worker_query_name;
+			bool is_ducklake_query = false;
+			{
+				auto newline_pos = query.find('\n');
+				if (newline_pos != string::npos && query.size() >= 2 && query[0] == '-' && query[1] == '-') {
+					string header = query.substr(0, newline_pos);
+					if (header.size() > 3) {
+						worker_query_name = header.substr(3);
+						while (!worker_query_name.empty() && (worker_query_name.back() == ' ' ||
+						                                       worker_query_name.back() == '\r')) {
+							worker_query_name.pop_back();
+						}
+						is_ducklake_query = worker_query_name.find("ducklake_") != string::npos && ducklake_ok;
+					}
+					query = query.substr(newline_pos + 1);
+				}
+			}
+			// Strip any remaining leading `-- …` comment lines (JSON metadata, etc.).
+			while (query.size() >= 2 && query[0] == '-' && query[1] == '-') {
+				auto nl = query.find('\n');
+				if (nl == string::npos) {
+					query.clear();
+					break;
+				}
+				query = query.substr(nl + 1);
 			}
 
 			// Trim leading/trailing whitespace, newlines, and semicolons for composable SQL
@@ -514,6 +575,15 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 
 			query_counter++;
 			string mv_name = "mv_q" + std::to_string(query_counter);
+
+			// Switch default catalog before anything else. The MV, its data
+			// table, delta view, and any deltas applied below all target the
+			// catalog active at execution time.
+			if (is_ducklake_query) {
+				con.Query("USE dl.main");
+			} else {
+				con.Query("USE memory.main");
+			}
 
 			uint8_t phase_reached = 0;  // 1=duckdb_fail, 2=mv_fail, 3=delta_fail, 4=refresh_fail, 5=verify_fail, 6=ok, 99=crash
 			uint8_t is_incremental = 0;
@@ -784,7 +854,7 @@ struct ForkWorker {
 		if (from_child_fd >= 0) { close(from_child_fd); from_child_fd = -1; }
 	}
 
-	void Submit(const string &query, double timeout_s) {
+	void Submit(const string &query, double timeout_s, const string &query_name = "") {
 		result_phase = 0;
 		result_incremental = 0;
 		result_correct = 0;
@@ -792,9 +862,12 @@ struct ForkWorker {
 
 		if (child_pid <= 0) return;
 
-		uint32_t query_len = static_cast<uint32_t>(query.size());
+		// Prepend `-- <query_name>\n` so the worker can recognize filename
+		// prefixes (e.g. `ducklake_`) and dispatch to the right catalog.
+		string framed = query_name.empty() ? query : ("-- " + query_name + "\n" + query);
+		uint32_t query_len = static_cast<uint32_t>(framed.size());
 		if (!WriteAllBytes(to_child_fd, &query_len, sizeof(query_len)) ||
-		    !WriteAllBytes(to_child_fd, query.data(), query_len)) {
+		    !WriteAllBytes(to_child_fd, framed.data(), query_len)) {
 			int status;
 			waitpid(child_pid, &status, 0);
 			child_pid = -1;
@@ -1024,7 +1097,7 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		// Parse metadata is_incremental prediction before running
 		int meta_incremental = ParseIsIncrementalFromQueryFile(query_sql);
 
-		worker.Submit(query_sql, timeout_s);
+		worker.Submit(query_sql, timeout_s, query_name);
 
 		uint8_t phase = worker.result_phase;
 		string error_msg = worker.result_error;

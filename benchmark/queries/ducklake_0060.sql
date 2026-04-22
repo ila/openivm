@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "ducklake": true}
+SELECT c.C_W_ID, c.C_ID, (c.C_BALANCE + c.C_YTD_PAYMENT) AS net, (d.D_YTD / 10.0) AS per_cust_ytd, (c.C_PAYMENT_CNT * 2) AS doubled FROM CUSTOMER c JOIN DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID WHERE c.C_PAYMENT_CNT > 0;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "HISTORY", "ducklake": true}
+SELECT h1.H_C_W_ID, h1.H_C_ID, COUNT(*) AS pairs FROM dl.HISTORY h1 JOIN dl.HISTORY h2 ON h1.H_C_W_ID = h2.H_C_W_ID AND h1.H_C_D_ID = h2.H_C_D_ID AND h1.H_C_ID = h2.H_C_ID AND h1.H_DATE < h2.H_DATE GROUP BY h1.H_C_W_ID, h1.H_C_ID;

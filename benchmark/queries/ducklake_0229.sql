@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK", "ducklake": true}
+SELECT s1.S_W_ID, COUNT(*) AS item_pairs, AVG(s1.S_QUANTITY + s2.S_QUANTITY) AS avg_combined_qty FROM dl.STOCK s1 JOIN dl.STOCK s2 ON s1.S_W_ID = s2.S_W_ID AND s1.S_I_ID < s2.S_I_ID WHERE s1.S_QUANTITY + s2.S_QUANTITY > 50 GROUP BY s1.S_W_ID;

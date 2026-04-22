@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "non_incr_reason": "op:ORDER", "ducklake": true}
+WITH cust_orders AS (SELECT c.C_W_ID, c.C_ID, COUNT(o.O_ID) AS order_cnt FROM dl.CUSTOMER c LEFT JOIN dl.OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID GROUP BY c.C_W_ID, c.C_ID) SELECT C_W_ID, C_ID, order_cnt, RANK() OVER (PARTITION BY C_W_ID ORDER BY order_cnt DESC) AS rk FROM cust_orders;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK", "ducklake": true}
+SELECT i.I_ID AS item_id, i.I_NAME AS name, (i.I_PRICE * 1.08) AS price_with_tax, (i.I_PRICE - 1.00) AS discounted, s.S_QUANTITY AS qty, (s.S_QUANTITY * i.I_PRICE * 1.08) AS taxed_value FROM ITEM i JOIN STOCK s ON i.I_ID = s.S_I_ID WHERE i.I_PRICE BETWEEN 5 AND 50;

@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "ducklake": true}
+WITH d_custs AS (SELECT C_W_ID, C_D_ID, COUNT(*) AS n, SUM(C_BALANCE) AS bal FROM dl.CUSTOMER GROUP BY C_W_ID, C_D_ID) SELECT d.D_W_ID, d.D_ID, d.D_YTD, COALESCE(dc.n, 0) AS custs, COALESCE(dc.bal, 0) AS bal_sum, (d.D_YTD - COALESCE(dc.bal, 0)) AS delta FROM dl.DISTRICT d LEFT JOIN d_custs dc ON d.D_W_ID = dc.C_W_ID AND d.D_ID = dc.C_D_ID;

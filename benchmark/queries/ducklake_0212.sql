@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "ducklake": true}
+WITH filtered AS (SELECT C_W_ID, C_D_ID, C_ID, C_BALANCE FROM dl.CUSTOMER WHERE C_PAYMENT_CNT > 0) SELECT C_W_ID, C_D_ID, COUNT(*) AS active, SUM(C_BALANCE) AS tot FROM filtered GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 3;

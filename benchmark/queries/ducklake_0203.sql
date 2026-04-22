@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": true, "tables": "CUSTOMER,OORDER", "ducklake": true}
+SELECT o.O_W_ID, o.O_D_ID, SUM(CASE WHEN o.O_CARRIER_ID IS NULL THEN 1 ELSE 0 END) AS pending, SUM(CASE WHEN o.O_CARRIER_ID IS NOT NULL THEN 1 ELSE 0 END) AS shipped FROM dl.OORDER o JOIN dl.CUSTOMER c ON o.O_W_ID = c.C_W_ID AND o.O_D_ID = c.C_D_ID AND o.O_C_ID = c.C_ID GROUP BY o.O_W_ID, o.O_D_ID;

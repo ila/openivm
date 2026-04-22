@@ -1,0 +1,2 @@
+-- {"operators": "SCAN", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "ducklake": true}
+SELECT c.C_W_ID, c.C_ID, UPPER(c.C_LAST) AS last_upper, LOWER(c.C_FIRST) AS first_lower, LENGTH(c.C_LAST) AS name_len, (c.C_LAST || ', ' || c.C_FIRST) AS full_name FROM dl.CUSTOMER c JOIN dl.DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID;

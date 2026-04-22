@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "ducklake": true}
+SELECT o.O_W_ID, o.O_D_ID, o.O_C_ID, COUNT(o.O_ID) AS cnt FROM dl.CUSTOMER c RIGHT JOIN dl.OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID WHERE o.O_OL_CNT > 1 GROUP BY o.O_W_ID, o.O_D_ID, o.O_C_ID;

@@ -971,7 +971,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				string cat_type = entry->ParentCatalog().GetCatalogType();
 				if (cat_type == "ducklake") {
 					catalog_type = "ducklake";
-					meta_table_name = table_name; // no delta table — store base table name
+					// Use the catalog's actual table name (entry->name), not the
+					// unquoted form from GetTableNames — the DuckLake join rule
+					// looks up metadata by `get->GetTable()->name`, which is the
+					// catalog-stored case.
+					meta_table_name = entry->name;
+					ducklake_tables.insert(entry->name);
+					// Also cache the SQL-parsed name so the delta-table skip loop
+					// below still matches when GetTableNames lowercased the SQL
+					// text but entry->name kept the original catalog case.
 					ducklake_tables.insert(table_name);
 
 					// Get current snapshot ID from DuckLake catalog
@@ -1037,8 +1045,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		for (const auto &table_name : table_names) {
-			// DuckLake tables don't need delta tables — change tracking is native
-			if (ducklake_tables.count(table_name)) {
+			// DuckLake tables don't need delta tables — change tracking is native.
+			// `ducklake_tables` stores the catalog-normalized (lowercase) name, so
+			// compare against a normalized copy of the SQL-parsed name.
+			string table_lc = table_name;
+			std::transform(table_lc.begin(), table_lc.end(), table_lc.begin(),
+			               [](unsigned char c) { return std::tolower(c); });
+			if (ducklake_tables.count(table_name) || ducklake_tables.count(table_lc)) {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] Skipping delta table for DuckLake table '%s'\n", table_name.c_str());
 				continue;
 			}

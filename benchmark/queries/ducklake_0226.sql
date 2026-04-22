@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,DISTINCT", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "ducklake": true}
+SELECT COUNT(DISTINCT c.C_CREDIT) AS credit_classes, COUNT(DISTINCT c.C_W_ID) AS warehouses, COUNT(DISTINCT c.C_D_ID) AS districts_used, AVG(c.C_BALANCE) AS avg_bal FROM dl.CUSTOMER c JOIN dl.DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID;

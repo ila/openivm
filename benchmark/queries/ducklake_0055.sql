@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "ducklake": true}
+WITH order_totals AS (SELECT OL_W_ID, OL_D_ID, OL_O_ID, SUM(OL_AMOUNT) AS total, COUNT(*) AS lines FROM dl.ORDER_LINE GROUP BY OL_W_ID, OL_D_ID, OL_O_ID HAVING COUNT(*) > 1) SELECT o.O_W_ID, o.O_D_ID, o.O_ID, o.O_C_ID, ot.total FROM dl.OORDER o JOIN order_totals ot ON o.O_W_ID = ot.OL_W_ID AND o.O_D_ID = ot.OL_D_ID AND o.O_ID = ot.OL_O_ID;

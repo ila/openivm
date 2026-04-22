@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,ORDER,WINDOW", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "non_incr_reason": "op:ORDER", "ducklake": true}
+SELECT o.O_W_ID, o.O_ID, o.O_C_ID, COUNT(*) OVER (PARTITION BY o.O_W_ID ORDER BY o.O_ID RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_orders FROM OORDER o JOIN CUSTOMER c ON o.O_W_ID = c.C_W_ID AND o.O_D_ID = c.C_D_ID AND o.O_C_ID = c.C_ID;

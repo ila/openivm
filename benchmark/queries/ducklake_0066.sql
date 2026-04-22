@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT", "ducklake": true}
+WITH active_d AS (SELECT D_W_ID, D_ID, D_YTD FROM dl.DISTRICT WHERE D_YTD > 0) SELECT w.W_ID, w.W_NAME, COUNT(a.D_ID) AS active_districts, SUM(COALESCE(a.D_YTD, 0)) AS total_ytd FROM dl.WAREHOUSE w LEFT JOIN active_d a ON w.W_ID = a.D_W_ID GROUP BY w.W_ID, w.W_NAME;

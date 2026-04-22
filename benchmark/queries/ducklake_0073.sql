@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,ORDER,WINDOW", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE", "non_incr_reason": "op:ORDER", "ducklake": true}
+SELECT OL_W_ID, OL_D_ID, OL_O_ID, OL_NUMBER, OL_AMOUNT, SUM(OL_AMOUNT) OVER (PARTITION BY OL_W_ID, OL_D_ID, OL_O_ID ORDER BY OL_NUMBER ROWS UNBOUNDED PRECEDING) AS running_total FROM dl.ORDER_LINE;

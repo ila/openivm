@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ORDER_LINE", "ducklake": true}
+WITH line_rank AS (SELECT OL_W_ID, OL_O_ID, OL_D_ID, OL_NUMBER, OL_AMOUNT, SUM(OL_AMOUNT) OVER (PARTITION BY OL_W_ID, OL_D_ID, OL_O_ID) AS order_total FROM dl.ORDER_LINE) SELECT OL_W_ID, OL_O_ID, OL_NUMBER, OL_AMOUNT, order_total, (OL_AMOUNT / NULLIF(order_total, 0)) AS line_share FROM line_rank;

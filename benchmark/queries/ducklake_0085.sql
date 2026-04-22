@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK", "ducklake": true}
+SELECT s.S_W_ID, i.I_ID, s.S_QUANTITY, (s.S_QUANTITY * i.I_PRICE) AS stock_value, SUM(s.S_QUANTITY * i.I_PRICE) OVER (PARTITION BY s.S_W_ID) AS w_value, AVG(i.I_PRICE) OVER (PARTITION BY s.S_W_ID) AS w_avg_price FROM dl.STOCK s JOIN dl.ITEM i ON s.S_I_ID = i.I_ID;

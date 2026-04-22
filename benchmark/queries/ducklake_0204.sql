@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,CTE,SUBQUERY,VALUES_ONLY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "non_incr_reason": "op:VALUES_ONLY", "ducklake": true}
+WITH credit_tiers AS (SELECT * FROM (VALUES ('GC', 'good'), ('BC', 'bad')) AS t(code, name)) SELECT ct.name, COUNT(*) AS n, SUM(c.C_BALANCE) AS tot FROM dl.CUSTOMER c JOIN credit_tiers ct ON c.C_CREDIT = ct.code GROUP BY ct.name;

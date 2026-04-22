@@ -1,0 +1,2 @@
+-- {"operators": "ORDER,WINDOW", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE", "non_incr_reason": "op:ORDER", "ducklake": true}
+SELECT OL_W_ID, OL_O_ID, OL_AMOUNT, PERCENT_RANK() OVER (PARTITION BY OL_W_ID ORDER BY OL_AMOUNT) AS pct_rank, CUME_DIST() OVER (PARTITION BY OL_W_ID ORDER BY OL_AMOUNT) AS cdist FROM dl.ORDER_LINE;
