@@ -229,6 +229,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 		string view_query = original_view_query; // will be overwritten by LPTS for DDL
 
+		// Apply the session's active catalog to `con` so unqualified table references in the
+		// MV query resolve in the user's catalog (e.g. `dl.main`) rather than the physical
+		// default. Without this, `CREATE MATERIALIZED VIEW mv AS SELECT * FROM WAREHOUSE`
+		// issued under `USE dl.main` fails during planning with "Table WAREHOUSE does not
+		// exist" because the fresh connection resolves against the physical-default catalog.
+		if (!current_catalog.empty() && current_catalog != default_db) {
+			con.Query("USE " + current_catalog + "." + current_schema);
+		}
+
 		// Use con for planning — sees all committed state from previous bind-phase DDL
 		con.BeginTransaction();
 		auto table_names = con.GetTableNames(statement->query);
