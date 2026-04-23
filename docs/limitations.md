@@ -86,6 +86,13 @@ anything it flags as `ivm_compatible = false` routes to `IVMType::FULL_REFRESH`.
   isolation. Concurrent DML during refresh does not affect the in-progress refresh, but
   the interaction has not been exhaustively audited.
 
+- **Multi-column `(a, b) IN (SELECT x, y FROM ...)` inside a MV definition** fails
+  `CREATE MATERIALIZED VIEW` with "Subquery returns 2 columns - expected 1". The same
+  query runs fine at top level (`CREATE TABLE AS SELECT ...`) — the error comes from
+  an internal DuckDB rewrite that fires during OpenIVM's `planner.CreatePlan`
+  invocation on the CTAS statement but not on the user-level query path. Workaround:
+  rewrite as an `EXISTS` subquery or an explicit `JOIN`.
+
 - **Window functions over DuckLake with non-output partition keys or multi-table inputs**
   fall back to full recompute (`DELETE FROM data; INSERT INTO data SELECT * FROM view_query`).
   Partition-level recompute (delete + re-insert only affected partitions via DuckLake
