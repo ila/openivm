@@ -28,6 +28,7 @@
 
 #include "core/openivm_debug.hpp"
 #include "storage/ducklake_scan.hpp"
+#include "storage/ducklake_table_entry.hpp"
 
 #include <regex>
 
@@ -1159,7 +1160,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 						std::transform(lc.begin(), lc.end(), lc.begin(),
 						               [](unsigned char c) { return std::tolower(c); });
 						if (dl_table_info.find(lc) == dl_table_info.end()) {
-							string cat = current_catalog.empty() ? "dl" : current_catalog;
+							// Always pull the catalog from the DuckLakeTableEntry — it's the
+							// one the `dl.ORDER_LINE` reference actually resolved to. Falling
+							// back to `current_catalog` is wrong for cross-system MVs (native
+							// MV reading from dl.*) because `current_catalog` is the physical
+							// default, not the DuckLake catalog.
+							string cat = info.table.ParentCatalog().GetName();
+							if (cat.empty()) {
+								cat = current_catalog.empty() ? "dl" : current_catalog;
+							}
 							dl_table_info[lc] = {info.table_name, cat};
 						}
 					}
@@ -1334,24 +1343,20 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// made AFTER the MV was created (not the initial data load).
 		for (const auto &table_name : table_names) {
 			if (ducklake_tables.count(table_name)) {
-				string cat_name = view_catalog_prefix.empty()
-				                      ? (current_catalog.empty() ? "memory" : current_catalog)
-				                      : view_catalog_prefix.substr(0, view_catalog_prefix.size() - 1);
-				// Remove trailing dot and extract catalog name
-				auto dot = cat_name.rfind('.');
-				if (dot != string::npos) {
-					cat_name = cat_name.substr(0, dot);
-				}
+				// Use the DuckLake catalog for current_snapshot() — NOT view_catalog_prefix
+				// or current_catalog. For cross-system MVs (native MV reading from dl.*),
+				// view_catalog_prefix is empty and current_catalog is the physical-default
+				// (e.g. the file DB) which doesn't have `current_snapshot()`.
 				// table_names entries may be lowercased by the parser; the metadata row was
 				// inserted above with the case-preserved DuckLake name (`dl_table_info`).
-				// Match on the same case-preserved name here so the UPDATE actually fires.
 				string table_lc_for_lookup = table_name;
 				std::transform(table_lc_for_lookup.begin(), table_lc_for_lookup.end(), table_lc_for_lookup.begin(),
 				               [](unsigned char c) { return std::tolower(c); });
 				auto info_it = dl_table_info.find(table_lc_for_lookup);
 				string meta_table_name = (info_it != dl_table_info.end()) ? info_it->second.table_name : table_name;
+				string dl_cat_name = (info_it != dl_table_info.end()) ? info_it->second.catalog_name : "dl";
 				ddl.push_back("UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = (SELECT id FROM " +
-				              cat_name + ".current_snapshot()) WHERE view_name = '" +
+				              dl_cat_name + ".current_snapshot()) WHERE view_name = '" +
 				              OpenIVMUtils::EscapeSingleQuotes(view_name) + "' AND table_name = '" +
 				              OpenIVMUtils::EscapeSingleQuotes(meta_table_name) + "'");
 			}

@@ -1289,15 +1289,26 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	                                OpenIVMUtils::EscapeValue(view_name) + "';\n";
 
 	// Update DuckLake snapshot IDs so the next refresh only sees new changes.
+	// For cross-system refresh (native MV that reads from dl.*), view_catalog_name
+	// is the physical-default (no `current_snapshot()` function), so probe
+	// `duckdb_databases()` once per refresh to find the attached DuckLake catalog.
+	string dl_catalog_name = attached_db_catalog_name;
+	if (dl_catalog_name.empty()) {
+		auto probe = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake' LIMIT 1");
+		if (probe && !probe->HasError() && probe->RowCount() > 0 && !probe->GetValue(0, 0).IsNull()) {
+			dl_catalog_name = probe->GetValue(0, 0).ToString();
+		} else if (!view_catalog_name.empty() && view_catalog_name != "memory") {
+			dl_catalog_name = view_catalog_name;
+		} else {
+			dl_catalog_name = "dl";
+		}
+	}
 	string snapshot_update_query;
 	for (auto &dt : delta_table_names) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
-			// Find the catalog name for this DuckLake table from the view query
-			// (the table name in metadata is the bare name, e.g. "products")
-			const string &cat_name = view_catalog_name; // default to view's catalog
 			snapshot_update_query += "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
-			                         " SET last_snapshot_id = (SELECT id FROM " + cat_name + ".current_snapshot())" +
-			                         " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+			                         " SET last_snapshot_id = (SELECT id FROM " + dl_catalog_name +
+			                         ".current_snapshot()) WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
 			                         "' AND table_name = '" + OpenIVMUtils::EscapeValue(dt) + "';\n";
 		}
 	}

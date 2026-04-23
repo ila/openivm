@@ -172,6 +172,11 @@ struct MVDef {
 	string create_sql;  // "CREATE MATERIALIZED VIEW <name> [REFRESH EVERY ...] AS ..."
 	string base_query;  // for EXCEPT ALL correctness; empty = skip
 	int64_t refresh_interval_secs = -1; // -1 = no REFRESH EVERY clause
+	string catalog_schema;              // qualifier for reads (e.g. "dl.main."); empty = native default
+
+	// Returns the fully-qualified MV name for use in SQL that runs on a connection
+	// that might not have USE <catalog> active.
+	string QualifiedName() const { return catalog_schema + name; }
 };
 
 // ---------------------------------------------------------------------------
@@ -469,14 +474,41 @@ static void BuildShape(SubtestCtx &ctx) {
 				               " REFRESH EVERY '1 minute' AS " + v.create_sql.substr(as_pos + 4);
 			}
 		}
-	} else if (ctx.subtest == "S9" || ctx.subtest == "S10" || ctx.subtest == "S11") {
-		// DuckLake sub-tests — use a simpler placeholder for now; worker will
-		// attach dl before creating these.  We set base_query to the
-		// equivalent query on dl.main.* so EXCEPT ALL works.
-		ctx.mvs.push_back(mv("mv_dl_1",
-		    "SELECT OL_W_ID AS w_id, SUM(OL_AMOUNT) AS total FROM dl.ORDER_LINE GROUP BY OL_W_ID",
-		    "SELECT OL_W_ID AS w_id, SUM(OL_AMOUNT) AS total FROM dl.ORDER_LINE GROUP BY OL_W_ID",
-		    one_min));
+	} else if (ctx.subtest == "S9") {
+		// DuckLake pipeline: 5-chain over dl.CUSTOMER/WAREHOUSE/DISTRICT. MVs live
+		// in dl.main because the worker ran `USE dl.main` before creating them.
+		MVDef m1 = mv("mv_dl_1",
+		    "WITH active AS (SELECT * FROM dl.CUSTOMER WHERE C_BALANCE > 0) "
+		    "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
+		    "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2",
+		    "WITH active AS (SELECT * FROM dl.CUSTOMER WHERE C_BALANCE > 0) "
+		    "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
+		    "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2",
+		    one_min);
+		m1.catalog_schema = "dl.main.";
+		ctx.mvs.push_back(m1);
+	} else if (ctx.subtest == "S10") {
+		// Cross-system MV: native MV reading from dl.*
+		MVDef m1 = mv("mv_cs_1",
+		    "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
+		    "FROM dl.CUSTOMER GROUP BY C_W_ID, C_D_ID",
+		    "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
+		    "FROM dl.CUSTOMER GROUP BY C_W_ID, C_D_ID",
+		    one_min);
+		ctx.mvs.push_back(m1);
+	} else if (ctx.subtest == "S11") {
+		// Parallel manual refresh on DuckLake — 2 MVs, disjoint sources. All in
+		// dl.main because worker does USE dl.main.
+		MVDef m1 = mv("mv_dl_a",
+		    "SELECT C_W_ID, COUNT(*) AS n FROM dl.CUSTOMER GROUP BY C_W_ID",
+		    "SELECT C_W_ID, COUNT(*) AS n FROM dl.CUSTOMER GROUP BY C_W_ID", -1);
+		m1.catalog_schema = "dl.main.";
+		ctx.mvs.push_back(m1);
+		MVDef m2 = mv("mv_dl_b",
+		    "SELECT OL_W_ID, SUM(OL_AMOUNT) AS total FROM dl.ORDER_LINE GROUP BY OL_W_ID",
+		    "SELECT OL_W_ID, SUM(OL_AMOUNT) AS total FROM dl.ORDER_LINE GROUP BY OL_W_ID", -1);
+		m2.catalog_schema = "dl.main.";
+		ctx.mvs.push_back(m2);
 	}
 
 	(void)ten_min;
@@ -488,6 +520,11 @@ static void BuildShape(SubtestCtx &ctx) {
 
 static void DMLThread(SubtestCtx &ctx, int interval_ms, size_t delta_start_offset) {
 	duckdb::Connection con(*ctx.db);
+	// DuckLake sub-tests need DML to hit dl.main.* (so each write advances the
+	// DuckLake snapshot and the daemon's skip-empty-deltas check doesn't bail).
+	if (ctx.subtest == "S9" || ctx.subtest == "S10" || ctx.subtest == "S11") {
+		con.Query("USE dl.main");
+	}
 	size_t idx = delta_start_offset;
 	while (!ctx.stop.load()) {
 		auto r = con.Query(ctx.deltas[idx % ctx.deltas.size()]);
@@ -503,14 +540,19 @@ static void DMLThread(SubtestCtx &ctx, int interval_ms, size_t delta_start_offse
 
 static void CheckerThread(SubtestCtx &ctx, int interval_ms) {
 	duckdb::Connection con(*ctx.db);
+	if (ctx.subtest == "S9" || ctx.subtest == "S11") {
+		// MVs are in dl.main; qualified names in MVDef.QualifiedName() handle
+		// this, but the base_query's unqualified column refs need dl.main active.
+		con.Query("USE dl.main");
+	}
 	while (!ctx.stop.load()) {
 		for (auto &v : ctx.mvs) {
 			if (ctx.stop.load()) break;
 			if (v.base_query.empty()) continue;
 			string q = "SELECT COUNT(*) FROM ("
-			           "  SELECT * FROM " + v.name + " EXCEPT ALL SELECT * FROM (" + v.base_query + ") __a"
+			           "  SELECT * FROM " + v.QualifiedName() + " EXCEPT ALL SELECT * FROM (" + v.base_query + ") __a"
 			           "  UNION ALL "
-			           "  SELECT * FROM (" + v.base_query + ") __b EXCEPT ALL SELECT * FROM " + v.name +
+			           "  SELECT * FROM (" + v.base_query + ") __b EXCEPT ALL SELECT * FROM " + v.QualifiedName() +
 			           ") __diff";
 			auto r = con.Query(q);
 			{
@@ -583,6 +625,9 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 // Manual refresh thread — for S4/S5/S6/S7 sub-tests
 static void ManualRefreshThread(SubtestCtx &ctx, vector<string> target_mvs, int interval_ms) {
 	duckdb::Connection con(*ctx.db);
+	if (ctx.subtest == "S11") {
+		con.Query("USE dl.main");
+	}
 	size_t idx = 0;
 	while (!ctx.stop.load()) {
 		if (target_mvs.empty()) {
@@ -654,18 +699,27 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 			ctx.disable_daemon = true;
 		}
 
-		// Clean up any leftover MVs from a previous crashed run
-		auto leftover = con.Query("SELECT table_name FROM information_schema.tables "
-		                          "WHERE table_schema='main' AND (table_name LIKE 'mv_%' OR table_name LIKE '_ivm_data_mv_%' OR table_name LIKE 'delta_mv_%')");
+		// Clean up any leftover MVs / data tables / delta tables from a previous
+		// crashed sub-test. Walk ALL catalogs (native + any attached) so DuckLake
+		// artifacts left by S9/S10/S11 don't leak into the next sub-test.
+		auto leftover = con.Query(
+		    "SELECT table_catalog, table_schema, table_name FROM information_schema.tables "
+		    "WHERE table_name LIKE 'mv_%' OR table_name LIKE '_ivm_data_mv_%' OR table_name LIKE 'delta_mv_%' "
+		    "  OR table_name LIKE 'ivm_delta_mv_%'");
 		if (leftover && !leftover->HasError()) {
 			for (idx_t i = 0; i < leftover->RowCount(); i++) {
-				string tn = leftover->GetValue(0, i).ToString();
-				con.Query("DROP VIEW IF EXISTS " + tn);
-				con.Query("DROP TABLE IF EXISTS " + tn);
+				string cat = leftover->GetValue(0, i).ToString();
+				string schema = leftover->GetValue(1, i).ToString();
+				string tn = leftover->GetValue(2, i).ToString();
+				string full = cat + "." + schema + "." + tn;
+				con.Query("DROP VIEW IF EXISTS " + full);
+				con.Query("DROP TABLE IF EXISTS " + full);
 			}
 		}
 		con.Query("DELETE FROM _duckdb_ivm_views WHERE view_name LIKE 'mv_%'");
 		con.Query("DELETE FROM _duckdb_ivm_delta_tables WHERE view_name LIKE 'mv_%'");
+		con.Query("DELETE FROM _duckdb_ivm_refresh_history WHERE view_name LIKE 'mv_%'");
+		con.Query("DELETE FROM _duckdb_ivm_refresh_hooks WHERE view_name LIKE 'mv_%'");
 
 		// DuckLake attach for S9/S10/S11
 		if (subtest == "S9" || subtest == "S10" || subtest == "S11") {
@@ -826,14 +880,17 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 
 		// Final consistency check on every MV with a base_query
 		duckdb::Connection fin_con(*ctx.db);
+		if (subtest == "S9" || subtest == "S11") {
+			fin_con.Query("USE dl.main");
+		}
 		for (auto &v : ctx.mvs) {
 			if (v.base_query.empty()) continue;
 			// Trigger a final refresh to be sure
 			fin_con.Query("PRAGMA ivm('" + v.name + "')");
 			string q = "SELECT COUNT(*) FROM ("
-			           "  SELECT * FROM " + v.name + " EXCEPT ALL SELECT * FROM (" + v.base_query + ") __a"
+			           "  SELECT * FROM " + v.QualifiedName() + " EXCEPT ALL SELECT * FROM (" + v.base_query + ") __a"
 			           "  UNION ALL "
-			           "  SELECT * FROM (" + v.base_query + ") __b EXCEPT ALL SELECT * FROM " + v.name +
+			           "  SELECT * FROM (" + v.base_query + ") __b EXCEPT ALL SELECT * FROM " + v.QualifiedName() +
 			           ") __diff";
 			auto r = fin_con.Query(q);
 			if (!r || r->HasError()) {
