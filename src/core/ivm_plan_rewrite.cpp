@@ -482,10 +482,11 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 /// The column is prefixed `_ivm_` so `column_hider` auto-excludes it from
 /// the user-facing VIEW; `CompileAggregateGroups` already recognizes it
 /// via ivm::COUNT_STAR_COL.
-static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan, bool is_top = true) {
-	for (auto &child : plan->children) {
-		InjectGroupCountStar(child, false);
-	}
+static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
+	// Only inject at the top of the plan — the AGGREGATE_GROUP compile path only
+	// runs when the MV root is PROJECTION → [FILTER] → AGGREGATE. Inner aggregates
+	// under a UNION/INTERSECT/EXCEPT or subquery are handled by different compile
+	// paths (often FULL_REFRESH) that would be broken by extra columns.
 	if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION || plan->children.empty()) {
 		return;
 	}
@@ -493,7 +494,7 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan, bool is_top 
 	auto *c0 = plan->children[0].get();
 	if (c0->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		agg_search = c0;
-	} else if (is_top && c0->type == LogicalOperatorType::LOGICAL_FILTER && !c0->children.empty() &&
+	} else if (c0->type == LogicalOperatorType::LOGICAL_FILTER && !c0->children.empty() &&
 	           c0->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		agg_search = c0->children[0].get();
 	}

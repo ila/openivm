@@ -195,7 +195,8 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 	auto v = con.Query("select sql_string from " + string(ivm::VIEWS_TABLE) + " where view_name = '" +
 	                   OpenIVMUtils::EscapeValue(view) + "';");
 	if (v->HasError()) {
-		throw InternalException("Error while querying view definition");
+		throw Exception(ExceptionType::CATALOG,
+		                "IVM: cannot read view definition for '" + view + "': " + v->GetError());
 	}
 	string view_query = v->GetValue(0, 0).ToString();
 

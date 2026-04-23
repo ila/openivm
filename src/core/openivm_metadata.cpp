@@ -94,7 +94,7 @@ void IVMMetadata::UpdateTimestamp(const string &view_name) {
 	    con.Query("UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_update = now() WHERE view_name = '" +
 	              OpenIVMUtils::EscapeValue(view_name) + "'");
 	if (result->HasError()) {
-		throw InternalException("Cannot update IVM metadata timestamp: " + result->GetError());
+		throw Exception(ExceptionType::EXECUTOR, "Cannot update IVM metadata timestamp: " + result->GetError());
 	}
 }
 
@@ -267,7 +267,7 @@ void IVMMetadata::UpdateSnapshotId(const string &view_name, const string &table_
 	              " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
 	              OpenIVMUtils::EscapeValue(table_name) + "'");
 	if (result->HasError()) {
-		throw InternalException("Cannot update DuckLake snapshot ID: " + result->GetError());
+		throw Exception(ExceptionType::EXECUTOR, "Cannot update DuckLake snapshot ID: " + result->GetError());
 	}
 }
 

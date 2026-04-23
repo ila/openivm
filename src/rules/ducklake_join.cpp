@@ -57,7 +57,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 		                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(pw.view) +
 		                             "' AND table_name = '" + OpenIVMUtils::EscapeValue(table_name) + "'");
 		if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
-			throw InternalException("No snapshot ID for DuckLake table '%s' in view '%s'", table_name, pw.view);
+			throw Exception(ExceptionType::CATALOG, "IVM: no snapshot ID recorded for DuckLake table '" + table_name +
+			                                            "' in view '" + pw.view + "'");
 		}
 		old_snapshots[i] = snap_result->GetValue(0, 0).GetValue<int64_t>();
 	}

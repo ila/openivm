@@ -113,6 +113,34 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
                               const string &vn, bool cross_system, const string &attached_db_catalog_name,
                               const string &attached_db_schema_name) {
 	IVMRefreshLocks::LockView(vn);
+	// Acquire delta-table locks in sorted order to serialize parallel refreshes that
+	// share base tables (e.g. mv_A and mv_B both reading STOCK → both write to
+	// `delta_STOCK` inside their transactions → "Conflict on tuple deletion!" when
+	// the second tx tries to delete rows the first already processed). Sorting
+	// guarantees the same acquisition order across all views, so no deadlock is
+	// possible between concurrent refreshes.
+	vector<unique_ptr<DeltaLockGuard>> delta_guards;
+	try {
+		Connection probe_con(*context.db.get());
+		IVMMetadata probe_meta(probe_con);
+		auto delta_table_names = probe_meta.GetDeltaTables(vn);
+		std::sort(delta_table_names.begin(), delta_table_names.end());
+		delta_table_names.erase(std::unique(delta_table_names.begin(), delta_table_names.end()),
+		                        delta_table_names.end());
+		for (auto &dt : delta_table_names) {
+			delta_guards.push_back(make_uniq<DeltaLockGuard>(dt));
+		}
+	} catch (...) {
+		IVMRefreshLocks::UnlockView(vn);
+		throw;
+	}
+	// Track whether we're inside an open exec_con transaction so any exception path can
+	// rollback cleanly. Without explicit rollback, a throw mid-transaction relies on the
+	// Connection destructor, which can leak uncommitted writes into the WAL under some
+	// failure modes (e.g. rebinding errors thrown by Query itself, not reported as
+	// HasError()). Rollback-then-throw keeps the WAL clean and leaves the DB valid.
+	Connection exec_con(*context.db.get());
+	bool tx_open = false;
 	try {
 		// Check if adaptive cost model is active — if so, compute estimate for history recording.
 		bool record_history = false;
@@ -146,7 +174,6 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		string sql = GenerateRefreshSQL(
 		    context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
 		    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr, cross_system ? &meta_post_sql : nullptr);
-		Connection exec_con(*context.db.get());
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs (N-term telescoping
 		// over 7+ tables produces hundreds of chained projections). Lift the default 1000
 		// expression-depth limit so the binder doesn't reject legitimate plans.
@@ -168,6 +195,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		// a separate meta_con (physical-default catalog) and data ops on exec_con (dl catalog).
 		if (!cross_system) {
 			exec_con.BeginTransaction();
+			tx_open = true;
 		} else if (!meta_pre_sql.empty()) {
 			Connection meta_con(*context.db.get());
 			meta_con.Query(meta_pre_sql);
@@ -177,14 +205,21 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		auto end = std::chrono::steady_clock::now();
 
 		if (result->HasError()) {
-			if (!cross_system) {
+			if (tx_open) {
 				exec_con.Rollback();
+				tx_open = false;
 			}
-			throw InternalException("IVM refresh of '" + vn + "' failed: " + result->GetError());
+			// Use a regular Exception (not InternalException) — a failed refresh is
+			// recoverable (e.g. transaction-conflict on a shared delta table from two
+			// parallel refreshes). InternalException causes DuckDB to flag the whole
+			// database as invalidated, forcing a restart. We've already rolled back, so
+			// the DB is in a clean state; the next refresh attempt should succeed.
+			throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + vn + "' failed: " + result->GetError());
 		}
-		if (!cross_system) {
+		if (tx_open) {
 			exec_con.Commit();
-		} else if (!meta_post_sql.empty()) {
+			tx_open = false;
+		} else if (cross_system && !meta_post_sql.empty()) {
 			Connection meta_con(*context.db.get());
 			meta_con.Query(meta_post_sql);
 		}
@@ -212,6 +247,19 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 			                    (long)duration_ms);
 		}
 	} catch (...) {
+		// Ensure the transaction is rolled back before we propagate the exception.
+		// This covers the case where Query() itself threw (vs returning HasError) —
+		// without this, the tx would stay open until exec_con's destructor runs,
+		// possibly leaving dirty WAL entries.
+		if (tx_open) {
+			try {
+				exec_con.Rollback();
+			} catch (...) {
+				// Rollback-inside-rollback failure is benign: the Connection destructor
+				// will still clean up. Swallow so we don't mask the original error.
+			}
+			tx_open = false;
+		}
 		IVMRefreshLocks::UnlockView(vn);
 		throw;
 	}

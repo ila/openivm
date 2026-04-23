@@ -37,7 +37,9 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
 	                             "' AND table_name = '" + OpenIVMUtils::EscapeValue(table_name) + "'");
 	if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
-		throw InternalException("No snapshot ID found for DuckLake table '%s' in view '%s'", table_name, view_name);
+		throw Exception(ExceptionType::CATALOG,
+		                "IVM: no snapshot ID recorded for DuckLake table '" + table_name + "' in view '" + view_name +
+		                    "' (metadata may be missing — try DROP MATERIALIZED VIEW and recreate)");
 	}
 	int64_t last_snap = snap_result->GetValue(0, 0).GetValue<int64_t>();
 
@@ -234,7 +236,8 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	                       OpenIVMUtils::EscapeValue(table_name) + "';";
 	auto r = con.Query(timestamp_query);
 	if (r->HasError()) {
-		throw InternalException("Error while querying last_update");
+		throw Exception(ExceptionType::EXECUTOR, "IVM: failed to read last_update for view '" + view_name +
+		                                             "', table '" + table_name + "': " + r->GetError());
 	}
 	auto ts_value = r->GetValue(0, 0);
 	if (ts_value.type() != LogicalType::TIMESTAMP) {

@@ -66,7 +66,8 @@ static duckdb::unique_ptr<FunctionData> DoIVMBind(ClientContext &context, TableF
 	Connection con(*context.db);
 	string view_query = IVMMetadata(con).GetViewQuery(view_name);
 	if (view_query.empty()) {
-		throw InternalException("Error while querying view definition");
+		throw Exception(ExceptionType::CATALOG,
+		                "IVM: materialized view '" + view_name + "' not found or its definition is missing");
 	}
 	OPENIVM_DEBUG_PRINT("[DoIVM Bind] View: %s, Query: %s\n", view_name.c_str(), view_query.c_str());
 

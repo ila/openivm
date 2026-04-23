@@ -374,7 +374,8 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						DeltaLockGuard guard(OpenIVMUtils::DeltaName(insert_table_name));
 						auto r = con.Query(insert_query);
 						if (r->HasError()) {
-							throw InternalException("Cannot insert in delta table after insertion! " + r->GetError());
+							throw Exception(ExceptionType::EXECUTOR,
+							                "Cannot insert in delta table after insertion! " + r->GetError());
 						}
 					}
 
@@ -395,7 +396,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 						DeltaLockGuard guard(OpenIVMUtils::DeltaName(insert_table_name));
 						auto r = con.Query(query);
 						if (r->HasError()) {
-							throw InternalException("Cannot insert in delta table! " + r->GetError());
+							throw Exception(ExceptionType::EXECUTOR, "Cannot insert in delta table! " + r->GetError());
 						}
 					}
 				}
@@ -476,7 +477,8 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					DeltaLockGuard guard(OpenIVMUtils::DeltaName(delete_table_name));
 					auto r = con.Query(insert_string);
 					if (r->HasError()) {
-						throw InternalException("Cannot insert in delta table after deletion! " + r->GetError());
+						throw Exception(ExceptionType::EXECUTOR,
+						                "Cannot insert in delta table after deletion! " + r->GetError());
 					}
 				}
 			}
@@ -580,14 +582,14 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					DeltaLockGuard guard(OpenIVMUtils::DeltaName(update_table_name));
 					auto r = con.Query(prefix_upd + " " + select_old);
 					if (r->HasError()) {
-						throw InternalException("Cannot insert old values in delta table after update! " +
-						                        r->GetError());
+						throw Exception(ExceptionType::EXECUTOR,
+						                "Cannot insert old values in delta table after update! " + r->GetError());
 					}
 					OPENIVM_DEBUG_PRINT("[INSERT RULE] select_new: %s\n", select_new.c_str());
 					auto r2 = con.Query(prefix_upd + " " + select_new);
 					if (r2->HasError()) {
-						throw InternalException("Cannot insert new values in delta table after update! " +
-						                        r2->GetError());
+						throw Exception(ExceptionType::EXECUTOR,
+						                "Cannot insert new values in delta table after update! " + r2->GetError());
 					}
 				}
 			}
