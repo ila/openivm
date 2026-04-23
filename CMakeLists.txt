@@ -74,8 +74,18 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
     target_link_libraries(tpcc_setup ${OPENIVM_LINK_LIBS})
     target_include_directories(tpcc_setup PUBLIC benchmark)
 
+    # Shared TPC-C helpers used by rewriter_benchmark and daemon_benchmark.
+    add_library(tpcc_helpers STATIC benchmark/src/tpcc_helpers.cpp)
+    target_link_libraries(tpcc_helpers ${OPENIVM_LINK_LIBS})
+    target_include_directories(tpcc_helpers PUBLIC benchmark/src)
+
     # IVM query benchmark harness
     add_executable(rewriter_benchmark benchmark/src/rewriter_benchmark.cpp)
-    target_link_libraries(rewriter_benchmark ${OPENIVM_LINK_LIBS})
-    target_include_directories(rewriter_benchmark PUBLIC benchmark)
+    target_link_libraries(rewriter_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
+    target_include_directories(rewriter_benchmark PUBLIC benchmark benchmark/src)
+
+    # Refresh-daemon / cascade / pipeline benchmark
+    add_executable(daemon_benchmark benchmark/src/daemon_benchmark.cpp)
+    target_link_libraries(daemon_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
+    target_include_directories(daemon_benchmark PUBLIC benchmark benchmark/src)
 endif()
