@@ -48,6 +48,20 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 			OPENIVM_DEBUG_PRINT("[IVMDDLBindFunction] Executing DDL: %s\n", q.c_str());
 			auto r = conn.Query(q);
 			if (r->HasError()) {
+				// The unique index on the MV data table is an upsert-time optimization
+				// (helps MERGE find the matching row quickly). If the classifier's
+				// group_columns don't actually form a unique key for the MV (e.g. a
+				// CTE with GROUP BY joined against another table — the outer JOIN
+				// duplicates rows), CREATE UNIQUE INDEX fails with "Data contains
+				// duplicates". Skip just that statement and continue; the refresh
+				// still works via key-based MERGE, just a bit slower.
+				bool is_unique_index = StringUtil::Contains(StringUtil::Lower(q), "create unique index") &&
+				                       StringUtil::Contains(r->GetError(), "Data contains duplicates");
+				if (is_unique_index) {
+					Printer::Print("Warning: could not create unique index for MV — group_columns "
+					               "are not unique in MV output. Refresh will still work (no index).");
+					continue;
+				}
 				throw CatalogException("Failed to execute IVM DDL: " + r->GetError());
 			}
 		}
