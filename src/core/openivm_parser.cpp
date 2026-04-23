@@ -1151,6 +1151,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		string data_table = IVMTableNames::DataTableName(view_name);
 		string qdt = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
 		string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
+		// The view_query may contain unqualified base-table references (e.g. `FROM WAREHOUSE`
+		// when the user wrote the MV under `USE dl.main`). The DDL executor's fresh
+		// Connection starts in the physical-default catalog, so apply USE before CREATE
+		// TABLE AS so those unqualified names resolve in the MV's catalog.
+		if (!current_catalog.empty() && current_catalog != default_db) {
+			ddl.push_back("use " + current_catalog + "." + current_schema);
+		}
 		ddl.push_back("create table " + qdt + " as " + view_query);
 		if (pac_loaded) {
 			ddl.push_back("SET pac_check = false");
@@ -1250,6 +1257,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 			index_query_view += ")";
 			ddl.push_back(index_query_view);
+		}
+
+		// Restore physical-default catalog so subsequent unqualified references to
+		// system tables (_duckdb_ivm_delta_tables, etc.) resolve correctly. The USE
+		// inserted before `create table qdt as view_query` routed unqualified base
+		// tables through the user's catalog; flip back for the metadata UPDATE below.
+		if (!current_catalog.empty() && current_catalog != default_db) {
+			ddl.push_back("use " + default_db + ".main");
 		}
 
 		// After all tables are created and populated, update DuckLake snapshot IDs

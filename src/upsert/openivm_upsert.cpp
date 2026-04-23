@@ -151,6 +151,12 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		// over 7+ tables produces hundreds of chained projections). Lift the default 1000
 		// expression-depth limit so the binder doesn't reject legitimate plans.
 		exec_con.Query("SET max_expression_depth = 10000");
+		// When the stored view_query_sql came from LPTS fallback (e.g. WINDOW functions
+		// serialized back to original user SQL), it contains unqualified base-table
+		// references. Switch to the MV's catalog so those resolve correctly during refresh.
+		if (cross_system && !view_catalog_name.empty()) {
+			exec_con.Query("USE " + view_catalog_name + "." + view_schema_name);
+		}
 		OPENIVM_DEBUG_PRINT("[UPSERT] Executing refresh SQL:\n%s\n", sql.c_str());
 
 		// Wrap the entire refresh in a transaction so that a failed refresh leaves the MV
