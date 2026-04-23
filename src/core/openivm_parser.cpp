@@ -946,6 +946,32 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			walk_for_nested(plan.get(), false);
 		}
 
+		// UNION between aggregates — e.g. `SELECT k, SUM(x) FROM t1 GROUP BY k UNION
+		// SELECT k, SUM(x) FROM t2 GROUP BY k`. Even if UNION rewrote to DISTINCT and
+		// the classifier earlier picked AGGREGATE_GROUP via distinct_at_top, UNION
+		// semantics can't be incrementally maintained by the MERGE path: a new row on
+		// one branch might duplicate a row that already exists on the other branch,
+		// and UNION's de-dup has no way to reflect this in our delta. Fall back to
+		// full recompute. The "UNION ALL of aggregates" fallback below already sets
+		// ivm_compatible=false via find_group_cols, but UNION (not UNION ALL) bypasses
+		// that because the plan wraps a DISTINCT on top — distinct_at_top fires
+		// before the union check.
+		bool has_union_over_agg = false;
+		{
+			std::function<bool(const LogicalOperator *)> has_union_below = [&](const LogicalOperator *op) -> bool {
+				if (op->type == LogicalOperatorType::LOGICAL_UNION) {
+					return true;
+				}
+				for (auto &c : op->children) {
+					if (has_union_below(c.get())) {
+						return true;
+					}
+				}
+				return false;
+			};
+			has_union_over_agg = found_aggregation && has_union_below(plan.get());
+		}
+
 		IVMType ivm_type;
 
 		if (found_window) {
@@ -956,6 +982,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' uses constructs not supported for incremental maintenance. "
 			               "Full refresh will be used.");
+		} else if (has_union_over_agg) {
+			ivm_type = IVMType::FULL_REFRESH;
+			Printer::Print("Warning: materialized view '" + view_name +
+			               "' combines aggregates via UNION/UNION ALL. "
+			               "IVM can't deduplicate across branches incrementally; using full refresh.");
 		} else if (has_derived_aggregate_below_join) {
 			ivm_type = IVMType::FULL_REFRESH;
 			Printer::Print("Warning: materialized view '" + view_name +
