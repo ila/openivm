@@ -628,7 +628,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			}
 		}
 		for (auto &column : aggregates) {
-			if (column.rfind("_ivm_count_", 0) == 0 || column == "_ivm_count_star") {
+			if (column.rfind(ivm::COUNT_COL_PREFIX, 0) == 0 || column == ivm::COUNT_STAR_COL ||
+			    column == ivm::DISTINCT_COUNT_COL) {
 				count_cols.push_back(column);
 			}
 		}

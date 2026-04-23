@@ -32,6 +32,11 @@ constexpr const char *SUM_SQP_COL_PREFIX = "_ivm_sum_sqp_"; // STDDEV_POP: sqrt 
 constexpr const char *VAR_SQP_COL_PREFIX = "_ivm_var_sqp_"; // VAR_POP: no sqrt + population denominator
 constexpr const char *COUNT_COL_PREFIX = "_ivm_count_";
 
+// Hidden COUNT(*) injected into AGGREGATE_GROUP MVs that don't already have a
+// count aggregate. Tracks per-group cardinality so the cleanup can delete rows
+// whose group reaches 0 remaining tuples (without confusing legitimate SUM=0).
+constexpr const char *COUNT_STAR_COL = "_ivm_count_star";
+
 // Match count columns for outer join incremental MERGE (Larson & Zhou / Zhang & Larson)
 constexpr const char *MATCH_COUNT_COL = "_ivm_match_count";
 constexpr const char *RIGHT_MATCH_COUNT_COL = "_ivm_right_match_count";

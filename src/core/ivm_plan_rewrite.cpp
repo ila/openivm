@@ -470,6 +470,73 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Derived aggregates → hidden columns, %zu decompositions\n", decomps.size());
 }
 
+/// Inject a hidden COUNT(*) (alias `_ivm_count_star`) into AGGREGATE_GROUP
+/// aggregates that don't already have a count-family aggregate.
+///
+/// Why: the post-MERGE cleanup in CompileAggregateGroups needs a per-group
+/// cardinality column to delete rows whose group has dropped to zero tuples.
+/// Views with only SUM/MIN/MAX (no COUNT) have no such column, so groups
+/// whose total hits 0 after deletes would linger in the MV. We can't use
+/// SUM = 0 as a proxy (CASE expressions can legitimately yield 0).
+///
+/// The column is prefixed `_ivm_` so `column_hider` auto-excludes it from
+/// the user-facing VIEW; `CompileAggregateGroups` already recognizes it
+/// via ivm::COUNT_STAR_COL.
+static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan, bool is_top = true) {
+	for (auto &child : plan->children) {
+		InjectGroupCountStar(child, false);
+	}
+	if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION || plan->children.empty()) {
+		return;
+	}
+	LogicalOperator *agg_search = nullptr;
+	auto *c0 = plan->children[0].get();
+	if (c0->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		agg_search = c0;
+	} else if (is_top && c0->type == LogicalOperatorType::LOGICAL_FILTER && !c0->children.empty() &&
+	           c0->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		agg_search = c0->children[0].get();
+	}
+	if (!agg_search) {
+		return;
+	}
+	auto &agg = agg_search->Cast<LogicalAggregate>();
+	// Only inject for GROUP BY (SIMPLE_AGGREGATE has a different compile path).
+	if (agg.groups.empty()) {
+		return;
+	}
+	// Skip if a count/count_star aggregate is already present (explicit user
+	// COUNT(x)/COUNT(*), the DISTINCT-injected _ivm_distinct_count, or a
+	// _ivm_count_<alias> from AVG/STDDEV decomposition).
+	for (auto &expr : agg.expressions) {
+		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			continue;
+		}
+		auto &bound = expr->Cast<BoundAggregateExpression>();
+		if (bound.function.name == "count" || bound.function.name == "count_star") {
+			return;
+		}
+	}
+	auto count_star_func = CountStarFun::GetFunction();
+	vector<unique_ptr<Expression>> count_args;
+	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star_func), std::move(count_args), nullptr,
+	                                                      nullptr, AggregateType::NON_DISTINCT);
+	count_expr->alias = ivm::COUNT_STAR_COL;
+	auto count_type = count_expr->return_type;
+	idx_t new_agg_idx = agg.expressions.size();
+	agg.expressions.push_back(std::move(count_expr));
+	agg.ResolveOperatorTypes();
+
+	ColumnBinding count_binding(agg.aggregate_index, new_agg_idx);
+	auto count_pt = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+	count_pt->alias = ivm::COUNT_STAR_COL;
+	auto &proj = plan->Cast<LogicalProjection>();
+	proj.expressions.push_back(std::move(count_pt));
+	proj.ResolveOperatorTypes();
+
+	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Injected _ivm_count_star for AGGREGATE_GROUP\n");
+}
+
 /// Returns true if `alias` is one of the reserved IVM-hidden-column prefixes
 /// added by DecomposeAvgStddev. Used to decide whether to propagate a child
 /// projection's expression up through a pass-through parent projection.
@@ -903,6 +970,7 @@ void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOp
 		Optimizer opt(binder, context);
 		RewriteDerivedAggregates(context, plan, opt);
 	}
+	InjectGroupCountStar(plan);
 	PropagateHiddenAggregateColumns(plan);
 	RewriteLeftJoinKey(binder, plan);
 	RewriteLeftJoinMatchCount(context, binder, plan);
