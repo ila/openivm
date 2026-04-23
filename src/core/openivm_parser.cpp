@@ -731,6 +731,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			};
 			if (has_union(plan.get())) {
 				group_names_list.clear();
+				// UNION ALL of per-branch aggregates (e.g.
+				//   `SELECT a, SUM(x) FROM t1 GROUP BY a
+				//    UNION ALL SELECT a, SUM(x) FROM t2 GROUP BY a`)
+				// produces output rows keyed by both (a, branch). SIMPLE_AGGREGATE would
+				// treat all rows as one aggregate group (no GROUP BY) and SUM them into
+				// a single row — wrong. Incremental per-branch maintenance would need a
+				// new AGGREGATE_UNION IVMType with branch tagging. Until that lands, mark
+				// the view as FULL_REFRESH so results stay correct.
+				ivm_compatible = false;
 			} else {
 				find_group_cols(plan.get());
 			}
