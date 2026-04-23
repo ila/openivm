@@ -500,17 +500,36 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// rewriter-rule path (which needs LPTS) isn't used.
 			{
 				bool needs_original = false;
-				// Walk the plan looking for GROUPING SETS / ROLLUP / CUBE — any aggregate
-				// with more than one grouping_set entry triggers fallback.
+				// Walk the plan looking for constructs LPTS can't round-trip:
+				//   - GROUPING SETS / ROLLUP / CUBE (aggregate.grouping_sets.size() > 1)
+				//   - Ordered-set aggregates (quantile_cont / quantile_disc / percentile_cont
+				//     / percentile_disc / approx_quantile) — their extra "within group" /
+				//     second-argument parameters don't survive the plan→SQL conversion.
 				std::function<void(LogicalOperator *)> walk = [&](LogicalOperator *op) {
 					if (needs_original || !op) {
 						return;
 					}
 					if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 						auto *agg = dynamic_cast<LogicalAggregate *>(op);
-						if (agg && agg->grouping_sets.size() > 1) {
-							needs_original = true;
-							return;
+						if (agg) {
+							if (agg->grouping_sets.size() > 1) {
+								needs_original = true;
+								return;
+							}
+							for (auto &expr : agg->expressions) {
+								if (expr->type != ExpressionType::BOUND_AGGREGATE) {
+									continue;
+								}
+								auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+								const string &fn_name = bound_agg.function.name;
+								if (fn_name == "quantile_cont" || fn_name == "quantile_disc" ||
+								    fn_name == "percentile_cont" || fn_name == "percentile_disc" ||
+								    fn_name == "approx_quantile" || fn_name == "mad" || fn_name == "median" ||
+								    fn_name == "mode") {
+									needs_original = true;
+									return;
+								}
+							}
 						}
 					}
 					for (auto &child : op->children) {
@@ -521,9 +540,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				if (needs_original) {
 					view_query = original_view_query;
 					lpts_fallback = true;
-					OPENIVM_DEBUG_PRINT(
-					    "[CREATE MV] LPTS can't round-trip GROUPING SETS/ROLLUP/CUBE — using original SQL: %s\n",
-					    view_query.c_str());
+					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — using original SQL: %s\n",
+					                    view_query.c_str());
 				}
 			}
 		}
