@@ -891,6 +891,61 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 
+		// AVG/STDDEV/VARIANCE need decomposition into SUM+COUNT (see DecomposeAvgStddev
+		// in ivm_plan_rewrite.cpp). Decomposition only works when the aggregate is
+		// directly below the top PROJECTION (with at most one FILTER for HAVING).
+		// If there's a JOIN sitting between the top and the aggregate (CTE pattern
+		// like `WITH agg AS (SELECT ..., AVG(x) ... GROUP BY k) SELECT ... FROM agg
+		// JOIN other ...`), the decomposition can't reach the top projection, so the
+		// stored `avg` column would get summed instead of averaged during MERGE.
+		// Fall back to full recompute for these — query_0617 is the canonical case.
+		bool has_derived_aggregate_below_join = false;
+		{
+			std::function<bool(const LogicalOperator *)> find_derived = [&](const LogicalOperator *op) -> bool {
+				if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+					auto &agg = op->Cast<LogicalAggregate>();
+					for (auto &expr : agg.expressions) {
+						if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+							continue;
+						}
+						auto &bound = expr->Cast<BoundAggregateExpression>();
+						const string &name = bound.function.name;
+						if (name == "avg" || name == "stddev" || name == "stddev_samp" || name == "stddev_pop" ||
+						    name == "variance" || name == "var_samp" || name == "var_pop") {
+							return true;
+						}
+					}
+				}
+				for (auto &c : op->children) {
+					if (find_derived(c.get())) {
+						return true;
+					}
+				}
+				return false;
+			};
+			// Walk into JOIN subtrees to see if there's an AGGREGATE with AVG/STDDEV/VARIANCE
+			// that sits beneath the top plan's aggregate (or beneath a JOIN).
+			std::function<void(const LogicalOperator *, bool)> walk_for_nested = [&](const LogicalOperator *op,
+			                                                                         bool under_join) {
+				if (has_derived_aggregate_below_join)
+					return;
+				if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+				    op->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+					under_join = true;
+				}
+				if (under_join && op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+					if (find_derived(op)) {
+						has_derived_aggregate_below_join = true;
+						return;
+					}
+				}
+				for (auto &c : op->children) {
+					walk_for_nested(c.get(), under_join);
+				}
+			};
+			walk_for_nested(plan.get(), false);
+		}
+
 		IVMType ivm_type;
 
 		if (found_window) {
@@ -901,6 +956,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' uses constructs not supported for incremental maintenance. "
 			               "Full refresh will be used.");
+		} else if (has_derived_aggregate_below_join) {
+			ivm_type = IVMType::FULL_REFRESH;
+			Printer::Print("Warning: materialized view '" + view_name +
+			               "' has AVG/STDDEV/VARIANCE inside a CTE joined with other tables. "
+			               "IVM decomposition can't propagate through the join; using full refresh.");
 		} else if (found_distinct && distinct_at_top && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (found_having && found_aggregation && !aggregate_columns.empty()) {
