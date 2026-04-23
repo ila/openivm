@@ -240,7 +240,17 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// Use con for planning — sees all committed state from previous bind-phase DDL
 		con.BeginTransaction();
-		auto table_names = con.GetTableNames(statement->query);
+		// GetTableNames binds the query internally. For MV queries that DuckDB's binder
+		// can't evaluate out-of-context (e.g. multi-column `(a, b) IN (SELECT x, y FROM t)`
+		// triggers an ARRAY-sublink path that rejects the 2-column subquery), the call
+		// throws. Catch and use an empty table_names — the later ExtractViewQuery path
+		// re-derives what it needs from the plan.
+		unordered_set<string> table_names;
+		try {
+			table_names = con.GetTableNames(statement->query);
+		} catch (const std::exception &e) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] GetTableNames failed: %s — continuing\n", e.what());
+		}
 
 		// Plan the full CREATE TABLE AS SELECT statement (for plan walking)
 		Planner planner(*con.context);
