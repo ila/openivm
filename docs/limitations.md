@@ -85,3 +85,14 @@ anything it flags as `ivm_compatible = false` routes to `IVMType::FULL_REFRESH`.
 - **Transaction isolation during refresh** uses a separate Connection with snapshot
   isolation. Concurrent DML during refresh does not affect the in-progress refresh, but
   the interaction has not been exhaustively audited.
+
+- **Window functions over DuckLake with non-output partition keys or multi-table inputs**
+  fall back to full recompute (`DELETE FROM data; INSERT INTO data SELECT * FROM view_query`).
+  Partition-level recompute (delete + re-insert only affected partitions via DuckLake
+  snapshot-diff) is used when all partition columns appear in the MV's output and there
+  is a single base table. When the PARTITION BY column is dropped by the outer SELECT
+  (e.g. `WITH cte AS (… PARTITION BY a, b, c …) SELECT a, c, … FROM cte` where `b` is
+  projected out), the outer `WHERE <b> IN (…)` can't resolve the column, so we can't
+  identify affected rows in the data table. Similarly for `UNION ALL` / multi-base-table
+  windows. A proper incremental fix requires rewriting the view query to push the
+  partition filter into the base scan; not yet implemented.

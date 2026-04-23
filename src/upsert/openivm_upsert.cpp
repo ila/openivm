@@ -974,10 +974,71 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	case IVMType::WINDOW_PARTITION: {
 		// Window functions: partition-level recompute — delete+re-insert affected partitions.
 		auto partition_cols = metadata.GetGroupColumns(view_name); // reuses group_columns field
-		upsert_query = CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, catalog_prefix,
-		                                      partition_cols, delta_table_names);
-		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols)\n",
-		                    partition_cols.size());
+		// For DuckLake base tables the delta source isn't a `delta_<T>` twin with
+		// `_duckdb_ivm_timestamp` — the delta_table_names entry is the DuckLake base name
+		// itself. Build the affected-partition filter via DuckLake snapshot diff instead:
+		// symmetric difference between current and last_snapshot_id.
+		bool any_ducklake = false;
+		for (auto &dt : delta_table_names) {
+			if (metadata.IsDuckLakeTable(view_name, dt)) {
+				any_ducklake = true;
+				break;
+			}
+		}
+		// Only use snapshot-diff recompute when safe: single base table AND every partition col
+		// is in the MV's output (so the WHERE can filter). Otherwise fall back to full recompute —
+		// CompileWindowRecompute's native path references _duckdb_ivm_timestamp which DuckLake
+		// tables lack, so we must not reach it for any DuckLake window.
+		bool safe_for_snapdiff = any_ducklake && !partition_cols.empty() && delta_table_names.size() == 1;
+		if (safe_for_snapdiff) {
+			for (auto &pc : partition_cols) {
+				if (std::find(column_names.begin(), column_names.end(), pc) == column_names.end()) {
+					safe_for_snapdiff = false;
+					break;
+				}
+			}
+		}
+		if (safe_for_snapdiff) {
+			const string &base_name = delta_table_names[0];
+			int64_t old_snap = metadata.GetLastSnapshotId(view_name, base_name);
+			// For PRAGMA ivm('mv'), attached_db_catalog_name is empty — use view_catalog_name
+			// (the catalog hosting the DuckLake MV, which also hosts its base tables).
+			string dl_catalog = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
+			string dl_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
+			string qualified_base =
+			    dl_catalog + "." + dl_schema + "." + KeywordHelper::WriteOptionallyQuoted(base_name);
+			string snap_clause = " AT (VERSION => " + to_string(old_snap) + ")";
+			string diff_sql = "(SELECT * FROM " + qualified_base + " EXCEPT ALL SELECT * FROM " + qualified_base +
+			                  snap_clause + ") UNION ALL (SELECT * FROM " + qualified_base + snap_clause +
+			                  " EXCEPT ALL SELECT * FROM " + qualified_base + ")";
+			string affected_filter;
+			for (size_t i = 0; i < partition_cols.size(); i++) {
+				if (i > 0) {
+					affected_filter += " OR ";
+				}
+				string col = KeywordHelper::WriteOptionallyQuoted(partition_cols[i]);
+				affected_filter +=
+				    col + " IN (SELECT DISTINCT " + col + " FROM (" + diff_sql + ") _ivm_diff_" + to_string(i) + ")";
+			}
+			upsert_query = "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n" + "INSERT INTO " +
+			               data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_recompute\nWHERE " +
+			               affected_filter + ";\n";
+			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake snapshot-diff, %zu "
+			                    "partition cols, old_snap=%ld)\n",
+			                    partition_cols.size(), (long)old_snap);
+		} else if (any_ducklake) {
+			// DuckLake edge case: multi-table window or partition col not in MV output.
+			// Full recompute — documented in docs/limitations.md.
+			upsert_query =
+			    "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
+			OPENIVM_DEBUG_PRINT(
+			    "[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake, full recompute fallback)\n");
+		} else {
+			upsert_query = CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, catalog_prefix,
+			                                      partition_cols, delta_table_names);
+			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols)\n",
+			                    partition_cols.size());
+		}
 		break;
 	}
 	case IVMType::FULL_REFRESH: {
