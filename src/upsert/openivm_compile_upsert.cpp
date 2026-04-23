@@ -608,24 +608,41 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 
 	string upsert_query = merge_query + "\n";
 
-	// Delete zero rows — skip when insert_only (groups can't reach zero from inserts alone).
-	// Also skip when _ivm_match_count is present: LEFT JOIN groups with match_count=0
-	// are valid (unmatched preserved-side rows with NULL aggregates, not deleted groups).
+	// Delete empty groups — a group is empty iff its row count is 0. We can only detect
+	// this when the MV has a COUNT-type aggregate (either an explicit COUNT(*) / COUNT(x),
+	// or a hidden count from AVG/STDDEV decomposition). For MVs with only SUM-style
+	// aggregates, `SUM=0` does NOT mean the group is empty — e.g.
+	//   SUM(CASE WHEN C_BALANCE < 0 THEN C_YTD_PAYMENT ELSE 0 END)
+	// legitimately returns 0 for every row when C_YTD_PAYMENT is always 0. Skip the
+	// cleanup in that case to avoid deleting valid rows.
+	// Also skip when insert_only (groups can't reach zero from inserts alone) and when
+	// _ivm_match_count is present (LEFT JOIN preserved-side NULL aggregates are valid).
 	if (!insert_only && !has_match_count) {
-		string delete_query = "\ndelete from " + data_table + " where ";
-		for (auto &column : aggregates) {
-			if (derived_cols.count(column)) {
-				continue; // skip derived cols (avg, stddev) — checking sum/count is sufficient
-			}
-			if (list_mode) {
-				delete_query += "list_reduce(" + column + ", lambda a, b: a + b) = 0.0 and ";
-			} else {
-				delete_query += "COALESCE(" + column + ", 0) = 0 and ";
+		// Find COUNT-type columns. aggregate_types is parallel to the user-facing aggregate
+		// list; col_agg_type maps column name -> aggregate function. Also consider hidden
+		// _ivm_count_<N> columns from AVG/STDDEV decomposition.
+		vector<string> count_cols;
+		for (auto &entry : col_agg_type) {
+			if (entry.second == "count" || entry.second == "count_star") {
+				count_cols.push_back(entry.first);
 			}
 		}
-		delete_query.erase(delete_query.size() - 5, 5);
-		delete_query += ";\n";
-		upsert_query += delete_query;
+		for (auto &column : aggregates) {
+			if (column.rfind("_ivm_count_", 0) == 0 || column == "_ivm_count_star") {
+				count_cols.push_back(column);
+			}
+		}
+		if (!count_cols.empty()) {
+			string delete_query = "\ndelete from " + data_table + " where ";
+			for (size_t i = 0; i < count_cols.size(); i++) {
+				if (i > 0) {
+					delete_query += " and ";
+				}
+				delete_query += "COALESCE(" + count_cols[i] + ", 0) = 0";
+			}
+			delete_query += ";\n";
+			upsert_query += delete_query;
+		}
 	}
 
 	return upsert_query;

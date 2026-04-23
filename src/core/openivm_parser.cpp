@@ -1280,10 +1280,18 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				if (dot != string::npos) {
 					cat_name = cat_name.substr(0, dot);
 				}
+				// table_names entries may be lowercased by the parser; the metadata row was
+				// inserted above with the case-preserved DuckLake name (`dl_table_info`).
+				// Match on the same case-preserved name here so the UPDATE actually fires.
+				string table_lc_for_lookup = table_name;
+				std::transform(table_lc_for_lookup.begin(), table_lc_for_lookup.end(), table_lc_for_lookup.begin(),
+				               [](unsigned char c) { return std::tolower(c); });
+				auto info_it = dl_table_info.find(table_lc_for_lookup);
+				string meta_table_name = (info_it != dl_table_info.end()) ? info_it->second.table_name : table_name;
 				ddl.push_back("UPDATE " + string(ivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = (SELECT id FROM " +
 				              cat_name + ".current_snapshot()) WHERE view_name = '" +
 				              OpenIVMUtils::EscapeSingleQuotes(view_name) + "' AND table_name = '" +
-				              OpenIVMUtils::EscapeSingleQuotes(table_name) + "'");
+				              OpenIVMUtils::EscapeSingleQuotes(meta_table_name) + "'");
 			}
 		}
 
