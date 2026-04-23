@@ -540,7 +540,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 								if (fn_name == "quantile_cont" || fn_name == "quantile_disc" ||
 								    fn_name == "percentile_cont" || fn_name == "percentile_disc" ||
 								    fn_name == "approx_quantile" || fn_name == "mad" || fn_name == "median" ||
-								    fn_name == "mode") {
+								    fn_name == "mode" ||
+								    // Two-argument statistical aggregates whose children LPTS
+								    // re-aliases to internal `tN_col` names; the serialized SQL
+								    // refers to those names against the original FROM clause and
+								    // fails binding at CREATE-table time (see query_1888).
+								    fn_name == "corr" || fn_name == "covar_pop" || fn_name == "covar_samp" ||
+								    fn_name == "regr_avgx" || fn_name == "regr_avgy" || fn_name == "regr_count" ||
+								    fn_name == "regr_intercept" || fn_name == "regr_r2" || fn_name == "regr_slope" ||
+								    fn_name == "regr_sxx" || fn_name == "regr_sxy" || fn_name == "regr_syy") {
 									needs_original = true;
 									return;
 								}
