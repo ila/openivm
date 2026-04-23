@@ -102,6 +102,11 @@ struct Summary {
 	int correctness_failures = 0;
 	int contention_events = 0;
 	int64_t max_staleness_ms = 0;
+	// Delta-sanity metrics: should deltas exist when we expect them to, and be
+	// cleaned when expected? The DeltaSanityThread bumps these on violation.
+	int delta_sanity_checks = 0;
+	int delta_missing_when_dml_pending = 0; // DML happened but delta table has no newer rows
+	int delta_stale_after_refresh = 0;      // refresh done but delta rows w/ ts < last_update remain
 	vector<double> refresh_latencies_ms;
 	vector<string> findings;
 	map<string, int> per_mv_refreshes;
@@ -121,6 +126,9 @@ struct Summary {
 		o << ",\"correctness_failures\":" << correctness_failures;
 		o << ",\"contention_events\":" << contention_events;
 		o << ",\"max_staleness_ms\":" << max_staleness_ms;
+		o << ",\"delta_sanity_checks\":" << delta_sanity_checks;
+		o << ",\"delta_missing_when_dml_pending\":" << delta_missing_when_dml_pending;
+		o << ",\"delta_stale_after_refresh\":" << delta_stale_after_refresh;
 
 		// refresh latency percentiles
 		auto l = refresh_latencies_ms;
@@ -574,6 +582,111 @@ static void CheckerThread(SubtestCtx &ctx, int interval_ms) {
 	}
 }
 
+// DeltaSanityThread — verifies two invariants:
+//
+//   (1) "Deltas exist when they should": if DML was applied and the view's
+//       last_update is older than the latest delta row, the delta table must
+//       have at least one row with timestamp > last_update. If zero, the DML
+//       was dropped (insert rule failed silently, or delta wasn't materialized).
+//
+//   (2) "Deltas are cleaned when they should be": the per-view last_update
+//       timestamp bumps on refresh; the delete_from_delta_table cleanup should
+//       have removed rows with timestamp < MIN(last_update) across all views
+//       referencing the same delta table. Any such stragglers indicate a
+//       cleanup-miss bug.
+//
+// We only flag repeat violations (a single tick may catch a refresh in flight);
+// a finding is recorded if the same violation persists across >= 3 consecutive
+// checks. Skipped for DuckLake sub-tests (S9/S10/S11) because DuckLake bases
+// don't use delta tables.
+static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
+	if (ctx.subtest == "S9" || ctx.subtest == "S10" || ctx.subtest == "S11") {
+		return;
+	}
+	duckdb::Connection con(*ctx.db);
+	map<string, int> missing_streak; // "view|delta" -> consecutive violation count
+	map<string, int> stale_streak;   // "delta" -> consecutive violation count
+	while (!ctx.stop.load()) {
+		this_thread::sleep_for(chrono::milliseconds(interval_ms));
+		if (ctx.stop.load()) break;
+		{
+			lock_guard<mutex> lk(ctx.log_mu);
+			ctx.summary.delta_sanity_checks++;
+		}
+		// Fetch (view_name, table_name, delta_table, last_update, last_dml_ts).
+		// last_dml_ts = MAX(_duckdb_ivm_timestamp) across rows currently in the
+		// delta_<table>. If last_dml_ts > last_update, the refresh hasn't caught
+		// up yet — delta should have rows. If last_dml_ts <= last_update globally
+		// across ALL views referencing this delta, the rows should have been
+		// cleaned by the DELETE FROM delta_<table> WHERE ts < MIN(last_update).
+		auto meta = con.Query(
+		    "SELECT view_name, table_name, last_update FROM _duckdb_ivm_delta_tables "
+		    "WHERE catalog_type = 'duckdb' OR catalog_type IS NULL");
+		if (!meta || meta->HasError()) continue;
+		for (idx_t i = 0; i < meta->RowCount(); i++) {
+			string view_name = meta->GetValue(0, i).ToString();
+			string base_table = meta->GetValue(1, i).ToString();
+			string last_update = meta->GetValue(2, i).IsNull() ? "" : meta->GetValue(2, i).ToString();
+			string delta_table = "delta_" + base_table;
+			// Count delta rows newer than last_update
+			string key = view_name + "|" + delta_table;
+			string newer_q = "SELECT COUNT(*) FROM " + delta_table + " WHERE _duckdb_ivm_timestamp > '" +
+			                  last_update + "'::TIMESTAMP";
+			auto newer_r = con.Query(newer_q);
+			if (!newer_r || newer_r->HasError()) continue;
+			int64_t newer_count = newer_r->GetValue(0, 0).GetValue<int64_t>();
+			// Did DML happen for this table? Check total delta row count
+			auto total_r = con.Query("SELECT COUNT(*) FROM " + delta_table);
+			if (!total_r || total_r->HasError()) continue;
+			int64_t total_count = total_r->GetValue(0, 0).GetValue<int64_t>();
+			// Invariant 1: if total > 0 and last_update is < MAX(ts in delta), newer_count > 0
+			auto maxts_r = con.Query("SELECT MAX(_duckdb_ivm_timestamp) FROM " + delta_table);
+			if (!maxts_r || maxts_r->HasError() || maxts_r->RowCount() == 0 || maxts_r->GetValue(0, 0).IsNull()) {
+				missing_streak[key] = 0;
+			} else {
+				string max_ts = maxts_r->GetValue(0, 0).ToString();
+				if (total_count > 0 && max_ts > last_update && newer_count == 0) {
+					missing_streak[key]++;
+					if (missing_streak[key] == 3) {
+						lock_guard<mutex> lk(ctx.log_mu);
+						ctx.summary.delta_missing_when_dml_pending++;
+						ctx.summary.findings.push_back(
+						    "delta sanity: " + delta_table + " has rows but none newer than last_update for view " +
+						    view_name + " (max_ts=" + max_ts + ", last_update=" + last_update + ")");
+					}
+				} else {
+					missing_streak[key] = 0;
+				}
+			}
+			// Invariant 2: delta rows older than MIN(last_update) across all
+			// views using this delta should have been cleaned up.
+			auto minlu_r =
+			    con.Query("SELECT MIN(last_update) FROM _duckdb_ivm_delta_tables WHERE table_name = '" + base_table + "'");
+			if (minlu_r && !minlu_r->HasError() && minlu_r->RowCount() > 0 && !minlu_r->GetValue(0, 0).IsNull()) {
+				string min_lu = minlu_r->GetValue(0, 0).ToString();
+				auto stale_r = con.Query("SELECT COUNT(*) FROM " + delta_table +
+				                          " WHERE _duckdb_ivm_timestamp < '" + min_lu + "'::TIMESTAMP");
+				if (stale_r && !stale_r->HasError()) {
+					int64_t stale_count = stale_r->GetValue(0, 0).GetValue<int64_t>();
+					if (stale_count > 0) {
+						stale_streak[delta_table]++;
+						if (stale_streak[delta_table] == 3) {
+							lock_guard<mutex> lk(ctx.log_mu);
+							ctx.summary.delta_stale_after_refresh++;
+							ctx.summary.findings.push_back(
+							    "delta sanity: " + delta_table + " has " + std::to_string(stale_count) +
+							    " rows with ts < MIN(last_update)=" + min_lu +
+							    " (cleanup miss after refresh)");
+						}
+					} else {
+						stale_streak[delta_table] = 0;
+					}
+				}
+			}
+		}
+	}
+}
+
 static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 	duckdb::Connection con(*ctx.db);
 	// Refresh bumps `_duckdb_ivm_delta_tables.last_update` (one row per source
@@ -800,52 +913,72 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 		ctx.t0_ms = NowMs();
 		vector<thread> workers;
 
-		// S6: heavier DML (100ms)
-		int dml_interval = (subtest == "S6") ? 100 : 200;
+		// STRESS: much tighter DML cadences + more concurrent DML workers.
+		// Baseline 100ms (was 200ms). S6/S8 go to 50ms with multiple writers to
+		// stack deltas on shared base tables. Higher pressure surfaces
+		// delta-table locking / transaction-conflict edge cases.
+		int dml_interval = (subtest == "S6" || subtest == "S8") ? 50 : 100;
 		workers.emplace_back(DMLThread, std::ref(ctx), dml_interval, 0);
 		if (subtest == "S8") {
-			// second DML thread, different offset to simulate delete-heavy worker
-			workers.emplace_back(DMLThread, std::ref(ctx), 100, 100);
+			// S8 is delete-heavy + insert-heavy two-writer: stack THREE
+			// DML threads with staggered offsets so every tick overlaps.
+			workers.emplace_back(DMLThread, std::ref(ctx), 50, 50);
+			workers.emplace_back(DMLThread, std::ref(ctx), 50, 150);
+		} else if (subtest == "S3" || subtest == "S5" || subtest == "S7") {
+			// S3/S5/S7: add a 2nd DML thread at 150ms offset so refreshes
+			// don't see a quiet window — deltas always have pending rows.
+			workers.emplace_back(DMLThread, std::ref(ctx), 100, 150);
 		}
 
 		// Checker
-		int checker_interval = (subtest == "S6" || subtest == "S8") ? 3000 : 5000;
+		int checker_interval = (subtest == "S6" || subtest == "S8") ? 2000 : 3000;
 		workers.emplace_back(CheckerThread, std::ref(ctx), checker_interval);
 
 		// Monitor
 		workers.emplace_back(MonitorThread, std::ref(ctx), 5000);
 
+		// Delta-sanity thread — verifies "deltas exist when they should;
+		// empty when they should be". Runs every 2s. No-ops on DuckLake.
+		workers.emplace_back(DeltaSanityThread, std::ref(ctx), 2000);
+
 		// Manual refresh threads (S4/S5/S6/S11) or hybrid (S7)
 		if (subtest == "S4") {
 			vector<string> targets;
 			for (auto &v : ctx.mvs) targets.push_back(v.name);
-			workers.emplace_back(ManualRefreshThread, std::ref(ctx), targets, 500);
+			workers.emplace_back(ManualRefreshThread, std::ref(ctx), targets, 250);
 		} else if (subtest == "S5") {
-			// 4 refresh threads, each owning a disjoint subset
+			// STRESS: 8 refresh threads on 10 MVs, 250ms cadence. Each thread
+			// owns a disjoint subset; parallelism stacks on shared base tables
+			// (CUSTOMER, DISTRICT, HISTORY, STOCK, ITEM, NEW_ORDER). This is
+			// the scenario that surfaces LockDelta serialization bugs.
 			vector<string> all;
 			for (auto &v : ctx.mvs) all.push_back(v.name);
-			for (int t = 0; t < 4; t++) {
+			for (int t = 0; t < 8; t++) {
 				vector<string> subset;
-				for (size_t i = t; i < all.size(); i += 4) subset.push_back(all[i]);
-				workers.emplace_back(ManualRefreshThread, std::ref(ctx), subset, 500);
+				for (size_t i = t; i < all.size(); i += 8) subset.push_back(all[i]);
+				if (!subset.empty()) {
+					workers.emplace_back(ManualRefreshThread, std::ref(ctx), subset, 250);
+				}
 			}
 		} else if (subtest == "S6") {
-			// 4 threads ALL hammer mv_ind1
-			for (int t = 0; t < 4; t++) {
-				workers.emplace_back(ManualRefreshThread, std::ref(ctx),
-				                      vector<string> {"mv_ind1"}, 200);
+			// STRESS: 6 threads hammering the same mv_ind1 at 100ms — maximal
+			// per-view lock contention. LockView must serialize without
+			// deadlock or priority inversion.
+			for (int t = 0; t < 6; t++) {
+				workers.emplace_back(ManualRefreshThread, std::ref(ctx), vector<string> {"mv_ind1"}, 100);
 			}
 		} else if (subtest == "S7") {
-			// one manual thread hammers mv_ind1 every 30s while daemon also fires
-			workers.emplace_back(ManualRefreshThread, std::ref(ctx),
-			                      vector<string> {"mv_ind1"}, 30000);
+			// STRESS: manual every 20s (was 30s) — more race windows vs the
+			// 1-min daemon and the ALTER mid-run.
+			workers.emplace_back(ManualRefreshThread, std::ref(ctx), vector<string> {"mv_ind1"}, 20000);
 		} else if (subtest == "S11") {
 			vector<string> all;
 			for (auto &v : ctx.mvs) all.push_back(v.name);
-			for (int t = 0; t < 3 && t < (int)all.size(); t++) {
-				vector<string> subset = {all[t]};
-				if (t + 3 < (int)all.size()) subset.push_back(all[t + 3]);
-				workers.emplace_back(ManualRefreshThread, std::ref(ctx), subset, 500);
+			// STRESS: 4 DuckLake refresh threads at 250ms (was 3 @ 500ms).
+			for (int t = 0; t < 4 && t < (int)all.size(); t++) {
+				vector<string> subset = {all[t % all.size()]};
+				if ((t + 4) < (int)all.size()) subset.push_back(all[(t + 4) % all.size()]);
+				workers.emplace_back(ManualRefreshThread, std::ref(ctx), subset, 250);
 			}
 		}
 

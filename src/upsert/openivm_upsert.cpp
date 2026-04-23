@@ -1182,11 +1182,27 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		OPENIVM_DEBUG_PRINT("[UPSERT] Optimizer done.\n");
 		con.Rollback();
 
-		// Convert the rewritten plan to SQL via the AST pipeline
-		auto ast = LogicalPlanToAst(con_ctx, plan);
-		auto cte_list = AstToCteList(*ast);
-		string raw_ivm_sql = cte_list->ToQuery(false);
-		OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_ivm_sql.c_str());
+		// Convert the rewritten plan to SQL via the AST pipeline.
+		// LPTS does not cover every operator (table functions, certain WINDOW shapes,
+		// nested subqueries, etc.). If serialization fails, fall back to a full
+		// recompute of the MV — semantically correct, slower, but safe. Without
+		// this fallback the whole PRAGMA ivm() call would surface "Invalid Error:
+		// map::at" and the user gets a cryptic crash instead of a working refresh.
+		string raw_ivm_sql;
+		try {
+			auto ast = LogicalPlanToAst(con_ctx, plan);
+			auto cte_list = AstToCteList(*ast);
+			raw_ivm_sql = cte_list->ToQuery(false);
+			OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_ivm_sql.c_str());
+		} catch (const std::exception &e) {
+			Printer::Print("Warning: materialized view '" + view_name +
+			               "' uses constructs not supported by IVM's SQL serializer (" + e.what() +
+			               "). Falling back to full recompute for this refresh.");
+			OPENIVM_DEBUG_PRINT("[UPSERT] LPTS fallback (%s) for view '%s' → full recompute\n", e.what(),
+			                    view_name.c_str());
+			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+			                           attached_db_schema_name, catalog_prefix);
+		}
 
 		// Use explicit column list in INSERT INTO delta_view, excluding _duckdb_ivm_timestamp
 		// so the DEFAULT now() fills it in (for chained MV support)
