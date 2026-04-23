@@ -147,6 +147,10 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		    context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
 		    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr, cross_system ? &meta_post_sql : nullptr);
 		Connection exec_con(*context.db.get());
+		// IVM-generated SQL can nest deeply for multi-table joins + CTEs (N-term telescoping
+		// over 7+ tables produces hundreds of chained projections). Lift the default 1000
+		// expression-depth limit so the binder doesn't reject legitimate plans.
+		exec_con.Query("SET max_expression_depth = 10000");
 		OPENIVM_DEBUG_PRINT("[UPSERT] Executing refresh SQL:\n%s\n", sql.c_str());
 
 		// Wrap the entire refresh in a transaction so that a failed refresh leaves the MV
@@ -930,13 +934,21 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			string rk = KeywordHelper::WriteOptionallyQuoted(string(ivm::RIGHT_KEY_COL));
 
 			auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
+			// DuckLake base tables lack `_duckdb_ivm_timestamp` — drop the ts filter when the
+			// delta source is a DuckLake base (delta_table_names stores the base name itself).
+			bool dt_left_is_ducklake =
+			    !foj.dt_left_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_left_name);
+			bool dt_right_is_ducklake =
+			    !foj.dt_right_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_right_name);
+			string delta_where_left = dt_left_is_ducklake ? "" : delta_where;
+			string delta_where_right = dt_right_is_ducklake ? "" : delta_where;
 
 			// Build affected-keys CTE: query each delta table for its join column
 			string union_parts;
 			if (!foj.dt_left_name.empty() && !foj.left_col.empty()) {
 				string dt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_left_name);
 				union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.left_col) +
-				               " AS _k FROM " + dt + delta_where;
+				               " AS _k FROM " + dt + delta_where_left;
 			}
 			if (!foj.dt_right_name.empty() && !foj.right_col.empty()) {
 				if (!union_parts.empty()) {
@@ -944,7 +956,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				}
 				string dt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_right_name);
 				union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.right_col) +
-				               " AS _k FROM " + dt + delta_where;
+				               " AS _k FROM " + dt + delta_where_right;
 			}
 
 			string where_clause;

@@ -654,7 +654,33 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 				return false;
 			};
-			find_group_cols(plan.get());
+			// If the plan contains a LOGICAL_UNION above the aggregate(s), the MV's output
+			// columns come from multiple independent branches — collecting group keys from
+			// a single branch would return names that aren't in the MV's user-facing output
+			// (UNION ALL re-aliases them at the top). Classify as SIMPLE_AGGREGATE so the
+			// refresh path doesn't generate SQL referencing the inner alias.
+			// `has_union` is a simple "contains LOGICAL_UNION anywhere" check: we already
+			// gate on `found_aggregation`, so ANY union under the CTAS signals UNION-over-aggregate
+			// when the aggregate is reachable via a CTE_REF branch.
+			std::function<bool(LogicalOperator *)> has_union = [&](LogicalOperator *op) -> bool {
+				if (!op) {
+					return false;
+				}
+				if (op->type == LogicalOperatorType::LOGICAL_UNION) {
+					return true;
+				}
+				for (auto &c : op->children) {
+					if (has_union(c.get())) {
+						return true;
+					}
+				}
+				return false;
+			};
+			if (has_union(plan.get())) {
+				group_names_list.clear();
+			} else {
+				find_group_cols(plan.get());
+			}
 			for (auto &name : group_names_list) {
 				aggregate_columns.push_back(name);
 			}
@@ -933,6 +959,69 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				return "";
 			};
 
+			// Index projections and gets by table_index so we can resolve a BCR's binding
+			// down the tree. CTE inlining stacks projections between the join and the
+			// underlying scan; `BoundColumnRefExpression::GetName()` at the join level
+			// returns whatever alias was applied by the nearest projection (e.g. `w`
+			// from `SELECT O_W_ID AS w`), not the base column name. The refresh paths
+			// need the base name (`O_W_ID`) because they query the delta/base table.
+			std::unordered_map<idx_t, LogicalProjection *> foj_proj_by_index;
+			std::unordered_map<idx_t, LogicalGet *> foj_get_by_index;
+			std::function<void(LogicalOperator *)> foj_index_ops = [&](LogicalOperator *op) {
+				if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+					auto &proj = op->Cast<LogicalProjection>();
+					foj_proj_by_index[proj.table_index] = &proj;
+				} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
+					auto &get = op->Cast<LogicalGet>();
+					foj_get_by_index[get.table_index] = &get;
+				}
+				for (auto &child : op->children) {
+					foj_index_ops(child.get());
+				}
+			};
+			foj_index_ops(plan.get());
+			auto resolve_bcr_to_base = [&](BoundColumnRefExpression *bcr) -> string {
+				idx_t tidx = bcr->binding.table_index;
+				idx_t cidx = bcr->binding.column_index;
+				for (int depth = 0; depth < 16; depth++) {
+					auto get_it = foj_get_by_index.find(tidx);
+					if (get_it != foj_get_by_index.end()) {
+						auto *get = get_it->second;
+						// column_ids[cidx] maps the scan's cidx-th output to the base column
+						// index; fall back to `names[cidx]` when column_ids is unset.
+						auto &ids = get->GetColumnIds();
+						if (cidx < ids.size() && get->GetTable().get()) {
+							auto base_idx = ids[cidx].GetPrimaryIndex();
+							auto &cols = get->GetTable().get()->GetColumns();
+							if (base_idx < cols.LogicalColumnCount()) {
+								return cols.GetColumn(LogicalIndex(base_idx)).Name();
+							}
+						}
+						if (cidx < get->names.size()) {
+							return get->names[cidx];
+						}
+						return "";
+					}
+					auto proj_it = foj_proj_by_index.find(tidx);
+					if (proj_it == foj_proj_by_index.end()) {
+						return "";
+					}
+					auto *proj = proj_it->second;
+					if (cidx >= proj->expressions.size()) {
+						return "";
+					}
+					auto &expr = proj->expressions[cidx];
+					if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+						// Computed expression — fall back to its alias.
+						return expr->alias.empty() ? expr->GetName() : expr->alias;
+					}
+					auto &next = expr->Cast<BoundColumnRefExpression>();
+					tidx = next.binding.table_index;
+					cidx = next.binding.column_index;
+				}
+				return "";
+			};
+
 			std::function<void(LogicalOperator *)> extract_foj_cols = [&](LogicalOperator *n) {
 				if (full_outer_join_cols_val != "null") {
 					return;
@@ -946,13 +1035,19 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 						if (left_expr->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
 							auto *lref = dynamic_cast<BoundColumnRefExpression *>(left_expr.get());
 							if (lref) {
-								left_col_name = lref->GetName();
+								left_col_name = resolve_bcr_to_base(lref);
+								if (left_col_name.empty()) {
+									left_col_name = lref->GetName();
+								}
 							}
 						}
 						if (right_expr->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
 							auto *rref = dynamic_cast<BoundColumnRefExpression *>(right_expr.get());
 							if (rref) {
-								right_col_name = rref->GetName();
+								right_col_name = resolve_bcr_to_base(rref);
+								if (right_col_name.empty()) {
+									right_col_name = rref->GetName();
+								}
 							}
 						}
 						// Get table names from each side of the join
