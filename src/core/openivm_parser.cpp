@@ -553,8 +553,33 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		size_t group_count = analysis.group_count;
 		idx_t group_index = analysis.group_index;
 		vector<string> aggregate_columns;
-		if (analysis.found_distinct) {
-			// DISTINCT: checker populated aggregate_columns from distinct_targets
+		// DISTINCT is only the MV's grouping when its targets actually appear in the MV's
+		// output columns. An inner-subquery DISTINCT (e.g. `SELECT COUNT(*) FROM (SELECT
+		// DISTINCT x FROM t)`, or a CTE like `WITH cte AS (SELECT DISTINCT x FROM t) ...`)
+		// exposes columns that never reach the data table, so its targets can't drive
+		// AGGREGATE_GROUP classification or the unique index.
+		bool distinct_at_top = false;
+		if (analysis.found_distinct && !analysis.aggregate_columns.empty() && !output_names.empty()) {
+			unordered_set<string> output_lc;
+			for (auto &n : output_names) {
+				string lc = n;
+				std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return std::tolower(c); });
+				output_lc.insert(lc);
+			}
+			distinct_at_top = true;
+			for (auto &t : analysis.aggregate_columns) {
+				string lc = t;
+				std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return std::tolower(c); });
+				if (!output_lc.count(lc)) {
+					distinct_at_top = false;
+					break;
+				}
+			}
+		}
+		if (distinct_at_top) {
+			aggregate_columns = std::move(analysis.aggregate_columns);
+		} else if (analysis.found_distinct && analysis.aggregate_columns.empty()) {
+			// Plain DISTINCT (no explicit targets) — trust the checker.
 			aggregate_columns = std::move(analysis.aggregate_columns);
 		} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
 			// Walk plan to find the outermost PROJECTION that references (group_index, i) bindings.
@@ -834,7 +859,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' uses constructs not supported for incremental maintenance. "
 			               "Full refresh will be used.");
-		} else if (found_distinct) {
+		} else if (found_distinct && distinct_at_top && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (found_having && found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_HAVING;
@@ -1256,7 +1281,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// (b) view_catalog_prefix is non-empty, meaning the data table lands in a non-default
 		// catalog (which is always DuckLake when set via the current_catalog != default_db path).
 		if ((ivm_type == IVMType::AGGREGATE_GROUP || ivm_type == IVMType::AGGREGATE_HAVING) &&
-		    ducklake_tables.empty() && view_catalog_prefix.empty()) {
+		    !aggregate_columns.empty() && ducklake_tables.empty() && view_catalog_prefix.empty()) {
 			string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + ivm::INDEX_SUFFIX);
 			string index_query_view = "create unique index " + index_name + " on " + qdt + "(";
 			for (size_t i = 0; i < aggregate_columns.size(); i++) {
