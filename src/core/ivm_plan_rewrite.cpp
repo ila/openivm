@@ -10,6 +10,7 @@
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -943,6 +944,41 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 			result += "(" + HavingExprToSQL(*conj.children[i], binding_to_alias) + ")";
 		}
 		return result;
+	}
+	case ExpressionClass::BOUND_OPERATOR: {
+		// Covers IS NULL / IS NOT NULL / IN-list / NOT etc. Recurse on children so
+		// aggregate references inside still get rewritten to their output alias.
+		auto &op = expr.Cast<BoundOperatorExpression>();
+		string suffix;
+		if (expr.type == ExpressionType::OPERATOR_IS_NULL) {
+			suffix = " IS NULL";
+		} else if (expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
+			suffix = " IS NOT NULL";
+		}
+		if (!suffix.empty() && op.children.size() == 1) {
+			return "(" + HavingExprToSQL(*op.children[0], binding_to_alias) + ")" + suffix;
+		}
+		if (expr.type == ExpressionType::OPERATOR_NOT && op.children.size() == 1) {
+			return "(NOT (" + HavingExprToSQL(*op.children[0], binding_to_alias) + "))";
+		}
+		return expr.ToString();
+	}
+	case ExpressionClass::BOUND_AGGREGATE: {
+		// HAVING can reference aggregate results directly (e.g. `HAVING AVG(x) > 100`).
+		// If the aggregate's binding isn't in the output-alias map, fall back to its
+		// printed form — but that references base columns the data table doesn't have.
+		// Best effort: check if any child is a plain BCR registered in the map.
+		auto &agg = expr.Cast<BoundAggregateExpression>();
+		if (agg.children.size() == 1 && agg.children[0]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+			auto &col = agg.children[0]->Cast<BoundColumnRefExpression>();
+			uint64_t key =
+			    (uint64_t)col.binding.table_index ^ ((uint64_t)col.binding.column_index * 0x9e3779b97f4a7c15ULL);
+			auto it = binding_to_alias.find(key);
+			if (it != binding_to_alias.end()) {
+				return it->second;
+			}
+		}
+		return expr.ToString();
 	}
 	default:
 		return expr.ToString();
