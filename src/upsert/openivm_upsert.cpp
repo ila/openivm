@@ -49,13 +49,16 @@ struct FojJoinInfo {
 				info.right_col = right_part.substr(rc + 1);
 			}
 		}
+		// Case-insensitive compare: delta_table_names are stored lowercased (DuckDB's parser
+		// lowercases unquoted identifiers), while full_outer_join_cols preserves the case of
+		// the MV's FROM clause (e.g. "OORDER:O_W_ID").
 		for (auto &dt_name : delta_table_names) {
 			string base = StringUtil::StartsWith(dt_name, ivm::DELTA_PREFIX) ? dt_name.substr(strlen(ivm::DELTA_PREFIX))
 			                                                                 : dt_name;
-			if (base == info.left_table) {
+			if (StringUtil::CIEquals(base, info.left_table)) {
 				info.dt_left_name = dt_name;
 			}
-			if (base == info.right_table) {
+			if (StringUtil::CIEquals(base, info.right_table)) {
 				info.dt_right_name = dt_name;
 			}
 		}
@@ -787,21 +790,40 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			string q_left_base = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.left_table);
 			string q_left_col = KeywordHelper::WriteOptionallyQuoted(foj.left_col);
 			string q_right_col = KeywordHelper::WriteOptionallyQuoted(foj.right_col);
-			string qdv = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+			string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+			// DuckLake base tables lack `_duckdb_ivm_timestamp` — applying the ts filter to
+			// `delta_oorder` works (it's a twin table with the ts column), but applying it to
+			// `dl.main.OORDER` errors with "column not found". Sources 2 and 3 query the
+			// DuckLake base table directly (delta_table_names stores the DuckLake name, no
+			// delta_ twin exists), so drop the filter for those sources on DuckLake.
+			bool dt_left_is_ducklake =
+			    !foj.dt_left_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_left_name);
+			bool dt_right_is_ducklake =
+			    !foj.dt_right_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_right_name);
+			string delta_where_left = dt_left_is_ducklake ? "" : delta_where;
+			string delta_where_right = dt_right_is_ducklake ? "" : delta_where;
 
 			// Source 1: delta view — matched-row changes (INNER-demoted delta has group keys)
 			string affected = "SELECT DISTINCT " + keys_tuple + " FROM " + qdv + delta_where;
 
+			// Sources 2 and 3 select `keys_tuple` from a base/delta table that doesn't have
+			// those columns by name, so the reference becomes a correlated reference to the
+			// outer `_ivm_data_mv_X.keys`. Single-column correlated IN is supported by DuckDB
+			// and forces full-delete of affected rows (INSERT then restores correctness);
+			// multi-column correlated IN is not yet supported, so skip sources 2/3 when the
+			// MV has a compound group key. Matched changes already covered by source 1.
+			bool single_col_keys = (group_cols.size() == 1);
+
 			// Source 2: left delta table — directly has group columns (unmatched-left changes)
-			if (!foj.dt_left_name.empty()) {
-				affected += "\n  UNION\n  SELECT DISTINCT " + keys_tuple + " FROM " + q_dt_left + delta_where;
+			if (single_col_keys && !foj.dt_left_name.empty()) {
+				affected += "\n  UNION\n  SELECT DISTINCT " + keys_tuple + " FROM " + q_dt_left + delta_where_left;
 			}
 
 			// Source 3: left base table lookup — map right-side join keys to group keys
-			if (!foj.dt_right_name.empty() && !foj.left_table.empty()) {
+			if (single_col_keys && !foj.dt_right_name.empty() && !foj.left_table.empty()) {
 				affected += "\n  UNION\n  SELECT DISTINCT " + keys_tuple + " FROM " + q_left_base + " WHERE " +
 				            q_left_col + " IN (" + "SELECT DISTINCT " + q_right_col + " FROM " + q_dt_right +
-				            delta_where + ")";
+				            delta_where_right + ")";
 			}
 
 			// Source 4: NULL group — always recompute (unmatched-right changes)
@@ -840,14 +862,25 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			}
 
 			auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
+			// DuckLake base tables lack `_duckdb_ivm_timestamp` — see group-recompute path above.
+			bool dt_left_is_ducklake =
+			    !foj.dt_left_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_left_name);
+			bool dt_right_is_ducklake =
+			    !foj.dt_right_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_right_name);
+			string delta_where_left = dt_left_is_ducklake ? "" : delta_where;
+			string delta_where_right = dt_right_is_ducklake ? "" : delta_where;
+
+			// Same correlated-IN limitation as the group-recompute path: skip sources 2/3 for
+			// multi-column group keys (DuckDB doesn't support correlated multi-column IN).
+			bool single_col_keys = (group_cols.size() == 1);
 
 			// Unmatched-affected groups: left delta (source 2) + base table lookup (source 3)
 			string unmatched_affected;
-			if (!foj.dt_left_name.empty()) {
+			if (single_col_keys && !foj.dt_left_name.empty()) {
 				string q_dt_left = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_left_name);
-				unmatched_affected = "SELECT DISTINCT " + keys_tuple + " FROM " + q_dt_left + delta_where;
+				unmatched_affected = "SELECT DISTINCT " + keys_tuple + " FROM " + q_dt_left + delta_where_left;
 			}
-			if (!foj.dt_right_name.empty() && !foj.left_table.empty()) {
+			if (single_col_keys && !foj.dt_right_name.empty() && !foj.left_table.empty()) {
 				string q_dt_right = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.dt_right_name);
 				string q_left_base = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(foj.left_table);
 				if (!unmatched_affected.empty()) {
@@ -856,7 +889,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				unmatched_affected += "SELECT DISTINCT " + keys_tuple + " FROM " + q_left_base + " WHERE " +
 				                      KeywordHelper::WriteOptionallyQuoted(foj.left_col) + " IN (SELECT DISTINCT " +
 				                      KeywordHelper::WriteOptionallyQuoted(foj.right_col) + " FROM " + q_dt_right +
-				                      delta_where + ")";
+				                      delta_where_right + ")";
 			}
 
 			// Build NULL check for source 4
@@ -932,7 +965,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		} else if (has_left_join) {
 			string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
 			const string &qdt = data_table;
-			string qdv = KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
+			string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(view_name));
 			string lk = KeywordHelper::WriteOptionallyQuoted(string(ivm::LEFT_KEY_COL));
 			string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
 			upsert_query = "DELETE FROM " + qdt + " WHERE " + affected + qdt + "." + lk + delta_where + ");\n" +
