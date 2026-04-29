@@ -688,7 +688,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					// index on a column absent from the data table.
 					auto &proj = op->Cast<LogicalProjection>();
 					bool matched = false;
-					for (auto &expr : proj.expressions) {
+					for (idx_t expr_i = 0; expr_i < proj.expressions.size(); expr_i++) {
+						auto &expr = proj.expressions[expr_i];
 						if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
 							auto &bcr = expr->Cast<BoundColumnRefExpression>();
 							// Trace through any stack of pass-through projections — the
@@ -696,7 +697,24 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 							// through 1-N intermediate projections (CTE inlining, AVG
 							// decomposition, etc.).
 							if (resolves_to_group(bcr.binding.table_index, bcr.binding.column_index, 0)) {
-								string col_name = expr->alias.empty() ? bcr.GetName() : expr->alias;
+								// Prefer the explicit user alias when present.
+								// When there is no alias, use output_names[expr_i] — the
+								// already-sanitized, data-table-authoritative name — rather
+								// than bcr.GetName(), which can return DuckDB-internal
+								// positional strings like "#[4.0]" for join columns resolved
+								// via GROUP BY ALL (or any future internal naming scheme).
+								// output_names[expr_i] is populated before find_group_cols is
+								// called and always matches what the CREATE TABLE AS query
+								// will produce as the column name.
+								string col_name;
+								if (!expr->alias.empty()) {
+									col_name = expr->alias;
+								} else if (expr_i < output_names.size() && !output_names[expr_i].empty() &&
+								           !IVMTableNames::IsInternalColumn(output_names[expr_i])) {
+									col_name = output_names[expr_i];
+								} else {
+									col_name = bcr.GetName();
+								}
 								if (!IVMTableNames::IsInternalColumn(col_name)) {
 									group_names_list.push_back(col_name);
 									matched = true;
@@ -862,7 +880,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 							// Only flag if this expression references an
 							// aggregate output (not just a group column).
 							bool refs_agg = false;
-							std::function<void(const Expression *)> check = [&](const Expression *e) {
+							std::function<void(Expression *)> check = [&](Expression *e) {
 								if (refs_agg) {
 									return;
 								}
@@ -876,7 +894,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 									return;
 								}
 								ExpressionIterator::EnumerateChildren(
-								    const_cast<Expression &>(*e), [&](unique_ptr<Expression> &c) { check(c.get()); });
+								    *e, [&](unique_ptr<Expression> &c) { check(c.get()); });
 							};
 							check(expr.get());
 							if (refs_agg) {
@@ -935,8 +953,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// that sits beneath the top plan's aggregate (or beneath a JOIN).
 			std::function<void(const LogicalOperator *, bool)> walk_for_nested = [&](const LogicalOperator *op,
 			                                                                         bool under_join) {
-				if (has_derived_aggregate_below_join)
+				if (has_derived_aggregate_below_join) {
 					return;
+				}
 				if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 				    op->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
 					under_join = true;
@@ -1034,6 +1053,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		vector<string> ddl;
 
 		// --- System tables DDL ---
+		// Matcher metadata columns (signature_hash..nullified_columns_json) stay
+		// NULL unless ivm_enable_view_matching=true; populated by Stage I wiring.
 		ddl.push_back("create table if not exists " + string(ivm::VIEWS_TABLE) +
 		              " (view_name varchar primary key, sql_string varchar, type tinyint,"
 		              " has_minmax boolean default false, has_left_join boolean default false,"
@@ -1043,7 +1064,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " aggregate_types varchar default null,"
 		              " having_predicate varchar default null,"
 		              " has_full_outer boolean default false,"
-		              " full_outer_join_cols varchar default null)");
+		              " full_outer_join_cols varchar default null,"
+		              " signature_hash ubigint default null,"
+		              " canonical_plan_blob blob default null,"
+		              " output_columns_json varchar default null,"
+		              " predicate_summary_json varchar default null,"
+		              " fd_summary_json varchar default null,"
+		              " source_tables_json varchar default null,"
+		              " aggregate_decomposition_json varchar default null,"
+		              " nullified_columns_json varchar default null)");
 
 		// Refresh hooks: extensions can register custom SQL to run on MV refresh
 		// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
@@ -1055,18 +1084,28 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " (view_name varchar, table_name varchar, last_update timestamp,"
 		              " catalog_type varchar default 'duckdb', last_snapshot_id bigint default null,"
 		              " last_refresh_ts timestamp default null,"
+		              " pending_row_estimate bigint default null,"
+		              " pending_estimate_ts timestamp default null,"
 		              " primary key(view_name, table_name))");
-		// Backfill for existing databases without the column (added post-release).
+		// Backfill for existing databases without the columns (added post-release).
 		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
 		              " add column if not exists last_refresh_ts timestamp default null");
+		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
+		              " add column if not exists pending_row_estimate bigint default null");
+		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
+		              " add column if not exists pending_estimate_ts timestamp default null");
 
-		// Refresh history: stores execution stats for learned cost model calibration
+		// Refresh history: stores execution stats for learned cost model calibration.
+		// Stage A.5 adds `strategy` (default 'incremental') for per-strategy regression.
 		ddl.push_back("create table if not exists " + string(ivm::HISTORY_TABLE) +
 		              " (view_name varchar, refresh_timestamp timestamp default current_timestamp,"
 		              " method varchar, ivm_compute_est double, ivm_upsert_est double,"
 		              " recompute_compute_est double, recompute_replace_est double,"
 		              " actual_duration_ms bigint,"
+		              " strategy varchar default 'incremental',"
 		              " primary key(view_name, refresh_timestamp))");
+		ddl.push_back("alter table " + string(ivm::HISTORY_TABLE) +
+		              " add column if not exists strategy varchar default 'incremental'");
 
 		// --- OR REPLACE: drop old MV if it exists ---
 		if (ivm_parse_data.is_replace) {
@@ -1247,11 +1286,60 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			extract_foj_cols(plan.get());
 		}
 
+		// 8 trailing NULLs are matcher metadata columns. Populated below when
+		// ivm_enable_view_matching=true — currently only source_tables_json
+		// and dependency edges; canonicalizer / oracle columns stay NULL.
 		ddl.push_back("insert or replace into " + string(ivm::VIEWS_TABLE) + " values ('" + view_name + "', '" +
 		              OpenIVMUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)ivm_type) + ", " +
 		              (found_minmax ? "true" : "false") + ", " + (found_left_join ? "true" : "false") + ", now(), " +
 		              refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
-		              (found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
+		              (found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val +
+		              ", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
+
+		Value match_flag_val;
+		bool view_matching_enabled = context.TryGetCurrentSetting("ivm_enable_view_matching", match_flag_val) &&
+		                             !match_flag_val.IsNull() && BooleanValue::Get(match_flag_val);
+		if (view_matching_enabled) {
+			// table_names may include _ivm_data_<x> when this MV reads from
+			// another MV (DuckDB binds the user-facing view to its data table).
+			// Strip the prefix so source_tables_json reflects user-facing names
+			// and the dependency-edge lookup hits a registered MV row.
+			vector<string> sorted_tables;
+			sorted_tables.reserve(table_names.size());
+			for (const auto &t : table_names) {
+				if (StringUtil::StartsWith(t, ivm::DATA_TABLE_PREFIX)) {
+					sorted_tables.push_back(t.substr(strlen(ivm::DATA_TABLE_PREFIX)));
+				} else {
+					sorted_tables.push_back(t);
+				}
+			}
+			std::sort(sorted_tables.begin(), sorted_tables.end());
+			// Build JSON without inner escaping; outer EscapeSingleQuotes runs
+			// once when the SQL is assembled.
+			string src_json = "[";
+			for (idx_t i = 0; i < sorted_tables.size(); i++) {
+				if (i) {
+					src_json += ",";
+				}
+				src_json += "\"" + sorted_tables[i] + "\"";
+			}
+			src_json += "]";
+			ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET source_tables_json = '" +
+			              OpenIVMUtils::EscapeSingleQuotes(src_json) + "' WHERE view_name = '" +
+			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+			// Replace any prior edges for this child, then re-emit. INSERTs are
+			// conditional on the source being a registered MV (the SELECT
+			// returns zero rows for non-MV sources).
+			ddl.push_back("DELETE FROM " + string(ivm::MV_DEPS_TABLE) + " WHERE child_view = '" +
+			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+			for (const auto &t : sorted_tables) {
+				ddl.push_back("INSERT INTO " + string(ivm::MV_DEPS_TABLE) +
+				              " (parent_view, child_view, edge_kind) SELECT view_name, '" +
+				              OpenIVMUtils::EscapeSingleQuotes(view_name) + "', 'direct' FROM " +
+				              string(ivm::VIEWS_TABLE) + " WHERE view_name = '" + OpenIVMUtils::EscapeSingleQuotes(t) +
+				              "'");
+			}
+		}
 
 		// Classify each base table by catalog type (duckdb vs ducklake).
 		// DuckLake tables use native change tracking; DuckDB tables use delta tables.

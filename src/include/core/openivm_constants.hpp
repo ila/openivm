@@ -11,6 +11,11 @@ constexpr const char *VIEWS_TABLE = "_duckdb_ivm_views";
 constexpr const char *DELTA_TABLES_TABLE = "_duckdb_ivm_delta_tables";
 constexpr const char *HISTORY_TABLE = "_duckdb_ivm_refresh_history";
 
+// View-matching system tables.
+constexpr const char *MV_DEPS_TABLE = "_duckdb_ivm_mv_dependencies";
+constexpr const char *CONSTRAINTS_CACHE_TABLE = "_duckdb_ivm_constraints_cache";
+constexpr const char *MATCH_LOG_TABLE = "_duckdb_ivm_match_log";
+
 // IVM metadata column names
 constexpr const char *MULTIPLICITY_COL = "_duckdb_ivm_multiplicity";
 constexpr const char *TIMESTAMP_COL = "_duckdb_ivm_timestamp";

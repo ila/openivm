@@ -14,9 +14,12 @@
 
 namespace duckdb {
 
-static const unordered_set<string> SUPPORTED_AGGREGATES = {
-    "count_star", "count",       "sum",        "min",      "max",      "avg",    "list",
-    "stddev",     "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop"};
+static const unordered_set<string> &GetSupportedAggregates() {
+	static const unordered_set<string> kSet = {"count_star", "count",    "sum",    "min",         "max",
+	                                           "avg",        "list",     "stddev", "stddev_samp", "stddev_pop",
+	                                           "variance",   "var_samp", "var_pop"};
+	return kSet;
+}
 
 /// Check if any expression in the given list contains a non-deterministic function.
 static bool HasVolatileExpression(vector<unique_ptr<Expression>> &expressions) {
@@ -139,7 +142,8 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 			for (auto &expr : agg->expressions) {
 				if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
 					auto &bound_agg = expr->Cast<BoundAggregateExpression>();
-					if (SUPPORTED_AGGREGATES.find(bound_agg.function.name) == SUPPORTED_AGGREGATES.end()) {
+					const auto &supported = GetSupportedAggregates();
+					if (supported.find(bound_agg.function.name) == supported.end()) {
 						result.ivm_compatible = false;
 					}
 					// COUNT(DISTINCT x) can't be maintained by summing delta counts — a
