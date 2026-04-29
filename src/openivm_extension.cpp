@@ -153,6 +153,24 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "decay factor for learned cost model regression (0.0-1.0, higher = slower adaptation)",
 	                             LogicalType::DOUBLE, Value::DOUBLE(0.9));
 
+	// View matching (master flag — ALL matcher behavior gated by this).
+	// Default false. See `feedback_view_matching_flag` memory note.
+	db_config.AddExtensionOption("ivm_enable_view_matching", "enable smart view matching at query time (master flag)",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("ivm_predicate_oracle",
+	                             "predicate implication oracle: 'syntactic', 'interval' (default), or 'sat' (stub)",
+	                             LogicalType::VARCHAR, Value("interval"));
+	db_config.AddExtensionOption("ivm_match_strategies",
+	                             "allowed strategies (csv): 'tier1','tier2','tier3','partial','full' or 'all'",
+	                             LogicalType::VARCHAR, Value("all"));
+	db_config.AddExtensionOption("ivm_match_estimate_ttl_ms",
+	                             "max staleness (ms) for cached pending-delta-row estimate before refresh",
+	                             LogicalType::BIGINT, Value::BIGINT(5000));
+	db_config.AddExtensionOption("ivm_match_log_decisions", "log per-query matcher decisions to _duckdb_ivm_match_log",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("ivm_match_log_retention", "max rows per query_hash retained in _duckdb_ivm_match_log",
+	                             LogicalType::BIGINT, Value::BIGINT(50));
+
 	Connection con(instance);
 
 	// Migration: add new columns to existing _duckdb_ivm_views tables
@@ -161,13 +179,67 @@ static void LoadInternal(ExtensionLoader &loader) {
 	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS refresh_in_progress BOOLEAN DEFAULT false");
 
-	// Migration: create refresh history table for learned cost model
+	// Migration: create refresh history table for learned cost model.
+	// Silently fails on fresh DB (core_functions not yet loaded → DEFAULT
+	// current_timestamp can't resolve). The parser recreates it with the
+	// default at first MV creation, so INSERTs (which omit refresh_timestamp)
+	// work. This stanza only matters for legacy DBs where the table already
+	// exists without the default.
 	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::HISTORY_TABLE) +
 	          " (view_name VARCHAR, refresh_timestamp TIMESTAMP DEFAULT current_timestamp,"
 	          " method VARCHAR, ivm_compute_est DOUBLE, ivm_upsert_est DOUBLE,"
 	          " recompute_compute_est DOUBLE, recompute_replace_est DOUBLE,"
 	          " actual_duration_ms BIGINT,"
 	          " PRIMARY KEY(view_name, refresh_timestamp))");
+
+	// View-matching CREATEs first (always succeed), ALTERs after. ALTERs that
+	// hit not-yet-existing tables on a fresh DB fail silently — the parser's
+	// CREATE TABLE includes these columns directly, so fresh DBs are fine.
+	// ALTERs are backward-compat for legacy DBs.
+	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::MATCH_LOG_TABLE) +
+	          " (query_hash UBIGINT,"
+	          " log_timestamp TIMESTAMP,"
+	          " matched_view VARCHAR,"
+	          " chosen_strategy VARCHAR,"
+	          " bypass_cost_est DOUBLE,"
+	          " chosen_cost_est DOUBLE,"
+	          " actual_duration_ms BIGINT,"
+	          " PRIMARY KEY (query_hash, log_timestamp))");
+	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::MV_DEPS_TABLE) +
+	          " (parent_view VARCHAR, child_view VARCHAR,"
+	          " edge_kind VARCHAR DEFAULT 'direct',"
+	          " PRIMARY KEY (parent_view, child_view))");
+	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::CONSTRAINTS_CACHE_TABLE) +
+	          " (table_name VARCHAR, constraint_kind VARCHAR,"
+	          " columns_json VARCHAR, referenced_table VARCHAR,"
+	          " referenced_columns_json VARCHAR,"
+	          " is_trusted BOOLEAN DEFAULT true,"
+	          " PRIMARY KEY (table_name, constraint_kind, columns_json))");
+
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS signature_hash UBIGINT DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS canonical_plan_blob BLOB DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS output_columns_json VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS predicate_summary_json VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS fd_summary_json VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS source_tables_json VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS aggregate_decomposition_json VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS nullified_columns_json VARCHAR DEFAULT NULL");
+
+	con.Query("ALTER TABLE " + string(ivm::DELTA_TABLES_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS pending_row_estimate BIGINT DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(ivm::DELTA_TABLES_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS pending_estimate_ts TIMESTAMP DEFAULT NULL");
+
+	con.Query("ALTER TABLE " + string(ivm::HISTORY_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS strategy VARCHAR DEFAULT 'incremental'");
 
 	auto ivm_parser = duckdb::IVMParserExtension();
 

@@ -1492,7 +1492,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// writes in one transaction. When out_pre_meta/out_post_meta are provided, we split them.
 	string data_sql = pre_companion + ivm_query + "\n" + companion_query + "\n" + upsert_query + "\n" + post_companion +
 	                  delete_from_view_query + "\n" + delete_from_delta_table_query;
-	string meta_pre_sql = set_in_progress;
+	const string &meta_pre_sql = set_in_progress;
 	string meta_post_sql = update_timestamp_query + snapshot_update_query + "\n" + clear_in_progress;
 
 	string clean_query;

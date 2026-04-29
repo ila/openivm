@@ -661,4 +661,19 @@ string IVMCostHistoryQuery(ClientContext &context, const FunctionParameters &par
 	       "' ORDER BY refresh_timestamp DESC LIMIT 20";
 }
 
+vector<StrategyCostEstimate> EstimatePerQuery(ClientContext &context, const string &view_name,
+                                              LogicalOperator &query_plan) {
+	(void)view_name;
+	(void)query_plan;
+	Value flag;
+	if (!context.TryGetCurrentSetting("ivm_enable_view_matching", flag) || flag.IsNull() || !BooleanValue::Get(flag)) {
+		return {};
+	}
+	// TODO: reuse EstimateIVMCost() for the static ivm/recompute components,
+	// then read pending_row_estimate from `_duckdb_ivm_delta_tables` and
+	// per-strategy regression from `_duckdb_ivm_refresh_history` (filtered by
+	// `strategy`) to score each MatchStrategy.
+	return {};
+}
+
 } // namespace duckdb

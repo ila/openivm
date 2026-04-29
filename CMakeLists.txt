@@ -36,6 +36,11 @@ set(EXTENSION_SOURCES
     src/rules/column_hider.cpp
     src/core/openivm_refresh_locks.cpp
     src/core/openivm_refresh_daemon.cpp
+    src/match/plan_canonical.cpp
+    src/match/predicate_oracle.cpp
+    src/match/equivalence_classes.cpp
+    src/match/constraint_cache.cpp
+    src/match/mv_catalog_index.cpp
     ${LPTS_DIR}/src/cte_nodes.cpp
     ${LPTS_DIR}/src/lpts_helpers.cpp
     ${LPTS_DIR}/src/lpts_ast.cpp

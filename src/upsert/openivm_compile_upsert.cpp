@@ -8,7 +8,7 @@
 namespace duckdb {
 
 // Zero-initialized 64-element float list, used as COALESCE default for NULL list aggregates.
-static const string ZEROS_LIST = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
+static constexpr const char *ZEROS_LIST = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 
 /// Quote a column name for safe use in generated SQL. Handles special characters like ().
 static string Q(const string &name) {
