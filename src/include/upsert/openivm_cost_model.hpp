@@ -24,6 +24,15 @@ struct IVMCostEstimate {
 	// Whether regression was used (true) or static fallback (false)
 	bool calibrated;
 
+	// Strategy this view actually uses on refresh — drives both the history label
+	// and the meaning of `ivm_compute` / `ivm_upsert`. For most views this is
+	// "incremental" (delta-driven IVM); for `IVMType::GROUP_RECOMPUTE` views
+	// (inner DISTINCT under aggregate) it's "group_recompute" and the IVM cost
+	// fields hold the affected-groups recompute cost instead. For
+	// `IVMType::WINDOW_PARTITION` it's "window_partition" (partition recompute).
+	// Always one of: "incremental", "group_recompute", "window_partition".
+	string strategy_label;
+
 	bool ShouldRecompute() const {
 		return recompute_predicted_ms < ivm_predicted_ms;
 	}

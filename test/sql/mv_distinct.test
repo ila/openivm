@@ -709,3 +709,11 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# View type 6 = GROUP_RECOMPUTE; PRAGMA ivm_cost('idist_mv') reports
+# `decision = group_recompute` (verified manually — sqllogictest can't run
+# PRAGMA inside CREATE TABLE AS, so the test only asserts the type column).
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'idist_mv';
+----
+6

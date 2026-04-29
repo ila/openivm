@@ -299,10 +299,14 @@ void IVMMetadata::RecordRefreshHistory(const string &view_name, const string &me
 vector<IVMMetadata::RefreshHistoryEntry> IVMMetadata::GetRefreshHistory(const string &view_name, const string &method,
                                                                         idx_t limit) {
 	// Select the cost components for the given method:
-	// - For 'incremental': use ivm_compute_est, ivm_upsert_est
-	// - For 'full': use recompute_compute_est, recompute_replace_est
-	string col1 = (method == "incremental") ? "ivm_compute_est" : "recompute_compute_est";
-	string col2 = (method == "incremental") ? "ivm_upsert_est" : "recompute_replace_est";
+	// - 'full': use recompute_compute_est, recompute_replace_est
+	// - 'incremental' / 'group_recompute' / 'window_partition' (anything else):
+	//   use ivm_compute_est, ivm_upsert_est. The cost model writes the chosen
+	//   strategy's compute/upsert cost into those columns at refresh time, so the
+	//   regression learns weights specific to whichever non-full path the view uses.
+	bool is_full = (method == "full");
+	string col1 = is_full ? "recompute_compute_est" : "ivm_compute_est";
+	string col2 = is_full ? "recompute_replace_est" : "ivm_upsert_est";
 
 	auto result =
 	    con.Query("SELECT " + col1 + ", " + col2 + ", actual_duration_ms FROM " + string(ivm::HISTORY_TABLE) +

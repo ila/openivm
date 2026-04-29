@@ -368,6 +368,19 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		fk_enabled = fk_val.GetValue<bool>();
 	}
 
+	// Read view type so the IVM-cost branch can reflect the strategy that will
+	// actually run at refresh time. Defaults to AGGREGATE_GROUP if the view isn't
+	// in metadata yet (e.g. test harnesses that call EstimateIVMCost on a raw plan).
+	IVMType view_type = IVMType::AGGREGATE_GROUP;
+	{
+		IVMMetadata vt_meta(con);
+		try {
+			view_type = vt_meta.GetViewType(view_name);
+		} catch (...) {
+			// view_name not in _duckdb_ivm_views — keep default
+		}
+	}
+
 	// 1. Collect all plan statistics in one tree walk
 	PlanStats plan_stats;
 	CollectPlanStatsRecursive(context, con, plan, view_name, plan_stats);
@@ -376,7 +389,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	size_t N = table_stats.size();
 	if (N == 0) {
 		// No base tables found — shouldn't happen, but default to IVM
-		return {0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, false};
+		return {0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, false, "incremental"};
 	}
 
 	// 2. Compute basic metrics
@@ -598,16 +611,80 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n",
 	                    ivm_predicted_ms < recompute_predicted_ms ? "IVM" : "FULL_RECOMPUTE");
 
+	// Strategy-aware override: for views whose refresh path is fixed-by-classification
+	// (no IVM-vs-recompute decision is actually consulted), replace the `ivm_*` fields
+	// with the cost of the strategy that will actually run.
+	//
+	//   GROUP_RECOMPUTE — affected-keys recompute. Compute cost ≈ cost of running the
+	//     view query restricted to source rows in any delta (one variant per source);
+	//     upsert cost ≈ DELETE+INSERT scoped to those keys. Both bounded above by full
+	//     recompute, so the view can never lose vs RECOMPUTE — but the regression still
+	//     learns weights from observed durations to predict `group_recompute` runs.
+	//
+	//   WINDOW_PARTITION — partition-level recompute. Touched partitions ≈ delta rows
+	//     fanned through partition-key selectivity to MV rows.
+	string strategy_label;
+	double strategy_compute = ivm_compute;
+	double strategy_upsert = ivm_upsert;
+	if (view_type == IVMType::GROUP_RECOMPUTE) {
+		strategy_label = "group_recompute";
+		// Estimated affected MV keys = Σᵢ delta_Tᵢ × (mv_card / actual_card_Tᵢ).
+		// Each source contributes a per-table view-query variant (substitute T_i
+		// with delta_T_i in view_query_sql), so compute scales with N_active sources.
+		double affected_keys = 0;
+		idx_t active_sources = 0;
+		for (auto &ts : table_stats) {
+			if (ts.delta_card <= 0) {
+				continue;
+			}
+			affected_keys += ts.delta_card * (mv_card / ts.actual_card);
+			active_sources++;
+		}
+		if (active_sources == 0) {
+			active_sources = 1; // empty deltas → one trivial scan
+		}
+		// Each variant runs the view body restricted to that source's delta. The
+		// restricted scan dominates; approximate as delta_T × scan_multiplier per
+		// variant, summed across active sources. Upper-bounded by full base scan
+		// (N_active = N_total in worst case → identical to RECOMPUTE).
+		double per_variant_scan = total_base_scan / static_cast<double>(N);
+		strategy_compute = static_cast<double>(active_sources) * per_variant_scan;
+		// DELETE+INSERT for affected_keys rows (bounded by mv_card).
+		double affected_keys_clamped = std::min(affected_keys, mv_card);
+		strategy_upsert = affected_keys_clamped * 2.0; // delete + insert
+	} else if (view_type == IVMType::WINDOW_PARTITION) {
+		strategy_label = "window_partition";
+		// Partition recompute: scan delta to identify affected partitions, then
+		// re-evaluate the view query for those partitions. Cost ≈ delta scan +
+		// affected-partitions fraction of full scan.
+		double total_delta = 0;
+		for (auto &ts : table_stats) {
+			total_delta += ts.delta_card;
+		}
+		double affected_fraction = std::min(1.0, total_delta / std::max(mv_card, 1.0));
+		strategy_compute = total_delta + total_base_scan * affected_fraction;
+		strategy_upsert = std::min(total_delta * (mv_card / std::max(total_base_scan, 1.0)), mv_card) * 2.0;
+	} else {
+		strategy_label = "incremental";
+	}
+	double strategy_total = strategy_compute + strategy_upsert;
+	double strategy_predicted_ms = ivm_predicted_ms; // calibrated regression already absorbed ivm_compute/upsert
+	if (strategy_label != "incremental") {
+		// Static fallback for non-IVM strategies until per-strategy regression history accrues.
+		strategy_predicted_ms = strategy_total;
+	}
+
 	IVMCostEstimate estimate;
-	estimate.ivm_compute = ivm_compute;
-	estimate.ivm_upsert = ivm_upsert;
+	estimate.ivm_compute = strategy_compute;
+	estimate.ivm_upsert = strategy_upsert;
 	estimate.recompute_compute = recompute_compute;
 	estimate.recompute_replace = recompute_replace;
-	estimate.ivm_cost = ivm_total;
+	estimate.ivm_cost = strategy_total;
 	estimate.recompute_cost = recompute_total;
-	estimate.ivm_predicted_ms = ivm_predicted_ms;
+	estimate.ivm_predicted_ms = strategy_predicted_ms;
 	estimate.recompute_predicted_ms = recompute_predicted_ms;
 	estimate.calibrated = calibrated;
+	estimate.strategy_label = std::move(strategy_label);
 	return estimate;
 }
 
@@ -648,7 +725,15 @@ string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters
 	auto estimate = EstimateIVMCost(con_ctx, *plan, view_name);
 	con.Rollback();
 
-	string decision = estimate.ShouldRecompute() ? "full" : "incremental";
+	// `decision`: which strategy actually runs at refresh time.
+	//   - For fixed-strategy views (group_recompute, window_partition), this is the
+	//     view's classification — the IVM-vs-full check never overrides it.
+	//   - For "incremental" views, the cost model may pick "full" when adaptive
+	//     refresh decides full recompute is cheaper.
+	string decision = estimate.strategy_label.empty() ? "incremental" : estimate.strategy_label;
+	if (decision == "incremental" && estimate.ShouldRecompute()) {
+		decision = "full";
+	}
 	return "SELECT '" + decision + "' AS decision, " + to_string(estimate.ivm_cost) + " AS ivm_cost, " +
 	       to_string(estimate.recompute_cost) + " AS recompute_cost, " + to_string(estimate.ivm_predicted_ms) +
 	       " AS ivm_predicted_ms, " + to_string(estimate.recompute_predicted_ms) + " AS recompute_predicted_ms, " +

@@ -233,11 +233,15 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		// Record execution history for the learned cost model.
 		if (record_history) {
 			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-			// Determine which method was used: if the cost model said recompute AND adaptive is on,
-			// then full; otherwise incremental (unless force_full, but that's already in the SQL).
-			string method = cost_estimate.ShouldRecompute() ? "full" : "incremental";
-
-			// Check if force_full_refresh overrides (ivm_refresh_mode = 'full')
+			// Determine which method was used. Priority:
+			//   1) `ivm_refresh_mode = 'full'` overrides everything → "full".
+			//   2) `cost_estimate.strategy_label` if set (group_recompute, window_partition).
+			//      For these fixed-strategy views the IVM-vs-full decision never fires.
+			//   3) For "incremental" views, the adaptive cost model may have picked full recompute.
+			string method = cost_estimate.strategy_label.empty() ? "incremental" : cost_estimate.strategy_label;
+			if (method == "incremental" && cost_estimate.ShouldRecompute()) {
+				method = "full";
+			}
 			Value mode_val;
 			if (context.TryGetCurrentSetting("ivm_refresh_mode", mode_val) && !mode_val.IsNull()) {
 				auto mode = StringUtil::Lower(mode_val.ToString());
