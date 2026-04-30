@@ -272,6 +272,21 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Rewrote FILTER aggregates to CASE expressions\n");
 }
 
+static LogicalOperator *FindProjectionAggregateInput(unique_ptr<LogicalOperator> &plan, bool allow_having_filter) {
+	if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION || plan->children.empty()) {
+		return nullptr;
+	}
+	auto *input = plan->children[0].get();
+	if (input->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return input;
+	}
+	if (allow_having_filter && input->type == LogicalOperatorType::LOGICAL_FILTER && !input->children.empty() &&
+	    input->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return input->children[0].get();
+	}
+	return nullptr;
+}
+
 /// Decompose AVG and STDDEV/VARIANCE aggregates into incrementalizable components.
 /// Handles both in a SINGLE PASS to keep aggregate expression indices consistent.
 /// - AVG(x)      → SUM(x), COUNT(x) + SUM/COUNT ratio in projection
@@ -290,9 +305,6 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 		RewriteDerivedAggregates(context, child, opt, false);
 	}
 
-	if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION) {
-		return;
-	}
 	// Walk down through at most one LOGICAL_FILTER (HAVING) to reach the aggregate.
 	// `SELECT ... GROUP BY ... HAVING AVG(x) > 0` sits PROJECTION → FILTER → AGGREGATE,
 	// and FILTER is pass-through (no column rebind), so `proj.expressions`' BCRs still
@@ -304,16 +316,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
 	// from CTE expansion): they REBIND outputs to fresh column indices, so the top
 	// projection's BCRs reference the middle projection's bindings, not the agg's.
 	// CTE queries are handled upstream via CTE inlining instead.
-	LogicalOperator *agg_search = nullptr;
-	if (!plan->children.empty()) {
-		auto *c0 = plan->children[0].get();
-		if (c0->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-			agg_search = c0;
-		} else if (is_top && c0->type == LogicalOperatorType::LOGICAL_FILTER && !c0->children.empty() &&
-		           c0->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-			agg_search = c0->children[0].get();
-		}
-	}
+	auto *agg_search = FindProjectionAggregateInput(plan, is_top);
 	if (!agg_search) {
 		return;
 	}
@@ -641,17 +644,7 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 	// runs when the MV root is PROJECTION → [FILTER] → AGGREGATE. Inner aggregates
 	// under a UNION/INTERSECT/EXCEPT or subquery are handled by different compile
 	// paths (often FULL_REFRESH) that would be broken by extra columns.
-	if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION || plan->children.empty()) {
-		return;
-	}
-	LogicalOperator *agg_search = nullptr;
-	auto *c0 = plan->children[0].get();
-	if (c0->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		agg_search = c0;
-	} else if (c0->type == LogicalOperatorType::LOGICAL_FILTER && !c0->children.empty() &&
-	           c0->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		agg_search = c0->children[0].get();
-	}
+	auto *agg_search = FindProjectionAggregateInput(plan, true);
 	if (!agg_search) {
 		return;
 	}
