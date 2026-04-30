@@ -25,7 +25,7 @@ namespace duckdb {
 /// Get the row count of a table by name, returns 0 if table doesn't exist.
 static double GetTableRowCount(Connection &con, const string &table_name) {
 	auto result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(table_name) + ";");
-	if (result->HasError()) {
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return 0;
 	}
 	return result->GetValue(0, 0).GetValue<double>();
@@ -39,7 +39,7 @@ static double GetDeltaRowCount(Connection &con, const string &delta_table_name, 
 	}
 	auto count_result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(delta_table_name) +
 	                              " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" + ts_string + "';");
-	if (count_result->HasError()) {
+	if (count_result->HasError() || count_result->RowCount() == 0 || count_result->GetValue(0, 0).IsNull()) {
 		return 0;
 	}
 	return count_result->GetValue(0, 0).GetValue<double>();
@@ -71,7 +71,7 @@ static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_na
 	IVMMetadata metadata(con);
 	auto last_snap = metadata.GetLastSnapshotId(view_name, table_name);
 	auto cur_snap_result = con.Query("SELECT id FROM " + catalog_name + ".current_snapshot()");
-	if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0) {
+	if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0 || cur_snap_result->GetValue(0, 0).IsNull()) {
 		return 0;
 	}
 	auto cur_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
@@ -717,6 +717,10 @@ string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters
 
 	Parser p;
 	p.ParseQuery(view_query);
+	if (p.statements.empty()) {
+		con.Rollback();
+		throw ParserException("View '" + view_name + "' has an empty IVM metadata query");
+	}
 	Planner planner(con_ctx);
 	planner.CreatePlan(p.statements[0]->Copy());
 	Optimizer optimizer(*planner.binder, con_ctx);
