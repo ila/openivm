@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,ORDER,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT", "openivm_verified": true}
+SELECT w.W_ID, d.D_ID, ROW_NUMBER() OVER (PARTITION BY w.W_ID ORDER BY d.D_ID DESC) AS rn FROM WAREHOUSE w JOIN DISTRICT d ON w.W_ID = d.D_W_ID;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER,HISTORY", "ducklake": true}
+SELECT w.W_ID, w.W_STATE, COUNT(h.H_DATA) AS events, SUM(h.H_AMOUNT) AS total FROM dl.WAREHOUSE w JOIN dl.CUSTOMER c ON w.W_ID = c.C_W_ID JOIN dl.HISTORY h ON c.C_W_ID = h.H_C_W_ID AND c.C_D_ID = h.H_C_D_ID AND c.C_ID = h.H_C_ID GROUP BY w.W_ID, w.W_STATE;

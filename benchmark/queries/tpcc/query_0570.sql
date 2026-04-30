@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK,ORDER_LINE", "non_incr_reason": "op:LATERAL"}
+SELECT s.S_W_ID, s.S_I_ID, s.S_QUANTITY, lat.times_ordered FROM STOCK s JOIN LATERAL (SELECT COUNT(*) AS times_ordered FROM ORDER_LINE WHERE OL_I_ID = s.S_I_ID AND OL_SUPPLY_W_ID = s.S_W_ID) lat ON true;

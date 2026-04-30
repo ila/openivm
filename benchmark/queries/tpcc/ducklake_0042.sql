@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ITEM,OORDER,ORDER_LINE", "ducklake": true}
+SELECT i.I_ID, i.I_NAME, SUM(ol.OL_AMOUNT) AS rev FROM ITEM i JOIN ORDER_LINE ol ON i.I_ID = ol.OL_I_ID JOIN OORDER o ON ol.OL_W_ID = o.O_W_ID AND ol.OL_D_ID = o.O_D_ID AND ol.OL_O_ID = o.O_ID WHERE o.O_CARRIER_ID IS NOT NULL GROUP BY i.I_ID, i.I_NAME;

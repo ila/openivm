@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,ITEM,OORDER,ORDER_LINE", "ducklake": true}
+SELECT c.C_W_ID, c.C_ID, i.I_ID, COUNT(*) AS bought FROM dl.CUSTOMER c JOIN dl.OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID JOIN dl.ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID JOIN dl.ITEM i ON ol.OL_I_ID = i.I_ID GROUP BY c.C_W_ID, c.C_ID, i.I_ID HAVING COUNT(*) > 1;

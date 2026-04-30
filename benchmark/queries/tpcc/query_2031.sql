@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,STOCK,WAREHOUSE,DISTRICT"}
+SELECT SUM(ol.OL_AMOUNT) AS total_revenue, COUNT(*) AS total_lines, MIN(ol.OL_AMOUNT) AS min_line, MAX(ol.OL_AMOUNT) AS max_line, SUM(ol.OL_QUANTITY) AS total_units FROM ORDER_LINE ol JOIN STOCK s ON ol.OL_W_ID = s.S_W_ID AND ol.OL_I_ID = s.S_I_ID JOIN WAREHOUSE w ON ol.OL_W_ID = w.W_ID JOIN DISTRICT d ON w.W_ID = d.D_W_ID WHERE ol.OL_AMOUNT > 0;

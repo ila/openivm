@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK,OORDER,ORDER_LINE", "ducklake": true}
+SELECT i.I_ID, i.I_NAME, SUM(ol.OL_QUANTITY * i.I_PRICE) AS projected_rev, COUNT(*) AS line_count FROM dl.ITEM i JOIN dl.STOCK s ON i.I_ID = s.S_I_ID JOIN dl.ORDER_LINE ol ON s.S_W_ID = ol.OL_SUPPLY_W_ID AND s.S_I_ID = ol.OL_I_ID JOIN dl.OORDER o ON ol.OL_W_ID = o.O_W_ID AND ol.OL_D_ID = o.O_D_ID AND ol.OL_O_ID = o.O_ID GROUP BY i.I_ID, i.I_NAME;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,HAVING", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,STOCK"}
+SELECT ol.OL_W_ID, ol.OL_I_ID, SUM(ol.OL_AMOUNT) AS total_ordered, SUM(ol.OL_QUANTITY) AS units_ordered, MAX(s.S_QUANTITY) AS current_stock, MAX(s.S_YTD) AS stock_ytd FROM ORDER_LINE ol JOIN STOCK s ON ol.OL_W_ID = s.S_W_ID AND ol.OL_I_ID = s.S_I_ID GROUP BY ol.OL_W_ID, ol.OL_I_ID HAVING SUM(ol.OL_AMOUNT) > MAX(s.S_YTD) AND COUNT(*) > 5;

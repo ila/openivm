@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER", "ducklake": true}
+WITH payments AS (SELECT C_W_ID, C_D_ID, C_ID, C_BALANCE, C_YTD_PAYMENT FROM dl.CUSTOMER) SELECT C_W_ID, C_D_ID, SUM(CASE WHEN C_BALANCE < 0 THEN C_YTD_PAYMENT ELSE 0 END) AS debt_payments, SUM(CASE WHEN C_BALANCE >= 0 THEN C_YTD_PAYMENT ELSE 0 END) AS credit_payments FROM payments GROUP BY C_W_ID, C_D_ID;

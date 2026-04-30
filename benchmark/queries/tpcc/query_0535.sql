@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER"}
+WITH customer_balance_tiers AS (SELECT C_W_ID, C_ID, C_BALANCE, CASE WHEN C_BALANCE >= 5000 THEN 'premium' WHEN C_BALANCE >= 1000 THEN 'standard' WHEN C_BALANCE >= 0 THEN 'basic' ELSE 'overdue' END AS tier FROM CUSTOMER) SELECT C_W_ID, tier, COUNT(*) AS cnt, AVG(C_BALANCE) AS avg_bal FROM customer_balance_tiers GROUP BY C_W_ID, tier;

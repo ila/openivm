@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "openivm_verified": true}
+WITH state_cust AS (SELECT C_STATE, COUNT(*) AS cnt, AVG(C_BALANCE) AS avg_b FROM CUSTOMER GROUP BY C_STATE), state_rank AS (SELECT *, RANK() OVER (ORDER BY cnt DESC) AS cust_rank, RANK() OVER (ORDER BY avg_b DESC) AS wealth_rank FROM state_cust) SELECT C_STATE, cnt, avg_b, cust_rank, wealth_rank FROM state_rank WHERE cust_rank <= 10 OR wealth_rank <= 10;

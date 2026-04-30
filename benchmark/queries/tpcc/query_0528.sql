@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE"}
+WITH order_totals AS (SELECT OL_W_ID, OL_O_ID, SUM(OL_AMOUNT) AS total FROM ORDER_LINE GROUP BY OL_W_ID, OL_O_ID) SELECT o.O_W_ID, o.O_ID, ot.total FROM OORDER o JOIN order_totals ot ON o.O_ID = ot.OL_O_ID AND o.O_W_ID = ot.OL_W_ID WHERE ot.total > 500;

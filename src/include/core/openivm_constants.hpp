@@ -70,8 +70,9 @@ enum class IVMType : uint8_t {
 	WINDOW_PARTITION, // window functions — partition-level recompute
 	GROUP_RECOMPUTE, // inner-DISTINCT-under-AGG fallback: DELETE+INSERT only the GROUP BY keys touched by source deltas
 	TOP_K,           // Legacy enum value; current top-k support strips ORDER BY/LIMIT into the user-facing view
-	DISTINCT_INCREMENTAL // inner-DISTINCT-under-AGG with aux state (ivm_distinct_aux_state=true): DBSP-correct
-	                     // distinct(R)=sgn(R[t]); per-tuple count table emits ±1 only on count transitions
+	DISTINCT_INCREMENTAL, // inner-DISTINCT-under-AGG with aux state (ivm_distinct_aux_state=true): DBSP-correct
+	                      // distinct(R)=sgn(R[t]); per-tuple count table emits ±1 only on count transitions
+	SEMI_ANTI_RECOMPUTE   // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
 };
 
 } // namespace duckdb

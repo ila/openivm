@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY"}
+WITH recent_history AS (SELECT H_C_W_ID, H_C_ID, SUM(H_AMOUNT) AS total FROM HISTORY GROUP BY H_C_W_ID, H_C_ID HAVING SUM(H_AMOUNT) > 100) SELECT rh.H_C_W_ID, c.C_LAST, rh.total FROM recent_history rh JOIN CUSTOMER c ON rh.H_C_W_ID = c.C_W_ID AND rh.H_C_ID = c.C_ID;

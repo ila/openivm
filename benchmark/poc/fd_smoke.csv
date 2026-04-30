@@ -1,0 +1,8 @@
+topology,delta_fraction,strategy,reps,median_s
+fanout,0.01,bypass,1,0.025402299012057483
+fanout,0.01,cascade_all,1,0.06888257502578199
+fanout,0.01,cascade_smart,1,0.03712739501497708
+fanout,0.01,stale_residual,1,0.017052310024155304
+diamond,0.01,bypass,1,0.020639726979425177
+diamond,0.01,cascade_all,1,0.08357088200864382
+diamond,0.01,cascade_smart,1,0.062088606995530427

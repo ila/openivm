@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,UNION", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,STOCK", "ivm_type": "RECOMPUTE"}
+SELECT OL_W_ID AS w_id, OL_D_ID AS d_id, SUM(OL_AMOUNT) AS total, 'orders' AS source_type FROM ORDER_LINE GROUP BY OL_W_ID, OL_D_ID UNION ALL SELECT S_W_ID AS w_id, 0 AS d_id, SUM(S_YTD) AS total, 'stock_ytd' AS source_type FROM STOCK GROUP BY S_W_ID;

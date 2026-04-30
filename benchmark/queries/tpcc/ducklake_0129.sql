@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT,OORDER", "ducklake": true}
+WITH o_count AS (SELECT O_W_ID, O_D_ID, COUNT(*) AS n FROM dl.OORDER GROUP BY O_W_ID, O_D_ID HAVING COUNT(*) > 3) SELECT w.W_ID, w.W_NAME, d.D_ID, d.D_NAME, oc.n AS total_orders FROM dl.WAREHOUSE w JOIN dl.DISTRICT d ON w.W_ID = d.D_W_ID JOIN o_count oc ON d.D_W_ID = oc.O_W_ID AND d.D_ID = oc.O_D_ID;

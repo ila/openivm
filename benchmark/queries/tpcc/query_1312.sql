@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE"}
+WITH order_totals AS (SELECT OL_W_ID, OL_O_ID, SUM(OL_AMOUNT) AS tot, COUNT(*) AS lines FROM ORDER_LINE GROUP BY OL_W_ID, OL_O_ID), order_info AS (SELECT O_W_ID, O_ID, O_OL_CNT, O_ENTRY_D FROM OORDER) SELECT oi.*, ot.tot, ot.lines FROM order_info oi LEFT JOIN order_totals ot ON oi.O_W_ID = ot.OL_W_ID AND oi.O_ID = ot.OL_O_ID;

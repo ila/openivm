@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER"}
+WITH cust_payments AS (SELECT C_W_ID, C_D_ID, SUM(C_YTD_PAYMENT) AS total_payments FROM CUSTOMER GROUP BY C_W_ID, C_D_ID), district_tax AS (SELECT D_W_ID, D_ID, D_TAX FROM DISTRICT) SELECT cp.C_W_ID, cp.C_D_ID, cp.total_payments, dt.D_TAX, ROUND(cp.total_payments * dt.D_TAX, 2) AS tax_amount FROM cust_payments cp JOIN district_tax dt ON cp.C_W_ID = dt.D_W_ID AND cp.C_D_ID = dt.D_ID;

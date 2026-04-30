@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": true, "tables": "ITEM,ORDER_LINE", "ducklake": true}
+SELECT ol.OL_W_ID, ol.OL_I_ID, COUNT(*) AS n_lines, SUM(CASE WHEN ol.OL_DELIVERY_D IS NULL THEN ol.OL_AMOUNT ELSE 0 END) AS pending_amt FROM dl.ORDER_LINE ol JOIN dl.ITEM i ON ol.OL_I_ID = i.I_ID GROUP BY ol.OL_W_ID, ol.OL_I_ID;

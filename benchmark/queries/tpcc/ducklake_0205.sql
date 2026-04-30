@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "WAREHOUSE,CUSTOMER", "ducklake": true}
+SELECT w.W_ID, w.W_NAME, SUM(c.C_BALANCE) AS total_bal, (SUM(c.C_BALANCE) / COUNT(*)) AS avg_bal, CASE WHEN SUM(c.C_BALANCE) > 1000 THEN 'top' WHEN SUM(c.C_BALANCE) > 0 THEN 'mid' ELSE 'low' END AS cat FROM dl.WAREHOUSE w JOIN dl.CUSTOMER c ON w.W_ID = c.C_W_ID GROUP BY w.W_ID, w.W_NAME;

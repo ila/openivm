@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER,OORDER,ORDER_LINE"}
+SELECT w.W_ID, w.W_NAME, c.C_ID, o.O_ID, ol.OL_AMOUNT FROM WAREHOUSE w JOIN CUSTOMER c ON w.W_ID = c.C_W_ID JOIN OORDER o ON c.C_ID = o.O_C_ID AND c.C_W_ID = o.O_W_ID JOIN ORDER_LINE ol ON o.O_ID = ol.OL_O_ID AND o.O_W_ID = ol.OL_W_ID;

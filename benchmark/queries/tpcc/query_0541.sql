@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": true, "tables": "ORDER_LINE"}
+WITH delivery_stats AS (SELECT OL_W_ID, COUNT(*) AS total, SUM(CASE WHEN OL_DELIVERY_D IS NOT NULL THEN 1 ELSE 0 END) AS delivered FROM ORDER_LINE GROUP BY OL_W_ID) SELECT ds.OL_W_ID, ds.total, ds.delivered, ds.total - ds.delivered AS pending, ROUND(100.0 * ds.delivered / NULLIF(ds.total, 0), 2) AS delivery_rate FROM delivery_stats ds;

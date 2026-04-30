@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,ORDER,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "openivm_verified": true}
+SELECT c.C_ID, o.O_OL_CNT, DENSE_RANK() OVER (PARTITION BY c.C_ID ORDER BY o.O_OL_CNT DESC) AS dr, NTILE(4) OVER (PARTITION BY c.C_ID ORDER BY o.O_OL_CNT) AS q FROM CUSTOMER c JOIN OORDER o ON c.C_ID = o.O_C_ID AND c.C_W_ID = o.O_W_ID;

@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER"}
+SELECT d.D_W_ID, d.D_ID, COUNT(c.C_ID) AS cust, ROUND(SUM(c.C_BALANCE) / NULLIF(COUNT(c.C_ID), 0), 2) AS avg_bal, ROUND(SUM(c.C_YTD_PAYMENT) / NULLIF(SUM(c.C_PAYMENT_CNT), 0), 2) AS avg_pay_per_payment FROM DISTRICT d LEFT JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID GROUP BY d.D_W_ID, d.D_ID;

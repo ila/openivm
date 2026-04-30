@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER"}
+WITH active_orders AS (SELECT O_W_ID, O_D_ID, O_C_ID, COUNT(*) AS order_cnt FROM OORDER GROUP BY O_W_ID, O_D_ID, O_C_ID HAVING COUNT(*) > 1) SELECT c.C_W_ID, c.C_ID, c.C_LAST, ao.order_cnt FROM CUSTOMER c JOIN active_orders ao ON c.C_W_ID = ao.O_W_ID AND c.C_D_ID = ao.O_D_ID AND c.C_ID = ao.O_C_ID;

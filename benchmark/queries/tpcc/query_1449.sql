@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "non_incr_reason": "op:SUBQUERY_FILTER"}
+SELECT o.O_W_ID, o.O_ID, o.O_OL_CNT, (SELECT COUNT(*) FROM ORDER_LINE ol WHERE ol.OL_O_ID = o.O_ID AND ol.OL_W_ID = o.O_W_ID) AS actual_lines, (SELECT SUM(ol.OL_AMOUNT) FROM ORDER_LINE ol WHERE ol.OL_O_ID = o.O_ID AND ol.OL_W_ID = o.O_W_ID) AS order_total FROM OORDER o;

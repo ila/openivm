@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,HAVING", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER"}
+SELECT c.C_W_ID, c.C_D_ID, COUNT(*) AS num_cust, SUM(c.C_BALANCE) AS total_bal, AVG(c.C_BALANCE) AS avg_bal, CASE WHEN AVG(c.C_BALANCE) > 1000 THEN 'high' WHEN AVG(c.C_BALANCE) > 0 THEN 'medium' ELSE 'low' END AS tier FROM CUSTOMER c GROUP BY c.C_W_ID, c.C_D_ID HAVING COUNT(*) > 5;

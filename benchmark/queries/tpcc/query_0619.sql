@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY"}
+SELECT c.C_W_ID, c.C_CREDIT, SUM(h.H_AMOUNT) AS total_payments, COUNT(*) AS payment_count, AVG(h.H_AMOUNT) AS avg_payment, MAX(h.H_AMOUNT) AS max_payment FROM CUSTOMER c JOIN HISTORY h ON c.C_ID = h.H_C_ID AND c.C_W_ID = h.H_C_W_ID GROUP BY c.C_W_ID, c.C_CREDIT HAVING COUNT(*) > 1;

@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,ORDER,HAVING,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "openivm_verified": true}
+WITH t AS (SELECT d.D_W_ID, d.D_ID, COUNT(c.C_ID) AS n, AVG(c.C_BALANCE) AS avg_b FROM DISTRICT d LEFT JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID GROUP BY d.D_W_ID, d.D_ID HAVING COUNT(c.C_ID) > 0) SELECT D_W_ID, D_ID, n, avg_b, LAG(avg_b) OVER (PARTITION BY D_W_ID ORDER BY D_ID) AS prev_avg FROM t;

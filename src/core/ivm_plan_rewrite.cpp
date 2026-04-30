@@ -212,9 +212,9 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
 
 /// @public — also called from openivm_parser.cpp on the full CREATE plan before AnalyzePlan.
 /// Normalize AGG(x) FILTER (WHERE p) → AGG(CASE WHEN p THEN x END) before the
-/// compatibility checker sees it. The rewrite is exact in Z-set algebra: a delta row
-/// with weight w contributes w × (p ? x : NULL), which is linear. Runs before
-/// RewriteDerivedAggregates so AVG/STDDEV FILTER queries are decomposed correctly.
+/// compatibility checker sees it. This is correct for NULL-ignoring aggregates and
+/// lets AVG/STDDEV FILTER queries decompose before maintenance compilation.
+/// LIST is intentionally skipped because it preserves NULL elements.
 ///   COUNT(*) FILTER (WHERE p) → COUNT(CASE WHEN p THEN 1 END)  (count_star → count)
 ///   AGG(x)   FILTER (WHERE p) → AGG(CASE WHEN p THEN x END)    (in-place child wrap)
 void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
@@ -236,12 +236,16 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 	if (!any_filter) {
 		return;
 	}
+	bool rewritten = false;
 	for (auto &expr : agg.expressions) {
 		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
 			continue;
 		}
 		auto &bound = expr->Cast<BoundAggregateExpression>();
 		if (!bound.filter) {
+			continue;
+		}
+		if (bound.function.name == "list") {
 			continue;
 		}
 		auto filter_expr = std::move(bound.filter); // nulls bound.filter
@@ -259,6 +263,7 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 			                                                    nullptr, AggregateType::NON_DISTINCT);
 			new_expr->alias = std::move(saved_alias);
 			expr = std::move(new_expr);
+			rewritten = true;
 		} else {
 			// AGG(x) FILTER (WHERE p) → AGG(CASE WHEN p THEN x END)
 			auto arg_type = bound.children[0]->return_type;
@@ -266,7 +271,11 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 			bound.children[0] = make_uniq<BoundCaseExpression>(std::move(filter_expr), std::move(bound.children[0]),
 			                                                   std::move(else_expr));
 			// bound.filter already nullptr from the move above
+			rewritten = true;
 		}
+	}
+	if (!rewritten) {
+		return;
 	}
 	agg.ResolveOperatorTypes();
 	OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Rewrote FILTER aggregates to CASE expressions\n");

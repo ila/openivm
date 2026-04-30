@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER,OORDER", "ducklake": true}
+SELECT w.W_ID, COUNT(DISTINCT c.C_ID) AS distinct_custs, COUNT(o.O_ID) AS orders FROM dl.WAREHOUSE w JOIN dl.CUSTOMER c ON w.W_ID = c.C_W_ID JOIN dl.OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID WHERE o.O_OL_CNT > 2 GROUP BY w.W_ID;

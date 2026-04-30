@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER"}
+SELECT t.tier, COUNT(c.C_ID) AS cust_cnt FROM (VALUES ('vip'), ('gold'), ('silver'), ('bronze')) t(tier) LEFT JOIN CUSTOMER c ON (t.tier = 'vip' AND c.C_BALANCE > 5000) OR (t.tier = 'gold' AND c.C_BALANCE BETWEEN 1000 AND 5000) OR (t.tier = 'silver' AND c.C_BALANCE BETWEEN 100 AND 1000) OR (t.tier = 'bronze' AND c.C_BALANCE < 100) GROUP BY t.tier;

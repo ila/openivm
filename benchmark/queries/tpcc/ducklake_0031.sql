@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "ducklake": true}
+SELECT d.D_W_ID, d.D_ID, d.D_NAME, sub.total_bal FROM dl.DISTRICT d JOIN (SELECT C_W_ID, C_D_ID, SUM(C_BALANCE) AS total_bal FROM dl.CUSTOMER GROUP BY C_W_ID, C_D_ID) sub ON d.D_W_ID = sub.C_W_ID AND d.D_ID = sub.C_D_ID;

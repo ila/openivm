@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK,ORDER_LINE", "ducklake": true}
+SELECT DISTINCT i.I_ID, i.I_NAME FROM dl.ITEM i JOIN dl.STOCK s ON i.I_ID = s.S_I_ID JOIN dl.ORDER_LINE ol ON s.S_I_ID = ol.OL_I_ID AND s.S_W_ID = ol.OL_SUPPLY_W_ID GROUP BY i.I_ID, i.I_NAME HAVING COUNT(*) > 0;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK,OORDER,ORDER_LINE"}
+SELECT i.I_ID, i.I_NAME, s.S_W_ID, s.S_QUANTITY, ol.OL_AMOUNT, o.O_OL_CNT FROM ITEM i JOIN STOCK s ON i.I_ID = s.S_I_ID JOIN ORDER_LINE ol ON ol.OL_I_ID = i.I_ID AND ol.OL_SUPPLY_W_ID = s.S_W_ID JOIN OORDER o ON ol.OL_O_ID = o.O_ID AND ol.OL_W_ID = o.O_W_ID;

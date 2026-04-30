@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER"}
+SELECT d.D_W_ID, d.D_ID, d.D_NAME, COUNT(c.C_ID) AS customers, COALESCE(SUM(c.C_BALANCE), 0) AS total_bal FROM DISTRICT d LEFT JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID GROUP BY d.D_W_ID, d.D_ID, d.D_NAME;

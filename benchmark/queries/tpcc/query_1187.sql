@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,DISTINCT", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE"}
+SELECT OL_W_ID, COUNT(DISTINCT OL_I_ID) AS uniq FROM ORDER_LINE GROUP BY OL_W_ID;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE"}
+SELECT o.O_W_ID, o.O_ID, ol_totals.total FROM OORDER o JOIN (SELECT OL_W_ID, OL_O_ID, SUM(OL_AMOUNT) AS total FROM ORDER_LINE GROUP BY OL_W_ID, OL_O_ID) ol_totals ON o.O_W_ID = ol_totals.OL_W_ID AND o.O_ID = ol_totals.OL_O_ID WHERE ol_totals.total > 500;

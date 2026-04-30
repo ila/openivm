@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "WAREHOUSE,CUSTOMER", "ducklake": true}
+SELECT w.W_ID, w.W_STATE, CASE WHEN w.W_STATE IN ('CA', 'NY') THEN 'tier1' WHEN w.W_STATE IN ('TX', 'FL') THEN 'tier2' ELSE 'tier3' END AS tier, COUNT(c.C_ID) AS n FROM dl.WAREHOUSE w JOIN dl.CUSTOMER c ON w.W_ID = c.C_W_ID GROUP BY w.W_ID, w.W_STATE;

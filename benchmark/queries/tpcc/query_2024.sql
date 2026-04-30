@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,WAREHOUSE"}
+SELECT ol.OL_W_ID, ol.OL_D_ID, ol.OL_O_ID, ol.OL_AMOUNT, w.W_NAME, FIRST_VALUE(ol.OL_AMOUNT) OVER (PARTITION BY ol.OL_W_ID, ol.OL_D_ID ORDER BY ol.OL_O_ID) AS first_order_amount, LAST_VALUE(ol.OL_AMOUNT) OVER (PARTITION BY ol.OL_W_ID, ol.OL_D_ID ORDER BY ol.OL_O_ID ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_order_amount FROM ORDER_LINE ol JOIN WAREHOUSE w ON ol.OL_W_ID = w.W_ID;

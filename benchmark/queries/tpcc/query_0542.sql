@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT,CUSTOMER"}
+WITH w_district AS (SELECT D_W_ID, COUNT(*) AS d_cnt FROM DISTRICT GROUP BY D_W_ID), w_customer AS (SELECT C_W_ID, COUNT(*) AS c_cnt, SUM(C_BALANCE) AS bal FROM CUSTOMER GROUP BY C_W_ID) SELECT w.W_ID, w.W_NAME, wd.d_cnt, wc.c_cnt, wc.bal FROM WAREHOUSE w LEFT JOIN w_district wd ON w.W_ID = wd.D_W_ID LEFT JOIN w_customer wc ON w.W_ID = wc.C_W_ID;

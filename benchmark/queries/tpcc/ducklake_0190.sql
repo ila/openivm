@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,DISTINCT,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER,OORDER", "ducklake": true}
+SELECT t.W_ID, t.n_custs, t.n_orders FROM (SELECT w.W_ID, COUNT(DISTINCT c.C_ID) AS n_custs, COUNT(DISTINCT o.O_ID) AS n_orders FROM dl.WAREHOUSE w JOIN dl.CUSTOMER c ON w.W_ID = c.C_W_ID JOIN dl.OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID GROUP BY w.W_ID) t WHERE t.n_orders > t.n_custs * 0.5;

@@ -5,6 +5,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
@@ -12,6 +13,7 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
+#include "duckdb/planner/operator/logical_unnest.hpp"
 
 #include <unordered_set>
 
@@ -62,6 +64,10 @@ static bool HasVolatileExpression(vector<unique_ptr<Expression>> &expressions) {
 		ExpressionIterator::EnumerateExpression(expr, [&](Expression &child) {
 			if (child.expression_class == ExpressionClass::BOUND_FUNCTION) {
 				auto &func = child.Cast<BoundFunctionExpression>();
+				if (func.function.name.rfind("__internal_compress", 0) == 0 ||
+				    func.function.name.rfind("__internal_decompress", 0) == 0 || func.function.name == "error") {
+					return;
+				}
 				if (func.function.GetStability() != FunctionStability::CONSISTENT) {
 					found_volatile = true;
 				}
@@ -82,7 +88,10 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_INSERT:
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 	case LogicalOperatorType::LOGICAL_GET:
+	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
+	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 	case LogicalOperatorType::LOGICAL_CTE_REF:
+	case LogicalOperatorType::LOGICAL_UNNEST:
 		break;
 
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
@@ -144,14 +153,19 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	}
 
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
 	case LogicalOperatorType::LOGICAL_JOIN:
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
 		result.found_join = true;
-		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
+		auto *join = dynamic_cast<LogicalJoin *>(node);
 		if (join) {
 			if (join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT &&
-			    join->join_type != JoinType::RIGHT && join->join_type != JoinType::OUTER) {
+			    join->join_type != JoinType::RIGHT && join->join_type != JoinType::OUTER &&
+			    join->join_type != JoinType::SEMI && join->join_type != JoinType::ANTI) {
 				result.ivm_compatible = false;
+			}
+			if (join->join_type == JoinType::SEMI || join->join_type == JoinType::ANTI) {
+				result.found_semi_anti_join = true;
 			}
 			if (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT ||
 			    join->join_type == JoinType::OUTER) {
@@ -177,7 +191,9 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 				if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
 					auto &bound_agg = expr->Cast<BoundAggregateExpression>();
 					const auto &supported = GetSupportedAggregates();
-					if (supported.find(bound_agg.function.name) == supported.end()) {
+					const bool scalar_subquery_first =
+					    bound_agg.function.name == "first" && result.group_index != DConstants::INVALID_INDEX;
+					if (supported.find(bound_agg.function.name) == supported.end() && !scalar_subquery_first) {
 						result.ivm_compatible = false;
 					}
 					// COUNT(DISTINCT x) can't be summed from delta counts, but group-recompute
@@ -185,12 +201,17 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 					if (bound_agg.IsDistinct()) {
 						result.found_count_distinct = true;
 					}
-					// FILTER (WHERE predicate) is normalized to CASE WHEN p THEN x END
-					// by RewriteAggregateFilters before the checker runs. If a FILTER reaches
-					// here it means the rewrite didn't fire (unexpected plan shape) — fall back
-					// to full refresh rather than producing wrong incremental results.
 					if (bound_agg.filter) {
-						result.ivm_compatible = false;
+						// LIST keeps NULL elements, so LIST(CASE WHEN p THEN x ELSE NULL END)
+						// is not equivalent to LIST(x) FILTER (WHERE p). Keep the raw FILTER
+						// and route the view to affected-group recompute using the original SQL.
+						if (bound_agg.function.name == "list") {
+							result.found_filtered_list = true;
+						} else {
+							// Other FILTER aggregates should have been normalized before the
+							// checker runs. If one reaches here, use full refresh.
+							result.ivm_compatible = false;
+						}
 					}
 					if (bound_agg.function.name == "min" || bound_agg.function.name == "max" ||
 					    bound_agg.function.name == "arg_min" || bound_agg.function.name == "arg_max") {

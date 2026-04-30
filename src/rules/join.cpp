@@ -70,6 +70,30 @@ static LogicalGet *GetLeafScan(const JoinLeafInfo &leaf) {
 	return leaf.get ? leaf.get : FindGetInSubtree(leaf.node);
 }
 
+static bool IsConstantLeafSubtree(LogicalOperator *node) {
+	if (!node) {
+		return false;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_GET) {
+		auto *get = dynamic_cast<LogicalGet *>(node);
+		return get && get->GetTable().get() == nullptr;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_CHUNK_GET || node->type == LogicalOperatorType::LOGICAL_DUMMY_SCAN ||
+	    node->type == LogicalOperatorType::LOGICAL_EXPRESSION_GET ||
+	    node->type == LogicalOperatorType::LOGICAL_UNNEST) {
+		return true;
+	}
+	if (node->children.empty()) {
+		return false;
+	}
+	for (auto &child : node->children) {
+		if (!IsConstantLeafSubtree(child.get())) {
+			return false;
+		}
+	}
+	return true;
+}
+
 unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, const vector<size_t> &path) {
 	unique_ptr<LogicalOperator> *current = &root;
 	for (size_t step : path) {
@@ -215,26 +239,29 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 struct DeltaStatus {
 	uint64_t insert_only_mask; // bit i=1: leaf i has no delete rows (insert-only or empty)
 	uint64_t empty_mask;       // bit i=1: leaf i has zero pending delta rows
+	uint64_t constant_mask;    // bit i=1: leaf has no mutable source table
 };
 
 /// For each leaf, detect delta status in a single query per table.
 /// Returns both insert_only_mask (no deletes) and empty_mask (no rows at all).
 static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_name,
                                      const vector<JoinLeafInfo> &leaves) {
-	DeltaStatus status = {0, 0};
+	DeltaStatus status = {0, 0, 0};
 	Connection con(*context.db);
 	con.SetAutoCommit(false);
 
 	for (size_t i = 0; i < leaves.size(); i++) {
 		LogicalGet *get = GetLeafScan(leaves[i]);
 		if (!get) {
-			// Only constant nodes with no catalog backing (CHUNK_GET/VALUES) have empty delta.
-			// Other !get cases (e.g. PROJECTION wrapping a nested join) may contain real tables —
-			// don't mark those as empty or we'd incorrectly prune valid IE terms.
-			if (leaves[i].node->type == LogicalOperatorType::LOGICAL_CHUNK_GET) {
+			// Constant relation leaves (VALUES/CHUNK/DUMMY), often wrapped in projections,
+			// have no catalog backing and therefore no delta. Other !get cases may contain
+			// real tables inside nested joins, so only prune when the whole leaf subtree is
+			// constant.
+			if (IsConstantLeafSubtree(leaves[i].node)) {
 				status.empty_mask |= (1ULL << i);
 				status.insert_only_mask |= (1ULL << i);
-				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (CHUNK_GET constant) has empty delta\n", i);
+				status.constant_mask |= (1ULL << i);
+				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (constant values) has empty delta\n", i);
 			}
 			continue;
 		}
@@ -249,12 +276,12 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 			// a non-changing input.
 			status.empty_mask |= (1ULL << i);
 			status.insert_only_mask |= (1ULL << i);
+			status.constant_mask |= (1ULL << i);
 			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (table function '%s') has empty delta\n", i,
 			                    get->function.name.c_str());
 			continue;
 		}
 		string delta_name = OpenIVMUtils::DeltaName(table_ref.get()->name);
-
 		// Get last_update timestamp for this view+table pair
 		auto ts_result = con.Query("SELECT last_update FROM " + string(ivm::DELTA_TABLES_TABLE) +
 		                           " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
@@ -406,15 +433,24 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 		skip_empty_enabled = skip_empty_val.GetValue<bool>();
 	}
 	uint64_t empty_mask = skip_empty_enabled ? delta_status.empty_mask : 0;
+	uint64_t total_terms = (1ULL << N) - 1;
+	uint64_t fallback_mask = total_terms;
+	for (size_t i = 0; i < N; i++) {
+		if (!(delta_status.constant_mask & (1ULL << i))) {
+			fallback_mask = 1ULL << i;
+			break;
+		}
+	}
 
 	uint64_t pruned_count = 0;
-	uint64_t total_terms = (1ULL << N) - 1;
 	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Building inclusion-exclusion terms (%lu total, skip_bits=%lu, empty_mask=%lu)\n",
 	                    (unsigned long)total_terms, (unsigned long)skip_bits, (unsigned long)empty_mask);
 	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
 		// Safety: always generate at least one term to avoid empty UNION ALL.
-		// The last mask (all bits set) is the fallback — even if it produces zero rows.
-		bool is_last_chance = (mask == total_terms) && terms.empty();
+		// If every useful term was pruned as empty, use one mutable source leaf as
+		// the fallback. Constant leaves (VALUES/UNNEST/table functions) have no
+		// delta scan, so the fallback must not force them onto the delta side.
+		bool is_last_chance = (mask == fallback_mask) && terms.empty();
 
 		// FK pruning: skip any term whose mask overlaps with insert-only PK leaves.
 		// All such terms cancel algebraically via XOR (see ComputeSkipBits).

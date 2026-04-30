@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,OORDER,ORDER_LINE"}
+SELECT i.I_IM_ID, COUNT(DISTINCT i.I_ID) AS unique_items, SUM(ol.OL_QUANTITY) AS qty, SUM(ol.OL_AMOUNT) AS rev, AVG(i.I_PRICE) AS avg_price FROM ITEM i JOIN ORDER_LINE ol ON i.I_ID = ol.OL_I_ID JOIN OORDER o ON ol.OL_O_ID = o.O_ID AND ol.OL_W_ID = o.O_W_ID WHERE o.O_ALL_LOCAL = 1 GROUP BY i.I_IM_ID;

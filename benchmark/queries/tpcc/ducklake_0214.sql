@@ -1,0 +1,2 @@
+-- {"operators": "CTE,SUBQUERY", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "non_incr_reason": "kw:EXCEPT", "ducklake": true}
+WITH all_keys AS (SELECT C_W_ID AS w, C_D_ID AS d, C_ID AS id FROM dl.CUSTOMER), ordered_keys AS (SELECT O_W_ID AS w, O_D_ID AS d, O_C_ID AS id FROM dl.OORDER) SELECT * FROM all_keys EXCEPT SELECT * FROM ordered_keys;

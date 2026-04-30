@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "non_incr_reason": "op:LATERAL"}
+SELECT d.D_W_ID, d.D_ID, lat.avg_b, lat.std_b, lat.max_b FROM DISTRICT d JOIN LATERAL (SELECT AVG(C_BALANCE) AS avg_b, STDDEV(C_BALANCE) AS std_b, MAX(C_BALANCE) AS max_b FROM CUSTOMER WHERE C_W_ID = d.D_W_ID AND C_D_ID = d.D_ID) lat ON TRUE;

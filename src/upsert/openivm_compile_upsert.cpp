@@ -910,10 +910,87 @@ static string ReplaceAllOccurrences(string haystack, const string &needle, const
 	return haystack;
 }
 
+static bool IsIdentifierChar(char c) {
+	return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.';
+}
+
+static bool IdentifierMatchesTable(const string &identifier, const string &table_name) {
+	if (StringUtil::CIEquals(identifier, table_name)) {
+		return true;
+	}
+	if (identifier.size() <= table_name.size()) {
+		return false;
+	}
+	auto suffix = identifier.substr(identifier.size() - table_name.size());
+	return identifier[identifier.size() - table_name.size() - 1] == '.' && StringUtil::CIEquals(suffix, table_name);
+}
+
+static string ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement) {
+	if (table_name.empty()) {
+		return sql;
+	}
+	string result;
+	result.reserve(sql.size());
+	bool in_single_quote = false;
+	bool expect_table = false;
+	for (idx_t i = 0; i < sql.size();) {
+		char c = sql[i];
+		if (c == '\'') {
+			result += c;
+			i++;
+			if (in_single_quote && i < sql.size() && sql[i] == '\'') {
+				result += sql[i++];
+				continue;
+			}
+			in_single_quote = !in_single_quote;
+			continue;
+		}
+		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
+			idx_t start = i;
+			bool in_identifier_quote = c == '"';
+			i++;
+			while (i < sql.size()) {
+				char nc = sql[i];
+				if (in_identifier_quote) {
+					i++;
+					if (nc == '"') {
+						break;
+					}
+					continue;
+				}
+				if (!IsIdentifierChar(nc)) {
+					break;
+				}
+				i++;
+			}
+			string token = sql.substr(start, i - start);
+			string unquoted = token;
+			if (unquoted.size() >= 2 && unquoted.front() == '"' && unquoted.back() == '"') {
+				unquoted = unquoted.substr(1, unquoted.size() - 2);
+			}
+			if (expect_table && IdentifierMatchesTable(unquoted, table_name)) {
+				result += replacement;
+				expect_table = false;
+				continue;
+			}
+			result += token;
+			string lower = StringUtil::Lower(unquoted);
+			expect_table = lower == "from" || lower == "join" || lower == "update" || lower == "into";
+			continue;
+		}
+		result += c;
+		if (!std::isspace(static_cast<unsigned char>(c))) {
+			expect_table = false;
+		}
+		i++;
+	}
+	return result;
+}
+
 } // namespace
 
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
-                             const vector<std::pair<string, string>> &delta_table_specs, const string &catalog_prefix,
+                             const vector<GroupRecomputeDeltaSpec> &delta_table_specs, const string &catalog_prefix,
                              const string &lpts_table_prefix) {
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 
@@ -929,24 +1006,42 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	// then project DISTINCT group_columns. Union across sources gives the affected-keys set.
 	string affected_subquery;
 	for (size_t i = 0; i < delta_table_specs.size(); i++) {
-		const string &base = delta_table_specs[i].first;
-		const string &last_update = delta_table_specs[i].second;
-		string delta_basename = string(ivm::DELTA_PREFIX) + base;
+		const auto &spec = delta_table_specs[i];
+		const string &base = spec.base_table;
 
-		string delta_filter;
-		if (!last_update.empty()) {
-			delta_filter = " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(last_update) +
-			               "'::TIMESTAMP";
+		string delta_subselect;
+		if (spec.is_ducklake) {
+			delta_subselect =
+			    "(SELECT * FROM ducklake_table_insertions('" + OpenIVMUtils::EscapeValue(spec.ducklake_catalog) +
+			    "', '" + OpenIVMUtils::EscapeValue(spec.ducklake_schema) + "', '" + OpenIVMUtils::EscapeValue(base) +
+			    "', " + to_string(spec.last_snapshot_id) + ", " + to_string(spec.current_snapshot_id) +
+			    ")\nUNION ALL\nSELECT * FROM ducklake_table_deletions('" +
+			    OpenIVMUtils::EscapeValue(spec.ducklake_catalog) + "', '" +
+			    OpenIVMUtils::EscapeValue(spec.ducklake_schema) + "', '" + OpenIVMUtils::EscapeValue(base) + "', " +
+			    to_string(spec.last_snapshot_id) + ", " + to_string(spec.current_snapshot_id) + "))";
+		} else {
+			string delta_basename = string(ivm::DELTA_PREFIX) + base;
+			string delta_filter;
+			if (!spec.last_update.empty()) {
+				delta_filter = " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" +
+				               OpenIVMUtils::EscapeValue(spec.last_update) + "'::TIMESTAMP";
+			}
+			delta_subselect = "(SELECT * EXCLUDE (" + string(ivm::MULTIPLICITY_COL) + ", " +
+			                  string(ivm::TIMESTAMP_COL) + ") FROM " + catalog_prefix + Q(delta_basename) +
+			                  delta_filter + ")";
 		}
-		string delta_subselect = "(SELECT * EXCLUDE (" + string(ivm::MULTIPLICITY_COL) + ", " +
-		                         string(ivm::TIMESTAMP_COL) + ") FROM " + catalog_prefix + Q(delta_basename) +
-		                         delta_filter + ")";
 
 		// LPTS form ALWAYS references base tables as fully-qualified `cat.schema.tbl`, even when
 		// the catalog is the default `memory` (so `catalog_prefix` is empty for SQL output, but
 		// `lpts_table_prefix` is still `memory.main.` here). Substitute that exact form.
+		// Original-SQL recompute paths (e.g. ROLLUP/GROUPING SETS) can contain unqualified
+		// table names, so fall back to identifier-safe bare replacement when the exact LPTS
+		// form is absent.
 		string source_full = (lpts_table_prefix.empty() ? catalog_prefix : lpts_table_prefix) + base;
 		string filtered = ReplaceAllOccurrences(view_query_sql, source_full, delta_subselect);
+		if (filtered == view_query_sql) {
+			filtered = ReplaceTableReferences(view_query_sql, base, delta_subselect);
+		}
 
 		if (i > 0) {
 			affected_subquery += "\n  UNION\n  ";
@@ -1069,6 +1164,117 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	OPENIVM_DEBUG_PRINT("[CompileDistinctIncremental] %zu distinct cols, %zu group cols, sum %s(%s)→%s, aux=%s\n",
 	                    distinct_cols.size(), group_columns.size(), "SUM", sum_arg.c_str(), sum_out.c_str(),
 	                    aux_table.c_str());
+	return sql;
+}
+
+string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
+                                const string &left_table, const string &left_alias, const string &right_table,
+                                const string &right_alias, const string &predicate, const string &post_filter,
+                                const vector<string> &left_cols, const vector<string> &output_cols,
+                                const string &left_delta_source, const string &right_delta_source,
+                                const string &left_last_update, const string &right_last_update,
+                                const string &catalog_prefix) {
+	if (left_cols.empty() || output_cols.empty() || aux_table.empty() || left_delta_source.empty() ||
+	    right_delta_source.empty() || left_last_update.empty() || right_last_update.empty()) {
+		return "-- CompileSemiAntiRecompute called with incomplete metadata; no-op\n";
+	}
+
+	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
+	string aux_q = catalog_prefix + Q(aux_table);
+	string left_delta_q = catalog_prefix + Q(left_delta_source);
+	string right_delta_q = catalog_prefix + Q(right_delta_source);
+	string dleft_table = "_ivm_saj_dleft_" + view_name;
+	string dright_table = "_ivm_saj_dright_" + view_name;
+	string old_table = "_ivm_saj_old_" + view_name;
+	string aff_table = "_ivm_saj_aff_" + view_name;
+	bool is_anti = StringUtil::Lower(join_type) == "anti";
+	string visible = is_anti ? "_match_count = 0" : "_match_count > 0";
+	string cur_visible = is_anti ? "_cur._match_count = 0" : "_cur._match_count > 0";
+	string old_filter;
+	string cur_filter;
+	if (!post_filter.empty()) {
+		old_filter = " AND (" + ReplaceAllOccurrences(post_filter, left_alias + ".", "_old.") + ")";
+		cur_filter = " AND (" + ReplaceAllOccurrences(post_filter, left_alias + ".", "_cur.") + ")";
+	}
+
+	string left_cols_csv = JoinQuotedColumns(left_cols);
+	string output_cols_csv = JoinQuotedColumns(output_cols);
+	string left_cols_i = JoinQualifiedQuotedColumns(left_cols, "i");
+	string left_cols_l = JoinQualifiedQuotedColumns(left_cols, left_alias);
+	string left_cols_old = JoinQualifiedQuotedColumns(left_cols, "_old");
+	string left_cols_cur = JoinQualifiedQuotedColumns(left_cols, "_cur");
+	string output_old = JoinQualifiedQuotedColumns(output_cols, "_old");
+	string output_cur = JoinQualifiedQuotedColumns(output_cols, "_cur");
+
+	string aux_i_match = BuildNullSafeMatch(left_cols, "_aux", "i");
+	string old_cur_match = BuildNullSafeMatch(left_cols, "_old", "_cur");
+	string aff_old_match = BuildNullSafeMatch(left_cols, "_aff", "_old");
+	string aff_cur_match = BuildNullSafeMatch(left_cols, "_aff", "_cur");
+	string data_match = BuildNullSafeMatch(output_cols, "_v", "_d");
+
+	string left_ts =
+	    string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(left_last_update) + "'::TIMESTAMP";
+	string right_ts = right_alias + "." + string(ivm::TIMESTAMP_COL) + " >= '" +
+	                  OpenIVMUtils::EscapeValue(right_last_update) + "'::TIMESTAMP";
+
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + Q(old_table) + " AS SELECT *, (" + visible + ") AS _visible FROM " +
+	       aux_q + ";\n\n";
+
+	sql += "CREATE OR REPLACE TEMP TABLE " + Q(dleft_table) + " AS\n  SELECT " + left_cols_csv + ", SUM(" +
+	       string(ivm::MULTIPLICITY_COL) + ")::BIGINT AS dmult\n  FROM " + left_delta_q + "\n  WHERE " + left_ts +
+	       "\n  GROUP BY " + left_cols_csv + "\n  HAVING SUM(" + string(ivm::MULTIPLICITY_COL) + ") <> 0;\n\n";
+
+	sql += "CREATE OR REPLACE TEMP TABLE " + Q(dright_table) + " AS\n  SELECT " + left_cols_l + ", SUM(" + right_alias +
+	       "." + string(ivm::MULTIPLICITY_COL) + ")::BIGINT AS dmatch\n  FROM " + aux_q + " " + left_alias + " JOIN " +
+	       right_delta_q + " " + right_alias + " ON " + predicate + "\n  WHERE " + right_ts + "\n  GROUP BY " +
+	       left_cols_l + "\n  HAVING SUM(" + right_alias + "." + string(ivm::MULTIPLICITY_COL) + ") <> 0;\n\n";
+
+	sql += "MERGE INTO " + aux_q + " _aux USING " + Q(dright_table) + " _d ON " +
+	       BuildNullSafeMatch(left_cols, "_aux", "_d") +
+	       "\nWHEN MATCHED THEN UPDATE SET _match_count = _aux._match_count + _d.dmatch;\n\n";
+
+	sql += "MERGE INTO " + aux_q + " _aux USING " + Q(dleft_table) + " i ON " + aux_i_match +
+	       "\nWHEN MATCHED THEN UPDATE SET _left_count = _aux._left_count + i.dmult;\n\n";
+
+	sql += "INSERT INTO " + aux_q + " (" + left_cols_csv + ", _left_count, _match_count)\nSELECT " + left_cols_i +
+	       ", i.dmult, COALESCE(mc._match_count, 0)::BIGINT\nFROM " + Q(dleft_table) + " i\nLEFT JOIN " + aux_q +
+	       " _aux ON " + aux_i_match + "\nLEFT JOIN (\n  SELECT " + left_cols_l +
+	       ", COUNT(*)::BIGINT AS _match_count\n  FROM " + Q(dleft_table) + " " + left_alias + " JOIN " + right_table +
+	       " " + right_alias + " ON " + predicate + "\n  GROUP BY " + left_cols_l + "\n) mc ON " +
+	       BuildNullSafeMatch(left_cols, "mc", "i") + "\nWHERE _aux._left_count IS NULL AND i.dmult > 0;\n\n";
+
+	sql += "CREATE OR REPLACE TEMP TABLE " + Q(aff_table) + " AS\nSELECT " + left_cols_old + " FROM " + Q(old_table) +
+	       " _old LEFT JOIN " + aux_q + " _cur ON " + old_cur_match +
+	       "\nWHERE _cur._left_count IS NULL OR _old._left_count IS DISTINCT FROM _cur._left_count OR "
+	       "_old._visible IS DISTINCT FROM (" +
+	       cur_visible + ")\nUNION\nSELECT " + left_cols_cur + " FROM " + aux_q + " _cur LEFT JOIN " + Q(old_table) +
+	       " _old ON " + old_cur_match +
+	       "\nWHERE _old._left_count IS NULL OR _old._left_count IS DISTINCT FROM _cur._left_count OR "
+	       "_old._visible IS DISTINCT FROM (" +
+	       cur_visible + ");\n\n";
+
+	sql += "WITH _old_rows AS (\n  SELECT " + output_old + " FROM " + Q(old_table) + " _old JOIN " + Q(aff_table) +
+	       " _aff ON " + aff_old_match +
+	       ", generate_series(1, _old._left_count::BIGINT)\n  WHERE _old._visible AND _old._left_count > 0" +
+	       old_filter +
+	       "\n), "
+	       "_net AS (\n  SELECT " +
+	       output_cols_csv + ", COUNT(*)::BIGINT AS _cnt FROM _old_rows GROUP BY " + output_cols_csv +
+	       "\n)\nDELETE FROM " + data_table + " WHERE rowid IN (\n  SELECT _v.rowid FROM (\n    SELECT rowid, " +
+	       output_cols_csv + ", ROW_NUMBER() OVER (PARTITION BY " + output_cols_csv + " ORDER BY rowid) AS _rn FROM " +
+	       data_table + "\n  ) _v JOIN _net _d ON " + data_match + " WHERE _v._rn <= _d._cnt\n);\n\n";
+
+	sql += "INSERT INTO " + data_table + " SELECT " + output_cur + "\nFROM " + aux_q + " _cur JOIN " + Q(aff_table) +
+	       " _aff ON " + aff_cur_match + ", generate_series(1, _cur._left_count::BIGINT)\nWHERE " + cur_visible +
+	       " AND _cur._left_count > 0" + cur_filter + ";\n\n";
+
+	sql += "DELETE FROM " + aux_q + " WHERE _left_count <= 0;\n";
+	sql += "DROP TABLE IF EXISTS " + Q(old_table) + ";\nDROP TABLE IF EXISTS " + Q(dleft_table) +
+	       ";\nDROP TABLE IF EXISTS " + Q(dright_table) + ";\nDROP TABLE IF EXISTS " + Q(aff_table) + ";\n";
+
+	OPENIVM_DEBUG_PRINT("[CompileSemiAntiRecompute] %s join, %zu left cols, aux=%s\n", join_type.c_str(),
+	                    left_cols.size(), aux_table.c_str());
 	return sql;
 }
 

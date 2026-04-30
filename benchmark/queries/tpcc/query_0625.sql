@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER"}
+SELECT C_W_ID, COUNT(*) AS total, SUM(CASE WHEN C_CREDIT = 'BC' THEN 1 ELSE 0 END) AS bad_credit, SUM(CASE WHEN C_BALANCE < 0 THEN 1 ELSE 0 END) AS negative_bal, ROUND(100.0 * SUM(CASE WHEN C_CREDIT = 'BC' THEN 1 ELSE 0 END) / COUNT(*), 2) AS bad_pct FROM CUSTOMER GROUP BY C_W_ID;

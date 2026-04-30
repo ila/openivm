@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "ducklake": true}
+WITH o_total AS (SELECT O_W_ID, O_D_ID, O_C_ID, SUM(O_OL_CNT) AS lines FROM dl.OORDER GROUP BY O_W_ID, O_D_ID, O_C_ID) SELECT c.C_W_ID, c.C_D_ID, c.C_ID, COALESCE(ot.lines, 0) AS total_lines, (ot.lines IS NULL) AS no_orders FROM dl.CUSTOMER c LEFT JOIN o_total ot ON c.C_W_ID = ot.O_W_ID AND c.C_D_ID = ot.O_D_ID AND c.C_ID = ot.O_C_ID;

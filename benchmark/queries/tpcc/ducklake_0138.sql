@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK,ORDER_LINE", "ducklake": true}
+WITH hot_items AS (SELECT ol.OL_I_ID, COUNT(*) AS ord FROM dl.ORDER_LINE ol GROUP BY ol.OL_I_ID HAVING COUNT(*) > 1) SELECT i.I_ID, i.I_NAME, i.I_PRICE, SUM(s.S_QUANTITY) AS total_stock, hi.ord FROM dl.ITEM i JOIN hot_items hi ON i.I_ID = hi.OL_I_ID JOIN dl.STOCK s ON i.I_ID = s.S_I_ID GROUP BY i.I_ID, i.I_NAME, i.I_PRICE, hi.ord;

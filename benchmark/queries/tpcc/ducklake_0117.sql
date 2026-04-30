@@ -1,0 +1,2 @@
+-- {"operators": "CTE,SUBQUERY", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "non_incr_reason": "kw:EXCEPT", "ducklake": true}
+WITH cust AS (SELECT C_W_ID, C_D_ID, C_ID FROM dl.CUSTOMER), ordered AS (SELECT O_W_ID AS C_W_ID, O_D_ID AS C_D_ID, O_C_ID AS C_ID FROM dl.OORDER) SELECT * FROM cust EXCEPT SELECT * FROM ordered;

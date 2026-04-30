@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,ORDER,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY", "openivm_verified": true}
+SELECT c.C_ID, h.H_AMOUNT, LAG(h.H_AMOUNT) OVER (PARTITION BY c.C_ID ORDER BY h.H_AMOUNT) AS prv, LEAD(h.H_AMOUNT) OVER (PARTITION BY c.C_ID ORDER BY h.H_AMOUNT) AS nxt FROM CUSTOMER c JOIN HISTORY h ON c.C_ID = h.H_C_ID AND c.C_W_ID = h.H_C_W_ID;

@@ -1,0 +1,2 @@
+-- {"operators": "FILTER,CORRELATED_SUBQUERY", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER,NEW_ORDER", "non_incr_reason": "op:CORRELATED_SUBQUERY"}
+SELECT c.C_W_ID, c.C_ID FROM CUSTOMER c WHERE EXISTS (SELECT 1 FROM OORDER o WHERE o.O_C_ID = c.C_ID AND o.O_W_ID = c.C_W_ID AND EXISTS (SELECT 1 FROM NEW_ORDER no WHERE no.NO_O_ID = o.O_ID AND no.NO_W_ID = o.O_W_ID));

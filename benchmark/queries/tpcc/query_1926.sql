@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "DISTRICT"}
+WITH tax_bins AS (SELECT D_W_ID, D_ID, CASE WHEN D_TAX < 0.05 THEN 'low' WHEN D_TAX < 0.10 THEN 'med' ELSE 'high' END AS bin FROM DISTRICT) SELECT bin, COUNT(*) AS n, AVG(D_YTD) FROM tax_bins tb JOIN DISTRICT d ON tb.D_W_ID = d.D_W_ID AND tb.D_ID = d.D_ID GROUP BY bin;

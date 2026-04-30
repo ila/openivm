@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "ducklake": true}
+WITH active_customers AS (SELECT C_W_ID, C_D_ID, C_ID FROM dl.CUSTOMER WHERE C_PAYMENT_CNT > 0) SELECT ac.C_W_ID, ac.C_D_ID, COUNT(o.O_ID) AS orders FROM active_customers ac JOIN dl.OORDER o ON ac.C_W_ID = o.O_W_ID AND ac.C_D_ID = o.O_D_ID AND ac.C_ID = o.O_C_ID GROUP BY ac.C_W_ID, ac.C_D_ID;

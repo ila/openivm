@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE"}
+SELECT COALESCE(o.O_ID, ol.OL_NUMBER) AS gk, COUNT(*) AS n, SUM(COALESCE(ol.OL_NUMBER, 0)) AS tot FROM OORDER o FULL OUTER JOIN ORDER_LINE ol ON o.O_ID = ol.OL_O_ID AND o.O_W_ID = ol.OL_W_ID GROUP BY COALESCE(o.O_ID, ol.OL_NUMBER);

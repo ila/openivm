@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER"}
+SELECT c.C_W_ID, c.C_ID, c.C_LAST, COALESCE(pc.orders, 0) AS orders FROM CUSTOMER c LEFT JOIN (SELECT O_C_ID, O_W_ID, COUNT(*) AS orders FROM OORDER GROUP BY O_C_ID, O_W_ID) pc ON c.C_ID = pc.O_C_ID AND c.C_W_ID = pc.O_W_ID;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY", "ducklake": true}
+SELECT h.H_W_ID, h.H_D_ID, COUNT(*) AS pay_count, SUM(h.H_AMOUNT) AS total FROM dl.CUSTOMER c JOIN dl.HISTORY h ON c.C_ID = h.H_C_ID AND c.C_D_ID = h.H_C_D_ID AND c.C_W_ID = h.H_C_W_ID WHERE c.C_CREDIT = 'GC' GROUP BY h.H_W_ID, h.H_D_ID;

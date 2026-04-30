@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "STOCK,ORDER_LINE"}
+SELECT COALESCE(s.S_W_ID, ol.OL_O_ID) AS gk, COUNT(*) AS n, SUM(COALESCE(ol.OL_O_ID, 0)) AS tot FROM STOCK s FULL OUTER JOIN ORDER_LINE ol ON s.S_I_ID = ol.OL_I_ID AND s.S_W_ID = ol.OL_SUPPLY_W_ID GROUP BY COALESCE(s.S_W_ID, ol.OL_O_ID);

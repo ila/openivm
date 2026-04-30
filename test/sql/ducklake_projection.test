@@ -362,6 +362,58 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# ==========================================
+# DuckLake projection over VALUES join
+# ==========================================
+
+statement ok
+CREATE TABLE dl.value_customers (id INTEGER, credit VARCHAR, last_name VARCHAR);
+
+statement ok
+INSERT INTO dl.value_customers VALUES (1, 'GC', 'Able'), (2, 'BC', 'Baker'), (3, 'XX', 'Cross');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_value_join AS
+    SELECT c.id, c.last_name, v.priority
+    FROM dl.value_customers c
+    JOIN (VALUES ('GC', 1), ('BC', 2)) AS v(credit, priority)
+      ON c.credit = v.credit;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_value_join';
+----
+2
+
+statement ok
+UPDATE dl.value_customers SET credit = 'GC' WHERE id = 3;
+
+statement ok
+PRAGMA ivm('mv_value_join');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, last_name, priority FROM dl.mv_value_join
+    EXCEPT ALL
+    SELECT c.id, c.last_name, v.priority
+    FROM dl.value_customers c
+    JOIN (VALUES ('GC', 1), ('BC', 2)) AS v(credit, priority)
+      ON c.credit = v.credit
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.id, c.last_name, v.priority
+    FROM dl.value_customers c
+    JOIN (VALUES ('GC', 1), ('BC', 2)) AS v(credit, priority)
+      ON c.credit = v.credit
+    EXCEPT ALL
+    SELECT id, last_name, priority FROM dl.mv_value_join
+);
+----
+0
+
 # Insert a new top scorer (frank=99 enters top-3)
 statement ok
 INSERT INTO dl.topkp VALUES (6,'frank',99);

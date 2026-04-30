@@ -1,0 +1,669 @@
+# name: test/sql/mv_semi_anti_join.test
+# description: Test aux-state IVM for SEMI and ANTI joins
+# group: [sql]
+
+require openivm
+
+# SEMI JOIN with an arbitrary non-equi predicate. The MV output is the left tuple
+# identity so the aux table can maintain per-left-tuple match counts.
+statement ok
+CREATE TABLE saj_l (id INT, x INT);
+
+statement ok
+CREATE TABLE saj_r (rid INT, y INT);
+
+statement ok
+INSERT INTO saj_l VALUES (1, 10), (1, 10), (2, 20), (3, 30), (4, 40);
+
+statement ok
+INSERT INTO saj_r VALUES (100, 8), (101, 100), (102, 41);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_saj_semi AS
+    SELECT l.id, l.x FROM saj_l l SEMI JOIN saj_r r ON abs(l.x - r.y) <= 2;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM saj_l l SEMI JOIN saj_r r ON abs(l.x - r.y) <= 2
+    EXCEPT ALL SELECT id, x FROM mv_saj_semi
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_saj_semi
+    EXCEPT ALL SELECT l.id, l.x FROM saj_l l SEMI JOIN saj_r r ON abs(l.x - r.y) <= 2
+);
+----
+0
+
+# Batch conflicting changes before one refresh:
+# - right insert makes id=2 visible
+# - right delete removes the only match for id=4
+# - left insert adds a second id=3 row that is visible through y=32
+# - left delete removes one duplicate id=1 row
+statement ok
+INSERT INTO saj_r VALUES (103, 21), (104, 32);
+
+statement ok
+DELETE FROM saj_r WHERE rid = 102;
+
+statement ok
+INSERT INTO saj_l VALUES (3, 30);
+
+statement ok
+DELETE FROM saj_l WHERE rowid IN (SELECT rowid FROM saj_l WHERE id = 1 AND x = 10 LIMIT 1);
+
+statement ok
+PRAGMA ivm('mv_saj_semi');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM saj_l l SEMI JOIN saj_r r ON abs(l.x - r.y) <= 2
+    EXCEPT ALL SELECT id, x FROM mv_saj_semi
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_saj_semi
+    EXCEPT ALL SELECT l.id, l.x FROM saj_l l SEMI JOIN saj_r r ON abs(l.x - r.y) <= 2
+);
+----
+0
+
+# The previous batch inserted a new left tuple and its matching right tuple in the
+# same refresh. Deleting that right tuple now must drop the left tuple; this catches
+# double-counting of current S plus ΔS during aux initialization.
+statement ok
+DELETE FROM saj_r WHERE rid = 104;
+
+statement ok
+PRAGMA ivm('mv_saj_semi');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM saj_l l SEMI JOIN saj_r r ON abs(l.x - r.y) <= 2
+    EXCEPT ALL SELECT id, x FROM mv_saj_semi
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_saj_semi
+    EXCEPT ALL SELECT l.id, l.x FROM saj_l l SEMI JOIN saj_r r ON abs(l.x - r.y) <= 2
+);
+----
+0
+
+# ============================================================
+# ANTI JOIN under GROUP BY. This currently uses FULL_REFRESH rather
+# than aux-state SEMI/ANTI, but it must remain correct for batched DML.
+# ============================================================
+
+statement ok
+CREATE TABLE ag_l (id INT, grp INT, x INT);
+
+statement ok
+CREATE TABLE ag_r (rid INT, y INT);
+
+statement ok
+INSERT INTO ag_l VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 50);
+
+statement ok
+INSERT INTO ag_r VALUES (1, 10), (2, 41);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ag_anti AS
+    SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
+    FROM ag_l l ANTI JOIN ag_r r ON abs(l.x - r.y) <= 1
+    GROUP BY l.grp;
+
+statement ok
+INSERT INTO ag_r VALUES (3, 20), (4, 50);
+
+statement ok
+DELETE FROM ag_r WHERE rid = 2;
+
+statement ok
+UPDATE ag_l SET x = 11 WHERE id = 3;
+
+statement ok
+INSERT INTO ag_l VALUES (6, 3, 60), (7, 3, 20);
+
+statement ok
+PRAGMA ivm('mv_ag_anti');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
+    FROM ag_l l ANTI JOIN ag_r r ON abs(l.x - r.y) <= 1
+    GROUP BY l.grp
+    EXCEPT ALL SELECT grp, cnt, total FROM mv_ag_anti
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, cnt, total FROM mv_ag_anti
+    EXCEPT ALL
+    SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
+    FROM ag_l l ANTI JOIN ag_r r ON abs(l.x - r.y) <= 1
+    GROUP BY l.grp
+);
+----
+0
+
+# ============================================================
+# ANTI JOIN after an inner-join chain. The left side of ANTI is a
+# subplan, not a single base table, so this must not use the simple
+# aux-state extractor.
+# ============================================================
+
+statement ok
+CREATE TABLE cj_orders (oid INT, cust_id INT, amount INT);
+
+statement ok
+CREATE TABLE cj_customers (cid INT, region VARCHAR);
+
+statement ok
+CREATE TABLE cj_blocked (bid INT, region VARCHAR, min_amount INT);
+
+statement ok
+INSERT INTO cj_orders VALUES (1, 10, 40), (2, 10, 120), (3, 20, 80), (4, 30, 15);
+
+statement ok
+INSERT INTO cj_customers VALUES (10, 'north'), (20, 'south'), (30, 'west');
+
+statement ok
+INSERT INTO cj_blocked VALUES (1, 'north', 100), (2, 'west', 10);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_chain_anti AS
+    SELECT o.oid, c.region, o.amount
+    FROM cj_orders o JOIN cj_customers c ON o.cust_id = c.cid
+    ANTI JOIN cj_blocked b ON c.region = b.region AND o.amount >= b.min_amount;
+
+statement ok
+INSERT INTO cj_blocked VALUES (3, 'south', 50);
+
+statement ok
+DELETE FROM cj_blocked WHERE bid = 2;
+
+statement ok
+UPDATE cj_orders SET amount = 105 WHERE oid = 1;
+
+statement ok
+INSERT INTO cj_orders VALUES (5, 30, 20);
+
+statement ok
+PRAGMA ivm('mv_chain_anti');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT o.oid, c.region, o.amount
+    FROM cj_orders o JOIN cj_customers c ON o.cust_id = c.cid
+    ANTI JOIN cj_blocked b ON c.region = b.region AND o.amount >= b.min_amount
+    EXCEPT ALL SELECT oid, region, amount FROM mv_chain_anti
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT oid, region, amount FROM mv_chain_anti
+    EXCEPT ALL
+    SELECT o.oid, c.region, o.amount
+    FROM cj_orders o JOIN cj_customers c ON o.cust_id = c.cid
+    ANTI JOIN cj_blocked b ON c.region = b.region AND o.amount >= b.min_amount
+);
+----
+0
+
+# ============================================================
+# SEMI/ANTI with subquery inputs.
+# ============================================================
+
+statement ok
+CREATE TABLE sq_l (id INT, x INT);
+
+statement ok
+CREATE TABLE sq_r (rid INT, y INT, active BOOLEAN);
+
+statement ok
+INSERT INTO sq_l VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+statement ok
+INSERT INTO sq_r VALUES (1, 10, true), (2, 20, false), (3, 99, true);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_subq_semi AS
+    SELECT l.id, l.x
+    FROM sq_l l SEMI JOIN (SELECT y FROM sq_r WHERE active) r ON l.x = r.y;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_subq_anti AS
+    SELECT l.id, l.x
+    FROM sq_l l ANTI JOIN (SELECT y FROM sq_r WHERE active) r ON l.x = r.y;
+
+statement ok
+UPDATE sq_r SET active = true WHERE rid = 2;
+
+statement ok
+INSERT INTO sq_r VALUES (4, 40, true);
+
+statement ok
+DELETE FROM sq_l WHERE id = 1;
+
+statement ok
+INSERT INTO sq_l VALUES (5, 50);
+
+statement ok
+PRAGMA ivm('mv_subq_semi');
+
+statement ok
+PRAGMA ivm('mv_subq_anti');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM sq_l l SEMI JOIN (SELECT y FROM sq_r WHERE active) r ON l.x = r.y
+    EXCEPT ALL SELECT id, x FROM mv_subq_semi
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_subq_semi
+    EXCEPT ALL SELECT l.id, l.x FROM sq_l l SEMI JOIN (SELECT y FROM sq_r WHERE active) r ON l.x = r.y
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM sq_l l ANTI JOIN (SELECT y FROM sq_r WHERE active) r ON l.x = r.y
+    EXCEPT ALL SELECT id, x FROM mv_subq_anti
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_subq_anti
+    EXCEPT ALL SELECT l.id, l.x FROM sq_l l ANTI JOIN (SELECT y FROM sq_r WHERE active) r ON l.x = r.y
+);
+----
+0
+
+# ANTI JOIN uses the same aux table shape but the visibility transition is inverted.
+statement ok
+CREATE TABLE aaj_l (id INT, x INT);
+
+statement ok
+CREATE TABLE aaj_r (rid INT, y INT);
+
+statement ok
+INSERT INTO aaj_l VALUES (1, 10), (2, 20), (3, 30), (3, 30), (4, 40);
+
+statement ok
+INSERT INTO aaj_r VALUES (200, 8), (201, 41);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_saj_anti AS
+    SELECT l.id, l.x FROM aaj_l l ANTI JOIN aaj_r r ON abs(l.x - r.y) <= 2;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM aaj_l l ANTI JOIN aaj_r r ON abs(l.x - r.y) <= 2
+    EXCEPT ALL SELECT id, x FROM mv_saj_anti
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_saj_anti
+    EXCEPT ALL SELECT l.id, l.x FROM aaj_l l ANTI JOIN aaj_r r ON abs(l.x - r.y) <= 2
+);
+----
+0
+
+# ============================================================
+# Duplicate RHS matches: SEMI should not disappear until the last
+# matching right tuple is deleted; ANTI should not reappear early.
+# ============================================================
+
+statement ok
+CREATE TABLE dup_l (id INT, x INT);
+
+statement ok
+CREATE TABLE dup_r (rid INT, y INT);
+
+statement ok
+INSERT INTO dup_l VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+INSERT INTO dup_r VALUES (10, 10), (11, 10), (20, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dup_semi AS
+    SELECT l.id, l.x FROM dup_l l SEMI JOIN dup_r r ON l.x = r.y;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dup_anti AS
+    SELECT l.id, l.x FROM dup_l l ANTI JOIN dup_r r ON l.x = r.y;
+
+statement ok
+DELETE FROM dup_r WHERE rid = 10;
+
+statement ok
+PRAGMA ivm('mv_dup_semi');
+
+statement ok
+PRAGMA ivm('mv_dup_anti');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM dup_l l SEMI JOIN dup_r r ON l.x = r.y
+    EXCEPT ALL SELECT id, x FROM mv_dup_semi
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_dup_semi
+    EXCEPT ALL SELECT l.id, l.x FROM dup_l l SEMI JOIN dup_r r ON l.x = r.y
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM dup_l l ANTI JOIN dup_r r ON l.x = r.y
+    EXCEPT ALL SELECT id, x FROM mv_dup_anti
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_dup_anti
+    EXCEPT ALL SELECT l.id, l.x FROM dup_l l ANTI JOIN dup_r r ON l.x = r.y
+);
+----
+0
+
+statement ok
+DELETE FROM dup_r WHERE rid = 11;
+
+statement ok
+PRAGMA ivm('mv_dup_semi');
+
+statement ok
+PRAGMA ivm('mv_dup_anti');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM dup_l l SEMI JOIN dup_r r ON l.x = r.y
+    EXCEPT ALL SELECT id, x FROM mv_dup_semi
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_dup_semi
+    EXCEPT ALL SELECT l.id, l.x FROM dup_l l SEMI JOIN dup_r r ON l.x = r.y
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM dup_l l ANTI JOIN dup_r r ON l.x = r.y
+    EXCEPT ALL SELECT id, x FROM mv_dup_anti
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_dup_anti
+    EXCEPT ALL SELECT l.id, l.x FROM dup_l l ANTI JOIN dup_r r ON l.x = r.y
+);
+----
+0
+
+# ============================================================
+# UPDATEs are tracked as delete+insert deltas. Exercise left-side
+# identity movement, right-side match movement, and NULL-safe predicates.
+# ============================================================
+
+statement ok
+CREATE TABLE upd_l (id INT, x INT);
+
+statement ok
+CREATE TABLE upd_r (rid INT, y INT);
+
+statement ok
+INSERT INTO upd_l VALUES (1, 10), (2, NULL), (3, 30), (4, 40);
+
+statement ok
+INSERT INTO upd_r VALUES (100, 10), (101, NULL), (102, 99);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_upd_semi AS
+    SELECT l.id, l.x FROM upd_l l SEMI JOIN upd_r r ON l.x IS NOT DISTINCT FROM r.y;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_upd_anti AS
+    SELECT l.id, l.x FROM upd_l l ANTI JOIN upd_r r ON l.x IS NOT DISTINCT FROM r.y;
+
+statement ok
+UPDATE upd_l SET x = 99 WHERE id = 3;
+
+statement ok
+UPDATE upd_r SET y = 40 WHERE rid = 102;
+
+statement ok
+DELETE FROM upd_r WHERE rid = 101;
+
+statement ok
+INSERT INTO upd_l VALUES (5, NULL), (5, NULL);
+
+statement ok
+PRAGMA ivm('mv_upd_semi');
+
+statement ok
+PRAGMA ivm('mv_upd_anti');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM upd_l l SEMI JOIN upd_r r ON l.x IS NOT DISTINCT FROM r.y
+    EXCEPT ALL SELECT id, x FROM mv_upd_semi
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_upd_semi
+    EXCEPT ALL SELECT l.id, l.x FROM upd_l l SEMI JOIN upd_r r ON l.x IS NOT DISTINCT FROM r.y
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM upd_l l ANTI JOIN upd_r r ON l.x IS NOT DISTINCT FROM r.y
+    EXCEPT ALL SELECT id, x FROM mv_upd_anti
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_upd_anti
+    EXCEPT ALL SELECT l.id, l.x FROM upd_l l ANTI JOIN upd_r r ON l.x IS NOT DISTINCT FROM r.y
+);
+----
+0
+
+# ============================================================
+# Stacked FILTER above SEMI/ANTI. The aux state tracks all left
+# tuples; refresh only materializes rows that pass the outer filter.
+# ============================================================
+
+statement ok
+CREATE TABLE stack_l (id INT, x INT);
+
+statement ok
+CREATE TABLE stack_r (rid INT, y INT);
+
+statement ok
+INSERT INTO stack_l VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+
+statement ok
+INSERT INTO stack_r VALUES (1, 10), (2, 21), (3, 70);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_stack_semi AS
+    SELECT l.id, l.x FROM stack_l l SEMI JOIN stack_r r ON abs(l.x - r.y) <= 1 WHERE l.id >= 2;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_stack_anti AS
+    SELECT l.id, l.x FROM stack_l l ANTI JOIN stack_r r ON abs(l.x - r.y) <= 1 WHERE l.id >= 2;
+
+statement ok
+INSERT INTO stack_r VALUES (4, 40), (5, 51);
+
+statement ok
+UPDATE stack_l SET id = 6 WHERE id = 1;
+
+statement ok
+DELETE FROM stack_r WHERE rid = 2;
+
+statement ok
+INSERT INTO stack_l VALUES (7, 70);
+
+statement ok
+PRAGMA ivm('mv_stack_semi');
+
+statement ok
+PRAGMA ivm('mv_stack_anti');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM stack_l l SEMI JOIN stack_r r ON abs(l.x - r.y) <= 1 WHERE l.id >= 2
+    EXCEPT ALL SELECT id, x FROM mv_stack_semi
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_stack_semi
+    EXCEPT ALL SELECT l.id, l.x FROM stack_l l SEMI JOIN stack_r r ON abs(l.x - r.y) <= 1 WHERE l.id >= 2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM stack_l l ANTI JOIN stack_r r ON abs(l.x - r.y) <= 1 WHERE l.id >= 2
+    EXCEPT ALL SELECT id, x FROM mv_stack_anti
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_stack_anti
+    EXCEPT ALL SELECT l.id, l.x FROM stack_l l ANTI JOIN stack_r r ON abs(l.x - r.y) <= 1 WHERE l.id >= 2
+);
+----
+0
+
+statement ok
+DELETE FROM upd_l WHERE id = 5;
+
+statement ok
+INSERT INTO upd_r VALUES (103, NULL);
+
+statement ok
+INSERT INTO upd_l VALUES (6, NULL);
+
+statement ok
+PRAGMA ivm('mv_upd_semi');
+
+statement ok
+PRAGMA ivm('mv_upd_anti');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM upd_l l SEMI JOIN upd_r r ON l.x IS NOT DISTINCT FROM r.y
+    EXCEPT ALL SELECT id, x FROM mv_upd_semi
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_upd_semi
+    EXCEPT ALL SELECT l.id, l.x FROM upd_l l SEMI JOIN upd_r r ON l.x IS NOT DISTINCT FROM r.y
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM upd_l l ANTI JOIN upd_r r ON l.x IS NOT DISTINCT FROM r.y
+    EXCEPT ALL SELECT id, x FROM mv_upd_anti
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_upd_anti
+    EXCEPT ALL SELECT l.id, l.x FROM upd_l l ANTI JOIN upd_r r ON l.x IS NOT DISTINCT FROM r.y
+);
+----
+0
+
+statement ok
+INSERT INTO aaj_r VALUES (202, 20), (203, 29);
+
+statement ok
+DELETE FROM aaj_r WHERE rid = 201;
+
+statement ok
+INSERT INTO aaj_l VALUES (5, 50);
+
+statement ok
+DELETE FROM aaj_l WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_saj_anti');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, l.x FROM aaj_l l ANTI JOIN aaj_r r ON abs(l.x - r.y) <= 2
+    EXCEPT ALL SELECT id, x FROM mv_saj_anti
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, x FROM mv_saj_anti
+    EXCEPT ALL SELECT l.id, l.x FROM aaj_l l ANTI JOIN aaj_r r ON abs(l.x - r.y) <= 2
+);
+----
+0

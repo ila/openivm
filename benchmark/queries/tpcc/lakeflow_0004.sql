@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "HISTORY,ORDER_LINE", "lakeflow": "gold_maintenance_events"}
+SELECT h.H_C_ID, h.H_W_ID, DATEDIFF('day', MIN(h.H_DATE), MAX(h.H_DATE)) AS days_span, AVG(ol.OL_AMOUNT) AS avg_order_amount FROM HISTORY h INNER JOIN ORDER_LINE ol ON ol.OL_W_ID = h.H_W_ID AND ol.OL_DELIVERY_D >= h.H_DATE AND ol.OL_DELIVERY_D <= h.H_DATE + INTERVAL '30' DAY GROUP BY h.H_C_ID, h.H_W_ID

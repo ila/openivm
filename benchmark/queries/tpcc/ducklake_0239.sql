@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER,ORDER_LINE", "ducklake": true}
+SELECT c.C_W_ID, c.C_ID, COUNT(ol.OL_NUMBER) AS lines_bought FROM dl.CUSTOMER c JOIN dl.OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID LEFT JOIN dl.ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID AND ol.OL_AMOUNT > 5 GROUP BY c.C_W_ID, c.C_ID;

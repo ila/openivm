@@ -10,6 +10,16 @@
 
 namespace duckdb {
 
+struct GroupRecomputeDeltaSpec {
+	string base_table;
+	string last_update;
+	bool is_ducklake = false;
+	string ducklake_catalog;
+	string ducklake_schema;
+	int64_t last_snapshot_id = -1;
+	int64_t current_snapshot_id = -1;
+};
+
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql = "", bool has_minmax = false,
                               bool list_mode = false, const string &delta_ts_filter = "",
@@ -35,13 +45,14 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 /// scoped to only the GROUP BY tuples touched by deltas — strictly cheaper than full RECOMPUTE
 /// when the affected key set is small.
 ///
-/// `delta_table_specs` carries one entry per source table: pair{base_table_name, last_update_ts}.
+/// `delta_table_specs` carries one entry per source table, including whether the source is a
+/// standard DuckDB delta table or a DuckLake snapshot-diff source.
 /// `catalog_prefix` is the SQL prefix used for the MV's data table — empty for the default
 /// catalog, "<cat>.<schema>." otherwise. `lpts_table_prefix` is the *always-fully-qualified*
 /// prefix that LPTS used in `view_query_sql` to reference base tables ("<cat>.<schema>." even
 /// when the catalog is default), so we can substitute the exact `cat.schema.tbl` pattern.
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
-                             const vector<std::pair<string, string>> &delta_table_specs,
+                             const vector<GroupRecomputeDeltaSpec> &delta_table_specs,
                              const string &catalog_prefix = "", const string &lpts_table_prefix = "");
 
 /// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM aggregate.
@@ -64,6 +75,14 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
                                   const string &delta_source, const string &last_update, const string &filter_sql,
                                   const vector<string> &group_columns, const string &sum_arg, const string &sum_out,
                                   const string &count_star_col, const string &catalog_prefix = "");
+
+string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
+                                const string &left_table, const string &left_alias, const string &right_table,
+                                const string &right_alias, const string &predicate, const string &post_filter,
+                                const vector<string> &left_cols, const vector<string> &output_cols,
+                                const string &left_delta_source, const string &right_delta_source,
+                                const string &left_last_update, const string &right_last_update,
+                                const string &catalog_prefix = "");
 
 } // namespace duckdb
 

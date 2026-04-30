@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,WINDOW,SUBQUERY", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "openivm_verified": true}
+SELECT state, credit, cust_count, AVG(cust_count) OVER (PARTITION BY state) AS state_avg FROM (SELECT C_STATE AS state, C_CREDIT AS credit, COUNT(*) AS cust_count FROM CUSTOMER GROUP BY C_STATE, C_CREDIT) sub;

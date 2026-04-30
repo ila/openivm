@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,OORDER,NEW_ORDER"}
+SELECT d.D_W_ID, d.D_ID, COUNT(*) AS cnt FROM OORDER o JOIN NEW_ORDER no ON o.O_ID = no.NO_O_ID AND o.O_W_ID = no.NO_W_ID JOIN DISTRICT d ON o.O_W_ID = d.D_W_ID AND o.O_D_ID = d.D_ID GROUP BY d.D_W_ID, d.D_ID HAVING COUNT(*) > 1;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "ducklake": true}
+WITH cust_bal AS (SELECT C_W_ID, C_D_ID, C_ID, C_BALANCE FROM dl.CUSTOMER) SELECT c1.C_W_ID, c1.C_D_ID, c1.C_ID, c2.C_ID AS richer_cust FROM cust_bal c1 JOIN cust_bal c2 ON c1.C_W_ID = c2.C_W_ID AND c1.C_D_ID = c2.C_D_ID AND c1.C_ID <> c2.C_ID AND c1.C_BALANCE < c2.C_BALANCE;

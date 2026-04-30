@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": true, "has_case": false, "tables": "DISTRICT,CUSTOMER,OORDER,ORDER_LINE"}
+SELECT d.D_W_ID, d.D_ID, COUNT(DISTINCT CAST((d.D_W_ID) AS VARCHAR)) AS uniq, COUNT(*) AS cnt FROM DISTRICT d JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID JOIN OORDER o ON c.C_ID = o.O_C_ID AND c.C_W_ID = o.O_W_ID JOIN ORDER_LINE ol ON o.O_ID = ol.OL_O_ID AND o.O_W_ID = ol.OL_W_ID GROUP BY d.D_W_ID, d.D_ID;

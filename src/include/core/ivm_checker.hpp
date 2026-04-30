@@ -15,8 +15,10 @@ struct PlanAnalysis {
 	bool found_distinct = false;
 	bool found_minmax = false;
 	bool found_list = false;
+	bool found_filtered_list = false; // LIST(...) FILTER needs group-recompute with original SQL
 	bool found_left_join = false;
 	bool found_full_outer = false;
+	bool found_semi_anti_join = false;
 	bool found_join = false;
 	bool found_window = false;
 	bool found_top_k = false;

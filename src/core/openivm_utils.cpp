@@ -6,8 +6,123 @@
 #include <fstream>
 #include <regex>
 #include <sstream>
+#include <cstring>
 
 namespace duckdb {
+
+static bool IsIdentifierChar(char c) {
+	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static void SkipWhitespace(const string &sql, size_t &pos) {
+	while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
+		pos++;
+	}
+}
+
+static bool StartsWithKeyword(const string &sql, size_t pos, const string &keyword) {
+	if (pos + keyword.size() > sql.size()) {
+		return false;
+	}
+	if (!StringUtil::CIEquals(sql.substr(pos, keyword.size()), keyword)) {
+		return false;
+	}
+	return pos + keyword.size() == sql.size() || !IsIdentifierChar(sql[pos + keyword.size()]);
+}
+
+static bool ReadCreateTargetName(const string &sql, const string &object_keyword, string &out) {
+	string lower = StringUtil::Lower(sql);
+	size_t pos = lower.find("create");
+	if (pos == string::npos) {
+		return false;
+	}
+	pos += strlen("create");
+	SkipWhitespace(sql, pos);
+	if (StartsWithKeyword(lower, pos, "or")) {
+		pos += strlen("or");
+		SkipWhitespace(sql, pos);
+		if (!StartsWithKeyword(lower, pos, "replace")) {
+			return false;
+		}
+		pos += strlen("replace");
+		SkipWhitespace(sql, pos);
+	}
+	if (object_keyword == "table") {
+		if (!StartsWithKeyword(lower, pos, "table")) {
+			return false;
+		}
+		pos += strlen("table");
+	} else {
+		if (StartsWithKeyword(lower, pos, "materialized")) {
+			pos += strlen("materialized");
+			SkipWhitespace(sql, pos);
+		}
+		if (!StartsWithKeyword(lower, pos, "view")) {
+			return false;
+		}
+		pos += strlen("view");
+	}
+	SkipWhitespace(sql, pos);
+	if (StartsWithKeyword(lower, pos, "if")) {
+		pos += strlen("if");
+		SkipWhitespace(sql, pos);
+		if (!StartsWithKeyword(lower, pos, "not")) {
+			return false;
+		}
+		pos += strlen("not");
+		SkipWhitespace(sql, pos);
+		if (!StartsWithKeyword(lower, pos, "exists")) {
+			return false;
+		}
+		pos += strlen("exists");
+		SkipWhitespace(sql, pos);
+	}
+
+	vector<string> parts;
+	while (pos < sql.size()) {
+		SkipWhitespace(sql, pos);
+		string part;
+		if (pos < sql.size() && sql[pos] == '"') {
+			pos++;
+			while (pos < sql.size()) {
+				if (sql[pos] == '"') {
+					if (pos + 1 < sql.size() && sql[pos + 1] == '"') {
+						part += '"';
+						pos += 2;
+						continue;
+					}
+					pos++;
+					break;
+				}
+				part += sql[pos++];
+			}
+		} else {
+			while (pos < sql.size() && (IsIdentifierChar(sql[pos]) || sql[pos] == '-')) {
+				part += sql[pos++];
+			}
+		}
+		if (part.empty()) {
+			break;
+		}
+		parts.push_back(part);
+		SkipWhitespace(sql, pos);
+		if (pos >= sql.size() || sql[pos] != '.') {
+			break;
+		}
+		pos++;
+	}
+	if (parts.empty()) {
+		return false;
+	}
+	out.clear();
+	for (idx_t i = 0; i < parts.size(); i++) {
+		if (i > 0) {
+			out += ".";
+		}
+		out += parts[i];
+	}
+	return true;
+}
 
 void OpenIVMUtils::WriteFile(const string &filename, bool append, const string &compiled_query) {
 	std::ofstream file;
@@ -21,6 +136,10 @@ void OpenIVMUtils::WriteFile(const string &filename, bool append, const string &
 }
 
 string OpenIVMUtils::ExtractTableName(const string &sql) {
+	string name;
+	if (ReadCreateTargetName(sql, "table", name)) {
+		return name;
+	}
 	// Matches: CREATE TABLE [IF NOT EXISTS] name|"quoted name" (AS ...|(...))
 	std::regex table_name_regex(
 	    R"re(create\s+table\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))re");
@@ -36,6 +155,10 @@ string OpenIVMUtils::ExtractTableName(const string &sql) {
 }
 
 string OpenIVMUtils::ExtractViewName(const string &sql) {
+	string name;
+	if (ReadCreateTargetName(sql, "view", name)) {
+		return name;
+	}
 	std::regex view_name_regex(
 	    R"re(create\s+(?:materialized\s+)?view\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))re");
 	std::smatch match;
@@ -67,6 +190,78 @@ void OpenIVMUtils::ReplaceMaterializedView(string &query) {
 }
 
 string OpenIVMUtils::ExtractViewQuery(string &query) {
+	string lower = StringUtil::Lower(query);
+	size_t pos = lower.find("create");
+	if (pos != string::npos) {
+		pos += strlen("create");
+		SkipWhitespace(query, pos);
+		if (StartsWithKeyword(lower, pos, "or")) {
+			pos += strlen("or");
+			SkipWhitespace(query, pos);
+			if (StartsWithKeyword(lower, pos, "replace")) {
+				pos += strlen("replace");
+				SkipWhitespace(query, pos);
+			}
+		}
+		bool found_object = false;
+		if (StartsWithKeyword(lower, pos, "table")) {
+			pos += strlen("table");
+			found_object = true;
+		} else if (StartsWithKeyword(lower, pos, "materialized")) {
+			pos += strlen("materialized");
+			SkipWhitespace(query, pos);
+			if (StartsWithKeyword(lower, pos, "view")) {
+				pos += strlen("view");
+				found_object = true;
+			}
+		}
+		if (found_object) {
+			SkipWhitespace(query, pos);
+			if (StartsWithKeyword(lower, pos, "if")) {
+				pos += strlen("if");
+				SkipWhitespace(query, pos);
+				if (StartsWithKeyword(lower, pos, "not")) {
+					pos += strlen("not");
+					SkipWhitespace(query, pos);
+				}
+				if (StartsWithKeyword(lower, pos, "exists")) {
+					pos += strlen("exists");
+					SkipWhitespace(query, pos);
+				}
+			}
+			while (pos < query.size()) {
+				SkipWhitespace(query, pos);
+				if (pos < query.size() && query[pos] == '"') {
+					pos++;
+					while (pos < query.size()) {
+						if (query[pos] == '"') {
+							pos++;
+							if (pos < query.size() && query[pos] == '"') {
+								pos++;
+								continue;
+							}
+							break;
+						}
+						pos++;
+					}
+				} else {
+					while (pos < query.size() && (IsIdentifierChar(query[pos]) || query[pos] == '-')) {
+						pos++;
+					}
+				}
+				SkipWhitespace(query, pos);
+				if (pos >= query.size() || query[pos] != '.') {
+					break;
+				}
+				pos++;
+			}
+			SkipWhitespace(query, pos);
+			if (StartsWithKeyword(lower, pos, "as")) {
+				pos += strlen("as");
+				return query.substr(pos);
+			}
+		}
+	}
 	// Match only up through "AS " — then return everything after as a raw substr so
 	// multi-line CTE bodies (which contain '\n') are not truncated by regex '.' semantics.
 	std::regex rgx_create_view(

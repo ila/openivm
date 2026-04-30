@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "ducklake": true}
+SELECT c.C_W_ID, c.C_D_ID, SUM(COALESCE(c.C_BALANCE, 0) + COALESCE(c.C_YTD_PAYMENT, 0)) AS total_flow FROM dl.CUSTOMER c JOIN dl.DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID GROUP BY c.C_W_ID, c.C_D_ID;

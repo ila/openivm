@@ -1,0 +1,2 @@
+-- {"operators": "FILTER,UNION,CTE,SUBQUERY", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE", "non_incr_reason": "kw:RECURSIVE"}
+WITH RECURSIVE wh_tree AS (SELECT W_ID, W_NAME, 0 AS lvl FROM WAREHOUSE WHERE W_ID = 1 UNION ALL SELECT w.W_ID, w.W_NAME, lvl + 1 FROM WAREHOUSE w, wh_tree wt WHERE w.W_ID = wt.W_ID + 1 AND lvl < 3) SELECT * FROM wh_tree;

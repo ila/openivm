@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "ducklake": true}
+WITH c_sum AS (SELECT C_W_ID, C_D_ID, SUM(C_BALANCE) AS tot FROM dl.CUSTOMER GROUP BY C_W_ID, C_D_ID HAVING SUM(C_BALANCE) > 0) SELECT cs.C_W_ID, cs.C_D_ID, cs.tot, d.D_YTD, (cs.tot / NULLIF(d.D_YTD, 0)) AS ratio FROM c_sum cs JOIN dl.DISTRICT d ON cs.C_W_ID = d.D_W_ID AND cs.C_D_ID = d.D_ID;

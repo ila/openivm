@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER", "complexity": "low", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ORDER_LINE"}
+SELECT OL_W_ID, OL_I_ID, DATE_TRUNC('month', OL_DELIVERY_D) AS delivery_month, COUNT(*) AS deliveries, SUM(OL_AMOUNT) AS total, AVG(OL_QUANTITY) AS avg_qty FROM ORDER_LINE WHERE OL_DELIVERY_D IS NOT NULL GROUP BY OL_W_ID, OL_I_ID, DATE_TRUNC('month', OL_DELIVERY_D);

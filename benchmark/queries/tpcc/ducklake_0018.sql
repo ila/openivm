@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK,ORDER_LINE", "ducklake": true}
+SELECT s.S_W_ID, s.S_I_ID, COUNT(ol.OL_NUMBER) AS order_lines, SUM(ol.OL_QUANTITY) AS total_ord FROM STOCK s JOIN ORDER_LINE ol ON s.S_W_ID = ol.OL_SUPPLY_W_ID AND s.S_I_ID = ol.OL_I_ID GROUP BY s.S_W_ID, s.S_I_ID;

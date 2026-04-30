@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "STOCK,ORDER_LINE"}
+SELECT s.S_W_ID, s.S_I_ID, s.S_QUANTITY, COALESCE(sales.qty, 0) AS sold_qty FROM STOCK s LEFT JOIN (SELECT OL_SUPPLY_W_ID, OL_I_ID, SUM(OL_QUANTITY) AS qty FROM ORDER_LINE GROUP BY OL_SUPPLY_W_ID, OL_I_ID) sales ON s.S_W_ID = sales.OL_SUPPLY_W_ID AND s.S_I_ID = sales.OL_I_ID;

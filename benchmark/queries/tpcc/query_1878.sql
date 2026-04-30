@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER"}
+WITH inner_agg AS (SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_b FROM CUSTOMER GROUP BY C_W_ID, C_D_ID) SELECT ia.C_W_ID, COUNT(*) AS n_districts, SUM(ia.n) AS total_cust, AVG(ia.avg_b) AS grand_avg FROM inner_agg ia GROUP BY ia.C_W_ID HAVING COUNT(*) > 1;

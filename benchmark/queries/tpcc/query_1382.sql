@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE", "complexity": "low", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": true, "tables": "ORDER_LINE"}
+SELECT ol.OL_W_ID, ol.OL_I_ID, COUNT(*) AS lines, SUM(ol.OL_QUANTITY) AS qty, SUM(ol.OL_AMOUNT) AS revenue, SUM(CASE WHEN ol.OL_DELIVERY_D IS NULL THEN 1 ELSE 0 END) AS pending, SUM(CASE WHEN ol.OL_DELIVERY_D IS NOT NULL THEN 1 ELSE 0 END) AS delivered FROM ORDER_LINE ol GROUP BY ol.OL_W_ID, ol.OL_I_ID;

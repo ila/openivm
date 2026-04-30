@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,ORDER,HAVING,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER", "openivm_verified": true}
+WITH agg AS (SELECT w.W_ID, COUNT(c.C_ID) AS c_cnt, SUM(c.C_BALANCE) AS bal FROM WAREHOUSE w LEFT JOIN CUSTOMER c ON w.W_ID = c.C_W_ID GROUP BY w.W_ID HAVING COUNT(c.C_ID) > 0) SELECT W_ID, c_cnt, bal, ROW_NUMBER() OVER (ORDER BY bal DESC) AS rn FROM agg;

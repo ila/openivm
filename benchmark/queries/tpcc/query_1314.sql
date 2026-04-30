@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER"}
+WITH per_wh AS (SELECT C_W_ID, AVG(C_BALANCE) AS avg_b FROM CUSTOMER GROUP BY C_W_ID) SELECT c.C_W_ID, c.C_ID, c.C_BALANCE, pw.avg_b FROM CUSTOMER c JOIN per_wh pw ON c.C_W_ID = pw.C_W_ID WHERE c.C_BALANCE > pw.avg_b;

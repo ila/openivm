@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,DISTINCT,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "non_incr_reason": "op:LATERAL"}
+SELECT c.C_W_ID, c.C_STATE, agg.cust_cnt FROM (SELECT DISTINCT C_W_ID, C_STATE FROM CUSTOMER) c JOIN LATERAL (SELECT COUNT(*) AS cust_cnt FROM CUSTOMER WHERE C_W_ID = c.C_W_ID AND C_STATE = c.C_STATE) agg ON TRUE;

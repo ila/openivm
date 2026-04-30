@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER", "openivm_verified": true}
+WITH orders_per_cust AS (SELECT O_C_ID, O_W_ID, COUNT(*) AS n FROM OORDER GROUP BY O_C_ID, O_W_ID), order_buckets AS (SELECT O_C_ID, O_W_ID, n, NTILE(4) OVER (ORDER BY n) AS bucket FROM orders_per_cust) SELECT bucket, COUNT(*) AS cust_cnt, AVG(n) AS avg_orders FROM order_buckets GROUP BY bucket;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER", "ducklake": true}
+WITH district_totals AS (SELECT C_W_ID AS D_W_ID, C_D_ID AS D_ID, COUNT(*) AS district_custs FROM dl.CUSTOMER GROUP BY C_W_ID, C_D_ID), warehouse_totals AS (SELECT D_W_ID, SUM(district_custs) AS total_custs FROM district_totals GROUP BY D_W_ID) SELECT w.W_ID, w.W_NAME, wt.total_custs FROM dl.WAREHOUSE w JOIN warehouse_totals wt ON w.W_ID = wt.D_W_ID;

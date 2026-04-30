@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,ORDER_LINE"}
+WITH warehouse_revenue AS (SELECT ol.OL_W_ID, SUM(ol.OL_AMOUNT) AS revenue FROM ORDER_LINE ol GROUP BY ol.OL_W_ID) SELECT w.W_ID, w.W_NAME, ROUND(wr.revenue, 2) AS revenue, ROUND(wr.revenue * w.W_TAX, 2) AS tax FROM WAREHOUSE w JOIN warehouse_revenue wr ON w.W_ID = wr.OL_W_ID;

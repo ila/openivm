@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "non_incr_reason": "op:LATERAL"}
+SELECT d.D_W_ID, d.D_ID, d.D_NAME, lat.avg_balance FROM DISTRICT d JOIN LATERAL (SELECT AVG(C_BALANCE) AS avg_balance FROM CUSTOMER WHERE C_W_ID = d.D_W_ID AND C_D_ID = d.D_ID) lat ON true;

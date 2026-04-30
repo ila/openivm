@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,HAVING", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK", "ducklake": true}
+SELECT s.S_W_ID, COUNT(*) AS item_count, SUM(s.S_QUANTITY) AS total_qty, AVG(i.I_PRICE) AS avg_price FROM STOCK s JOIN ITEM i ON s.S_I_ID = i.I_ID WHERE s.S_QUANTITY > 30 GROUP BY s.S_W_ID HAVING AVG(i.I_PRICE) > 20;

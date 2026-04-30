@@ -719,6 +719,64 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# ==========================================
+# UNION DISTINCT over aggregates
+# Regression: recompute affected branch keys, not full distinct output tuples.
+# ==========================================
+
+statement ok
+CREATE TABLE uod_customer (w_id INT, balance DOUBLE);
+
+statement ok
+CREATE TABLE uod_history (w_id INT, amount DOUBLE);
+
+statement ok
+INSERT INTO uod_customer VALUES (1, 100.0), (1, 200.0), (2, 50.0);
+
+statement ok
+INSERT INTO uod_history VALUES (1, 10.0), (2, 20.0), (2, 30.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_uod AS
+    SELECT w_id, SUM(balance) AS total FROM uod_customer GROUP BY w_id
+    UNION
+    SELECT w_id, SUM(amount) FROM uod_history GROUP BY w_id;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_uod';
+----
+6
+
+statement ok
+INSERT INTO uod_customer VALUES (1, 300.0);
+
+statement ok
+DELETE FROM uod_history WHERE w_id = 2 AND amount = 20.0;
+
+statement ok
+PRAGMA ivm('mv_uod');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT w_id, SUM(balance) AS total FROM uod_customer GROUP BY w_id
+     UNION
+     SELECT w_id, SUM(amount) FROM uod_history GROUP BY w_id)
+    EXCEPT ALL SELECT * FROM mv_uod
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_uod
+    EXCEPT ALL
+    (SELECT w_id, SUM(balance) AS total FROM uod_customer GROUP BY w_id
+     UNION
+     SELECT w_id, SUM(amount) FROM uod_history GROUP BY w_id)
+);
+----
+0
+
 # Second refresh with mixed deltas (insert + delete on both tables)
 statement ok
 INSERT INTO uoa_history VALUES (3, 99.0);

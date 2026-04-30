@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER"}
+SELECT COALESCE(c.C_W_ID, d.D_W_ID) AS w_id, COALESCE(c.C_D_ID, d.D_ID) AS d_id, COUNT(c.C_ID) AS cust, d.D_NAME FROM CUSTOMER c FULL OUTER JOIN DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID GROUP BY COALESCE(c.C_W_ID, d.D_W_ID), COALESCE(c.C_D_ID, d.D_ID), d.D_NAME;

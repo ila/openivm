@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,HAVING", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY", "ducklake": true}
+SELECT h.H_W_ID, h.H_D_ID, COUNT(*) AS n FROM dl.HISTORY h JOIN dl.CUSTOMER c ON h.H_C_W_ID = c.C_W_ID AND h.H_C_D_ID = c.C_D_ID AND h.H_C_ID = c.C_ID WHERE h.H_AMOUNT IS NOT NULL GROUP BY h.H_W_ID, h.H_D_ID HAVING COUNT(*) > 0;

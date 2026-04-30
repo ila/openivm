@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,DISTINCT,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE"}
+WITH multi_warehouse AS (SELECT OL_I_ID, COUNT(DISTINCT OL_SUPPLY_W_ID) AS w_cnt FROM ORDER_LINE GROUP BY OL_I_ID HAVING COUNT(DISTINCT OL_SUPPLY_W_ID) > 1) SELECT i.I_ID, i.I_NAME, mw.w_cnt FROM ITEM i JOIN multi_warehouse mw ON i.I_ID = mw.OL_I_ID;

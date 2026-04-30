@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE"}
+WITH ord_lines AS (SELECT OL_W_ID, OL_O_ID, SUM(OL_AMOUNT) AS ord_total FROM ORDER_LINE GROUP BY OL_W_ID, OL_O_ID) SELECT o.O_W_ID, o.O_D_ID, COUNT(*) AS orders, AVG(ol_a.ord_total) AS avg_order_val, MAX(ol_a.ord_total) AS max_order FROM OORDER o JOIN ord_lines ol_a ON o.O_W_ID = ol_a.OL_W_ID AND o.O_ID = ol_a.OL_O_ID GROUP BY o.O_W_ID, o.O_D_ID HAVING COUNT(*) > 2;

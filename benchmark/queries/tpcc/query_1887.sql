@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,CORRELATED_SUBQUERY", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER", "non_incr_reason": "op:CORRELATED_SUBQUERY"}
+SELECT w.W_ID, w.W_NAME, (SELECT AVG(c.C_BALANCE) FROM CUSTOMER c WHERE c.C_W_ID = w.W_ID) AS w_avg_bal, (SELECT AVG(C_BALANCE) FROM CUSTOMER) AS overall_avg_bal, (SELECT AVG(c.C_BALANCE) FROM CUSTOMER c WHERE c.C_W_ID = w.W_ID) - (SELECT AVG(C_BALANCE) FROM CUSTOMER) AS diff FROM WAREHOUSE w;

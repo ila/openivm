@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT,CUSTOMER"}
+SELECT COALESCE(w.W_STATE, 'UNKNOWN') AS state, COUNT(DISTINCT w.W_ID) AS warehouses, COUNT(DISTINCT d.D_ID) AS districts, COUNT(DISTINCT c.C_ID) AS customers FROM WAREHOUSE w LEFT JOIN DISTRICT d ON w.W_ID = d.D_W_ID LEFT JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID GROUP BY COALESCE(w.W_STATE, 'UNKNOWN');

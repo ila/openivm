@@ -2533,6 +2533,64 @@ SELECT count(*) FROM (
 ----
 0
 
+# ============================================================
+# COUNT(DISTINCT constant) over duplicate join rows
+# ============================================================
+
+statement ok
+CREATE TABLE cd_order (id INT, w_id INT);
+
+statement ok
+CREATE TABLE cd_new_order (o_id INT, w_id INT);
+
+statement ok
+INSERT INTO cd_order VALUES (1, 1), (2, 1);
+
+statement ok
+INSERT INTO cd_new_order VALUES (1, 1), (1, 1), (2, 1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_count_distinct_constant AS
+  SELECT o.id, MIN(1) AS mn, MAX(1) AS mx, COUNT(DISTINCT 1) AS uniq
+  FROM cd_order o
+  JOIN cd_new_order no ON o.id = no.o_id AND o.w_id = no.w_id
+  GROUP BY o.id;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_count_distinct_constant';
+----
+6
+
+statement ok
+INSERT INTO cd_new_order VALUES (1, 1);
+
+statement ok
+PRAGMA ivm('mv_count_distinct_constant');
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT * FROM mv_count_distinct_constant
+  EXCEPT ALL
+  SELECT o.id, MIN(1) AS mn, MAX(1) AS mx, COUNT(DISTINCT 1) AS uniq
+  FROM cd_order o
+  JOIN cd_new_order no ON o.id = no.o_id AND o.w_id = no.w_id
+  GROUP BY o.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT o.id, MIN(1) AS mn, MAX(1) AS mx, COUNT(DISTINCT 1) AS uniq
+  FROM cd_order o
+  JOIN cd_new_order no ON o.id = no.o_id AND o.w_id = no.w_id
+  GROUP BY o.id
+  EXCEPT ALL
+  SELECT * FROM mv_count_distinct_constant
+);
+----
+0
+
 # Insert rows that change the ranking (d now has 515, displacing a=300)
 statement ok
 INSERT INTO topk_t VALUES (9,'d',500);

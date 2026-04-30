@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,UNION", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": true, "has_case": false, "tables": "WAREHOUSE,DISTRICT,CUSTOMER"}
+SELECT 'warehouse_revenue' AS source, W_ID AS key, CAST(W_YTD AS DECIMAL(12,2)) AS value FROM WAREHOUSE UNION ALL SELECT 'district_revenue', D_W_ID * 100 + D_ID, CAST(D_YTD AS DECIMAL(12,2)) FROM DISTRICT UNION ALL SELECT 'customer_balance', C_W_ID * 10000 + C_ID, CAST(SUM(C_BALANCE) AS DECIMAL(12,2)) FROM CUSTOMER GROUP BY C_W_ID, C_ID;

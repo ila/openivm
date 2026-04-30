@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY", "ducklake": true}
+SELECT h.H_C_W_ID, h.H_C_ID, h.H_AMOUNT, MIN(h.H_AMOUNT) OVER (PARTITION BY h.H_C_W_ID, h.H_C_D_ID, h.H_C_ID) AS min_amt, MAX(h.H_AMOUNT) OVER (PARTITION BY h.H_C_W_ID, h.H_C_D_ID, h.H_C_ID) AS max_amt FROM dl.CUSTOMER c JOIN dl.HISTORY h ON c.C_W_ID = h.H_C_W_ID AND c.C_D_ID = h.H_C_D_ID AND c.C_ID = h.H_C_ID;

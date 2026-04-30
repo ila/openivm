@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,DISTINCT", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "openivm_verified": true}
+SELECT i.I_IM_ID, COUNT(DISTINCT i.I_ID) AS unique_items, SUM(ol.OL_QUANTITY) AS tot_qty, AVG(ol.OL_AMOUNT) AS avg_amt, VARIANCE(ol.OL_AMOUNT) AS amt_var FROM ITEM i JOIN ORDER_LINE ol ON i.I_ID = ol.OL_I_ID GROUP BY i.I_IM_ID;

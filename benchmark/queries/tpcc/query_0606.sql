@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT,OORDER,NEW_ORDER"}
+SELECT w.W_ID, d.D_ID, o.O_ID, COUNT(no.NO_O_ID) AS is_new FROM WAREHOUSE w JOIN DISTRICT d ON w.W_ID = d.D_W_ID JOIN OORDER o ON o.O_W_ID = d.D_W_ID AND o.O_D_ID = d.D_ID LEFT JOIN NEW_ORDER no ON no.NO_O_ID = o.O_ID AND no.NO_W_ID = o.O_W_ID GROUP BY w.W_ID, d.D_ID, o.O_ID;

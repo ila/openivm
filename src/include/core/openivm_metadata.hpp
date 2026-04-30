@@ -136,6 +136,21 @@ public:
 	// Read the JSON-encoded distinct-aux metadata. Returns false if the column is NULL
 	// (view isn't DISTINCT_INCREMENTAL) or parsing fails.
 	bool GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out);
+
+	struct SemiAntiAuxMeta {
+		string aux_table;
+		string join_type;
+		string left_table;
+		string left_alias;
+		string right_table;
+		string right_alias;
+		string predicate;
+		string post_filter;
+		vector<string> left_cols;
+		vector<string> output_cols;
+	};
+
+	bool GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out);
 };
 
 } // namespace duckdb

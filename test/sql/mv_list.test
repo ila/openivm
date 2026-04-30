@@ -44,6 +44,54 @@ SELECT COUNT(*) FROM (
 0
 
 # ==========================================
+# LIST aggregate with FILTER must not retain NULLs
+# ==========================================
+
+statement ok
+CREATE TABLE list_filter_items (grp INT, item INT, qty INT);
+
+statement ok
+INSERT INTO list_filter_items VALUES
+    (1, 10, 90), (1, 20, 10), (1, 30, 80),
+    (2, 40, 20), (2, 50, 70);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_list_filter AS
+    SELECT grp, LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+    FROM list_filter_items GROUP BY grp;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_list_filter';
+----
+6
+
+statement ok
+INSERT INTO list_filter_items VALUES (1, 60, 95), (2, 70, 30);
+
+statement ok
+pragma ivm('mv_list_filter');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_filter
+    EXCEPT ALL
+    SELECT grp, LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+    FROM list_filter_items GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+    FROM list_filter_items GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_list_filter
+);
+----
+0
+
+# ==========================================
 # 1. Insert into existing group
 # ==========================================
 

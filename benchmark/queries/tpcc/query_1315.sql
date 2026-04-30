@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,DISTINCT,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": true, "tables": "CUSTOMER,OORDER"}
+WITH active AS (SELECT DISTINCT O_C_ID, O_W_ID FROM OORDER) SELECT c.C_W_ID, c.C_ID, c.C_LAST, CASE WHEN a.O_C_ID IS NULL THEN 'inactive' ELSE 'active' END AS status FROM CUSTOMER c LEFT JOIN active a ON c.C_ID = a.O_C_ID AND c.C_W_ID = a.O_W_ID;

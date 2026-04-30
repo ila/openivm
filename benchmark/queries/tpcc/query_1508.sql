@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK"}
+SELECT COALESCE(i.I_ID, s.S_I_ID) AS item_id, COUNT(i.I_ID) AS has_item, COUNT(s.S_I_ID) AS has_stock, SUM(COALESCE(s.S_QUANTITY, 0)) AS total_qty FROM ITEM i FULL OUTER JOIN STOCK s ON i.I_ID = s.S_I_ID GROUP BY COALESCE(i.I_ID, s.S_I_ID);

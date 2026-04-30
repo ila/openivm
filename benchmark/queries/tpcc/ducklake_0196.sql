@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "ducklake": true}
+WITH by_w AS (SELECT C_W_ID, C_ID, C_BALANCE FROM dl.CUSTOMER) SELECT C_W_ID, C_ID, C_BALANCE, COUNT(*) OVER (PARTITION BY C_W_ID) AS w_cnt, SUM(C_BALANCE) OVER (PARTITION BY C_W_ID) AS w_tot, C_BALANCE - AVG(C_BALANCE) OVER (PARTITION BY C_W_ID) AS dev FROM by_w;

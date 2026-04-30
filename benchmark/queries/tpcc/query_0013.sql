@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT,CUSTOMER,OORDER"}
+SELECT w.W_ID, COUNT(DISTINCT c.C_ID) as cust_count, SUM(o.O_OL_CNT) as total_lines FROM WAREHOUSE w JOIN DISTRICT d ON w.W_ID = d.D_W_ID JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID LEFT JOIN OORDER o ON c.C_ID = o.O_C_ID GROUP BY w.W_ID;

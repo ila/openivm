@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "openivm_verified": true}
+WITH cust_ord AS (SELECT c.C_W_ID, c.C_ID, c.C_LAST, COUNT(o.O_ID) AS n_ord, COALESCE(SUM(o.O_OL_CNT), 0) AS lines FROM CUSTOMER c LEFT JOIN OORDER o ON c.C_ID = o.O_C_ID AND c.C_W_ID = o.O_W_ID GROUP BY c.C_W_ID, c.C_ID, c.C_LAST) SELECT C_W_ID, C_ID, C_LAST, n_ord, lines, PERCENT_RANK() OVER (PARTITION BY C_W_ID ORDER BY lines) AS pr FROM cust_ord;

@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT"}
+SELECT COALESCE(w.W_ID, d.D_W_ID) AS w_id, COUNT(w.W_ID) AS has_wh, COUNT(d.D_ID) AS districts, SUM(d.D_YTD) AS total_ytd FROM WAREHOUSE w FULL OUTER JOIN DISTRICT d ON w.W_ID = d.D_W_ID GROUP BY COALESCE(w.W_ID, d.D_W_ID);

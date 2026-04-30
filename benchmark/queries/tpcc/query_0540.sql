@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "openivm_verified": true}
+WITH per_warehouse AS (SELECT C_W_ID, AVG(C_BALANCE) AS avg_bal, STDDEV(C_BALANCE) AS std_bal, COUNT(*) AS cnt FROM CUSTOMER GROUP BY C_W_ID) SELECT C_W_ID, ROUND(avg_bal, 2) AS avg, ROUND(std_bal, 2) AS std, cnt, ROUND(avg_bal / NULLIF(std_bal, 0), 4) AS cv FROM per_warehouse;

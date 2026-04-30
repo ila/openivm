@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,FILTER,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER", "openivm_verified": true}
+WITH cust_rank AS (SELECT C_W_ID, C_ID, C_LAST, C_BALANCE, RANK() OVER (PARTITION BY C_W_ID ORDER BY C_BALANCE DESC) AS rnk FROM CUSTOMER) SELECT cr.C_W_ID, cr.C_ID, cr.C_LAST, cr.C_BALANCE, cr.rnk, w.W_NAME FROM cust_rank cr JOIN WAREHOUSE w ON cr.C_W_ID = w.W_ID WHERE cr.rnk <= 5;

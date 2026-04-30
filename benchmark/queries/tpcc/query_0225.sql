@@ -1,0 +1,2 @@
+-- {"operators": "DISTINCT", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM"}
+SELECT DISTINCT I_PRICE, I_PRICE FROM ITEM;

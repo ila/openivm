@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "openivm_verified": true}
+SELECT C_W_ID, COUNT(*) FILTER (WHERE C_LAST LIKE 'A%') AS starts_a, COUNT(*) FILTER (WHERE C_LAST LIKE '%son') AS ends_son, COUNT(*) FILTER (WHERE UPPER(C_LAST) SIMILAR TO '[B-D].*') AS starts_bd FROM CUSTOMER GROUP BY C_W_ID;

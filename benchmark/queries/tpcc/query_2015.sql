@@ -1,0 +1,2 @@
+-- {"operators": "CTE,INNER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,WAREHOUSE", "ivm_type": "RECOMPUTE"}
+WITH district_avg AS (SELECT OL_W_ID, OL_D_ID, AVG(OL_AMOUNT) AS avg_revenue, COUNT(*) AS line_count FROM ORDER_LINE GROUP BY OL_W_ID, OL_D_ID) SELECT w.W_ID, w.W_NAME, da.OL_D_ID, da.avg_revenue, da.line_count, da.avg_revenue * (1 + w.W_TAX) AS taxed_avg FROM WAREHOUSE w JOIN district_avg da ON w.W_ID = da.OL_W_ID;

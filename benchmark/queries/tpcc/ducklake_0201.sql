@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "ducklake": true}
+WITH inner_q AS (SELECT c.C_W_ID, c.C_ID, AVG(c.C_BALANCE) OVER (PARTITION BY c.C_W_ID) AS avg_bal, c.C_BALANCE FROM dl.CUSTOMER c) SELECT C_W_ID, COUNT(*) AS above_avg FROM inner_q WHERE C_BALANCE > avg_bal GROUP BY C_W_ID;

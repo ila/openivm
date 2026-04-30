@@ -1,0 +1,2 @@
+-- {"operators": "CROSS_JOIN,AGGREGATE,FILTER,TABLE_FUNCTION,SUBQUERY,VALUES_ONLY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER", "non_incr_reason": "op:VALUES_ONLY"}
+SELECT c.C_CREDIT, t.tier, COUNT(*) AS cnt FROM CUSTOMER c CROSS JOIN (SELECT unnest(['low', 'med', 'high']) AS tier) t WHERE (t.tier = 'high' AND c.C_BALANCE > 4000) OR (t.tier = 'med' AND c.C_BALANCE BETWEEN 1000 AND 4000) OR (t.tier = 'low' AND c.C_BALANCE < 1000) GROUP BY c.C_CREDIT, t.tier;

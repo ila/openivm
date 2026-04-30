@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "ducklake": true}
+WITH order_avg AS (SELECT OL_W_ID, AVG(OL_AMOUNT) AS avg_amt FROM dl.ORDER_LINE GROUP BY OL_W_ID) SELECT o.O_W_ID, o.O_ID, ol.OL_AMOUNT, oa.avg_amt, (ol.OL_AMOUNT - oa.avg_amt) AS deviation FROM dl.OORDER o JOIN dl.ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID JOIN order_avg oa ON o.O_W_ID = oa.OL_W_ID;

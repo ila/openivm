@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY", "ducklake": true}
+SELECT COALESCE(c.C_W_ID, h.H_C_W_ID) AS wid, COUNT(c.C_ID) AS custs, COUNT(h.H_DATA) AS histories FROM dl.CUSTOMER c FULL OUTER JOIN dl.HISTORY h ON c.C_W_ID = h.H_C_W_ID AND c.C_D_ID = h.H_C_D_ID AND c.C_ID = h.H_C_ID GROUP BY COALESCE(c.C_W_ID, h.H_C_W_ID);

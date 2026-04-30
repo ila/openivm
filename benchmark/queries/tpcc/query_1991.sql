@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,UNION", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER,ORDER_LINE"}
+SELECT 'customers' AS entity, C_W_ID AS w_id, COUNT(*) AS n FROM CUSTOMER GROUP BY C_W_ID UNION ALL SELECT 'orders', O_W_ID, COUNT(*) FROM OORDER GROUP BY O_W_ID UNION ALL SELECT 'order_lines', OL_W_ID, COUNT(*) FROM ORDER_LINE GROUP BY OL_W_ID;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY_FILTER", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK", "non_incr_reason": "op:SUBQUERY_FILTER"}
+WITH top_items AS (SELECT I_ID, I_PRICE FROM ITEM WHERE I_PRICE > 50), stocked AS (SELECT S_I_ID, SUM(S_QUANTITY) AS total_qty FROM STOCK WHERE S_I_ID IN (SELECT I_ID FROM top_items) GROUP BY S_I_ID) SELECT ti.I_ID, ti.I_PRICE, s.total_qty FROM top_items ti JOIN stocked s ON ti.I_ID = s.S_I_ID;

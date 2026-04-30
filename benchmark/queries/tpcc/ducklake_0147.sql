@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,UNION", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER,NEW_ORDER", "ducklake": true}
+SELECT c.C_ID AS cust, COUNT(*) AS n, 'pending' AS kind FROM dl.CUSTOMER c JOIN dl.NEW_ORDER no ON c.C_W_ID = no.NO_W_ID AND c.C_D_ID = no.NO_D_ID JOIN dl.OORDER o ON no.NO_W_ID = o.O_W_ID AND no.NO_D_ID = o.O_D_ID AND no.NO_O_ID = o.O_ID AND c.C_ID = o.O_C_ID GROUP BY c.C_ID UNION ALL SELECT C_ID AS cust, 0 AS n, 'all' FROM dl.CUSTOMER;

@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,UNION,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER", "ducklake": true}
+WITH cust_stats AS (SELECT C_W_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal FROM dl.CUSTOMER GROUP BY C_W_ID), w_stats AS (SELECT W_ID, W_YTD FROM dl.WAREHOUSE) SELECT cs.C_W_ID AS w, cs.n AS metric_val, 'count' AS kind FROM cust_stats cs UNION ALL SELECT cs.C_W_ID, cs.avg_bal, 'avg_bal' FROM cust_stats cs UNION ALL SELECT ws.W_ID, ws.W_YTD, 'ytd' FROM w_stats ws;

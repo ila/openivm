@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY"}
+WITH cust_payments AS (SELECT H_C_W_ID, H_C_ID, SUM(H_AMOUNT) AS pmt FROM HISTORY GROUP BY H_C_W_ID, H_C_ID) SELECT c.C_W_ID, c.C_ID, c.C_LAST, COALESCE(cp.pmt, 0) AS total_paid FROM CUSTOMER c LEFT JOIN cust_payments cp ON c.C_W_ID = cp.H_C_W_ID AND c.C_ID = cp.H_C_ID;

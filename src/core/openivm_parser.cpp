@@ -256,6 +256,12 @@ struct OpenIVMDuckLakeTableInfo {
 	string catalog_name; // DuckLake catalog name (e.g., "dl")
 };
 
+struct OpenIVMSourceTableInfo {
+	string table_name;
+	string catalog_name;
+	string schema_name;
+};
+
 struct MVClassificationState {
 	bool ivm_compatible;
 	bool found_aggregation;
@@ -265,11 +271,14 @@ struct MVClassificationState {
 	bool found_minmax;
 	bool found_left_join;
 	bool found_full_outer;
+	bool found_semi_anti_join;
 	bool found_window;
 	bool found_join;
 	bool found_top_k;
+	bool found_count_distinct;
 	bool found_grouping_sets;
 	bool found_nested_aggregate;
+	bool found_filtered_list;
 
 	explicit MVClassificationState(const PlanAnalysis &analysis)
 	    : ivm_compatible(analysis.ivm_compatible), found_aggregation(analysis.found_aggregation),
@@ -277,8 +286,10 @@ struct MVClassificationState {
 	      found_having(analysis.found_having),
 	      found_minmax(analysis.found_minmax || analysis.found_count_distinct || analysis.found_list),
 	      found_left_join(analysis.found_left_join), found_full_outer(analysis.found_full_outer),
-	      found_window(analysis.found_window), found_join(analysis.found_join), found_top_k(analysis.found_top_k),
-	      found_grouping_sets(analysis.found_grouping_sets), found_nested_aggregate(analysis.found_nested_aggregate) {
+	      found_semi_anti_join(analysis.found_semi_anti_join), found_window(analysis.found_window),
+	      found_join(analysis.found_join), found_top_k(analysis.found_top_k),
+	      found_count_distinct(analysis.found_count_distinct), found_grouping_sets(analysis.found_grouping_sets),
+	      found_nested_aggregate(analysis.found_nested_aggregate), found_filtered_list(analysis.found_filtered_list) {
 	}
 };
 
@@ -310,6 +321,31 @@ static void CollectDuckLakeTables(LogicalOperator *op, const string &current_cat
 	for (auto &child : op->children) {
 		CollectDuckLakeTables(child.get(), current_catalog, dl_table_info);
 	}
+}
+
+static void CollectSourceTables(LogicalOperator *op, unordered_map<string, OpenIVMSourceTableInfo> &source_table_info) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		auto table_ref = get.GetTable();
+		if (table_ref.get()) {
+			auto &table = *table_ref.get();
+			string table_name = table.name;
+			if (!table_name.empty() && !IVMTableNames::IsDataTable(table_name) && !OpenIVMUtils::IsDelta(table_name)) {
+				source_table_info[table_name] = {table_name, table.ParentCatalog().GetName(), table.schema.name};
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		CollectSourceTables(child.get(), source_table_info);
+	}
+}
+
+static string QualifiedTablePrefix(const string &catalog_name, const string &schema_name) {
+	return KeywordHelper::WriteOptionallyQuoted(catalog_name) + "." +
+	       KeywordHelper::WriteOptionallyQuoted(schema_name) + ".";
 }
 
 static void CollectProjectionIndex(LogicalOperator *op,
@@ -990,6 +1026,185 @@ static bool ExtractInnerDistinct(const string &original_sql, vector<string> &out
 	return true;
 }
 
+struct SemiAntiExtract {
+	string join_type;
+	string left_table;
+	string left_alias;
+	string right_table;
+	string right_alias;
+	string predicate;
+	string post_filter;
+	vector<string> output_cols;
+};
+
+static bool ReadIdentifierToken(const string &sql, size_t &pos, string &out) {
+	while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
+		pos++;
+	}
+	if (pos >= sql.size()) {
+		return false;
+	}
+	size_t start = pos;
+	bool in_quote = false;
+	while (pos < sql.size()) {
+		char c = sql[pos];
+		if (in_quote) {
+			if (c == '"') {
+				in_quote = false;
+			}
+			pos++;
+			continue;
+		}
+		if (c == '"') {
+			in_quote = true;
+			pos++;
+			continue;
+		}
+		if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.') {
+			pos++;
+			continue;
+		}
+		break;
+	}
+	out = sql.substr(start, pos - start);
+	return !out.empty();
+}
+
+static string LastIdentifierPart(string ident) {
+	StringUtil::Trim(ident);
+	size_t dot = ident.find_last_of('.');
+	if (dot != string::npos) {
+		ident = ident.substr(dot + 1);
+	}
+	if (ident.size() >= 2 && ident.front() == '"' && ident.back() == '"') {
+		ident = ident.substr(1, ident.size() - 2);
+	}
+	return ident;
+}
+
+static bool ExtractSemiAntiJoin(const string &original_sql, SemiAntiExtract &out) {
+	string lower = StringUtil::Lower(original_sql);
+	size_t semi_pos = FindKeywordToken(lower, "semi join", 0);
+	size_t anti_pos = FindKeywordToken(lower, "anti join", 0);
+	if (semi_pos != string::npos && anti_pos != string::npos) {
+		return false;
+	}
+	bool is_semi = semi_pos != string::npos;
+	size_t join_pos = is_semi ? semi_pos : anti_pos;
+	if (join_pos == string::npos) {
+		return false;
+	}
+	out.join_type = is_semi ? "semi" : "anti";
+
+	size_t from_pos = FindKeywordToken(lower, "from", 0);
+	if (from_pos == string::npos || from_pos > join_pos) {
+		return false;
+	}
+	size_t select_pos = FindKeywordToken(lower, "select", 0);
+	if (select_pos == string::npos || select_pos > from_pos) {
+		return false;
+	}
+
+	string select_list = original_sql.substr(select_pos + strlen("select"), from_pos - (select_pos + strlen("select")));
+	vector<string> output_cols;
+	int depth = 0;
+	size_t last = 0;
+	for (size_t i = 0; i < select_list.size(); i++) {
+		if (select_list[i] == '(') {
+			depth++;
+		} else if (select_list[i] == ')') {
+			depth--;
+		} else if (depth == 0 && select_list[i] == ',') {
+			string col = LastIdentifierPart(select_list.substr(last, i - last));
+			if (col.empty() || col == "*") {
+				return false;
+			}
+			output_cols.push_back(std::move(col));
+			last = i + 1;
+		}
+	}
+	string col = LastIdentifierPart(select_list.substr(last));
+	if (col.empty() || col == "*") {
+		return false;
+	}
+	output_cols.push_back(std::move(col));
+
+	size_t pos = from_pos + strlen("from");
+	if (!ReadIdentifierToken(original_sql, pos, out.left_table)) {
+		return false;
+	}
+	size_t alias_pos = pos;
+	string maybe_alias;
+	if (ReadIdentifierToken(original_sql, alias_pos, maybe_alias)) {
+		string maybe_lower = StringUtil::Lower(maybe_alias);
+		if (maybe_lower != "semi" && maybe_lower != "anti") {
+			out.left_alias = maybe_alias;
+			pos = alias_pos;
+		}
+	}
+	if (out.left_alias.empty()) {
+		out.left_alias = LastIdentifierPart(out.left_table);
+	}
+	string between_left_and_join = original_sql.substr(pos, join_pos - pos);
+	string between_left_and_join_lower = StringUtil::Lower(between_left_and_join);
+	if (FindKeywordToken(between_left_and_join_lower, "join", 0) != string::npos ||
+	    between_left_and_join_lower.find(',') != string::npos) {
+		return false;
+	}
+
+	size_t right_pos = join_pos + (is_semi ? strlen("semi join") : strlen("anti join"));
+	if (!ReadIdentifierToken(original_sql, right_pos, out.right_table)) {
+		return false;
+	}
+	alias_pos = right_pos;
+	maybe_alias.clear();
+	if (ReadIdentifierToken(original_sql, alias_pos, maybe_alias)) {
+		if (StringUtil::Lower(maybe_alias) != "on") {
+			out.right_alias = maybe_alias;
+			right_pos = alias_pos;
+		}
+	}
+	if (out.right_alias.empty()) {
+		out.right_alias = LastIdentifierPart(out.right_table);
+	}
+
+	size_t on_pos = FindKeywordToken(lower, "on", right_pos);
+	if (on_pos == string::npos) {
+		return false;
+	}
+	size_t pred_start = on_pos + strlen("on");
+	size_t pred_end = original_sql.size();
+	size_t where_pos = string::npos;
+	for (auto kw : {"where", "group", "order", "limit", "union"}) {
+		size_t kw_pos = FindKeywordToken(lower, kw, pred_start);
+		if (kw_pos != string::npos) {
+			if (string(kw) == "where") {
+				where_pos = kw_pos;
+			}
+			pred_end = std::min(pred_end, kw_pos);
+		}
+	}
+	out.predicate = original_sql.substr(pred_start, pred_end - pred_start);
+	StringUtil::Trim(out.predicate);
+	if (out.predicate.empty()) {
+		return false;
+	}
+	if (where_pos != string::npos) {
+		size_t filter_start = where_pos + strlen("where");
+		size_t filter_end = original_sql.size();
+		for (auto kw : {"group", "order", "limit", "union"}) {
+			size_t kw_pos = FindKeywordToken(lower, kw, filter_start);
+			if (kw_pos != string::npos) {
+				filter_end = std::min(filter_end, kw_pos);
+			}
+		}
+		out.post_filter = original_sql.substr(filter_start, filter_end - filter_start);
+		StringUtil::Trim(out.post_filter);
+	}
+	out.output_cols = std::move(output_cols);
+	return true;
+}
+
 static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	// DDL statements are passed via result.parameters from the plan function.
@@ -1226,6 +1441,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// (The SELECT-only `select_plan` below does the same for LPTS serialization.)
 		InlineCtesIfPresent(context, *planner.binder, plan);
 
+		unordered_map<string, OpenIVMSourceTableInfo> source_table_info;
+		CollectSourceTables(plan.get(), source_table_info);
+		if (!source_table_info.empty()) {
+			table_names.clear();
+			for (const auto &entry : source_table_info) {
+				table_names.insert(entry.second.table_name);
+			}
+		}
+
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 		vector<string> output_names;
 		string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
@@ -1355,8 +1579,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// For views that LPTS silently mis-serializes (GROUPING SETS / ROLLUP / CUBE
 			// → plain GROUP BY; STRUCT_PACK field names → tN_col aliases; etc.), detect
 			// structurally and prefer the original SQL. Those constructs never need the
-			// LPTS-rewritten form anyway — they're classified FULL_REFRESH and the
-			// rewriter-rule path (which needs LPTS) isn't used.
+			// LPTS-rewritten form anyway — they're maintained by recompute-style paths
+			// using the original SQL, so the rewriter-rule path (which needs LPTS) isn't used.
 			{
 				if (PlanNeedsOriginalSqlForLpts(select_plan.get())) {
 					view_query = original_view_query;
@@ -1380,6 +1604,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// Single-pass plan analysis: validates IVM compatibility AND extracts metadata
 		auto analysis = AnalyzePlan(plan.get());
 		MVClassificationState classification(analysis);
+		if (classification.found_filtered_list) {
+			view_query = original_view_query;
+			lpts_fallback = true;
+			OPENIVM_DEBUG_PRINT("[CREATE MV] LIST FILTER requires original SQL for group-recompute: %s\n",
+			                    view_query.c_str());
+		}
 		// Derive GROUP BY column names by walking the plan's projection above the aggregate.
 		// The projection maps GROUP BY bindings (group_index, i) to SELECT-list aliases — these
 		// aliases are the actual column names in the data table. Plan-walk aliases on agg.groups
@@ -1418,8 +1648,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// For agg-over-union (e.g. SELECT ... FROM (t1 UNION ALL t2) GROUP BY ...) the
 		// UNION is a descendant of the aggregate — that is a normal AGGREGATE_GROUP view.
 		bool has_union_over_agg = classification.found_aggregation && HasUnionBeforeAggregate(plan.get());
+		bool union_distinct_over_agg = classification.found_distinct && distinct_at_top && has_union_over_agg;
 
-		if (distinct_at_top) {
+		if (union_distinct_over_agg) {
+			aggregate_columns =
+			    DeriveGroupColumnNames(plan.get(), group_index, group_count, output_names, has_union_over_agg);
+		} else if (distinct_at_top) {
 			aggregate_columns = std::move(analysis.aggregate_columns);
 		} else if (classification.found_distinct && analysis.aggregate_columns.empty()) {
 			// Plain DISTINCT (no explicit targets) — trust the checker.
@@ -1571,21 +1805,53 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// `sum_out` is the user-facing output column name in the data table.
 		string distinct_sum_arg;
 		string distinct_sum_out;
+		SemiAntiExtract semi_anti_extract;
+		vector<string> semi_anti_left_cols;
 
-		if (classification.found_window) {
-			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
-			ivm_type = IVMType::WINDOW_PARTITION;
-		} else if (classification.found_grouping_sets) {
-			// ROLLUP / CUBE / GROUPING SETS produce multiple grouping sets per row;
-			// the incremental aggregate path can't decompose them yet. Use FULL_REFRESH
-			// (always recompute, no empty-delta short-circuit) until per-grouping-set
-			// expansion into UNION ALL lands.
-			ivm_type = IVMType::FULL_REFRESH;
-		} else if (!classification.ivm_compatible) {
+		if (!classification.ivm_compatible) {
 			ivm_type = IVMType::FULL_REFRESH;
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' uses constructs not supported for incremental maintenance. "
 			               "Full refresh will be used.");
+		} else if (classification.found_window) {
+			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
+			ivm_type = IVMType::WINDOW_PARTITION;
+		} else if (classification.found_semi_anti_join && classification.found_aggregation) {
+			// SEMI/ANTI joins are thresholded by match-count transitions. The aux-state path below
+			// supports projection/filter stacks over one left base table; aggregates over SEMI/ANTI
+			// need a separate transition-to-aggregate compiler. Use full recompute until that lands.
+			ivm_type = IVMType::FULL_REFRESH;
+		} else if (classification.found_semi_anti_join && !classification.found_aggregation &&
+		           !classification.found_distinct) {
+			if (ExtractSemiAntiJoin(original_view_query, semi_anti_extract)) {
+				string left_table_name = LastIdentifierPart(semi_anti_extract.left_table);
+				auto col_result =
+				    con.Query("SELECT column_name FROM information_schema.columns WHERE table_name = '" +
+				              OpenIVMUtils::EscapeSingleQuotes(left_table_name) + "' AND table_schema = '" +
+				              OpenIVMUtils::EscapeSingleQuotes(current_schema) + "' ORDER BY ordinal_position");
+				if (!col_result->HasError() && col_result->RowCount() > 0) {
+					for (idx_t i = 0; i < col_result->RowCount(); i++) {
+						semi_anti_left_cols.push_back(col_result->GetValue(0, i).ToString());
+					}
+					ivm_type = IVMType::SEMI_ANTI_RECOMPUTE;
+				} else {
+					ivm_type = IVMType::FULL_REFRESH;
+				}
+			} else {
+				ivm_type = IVMType::FULL_REFRESH;
+			}
+		} else if (classification.found_grouping_sets) {
+			// ROLLUP / CUBE / GROUPING SETS produce multiple grouping sets per row;
+			// maintain them by recomputing the grouping-set keys touched by source
+			// deltas. The parser keeps the original SQL because LPTS currently drops
+			// the grouping-set annotation.
+			ivm_type = aggregate_columns.empty() ? IVMType::FULL_REFRESH : IVMType::GROUP_RECOMPUTE;
+		} else if (classification.found_filtered_list && !aggregate_columns.empty()) {
+			ivm_type = IVMType::GROUP_RECOMPUTE;
+		} else if (classification.found_filtered_list) {
+			ivm_type = IVMType::FULL_REFRESH;
+		} else if (classification.found_count_distinct && !aggregate_columns.empty()) {
+			ivm_type = IVMType::GROUP_RECOMPUTE;
 		} else if (classification.found_distinct && !distinct_at_top && classification.found_aggregation) {
 			// Inner DISTINCT under an aggregate. Two paths:
 			//   - `ivm_distinct_aux_state = true` AND single-source body → DISTINCT_INCREMENTAL.
@@ -1675,6 +1941,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					}
 				}
 			}
+		} else if (union_distinct_over_agg && !aggregate_columns.empty()) {
+			// UNION DISTINCT over grouped aggregate outputs must recompute by the branch
+			// aggregate key, not by the full distinct output tuple. The old aggregate value
+			// is no longer discoverable from delta-filtered recompute after an update.
+			ivm_type = IVMType::GROUP_RECOMPUTE;
 		} else if (classification.found_distinct && distinct_at_top && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (classification.found_having && classification.found_aggregation && !aggregate_columns.empty()) {
@@ -1708,6 +1979,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		                    : ivm_type == IVMType::WINDOW_PARTITION     ? "WINDOW_PARTITION"
 		                    : ivm_type == IVMType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
 		                    : ivm_type == IVMType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
+		                    : ivm_type == IVMType::SEMI_ANTI_RECOMPUTE  ? "SEMI_ANTI_RECOMPUTE"
 		                                                                : "UNKNOWN",
 		                    (int)classification.found_aggregation, (int)classification.found_projection,
 		                    aggregate_columns.size());
@@ -1741,11 +2013,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " source_tables_json varchar default null,"
 		              " aggregate_decomposition_json varchar default null,"
 		              " nullified_columns_json varchar default null,"
-		              " distinct_aux_meta_json varchar default null)");
+		              " distinct_aux_meta_json varchar default null,"
+		              " semi_anti_aux_meta_json varchar default null)");
 		// Forward-compat ALTER for existing DBs that pre-date `distinct_aux_meta_json`
 		// (the CREATE IF NOT EXISTS above is a no-op when the table exists with the older schema).
 		ddl.push_back("alter table " + string(ivm::VIEWS_TABLE) +
 		              " add column if not exists distinct_aux_meta_json varchar default null");
+		ddl.push_back("alter table " + string(ivm::VIEWS_TABLE) +
+		              " add column if not exists semi_anti_aux_meta_json varchar default null");
 
 		// Refresh hooks: extensions can register custom SQL to run on MV refresh
 		// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
@@ -1840,7 +2115,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 
-		// 9 trailing NULLs: 8 matcher metadata columns + distinct_aux_meta_json.
+		// 10 trailing NULLs: 8 matcher metadata columns + distinct/semi-anti aux metadata.
 		// Matcher metadata is populated by the Stage I block below when
 		// ivm_enable_view_matching=true. distinct_aux_meta_json is populated by a
 		// follow-up UPDATE if ivm_type == DISTINCT_INCREMENTAL and the extractor
@@ -1851,7 +2126,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              (classification.found_left_join ? "true" : "false") + ", now(), " + refresh_val + ", false, " +
 		              group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
 		              (classification.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val +
-		              ", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
+		              ", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
 
 		Value match_flag_val;
 		bool view_matching_enabled = context.TryGetCurrentSetting("ivm_enable_view_matching", match_flag_val) &&
@@ -1935,6 +2210,71 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			                   ",\"sum_arg\":" + JsonQuote(distinct_sum_arg) +
 			                   ",\"sum_out\":" + JsonQuote(distinct_sum_out) + "}";
 			ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET distinct_aux_meta_json = '" +
+			              OpenIVMUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
+			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+		}
+
+		if (ivm_type == IVMType::SEMI_ANTI_RECOMPUTE) {
+			string aux_table = "_ivm_semi_anti_state_" + view_name;
+			string left_cols_csv;
+			string left_cols_qualified;
+			string left_cols_lc;
+			string left_cols_mc;
+			string lc_mc_match;
+			for (size_t i = 0; i < semi_anti_left_cols.size(); i++) {
+				if (i > 0) {
+					left_cols_csv += ", ";
+					left_cols_qualified += ", ";
+					left_cols_lc += ", ";
+					left_cols_mc += ", ";
+					lc_mc_match += " AND ";
+				}
+				string qcol = KeywordHelper::WriteOptionallyQuoted(semi_anti_left_cols[i]);
+				left_cols_csv += qcol;
+				left_cols_qualified += semi_anti_extract.left_alias + "." + qcol;
+				left_cols_lc += "lc." + qcol;
+				left_cols_mc += "mc." + qcol;
+				lc_mc_match += "lc." + qcol + " IS NOT DISTINCT FROM mc." + qcol;
+			}
+			string aux_create =
+			    "create table if not exists " + view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(aux_table) +
+			    " as with left_counts as (select " + left_cols_csv + ", count(*)::BIGINT as _left_count from " +
+			    semi_anti_extract.left_table + " group by " + left_cols_csv + "), match_counts as (select " +
+			    left_cols_qualified + ", count(*)::BIGINT as _match_count from (select distinct " + left_cols_csv +
+			    " from " + semi_anti_extract.left_table + ") " + semi_anti_extract.left_alias + " join " +
+			    semi_anti_extract.right_table + " " + semi_anti_extract.right_alias + " on " +
+			    semi_anti_extract.predicate + " group by " + left_cols_qualified + ") select " + left_cols_lc +
+			    ", lc._left_count, coalesce(mc._match_count, 0)::BIGINT as _match_count from "
+			    "left_counts lc left join match_counts mc on " +
+			    lc_mc_match;
+			ddl.push_back(aux_create);
+
+			string left_cols_json = "[";
+			for (size_t i = 0; i < semi_anti_left_cols.size(); i++) {
+				if (i > 0) {
+					left_cols_json += ",";
+				}
+				left_cols_json += JsonQuote(semi_anti_left_cols[i]);
+			}
+			left_cols_json += "]";
+			string output_cols_json = "[";
+			for (size_t i = 0; i < semi_anti_extract.output_cols.size(); i++) {
+				if (i > 0) {
+					output_cols_json += ",";
+				}
+				output_cols_json += JsonQuote(semi_anti_extract.output_cols[i]);
+			}
+			output_cols_json += "]";
+			string meta_json = "{\"aux_table\":" + JsonQuote(aux_table) +
+			                   ",\"join_type\":" + JsonQuote(semi_anti_extract.join_type) +
+			                   ",\"left_table\":" + JsonQuote(semi_anti_extract.left_table) +
+			                   ",\"left_alias\":" + JsonQuote(semi_anti_extract.left_alias) +
+			                   ",\"right_table\":" + JsonQuote(semi_anti_extract.right_table) +
+			                   ",\"right_alias\":" + JsonQuote(semi_anti_extract.right_alias) +
+			                   ",\"predicate\":" + JsonQuote(semi_anti_extract.predicate) +
+			                   ",\"post_filter\":" + JsonQuote(semi_anti_extract.post_filter) +
+			                   ",\"left_cols\":" + left_cols_json + ",\"output_cols\":" + output_cols_json + "}";
+			ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET semi_anti_aux_meta_json = '" +
 			              OpenIVMUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
 			              OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
 		}
@@ -2053,6 +2393,11 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 			Value catalog_value;
 			Value schema_value;
+			auto source_it = source_table_info.find(table_name);
+			if (source_it != source_table_info.end()) {
+				catalog_value = Value(source_it->second.catalog_name);
+				schema_value = Value(source_it->second.schema_name);
+			}
 
 			if (catalog_value.IsNull() && !context.db->config.options.database_path.empty()) {
 				// Look up the catalog name for this table via Catalog API
@@ -2061,6 +2406,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				                                                  table_name, OnEntryNotFound::RETURN_NULL);
 				if (entry) {
 					catalog_value = Value(entry->ParentCatalog().GetName());
+					schema_value = Value(entry->schema.name);
 				}
 				con.Rollback();
 			}
@@ -2069,14 +2415,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 
 			if (schema_value.IsNull()) {
-				schema_value = Value("main");
+				schema_value = Value(current_schema.empty() ? "main" : current_schema);
 			}
 
-			auto catalog_schema = catalog_value.ToString() + "." + schema_value.ToString() + ".";
+			auto catalog_schema = QualifiedTablePrefix(catalog_value.ToString(), schema_value.ToString());
 
-			ddl.push_back("create table if not exists " + catalog_schema + OpenIVMUtils::DeltaName(table_name) +
+			ddl.push_back("create table if not exists " + catalog_schema +
+			              KeywordHelper::WriteOptionallyQuoted(OpenIVMUtils::DeltaName(table_name)) +
 			              " as select *, 1::INTEGER as " + string(ivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
-			              string(ivm::TIMESTAMP_COL) + " from " + catalog_schema + table_name + " limit 0");
+			              string(ivm::TIMESTAMP_COL) + " from " + catalog_schema +
+			              KeywordHelper::WriteOptionallyQuoted(table_name) + " limit 0");
 		}
 
 		// Delta table for the MV — based on the DATA table (has all columns)

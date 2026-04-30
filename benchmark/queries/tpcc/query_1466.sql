@@ -1,0 +1,2 @@
+-- {"operators": "LATERAL,AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT,CUSTOMER,OORDER", "non_incr_reason": "op:LATERAL,SUBQUERY_FILTER"}
+SELECT w.W_ID, stats.d_cnt, stats.c_cnt, stats.o_cnt FROM WAREHOUSE w, LATERAL (SELECT (SELECT COUNT(*) FROM DISTRICT WHERE D_W_ID = w.W_ID) AS d_cnt, (SELECT COUNT(*) FROM CUSTOMER WHERE C_W_ID = w.W_ID) AS c_cnt, (SELECT COUNT(*) FROM OORDER WHERE O_W_ID = w.W_ID) AS o_cnt) stats;

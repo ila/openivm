@@ -180,6 +180,27 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 		OPENIVM_DEBUG_PRINT("[RewritePlan] CHUNK_GET leaf — returning unchanged (constant, no delta)\n");
 		return {std::move(pw.plan), bindings[0]};
 	}
+	case LogicalOperatorType::LOGICAL_DUMMY_SCAN: {
+		// DUMMY_SCAN is a constant one-row relation. Join delta pruning should
+		// normally remove delta terms containing it, but a standalone constant
+		// subtree can still reach this leaf.
+		auto bindings = pw.plan->GetColumnBindings();
+		if (bindings.empty()) {
+			throw NotImplementedException("DUMMY_SCAN has no column bindings");
+		}
+		OPENIVM_DEBUG_PRINT("[RewritePlan] DUMMY_SCAN leaf — returning unchanged (constant, no delta)\n");
+		return {std::move(pw.plan), bindings[0]};
+	}
+	case LogicalOperatorType::LOGICAL_EXPRESSION_GET: {
+		// VALUES clauses are constant inputs. Join delta pruning marks them as empty;
+		// if a standalone rewrite reaches this leaf, preserve it unchanged.
+		auto bindings = pw.plan->GetColumnBindings();
+		if (bindings.empty()) {
+			throw NotImplementedException("EXPRESSION_GET has no column bindings");
+		}
+		OPENIVM_DEBUG_PRINT("[RewritePlan] EXPRESSION_GET leaf — returning unchanged (constant, no delta)\n");
+		return {std::move(pw.plan), bindings[0]};
+	}
 	default:
 		throw NotImplementedException("Operator type %s not supported", LogicalOperatorToString(plan->type));
 	}

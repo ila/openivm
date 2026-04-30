@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "STOCK,ORDER_LINE"}
+SELECT s.S_W_ID, s.S_I_ID, s.S_QUANTITY, COUNT(ol.OL_NUMBER) AS sales, COALESCE(SUM(ol.OL_QUANTITY), 0) AS ordered FROM STOCK s LEFT JOIN ORDER_LINE ol ON s.S_I_ID = ol.OL_I_ID AND s.S_W_ID = ol.OL_SUPPLY_W_ID GROUP BY s.S_W_ID, s.S_I_ID, s.S_QUANTITY;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,DISTRICT"}
+SELECT c.C_W_ID, c.C_D_ID, c.C_ID, c.C_LAST, c.C_BALANCE, c.C_CREDIT, d.D_NAME, ROW_NUMBER() OVER (PARTITION BY c.C_W_ID, c.C_D_ID ORDER BY c.C_BALANCE DESC) AS balance_rank FROM CUSTOMER c JOIN DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID;

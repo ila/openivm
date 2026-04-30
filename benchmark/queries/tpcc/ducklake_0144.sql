@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "ducklake": true}
+SELECT d.D_W_ID, d.D_ID, AVG(c.C_BALANCE) AS avg_bal, STDDEV(c.C_BALANCE) AS std_bal, VARIANCE(c.C_BALANCE) AS var_bal FROM dl.CUSTOMER c JOIN dl.DISTRICT d ON c.C_W_ID = d.D_W_ID AND c.C_D_ID = d.D_ID GROUP BY d.D_W_ID, d.D_ID;

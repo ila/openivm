@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,CTE,SUBQUERY_FILTER", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "non_incr_reason": "op:SUBQUERY_FILTER"}
+WITH ord_agg AS (SELECT O_W_ID, O_D_ID, O_C_ID, COUNT(*) AS n, SUM(O_OL_CNT) AS lines FROM OORDER GROUP BY O_W_ID, O_D_ID, O_C_ID) SELECT oa.O_W_ID, oa.O_D_ID, oa.O_C_ID, oa.n, (SELECT C_LAST FROM CUSTOMER WHERE C_ID = oa.O_C_ID AND C_W_ID = oa.O_W_ID) AS c_last FROM ord_agg oa WHERE oa.n > 1;

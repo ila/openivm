@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": true, "tables": "ITEM,STOCK,ORDER_LINE"}
+SELECT i.I_ID, i.I_NAME, i.I_PRICE, SUM(s.S_QUANTITY) AS stock, SUM(ol.OL_QUANTITY) AS ordered, SUM(s.S_QUANTITY) - COALESCE(SUM(ol.OL_QUANTITY), 0) AS net, CASE WHEN SUM(s.S_QUANTITY) < 50 THEN 'reorder' ELSE 'ok' END AS action FROM ITEM i LEFT JOIN STOCK s ON i.I_ID = s.S_I_ID LEFT JOIN ORDER_LINE ol ON i.I_ID = ol.OL_I_ID GROUP BY i.I_ID, i.I_NAME, i.I_PRICE;

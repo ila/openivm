@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,HAVING", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER,OORDER", "ducklake": true}
+SELECT o.O_W_ID, o.O_D_ID, COUNT(CASE WHEN o.O_OL_CNT > 3 THEN 1 END) AS big_orders, COUNT(CASE WHEN o.O_OL_CNT <= 3 THEN 1 END) AS small_orders FROM dl.OORDER o JOIN dl.CUSTOMER c ON o.O_W_ID = c.C_W_ID AND o.O_D_ID = c.C_D_ID AND o.O_C_ID = c.C_ID WHERE c.C_CREDIT = 'GC' GROUP BY o.O_W_ID, o.O_D_ID HAVING COUNT(*) > 0;

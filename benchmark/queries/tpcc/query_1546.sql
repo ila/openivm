@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT", "openivm_verified": true}
+WITH d_agg AS (SELECT D_W_ID, D_ID, AVG(D_YTD) AS avg_ytd, COUNT(*) AS n FROM DISTRICT GROUP BY D_W_ID, D_ID) SELECT D_W_ID, D_ID, avg_ytd, ROW_NUMBER() OVER (PARTITION BY D_W_ID ORDER BY avg_ytd DESC) AS rn FROM d_agg;

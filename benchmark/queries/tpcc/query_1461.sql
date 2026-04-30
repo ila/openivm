@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,CORRELATED_SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY", "non_incr_reason": "op:CORRELATED_SUBQUERY,LATERAL"}
+SELECT c.C_ID, c.C_W_ID, c.C_LAST, lat.max_pay FROM CUSTOMER c JOIN LATERAL (SELECT MAX(h.H_AMOUNT) AS max_pay FROM HISTORY h WHERE h.H_C_ID = c.C_ID AND h.H_C_W_ID = c.C_W_ID) lat ON TRUE WHERE lat.max_pay > 100;

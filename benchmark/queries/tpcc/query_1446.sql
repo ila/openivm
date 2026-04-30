@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER,HISTORY", "non_incr_reason": "op:SUBQUERY_FILTER"}
+SELECT c.C_W_ID, c.C_ID, c.C_LAST, (SELECT COUNT(*) FROM OORDER o WHERE o.O_C_ID = c.C_ID AND o.O_W_ID = c.C_W_ID) AS order_count, (SELECT SUM(h.H_AMOUNT) FROM HISTORY h WHERE h.H_C_ID = c.C_ID AND h.H_C_W_ID = c.C_W_ID) AS total_payments FROM CUSTOMER c;

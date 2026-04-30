@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,FILTER,DISTINCT", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY", "ducklake": true}
+SELECT DISTINCT h.H_W_ID AS w, h.H_D_ID AS d, c.C_CREDIT AS credit FROM dl.CUSTOMER c JOIN dl.HISTORY h ON c.C_W_ID = h.H_C_W_ID AND c.C_D_ID = h.H_C_D_ID AND c.C_ID = h.H_C_ID WHERE h.H_AMOUNT > 50;

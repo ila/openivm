@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,NEW_ORDER"}
+WITH new_order_summary AS (SELECT NO_W_ID, NO_D_ID, COUNT(*) AS cnt FROM NEW_ORDER GROUP BY NO_W_ID, NO_D_ID), district_info AS (SELECT D_W_ID, D_ID, D_NAME, D_NEXT_O_ID FROM DISTRICT) SELECT di.D_W_ID, di.D_NAME, COALESCE(nos.cnt, 0) AS pending_orders FROM district_info di LEFT JOIN new_order_summary nos ON di.D_W_ID = nos.NO_W_ID AND di.D_ID = nos.NO_D_ID;

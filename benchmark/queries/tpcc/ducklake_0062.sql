@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "ducklake": true}
+SELECT o.O_W_ID, o.O_D_ID, COUNT(*) FILTER (WHERE o.O_CARRIER_ID IS NULL) AS pending_orders, COUNT(*) FILTER (WHERE o.O_CARRIER_ID IS NOT NULL) AS shipped FROM dl.OORDER o JOIN dl.ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID GROUP BY o.O_W_ID, o.O_D_ID;

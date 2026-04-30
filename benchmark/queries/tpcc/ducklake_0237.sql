@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,UNION,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,STOCK,OORDER", "ducklake": true}
+WITH s1 AS (SELECT 'cust' AS src, C_W_ID AS w, COUNT(*) AS n FROM dl.CUSTOMER GROUP BY C_W_ID), s2 AS (SELECT 'order' AS src, O_W_ID AS w, COUNT(*) AS n FROM dl.OORDER GROUP BY O_W_ID), s3 AS (SELECT 'stock' AS src, S_W_ID AS w, COUNT(*) AS n FROM dl.STOCK GROUP BY S_W_ID) SELECT * FROM s1 UNION ALL SELECT * FROM s2 UNION ALL SELECT * FROM s3;

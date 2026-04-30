@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY"}
+SELECT COALESCE(c.C_W_ID, h.H_C_W_ID) AS w_id, COALESCE(c.C_ID, h.H_C_ID) AS c_id, c.C_BALANCE, SUM(h.H_AMOUNT) AS hist FROM CUSTOMER c FULL OUTER JOIN HISTORY h ON c.C_ID = h.H_C_ID AND c.C_W_ID = h.H_C_W_ID GROUP BY COALESCE(c.C_W_ID, h.H_C_W_ID), COALESCE(c.C_ID, h.H_C_ID), c.C_BALANCE;

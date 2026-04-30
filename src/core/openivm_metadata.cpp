@@ -230,9 +230,10 @@ void IVMMetadata::SetRefreshInProgress(const string &view_name, bool in_progress
 }
 
 string IVMMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key) {
-	return "DELETE FROM " + KeywordHelper::WriteOptionallyQuoted(target) + " WHERE " + string(ivm::TIMESTAMP_COL) +
-	       " < (SELECT MIN(last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
-	       OpenIVMUtils::EscapeValue(metadata_key) + "');\n";
+	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
+	return "DELETE FROM " + qtarget + " WHERE " + string(ivm::TIMESTAMP_COL) + " < (SELECT MIN(last_update) FROM " +
+	       string(ivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" + OpenIVMUtils::EscapeValue(metadata_key) +
+	       "');\n";
 }
 
 // --- DuckLake support ---
@@ -416,6 +417,30 @@ bool IVMMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &o
 	ExtractJsonString(json, "filter", out.filter);
 	ok &= ExtractJsonString(json, "sum_arg", out.sum_arg);
 	ok &= ExtractJsonString(json, "sum_out", out.sum_out);
+	return ok;
+}
+
+bool IVMMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out) {
+	auto result = con.Query("SELECT semi_anti_aux_meta_json FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	string json = result->GetValue(0, 0).ToString();
+	if (json.empty()) {
+		return false;
+	}
+	bool ok = true;
+	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= ExtractJsonString(json, "join_type", out.join_type);
+	ok &= ExtractJsonString(json, "left_table", out.left_table);
+	ok &= ExtractJsonString(json, "left_alias", out.left_alias);
+	ok &= ExtractJsonString(json, "right_table", out.right_table);
+	ok &= ExtractJsonString(json, "right_alias", out.right_alias);
+	ok &= ExtractJsonString(json, "predicate", out.predicate);
+	ExtractJsonString(json, "post_filter", out.post_filter);
+	ok &= ExtractJsonStringArray(json, "left_cols", out.left_cols);
+	ok &= ExtractJsonStringArray(json, "output_cols", out.output_cols);
 	return ok;
 }
 

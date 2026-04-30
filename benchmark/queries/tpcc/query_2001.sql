@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK"}
+SELECT label, low, high, COUNT(s.S_W_ID) AS items FROM (VALUES ('empty', 0, 1), ('low', 1, 20), ('med', 20, 80), ('high', 80, 10000)) t(label, low, high) LEFT JOIN STOCK s ON s.S_QUANTITY >= t.low AND s.S_QUANTITY < t.high GROUP BY label, low, high;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,CUSTOMER", "openivm_verified": true}
+SELECT w.W_STATE, COUNT(c.C_ID) AS n, MIN(c.C_BALANCE) AS min_b, MAX(c.C_BALANCE) AS max_b, AVG(c.C_BALANCE) AS avg_b, STDDEV(c.C_BALANCE) AS std_b FROM WAREHOUSE w JOIN CUSTOMER c ON w.W_ID = c.C_W_ID GROUP BY w.W_STATE HAVING COUNT(c.C_ID) >= 3;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN", "complexity": "low", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "ITEM,STOCK"}
+SELECT s.S_W_ID, s.S_I_ID, s.S_QUANTITY, i.I_PRICE, s.S_QUANTITY * i.I_PRICE AS stock_value, CASE WHEN s.S_QUANTITY < 20 THEN 'reorder' WHEN s.S_QUANTITY < 50 THEN 'low' ELSE 'adequate' END AS stock_status FROM STOCK s JOIN ITEM i ON s.S_I_ID = i.I_ID;

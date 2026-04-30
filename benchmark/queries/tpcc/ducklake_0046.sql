@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "ducklake": true}
+SELECT c.C_W_ID, c.C_ID, c.C_LAST AS last, COUNT(o.O_ID) AS order_count, COALESCE(MAX(o.O_ENTRY_D), '1900-01-01') AS last_order FROM CUSTOMER c LEFT JOIN OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID GROUP BY c.C_W_ID, c.C_ID, c.C_LAST;

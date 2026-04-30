@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT,CUSTOMER"}
+SELECT w.W_ID, w.W_NAME, d.D_ID, COUNT(DISTINCT c.C_ID) AS cust, SUM(c.C_BALANCE) AS tot_bal, AVG(c.C_BALANCE) AS avg_bal, MIN(c.C_BALANCE) AS min_bal, MAX(c.C_BALANCE) AS max_bal FROM WAREHOUSE w JOIN DISTRICT d ON w.W_ID = d.D_W_ID JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID GROUP BY w.W_ID, w.W_NAME, d.D_ID HAVING COUNT(DISTINCT c.C_ID) > 1;

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,DISTINCT,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "openivm_verified": true}
+WITH item_stats AS (SELECT i.I_IM_ID, COUNT(DISTINCT i.I_ID) AS items, SUM(ol.OL_AMOUNT) AS rev FROM ITEM i JOIN ORDER_LINE ol ON i.I_ID = ol.OL_I_ID GROUP BY i.I_IM_ID HAVING SUM(ol.OL_AMOUNT) > 0) SELECT I_IM_ID, items, rev, rev / SUM(rev) OVER () AS pct FROM item_stats;

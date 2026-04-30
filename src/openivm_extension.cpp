@@ -238,6 +238,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " ADD COLUMN IF NOT EXISTS aggregate_decomposition_json VARCHAR DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS nullified_columns_json VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS distinct_aux_meta_json VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS semi_anti_aux_meta_json VARCHAR DEFAULT NULL");
 
 	con.Query("ALTER TABLE " + string(ivm::DELTA_TABLES_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS pending_row_estimate BIGINT DEFAULT NULL");
@@ -327,9 +331,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    // 'unknown' on failure rather than throwing. Order MUST mirror IVMType enum
 		    // in src/include/core/openivm_constants.hpp.
 		    static const char *kTypeNames[] = {
-		        "aggregate_group",     "simple_aggregate", "simple_projection", "full_refresh",
-		        "aggregate_having",    "window_partition", "group_recompute",   "top_k",
-		        "distinct_incremental"};
+		        "aggregate_group",      "simple_aggregate",   "simple_projection", "full_refresh",
+		        "aggregate_having",     "window_partition",   "group_recompute",   "top_k",
+		        "distinct_incremental", "semi_anti_recompute"};
 		    string strategy_str = "'unknown'";
 		    auto type_result = con.Query("SELECT type FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
 		                                 OpenIVMUtils::EscapeValue(view_name) + "'");

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": true, "has_case": false, "tables": "CUSTOMER,HISTORY", "ducklake": true}
+SELECT c.C_W_ID, c.C_ID, CONCAT(c.C_LAST, '-', CAST(c.C_ID AS VARCHAR)) AS unique_id, LEFT(c.C_FIRST, 3) AS first_initial, SUM(h.H_AMOUNT) AS total_paid FROM dl.CUSTOMER c JOIN dl.HISTORY h ON c.C_W_ID = h.H_C_W_ID AND c.C_D_ID = h.H_C_D_ID AND c.C_ID = h.H_C_ID GROUP BY c.C_W_ID, c.C_ID, c.C_LAST, c.C_FIRST;

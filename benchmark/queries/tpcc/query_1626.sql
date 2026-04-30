@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER"}
+SELECT d.D_W_ID, d.D_ID, d.D_NAME, cust_count.cnt FROM DISTRICT d JOIN (SELECT C_W_ID, C_D_ID, COUNT(*) AS cnt FROM CUSTOMER GROUP BY C_W_ID, C_D_ID) cust_count ON d.D_W_ID = cust_count.C_W_ID AND d.D_ID = cust_count.C_D_ID;

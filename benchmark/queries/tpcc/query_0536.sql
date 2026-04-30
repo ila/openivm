@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE"}
+WITH item_orders AS (SELECT OL_I_ID, COUNT(*) AS order_cnt, SUM(OL_AMOUNT) AS revenue FROM ORDER_LINE GROUP BY OL_I_ID) SELECT i.I_ID, i.I_NAME, i.I_PRICE, COALESCE(io.order_cnt, 0) AS times_ordered, COALESCE(io.revenue, 0) AS revenue FROM ITEM i LEFT JOIN item_orders io ON i.I_ID = io.OL_I_ID;

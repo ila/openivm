@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY", "ducklake": true}
+SELECT h.H_W_ID, h.H_D_ID, h.H_C_ID, SUM(h.H_AMOUNT) AS total, COUNT(c.C_BALANCE) AS cust_match_count FROM dl.CUSTOMER c RIGHT JOIN dl.HISTORY h ON c.C_W_ID = h.H_C_W_ID AND c.C_D_ID = h.H_C_D_ID AND c.C_ID = h.H_C_ID GROUP BY h.H_W_ID, h.H_D_ID, h.H_C_ID;

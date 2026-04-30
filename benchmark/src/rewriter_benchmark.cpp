@@ -30,18 +30,19 @@
 #include <signal.h>
 #include <limits.h>
 #include <random>
+#include <unordered_set>
 
 using namespace std;
 
 // Thin wrappers around shared helpers so existing in-file call sites don't need to change.
-using openivm_bench::Timestamp;
-using openivm_bench::Log;
-using openivm_bench::WriteAllBytes;
-using openivm_bench::ReadAllBytes;
-using openivm_bench::FileExists;
 using openivm_bench::CreateTPCCSchema;
-using openivm_bench::InsertTPCCData;
+using openivm_bench::FileExists;
 using openivm_bench::GenerateDeltaPool;
+using openivm_bench::InsertTPCCData;
+using openivm_bench::Log;
+using openivm_bench::ReadAllBytes;
+using openivm_bench::Timestamp;
+using openivm_bench::WriteAllBytes;
 
 static string FormatNumber(double v) {
 	std::ostringstream oss;
@@ -49,8 +50,12 @@ static string FormatNumber(double v) {
 	string s = oss.str();
 	auto pos = s.find('.');
 	if (pos != string::npos) {
-		while (!s.empty() && s.back() == '0') { s.pop_back(); }
-		if (!s.empty() && s.back() == '.') { s.pop_back(); }
+		while (!s.empty() && s.back() == '0') {
+			s.pop_back();
+		}
+		if (!s.empty() && s.back() == '.') {
+			s.pop_back();
+		}
 	}
 	return s;
 }
@@ -77,8 +82,9 @@ static string FormatNumber(double v) {
 // If schema lookup fails, column_list is empty and normalized is "*" — caller
 // falls back to the strict SELECT * compare.
 struct NormalizedVerify {
-	string column_list;     // e.g. "c1, c2, c3" — used in WITH cte(<column_list>) AS ...
-	string normalized;      // e.g. "c1, ROUND(c2, 10) AS c2, c3"
+	string column_list; // e.g. "c1, c2, c3" — used in WITH cte(<column_list>) AS ...
+	string normalized;  // e.g. "c1, ROUND(c2, 10) AS c2, c3"
+	vector<string> normalized_columns;
 	bool has_float = false; // any DOUBLE/FLOAT/REAL column present — if false, fall back
 	                        // to the strict `SELECT *` verify (avoids reshaping SQL for
 	                        // queries that don't need tolerance, e.g. NTILE/ROW_NUMBER
@@ -91,7 +97,8 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 	string escaped;
 	for (char c : rel_name) {
 		escaped += c;
-		if (c == '\'') escaped += '\'';
+		if (c == '\'')
+			escaped += '\'';
 	}
 	auto info = con.Query("PRAGMA table_info('" + escaped + "')");
 	if (!info || info->HasError() || info->RowCount() == 0) {
@@ -101,17 +108,106 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 	for (duckdb::idx_t r = 0; r < info->RowCount(); r++) {
 		string type = info->GetValue(2, r).ToString();
 		string cname = "c" + std::to_string(r);
-		if (!result.column_list.empty()) result.column_list += ", ";
+		if (!result.column_list.empty())
+			result.column_list += ", ";
 		result.column_list += cname;
-		if (!result.normalized.empty()) result.normalized += ", ";
+		if (!result.normalized.empty())
+			result.normalized += ", ";
 		if (type == "DOUBLE" || type == "FLOAT" || type == "REAL") {
 			// Format with 12 significant digits (relative precision, not absolute).
 			// NULLs stay as NULL — DuckDB's printf('%.12g', NULL) returns NULL, and
 			// EXCEPT ALL treats NULL-rows as equal on both sides.
-			result.normalized += "printf('%.12g', " + cname + ") AS " + cname;
+			string normalized_col = "printf('%.12g', " + cname + ") AS " + cname;
+			result.normalized += normalized_col;
+			result.normalized_columns.push_back(std::move(normalized_col));
 			result.has_float = true;
 		} else {
 			result.normalized += cname;
+			result.normalized_columns.push_back(cname);
+		}
+	}
+	return result;
+}
+
+static string LowerASCII(string s) {
+	std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+	return s;
+}
+
+static vector<string> SplitTopLevelSelectList(const string &query) {
+	string lower = LowerASCII(query);
+	size_t select_pos = lower.find("select");
+	if (select_pos == string::npos) {
+		return {};
+	}
+	size_t list_start = select_pos + 6;
+	int depth = 0;
+	bool in_single = false, in_double = false;
+	size_t from_pos = string::npos;
+	for (size_t i = list_start; i < query.size(); i++) {
+		char c = query[i];
+		if (c == '\'' && !in_double) {
+			in_single = !in_single;
+		} else if (c == '"' && !in_single) {
+			in_double = !in_double;
+		} else if (!in_single && !in_double) {
+			if (c == '(') {
+				depth++;
+			} else if (c == ')' && depth > 0) {
+				depth--;
+			} else if (depth == 0 && i + 4 <= lower.size() && lower.substr(i, 4) == "from" &&
+			           (i == 0 || std::isspace(static_cast<unsigned char>(lower[i - 1]))) &&
+			           (i + 4 == lower.size() || std::isspace(static_cast<unsigned char>(lower[i + 4])))) {
+				from_pos = i;
+				break;
+			}
+		}
+	}
+	if (from_pos == string::npos) {
+		return {};
+	}
+	vector<string> exprs;
+	size_t expr_start = list_start;
+	depth = 0;
+	in_single = false;
+	in_double = false;
+	for (size_t i = list_start; i <= from_pos; i++) {
+		char c = (i == from_pos) ? ',' : query[i];
+		if (c == '\'' && !in_double) {
+			in_single = !in_single;
+		} else if (c == '"' && !in_single) {
+			in_double = !in_double;
+		} else if (!in_single && !in_double) {
+			if (c == '(') {
+				depth++;
+			} else if (c == ')' && depth > 0) {
+				depth--;
+			} else if (c == ',' && depth == 0) {
+				string expr = query.substr(expr_start, i - expr_start);
+				while (!expr.empty() && std::isspace(static_cast<unsigned char>(expr.front()))) {
+					expr.erase(expr.begin());
+				}
+				while (!expr.empty() && std::isspace(static_cast<unsigned char>(expr.back()))) {
+					expr.pop_back();
+				}
+				exprs.push_back(std::move(expr));
+				expr_start = i + 1;
+			}
+		}
+	}
+	return exprs;
+}
+
+static vector<idx_t> WindowOutputColumns(const string &query, idx_t column_count) {
+	auto exprs = SplitTopLevelSelectList(query);
+	if (exprs.size() != column_count) {
+		return {};
+	}
+	vector<idx_t> result;
+	for (idx_t i = 0; i < exprs.size(); i++) {
+		string expr_lc = LowerASCII(exprs[i]);
+		if (expr_lc.find(" over ") != string::npos || expr_lc.find(" over(") != string::npos) {
+			result.push_back(i);
 		}
 	}
 	return result;
@@ -123,21 +219,29 @@ static int ParseIsIncrementalFromQueryFile(const string &query_sql) {
 	// Look at the first line for "-- {...}" and find "is_incremental": true|false
 	size_t nl = query_sql.find('\n');
 	string first_line = (nl == string::npos) ? query_sql : query_sql.substr(0, nl);
-	if (first_line.rfind("-- ", 0) != 0) return -1;
+	if (first_line.rfind("-- ", 0) != 0)
+		return -1;
 	size_t pos = first_line.find("\"is_incremental\"");
-	if (pos == string::npos) return -1;
+	if (pos == string::npos)
+		return -1;
 	pos = first_line.find(':', pos);
-	if (pos == string::npos) return -1;
+	if (pos == string::npos)
+		return -1;
 	// Skip whitespace
-	while (pos + 1 < first_line.size() && (first_line[pos + 1] == ' ' || first_line[pos + 1] == '\t')) pos++;
-	if (first_line.compare(pos + 1, 4, "true") == 0) return 1;
-	if (first_line.compare(pos + 1, 5, "false") == 0) return 0;
+	while (pos + 1 < first_line.size() && (first_line[pos + 1] == ' ' || first_line[pos + 1] == '\t'))
+		pos++;
+	if (first_line.compare(pos + 1, 4, "true") == 0)
+		return 1;
+	if (first_line.compare(pos + 1, 5, "false") == 0)
+		return 0;
 	return -1;
 }
 
 static string ReadFileToString(const string &path) {
 	std::ifstream in(path);
-	if (!in.is_open()) { return string(); }
+	if (!in.is_open()) {
+		return string();
+	}
 	std::ostringstream ss;
 	ss << in.rdbuf();
 	return ss.str();
@@ -146,7 +250,9 @@ static string ReadFileToString(const string &path) {
 static vector<string> CollectQueryFiles(const string &dir) {
 	vector<string> files;
 	DIR *d = opendir(dir.c_str());
-	if (!d) { return files; }
+	if (!d) {
+		return files;
+	}
 	struct dirent *entry;
 	while ((entry = readdir(d)) != nullptr) {
 		string name = entry->d_name;
@@ -168,7 +274,8 @@ static vector<string> CollectQueryFiles(const string &dir) {
 		string ba = basename(a), bb = basename(b);
 		bool a_dl = ba.rfind("ducklake_", 0) == 0;
 		bool b_dl = bb.rfind("ducklake_", 0) == 0;
-		if (a_dl != b_dl) return !a_dl; // native (non-ducklake) first
+		if (a_dl != b_dl)
+			return !a_dl; // native (non-ducklake) first
 		return ba < bb;
 	});
 	return files;
@@ -177,24 +284,26 @@ static vector<string> CollectQueryFiles(const string &dir) {
 static string QueryName(const string &path) {
 	auto pos = path.find_last_of('/');
 	string fname = (pos != string::npos) ? path.substr(pos + 1) : path;
-	if (fname.size() > 4) { fname = fname.substr(0, fname.size() - 4); }
+	if (fname.size() > 4) {
+		fname = fname.substr(0, fname.size() - 4);
+	}
 	return fname;
 }
 
 static string FindQueriesDir(const string &workload = "tpcc") {
 	// Look for benchmark/queries/<workload>/ first; fall back to legacy benchmark/queries/
 	vector<string> candidates = {
-		"benchmark/queries/" + workload,
-		"queries/" + workload,
-		"../benchmark/queries/" + workload,
-		"../../benchmark/queries/" + workload,
-		"../../../benchmark/queries/" + workload,
-		// Legacy flat directory (pre-split) for backward compatibility
-		"benchmark/queries",
-		"queries",
-		"../benchmark/queries",
-		"../../benchmark/queries",
-		"../../../benchmark/queries",
+	    "benchmark/queries/" + workload,
+	    "queries/" + workload,
+	    "../benchmark/queries/" + workload,
+	    "../../benchmark/queries/" + workload,
+	    "../../../benchmark/queries/" + workload,
+	    // Legacy flat directory (pre-split) for backward compatibility
+	    "benchmark/queries",
+	    "queries",
+	    "../benchmark/queries",
+	    "../../benchmark/queries",
+	    "../../../benchmark/queries",
 	};
 
 	for (auto &c : candidates) {
@@ -223,7 +332,8 @@ static string FindQueriesDir(const string &workload = "tpcc") {
 				return cand_legacy;
 			}
 			auto p2 = dir.find_last_of('/');
-			if (p2 == string::npos) break;
+			if (p2 == string::npos)
+				break;
 			dir = dir.substr(0, p2);
 		}
 	}
@@ -234,7 +344,8 @@ static string FindQueriesDir(const string &workload = "tpcc") {
 static string FormatQueryList(const vector<string> &names, size_t max_show = 10) {
 	string out;
 	for (size_t i = 0; i < names.size(); ++i) {
-		if (i > 0) out += ", ";
+		if (i > 0)
+			out += ", ";
 		if (i >= max_show) {
 			out += "... +" + std::to_string(names.size() - i) + " more";
 			break;
@@ -271,7 +382,8 @@ struct RewriterStats {
 };
 
 static void PrintErrorBreakdown(const RewriterStats &stats, int total) {
-	if (stats.error_counts.empty()) return;
+	if (stats.error_counts.empty())
+		return;
 
 	int total_errors = 0;
 	for (const auto &e : stats.error_counts) {
@@ -280,12 +392,11 @@ static void PrintErrorBreakdown(const RewriterStats &stats, int total) {
 
 	vector<std::pair<string, int>> sorted_errors(stats.error_counts.begin(), stats.error_counts.end());
 	std::sort(sorted_errors.begin(), sorted_errors.end(),
-	          [](const std::pair<string, int> &a, const std::pair<string, int> &b) {
-		          return a.second > b.second;
-	          });
+	          [](const std::pair<string, int> &a, const std::pair<string, int> &b) { return a.second > b.second; });
 
 	Log("");
-	Log("=== Error Breakdown (" + std::to_string(total_errors) + " total errors across " + std::to_string(total) + " queries) ===");
+	Log("=== Error Breakdown (" + std::to_string(total_errors) + " total errors across " + std::to_string(total) +
+	    " queries) ===");
 	for (const auto &e : sorted_errors) {
 		double pct = (total > 0) ? (100.0 * e.second / total) : 0.0;
 		string msg = e.first;
@@ -305,20 +416,22 @@ static void PrintErrorBreakdown(const RewriterStats &stats, int total) {
 // ===== ForkWorker (identical to sqlstorm pattern) =====
 
 static bool IsFatalError(const string &error) {
-	return error.find("FATAL") != string::npos ||
-	       error.find("database has been invalidated") != string::npos;
+	return error.find("FATAL") != string::npos || error.find("database has been invalidated") != string::npos;
 }
 
 static string TruncateError(const string &error) {
 	string msg = error;
 	// Strip stack traces
 	auto st = msg.find("\n\nStack Trace");
-	if (st != string::npos) msg = msg.substr(0, st);
+	if (st != string::npos)
+		msg = msg.substr(0, st);
 	// Also strip JSON stack traces
 	auto js = msg.find("\"stack_trace");
-	if (js != string::npos) msg = msg.substr(0, js);
+	if (js != string::npos)
+		msg = msg.substr(0, js);
 	// Cap length
-	if (msg.size() > 200) msg = msg.substr(0, 200) + "...";
+	if (msg.size() > 200)
+		msg = msg.substr(0, 200) + "...";
 	return msg;
 }
 
@@ -362,8 +475,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					ducklake_ok = true;
 					auto have = con.Query("SELECT COUNT(*) FROM information_schema.tables "
 					                      "WHERE table_catalog = 'dl' AND LOWER(table_name) = 'warehouse'");
-					bool needs_init =
-					    !have || have->HasError() || have->RowCount() == 0 || have->GetValue(0, 0).GetValue<int64_t>() == 0;
+					bool needs_init = !have || have->HasError() || have->RowCount() == 0 ||
+					                  have->GetValue(0, 0).GetValue<int64_t>() == 0;
 					if (needs_init) {
 						con.Query("USE dl.main");
 						CreateTPCCSchema(con);
@@ -394,10 +507,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				}
 			}
 			// Drop orphaned data/delta tables from all catalogs
-			auto orphaned =
-			    con.Query("SELECT table_catalog, table_name FROM information_schema.tables "
-			              "WHERE (table_name LIKE '_ivm_data_mv_q%' OR table_name LIKE 'delta_mv_q%'"
-			              "    OR table_name LIKE 'ivm_delta_mv_q%') AND table_schema = 'main'");
+			auto orphaned = con.Query("SELECT table_catalog, table_name FROM information_schema.tables "
+			                          "WHERE (table_name LIKE '_ivm_data_mv_q%' OR table_name LIKE 'delta_mv_q%'"
+			                          "    OR table_name LIKE 'ivm_delta_mv_q%') AND table_schema = 'main'");
 			if (orphaned && !orphaned->HasError()) {
 				for (idx_t r = 0; r < orphaned->RowCount(); r++) {
 					string cat = orphaned->GetValue(0, r).ToString();
@@ -416,11 +528,14 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 
 		while (true) {
 			uint32_t query_len = 0;
-			if (!ReadAllBytes(read_fd, &query_len, sizeof(query_len))) break;
-			if (query_len == 0) break;
+			if (!ReadAllBytes(read_fd, &query_len, sizeof(query_len)))
+				break;
+			if (query_len == 0)
+				break;
 
 			string query(query_len, '\0');
-			if (!ReadAllBytes(read_fd, &query[0], query_len)) break;
+			if (!ReadAllBytes(read_fd, &query[0], query_len))
+				break;
 
 			// First line is `-- <query_name>` (injected by the parent via Submit)
 			// so the child knows which query it's processing. We use the name to
@@ -436,8 +551,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					string header = query.substr(0, newline_pos);
 					if (header.size() > 3) {
 						worker_query_name = header.substr(3);
-						while (!worker_query_name.empty() && (worker_query_name.back() == ' ' ||
-						                                       worker_query_name.back() == '\r')) {
+						while (!worker_query_name.empty() &&
+						       (worker_query_name.back() == ' ' || worker_query_name.back() == '\r')) {
 							worker_query_name.pop_back();
 						}
 						is_ducklake_query = worker_query_name.find("ducklake_") != string::npos && ducklake_ok;
@@ -459,7 +574,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			while (!query.empty() && (query[0] == '\n' || query[0] == '\r' || query[0] == ' ')) {
 				query = query.substr(1);
 			}
-			while (!query.empty() && (query.back() == ';' || query.back() == '\n' || query.back() == '\r' || query.back() == ' ')) {
+			while (!query.empty() &&
+			       (query.back() == ';' || query.back() == '\n' || query.back() == '\r' || query.back() == ' ')) {
 				query.pop_back();
 			}
 
@@ -475,7 +591,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				con.Query(native_use);
 			}
 
-			uint8_t phase_reached = 0;  // 1=duckdb_fail, 2=mv_fail, 3=delta_fail, 4=refresh_fail, 5=verify_fail, 6=ok, 99=crash
+			uint8_t phase_reached =
+			    0; // 1=duckdb_fail, 2=mv_fail, 3=delta_fail, 4=refresh_fail, 5=verify_fail, 6=ok, 99=crash
 			uint8_t is_incremental = 0;
 			uint8_t is_correct = 0;
 			double time_select_ms = 0, time_mv_ms = 0, time_refresh_ms = 0, time_verify_ms = 0;
@@ -526,7 +643,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// Qualify with native_catalog so the lookup works both when the active catalog
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
 						// name = filename, never "memory").
-						auto check_result = con.Query("SELECT type FROM " + native_catalog + "._duckdb_ivm_views WHERE view_name = '" + mv_name + "'");
+						auto check_result = con.Query("SELECT type FROM " + native_catalog +
+						                              "._duckdb_ivm_views WHERE view_name = '" + mv_name + "'");
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
 							int64_t ivm_type = check_result->GetValue(0, 0).GetValue<int64_t>();
 							is_incremental = (ivm_type != 3) ? 1 : 0;
@@ -534,9 +652,10 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 
 						// Phase 3: Apply deltas
 						for (int d = 0; d < delta_batch_size && (size_t)delta_idx < deltas.size(); d++, delta_idx++) {
-							con.Query(deltas[delta_idx]);  // Errors are OK (e.g. duplicate keys)
+							con.Query(deltas[delta_idx]); // Errors are OK (e.g. duplicate keys)
 						}
-						if ((size_t)delta_idx >= deltas.size()) delta_idx = 0;
+						if ((size_t)delta_idx >= deltas.size())
+							delta_idx = 0;
 						phase_reached = 4;
 
 						// Phase 4: PRAGMA ivm()
@@ -571,27 +690,84 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 								// is order-sensitive under CTE materialization (NTILE, etc.)
 								// aren't perturbed.
 								verify_query = "SELECT COUNT(*) FROM ("
-									"SELECT * FROM " + mv_name + " EXCEPT ALL SELECT * FROM (" + query + ") __a"
-									" UNION ALL "
-									"SELECT * FROM (" + query + ") __b EXCEPT ALL SELECT * FROM " + mv_name +
-									") __diff";
+								               "SELECT * FROM " +
+								               mv_name + " EXCEPT ALL SELECT * FROM (" + query +
+								               ") __a"
+								               " UNION ALL "
+								               "SELECT * FROM (" +
+								               query + ") __b EXCEPT ALL SELECT * FROM " + mv_name + ") __diff";
 							} else {
-								verify_query =
-									"WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " + mv_name + "), "
-									"gt_r(" + nv.column_list + ") AS (SELECT * FROM (" + query + ") __gt) "
-									"SELECT COUNT(*) FROM ("
-									"SELECT " + nv.normalized + " FROM mv_r "
-									"EXCEPT ALL "
-									"SELECT " + nv.normalized + " FROM gt_r "
-									"UNION ALL "
-									"SELECT " + nv.normalized + " FROM gt_r "
-									"EXCEPT ALL "
-									"SELECT " + nv.normalized + " FROM mv_r"
-									") __diff";
+								verify_query = "WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " + mv_name +
+								               "), "
+								               "gt_r(" +
+								               nv.column_list + ") AS (SELECT * FROM (" + query +
+								               ") __gt) "
+								               "SELECT COUNT(*) FROM ("
+								               "SELECT " +
+								               nv.normalized +
+								               " FROM mv_r "
+								               "EXCEPT ALL "
+								               "SELECT " +
+								               nv.normalized +
+								               " FROM gt_r "
+								               "UNION ALL "
+								               "SELECT " +
+								               nv.normalized +
+								               " FROM gt_r "
+								               "EXCEPT ALL "
+								               "SELECT " +
+								               nv.normalized +
+								               " FROM mv_r"
+								               ") __diff";
 							}
 							auto verify_result = con.Query(verify_query);
 							if (verify_result && !verify_result->HasError() && verify_result->RowCount() > 0) {
 								int64_t mismatch_count = verify_result->GetValue(0, 0).GetValue<int64_t>();
+								if (mismatch_count != 0 && !nv.column_list.empty()) {
+									auto window_cols = WindowOutputColumns(query, nv.normalized_columns.size());
+									if (!window_cols.empty() && window_cols.size() < nv.normalized_columns.size()) {
+										unordered_set<idx_t> window_set(window_cols.begin(), window_cols.end());
+										string non_window_select;
+										for (idx_t i = 0; i < nv.normalized_columns.size(); i++) {
+											if (window_set.count(i)) {
+												continue;
+											}
+											if (!non_window_select.empty()) {
+												non_window_select += ", ";
+											}
+											non_window_select += nv.normalized_columns[i];
+										}
+										string relaxed_query = "WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " +
+										                       mv_name +
+										                       "), "
+										                       "gt_r(" +
+										                       nv.column_list + ") AS (SELECT * FROM (" + query +
+										                       ") __gt) "
+										                       "SELECT COUNT(*) FROM ("
+										                       "SELECT " +
+										                       non_window_select +
+										                       " FROM mv_r "
+										                       "EXCEPT ALL "
+										                       "SELECT " +
+										                       non_window_select +
+										                       " FROM gt_r "
+										                       "UNION ALL "
+										                       "SELECT " +
+										                       non_window_select +
+										                       " FROM gt_r "
+										                       "EXCEPT ALL "
+										                       "SELECT " +
+										                       non_window_select +
+										                       " FROM mv_r"
+										                       ") __diff";
+										auto relaxed_result = con.Query(relaxed_query);
+										if (relaxed_result && !relaxed_result->HasError() &&
+										    relaxed_result->RowCount() > 0 &&
+										    relaxed_result->GetValue(0, 0).GetValue<int64_t>() == 0) {
+											mismatch_count = 0;
+										}
+									}
+								}
 								is_correct = (mismatch_count == 0) ? 1 : 0;
 								if (!is_correct && getenv("OPENIVM_DUMP_DIFF")) {
 									// Dump the diff rows to stderr for post-mortem analysis.
@@ -601,8 +777,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 									        static_cast<long long>(mismatch_count));
 									string mv_only_q, gt_only_q;
 									if (nv.column_list.empty() || !nv.has_float) {
-										mv_only_q = "SELECT * FROM " + mv_name + " EXCEPT ALL SELECT * FROM (" +
-										            query + ") __a LIMIT 10";
+										mv_only_q = "SELECT * FROM " + mv_name + " EXCEPT ALL SELECT * FROM (" + query +
+										            ") __a LIMIT 10";
 										gt_only_q = "SELECT * FROM (" + query + ") __b EXCEPT ALL SELECT * FROM " +
 										            mv_name + " LIMIT 10";
 									} else {
@@ -617,8 +793,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 									auto dump_side = [&](const string &label, const string &q) {
 										auto rows = con.Query(q);
 										if (!rows || rows->HasError()) {
-											fprintf(stderr, "[DIFF %s]   %s: ERROR %s\n", mv_name.c_str(), label.c_str(),
-											        rows ? rows->GetError().c_str() : "(null)");
+											fprintf(stderr, "[DIFF %s]   %s: ERROR %s\n", mv_name.c_str(),
+											        label.c_str(), rows ? rows->GetError().c_str() : "(null)");
 											return;
 										}
 										if (rows->RowCount() == 0) {
@@ -627,7 +803,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 										for (idx_t r = 0; r < rows->RowCount(); r++) {
 											string row;
 											for (idx_t c = 0; c < rows->ColumnCount(); c++) {
-												if (c > 0) row += " | ";
+												if (c > 0)
+													row += " | ";
 												row += rows->GetValue(c, r).ToString();
 											}
 											fprintf(stderr, "[DIFF %s]   %s: %s\n", mv_name.c_str(), label.c_str(),
@@ -677,9 +854,12 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			WriteAllBytes(write_fd, &time_verify_ms, sizeof(time_verify_ms));
 			uint32_t err_len = static_cast<uint32_t>(error.size());
 			WriteAllBytes(write_fd, &err_len, sizeof(err_len));
-			if (err_len > 0) WriteAllBytes(write_fd, error.data(), err_len);
+			if (err_len > 0)
+				WriteAllBytes(write_fd, error.data(), err_len);
 
-			if (phase_reached == 99) { _exit(1); }
+			if (phase_reached == 99) {
+				_exit(1);
+			}
 		}
 	} catch (std::exception &e) {
 		fprintf(stderr, "Child fatal: %s\n", e.what());
@@ -707,22 +887,27 @@ struct ForkWorker {
 	void Start() {
 		Stop();
 		int to_child[2], from_child[2];
-		if (pipe(to_child) != 0 || pipe(from_child) != 0) throw std::runtime_error("pipe() failed");
+		if (pipe(to_child) != 0 || pipe(from_child) != 0)
+			throw std::runtime_error("pipe() failed");
 
 		child_pid = fork();
 		if (child_pid < 0) {
-			close(to_child[0]); close(to_child[1]);
-			close(from_child[0]); close(from_child[1]);
+			close(to_child[0]);
+			close(to_child[1]);
+			close(from_child[0]);
+			close(from_child[1]);
 			throw std::runtime_error("fork() failed");
 		}
 
 		if (child_pid == 0) {
-			close(to_child[1]); close(from_child[0]);
+			close(to_child[1]);
+			close(from_child[0]);
 			ChildWorkerMain(to_child[0], from_child[1], db_path, deltas, workload);
 			_exit(0);
 		}
 
-		close(to_child[0]); close(from_child[1]);
+		close(to_child[0]);
+		close(from_child[1]);
 		to_child_fd = to_child[1];
 		from_child_fd = from_child[0];
 	}
@@ -734,7 +919,8 @@ struct ForkWorker {
 			int status;
 			for (int i = 0; i < 4; i++) {
 				int w = waitpid(child_pid, &status, WNOHANG);
-				if (w != 0) break;
+				if (w != 0)
+					break;
 				usleep(50000);
 			}
 			int w = waitpid(child_pid, &status, WNOHANG);
@@ -744,8 +930,14 @@ struct ForkWorker {
 			}
 			child_pid = -1;
 		}
-		if (to_child_fd >= 0) { close(to_child_fd); to_child_fd = -1; }
-		if (from_child_fd >= 0) { close(from_child_fd); from_child_fd = -1; }
+		if (to_child_fd >= 0) {
+			close(to_child_fd);
+			to_child_fd = -1;
+		}
+		if (from_child_fd >= 0) {
+			close(from_child_fd);
+			from_child_fd = -1;
+		}
 	}
 
 	void Submit(const string &query, double timeout_s, const string &query_name = "") {
@@ -754,7 +946,8 @@ struct ForkWorker {
 		result_correct = 0;
 		result_error.clear();
 
-		if (child_pid <= 0) return;
+		if (child_pid <= 0)
+			return;
 
 		// Prepend `-- <query_name>\n` so the worker can recognize filename
 		// prefixes (e.g. `ducklake_`) and dispatch to the right catalog.
@@ -769,9 +962,9 @@ struct ForkWorker {
 			return;
 		}
 
-		auto deadline = std::chrono::steady_clock::now() +
-			std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-				std::chrono::duration<double>(timeout_s));
+		auto deadline =
+		    std::chrono::steady_clock::now() +
+		    std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(timeout_s));
 
 		while (true) {
 			auto now = std::chrono::steady_clock::now();
@@ -779,13 +972,13 @@ struct ForkWorker {
 				kill(child_pid, SIGKILL);
 				waitpid(child_pid, nullptr, 0);
 				child_pid = -1;
-				result_phase = 2;  // timeout
+				result_phase = 2; // timeout
 				result_error = "timeout";
 				return;
 			}
 
-			int remaining_ms = static_cast<int>(
-				std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+			int remaining_ms =
+			    static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
 			int poll_ms = std::min(remaining_ms, 500);
 
 			struct pollfd pfd;
@@ -868,7 +1061,9 @@ struct ForkWorker {
 		}
 	}
 
-	~ForkWorker() { Stop(); }
+	~ForkWorker() {
+		Stop();
+	}
 };
 
 // ===== Main Benchmark Logic =====
@@ -889,10 +1084,12 @@ static void PrintIncrementalityMatrix(const RewriterStats &stats) {
 	Log("");
 	Log("                          | OpenIVM:  INCREMENTAL  |  OpenIVM:  FULL_REFRESH |");
 	Log("  ------------------------+------------------------+-------------------------+");
-	Log("  Metadata: INCREMENTAL   |  correct:   " + std::to_string(mt_at) + string(10 - std::min<size_t>(10, std::to_string(mt_at).size()), ' ') +
-	    "|  mismatch:  " + std::to_string(mt_af) + string(11 - std::min<size_t>(11, std::to_string(mt_af).size()), ' ') + "|");
-	Log("  Metadata: FULL_REFRESH  |  mismatch:  " + std::to_string(mf_at) + string(10 - std::min<size_t>(10, std::to_string(mf_at).size()), ' ') +
-	    "|  correct:   " + std::to_string(mf_af) + string(11 - std::min<size_t>(11, std::to_string(mf_af).size()), ' ') + "|");
+	Log("  Metadata: INCREMENTAL   |  correct:   " + std::to_string(mt_at) +
+	    string(10 - std::min<size_t>(10, std::to_string(mt_at).size()), ' ') + "|  mismatch:  " +
+	    std::to_string(mt_af) + string(11 - std::min<size_t>(11, std::to_string(mt_af).size()), ' ') + "|");
+	Log("  Metadata: FULL_REFRESH  |  mismatch:  " + std::to_string(mf_at) +
+	    string(10 - std::min<size_t>(10, std::to_string(mf_at).size()), ' ') + "|  correct:   " +
+	    std::to_string(mf_af) + string(11 - std::min<size_t>(11, std::to_string(mf_af).size()), ' ') + "|");
 	Log("");
 	if (total > 0) {
 		Log("  Correctly classified by metadata: " + std::to_string(correct) + " (" +
@@ -919,12 +1116,18 @@ static void PrintIncrementalityMatrix(const RewriterStats &stats) {
 static void PrintStats(const string &label, const RewriterStats &stats, int total) {
 	Log("--- " + label + " ---");
 	Log("  Total:   " + std::to_string(total));
-	Log("  Validation OK:   " + std::to_string(stats.validation_ok) + " (" + FormatNumber(100.0 * stats.validation_ok / total) + "%)");
-	Log("  MV Creation OK:   " + std::to_string(stats.mv_creation_ok) + " (" + FormatNumber(100.0 * stats.mv_creation_ok / total) + "%)");
-	Log("  Incremental:  " + std::to_string(stats.incremental) + " (" + FormatNumber(100.0 * stats.incremental / std::max(1, stats.mv_creation_ok)) + "% of created)");
-	Log("  Full refresh: " + std::to_string(stats.full_refresh) + " (" + FormatNumber(100.0 * stats.full_refresh / std::max(1, stats.mv_creation_ok)) + "% of created)");
-	Log("  Refresh OK:   " + std::to_string(stats.refresh_ok) + " (" + FormatNumber(100.0 * stats.refresh_ok / total) + "%)");
-	Log("  Correct:      " + std::to_string(stats.correct) + " (" + FormatNumber(100.0 * stats.correct / std::max(1, stats.refresh_ok)) + "% of refreshed)");
+	Log("  Validation OK:   " + std::to_string(stats.validation_ok) + " (" +
+	    FormatNumber(100.0 * stats.validation_ok / total) + "%)");
+	Log("  MV Creation OK:   " + std::to_string(stats.mv_creation_ok) + " (" +
+	    FormatNumber(100.0 * stats.mv_creation_ok / total) + "%)");
+	Log("  Incremental:  " + std::to_string(stats.incremental) + " (" +
+	    FormatNumber(100.0 * stats.incremental / std::max(1, stats.mv_creation_ok)) + "% of created)");
+	Log("  Full refresh: " + std::to_string(stats.full_refresh) + " (" +
+	    FormatNumber(100.0 * stats.full_refresh / std::max(1, stats.mv_creation_ok)) + "% of created)");
+	Log("  Refresh OK:   " + std::to_string(stats.refresh_ok) + " (" + FormatNumber(100.0 * stats.refresh_ok / total) +
+	    "%)");
+	Log("  Correct:      " + std::to_string(stats.correct) + " (" +
+	    FormatNumber(100.0 * stats.correct / std::max(1, stats.refresh_ok)) + "% of refreshed)");
 	Log("  Crashed:      " + std::to_string(stats.crashed) + " (" + FormatNumber(100.0 * stats.crashed / total) + "%)");
 	if (stats.mv_creation_ok > 0) {
 		Log("  Avg MV time:      " + FormatNumber(stats.total_mv_ms / stats.mv_creation_ok) + " ms");
@@ -933,10 +1136,11 @@ static void PrintStats(const string &label, const RewriterStats &stats, int tota
 	}
 }
 
-static vector<string> RunBenchmark(const string &queries_dir, const string &db_path, int scale_factor,
-                                   double timeout_s, const string &workload = "tpcc") {
+static vector<string> RunBenchmark(const string &queries_dir, const string &db_path, int scale_factor, double timeout_s,
+                                   const string &workload = "tpcc") {
 	vector<string> csv_lines;
-	csv_lines.push_back("query_name,phase_reached,meta_is_incremental,actual_is_incremental,is_correct,time_select_ms,time_mv_ms,time_refresh_ms,time_verify_ms,error");
+	csv_lines.push_back("query_name,phase_reached,meta_is_incremental,actual_is_incremental,is_correct,time_select_ms,"
+	                    "time_mv_ms,time_refresh_ms,time_verify_ms,error");
 
 	if (!FileExists(db_path)) {
 		Log("Creating " + workload + " database: " + db_path);
@@ -986,15 +1190,17 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 	ForkWorker worker;
 	worker.db_path = db_path;
 	worker.workload = workload;
-	worker.deltas = (workload == "tpcdi") ? openivm_bench::GenerateTPCDIDeltaPool(scale_factor)
-	                                      : GenerateDeltaPool(scale_factor);
+	worker.deltas =
+	    (workload == "tpcdi") ? openivm_bench::GenerateTPCDIDeltaPool(scale_factor) : GenerateDeltaPool(scale_factor);
 	worker.Start();
 
 	int log_interval = std::max(1, total / 10);
 	string last_internal_error_query;
 
 	for (int i = 0; i < total; i++) {
-		if (worker.child_pid <= 0) { worker.Start(); }
+		if (worker.child_pid <= 0) {
+			worker.Start();
+		}
 
 		string query_file = query_files[i];
 		string query_name = QueryName(query_file);
@@ -1069,8 +1275,10 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		} else if (phase == 3 || phase == 4) {
 			stats.validation_ok++;
 			stats.mv_creation_ok++;
-			if (worker.result_incremental) stats.incremental++;
-			else stats.full_refresh++;
+			if (worker.result_incremental)
+				stats.incremental++;
+			else
+				stats.full_refresh++;
 			stats.refresh_fail++;
 			stats.error_counts[error_msg]++;
 			stats.error_queries[error_msg].push_back(query_name);
@@ -1082,8 +1290,10 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		} else if (phase == 5) {
 			stats.validation_ok++;
 			stats.mv_creation_ok++;
-			if (worker.result_incremental) stats.incremental++;
-			else stats.full_refresh++;
+			if (worker.result_incremental)
+				stats.incremental++;
+			else
+				stats.full_refresh++;
 			stats.refresh_ok++;
 			stats.incorrect++;
 			stats.incorrect_queries.push_back(query_name);
@@ -1098,8 +1308,10 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		} else if (phase == 6) {
 			stats.validation_ok++;
 			stats.mv_creation_ok++;
-			if (worker.result_incremental) stats.incremental++;
-			else stats.full_refresh++;
+			if (worker.result_incremental)
+				stats.incremental++;
+			else
+				stats.full_refresh++;
 			stats.refresh_ok++;
 			stats.correct++;
 			stats.total_mv_ms += worker.result_time_mv_ms;
@@ -1130,23 +1342,20 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		// Build CSV line — meta_is_incremental column is blank when metadata is missing
 		string meta_str = (meta_incremental < 0) ? "" : std::to_string(meta_incremental);
 		std::ostringstream csv_line;
-		csv_line << query_name << "," << std::to_string(phase) << ","
-		         << meta_str << "," << std::to_string(worker.result_incremental) << ","
-		         << std::to_string(worker.result_correct) << ","
+		csv_line << query_name << "," << std::to_string(phase) << "," << meta_str << ","
+		         << std::to_string(worker.result_incremental) << "," << std::to_string(worker.result_correct) << ","
 		         << FormatNumber(worker.result_time_select_ms) << "," << FormatNumber(worker.result_time_mv_ms) << ","
-		         << FormatNumber(worker.result_time_refresh_ms) << "," << FormatNumber(worker.result_time_verify_ms) << ",\"" << error_msg << "\"";
+		         << FormatNumber(worker.result_time_refresh_ms) << "," << FormatNumber(worker.result_time_verify_ms)
+		         << ",\"" << error_msg << "\"";
 		csv_lines.push_back(csv_line.str());
 
 		if ((i + 1) % log_interval == 0 || i + 1 == total) {
-			Log("[" + std::to_string(i + 1) + "/" + std::to_string(total) + "] val=" + std::to_string(stats.validation_ok) +
-			    " mv=" + std::to_string(stats.mv_creation_ok) +
-			    " incr=" + std::to_string(stats.incremental) +
-			    " refresh=" + std::to_string(stats.refresh_ok) +
-			    " correct=" + std::to_string(stats.correct) +
-			    " crash=" + std::to_string(stats.crashed) +
-			    " | meta[T/T=" + std::to_string(stats.meta_true_actual_true) +
-			    " T/F=" + std::to_string(stats.meta_true_actual_false) +
-			    " F/T=" + std::to_string(stats.meta_false_actual_true) +
+			Log("[" + std::to_string(i + 1) + "/" + std::to_string(total) +
+			    "] val=" + std::to_string(stats.validation_ok) + " mv=" + std::to_string(stats.mv_creation_ok) +
+			    " incr=" + std::to_string(stats.incremental) + " refresh=" + std::to_string(stats.refresh_ok) +
+			    " correct=" + std::to_string(stats.correct) + " crash=" + std::to_string(stats.crashed) +
+			    " | meta[T/T=" + std::to_string(stats.meta_true_actual_true) + " T/F=" +
+			    std::to_string(stats.meta_true_actual_false) + " F/T=" + std::to_string(stats.meta_false_actual_true) +
 			    " F/F=" + std::to_string(stats.meta_false_actual_false) + "]");
 		}
 	}

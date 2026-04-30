@@ -1013,3 +1013,93 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 44: Quoted multi-part MV target and source names
+# ==========================================
+
+statement ok
+ATTACH ':memory:' AS mem2;
+
+statement ok
+CREATE SCHEMA mem2.s;
+
+statement ok
+CREATE TABLE mem2.s.t(i INT);
+
+statement ok
+INSERT INTO mem2.s.t VALUES (1);
+
+# Quoted multi-part MV target must not crash or lose the AS query body.
+statement ok
+CREATE MATERIALIZED VIEW "mem2"."s"."mvq_target" AS
+SELECT COUNT(*) AS c FROM mem2.s.t;
+
+query I
+SELECT c FROM mem2.s.mvq_target;
+----
+1
+
+statement ok
+INSERT INTO mem2.s.t VALUES (2), (3);
+
+statement ok
+PRAGMA ivm('mvq_target');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM mem2.s.mvq_target
+  EXCEPT ALL
+  SELECT COUNT(*) AS c FROM mem2.s.t
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT COUNT(*) AS c FROM mem2.s.t
+  EXCEPT ALL
+  SELECT * FROM mem2.s.mvq_target
+);
+----
+0
+
+statement ok
+CREATE TABLE mem2.s.t2(i INT);
+
+statement ok
+INSERT INTO mem2.s.t2 VALUES (10);
+
+# Quoted multi-part source must retain its catalog/schema when OpenIVM creates deltas.
+statement ok
+CREATE MATERIALIZED VIEW mem2.s.mvq_source AS
+SELECT COUNT(*) AS c FROM "mem2"."s"."t2";
+
+query I
+SELECT c FROM mem2.s.mvq_source;
+----
+1
+
+statement ok
+INSERT INTO mem2.s.t2 VALUES (20), (30);
+
+statement ok
+PRAGMA ivm('mvq_source');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM mem2.s.mvq_source
+  EXCEPT ALL
+  SELECT COUNT(*) AS c FROM mem2.s.t2
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT COUNT(*) AS c FROM mem2.s.t2
+  EXCEPT ALL
+  SELECT * FROM mem2.s.mvq_source
+);
+----
+0

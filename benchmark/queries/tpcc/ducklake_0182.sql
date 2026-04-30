@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK", "ducklake": true}
+WITH avg_stock AS (SELECT S_W_ID, AVG(S_QUANTITY) AS avg_q FROM dl.STOCK GROUP BY S_W_ID) SELECT a.S_W_ID, i.I_ID, (i.I_PRICE * a.avg_q) AS projected_val FROM avg_stock a RIGHT JOIN dl.ITEM i ON 1 = 1 WHERE a.S_W_ID IS NOT NULL;

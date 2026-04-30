@@ -1,0 +1,2 @@
+-- {"operators": "CROSS_JOIN,AGGREGATE,FILTER,TABLE_FUNCTION,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK"}
+SELECT dim.lvl, COUNT(*) AS n FROM (SELECT unnest(['low', 'mid', 'high']) AS lvl) dim CROSS JOIN STOCK s WHERE (dim.lvl = 'low' AND s.S_QUANTITY < 20) OR (dim.lvl = 'mid' AND s.S_QUANTITY BETWEEN 20 AND 80) OR (dim.lvl = 'high' AND s.S_QUANTITY > 80) GROUP BY dim.lvl;

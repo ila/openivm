@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "CUSTOMER"}
+WITH t1 AS (SELECT C_W_ID, COUNT(*) AS n FROM CUSTOMER GROUP BY C_W_ID), t2 AS (SELECT t1.C_W_ID, t1.n, CASE WHEN t1.n > 100 THEN 'big' WHEN t1.n > 10 THEN 'med' ELSE 'small' END AS size FROM t1), t3 AS (SELECT t2.size, COUNT(*) AS wh_count, SUM(t2.n) AS total_cust FROM t2 GROUP BY t2.size) SELECT * FROM t3;

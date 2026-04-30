@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "openivm_verified": true}
+WITH per_item AS (SELECT OL_I_ID, COUNT(*) AS cnt, SUM(OL_AMOUNT) AS rev, SUM(OL_QUANTITY) AS qty FROM ORDER_LINE GROUP BY OL_I_ID) SELECT i.I_NAME, i.I_PRICE, pi.cnt, pi.rev, pi.qty, ROUND(pi.rev / NULLIF(pi.qty, 0), 2) AS unit_price, RANK() OVER (ORDER BY pi.rev DESC) AS rev_rank FROM ITEM i JOIN per_item pi ON i.I_ID = pi.OL_I_ID;

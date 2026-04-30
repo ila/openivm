@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,FILTER,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER"}
+WITH top_customers AS (SELECT C_W_ID, C_ID, C_BALANCE FROM CUSTOMER WHERE C_BALANCE > 4000) SELECT tc.C_W_ID, tc.C_ID, tc.C_BALANCE, COUNT(o.O_ID) AS order_count FROM top_customers tc LEFT JOIN OORDER o ON tc.C_ID = o.O_C_ID AND tc.C_W_ID = o.O_W_ID GROUP BY tc.C_W_ID, tc.C_ID, tc.C_BALANCE;

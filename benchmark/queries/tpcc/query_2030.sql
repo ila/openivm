@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE"}
+SELECT a.OL_W_ID, a.OL_D_ID, a.OL_O_ID, COUNT(*) AS pair_count, SUM(ABS(a.OL_AMOUNT - b.OL_AMOUNT)) AS amount_spread FROM ORDER_LINE a JOIN ORDER_LINE b ON a.OL_W_ID = b.OL_W_ID AND a.OL_D_ID = b.OL_D_ID AND a.OL_O_ID = b.OL_O_ID AND a.OL_NUMBER < b.OL_NUMBER GROUP BY a.OL_W_ID, a.OL_D_ID, a.OL_O_ID;

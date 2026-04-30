@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "ducklake": true}
+SELECT ol.OL_W_ID, ol.OL_D_ID, SUM(ol.OL_AMOUNT) AS total FROM dl.OORDER o JOIN dl.ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID WHERE ol.OL_AMOUNT > 0 GROUP BY ol.OL_W_ID, ol.OL_D_ID;
