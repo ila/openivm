@@ -66,6 +66,10 @@ LogicalGet *FindGetInSubtree(LogicalOperator *node) {
 	return nullptr;
 }
 
+static LogicalGet *GetLeafScan(const JoinLeafInfo &leaf) {
+	return leaf.get ? leaf.get : FindGetInSubtree(leaf.node);
+}
+
 unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, const vector<size_t> &path) {
 	unique_ptr<LogicalOperator> *current = &root;
 	for (size_t step : path) {
@@ -222,7 +226,7 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 	con.SetAutoCommit(false);
 
 	for (size_t i = 0; i < leaves.size(); i++) {
-		LogicalGet *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+		LogicalGet *get = GetLeafScan(leaves[i]);
 		if (!get) {
 			// Only constant nodes with no catalog backing (CHUNK_GET/VALUES) have empty delta.
 			// Other !get cases (e.g. PROJECTION wrapping a nested join) may contain real tables —
@@ -299,7 +303,7 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 	// Build map: table_name -> leaf index (for matching FK targets to leaves)
 	unordered_map<string, size_t> table_to_leaf;
 	for (size_t i = 0; i < leaves.size(); i++) {
-		LogicalGet *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+		LogicalGet *get = GetLeafScan(leaves[i]);
 		if (!get) {
 			continue;
 		}
@@ -312,7 +316,7 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 
 	// For each leaf, check its constraints for FK references to other leaves
 	for (size_t i = 0; i < leaves.size(); i++) {
-		LogicalGet *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+		LogicalGet *get = GetLeafScan(leaves[i]);
 		if (!get) {
 			continue;
 		}
@@ -626,7 +630,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
 		all_ducklake = false; // forced to inclusion-exclusion
 	} else {
 		for (size_t i = 0; i < N; i++) {
-			auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+			auto *get = GetLeafScan(leaves[i]);
 			if (!get || get->function.name != "ducklake_scan") {
 				all_ducklake = false;
 				break;
