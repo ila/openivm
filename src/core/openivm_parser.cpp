@@ -1102,14 +1102,28 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			               "' uses constructs not supported for incremental maintenance. "
 			               "Full refresh will be used.");
 		} else if (found_distinct && !distinct_at_top && found_aggregation) {
-			// Inner DISTINCT under an aggregate cannot be Z-set-incrementalized without
-			// auxiliary count state per distinct tuple (DBSP: distinct(R)=sgn(R), Δdistinct
-			// fires only on count transitions across zero). Until that aux machinery lands,
-			// route to GROUP_RECOMPUTE: re-evaluate only the outer GROUP BY keys touched by
-			// source deltas, instead of recomputing the entire MV.
-			// See plan /home/ila/.claude/plans/we-will-put-new-fizzy-sonnet.md §5 for the
-			// full aux-state design.
-			ivm_type = IVMType::GROUP_RECOMPUTE;
+			// Inner DISTINCT under an aggregate. Two paths:
+			//   - `ivm_distinct_aux_state = true` AND single-source body → DISTINCT_INCREMENTAL.
+			//     Maintains per-DISTINCT-tuple count auxiliary state; on refresh emits ±1
+			//     only on count transitions across zero (DBSP distinct(R)=sgn(R[t])). Strictly
+			//     fewer rows reach the parent aggregate's MERGE than GROUP_RECOMPUTE.
+			//   - Otherwise → GROUP_RECOMPUTE: re-evaluate only the outer GROUP BY keys touched
+			//     by source deltas. Correctness-equivalent fallback; multi-source views also
+			//     land here in v0 (multi-source aux-state needs IE substitution — TODO).
+			// Read the flag from the user's ClientContext (`context`), not the local
+			// `con` — the local connection is a fresh one and doesn't inherit the
+			// caller's session settings.
+			Value aux_val;
+			bool aux_enabled = false;
+			if (context.TryGetCurrentSetting("ivm_distinct_aux_state", aux_val) && !aux_val.IsNull()) {
+				aux_enabled = aux_val.GetValue<bool>();
+			}
+			bool single_source = table_names.size() == 1;
+			if (aux_enabled && single_source) {
+				ivm_type = IVMType::DISTINCT_INCREMENTAL;
+			} else {
+				ivm_type = IVMType::GROUP_RECOMPUTE;
+			}
 		} else if (found_distinct && distinct_at_top && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_GROUP;
 		} else if (found_having && found_aggregation && !aggregate_columns.empty()) {
@@ -1127,13 +1141,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, projection=%d, group_cols=%zu)\n",
-		                    ivm_type == IVMType::AGGREGATE_GROUP     ? "AGGREGATE_GROUP"
-		                    : ivm_type == IVMType::SIMPLE_AGGREGATE  ? "SIMPLE_AGGREGATE"
-		                    : ivm_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
-		                    : ivm_type == IVMType::FULL_REFRESH      ? "FULL_REFRESH"
-		                    : ivm_type == IVMType::WINDOW_PARTITION  ? "WINDOW_PARTITION"
-		                    : ivm_type == IVMType::GROUP_RECOMPUTE   ? "GROUP_RECOMPUTE"
-		                                                             : "UNKNOWN",
+		                    ivm_type == IVMType::AGGREGATE_GROUP        ? "AGGREGATE_GROUP"
+		                    : ivm_type == IVMType::SIMPLE_AGGREGATE     ? "SIMPLE_AGGREGATE"
+		                    : ivm_type == IVMType::SIMPLE_PROJECTION    ? "SIMPLE_PROJECTION"
+		                    : ivm_type == IVMType::FULL_REFRESH         ? "FULL_REFRESH"
+		                    : ivm_type == IVMType::WINDOW_PARTITION     ? "WINDOW_PARTITION"
+		                    : ivm_type == IVMType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
+		                    : ivm_type == IVMType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
+		                                                                : "UNKNOWN",
 		                    (int)found_aggregation, (int)found_projection, aggregate_columns.size());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
 		for (const auto &t : table_names) {

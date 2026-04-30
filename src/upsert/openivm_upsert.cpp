@@ -816,13 +816,14 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 
 	// Compile the upsert query based on view type
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n",
-	                    view_query_type == IVMType::AGGREGATE_HAVING    ? "AGGREGATE_HAVING"
-	                    : view_query_type == IVMType::AGGREGATE_GROUP   ? "AGGREGATE_GROUP"
-	                    : view_query_type == IVMType::SIMPLE_AGGREGATE  ? "SIMPLE_AGGREGATE"
-	                    : view_query_type == IVMType::SIMPLE_PROJECTION ? "SIMPLE_PROJECTION"
-	                    : view_query_type == IVMType::WINDOW_PARTITION  ? "WINDOW_PARTITION"
-	                    : view_query_type == IVMType::GROUP_RECOMPUTE   ? "GROUP_RECOMPUTE"
-	                                                                    : "UNKNOWN");
+	                    view_query_type == IVMType::AGGREGATE_HAVING       ? "AGGREGATE_HAVING"
+	                    : view_query_type == IVMType::AGGREGATE_GROUP      ? "AGGREGATE_GROUP"
+	                    : view_query_type == IVMType::SIMPLE_AGGREGATE     ? "SIMPLE_AGGREGATE"
+	                    : view_query_type == IVMType::SIMPLE_PROJECTION    ? "SIMPLE_PROJECTION"
+	                    : view_query_type == IVMType::WINDOW_PARTITION     ? "WINDOW_PARTITION"
+	                    : view_query_type == IVMType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
+	                    : view_query_type == IVMType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
+	                                                                       : "UNKNOWN");
 	// All DML (INSERT, DELETE, UPDATE, MERGE) targets the physical data table,
 	// not the user-facing VIEW which excludes internal _ivm_* columns.
 	// The compile functions receive view_name and compute data_table internally.
@@ -1185,6 +1186,14 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		}
 		break;
 	}
+	case IVMType::DISTINCT_INCREMENTAL:
+		// TODO(plan §5): aux-state DBSP-correct DISTINCT pipeline. Maintains a per-DISTINCT
+		// count auxiliary table; on refresh emits ±1 only on count transitions across zero,
+		// strictly fewer rows than GROUP_RECOMPUTE reaches the parent aggregate's MERGE.
+		// Until that pipeline lands, fall through to GROUP_RECOMPUTE — semantically
+		// correct, just not minimal-delta. The flag `ivm_distinct_aux_state` and this
+		// enum value are wired so the eventual implementation has stable surface.
+		[[fallthrough]];
 	case IVMType::GROUP_RECOMPUTE: {
 		// Inner-DISTINCT-under-AGG: re-evaluate only the GROUP BY tuples touched by source
 		// deltas. For each base table register a (base_name, last_update) spec; the compile
@@ -1229,13 +1238,15 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string post_companion;
 	string delete_from_view_query;
 
-	if (view_query_type == IVMType::WINDOW_PARTITION || view_query_type == IVMType::GROUP_RECOMPUTE) {
-		// These types use a recompute path (partition-scoped or group-scoped) on the data
-		// table directly — no delta-join plan needed, so skip the DoIVM/rewrite-rule path
-		// entirely. (Running DoIVM would hit operator types that the delta rewrite rules
-		// don't handle, causing "Operator type X not supported" errors.)
+	if (view_query_type == IVMType::WINDOW_PARTITION || view_query_type == IVMType::GROUP_RECOMPUTE ||
+	    view_query_type == IVMType::DISTINCT_INCREMENTAL) {
+		// These types use a recompute path (partition-scoped, group-scoped, or — once
+		// the aux-state pipeline lands — distinct-tuple-transition-only) on the data
+		// table directly. No delta-join plan needed, so skip the DoIVM/rewrite-rule path.
 		OPENIVM_DEBUG_PRINT("[UPSERT] Skipping DoIVM for %s\n",
-		                    view_query_type == IVMType::GROUP_RECOMPUTE ? "GROUP_RECOMPUTE" : "WINDOW_PARTITION");
+		                    view_query_type == IVMType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
+		                    : view_query_type == IVMType::GROUP_RECOMPUTE    ? "GROUP_RECOMPUTE"
+		                                                                     : "WINDOW_PARTITION");
 		ivm_query = "";
 	} else {
 		// splitting the query in two to make it easier to turn into string (insertions are the same)

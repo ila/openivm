@@ -68,7 +68,10 @@ enum class IVMType : uint8_t {
 	FULL_REFRESH,
 	AGGREGATE_HAVING,
 	WINDOW_PARTITION, // window functions — partition-level recompute
-	GROUP_RECOMPUTE   // inner-DISTINCT-under-AGG: DELETE+INSERT only the GROUP BY keys touched by source deltas
+	GROUP_RECOMPUTE, // inner-DISTINCT-under-AGG fallback: DELETE+INSERT only the GROUP BY keys touched by source deltas
+	TOP_K,           // LIMIT/TOP-N — DBSP I_k bounded integration over an inner-shadow MV + auxiliary sorted index
+	DISTINCT_INCREMENTAL // inner-DISTINCT-under-AGG with aux state (ivm_distinct_aux_state=true): DBSP-correct
+	                     // distinct(R)=sgn(R[t]); per-tuple count table emits ±1 only on count transitions
 };
 
 } // namespace duckdb

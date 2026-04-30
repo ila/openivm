@@ -717,3 +717,61 @@ query I
 SELECT type FROM _duckdb_ivm_views WHERE view_name = 'idist_mv';
 ----
 6
+
+# Flag `ivm_distinct_aux_state` routes single-source inner-DISTINCT-under-AGG
+# views to IVMType::DISTINCT_INCREMENTAL (8) at CREATE time. The actual
+# aux-state SQL pipeline isn't wired yet — it falls through to the
+# GROUP_RECOMPUTE compile path as a stub — but the classification surface
+# is stable so the eventual implementation can replace just the upsert SQL
+# without touching parser/dispatch.
+statement ok
+SET ivm_distinct_aux_state = true;
+
+statement ok
+CREATE TABLE idist_u2 (grp INT, machine VARCHAR, cores INT);
+
+statement ok
+INSERT INTO idist_u2 VALUES (1, 'm1', 8), (1, 'm1', 8), (1, 'm2', 16), (2, 'm3', 4);
+
+statement ok
+CREATE MATERIALIZED VIEW idist_mv_aux AS
+    SELECT grp, SUM(cores) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cores FROM idist_u2 WHERE machine IS NOT NULL) d
+    GROUP BY grp;
+
+# Single-source view classifies as DISTINCT_INCREMENTAL (type 8).
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'idist_mv_aux';
+----
+8
+
+# Refresh still produces correct results (via the GROUP_RECOMPUTE fallback for now).
+statement ok
+INSERT INTO idist_u2 VALUES (2, 'm3', 4), (1, 'm5', 32);
+
+statement ok
+PRAGMA ivm('idist_mv_aux');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u2 WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM idist_mv_aux
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM idist_mv_aux
+    EXCEPT ALL
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u2 WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+);
+----
+0
+
+statement ok
+SET ivm_distinct_aux_state = false;

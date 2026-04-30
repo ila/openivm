@@ -147,6 +147,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "use incremental MERGE for FULL OUTER JOIN aggregates (Zhang & Larson) "
 	                             "instead of group-recompute",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("ivm_distinct_aux_state",
+	                             "use auxiliary count state for inner DISTINCT under aggregate (DBSP "
+	                             "distinct(R)=sgn(R[t]) — emit ±1 only on count transitions across zero) "
+	                             "instead of GROUP_RECOMPUTE. Single-source views only in v0; multi-source "
+	                             "views fall back to GROUP_RECOMPUTE.",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Learned cost model
 	db_config.AddExtensionOption("ivm_cost_decay",
@@ -320,9 +326,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    // Query IVMType directly, same pattern as GetRefreshInterval — returns
 		    // 'unknown' on failure rather than throwing. Order MUST mirror IVMType enum
 		    // in src/include/core/openivm_constants.hpp.
-		    static const char *kTypeNames[] = {"aggregate_group", "simple_aggregate", "simple_projection",
-		                                       "full_refresh",    "aggregate_having", "window_partition",
-		                                       "group_recompute"};
+		    static const char *kTypeNames[] = {
+		        "aggregate_group",     "simple_aggregate", "simple_projection", "full_refresh",
+		        "aggregate_having",    "window_partition", "group_recompute",   "top_k",
+		        "distinct_incremental"};
 		    string strategy_str = "'unknown'";
 		    auto type_result = con.Query("SELECT type FROM " + string(ivm::VIEWS_TABLE) + " WHERE view_name = '" +
 		                                 OpenIVMUtils::EscapeValue(view_name) + "'");
