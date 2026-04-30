@@ -101,6 +101,23 @@ static string BuildNullSafeKeyPredicate(const vector<string> &columns, const str
 	return result;
 }
 
+static string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col) {
+	if (!has_ts_col) {
+		return "";
+	}
+	auto last_refresh_result =
+	    con.Query("SELECT COALESCE(last_refresh_ts, last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
+	              " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' LIMIT 1");
+	if (last_refresh_result->HasError() || last_refresh_result->RowCount() == 0) {
+		return "";
+	}
+	auto ts = last_refresh_result->GetValue(0, 0);
+	if (ts.IsNull()) {
+		return "";
+	}
+	return string(ivm::TIMESTAMP_COL) + " > '" + ts.ToString() + "'::TIMESTAMP";
+}
+
 static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name, const string &view_query_sql,
                                   bool cross_system, const string &attached_catalog = "",
                                   const string &attached_schema = "", const string &catalog_prefix = "",
@@ -706,18 +723,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// ts = that refresh's now(); we need last_refresh_ts >= that now() so the
 	// filter `ts > last_refresh_ts` correctly excludes them. Using last_update
 	// here would under-filter and let prior companion rows get re-processed.
-	string delta_ts_filter;
-	if (has_ts_col) {
-		auto last_refresh_result =
-		    con.Query("SELECT COALESCE(last_refresh_ts, last_update) FROM " + string(ivm::DELTA_TABLES_TABLE) +
-		              " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' LIMIT 1");
-		if (!last_refresh_result->HasError() && last_refresh_result->RowCount() > 0) {
-			auto ts = last_refresh_result->GetValue(0, 0);
-			if (!ts.IsNull()) {
-				delta_ts_filter = string(ivm::TIMESTAMP_COL) + " > '" + ts.ToString() + "'::TIMESTAMP";
-			}
-		}
-	} // has_ts_col
+	string delta_ts_filter = BuildDeltaTimestampFilter(con, view_name, has_ts_col);
 
 	// Detect LEFT JOIN: the parser adds _ivm_left_key as a hidden column for LEFT/RIGHT JOIN views.
 	// If the MV has this column, use it for the partial recompute filter.
