@@ -169,19 +169,17 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	OPENIVM_DEBUG_PRINT("[CreateDeltaGet] Creating delta get for view '%s', original table_index=%lu\n",
 	                    view_name.c_str(), (unsigned long)old_get->table_index);
 
+	auto *source_table = old_get->GetTable().get();
+	if (!source_table) {
+		throw Exception(ExceptionType::BINDER,
+		                "IVM: cannot create a delta scan for a table function in view '" + view_name + "'");
+	}
+
 	optional_ptr<TableCatalogEntry> opt_catalog_entry;
 	{
-		string delta_table;
-		string delta_table_schema;
-		string delta_table_catalog;
-		if (old_get->GetTable().get() == nullptr) {
-			delta_table_schema = "public";
-			delta_table_catalog = "p"; // todo
-		} else {
-			delta_table = OpenIVMUtils::DeltaName(old_get->GetTable().get()->name);
-			delta_table_schema = old_get->GetTable().get()->schema.name;
-			delta_table_catalog = old_get->GetTable().get()->catalog.GetName();
-		}
+		string delta_table = OpenIVMUtils::DeltaName(source_table->name);
+		string delta_table_schema = source_table->schema.name;
+		string delta_table_catalog = source_table->catalog.GetName();
 		QueryErrorContext error_context;
 		opt_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
 		    context, delta_table_catalog, delta_table_schema, delta_table, OnEntryNotFound::RETURN_NULL, error_context);
@@ -240,6 +238,10 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	if (r->HasError()) {
 		throw Exception(ExceptionType::EXECUTOR, "IVM: failed to read last_update for view '" + view_name +
 		                                             "', table '" + table_name + "': " + r->GetError());
+	}
+	if (r->RowCount() == 0 || r->GetValue(0, 0).IsNull()) {
+		throw Exception(ExceptionType::CATALOG,
+		                "IVM: missing last_update for view '" + view_name + "', table '" + table_name + "'");
 	}
 	auto ts_value = r->GetValue(0, 0);
 	if (ts_value.type() != LogicalType::TIMESTAMP) {
