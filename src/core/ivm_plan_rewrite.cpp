@@ -776,55 +776,75 @@ static void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
 	}
 }
 
-/// Add _ivm_left_key (and _ivm_right_key for FULL OUTER) projection at the top of the plan.
-static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan) {
-	// Find the first LEFT/RIGHT/OUTER JOIN and extract key bindings
+struct OuterJoinBindings {
 	bool found = false;
 	bool is_full_outer = false;
-	ColumnBinding key_binding;
-	LogicalType key_type;
+	ColumnBinding preserved_key_binding;
+	LogicalType preserved_key_type;
 	ColumnBinding right_key_binding;
 	LogicalType right_key_type;
+	ColumnBinding null_side_binding;
+	LogicalType null_side_type;
+	ColumnBinding left_side_binding;
+	LogicalType left_side_type;
+};
 
-	std::function<void(LogicalOperator *)> find = [&](LogicalOperator *n) {
-		if (found) {
-			return;
-		}
-		if (n->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-			auto &join = n->Cast<LogicalComparisonJoin>();
-			if ((join.join_type == JoinType::LEFT || join.join_type == JoinType::RIGHT ||
-			     join.join_type == JoinType::OUTER) &&
-			    !join.conditions.empty()) {
-				found = true;
-				is_full_outer = (join.join_type == JoinType::OUTER);
-				// For LEFT/OUTER: preserved side is left; for RIGHT: preserved side is right
-				auto &preserved =
-				    (join.join_type == JoinType::RIGHT) ? join.conditions[0].right : join.conditions[0].left;
-				if (preserved->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-					auto &ref = preserved->Cast<BoundColumnRefExpression>();
-					key_binding = ref.binding;
-					key_type = ref.return_type;
-				}
-				// For FULL OUTER: also extract the right-side key
-				if (is_full_outer) {
-					auto &right_key = join.conditions[0].right;
-					if (right_key->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-						auto &ref = right_key->Cast<BoundColumnRefExpression>();
-						right_key_binding = ref.binding;
-						right_key_type = ref.return_type;
-					}
-				}
-			}
-		}
-		for (auto &child : n->children) {
-			find(child.get());
-		}
-	};
-	find(plan.get());
+static bool IsOuterJoin(JoinType join_type) {
+	return join_type == JoinType::LEFT || join_type == JoinType::RIGHT || join_type == JoinType::OUTER;
+}
 
-	if (!found) {
+static void ReadColumnRefBinding(const unique_ptr<Expression> &expr, ColumnBinding &binding, LogicalType &type) {
+	if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
 		return;
 	}
+	auto &ref = expr->Cast<BoundColumnRefExpression>();
+	binding = ref.binding;
+	type = ref.return_type;
+}
+
+static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan) {
+	OuterJoinBindings bindings;
+
+	std::function<bool(LogicalOperator *)> find = [&](LogicalOperator *node) {
+		if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+			auto &join = node->Cast<LogicalComparisonJoin>();
+			if (IsOuterJoin(join.join_type) && !join.conditions.empty()) {
+				auto &condition = join.conditions[0];
+				bindings.found = true;
+				bindings.is_full_outer = join.join_type == JoinType::OUTER;
+
+				auto &preserved_key = join.join_type == JoinType::RIGHT ? condition.right : condition.left;
+				ReadColumnRefBinding(preserved_key, bindings.preserved_key_binding, bindings.preserved_key_type);
+				ReadColumnRefBinding(condition.right, bindings.right_key_binding, bindings.right_key_type);
+
+				auto &null_side = join.join_type == JoinType::RIGHT ? condition.left : condition.right;
+				ReadColumnRefBinding(null_side, bindings.null_side_binding, bindings.null_side_type);
+				ReadColumnRefBinding(condition.left, bindings.left_side_binding, bindings.left_side_type);
+				return true;
+			}
+		}
+		for (auto &child : node->children) {
+			if (find(child.get())) {
+				return true;
+			}
+		}
+		return false;
+	};
+	find(plan);
+	return bindings;
+}
+
+/// Add _ivm_left_key (and _ivm_right_key for FULL OUTER) projection at the top of the plan.
+static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan) {
+	auto outer_join = FindFirstOuterJoinBindings(plan.get());
+	if (!outer_join.found) {
+		return;
+	}
+	bool is_full_outer = outer_join.is_full_outer;
+	auto key_binding = outer_join.preserved_key_binding;
+	auto key_type = outer_join.preserved_key_type;
+	auto right_key_binding = outer_join.right_key_binding;
+	auto right_key_type = outer_join.right_key_type;
 
 	// Skip _ivm_left_key for plans with AGGREGATE above the LEFT JOIN.
 	// These use group-recompute (not partial LEFT JOIN recompute), so the key isn't needed
@@ -1017,53 +1037,15 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 /// These hidden aggregates track how many rows match from each side (Larson & Zhou / Zhang & Larson).
 /// When match_count=0, aggregate columns from that side should be NULL.
 static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
-	// Find the LEFT/RIGHT/OUTER JOIN and extract null-supplying side bindings
-	bool found = false;
-	bool is_full_outer = false;
-	ColumnBinding null_side_binding;
-	LogicalType null_side_type;
-	ColumnBinding left_side_binding;
-	LogicalType left_side_type;
-
-	std::function<void(LogicalOperator *)> find = [&](LogicalOperator *n) {
-		if (found) {
-			return;
-		}
-		if (n->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-			auto &join = n->Cast<LogicalComparisonJoin>();
-			if ((join.join_type == JoinType::LEFT || join.join_type == JoinType::RIGHT ||
-			     join.join_type == JoinType::OUTER) &&
-			    !join.conditions.empty()) {
-				found = true;
-				is_full_outer = (join.join_type == JoinType::OUTER);
-				// Null-supplying side (right for LEFT/OUTER, left for RIGHT)
-				auto &null_side =
-				    (join.join_type == JoinType::RIGHT) ? join.conditions[0].left : join.conditions[0].right;
-				if (null_side->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-					auto &ref = null_side->Cast<BoundColumnRefExpression>();
-					null_side_binding = ref.binding;
-					null_side_type = ref.return_type;
-				}
-				// For FULL OUTER: also extract the left-side key (both sides are null-supplying)
-				if (is_full_outer) {
-					auto &left_key = join.conditions[0].left;
-					if (left_key->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-						auto &ref = left_key->Cast<BoundColumnRefExpression>();
-						left_side_binding = ref.binding;
-						left_side_type = ref.return_type;
-					}
-				}
-			}
-		}
-		for (auto &child : n->children) {
-			find(child.get());
-		}
-	};
-	find(plan.get());
-
-	if (!found) {
+	auto outer_join = FindFirstOuterJoinBindings(plan.get());
+	if (!outer_join.found) {
 		return;
 	}
+	bool is_full_outer = outer_join.is_full_outer;
+	auto null_side_binding = outer_join.null_side_binding;
+	auto null_side_type = outer_join.null_side_type;
+	auto left_side_binding = outer_join.left_side_binding;
+	auto left_side_type = outer_join.left_side_type;
 
 	// Only applies to aggregate plans (PROJECTION → AGGREGATE → ...).
 	// For SIMPLE_PROJECTION outer JOINs, match count isn't needed (partial recompute via keys).
