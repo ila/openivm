@@ -544,8 +544,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			//   (A) LOGICAL_TOP_N → child  [top_n disabled by LPTS — never reached here]
 			//   (B) LOGICAL_LIMIT → LOGICAL_ORDER_BY → child  [LPTS active — common case]
 			//
-			// For projection top-k (no GROUP BY): leave the plan as-is; LPTS will fail and
-			// fall back to original_view_query (which contains ORDER BY LIMIT).
+			// Projection top-k uses the same split: maintain the unlimited projection in
+			// the data table and apply ORDER BY ... LIMIT in the user-facing view.
 			{
 				LogicalOperator *limit_node = nullptr;
 				LogicalOperator *order_node = nullptr;
@@ -563,11 +563,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 
 				if (limit_node) {
-					// Strip top-K unconditionally — data table stores the unlimited result and
-					// the user-facing VIEW applies ORDER BY ... LIMIT at read time. This works
-					// for both aggregate and projection top-K (the previous "aggregate-only"
-					// guard forced projection top-K through RECOMPUTE; we now incrementalize the
-					// underlying SIMPLE_PROJECTION instead).
+					// Strip top-k unconditionally. The data table stores the unlimited result,
+					// while the user-facing view applies ORDER BY ... LIMIT at read time.
 					if (limit_node->type == LogicalOperatorType::LOGICAL_TOP_N) {
 						auto &top_n = limit_node->Cast<LogicalTopN>();
 						top_k_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names);
@@ -1094,7 +1091,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// ROLLUP / CUBE / GROUPING SETS produce multiple grouping sets per row;
 			// the incremental aggregate path can't decompose them yet. Use FULL_REFRESH
 			// (always recompute, no empty-delta short-circuit) until per-grouping-set
-			// explosion lands. See plan §7.
+			// expansion into UNION ALL lands.
 			ivm_type = IVMType::FULL_REFRESH;
 		} else if (!ivm_compatible) {
 			ivm_type = IVMType::FULL_REFRESH;

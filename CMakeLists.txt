@@ -33,6 +33,7 @@ set(EXTENSION_SOURCES
     src/rules/union.cpp
     src/rules/distinct.cpp
     src/rules/window.cpp
+    src/rules/topk.cpp
     src/rules/column_hider.cpp
     src/core/openivm_refresh_locks.cpp
     src/core/openivm_refresh_daemon.cpp

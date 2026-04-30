@@ -809,3 +809,117 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# Projection top-k: ORDER BY + LIMIT without GROUP BY
+# Maintains the unlimited projection incrementally; the view applies top-k at read time.
+# ============================================================
+
+statement ok
+CREATE TABLE topkp_t (id INT, name VARCHAR, score INT);
+
+statement ok
+INSERT INTO topkp_t VALUES (1,'alice',80),(2,'bob',95),(3,'carol',70),(4,'dave',88),(5,'eve',92);
+
+statement ok
+CREATE MATERIALIZED VIEW topkp_mv AS
+  SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3;
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topkp_mv
+  EXCEPT ALL
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topkp_mv
+);
+----
+0
+
+# Insert a new top-scorer
+statement ok
+INSERT INTO topkp_t VALUES (6,'frank',99);
+
+statement ok
+PRAGMA ivm('topkp_mv');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topkp_mv
+  EXCEPT ALL
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topkp_mv
+);
+----
+0
+
+# Delete a top-scorer
+statement ok
+DELETE FROM topkp_t WHERE id = 6;
+
+statement ok
+PRAGMA ivm('topkp_mv');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topkp_mv
+  EXCEPT ALL
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topkp_mv
+);
+----
+0
+
+# --- stress: batch INSERT + DELETE + UPDATE before single refresh ---
+statement ok
+INSERT INTO topkp_t VALUES (7,'grace',100),(8,'heidi',60);
+
+statement ok
+DELETE FROM topkp_t WHERE id IN (1,3);
+
+statement ok
+UPDATE topkp_t SET score = 50 WHERE id = 2;
+
+statement ok
+PRAGMA ivm('topkp_mv');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topkp_mv
+  EXCEPT ALL
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topkp_mv
+);
+----
+0

@@ -325,3 +325,95 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Projection top-k: ORDER BY + LIMIT without GROUP BY
+# ==========================================
+
+statement ok
+CREATE TABLE dl.topkp (id INT, name VARCHAR, score INT);
+
+statement ok
+INSERT INTO dl.topkp VALUES
+    (1,'alice',80),(2,'bob',95),(3,'carol',70),(4,'dave',88),(5,'eve',92);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.topkp_mv AS
+    SELECT id, name, score FROM dl.topkp ORDER BY score DESC LIMIT 3;
+
+statement ok
+PRAGMA ivm('topkp_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name, score FROM dl.topkp_mv
+    EXCEPT ALL
+    SELECT * FROM (SELECT id, name, score FROM dl.topkp ORDER BY score DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (SELECT id, name, score FROM dl.topkp ORDER BY score DESC LIMIT 3) _q
+    EXCEPT ALL
+    SELECT id, name, score FROM dl.topkp_mv
+);
+----
+0
+
+# Insert a new top scorer (frank=99 enters top-3)
+statement ok
+INSERT INTO dl.topkp VALUES (6,'frank',99);
+
+statement ok
+PRAGMA ivm('topkp_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name, score FROM dl.topkp_mv
+    EXCEPT ALL
+    SELECT * FROM (SELECT id, name, score FROM dl.topkp ORDER BY score DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (SELECT id, name, score FROM dl.topkp ORDER BY score DESC LIMIT 3) _q
+    EXCEPT ALL
+    SELECT id, name, score FROM dl.topkp_mv
+);
+----
+0
+
+# Stress: conflicting INSERT + DELETE + UPDATE before single refresh
+statement ok
+INSERT INTO dl.topkp VALUES (7,'grace',100),(8,'heidi',60);
+
+statement ok
+DELETE FROM dl.topkp WHERE id = 6;
+
+statement ok
+UPDATE dl.topkp SET score = 50 WHERE id = 2;
+
+statement ok
+PRAGMA ivm('topkp_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name, score FROM dl.topkp_mv
+    EXCEPT ALL
+    SELECT * FROM (SELECT id, name, score FROM dl.topkp ORDER BY score DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (SELECT id, name, score FROM dl.topkp ORDER BY score DESC LIMIT 3) _q
+    EXCEPT ALL
+    SELECT id, name, score FROM dl.topkp_mv
+);
+----
+0

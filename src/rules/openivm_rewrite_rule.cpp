@@ -6,6 +6,7 @@
 #include "rules/join.hpp"
 #include "rules/projection.hpp"
 #include "rules/scan.hpp"
+#include "rules/topk.hpp"
 #include "rules/union.hpp"
 #include "rules/window.hpp"
 #include "core/openivm_constants.hpp"
@@ -130,6 +131,12 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 	}
 	case LogicalOperatorType::LOGICAL_WINDOW: {
 		IvmWindowRule rule;
+		return rule.Rewrite(pw);
+	}
+	case LogicalOperatorType::LOGICAL_TOP_N:
+	case LogicalOperatorType::LOGICAL_LIMIT:
+	case LogicalOperatorType::LOGICAL_ORDER_BY: {
+		IvmTopKRule rule;
 		return rule.Rewrite(pw);
 	}
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {

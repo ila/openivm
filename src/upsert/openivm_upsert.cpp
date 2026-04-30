@@ -1246,8 +1246,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		break;
 	}
 	case IVMType::TOP_K:
-		// TOP_K is reserved for a future DBSP-correct bounded integration path; the classifier
-		// never assigns it today, so this case is unreachable in practice.
+		// Top-k is handled before this enum: the parser strips ORDER BY/LIMIT into
+		// the user-facing view and classifies the maintained data query as
+		// AGGREGATE_GROUP or SIMPLE_PROJECTION. The TOP_K enum is not assigned.
 		[[fallthrough]];
 	case IVMType::FULL_REFRESH: {
 		// Should not reach here — full refresh is handled earlier via BuildRecomputeQuery.

@@ -24,6 +24,37 @@ static const unordered_set<string> &GetSupportedAggregates() {
 	return kSet;
 }
 
+/// Extract a column name from an ORDER BY expression. Returns empty if the expression
+/// isn't a column reference (rejecting non-column ORDER BY in Phase 1 keeps the new-top-k
+/// SQL emission simple — function/CASE/cast expressions over base columns would need a
+/// projection alias).
+static string OrderByColumnName(const Expression &expr) {
+	if (expr.type == ExpressionType::BOUND_COLUMN_REF) {
+		auto &bcr = expr.Cast<BoundColumnRefExpression>();
+		if (!bcr.alias.empty()) {
+			return bcr.alias;
+		}
+		return bcr.GetName();
+	}
+	return string();
+}
+
+/// Populate top_k_order_columns / top_k_order_desc from a vector<BoundOrderByNode>.
+/// Returns false if any entry is non-column-ref (caller should mark ivm_compatible=false).
+static bool ExtractOrderBy(const vector<BoundOrderByNode> &orders, PlanAnalysis &result) {
+	result.top_k_order_columns.clear();
+	result.top_k_order_desc.clear();
+	for (auto &o : orders) {
+		string name = OrderByColumnName(*o.expression);
+		if (name.empty()) {
+			return false;
+		}
+		result.top_k_order_columns.push_back(name);
+		result.top_k_order_desc.push_back(o.type == OrderType::DESCENDING);
+	}
+	return true;
+}
+
 /// Check if any expression in the given list contains a non-deterministic function.
 static bool HasVolatileExpression(vector<unique_ptr<Expression>> &expressions) {
 	for (auto &expr : expressions) {
@@ -222,32 +253,48 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	}
 
 	case LogicalOperatorType::LOGICAL_TOP_N: {
-		// LPTS disables top_n optimizer, so this only appears if LPTS is not loaded.
-		// Transparent: record presence, recurse to child.
+		// TOP_N fuses ORDER BY + LIMIT. Capture both for top-k suffix handling.
 		auto &top_n = node->Cast<LogicalTopN>();
 		result.found_top_k = true;
 		result.top_k_limit = top_n.limit;
+		result.top_k_offset = top_n.offset;
+		if (!ExtractOrderBy(top_n.orders, result)) {
+			result.ivm_compatible = false; // non-column ORDER BY: fall through to FULL_REFRESH
+		}
 		if (!node->children.empty()) {
 			AnalyzeNode(node->children[0].get(), result);
 		}
 		return;
 	}
 
-	case LogicalOperatorType::LOGICAL_ORDER_BY:
-		// Transparent: ORDER BY alone (without LIMIT) is valid and stripped at view-creation time.
-		// It does NOT mark found_top_k — a top-k pattern requires LIMIT.
+	case LogicalOperatorType::LOGICAL_ORDER_BY: {
+		// ORDER BY alone (without LIMIT) is meaningless on an MV (a table has no inherent
+		// order). The IvmTopKRule drops the node from the delta plan; we still capture
+		// the order columns so a sibling LIMIT below this node — see plan shapes where
+		// LPTS keeps them as separate ORDER_BY → LIMIT nodes — has them available for
+		// top-k suffix handling.
+		auto &order = node->Cast<LogicalOrder>();
+		if (result.top_k_order_columns.empty()) {
+			(void)ExtractOrderBy(order.orders, result);
+		}
 		if (!node->children.empty()) {
 			AnalyzeNode(node->children[0].get(), result);
 		}
 		return;
+	}
 
 	case LogicalOperatorType::LOGICAL_LIMIT: {
 		// LPTS disables the top_n optimizer so ORDER BY + LIMIT appear as separate nodes.
 		// LIMIT is what makes a query top-k; ORDER BY alone does not.
 		result.found_top_k = true;
 		auto *limit_node = dynamic_cast<LogicalLimit *>(node);
-		if (limit_node && limit_node->limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
-			result.top_k_limit = limit_node->limit_val.GetConstantValue();
+		if (limit_node) {
+			if (limit_node->limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+				result.top_k_limit = limit_node->limit_val.GetConstantValue();
+			}
+			if (limit_node->offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+				result.top_k_offset = limit_node->offset_val.GetConstantValue();
+			}
 		}
 		if (!node->children.empty()) {
 			AnalyzeNode(node->children[0].get(), result);
