@@ -53,8 +53,8 @@ static string BuildUpdatedAggregateColumn(const string &col) {
 }
 
 static string BuildNullSafeExtremumUpdate(const string &col, const string &fn) {
-	return "CASE WHEN v." + col + " IS NULL THEN d." + col + " WHEN d." + col + " IS NULL THEN v." + col +
-	       " ELSE " + fn + "(v." + col + ", d." + col + ") END";
+	return "CASE WHEN v." + col + " IS NULL THEN d." + col + " WHEN d." + col + " IS NULL THEN v." + col + " ELSE " +
+	       fn + "(v." + col + ", d." + col + ") END";
 }
 
 /// Detect AVG and STDDEV/VARIANCE decomposition columns from the column list.
@@ -843,9 +843,10 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 		}
 	}
 	if (select_columns.empty()) {
-		throw InvalidInputException("Cannot compile projection refresh for materialized view '%s': delta view '%s' has no "
-		                            "user-visible columns",
-		                            view_name, OpenIVMUtils::DeltaName(view_name));
+		throw InvalidInputException(
+		    "Cannot compile projection refresh for materialized view '%s': delta view '%s' has no "
+		    "user-visible columns",
+		    view_name, OpenIVMUtils::DeltaName(view_name));
 	}
 	match_conditions.erase(match_conditions.size() - 5, 5);
 	select_columns.erase(select_columns.size() - 2, 2);

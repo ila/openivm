@@ -318,7 +318,8 @@ static ViewLocation ResolveViewLocation(Connection &con, const string &view_name
 	               "AND table_name = '" +
 	               OpenIVMUtils::EscapeValue(view_name) + "' ORDER BY CASE WHEN table_catalog = '" +
 	               OpenIVMUtils::EscapeValue(fallback_catalog) + "' AND table_schema = '" +
-	               OpenIVMUtils::EscapeValue(fallback_schema) + "' THEN 0 ELSE 1 END, table_catalog, table_schema LIMIT 1";
+	               OpenIVMUtils::EscapeValue(fallback_schema) +
+	               "' THEN 0 ELSE 1 END, table_catalog, table_schema LIMIT 1";
 	auto found = con.Query(query);
 	if (!found->HasError() && found->RowCount() > 0) {
 		catalog_name = found->GetValue(0, 0).ToString();
@@ -415,7 +416,7 @@ static string QualifiedName(const string &catalog_name, const string &schema_nam
 	       OpenIVMUtils::QuoteIdentifier(table_name);
 }
 
-static const string DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
+static constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
 
 // Generate refresh SQL for a single view (no cascade logic).
 static string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name,
@@ -684,8 +685,8 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		auto upstream = metadata.GetUpstreamViews(view_name);
 		for (auto &dep : upstream) {
 			auto dep_location = ResolveViewLocation(con, dep, view_catalog_name, view_schema_name);
-			RefreshViewLocked(context, dep_location.catalog_name, dep_location.schema_name, dep, dep_location.cross_system,
-			                  attached_db_catalog_name, attached_db_schema_name);
+			RefreshViewLocked(context, dep_location.catalog_name, dep_location.schema_name, dep,
+			                  dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name);
 		}
 	}
 
@@ -706,12 +707,11 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 			for (auto &dt : delta_tables) {
 				if (metadata.IsDuckLakeTable(view_name, dt)) {
 					Connection snap_con(*context.db.get());
-					auto loc = ResolveDuckLakeSourceLocation(snap_con, view_name, dt, view_catalog_name,
-					                                         view_schema_name, attached_db_catalog_name,
-					                                         attached_db_schema_name);
-					auto cur_snap_result =
-					    snap_con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(loc.catalog_name) +
-					                   ".current_snapshot()");
+					auto loc =
+					    ResolveDuckLakeSourceLocation(snap_con, view_name, dt, view_catalog_name, view_schema_name,
+					                                  attached_db_catalog_name, attached_db_schema_name);
+					auto cur_snap_result = snap_con.Query(
+					    "SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot()");
 					if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0 ||
 					    cur_snap_result->GetValue(0, 0).IsNull()) {
 						all_empty = false;
@@ -778,8 +778,8 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		auto downstream = metadata.GetDownstreamViews(view_name);
 		for (auto &dep : downstream) {
 			auto dep_location = ResolveViewLocation(con, dep, view_catalog_name, view_schema_name);
-			RefreshViewLocked(context, dep_location.catalog_name, dep_location.schema_name, dep, dep_location.cross_system,
-			                  attached_db_catalog_name, attached_db_schema_name);
+			RefreshViewLocked(context, dep_location.catalog_name, dep_location.schema_name, dep,
+			                  dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name);
 		}
 	}
 }
@@ -1023,9 +1023,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			if (metadata.IsDuckLakeTable(view_name, dt)) {
 				auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
 				                                         attached_db_catalog_name, attached_db_schema_name);
-				auto cur_snap_result =
-				    con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(loc.catalog_name) +
-				              ".current_snapshot()");
+				auto cur_snap_result = con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(loc.catalog_name) +
+				                                 ".current_snapshot()");
 				auto last_snap = metadata.GetLastSnapshotId(view_name, dt);
 				if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0 ||
 				    cur_snap_result->GetValue(0, 0).IsNull()) {
@@ -1038,12 +1037,11 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 					continue; // no changes — empty delta
 				}
 				tables_with_changes++;
-				auto del_result =
-				    con.Query("SELECT COUNT(*) FROM ducklake_table_deletions('" +
-				              OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
-				              OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
-				              OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
-				              to_string(cur_snap) + ")");
+				auto del_result = con.Query("SELECT COUNT(*) FROM ducklake_table_deletions('" +
+				                            OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
+				                            OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
+				                            OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) +
+				                            ", " + to_string(cur_snap) + ")");
 				if (del_result->HasError() || del_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
 					any_has_deletes = true;
 				}
@@ -1460,9 +1458,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		string recompute_ducklake_catalog =
 		    ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
 		string recompute_ducklake_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
-		auto delta_specs =
-		    BuildGroupRecomputeDeltaSpecs(metadata, view_name, con, delta_table_names, recompute_ducklake_catalog,
-		                                  recompute_ducklake_schema);
+		auto delta_specs = BuildGroupRecomputeDeltaSpecs(metadata, view_name, con, delta_table_names,
+		                                                 recompute_ducklake_catalog, recompute_ducklake_schema);
 		// LPTS emits fully-qualified `cat.schema.tbl` even when the catalog is the default
 		// `memory` (where `catalog_prefix` for SQL emission is empty). Reconstruct the
 		// always-qualified prefix so the source-table substitution finds the LPTS form
@@ -1777,8 +1774,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		if (cross_system) {
 			continue;
 		}
-		string resolved = dt;
-		delete_from_delta_table_query += IVMMetadata::BuildDeltaCleanupSQL(resolved, dt);
+		delete_from_delta_table_query += IVMMetadata::BuildDeltaCleanupSQL(dt, dt);
 	}
 
 	// Crash safety: set flag before the critical section, clear after last_update is set.

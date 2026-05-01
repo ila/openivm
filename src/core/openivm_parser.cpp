@@ -1576,7 +1576,7 @@ static bool ExtractInSubquery(const string &original_sql, SemiAntiExtract &out) 
 	size_t left_pos = 0;
 	string left_ident;
 	if (ReadIdentifierToken(left_from, left_pos, left_ident)) {
-		string candidate_table = left_ident;
+		const string &candidate_table = left_ident;
 		string candidate_alias = LastIdentifierPart(left_ident);
 		size_t left_alias_pos = left_pos;
 		string maybe_left_alias;
