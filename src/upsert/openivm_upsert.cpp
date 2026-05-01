@@ -22,6 +22,7 @@
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include <cctype>
 #include <chrono>
 
 namespace duckdb {
@@ -414,6 +415,103 @@ static string BuildLptsTablePrefix(const string &view_catalog_name, const string
 static string QualifiedName(const string &catalog_name, const string &schema_name, const string &table_name) {
 	return OpenIVMUtils::QuoteIdentifier(catalog_name) + "." + OpenIVMUtils::QuoteIdentifier(schema_name) + "." +
 	       OpenIVMUtils::QuoteIdentifier(table_name);
+}
+
+static bool IsIdentifierChar(char c) {
+	return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.';
+}
+
+static bool IdentifierMatchesTable(const string &identifier, const string &table_name) {
+	if (StringUtil::CIEquals(identifier, table_name)) {
+		return true;
+	}
+	if (identifier.size() <= table_name.size()) {
+		return false;
+	}
+	auto suffix = identifier.substr(identifier.size() - table_name.size());
+	return identifier[identifier.size() - table_name.size() - 1] == '.' && StringUtil::CIEquals(suffix, table_name);
+}
+
+static string ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement) {
+	if (table_name.empty()) {
+		return sql;
+	}
+	string result;
+	result.reserve(sql.size());
+	bool in_single_quote = false;
+	bool expect_table = false;
+	for (idx_t i = 0; i < sql.size();) {
+		char c = sql[i];
+		if (c == '\'') {
+			result += c;
+			i++;
+			if (in_single_quote && i < sql.size() && sql[i] == '\'') {
+				result += sql[i++];
+				continue;
+			}
+			in_single_quote = !in_single_quote;
+			continue;
+		}
+		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
+			idx_t start = i;
+			bool in_identifier_quote = c == '"';
+			i++;
+			while (i < sql.size()) {
+				char nc = sql[i];
+				if (in_identifier_quote) {
+					i++;
+					if (nc == '"') {
+						break;
+					}
+					continue;
+				}
+				if (!IsIdentifierChar(nc)) {
+					break;
+				}
+				i++;
+			}
+			string token = sql.substr(start, i - start);
+			string unquoted = token;
+			if (unquoted.size() >= 2 && unquoted.front() == '"' && unquoted.back() == '"') {
+				unquoted = unquoted.substr(1, unquoted.size() - 2);
+			}
+			if (expect_table && IdentifierMatchesTable(unquoted, table_name)) {
+				result += replacement;
+				expect_table = false;
+				continue;
+			}
+			result += token;
+			string lower = StringUtil::Lower(unquoted);
+			expect_table = lower == "from" || lower == "join" || lower == "update" || lower == "into";
+			continue;
+		}
+		result += c;
+		if (!std::isspace(static_cast<unsigned char>(c))) {
+			expect_table = false;
+		}
+		i++;
+	}
+	return result;
+}
+
+static string BuildDuckLakeSnapshotQuery(IVMMetadata &metadata, Connection &con, const string &view_name,
+                                         const string &view_query_sql, const vector<string> &delta_table_names,
+                                         const string &view_catalog_name, const string &view_schema_name,
+                                         const string &attached_db_catalog_name,
+                                         const string &attached_db_schema_name) {
+	string snapshot_query = view_query_sql;
+	for (auto &dt : delta_table_names) {
+		if (!metadata.IsDuckLakeTable(view_name, dt)) {
+			continue;
+		}
+		int64_t old_snap = metadata.GetLastSnapshotId(view_name, dt);
+		auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
+		                                         attached_db_catalog_name, attached_db_schema_name);
+		string replacement = "(SELECT * FROM " + QualifiedName(loc.catalog_name, loc.schema_name, loc.table_name) +
+		                     " AT (VERSION => " + to_string(old_snap) + "))";
+		snapshot_query = ReplaceTableReferences(snapshot_query, loc.table_name, replacement);
+	}
+	return snapshot_query;
 }
 
 static constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
@@ -1332,11 +1430,11 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				break;
 			}
 		}
-		// Only use snapshot-diff recompute when safe: single base table AND every partition col
-		// is in the MV's output (so the WHERE can filter). Otherwise fall back to full recompute —
-		// CompileWindowRecompute's native path references _duckdb_ivm_timestamp which DuckLake
-		// tables lack, so we must not reach it for any DuckLake window.
-		bool safe_for_snapdiff = any_ducklake && !partition_cols.empty() && delta_table_names.size() == 1;
+		// Only use snapshot-diff recompute when every partition col is in the MV's output
+		// so the DELETE/INSERT can filter affected partitions. Single-source windows can
+		// derive keys directly from the source table diff; multi-source windows compare the
+		// old/new view's partition-key projection at DuckLake snapshots.
+		bool safe_for_snapdiff = any_ducklake && !partition_cols.empty();
 		if (safe_for_snapdiff) {
 			for (auto &pc : partition_cols) {
 				auto parsed = split_partition_spec(pc);
@@ -1346,7 +1444,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				}
 			}
 		}
-		if (safe_for_snapdiff) {
+		if (safe_for_snapdiff && delta_table_names.size() == 1) {
 			const string &base_name = delta_table_names[0];
 			int64_t old_snap = metadata.GetLastSnapshotId(view_name, base_name);
 			auto loc = ResolveDuckLakeSourceLocation(con, view_name, base_name, view_catalog_name, view_schema_name,
@@ -1373,8 +1471,41 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake snapshot-diff, %zu "
 			                    "partition cols, old_snap=%ld)\n",
 			                    partition_cols.size(), (long)old_snap);
+		} else if (safe_for_snapdiff && any_ducklake) {
+			string old_view_query = BuildDuckLakeSnapshotQuery(metadata, con, view_name, view_query_sql, delta_table_names,
+			                                                  view_catalog_name, view_schema_name,
+			                                                  attached_db_catalog_name, attached_db_schema_name);
+			string key_cols;
+			string key_tuple;
+			for (size_t i = 0; i < partition_cols.size(); i++) {
+				if (i > 0) {
+					key_cols += ", ";
+					key_tuple += ", ";
+				}
+				auto parsed = split_partition_spec(partition_cols[i]);
+				string output_col = KeywordHelper::WriteOptionallyQuoted(parsed.first);
+				key_cols += output_col;
+				key_tuple += output_col;
+			}
+			string current_rows = "SELECT * FROM (" + view_query_sql + ") _ivm_current_rows";
+			string old_rows = "SELECT * FROM (" + old_view_query + ") _ivm_old_rows";
+			string changed_rows = "((" + current_rows + ") EXCEPT ALL (" + old_rows + ")) UNION ALL ((" + old_rows +
+			                      ") EXCEPT ALL (" + current_rows + "))";
+			string affected_keys = "SELECT DISTINCT " + key_cols + " FROM (" + changed_rows + ") _ivm_changed_rows";
+			string affected_filter;
+			if (partition_cols.size() == 1) {
+				affected_filter = key_tuple + " IN (" + affected_keys + ")";
+			} else {
+				affected_filter = "(" + key_tuple + ") IN (" + affected_keys + ")";
+			}
+			upsert_query = "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n" + "INSERT INTO " +
+			               data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_recompute\nWHERE " +
+			               affected_filter + ";\n";
+			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake view-diff, %zu "
+			                    "partition cols, %zu sources)\n",
+			                    partition_cols.size(), delta_table_names.size());
 		} else if (any_ducklake) {
-			// DuckLake edge case: multi-table window or partition col not in MV output.
+			// DuckLake edge case: partition col not in MV output.
 			// Full recompute — documented in docs/limitations.md.
 			upsert_query =
 			    "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";

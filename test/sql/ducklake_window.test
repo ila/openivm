@@ -93,3 +93,95 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+statement ok
+CREATE TABLE dl.window_join_events (
+    acct_id INT,
+    event_ts INT,
+    code INT,
+    amount INT
+);
+
+statement ok
+CREATE TABLE dl.window_join_codes (
+    code INT,
+    label VARCHAR
+);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_window_join AS
+SELECT
+    e.acct_id,
+    e.event_ts,
+    c.label,
+    SUM(e.amount) OVER (
+        PARTITION BY e.acct_id
+        ORDER BY e.event_ts
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_amount
+FROM dl.window_join_events e
+LEFT JOIN dl.window_join_codes c
+    ON e.code = c.code;
+
+query I
+SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_window_join';
+----
+acct_id=acct_id
+
+statement ok
+INSERT INTO dl.window_join_codes VALUES (1, 'open');
+
+statement ok
+INSERT INTO dl.window_join_events VALUES
+    (10, 1, 1, 5),
+    (10, 2, 2, 7),
+    (20, 1, 1, 11);
+
+statement ok
+PRAGMA ivm('mv_window_join');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_window_join
+    EXCEPT ALL
+    SELECT
+        e.acct_id,
+        e.event_ts,
+        c.label,
+        SUM(e.amount) OVER (
+            PARTITION BY e.acct_id
+            ORDER BY e.event_ts
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )
+    FROM dl.window_join_events e
+    LEFT JOIN dl.window_join_codes c
+        ON e.code = c.code
+);
+----
+0
+
+statement ok
+INSERT INTO dl.window_join_codes VALUES (2, 'closed');
+
+statement ok
+PRAGMA ivm('mv_window_join');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_window_join
+    EXCEPT ALL
+    SELECT
+        e.acct_id,
+        e.event_ts,
+        c.label,
+        SUM(e.amount) OVER (
+            PARTITION BY e.acct_id
+            ORDER BY e.event_ts
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )
+    FROM dl.window_join_events e
+    LEFT JOIN dl.window_join_codes c
+        ON e.code = c.code
+);
+----
+0

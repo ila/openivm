@@ -1968,6 +1968,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				table_names.insert(entry.second.table_name);
 			}
 		}
+		unordered_map<string, OpenIVMDuckLakeTableInfo> dl_table_info_for_classification;
+		CollectDuckLakeTables(plan.get(), current_catalog, dl_table_info_for_classification);
 
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 		vector<string> output_names;
@@ -2299,11 +2301,25 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 
-		// Window over join: partition columns may come from a joined table whose delta
-		// doesn't have that column. We can't resolve joins at refresh time without LPTS
-		// support for WINDOW. Fall back to full recompute for window+join views.
-		// Single-table window views keep partition-level recompute.
-		if (classification.found_window && classification.found_join) {
+		// Window over join: non-DuckLake delta tables may not expose the partition key for
+		// every changed source, so native window recompute could miss partitions. DuckLake
+		// can compare the old/new view result at source snapshots, so it can safely keep
+		// partition keys even for multi-source window joins.
+		bool all_sources_are_ducklake = !table_names.empty() && table_names.size() == dl_table_info_for_classification.size();
+		if (all_sources_are_ducklake) {
+			for (const auto &table_name : table_names) {
+				string table_lc = table_name;
+				std::transform(table_lc.begin(), table_lc.end(), table_lc.begin(),
+				               [](unsigned char c) { return std::tolower(c); });
+				if (dl_table_info_for_classification.find(table_lc) == dl_table_info_for_classification.end()) {
+					all_sources_are_ducklake = false;
+					break;
+				}
+			}
+		}
+		bool single_source_window_join = classification.found_window && classification.found_join && table_names.size() == 1;
+		if (classification.found_window && classification.found_join && !single_source_window_join &&
+		    !all_sources_are_ducklake) {
 			window_partition_columns.clear();
 		}
 
