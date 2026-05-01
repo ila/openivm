@@ -181,6 +181,121 @@ SELECT count(*) FROM (SELECT COUNT(*) as cnt FROM dl.counter EXCEPT ALL SELECT c
 0
 
 # ==========================================
+# Group recompute with MIN/MAX plus computed output
+# ==========================================
+
+statement ok
+CREATE TABLE dl.watch_events (
+    customer_id INT,
+    symbol VARCHAR,
+    company_id INT,
+    company_name VARCHAR,
+    event_ts TIMESTAMP,
+    action_type VARCHAR
+);
+
+statement ok
+INSERT INTO dl.watch_events VALUES
+    (1, 'AAA', NULL, NULL, TIMESTAMP '2026-01-01 10:00:00', 'Activate'),
+    (2, 'BBB', 10, 'Beta', TIMESTAMP '2026-01-01 11:00:00', 'Activate');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.watch_history AS
+    SELECT customer_id, symbol, company_id, company_name, event_ts, action_type FROM dl.watch_events;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.watch_state AS
+    WITH s1 AS (
+        SELECT
+            customer_id,
+            symbol,
+            company_id,
+            company_name,
+            CASE action_type WHEN 'Activate' THEN event_ts ELSE NULL END AS placed_timestamp,
+            CASE action_type WHEN 'Cancelled' THEN event_ts ELSE NULL END AS removed_timestamp
+        FROM dl.watch_history
+    )
+    SELECT
+        customer_id,
+        symbol,
+        company_id,
+        company_name,
+        MIN(placed_timestamp) AS placed_timestamp,
+        MAX(removed_timestamp) AS removed_timestamp,
+        CASE WHEN MAX(removed_timestamp) IS NULL THEN 'Active' ELSE 'Inactive' END AS watch_status
+    FROM s1
+    GROUP BY customer_id, symbol, company_id, company_name;
+
+statement ok
+INSERT INTO dl.watch_events VALUES
+    (1, 'AAA', NULL, NULL, TIMESTAMP '2026-01-02 10:00:00', 'Cancelled'),
+    (3, 'CCC', NULL, NULL, TIMESTAMP '2026-01-02 12:00:00', 'Activate');
+
+statement ok
+PRAGMA ivm('watch_history');
+
+statement ok
+PRAGMA ivm('watch_state');
+
+query I
+SELECT count(*) FROM (
+    WITH s1 AS (
+        SELECT
+            customer_id,
+            symbol,
+            company_id,
+            company_name,
+            CASE action_type WHEN 'Activate' THEN event_ts ELSE NULL END AS placed_timestamp,
+            CASE action_type WHEN 'Cancelled' THEN event_ts ELSE NULL END AS removed_timestamp
+        FROM dl.watch_history
+    )
+    SELECT
+        customer_id,
+        symbol,
+        company_id,
+        company_name,
+        MIN(placed_timestamp) AS placed_timestamp,
+        MAX(removed_timestamp) AS removed_timestamp,
+        CASE WHEN MAX(removed_timestamp) IS NULL THEN 'Active' ELSE 'Inactive' END AS watch_status
+    FROM s1
+    GROUP BY customer_id, symbol, company_id, company_name
+    EXCEPT ALL
+    SELECT customer_id, symbol, company_id, company_name, placed_timestamp, removed_timestamp, watch_status FROM dl.watch_state
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT customer_id, symbol, company_id, company_name, placed_timestamp, removed_timestamp, watch_status FROM dl.watch_state
+    EXCEPT ALL
+    SELECT * FROM (
+        WITH s1 AS (
+            SELECT
+                customer_id,
+                symbol,
+                company_id,
+                company_name,
+                CASE action_type WHEN 'Activate' THEN event_ts ELSE NULL END AS placed_timestamp,
+                CASE action_type WHEN 'Cancelled' THEN event_ts ELSE NULL END AS removed_timestamp
+            FROM dl.watch_history
+        )
+        SELECT
+            customer_id,
+            symbol,
+            company_id,
+            company_name,
+            MIN(placed_timestamp) AS placed_timestamp,
+            MAX(removed_timestamp) AS removed_timestamp,
+            CASE WHEN MAX(removed_timestamp) IS NULL THEN 'Active' ELSE 'Inactive' END AS watch_status
+        FROM s1
+        GROUP BY customer_id, symbol, company_id, company_name
+    )
+);
+----
+0
+
+# ==========================================
 # Stress test: batch many conflicting DML ops
 # before a single refresh
 # ==========================================

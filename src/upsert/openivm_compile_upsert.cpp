@@ -399,28 +399,28 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// For MIN/MAX without non-summable cols, insert_only uses GREATEST/LEAST in
 		// the MERGE path below.
 		string keys_tuple;
-		string null_check;
+		string match_delete;
+		string match_insert;
 		for (size_t i = 0; i < keys.size(); i++) {
 			keys_tuple += keys[i];
 			if (i != keys.size() - 1) {
 				keys_tuple += ", ";
 			}
-			if (!null_check.empty()) {
-				null_check += " AND ";
+			if (!match_delete.empty()) {
+				match_delete += " AND ";
+				match_insert += " AND ";
 			}
-			null_check += keys[i] + " IS NULL";
+			match_delete += "_ivm_aff." + keys[i] + " IS NOT DISTINCT FROM _ivm_tgt." + keys[i];
+			match_insert += "_ivm_aff." + keys[i] + " IS NOT DISTINCT FROM _ivm_recompute." + keys[i];
 		}
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-		// The all-NULL group (every key column IS NULL) is unreachable via `(keys) IN (...)`
-		// because NULL IN subquery is NULL, not true. That group is produced by RIGHT/FULL
-		// OUTER JOIN unmatched-right-side rows (NULL pads the left keys). If the delta has
-		// any row with all-NULL keys, we always recompute the NULL group. This is cheap
-		// (at most one group) and correct for INNER/LEFT JOIN too (no such group exists).
 		string affected = "select distinct " + keys_tuple + " from " + delta_view + delta_where;
-		string where = "(" + keys_tuple + ") in (\n  " + affected + "\n) OR (" + null_check + ")";
-		string delete_query = "delete from " + data_table + " where " + where + ";\n";
+		string affected_block = "(\n  " + affected + "\n)";
+		string delete_query = "delete from " + data_table + " AS _ivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " +
+		                      affected_block + " AS _ivm_aff WHERE " + match_delete + "\n);\n";
 		string insert_query = "insert into " + data_table + "\n" + "select * from (" + view_query_sql +
-		                      ") _ivm_recompute\n" + "where " + where + ";\n";
+		                      ") _ivm_recompute\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_block +
+		                      " AS _ivm_aff WHERE " + match_insert + "\n);\n";
 		return delete_query + "\n" + insert_query;
 	}
 
