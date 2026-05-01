@@ -917,6 +917,29 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Insert-only MIN/MAX must handle NULL -> value transitions.
+statement ok
+CREATE TABLE agg_minmax_null_insert (grp VARCHAR, placed TIMESTAMP, removed TIMESTAMP);
+
+statement ok
+INSERT INTO agg_minmax_null_insert VALUES ('a', TIMESTAMP '2026-01-01 10:00:00', NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg_minmax_null_insert AS
+    SELECT grp, MIN(placed) AS placed_at, MAX(removed) AS removed_at
+    FROM agg_minmax_null_insert GROUP BY grp;
+
+statement ok
+INSERT INTO agg_minmax_null_insert VALUES ('a', NULL, TIMESTAMP '2026-01-02 11:00:00');
+
+statement ok
+PRAGMA ivm('mv_agg_minmax_null_insert');
+
+query ITT
+SELECT grp, placed_at, removed_at FROM mv_agg_minmax_null_insert ORDER BY grp;
+----
+a	2026-01-01 10:00:00	2026-01-02 11:00:00
+
 # ==========================================
 # UPDATE that changes GROUP BY key (row moves between groups)
 # ==========================================

@@ -52,6 +52,11 @@ static string BuildUpdatedAggregateColumn(const string &col) {
 	return "COALESCE(v." + col + " + d." + col + ", v." + col + ", d." + col + ")";
 }
 
+static string BuildNullSafeExtremumUpdate(const string &col, const string &fn) {
+	return "CASE WHEN v." + col + " IS NULL THEN d." + col + " WHEN d." + col + " IS NULL THEN v." + col +
+	       " ELSE " + fn + "(v." + col + ", d." + col + ") END";
+}
+
 /// Detect AVG and STDDEV/VARIANCE decomposition columns from the column list.
 /// AVG(x) is stored as _ivm_sum_<alias>, _ivm_count_<alias>, and <alias>.
 /// STDDEV/VARIANCE(x) adds a sum-of-squares column with a prefix encoding the function type:
@@ -555,9 +560,9 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				// Regular aggregate column
 				string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
 				if (insert_only && agg_type == "min") {
-					update_set += column + " = LEAST(v." + column + ", d." + column + ")";
+					update_set += column + " = " + BuildNullSafeExtremumUpdate(column, "LEAST");
 				} else if (insert_only && agg_type == "max") {
-					update_set += column + " = GREATEST(v." + column + ", d." + column + ")";
+					update_set += column + " = " + BuildNullSafeExtremumUpdate(column, "GREATEST");
 				} else if (list_mode) {
 					update_set += column + " = list_transform(list_zip(v." + column + ", d." + column +
 					              "), lambda x: x[1] + x[2])";
