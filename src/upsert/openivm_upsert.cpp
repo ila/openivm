@@ -432,6 +432,18 @@ static bool IdentifierMatchesTable(const string &identifier, const string &table
 	return identifier[identifier.size() - table_name.size() - 1] == '.' && StringUtil::CIEquals(suffix, table_name);
 }
 
+static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement) {
+	if (needle.empty()) {
+		return haystack;
+	}
+	size_t pos = 0;
+	while ((pos = haystack.find(needle, pos)) != string::npos) {
+		haystack.replace(pos, needle.size(), replacement);
+		pos += replacement.size();
+	}
+	return haystack;
+}
+
 static string ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement) {
 	if (table_name.empty()) {
 		return sql;
@@ -530,6 +542,10 @@ static string BuildDuckLakeSnapshotQuery(IVMMetadata &metadata, Connection &con,
 		string replacement = "(SELECT " + visible_cols + " FROM " +
 		                     QualifiedName(loc.catalog_name, loc.schema_name, loc.table_name) + " AT (VERSION => " +
 		                     to_string(old_snap) + "))";
+		snapshot_query = ReplaceAllOccurrences(
+		    snapshot_query, QualifiedName(loc.catalog_name, loc.schema_name, source_name), replacement);
+		snapshot_query = ReplaceAllOccurrences(
+		    snapshot_query, loc.catalog_name + "." + loc.schema_name + "." + source_name, replacement);
 		snapshot_query = ReplaceTableReferences(snapshot_query, loc.table_name, replacement);
 		if (!StringUtil::CIEquals(source_name, loc.table_name)) {
 			snapshot_query = ReplaceTableReferences(snapshot_query, source_name, replacement);

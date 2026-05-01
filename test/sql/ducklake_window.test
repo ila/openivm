@@ -161,6 +161,111 @@ SELECT count(*) FROM (
 0
 
 statement ok
+CREATE TABLE dl.window_upstream_src (
+    acct_id INT,
+    event_ts INT,
+    amount INT
+);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.window_upstream_base AS
+SELECT
+    acct_id,
+    event_ts,
+    amount
+FROM dl.window_upstream_src;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_window_upstream AS
+SELECT
+    acct_id,
+    event_ts,
+    SUM(amount) OVER (
+        PARTITION BY acct_id
+        ORDER BY event_ts DESC
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_amount
+FROM dl.window_upstream_base;
+
+query I
+SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'mv_window_upstream';
+----
+acct_id=acct_id
+
+statement ok
+INSERT INTO dl.window_upstream_src VALUES
+    (1, 10, 100),
+    (2, 10, 200);
+
+statement ok
+PRAGMA ivm('window_upstream_base');
+
+statement ok
+PRAGMA ivm('mv_window_upstream');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_window_upstream
+    EXCEPT ALL
+    SELECT
+        acct_id,
+        event_ts,
+        SUM(amount) OVER (
+            PARTITION BY acct_id
+            ORDER BY event_ts DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )
+    FROM dl.window_upstream_base
+);
+----
+0
+
+statement ok
+INSERT INTO dl.window_upstream_src VALUES
+    (3, 10, 300),
+    (1, 20, 50);
+
+statement ok
+PRAGMA ivm('window_upstream_base');
+
+statement ok
+PRAGMA ivm('mv_window_upstream');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_window_upstream
+    EXCEPT ALL
+    SELECT
+        acct_id,
+        event_ts,
+        SUM(amount) OVER (
+            PARTITION BY acct_id
+            ORDER BY event_ts DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )
+    FROM dl.window_upstream_base
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        acct_id,
+        event_ts,
+        SUM(amount) OVER (
+            PARTITION BY acct_id
+            ORDER BY event_ts DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )
+    FROM dl.window_upstream_base
+    EXCEPT ALL
+    SELECT * FROM dl.mv_window_upstream
+);
+----
+0
+
+statement ok
 INSERT INTO dl.window_join_codes VALUES (2, 'closed');
 
 statement ok
