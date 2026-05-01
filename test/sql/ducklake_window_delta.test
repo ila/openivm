@@ -1,0 +1,114 @@
+# name: test/sql/ducklake_window_delta.test
+# description: DuckLake window refresh should preserve unchanged partition rows
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_window_delta.db' AS dl (TYPE ducklake);
+
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE dl.market(symbol VARCHAR, d INT, price INT);
+
+statement ok
+CREATE TABLE dl.security(symbol VARCHAR, sector VARCHAR);
+
+statement ok
+INSERT INTO dl.market VALUES
+  ('A', 1, 10), ('A', 2, 20), ('A', 3, 30),
+  ('B', 1, 11), ('B', 2, 21), ('B', 3, 31);
+
+statement ok
+INSERT INTO dl.security VALUES ('A', 'tech'), ('B', 'bank');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_market AS
+SELECT
+  symbol,
+  d,
+  price,
+  max(price) OVER (
+    PARTITION BY symbol
+    ORDER BY d
+    ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+  ) AS roll_max
+FROM dl.market;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_market_join AS
+SELECT m.symbol, m.d, m.roll_max, s.sector
+FROM dl.mv_market m
+JOIN dl.security s USING (symbol);
+
+statement ok
+INSERT INTO dl.market VALUES ('A', 4, 25);
+
+statement ok
+PRAGMA ivm('mv_market');
+
+query I
+SELECT count(*) FROM (
+  SELECT symbol, d, price,
+         max(price) OVER (
+           PARTITION BY symbol
+           ORDER BY d
+           ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+         ) AS roll_max
+  FROM dl.market
+  EXCEPT ALL
+  SELECT symbol, d, price, roll_max FROM dl.mv_market
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT symbol, d, price, roll_max FROM dl.mv_market
+  EXCEPT ALL
+  SELECT symbol, d, price,
+         max(price) OVER (
+           PARTITION BY symbol
+           ORDER BY d
+           ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+         ) AS roll_max
+  FROM dl.market
+);
+----
+0
+
+statement ok
+PRAGMA ivm('mv_market_join');
+
+query I
+SELECT count(*) FROM (
+  SELECT symbol, d, roll_max, sector FROM dl.mv_market_join
+  EXCEPT ALL
+  SELECT m.symbol, m.d, m.roll_max, s.sector
+  FROM dl.mv_market m
+  JOIN dl.security s USING (symbol)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT m.symbol, m.d, m.roll_max, s.sector
+  FROM dl.mv_market m
+  JOIN dl.security s USING (symbol)
+  EXCEPT ALL
+  SELECT symbol, d, roll_max, sector FROM dl.mv_market_join
+);
+----
+0
+

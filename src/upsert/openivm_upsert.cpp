@@ -101,6 +101,38 @@ static string BuildNullSafeKeyPredicate(const vector<string> &columns, const str
 	return result;
 }
 
+static string BuildBagDiffPartitionRefresh(const string &data_table, const string &view_query_sql,
+                                           const string &affected_filter, const vector<string> &column_names,
+                                           const string &view_name) {
+	vector<string> data_columns;
+	for (auto &col : column_names) {
+		if (col != string(ivm::MULTIPLICITY_COL)) {
+			data_columns.push_back(col);
+		}
+	}
+	string col_list = JoinQuotedColumns(data_columns);
+	string temp_base = string(ivm::TEMP_TABLE_PREFIX) + view_name;
+	string new_rows = KeywordHelper::WriteOptionallyQuoted(temp_base + "_new_rows");
+	string old_ranked = KeywordHelper::WriteOptionallyQuoted(temp_base + "_old_ranked");
+	string new_ranked = KeywordHelper::WriteOptionallyQuoted(temp_base + "_new_ranked");
+	string match_cols = BuildNullSafeKeyPredicate(data_columns, "n.", "o.");
+
+	return "CREATE TEMP TABLE " + new_rows + " AS\nSELECT * FROM (" + view_query_sql +
+	       ") _ivm_recompute\nWHERE " + affected_filter + ";\n" +
+	       "CREATE TEMP TABLE " + old_ranked + " AS\nSELECT rowid AS _ivm_rowid, *, row_number() OVER "
+	       "(PARTITION BY " +
+	       col_list + " ORDER BY rowid) AS _ivm_rn\nFROM " + data_table + "\nWHERE " + affected_filter + ";\n" +
+	       "CREATE TEMP TABLE " + new_ranked + " AS\nSELECT *, row_number() OVER (PARTITION BY " + col_list +
+	       " ORDER BY " + col_list + ") AS _ivm_rn\nFROM " + new_rows + ";\n" +
+	       "DELETE FROM " + data_table + "\nWHERE rowid IN (\n  SELECT o._ivm_rowid FROM " + old_ranked +
+	       " o\n  WHERE NOT EXISTS (\n    SELECT 1 FROM " + new_ranked + " n\n    WHERE " + match_cols +
+	       " AND n._ivm_rn = o._ivm_rn\n  )\n);\n" +
+	       "INSERT INTO " + data_table + " (" + col_list + ")\nSELECT " + col_list + " FROM " + new_ranked +
+	       " n\nWHERE NOT EXISTS (\n  SELECT 1 FROM " + old_ranked + " o\n  WHERE " + match_cols +
+	       " AND o._ivm_rn = n._ivm_rn\n);\n" +
+	       "DROP TABLE " + new_ranked + ";\nDROP TABLE " + old_ranked + ";\nDROP TABLE " + new_rows + ";\n";
+}
+
 static string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col) {
 	if (!has_ts_col) {
 		return "";
@@ -1367,9 +1399,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				affected_filter += col + " IN (SELECT DISTINCT " + source_col + " FROM (" + diff_sql + ") _ivm_diff_" +
 				                   to_string(i) + ")";
 			}
-			upsert_query = "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n" + "INSERT INTO " +
-			               data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_recompute\nWHERE " +
-			               affected_filter + ";\n";
+			upsert_query =
+			    BuildBagDiffPartitionRefresh(data_table, view_query_sql, affected_filter, column_names, view_name);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake snapshot-diff, %zu "
 			                    "partition cols, old_snap=%ld)\n",
 			                    partition_cols.size(), (long)old_snap);
