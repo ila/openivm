@@ -35,6 +35,7 @@ struct PlanAnalysis {
 	vector<string> aggregate_columns;
 	vector<string> aggregate_types;          // per-column: "min", "max", "sum", "count_star", "count", "avg", "list"
 	vector<string> window_partition_columns; // PARTITION BY columns from window functions
+	vector<idx_t> window_partition_column_indexes; // output indexes for PARTITION BY columns when known
 	size_t group_count = 0;                  // number of GROUP BY expressions
 	idx_t group_index = DConstants::INVALID_INDEX; // aggregate's group_index for binding lookup
 };
