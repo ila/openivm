@@ -1693,28 +1693,56 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			int64_t old_snap = metadata.GetLastSnapshotId(view_name, base_name);
 			auto loc = ResolveDuckLakeSourceLocation(con, view_name, base_name, view_catalog_name, view_schema_name,
 			                                         attached_db_catalog_name, attached_db_schema_name);
-			string qualified_base = QualifiedName(loc.catalog_name, loc.schema_name, loc.table_name);
-			string snap_clause = " AT (VERSION => " + to_string(old_snap) + ")";
-			string diff_sql = "(SELECT * FROM " + qualified_base + " EXCEPT ALL SELECT * FROM " + qualified_base +
-			                  snap_clause + ") UNION ALL (SELECT * FROM " + qualified_base + snap_clause +
-			                  " EXCEPT ALL SELECT * FROM " + qualified_base + ")";
-			string affected_filter;
+			auto snap_result =
+			    con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot()");
+			int64_t current_snap = old_snap;
+			if (!snap_result->HasError() && snap_result->RowCount() > 0 && !snap_result->GetValue(0, 0).IsNull()) {
+				current_snap = snap_result->GetValue(0, 0).GetValue<int64_t>();
+			}
+
+			string affected_cols;
+			string affected_select;
+			string affected_tuple;
 			for (size_t i = 0; i < partition_cols.size(); i++) {
 				if (i > 0) {
-					affected_filter += " OR ";
+					affected_cols += ", ";
+					affected_select += ", ";
+					affected_tuple += ", ";
 				}
 				auto parsed = split_partition_spec(partition_cols[i]);
-				string col = KeywordHelper::WriteOptionallyQuoted(parsed.first);
-				string source_col = KeywordHelper::WriteOptionallyQuoted(parsed.second);
-				affected_filter += col + " IN (SELECT DISTINCT " + source_col + " FROM (" + diff_sql + ") _ivm_diff_" +
-				                   to_string(i) + ")";
+				affected_cols += KeywordHelper::WriteOptionallyQuoted(parsed.first);
+				affected_select += KeywordHelper::WriteOptionallyQuoted(parsed.second) + " AS " +
+				                   KeywordHelper::WriteOptionallyQuoted(parsed.first);
+				affected_tuple += KeywordHelper::WriteOptionallyQuoted(parsed.first);
 			}
-			upsert_query = "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n" + "INSERT INTO " +
-			               data_table + "\nSELECT * FROM (" + view_query_sql + ") _ivm_recompute\nWHERE " +
-			               affected_filter + ";\n";
-			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake snapshot-diff, %zu "
-			                    "partition cols, old_snap=%ld)\n",
-			                    partition_cols.size(), (long)old_snap);
+			string temp_affected = string(ivm::TEMP_TABLE_PREFIX) + "affected_" + view_name;
+			string qtemp_affected = KeywordHelper::WriteOptionallyQuoted(temp_affected);
+			string insertions = "SELECT " + affected_select + " FROM ducklake_table_insertions('" +
+			                    OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
+			                    OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
+			                    OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(old_snap) + ", " +
+			                    to_string(current_snap) + ")";
+			string deletions = "SELECT " + affected_select + " FROM ducklake_table_deletions('" +
+			                   OpenIVMUtils::EscapeValue(loc.catalog_name) + "', '" +
+			                   OpenIVMUtils::EscapeValue(loc.schema_name) + "', '" +
+			                   OpenIVMUtils::EscapeValue(loc.table_name) + "', " + to_string(old_snap) + ", " +
+			                   to_string(current_snap) + ")";
+			string affected_filter;
+			if (partition_cols.size() == 1) {
+				affected_filter = affected_tuple + " IN (SELECT " + affected_cols + " FROM " + qtemp_affected + ")";
+			} else {
+				affected_filter = "(" + affected_tuple + ") IN (SELECT " + affected_cols + " FROM " +
+				                  qtemp_affected + ")";
+			}
+			upsert_query = "CREATE TEMP TABLE " + qtemp_affected + " AS SELECT DISTINCT " + affected_cols +
+			               " FROM ((" + insertions + ") UNION ALL (" + deletions + ")) _ivm_changed_partitions;\n";
+			upsert_query += "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
+			upsert_query += "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql +
+			                ") _ivm_recompute\nWHERE " + affected_filter + ";\n";
+			upsert_query += "DROP TABLE " + qtemp_affected + ";\n";
+			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake change-feed, %zu "
+			                    "partition cols, old_snap=%ld, current_snap=%ld)\n",
+			                    partition_cols.size(), (long)old_snap, (long)current_snap);
 		} else if (safe_for_snapdiff && any_ducklake) {
 			string old_view_query = BuildDuckLakeSnapshotQuery(metadata, con, view_name, view_query_sql, delta_table_names,
 			                                                  view_catalog_name, view_schema_name,
@@ -1964,18 +1992,20 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		// The IVM query produces the NEW state (delta with mul=true).
 		// The companion query records the OLD state (current MV rows with mul=false)
 		// BEFORE the upsert modifies the MV.
-		// For SIMPLE_AGGREGATE / SIMPLE_PROJECTION with downstream consumers:
+		// For SIMPLE_AGGREGATE with downstream consumers:
 		// The IVM delta represents the CHANGE (+5), but downstream projections need
 		// the ABSOLUTE old and new values to compute their own deltas correctly.
 		// Strategy: record old state (mul=false) BEFORE upsert, then record new state
 		// (mul=true) AFTER upsert. The IVM delta in delta_view is replaced by these
 		// absolute snapshots so downstream sees a clean old→new transition.
 
-		if (has_downstream &&
-		    (view_query_type == IVMType::SIMPLE_AGGREGATE || view_query_type == IVMType::SIMPLE_PROJECTION)) {
+		if (has_downstream && view_query_type == IVMType::SIMPLE_AGGREGATE) {
 			// Save old MV state to a temp table BEFORE the IVM+upsert modifies the MV.
 			// After the upsert, clear IVM delta from delta_view and replace with
 			// old(false) + new(true) absolute snapshots for downstream consumption.
+			// SIMPLE_PROJECTION/FILTER views do not use this path: their IVM output is
+			// already a row-level Z-set delta, while full old/new snapshots make downstream
+			// DuckLake joins pay for unchanged rows before compaction can cancel them.
 			string col_list;
 			for (auto &col : column_names) {
 				if (!col_list.empty()) {
