@@ -843,6 +843,59 @@ SELECT count(*) FROM (
 ----
 0
 
+# ==========================================
+# Join projection over a derived-table leaf
+# ==========================================
+
+statement ok
+CREATE TABLE proj_join_item(i_id INT, i_price INT, i_name VARCHAR);
+
+statement ok
+CREATE TABLE proj_join_stock(s_w_id INT, s_i_id INT, s_quantity INT);
+
+statement ok
+INSERT INTO proj_join_item VALUES (1, 60, 'a'), (2, 40, 'b');
+
+statement ok
+INSERT INTO proj_join_stock VALUES (1, 1, 10), (1, 2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW proj_join_mv AS
+    SELECT s.s_w_id, s.s_i_id, s.s_quantity, iv.i_name
+    FROM proj_join_stock s
+    JOIN (SELECT i_id, i_name FROM proj_join_item WHERE i_price > 50) iv
+      ON s.s_i_id = iv.i_id;
+
+statement ok
+UPDATE proj_join_stock SET s_quantity = 11 WHERE s_w_id = 1 AND s_i_id = 1;
+
+statement ok
+PRAGMA ivm('proj_join_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM proj_join_mv
+    EXCEPT ALL
+    SELECT s.s_w_id, s.s_i_id, s.s_quantity, iv.i_name
+    FROM proj_join_stock s
+    JOIN (SELECT i_id, i_name FROM proj_join_item WHERE i_price > 50) iv
+      ON s.s_i_id = iv.i_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s.s_w_id, s.s_i_id, s.s_quantity, iv.i_name
+    FROM proj_join_stock s
+    JOIN (SELECT i_id, i_name FROM proj_join_item WHERE i_price > 50) iv
+      ON s.s_i_id = iv.i_id
+    EXCEPT ALL
+    SELECT * FROM proj_join_mv
+);
+----
+0
+
 # Insert a new top-scorer
 statement ok
 INSERT INTO topkp_t VALUES (6,'frank',99);

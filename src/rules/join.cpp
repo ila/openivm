@@ -207,6 +207,59 @@ static LogicalGet *GetLeafScan(const JoinLeafInfo &leaf) {
 	return leaf.get ? leaf.get : FindGetInSubtree(leaf.node);
 }
 
+static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBinding &binding, string &table_name,
+                                           string &column_name) {
+	if (!node) {
+		return false;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_GET) {
+		auto *get = dynamic_cast<LogicalGet *>(node);
+		if (!get || get->GetTable().get() == nullptr) {
+			return false;
+		}
+		auto bindings = get->GetColumnBindings();
+		auto &column_ids = get->GetColumnIds();
+		idx_t count = std::min<idx_t>(bindings.size(), column_ids.size());
+		for (idx_t col_idx = 0; col_idx < count; col_idx++) {
+			if (BindingKey(bindings[col_idx]) != BindingKey(binding) || column_ids[col_idx].IsVirtualColumn()) {
+				continue;
+			}
+			table_name = get->GetTable().get()->name;
+			column_name = get->GetColumnName(column_ids[col_idx]);
+			return true;
+		}
+		return false;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_PROJECTION && !node->children.empty()) {
+		auto &projection = node->Cast<LogicalProjection>();
+		auto bindings = node->GetColumnBindings();
+		idx_t count = std::min<idx_t>(bindings.size(), projection.expressions.size());
+		for (idx_t expr_idx = 0; expr_idx < count; expr_idx++) {
+			if (BindingKey(bindings[expr_idx]) != BindingKey(binding)) {
+				continue;
+			}
+			ColumnBinding child_binding;
+			if (!TryGetColumnRef(*projection.expressions[expr_idx], child_binding)) {
+				return false;
+			}
+			return ResolveLeafBindingToBaseColumn(node->children[0].get(), child_binding, table_name, column_name);
+		}
+	}
+	if (node->children.size() == 1) {
+		auto bindings = node->GetColumnBindings();
+		auto child_bindings = node->children[0]->GetColumnBindings();
+		idx_t count = std::min<idx_t>(bindings.size(), child_bindings.size());
+		for (idx_t col_idx = 0; col_idx < count; col_idx++) {
+			if (BindingKey(bindings[col_idx]) == BindingKey(binding)) {
+				return ResolveLeafBindingToBaseColumn(node->children[0].get(), child_bindings[col_idx], table_name,
+				                                      column_name);
+			}
+		}
+		return ResolveLeafBindingToBaseColumn(node->children[0].get(), binding, table_name, column_name);
+	}
+	return false;
+}
+
 static bool IsConstantLeafSubtree(LogicalOperator *node) {
 	if (!node) {
 		return false;
@@ -599,27 +652,17 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 			leaf_refs[i].delta_name = delta_name;
 			leaf_refs[i].last_update = ts_result->GetValue(0, 0).ToString();
 
-			auto bindings = get->GetColumnBindings();
-			auto &column_ids = get->GetColumnIds();
-			idx_t count = std::min<idx_t>(bindings.size(), column_ids.size());
-			for (idx_t col_idx = 0; col_idx < count; col_idx++) {
-				if (column_ids[col_idx].IsVirtualColumn()) {
-					continue;
-				}
-				auto column_name = get->GetColumnName(column_ids[col_idx]);
-				leaf_refs[i].column_name = column_name;
-				column_refs[BindingKey(bindings[col_idx])] = {i, table_name, delta_name, column_name,
-				                                              leaf_refs[i].last_update};
-			}
 			auto leaf_bindings = leaves[i].node->GetColumnBindings();
-			idx_t leaf_count = std::min<idx_t>(leaf_bindings.size(), count);
-			for (idx_t col_idx = 0; col_idx < leaf_count; col_idx++) {
-				if (column_ids[col_idx].IsVirtualColumn()) {
+			for (auto &binding : leaf_bindings) {
+				string resolved_table;
+				string resolved_column;
+				if (!ResolveLeafBindingToBaseColumn(leaves[i].node, binding, resolved_table, resolved_column) ||
+				    !StringUtil::CIEquals(resolved_table, table_name)) {
 					continue;
 				}
-				auto column_name = get->GetColumnName(column_ids[col_idx]);
-				column_refs[BindingKey(leaf_bindings[col_idx])] = {i, table_name, delta_name, column_name,
-				                                                   leaf_refs[i].last_update};
+				leaf_refs[i].column_name = resolved_column;
+				column_refs[BindingKey(binding)] = {i, table_name, delta_name, resolved_column,
+				                                    leaf_refs[i].last_update};
 			}
 		}
 		CollectJoinKeyProbes(pw.plan.get(), column_refs, key_probes);

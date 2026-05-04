@@ -354,6 +354,94 @@ SELECT count(*) FROM (
 0
 
 # ============================================================
+# CTE aggregate joined to dimension-side pass-through columns
+# ============================================================
+
+statement ok
+CREATE TABLE cte_joinagg_customer(w INT, credit VARCHAR, bal DOUBLE);
+
+statement ok
+CREATE TABLE cte_joinagg_wh(w INT, tax DOUBLE);
+
+statement ok
+INSERT INTO cte_joinagg_customer VALUES
+    (1, 'GC', 10), (1, 'GC', 20), (1, 'BC', 50),
+    (2, 'GC', 100), (2, 'GC', 130);
+
+statement ok
+INSERT INTO cte_joinagg_wh VALUES (1, 0.05), (2, 0.10);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cte_joinagg AS
+    WITH customer_segments AS (
+        SELECT w,
+               CASE WHEN credit = 'GC' THEN 'good' ELSE 'bad' END AS credit_seg,
+               AVG(bal) AS avg_bal,
+               STDDEV(bal) AS std_bal,
+               COUNT(*) AS cnt
+        FROM cte_joinagg_customer
+        GROUP BY w, CASE WHEN credit = 'GC' THEN 'good' ELSE 'bad' END
+    )
+    SELECT cs.w, cs.credit_seg, cs.avg_bal, cs.std_bal, cs.cnt, wh.tax
+    FROM customer_segments cs JOIN cte_joinagg_wh wh ON cs.w = wh.w;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_cte_joinagg';
+----
+6
+
+statement ok
+UPDATE cte_joinagg_customer SET bal = 100 WHERE w = 1 AND credit = 'GC' AND bal = 10;
+
+statement ok
+UPDATE cte_joinagg_wh SET tax = 0.15 WHERE w = 2;
+
+statement ok
+PRAGMA ivm('mv_cte_joinagg');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cte_joinagg
+    EXCEPT ALL
+    SELECT * FROM (
+        WITH customer_segments AS (
+            SELECT w,
+                   CASE WHEN credit = 'GC' THEN 'good' ELSE 'bad' END AS credit_seg,
+                   AVG(bal) AS avg_bal,
+                   STDDEV(bal) AS std_bal,
+                   COUNT(*) AS cnt
+            FROM cte_joinagg_customer
+            GROUP BY w, CASE WHEN credit = 'GC' THEN 'good' ELSE 'bad' END
+        )
+        SELECT cs.w, cs.credit_seg, cs.avg_bal, cs.std_bal, cs.cnt, wh.tax
+        FROM customer_segments cs JOIN cte_joinagg_wh wh ON cs.w = wh.w
+    )
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        WITH customer_segments AS (
+            SELECT w,
+                   CASE WHEN credit = 'GC' THEN 'good' ELSE 'bad' END AS credit_seg,
+                   AVG(bal) AS avg_bal,
+                   STDDEV(bal) AS std_bal,
+                   COUNT(*) AS cnt
+            FROM cte_joinagg_customer
+            GROUP BY w, CASE WHEN credit = 'GC' THEN 'good' ELSE 'bad' END
+        )
+        SELECT cs.w, cs.credit_seg, cs.avg_bal, cs.std_bal, cs.cnt, wh.tax
+        FROM customer_segments cs JOIN cte_joinagg_wh wh ON cs.w = wh.w
+    )
+    EXCEPT ALL
+    SELECT * FROM mv_cte_joinagg
+);
+----
+0
+
+# ============================================================
 # HAVING inside a CTE body.
 # The outer uses the CTE in a JOIN; HAVING belongs to the CTE's own aggregate,
 # not the MV's output. Two things must work:

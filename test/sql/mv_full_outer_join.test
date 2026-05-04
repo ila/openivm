@@ -584,6 +584,56 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# --- MERGE: left-side non-join group column changes under compound GROUP BY ---
+statement ok
+CREATE TABLE foj_attr_l (id INT, grp INT, attr INT);
+
+statement ok
+CREATE TABLE foj_attr_r (id INT, lid INT, amount INT);
+
+statement ok
+INSERT INTO foj_attr_l VALUES (1, 10, 50), (2, 10, 60), (3, 20, 70);
+
+statement ok
+INSERT INTO foj_attr_r VALUES (1, 1, 100), (2, 4, 400);
+
+statement ok
+CREATE MATERIALIZED VIEW foj_attr_mv AS
+    SELECT COALESCE(l.grp, r.lid) AS g, COALESCE(l.id, r.lid) AS k, l.attr, SUM(r.amount) AS total
+    FROM foj_attr_l l FULL OUTER JOIN foj_attr_r r ON l.id = r.lid
+    GROUP BY COALESCE(l.grp, r.lid), COALESCE(l.id, r.lid), l.attr;
+
+statement ok
+UPDATE foj_attr_l SET attr = 55 WHERE id = 1;
+
+statement ok
+INSERT INTO foj_attr_r VALUES (3, 2, 200);
+
+statement ok
+PRAGMA ivm('foj_attr_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT COALESCE(l.grp, r.lid), COALESCE(l.id, r.lid), l.attr, SUM(r.amount)
+    FROM foj_attr_l l FULL OUTER JOIN foj_attr_r r ON l.id = r.lid
+    GROUP BY COALESCE(l.grp, r.lid), COALESCE(l.id, r.lid), l.attr
+    EXCEPT ALL
+    SELECT * FROM foj_attr_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM foj_attr_mv
+    EXCEPT ALL
+    SELECT COALESCE(l.grp, r.lid), COALESCE(l.id, r.lid), l.attr, SUM(r.amount)
+    FROM foj_attr_l l FULL OUTER JOIN foj_attr_r r ON l.id = r.lid
+    GROUP BY COALESCE(l.grp, r.lid), COALESCE(l.id, r.lid), l.attr
+);
+----
+0
+
 # ============================================================
 # STRESS TESTS
 # ============================================================

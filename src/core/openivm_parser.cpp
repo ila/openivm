@@ -877,12 +877,7 @@ static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
 
 static bool QueryNeedsOriginalSqlForLpts(const string &query) {
 	string lower = StringUtil::Lower(query);
-	return lower.find(" in (select") != string::npos || lower.find(" not in (select") != string::npos ||
-	       lower.find(" exists (select") != string::npos || lower.find(" intersect ") != string::npos ||
-	       lower.find(" intersect all ") != string::npos || lower.find(" except ") != string::npos ||
-	       lower.find(" except all ") != string::npos || lower.find("pivot ") != string::npos ||
-	       lower.find("(pivot ") != string::npos || lower.find(" unnest(") != string::npos ||
-	       lower.find(" cross join unnest(") != string::npos;
+	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos;
 }
 
 static bool QueryHasUnsupportedIncrementalConstruct(const string &query) {
@@ -895,19 +890,8 @@ static bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op) {
 	if (!op) {
 		return false;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_EXCEPT || op->type == LogicalOperatorType::LOGICAL_INTERSECT ||
-	    op->type == LogicalOperatorType::LOGICAL_PIVOT || op->type == LogicalOperatorType::LOGICAL_UNNEST ||
-	    op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
-	    op->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+	if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
 		return true;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
-		auto *join = dynamic_cast<LogicalJoin *>(op);
-		if (join && (join->join_type == JoinType::SEMI || join->join_type == JoinType::ANTI ||
-		             join->join_type == JoinType::MARK || join->join_type == JoinType::RIGHT_SEMI ||
-		             join->join_type == JoinType::RIGHT_ANTI)) {
-			return true;
-		}
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		auto *agg = dynamic_cast<LogicalAggregate *>(op);
@@ -2055,24 +2039,22 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			auto select_plan = std::move(select_planner.plan);
 			original_has_repeated_cte_ref_under_join = HasRepeatedCteRefUnderJoin(select_plan.get());
 
-			// Inline CTEs so LPTS (which doesn't implement LOGICAL_CTE_REF) sees a flat
-			// plan. Query-bound CTEs become LOGICAL_MATERIALIZED_CTE + LOGICAL_CTE_REF
-			// nodes in the bound plan; CTEInlining rewrites small/non-recursive ones
-			// into direct subqueries. Running the full DuckDB optimizer here would
-			// also reorder joins / push filters, which conflicts with IVM's subsequent
-			// plan rewrites — so we run only the CTE-inlining pass, and only when a
-			// CTE reference actually appears in the plan (the optimizer isn't always
-			// a no-op on CTE-free plans — e.g. it can rewrite DISTINCT subqueries in
-			// ways that confuse the downstream structural rewrites).
+			// Inline CTEs so the refresh rewriter sees one maintainable operator tree.
+			// Query-bound CTEs become LOGICAL_MATERIALIZED_CTE + LOGICAL_CTE_REF nodes
+			// in the bound plan; CTEInlining rewrites small/non-recursive ones into
+			// direct subqueries. Running the full DuckDB optimizer here would also
+			// reorder joins / push filters, which conflicts with IVM's subsequent plan
+			// rewrites — so we run only the CTE-inlining pass, and only when a CTE
+			// reference actually appears in the plan (the optimizer isn't always a
+			// no-op on CTE-free plans — e.g. it can rewrite DISTINCT subqueries in ways
+			// that confuse the downstream structural rewrites).
 			// DuckDB's binder sets LogicalMaterializedCTE::materialize to
 			// CTE_MATERIALIZE_ALWAYS by default. CTEInlining bails early on ALWAYS
-			// and leaves the CTE as a materialized node. IVM can't maintain views
-			// whose plan still contains LOGICAL_CTE_REF — LPTS has no serializer
-			// for it and the refresh path has no delta-consolidation rule. Relax
-			// every CTE to CTE_MATERIALIZE_DEFAULT before inlining so CTEInlining
-			// folds them into the outer plan. Single-ref CTEs always inline; multi-
-			// ref CTEs inline when they're cheap and don't end in an aggregate that
-			// would be wastefully re-materialized.
+			// and leaves the CTE as a materialized node. The refresh path has no
+			// delta-consolidation rule for LOGICAL_CTE_REF, so relax every CTE to
+			// CTE_MATERIALIZE_DEFAULT before inlining. Single-ref CTEs always inline;
+			// multi-ref CTEs inline when they're cheap and don't end in an aggregate
+			// that would be wastefully re-materialized.
 			InlineCtesIfPresent(context, *select_planner.binder, select_plan);
 
 			// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
@@ -2138,8 +2120,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 
 			// Strip a standalone ORDER_BY at the top of select_plan (e.g. DISTINCT + ORDER BY
-			// without LIMIT, or simple projection + ORDER BY). LPTS can't serialize ORDER_BY;
-			// the suffix is appended to the CREATE VIEW instead.
+			// without LIMIT, or simple projection + ORDER BY). The data table stores unordered
+			// rows; the suffix is appended to the CREATE VIEW instead.
 			if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_ORDER_BY && top_k_suffix.empty() &&
 			    !select_plan->children.empty()) {
 				auto &order_op = select_plan->Cast<LogicalOrder>();
@@ -2405,6 +2387,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				}
 			}
 		}
+		bool join_aggregate_projection_fallback = false;
+		if (classification.found_join && classification.found_aggregation && !aggregate_columns.empty()) {
+			idx_t expected_linear_outputs = aggregate_columns.size() + aggregate_types.size();
+			join_aggregate_projection_fallback = output_names.size() > expected_linear_outputs;
+			if (join_aggregate_projection_fallback) {
+				OPENIVM_DEBUG_PRINT("[CREATE MV] Join-over-aggregate exposes %zu columns but only %zu are "
+				                    "group/aggregate outputs — using GROUP_RECOMPUTE\n",
+				                    output_names.size(), expected_linear_outputs);
+			}
+		}
 
 		// Window over join: non-DuckLake delta tables may not expose the partition key for
 		// every changed source, so native window recompute could miss partitions. DuckLake
@@ -2650,8 +2642,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		} else if (classification.found_having && classification.found_aggregation && !aggregate_columns.empty()) {
 			ivm_type = IVMType::AGGREGATE_HAVING;
 		} else if ((has_union_over_agg || join_key_group_fallback || delim_aggregate_group_fallback ||
-		            nested_aggregate_group_fallback || repeated_cte_aggregate_group_fallback ||
-		            classification.found_nested_aggregate) &&
+		            join_aggregate_projection_fallback || nested_aggregate_group_fallback ||
+		            repeated_cte_aggregate_group_fallback || classification.found_nested_aggregate) &&
 		           !aggregate_columns.empty()) {
 			// UNION/UNION ALL over aggregates: group keys extracted positionally from output_names.
 			// Inner-aggregate-in-join: group keys are the join-condition columns visible in the
@@ -3039,6 +3031,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 
+		unordered_set<string> inserted_meta_table_names;
 		for (const auto &table_name : table_names) {
 			string catalog_type = "duckdb";
 			string snapshot_val = "null";
@@ -3065,6 +3058,15 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				source_schema_val = it->second.schema_name;
 				OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake table '%s' → meta_name='%s', snap=%s\n", table_name.c_str(),
 				                    meta_table_name.c_str(), snapshot_val.c_str());
+			}
+
+			// A single physical source can appear under multiple logical names after planning.
+			// DuckLake chained views are the common case: the query can contain both the
+			// user-facing MV name and its backing _ivm_data_* table. Metadata is keyed by
+			// (view_name, table_name), so emit only one dependency row for the canonical
+			// metadata table name after the DuckLake mapping above.
+			if (!inserted_meta_table_names.insert(meta_table_name).second) {
+				continue;
 			}
 
 			ddl.push_back("insert into " + string(ivm::DELTA_TABLES_TABLE) +
