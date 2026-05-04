@@ -13,6 +13,12 @@ statement ok
 LOAD ducklake;
 
 statement ok
+INSTALL sqlite_scanner;
+
+statement ok
+LOAD sqlite_scanner;
+
+statement ok
 ATTACH '__TEST_DIR__/ducklake_aggregate.db' AS dl (TYPE ducklake);
 
 # ==========================================
