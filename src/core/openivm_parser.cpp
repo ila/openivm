@@ -3292,6 +3292,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		string data_table = IVMTableNames::DataTableName(view_name);
 		string qdt = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
 		string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
+		string stage_table = "_ivm_stage_" + view_name;
+		string qstage =
+		    QualifiedTablePrefix(default_db, "main") + KeywordHelper::WriteOptionallyQuoted(stage_table);
 		// The view_query may contain unqualified base-table references (e.g. `FROM WAREHOUSE`
 		// when the user wrote the MV under `USE dl.main`). The DDL executor's fresh
 		// Connection starts in the physical-default catalog, so apply USE before CREATE
@@ -3299,7 +3302,17 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		if (!current_catalog.empty() && current_catalog != default_db) {
 			ddl.push_back("use " + current_catalog + "." + current_schema);
 		}
-		ddl.push_back("create table " + qdt + " as " + view_query);
+		if (!view_catalog_prefix.empty()) {
+			// DuckLake can self-lock when one statement reads DuckLake tables and commits
+			// a DuckLake CTAS. Stage the SELECT into the physical default DB first, then
+			// copy that result into DuckLake so the DuckLake commit has no DuckLake read.
+			ddl.push_back("DROP TABLE IF EXISTS " + qstage);
+			ddl.push_back("create table " + qstage + " as " + view_query);
+			ddl.push_back("create table " + qdt + " as select * from " + qstage);
+			ddl.push_back("DROP TABLE IF EXISTS " + qstage);
+		} else {
+			ddl.push_back("create table " + qdt + " as " + view_query);
+		}
 		if (pac_loaded) {
 			ddl.push_back("SET pac_check = false");
 			ddl.push_back("SET pac_rewrite = false");

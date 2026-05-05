@@ -353,6 +353,87 @@ SELECT acct_id, event_ts, amount FROM dl.retry_window_src;
 Duplicate key: materialized view "mv_retry_window" already exists
 
 statement ok
+CREATE TABLE dl.stage_lock_market_src (
+    sym VARCHAR,
+    trade_date DATE,
+    close_price DOUBLE,
+    high_price DOUBLE,
+    low_price DOUBLE,
+    volume INT
+);
+
+statement ok
+INSERT INTO dl.stage_lock_market_src
+SELECT
+    'S' || CAST(i % 20 AS VARCHAR) AS sym,
+    DATE '2026-01-01' + CAST(i % 120 AS INTEGER) AS trade_date,
+    100.0 + CAST(i % 31 AS DOUBLE) AS close_price,
+    105.0 + CAST(i % 31 AS DOUBLE) AS high_price,
+    95.0 + CAST(i % 31 AS DOUBLE) AS low_price,
+    CAST(1000 + i AS INTEGER) AS volume
+FROM range(0, 2000) AS r(i);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_ducklake_stage_lock AS
+WITH price_changes AS (
+    SELECT
+        sym,
+        trade_date,
+        close_price,
+        high_price - low_price AS intraday_range,
+        volume,
+        LAG(close_price) OVER (PARTITION BY sym ORDER BY trade_date) AS prev_close
+    FROM dl.stage_lock_market_src
+),
+daily_returns AS (
+    SELECT
+        sym,
+        trade_date,
+        close_price,
+        intraday_range,
+        volume,
+        CASE WHEN prev_close > 0 THEN (close_price - prev_close) / prev_close ELSE NULL END AS daily_return
+    FROM price_changes
+),
+symbol_volatility AS (
+    SELECT
+        sym,
+        COUNT(*) AS trading_days,
+        AVG(daily_return) AS avg_daily_return,
+        STDDEV(daily_return) AS return_volatility,
+        AVG(intraday_range) AS avg_intraday_range,
+        SUM(CAST(volume AS BIGINT)) AS total_volume
+    FROM daily_returns
+    GROUP BY sym
+    HAVING COUNT(daily_return) >= 3
+),
+global_market AS (
+    SELECT
+        AVG(return_volatility) AS market_avg_volatility,
+        SUM(total_volume) AS market_total_volume
+    FROM symbol_volatility
+),
+scored AS (
+    SELECT
+        sv.*,
+        ROUND(sv.total_volume * 100.0 / NULLIF(gm.market_total_volume, 0), 4) AS pct_market_volume,
+        RANK() OVER (ORDER BY sv.return_volatility DESC) AS rank_by_volatility
+    FROM symbol_volatility sv
+    CROSS JOIN global_market gm
+)
+SELECT * FROM scored;
+
+query I
+SELECT count(*) FROM dl.mv_ducklake_stage_lock;
+----
+20
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name = '_ivm_stage_mv_ducklake_stage_lock';
+----
+0
+
+statement ok
 SET ivm_cascade_refresh = 'downstream';
 
 statement ok
