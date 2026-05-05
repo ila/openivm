@@ -49,6 +49,8 @@ Filters and projections are **linear operators** — their incremental form is t
 
 The upsert uses **counting-based consolidation**: each distinct tuple gets a net count (_net). Net insertions are replicated via `generate_series`, net deletions are removed via `rowid` + `ROW_NUMBER`. This preserves full bag semantics including duplicate rows.
 
+For deletes, OpenIVM first joins the net-negative tuples to the MV data table and only ranks those matched candidate rows. The result is the same bag-semantic delete as ranking the whole MV, but large projection/join views avoid a full data-table `ROW_NUMBER()` pass when only a few tuples changed.
+
 ## Compiled SQL (projection)
 
 ### IVM query (delta propagation)
@@ -104,6 +106,12 @@ The upsert is identical for projection and filter views. Shown here for the proj
 -- Step 1: compute the net change per distinct tuple
 -- +1 for each insertion, -1 for each deletion, sum to get net effect
 -- HAVING filters out tuples where inserts and deletes cancel out (_net = 0)
+-- The DELETE and INSERT statements each define this CTE.
+
+-- Step 2: delete net-removed copies
+-- Join negative net tuples to the MV first, then rank only matched candidates.
+-- ROW_NUMBER assigns a deterministic ordering within each group of identical
+-- tuples, so exactly |_net| copies are removed starting from the lowest rowid.
 WITH _ivm_net AS (
     SELECT id, name,
         SUM(_duckdb_ivm_multiplicity) AS _net
@@ -111,19 +119,24 @@ WITH _ivm_net AS (
     WHERE _duckdb_ivm_timestamp >= '{ts}'::TIMESTAMP
     GROUP BY id, name
     HAVING SUM(_duckdb_ivm_multiplicity) != 0
+),
+_ivm_delete_net AS (
+    SELECT * FROM _ivm_net WHERE _net < 0
+),
+_ivm_delete_candidates AS (
+    SELECT v.rowid, v.id AS id, v.name AS name, d._net
+    FROM emp_names v
+    JOIN _ivm_delete_net d
+      ON v.id IS NOT DISTINCT FROM d.id
+     AND v.name IS NOT DISTINCT FROM d.name
+),
+_ivm_ranked_deletes AS (
+    SELECT rowid, _net,
+        ROW_NUMBER() OVER (PARTITION BY id, name ORDER BY rowid) AS _rn
+    FROM _ivm_delete_candidates
 )
--- Step 2: delete net-removed copies
--- ROW_NUMBER assigns a deterministic ordering within each group of identical tuples
--- We delete exactly |_net| copies, starting from the lowest rowid
 DELETE FROM emp_names WHERE rowid IN (
-    SELECT v.rowid FROM (
-        SELECT rowid, id, name,
-            ROW_NUMBER() OVER (PARTITION BY id, name ORDER BY rowid) AS _rn
-        FROM emp_names
-    ) v JOIN _ivm_net d
-        ON v.id IS NOT DISTINCT FROM d.id
-       AND v.name IS NOT DISTINCT FROM d.name
-    WHERE d._net < 0 AND v._rn <= -d._net
+    SELECT rowid FROM _ivm_ranked_deletes WHERE _rn <= -_net
 );
 
 -- Step 3: insert net-added copies

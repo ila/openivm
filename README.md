@@ -79,7 +79,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `DISTINCT` | Incremental | [Distinct](docs/operators/distinct.md) |
 | Window functions (`ROW_NUMBER`, `RANK`, etc.) | Partition-level recompute | [Window functions](docs/operators/window-functions.md) |
 | `LIST` aggregates | Incremental | [List aggregates](docs/operators/list-aggregates.md) |
-| `WITH` (CTEs), decorrelated subqueries | Incremental when the decorrelated plan uses supported operators | [CTEs & subqueries](docs/operators/cte-subquery.md) |
+| `WITH` (CTEs), decorrelated subqueries, scalar correlated subqueries | Incremental when the lowered plan uses supported operators; scalar `SINGLE` delim shapes use affected-key recompute | [CTEs & subqueries](docs/operators/cte-subquery.md) |
 
 
 ## Settings
