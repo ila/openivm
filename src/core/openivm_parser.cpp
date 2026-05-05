@@ -40,6 +40,8 @@
 
 namespace duckdb {
 
+static constexpr const char *OPENIVM_DDL_RECONNECT = "__openivm_reconnect__";
+
 /// Build "ORDER BY col1 ASC, col2 DESC LIMIT k [OFFSET n]".
 /// Works for both LOGICAL_TOP_N (fused) and separate LOGICAL_ORDER_BY + LOGICAL_LIMIT nodes.
 /// output_col_names is the sanitized output column list; BoundColumnRefs are resolved via
@@ -1925,14 +1927,21 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 	// DDL statements are passed via result.parameters from the plan function.
 	if (!input.inputs.empty()) {
 		auto &db = DatabaseInstance::GetDatabase(context);
-		Connection conn(db);
+		auto conn = make_uniq<Connection>(db);
 		for (auto &param : input.inputs) {
 			auto q = param.GetValue<string>();
 			if (q.empty()) {
 				continue;
 			}
+			if (q == OPENIVM_DDL_RECONNECT) {
+				// DuckLake keeps read transaction state on the connection. Reconnect
+				// between staged DuckLake reads and DuckLake writes so the write-side
+				// commit cannot self-block on an earlier read from the same CREATE MV.
+				conn = make_uniq<Connection>(db);
+				continue;
+			}
 			OPENIVM_DEBUG_PRINT("[IVMDDLBindFunction] Executing DDL: %s\n", q.c_str());
-			auto r = conn.Query(q);
+			auto r = conn->Query(q);
 			if (r->HasError()) {
 				// The unique index on the MV data table is an upsert-time optimization
 				// (helps MERGE find the matching row quickly). If the classifier's
@@ -3294,6 +3303,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// copy that result into DuckLake so the DuckLake commit has no DuckLake read.
 			ddl.push_back("DROP TABLE IF EXISTS " + qstage);
 			ddl.push_back("create table " + qstage + " as " + view_query);
+			ddl.push_back(OPENIVM_DDL_RECONNECT);
 			ddl.push_back("use " + default_catalog_schema);
 			ddl.push_back("create table " + qdt + " as select * from " + qstage);
 			ddl.push_back("DROP TABLE IF EXISTS " + qstage);
