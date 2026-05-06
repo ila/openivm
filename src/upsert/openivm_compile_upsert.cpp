@@ -1413,8 +1413,9 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		const auto &spec = partition_delta_specs[i];
 		string output_col = Q(spec.output_column);
 		string source_col = Q(spec.source_column);
+		string delta_table = spec.delta_table_sql.empty() ? Q(spec.delta_table) : spec.delta_table_sql;
 		affected_filter +=
-		    output_col + " IN (SELECT DISTINCT " + source_col + " FROM " + Q(spec.delta_table) + delta_where + ")";
+		    output_col + " IN (SELECT DISTINCT " + source_col + " FROM " + delta_table + delta_where + ")";
 	}
 
 	string delete_query = "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";

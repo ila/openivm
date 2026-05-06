@@ -352,6 +352,180 @@ SELECT count(*) FROM (
 ----
 0
 
+# Projection chains use the upstream MV's materialized data table directly.
+statement ok
+CREATE TABLE dl.bronze.catalog_chain_base (id INT, amount INT);
+
+statement ok
+INSERT INTO dl.bronze.catalog_chain_base VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.bronze.catalog_chain_l1 AS
+  SELECT id, amount FROM dl.bronze.catalog_chain_base;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.silver.catalog_chain_l2 AS
+  SELECT id, amount FROM dl.bronze.catalog_chain_l1;
+
+query II
+SELECT table_name, source_catalog
+FROM _duckdb_ivm_delta_tables
+WHERE view_name = 'catalog_chain_l2'
+ORDER BY table_name;
+----
+_ivm_data_catalog_chain_l1	dl
+
+statement ok
+INSERT INTO dl.bronze.catalog_chain_base VALUES (3, 30);
+
+statement ok
+PRAGMA ivm_options('dl', 'bronze', 'catalog_chain_l1');
+
+statement ok
+PRAGMA ivm_options('dl', 'silver', 'catalog_chain_l2');
+
+query I
+SELECT count(*) FROM (
+  SELECT id, amount FROM dl.silver.catalog_chain_l2
+  EXCEPT ALL
+  SELECT id, amount FROM dl.bronze.catalog_chain_l1
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, amount FROM dl.bronze.catalog_chain_l1
+  EXCEPT ALL
+  SELECT id, amount FROM dl.silver.catalog_chain_l2
+);
+----
+0
+
+# Benchmark-shaped persisted metadata can track an upstream MV through its
+# companion delta_<upstream_mv> table. The downstream MV lives in DuckLake, but
+# that companion delta table is a physical OpenIVM table, so refresh metadata
+# updates and empty-delta probes must qualify it via source_catalog/source_schema
+# instead of the target DuckLake schema.
+statement ok
+CREATE TABLE dl.bronze.catalog_window_base (
+  sym VARCHAR,
+  trade_date DATE,
+  low_price INT,
+  high_price INT
+);
+
+statement ok
+INSERT INTO dl.bronze.catalog_window_base VALUES
+  ('A', DATE '2026-01-01', 10, 20),
+  ('A', DATE '2026-01-02', 8, 22),
+  ('B', DATE '2026-01-01', 30, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.bronze.catalog_window_l1 AS
+  SELECT sym, trade_date, low_price, high_price FROM dl.bronze.catalog_window_base;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.silver.catalog_window_l2 AS
+  SELECT
+    sym,
+    trade_date,
+    low_price,
+    high_price,
+    MIN(low_price) OVER (PARTITION BY sym ORDER BY trade_date) AS running_low,
+    MAX(high_price) OVER (PARTITION BY sym ORDER BY trade_date) AS running_high
+  FROM dl.bronze.catalog_window_l1;
+
+statement ok
+UPDATE _duckdb_ivm_delta_tables
+SET table_name = 'delta_catalog_window_l1',
+    catalog_type = 'duckdb',
+    source_catalog = 'dl',
+    source_schema = 'bronze'
+WHERE view_name = 'catalog_window_l2'
+  AND table_name = '_ivm_data_catalog_window_l1';
+
+query II
+SELECT table_name, source_schema
+FROM _duckdb_ivm_delta_tables
+WHERE view_name = 'catalog_window_l2'
+ORDER BY table_name;
+----
+delta_catalog_window_l1	bronze
+
+statement ok
+INSERT INTO dl.bronze.catalog_window_base VALUES
+  ('A', DATE '2026-01-03', 7, 25),
+  ('B', DATE '2026-01-02', 28, 41);
+
+statement ok
+PRAGMA ivm_options('dl', 'bronze', 'catalog_window_l1');
+
+# The in-memory DuckLake test normally tracks the upstream MV through DuckLake
+# snapshots. Seed the companion delta table to emulate the benchmark's persisted
+# delta_<upstream_mv> dependency and force the downstream refresh to read it.
+statement ok
+INSERT INTO dl.bronze.delta_catalog_window_l1
+SELECT sym, trade_date, low_price, high_price, 1, now()
+FROM dl.bronze.catalog_window_l1
+WHERE trade_date IN (DATE '2026-01-02', DATE '2026-01-03');
+
+statement ok
+PRAGMA ivm_options('dl', 'silver', 'catalog_window_l2');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM dl.silver.catalog_window_l2
+  EXCEPT ALL
+  SELECT
+    sym,
+    trade_date,
+    low_price,
+    high_price,
+    MIN(low_price) OVER (PARTITION BY sym ORDER BY trade_date) AS running_low,
+    MAX(high_price) OVER (PARTITION BY sym ORDER BY trade_date) AS running_high
+  FROM dl.bronze.catalog_window_l1
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT
+    sym,
+    trade_date,
+    low_price,
+    high_price,
+    MIN(low_price) OVER (PARTITION BY sym ORDER BY trade_date) AS running_low,
+    MAX(high_price) OVER (PARTITION BY sym ORDER BY trade_date) AS running_high
+  FROM dl.bronze.catalog_window_l1
+  EXCEPT ALL
+  SELECT * FROM dl.silver.catalog_window_l2
+);
+----
+0
+
+# A second downstream refresh with no upstream changes must probe the same
+# physical companion delta table and then skip cleanly.
+statement ok
+PRAGMA ivm_options('dl', 'silver', 'catalog_window_l2');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM dl.silver.catalog_window_l2
+  EXCEPT ALL
+  SELECT
+    sym,
+    trade_date,
+    low_price,
+    high_price,
+    MIN(low_price) OVER (PARTITION BY sym ORDER BY trade_date) AS running_low,
+    MAX(high_price) OVER (PARTITION BY sym ORDER BY trade_date) AS running_high
+  FROM dl.bronze.catalog_window_l1
+);
+----
+0
+
 # ==========================================
 # Cascade mode: downstream
 # Refreshing mv_region should auto-refresh mv_top

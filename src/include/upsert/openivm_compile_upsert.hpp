@@ -22,6 +22,7 @@ struct GroupRecomputeDeltaSpec {
 
 struct WindowPartitionDeltaSpec {
 	string delta_table;
+	string delta_table_sql;
 	string output_column;
 	string source_column;
 };

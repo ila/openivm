@@ -388,8 +388,8 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 	return "dl";
 }
 
-static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name, const string &view_query_sql,
-                                  bool cross_system, const string &attached_catalog = "",
+static string BuildRecomputeQuery(IVMMetadata &metadata, Connection &con, const string &view_name,
+                                  const string &view_query_sql, bool cross_system, const string &attached_catalog = "",
                                   const string &attached_schema = "", const string &catalog_prefix = "",
                                   string *out_post_meta = nullptr) {
 	string qdt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(view_name));
@@ -419,8 +419,20 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, const string &view_name
 			continue;
 		}
 		string resolved = dt;
-		if (cross_system && !attached_catalog.empty() && !attached_schema.empty()) {
-			resolved = attached_catalog + "." + attached_schema + "." + dt;
+		if (cross_system) {
+			auto source_meta =
+			    con.Query("SELECT source_catalog, source_schema FROM " + string(ivm::DELTA_TABLES_TABLE) +
+			              " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+			              OpenIVMUtils::EscapeValue(dt) + "'");
+			if (!source_meta->HasError() && source_meta->RowCount() > 0 && !source_meta->GetValue(0, 0).IsNull() &&
+			    !source_meta->GetValue(1, 0).IsNull()) {
+				resolved = OpenIVMUtils::QuoteIdentifier(source_meta->GetValue(0, 0).ToString()) + "." +
+				           OpenIVMUtils::QuoteIdentifier(source_meta->GetValue(1, 0).ToString()) + "." +
+				           OpenIVMUtils::QuoteIdentifier(dt);
+			} else if (!attached_catalog.empty() && !attached_schema.empty()) {
+				resolved = OpenIVMUtils::QuoteIdentifier(attached_catalog) + "." +
+				           OpenIVMUtils::QuoteIdentifier(attached_schema) + "." + OpenIVMUtils::QuoteIdentifier(dt);
+			}
 		}
 		delta_cleanup += IVMMetadata::BuildDeltaCleanupSQL(resolved, dt);
 	}
@@ -666,6 +678,31 @@ static string BuildLptsTablePrefix(const string &view_catalog_name, const string
 static string QualifiedName(const string &catalog_name, const string &schema_name, const string &table_name) {
 	return OpenIVMUtils::QuoteIdentifier(catalog_name) + "." + OpenIVMUtils::QuoteIdentifier(schema_name) + "." +
 	       OpenIVMUtils::QuoteIdentifier(table_name);
+}
+
+static string ResolveStandardDeltaQualifiedName(Connection &con, const string &view_name,
+                                                const string &delta_table_name, const string &fallback_catalog,
+                                                const string &fallback_schema) {
+	string catalog_name = fallback_catalog;
+	string schema_name = fallback_schema;
+	auto meta = con.Query("SELECT source_catalog, source_schema FROM " + string(ivm::DELTA_TABLES_TABLE) +
+	                      " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	                      OpenIVMUtils::EscapeValue(delta_table_name) + "'");
+	if (!meta->HasError() && meta->RowCount() > 0) {
+		if (!meta->GetValue(0, 0).IsNull()) {
+			catalog_name = meta->GetValue(0, 0).ToString();
+		}
+		if (!meta->GetValue(1, 0).IsNull()) {
+			schema_name = meta->GetValue(1, 0).ToString();
+		}
+	}
+	if (catalog_name.empty()) {
+		return OpenIVMUtils::QuoteIdentifier(delta_table_name);
+	}
+	if (schema_name.empty()) {
+		schema_name = "main";
+	}
+	return QualifiedName(catalog_name, schema_name, delta_table_name);
 }
 
 static string BaseTableNameFromDeltaKey(const string &delta_key) {
@@ -1241,7 +1278,9 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 					continue;
 				}
 				string delta_probe = OpenIVMUtils::QuoteIdentifier(dt);
-				if (!view_catalog_name.empty() && !view_schema_name.empty()) {
+				if (cross_system) {
+					delta_probe = ResolveStandardDeltaQualifiedName(con, view_name, dt, "", "");
+				} else if (!view_catalog_name.empty() && !view_schema_name.empty()) {
 					delta_probe = QualifiedName(view_catalog_name, view_schema_name, dt);
 				}
 				auto last_update = metadata.GetLastUpdate(view_name, dt);
@@ -1405,7 +1444,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		    flag_result->GetValue(0, 0).GetValue<bool>()) {
 			Printer::Print("Warning: recovering '" + view_name + "' from interrupted refresh via full recompute.");
 			metadata.SetRefreshInProgress(view_name, false);
-			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+			return BuildRecomputeQuery(metadata, con, view_name, view_query_sql, cross_system, attached_db_catalog_name,
 			                           attached_db_schema_name, internal_catalog_prefix, out_post_meta);
 		}
 	}
@@ -1448,7 +1487,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	}
 
 	if (force_full_refresh || view_query_type == IVMType::FULL_REFRESH) {
-		return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+		return BuildRecomputeQuery(metadata, con, view_name, view_query_sql, cross_system, attached_db_catalog_name,
 		                           attached_db_schema_name, internal_catalog_prefix, out_post_meta);
 	}
 
@@ -1472,7 +1511,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		con.Rollback();
 		if (cost_estimate.ShouldRecompute()) {
 			OPENIVM_DEBUG_PRINT("[ADAPTIVE] Full recompute is cheaper — skipping IVM\n");
-			return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+			return BuildRecomputeQuery(metadata, con, view_name, view_query_sql, cross_system, attached_db_catalog_name,
 			                           attached_db_schema_name, internal_catalog_prefix, out_post_meta);
 		}
 	}
@@ -1621,19 +1660,21 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				if (ts_string.empty()) {
 					continue;
 				}
+				string delta_table_sql = cross_system ? ResolveStandardDeltaQualifiedName(con, view_name, dt, "", "")
+				                                      : OpenIVMUtils::QuoteIdentifier(dt);
 				// Check if delta has any rows at all
-				auto total_result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(dt) + " WHERE " +
-				                              string(ivm::TIMESTAMP_COL) + " >= '" +
-				                              OpenIVMUtils::EscapeValue(ts_string) + "'::TIMESTAMP");
+				auto total_result =
+				    con.Query("SELECT COUNT(*) FROM " + delta_table_sql + " WHERE " + string(ivm::TIMESTAMP_COL) +
+				              " >= '" + OpenIVMUtils::EscapeValue(ts_string) + "'::TIMESTAMP");
 				if (total_result->HasError() || total_result->GetValue(0, 0).GetValue<int64_t>() == 0) {
 					continue; // empty delta
 				}
 				tables_with_changes++;
 				// Check for deletes
 				auto del_result =
-				    con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(dt) + " WHERE " +
-				              string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(ts_string) +
-				              "'::TIMESTAMP AND " + string(ivm::MULTIPLICITY_COL) + " < 0");
+				    con.Query("SELECT COUNT(*) FROM " + delta_table_sql + " WHERE " + string(ivm::TIMESTAMP_COL) +
+				              " >= '" + OpenIVMUtils::EscapeValue(ts_string) + "'::TIMESTAMP AND " +
+				              string(ivm::MULTIPLICITY_COL) + " < 0");
 				if (!del_result->HasError() && del_result->GetValue(0, 0).GetValue<int64_t>() > 0) {
 					any_has_deletes = true;
 				}
@@ -1786,7 +1827,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 					continue;
 				}
 				if (delta_has_column(dt, parsed.second)) {
-					partition_delta_specs.push_back({dt, parsed.first, parsed.second});
+					string delta_table_sql = cross_system
+					                             ? ResolveStandardDeltaQualifiedName(con, view_name, dt, "", "")
+					                             : OpenIVMUtils::QuoteIdentifier(dt);
+					partition_delta_specs.push_back({dt, delta_table_sql, parsed.first, parsed.second});
 				}
 			}
 		}
@@ -2079,8 +2123,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				               "). Falling back to full recompute for this refresh.");
 				OPENIVM_DEBUG_PRINT("[UPSERT] LPTS fallback (%s) for view '%s' → full recompute\n", e.what(),
 				                    view_name.c_str());
-				return BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-				                           attached_db_schema_name, internal_catalog_prefix, out_post_meta);
+				return BuildRecomputeQuery(metadata, con, view_name, view_query_sql, cross_system,
+				                           attached_db_catalog_name, attached_db_schema_name, internal_catalog_prefix,
+				                           out_post_meta);
 			}
 		}
 
@@ -2279,9 +2324,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		}
 		string resolved = dt;
 		if (cross_system) {
-			string source_catalog = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
-			string source_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
-			resolved = QualifiedName(source_catalog, source_schema, dt);
+			resolved = ResolveStandardDeltaQualifiedName(con, view_name, dt, "", "");
 		}
 		update_timestamp_query += "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
 		                          " SET last_update = COALESCE("
