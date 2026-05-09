@@ -1,5 +1,5 @@
-# name: test/sql/ivm_checker.test
-# description: Test IVM compatibility checker — classifies views as incremental or full refresh
+# name: test/sql/ivm_classification.test
+# description: Test delta-model classification of views as incremental or full refresh
 # group: [sql]
 
 require openivm
@@ -241,6 +241,88 @@ SELECT COUNT(*) FROM (
     SELECT id, val FROM mv_union
     EXCEPT ALL
     (SELECT id, val FROM u1 UNION ALL SELECT id, val FROM u2)
+);
+----
+0
+
+# ==========================================
+# DISTINCT — incremental classification
+# ==========================================
+
+statement ok
+CREATE TABLE d_src(id INT, region VARCHAR);
+
+statement ok
+INSERT INTO d_src VALUES (1, 'east'), (2, 'east'), (3, 'west');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_distinct_region AS SELECT DISTINCT region FROM d_src;
+
+statement ok
+INSERT INTO d_src VALUES (4, 'north'), (5, 'east');
+
+statement ok
+DELETE FROM d_src WHERE id = 3;
+
+statement ok
+PRAGMA ivm('mv_distinct_region');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region FROM mv_distinct_region
+    EXCEPT ALL
+    SELECT DISTINCT region FROM d_src
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT region FROM d_src
+    EXCEPT ALL
+    SELECT region FROM mv_distinct_region
+);
+----
+0
+
+# ==========================================
+# WINDOW — partition recompute classification
+# ==========================================
+
+statement ok
+CREATE TABLE w_src(id INT, dept VARCHAR, score INT);
+
+statement ok
+INSERT INTO w_src VALUES (1, 'eng', 10), (2, 'eng', 30), (3, 'sales', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_window_rank AS
+    SELECT id, dept, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score, id) AS rn
+    FROM w_src;
+
+statement ok
+INSERT INTO w_src VALUES (4, 'eng', 25), (5, 'ops', 1);
+
+statement ok
+UPDATE w_src SET score = 5 WHERE id = 3;
+
+statement ok
+PRAGMA ivm('mv_window_rank');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dept, score, rn FROM mv_window_rank
+    EXCEPT ALL
+    SELECT id, dept, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score, id) AS rn FROM w_src
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dept, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score, id) AS rn FROM w_src
+    EXCEPT ALL
+    SELECT id, dept, score, rn FROM mv_window_rank
 );
 ----
 0

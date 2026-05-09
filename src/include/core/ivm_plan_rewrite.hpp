@@ -8,7 +8,7 @@ namespace duckdb {
 
 /// Strip AGG(...) FILTER (WHERE p) by converting to AGG(CASE WHEN p THEN arg END).
 /// Must be called on both the SELECT plan (for LPTS serialization) and the full CREATE plan
-/// (for AnalyzePlan / find_group_cols) so the checker sees no FILTER aggregates.
+/// (for delta-model analysis / find_group_cols) so classification sees no FILTER aggregates.
 void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator> &plan);
 
 /// Rewrite a materialized view's logical plan for IVM compatibility.

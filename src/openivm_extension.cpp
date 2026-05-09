@@ -117,7 +117,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("ivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-
 	// Per-optimization flags (default: all enabled)
 	db_config.AddExtensionOption("ivm_skip_empty_deltas", "skip refresh or join terms when deltas are empty",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));

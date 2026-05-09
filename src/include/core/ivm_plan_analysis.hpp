@@ -1,12 +1,12 @@
-#ifndef IVM_CHECKER_HPP
-#define IVM_CHECKER_HPP
+#ifndef IVM_PLAN_ANALYSIS_HPP
+#define IVM_PLAN_ANALYSIS_HPP
 
 #include "duckdb.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
 namespace duckdb {
 
-/// Result of a single-pass plan analysis: IVM compatibility check + metadata extraction.
+/// Result of CREATE-time plan analysis: IVM compatibility plus metadata used by classification and SQL compilation.
 struct PlanAnalysis {
 	bool ivm_compatible = true;
 	bool found_aggregation = false;
@@ -42,14 +42,6 @@ struct PlanAnalysis {
 	idx_t group_index = DConstants::INVALID_INDEX; // aggregate's group_index for binding lookup
 };
 
-/// Walk the logical plan tree once, validating IVM compatibility AND extracting
-/// metadata (aggregation type, join type, group-by columns, etc.).
-/// Replaces the separate ValidateIVMPlan + parser stack walk.
-PlanAnalysis AnalyzePlan(LogicalOperator *plan);
-
-/// Thin wrapper for backward compatibility. Returns true if the plan is fully IVM-compatible.
-bool ValidateIVMPlan(LogicalOperator *plan);
-
 } // namespace duckdb
 
-#endif // IVM_CHECKER_HPP
+#endif // IVM_PLAN_ANALYSIS_HPP

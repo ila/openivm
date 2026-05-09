@@ -210,9 +210,9 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
 	                    (unsigned long)cte_index);
 }
 
-/// @public — also called from openivm_parser.cpp on the full CREATE plan before AnalyzePlan.
+/// @public — also called from openivm_parser.cpp on the full CREATE plan before delta-model analysis.
 /// Normalize AGG(x) FILTER (WHERE p) → AGG(CASE WHEN p THEN x END) before the
-/// compatibility checker sees it. This is correct for NULL-ignoring aggregates and
+/// delta-model classifier sees it. This is correct for NULL-ignoring aggregates and
 /// lets AVG/STDDEV FILTER queries decompose before maintenance compilation.
 /// LIST is intentionally skipped because it preserves NULL elements.
 ///   COUNT(*) FILTER (WHERE p) → COUNT(CASE WHEN p THEN 1 END)  (count_star → count)

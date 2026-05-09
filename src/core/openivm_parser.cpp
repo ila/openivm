@@ -1,7 +1,7 @@
 #include "core/openivm_parser.hpp"
 
-#include "core/ivm_checker.hpp"
 #include "core/ivm_plan_rewrite.hpp"
+#include "core/ivm_delta_model.hpp"
 #include "core/openivm_constants.hpp"
 #include "lpts_pipeline.hpp"
 #include "core/openivm_utils.hpp"
@@ -2272,7 +2272,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		planner.CreatePlan(statement->Copy());
 		auto plan = std::move(planner.plan);
 
-		// Inline CTEs in this plan too so AnalyzePlan / find_group_cols / HasLeftJoin
+		// Inline CTEs in this plan too so delta-model analysis / find_group_cols / HasLeftJoin
 		// walks see the folded structure. DuckDB's binder defaults to
 		// CTE_MATERIALIZE_ALWAYS, which makes CTEInlining bail — relax to DEFAULT first.
 		// (The SELECT-only `select_plan` below does the same for LPTS serialization.)
@@ -2442,13 +2442,14 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		OPENIVM_DEBUG_PRINT("[CREATE MV] View query: %s\n", view_query.c_str());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Logical plan:\n%s\n", plan->ToString().c_str());
 
-		// Normalize FILTER aggregates in the full plan before analysis so the checker
+		// Normalize FILTER aggregates in the full plan before analysis so the delta model
 		// sees CASE expressions instead of raw FILTER and doesn't set ivm_compatible=false.
 		// (IVMPlanRewrite already rewrote select_plan for the LPTS view_query above.)
 		RewriteAggregateFilters(context, plan);
 
-		// Single-pass plan analysis: validates IVM compatibility AND extracts metadata
-		auto analysis = AnalyzePlan(plan.get());
+		auto delta_model = BuildDeltaPlanModel(plan.get());
+		OPENIVM_DEBUG_PRINT("[CREATE MV] delta model: %s\n", delta_model.DebugString().c_str());
+		auto analysis = std::move(delta_model.analysis);
 		MVClassificationState classification(analysis);
 		if (analysis.found_delim_join && !classification.found_aggregation && !analysis.found_single_join) {
 			// Preserve DuckDB's dependent/DELIM_JOIN plan shape for refresh. LPTS can
@@ -2468,7 +2469,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// The projection maps GROUP BY bindings (group_index, i) to SELECT-list aliases — these
 		// aliases are the actual column names in the data table. Plan-walk aliases on agg.groups
 		// are unreliable for CASE/COALESCE expressions.
-		// For DISTINCT views, the checker already extracts aggregate_columns from distinct_targets.
+		// For DISTINCT views, the delta model extracts aggregate_columns from distinct_targets.
 		size_t group_count = analysis.group_count;
 		idx_t group_index = analysis.group_index;
 		vector<string> aggregate_columns;
@@ -2510,7 +2511,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		} else if (distinct_at_top) {
 			aggregate_columns = std::move(analysis.aggregate_columns);
 		} else if (classification.found_distinct && analysis.aggregate_columns.empty()) {
-			// Plain DISTINCT (no explicit targets) — trust the checker.
+			// Plain DISTINCT (no explicit targets) — trust the delta model.
 			aggregate_columns = std::move(analysis.aggregate_columns);
 		} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
 			auto group_names_list =

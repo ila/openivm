@@ -2419,7 +2419,7 @@ SELECT count(*) FROM (SELECT w, d, COUNT(c_bal), ROUND(SUM(c_bal) / NULLIF(COUNT
 # ============================================================
 # AGGREGATE FILTER (WHERE p) rewrite
 # AGG(x) FILTER (WHERE p) → AGG(CASE WHEN p THEN x END) before
-# the compatibility checker, so FILTER views are incremental.
+# the delta-model classifier, so FILTER views are incremental.
 # ============================================================
 
 statement ok

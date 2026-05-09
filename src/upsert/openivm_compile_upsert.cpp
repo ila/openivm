@@ -288,7 +288,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				continue;
 			}
 			// _ivm_match_count / _ivm_right_match_count are added by
-			// RewriteLeftJoinMatchCount *after* AnalyzePlan captures aggregate_types,
+			// RewriteLeftJoinMatchCount *after* delta-model analysis captures aggregate_types,
 			// so aggregate_types does NOT include them. Exclude them here for a
 			// like-with-like comparison.
 			if (column == Q(string(ivm::MATCH_COUNT_COL)) || column == string(ivm::MATCH_COUNT_COL) ||
