@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,DISTINCT", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,OORDER,ORDER_LINE", "delta": true}
+SELECT o.O_W_ID, o.O_D_ID, COUNT(DISTINCT ol.OL_I_ID) AS unique_items, SUM(ol.OL_AMOUNT) AS revenue FROM d_OORDER o JOIN d_ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID JOIN d_ITEM i ON ol.OL_I_ID = i.I_ID GROUP BY o.O_W_ID, o.O_D_ID;

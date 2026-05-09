@@ -2,13 +2,17 @@
 
 #include "duckdb/common/printer.hpp"
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
 #include <iomanip>
 #include <random>
 #include <sstream>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace openivm_bench {
@@ -54,6 +58,152 @@ bool ReadAllBytes(int fd, void *buf, size_t n) {
 bool FileExists(const std::string &path) {
 	struct stat buffer;
 	return (stat(path.c_str(), &buffer) == 0);
+}
+
+static std::string EscapeSingleQuotes(const std::string &value) {
+	std::string result;
+	for (auto c : value) {
+		result += c;
+		if (c == '\'') {
+			result += '\'';
+		}
+	}
+	return result;
+}
+
+static std::string JsonEscape(const std::string &value) {
+	std::string result;
+	for (auto c : value) {
+		switch (c) {
+		case '\\':
+			result += "\\\\";
+			break;
+		case '"':
+			result += "\\\"";
+			break;
+		case '\n':
+			result += "\\n";
+			break;
+		case '\r':
+			result += "\\r";
+			break;
+		case '\t':
+			result += "\\t";
+			break;
+		default:
+			result += c;
+			break;
+		}
+	}
+	return result;
+}
+
+static bool EnsureDir(const std::string &path) {
+	if (path.empty()) {
+		return false;
+	}
+	std::string current;
+	for (size_t i = 0; i < path.size(); i++) {
+		current += path[i];
+		if (path[i] != '/' && i + 1 != path.size()) {
+			continue;
+		}
+		if (current.empty() || current == "/") {
+			continue;
+		}
+		if (mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static int64_t FileSize(const std::string &path) {
+	struct stat buffer;
+	if (stat(path.c_str(), &buffer) != 0) {
+		return 0;
+	}
+	return static_cast<int64_t>(buffer.st_size);
+}
+
+static std::string DeltaType(const std::string &duck_type) {
+	std::string upper = duck_type;
+	std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return std::toupper(c); });
+	if (upper == "TINYINT" || upper == "SMALLINT" || upper == "INTEGER" || upper == "INT") {
+		return "integer";
+	}
+	if (upper == "BIGINT" || upper == "HUGEINT" || upper == "UBIGINT") {
+		return "long";
+	}
+	if (upper == "FLOAT" || upper == "REAL") {
+		return "float";
+	}
+	if (upper == "DOUBLE") {
+		return "double";
+	}
+	if (upper.rfind("DECIMAL", 0) == 0) {
+		std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return std::tolower(c); });
+		return upper;
+	}
+	if (upper == "DATE") {
+		return "date";
+	}
+	if (upper.rfind("TIMESTAMP", 0) == 0) {
+		return "timestamp";
+	}
+	if (upper == "BOOLEAN" || upper == "BOOL") {
+		return "boolean";
+	}
+	return "string";
+}
+
+static std::string BuildDeltaSchemaString(duckdb::Connection &con, const std::string &native_catalog,
+                                          const std::string &table_name) {
+	auto info = con.Query("PRAGMA table_info('" + EscapeSingleQuotes(native_catalog) + ".main." + table_name + "')");
+	if (!info || info->HasError() || info->RowCount() == 0) {
+		return "";
+	}
+	std::string schema = "{\"type\":\"struct\",\"fields\":[";
+	for (duckdb::idx_t r = 0; r < info->RowCount(); r++) {
+		if (r > 0) {
+			schema += ",";
+		}
+		std::string col_name = info->GetValue(1, r).ToString();
+		std::string col_type = info->GetValue(2, r).ToString();
+		schema += "{\"name\":\"" + JsonEscape(col_name) + "\",\"type\":\"" + DeltaType(col_type) +
+		          "\",\"nullable\":true,\"metadata\":{}}";
+	}
+	schema += "]}";
+	return schema;
+}
+
+static bool WriteDeltaLog(duckdb::Connection &con, const std::string &native_catalog, const std::string &table_name,
+                          const std::string &table_dir, const std::string &parquet_file) {
+	auto schema = BuildDeltaSchemaString(con, native_catalog, table_name);
+	if (schema.empty()) {
+		return false;
+	}
+	auto count_result = con.Query("SELECT COUNT(*) FROM " + native_catalog + ".main." + table_name);
+	int64_t row_count = 0;
+	if (count_result && !count_result->HasError() && count_result->RowCount() > 0) {
+		row_count = count_result->GetValue(0, 0).GetValue<int64_t>();
+	}
+	if (!EnsureDir(table_dir + "/_delta_log")) {
+		return false;
+	}
+	std::ofstream out(table_dir + "/_delta_log/00000000000000000000.json", std::ios::trunc);
+	if (!out.is_open()) {
+		return false;
+	}
+	const int64_t timestamp_ms = 1700000000000LL;
+	out << "{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n";
+	out << "{\"metaData\":{\"id\":\"00000000-0000-0000-0000-000000" << table_name
+	    << "\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":\"" << JsonEscape(schema)
+	    << "\",\"partitionColumns\":[],\"configuration\":{},\"createdTime\":" << timestamp_ms << "}}\n";
+	out << "{\"add\":{\"path\":\"" << JsonEscape(parquet_file) << "\",\"partitionValues\":{},\"size\":"
+	    << FileSize(table_dir + "/" + parquet_file) << ",\"modificationTime\":" << timestamp_ms
+	    << ",\"dataChange\":true,\"stats\":\"{\\\"numRecords\\\":" << row_count << "}\"}}\n";
+	return true;
 }
 
 void CreateTPCCSchema(duckdb::Connection &con) {
@@ -190,6 +340,101 @@ std::vector<std::string> GenerateDeltaPool(int scale_factor) {
 		}
 	}
 	return deltas;
+}
+
+std::vector<std::string> GenerateDeltaAppendOnlyPool(int scale_factor) {
+	std::vector<std::string> deltas;
+	std::mt19937 rng(4242);
+	std::uniform_int_distribution<> w_dist(1, scale_factor);
+	std::uniform_int_distribution<> d_dist(1, 10);
+	std::uniform_int_distribution<> c_dist(1, 30);
+	std::uniform_int_distribution<> i_dist(1, 100);
+	std::uniform_int_distribution<> amount_dist(50, 500);
+
+	for (int i = 0; i < 500; i++) {
+		int w = w_dist(rng);
+		int d = d_dist(rng);
+		int c = c_dist(rng);
+		int item = i_dist(rng);
+		int amt = amount_dist(rng);
+		int new_order_id = 100000 + i;
+		switch (i % 6) {
+		case 0:
+			deltas.push_back("INSERT INTO d_HISTORY VALUES (" + std::to_string(c) + ", " + std::to_string(d) + ", " +
+			                 std::to_string(w) + ", " + std::to_string(d) + ", " + std::to_string(w) +
+			                 ", '2026-01-01 00:00:00', " + std::to_string(amt) + ".00, 'DeltaPayment')");
+			break;
+		case 1:
+			deltas.push_back("INSERT INTO d_NEW_ORDER VALUES (" + std::to_string(w) + ", " + std::to_string(d) +
+			                 ", " + std::to_string(new_order_id) + ")");
+			break;
+		case 2:
+			deltas.push_back("INSERT INTO d_OORDER VALUES (" + std::to_string(w) + ", " + std::to_string(d) + ", " +
+			                 std::to_string(new_order_id) + ", " + std::to_string(c) +
+			                 ", NULL, 3, 1, '2026-01-01 00:00:00')");
+			break;
+		case 3:
+			deltas.push_back("INSERT INTO d_ORDER_LINE VALUES (" + std::to_string(w) + ", " + std::to_string(d) +
+			                 ", " + std::to_string(new_order_id) + ", 1, " + std::to_string(item) +
+			                 ", NULL, " + std::to_string(amt % 100 + 1) + ".00, " + std::to_string(w) +
+			                 ", 5.00, 'DeltaInfo')");
+			break;
+		case 4:
+			deltas.push_back("INSERT INTO d_CUSTOMER VALUES (" + std::to_string(w) + ", " + std::to_string(d) +
+			                 ", " + std::to_string(100000 + i) +
+			                 ", 0.05, 'GC', 'DeltaLast', 'DeltaFirst', 50000.00, 10000.00, 0.0, 0, 0, 'St1', "
+			                 "'St2', 'City', 'ST', '123456789', '1234567890123456', '2026-01-01 00:00:00', 'M', "
+			                 "'data')");
+			break;
+		default:
+			deltas.push_back("INSERT INTO d_STOCK VALUES (" + std::to_string(w) + ", " + std::to_string(100000 + i) +
+			                 ", " + std::to_string(50 + (i % 50)) +
+			                 ", 0.00, 0, 0, 'DeltaStock', 'Dist1', 'Dist2', 'Dist3', 'Dist4', 'Dist5', 'Dist6', "
+			                 "'Dist7', 'Dist8', 'Dist9', 'Dist10')");
+			break;
+		}
+	}
+	return deltas;
+}
+
+bool AttachTPCCDeltaCatalogs(duckdb::Connection &con, const std::string &db_path, const std::string &native_catalog) {
+	auto install = con.Query("INSTALL delta");
+	auto load = con.Query("LOAD delta");
+	if ((install && install->HasError()) || (load && load->HasError())) {
+		return false;
+	}
+
+	const std::vector<std::string> tables = {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM",      "STOCK",
+	                                         "OORDER",    "NEW_ORDER", "ORDER_LINE", "HISTORY"};
+	std::string root = db_path + ".delta_tables";
+	if (!EnsureDir(root)) {
+		return false;
+	}
+
+	for (auto &table : tables) {
+		std::string table_dir = root + "/" + table;
+		std::string parquet_file = "part-00000.parquet";
+		if (!FileExists(table_dir + "/_delta_log/00000000000000000000.json")) {
+			if (!EnsureDir(table_dir)) {
+				return false;
+			}
+			auto copy = con.Query("COPY (SELECT * FROM " + native_catalog + ".main." + table + ") TO '" +
+			                      EscapeSingleQuotes(table_dir + "/" + parquet_file) + "' (FORMAT PARQUET)");
+			if (!copy || copy->HasError()) {
+				return false;
+			}
+			if (!WriteDeltaLog(con, native_catalog, table, table_dir, parquet_file)) {
+				return false;
+			}
+		}
+
+		auto attach = con.Query("ATTACH IF NOT EXISTS '" + EscapeSingleQuotes(table_dir) + "' AS d_" + table +
+		                        " (TYPE delta)");
+		if (!attach || attach->HasError()) {
+			return false;
+		}
+	}
+	return true;
 }
 
 } // namespace openivm_bench

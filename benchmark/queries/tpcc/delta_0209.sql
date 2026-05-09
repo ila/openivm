@@ -1,0 +1,2 @@
+-- {"operators": "AGGREGATE,UNION,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "delta": true}
+WITH per_w AS (SELECT C_W_ID AS w, COUNT(*) AS n, 'cust' AS src FROM d_CUSTOMER GROUP BY C_W_ID), per_d AS (SELECT D_W_ID AS w, COUNT(*) AS n, 'dist' AS src FROM d_DISTRICT GROUP BY D_W_ID) SELECT * FROM per_w UNION ALL SELECT * FROM per_d;

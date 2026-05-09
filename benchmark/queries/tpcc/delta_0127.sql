@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": true, "tables": "OORDER,NEW_ORDER", "delta": true}
+WITH status AS (SELECT o.O_W_ID, o.O_D_ID, o.O_ID, CASE WHEN no.NO_O_ID IS NULL THEN 'fulfilled' ELSE 'pending' END AS state FROM d_OORDER o LEFT JOIN d_NEW_ORDER no ON o.O_W_ID = no.NO_W_ID AND o.O_D_ID = no.NO_D_ID AND o.O_ID = no.NO_O_ID) SELECT O_W_ID, state, COUNT(*) OVER (PARTITION BY O_W_ID, state) AS state_count, O_ID FROM status;

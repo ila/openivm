@@ -5,8 +5,11 @@
 #include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
 #include "upsert/openivm_index_regen.hpp"
+#include "lpts_pipeline.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/constraint.hpp"
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -23,11 +26,24 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
+#include "duckdb/planner/planner.hpp"
+#include "functions/delta_scan/delta_scan.hpp"
 
 namespace duckdb {
 
 static uint64_t BindingKey(const ColumnBinding &binding) {
 	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
+}
+
+static idx_t FindMaxTableIndexInPlan(LogicalOperator *node) {
+	idx_t max_idx = 0;
+	for (auto &binding : node->GetColumnBindings()) {
+		max_idx = std::max(max_idx, binding.table_index);
+	}
+	for (auto &child : node->children) {
+		max_idx = std::max(max_idx, FindMaxTableIndexInPlan(child.get()));
+	}
+	return max_idx;
 }
 
 struct JoinColumnRef {
@@ -127,6 +143,57 @@ static bool DeltaKeyHasDeltaMatch(Connection &con, const JoinColumnRef &left_ref
 		return true;
 	}
 	return result->GetValue(0, 0).GetValue<bool>();
+}
+
+static unique_ptr<LogicalOperator> ReplanJoinTermFromSQL(ClientContext &context, Binder &binder,
+                                                         unique_ptr<LogicalOperator> &plan) {
+	auto ast = LogicalPlanToAst(context, plan);
+	auto cte_list = AstToCteList(*ast);
+	string sql = cte_list->ToQuery(false);
+	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Replanning uncopyable join term via LPTS SQL:\n%s\n", sql.c_str());
+
+	Parser parser;
+	parser.ParseQuery(sql);
+	if (parser.statements.empty()) {
+		throw Exception(ExceptionType::PARSER, "IVM: LPTS produced an empty join term query");
+	}
+	Planner planner(context);
+	planner.CreatePlan(std::move(parser.statements[0]));
+	Optimizer optimizer(*planner.binder, context);
+	auto replanned = optimizer.Optimize(std::move(planner.plan));
+
+	idx_t max_idx = FindMaxTableIndexInPlan(replanned.get());
+	while (binder.GenerateTableIndex() <= max_idx) {
+	}
+	return replanned;
+}
+
+static unique_ptr<LogicalOperator> CopyJoinTermForRewrite(ClientContext &context, Binder &binder,
+                                                          unique_ptr<LogicalOperator> &plan) {
+	try {
+		return plan->Copy(context);
+	} catch (const std::exception &e) {
+		string error = e.what();
+		if (error.find("serialization not implemented") == string::npos &&
+		    error.find("requires the logical operator") == string::npos) {
+			throw;
+		}
+		OPENIVM_DEBUG_PRINT("[IvmJoinRule] LogicalOperator::Copy failed (%s); using LPTS replan fallback\n", e.what());
+		return ReplanJoinTermFromSQL(context, binder, plan);
+	}
+}
+
+static void StripSyntheticUnaryJoinRoot(unique_ptr<LogicalOperator> &term, idx_t expected_leaf_count) {
+	while (term && term->children.size() == 1) {
+		vector<JoinLeafInfo> child_leaves;
+		CollectJoinLeaves(term->children[0].get(), {}, child_leaves);
+		if (term->type != LogicalOperatorType::LOGICAL_PROJECTION && child_leaves.size() != expected_leaf_count) {
+			return;
+		}
+		OPENIVM_DEBUG_PRINT("[IvmJoinRule] Stripping synthetic unary root %s from replanned join term\n",
+		                    LogicalOperatorToString(term->type).c_str());
+		term = std::move(term->children[0]);
+	}
 }
 
 static void CollectExistingMultiplicityBindings(LogicalOperator *node, unordered_set<uint64_t> &mul_set) {
@@ -402,6 +469,11 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 	if (leaf.path.empty()) {
 		return;
 	}
+	auto &child = GetNodeAtPath(term, leaf.path);
+	auto child_bindings = child->GetColumnBindings();
+	if (child_bindings.empty()) {
+		return;
+	}
 	size_t child_side = leaf.path.back();
 	unique_ptr<LogicalOperator> *parent = &term;
 	for (size_t s = 0; s + 1 < leaf.path.size(); s++) {
@@ -412,7 +484,7 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 		if (join) {
 			auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
 			if (!proj_map.empty()) {
-				idx_t mul_idx = leaf.node->GetColumnBindings().size();
+				idx_t mul_idx = child_bindings.size() - 1;
 				proj_map.push_back(mul_idx);
 				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
 				                    child_side == 0 ? "left" : "right");
@@ -457,6 +529,77 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 		}
 		auto table_ref = get->GetTable();
 		if (table_ref.get() == nullptr) {
+			if (get->function.name == "delta_scan") {
+				string table_name;
+				string source_path;
+				string source_catalog;
+				auto table_param = get->named_parameters.find("openivm_delta_table");
+				if (table_param != get->named_parameters.end() && !table_param->second.IsNull()) {
+					table_name = table_param->second.ToString();
+				}
+				auto catalog_param = get->named_parameters.find("openivm_delta_catalog");
+				if (catalog_param != get->named_parameters.end() && !catalog_param->second.IsNull()) {
+					source_catalog = catalog_param->second.ToString();
+				}
+				auto path_param = get->named_parameters.find("openivm_delta_path");
+				if (path_param != get->named_parameters.end() && !path_param->second.IsNull()) {
+					source_path = path_param->second.ToString();
+				}
+				if (get->function.function_info) {
+					auto &func_info = get->function.function_info->Cast<DeltaFunctionInfo>();
+					if (source_catalog.empty() && !func_info.table_name.empty()) {
+						source_catalog = func_info.table_name;
+					}
+					if (source_path.empty() && func_info.snapshot) {
+						source_path = func_info.snapshot->GetPath();
+					}
+				}
+				string where_clause = "catalog_type = 'delta'";
+				if (!table_name.empty()) {
+					where_clause += " AND table_name = '" + OpenIVMUtils::EscapeValue(table_name) + "'";
+				}
+				if (!source_catalog.empty()) {
+					where_clause +=
+					    " AND lower(source_catalog) = lower('" + OpenIVMUtils::EscapeValue(source_catalog) + "')";
+				}
+				if (!source_path.empty()) {
+					where_clause += " AND source_path = '" + OpenIVMUtils::EscapeValue(source_path) + "'";
+				}
+				auto meta_result = con.Query("SELECT table_name, source_path, last_snapshot_id FROM " +
+				                             string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+				                             OpenIVMUtils::EscapeValue(view_name) + "' AND " + where_clause);
+				if (!meta_result->HasError() && meta_result->RowCount() == 1 && !meta_result->GetValue(2, 0).IsNull()) {
+					if (table_name.empty()) {
+						table_name = meta_result->GetValue(0, 0).ToString();
+					}
+					if (source_path.empty() && !meta_result->GetValue(1, 0).IsNull()) {
+						source_path = meta_result->GetValue(1, 0).ToString();
+					}
+					auto last_version = meta_result->GetValue(2, 0).GetValue<int64_t>();
+					auto version_result = con.Query(
+					    "SELECT COALESCE(MAX(CAST(regexp_extract(file, '([0-9]+)\\.json$', 1) AS BIGINT)), -1) "
+					    "FROM glob('" +
+					    OpenIVMUtils::EscapeSingleQuotes(source_path) + "/_delta_log/*.json')");
+					if (!version_result->HasError() && version_result->RowCount() > 0 &&
+					    !version_result->GetValue(0, 0).IsNull()) {
+						auto current_version = version_result->GetValue(0, 0).GetValue<int64_t>();
+						if (last_version >= current_version) {
+							status.empty_mask |= (1ULL << i);
+							status.insert_only_mask |= (1ULL << i);
+							OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (Delta %s) has empty delta\n", i,
+							                    table_name.c_str());
+						} else {
+							status.insert_only_mask |= (1ULL << i);
+							OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (Delta %s) has append-only delta\n", i,
+							                    table_name.c_str());
+						}
+						continue;
+					}
+				}
+				status.insert_only_mask |= (1ULL << i);
+				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (Delta scan) treated as non-empty append-only delta\n", i);
+				continue;
+			}
 			// Table function (generate_series, range, etc.) has no catalog-backing
 			// table, so no delta table exists. Its output is constant across
 			// refreshes — the "delta" is always empty. Mark it as empty so the
@@ -469,6 +612,41 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 			status.constant_mask |= (1ULL << i);
 			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (table function '%s') has empty delta\n", i,
 			                    get->function.name.c_str());
+			continue;
+		}
+		if (table_ref.get()->ParentCatalog().GetCatalogType() == "delta") {
+			string table_name = table_ref.get()->name;
+			auto meta_result =
+			    con.Query("SELECT source_path, last_snapshot_id FROM " + string(ivm::DELTA_TABLES_TABLE) +
+			              " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+			              OpenIVMUtils::EscapeValue(table_name) + "'");
+			if (!meta_result->HasError() && meta_result->RowCount() == 1 && !meta_result->GetValue(1, 0).IsNull()) {
+				string source_path = meta_result->GetValue(0, 0).IsNull() ? table_ref.get()->ParentCatalog().GetDBPath()
+				                                                          : meta_result->GetValue(0, 0).ToString();
+				auto last_version = meta_result->GetValue(1, 0).GetValue<int64_t>();
+				auto version_result =
+				    con.Query("SELECT COALESCE(MAX(CAST(regexp_extract(file, '([0-9]+)\\.json$', 1) AS BIGINT)), -1) "
+				              "FROM glob('" +
+				              OpenIVMUtils::EscapeSingleQuotes(source_path) + "/_delta_log/*.json')");
+				if (!version_result->HasError() && version_result->RowCount() > 0 &&
+				    !version_result->GetValue(0, 0).IsNull()) {
+					auto current_version = version_result->GetValue(0, 0).GetValue<int64_t>();
+					if (last_version >= current_version) {
+						status.empty_mask |= (1ULL << i);
+						status.insert_only_mask |= (1ULL << i);
+						OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (Delta %s) has empty delta\n", i,
+						                    table_name.c_str());
+					} else {
+						status.insert_only_mask |= (1ULL << i);
+						OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (Delta %s) has append-only delta\n", i,
+						                    table_name.c_str());
+					}
+					continue;
+				}
+			}
+			status.insert_only_mask |= (1ULL << i);
+			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (Delta %s) treated as non-empty append-only delta\n", i,
+			                    table_name.c_str());
 			continue;
 		}
 		string delta_name = OpenIVMUtils::DeltaName(table_ref.get()->name);
@@ -719,10 +897,17 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Skipped term mask=%lu (delta key-domain empty)\n", (unsigned long)mask);
 			continue;
 		}
-		auto term = pw.plan->Copy(context);
+		auto term = CopyJoinTermForRewrite(context, binder, pw.plan);
+		StripSyntheticUnaryJoinRoot(term, N);
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);
 		LogicalOperator *term_root = term.get();
+		vector<JoinLeafInfo> term_leaves;
+		CollectJoinLeaves(term.get(), {}, term_leaves);
+		if (term_leaves.size() != N) {
+			throw InternalException("Join rewrite term leaf count changed after copy/replan (%zu vs %zu)",
+			                        term_leaves.size(), N);
+		}
 		vector<ColumnBinding> mul_bindings;
 
 		// LEFT JOIN delta rule (per-LJ): demote each LJ to INNER iff its right
@@ -739,23 +924,23 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 		// This subsumes both original cases (right-only delta, both-sides delta)
 		// without over-demoting in chained-LJ shapes.
 		if (has_left_join) {
-			DemoteLeftJoinsForMask(term.get(), leaves, mask);
+			DemoteLeftJoinsForMask(term.get(), term_leaves, mask);
 		}
 
 		// Replace delta leaves
 		for (size_t i = 0; i < N; i++) {
 			if (mask & (1ULL << i)) {
-				if (leaves[i].get) {
-					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, pw.view);
+				if (term_leaves[i].get) {
+					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, term_leaves[i].get, pw.view);
 					mul_bindings.push_back(delta_i.mul_binding);
-					GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
+					GetNodeAtPath(term, term_leaves[i].path) = std::move(delta_i.node);
 				} else {
-					auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
+					auto &subtree_ref = GetNodeAtPath(term, term_leaves[i].path);
 					auto rewritten = IVMRewriteRule::RewritePlan(pw.input, subtree_ref, pw.view, term_root);
 					mul_bindings.push_back(rewritten.mul_binding);
 					subtree_ref = std::move(rewritten.op);
 				}
-				UpdateParentProjectionMap(term, leaves[i]);
+				UpdateParentProjectionMap(term, term_leaves[i]);
 			}
 		}
 
@@ -850,19 +1035,21 @@ static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOpe
 		empty->ResolveOperatorTypes();
 		return std::move(empty);
 	}
+	vector<LogicalType> union_types = terms[0]->types.empty() ? types : terms[0]->types;
 	auto result = std::move(terms[0]);
 	for (size_t i = 1; i < terms.size(); i++) {
 		auto union_table_index = binder.GenerateTableIndex();
-		result = make_uniq<LogicalSetOperation>(union_table_index, types.size(), std::move(result), std::move(terms[i]),
-		                                        LogicalOperatorType::LOGICAL_UNION, true);
-		result->types = types;
+		result = make_uniq<LogicalSetOperation>(union_table_index, union_types.size(), std::move(result),
+		                                        std::move(terms[i]), LogicalOperatorType::LOGICAL_UNION, true);
+		result->types = union_types;
 	}
 
 	// Clean projection to disambiguate column names for LPTS
 	auto union_bindings = result->GetColumnBindings();
 	vector<unique_ptr<Expression>> clean_exprs;
-	for (idx_t i = 0; i < union_bindings.size(); i++) {
-		clean_exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], union_bindings[i]));
+	idx_t clean_count = std::min<idx_t>(union_types.size(), union_bindings.size());
+	for (idx_t i = 0; i < clean_count; i++) {
+		clean_exprs.push_back(make_uniq<BoundColumnRefExpression>(union_types[i], union_bindings[i]));
 	}
 	auto clean_proj = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(clean_exprs));
 	clean_proj->children.push_back(std::move(result));

@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,ORDER_LINE", "delta": true}
+WITH w_rev AS (SELECT OL_W_ID, SUM(OL_AMOUNT) AS rev FROM d_ORDER_LINE GROUP BY OL_W_ID) SELECT w.W_ID, w.W_NAME, w.W_YTD, wr.rev, (wr.rev / NULLIF(w.W_YTD, 0)) AS rev_ratio FROM d_WAREHOUSE w JOIN w_rev wr ON w.W_ID = wr.OL_W_ID;

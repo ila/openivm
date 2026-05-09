@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "delta": true}
+SELECT ol.OL_W_ID, ol.OL_I_ID, SUM(ol.OL_QUANTITY) AS qty, SUM(ol.OL_AMOUNT) AS amt, (SUM(ol.OL_AMOUNT) / NULLIF(SUM(ol.OL_QUANTITY), 0)) AS avg_unit FROM d_ORDER_LINE ol JOIN d_ITEM i ON ol.OL_I_ID = i.I_ID WHERE i.I_PRICE > 15 GROUP BY ol.OL_W_ID, ol.OL_I_ID;

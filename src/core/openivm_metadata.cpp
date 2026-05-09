@@ -236,7 +236,7 @@ string IVMMetadata::BuildDeltaCleanupSQL(const string &target, const string &met
 	       "');\n";
 }
 
-// --- DuckLake support ---
+// --- Externally versioned source support ---
 
 string IVMMetadata::GetCatalogType(const string &view_name, const string &table_name) {
 	auto result = con.Query("SELECT catalog_type FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
@@ -250,6 +250,25 @@ string IVMMetadata::GetCatalogType(const string &view_name, const string &table_
 
 bool IVMMetadata::IsDuckLakeTable(const string &view_name, const string &table_name) {
 	return GetCatalogType(view_name, table_name) == "ducklake";
+}
+
+bool IVMMetadata::IsDeltaTable(const string &view_name, const string &table_name) {
+	return GetCatalogType(view_name, table_name) == "delta";
+}
+
+bool IVMMetadata::IsExternallyVersionedTable(const string &view_name, const string &table_name) {
+	auto catalog_type = GetCatalogType(view_name, table_name);
+	return catalog_type == "ducklake" || catalog_type == "delta";
+}
+
+string IVMMetadata::GetSourcePath(const string &view_name, const string &table_name) {
+	auto result = con.Query("SELECT source_path FROM " + string(ivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	                        OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	                        OpenIVMUtils::EscapeValue(table_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return "";
+	}
+	return result->GetValue(0, 0).ToString();
 }
 
 int64_t IVMMetadata::GetLastSnapshotId(const string &view_name, const string &table_name) {
@@ -268,7 +287,7 @@ void IVMMetadata::UpdateSnapshotId(const string &view_name, const string &table_
 	              " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
 	              OpenIVMUtils::EscapeValue(table_name) + "'");
 	if (result->HasError()) {
-		throw Exception(ExceptionType::EXECUTOR, "Cannot update DuckLake snapshot ID: " + result->GetError());
+		throw Exception(ExceptionType::EXECUTOR, "Cannot update source snapshot/version ID: " + result->GetError());
 	}
 }
 

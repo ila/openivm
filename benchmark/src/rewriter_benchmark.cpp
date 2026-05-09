@@ -36,7 +36,9 @@ using namespace std;
 
 // Thin wrappers around shared helpers so existing in-file call sites don't need to change.
 using openivm_bench::CreateTPCCSchema;
+using openivm_bench::AttachTPCCDeltaCatalogs;
 using openivm_bench::FileExists;
+using openivm_bench::GenerateDeltaAppendOnlyPool;
 using openivm_bench::GenerateDeltaPool;
 using openivm_bench::InsertTPCCData;
 using openivm_bench::Log;
@@ -261,17 +263,29 @@ static vector<string> CollectQueryFiles(const string &dir) {
 		}
 	}
 	closedir(d);
-	// Sort: native `query_*` first, DuckLake `ducklake_*` last. DuckLake queries
-	// can trigger INTERNAL errors that invalidate the DB and force the parent to
-	// delete the WAL. If DuckLake runs first (alphabetical), that WAL deletion
-	// wipes the native TPC-C tables before any native query runs. Reverse order
-	// so native runs on a clean DB, then DuckLake runs against the same DB.
+	// Sort: native `query_*` first, Delta `delta_*` second, DuckLake `ducklake_*`
+	// last. DuckLake queries can trigger INTERNAL errors that invalidate the DB and
+	// force the parent to delete the WAL. Keep native and Delta runs ahead of them.
 	std::sort(files.begin(), files.end(), [](const string &a, const string &b) {
 		auto basename = [](const string &p) {
 			auto pos = p.find_last_of('/');
 			return pos != string::npos ? p.substr(pos + 1) : p;
 		};
 		string ba = basename(a), bb = basename(b);
+		auto rank = [](const string &name) {
+			if (name.rfind("ducklake_", 0) == 0) {
+				return 2;
+			}
+			if (name.rfind("delta_", 0) == 0) {
+				return 1;
+			}
+			return 0;
+		};
+		int ra = rank(ba);
+		int rb = rank(bb);
+		if (ra != rb) {
+			return ra < rb;
+		}
 		bool a_dl = ba.rfind("ducklake_", 0) == 0;
 		bool b_dl = bb.rfind("ducklake_", 0) == 0;
 		if (a_dl != b_dl)
@@ -436,7 +450,7 @@ static string TruncateError(const string &error) {
 }
 
 static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, const vector<string> &deltas,
-                            const string &workload) {
+                            const vector<string> &delta_append_only_deltas, const string &workload) {
 	try {
 		duckdb::DuckDB db(db_path);
 		duckdb::Connection con(db);
@@ -461,6 +475,13 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			}
 		}
 		string native_use = "USE " + native_catalog + ".main";
+
+		const char *ivm_files_path = std::getenv("OPENIVM_BENCH_IVM_FILES_PATH");
+		if (ivm_files_path && ivm_files_path[0] != '\0') {
+			string path = ivm_files_path;
+			std::replace(path.begin(), path.end(), '\'', '_');
+			con.Query("SET ivm_files_path='" + path + "'");
+		}
 
 		// DuckLake support is only for the tpcc workload — tpcdi has no DuckLake variants.
 		bool ducklake_ok = false;
@@ -490,6 +511,12 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					}
 				}
 			}
+		}
+
+		bool delta_ok = false;
+		if (workload == "tpcc") {
+			delta_ok = AttachTPCCDeltaCatalogs(con, db_path, native_catalog);
+			con.Query(native_use);
 		}
 
 		// Clean up any leftover mv_q* views and orphaned data tables from a previous crashed child.
@@ -545,6 +572,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			// header shipped inside each query file) are stripped next.
 			string worker_query_name;
 			bool is_ducklake_query = false;
+			bool is_delta_query = false;
 			{
 				auto newline_pos = query.find('\n');
 				if (newline_pos != string::npos && query.size() >= 2 && query[0] == '-' && query[1] == '-') {
@@ -556,6 +584,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							worker_query_name.pop_back();
 						}
 						is_ducklake_query = worker_query_name.find("ducklake_") != string::npos && ducklake_ok;
+						is_delta_query = worker_query_name.find("delta_") != string::npos && delta_ok;
 					}
 					query = query.substr(newline_pos + 1);
 				}
@@ -652,7 +681,11 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 
 						// Phase 3: Apply deltas
 						for (int d = 0; d < delta_batch_size && (size_t)delta_idx < deltas.size(); d++, delta_idx++) {
-							con.Query(deltas[delta_idx]); // Errors are OK (e.g. duplicate keys)
+							if (is_delta_query && !delta_append_only_deltas.empty()) {
+								con.Query(delta_append_only_deltas[delta_idx % delta_append_only_deltas.size()]);
+							} else {
+								con.Query(deltas[delta_idx]); // Errors are OK (e.g. duplicate keys)
+							}
 						}
 						if ((size_t)delta_idx >= deltas.size())
 							delta_idx = 0;
@@ -877,6 +910,7 @@ struct ForkWorker {
 	string db_path;
 	string workload = "tpcc";
 	vector<string> deltas;
+	vector<string> delta_append_only_deltas;
 
 	uint8_t result_phase = 0;
 	uint8_t result_incremental = 0;
@@ -902,7 +936,7 @@ struct ForkWorker {
 		if (child_pid == 0) {
 			close(to_child[1]);
 			close(from_child[0]);
-			ChildWorkerMain(to_child[0], from_child[1], db_path, deltas, workload);
+			ChildWorkerMain(to_child[0], from_child[1], db_path, deltas, delta_append_only_deltas, workload);
 			_exit(0);
 		}
 
@@ -1196,6 +1230,9 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 	worker.workload = workload;
 	worker.deltas =
 	    (workload == "tpcdi") ? openivm_bench::GenerateTPCDIDeltaPool(scale_factor) : GenerateDeltaPool(scale_factor);
+	if (workload == "tpcc") {
+		worker.delta_append_only_deltas = GenerateDeltaAppendOnlyPool(scale_factor);
+	}
 	worker.Start();
 
 	int log_interval = std::max(1, total / 10);

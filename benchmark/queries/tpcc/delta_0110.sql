@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,HAVING,UNION", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER,HISTORY", "delta": true}
+SELECT C_W_ID, C_D_ID, COUNT(*) AS n, 'orders' AS kind FROM d_CUSTOMER c JOIN d_OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2 UNION ALL SELECT H_C_W_ID, H_C_D_ID, COUNT(*), 'history' FROM d_HISTORY GROUP BY H_C_W_ID, H_C_D_ID HAVING COUNT(*) > 2;

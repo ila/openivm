@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,ORDER,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "delta": true}
+SELECT o.O_W_ID, o.O_ID, ol.OL_NUMBER, ol.OL_AMOUNT, LAG(ol.OL_AMOUNT, 1) OVER (PARTITION BY o.O_W_ID, o.O_ID ORDER BY ol.OL_NUMBER) AS prev_amt, LEAD(ol.OL_AMOUNT, 1) OVER (PARTITION BY o.O_W_ID, o.O_ID ORDER BY ol.OL_NUMBER) AS next_amt FROM d_OORDER o JOIN d_ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID;

@@ -14,8 +14,11 @@ struct GroupRecomputeDeltaSpec {
 	string base_table;
 	string last_update;
 	bool is_ducklake = false;
+	bool is_delta = false;
 	string ducklake_catalog;
 	string ducklake_schema;
+	string delta_catalog;
+	string delta_schema;
 	int64_t last_snapshot_id = -1;
 	int64_t current_snapshot_id = -1;
 };

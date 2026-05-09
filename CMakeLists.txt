@@ -8,7 +8,12 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 set(LPTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lpts")
-include_directories(src/include ${LPTS_DIR}/src/include ${LPTS_DIR}/third_party/ducklake/src/include)
+include_directories(
+    src/include
+    ${LPTS_DIR}/src/include
+    ${LPTS_DIR}/third_party/ducklake/src/include
+    ${LPTS_DIR}/third_party/duckdb-delta/src/include
+    "${CMAKE_BINARY_DIR}/codegen/include")
 
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
@@ -51,6 +56,14 @@ set(EXTENSION_SOURCES
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+if(TARGET delta_kernel)
+    add_dependencies(${EXTENSION_NAME} delta_kernel)
+    add_dependencies(${LOADABLE_EXTENSION_NAME} delta_kernel)
+endif()
+
+target_compile_definitions(${EXTENSION_NAME} PRIVATE DEFINE_DEFAULT_ENGINE DEFINE_DEFAULT_ENGINE_BASE)
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE DEFINE_DEFAULT_ENGINE DEFINE_DEFAULT_ENGINE_BASE)
+
 install(
   TARGETS ${EXTENSION_NAME}
   EXPORT "${DUCKDB_EXPORT_SET}"
@@ -65,6 +78,7 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
         ${EXTENSION_NAME}
         core_functions_extension
         parquet_extension
+        delta_extension
         duckdb_static)
 
     if(DUCKDB_EXTENSION_JEMALLOC_SHOULD_LINK)

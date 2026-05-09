@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "ITEM,STOCK", "delta": true}
+WITH adj_stock AS (SELECT S_W_ID, S_I_ID, CASE WHEN S_QUANTITY < 20 THEN S_QUANTITY * 2 ELSE S_QUANTITY END AS eff_qty FROM d_STOCK) SELECT a.S_W_ID, i.I_ID, i.I_NAME, a.eff_qty, (i.I_PRICE * a.eff_qty) AS projected FROM adj_stock a JOIN d_ITEM i ON a.S_I_ID = i.I_ID;

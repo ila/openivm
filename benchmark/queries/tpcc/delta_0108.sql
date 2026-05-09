@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER,NEW_ORDER", "delta": true}
+SELECT c.C_W_ID, c.C_ID, c.C_LAST, COUNT(o.O_ID) AS total_orders, COUNT(no.NO_O_ID) AS pending_orders FROM d_CUSTOMER c LEFT JOIN d_OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID LEFT JOIN d_NEW_ORDER no ON o.O_W_ID = no.NO_W_ID AND o.O_D_ID = no.NO_D_ID AND o.O_ID = no.NO_O_ID GROUP BY c.C_W_ID, c.C_ID, c.C_LAST;

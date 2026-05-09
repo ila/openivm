@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK", "delta": true}
+WITH stock_agg AS (SELECT S_I_ID, SUM(S_QUANTITY) AS total_qty FROM d_STOCK GROUP BY S_I_ID) SELECT i.I_ID, i.I_NAME, i.I_PRICE, sa.total_qty, ROW_NUMBER() OVER (ORDER BY sa.total_qty DESC) AS stock_rank FROM d_ITEM i JOIN stock_agg sa ON i.I_ID = sa.S_I_ID;

@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": true, "tables": "WAREHOUSE,DISTRICT,CUSTOMER", "delta": true}
+SELECT w.W_ID, w.W_STATE, CASE WHEN COUNT(c.C_ID) = 0 THEN 'empty' WHEN COUNT(c.C_ID) < 10 THEN 'small' ELSE 'large' END AS size, AVG(COALESCE(c.C_BALANCE, 0)) AS avg_bal FROM d_WAREHOUSE w LEFT JOIN d_DISTRICT d ON w.W_ID = d.D_W_ID LEFT JOIN d_CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID GROUP BY w.W_ID, w.W_STATE;

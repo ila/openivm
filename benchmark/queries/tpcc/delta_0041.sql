@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,FILTER", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "WAREHOUSE,DISTRICT,CUSTOMER", "delta": true}
+SELECT c.C_ID AS cust_id, c.C_LAST AS last_name, d.D_NAME AS district, w.W_NAME AS warehouse FROM d_WAREHOUSE w JOIN d_DISTRICT d ON w.W_ID = d.D_W_ID JOIN d_CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID WHERE c.C_BALANCE < 0;

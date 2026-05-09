@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE,HAVING,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "DISTRICT,CUSTOMER", "delta": true}
+WITH per_dist AS (SELECT C_W_ID, C_D_ID, COUNT(*) AS custs, AVG(C_BALANCE) AS avg_bal FROM d_CUSTOMER GROUP BY C_W_ID, C_D_ID HAVING AVG(C_BALANCE) > 0) SELECT d.D_W_ID, d.D_ID, d.D_NAME, pd.custs, pd.avg_bal FROM d_DISTRICT d LEFT JOIN per_dist pd ON d.D_W_ID = pd.C_W_ID AND d.D_ID = pd.C_D_ID;

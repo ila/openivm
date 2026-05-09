@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,FILTER,HAVING", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "DISTRICT,CUSTOMER", "delta": true}
+SELECT d.D_W_ID, d.D_ID, d.D_TAX, COUNT(*) AS ncust, SUM(CASE WHEN c.C_BALANCE > 0 THEN c.C_BALANCE ELSE 0 END) AS credit_bal FROM d_DISTRICT d JOIN d_CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID WHERE d.D_TAX > 0 GROUP BY d.D_W_ID, d.D_ID, d.D_TAX HAVING SUM(CASE WHEN c.C_BALANCE > 0 THEN c.C_BALANCE ELSE 0 END) > 100;

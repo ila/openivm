@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "DISTRICT,OORDER", "delta": true}
+SELECT d.D_W_ID, d.D_ID, d.D_YTD, COUNT(o.O_ID) AS orders, (d.D_YTD / NULLIF(COUNT(o.O_ID), 0)) AS ytd_per_order FROM d_DISTRICT d LEFT JOIN d_OORDER o ON d.D_W_ID = o.O_W_ID AND d.D_ID = o.O_D_ID GROUP BY d.D_W_ID, d.D_ID, d.D_YTD;

@@ -19,7 +19,9 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
+#include "functions/delta_scan/delta_scan.hpp"
 #include "storage/ducklake_scan.hpp"
 
 namespace duckdb {
@@ -262,6 +264,188 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 }
 
 // ============================================================================
+// Delta Lake append-only delta scan: current version EXCEPT ALL last version
+// ============================================================================
+
+static DeltaGetResult CreateDeltaAppendOnlyDeltaNode(ClientContext &context, Binder &binder, LogicalGet *old_get,
+                                                     const string &view_name) {
+	auto table_ref = old_get->GetTable();
+	Connection con(*context.db);
+	if (!table_ref.get()) {
+		auto catalog_param = old_get->named_parameters.find("openivm_delta_catalog");
+		auto schema_param = old_get->named_parameters.find("openivm_delta_schema");
+		auto table_param = old_get->named_parameters.find("openivm_delta_table");
+		if (catalog_param != old_get->named_parameters.end() && table_param != old_get->named_parameters.end()) {
+			string metadata_catalog_name = catalog_param->second.ToString();
+			string metadata_schema_name =
+			    schema_param == old_get->named_parameters.end() ? "main" : schema_param->second.ToString();
+			string metadata_table_name = table_param->second.ToString();
+			auto &entry = Catalog::GetEntry(context, metadata_catalog_name, metadata_schema_name,
+			                                EntryLookupInfo(CatalogType::TABLE_ENTRY, metadata_table_name));
+			table_ref = entry.Cast<TableCatalogEntry>();
+		} else {
+			string base_metadata_filter =
+			    "view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "' AND catalog_type = 'delta'";
+			vector<string> metadata_filters;
+			if (old_get->function.name == "delta_scan" && old_get->function.function_info) {
+				auto &func_info = old_get->function.function_info->Cast<DeltaFunctionInfo>();
+				if (!func_info.table_name.empty()) {
+					metadata_filters.push_back(base_metadata_filter + " AND lower(source_catalog) = lower('" +
+					                           OpenIVMUtils::EscapeValue(func_info.table_name) + "')");
+					metadata_filters.push_back(base_metadata_filter + " AND lower(table_name) = lower('" +
+					                           OpenIVMUtils::EscapeValue(func_info.table_name) + "')");
+				}
+				if (func_info.snapshot) {
+					string source_path = func_info.snapshot->GetPath();
+					if (!source_path.empty()) {
+						metadata_filters.push_back(base_metadata_filter + " AND source_path = '" +
+						                           OpenIVMUtils::EscapeValue(source_path) + "'");
+					}
+				}
+			}
+			metadata_filters.push_back(base_metadata_filter);
+			unique_ptr<MaterializedQueryResult> source_result;
+			for (auto &metadata_filter : metadata_filters) {
+				source_result = con.Query("SELECT table_name, source_catalog, source_schema FROM " +
+				                          string(ivm::DELTA_TABLES_TABLE) + " WHERE " + metadata_filter);
+				if (!source_result->HasError() && source_result->RowCount() == 1) {
+					break;
+				}
+			}
+			if (source_result->HasError() || source_result->RowCount() != 1) {
+				throw Exception(ExceptionType::BINDER, "IVM: cannot resolve Delta Lake delta scan for view '" +
+				                                           view_name + "' without an unambiguous catalog table");
+			}
+			string metadata_table_name = source_result->GetValue(0, 0).ToString();
+			string metadata_catalog_name =
+			    source_result->GetValue(1, 0).IsNull() ? metadata_table_name : source_result->GetValue(1, 0).ToString();
+			string metadata_schema_name =
+			    source_result->GetValue(2, 0).IsNull() ? "main" : source_result->GetValue(2, 0).ToString();
+			auto &entry = Catalog::GetEntry(context, metadata_catalog_name, metadata_schema_name,
+			                                EntryLookupInfo(CatalogType::TABLE_ENTRY, metadata_table_name));
+			table_ref = entry.Cast<TableCatalogEntry>();
+		}
+	}
+	string catalog_name = table_ref->ParentCatalog().GetName();
+	string schema_name = table_ref->schema.name;
+	string table_name = table_ref.get()->name;
+
+	Value delta_append_only_val;
+	bool delta_append_only = true;
+	if (context.TryGetCurrentSetting("ivm_delta_append_only", delta_append_only_val) &&
+	    !delta_append_only_val.IsNull()) {
+		delta_append_only = delta_append_only_val.GetValue<bool>();
+	}
+	// TODO: true is the only supported Delta mode today. Revisit this guard when
+	// OpenIVM can validate or maintain non-append Delta log actions.
+	if (!delta_append_only) {
+		throw NotImplementedException("IVM: Delta Lake source '" + table_name +
+		                              "' requires ivm_delta_append_only=true for incremental refresh");
+	}
+
+	auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(ivm::DELTA_TABLES_TABLE) +
+	                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+	                             "' AND table_name = '" + OpenIVMUtils::EscapeValue(table_name) + "'");
+	if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
+		throw Exception(ExceptionType::CATALOG,
+		                "IVM: no version recorded for Delta Lake table '" + table_name + "' in view '" + view_name +
+		                    "' (metadata may be missing — try DROP MATERIALIZED VIEW and recreate)");
+	}
+	int64_t last_version = snap_result->GetValue(0, 0).GetValue<int64_t>();
+	string delta_path = table_ref->ParentCatalog().GetDBPath();
+	auto version_result =
+	    con.Query("SELECT COALESCE(MAX(CAST(regexp_extract(file, '([0-9]+)\\.json$', 1) AS BIGINT)), -1) FROM glob('" +
+	              OpenIVMUtils::EscapeSingleQuotes(delta_path) + "/_delta_log/*.json')");
+	if (version_result->HasError() || version_result->RowCount() == 0 || version_result->GetValue(0, 0).IsNull()) {
+		throw Exception(ExceptionType::CATALOG,
+		                "IVM: could not determine Delta Lake version for table '" + table_name + "'");
+	}
+	int64_t current_version = version_result->GetValue(0, 0).GetValue<int64_t>();
+	OPENIVM_DEBUG_PRINT("[Delta] Version range for '%s.%s': %ld -> %ld\n", catalog_name.c_str(), table_name.c_str(),
+	                    (long)last_version, (long)current_version);
+
+	if (last_version >= current_version) {
+		vector<LogicalType> empty_types = old_get->types;
+		empty_types.push_back(LogicalType::INTEGER);
+		vector<ColumnBinding> bindings;
+		auto table_index = binder.GenerateTableIndex();
+		for (idx_t i = 0; i < empty_types.size(); i++) {
+			bindings.emplace_back(table_index, i);
+		}
+		auto mul_binding = bindings.back();
+		auto empty = make_uniq<LogicalEmptyResult>(empty_types, std::move(bindings));
+		empty->ResolveOperatorTypes();
+		return {std::move(empty), mul_binding};
+	}
+
+	auto make_table_scan = [&](optional_idx version, idx_t table_idx) -> unique_ptr<LogicalGet> {
+		optional_ptr<TableCatalogEntry> scan_table = table_ref;
+		unique_ptr<BoundAtClause> at_clause;
+		unique_ptr<EntryLookupInfo> lookup;
+		if (version.IsValid()) {
+			at_clause = make_uniq<BoundAtClause>("VERSION", Value::BIGINT(NumericCast<int64_t>(version.GetIndex())));
+			lookup = make_uniq<EntryLookupInfo>(CatalogType::TABLE_ENTRY, table_name,
+			                                    optional_ptr<BoundAtClause>(*at_clause), QueryErrorContext());
+			auto &entry = Catalog::GetEntry(context, catalog_name, schema_name, *lookup);
+			scan_table = entry.Cast<TableCatalogEntry>();
+		}
+
+		unique_ptr<FunctionData> bind_data;
+		TableFunction scan_function;
+		if (lookup) {
+			scan_function = scan_table->GetScanFunction(context, bind_data, *lookup);
+		} else {
+			scan_function = scan_table->GetScanFunction(context, bind_data);
+		}
+
+		auto get = make_uniq<LogicalGet>(table_idx, std::move(scan_function), std::move(bind_data),
+		                                 vector<LogicalType>(old_get->returned_types), vector<string>(old_get->names),
+		                                 old_get->virtual_columns);
+		get->SetColumnIds(vector<ColumnIndex>(old_get->GetColumnIds()));
+		get->projection_ids = old_get->projection_ids;
+		auto filter_copy = old_get->table_filters.Copy();
+		get->table_filters.filters = std::move(filter_copy->filters);
+		get->parameters = old_get->parameters;
+		get->named_parameters = old_get->named_parameters;
+		get->named_parameters["openivm_delta_catalog"] = Value(catalog_name);
+		get->named_parameters["openivm_delta_schema"] = Value(schema_name);
+		get->named_parameters["openivm_delta_table"] = Value(table_name);
+		get->named_parameters["openivm_delta_path"] = Value(table_ref->ParentCatalog().GetDBPath());
+		if (version.IsValid()) {
+			get->named_parameters["openivm_at_version"] = Value::BIGINT(NumericCast<int64_t>(version.GetIndex()));
+		}
+		get->ResolveOperatorTypes();
+		return get;
+	};
+
+	auto current_get = make_table_scan(optional_idx(), binder.GenerateTableIndex());
+	auto old_version_get = make_table_scan(optional_idx(NumericCast<idx_t>(last_version)), binder.GenerateTableIndex());
+	auto except_types = current_get->types;
+	idx_t output_cols = except_types.size();
+	auto except_op =
+	    make_uniq<LogicalSetOperation>(binder.GenerateTableIndex(), output_cols, std::move(current_get),
+	                                   std::move(old_version_get), LogicalOperatorType::LOGICAL_EXCEPT, true);
+	except_op->types = except_types;
+
+	auto bindings = except_op->GetColumnBindings();
+	vector<unique_ptr<Expression>> exprs;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		exprs.push_back(make_uniq<BoundColumnRefExpression>(except_op->types[i], bindings[i]));
+	}
+	exprs.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
+
+	auto proj = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(exprs));
+	proj->children.push_back(std::move(except_op));
+	proj->ResolveOperatorTypes();
+	ColumnBinding mul_binding(proj->GetColumnBindings().back());
+
+	if (!CompactDeltasEnabled(context)) {
+		return RemapDeltaNode(context, std::move(proj), old_get->table_index, mul_binding);
+	}
+	return CompactDeltaNode(context, binder, std::move(proj), old_get->table_index, mul_binding);
+}
+
+// ============================================================================
 // Standard DuckDB delta scan (existing logic)
 // ============================================================================
 
@@ -271,6 +455,12 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	auto table_ref = old_get->GetTable();
 	if (table_ref.get() && table_ref->ParentCatalog().GetCatalogType() == "ducklake") {
 		return CreateDuckLakeDeltaNode(context, binder, old_get, view_name);
+	}
+	if (table_ref.get() && table_ref->ParentCatalog().GetCatalogType() == "delta") {
+		return CreateDeltaAppendOnlyDeltaNode(context, binder, old_get, view_name);
+	}
+	if (!table_ref.get() && old_get->function.name == "delta_scan") {
+		return CreateDeltaAppendOnlyDeltaNode(context, binder, old_get, view_name);
 	}
 	// Table functions (generate_series, range, etc.) have no catalog-backing table
 	// and therefore no delta table. Their output is constant across refreshes, so

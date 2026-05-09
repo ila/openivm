@@ -31,4 +31,14 @@ void InsertTPCCData(duckdb::Connection &con, int scale_factor);
 // NEW_ORDER / WAREHOUSE.
 std::vector<std::string> GenerateDeltaPool(int scale_factor);
 
+// Returns deterministic append-only DML statements for Delta Lake catalogs
+// attached as d_<TABLE>. Delta Lake currently has no UPDATE/DELETE/MERGE path
+// in DuckDB, so benchmark mutations must be inserts only.
+std::vector<std::string> GenerateDeltaAppendOnlyPool(int scale_factor);
+
+// Seed one single-table Delta Lake directory per TPC-C table from the native
+// TPC-C database and attach them as d_<TABLE>. Returns false if the delta
+// extension or any generated Delta catalog is unavailable.
+bool AttachTPCCDeltaCatalogs(duckdb::Connection &con, const std::string &db_path, const std::string &native_catalog);
+
 } // namespace openivm_bench

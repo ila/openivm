@@ -15,6 +15,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_error_context.hpp"
@@ -24,6 +25,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_cte.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include <cctype>
 #include <chrono>
@@ -143,10 +145,12 @@ static string BuildFullOuterAffectedGroupsSubquery(IVMMetadata &metadata, const 
                                                    const string &delta_ts_filter, const string &catalog_prefix) {
 	auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
 	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-	bool dt_left_is_ducklake = !foj.dt_left_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_left_name);
-	bool dt_right_is_ducklake = !foj.dt_right_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_right_name);
-	string delta_where_left = dt_left_is_ducklake ? "" : delta_where;
-	string delta_where_right = dt_right_is_ducklake ? "" : delta_where;
+	bool dt_left_is_versioned =
+	    !foj.dt_left_name.empty() && metadata.IsExternallyVersionedTable(view_name, foj.dt_left_name);
+	bool dt_right_is_versioned =
+	    !foj.dt_right_name.empty() && metadata.IsExternallyVersionedTable(view_name, foj.dt_right_name);
+	string delta_where_left = dt_left_is_versioned ? "" : delta_where;
+	string delta_where_right = dt_right_is_versioned ? "" : delta_where;
 
 	string keys_tuple = JoinQuotedColumns(group_cols);
 	string affected;
@@ -388,6 +392,43 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 	return "dl";
 }
 
+static constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
+
+static string BuildExternallyVersionedSnapshotUpdateSQL(IVMMetadata &metadata, Connection &con, const string &view_name,
+                                                        const vector<string> &delta_table_names,
+                                                        const string &view_catalog_name,
+                                                        const string &attached_db_catalog_name, bool cross_system) {
+	// Externally versioned sources have no OpenIVM delta table to clean up. Advancing
+	// their source snapshot is what makes a full recompute a proper refresh boundary;
+	// otherwise the next incremental refresh replays rows already included by the full scan.
+	string dl_catalog_name = ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
+	string dl_snapshot_expr =
+	    cross_system ? DUCKLAKE_SNAPSHOT_PLACEHOLDER : "(SELECT id FROM " + dl_catalog_name + ".current_snapshot())";
+	string snapshot_update_query;
+	for (auto &dt : delta_table_names) {
+		if (metadata.IsDuckLakeTable(view_name, dt)) {
+			snapshot_update_query += "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
+			                         " SET last_snapshot_id = " + dl_snapshot_expr + " WHERE view_name = '" +
+			                         OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
+			                         OpenIVMUtils::EscapeValue(dt) + "';\n";
+		} else if (metadata.IsDeltaTable(view_name, dt)) {
+			auto source_path = metadata.GetSourcePath(view_name, dt);
+			if (source_path.empty()) {
+				throw Exception(ExceptionType::CATALOG, "IVM: missing Delta Lake source path for table '" + dt +
+				                                            "' in view '" + view_name + "'");
+			}
+			snapshot_update_query +=
+			    "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
+			    " SET last_snapshot_id = ("
+			    "SELECT COALESCE(MAX(CAST(regexp_extract(file, '([0-9]+)\\.json$', 1) AS "
+			    "BIGINT)), -1) FROM glob('" +
+			    OpenIVMUtils::EscapeSingleQuotes(source_path) + "/_delta_log/*.json')) WHERE view_name = '" +
+			    OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" + OpenIVMUtils::EscapeValue(dt) + "';\n";
+		}
+	}
+	return snapshot_update_query;
+}
+
 static string BuildRecomputeQuery(IVMMetadata &metadata, Connection &con, const string &view_name,
                                   const string &view_query_sql, bool cross_system, const string &attached_catalog = "",
                                   const string &attached_schema = "", const string &catalog_prefix = "",
@@ -403,8 +444,11 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, Connection &con, const 
 	//   restriction). Append to out_post_meta so RefreshViewLocked runs it on meta_con after
 	//   exec_con.Query() succeeds.
 	string update_ts_sql = "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
-	                       " SET last_update = now() WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
-	                       "';\n";
+	                       " SET last_update = now(), last_refresh_ts = now() WHERE view_name = '" +
+	                       OpenIVMUtils::EscapeValue(view_name) + "';\n";
+	auto delta_tables = metadata.GetDeltaTables(view_name);
+	update_ts_sql += BuildExternallyVersionedSnapshotUpdateSQL(metadata, con, view_name, delta_tables, attached_catalog,
+	                                                           attached_catalog, cross_system);
 	string update_ts;
 	if (!cross_system) {
 		update_ts = update_ts_sql;
@@ -413,9 +457,8 @@ static string BuildRecomputeQuery(IVMMetadata &metadata, Connection &con, const 
 	}
 
 	string delta_cleanup;
-	auto delta_tables = metadata.GetDeltaTables(view_name);
 	for (auto &dt : delta_tables) {
-		if (metadata.IsDuckLakeTable(view_name, dt)) {
+		if (metadata.IsExternallyVersionedTable(view_name, dt)) {
 			continue;
 		}
 		string resolved = dt;
@@ -451,12 +494,14 @@ static string BuildFullOuterProjectionRefresh(IVMMetadata &metadata, const strin
 	string rk = KeywordHelper::WriteOptionallyQuoted(string(ivm::RIGHT_KEY_COL));
 
 	auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
-	// DuckLake base tables lack `_duckdb_ivm_timestamp` — drop the ts filter when the
-	// delta source is a DuckLake base (delta_table_names stores the base name itself).
-	bool dt_left_is_ducklake = !foj.dt_left_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_left_name);
-	bool dt_right_is_ducklake = !foj.dt_right_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_right_name);
-	string delta_where_left = dt_left_is_ducklake ? "" : delta_where;
-	string delta_where_right = dt_right_is_ducklake ? "" : delta_where;
+	// Externally versioned base tables lack `_duckdb_ivm_timestamp` — drop the ts filter
+	// when the delta source is versioned (delta_table_names stores the base name itself).
+	bool dt_left_is_versioned =
+	    !foj.dt_left_name.empty() && metadata.IsExternallyVersionedTable(view_name, foj.dt_left_name);
+	bool dt_right_is_versioned =
+	    !foj.dt_right_name.empty() && metadata.IsExternallyVersionedTable(view_name, foj.dt_right_name);
+	string delta_where_left = dt_left_is_versioned ? "" : delta_where;
+	string delta_where_right = dt_right_is_versioned ? "" : delta_where;
 
 	string union_parts;
 	if (!foj.dt_left_name.empty() && !foj.left_col.empty()) {
@@ -653,6 +698,7 @@ static vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(IVMMetadata
 		}
 		spec.last_update = metadata.GetLastUpdate(view_name, dt);
 		spec.is_ducklake = metadata.IsDuckLakeTable(view_name, dt);
+		spec.is_delta = metadata.IsDeltaTable(view_name, dt);
 		if (spec.is_ducklake) {
 			auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, ducklake_catalog, ducklake_schema, "", "");
 			spec.ducklake_catalog = loc.catalog_name;
@@ -662,6 +708,19 @@ static vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(IVMMetadata
 			    con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot()");
 			if (!snap_result->HasError() && snap_result->RowCount() > 0 && !snap_result->GetValue(0, 0).IsNull()) {
 				spec.current_snapshot_id = snap_result->GetValue(0, 0).GetValue<int64_t>();
+			}
+		} else if (spec.is_delta) {
+			auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, ducklake_catalog, ducklake_schema, "", "");
+			spec.delta_catalog = loc.catalog_name;
+			spec.delta_schema = loc.schema_name;
+			spec.last_snapshot_id = metadata.GetLastSnapshotId(view_name, dt);
+			auto source_path = metadata.GetSourcePath(view_name, dt);
+			auto version_result = con.Query(
+			    "SELECT COALESCE(MAX(CAST(regexp_extract(file, '([0-9]+)\\.json$', 1) AS BIGINT)), -1) FROM glob('" +
+			    OpenIVMUtils::EscapeSingleQuotes(source_path) + "/_delta_log/*.json')");
+			if (!version_result->HasError() && version_result->RowCount() > 0 &&
+			    !version_result->GetValue(0, 0).IsNull()) {
+				spec.current_snapshot_id = version_result->GetValue(0, 0).GetValue<int64_t>();
 			}
 		}
 		delta_specs.push_back(std::move(spec));
@@ -941,8 +1000,6 @@ static string QualifyViewQuerySources(IVMMetadata &metadata, Connection &con, co
 	return qualified_query;
 }
 
-static constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
-
 struct RefreshProfileStep {
 	int32_t step_order;
 	string step_name;
@@ -1101,6 +1158,10 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		// over 7+ tables produces hundreds of chained projections). Lift the default 1000
 		// expression-depth limit so the binder doesn't reject legitimate plans.
 		exec_con.Query("SET max_expression_depth = 10000");
+		// Refreshes update relational MV state; physical insertion order is not part of
+		// the contract. Let DuckDB avoid large order-preservation buffers for big
+		// INSERT/CREATE TABLE style refresh plans.
+		exec_con.Query("SET preserve_insertion_order=false");
 		// Keep refresh execution in the physical default catalog. DuckLake-targeted MVs
 		// now write only physical _ivm_data_*/delta_* state; DuckLake source references
 		// emitted by LPTS are catalog-qualified, so switching USE to DuckLake would make
@@ -1226,6 +1287,11 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 
 void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters) {
 	OPENIVM_DEBUG_PRINT("[UPSERT] UpsertDeltaQueriesLocked START\n");
+	// PRAGMA ivm refreshes relational state, not ordered output. Force the
+	// OpenIVM entry point onto DuckDB's unordered execution mode even if this
+	// connection previously had a local preserve_insertion_order=true setting.
+	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
+	                                                             Value::BOOLEAN(false));
 	string view_catalog_name;
 	string view_schema_name;
 	string attached_db_catalog_name;
@@ -1369,6 +1435,25 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 					                   to_string(ducklake_current_snap) + ") LIMIT 1)) _ivm_delta_probe LIMIT 1)");
 					if (has_changes->HasError() || has_changes->RowCount() == 0 ||
 					    has_changes->GetValue(0, 0).IsNull() || has_changes->GetValue(0, 0).GetValue<bool>()) {
+						all_empty = false;
+						break;
+					}
+					continue;
+				}
+				if (metadata.IsDeltaTable(view_name, dt)) {
+					auto last_version = metadata.GetLastSnapshotId(view_name, dt);
+					auto source_path = metadata.GetSourcePath(view_name, dt);
+					auto version_result = con.Query(
+					    "SELECT COALESCE(MAX(CAST(regexp_extract(file, '([0-9]+)\\.json$', 1) AS BIGINT)), -1) "
+					    "FROM glob('" +
+					    OpenIVMUtils::EscapeSingleQuotes(source_path) + "/_delta_log/*.json')");
+					if (version_result->HasError() || version_result->RowCount() == 0 ||
+					    version_result->GetValue(0, 0).IsNull()) {
+						all_empty = false;
+						break;
+					}
+					auto current_version = version_result->GetValue(0, 0).GetValue<int64_t>();
+					if (last_version < current_version) {
 						all_empty = false;
 						break;
 					}
@@ -1750,6 +1835,24 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 				tables_with_changes++;
 				if (delete_count > 0) {
 					any_has_deletes = true;
+				}
+			} else if (metadata.IsDeltaTable(view_name, dt)) {
+				auto last_version = metadata.GetLastSnapshotId(view_name, dt);
+				auto source_path = metadata.GetSourcePath(view_name, dt);
+				auto version_result =
+				    con.Query("SELECT COALESCE(MAX(CAST(regexp_extract(file, '([0-9]+)\\.json$', 1) AS BIGINT)), -1) "
+				              "FROM glob('" +
+				              OpenIVMUtils::EscapeSingleQuotes(source_path) + "/_delta_log/*.json')");
+				if (version_result->HasError() || version_result->RowCount() == 0 ||
+				    version_result->GetValue(0, 0).IsNull()) {
+					any_has_deletes = true;
+					tables_with_changes++;
+					continue;
+				}
+				all_ducklake = false;
+				auto current_version = version_result->GetValue(0, 0).GetValue<int64_t>();
+				if (last_version < current_version) {
+					tables_with_changes++;
 				}
 			} else {
 				all_ducklake = false;
@@ -2411,8 +2514,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	//                       MAX(base_ts)+1us.
 	string update_timestamp_query;
 	for (auto &dt : delta_table_names) {
-		if (metadata.IsDuckLakeTable(view_name, dt)) {
-			// DuckLake doesn't use _duckdb_ivm_timestamp; keep now() semantics.
+		if (metadata.IsExternallyVersionedTable(view_name, dt)) {
+			// Externally versioned sources don't use _duckdb_ivm_timestamp; keep now() semantics.
 			update_timestamp_query += "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
 			                          " SET last_update = now(), last_refresh_ts = now() WHERE view_name = '" +
 			                          OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
@@ -2447,12 +2550,33 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			                         " SET last_snapshot_id = " + dl_snapshot_expr + " WHERE view_name = '" +
 			                         OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
 			                         OpenIVMUtils::EscapeValue(dt) + "';\n";
+		} else if (metadata.IsDeltaTable(view_name, dt)) {
+			auto source_meta = con.Query("SELECT source_path FROM " + string(ivm::DELTA_TABLES_TABLE) +
+			                             " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+			                             "' AND table_name = '" + OpenIVMUtils::EscapeValue(dt) + "'");
+			if (source_meta->HasError() || source_meta->RowCount() == 0 || source_meta->GetValue(0, 0).IsNull()) {
+				throw Exception(ExceptionType::CATALOG, "IVM: missing Delta Lake source path for table '" + dt +
+				                                            "' in view '" + view_name + "'");
+			}
+			string delta_path = source_meta->GetValue(0, 0).ToString();
+			auto version_result = con.Query(
+			    "SELECT COALESCE(MAX(CAST(regexp_extract(file, '([0-9]+)\\.json$', 1) AS BIGINT)), -1) FROM glob('" +
+			    OpenIVMUtils::EscapeSingleQuotes(delta_path) + "/_delta_log/*.json')");
+			if (version_result->HasError() || version_result->RowCount() == 0 ||
+			    version_result->GetValue(0, 0).IsNull()) {
+				throw Exception(ExceptionType::CATALOG, "IVM: could not determine Delta Lake version for table '" + dt +
+				                                            "' in view '" + view_name + "'");
+			}
+			snapshot_update_query += "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
+			                         " SET last_snapshot_id = " + version_result->GetValue(0, 0).ToString() +
+			                         " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) +
+			                         "' AND table_name = '" + OpenIVMUtils::EscapeValue(dt) + "';\n";
 		}
 	}
 
 	for (auto &dt : delta_table_names) {
-		// DuckLake tables have no delta tables to clean up
-		if (metadata.IsDuckLakeTable(view_name, dt)) {
+		// Externally versioned sources have no OpenIVM delta tables to clean up.
+		if (metadata.IsExternallyVersionedTable(view_name, dt)) {
 			continue;
 		}
 		if (cross_system) {

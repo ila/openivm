@@ -1112,6 +1112,12 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 			    OpenIVMUtils::EscapeValue(spec.ducklake_catalog) + "', '" +
 			    OpenIVMUtils::EscapeValue(spec.ducklake_schema) + "', '" + OpenIVMUtils::EscapeValue(base) + "', " +
 			    to_string(spec.last_snapshot_id) + ", " + to_string(spec.current_snapshot_id) + "))";
+		} else if (spec.is_delta) {
+			string source = OpenIVMUtils::QuoteIdentifier(spec.delta_catalog) + "." +
+			                OpenIVMUtils::QuoteIdentifier(spec.delta_schema) + "." +
+			                OpenIVMUtils::QuoteIdentifier(base);
+			delta_subselect = "(SELECT * FROM " + source + "\nEXCEPT ALL\nSELECT * FROM " + source +
+			                  " AT (VERSION => " + to_string(spec.last_snapshot_id) + "))";
 		} else {
 			string delta_basename = string(ivm::DELTA_PREFIX) + base;
 			string delta_filter;

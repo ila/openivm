@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,ORDER,WINDOW", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "ITEM,STOCK", "delta": true}
+SELECT s.S_W_ID, s.S_I_ID, i.I_PRICE, CASE WHEN s.S_QUANTITY < 20 THEN 'low' WHEN s.S_QUANTITY < 50 THEN 'mid' ELSE 'high' END AS stock_level, RANK() OVER (PARTITION BY s.S_W_ID ORDER BY i.I_PRICE DESC) AS price_rank FROM d_STOCK s JOIN d_ITEM i ON s.S_I_ID = i.I_ID;

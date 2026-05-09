@@ -1,0 +1,511 @@
+# name: test/sql/delta_append_only.test
+# description: Test append-only Delta Lake sources with version-based incremental refresh
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+LOAD delta;
+
+statement ok
+FROM copy_dir('third_party/lpts/third_party/duckdb-delta/data/inlined/simple_table', '__TEST_DIR__/delta_append_only');
+
+statement ok
+ATTACH '__TEST_DIR__/delta_append_only/delta_lake' AS d (TYPE delta);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_delta AS
+SELECT count(*) AS c, sum(i) AS s FROM d;
+
+query III
+SELECT catalog_type, last_snapshot_id, source_path IS NOT NULL
+FROM _duckdb_ivm_delta_tables
+WHERE view_name = 'mv_delta';
+----
+delta	0	true
+
+statement ok
+INSERT INTO d VALUES (10), (11);
+
+statement ok
+PRAGMA ivm('mv_delta');
+
+query II
+SELECT * FROM mv_delta;
+----
+12	66
+
+query II
+SELECT * FROM mv_delta
+EXCEPT ALL
+SELECT count(*) AS c, sum(i) AS s FROM d;
+----
+
+query II
+SELECT count(*) AS c, sum(i) AS s FROM d
+EXCEPT ALL
+SELECT * FROM mv_delta;
+----
+
+# Downstream cascade sees the Delta-backed MV companion delta.
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_child AS
+SELECT c, s + 1 AS s_plus_one FROM mv_delta;
+
+statement ok
+INSERT INTO d VALUES (12), (13);
+
+statement ok
+PRAGMA ivm('mv_delta');
+
+query II
+SELECT * FROM mv_delta_child;
+----
+14	92
+
+query II
+SELECT * FROM mv_delta_child
+EXCEPT ALL
+SELECT c, s + 1 AS s_plus_one FROM mv_delta;
+----
+
+query II
+SELECT c, s + 1 AS s_plus_one FROM mv_delta
+EXCEPT ALL
+SELECT * FROM mv_delta_child;
+----
+
+# Empty refresh is a no-op and must not change metadata snapshot.
+statement ok
+CREATE TEMP TABLE delta_snap_before_empty AS
+SELECT last_snapshot_id AS snap FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_delta';
+
+statement ok
+PRAGMA ivm('mv_delta');
+
+query I
+SELECT last_snapshot_id = (SELECT snap FROM delta_snap_before_empty)
+FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_delta';
+----
+true
+
+query II
+SELECT * FROM mv_delta
+EXCEPT ALL
+SELECT count(*) AS c, sum(i) AS s FROM d;
+----
+
+query II
+SELECT count(*) AS c, sum(i) AS s FROM d
+EXCEPT ALL
+SELECT * FROM mv_delta;
+----
+
+statement ok
+DROP TABLE delta_snap_before_empty;
+
+# OpenIVM must not create a synthetic delta_<source> table for Delta catalogs.
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'delta_d';
+----
+0
+
+# Projection and filter.
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_proj AS
+SELECT i, i * 2 AS doubled FROM d WHERE i >= 10;
+
+statement ok
+INSERT INTO d VALUES (14), (15);
+
+statement ok
+PRAGMA ivm('mv_delta_proj');
+
+query II rowsort
+SELECT * FROM mv_delta_proj
+EXCEPT ALL
+SELECT i, i * 2 AS doubled FROM d WHERE i >= 10;
+----
+
+query II rowsort
+SELECT i, i * 2 AS doubled FROM d WHERE i >= 10
+EXCEPT ALL
+SELECT * FROM mv_delta_proj;
+----
+
+# Grouped aggregate.
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_group AS
+SELECT i % 3 AS bucket, count(*) AS c, sum(i) AS s FROM d GROUP BY i % 3;
+
+statement ok
+INSERT INTO d VALUES (16), (17), (18);
+
+statement ok
+PRAGMA ivm('mv_delta_group');
+
+query III rowsort
+SELECT * FROM mv_delta_group
+EXCEPT ALL
+SELECT i % 3 AS bucket, count(*) AS c, sum(i) AS s FROM d GROUP BY i % 3;
+----
+
+query III rowsort
+SELECT i % 3 AS bucket, count(*) AS c, sum(i) AS s FROM d GROUP BY i % 3
+EXCEPT ALL
+SELECT * FROM mv_delta_group;
+----
+
+# CTE and UNION ALL.
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_cte AS
+WITH hi AS (SELECT i FROM d WHERE i >= 15)
+SELECT i, 'hi' AS tag FROM hi
+UNION ALL
+SELECT i, 'even' AS tag FROM d WHERE i % 2 = 0 AND i >= 16;
+
+statement ok
+INSERT INTO d VALUES (19), (20);
+
+statement ok
+PRAGMA ivm('mv_delta_cte');
+
+query IT rowsort
+SELECT * FROM mv_delta_cte
+EXCEPT ALL
+SELECT * FROM (
+  WITH hi AS (SELECT i FROM d WHERE i >= 15)
+  SELECT i, 'hi' AS tag FROM hi
+  UNION ALL
+  SELECT i, 'even' AS tag FROM d WHERE i % 2 = 0 AND i >= 16
+) q;
+----
+
+query IT rowsort
+SELECT * FROM (
+  WITH hi AS (SELECT i FROM d WHERE i >= 15)
+  SELECT i, 'hi' AS tag FROM hi
+  UNION ALL
+  SELECT i, 'even' AS tag FROM d WHERE i % 2 = 0 AND i >= 16
+) q
+EXCEPT ALL
+SELECT * FROM mv_delta_cte;
+----
+
+# DISTINCT/group-recompute.
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_distinct AS
+SELECT bucket, sum(i) AS s
+FROM (SELECT DISTINCT i % 5 AS bucket, i FROM d) x
+GROUP BY bucket;
+
+statement ok
+INSERT INTO d VALUES (21), (22), (23);
+
+statement ok
+PRAGMA ivm('mv_delta_distinct');
+
+query II rowsort
+SELECT * FROM mv_delta_distinct
+EXCEPT ALL
+SELECT bucket, sum(i) AS s
+FROM (SELECT DISTINCT i % 5 AS bucket, i FROM d) x
+GROUP BY bucket;
+----
+
+query II rowsort
+SELECT bucket, sum(i) AS s
+FROM (SELECT DISTINCT i % 5 AS bucket, i FROM d) x
+GROUP BY bucket
+EXCEPT ALL
+SELECT * FROM mv_delta_distinct;
+----
+
+# Window/partition recompute.
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_window AS
+SELECT i % 4 AS bucket, i, row_number() OVER (PARTITION BY i % 4 ORDER BY i) AS rn FROM d;
+
+statement ok
+INSERT INTO d VALUES (24), (25);
+
+statement ok
+PRAGMA ivm('mv_delta_window');
+
+query III rowsort
+SELECT * FROM mv_delta_window
+EXCEPT ALL
+SELECT i % 4 AS bucket, i, row_number() OVER (PARTITION BY i % 4 ORDER BY i) AS rn FROM d;
+----
+
+query III rowsort
+SELECT i % 4 AS bucket, i, row_number() OVER (PARTITION BY i % 4 ORDER BY i) AS rn FROM d
+EXCEPT ALL
+SELECT * FROM mv_delta_window;
+----
+
+# Inner join over two Delta catalogs.
+statement ok
+FROM copy_dir('third_party/lpts/third_party/duckdb-delta/data/inlined/simple_table', '__TEST_DIR__/delta_join_left');
+
+statement ok
+FROM copy_dir('third_party/lpts/third_party/duckdb-delta/data/inlined/simple_table', '__TEST_DIR__/delta_join_right');
+
+statement ok
+ATTACH '__TEST_DIR__/delta_join_left/delta_lake' AS d_left (TYPE delta);
+
+statement ok
+ATTACH '__TEST_DIR__/delta_join_right/delta_lake' AS d_right (TYPE delta);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_join AS
+SELECT l.i, count(*) AS matches
+FROM d_left l JOIN d_right r ON l.i = r.i
+GROUP BY l.i;
+
+statement ok
+INSERT INTO d_left VALUES (100), (101);
+
+statement ok
+INSERT INTO d_right VALUES (100), (102);
+
+statement ok
+PRAGMA ivm('mv_delta_join');
+
+query II rowsort
+SELECT * FROM mv_delta_join
+EXCEPT ALL
+SELECT l.i, count(*) AS matches
+FROM d_left l JOIN d_right r ON l.i = r.i
+GROUP BY l.i;
+----
+
+query II rowsort
+SELECT l.i, count(*) AS matches
+FROM d_left l JOIN d_right r ON l.i = r.i
+GROUP BY l.i
+EXCEPT ALL
+SELECT * FROM mv_delta_join;
+----
+
+# LEFT JOIN aggregate over Delta catalogs.
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_left_join AS
+SELECT l.i, count(r.i) AS matches
+FROM d_left l LEFT JOIN d_right r ON l.i = r.i
+GROUP BY l.i;
+
+statement ok
+INSERT INTO d_left VALUES (103);
+
+statement ok
+INSERT INTO d_right VALUES (101), (103);
+
+statement ok
+PRAGMA ivm('mv_delta_left_join');
+
+query II rowsort
+SELECT * FROM mv_delta_left_join
+EXCEPT ALL
+SELECT l.i, count(r.i) AS matches
+FROM d_left l LEFT JOIN d_right r ON l.i = r.i
+GROUP BY l.i;
+----
+
+query II rowsort
+SELECT l.i, count(r.i) AS matches
+FROM d_left l LEFT JOIN d_right r ON l.i = r.i
+GROUP BY l.i
+EXCEPT ALL
+SELECT * FROM mv_delta_left_join;
+----
+
+# Append-only refresh catches up after an additional Delta version.
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_safety AS
+SELECT count(*) AS c, sum(i) AS s FROM d;
+
+statement ok
+INSERT INTO d VALUES (26);
+
+statement ok
+PRAGMA ivm('mv_delta_safety');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM mv_delta_safety
+  EXCEPT ALL
+  SELECT count(*) AS c, sum(i) AS s FROM d
+) diff;
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT count(*) AS c, sum(i) AS s FROM d
+  EXCEPT ALL
+  SELECT * FROM mv_delta_safety
+) diff;
+----
+0
+
+query I
+SELECT last_snapshot_id = (
+  SELECT COALESCE(MAX(CAST(regexp_extract(file, '([0-9]+)\.json$', 1) AS BIGINT)), -1)
+  FROM glob('__TEST_DIR__/delta_append_only/delta_lake/_delta_log/*.json')
+)
+FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_delta_safety';
+----
+true
+
+statement ok
+INSERT INTO d VALUES (27);
+
+statement ok
+PRAGMA ivm('mv_delta_safety');
+
+query II
+SELECT * FROM mv_delta_safety
+EXCEPT ALL
+SELECT count(*) AS c, sum(i) AS s FROM d;
+----
+
+query II
+SELECT count(*) AS c, sum(i) AS s FROM d
+EXCEPT ALL
+SELECT * FROM mv_delta_safety;
+----
+
+# Refresh mode coverage: full, auto, and REFRESH EVERY metadata.
+statement ok
+SET ivm_refresh_mode = 'full';
+
+statement ok
+INSERT INTO d VALUES (28);
+
+statement ok
+PRAGMA ivm('mv_delta_safety');
+
+query II
+SELECT * FROM mv_delta_safety
+EXCEPT ALL
+SELECT count(*) AS c, sum(i) AS s FROM d;
+----
+
+query II
+SELECT count(*) AS c, sum(i) AS s FROM d
+EXCEPT ALL
+SELECT * FROM mv_delta_safety;
+----
+
+statement ok
+SET ivm_refresh_mode = 'auto';
+
+statement ok
+INSERT INTO d VALUES (29);
+
+statement ok
+PRAGMA ivm('mv_delta_safety');
+
+query II
+SELECT * FROM mv_delta_safety
+EXCEPT ALL
+SELECT count(*) AS c, sum(i) AS s FROM d;
+----
+
+query II
+SELECT count(*) AS c, sum(i) AS s FROM d
+EXCEPT ALL
+SELECT * FROM mv_delta_safety;
+----
+
+statement ok
+SET ivm_refresh_mode = 'incremental';
+
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_scheduled REFRESH EVERY '10 minutes' AS
+SELECT count(*) AS c FROM d;
+
+query II
+SELECT view_name, refresh_interval FROM _duckdb_ivm_views WHERE view_name = 'mv_delta_scheduled';
+----
+mv_delta_scheduled	600
+
+# Delta joins must not rely on LogicalOperator::Copy() for extension scans.
+# These shapes mirror the benchmark failures that used to raise:
+# "DeltaScan serialization not implemented".
+statement ok
+FROM copy_dir('third_party/lpts/third_party/duckdb-delta/data/inlined/simple_table', '__TEST_DIR__/delta_copy_left');
+
+statement ok
+FROM copy_dir('third_party/lpts/third_party/duckdb-delta/data/inlined/simple_table', '__TEST_DIR__/delta_copy_right');
+
+statement ok
+ATTACH '__TEST_DIR__/delta_copy_left/delta_lake' AS d_copy_left (TYPE delta);
+
+statement ok
+ATTACH '__TEST_DIR__/delta_copy_right/delta_lake' AS d_copy_right (TYPE delta);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_copy_join AS
+SELECT l.i AS li, r.i AS ri
+FROM d_copy_left l JOIN d_copy_right r ON l.i = r.i
+WHERE l.i >= 3;
+
+statement ok
+INSERT INTO d_copy_left VALUES (30), (31);
+
+statement ok
+INSERT INTO d_copy_right VALUES (30), (32);
+
+statement ok
+PRAGMA ivm('mv_delta_copy_join');
+
+query II
+SELECT * FROM mv_delta_copy_join
+EXCEPT ALL
+SELECT l.i AS li, r.i AS ri
+FROM d_copy_left l JOIN d_copy_right r ON l.i = r.i
+WHERE l.i >= 3;
+----
+
+query II
+SELECT l.i AS li, r.i AS ri
+FROM d_copy_left l JOIN d_copy_right r ON l.i = r.i
+WHERE l.i >= 3
+EXCEPT ALL
+SELECT * FROM mv_delta_copy_join;
+----
+
+statement ok
+CREATE MATERIALIZED VIEW mv_delta_copy_having AS
+SELECT l.i, COUNT(r.i) AS c
+FROM d_copy_left l JOIN d_copy_right r ON l.i = r.i
+GROUP BY l.i HAVING COUNT(r.i) > 0;
+
+statement ok
+INSERT INTO d_copy_left VALUES (40);
+
+statement ok
+INSERT INTO d_copy_right VALUES (40);
+
+statement ok
+PRAGMA ivm('mv_delta_copy_having');
+
+query II
+SELECT * FROM mv_delta_copy_having
+EXCEPT ALL
+SELECT l.i, COUNT(r.i) AS c
+FROM d_copy_left l JOIN d_copy_right r ON l.i = r.i
+GROUP BY l.i HAVING COUNT(r.i) > 0;
+----
+
+query II
+SELECT l.i, COUNT(r.i) AS c
+FROM d_copy_left l JOIN d_copy_right r ON l.i = r.i
+GROUP BY l.i HAVING COUNT(r.i) > 0
+EXCEPT ALL
+SELECT * FROM mv_delta_copy_having;
+----

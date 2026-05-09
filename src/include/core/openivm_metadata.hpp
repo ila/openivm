@@ -83,18 +83,27 @@ public:
 	// Get per-column aggregate function types (min, max, sum, count_star, etc.).
 	vector<string> GetAggregateTypes(const string &view_name);
 
-	// --- DuckLake support ---
+	// --- Externally versioned source support (DuckLake now, Delta append-only next) ---
 
-	// Get the catalog type for a base table entry ('duckdb' or 'ducklake').
+	// Get the catalog type for a base table entry ('duckdb', 'ducklake', or 'delta').
 	string GetCatalogType(const string &view_name, const string &table_name);
+
+	// Check if a base table entry is backed by an externally versioned lake source.
+	bool IsExternallyVersionedTable(const string &view_name, const string &table_name);
 
 	// Check if a base table entry is backed by DuckLake.
 	bool IsDuckLakeTable(const string &view_name, const string &table_name);
 
-	// Get the DuckLake snapshot ID at last refresh. Returns -1 if not set.
+	// Check if a base table entry is backed by Delta Lake.
+	bool IsDeltaTable(const string &view_name, const string &table_name);
+
+	// Get the source path for an externally versioned table. Returns empty if not stored.
+	string GetSourcePath(const string &view_name, const string &table_name);
+
+	// Get the source snapshot/version ID at last refresh. Returns -1 if not set.
 	int64_t GetLastSnapshotId(const string &view_name, const string &table_name);
 
-	// Update the DuckLake snapshot ID after refresh.
+	// Update the source snapshot/version ID after refresh.
 	void UpdateSnapshotId(const string &view_name, const string &table_name, int64_t snapshot_id);
 
 	// --- Refresh history (learned cost model) ---

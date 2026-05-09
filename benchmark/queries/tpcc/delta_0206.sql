@@ -1,0 +1,2 @@
+-- {"operators": "OUTER_JOIN", "complexity": "low", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "delta": true}
+SELECT c.C_W_ID, c.C_ID, c.C_LAST, COALESCE(o.O_ID, -1) AS maybe_order, COALESCE(o.O_CARRIER_ID, 0) AS carrier_or_zero FROM d_CUSTOMER c LEFT JOIN d_OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID;

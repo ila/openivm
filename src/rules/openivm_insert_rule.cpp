@@ -192,8 +192,8 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 			          KeywordHelper::WriteOptionallyQuoted(IVMTableNames::DataTableName(table_name)));
 
 			for (auto &dt : delta_tables) {
-				// DuckLake entries store the base table name — never drop it
-				if (metadata.IsDuckLakeTable(table_name, dt)) {
+				// Externally versioned entries store the base table name — never drop it.
+				if (metadata.IsExternallyVersionedTable(table_name, dt)) {
 					continue;
 				}
 				auto remaining = con.Query("SELECT count(*) FROM " + string(ivm::DELTA_TABLES_TABLE) +

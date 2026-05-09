@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE,ORDER,WINDOW,CTE,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK", "delta": true}
+WITH stock_val AS (SELECT s.S_W_ID, s.S_I_ID, s.S_QUANTITY, i.I_PRICE, (s.S_QUANTITY * i.I_PRICE) AS val FROM d_STOCK s JOIN d_ITEM i ON s.S_I_ID = i.I_ID) SELECT S_W_ID, S_I_ID, val, SUM(val) OVER (PARTITION BY S_W_ID) AS w_total, ROW_NUMBER() OVER (PARTITION BY S_W_ID ORDER BY val DESC) AS rk FROM stock_val;

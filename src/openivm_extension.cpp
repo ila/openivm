@@ -17,6 +17,7 @@
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/parser_extension.hpp"
@@ -104,6 +105,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &instance = loader.GetDatabaseInstance();
 	auto &db_config = duckdb::DBConfig::GetConfig(instance);
 
+	// OpenIVM materializes and refreshes relations, not ordered result streams.
+	// Make unordered execution the database-wide default for connections created
+	// after the extension is loaded. Entry points also set the current ClientContext
+	// explicitly because pre-existing local settings override global defaults.
+	db_config.SetOption(PreserveInsertionOrderSetting::SettingIndex, Value::BOOLEAN(false));
+
 	db_config.AddExtensionOption("ivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("ivm_refresh_mode", "refresh strategy: incremental, full, or auto",
 	                             LogicalType::VARCHAR, Value("incremental"));
@@ -126,6 +133,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("ivm_ducklake_nterm",
 	                             "use N-term telescoping for DuckLake joins (vs 2^N-1 inclusion-exclusion)",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	// TODO: true is the only supported Delta mode today. Define false-mode semantics when
+	// Delta UPDATE/DELETE support or log-action validation is implemented.
+	db_config.AddExtensionOption("ivm_delta_append_only",
+	                             "allow append-only Delta Lake sources to use externally versioned incremental refresh",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("ivm_fk_pruning", "prune inclusion-exclusion join terms using FK constraints",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
@@ -181,11 +193,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BIGINT, Value::BIGINT(50));
 	db_config.AddExtensionOption("ivm_profile_refresh", "record per-step materialized view refresh timings",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	db_config.AddExtensionOption("ivm_profile_retention_days",
-	                             "delete refresh profile rows older than this many days when profiling is written",
-	                             LogicalType::BIGINT, Value::BIGINT(31));
+		db_config.AddExtensionOption("ivm_profile_retention_days",
+		                             "delete refresh profile rows older than this many days when profiling is written",
+		                             LogicalType::BIGINT, Value::BIGINT(31));
+		db_config.AddExtensionOption("ivm_explain_initial_load",
+		                             "print CREATE MATERIALIZED VIEW initial-load SQL and EXPLAIN plans",
+		                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+		db_config.AddExtensionOption("ivm_explain_initial_load_only",
+		                             "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
+		                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
-	Connection con(instance);
+		Connection con(instance);
 
 	// Migration: add new columns to existing _duckdb_ivm_views tables
 	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +

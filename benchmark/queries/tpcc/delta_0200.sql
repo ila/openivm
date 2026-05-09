@@ -1,0 +1,2 @@
+-- {"operators": "INNER_JOIN,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": true, "tables": "WAREHOUSE,CUSTOMER", "delta": true}
+SELECT w.W_ID, w.W_YTD, SUM(CASE WHEN c.C_BALANCE < 0 THEN ABS(c.C_BALANCE) ELSE 0 END) AS debt, SUM(CASE WHEN c.C_BALANCE > 0 THEN c.C_BALANCE ELSE 0 END) AS credit, COUNT(*) AS custs FROM d_WAREHOUSE w JOIN d_CUSTOMER c ON w.W_ID = c.C_W_ID GROUP BY w.W_ID, w.W_YTD;

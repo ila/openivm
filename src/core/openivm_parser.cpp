@@ -8,8 +8,10 @@
 #include "rules/column_hider.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
@@ -121,6 +123,67 @@ static void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_p
 	Optimizer cte_opt(binder, context);
 	CTEInlining cte_inlining(cte_opt);
 	plan = cte_inlining.Optimize(std::move(plan));
+}
+
+static bool BoolSetting(ClientContext &context, const string &name) {
+	Value value;
+	return context.TryGetCurrentSetting(name, value) && !value.IsNull() && BooleanValue::Get(value);
+}
+
+static const char *ParserIVMTypeName(IVMType type) {
+	switch (type) {
+	case IVMType::AGGREGATE_HAVING:
+		return "AGGREGATE_HAVING";
+	case IVMType::AGGREGATE_GROUP:
+		return "AGGREGATE_GROUP";
+	case IVMType::SIMPLE_AGGREGATE:
+		return "SIMPLE_AGGREGATE";
+	case IVMType::SIMPLE_PROJECTION:
+		return "SIMPLE_PROJECTION";
+	case IVMType::WINDOW_PARTITION:
+		return "WINDOW_PARTITION";
+	case IVMType::GROUP_RECOMPUTE:
+		return "GROUP_RECOMPUTE";
+	case IVMType::DISTINCT_INCREMENTAL:
+		return "DISTINCT_INCREMENTAL";
+	case IVMType::SEMI_ANTI_RECOMPUTE:
+		return "SEMI_ANTI_RECOMPUTE";
+	case IVMType::TOP_K:
+		return "TOP_K";
+	case IVMType::FULL_REFRESH:
+		return "FULL_REFRESH";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static string StripTrailingSemicolon(string sql) {
+	StringUtil::Trim(sql);
+	if (!sql.empty() && sql.back() == ';') {
+		sql.pop_back();
+		StringUtil::Trim(sql);
+	}
+	return sql;
+}
+
+static string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query) {
+	string sql = StripTrailingSemicolon(query);
+	if (sql.empty()) {
+		return label + "\n<empty query>\n";
+	}
+	auto old_explain = con.Query("SELECT current_setting('explain_output')");
+	con.Query("SET explain_output='all'");
+	auto explain = con.Query("EXPLAIN " + sql);
+	if (old_explain && !old_explain->HasError() && old_explain->RowCount() > 0 && !old_explain->GetValue(0, 0).IsNull()) {
+		con.Query("SET explain_output='" + OpenIVMUtils::EscapeSingleQuotes(old_explain->GetValue(0, 0).ToString()) + "'");
+	}
+	string result = label + "\n";
+	if (!explain || explain->HasError()) {
+		result += "<EXPLAIN failed: " + (explain ? explain->GetError() : string("no result")) + ">\n";
+	} else {
+		result += explain->ToString() + "\n";
+	}
+	return result;
 }
 
 static bool HasUnionBeforeAggregate(const LogicalOperator *op, bool seen_agg_above = false) {
@@ -327,6 +390,14 @@ struct OpenIVMDuckLakeTableInfo {
 	string schema_name;  // DuckLake schema name
 };
 
+struct OpenIVMDeltaTableInfo {
+	string table_name;   // actual name as stored in Delta catalog (case-preserved)
+	string catalog_name; // Delta catalog name (e.g., "delta_table")
+	string schema_name;  // Delta schema name
+	string path;         // Delta table path
+	int64_t version;
+};
+
 struct OpenIVMSourceTableInfo {
 	string table_name;
 	string catalog_name;
@@ -394,6 +465,69 @@ static void CollectDuckLakeTables(LogicalOperator *op, const string &current_cat
 	for (auto &child : op->children) {
 		CollectDuckLakeTables(child.get(), current_catalog, dl_table_info);
 	}
+}
+
+static void CollectDeltaTables(LogicalOperator *op, ClientContext &context,
+                               unordered_map<string, OpenIVMDeltaTableInfo> &delta_table_info) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		auto table_ref = get.GetTable();
+		if (table_ref.get() && table_ref->ParentCatalog().GetCatalogType() == "delta") {
+			auto &table = *table_ref.get();
+			string lc = table.name;
+			std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return std::tolower(c); });
+			if (delta_table_info.find(lc) == delta_table_info.end()) {
+				auto &catalog = table.ParentCatalog();
+				int64_t version = -1;
+				delta_table_info[lc] = {table.name, catalog.GetName(), table.schema.name, catalog.GetDBPath(), version};
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		CollectDeltaTables(child.get(), context, delta_table_info);
+	}
+}
+
+static void AnnotateDeltaScansForLpts(LogicalOperator *op) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		auto table_ref = get.GetTable();
+		if (table_ref.get() && table_ref->ParentCatalog().GetCatalogType() == "delta") {
+			auto &table = *table_ref.get();
+			auto &catalog = table.ParentCatalog();
+			get.named_parameters["openivm_delta_catalog"] = Value(catalog.GetName());
+			get.named_parameters["openivm_delta_schema"] = Value(table.schema.name);
+			get.named_parameters["openivm_delta_table"] = Value(table.name);
+			get.named_parameters["openivm_delta_path"] = Value(catalog.GetDBPath());
+		}
+	}
+	for (auto &child : op->children) {
+		AnnotateDeltaScansForLpts(child.get());
+	}
+}
+
+static bool HasUnannotatedDeltaScan(LogicalOperator *op) {
+	if (!op) {
+		return false;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		if (get.function.name == "delta_scan" && !get.GetTable().get()) {
+			return true;
+		}
+	}
+	for (auto &child : op->children) {
+		if (HasUnannotatedDeltaScan(child.get())) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static void CollectSourceTables(LogicalOperator *op, unordered_map<string, OpenIVMSourceTableInfo> &source_table_info) {
@@ -1992,6 +2126,16 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 	if (!input.inputs.empty()) {
 		auto &db = DatabaseInstance::GetDatabase(context);
 		auto conn = make_uniq<Connection>(db);
+		auto configure_openivm_connection = [&]() {
+			// OpenIVM-managed DDL materializes relational state where physical insertion
+			// order is not observable. Disabling order preservation avoids DuckDB holding
+			// large ordering buffers for wide CTAS-style MV builds.
+			auto preserve_result = conn->Query("SET preserve_insertion_order=false");
+			if (preserve_result->HasError()) {
+				throw CatalogException("Failed to configure OpenIVM DDL connection: " + preserve_result->GetError());
+			}
+		};
+		configure_openivm_connection();
 		vector<string> cleanup_ddl;
 		auto run_cleanup = [&]() {
 			for (const auto &cleanup : cleanup_ddl) {
@@ -2017,6 +2161,7 @@ static unique_ptr<FunctionData> IVMDDLBindFunction(ClientContext &context, Table
 				// between staged DuckLake reads and DuckLake writes so the write-side
 				// commit cannot self-block on an earlier read from the same CREATE MV.
 				conn = make_uniq<Connection>(db);
+				configure_openivm_connection();
 				continue;
 			}
 			OPENIVM_DEBUG_PRINT("[IVMDDLBindFunction] Executing DDL: %s\n", q.c_str());
@@ -2137,6 +2282,11 @@ ParserExtensionParseResult IVMParserExtension::IVMParseFunction(ParserExtensionI
 
 ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInfo *info, ClientContext &context,
                                                               unique_ptr<ParserExtensionParseData> parse_data) {
+	// CREATE MATERIALIZED VIEW stores a relation. Physical insertion order is not
+	// semantically observable unless users query with ORDER BY, so keep OpenIVM's
+	// whole execution path on DuckDB's lower-memory unordered mode.
+	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
+	                                                             Value::BOOLEAN(false));
 	auto &ivm_parse_data = dynamic_cast<IVMParseData &>(*parse_data);
 	auto statement = dynamic_cast<SQLStatement *>(ivm_parse_data.statement.get());
 
@@ -2288,6 +2438,20 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 		unordered_map<string, OpenIVMDuckLakeTableInfo> dl_table_info_for_classification;
 		CollectDuckLakeTables(plan.get(), current_catalog, dl_table_info_for_classification);
+		unordered_map<string, OpenIVMDeltaTableInfo> delta_table_info_for_classification;
+		CollectDeltaTables(plan.get(), *con.context, delta_table_info_for_classification);
+		bool has_delta_source_for_classification = !delta_table_info_for_classification.empty();
+		if (!has_delta_source_for_classification) {
+			for (const auto &table_name : table_names) {
+				auto delta_catalog_result =
+				    con.Query("SELECT type FROM duckdb_databases() WHERE lower(database_name) = lower('" +
+				              OpenIVMUtils::EscapeSingleQuotes(table_name) + "') AND type = 'delta'");
+				if (!delta_catalog_result->HasError() && delta_catalog_result->RowCount() > 0) {
+					has_delta_source_for_classification = true;
+					break;
+				}
+			}
+		}
 
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 		vector<string> output_names;
@@ -2392,8 +2556,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				select_plan = std::move(select_plan->children[0]);
 				OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
 			}
+			AnnotateDeltaScansForLpts(select_plan.get());
 
-			if (statement_needs_original_sql_for_lpts || QueryNeedsOriginalSqlForLpts(original_view_query)) {
+			if (statement_needs_original_sql_for_lpts || QueryNeedsOriginalSqlForLpts(original_view_query) ||
+			    HasUnannotatedDeltaScan(select_plan.get())) {
 				view_query = original_view_query;
 				lpts_fallback = true;
 				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — using original SQL: %s\n",
@@ -2947,6 +3113,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		} else if ((has_union_over_agg || join_key_group_fallback || delim_aggregate_group_fallback ||
 		            scalar_delim_projection_group_fallback || join_aggregate_projection_fallback ||
 		            nested_aggregate_group_fallback || repeated_cte_aggregate_group_fallback ||
+		            (has_delta_source_for_classification && classification.found_join &&
+		             classification.found_aggregation) ||
 		            classification.found_nested_aggregate) &&
 		           !aggregate_columns.empty()) {
 			// UNION/UNION ALL over aggregates: group keys extracted positionally from output_names.
@@ -3059,6 +3227,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " pending_estimate_ts timestamp default null,"
 		              " source_catalog varchar default null,"
 		              " source_schema varchar default null,"
+		              " source_path varchar default null,"
 		              " primary key(view_name, table_name))");
 		// Backfill for existing databases without the columns (added post-release).
 		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
@@ -3071,6 +3240,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		              " add column if not exists source_catalog varchar default null");
 		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
 		              " add column if not exists source_schema varchar default null");
+		ddl.push_back("alter table " + string(ivm::DELTA_TABLES_TABLE) +
+		              " add column if not exists source_path varchar default null");
 
 		// Refresh history: stores execution stats for learned cost model calibration.
 		// Stage A.5 adds `strategy` (default 'incremental') for per-strategy regression.
@@ -3349,16 +3520,30 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			                           OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
 		}
 
-		// Classify each base table by catalog type (duckdb vs ducklake).
-		// DuckLake tables use native change tracking; DuckDB tables use delta tables.
+		// Classify each base table by catalog type.
+		// Externally versioned tables use source-native version tracking; DuckDB tables use delta tables.
 		//
 		// Catalog::GetEntry inside BeginTransaction() cannot see DuckLake entries:
 		// DuckLake requires its own transaction protocol. Walk the logical plan's
 		// DUCKLAKE_SCAN nodes instead — same approach used in ducklake_join.cpp.
 		unordered_map<string, OpenIVMDuckLakeTableInfo> dl_table_info; // keyed by lowercased name
 		CollectDuckLakeTables(plan.get(), current_catalog, dl_table_info);
+		unordered_map<string, OpenIVMDeltaTableInfo> delta_table_info; // keyed by lowercased name
+		CollectDeltaTables(plan.get(), *con.context, delta_table_info);
 
 		unordered_set<string> ducklake_tables;
+		unordered_set<string> externally_versioned_tables;
+		auto delta_version_from_path = [&](const string &path) -> int64_t {
+			auto version_result =
+			    con.Query("SELECT COALESCE(MAX(CAST(regexp_extract(file, '([0-9]+)\\.json$', 1) AS BIGINT)), -1) "
+			              "FROM glob('" +
+			              OpenIVMUtils::EscapeSingleQuotes(path) + "/_delta_log/*.json')");
+			if (version_result->HasError() || version_result->RowCount() == 0 ||
+			    version_result->GetValue(0, 0).IsNull()) {
+				return -1;
+			}
+			return version_result->GetValue(0, 0).GetValue<int64_t>();
+		};
 		// Single snapshot query per DuckLake catalog (all tables share the same snapshot).
 		string dl_snapshot_val = "null";
 		if (!dl_table_info.empty()) {
@@ -3378,6 +3563,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			string meta_table_name = OpenIVMUtils::DeltaName(table_name);
 			string source_catalog_val = current_catalog.empty() ? "memory" : current_catalog;
 			string source_schema_val = current_schema.empty() ? "main" : current_schema;
+			string source_path_val = "";
 
 			string table_lc = table_name;
 			std::transform(table_lc.begin(), table_lc.end(), table_lc.begin(),
@@ -3393,11 +3579,58 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				meta_table_name = it->second.table_name; // case-preserved name
 				ducklake_tables.insert(it->second.table_name);
 				ducklake_tables.insert(table_name); // also insert SQL-parsed name
+				externally_versioned_tables.insert(it->second.table_name);
+				externally_versioned_tables.insert(table_name); // also insert SQL-parsed name
+				externally_versioned_tables.insert(table_lc);
 				snapshot_val = dl_snapshot_val;
 				source_catalog_val = it->second.catalog_name;
 				source_schema_val = it->second.schema_name;
 				OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake table '%s' → meta_name='%s', snap=%s\n", table_name.c_str(),
 				                    meta_table_name.c_str(), snapshot_val.c_str());
+			}
+			auto delta_it = delta_table_info.find(table_lc);
+			if (delta_it != delta_table_info.end()) {
+				catalog_type = "delta";
+				meta_table_name = delta_it->second.table_name; // case-preserved name
+				externally_versioned_tables.insert(delta_it->second.table_name);
+				externally_versioned_tables.insert(table_name); // also insert SQL-parsed name
+				externally_versioned_tables.insert(table_lc);
+				if (delta_it->second.version >= 0) {
+					snapshot_val = to_string(delta_it->second.version);
+				}
+				source_catalog_val = delta_it->second.catalog_name;
+				source_schema_val = delta_it->second.schema_name;
+				source_path_val = delta_it->second.path;
+				auto version = delta_version_from_path(source_path_val);
+				if (version >= 0) {
+					snapshot_val = to_string(version);
+				}
+				OPENIVM_DEBUG_PRINT("[CREATE MV] Delta table '%s' → meta_name='%s', version=%s path='%s'\n",
+				                    table_name.c_str(), meta_table_name.c_str(), snapshot_val.c_str(),
+				                    source_path_val.c_str());
+			} else {
+				auto delta_catalog_result = con.Query("SELECT database_name, path, type FROM duckdb_databases() "
+				                                      "WHERE lower(database_name) = lower('" +
+				                                      OpenIVMUtils::EscapeSingleQuotes(table_name) + "')");
+				if (!delta_catalog_result->HasError() && delta_catalog_result->RowCount() > 0 &&
+				    !delta_catalog_result->GetValue(2, 0).IsNull() &&
+				    delta_catalog_result->GetValue(2, 0).ToString() == "delta") {
+					catalog_type = "delta";
+					meta_table_name = delta_catalog_result->GetValue(0, 0).ToString();
+					externally_versioned_tables.insert(meta_table_name);
+					externally_versioned_tables.insert(table_name);
+					externally_versioned_tables.insert(table_lc);
+					source_catalog_val = delta_catalog_result->GetValue(0, 0).ToString();
+					source_schema_val = "main";
+					source_path_val = delta_catalog_result->GetValue(1, 0).ToString();
+					auto version = delta_version_from_path(source_path_val);
+					if (version >= 0) {
+						snapshot_val = to_string(version);
+					}
+					OPENIVM_DEBUG_PRINT("[CREATE MV] Delta catalog '%s' → meta_name='%s', version=%s path='%s'\n",
+					                    table_name.c_str(), meta_table_name.c_str(), snapshot_val.c_str(),
+					                    source_path_val.c_str());
+				}
 			}
 
 			// A single physical source can appear under multiple logical names after planning.
@@ -3409,14 +3642,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				continue;
 			}
 
-			source_metadata_ddl.push_back("insert or replace into " + string(ivm::DELTA_TABLES_TABLE) +
-			                              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
-			                              "last_refresh_ts, source_catalog, source_schema) "
-			                              "values ('" +
-			                              view_name + "', '" + OpenIVMUtils::EscapeSingleQuotes(meta_table_name) +
-			                              "', now(), '" + catalog_type + "', " + snapshot_val + ", now(), '" +
-			                              OpenIVMUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
-			                              OpenIVMUtils::EscapeSingleQuotes(source_schema_val) + "')");
+			source_metadata_ddl.push_back(
+			    "insert or replace into " + string(ivm::DELTA_TABLES_TABLE) +
+			    " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
+			    "last_refresh_ts, source_catalog, source_schema, source_path) "
+			    "values ('" +
+			    view_name + "', '" + OpenIVMUtils::EscapeSingleQuotes(meta_table_name) + "', now(), '" + catalog_type +
+			    "', " + snapshot_val + ", now(), '" + OpenIVMUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
+			    OpenIVMUtils::EscapeSingleQuotes(source_schema_val) + "', " +
+			    (source_path_val.empty() ? "NULL" : "'" + OpenIVMUtils::EscapeSingleQuotes(source_path_val) + "'") +
+			    ")");
 		}
 
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---
@@ -3424,12 +3659,52 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		// DuckLake-targeted MVs publish only the user-facing view in DuckLake. Internal
 		// state remains in the physical default catalog, because DuckDB/DuckLake cannot
 		// roll back one atomic transaction across both catalogs.
-		string stage_table = "_ivm_stage_" + view_name;
-		string qstage =
-		    QualifiedTablePrefix(default_db, default_schema) + KeywordHelper::WriteOptionallyQuoted(stage_table);
-		// The view_query may contain unqualified base-table references (e.g. `FROM WAREHOUSE`
-		// when the user wrote the MV under `USE dl.main`). The DDL executor's fresh
-		// Connection starts in the physical-default catalog, so apply USE before CREATE
+			string stage_table = "_ivm_stage_" + view_name;
+			string qstage =
+			    QualifiedTablePrefix(default_db, default_schema) + KeywordHelper::WriteOptionallyQuoted(stage_table);
+			if (BoolSetting(context, "ivm_explain_initial_load")) {
+				// This diagnostic intentionally reports the exact first heavy statement that
+				// CREATE MV will run. DuckLake-targeted MVs may stage into the physical
+				// catalog before copying to _ivm_data_*, so they are not always a single CTAS.
+				if (!current_catalog.empty() && current_catalog != default_db) {
+					con.Query("USE " + current_catalog_schema);
+				}
+				string initial_load_statement = view_catalog_prefix.empty() ? "CREATE TABLE " + qdt + " AS " + view_query
+				                                                            : "CREATE TABLE " + qstage + " AS " + view_query;
+				string diagnostic;
+				diagnostic += "\n[OpenIVM initial-load diagnostic]\n";
+				diagnostic += "view_name: " + view_name + "\n";
+				diagnostic += "ivm_type: " + string(ParserIVMTypeName(ivm_type)) + "\n";
+				diagnostic += "lpts_fallback: " + string(lpts_fallback ? "true" : "false") + "\n";
+				diagnostic += "uses_staging_table: " + string(view_catalog_prefix.empty() ? "false" : "true") + "\n";
+				diagnostic += "initial_load_statement:\n" + initial_load_statement + "\n\n";
+				if (!view_catalog_prefix.empty()) {
+					diagnostic += "follow_up_copy_statement:\nCREATE TABLE " + qdt + " AS SELECT * FROM " + qstage +
+					              "\n\n";
+				}
+				diagnostic += "original_view_query:\n" + original_view_query + "\n\n";
+				diagnostic += "generated_view_query:\n" + view_query + "\n\n";
+				diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN original_view_query:", original_view_query);
+				diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN generated_view_query:", view_query);
+				diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN initial_load_statement:", initial_load_statement);
+				Printer::Print(diagnostic);
+
+				Value files_path_val;
+				if (context.TryGetCurrentSetting("ivm_files_path", files_path_val) && !files_path_val.IsNull()) {
+					OpenIVMUtils::WriteFile(files_path_val.ToString() + "/ivm_initial_load_explain_" + view_name + ".txt",
+					                        false, diagnostic);
+				}
+				if (BoolSetting(context, "ivm_explain_initial_load_only")) {
+					result.function = TableFunction("ivm_ddl_executor", {}, IVMDDLExecuteFunction, IVMDDLBindFunction,
+					                                IVMFunction::IVMInit);
+					result.requires_valid_transaction = true;
+					result.return_type = StatementReturnType::QUERY_RESULT;
+					return result;
+				}
+			}
+			// The view_query may contain unqualified base-table references (e.g. `FROM WAREHOUSE`
+			// when the user wrote the MV under `USE dl.main`). The DDL executor's fresh
+			// Connection starts in the physical-default catalog, so apply USE before CREATE
 		// TABLE AS so those unqualified names resolve in the MV's catalog.
 		if (!current_catalog.empty() && current_catalog != default_db) {
 			ddl.push_back("use " + current_catalog_schema);
@@ -3491,14 +3766,16 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		for (const auto &table_name : table_names) {
-			// DuckLake tables don't need delta tables — change tracking is native.
-			// `ducklake_tables` stores the catalog-normalized (lowercase) name, so
+			// Externally versioned tables don't need synthetic delta tables — source-native
+			// version tracking supplies changes. `externally_versioned_tables` stores the
+			// catalog-normalized (lowercase) name, so
 			// compare against a normalized copy of the SQL-parsed name.
 			string table_lc = table_name;
 			std::transform(table_lc.begin(), table_lc.end(), table_lc.begin(),
 			               [](unsigned char c) { return std::tolower(c); });
-			if (ducklake_tables.count(table_name) || ducklake_tables.count(table_lc)) {
-				OPENIVM_DEBUG_PRINT("[CREATE MV] Skipping delta table for DuckLake table '%s'\n", table_name.c_str());
+			if (externally_versioned_tables.count(table_name) || externally_versioned_tables.count(table_lc)) {
+				OPENIVM_DEBUG_PRINT("[CREATE MV] Skipping delta table for externally versioned table '%s'\n",
+				                    table_name.c_str());
 				continue;
 			}
 
