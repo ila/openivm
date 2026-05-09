@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -11,6 +12,7 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 
@@ -397,11 +399,146 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 	}
 }
 
+static bool HasUnionBeforeAggregate(const LogicalOperator *op, bool seen_agg_above = false) {
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		seen_agg_above = true;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_UNION && !seen_agg_above) {
+		return true;
+	}
+	for (auto &child : op->children) {
+		if (HasUnionBeforeAggregate(child.get(), seen_agg_above)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool HasUnsupportedSetOperation(const LogicalOperator *op) {
+	if (!op) {
+		return false;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_INTERSECT || op->type == LogicalOperatorType::LOGICAL_EXCEPT) {
+		return true;
+	}
+	for (auto &child : op->children) {
+		if (HasUnsupportedSetOperation(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
+	return fn_name == "quantile_cont" || fn_name == "quantile_disc" || fn_name == "percentile_cont" ||
+	       fn_name == "percentile_disc" || fn_name == "approx_quantile" || fn_name == "mad" || fn_name == "median" ||
+	       fn_name == "mode" ||
+	       // Two-argument aggregates whose children LPTS re-aliases to internal
+	       // `tN_col` names; the serialized SQL refers to those names against the
+	       // original FROM clause and fails binding at CREATE-table time.
+	       fn_name == "corr" || fn_name == "covar_pop" || fn_name == "covar_samp" || fn_name == "regr_avgx" ||
+	       fn_name == "regr_avgy" || fn_name == "regr_count" || fn_name == "regr_intercept" || fn_name == "regr_r2" ||
+	       fn_name == "regr_slope" || fn_name == "regr_sxx" || fn_name == "regr_sxy" || fn_name == "regr_syy" ||
+	       fn_name == "arg_min" || fn_name == "arg_max";
+}
+
+static bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op) {
+	if (!op) {
+		return false;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
+		return true;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto *agg = dynamic_cast<LogicalAggregate *>(op);
+		if (agg) {
+			for (auto &expr : agg->expressions) {
+				if (expr->type != ExpressionType::BOUND_AGGREGATE) {
+					continue;
+				}
+				auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+				if (IsAggregateFunctionUnsupportedByLpts(bound_agg.function.name)) {
+					return true;
+				}
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		if (PlanNeedsOriginalSqlForLpts(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool IsPurePassThroughExpression(const Expression *expr) {
+	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+		return true;
+	}
+	if (expr->expression_class == ExpressionClass::BOUND_CAST) {
+		auto &cast = expr->Cast<BoundCastExpression>();
+		return IsPurePassThroughExpression(cast.child.get());
+	}
+	return false;
+}
+
+static bool ExpressionReferencesNonGroupBinding(Expression *expr, idx_t group_index) {
+	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+		auto &bcr = expr->Cast<BoundColumnRefExpression>();
+		return bcr.binding.table_index != group_index;
+	}
+	bool refs_non_group = false;
+	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
+		if (!refs_non_group && ExpressionReferencesNonGroupBinding(child.get(), group_index)) {
+			refs_non_group = true;
+		}
+	});
+	return refs_non_group;
+}
+
+static bool OuterJoinAggregateNeedsRecompute(LogicalOperator *op, idx_t group_index) {
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &agg = op->Cast<LogicalAggregate>();
+		for (auto &expr : agg.expressions) {
+			if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+				continue;
+			}
+			auto &bound = expr->Cast<BoundAggregateExpression>();
+			for (auto &child : bound.children) {
+				if (!IsPurePassThroughExpression(child.get())) {
+					return true;
+				}
+			}
+		}
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &proj = op->Cast<LogicalProjection>();
+		for (auto &expr : proj.expressions) {
+			if (!IsPurePassThroughExpression(expr.get()) &&
+			    ExpressionReferencesNonGroupBinding(expr.get(), group_index)) {
+				return true;
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		if (OuterJoinAggregateNeedsRecompute(child.get(), group_index)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 } // namespace
 
 DeltaPlanModel BuildDeltaPlanModel(LogicalOperator *plan) {
 	DeltaPlanModel model;
 	AnalyzeDeltaNode(plan, model);
+	model.analysis.found_union_before_aggregate = model.analysis.found_aggregation && HasUnionBeforeAggregate(plan);
+	model.analysis.found_unsupported_set_operation = HasUnsupportedSetOperation(plan);
+	model.analysis.needs_original_sql_for_lpts = PlanNeedsOriginalSqlForLpts(plan);
+	model.analysis.outer_join_aggregate_needs_recompute =
+	    (model.analysis.found_left_join || model.analysis.found_full_outer) && model.analysis.found_aggregation &&
+	    OuterJoinAggregateNeedsRecompute(plan, model.analysis.group_index);
 	return model;
 }
 
@@ -412,6 +549,10 @@ string DeltaPlanModel::DebugString() const {
 	result += " projection=" + string(analysis.found_projection ? "true" : "false");
 	result += " group_count=" + to_string(analysis.group_count);
 	result += " aggregate_types=" + to_string(analysis.aggregate_types.size());
+	result += " union_before_agg=" + string(analysis.found_union_before_aggregate ? "true" : "false");
+	result += " unsupported_set=" + string(analysis.found_unsupported_set_operation ? "true" : "false");
+	result += " lpts_original_sql=" + string(analysis.needs_original_sql_for_lpts ? "true" : "false");
+	result += " outer_join_recompute=" + string(analysis.outer_join_aggregate_needs_recompute ? "true" : "false");
 	return result;
 }
 
