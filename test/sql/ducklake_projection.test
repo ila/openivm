@@ -400,6 +400,14 @@ statement ok
 CREATE MATERIALIZED VIEW lakecat.alt_mv AS SELECT id, name FROM lakecat.alt_src;
 
 query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat'
+  AND table_schema = 'main'
+  AND table_name IN ('_ivm_data_alt_mv', 'delta_alt_mv');
+----
+2
+
+query I
 SELECT count(*) FROM _duckdb_ivm_delta_tables
 WHERE view_name = 'alt_mv'
   AND table_name = 'alt_src'
@@ -441,6 +449,14 @@ statement ok
 USE memory.main;
 
 query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat'
+  AND table_schema = 'main'
+  AND table_name IN ('_ivm_data_alt_mv_from_use', 'delta_alt_mv_from_use');
+----
+2
+
+query I
 SELECT count(*) FROM _duckdb_ivm_delta_tables
 WHERE view_name = 'alt_mv_from_use'
   AND table_name = 'alt_src'
@@ -468,6 +484,167 @@ SELECT COUNT(*) FROM (
     SELECT id, name FROM lakecat.alt_mv_from_use
     EXCEPT ALL
     SELECT id, name FROM lakecat.alt_src
+);
+----
+0
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_projection_alt2.db' AS lakecat2 (TYPE ducklake);
+
+statement ok
+CREATE TABLE lakecat.cat_a (id INT, v INT);
+
+statement ok
+CREATE TABLE lakecat2.cat_b (id INT, label VARCHAR);
+
+statement ok
+INSERT INTO lakecat.cat_a VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO lakecat2.cat_b VALUES (1, 'one'), (2, 'two');
+
+statement ok
+CREATE MATERIALIZED VIEW lakecat.mv_two_catalogs AS
+SELECT a.id, a.v, b.label
+FROM lakecat.cat_a a
+JOIN lakecat2.cat_b b USING (id);
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat'
+  AND table_schema = 'main'
+  AND table_name IN ('_ivm_data_mv_two_catalogs', 'delta_mv_two_catalogs');
+----
+2
+
+query II rowsort
+SELECT table_name, source_catalog
+FROM _duckdb_ivm_delta_tables
+WHERE view_name = 'mv_two_catalogs'
+ORDER BY table_name;
+----
+cat_a	lakecat
+cat_b	lakecat2
+
+statement ok
+INSERT INTO lakecat.cat_a VALUES (3, 30);
+
+statement ok
+INSERT INTO lakecat2.cat_b VALUES (3, 'three');
+
+statement ok
+PRAGMA ivm_options('lakecat', 'main', 'mv_two_catalogs');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
+    EXCEPT ALL
+    SELECT id, v, label FROM lakecat.mv_two_catalogs
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, v, label FROM lakecat.mv_two_catalogs
+    EXCEPT ALL
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
+);
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW lakecat2.mv_two_catalogs_inverse AS
+SELECT a.id, a.v, b.label
+FROM lakecat.cat_a a
+JOIN lakecat2.cat_b b USING (id);
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat2'
+  AND table_schema = 'main'
+  AND table_name IN ('_ivm_data_mv_two_catalogs_inverse', 'delta_mv_two_catalogs_inverse');
+----
+2
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat'
+  AND table_schema = 'main'
+  AND table_name IN ('_ivm_data_mv_two_catalogs_inverse', 'delta_mv_two_catalogs_inverse');
+----
+0
+
+statement ok
+INSERT INTO lakecat.cat_a VALUES (4, 40);
+
+statement ok
+INSERT INTO lakecat2.cat_b VALUES (4, 'four');
+
+statement ok
+PRAGMA ivm_options('lakecat2', 'main', 'mv_two_catalogs_inverse');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
+    EXCEPT ALL
+    SELECT id, v, label FROM lakecat2.mv_two_catalogs_inverse
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, v, label FROM lakecat2.mv_two_catalogs_inverse
+    EXCEPT ALL
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
+);
+----
+0
+
+statement ok
+USE lakecat2.main;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_two_catalogs_from_use AS
+SELECT a.id, a.v, b.label
+FROM lakecat.cat_a a
+JOIN cat_b b USING (id);
+
+statement ok
+USE memory.main;
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'lakecat2'
+  AND table_schema = 'main'
+  AND table_name IN ('_ivm_data_mv_two_catalogs_from_use', 'delta_mv_two_catalogs_from_use');
+----
+2
+
+statement ok
+INSERT INTO lakecat.cat_a VALUES (5, 50);
+
+statement ok
+INSERT INTO lakecat2.cat_b VALUES (5, 'five');
+
+statement ok
+PRAGMA ivm_options('lakecat2', 'main', 'mv_two_catalogs_from_use');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
+    EXCEPT ALL
+    SELECT id, v, label FROM lakecat2.mv_two_catalogs_from_use
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, v, label FROM lakecat2.mv_two_catalogs_from_use
+    EXCEPT ALL
+    SELECT a.id, a.v, b.label FROM lakecat.cat_a a JOIN lakecat2.cat_b b USING (id)
 );
 ----
 0

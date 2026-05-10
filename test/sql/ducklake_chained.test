@@ -102,6 +102,90 @@ SELECT count(*) FROM (
 ----
 0
 
+# ==========================================
+# Cross-catalog DuckLake pipeline with non-dl catalog names
+# ==========================================
+
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_chain_a.db' AS chain_a (TYPE ducklake);
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_chain_b.db' AS chain_b (TYPE ducklake);
+
+statement ok
+CREATE TABLE chain_a.pipeline_src (id INT, amount INT);
+
+statement ok
+INSERT INTO chain_a.pipeline_src VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW chain_b.pipeline_l1 AS
+SELECT id, amount FROM chain_a.pipeline_src;
+
+statement ok
+CREATE MATERIALIZED VIEW chain_a.pipeline_l2 AS
+SELECT id, amount, amount * 2 AS doubled FROM chain_b.pipeline_l1;
+
+query II rowsort
+SELECT table_catalog, table_name
+FROM information_schema.tables
+WHERE table_name IN ('_ivm_data_pipeline_l1', 'delta_pipeline_l1',
+                     '_ivm_data_pipeline_l2', 'delta_pipeline_l2')
+ORDER BY table_catalog, table_name;
+----
+chain_a	_ivm_data_pipeline_l2
+chain_a	delta_pipeline_l2
+chain_b	_ivm_data_pipeline_l1
+chain_b	delta_pipeline_l1
+
+statement ok
+INSERT INTO chain_a.pipeline_src VALUES (3, 30);
+
+statement ok
+PRAGMA ivm_options('chain_b', 'main', 'pipeline_l1');
+
+statement ok
+PRAGMA ivm_options('chain_a', 'main', 'pipeline_l2');
+
+query I
+SELECT count(*) FROM (
+  SELECT id, amount FROM chain_a.pipeline_src
+  EXCEPT ALL
+  SELECT id, amount FROM chain_b.pipeline_l1
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, amount FROM chain_b.pipeline_l1
+  EXCEPT ALL
+  SELECT id, amount FROM chain_a.pipeline_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, amount, amount * 2 AS doubled FROM chain_b.pipeline_l1
+  EXCEPT ALL
+  SELECT id, amount, doubled FROM chain_a.pipeline_l2
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, amount, doubled FROM chain_a.pipeline_l2
+  EXCEPT ALL
+  SELECT id, amount, amount * 2 AS doubled FROM chain_b.pipeline_l1
+);
+----
+0
+
 # --- Delete: drop east below threshold ---
 statement ok
 DELETE FROM dl.sales WHERE id = 1;

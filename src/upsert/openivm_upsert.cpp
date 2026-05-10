@@ -400,6 +400,16 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 	throw Exception(ExceptionType::CATALOG, "Could not resolve attached DuckLake catalog");
 }
 
+static bool IsDuckLakeCatalog(Connection &con, const string &catalog_name) {
+	if (catalog_name.empty()) {
+		return false;
+	}
+	auto result = con.Query("SELECT type FROM duckdb_databases() WHERE database_name = '" +
+	                        OpenIVMUtils::EscapeValue(catalog_name) + "' LIMIT 1");
+	return !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
+	       StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "ducklake");
+}
+
 static string BuildRecomputeQuery(IVMMetadata &metadata, Connection &con, const string &view_name,
                                   const string &view_query_sql, bool cross_system, const string &attached_catalog = "",
                                   const string &attached_schema = "", const string &catalog_prefix = "",
@@ -955,6 +965,22 @@ static string QualifyViewQuerySources(IVMMetadata &metadata, Connection &con, co
 
 static constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
 
+static string HexEncodeToken(const string &input) {
+	static constexpr const char *hex = "0123456789ABCDEF";
+	string result;
+	result.reserve(input.size() * 2);
+	for (auto c : input) {
+		auto byte = static_cast<unsigned char>(c);
+		result.push_back(hex[(byte >> 4) & 0x0F]);
+		result.push_back(hex[byte & 0x0F]);
+	}
+	return result;
+}
+
+static string DuckLakeSnapshotPlaceholder(const string &catalog_name) {
+	return string(DUCKLAKE_SNAPSHOT_PLACEHOLDER) + HexEncodeToken(catalog_name) + "__";
+}
+
 struct RefreshProfileStep {
 	int32_t step_order;
 	string step_name;
@@ -1117,10 +1143,8 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.
 		exec_con.Query("SET preserve_insertion_order=false");
-		// Keep refresh execution in the physical default catalog. DuckLake-targeted MVs
-		// now write only physical _ivm_data_*/delta_* state; DuckLake source references
-		// emitted by LPTS are catalog-qualified, so switching USE to DuckLake would make
-		// any remaining unqualified internal references bind to the wrong catalog.
+		// Refresh SQL uses fully qualified internal data/delta names. DuckLake-targeted
+		// MVs write those objects in DuckLake; native MVs keep them in the physical DB.
 		OPENIVM_DEBUG_PRINT("[UPSERT] Executing refresh SQL:\n%s\n", sql.c_str());
 
 		// Wrap the entire refresh in a transaction so that a failed refresh leaves the MV
@@ -1166,20 +1190,44 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		} else if (cross_system && !meta_post_sql.empty()) {
 			auto meta_post_start = std::chrono::steady_clock::now();
 			if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
-				string dl_catalog = ResolveDuckLakeCatalogName(exec_con, view_catalog_name, attached_db_catalog_name);
 				// DuckLake can keep read snapshot state on the connection that compiled
 				// the data refresh. Read the post-refresh watermark through a fresh
 				// connection so we do not persist an old snapshot and replay deltas.
 				Connection snap_con(*context.db.get());
-				auto snap_result = snap_con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(dl_catalog) +
-				                                  ".current_snapshot()");
-				if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
+				auto catalogs = snap_con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'");
+				if (catalogs->HasError()) {
 					throw Exception(ExceptionType::EXECUTOR,
 					                "IVM refresh of '" + vn +
-					                    "' failed: could not read DuckLake snapshot after data refresh");
+					                    "' failed: could not list DuckLake catalogs after data "
+					                    "refresh: " +
+					                    catalogs->GetError());
 				}
-				meta_post_sql = StringUtil::Replace(meta_post_sql, DUCKLAKE_SNAPSHOT_PLACEHOLDER,
-				                                    snap_result->GetValue(0, 0).ToString());
+				for (idx_t row = 0; row < catalogs->RowCount(); row++) {
+					if (catalogs->GetValue(0, row).IsNull()) {
+						continue;
+					}
+					string dl_catalog = catalogs->GetValue(0, row).ToString();
+					string placeholder = DuckLakeSnapshotPlaceholder(dl_catalog);
+					if (meta_post_sql.find(placeholder) == string::npos) {
+						continue;
+					}
+					auto snap_result = snap_con.Query("SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(dl_catalog) +
+					                                  ".current_snapshot()");
+					if (snap_result->HasError() || snap_result->RowCount() == 0 ||
+					    snap_result->GetValue(0, 0).IsNull()) {
+						throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + vn +
+						                                             "' failed: could not read DuckLake snapshot for "
+						                                             "catalog '" +
+						                                             dl_catalog + "' after data refresh");
+					}
+					meta_post_sql =
+					    StringUtil::Replace(meta_post_sql, placeholder, snap_result->GetValue(0, 0).ToString());
+				}
+				if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
+					throw Exception(ExceptionType::EXECUTOR,
+					                "IVM refresh of '" + vn +
+					                    "' failed: unresolved DuckLake snapshot placeholder after data refresh");
+				}
 			}
 			Connection meta_con(*context.db.get());
 			auto meta_result = meta_con.Query(meta_post_sql);
@@ -1468,7 +1516,7 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 }
 
 // When cross_system is true (DuckLake MVs), the refresh SQL touches two catalogs:
-// data ops write to dl.main.*, metadata ops write to the physical default.
+// data ops write to the MV target catalog, metadata ops write to the physical default.
 // DuckDB forbids cross-catalog writes in one transaction. We split the SQL into
 // three parts: pre-metadata (set_in_progress), data ops, post-metadata (timestamps).
 // out_pre_meta / out_post_meta receive those parts; the return value is data-only.
@@ -1485,9 +1533,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	if (context.TryGetCurrentSetting("ivm_skip_empty_deltas", skip_empty_val) && !skip_empty_val.IsNull()) {
 		skip_empty_enabled = skip_empty_val.GetValue<bool>();
 	}
-	// Catalog-qualified prefix for OpenIVM internal state. DuckLake-targeted MVs expose
-	// a DuckLake view, but _ivm_data_* and delta_<mv> live in the physical default DB so
-	// refresh does not need a cross-catalog write transaction.
+	// Catalog-qualified prefix for OpenIVM internal state. DuckLake-targeted MVs store
+	// _ivm_data_* and delta_<mv> in DuckLake so initial load and refresh data writes use
+	// the same storage path as DuckLake CTAS. Metadata remains in the physical default DB.
 	string default_db;
 	string default_schema = "main";
 	{
@@ -1508,7 +1556,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	string internal_catalog_name = view_catalog_name;
 	string internal_schema_name = view_schema_name;
 	string internal_catalog_prefix = catalog_prefix;
-	if (cross_system && !default_db.empty() && default_db != "memory" && view_catalog_name != default_db) {
+	bool target_is_ducklake = IsDuckLakeCatalog(con, view_catalog_name);
+	if (!target_is_ducklake && cross_system && !default_db.empty() && default_db != "memory" &&
+	    view_catalog_name != default_db) {
 		internal_catalog_name = default_db;
 		internal_schema_name = default_schema;
 		internal_catalog_prefix =
@@ -2449,16 +2499,21 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		                          OpenIVMUtils::EscapeValue(dt) + "';\n";
 	}
 
-	// Update DuckLake snapshot IDs so the next refresh only sees new changes.
-	// For cross-system refresh (native MV that reads from dl.*), view_catalog_name
-	// is the physical-default (no `current_snapshot()` function), so probe
-	// `duckdb_databases()` once per refresh to find the attached DuckLake catalog.
-	string dl_catalog_name = ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
-	string dl_snapshot_expr =
-	    cross_system ? DUCKLAKE_SNAPSHOT_PLACEHOLDER : "(SELECT id FROM " + dl_catalog_name + ".current_snapshot())";
+	// Update DuckLake snapshot IDs so the next refresh only sees new changes. Track
+	// each source catalog independently: one MV may read from multiple DuckLake catalogs.
 	string snapshot_update_query;
 	for (auto &dt : delta_table_names) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
+			auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
+			                                         attached_db_catalog_name, attached_db_schema_name);
+			if (loc.catalog_name.empty()) {
+				throw Exception(ExceptionType::CATALOG,
+				                "Could not resolve DuckLake catalog for source table '" + dt + "'");
+			}
+			string dl_snapshot_expr =
+			    cross_system
+			        ? DuckLakeSnapshotPlaceholder(loc.catalog_name)
+			        : "(SELECT id FROM " + OpenIVMUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot())";
 			snapshot_update_query += "UPDATE " + string(ivm::DELTA_TABLES_TABLE) +
 			                         " SET last_snapshot_id = " + dl_snapshot_expr + " WHERE view_name = '" +
 			                         OpenIVMUtils::EscapeValue(view_name) + "' AND table_name = '" +
@@ -2500,7 +2555,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// 9. delete_from_delta: clean old base delta rows
 	//
 	// For cross_system (DuckLake) MVs, steps 0 and 6-7 write to the physical-default catalog
-	// (metadata tables) while steps 1-5 and 8-9 write to dl. DuckDB forbids cross-catalog
+	// (metadata tables) while data steps write to the MV target catalog. DuckDB forbids cross-catalog
 	// writes in one transaction. When out_pre_meta/out_post_meta are provided, we split them.
 	string data_sql = pre_companion + ivm_query + "\n" + companion_query + "\n" + upsert_query + "\n" + post_companion +
 	                  compact_delta_view_query + delete_from_view_query + "\n" + delete_from_delta_table_query;

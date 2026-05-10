@@ -512,6 +512,16 @@ static string QuoteQualifiedPrefix(const string &prefix) {
 	return result.empty() ? "" : result + ".";
 }
 
+static bool CatalogIsDuckLake(Connection &con, const string &catalog_name) {
+	if (catalog_name.empty()) {
+		return false;
+	}
+	auto result = con.Query("SELECT type FROM duckdb_databases() WHERE database_name = '" +
+	                        OpenIVMUtils::EscapeValue(catalog_name) + "' LIMIT 1");
+	return !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
+	       StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "ducklake");
+}
+
 static bool RelationExists(Connection &con, const string &qualified_name) {
 	auto result = con.Query("SELECT * FROM " + qualified_name + " LIMIT 0");
 	return !result->HasError();
@@ -2412,14 +2422,22 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		auto original_view_query = OpenIVMUtils::ExtractViewQuery(statement->query);
 
 		// Split catalog-qualified name (e.g. "dl.mv_totals") into prefix and bare name.
-		// The target prefix is used only for the user-facing view. DuckLake-backed MVs keep
-		// OpenIVM's internal state in the physical default catalog so CREATE/REFRESH does not
-		// need to atomically write DuckLake metadata and DuckDB catalog objects together.
 		string view_catalog_prefix; // e.g. "dl." or "" for default catalog
 		string view_name;           // bare name without catalog, e.g. "mv_totals"
+		string view_target_catalog = current_catalog;
+		string view_target_schema = current_schema;
 		auto dot_pos = full_view_name.rfind('.');
 		if (dot_pos != string::npos) {
-			view_catalog_prefix = QuoteQualifiedPrefix(full_view_name.substr(0, dot_pos + 1));
+			auto raw_prefix = full_view_name.substr(0, dot_pos);
+			view_catalog_prefix = QuoteQualifiedPrefix(raw_prefix + ".");
+			auto schema_dot_pos = raw_prefix.rfind('.');
+			if (schema_dot_pos != string::npos) {
+				view_target_catalog = raw_prefix.substr(0, schema_dot_pos);
+				view_target_schema = raw_prefix.substr(schema_dot_pos + 1);
+			} else {
+				view_target_catalog = raw_prefix;
+				view_target_schema = current_schema.empty() ? "main" : current_schema;
+			}
 			view_name = full_view_name.substr(dot_pos + 1);
 		} else {
 			view_name = full_view_name;
@@ -2431,8 +2449,12 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 				view_catalog_prefix = QualifiedTablePrefix(current_catalog, current_schema);
 			}
 		}
+		bool target_is_ducklake = CatalogIsDuckLake(con, view_target_catalog);
 		string internal_catalog_prefix = view_catalog_prefix;
-		if (!view_catalog_prefix.empty() && default_db != "memory") {
+		// Native MVs created from another active catalog keep OpenIVM state in the physical
+		// default DB. DuckLake-targeted MVs store their data/delta tables in DuckLake so
+		// initial materialization follows the same storage path as DuckLake CTAS.
+		if (!target_is_ducklake && !view_catalog_prefix.empty() && default_db != "memory") {
 			internal_catalog_prefix = QualifiedTablePrefix(default_db, default_schema);
 		}
 		string data_table = IVMTableNames::DataTableName(view_name);
@@ -3636,9 +3658,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---
 		// Physical data table stores all columns (including _ivm_* internal cols).
-		// DuckLake-targeted MVs publish only the user-facing view in DuckLake. Internal
-		// state remains in the physical default catalog, because DuckDB/DuckLake cannot
-		// roll back one atomic transaction across both catalogs.
+		// DuckLake-targeted MVs store the data/delta tables in DuckLake and keep only
+		// OpenIVM metadata in the physical default catalog. CREATE/REFRESH split metadata
+		// writes from DuckLake data writes because DuckDB cannot commit one transaction
+		// across both catalogs.
 		string stage_table = "_ivm_stage_" + view_name;
 		string qstage =
 		    QualifiedTablePrefix(default_db, default_schema) + KeywordHelper::WriteOptionallyQuoted(stage_table);
@@ -3689,8 +3712,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		if (!view_catalog_prefix.empty()) {
 			// DuckLake can self-lock when the same connection both reads DuckLake tables
 			// and later publishes DuckLake metadata. Keep the reconnect boundary before
-			// the user-facing view publish, but write OpenIVM's internal state directly
-			// to the physical default catalog so large MVs do not need a second full copy.
+			// the user-facing view publish.
 			ddl.push_back("create table " + qdt + " as " + view_query);
 			ddl.push_back(OPENIVM_DDL_RECONNECT);
 			ddl.push_back("use " + default_catalog_schema);
@@ -3800,9 +3822,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		add_cleanup("DROP TABLE IF EXISTS " + qdv);
 
 		// --- Index DDL (for aggregate group queries) ---
-		// DuckLake source scans do not support indexes. DuckLake-targeted MVs store the
-		// internal data table in the physical default catalog, but source-side DuckLake
-		// change tracking still skips this optional index.
+		// DuckLake source scans and DuckLake-backed MV state do not support this optional
+		// native index.
 		if ((ivm_type == IVMType::AGGREGATE_GROUP || ivm_type == IVMType::AGGREGATE_HAVING) &&
 		    !aggregate_columns.empty() && ducklake_tables.empty() && view_catalog_prefix.empty()) {
 			add_profile_marker("create_mv_index", "columns=" + to_string(aggregate_columns.size()));
