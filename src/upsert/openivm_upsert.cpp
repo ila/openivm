@@ -4,6 +4,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/openivm_metadata.hpp"
 #include "core/openivm_refresh_locks.hpp"
+#include "core/ivm_view_classifier.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "core/openivm_utils.hpp"
@@ -344,33 +345,6 @@ static string BuildCompactDeltaViewSQL(const string &view_name, const string &de
 	sql += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + col_list + " FROM " + qtemp + ";\n";
 	sql += "DROP TABLE " + qtemp + ";\n";
 	return sql;
-}
-
-static const char *IVMTypeName(IVMType type) {
-	switch (type) {
-	case IVMType::AGGREGATE_HAVING:
-		return "AGGREGATE_HAVING";
-	case IVMType::AGGREGATE_GROUP:
-		return "AGGREGATE_GROUP";
-	case IVMType::SIMPLE_AGGREGATE:
-		return "SIMPLE_AGGREGATE";
-	case IVMType::SIMPLE_PROJECTION:
-		return "SIMPLE_PROJECTION";
-	case IVMType::WINDOW_PARTITION:
-		return "WINDOW_PARTITION";
-	case IVMType::GROUP_RECOMPUTE:
-		return "GROUP_RECOMPUTE";
-	case IVMType::DISTINCT_INCREMENTAL:
-		return "DISTINCT_INCREMENTAL";
-	case IVMType::SEMI_ANTI_RECOMPUTE:
-		return "SEMI_ANTI_RECOMPUTE";
-	case IVMType::TOP_K:
-		return "TOP_K";
-	case IVMType::FULL_REFRESH:
-		return "FULL_REFRESH";
-	default:
-		return "UNKNOWN";
-	}
 }
 
 static string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_name,
@@ -1546,12 +1520,6 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		}
 	}
 
-	// AVG, MIN, MAX, HAVING use group-recompute strategy (not decomposable as simple deltas).
-	// HAVING needs recompute because groups may enter/leave the result set after aggregate changes.
-	// MIN, MAX use group-recompute. AVG is decomposed to SUM+COUNT by the parser (fully incremental).
-	// HAVING needs recompute because groups may enter/leave the result set.
-	// LEFT JOIN aggregates: group-recompute unless ivm_left_join_merge is on (Larson & Zhou).
-	// FULL OUTER JOIN aggregates: group-recompute unless ivm_full_outer_merge is on (Zhang & Larson).
 	bool source_has_left_join = metadata.HasLeftJoin(view_name);
 	// Only query has_full_outer when the view has an outer join (avoids extra SQL for INNER-only views)
 	bool source_has_full_outer = source_has_left_join && metadata.HasFullOuter(view_name);
@@ -1569,9 +1537,10 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			full_outer_merge = foj_merge_val.GetValue<bool>();
 		}
 	}
-	bool has_minmax = metadata.HasMinMax(view_name) || view_query_type == IVMType::AGGREGATE_HAVING ||
-	                  (source_has_left_join && !source_has_full_outer && !left_join_merge) ||
-	                  (source_has_full_outer && !full_outer_merge);
+	bool has_minmax_metadata = metadata.HasMinMax(view_name);
+	bool force_mixed_delta_group_recompute = view_query_type == IVMType::AGGREGATE_HAVING ||
+	                                         (source_has_left_join && !source_has_full_outer && !left_join_merge) ||
+	                                         (source_has_full_outer && !full_outer_merge);
 
 	// Check ivm_refresh_mode: 'full' forces full recompute, skipping the IVM pipeline.
 	Value refresh_mode_val;
@@ -1819,31 +1788,37 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	// GROUP BY columns: from index (standard) or metadata (DuckLake fallback).
 	auto group_cols = metadata.GetGroupColumns(view_name);
 	auto agg_types = metadata.GetAggregateTypes(view_name);
-	// ARG_MIN/ARG_MAX require group-recompute even for insert-only deltas — the
-	// GREATEST/LEAST fast path used for MIN/MAX doesn't apply to these two-arg aggregates.
-	bool has_argminmax = std::any_of(agg_types.begin(), agg_types.end(),
-	                                 [](const string &t) { return t == "arg_min" || t == "arg_max"; });
+	bool has_extremum_aggregate =
+	    std::any_of(agg_types.begin(), agg_types.end(), [](const string &t) { return IsExtremumAggregateType(t); });
+	bool has_argminmax =
+	    std::any_of(agg_types.begin(), agg_types.end(), [](const string &t) { return IsArgMinMaxAggregateType(t); });
+	bool force_group_recompute = has_minmax_metadata && !has_extremum_aggregate;
+	bool recompute_on_mixed_delta = has_extremum_aggregate || force_mixed_delta_group_recompute;
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", IVMTypeName(view_query_type));
 	switch (view_query_type) {
 	case IVMType::AGGREGATE_HAVING: {
 		// When ivm_having_merge is enabled, the data table stores ALL groups (HAVING filter
 		// is in the VIEW). Use standard MERGE — same as AGGREGATE_GROUP.
-		// When disabled, fall back to group-recompute (has_minmax=true forces delete+re-insert).
+		// When disabled, fall back to group-recompute.
 		Value having_merge_val;
 		bool having_merge = true;
 		if (context.TryGetCurrentSetting("ivm_having_merge", having_merge_val) && !having_merge_val.IsNull()) {
 			having_merge = having_merge_val.GetValue<bool>();
 		}
 		if (having_merge) {
-			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
-			upsert_query = CompileAggregateGroups(
-			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
-			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types);
+			bool effective_insert_only =
+			    has_argminmax
+			        ? false
+			        : (recompute_on_mixed_delta || force_group_recompute ? minmax_incremental : skip_agg_delete);
+			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
+			                                      view_query_sql, recompute_on_mixed_delta, force_group_recompute,
+			                                      list_mode, delta_ts_filter, group_cols, internal_catalog_prefix,
+			                                      effective_insert_only, agg_types, column_types);
 		} else {
-			upsert_query =
-			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-			                           /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols,
-			                           internal_catalog_prefix, /*insert_only=*/false, agg_types, column_types);
+			upsert_query = CompileAggregateGroups(
+			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
+			    /*recompute_on_mixed_delta=*/true, /*force_group_recompute=*/true, list_mode, delta_ts_filter,
+			    group_cols, internal_catalog_prefix, /*insert_only=*/false, agg_types, column_types);
 		}
 		break;
 	}
@@ -1865,7 +1840,8 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			bool effective_insert_only = has_argminmax ? false : skip_agg_delete;
 			upsert_query =
 			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-			                           /*has_minmax=*/has_argminmax, list_mode, delta_ts_filter, group_cols,
+			                           /*recompute_on_mixed_delta=*/has_argminmax,
+			                           /*force_group_recompute=*/false, list_mode, delta_ts_filter, group_cols,
 			                           internal_catalog_prefix, effective_insert_only, agg_types, column_types);
 
 			// Phase 2: recompute groups affected by unmatched/full-outer transfers.
@@ -1874,10 +1850,14 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 			                                                   internal_catalog_prefix, "_ivm_unmatched");
 		} else {
 			// Standard path: MIN/MAX group-recompute or incremental MERGE
-			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
-			upsert_query = CompileAggregateGroups(
-			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
-			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types);
+			bool effective_insert_only =
+			    has_argminmax
+			        ? false
+			        : (recompute_on_mixed_delta || force_group_recompute ? minmax_incremental : skip_agg_delete);
+			upsert_query = CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names,
+			                                      view_query_sql, recompute_on_mixed_delta, force_group_recompute,
+			                                      list_mode, delta_ts_filter, group_cols, internal_catalog_prefix,
+			                                      effective_insert_only, agg_types, column_types);
 		}
 		break;
 	}
@@ -1891,9 +1871,9 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	case IVMType::SIMPLE_AGGREGATE: {
 		// ARG_MIN/ARG_MAX can't be maintained by delta-sum UPDATE even for insert-only deltas.
 		bool sa_insert_only = has_argminmax ? false : insert_only;
-		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode,
+		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax_metadata, list_mode,
 		                                       delta_ts_filter, internal_catalog_prefix, sa_insert_only, column_types);
-		if (!has_minmax) {
+		if (!has_minmax_metadata) {
 			AppendSimpleAggregateEmptySourceNulling(metadata, upsert_query, view_name, column_names, data_table, con,
 			                                        view_catalog_name, view_schema_name, attached_db_catalog_name,
 			                                        attached_db_schema_name);

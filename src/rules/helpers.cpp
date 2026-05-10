@@ -1,8 +1,10 @@
 #include "rules/rule.hpp"
 
+#include "core/ivm_delta_model.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
+#include "rules/openivm_rewrite_rule.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
@@ -23,6 +25,72 @@
 #include "storage/ducklake_scan.hpp"
 
 namespace duckdb {
+
+static void AssertLinearRewrite(LogicalOperatorType op_type, const string &context) {
+	auto spec = GetDeltaOperatorSpec(op_type);
+	if (spec.linearity != Linearity::LINEAR) {
+		throw InternalException("%s helper used for non-linear operator %s", context,
+		                        LogicalOperatorToString(op_type).c_str());
+	}
+}
+
+idx_t FindColumnBindingIndex(const vector<ColumnBinding> &bindings, ColumnBinding target, const string &context) {
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		if (bindings[i] == target) {
+			return i;
+		}
+	}
+	throw InternalException("%s does not contain multiplicity binding", context);
+}
+
+ColumnBinding RewriteLinearChild(PlanWrapper &pw, idx_t child_index) {
+	AssertLinearRewrite(pw.plan->type, "RewriteLinearChild");
+	if (child_index >= pw.plan->children.size()) {
+		throw InternalException("Linear operator %s does not have child %llu", LogicalOperatorToString(pw.plan->type),
+		                        (unsigned long long)child_index);
+	}
+	auto child_mul = IVMRewriteRule::RewritePlan(pw.input, pw.plan->children[child_index], pw.view, pw.root);
+	pw.plan->children[child_index] = std::move(child_mul.op);
+	return child_mul.mul_binding;
+}
+
+ModifiedPlan RewriteLinearProjectionWithMultiplicity(PlanWrapper pw) {
+	AssertLinearRewrite(pw.plan->type, "RewriteLinearProjectionWithMultiplicity");
+	auto child_mul_binding = RewriteLinearChild(pw);
+
+	auto projection_node = unique_ptr_cast<LogicalOperator, LogicalProjection>(std::move(pw.plan));
+	auto mul_expression = make_uniq<BoundColumnRefExpression>(ivm::MULTIPLICITY_COL, pw.mul_type, child_mul_binding);
+	projection_node->expressions.emplace_back(std::move(mul_expression));
+	projection_node->types.clear();
+	for (auto &expr : projection_node->expressions) {
+		projection_node->types.push_back(expr->return_type);
+	}
+
+	auto new_mul_binding = projection_node->GetColumnBindings().back();
+	projection_node->Verify(pw.input.context);
+	return {std::move(projection_node), new_mul_binding};
+}
+
+ModifiedPlan RewriteLinearUnion(PlanWrapper pw) {
+	AssertLinearRewrite(pw.plan->type, "RewriteLinearUnion");
+	if (pw.plan->children.size() != 2) {
+		throw InternalException("Linear UNION rewrite expected 2 children, found %llu",
+		                        (unsigned long long)pw.plan->children.size());
+	}
+	RewriteLinearChild(pw, 0);
+	RewriteLinearChild(pw, 1);
+
+	auto *set_op = dynamic_cast<LogicalSetOperation *>(pw.plan.get());
+	if (!set_op) {
+		throw InternalException("Linear UNION rewrite expected LogicalSetOperation");
+	}
+	set_op->column_count = pw.plan->children[0]->GetColumnBindings().size();
+	pw.plan->ResolveOperatorTypes();
+
+	auto union_bindings = pw.plan->GetColumnBindings();
+	ColumnBinding new_mul_binding = union_bindings.back();
+	return {std::move(pw.plan), new_mul_binding};
+}
 
 static AggregateFunction BindAggregateByName(ClientContext &context, const string &name,
                                              const vector<LogicalType> &arg_types) {

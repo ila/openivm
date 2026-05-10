@@ -10,6 +10,7 @@
 #include "rules/topk.hpp"
 #include "rules/union.hpp"
 #include "rules/window.hpp"
+#include "core/ivm_delta_model.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
@@ -60,6 +61,16 @@ static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, c
 	}
 }
 
+static ModifiedPlan RewriteConstantLeaf(PlanWrapper &pw) {
+	auto bindings = pw.plan->GetColumnBindings();
+	if (bindings.empty()) {
+		throw NotImplementedException("%s has no column bindings", LogicalOperatorToString(pw.plan->type).c_str());
+	}
+	OPENIVM_DEBUG_PRINT("[RewritePlan] %s leaf — returning unchanged (constant, no delta)\n",
+	                    LogicalOperatorToString(pw.plan->type).c_str());
+	return {std::move(pw.plan), bindings[0]};
+}
+
 void IVMRewriteRule::AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                                    string &view_name, string &view_catalog_name, string &view_schema_name) {
 #if OPENIVM_DEBUG
@@ -96,54 +107,48 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 	OPENIVM_DEBUG_PRINT("[RewritePlan] Visiting node: %s\n", LogicalOperatorToString(plan->type).c_str());
 	OPENIVM_DEBUG_PRINT("[RewritePlan] Node detail: %s\n", plan->ToString().c_str());
 
-	switch (plan->type) {
-	case LogicalOperatorType::LOGICAL_GET: {
+	switch (GetDeltaRewriteKind(plan->type)) {
+	case DeltaRewriteKind::SCAN: {
 		IvmScanRule rule;
 		return rule.Rewrite(pw);
 	}
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_JOIN:
-	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-	case LogicalOperatorType::LOGICAL_ANY_JOIN: {
+	case DeltaRewriteKind::JOIN: {
 		IvmJoinRule rule;
 		return rule.Rewrite(pw);
 	}
-	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN: {
+	case DeltaRewriteKind::DELIM_JOIN: {
 		IvmDelimJoinRule rule;
 		return rule.Rewrite(pw);
 	}
-	case LogicalOperatorType::LOGICAL_PROJECTION: {
+	case DeltaRewriteKind::PROJECTION: {
 		IvmProjectionRule rule;
 		return rule.Rewrite(pw);
 	}
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+	case DeltaRewriteKind::AGGREGATE: {
 		IvmAggregateRule rule;
 		return rule.Rewrite(pw);
 	}
-	case LogicalOperatorType::LOGICAL_FILTER: {
+	case DeltaRewriteKind::FILTER: {
 		IvmFilterRule rule;
 		return rule.Rewrite(pw);
 	}
-	case LogicalOperatorType::LOGICAL_UNION: {
+	case DeltaRewriteKind::UNION: {
 		IvmUnionRule rule;
 		return rule.Rewrite(pw);
 	}
-	case LogicalOperatorType::LOGICAL_DISTINCT: {
+	case DeltaRewriteKind::DISTINCT: {
 		IvmDistinctRule rule;
 		return rule.Rewrite(pw);
 	}
-	case LogicalOperatorType::LOGICAL_WINDOW: {
+	case DeltaRewriteKind::WINDOW: {
 		IvmWindowRule rule;
 		return rule.Rewrite(pw);
 	}
-	case LogicalOperatorType::LOGICAL_TOP_N:
-	case LogicalOperatorType::LOGICAL_LIMIT:
-	case LogicalOperatorType::LOGICAL_ORDER_BY: {
+	case DeltaRewriteKind::TOPK: {
 		IvmTopKRule rule;
 		return rule.Rewrite(pw);
 	}
-	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
+	case DeltaRewriteKind::MATERIALIZED_CTE: {
 		// CTE wrapper: children[0] = CTE definition, children[1] = consumer.
 		auto &cte = pw.plan->Cast<LogicalCTE>();
 		idx_t cte_table_index = cte.table_index;
@@ -167,46 +172,16 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
 		pw.plan->ResolveOperatorTypes();
 		return {std::move(pw.plan), cons_mul.mul_binding};
 	}
-	case LogicalOperatorType::LOGICAL_CTE_REF: {
+	case DeltaRewriteKind::CTE_REF: {
 		// CTE reference: leaf that reads from a rewritten CTE definition.
 		// The multiplicity column was added by the MATERIALIZED_CTE handler above.
 		auto bindings = pw.plan->GetColumnBindings();
 		ColumnBinding mul_binding = bindings.back();
 		return {std::move(pw.plan), mul_binding};
 	}
-	case LogicalOperatorType::LOGICAL_CHUNK_GET: {
-		// CHUNK_GET is a constant in-memory VALUES node (used for IN-list MARK joins, etc.).
-		// It has no delta table. DetectDeltaStatus marks it as empty so IvmJoinRule skips all
-		// terms that include this leaf in the delta mask. If we somehow reach here anyway, return
-		// it unchanged with a dummy multiplicity binding (column 0 of the chunk).
-		auto bindings = pw.plan->GetColumnBindings();
-		if (bindings.empty()) {
-			throw NotImplementedException("CHUNK_GET has no column bindings");
-		}
-		OPENIVM_DEBUG_PRINT("[RewritePlan] CHUNK_GET leaf — returning unchanged (constant, no delta)\n");
-		return {std::move(pw.plan), bindings[0]};
-	}
-	case LogicalOperatorType::LOGICAL_DUMMY_SCAN: {
-		// DUMMY_SCAN is a constant one-row relation. Join delta pruning should
-		// normally remove delta terms containing it, but a standalone constant
-		// subtree can still reach this leaf.
-		auto bindings = pw.plan->GetColumnBindings();
-		if (bindings.empty()) {
-			throw NotImplementedException("DUMMY_SCAN has no column bindings");
-		}
-		OPENIVM_DEBUG_PRINT("[RewritePlan] DUMMY_SCAN leaf — returning unchanged (constant, no delta)\n");
-		return {std::move(pw.plan), bindings[0]};
-	}
-	case LogicalOperatorType::LOGICAL_EXPRESSION_GET: {
-		// VALUES clauses are constant inputs. Join delta pruning marks them as empty;
-		// if a standalone rewrite reaches this leaf, preserve it unchanged.
-		auto bindings = pw.plan->GetColumnBindings();
-		if (bindings.empty()) {
-			throw NotImplementedException("EXPRESSION_GET has no column bindings");
-		}
-		OPENIVM_DEBUG_PRINT("[RewritePlan] EXPRESSION_GET leaf — returning unchanged (constant, no delta)\n");
-		return {std::move(pw.plan), bindings[0]};
-	}
+	case DeltaRewriteKind::CONSTANT_LEAF:
+		return RewriteConstantLeaf(pw);
+	case DeltaRewriteKind::UNSUPPORTED:
 	default:
 		throw NotImplementedException("Operator type %s not supported", LogicalOperatorToString(plan->type));
 	}
@@ -274,6 +249,11 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
 
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Optimized plan: \n%s\n", optimized_plan->ToString().c_str());
+#endif
+
+#if OPENIVM_DEBUG
+	auto delta_model = BuildDeltaPlanModel(optimized_plan.get());
+	OPENIVM_DEBUG_PRINT("[IVM Rewrite] delta model: %s\n", delta_model.DebugString().c_str());
 #endif
 
 	if (optimized_plan->children.empty()) {

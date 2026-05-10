@@ -20,6 +20,110 @@
 
 namespace duckdb {
 
+DeltaOperatorSpec GetDeltaOperatorSpec(LogicalOperatorType op_type) {
+	switch (op_type) {
+	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
+	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
+	case LogicalOperatorType::LOGICAL_CHUNK_GET:
+	case LogicalOperatorType::LOGICAL_DELIM_GET:
+	case LogicalOperatorType::LOGICAL_CTE_REF:
+		return {op_type,
+		        op_type == LogicalOperatorType::LOGICAL_CTE_REF     ? DeltaRewriteKind::CTE_REF
+		        : op_type == LogicalOperatorType::LOGICAL_DELIM_GET ? DeltaRewriteKind::UNSUPPORTED
+		                                                            : DeltaRewriteKind::CONSTANT_LEAF,
+		        Linearity::LINEAR,
+		        DeltaApplyKind::INCREMENTAL,
+		        /*preserves_insert_only=*/true,
+		        /*needs_source_consolidation=*/false,
+		        /*needs_delta_consolidation=*/false};
+	case LogicalOperatorType::LOGICAL_GET:
+		return {op_type,
+		        DeltaRewriteKind::SCAN,
+		        Linearity::LINEAR,
+		        DeltaApplyKind::INCREMENTAL,
+		        /*preserves_insert_only=*/true,
+		        /*needs_source_consolidation=*/true,
+		        /*needs_delta_consolidation=*/false};
+	case LogicalOperatorType::LOGICAL_FILTER:
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+	case LogicalOperatorType::LOGICAL_UNION:
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+		return {op_type,
+		        op_type == LogicalOperatorType::LOGICAL_FILTER       ? DeltaRewriteKind::FILTER
+		        : op_type == LogicalOperatorType::LOGICAL_PROJECTION ? DeltaRewriteKind::PROJECTION
+		        : op_type == LogicalOperatorType::LOGICAL_UNION      ? DeltaRewriteKind::UNION
+		                                                             : DeltaRewriteKind::MATERIALIZED_CTE,
+		        Linearity::LINEAR,
+		        DeltaApplyKind::INCREMENTAL,
+		        /*preserves_insert_only=*/true,
+		        /*needs_source_consolidation=*/false,
+		        /*needs_delta_consolidation=*/false};
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		return {op_type,
+		        DeltaRewriteKind::AGGREGATE,
+		        Linearity::LINEAR,
+		        DeltaApplyKind::INCREMENTAL,
+		        /*preserves_insert_only=*/true,
+		        /*needs_source_consolidation=*/false,
+		        /*needs_delta_consolidation=*/true};
+	case LogicalOperatorType::LOGICAL_TOP_N:
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+	case LogicalOperatorType::LOGICAL_LIMIT:
+		return {op_type,
+		        DeltaRewriteKind::TOPK,
+		        Linearity::NON_LINEAR,
+		        DeltaApplyKind::INCREMENTAL,
+		        /*preserves_insert_only=*/true,
+		        /*needs_source_consolidation=*/false,
+		        /*needs_delta_consolidation=*/false};
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+	case LogicalOperatorType::LOGICAL_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+		return {op_type,
+		        op_type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+		                op_type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN
+		            ? DeltaRewriteKind::DELIM_JOIN
+		            : DeltaRewriteKind::JOIN,
+		        Linearity::BILINEAR,
+		        DeltaApplyKind::INCREMENTAL,
+		        /*preserves_insert_only=*/false,
+		        /*needs_source_consolidation=*/true,
+		        /*needs_delta_consolidation=*/true};
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+		return {op_type,
+		        DeltaRewriteKind::DISTINCT,
+		        Linearity::NON_LINEAR,
+		        DeltaApplyKind::INCREMENTAL,
+		        /*preserves_insert_only=*/false,
+		        /*needs_source_consolidation=*/false,
+		        /*needs_delta_consolidation=*/true};
+	case LogicalOperatorType::LOGICAL_WINDOW:
+		return {op_type,
+		        DeltaRewriteKind::WINDOW,
+		        Linearity::NON_LINEAR,
+		        DeltaApplyKind::PARTITION_RECOMPUTE,
+		        /*preserves_insert_only=*/false,
+		        /*needs_source_consolidation=*/true,
+		        /*needs_delta_consolidation=*/true};
+	case LogicalOperatorType::LOGICAL_UNNEST:
+	default:
+		return {op_type,
+		        DeltaRewriteKind::UNSUPPORTED,
+		        Linearity::NON_LINEAR,
+		        DeltaApplyKind::FULL_REFRESH,
+		        /*preserves_insert_only=*/false,
+		        /*needs_source_consolidation=*/true,
+		        /*needs_delta_consolidation=*/true};
+	}
+}
+
+DeltaRewriteKind GetDeltaRewriteKind(LogicalOperatorType op_type) {
+	return GetDeltaOperatorSpec(op_type).rewrite_kind;
+}
+
 namespace {
 
 static const unordered_set<string> &SupportedAggregates() {
@@ -109,11 +213,8 @@ static void AddWindowPartitionColumn(PlanAnalysis &analysis, string col_name, id
 	analysis.window_partition_column_indexes.push_back(col_index);
 }
 
-static void AddOperator(DeltaPlanModel &model, LogicalOperatorType op_type, Linearity linearity,
-                        DeltaApplyKind apply_kind, bool preserves_insert_only, bool needs_source_consolidation,
-                        bool needs_delta_consolidation) {
-	model.operators.push_back(
-	    {op_type, linearity, apply_kind, preserves_insert_only, needs_source_consolidation, needs_delta_consolidation});
+static void AddOperator(DeltaPlanModel &model, LogicalOperatorType op_type) {
+	model.operators.push_back(GetDeltaOperatorSpec(op_type));
 }
 
 static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
@@ -135,10 +236,7 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 	case LogicalOperatorType::LOGICAL_DELIM_GET:
 	case LogicalOperatorType::LOGICAL_CTE_REF:
-		AddOperator(model, node->type, Linearity::LINEAR, DeltaApplyKind::INCREMENTAL,
-		            /*preserves_insert_only=*/true,
-		            /*needs_source_consolidation=*/node->type == LogicalOperatorType::LOGICAL_GET,
-		            /*needs_delta_consolidation=*/false);
+		AddOperator(model, node->type);
 		return;
 
 	case LogicalOperatorType::LOGICAL_FILTER:
@@ -148,10 +246,7 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 		if (!node->children.empty() && ChildIsAggregateThroughProjection(node->children[0].get())) {
 			model.analysis.found_having = true;
 		}
-		AddOperator(model, node->type, Linearity::LINEAR, DeltaApplyKind::INCREMENTAL,
-		            /*preserves_insert_only=*/true,
-		            /*needs_source_consolidation=*/false,
-		            /*needs_delta_consolidation=*/false);
+		AddOperator(model, node->type);
 		break;
 
 	case LogicalOperatorType::LOGICAL_PROJECTION:
@@ -159,20 +254,14 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 		if (HasVolatileExpression(node->expressions) || HasUnnestExpression(node->expressions)) {
 			model.analysis.ivm_compatible = false;
 		}
-		AddOperator(model, node->type, Linearity::LINEAR, DeltaApplyKind::INCREMENTAL,
-		            /*preserves_insert_only=*/true,
-		            /*needs_source_consolidation=*/false,
-		            /*needs_delta_consolidation=*/false);
+		AddOperator(model, node->type);
 		break;
 
 	case LogicalOperatorType::LOGICAL_UNION:
 		if (HasVolatileExpression(node->expressions)) {
 			model.analysis.ivm_compatible = false;
 		}
-		AddOperator(model, node->type, Linearity::LINEAR, DeltaApplyKind::INCREMENTAL,
-		            /*preserves_insert_only=*/true,
-		            /*needs_source_consolidation=*/false,
-		            /*needs_delta_consolidation=*/false);
+		AddOperator(model, node->type);
 		break;
 
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
@@ -222,10 +311,7 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 		} else {
 			model.analysis.found_nested_aggregate = true;
 		}
-		AddOperator(model, node->type, Linearity::LINEAR, DeltaApplyKind::INCREMENTAL,
-		            /*preserves_insert_only=*/true,
-		            /*needs_source_consolidation=*/false,
-		            /*needs_delta_consolidation=*/true);
+		AddOperator(model, node->type);
 		break;
 	}
 
@@ -237,10 +323,7 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 		if (!ExtractOrderBy(top_n.orders, model.analysis)) {
 			model.analysis.ivm_compatible = false;
 		}
-		AddOperator(model, node->type, Linearity::NON_LINEAR, DeltaApplyKind::INCREMENTAL,
-		            /*preserves_insert_only=*/true,
-		            /*needs_source_consolidation=*/false,
-		            /*needs_delta_consolidation=*/false);
+		AddOperator(model, node->type);
 		break;
 	}
 
@@ -249,10 +332,7 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 		if (model.analysis.top_k_order_columns.empty()) {
 			(void)ExtractOrderBy(order.orders, model.analysis);
 		}
-		AddOperator(model, node->type, Linearity::NON_LINEAR, DeltaApplyKind::INCREMENTAL,
-		            /*preserves_insert_only=*/true,
-		            /*needs_source_consolidation=*/false,
-		            /*needs_delta_consolidation=*/false);
+		AddOperator(model, node->type);
 		break;
 	}
 
@@ -265,10 +345,7 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 		if (limit.offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
 			model.analysis.top_k_offset = limit.offset_val.GetConstantValue();
 		}
-		AddOperator(model, node->type, Linearity::NON_LINEAR, DeltaApplyKind::INCREMENTAL,
-		            /*preserves_insert_only=*/true,
-		            /*needs_source_consolidation=*/false,
-		            /*needs_delta_consolidation=*/false);
+		AddOperator(model, node->type);
 		break;
 	}
 
@@ -306,10 +383,7 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 				model.analysis.found_full_outer = true;
 			}
 		}
-		AddOperator(model, node->type, Linearity::BILINEAR, DeltaApplyKind::INCREMENTAL,
-		            /*preserves_insert_only=*/false,
-		            /*needs_source_consolidation=*/true,
-		            /*needs_delta_consolidation=*/true);
+		AddOperator(model, node->type);
 		break;
 	}
 
@@ -328,10 +402,7 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 				model.analysis.aggregate_columns.emplace_back("col" + to_string(i));
 			}
 		}
-		AddOperator(model, node->type, Linearity::NON_LINEAR, DeltaApplyKind::INCREMENTAL,
-		            /*preserves_insert_only=*/false,
-		            /*needs_source_consolidation=*/false,
-		            /*needs_delta_consolidation=*/true);
+		AddOperator(model, node->type);
 		break;
 	}
 
@@ -357,18 +428,12 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 				AddWindowPartitionColumn(model.analysis, col_name, col_index);
 			}
 		}
-		AddOperator(model, node->type, Linearity::NON_LINEAR, DeltaApplyKind::PARTITION_RECOMPUTE,
-		            /*preserves_insert_only=*/false,
-		            /*needs_source_consolidation=*/true,
-		            /*needs_delta_consolidation=*/true);
+		AddOperator(model, node->type);
 		break;
 	}
 
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-		AddOperator(model, node->type, Linearity::LINEAR, DeltaApplyKind::INCREMENTAL,
-		            /*preserves_insert_only=*/true,
-		            /*needs_source_consolidation=*/false,
-		            /*needs_delta_consolidation=*/false);
+		AddOperator(model, node->type);
 		if (node->children.size() >= 2) {
 			AnalyzeDeltaNode(node->children[1].get(), model);
 			if (!model.analysis.found_aggregation && !model.analysis.found_distinct && !model.analysis.found_join) {
@@ -379,18 +444,12 @@ static void AnalyzeDeltaNode(LogicalOperator *node, DeltaPlanModel &model) {
 
 	case LogicalOperatorType::LOGICAL_UNNEST:
 		model.analysis.ivm_compatible = false;
-		AddOperator(model, node->type, Linearity::NON_LINEAR, DeltaApplyKind::FULL_REFRESH,
-		            /*preserves_insert_only=*/false,
-		            /*needs_source_consolidation=*/true,
-		            /*needs_delta_consolidation=*/true);
+		AddOperator(model, node->type);
 		return;
 
 	default:
 		model.analysis.ivm_compatible = false;
-		AddOperator(model, node->type, Linearity::NON_LINEAR, DeltaApplyKind::FULL_REFRESH,
-		            /*preserves_insert_only=*/false,
-		            /*needs_source_consolidation=*/true,
-		            /*needs_delta_consolidation=*/true);
+		AddOperator(model, node->type);
 		return;
 	}
 

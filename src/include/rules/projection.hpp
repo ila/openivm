@@ -8,9 +8,6 @@ namespace duckdb {
 class IvmProjectionRule : public IvmRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
-	Linearity GetLinearity() const override {
-		return Linearity::LINEAR;
-	}
 };
 
 } // namespace duckdb

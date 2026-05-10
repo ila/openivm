@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/openivm_utils.hpp"
+#include "core/ivm_view_classifier.hpp"
 #include "rules/column_hider.hpp"
 
 namespace duckdb {
@@ -167,10 +168,10 @@ static bool IsSummableType(const LogicalType &type) {
 }
 
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
-                              vector<string> column_names, const string &view_query_sql, bool has_minmax,
-                              bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
-                              const string &catalog_prefix, bool insert_only, const vector<string> &aggregate_types,
-                              const vector<LogicalType> &column_types) {
+                              vector<string> column_names, const string &view_query_sql, bool recompute_on_mixed_delta,
+                              bool force_group_recompute, bool list_mode, const string &delta_ts_filter,
+                              const vector<string> &group_column_names, const string &catalog_prefix, bool insert_only,
+                              const vector<string> &aggregate_types, const vector<LogicalType> &column_types) {
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + Q(OpenIVMUtils::DeltaName(view_name));
 
@@ -208,7 +209,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// This is correct for VARCHAR literals, string functions of group keys, LIST
 	// aggregates, and CASE over aggregates alike. Slower than MERGE, faster than
 	// full recompute (only affected groups are re-evaluated).
-	bool needs_group_recompute = has_non_summable_col;
+	bool needs_group_recompute = force_group_recompute || has_non_summable_col;
 
 	auto decomp = DetectDerivedAggColumns(aggregates);
 
@@ -255,8 +256,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// computed expression — sum-of-deltas is wrong for that expression.
 	bool has_computed_over_derived = false;
 	if (!aggregate_types.empty()) {
-		static const unordered_set<string> DECOMPOSED_TYPES_CHK = {"avg",      "stddev",   "stddev_samp", "stddev_pop",
-		                                                           "variance", "var_samp", "var_pop"};
 		// Pass 1 — "type excess": more non-decomposed aggregate types than
 		// aggregate columns (INCLUDING hidden helpers like _ivm_match_count and
 		// _ivm_*) means at least one aggregate is consumed inside a computed
@@ -266,7 +265,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// RewriteLeftJoinMatchCount adds a real COUNT to the plan).
 		idx_t non_decomposed_type_count = 0;
 		for (auto &t : aggregate_types) {
-			if (!DECOMPOSED_TYPES_CHK.count(t)) {
+			if (!IsDecomposedAggregateType(t)) {
 				non_decomposed_type_count++;
 			}
 		}
@@ -313,7 +312,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				if (decomp.derived_cols.count(column) || column.find("_ivm_") != string::npos) {
 					continue;
 				}
-				while (probe_idx < aggregate_types.size() && DECOMPOSED_TYPES_CHK.count(aggregate_types[probe_idx])) {
+				while (probe_idx < aggregate_types.size() && IsDecomposedAggregateType(aggregate_types[probe_idx])) {
 					probe_idx++;
 				}
 				if (probe_idx >= aggregate_types.size()) {
@@ -331,35 +330,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		needs_group_recompute = true;
 	}
 
-	// has_minmax=true is set by TWO unrelated conditions in the classifier:
-	//   (a) the view has an actual MIN/MAX/ARG_MIN/ARG_MAX aggregate — insert-only can use
-	//       GREATEST/LEAST in MERGE (fast path for MIN/MAX), mixed needs group-recompute.
-	//       For ARG_MIN/ARG_MAX the caller always passes insert_only=false via has_argminmax,
-	//       so (has_minmax && !insert_only) below handles group-recompute — this block
-	//       correctly stays quiet (has_real_minmax=true) to avoid double-triggering.
-	//   (b) the view has a LEFT/RIGHT/OUTER JOIN + a "computed" aggregate
-	//       argument (COALESCE/CASE/constant/non-BCR), which breaks the
-	//       Larson & Zhou MERGE template — group-recompute is REQUIRED for
-	//       every delta shape, including insert-only. See the classifier
-	//       comment in openivm_parser.cpp (`query_1502/1696/1746/1749`).
-	// Distinguish: case (a) has "min"/"max"/"arg_min"/"arg_max" in aggregate_types;
-	// case (b) does not. Force group-recompute for (b) since the MERGE path produces
-	// incorrect MV state when a new right-side row converts an existing
-	// NULL-padded LEFT JOIN row into a match.
-	{
-		bool has_real_minmax = false;
-		for (auto &t : aggregate_types) {
-			if (t == "min" || t == "max" || t == "arg_min" || t == "arg_max") {
-				has_real_minmax = true;
-				break;
-			}
-		}
-		if (has_minmax && !has_real_minmax) {
-			needs_group_recompute = true;
-			OPENIVM_DEBUG_PRINT(
-			    "[CompileAggregateGroups] has_minmax=true with no MIN/MAX in agg_types — LEFT JOIN + computed "
-			    "aggregate case → group-recompute\n");
-		}
+	if (force_group_recompute) {
+		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] caller requested group-recompute fallback\n");
 	}
 
 	// Build per-column aggregate type map from metadata (for insert-only MIN/MAX).
@@ -369,8 +341,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// aggregate_types has one entry per ORIGINAL aggregate expression (before plan rewrites).
 	// Decomposed aggregates (avg, stddev, variance) are replaced by hidden columns in the
 	// plan rewrite, so we skip their entries to keep the mapping aligned with user-visible columns.
-	static const unordered_set<string> DECOMPOSED_TYPES = {"avg",      "stddev",   "stddev_samp", "stddev_pop",
-	                                                       "variance", "var_samp", "var_pop"};
 	unordered_map<string, string> col_agg_type;
 	if (!aggregate_types.empty()) {
 		idx_t type_idx = 0;
@@ -379,7 +349,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				continue;
 			}
 			// Skip decomposed aggregate_types entries (avg → SUM+COUNT hidden cols)
-			while (type_idx < aggregate_types.size() && DECOMPOSED_TYPES.count(aggregate_types[type_idx])) {
+			while (type_idx < aggregate_types.size() && IsDecomposedAggregateType(aggregate_types[type_idx])) {
 				type_idx++;
 			}
 			if (type_idx < aggregate_types.size()) {
@@ -390,7 +360,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		                    col_agg_type.size(), aggregate_types.size(), aggregates.size());
 	}
 
-	if (needs_group_recompute || (has_minmax && !insert_only)) {
+	if (needs_group_recompute || (recompute_on_mixed_delta && !insert_only)) {
 		// Group-recompute strategy: delete affected groups, re-insert from original query.
 		// Always triggered by non-summable columns (LIST aggregates, VARCHAR literals,
 		// CASE results, etc.) — even in insert-only mode, the MERGE path emits
@@ -725,7 +695,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 }
 
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
-                               const string &view_query_sql, bool has_minmax, bool list_mode,
+                               const string &view_query_sql, bool force_full_recompute, bool list_mode,
                                const string &delta_ts_filter, const string &catalog_prefix, bool /*insert_only*/,
                                const vector<LogicalType> &column_types) {
 	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
@@ -745,7 +715,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 		}
 	}
 
-	if (has_minmax || has_non_summable_col) {
+	if (force_full_recompute || has_non_summable_col) {
 		string delete_query = "DELETE FROM " + data_table + ";\n";
 		string insert_query = "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 		return delete_query + insert_query;

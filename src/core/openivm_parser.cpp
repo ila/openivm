@@ -2,6 +2,7 @@
 
 #include "core/ivm_plan_rewrite.hpp"
 #include "core/ivm_delta_model.hpp"
+#include "core/ivm_view_classifier.hpp"
 #include "core/openivm_constants.hpp"
 #include "lpts_pipeline.hpp"
 #include "core/openivm_utils.hpp"
@@ -14,12 +15,9 @@
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
@@ -121,92 +119,6 @@ static void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_p
 	plan = cte_inlining.Optimize(std::move(plan));
 }
 
-static LogicalProjection *FindFirstProjection(LogicalOperator *op) {
-	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		return &op->Cast<LogicalProjection>();
-	}
-	for (auto &child : op->children) {
-		auto *projection = FindFirstProjection(child.get());
-		if (projection) {
-			return projection;
-		}
-	}
-	return nullptr;
-}
-
-static LogicalComparisonJoin *FindFirstComparisonJoin(LogicalOperator *op) {
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		return &op->Cast<LogicalComparisonJoin>();
-	}
-	for (auto &child : op->children) {
-		auto *join = FindFirstComparisonJoin(child.get());
-		if (join) {
-			return join;
-		}
-	}
-	return nullptr;
-}
-
-static void AddJoinKeyColumn(const unique_ptr<Expression> &expr,
-                             unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols) {
-	if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
-		return;
-	}
-	auto &bcr = expr->Cast<BoundColumnRefExpression>();
-	join_key_cols[bcr.binding.table_index].insert(bcr.binding.column_index);
-}
-
-static string BindingKey(const BoundColumnRefExpression &bcr) {
-	return to_string(bcr.binding.table_index) + ":" + to_string(bcr.binding.column_index);
-}
-
-static string FindBindingParent(unordered_map<string, string> &parents, const string &key) {
-	auto it = parents.find(key);
-	if (it == parents.end()) {
-		parents[key] = key;
-		return key;
-	}
-	if (it->second == key) {
-		return key;
-	}
-	it->second = FindBindingParent(parents, it->second);
-	return it->second;
-}
-
-static void UnionBindings(unordered_map<string, string> &parents, const string &left, const string &right) {
-	string left_parent = FindBindingParent(parents, left);
-	string right_parent = FindBindingParent(parents, right);
-	if (left_parent != right_parent) {
-		parents[right_parent] = left_parent;
-	}
-}
-
-static void CollectJoinEquivalences(LogicalOperator *op, unordered_map<string, string> &parents,
-                                    vector<BoundColumnRefExpression *> &join_refs) {
-	if (!op) {
-		return;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto &join = op->Cast<LogicalComparisonJoin>();
-		for (auto &cond : join.conditions) {
-			if (cond.left->type != ExpressionType::BOUND_COLUMN_REF ||
-			    cond.right->type != ExpressionType::BOUND_COLUMN_REF) {
-				continue;
-			}
-			auto &left = cond.left->Cast<BoundColumnRefExpression>();
-			auto &right = cond.right->Cast<BoundColumnRefExpression>();
-			string left_key = BindingKey(left);
-			string right_key = BindingKey(right);
-			UnionBindings(parents, left_key, right_key);
-			join_refs.push_back(&left);
-			join_refs.push_back(&right);
-		}
-	}
-	for (auto &child : op->children) {
-		CollectJoinEquivalences(child.get(), parents, join_refs);
-	}
-}
-
 struct OpenIVMDuckLakeTableInfo {
 	string table_name;   // actual name as stored in DuckLake (case-preserved)
 	string catalog_name; // DuckLake catalog name (e.g., "dl")
@@ -297,500 +209,6 @@ static string QuoteQualifiedPrefix(const string &prefix) {
 static bool RelationExists(Connection &con, const string &qualified_name) {
 	auto result = con.Query("SELECT * FROM " + qualified_name + " LIMIT 0");
 	return !result->HasError();
-}
-
-static void CollectProjectionIndex(LogicalOperator *op,
-                                   unordered_map<idx_t, LogicalProjection *> &projections_by_index) {
-	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &proj = op->Cast<LogicalProjection>();
-		projections_by_index[proj.table_index] = &proj;
-	}
-	for (auto &child : op->children) {
-		CollectProjectionIndex(child.get(), projections_by_index);
-	}
-}
-
-static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
-                                   const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
-                                   int depth = 0) {
-	if (depth > 16) {
-		return false;
-	}
-	if (table_index == group_index) {
-		return column_index < static_cast<idx_t>(group_count);
-	}
-	auto it = projections_by_index.find(table_index);
-	if (it == projections_by_index.end()) {
-		return false;
-	}
-	auto &proj = *it->second;
-	if (column_index >= proj.expressions.size()) {
-		return false;
-	}
-	auto &expr = proj.expressions[column_index];
-	if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
-		return false;
-	}
-	auto &bcr = expr->Cast<BoundColumnRefExpression>();
-	return ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
-	                              projections_by_index, depth + 1);
-}
-
-static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,
-                                   const vector<string> &output_names, const BoundColumnRefExpression &bcr) {
-	if (!expr->alias.empty()) {
-		return expr->alias;
-	}
-	if (expr_index < output_names.size() && !output_names[expr_index].empty() &&
-	    !IVMTableNames::IsInternalColumn(output_names[expr_index])) {
-		return output_names[expr_index];
-	}
-	return bcr.GetName();
-}
-
-static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
-	while (expr && expr->expression_class == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr->Cast<BoundCastExpression>();
-		expr = cast.child.get();
-	}
-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
-		return nullptr;
-	}
-	return &expr->Cast<BoundColumnRefExpression>();
-}
-
-static bool AddGroupColumnsFromProjection(LogicalProjection &proj,
-                                          const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
-                                          idx_t group_index, size_t group_count, const vector<string> &output_names,
-                                          vector<string> &group_names) {
-	bool matched = false;
-	for (idx_t expr_i = 0; expr_i < proj.expressions.size(); expr_i++) {
-		auto &expr = proj.expressions[expr_i];
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
-			continue;
-		}
-		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		if (!ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
-		                            projections_by_index)) {
-			continue;
-		}
-		string col_name = ProjectionOutputName(expr, expr_i, output_names, bcr);
-		if (!IVMTableNames::IsInternalColumn(col_name)) {
-			group_names.push_back(col_name);
-			matched = true;
-		}
-	}
-	return matched;
-}
-
-static bool FindGroupColumns(LogicalOperator *op, const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
-                             idx_t group_index, size_t group_count, const vector<string> &output_names,
-                             vector<string> &group_names) {
-	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &proj = op->Cast<LogicalProjection>();
-		return AddGroupColumnsFromProjection(proj, projections_by_index, group_index, group_count, output_names,
-		                                     group_names);
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_UNION) {
-		return false;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-		if (op->children.size() >= 2) {
-			if (FindGroupColumns(op->children[1].get(), projections_by_index, group_index, group_count, output_names,
-			                     group_names)) {
-				return true;
-			}
-			return FindGroupColumns(op->children[0].get(), projections_by_index, group_index, group_count, output_names,
-			                        group_names);
-		}
-		return false;
-	}
-	for (auto &child : op->children) {
-		if (FindGroupColumns(child.get(), projections_by_index, group_index, group_count, output_names, group_names)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static vector<string> DeriveGroupColumnNames(LogicalOperator *plan, idx_t group_index, size_t group_count,
-                                             const vector<string> &output_names, bool has_union_over_agg) {
-	vector<string> group_names;
-	if (has_union_over_agg) {
-		for (size_t i = 0; i < group_count && i < output_names.size(); i++) {
-			if (!IVMTableNames::IsInternalColumn(output_names[i])) {
-				group_names.push_back(output_names[i]);
-			}
-		}
-		return group_names;
-	}
-	unordered_map<idx_t, LogicalProjection *> projections_by_index;
-	CollectProjectionIndex(plan, projections_by_index);
-	FindGroupColumns(plan, projections_by_index, group_index, group_count, output_names, group_names);
-	return group_names;
-}
-
-static void AddUniqueGroupNames(vector<string> &group_names, const vector<string> &new_names) {
-	for (auto &name : new_names) {
-		bool exists = false;
-		for (auto &existing : group_names) {
-			if (StringUtil::CIEquals(existing, name)) {
-				exists = true;
-				break;
-			}
-		}
-		if (!exists) {
-			group_names.push_back(name);
-		}
-	}
-}
-
-static void CollectSingleDelimKeyBindings(LogicalOperator *op, unordered_set<string> &key_bindings) {
-	if (!op) {
-		return;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
-		auto &join = op->Cast<LogicalComparisonJoin>();
-		if (join.join_type == JoinType::SINGLE) {
-			for (auto &expr : join.duplicate_eliminated_columns) {
-				if (expr && expr->type == ExpressionType::BOUND_COLUMN_REF) {
-					key_bindings.insert(BindingKey(expr->Cast<BoundColumnRefExpression>()));
-				}
-			}
-			for (auto &cond : join.conditions) {
-				if (cond.left && cond.left->type == ExpressionType::BOUND_COLUMN_REF) {
-					key_bindings.insert(BindingKey(cond.left->Cast<BoundColumnRefExpression>()));
-				}
-				if (cond.right && cond.right->type == ExpressionType::BOUND_COLUMN_REF) {
-					key_bindings.insert(BindingKey(cond.right->Cast<BoundColumnRefExpression>()));
-				}
-			}
-		}
-	}
-	for (auto &child : op->children) {
-		CollectSingleDelimKeyBindings(child.get(), key_bindings);
-	}
-}
-
-static vector<string> DeriveScalarDelimKeyColumnNames(LogicalOperator *plan, const vector<string> &output_names) {
-	vector<string> group_names;
-	unordered_set<string> key_bindings;
-	CollectSingleDelimKeyBindings(plan, key_bindings);
-	auto *top_projection = FindFirstProjection(plan);
-	if (top_projection) {
-		for (idx_t expr_idx = 0; expr_idx < top_projection->expressions.size() && expr_idx < output_names.size();
-		     expr_idx++) {
-			auto &expr = top_projection->expressions[expr_idx];
-			if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
-				continue;
-			}
-			if (!key_bindings.count(BindingKey(expr->Cast<BoundColumnRefExpression>()))) {
-				continue;
-			}
-			if (!output_names[expr_idx].empty() && !IVMTableNames::IsInternalColumn(output_names[expr_idx])) {
-				AddUniqueGroupNames(group_names, vector<string> {output_names[expr_idx]});
-			}
-		}
-	}
-	if (group_names.empty() && !output_names.empty() && !IVMTableNames::IsInternalColumn(output_names[0])) {
-		// Scalar correlated subqueries normally project the duplicate-eliminated outer keys
-		// first. Use that shape as a fallback if binding aliases were hidden by projection
-		// rewrites.
-		group_names.push_back(output_names[0]);
-	}
-	return group_names;
-}
-
-static void CollectAggregateGroupColumns(LogicalOperator *root, LogicalOperator *op,
-                                         const unordered_map<idx_t, LogicalProjection *> &projections_by_index,
-                                         const vector<string> &output_names, vector<string> &group_names,
-                                         bool include_first_aggregate, bool &seen_aggregate) {
-	if (!op) {
-		return;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		auto &agg = op->Cast<LogicalAggregate>();
-		bool include_this = include_first_aggregate || seen_aggregate;
-		seen_aggregate = true;
-		if (include_this && !agg.groups.empty()) {
-			vector<string> nested_names;
-			if (FindGroupColumns(root, projections_by_index, agg.group_index, agg.groups.size(), output_names,
-			                     nested_names)) {
-				AddUniqueGroupNames(group_names, nested_names);
-			}
-		}
-	}
-	for (auto &child : op->children) {
-		CollectAggregateGroupColumns(root, child.get(), projections_by_index, output_names, group_names,
-		                             include_first_aggregate, seen_aggregate);
-	}
-}
-
-static vector<string> DeriveAggregateGroupColumnNames(LogicalOperator *plan, const vector<string> &output_names,
-                                                      bool include_first_aggregate) {
-	vector<string> group_names;
-	unordered_map<idx_t, LogicalProjection *> projections_by_index;
-	CollectProjectionIndex(plan, projections_by_index);
-	bool seen_aggregate = false;
-	CollectAggregateGroupColumns(plan, plan, projections_by_index, output_names, group_names, include_first_aggregate,
-	                             seen_aggregate);
-	return group_names;
-}
-
-static string FindFirstTableName(LogicalOperator *node) {
-	if (node->type == LogicalOperatorType::LOGICAL_GET) {
-		auto *get = dynamic_cast<LogicalGet *>(node);
-		if (get && get->GetTable().get()) {
-			return get->GetTable().get()->name;
-		}
-	}
-	for (auto &child : node->children) {
-		string name = FindFirstTableName(child.get());
-		if (!name.empty()) {
-			return name;
-		}
-	}
-	return "";
-}
-
-static void IndexProjectionsAndGets(LogicalOperator *op, unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                    unordered_map<idx_t, LogicalGet *> &get_by_index) {
-	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &proj = op->Cast<LogicalProjection>();
-		proj_by_index[proj.table_index] = &proj;
-	} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op->Cast<LogicalGet>();
-		get_by_index[get.table_index] = &get;
-	}
-	for (auto &child : op->children) {
-		IndexProjectionsAndGets(child.get(), proj_by_index, get_by_index);
-	}
-}
-
-static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr,
-                                         const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                         const unordered_map<idx_t, LogicalGet *> &get_by_index) {
-	idx_t table_index = bcr->binding.table_index;
-	idx_t column_index = bcr->binding.column_index;
-	for (int depth = 0; depth < 16; depth++) {
-		auto get_it = get_by_index.find(table_index);
-		if (get_it != get_by_index.end()) {
-			auto *get = get_it->second;
-			auto &ids = get->GetColumnIds();
-			if (column_index < ids.size() && get->GetTable().get()) {
-				auto base_idx = ids[column_index].GetPrimaryIndex();
-				auto &cols = get->GetTable().get()->GetColumns();
-				if (base_idx < cols.LogicalColumnCount()) {
-					return cols.GetColumn(LogicalIndex(base_idx)).Name();
-				}
-			}
-			if (column_index < get->names.size()) {
-				return get->names[column_index];
-			}
-			return "";
-		}
-		auto proj_it = proj_by_index.find(table_index);
-		if (proj_it == proj_by_index.end()) {
-			return "";
-		}
-		auto *proj = proj_it->second;
-		if (column_index >= proj->expressions.size()) {
-			return "";
-		}
-		auto &expr = proj->expressions[column_index];
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
-			return expr->alias.empty() ? expr->GetName() : expr->alias;
-		}
-		auto &next = expr->Cast<BoundColumnRefExpression>();
-		table_index = next.binding.table_index;
-		column_index = next.binding.column_index;
-	}
-	return "";
-}
-
-static void ResolveWindowPartitionOutputNames(LogicalOperator *plan, vector<string> &partition_columns,
-                                              const vector<string> &output_names) {
-	if (partition_columns.empty()) {
-		return;
-	}
-	auto *top_projection = FindFirstProjection(plan);
-	if (!top_projection) {
-		return;
-	}
-
-	unordered_map<idx_t, LogicalProjection *> proj_by_index;
-	unordered_map<idx_t, LogicalGet *> get_by_index;
-	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
-
-	for (auto &partition_column : partition_columns) {
-		if (partition_column.find('=') != string::npos) {
-			continue;
-		}
-		for (idx_t expr_i = 0; expr_i < top_projection->expressions.size(); expr_i++) {
-			auto &expr = top_projection->expressions[expr_i];
-			auto *bcr = GetColumnRefThroughCasts(expr.get());
-			if (!bcr) {
-				continue;
-			}
-			string base_col = ResolveBindingToBaseColumn(bcr, proj_by_index, get_by_index);
-			if (!StringUtil::CIEquals(base_col, partition_column) &&
-			    !StringUtil::CIEquals(bcr->GetName(), partition_column)) {
-				continue;
-			}
-			string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
-			if (!output_col.empty() && !IVMTableNames::IsInternalColumn(output_col)) {
-				partition_column = output_col + "=" + partition_column;
-			}
-			break;
-		}
-	}
-}
-
-static void ResolveAggregateGroupColumnsThroughJoinKeys(LogicalOperator *plan, vector<string> &aggregate_columns,
-                                                        const vector<string> &output_names) {
-	if (aggregate_columns.empty()) {
-		return;
-	}
-	auto *top_projection = FindFirstProjection(plan);
-	if (!top_projection) {
-		return;
-	}
-
-	unordered_map<idx_t, LogicalProjection *> proj_by_index;
-	unordered_map<idx_t, LogicalGet *> get_by_index;
-	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
-
-	unordered_map<string, string> parents;
-	vector<BoundColumnRefExpression *> join_refs;
-	CollectJoinEquivalences(plan, parents, join_refs);
-	if (join_refs.empty()) {
-		return;
-	}
-
-	unordered_map<string, string> output_by_parent;
-	for (idx_t expr_i = 0; expr_i < top_projection->expressions.size(); expr_i++) {
-		auto &expr = top_projection->expressions[expr_i];
-		auto *bcr = GetColumnRefThroughCasts(expr.get());
-		if (!bcr) {
-			continue;
-		}
-		string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
-		if (output_col.empty() || IVMTableNames::IsInternalColumn(output_col)) {
-			continue;
-		}
-		string parent = FindBindingParent(parents, BindingKey(*bcr));
-		if (!output_by_parent.count(parent)) {
-			output_by_parent[parent] = output_col;
-		}
-	}
-
-	for (auto &group_col : aggregate_columns) {
-		bool already_visible = false;
-		for (auto &output_col : output_names) {
-			if (StringUtil::CIEquals(group_col, output_col)) {
-				already_visible = true;
-				break;
-			}
-		}
-		if (already_visible) {
-			continue;
-		}
-		for (auto *ref : join_refs) {
-			string ref_col = ResolveBindingToBaseColumn(ref, proj_by_index, get_by_index);
-			if (ref_col.empty()) {
-				ref_col = ref->GetName();
-			}
-			if (!StringUtil::CIEquals(ref_col, group_col) && !StringUtil::CIEquals(ref->GetName(), group_col)) {
-				continue;
-			}
-			string parent = FindBindingParent(parents, BindingKey(*ref));
-			auto out_it = output_by_parent.find(parent);
-			if (out_it != output_by_parent.end()) {
-				group_col = out_it->second;
-				break;
-			}
-		}
-		bool resolved = false;
-		for (auto &output_col : output_names) {
-			if (StringUtil::CIEquals(group_col, output_col)) {
-				resolved = true;
-				break;
-			}
-		}
-		if (resolved) {
-			continue;
-		}
-		string suffix = group_col;
-		while (true) {
-			auto underscore = suffix.find('_');
-			if (underscore == string::npos || underscore + 1 >= suffix.size()) {
-				break;
-			}
-			suffix = suffix.substr(underscore + 1);
-			string matched_output;
-			for (auto &output_col : output_names) {
-				if (StringUtil::CIEquals(output_col, suffix)) {
-					if (!matched_output.empty()) {
-						matched_output.clear();
-						break;
-					}
-					matched_output = output_col;
-				}
-			}
-			if (!matched_output.empty()) {
-				group_col = matched_output;
-				break;
-			}
-		}
-	}
-}
-
-static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr,
-                                      const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                      const unordered_map<idx_t, LogicalGet *> &get_by_index) {
-	if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
-		return "";
-	}
-	auto *ref = dynamic_cast<BoundColumnRefExpression *>(expr.get());
-	if (!ref) {
-		return "";
-	}
-	string col_name = ResolveBindingToBaseColumn(ref, proj_by_index, get_by_index);
-	return col_name.empty() ? ref->GetName() : col_name;
-}
-
-static bool ExtractFullOuterJoinCols(LogicalOperator *node,
-                                     const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                     const unordered_map<idx_t, LogicalGet *> &get_by_index, string &result) {
-	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (join && join->join_type == JoinType::OUTER && !join->conditions.empty()) {
-			auto &condition = join->conditions[0];
-			string left_col_name = FullOuterJoinColumnName(condition.left, proj_by_index, get_by_index);
-			string right_col_name = FullOuterJoinColumnName(condition.right, proj_by_index, get_by_index);
-			string left_table = !join->children.empty() ? FindFirstTableName(join->children[0].get()) : "";
-			string right_table = join->children.size() > 1 ? FindFirstTableName(join->children[1].get()) : "";
-			if (!left_col_name.empty() && !right_col_name.empty() && !left_table.empty() && !right_table.empty()) {
-				result = left_table + ":" + left_col_name + "," + right_table + ":" + right_col_name;
-				return true;
-			}
-		}
-	}
-	for (auto &child : node->children) {
-		if (ExtractFullOuterJoinCols(child.get(), proj_by_index, get_by_index, result)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static string ExtractFullOuterJoinMetadata(LogicalOperator *plan) {
-	unordered_map<idx_t, LogicalProjection *> proj_by_index;
-	unordered_map<idx_t, LogicalGet *> get_by_index;
-	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
-	string result;
-	ExtractFullOuterJoinCols(plan, proj_by_index, get_by_index, result);
-	return result;
 }
 
 static string SanitizeOutputName(const string &name) {
@@ -2265,7 +1683,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		auto delta_model = BuildDeltaPlanModel(plan.get());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] delta model: %s\n", delta_model.DebugString().c_str());
 		auto analysis = std::move(delta_model.analysis);
-		bool has_minmax_metadata = analysis.found_minmax || analysis.found_count_distinct || analysis.found_list;
 		if (analysis.found_delim_join && !analysis.found_aggregation && !analysis.found_single_join) {
 			// Preserve DuckDB's dependent/DELIM_JOIN plan shape for refresh. LPTS can
 			// round-trip lateral table functions, but its CTE-normalized SQL lowers them
@@ -2280,230 +1697,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			OPENIVM_DEBUG_PRINT("[CREATE MV] LIST FILTER requires original SQL for group-recompute: %s\n",
 			                    view_query.c_str());
 		}
-		// Derive GROUP BY column names by walking the plan's projection above the aggregate.
-		// The projection maps GROUP BY bindings (group_index, i) to SELECT-list aliases — these
-		// aliases are the actual column names in the data table. Plan-walk aliases on agg.groups
-		// are unreliable for CASE/COALESCE expressions.
-		// For DISTINCT views, the delta model extracts aggregate_columns from distinct_targets.
-		size_t group_count = analysis.group_count;
-		idx_t group_index = analysis.group_index;
-		vector<string> aggregate_columns;
-		bool join_key_group_fallback = false;
-		// DISTINCT is only the MV's grouping when its targets actually appear in the MV's
-		// output columns. An inner-subquery DISTINCT (e.g. `SELECT COUNT(*) FROM (SELECT
-		// DISTINCT x FROM t)`, or a CTE like `WITH cte AS (SELECT DISTINCT x FROM t) ...`)
-		// exposes columns that never reach the data table, so its targets can't drive
-		// AGGREGATE_GROUP classification or the unique index.
-		bool distinct_at_top = false;
-		if (analysis.found_distinct && !analysis.aggregate_columns.empty() && !output_names.empty()) {
-			unordered_set<string> output_lc;
-			for (auto &n : output_names) {
-				string lc = n;
-				std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return std::tolower(c); });
-				output_lc.insert(lc);
-			}
-			distinct_at_top = true;
-			for (auto &t : analysis.aggregate_columns) {
-				string lc = t;
-				std::transform(lc.begin(), lc.end(), lc.begin(), [](unsigned char c) { return std::tolower(c); });
-				if (!output_lc.count(lc)) {
-					distinct_at_top = false;
-					break;
-				}
-			}
-		}
-		// Detect UNION / UNION ALL over aggregates once, shared by the group_cols block below
-		// (to skip key extraction) and the classification chain (to route to RECOMPUTE).
-		// True only when the UNION node is an ancestor of the aggregate (union-of-aggs pattern).
-		// For agg-over-union (e.g. SELECT ... FROM (t1 UNION ALL t2) GROUP BY ...) the
-		// UNION is a descendant of the aggregate — that is a normal AGGREGATE_GROUP view.
-		bool has_union_over_agg = analysis.found_union_before_aggregate;
-		bool union_distinct_over_agg = analysis.found_distinct && distinct_at_top && has_union_over_agg;
-
-		if (union_distinct_over_agg) {
-			aggregate_columns =
-			    DeriveGroupColumnNames(plan.get(), group_index, group_count, output_names, has_union_over_agg);
-		} else if (distinct_at_top) {
-			aggregate_columns = std::move(analysis.aggregate_columns);
-		} else if (analysis.found_distinct && analysis.aggregate_columns.empty()) {
-			// Plain DISTINCT (no explicit targets) — trust the delta model.
-			aggregate_columns = std::move(analysis.aggregate_columns);
-		} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
-			auto group_names_list =
-			    DeriveGroupColumnNames(plan.get(), group_index, group_count, output_names, has_union_over_agg);
-			for (auto &name : group_names_list) {
-				aggregate_columns.push_back(name);
-			}
-		}
-
-		// LATERAL/correlated subquery aggregates are represented by DEPENDENT/DELIM joins.
-		// The inner aggregate's group binding is not projected as a top-level GROUP BY, so
-		// the normal group-column derivation above leaves aggregate_columns empty and would
-		// misclassify the MV as a scalar SIMPLE_AGGREGATE. For this shape, the visible
-		// non-aggregate output columns are the affected-key columns that scope
-		// GROUP_RECOMPUTE.
-		bool delim_aggregate_group_fallback = false;
-		if (analysis.found_delim_join && analysis.found_aggregation && aggregate_columns.empty() &&
-		    output_names.size() > analysis.aggregate_types.size()) {
-			idx_t key_count = output_names.size() - analysis.aggregate_types.size();
-			for (idx_t i = 0; i < key_count; i++) {
-				if (!output_names[i].empty() && !IVMTableNames::IsInternalColumn(output_names[i])) {
-					aggregate_columns.push_back(output_names[i]);
-				}
-			}
-			delim_aggregate_group_fallback = !aggregate_columns.empty();
-			if (delim_aggregate_group_fallback) {
-				OPENIVM_DEBUG_PRINT("[CREATE MV] DELIM/DEPENDENT aggregate: using %zu visible key columns for "
-				                    "GROUP_RECOMPUTE\n",
-				                    aggregate_columns.size());
-			}
-		}
-
-		bool scalar_delim_projection_group_fallback = false;
-		if (analysis.found_delim_join && analysis.found_single_join && !analysis.found_aggregation &&
-		    aggregate_columns.empty()) {
-			auto delim_key_names = DeriveScalarDelimKeyColumnNames(plan.get(), output_names);
-			for (auto &name : delim_key_names) {
-				aggregate_columns.push_back(name);
-			}
-			scalar_delim_projection_group_fallback = !aggregate_columns.empty();
-			if (scalar_delim_projection_group_fallback) {
-				OPENIVM_DEBUG_PRINT("[CREATE MV] Scalar DELIM/DEPENDENT projection: using %zu visible key columns "
-				                    "for GROUP_RECOMPUTE\n",
-				                    aggregate_columns.size());
-			}
-		}
-
-		bool nested_aggregate_group_fallback = false;
-		if (analysis.found_nested_aggregate && aggregate_columns.empty()) {
-			auto nested_group_names = DeriveAggregateGroupColumnNames(plan.get(), output_names, false);
-			for (auto &name : nested_group_names) {
-				if (!IVMTableNames::IsInternalColumn(name)) {
-					aggregate_columns.push_back(name);
-				}
-			}
-			nested_aggregate_group_fallback = !aggregate_columns.empty();
-			if (nested_aggregate_group_fallback) {
-				OPENIVM_DEBUG_PRINT("[CREATE MV] Nested aggregate: using %zu visible inner group columns for "
-				                    "GROUP_RECOMPUTE\n",
-				                    aggregate_columns.size());
-			}
-		}
-
-		bool repeated_cte_aggregate_group_fallback = false;
-		if (analysis.found_aggregation && aggregate_columns.empty()) {
-			auto cte_group_names = DeriveAggregateGroupColumnNames(plan.get(), output_names, true);
-			for (auto &name : cte_group_names) {
-				if (!IVMTableNames::IsInternalColumn(name)) {
-					aggregate_columns.push_back(name);
-				}
-			}
-			repeated_cte_aggregate_group_fallback = !aggregate_columns.empty();
-			if (repeated_cte_aggregate_group_fallback) {
-				OPENIVM_DEBUG_PRINT("[CREATE MV] Repeated CTE aggregate under join: using %zu visible group columns "
-				                    "for GROUP_RECOMPUTE\n",
-				                    aggregate_columns.size());
-			}
-		}
-
-		// Deduplicate aggregate_columns the same way we deduped output_names above.
-		// When the user writes `SELECT DISTINCT w_id, w_id` (or groups twice on the
-		// same column), the data table has columns `w_id, w_id_1` after the output_names
-		// dedup — the unique index and MERGE ON/UPDATE SET clauses read group names
-		// from aggregate_columns, so they must match the data table's deduped names.
-		// Without this, the second occurrence gets treated as an aggregate column in
-		// `UPDATE SET w_id_1 = v.w_id_1 + d.w_id_1` and values are summed instead of matched.
-		{
-			unordered_set<string> seen_group;
-			for (auto &name : aggregate_columns) {
-				if (IVMTableNames::IsInternalColumn(name)) {
-					continue;
-				}
-				string candidate = name;
-				idx_t suffix = 1;
-				while (seen_group.count(candidate)) {
-					candidate = name + "_" + to_string(suffix++);
-				}
-				seen_group.insert(candidate);
-				name = candidate;
-			}
-		}
-		auto aggregate_types = std::move(analysis.aggregate_types);
-		auto window_partition_columns = std::move(analysis.window_partition_columns);
-		ResolveWindowPartitionOutputNames(plan.get(), window_partition_columns, output_names);
-
-		// Fallback group-key extraction for inner-aggregate-in-join patterns.
-		// When the top-level SELECT joins against a subquery/CTE that performs GROUP BY,
-		// find_group_cols fails (the inner aggregate's group_index isn't referenced by the
-		// outer projection — the join key comes from the non-aggregate arm). Recover group
-		// keys by matching the outermost JOIN's condition BCRs against the top projection.
-		//
-		// Use GROUP_RECOMPUTE for these views: AGGREGATE_GROUP would try to SUM pass-through
-		// attributes (e.g. W_YTD from WAREHOUSE) as if they were aggregate results.
-		if (analysis.found_join && group_count > 0 && !has_union_over_agg) {
-			// plan root is LOGICAL_CREATE_TABLE; descend to find the SELECT output
-			// projection and outermost comparison join.
-			auto *top_proj_ptr = FindFirstProjection(plan.get());
-			auto *cjoin = FindFirstComparisonJoin(plan.get());
-			if (top_proj_ptr && cjoin) {
-				// Collect (table_index, column_index) pairs that appear in join conditions.
-				unordered_map<idx_t, unordered_set<idx_t>> join_key_cols;
-				for (auto &cond : cjoin->conditions) {
-					AddJoinKeyColumn(cond.left, join_key_cols);
-					AddJoinKeyColumn(cond.right, join_key_cols);
-				}
-				// Match those bindings against the top projection's output expressions.
-				auto &top_proj = *top_proj_ptr;
-				for (idx_t expr_i = 0; expr_i < top_proj.expressions.size(); expr_i++) {
-					auto &expr = top_proj.expressions[expr_i];
-					if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
-						continue;
-					}
-					auto &bcr = expr->Cast<BoundColumnRefExpression>();
-					auto it = join_key_cols.find(bcr.binding.table_index);
-					if (it == join_key_cols.end() || !it->second.count(bcr.binding.column_index)) {
-						continue;
-					}
-					string col_name;
-					if (!expr->alias.empty()) {
-						col_name = expr->alias;
-					} else if (expr_i < output_names.size() && !output_names[expr_i].empty() &&
-					           !IVMTableNames::IsInternalColumn(output_names[expr_i])) {
-						col_name = output_names[expr_i];
-					} else {
-						col_name = bcr.GetName();
-					}
-					if (!IVMTableNames::IsInternalColumn(col_name)) {
-						bool exists = false;
-						for (auto &existing : aggregate_columns) {
-							if (StringUtil::CIEquals(existing, col_name)) {
-								exists = true;
-								break;
-							}
-						}
-						if (!exists) {
-							aggregate_columns.push_back(col_name);
-							join_key_group_fallback = true;
-						}
-					}
-				}
-			}
-		}
-		if (analysis.found_join && analysis.found_aggregation && !aggregate_columns.empty()) {
-			ResolveAggregateGroupColumnsThroughJoinKeys(plan.get(), aggregate_columns, output_names);
-		}
-
-		bool join_aggregate_projection_fallback = false;
-		if (analysis.found_join && analysis.found_aggregation && !aggregate_columns.empty()) {
-			idx_t expected_linear_outputs = aggregate_columns.size() + aggregate_types.size();
-			join_aggregate_projection_fallback = output_names.size() > expected_linear_outputs;
-			if (join_aggregate_projection_fallback) {
-				OPENIVM_DEBUG_PRINT("[CREATE MV] Join-over-aggregate exposes %zu columns but only %zu are "
-				                    "group/aggregate outputs — using GROUP_RECOMPUTE\n",
-				                    output_names.size(), expected_linear_outputs);
-			}
-		}
-
 		// Window over join: non-DuckLake delta tables may not expose the partition key for
 		// every changed source, so native window recompute could miss partitions. DuckLake
 		// can compare the old/new view result at source snapshots, so it can safely keep
@@ -2529,27 +1722,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 		}
 		bool single_source_window_join = analysis.found_window && analysis.found_join && table_names.size() == 1;
-		if (analysis.found_window && analysis.found_join && !single_source_window_join && !all_sources_are_ducklake) {
-			window_partition_columns.clear();
-		}
-
-		// LEFT/RIGHT/OUTER JOIN aggregate with a non-trivial aggregate argument
-		// (e.g. `SUM(COALESCE(h.x, 0))`, `AVG(1)`, `SUM(CASE …)`) or a non-BCR
-		// projection wrapping an aggregate output (e.g. `COALESCE(SUM(…), 0)`)
-		// breaks the Larson & Zhou MERGE logic: the NULL-semantics shortcut that
-		// resets right-side aggregates to NULL when match_count=0 produces the
-		// wrong value when the stored expression would evaluate to the COALESCE
-		// default (0). Route these to group-recompute by setting found_minmax so
-		// the view is compiled with has_minmax=true. Detection runs only when
-		// the view already has a LEFT/RIGHT/OUTER JOIN and an AGGREGATE.
-		//   query_1502: COALESCE(SUM(ol.OL_QUANTITY), 0) AS ordered
-		//   query_1696/1699: SUM(COALESCE(h.H_AMOUNT, 0))
-		//   query_1746/1749: SUM(COALESCE(1, 0)), AVG(1)
-		if (analysis.outer_join_aggregate_needs_recompute) {
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT/OUTER JOIN aggregate with computed aggregate or projection wrapper — "
-			                    "using group-recompute (found_minmax=true)\n");
-			has_minmax_metadata = true;
-		}
 		bool has_unsupported_set_operation = analysis.found_unsupported_set_operation;
 		bool has_unsupported_incremental_construct = query_constructs.has_unsupported_incremental_construct;
 		if (has_unsupported_set_operation || has_unsupported_incremental_construct) {
@@ -2559,8 +1731,17 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			view_query = original_view_query;
 			lpts_fallback = true;
 		}
+		bool keep_window_join_partitions =
+		    !analysis.found_window || !analysis.found_join || single_source_window_join || all_sources_are_ducklake;
 
-		IVMType ivm_type;
+		DeltaViewModelInput model_input;
+		model_input.analysis = analysis;
+		model_input.plan = plan.get();
+		model_input.output_names = output_names;
+		model_input.has_unsupported_incremental_construct = has_unsupported_incremental_construct;
+		model_input.keep_window_join_partitions = keep_window_join_partitions;
+		auto prelim_view_model = BuildDeltaViewModel(model_input);
+
 		// Populated by ExtractInnerDistinct when classified as DISTINCT_INCREMENTAL.
 		vector<string> distinct_extracted_cols;
 		string distinct_extracted_input_sql;
@@ -2575,22 +1756,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		SemiAntiExtract semi_anti_extract;
 		vector<string> semi_anti_left_cols;
 
-		if (has_unsupported_set_operation || has_unsupported_incremental_construct) {
-			ivm_type = IVMType::FULL_REFRESH;
-		} else if (analysis.found_window) {
-			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
-			ivm_type = IVMType::WINDOW_PARTITION;
-		} else if (analysis.found_grouping_sets) {
-			// ROLLUP / CUBE / GROUPING SETS produce multiple grouping sets per row;
-			// maintain them by recomputing the grouping-set keys touched by source
-			// deltas.
-			ivm_type = aggregate_columns.empty() ? IVMType::FULL_REFRESH : IVMType::GROUP_RECOMPUTE;
-		} else if (analysis.found_semi_anti_join && analysis.found_aggregation) {
-			// SEMI/ANTI joins are thresholded by match-count transitions. The aux-state path below
-			// supports projection/filter stacks over one left base table; aggregates over SEMI/ANTI
-			// need a separate transition-to-aggregate compiler. Use full recompute until that lands.
-			ivm_type = IVMType::FULL_REFRESH;
-		} else if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
+		bool semi_anti_recompute_supported = false;
+		if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
 			if (ExtractSemiAntiQuery(original_view_query, semi_anti_extract)) {
 				string left_table_name = LastIdentifierPart(semi_anti_extract.left_table);
 				auto col_result =
@@ -2619,41 +1786,18 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 							add_semi_anti_left_col(col_result->GetValue(0, i).ToString());
 						}
 					}
-					ivm_type = semi_anti_left_cols.empty() ? IVMType::FULL_REFRESH : IVMType::SEMI_ANTI_RECOMPUTE;
+					semi_anti_recompute_supported = !semi_anti_left_cols.empty();
 				} else if (!col_result->HasError() && col_result->RowCount() > 0) {
 					for (idx_t i = 0; i < col_result->RowCount(); i++) {
 						add_semi_anti_left_col(col_result->GetValue(0, i).ToString());
 					}
-					ivm_type = IVMType::SEMI_ANTI_RECOMPUTE;
-				} else {
-					ivm_type = IVMType::FULL_REFRESH;
+					semi_anti_recompute_supported = true;
 				}
-			} else {
-				ivm_type = IVMType::FULL_REFRESH;
 			}
-		} else if (!analysis.ivm_compatible) {
-			ivm_type = IVMType::FULL_REFRESH;
-			Printer::Print("Warning: materialized view '" + view_name +
-			               "' uses constructs not supported for incremental maintenance. "
-			               "Full refresh will be used.");
-		} else if (analysis.found_filtered_list && !aggregate_columns.empty()) {
-			ivm_type = IVMType::GROUP_RECOMPUTE;
-		} else if (analysis.found_filtered_list) {
-			ivm_type = IVMType::FULL_REFRESH;
-		} else if (analysis.found_count_distinct && !aggregate_columns.empty()) {
-			ivm_type = IVMType::GROUP_RECOMPUTE;
-		} else if (analysis.found_distinct && !distinct_at_top && analysis.found_aggregation) {
-			// Inner DISTINCT under an aggregate. Two paths:
-			//   - `ivm_distinct_aux_state = true` AND single-source body → DISTINCT_INCREMENTAL.
-			//     Maintains per-DISTINCT-tuple count auxiliary state; on refresh emits ±1
-			//     only on count transitions across zero (DBSP distinct(R)=sgn(R[t])). Strictly
-			//     fewer rows reach the parent aggregate's MERGE than GROUP_RECOMPUTE.
-			//   - Otherwise → GROUP_RECOMPUTE: re-evaluate only the outer GROUP BY keys touched
-			//     by source deltas. Correctness-equivalent fallback; multi-source views stay
-			//     there until the aux-state path can substitute each source independently.
-			// Read the flag from the user's ClientContext (`context`), not the local
-			// `con` — the local connection is a fresh one and doesn't inherit the
-			// caller's session settings.
+		}
+
+		bool distinct_incremental_supported = false;
+		if (analysis.found_distinct && !prelim_view_model.distinct_at_top && analysis.found_aggregation) {
 			Value aux_val;
 			bool aux_enabled = false;
 			if (context.TryGetCurrentSetting("ivm_distinct_aux_state", aux_val) && !aux_val.IsNull()) {
@@ -2661,18 +1805,9 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			}
 			bool single_source = table_names.size() == 1;
 			if (aux_enabled && single_source) {
-				ivm_type = IVMType::DISTINCT_INCREMENTAL;
-			} else {
-				ivm_type = IVMType::GROUP_RECOMPUTE;
-			}
-			// Try to extract the DISTINCT subquery from the user's original SQL. If the
-			// shape isn't recognised (multi-source body, subquery FROM, etc.), demote to
-			// GROUP_RECOMPUTE — the aux pipeline is single-source-only in v0.
-			if (ivm_type == IVMType::DISTINCT_INCREMENTAL) {
 				vector<string> dcols;
 				string d_input_sql, d_source, d_filter;
 				if (!ExtractInnerDistinct(original_view_query, dcols, d_input_sql, d_source, d_filter)) {
-					ivm_type = IVMType::GROUP_RECOMPUTE;
 					OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL extractor failed — demoting to "
 					                    "GROUP_RECOMPUTE\n");
 				} else {
@@ -2682,11 +1817,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					distinct_extracted_filter = std::move(d_filter);
 				}
 			}
-			// Walk the rewritten plan for the outer aggregate's expressions. v0 supports
-			// exactly one SUM(<arg>) — `_ivm_count_star` (auto-injected by IVMPlanRewrite)
-			// is allowed alongside it. Anything else (AVG, COUNT, MIN/MAX, multiple SUMs)
-			// demotes back to GROUP_RECOMPUTE.
-			if (ivm_type == IVMType::DISTINCT_INCREMENTAL) {
+
+			if (!distinct_extracted_cols.empty()) {
 				LogicalAggregate *outer_agg = FindOuterAggregate(plan.get());
 				int sum_count = 0;
 				bool unsupported_agg = false;
@@ -2716,7 +1848,6 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					}
 				}
 				if (!outer_agg || unsupported_agg || sum_count != 1) {
-					ivm_type = IVMType::GROUP_RECOMPUTE;
 					distinct_sum_arg.clear();
 					distinct_sum_out.clear();
 					OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL outer-agg not single-SUM — demoting "
@@ -2726,57 +1857,49 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 					// aggregate, not on the BoundAggregateExpression itself. Recover it
 					// from output_names: the SUM output column is the first non-group
 					// position (group cols come first in the data table layout).
-					if (aggregate_columns.size() < output_names.size()) {
-						distinct_sum_out = output_names[aggregate_columns.size()];
+					if (prelim_view_model.group_columns.size() < output_names.size()) {
+						distinct_sum_out = output_names[prelim_view_model.group_columns.size()];
 					}
 				}
+				distinct_incremental_supported = !distinct_sum_arg.empty() && !distinct_sum_out.empty();
 			}
-		} else if (union_distinct_over_agg && !aggregate_columns.empty()) {
-			// UNION DISTINCT over grouped aggregate outputs must recompute by the branch
-			// aggregate key, not by the full distinct output tuple. The old aggregate value
-			// is no longer discoverable from delta-filtered recompute after an update.
-			ivm_type = IVMType::GROUP_RECOMPUTE;
-		} else if (analysis.found_distinct && distinct_at_top && !aggregate_columns.empty()) {
-			ivm_type = IVMType::AGGREGATE_GROUP;
-		} else if (analysis.found_having && analysis.found_aggregation && !aggregate_columns.empty()) {
-			ivm_type = IVMType::AGGREGATE_HAVING;
-		} else if ((has_union_over_agg || join_key_group_fallback || delim_aggregate_group_fallback ||
-		            scalar_delim_projection_group_fallback || join_aggregate_projection_fallback ||
-		            nested_aggregate_group_fallback || repeated_cte_aggregate_group_fallback ||
-		            analysis.found_nested_aggregate) &&
-		           !aggregate_columns.empty()) {
-			// UNION/UNION ALL over aggregates: group keys extracted positionally from output_names.
-			// Inner-aggregate-in-join: group keys are the join-condition columns visible in the
-			// top projection. DELIM/DEPENDENT aggregate or scalar-subquery projection: group
-			// keys are the visible correlated output columns. Nested aggregate (outer COUNT(*)
-			// over inner GROUP BY via CTE): outer COUNT counts inner groups, not source rows,
-			// so linear delta is incorrect. These use GROUP_RECOMPUTE — not AGGREGATE_GROUP —
-			// because non-key output columns may be pass-through attributes or non-linear
-			// functions over inner/correlated expressions.
-			ivm_type = IVMType::GROUP_RECOMPUTE;
-		} else if (analysis.found_aggregation && !aggregate_columns.empty()) {
-			ivm_type = IVMType::AGGREGATE_GROUP;
-		} else if (analysis.found_aggregation && aggregate_columns.empty()) {
-			ivm_type = IVMType::SIMPLE_AGGREGATE;
-		} else if (analysis.found_projection && !analysis.found_aggregation) {
-			ivm_type = IVMType::SIMPLE_PROJECTION;
-		} else {
-			ivm_type = IVMType::FULL_REFRESH;
+		}
+
+		model_input.distinct_incremental_supported = distinct_incremental_supported;
+		model_input.semi_anti_recompute_supported = semi_anti_recompute_supported;
+		auto view_model = BuildDeltaViewModel(model_input);
+		IVMType ivm_type = view_model.type;
+		auto aggregate_columns = view_model.group_columns;
+		auto aggregate_types = view_model.aggregate_types;
+		auto window_partition_columns = view_model.window_partition_columns;
+		bool has_minmax_metadata = view_model.has_minmax_metadata;
+		if (ivm_type != IVMType::DISTINCT_INCREMENTAL) {
+			distinct_extracted_cols.clear();
+			distinct_extracted_input_sql.clear();
+			distinct_extracted_source.clear();
+			distinct_extracted_filter.clear();
+			distinct_sum_arg.clear();
+			distinct_sum_out.clear();
+		}
+		if (ivm_type != IVMType::SEMI_ANTI_RECOMPUTE) {
+			semi_anti_left_cols.clear();
+		}
+		if (view_model.warn_unsupported_incremental) {
+			Printer::Print("Warning: materialized view '" + view_name +
+			               "' uses constructs not supported for incremental maintenance. "
+			               "Full refresh will be used.");
+		}
+		if (view_model.warn_unrecognized_pattern) {
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' has an unrecognized query pattern. Full refresh will be used.");
 		}
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, projection=%d, group_cols=%zu)\n",
-		                    ivm_type == IVMType::AGGREGATE_GROUP        ? "AGGREGATE_GROUP"
-		                    : ivm_type == IVMType::SIMPLE_AGGREGATE     ? "SIMPLE_AGGREGATE"
-		                    : ivm_type == IVMType::SIMPLE_PROJECTION    ? "SIMPLE_PROJECTION"
-		                    : ivm_type == IVMType::FULL_REFRESH         ? "FULL_REFRESH"
-		                    : ivm_type == IVMType::WINDOW_PARTITION     ? "WINDOW_PARTITION"
-		                    : ivm_type == IVMType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
-		                    : ivm_type == IVMType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
-		                    : ivm_type == IVMType::SEMI_ANTI_RECOMPUTE  ? "SEMI_ANTI_RECOMPUTE"
-		                                                                : "UNKNOWN",
-		                    (int)analysis.found_aggregation, (int)analysis.found_projection, aggregate_columns.size());
+		                    IVMTypeName(ivm_type), (int)analysis.found_aggregation, (int)analysis.found_projection,
+		                    aggregate_columns.size());
+		for (auto reason : view_model.strategy_reasons) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Strategy reason: %s\n", DeltaStrategyReasonName(reason));
+		}
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
 		for (const auto &t : table_names) {
 			OPENIVM_DEBUG_PRINT(" %s", t.c_str());
@@ -2937,11 +2060,8 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 
 		// Extract FULL OUTER JOIN condition: "left_table:left_col,right_table:right_col"
 		string full_outer_join_cols_val = "null";
-		if (analysis.found_full_outer) {
-			string foj_cols = ExtractFullOuterJoinMetadata(plan.get());
-			if (!foj_cols.empty()) {
-				full_outer_join_cols_val = "'" + OpenIVMUtils::EscapeSingleQuotes(foj_cols) + "'";
-			}
+		if (analysis.found_full_outer && !view_model.full_outer_join_cols.empty()) {
+			full_outer_join_cols_val = "'" + OpenIVMUtils::EscapeSingleQuotes(view_model.full_outer_join_cols) + "'";
 		}
 
 		// 10 trailing NULLs: 8 matcher metadata columns + distinct/semi-anti aux metadata.

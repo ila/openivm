@@ -28,12 +28,6 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 class IvmJoinRule : public IvmRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;
-	// Join is bilinear: linear in each input separately. The delta rule expands
-	// to 2^N − 1 inclusion-exclusion terms (or N for DuckLake N-term telescoping),
-	// each weighted by the Z-set product times a Möbius sign.
-	Linearity GetLinearity() const override {
-		return Linearity::BILINEAR;
-	}
 };
 
 } // namespace duckdb

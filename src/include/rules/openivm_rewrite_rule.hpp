@@ -14,7 +14,7 @@ public:
 	static void AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
 	                          string &view_name, string &view_catalog_name, string &view_schema_name);
 
-	/// Orchestrator: dispatches to the correct IvmRule based on operator type.
+	/// Orchestrator: dispatches through the delta model to the correct operator-specific IvmRule.
 	static ModifiedPlan RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan, string &view,
 	                                LogicalOperator *&root);
 
