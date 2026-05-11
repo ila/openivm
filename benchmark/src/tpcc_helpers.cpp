@@ -182,8 +182,8 @@ std::vector<std::string> GenerateDeltaPool(int scale_factor) {
 		} else if (type < 90) {
 			deltas.push_back("INSERT INTO NEW_ORDER VALUES (" + std::to_string(w) + ", " + std::to_string(d) + ", 1)");
 		} else if (type < 95) {
-			deltas.push_back("DELETE FROM NEW_ORDER WHERE NO_W_ID = " + std::to_string(w) +
-			                 " AND NO_D_ID = " + std::to_string(d) + " LIMIT 1");
+			deltas.push_back("DELETE FROM NEW_ORDER WHERE rowid IN (SELECT rowid FROM NEW_ORDER WHERE NO_W_ID = " +
+			                 std::to_string(w) + " AND NO_D_ID = " + std::to_string(d) + " LIMIT 1)");
 		} else {
 			deltas.push_back("UPDATE WAREHOUSE SET W_YTD = " + std::to_string(amt * 100) +
 			                 ".00 WHERE W_ID = " + std::to_string(w));

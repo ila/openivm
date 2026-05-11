@@ -1153,3 +1153,165 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# Regression: FULL OUTER hidden right key through projection/filter stack
+# ============================================================
+
+statement ok
+CREATE TABLE chain_foj_left_src (id INT, totaln INT, districts INT);
+
+statement ok
+CREATE TABLE chain_foj_right_src (id INT, total_orders INT, order_avg DOUBLE);
+
+statement ok
+INSERT INTO chain_foj_left_src VALUES (1, 20, 2), (2, 7, 1), (4, 11, 3);
+
+statement ok
+INSERT INTO chain_foj_right_src VALUES (1, 12, 2.5), (3, 5, 1.5), (4, 20, 0.5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_chain_foj_left AS
+    SELECT id AS C_W_ID, totaln, districts FROM chain_foj_left_src WHERE totaln > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_chain_foj_right AS
+    SELECT id AS w_id, total_orders, order_avg FROM chain_foj_right_src;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_chain_foj_cross AS
+    WITH a AS (SELECT * FROM mv_chain_foj_left),
+         b AS (SELECT * FROM mv_chain_foj_right),
+         combined AS (
+             SELECT COALESCE(a.C_W_ID, b.w_id) AS w_id,
+                    a.totaln AS cust_totaln,
+                    a.districts AS cust_districts,
+                    b.total_orders AS order_lines,
+                    b.order_avg AS order_avg
+             FROM a FULL OUTER JOIN b ON a.C_W_ID = b.w_id
+         )
+    SELECT w_id, cust_totaln, cust_districts, order_lines, order_avg,
+           CASE WHEN cust_totaln IS NULL THEN 'order-only'
+                WHEN order_lines IS NULL THEN 'cust-only'
+                WHEN cust_totaln > 0 AND order_avg > 1 THEN 'active'
+                ELSE 'dormant' END AS status
+    FROM combined
+    WHERE cust_totaln IS NOT NULL OR order_lines IS NOT NULL;
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT w_id, cust_totaln, cust_districts, order_lines, order_avg, status FROM mv_chain_foj_cross)
+    EXCEPT ALL
+    (WITH a AS (SELECT id AS C_W_ID, totaln, districts FROM chain_foj_left_src WHERE totaln > 0),
+         b AS (SELECT id AS w_id, total_orders, order_avg FROM chain_foj_right_src),
+         combined AS (
+             SELECT COALESCE(a.C_W_ID, b.w_id) AS w_id,
+                    a.totaln AS cust_totaln,
+                    a.districts AS cust_districts,
+                    b.total_orders AS order_lines,
+                    b.order_avg AS order_avg
+             FROM a FULL OUTER JOIN b ON a.C_W_ID = b.w_id
+         )
+    SELECT w_id, cust_totaln, cust_districts, order_lines, order_avg,
+           CASE WHEN cust_totaln IS NULL THEN 'order-only'
+                WHEN order_lines IS NULL THEN 'cust-only'
+                WHEN cust_totaln > 0 AND order_avg > 1 THEN 'active'
+                ELSE 'dormant' END AS status
+    FROM combined
+    WHERE cust_totaln IS NOT NULL OR order_lines IS NOT NULL)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (WITH a AS (SELECT id AS C_W_ID, totaln, districts FROM chain_foj_left_src WHERE totaln > 0),
+         b AS (SELECT id AS w_id, total_orders, order_avg FROM chain_foj_right_src),
+         combined AS (
+             SELECT COALESCE(a.C_W_ID, b.w_id) AS w_id,
+                    a.totaln AS cust_totaln,
+                    a.districts AS cust_districts,
+                    b.total_orders AS order_lines,
+                    b.order_avg AS order_avg
+             FROM a FULL OUTER JOIN b ON a.C_W_ID = b.w_id
+         )
+    SELECT w_id, cust_totaln, cust_districts, order_lines, order_avg,
+           CASE WHEN cust_totaln IS NULL THEN 'order-only'
+                WHEN order_lines IS NULL THEN 'cust-only'
+                WHEN cust_totaln > 0 AND order_avg > 1 THEN 'active'
+                ELSE 'dormant' END AS status
+    FROM combined
+    WHERE cust_totaln IS NOT NULL OR order_lines IS NOT NULL)
+    EXCEPT ALL
+    (SELECT w_id, cust_totaln, cust_districts, order_lines, order_avg, status FROM mv_chain_foj_cross)
+);
+----
+0
+
+statement ok
+INSERT INTO chain_foj_right_src VALUES (2, 14, 3.0);
+
+statement ok
+DELETE FROM chain_foj_left_src WHERE id = 1;
+
+statement ok
+INSERT INTO chain_foj_left_src VALUES (3, 9, 2);
+
+statement ok
+PRAGMA ivm('mv_chain_foj_left');
+
+statement ok
+PRAGMA ivm('mv_chain_foj_right');
+
+statement ok
+PRAGMA ivm('mv_chain_foj_cross');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT w_id, cust_totaln, cust_districts, order_lines, order_avg, status FROM mv_chain_foj_cross)
+    EXCEPT ALL
+    (WITH a AS (SELECT id AS C_W_ID, totaln, districts FROM chain_foj_left_src WHERE totaln > 0),
+         b AS (SELECT id AS w_id, total_orders, order_avg FROM chain_foj_right_src),
+         combined AS (
+             SELECT COALESCE(a.C_W_ID, b.w_id) AS w_id,
+                    a.totaln AS cust_totaln,
+                    a.districts AS cust_districts,
+                    b.total_orders AS order_lines,
+                    b.order_avg AS order_avg
+             FROM a FULL OUTER JOIN b ON a.C_W_ID = b.w_id
+         )
+    SELECT w_id, cust_totaln, cust_districts, order_lines, order_avg,
+           CASE WHEN cust_totaln IS NULL THEN 'order-only'
+                WHEN order_lines IS NULL THEN 'cust-only'
+                WHEN cust_totaln > 0 AND order_avg > 1 THEN 'active'
+                ELSE 'dormant' END AS status
+    FROM combined
+    WHERE cust_totaln IS NOT NULL OR order_lines IS NOT NULL)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (WITH a AS (SELECT id AS C_W_ID, totaln, districts FROM chain_foj_left_src WHERE totaln > 0),
+         b AS (SELECT id AS w_id, total_orders, order_avg FROM chain_foj_right_src),
+         combined AS (
+             SELECT COALESCE(a.C_W_ID, b.w_id) AS w_id,
+                    a.totaln AS cust_totaln,
+                    a.districts AS cust_districts,
+                    b.total_orders AS order_lines,
+                    b.order_avg AS order_avg
+             FROM a FULL OUTER JOIN b ON a.C_W_ID = b.w_id
+         )
+    SELECT w_id, cust_totaln, cust_districts, order_lines, order_avg,
+           CASE WHEN cust_totaln IS NULL THEN 'order-only'
+                WHEN order_lines IS NULL THEN 'cust-only'
+                WHEN cust_totaln > 0 AND order_avg > 1 THEN 'active'
+                ELSE 'dormant' END AS status
+    FROM combined
+    WHERE cust_totaln IS NOT NULL OR order_lines IS NOT NULL)
+    EXCEPT ALL
+    (SELECT w_id, cust_totaln, cust_districts, order_lines, order_avg, status FROM mv_chain_foj_cross)
+);
+----
+0

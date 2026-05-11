@@ -848,6 +848,85 @@ static bool PlanContainsOperator(LogicalOperator *plan, LogicalOperatorType type
 	return false;
 }
 
+static void PropagateBindingThroughOperatorPath(unique_ptr<LogicalOperator> &plan, ColumnBinding &binding,
+                                                LogicalType &type) {
+	plan->ResolveOperatorTypes();
+	auto top_bindings = plan->GetColumnBindings();
+	auto top_types = plan->types;
+	for (idx_t i = 0; i < top_bindings.size(); i++) {
+		if (top_bindings[i] == binding) {
+			type = top_types[i];
+			return;
+		}
+	}
+
+	struct PathEntry {
+		LogicalOperator *op;
+		idx_t child_idx;
+	};
+	vector<PathEntry> path;
+	std::function<bool(LogicalOperator *, bool)> find_path = [&](LogicalOperator *node, bool is_root) -> bool {
+		auto bindings = node->GetColumnBindings();
+		for (auto &candidate : bindings) {
+			if (candidate == binding) {
+				return true;
+			}
+		}
+		for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
+			if (find_path(node->children[child_idx].get(), false)) {
+				if (!is_root) {
+					path.push_back({node, child_idx});
+				}
+				return true;
+			}
+		}
+		return false;
+	};
+	find_path(plan.get(), false);
+
+	ColumnBinding current = binding;
+	for (auto &entry : path) {
+		if (entry.op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = entry.op->Cast<LogicalProjection>();
+			bool found = false;
+			for (idx_t i = 0; i < projection.expressions.size(); i++) {
+				if (projection.expressions[i]->type != ExpressionType::BOUND_COLUMN_REF) {
+					continue;
+				}
+				auto &ref = projection.expressions[i]->Cast<BoundColumnRefExpression>();
+				if (ref.binding == current) {
+					current = ColumnBinding(projection.table_index, i);
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				auto col_ref = make_uniq<BoundColumnRefExpression>(type, current);
+				projection.expressions.push_back(std::move(col_ref));
+				current = ColumnBinding(projection.table_index, projection.expressions.size() - 1);
+			}
+			projection.ResolveOperatorTypes();
+		} else if (entry.op->type == LogicalOperatorType::LOGICAL_FILTER) {
+			auto &filter = entry.op->Cast<LogicalFilter>();
+			if (!filter.projection_map.empty()) {
+				bool in_map = false;
+				for (auto &idx : filter.projection_map) {
+					if (idx == current.column_index) {
+						in_map = true;
+						break;
+					}
+				}
+				if (!in_map) {
+					filter.projection_map.push_back(current.column_index);
+				}
+			}
+			filter.ResolveOperatorTypes();
+		}
+		// JOINs and other transparent nodes already pass child bindings through.
+	}
+	binding = current;
+}
+
 /// Add _ivm_left_key (and _ivm_right_key for FULL OUTER) projection at the top of the plan.
 static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan, const OuterJoinBindings &outer_join) {
 	bool is_full_outer = outer_join.is_full_outer;
@@ -856,9 +935,15 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 	auto right_key_binding = outer_join.right_key_binding;
 	auto right_key_type = outer_join.right_key_type;
 
-	// Ensure types are resolved before accessing them
-	plan->ResolveOperatorTypes();
-	// Add projection: all existing columns + _ivm_left_key
+	// Outer-join key bindings originate inside the join subtree. User projections,
+	// filters with projection maps, and CTE/projection stacks can hide either key
+	// before the top of the plan. Push both keys through the operator path first,
+	// then build one final projection that exposes user columns plus hidden keys.
+	PropagateBindingThroughOperatorPath(plan, key_binding, key_type);
+	if (is_full_outer) {
+		PropagateBindingThroughOperatorPath(plan, right_key_binding, right_key_type);
+	}
+
 	auto top_bindings = plan->GetColumnBindings();
 	auto top_types = plan->types;
 
@@ -867,144 +952,11 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 		proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(top_types[i], top_bindings[i]));
 	}
 
-	// The key_binding references a column inside the join tree. We need to check if it's
-	// accessible from the top. If the join key was projected through, it's in top_bindings.
-	// If not, we need to find it. For safety, search top_bindings for the key.
-	bool key_in_output = false;
-	for (idx_t i = 0; i < top_bindings.size(); i++) {
-		if (top_bindings[i] == key_binding) {
-			key_in_output = true;
-			key_type = top_types[i];
-			break;
-		}
-	}
-
-	if (!key_in_output) {
-		// Key was projected away. Propagate it through intermediate operators
-		// by adding passthrough expressions (same approach as PAC's PropagateSingleBinding).
-
-		// Step 1: Find path from plan root to the join that has the key
-		struct PathEntry {
-			LogicalOperator *op;
-			idx_t child_idx;
-		};
-		vector<PathEntry> path;
-		std::function<bool(LogicalOperator *, bool)> find_path = [&](LogicalOperator *n, bool is_root) -> bool {
-			// Check if this node outputs the key binding
-			auto binds = n->GetColumnBindings();
-			for (auto &b : binds) {
-				if (b == key_binding) {
-					return true;
-				}
-			}
-			for (idx_t ci = 0; ci < n->children.size(); ci++) {
-				if (find_path(n->children[ci].get(), false)) {
-					if (!is_root) {
-						path.push_back({n, ci});
-					}
-					return true;
-				}
-			}
-			return false;
-		};
-		find_path(plan.get(), false);
-		// Step 2: Propagate binding through each operator on the path
-		ColumnBinding current = key_binding;
-		for (auto &entry : path) {
-			if (entry.op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-				auto &proj = entry.op->Cast<LogicalProjection>();
-				// Check if already passed through
-				bool found = false;
-				for (idx_t i = 0; i < proj.expressions.size(); i++) {
-					if (proj.expressions[i]->type == ExpressionType::BOUND_COLUMN_REF) {
-						auto &ref = proj.expressions[i]->Cast<BoundColumnRefExpression>();
-						if (ref.binding == current) {
-							current = ColumnBinding(proj.table_index, i);
-							found = true;
-							break;
-						}
-					}
-				}
-				if (!found) {
-					auto col_ref = make_uniq<BoundColumnRefExpression>(key_type, current);
-					proj.expressions.push_back(std::move(col_ref));
-					current = ColumnBinding(proj.table_index, proj.expressions.size() - 1);
-				}
-				proj.ResolveOperatorTypes();
-			} else if (entry.op->type == LogicalOperatorType::LOGICAL_FILTER) {
-				auto &filter = entry.op->Cast<LogicalFilter>();
-				if (!filter.projection_map.empty()) {
-					bool in_map = false;
-					for (auto &idx : filter.projection_map) {
-						if (idx == current.column_index) {
-							in_map = true;
-							break;
-						}
-					}
-					if (!in_map) {
-						filter.projection_map.push_back(current.column_index);
-					}
-				}
-				filter.ResolveOperatorTypes();
-			}
-			// JOINs pass bindings through — no action needed
-		}
-		key_binding = current;
-
-		// After propagation, refresh top bindings and rebuild proj_exprs.
-		top_bindings = plan->GetColumnBindings();
-		top_types = plan->types;
-		proj_exprs.clear();
-		for (idx_t i = 0; i < top_bindings.size(); i++) {
-			proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(top_types[i], top_bindings[i]));
-		}
-	}
-
 	// Always add _ivm_left_key as a separate extra column.
 	proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(ivm::LEFT_KEY_COL, key_type, key_binding));
 
 	// For FULL OUTER: also add _ivm_right_key in the same projection.
 	if (is_full_outer) {
-		// The right key binding may also need propagation. Check if it's in the current top output.
-		bool right_key_in_output = false;
-		for (idx_t i = 0; i < top_bindings.size(); i++) {
-			if (top_bindings[i] == right_key_binding) {
-				right_key_in_output = true;
-				right_key_type = top_types[i];
-				break;
-			}
-		}
-		if (!right_key_in_output) {
-			// Propagate right key through top projection (it may have been projected away)
-			if (plan->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-				auto &proj = plan->Cast<LogicalProjection>();
-				bool already_in = false;
-				for (idx_t i = 0; i < proj.expressions.size(); i++) {
-					if (proj.expressions[i]->type == ExpressionType::BOUND_COLUMN_REF) {
-						auto &ref = proj.expressions[i]->Cast<BoundColumnRefExpression>();
-						if (ref.binding == right_key_binding) {
-							right_key_binding = ColumnBinding(proj.table_index, i);
-							already_in = true;
-							break;
-						}
-					}
-				}
-				if (!already_in) {
-					// Need to add passthrough in intermediate projections
-					// For simplicity, if the right key comes from a child output, just reference it
-					auto child_binds = proj.children[0]->GetColumnBindings();
-					for (auto &cb : child_binds) {
-						if (cb == right_key_binding) {
-							// Key is in child output — add a passthrough ref
-							auto ref = make_uniq<BoundColumnRefExpression>(right_key_type, right_key_binding);
-							proj.expressions.push_back(std::move(ref));
-							right_key_binding = ColumnBinding(proj.table_index, proj.expressions.size() - 1);
-							break;
-						}
-					}
-				}
-			}
-		}
 		proj_exprs.push_back(
 		    make_uniq<BoundColumnRefExpression>(ivm::RIGHT_KEY_COL, right_key_type, right_key_binding));
 	}
