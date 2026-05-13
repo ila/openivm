@@ -45,10 +45,10 @@ struct RefreshCostEstimate {
 RefreshCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name);
 
 /// Pragma function: returns the IVM cost estimate for a view as a string.
-string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters);
+string RefreshCostQuery(ClientContext &context, const FunctionParameters &parameters);
 
 /// Pragma function: returns refresh history for a view.
-string IVMCostHistoryQuery(ClientContext &context, const FunctionParameters &parameters);
+string RefreshCostHistoryQuery(ClientContext &context, const FunctionParameters &parameters);
 
 // =============================================================================
 // View-matching extension (gated by `openivm_enable_view_matching`).

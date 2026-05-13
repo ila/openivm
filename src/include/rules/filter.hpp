@@ -1,5 +1,5 @@
-#ifndef IVM_FILTER_RULE_HPP
-#define IVM_FILTER_RULE_HPP
+#ifndef OPENIVM_FILTER_RULE_HPP
+#define OPENIVM_FILTER_RULE_HPP
 
 #include "rules/rule.hpp"
 

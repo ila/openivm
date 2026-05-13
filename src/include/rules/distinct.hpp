@@ -1,5 +1,5 @@
-#ifndef IVM_DISTINCT_RULE_HPP
-#define IVM_DISTINCT_RULE_HPP
+#ifndef OPENIVM_DISTINCT_RULE_HPP
+#define OPENIVM_DISTINCT_RULE_HPP
 
 #include "rules/rule.hpp"
 

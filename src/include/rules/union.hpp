@@ -1,5 +1,5 @@
-#ifndef IVM_UNION_RULE_HPP
-#define IVM_UNION_RULE_HPP
+#ifndef OPENIVM_UNION_RULE_HPP
+#define OPENIVM_UNION_RULE_HPP
 
 #include "rules/rule.hpp"
 

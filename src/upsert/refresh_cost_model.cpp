@@ -690,7 +690,7 @@ RefreshCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &pla
 	return estimate;
 }
 
-string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters) {
+string RefreshCostQuery(ClientContext &context, const FunctionParameters &parameters) {
 	auto view_name = StringValue::Get(parameters.values[0]);
 
 	auto &db = DatabaseInstance::GetDatabase(context);
@@ -747,7 +747,7 @@ string IVMCostQuery(ClientContext &context, const FunctionParameters &parameters
 	       " AS recompute_predicted_ms, " + (estimate.calibrated ? "true" : "false") + " AS calibrated";
 }
 
-string IVMCostHistoryQuery(ClientContext &context, const FunctionParameters &parameters) {
+string RefreshCostHistoryQuery(ClientContext &context, const FunctionParameters &parameters) {
 	auto view_name = StringValue::Get(parameters.values[0]);
 	return "SELECT view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est,"
 	       " recompute_compute_est, recompute_replace_est, actual_duration_ms"

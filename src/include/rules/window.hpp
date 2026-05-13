@@ -1,5 +1,5 @@
-#ifndef IVM_WINDOW_RULE_HPP
-#define IVM_WINDOW_RULE_HPP
+#ifndef OPENIVM_WINDOW_RULE_HPP
+#define OPENIVM_WINDOW_RULE_HPP
 
 #include "rules/rule.hpp"
 

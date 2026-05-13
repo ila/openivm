@@ -1,5 +1,5 @@
-#ifndef IVM_AGGREGATE_RULE_HPP
-#define IVM_AGGREGATE_RULE_HPP
+#ifndef OPENIVM_AGGREGATE_RULE_HPP
+#define OPENIVM_AGGREGATE_RULE_HPP
 
 #include "rules/rule.hpp"
 

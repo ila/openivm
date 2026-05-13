@@ -1,5 +1,5 @@
-#ifndef IVM_TOPK_RULE_HPP
-#define IVM_TOPK_RULE_HPP
+#ifndef OPENIVM_TOPK_RULE_HPP
+#define OPENIVM_TOPK_RULE_HPP
 
 #include "rules/rule.hpp"
 
@@ -21,4 +21,4 @@ public:
 
 } // namespace duckdb
 
-#endif // IVM_TOPK_RULE_HPP
+#endif // OPENIVM_TOPK_RULE_HPP

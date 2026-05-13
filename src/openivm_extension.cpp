@@ -309,9 +309,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(refresh_options);
 	auto refresh = PragmaFunction::PragmaCall("refresh", UpsertDeltaQueriesLocked, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh);
-	auto refresh_cost = PragmaFunction::PragmaCall("refresh_cost", IVMCostQuery, {LogicalType::VARCHAR});
+	auto refresh_cost = PragmaFunction::PragmaCall("refresh_cost", RefreshCostQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cost);
-	auto refresh_history = PragmaFunction::PragmaCall("refresh_history", IVMCostHistoryQuery, {LogicalType::VARCHAR});
+	auto refresh_history =
+	    PragmaFunction::PragmaCall("refresh_history", RefreshCostHistoryQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_history);
 	auto refresh_cross_system = PragmaFunction::PragmaCall(
 	    "refresh_cross_system", UpsertDeltaQueriesLocked,

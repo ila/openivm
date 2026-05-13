@@ -1,5 +1,5 @@
-#ifndef IVM_PROJECTION_RULE_HPP
-#define IVM_PROJECTION_RULE_HPP
+#ifndef OPENIVM_PROJECTION_RULE_HPP
+#define OPENIVM_PROJECTION_RULE_HPP
 
 #include "rules/rule.hpp"
 

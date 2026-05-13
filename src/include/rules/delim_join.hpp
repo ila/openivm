@@ -1,5 +1,5 @@
-#ifndef IVM_DELIM_JOIN_RULE_HPP
-#define IVM_DELIM_JOIN_RULE_HPP
+#ifndef OPENIVM_DELIM_JOIN_RULE_HPP
+#define OPENIVM_DELIM_JOIN_RULE_HPP
 
 #include "rules/rule.hpp"
 

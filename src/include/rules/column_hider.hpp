@@ -1,5 +1,5 @@
-#ifndef IVM_COLUMN_HIDER_HPP
-#define IVM_COLUMN_HIDER_HPP
+#ifndef OPENIVM_COLUMN_HIDER_HPP
+#define OPENIVM_COLUMN_HIDER_HPP
 
 #include "core/openivm_constants.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -36,4 +36,4 @@ struct IncrementalTableNames {
 
 } // namespace duckdb
 
-#endif // IVM_COLUMN_HIDER_HPP
+#endif // OPENIVM_COLUMN_HIDER_HPP

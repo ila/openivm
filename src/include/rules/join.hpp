@@ -1,5 +1,5 @@
-#ifndef IVM_JOIN_RULE_HPP
-#define IVM_JOIN_RULE_HPP
+#ifndef OPENIVM_JOIN_RULE_HPP
+#define OPENIVM_JOIN_RULE_HPP
 
 #include "rules/rule.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"

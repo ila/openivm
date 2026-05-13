@@ -1,5 +1,5 @@
-#ifndef IVM_RULE_HPP
-#define IVM_RULE_HPP
+#ifndef OPENIVM_RULE_HPP
+#define OPENIVM_RULE_HPP
 
 #include "duckdb.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -81,4 +81,4 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 
 } // namespace duckdb
 
-#endif // IVM_RULE_HPP
+#endif // OPENIVM_RULE_HPP
