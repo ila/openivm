@@ -2,7 +2,7 @@
 
 ## Refresh serialization
 
-Each materialized view has a per-view mutex. When `PRAGMA ivm('view_name')` runs, it
+Each materialized view has a per-view mutex. When `PRAGMA refresh('view_name')` runs, it
 acquires the view's lock before generating or executing any SQL. This prevents two
 concurrent refresh calls from applying overlapping deltas to the same view.
 
@@ -51,7 +51,7 @@ Anchoring `last_update` to the maximum timestamp we *actually* processed elimina
 
 | Lock | Scope | Held during | Used by |
 |---|---|---|---|
-| View mutex | Per view name | Entire refresh cycle | `PRAGMA ivm()`, refresh daemon |
+| View mutex | Per view name | Entire refresh cycle | `PRAGMA refresh()`, refresh daemon |
 | Delta mutex | Per delta table name | Delta row insertion | Insert rule (DML triggers) |
 | Map mutex | Global (static) | Mutex map lookup | Internal — protects the mutex maps |
 

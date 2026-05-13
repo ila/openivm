@@ -42,7 +42,7 @@ statement ok
 INSERT INTO orders_eu VALUES (7, 'screw', 75);
 
 statement ok
-PRAGMA ivm('all_orders');
+PRAGMA refresh('all_orders');
 
 query I
 SELECT COUNT(*) FROM (
@@ -67,7 +67,7 @@ statement ok
 DELETE FROM orders_us WHERE id = 1;
 
 statement ok
-PRAGMA ivm('all_orders');
+PRAGMA refresh('all_orders');
 
 query I
 SELECT COUNT(*) FROM (
@@ -98,7 +98,7 @@ statement ok
 INSERT INTO orders_eu VALUES (8, 'nail', 10), (8, 'nail', 10);
 
 statement ok
-PRAGMA ivm('all_orders');
+PRAGMA refresh('all_orders');
 
 query I
 SELECT COUNT(*) FROM (
@@ -155,7 +155,7 @@ statement ok
 INSERT INTO sales_store VALUES ('EU', 100);
 
 statement ok
-PRAGMA ivm('total_by_region');
+PRAGMA refresh('total_by_region');
 
 query I
 SELECT COUNT(*) FROM (
@@ -225,7 +225,7 @@ statement ok
 INSERT INTO orders_b VALUES (2, 25);
 
 statement ok
-PRAGMA ivm('all_product_orders');
+PRAGMA refresh('all_product_orders');
 
 query I
 SELECT COUNT(*) FROM (
@@ -254,7 +254,7 @@ statement ok
 DELETE FROM orders_a WHERE qty = 10;
 
 statement ok
-PRAGMA ivm('all_product_orders');
+PRAGMA refresh('all_product_orders');
 
 query I
 SELECT COUNT(*) FROM (
@@ -283,7 +283,7 @@ SELECT COUNT(*) FROM (
 # ==========================================
 
 statement ok
-PRAGMA ivm('all_orders');
+PRAGMA refresh('all_orders');
 
 query I
 SELECT COUNT(*) FROM (
@@ -315,7 +315,7 @@ CREATE MATERIALIZED VIEW mv_union_empty AS
     SELECT id FROM u_a UNION ALL SELECT id FROM u_b;
 
 statement ok
-PRAGMA ivm('mv_union_empty');
+PRAGMA refresh('mv_union_empty');
 
 # Cross-check after initial load
 query I
@@ -344,7 +344,7 @@ statement ok
 DELETE FROM u_b;
 
 statement ok
-PRAGMA ivm('mv_union_empty');
+PRAGMA refresh('mv_union_empty');
 
 # MV should be empty
 query I
@@ -373,7 +373,7 @@ statement ok
 INSERT INTO u_b VALUES (30), (40), (50);
 
 statement ok
-PRAGMA ivm('mv_union_empty');
+PRAGMA refresh('mv_union_empty');
 
 query I
 SELECT COUNT(*) FROM (
@@ -415,7 +415,7 @@ CREATE MATERIALIZED VIEW mv_union_dup AS
     SELECT id FROM u_dup_l UNION ALL SELECT id FROM u_dup_r;
 
 statement ok
-PRAGMA ivm('mv_union_dup');
+PRAGMA refresh('mv_union_dup');
 
 # Cross-check: 8 rows with id=1
 query I
@@ -441,7 +441,7 @@ statement ok
 DELETE FROM u_dup_l;
 
 statement ok
-PRAGMA ivm('mv_union_dup');
+PRAGMA refresh('mv_union_dup');
 
 # Cross-check: 3 rows remain (from right only)
 query I
@@ -467,7 +467,7 @@ statement ok
 INSERT INTO u_dup_l SELECT 1 FROM range(10);
 
 statement ok
-PRAGMA ivm('mv_union_dup');
+PRAGMA refresh('mv_union_dup');
 
 # Cross-check: 13 rows total
 query I
@@ -513,7 +513,7 @@ statement ok
 DELETE FROM u_side_a;
 
 statement ok
-PRAGMA ivm('mv_union_side');
+PRAGMA refresh('mv_union_side');
 
 query I
 SELECT COUNT(*) FROM (
@@ -536,7 +536,7 @@ statement ok
 INSERT INTO u_side_a VALUES (5, 'epsilon'), (6, 'zeta');
 
 statement ok
-PRAGMA ivm('mv_union_side');
+PRAGMA refresh('mv_union_side');
 
 query I
 SELECT COUNT(*) FROM (
@@ -584,7 +584,7 @@ statement ok
 DELETE FROM ua_store WHERE product = 'Gadget';
 
 statement ok
-PRAGMA ivm('mv_total_sales');
+PRAGMA refresh('mv_total_sales');
 
 query I
 SELECT COUNT(*) FROM (
@@ -637,7 +637,7 @@ statement ok
 DELETE FROM mu_emp WHERE id = 2;
 
 statement ok
-PRAGMA ivm('mv_all_staff');
+PRAGMA refresh('mv_all_staff');
 
 query I
 SELECT COUNT(*) FROM (
@@ -696,7 +696,7 @@ statement ok
 DELETE FROM uoa_history WHERE w_id = 2 AND amount = 20.0;
 
 statement ok
-PRAGMA ivm('mv_uoa');
+PRAGMA refresh('mv_uoa');
 
 query I
 SELECT COUNT(*) FROM (
@@ -754,7 +754,7 @@ statement ok
 DELETE FROM uod_history WHERE w_id = 2 AND amount = 20.0;
 
 statement ok
-PRAGMA ivm('mv_uod');
+PRAGMA refresh('mv_uod');
 
 query I
 SELECT COUNT(*) FROM (
@@ -785,7 +785,7 @@ statement ok
 DELETE FROM uoa_customer WHERE w_id = 2;
 
 statement ok
-PRAGMA ivm('mv_uoa');
+PRAGMA refresh('mv_uoa');
 
 query I
 SELECT COUNT(*) FROM (

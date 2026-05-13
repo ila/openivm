@@ -32,7 +32,7 @@ statement ok
 INSERT INTO colors VALUES (5, 'red'), (6, 'blue');
 
 statement ok
-PRAGMA ivm('distinct_colors');
+PRAGMA refresh('distinct_colors');
 
 query I
 SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
@@ -49,7 +49,7 @@ statement ok
 INSERT INTO colors VALUES (7, 'yellow');
 
 statement ok
-PRAGMA ivm('distinct_colors');
+PRAGMA refresh('distinct_colors');
 
 query I
 SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
@@ -66,7 +66,7 @@ statement ok
 DELETE FROM colors WHERE color = 'green';
 
 statement ok
-PRAGMA ivm('distinct_colors');
+PRAGMA refresh('distinct_colors');
 
 query I
 SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
@@ -103,7 +103,7 @@ statement ok
 INSERT INTO pairs VALUES ('x', 1), ('y', 1);
 
 statement ok
-PRAGMA ivm('distinct_pairs');
+PRAGMA refresh('distinct_pairs');
 
 query I
 SELECT COUNT(*) FROM (SELECT DISTINCT a, b FROM pairs EXCEPT ALL SELECT a, b FROM distinct_pairs);
@@ -115,7 +115,7 @@ statement ok
 DELETE FROM pairs WHERE a = 'x' AND b = 1;
 
 statement ok
-PRAGMA ivm('distinct_pairs');
+PRAGMA refresh('distinct_pairs');
 
 # x,1 still exists in pairs (was inserted twice before, deleted once)
 query I
@@ -142,7 +142,7 @@ statement ok
 INSERT INTO colors VALUES (13, 'yellow');
 
 statement ok
-PRAGMA ivm('distinct_colors');
+PRAGMA refresh('distinct_colors');
 
 query I
 SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
@@ -168,7 +168,7 @@ statement ok
 CREATE MATERIALIZED VIEW mv_dist_all_null AS SELECT DISTINCT a, b FROM dist_all_null;
 
 statement ok
-PRAGMA ivm('mv_dist_all_null');
+PRAGMA refresh('mv_dist_all_null');
 
 # Should have 3 distinct rows: (NULL, NULL), (1, NULL), (NULL, 'x')
 query I
@@ -194,7 +194,7 @@ statement ok
 DELETE FROM dist_all_null WHERE a IS NULL AND b IS NULL;
 
 statement ok
-PRAGMA ivm('mv_dist_all_null');
+PRAGMA refresh('mv_dist_all_null');
 
 query I
 SELECT COUNT(*) FROM (
@@ -219,7 +219,7 @@ statement ok
 INSERT INTO dist_all_null VALUES (NULL, NULL);
 
 statement ok
-PRAGMA ivm('mv_dist_all_null');
+PRAGMA refresh('mv_dist_all_null');
 
 query I
 SELECT COUNT(*) FROM (
@@ -253,7 +253,7 @@ statement ok
 CREATE MATERIALIZED VIEW mv_dist_collapse AS SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse;
 
 statement ok
-PRAGMA ivm('mv_dist_collapse');
+PRAGMA refresh('mv_dist_collapse');
 
 # Should have 3 distinct abs values: 0, 5, 10
 query I
@@ -279,7 +279,7 @@ statement ok
 DELETE FROM dist_collapse WHERE val = -5;
 
 statement ok
-PRAGMA ivm('mv_dist_collapse');
+PRAGMA refresh('mv_dist_collapse');
 
 query I
 SELECT COUNT(*) FROM (
@@ -304,7 +304,7 @@ statement ok
 DELETE FROM dist_collapse WHERE val = 5;
 
 statement ok
-PRAGMA ivm('mv_dist_collapse');
+PRAGMA refresh('mv_dist_collapse');
 
 query I
 SELECT COUNT(*) FROM (
@@ -329,7 +329,7 @@ statement ok
 INSERT INTO dist_collapse VALUES (-5), (-5);
 
 statement ok
-PRAGMA ivm('mv_dist_collapse');
+PRAGMA refresh('mv_dist_collapse');
 
 query I
 SELECT COUNT(*) FROM (
@@ -380,7 +380,7 @@ statement ok
 INSERT INTO dist_j_orders VALUES (5, 'B'), (6, 'A');
 
 statement ok
-PRAGMA ivm('mv_dist_join');
+PRAGMA refresh('mv_dist_join');
 
 query I
 SELECT COUNT(*) FROM (
@@ -403,7 +403,7 @@ statement ok
 DELETE FROM dist_j_orders WHERE product = 'C';
 
 statement ok
-PRAGMA ivm('mv_dist_join');
+PRAGMA refresh('mv_dist_join');
 
 query I
 SELECT COUNT(*) FROM (
@@ -471,7 +471,7 @@ statement ok
 DELETE FROM u_dist_a WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_union_distinct');
+PRAGMA refresh('mv_union_distinct');
 
 query I
 SELECT COUNT(*) FROM (
@@ -504,7 +504,7 @@ statement ok
 DELETE FROM u_dist_b WHERE id = 4;
 
 statement ok
-PRAGMA ivm('mv_union_labeled');
+PRAGMA refresh('mv_union_labeled');
 
 query I
 SELECT COUNT(*) FROM (
@@ -574,7 +574,7 @@ statement ok
 UPDATE dist_order SET local = 0 WHERE w_id = 2;
 
 statement ok
-PRAGMA ivm('mv_dist_order');
+PRAGMA refresh('mv_dist_order');
 
 query I
 SELECT COUNT(*) FROM (
@@ -657,7 +657,7 @@ statement ok
 INSERT INTO idist_u VALUES (2, 'm3', 4);
 
 statement ok
-PRAGMA ivm('idist_mv');
+PRAGMA refresh('idist_mv');
 
 query I
 SELECT COUNT(*) FROM (
@@ -687,7 +687,7 @@ statement ok
 INSERT INTO idist_u VALUES (1, 'm4', 32), (1, 'm1', 8), (2, NULL, 999), (3, 'm5', 1);
 
 statement ok
-PRAGMA ivm('idist_mv');
+PRAGMA refresh('idist_mv');
 
 query I
 SELECT COUNT(*) FROM (
@@ -710,7 +710,7 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# View type 6 = GROUP_RECOMPUTE; PRAGMA ivm_cost('idist_mv') reports
+# View type 6 = GROUP_RECOMPUTE; PRAGMA refresh_cost('idist_mv') reports
 # `decision = group_recompute` (verified manually — sqllogictest can't run
 # PRAGMA inside CREATE TABLE AS, so the test only asserts the type column).
 query I
@@ -750,7 +750,7 @@ statement ok
 INSERT INTO idist_u2 VALUES (2, 'm3', 4), (1, 'm5', 32);
 
 statement ok
-PRAGMA ivm('idist_mv_aux');
+PRAGMA refresh('idist_mv_aux');
 
 query I
 SELECT COUNT(*) FROM (
@@ -809,7 +809,7 @@ statement ok
 INSERT INTO idist_u3 VALUES (1, 'm1', 8);
 
 statement ok
-PRAGMA ivm('idist_aux_v3');
+PRAGMA refresh('idist_aux_v3');
 
 query II
 SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
@@ -827,7 +827,7 @@ statement ok
 INSERT INTO idist_u3 VALUES (1, 'm9', 100);
 
 statement ok
-PRAGMA ivm('idist_aux_v3');
+PRAGMA refresh('idist_aux_v3');
 
 query II
 SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
@@ -846,7 +846,7 @@ statement ok
 DELETE FROM idist_u3 WHERE rowid IN (SELECT rowid FROM idist_u3 WHERE grp=1 AND machine='m1' AND cores=8 LIMIT 1);
 
 statement ok
-PRAGMA ivm('idist_aux_v3');
+PRAGMA refresh('idist_aux_v3');
 
 query II
 SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
@@ -865,7 +865,7 @@ statement ok
 DELETE FROM idist_u3 WHERE grp=1 AND machine='m1' AND cores=8;
 
 statement ok
-PRAGMA ivm('idist_aux_v3');
+PRAGMA refresh('idist_aux_v3');
 
 query II
 SELECT grp, s FROM idist_aux_v3 ORDER BY grp;

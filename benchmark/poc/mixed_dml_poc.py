@@ -74,7 +74,7 @@ BYPASS = (
 )
 CASCADE = (
 	"SET ivm_cascade_refresh='downstream';\n"
-	"PRAGMA ivm('mv_a');\n"
+	"PRAGMA refresh('mv_a');\n"
 	"SELECT o_region, revenue, cnt FROM mv_b ORDER BY o_region;"
 )
 STALE_RES = (
@@ -177,7 +177,7 @@ def one_run(n_orders: int, avg_li: int, workload: str, n_affected: int, strategy
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "bench.db")
 		setup = setup_sql(n_orders, avg_li) + MV_A + MV_B
-		setup += "PRAGMA ivm('mv_a');\nPRAGMA ivm('mv_b');\n"
+		setup += "PRAGMA refresh('mv_a');\nPRAGMA ivm('mv_b');\n"
 		out, err, rc = run_sql(db, setup)
 		if rc != 0:
 			raise RuntimeError(f"setup failed: {err}")
@@ -191,7 +191,7 @@ def correctness_check(n_orders: int, avg_li: int, workload: str, n_affected: int
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "bench.db")
 		setup = setup_sql(n_orders, avg_li) + MV_A + MV_B
-		setup += "PRAGMA ivm('mv_a');\nPRAGMA ivm('mv_b');\n"
+		setup += "PRAGMA refresh('mv_a');\nPRAGMA ivm('mv_b');\n"
 		run_sql(db, setup)
 		apply_workload(db, n_orders, n_lineitem, workload, n_affected)
 		bypass_res = collect_result(db, "bypass")
@@ -200,7 +200,7 @@ def correctness_check(n_orders: int, avg_li: int, workload: str, n_affected: int
 	with tempfile.TemporaryDirectory() as tmp2:
 		db2 = os.path.join(tmp2, "bench.db")
 		setup = setup_sql(n_orders, avg_li) + MV_A + MV_B
-		setup += "PRAGMA ivm('mv_a');\nPRAGMA ivm('mv_b');\n"
+		setup += "PRAGMA refresh('mv_a');\nPRAGMA ivm('mv_b');\n"
 		run_sql(db2, setup)
 		apply_workload(db2, n_orders, n_lineitem, workload, n_affected)
 		cascade_res = collect_result(db2, "cascade")

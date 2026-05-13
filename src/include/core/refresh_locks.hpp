@@ -20,7 +20,7 @@ class IVMRefreshLocks {
 public:
 	// --- View-level locks (prevent concurrent refresh of same MV) ---
 
-	// Blocking lock — used by PRAGMA ivm() (user explicitly wants to refresh, so wait).
+	// Blocking lock — used by PRAGMA refresh() (user explicitly wants to refresh, so wait).
 	static void LockView(const string &view_name);
 
 	// Non-blocking try-lock — used by the refresh daemon (skip if busy).

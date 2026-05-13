@@ -98,9 +98,9 @@ INSERT INTO t2 VALUES (3, 300);
 statement ok
 INSERT INTO t3 VALUES (4);
 
-# LEFT JOIN MV: auto full refresh via PRAGMA ivm
+# LEFT JOIN MV: auto full refresh via PRAGMA refresh
 statement ok
-PRAGMA ivm('mv_left');
+PRAGMA refresh('mv_left');
 
 query III
 SELECT a, b, c FROM mv_left ORDER BY a;
@@ -119,7 +119,7 @@ SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a ORDER BY t1.a;
 
 # STDDEV MV: auto full refresh
 statement ok
-PRAGMA ivm('mv_stddev');
+PRAGMA refresh('mv_stddev');
 
 query I
 SELECT COUNT(*) FROM (
@@ -132,7 +132,7 @@ SELECT COUNT(*) FROM (
 
 # RANDOM() MV: full refresh (values will differ from base query, but row count matches)
 statement ok
-PRAGMA ivm('mv_random');
+PRAGMA refresh('mv_random');
 
 query I
 SELECT COUNT(*) FROM mv_random;
@@ -141,7 +141,7 @@ SELECT COUNT(*) FROM mv_random;
 
 # NOW() MV: full refresh
 statement ok
-PRAGMA ivm('mv_now');
+PRAGMA refresh('mv_now');
 
 query I
 SELECT COUNT(*) FROM mv_now;
@@ -153,7 +153,7 @@ SELECT COUNT(*) FROM mv_now;
 # ==========================================
 
 statement ok
-PRAGMA ivm('mv_sum');
+PRAGMA refresh('mv_sum');
 
 query II
 SELECT a, total FROM mv_sum ORDER BY a;
@@ -169,7 +169,7 @@ SELECT COUNT(*) FROM (SELECT a, SUM(b) AS total FROM t1 GROUP BY a EXCEPT ALL SE
 0
 
 statement ok
-PRAGMA ivm('mv_avg');
+PRAGMA refresh('mv_avg');
 
 query I
 SELECT COUNT(*) FROM (SELECT a, AVG(b) AS avg_b FROM t1 GROUP BY a EXCEPT ALL SELECT a, avg_b FROM mv_avg);
@@ -177,7 +177,7 @@ SELECT COUNT(*) FROM (SELECT a, AVG(b) AS avg_b FROM t1 GROUP BY a EXCEPT ALL SE
 0
 
 statement ok
-PRAGMA ivm('mv_proj');
+PRAGMA refresh('mv_proj');
 
 query I
 SELECT COUNT(*) FROM (SELECT a, b FROM t1 EXCEPT ALL SELECT a, b FROM mv_proj);
@@ -224,7 +224,7 @@ statement ok
 INSERT INTO u2 VALUES (6, 'f');
 
 statement ok
-PRAGMA ivm('mv_union');
+PRAGMA refresh('mv_union');
 
 # Cross-check
 query I
@@ -250,7 +250,7 @@ statement ok
 DELETE FROM u1 WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_union');
+PRAGMA refresh('mv_union');
 
 query I
 SELECT COUNT(*) FROM (

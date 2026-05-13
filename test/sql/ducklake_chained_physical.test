@@ -65,7 +65,7 @@ INSERT INTO dl.bronze.src VALUES
     (DATE '2026-01-03', 'A', 7, 25);
 
 statement ok
-PRAGMA ivm_options('dl', 'bronze', 'l1');
+PRAGMA refresh_options('dl', 'bronze', 'l1');
 
 # The upstream DuckLake MV writes its user-facing objects and OpenIVM data/delta
 # state to DuckLake. Downstream MVs track changes on the upstream DuckLake
@@ -76,7 +76,7 @@ SELECT count(*) FROM dl.bronze.delta_l1;
 0
 
 statement ok
-PRAGMA ivm_options('dl', 'silver', 'l2');
+PRAGMA refresh_options('dl', 'silver', 'l2');
 
 # Window-partition recompute updates l2 directly. Since l3 reads l2's DuckLake
 # _ivm_data_* table, downstream refresh can use DuckLake change tracking instead
@@ -103,7 +103,7 @@ SELECT count(*) FROM (
 0
 
 statement ok
-PRAGMA ivm_options('dl', 'silver', 'l3');
+PRAGMA refresh_options('dl', 'silver', 'l3');
 
 query I
 SELECT count(*) FROM (

@@ -30,12 +30,12 @@ statement ok
 INSERT INTO proj_base VALUES (101, 'new_name');
 
 query IIIIII
-PRAGMA ivm_cost('mv_proj');
+PRAGMA refresh_cost('mv_proj');
 ----
 incremental	8.643856	401.000000	8.643856	401.000000	false
 
 statement ok
-PRAGMA ivm('mv_proj');
+PRAGMA refresh('mv_proj');
 
 query I
 SELECT count(*) FROM mv_proj;
@@ -73,7 +73,7 @@ statement ok
 INSERT INTO profile_proj_base VALUES (2, 'two');
 
 statement ok
-PRAGMA ivm('mv_profile_proj');
+PRAGMA refresh('mv_profile_proj');
 
 query I
 SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'total_refresh';
@@ -101,12 +101,12 @@ statement ok
 INSERT INTO proj_base SELECT i, 'batch_' || i::VARCHAR FROM range(102, 402) t(i);
 
 query IIIIII
-PRAGMA ivm_cost('mv_proj');
+PRAGMA refresh_cost('mv_proj');
 ----
 full	2597.463445	704.000000	2597.463445	704.000000	false
 
 statement ok
-PRAGMA ivm('mv_proj');
+PRAGMA refresh('mv_proj');
 
 query I
 SELECT count(*) FROM mv_proj;
@@ -149,12 +149,12 @@ statement ok
 INSERT INTO agg_base VALUES (202, 0, 1);
 
 query IIIIII
-PRAGMA ivm_cost('mv_agg');
+PRAGMA refresh_cost('mv_agg');
 ----
 incremental	6.000000	232.000000	6.000000	232.000000	false
 
 statement ok
-PRAGMA ivm('mv_agg');
+PRAGMA refresh('mv_agg');
 
 query II
 SELECT total, cnt FROM mv_agg WHERE grp = 0;
@@ -189,12 +189,12 @@ statement ok
 DELETE FROM del_base WHERE id > 20;
 
 query IIIIII
-PRAGMA ivm_cost('mv_del');
+PRAGMA refresh_cost('mv_del');
 ----
 full	691.508495	400.000000	691.508495	400.000000	false
 
 statement ok
-PRAGMA ivm('mv_del');
+PRAGMA refresh('mv_del');
 
 query I
 SELECT count(*) FROM mv_del;
@@ -230,12 +230,12 @@ statement ok
 DELETE FROM agg_del WHERE grp = 'even';
 
 query IIIIII
-PRAGMA ivm_cost('mv_agg_del');
+PRAGMA refresh_cost('mv_agg_del');
 ----
 incremental	29.000000	56.000000	29.000000	56.000000	false
 
 statement ok
-PRAGMA ivm('mv_agg_del');
+PRAGMA refresh('mv_agg_del');
 
 query III
 SELECT grp, total, cnt FROM mv_agg_del ORDER BY grp;
@@ -260,12 +260,12 @@ statement ok
 INSERT INTO multi VALUES (101, 0, 500);
 
 query IIIIII
-PRAGMA ivm_cost('mv_multi');
+PRAGMA refresh_cost('mv_multi');
 ----
 incremental	3.000000	116.000000	3.000000	116.000000	false
 
 statement ok
-PRAGMA ivm('mv_multi');
+PRAGMA refresh('mv_multi');
 
 query II
 SELECT grp, total FROM mv_multi WHERE grp = 0;
@@ -277,12 +277,12 @@ statement ok
 INSERT INTO multi VALUES (102, 1, 1000);
 
 query IIIIII
-PRAGMA ivm_cost('mv_multi');
+PRAGMA refresh_cost('mv_multi');
 ----
 incremental	3.000000	117.000000	3.000000	117.000000	false
 
 statement ok
-PRAGMA ivm('mv_multi');
+PRAGMA refresh('mv_multi');
 
 query II
 SELECT grp, total FROM mv_multi WHERE grp = 1;
@@ -294,12 +294,12 @@ statement ok
 INSERT INTO multi SELECT i, i % 5, i * 2 FROM range(200, 500) t(i);
 
 query IIIIII
-PRAGMA ivm_cost('mv_multi');
+PRAGMA refresh_cost('mv_multi');
 ----
 incremental	310.000000	417.000000	310.000000	417.000000	false
 
 statement ok
-PRAGMA ivm('mv_multi');
+PRAGMA refresh('mv_multi');
 
 query I
 SELECT count(*) FROM multi;
@@ -329,12 +329,12 @@ SELECT grp, sum(val) as total FROM multi GROUP BY grp ORDER BY grp;
 # ==========================================
 
 query IIIIII
-PRAGMA ivm_cost('mv_multi');
+PRAGMA refresh_cost('mv_multi');
 ----
 incremental	0.000000	417.000000	0.000000	417.000000	false
 
 statement ok
-PRAGMA ivm('mv_multi');
+PRAGMA refresh('mv_multi');
 
 query II
 SELECT grp, total FROM mv_multi ORDER BY grp;
@@ -368,12 +368,12 @@ statement ok
 INSERT INTO filt VALUES (151, 'active', 151);
 
 query IIIIII
-PRAGMA ivm_cost('mv_filt');
+PRAGMA refresh_cost('mv_filt');
 ----
 incremental	4.343928	226.000000	4.343928	226.000000	false
 
 statement ok
-PRAGMA ivm('mv_filt');
+PRAGMA refresh('mv_filt');
 
 query I
 SELECT count(*) FROM mv_filt;
@@ -385,12 +385,12 @@ statement ok
 INSERT INTO filt SELECT i, 'active', i FROM range(200, 500) t(i);
 
 query IIIIII
-PRAGMA ivm_cost('mv_filt');
+PRAGMA refresh_cost('mv_filt');
 ----
 full	1303.083011	379.000000	1303.083011	379.000000	false
 
 statement ok
-PRAGMA ivm('mv_filt');
+PRAGMA refresh('mv_filt');
 
 query I
 SELECT count(*) FROM mv_filt;
@@ -427,12 +427,12 @@ statement ok
 INSERT INTO minmax_base VALUES (61, 'a', 0);
 
 query IIIIII
-PRAGMA ivm_cost('mv_minmax');
+PRAGMA refresh_cost('mv_minmax');
 ----
 incremental	3.000000	70.000000	3.000000	70.000000	false
 
 statement ok
-PRAGMA ivm('mv_minmax');
+PRAGMA refresh('mv_minmax');
 
 query IIII
 SELECT grp, lo, hi, cnt FROM mv_minmax ORDER BY grp;
@@ -446,12 +446,12 @@ statement ok
 DELETE FROM minmax_base WHERE id = 61;
 
 query IIIIII
-PRAGMA ivm_cost('mv_minmax');
+PRAGMA refresh_cost('mv_minmax');
 ----
 incremental	3.000000	70.000000	3.000000	70.000000	false
 
 statement ok
-PRAGMA ivm('mv_minmax');
+PRAGMA refresh('mv_minmax');
 
 query IIII
 SELECT grp, lo, hi, cnt FROM mv_minmax ORDER BY grp;
@@ -478,12 +478,12 @@ statement ok
 INSERT INTO xcheck VALUES (81, 'A', 9999);
 
 query IIIIII
-PRAGMA ivm_cost('mv_xcheck');
+PRAGMA refresh_cost('mv_xcheck');
 ----
 incremental	3.000000	93.000000	3.000000	93.000000	false
 
 statement ok
-PRAGMA ivm('mv_xcheck');
+PRAGMA refresh('mv_xcheck');
 
 query III
 SELECT cat, total, n FROM mv_xcheck ORDER BY cat;
@@ -506,12 +506,12 @@ statement ok
 DELETE FROM xcheck WHERE cat = 'D';
 
 query IIIIII
-PRAGMA ivm_cost('mv_xcheck');
+PRAGMA refresh_cost('mv_xcheck');
 ----
 incremental	28.000000	93.000000	28.000000	93.000000	false
 
 statement ok
-PRAGMA ivm('mv_xcheck');
+PRAGMA refresh('mv_xcheck');
 
 query III
 SELECT cat, total, n FROM mv_xcheck ORDER BY cat;
@@ -532,12 +532,12 @@ statement ok
 INSERT INTO xcheck SELECT i, 'A', 1 FROM range(1, 301) t(i);
 
 query IIIIII
-PRAGMA ivm_cost('mv_xcheck');
+PRAGMA refresh_cost('mv_xcheck');
 ----
 incremental	306.000000	370.000000	306.000000	370.000000	false
 
 statement ok
-PRAGMA ivm('mv_xcheck');
+PRAGMA refresh('mv_xcheck');
 
 query III
 SELECT cat, total, n FROM mv_xcheck ORDER BY cat;
@@ -554,7 +554,7 @@ B	7800	20
 C	8000	20
 
 # ==========================================
-# Test 11: PRAGMA ivm_cost — verify cost estimator decisions
+# Test 11: PRAGMA refresh_cost — verify cost estimator decisions
 # ==========================================
 
 statement ok
@@ -568,10 +568,10 @@ CREATE MATERIALIZED VIEW mv_cost AS SELECT id, name FROM cost_base;
 
 # No pending delta — IVM should be extremely cheap
 statement ok
-PRAGMA ivm('mv_cost');
+PRAGMA refresh('mv_cost');
 
 query IIIIII
-PRAGMA ivm_cost('mv_cost');
+PRAGMA refresh_cost('mv_cost');
 ----
 incremental	0.000000	400.000000	0.000000	400.000000	false
 
@@ -580,28 +580,28 @@ statement ok
 INSERT INTO cost_base VALUES (101, 'x');
 
 query IIIIII
-PRAGMA ivm_cost('mv_cost');
+PRAGMA refresh_cost('mv_cost');
 ----
 incremental	8.643856	401.000000	8.643856	401.000000	false
 
 statement ok
-PRAGMA ivm('mv_cost');
+PRAGMA refresh('mv_cost');
 
 # Large delta (300 rows on 101-row base) → full recompute
 statement ok
 INSERT INTO cost_base SELECT i, 'batch' FROM range(200, 500) t(i);
 
 query IIIIII
-PRAGMA ivm_cost('mv_cost');
+PRAGMA refresh_cost('mv_cost');
 ----
 full	2597.463445	704.000000	2597.463445	704.000000	false
 
 statement ok
-PRAGMA ivm('mv_cost');
+PRAGMA refresh('mv_cost');
 
 # After refresh, delta is empty — back to incremental
 query IIIIII
-PRAGMA ivm_cost('mv_cost');
+PRAGMA refresh_cost('mv_cost');
 ----
 incremental	0.000000	1604.000000	0.000000	1604.000000	false
 
@@ -633,12 +633,12 @@ INSERT INTO mode_base VALUES (51, 'even', 999);
 
 # Cost model says incremental, but we override
 query IIIIII
-PRAGMA ivm_cost('mv_mode');
+PRAGMA refresh_cost('mv_mode');
 ----
 incremental	3.000000	57.000000	3.000000	57.000000	false
 
 statement ok
-PRAGMA ivm('mv_mode');
+PRAGMA refresh('mv_mode');
 
 # Result should still be correct regardless of path
 query III
@@ -665,12 +665,12 @@ statement ok
 INSERT INTO mode_base SELECT i, 'odd', 1 FROM range(100, 400) t(i);
 
 query IIIIII
-PRAGMA ivm_cost('mv_mode');
+PRAGMA refresh_cost('mv_mode');
 ----
 incremental	304.000000	357.000000	304.000000	357.000000	false
 
 statement ok
-PRAGMA ivm('mv_mode');
+PRAGMA refresh('mv_mode');
 
 # Result should still be correct
 query III
@@ -696,7 +696,7 @@ statement ok
 INSERT INTO mode_base VALUES (999, 'even', 1);
 
 statement ok
-PRAGMA ivm('mv_mode');
+PRAGMA refresh('mv_mode');
 
 query III
 SELECT grp, total, cnt FROM mv_mode ORDER BY grp;
@@ -735,12 +735,12 @@ INSERT INTO sel_base SELECT i, i FROM range(10001, 10101) t(i);
 
 # IVM cost should be reduced by filter selectivity (~1% selectivity)
 query IIIIII
-PRAGMA ivm_cost('mv_selfilt');
+PRAGMA refresh_cost('mv_selfilt');
 ----
 incremental	252.877124	2320.000000	252.877124	2320.000000	false
 
 statement ok
-PRAGMA ivm('mv_selfilt');
+PRAGMA refresh('mv_selfilt');
 
 query I
 SELECT count(*) FROM mv_selfilt;
@@ -766,12 +766,12 @@ INSERT INTO sel_base SELECT i, 0 FROM range(20001, 20201) t(i);
 
 # Despite 200 delta rows, filter selectivity keeps IVM cost manageable
 query IIIIII
-PRAGMA ivm_cost('mv_selfilt');
+PRAGMA refresh_cost('mv_selfilt');
 ----
 incremental	545.754248	2660.000000	545.754248	2660.000000	false
 
 statement ok
-PRAGMA ivm('mv_selfilt');
+PRAGMA refresh('mv_selfilt');
 
 # Count unchanged — filter rejects all new rows
 query I
@@ -803,7 +803,7 @@ statement ok
 DELETE FROM sel_base WHERE id = 9901;
 
 statement ok
-PRAGMA ivm('mv_selfilt');
+PRAGMA refresh('mv_selfilt');
 
 query I
 SELECT count(*) FROM mv_selfilt;
@@ -840,19 +840,19 @@ statement ok
 INSERT INTO lt VALUES (101, 0, 500);
 
 statement ok
-PRAGMA ivm('mv_lt');
+PRAGMA refresh('mv_lt');
 
 statement ok
 INSERT INTO lt VALUES (102, 1, 500);
 
 statement ok
-PRAGMA ivm('mv_lt');
+PRAGMA refresh('mv_lt');
 
 statement ok
 INSERT INTO lt SELECT i, i % 5, i FROM range(200, 210) t(i);
 
 statement ok
-PRAGMA ivm('mv_lt');
+PRAGMA refresh('mv_lt');
 
 # History recorded: 3 incremental entries with non-negative durations
 query I
@@ -873,7 +873,7 @@ statement ok
 INSERT INTO lt VALUES (103, 2, 500);
 
 statement ok
-PRAGMA ivm('mv_lt');
+PRAGMA refresh('mv_lt');
 
 query I
 SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name IN ('generate_refresh_sql', 'execute_refresh_sql', 'total_refresh');
@@ -894,7 +894,7 @@ statement ok
 INSERT INTO lt VALUES (104, 3, 500);
 
 statement ok
-PRAGMA ivm('mv_lt');
+PRAGMA refresh('mv_lt');
 
 query I
 SELECT count(*) FROM _duckdb_ivm_refresh_profile WHERE refresh_id = 'old_profile_row';
@@ -908,7 +908,7 @@ statement ok
 INSERT INTO lt VALUES (105, 4, 500);
 
 statement ok
-PRAGMA ivm('mv_lt');
+PRAGMA refresh('mv_lt');
 
 query I
 SELECT count(DISTINCT refresh_id) FROM _duckdb_ivm_refresh_profile WHERE view_name = 'mv_lt';
@@ -953,7 +953,7 @@ INSERT INTO cold_base VALUES (101, 101);
 
 # No history — predicted_ms equals static cost, calibrated = false
 query IIIIII
-PRAGMA ivm_cost('mv_cold');
+PRAGMA refresh_cost('mv_cold');
 ----
 incremental	8.643856	401.000000	8.643856	401.000000	false
 
@@ -1018,7 +1018,7 @@ statement ok
 INSERT INTO ed_c VALUES (51, 'c_51');
 
 statement ok
-PRAGMA ivm('mv_ed');
+PRAGMA refresh('mv_ed');
 
 # Cross-check: MV matches base query
 query III
@@ -1041,7 +1041,7 @@ statement ok
 INSERT INTO ed_a VALUES (52, 999);
 
 statement ok
-PRAGMA ivm('mv_ed');
+PRAGMA refresh('mv_ed');
 
 # Row 52 exists in A but not in B/C — no join match, MV unchanged
 query I

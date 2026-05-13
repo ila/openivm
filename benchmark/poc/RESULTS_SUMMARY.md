@@ -6,7 +6,7 @@ Single-node DuckDB with OpenIVM extension. Fresh DB per run (cold cache).
 ## Strategies glossary
 
 - **bypass** — run the original query directly against base tables (no MV).
-- **cascade** — `PRAGMA ivm` on the chain, then scan the top MV. OpenIVM's default mode.
+- **cascade** — `PRAGMA refresh` on the chain, then scan the top MV. OpenIVM's default mode.
 - **stale_plus_residual** — read stale top MV + compute delta contribution inline
   via `UNION ALL` of (stale MV) + (join delta with unchanged base tables). The
   Tier 2 novelty anchor.

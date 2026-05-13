@@ -37,7 +37,7 @@ statement ok
 INSERT INTO t2 VALUES (3, 300);
 
 statement ok
-PRAGMA ivm('mv_left');
+PRAGMA refresh('mv_left');
 
 query I
 SELECT COUNT(*) FROM (
@@ -62,7 +62,7 @@ SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_unnest_values';
 2
 
 statement ok
-PRAGMA ivm('mv_unnest_values');
+PRAGMA refresh('mv_unnest_values');
 
 query I
 SELECT COUNT(*) FROM (
@@ -97,7 +97,7 @@ statement ok
 INSERT INTO t1 VALUES (99, 100);
 
 statement ok
-PRAGMA ivm('mv_except_all');
+PRAGMA refresh('mv_except_all');
 
 query I
 SELECT COUNT(*) FROM (
@@ -141,7 +141,7 @@ statement ok
 INSERT INTO t1 VALUES (1, 15);
 
 statement ok
-PRAGMA ivm('mv_stddev');
+PRAGMA refresh('mv_stddev');
 
 query I
 SELECT COUNT(*) FROM (
@@ -163,7 +163,7 @@ statement ok
 INSERT INTO t1 VALUES (5, 50);
 
 statement ok
-PRAGMA ivm('mv_string_agg');
+PRAGMA refresh('mv_string_agg');
 
 query I
 SELECT COUNT(*) FROM (
@@ -191,7 +191,7 @@ statement ok
 INSERT INTO t3 VALUES (3, 30.7);
 
 statement ok
-PRAGMA ivm('mv_cast');
+PRAGMA refresh('mv_cast');
 
 query I
 SELECT COUNT(*) FROM (
@@ -219,7 +219,7 @@ statement ok
 DELETE FROM t1 WHERE a = 1;
 
 statement ok
-PRAGMA ivm('mv_left');
+PRAGMA refresh('mv_left');
 
 query I
 SELECT COUNT(*) FROM (
@@ -244,10 +244,10 @@ SELECT COUNT(*) FROM (
 # ============================================================
 
 statement ok
-PRAGMA ivm('mv_left');
+PRAGMA refresh('mv_left');
 
 statement ok
-PRAGMA ivm('mv_left');
+PRAGMA refresh('mv_left');
 
 query I
 SELECT COUNT(*) FROM (

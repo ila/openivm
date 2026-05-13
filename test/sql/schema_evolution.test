@@ -38,7 +38,7 @@ statement ok
 INSERT INTO t VALUES (4, 30, 400, 50);
 
 statement ok
-PRAGMA ivm('mv');
+PRAGMA refresh('mv');
 
 query III
 SELECT val, total, cnt FROM mv ORDER BY val;
@@ -67,7 +67,7 @@ statement ok
 INSERT INTO t VALUES (5, 10, 500);
 
 statement ok
-PRAGMA ivm('mv');
+PRAGMA refresh('mv');
 
 query I
 SELECT count(*) FROM (
@@ -98,7 +98,7 @@ statement ok
 INSERT INTO t VALUES (6, 20, 600);
 
 statement ok
-PRAGMA ivm('mv');
+PRAGMA refresh('mv');
 
 query I
 SELECT count(*) FROM (
@@ -132,7 +132,7 @@ statement ok
 INSERT INTO t VALUES (7, 10, 700, 1, 'hello');
 
 statement ok
-PRAGMA ivm('mv');
+PRAGMA refresh('mv');
 
 statement ok
 ALTER TABLE t DROP COLUMN temp1;
@@ -144,7 +144,7 @@ statement ok
 INSERT INTO t VALUES (8, 20, 800);
 
 statement ok
-PRAGMA ivm('mv');
+PRAGMA refresh('mv');
 
 query I
 SELECT count(*) FROM (

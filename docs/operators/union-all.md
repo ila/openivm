@@ -16,7 +16,7 @@ CREATE MATERIALIZED VIEW all_orders AS
     SELECT id, product FROM orders_eu;
 
 INSERT INTO orders_us VALUES (3, 'Bolt');
-PRAGMA ivm('all_orders');
+PRAGMA refresh('all_orders');
 ```
 
 ## How IVM handles it

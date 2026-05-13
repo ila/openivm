@@ -34,7 +34,7 @@ statement ok
 INSERT INTO dl.sensors VALUES (4, 200, 'critical');
 
 statement ok
-PRAGMA ivm('high_readings');
+PRAGMA refresh('high_readings');
 
 query I
 SELECT COUNT(*) FROM (
@@ -59,7 +59,7 @@ statement ok
 INSERT INTO dl.sensors VALUES (5, 30, 'ok');
 
 statement ok
-PRAGMA ivm('high_readings');
+PRAGMA refresh('high_readings');
 
 # MV unchanged — filtered out
 query I
@@ -97,7 +97,7 @@ CREATE MATERIALIZED VIEW dl.big_orders_by_region AS
     GROUP BY region;
 
 statement ok
-PRAGMA ivm('big_orders_by_region');
+PRAGMA refresh('big_orders_by_region');
 
 query I
 SELECT COUNT(*) FROM (
@@ -122,7 +122,7 @@ statement ok
 INSERT INTO dl.orders VALUES (5, 'EU', 200), (6, 'US', 10);
 
 statement ok
-PRAGMA ivm('big_orders_by_region');
+PRAGMA refresh('big_orders_by_region');
 
 query I
 SELECT COUNT(*) FROM (
@@ -157,7 +157,7 @@ CREATE MATERIALIZED VIEW dl.hot_events AS
     SELECT id, score, category FROM dl.events WHERE score > 50;
 
 statement ok
-PRAGMA ivm('hot_events');
+PRAGMA refresh('hot_events');
 
 # Cross-check after initial load
 query I
@@ -199,7 +199,7 @@ DELETE FROM dl.events WHERE id = 5;
 
 # Single refresh after all the batched operations
 statement ok
-PRAGMA ivm('hot_events');
+PRAGMA refresh('hot_events');
 
 query I
 SELECT COUNT(*) FROM (

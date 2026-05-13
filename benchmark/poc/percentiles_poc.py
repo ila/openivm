@@ -47,7 +47,7 @@ INSERT INTO lineitem SELECT i, i%{n_orders}, i%500, 1+(i%10), ((i*2654435761)%10
 CREATE MATERIALIZED VIEW mv_a AS SELECT o.o_region, o.o_month, l.l_product, SUM(l.l_qty*l.l_price) AS revenue, COUNT(*) AS cnt FROM lineitem l JOIN orders o ON l.l_order_id=o.o_id GROUP BY o.o_region, o.o_month, l.l_product;
 CREATE MATERIALIZED VIEW mv_b AS SELECT o_region, o_month, SUM(revenue) AS revenue, SUM(cnt) AS cnt FROM mv_a GROUP BY o_region, o_month;
 CREATE MATERIALIZED VIEW mv_c AS SELECT o_region, SUM(revenue) AS revenue, SUM(cnt) AS cnt FROM mv_b GROUP BY o_region;
-PRAGMA ivm('mv_a'); PRAGMA ivm('mv_b'); PRAGMA ivm('mv_c');
+PRAGMA refresh('mv_a'); PRAGMA refresh('mv_b'); PRAGMA refresh('mv_c');
 """
 
 

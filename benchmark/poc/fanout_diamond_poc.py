@@ -87,13 +87,13 @@ FANOUT_BYPASS = (
 	"FROM lineitem l JOIN orders o ON l.l_order_id=o.o_id GROUP BY o.o_region;"
 )
 FANOUT_CASCADE_ALL = (
-	"PRAGMA ivm('mv_region');\n"
-	"PRAGMA ivm('mv_product');\n"
-	"PRAGMA ivm('mv_month');\n"
+	"PRAGMA refresh('mv_region');\n"
+	"PRAGMA refresh('mv_product');\n"
+	"PRAGMA refresh('mv_month');\n"
 	"SELECT * FROM mv_region;"
 )
 FANOUT_CASCADE_ONE = (
-	"PRAGMA ivm('mv_region');\n"
+	"PRAGMA refresh('mv_region');\n"
 	"SELECT * FROM mv_region;"
 )
 FANOUT_STALE_RES = (
@@ -138,15 +138,15 @@ DIAMOND_BYPASS = (
 )
 # Cascade — must refresh mv_a before mv_top (dependency), but mv_b is orthogonal
 DIAMOND_CASCADE_NEEDED = (
-	"PRAGMA ivm('mv_a');\n"
-	"PRAGMA ivm('mv_top');\n"
+	"PRAGMA refresh('mv_a');\n"
+	"PRAGMA refresh('mv_top');\n"
 	"SELECT * FROM mv_top;"
 )
 # Cascade with ALL MVs refreshed (wasteful if we don't need mv_b)
 DIAMOND_CASCADE_ALL = (
-	"PRAGMA ivm('mv_a');\n"
-	"PRAGMA ivm('mv_b');\n"
-	"PRAGMA ivm('mv_top');\n"
+	"PRAGMA refresh('mv_a');\n"
+	"PRAGMA refresh('mv_b');\n"
+	"PRAGMA refresh('mv_top');\n"
 	"SELECT * FROM mv_top;"
 )
 DIAMOND_STALE_RES = (
@@ -203,7 +203,7 @@ def one_run(topology: str, n_orders: int, avg_li: int, delta_fraction: float, st
 		db = os.path.join(tmp, "bench.db")
 		setup = base_setup(n_orders, avg_li) + cfg["mvs"]
 		for name in cfg["mv_names"]:
-			setup += f"PRAGMA ivm('{name}');\n"
+			setup += f"PRAGMA refresh('{name}');\n"
 		out, err, rc = run_sql(db, setup)
 		if rc != 0:
 			raise RuntimeError(f"setup: {err}")

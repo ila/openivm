@@ -24,7 +24,7 @@ statement ok
 INSERT INTO products VALUES (4, 'Thingamajig', 8, 'A');
 
 statement ok
-pragma ivm('cheap_products');
+pragma refresh('cheap_products');
 
 query III
 SELECT id, name, price FROM cheap_products ORDER BY id;
@@ -38,7 +38,7 @@ statement ok
 INSERT INTO products VALUES (5, 'Expensive', 50, 'B');
 
 statement ok
-pragma ivm('cheap_products');
+pragma refresh('cheap_products');
 
 # MV unchanged (filtered out)
 query III
@@ -53,7 +53,7 @@ statement ok
 DELETE FROM products WHERE id = 1;
 
 statement ok
-pragma ivm('cheap_products');
+pragma refresh('cheap_products');
 
 query III
 SELECT id, name, price FROM cheap_products ORDER BY id;
@@ -63,7 +63,7 @@ SELECT id, name, price FROM cheap_products ORDER BY id;
 
 # --- No-op PRAGMA ---
 statement ok
-pragma ivm('cheap_products');
+pragma refresh('cheap_products');
 
 query III
 SELECT id, name, price FROM cheap_products ORDER BY id;
@@ -76,7 +76,7 @@ statement ok
 INSERT INTO products VALUES (6, 'Boundary', 19, 'C');
 
 statement ok
-pragma ivm('cheap_products');
+pragma refresh('cheap_products');
 
 query III
 SELECT id, name, price FROM cheap_products ORDER BY id;
@@ -90,7 +90,7 @@ statement ok
 INSERT INTO products VALUES (7, 'TooExpensive', 20, 'C');
 
 statement ok
-pragma ivm('cheap_products');
+pragma refresh('cheap_products');
 
 query III
 SELECT id, name, price FROM cheap_products ORDER BY id;
@@ -107,7 +107,7 @@ statement ok
 DELETE FROM products WHERE id = 3;
 
 statement ok
-pragma ivm('cheap_products');
+pragma refresh('cheap_products');
 
 query III
 SELECT id, name, price FROM cheap_products ORDER BY id;
@@ -121,7 +121,7 @@ statement ok
 DELETE FROM products WHERE id = 5;
 
 statement ok
-pragma ivm('cheap_products');
+pragma refresh('cheap_products');
 
 query III
 SELECT id, name, price FROM cheap_products ORDER BY id;
@@ -145,7 +145,7 @@ CREATE MATERIALIZED VIEW mv_filt_null AS
     SELECT id, price FROM filt_null WHERE price > 5 AND active = true;
 
 statement ok
-PRAGMA ivm('mv_filt_null');
+PRAGMA refresh('mv_filt_null');
 
 # Cross-check after initial load — only id=1 matches (price=10, active=true)
 query I
@@ -171,7 +171,7 @@ statement ok
 UPDATE filt_null SET price = NULL WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_filt_null');
+PRAGMA refresh('mv_filt_null');
 
 query I
 SELECT COUNT(*) FROM (
@@ -196,7 +196,7 @@ statement ok
 UPDATE filt_null SET active = true WHERE id = 4;
 
 statement ok
-PRAGMA ivm('mv_filt_null');
+PRAGMA refresh('mv_filt_null');
 
 query I
 SELECT COUNT(*) FROM (
@@ -221,7 +221,7 @@ statement ok
 INSERT INTO filt_null VALUES (5, NULL, true), (6, 100, NULL);
 
 statement ok
-PRAGMA ivm('mv_filt_null');
+PRAGMA refresh('mv_filt_null');
 
 query I
 SELECT COUNT(*) FROM (
@@ -256,7 +256,7 @@ CREATE MATERIALIZED VIEW mv_filt_bulk AS
     SELECT id, val FROM filt_bulk WHERE val > 50;
 
 statement ok
-PRAGMA ivm('mv_filt_bulk');
+PRAGMA refresh('mv_filt_bulk');
 
 # Cross-check after initial load
 query I
@@ -285,7 +285,7 @@ statement ok
 INSERT INTO filt_bulk VALUES (9001, 999), (9002, 999), (9003, 999);
 
 statement ok
-PRAGMA ivm('mv_filt_bulk');
+PRAGMA refresh('mv_filt_bulk');
 
 # MV gains only 3 rows
 query I
@@ -311,7 +311,7 @@ statement ok
 DELETE FROM filt_bulk WHERE val = 1;
 
 statement ok
-PRAGMA ivm('mv_filt_bulk');
+PRAGMA refresh('mv_filt_bulk');
 
 query I
 SELECT COUNT(*) FROM (
@@ -349,7 +349,7 @@ statement ok
 UPDATE filter_update SET price = 30 WHERE id = 2;
 
 statement ok
-PRAGMA ivm('mv_filter_update');
+PRAGMA refresh('mv_filter_update');
 
 query I
 SELECT COUNT(*) FROM (
@@ -372,7 +372,7 @@ statement ok
 UPDATE filter_update SET price = 5 WHERE id = 3;
 
 statement ok
-PRAGMA ivm('mv_filter_update');
+PRAGMA refresh('mv_filter_update');
 
 query I
 SELECT COUNT(*) FROM (
@@ -409,7 +409,7 @@ statement ok
 INSERT INTO df_data VALUES ('B', 30), ('C', 50);
 
 statement ok
-PRAGMA ivm('mv_df');
+PRAGMA refresh('mv_df');
 
 query I
 SELECT COUNT(*) FROM (
@@ -432,7 +432,7 @@ statement ok
 DELETE FROM df_data WHERE category = 'A' AND score = 20;
 
 statement ok
-PRAGMA ivm('mv_df');
+PRAGMA refresh('mv_df');
 
 query I
 SELECT COUNT(*) FROM (

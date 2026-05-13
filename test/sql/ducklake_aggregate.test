@@ -47,7 +47,7 @@ statement ok
 INSERT INTO dl.sales VALUES (4, 'east', 50);
 
 statement ok
-PRAGMA ivm('sales_summary');
+PRAGMA refresh('sales_summary');
 
 query I
 SELECT count(*) FROM (
@@ -70,7 +70,7 @@ statement ok
 INSERT INTO dl.sales VALUES (5, 'north', 300);
 
 statement ok
-PRAGMA ivm('sales_summary');
+PRAGMA refresh('sales_summary');
 
 query I
 SELECT count(*) FROM (
@@ -93,7 +93,7 @@ statement ok
 DELETE FROM dl.sales WHERE id = 1;
 
 statement ok
-PRAGMA ivm('sales_summary');
+PRAGMA refresh('sales_summary');
 
 query I
 SELECT count(*) FROM (
@@ -116,7 +116,7 @@ statement ok
 UPDATE dl.sales SET amount = 500 WHERE id = 2;
 
 statement ok
-PRAGMA ivm('sales_summary');
+PRAGMA refresh('sales_summary');
 
 query I
 SELECT count(*) FROM (
@@ -156,7 +156,7 @@ statement ok
 INSERT INTO dl.counter VALUES (4, 40), (5, 50);
 
 statement ok
-PRAGMA ivm('mv_counter');
+PRAGMA refresh('mv_counter');
 
 query I
 SELECT cnt FROM dl.mv_counter;
@@ -174,7 +174,7 @@ statement ok
 DELETE FROM dl.counter WHERE id <= 2;
 
 statement ok
-PRAGMA ivm('mv_counter');
+PRAGMA refresh('mv_counter');
 
 query I
 SELECT cnt FROM dl.mv_counter;
@@ -258,7 +258,7 @@ statement ok
 INSERT INTO dl.market VALUES (DATE '2019-12-31', 'A', 9, 21, 1, 50);
 
 statement ok
-PRAGMA ivm('market_rollup');
+PRAGMA refresh('market_rollup');
 
 query I
 WITH expected AS (
@@ -372,10 +372,10 @@ INSERT INTO dl.watch_events VALUES
     (3, 'CCC', NULL, NULL, TIMESTAMP '2026-01-02 12:00:00', 'Activate');
 
 statement ok
-PRAGMA ivm('watch_history');
+PRAGMA refresh('watch_history');
 
 statement ok
-PRAGMA ivm('watch_state');
+PRAGMA refresh('watch_state');
 
 query I
 SELECT count(*) FROM (
@@ -490,7 +490,7 @@ DELETE FROM dl.stress WHERE id = 8;
 
 # Single refresh after all the batched DML
 statement ok
-PRAGMA ivm('stress_agg');
+PRAGMA refresh('stress_agg');
 
 query I
 SELECT count(*) FROM (
@@ -526,7 +526,7 @@ DELETE FROM dl.stress WHERE id = 11;
 
 # Single refresh
 statement ok
-PRAGMA ivm('stress_agg');
+PRAGMA refresh('stress_agg');
 
 query I
 SELECT count(*) FROM (
@@ -563,7 +563,7 @@ CREATE MATERIALIZED VIEW dl.topk_sales_mv AS
     ORDER BY total DESC LIMIT 3;
 
 statement ok
-PRAGMA ivm('topk_sales_mv');
+PRAGMA refresh('topk_sales_mv');
 
 query I
 SELECT COUNT(*) FROM (
@@ -636,7 +636,7 @@ statement ok
 INSERT INTO dl.hav_customer VALUES (1, 1, 13, 'Delta');
 
 statement ok
-PRAGMA ivm('mv_hav_scalar');
+PRAGMA refresh('mv_hav_scalar');
 
 query I
 SELECT COUNT(*) FROM (
@@ -714,7 +714,7 @@ statement ok
 DELETE FROM dl.gr_sales WHERE item_id = 1 AND qty = 5;
 
 statement ok
-PRAGMA ivm('mv_gr_distinct');
+PRAGMA refresh('mv_gr_distinct');
 
 query I
 SELECT COUNT(*) FROM (
@@ -745,7 +745,7 @@ statement ok
 INSERT INTO dl.topk_sales VALUES (6,'grape',600);
 
 statement ok
-PRAGMA ivm('topk_sales_mv');
+PRAGMA refresh('topk_sales_mv');
 
 query I
 SELECT COUNT(*) FROM (
@@ -776,7 +776,7 @@ statement ok
 UPDATE dl.topk_sales SET revenue = 600 WHERE id = 3;
 
 statement ok
-PRAGMA ivm('topk_sales_mv');
+PRAGMA refresh('topk_sales_mv');
 
 query I
 SELECT COUNT(*) FROM (
@@ -815,7 +815,7 @@ statement ok
 INSERT INTO dlsql.lock_t VALUES (2), (3);
 
 statement ok
-PRAGMA ivm('lock_mv');
+PRAGMA refresh('lock_mv');
 
 query I
 SELECT COUNT(*) FROM (

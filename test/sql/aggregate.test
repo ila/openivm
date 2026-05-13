@@ -24,7 +24,7 @@ statement ok
 INSERT INTO sales VALUES (4, 'east', 50);
 
 statement ok
-pragma ivm('sales_summary');
+pragma refresh('sales_summary');
 
 query III
 SELECT region, total, cnt FROM sales_summary ORDER BY region;
@@ -37,7 +37,7 @@ statement ok
 INSERT INTO sales VALUES (5, 'north', 300);
 
 statement ok
-pragma ivm('sales_summary');
+pragma refresh('sales_summary');
 
 query III
 SELECT region, total, cnt FROM sales_summary ORDER BY region;
@@ -51,7 +51,7 @@ statement ok
 DELETE FROM sales WHERE id = 1;
 
 statement ok
-pragma ivm('sales_summary');
+pragma refresh('sales_summary');
 
 query III
 SELECT region, total, cnt FROM sales_summary ORDER BY region;
@@ -65,7 +65,7 @@ statement ok
 INSERT INTO sales VALUES (6, 'west', 75), (7, 'west', 25);
 
 statement ok
-pragma ivm('sales_summary');
+pragma refresh('sales_summary');
 
 query III
 SELECT region, total, cnt FROM sales_summary ORDER BY region;
@@ -76,7 +76,7 @@ west	300	3
 
 # --- No-op PRAGMA ---
 statement ok
-pragma ivm('sales_summary');
+pragma refresh('sales_summary');
 
 query III
 SELECT region, total, cnt FROM sales_summary ORDER BY region;
@@ -90,7 +90,7 @@ statement ok
 INSERT INTO sales VALUES (10, 'south', 100), (11, 'south', 200), (12, 'north', 50);
 
 statement ok
-pragma ivm('sales_summary');
+pragma refresh('sales_summary');
 
 query III
 SELECT region, total, cnt FROM sales_summary WHERE region IN ('south', 'north') ORDER BY region;
@@ -106,7 +106,7 @@ statement ok
 DELETE FROM sales WHERE id = 6;
 
 statement ok
-pragma ivm('sales_summary');
+pragma refresh('sales_summary');
 
 query III
 SELECT region, total, cnt FROM sales_summary WHERE region = 'west';
@@ -118,7 +118,7 @@ statement ok
 DELETE FROM sales WHERE region = 'east';
 
 statement ok
-pragma ivm('sales_summary');
+pragma refresh('sales_summary');
 
 query III
 SELECT region, total, cnt FROM sales_summary WHERE region != 'east' ORDER BY region;
@@ -150,7 +150,7 @@ statement ok
 INSERT INTO nullable_grp VALUES (NULL, 5), ('b', 100);
 
 statement ok
-pragma ivm('mv_null_grp');
+pragma refresh('mv_null_grp');
 
 query II
 SELECT grp, total FROM mv_null_grp ORDER BY grp NULLS LAST;
@@ -172,7 +172,7 @@ statement ok
 DELETE FROM nullable_grp WHERE grp IS NULL;
 
 statement ok
-pragma ivm('mv_null_grp');
+pragma refresh('mv_null_grp');
 
 query II
 SELECT grp, total FROM mv_null_grp ORDER BY grp;
@@ -203,7 +203,7 @@ statement ok
 INSERT INTO decimals VALUES ('x', 0.01), ('y', 99.99);
 
 statement ok
-pragma ivm('mv_dec');
+pragma refresh('mv_dec');
 
 query II
 SELECT category, total FROM mv_dec ORDER BY category;
@@ -240,7 +240,7 @@ statement ok
 INSERT INTO big_nums VALUES (1, 500);
 
 statement ok
-pragma ivm('mv_big');
+pragma refresh('mv_big');
 
 query II
 SELECT grp, total FROM mv_big;
@@ -270,7 +270,7 @@ statement ok
 INSERT INTO daily_sales VALUES ('2024-01-02', 50), ('2024-01-03', 400);
 
 statement ok
-pragma ivm('mv_daily');
+pragma refresh('mv_daily');
 
 query II
 SELECT sale_date, total FROM mv_daily ORDER BY sale_date;
@@ -305,7 +305,7 @@ statement ok
 INSERT INTO empty_base VALUES (1, 100), (2, 200);
 
 statement ok
-pragma ivm('mv_empty');
+pragma refresh('mv_empty');
 
 query II
 SELECT id, total FROM mv_empty ORDER BY id;
@@ -327,7 +327,7 @@ statement ok
 INSERT INTO batch_tbl SELECT i % 10, i FROM range(1000) t(i);
 
 statement ok
-pragma ivm('mv_batch');
+pragma refresh('mv_batch');
 
 # Cross-check
 query I
@@ -356,7 +356,7 @@ statement ok
 DELETE FROM del_all;
 
 statement ok
-pragma ivm('mv_del_all');
+pragma refresh('mv_del_all');
 
 query II
 SELECT grp, total FROM mv_del_all;
@@ -386,7 +386,7 @@ statement ok
 INSERT INTO scores VALUES (4, 40, 'd');
 
 statement ok
-pragma ivm('score_totals');
+pragma refresh('score_totals');
 
 query II
 SELECT total, cnt FROM score_totals;
@@ -398,7 +398,7 @@ statement ok
 DELETE FROM scores WHERE id = 1;
 
 statement ok
-pragma ivm('score_totals');
+pragma refresh('score_totals');
 
 query II
 SELECT total, cnt FROM score_totals;
@@ -413,7 +413,7 @@ statement ok
 DELETE FROM scores WHERE id = 2;
 
 statement ok
-pragma ivm('score_totals');
+pragma refresh('score_totals');
 
 query II
 SELECT total, cnt FROM score_totals;
@@ -422,7 +422,7 @@ SELECT total, cnt FROM score_totals;
 
 # --- No-op PRAGMA ---
 statement ok
-pragma ivm('score_totals');
+pragma refresh('score_totals');
 
 query II
 SELECT total, cnt FROM score_totals;
@@ -434,7 +434,7 @@ statement ok
 INSERT INTO scores VALUES (6, 10, 'f'), (7, 20, 'g'), (8, 30, 'h');
 
 statement ok
-pragma ivm('score_totals');
+pragma refresh('score_totals');
 
 query II
 SELECT total, cnt FROM score_totals;
@@ -446,7 +446,7 @@ statement ok
 DELETE FROM scores WHERE value <= 20;
 
 statement ok
-pragma ivm('score_totals');
+pragma refresh('score_totals');
 
 # Remaining: id=3(30), id=4(40), id=5(50), id=8(30) = 150, cnt=4
 query II
@@ -474,7 +474,7 @@ statement ok
 INSERT INTO t1 VALUES (5, 'a', 3);
 
 statement ok
-PRAGMA ivm('mv_min');
+PRAGMA refresh('mv_min');
 
 query II
 SELECT grp, min_val FROM mv_min ORDER BY grp;
@@ -486,7 +486,7 @@ statement ok
 DELETE FROM t1 WHERE id = 5;
 
 statement ok
-PRAGMA ivm('mv_min');
+PRAGMA refresh('mv_min');
 
 query II
 SELECT grp, min_val FROM mv_min ORDER BY grp;
@@ -509,7 +509,7 @@ statement ok
 INSERT INTO t2 VALUES (5, 'y', 300);
 
 statement ok
-PRAGMA ivm('mv_max');
+PRAGMA refresh('mv_max');
 
 query II
 SELECT grp, max_val FROM mv_max ORDER BY grp;
@@ -521,7 +521,7 @@ statement ok
 DELETE FROM t2 WHERE id = 5;
 
 statement ok
-PRAGMA ivm('mv_max');
+PRAGMA refresh('mv_max');
 
 query II
 SELECT grp, max_val FROM mv_max ORDER BY grp;
@@ -544,7 +544,7 @@ statement ok
 INSERT INTO t3 VALUES (4, 'g1', 5, 50, 10);
 
 statement ok
-PRAGMA ivm('mv_mixed');
+PRAGMA refresh('mv_mixed');
 
 query IIII
 SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
@@ -556,7 +556,7 @@ statement ok
 DELETE FROM t3 WHERE id = 4;
 
 statement ok
-PRAGMA ivm('mv_mixed');
+PRAGMA refresh('mv_mixed');
 
 query IIII
 SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
@@ -579,7 +579,7 @@ statement ok
 INSERT INTO t5 VALUES (4, 10);
 
 statement ok
-PRAGMA ivm('mv_simple_min');
+PRAGMA refresh('mv_simple_min');
 
 query I
 SELECT min_val FROM mv_simple_min;
@@ -590,7 +590,7 @@ statement ok
 DELETE FROM t5 WHERE id = 4;
 
 statement ok
-PRAGMA ivm('mv_simple_min');
+PRAGMA refresh('mv_simple_min');
 
 query I
 SELECT min_val FROM mv_simple_min;
@@ -621,7 +621,7 @@ statement ok
 INSERT INTO employees VALUES (5, 1, 50);
 
 statement ok
-PRAGMA ivm('mv_dept_salaries');
+PRAGMA refresh('mv_dept_salaries');
 
 query III
 SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
@@ -633,7 +633,7 @@ statement ok
 DELETE FROM employees WHERE id = 5;
 
 statement ok
-PRAGMA ivm('mv_dept_salaries');
+PRAGMA refresh('mv_dept_salaries');
 
 query III
 SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
@@ -648,7 +648,7 @@ statement ok
 INSERT INTO employees VALUES (6, 3, 75);
 
 statement ok
-PRAGMA ivm('mv_dept_salaries');
+PRAGMA refresh('mv_dept_salaries');
 
 query III
 SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
@@ -680,7 +680,7 @@ statement ok
 INSERT INTO avg_data VALUES ('a', 40), ('c', 100);
 
 statement ok
-pragma ivm('mv_avg');
+pragma refresh('mv_avg');
 
 query II
 SELECT grp, avg_val FROM mv_avg ORDER BY grp;
@@ -702,7 +702,7 @@ statement ok
 DELETE FROM avg_data WHERE grp = 'a' AND val = 10;
 
 statement ok
-pragma ivm('mv_avg');
+pragma refresh('mv_avg');
 
 query II
 SELECT grp, avg_val FROM mv_avg ORDER BY grp;
@@ -730,7 +730,7 @@ statement ok
 INSERT INTO avg_ungrouped VALUES (40);
 
 statement ok
-pragma ivm('mv_avg_scalar');
+pragma refresh('mv_avg_scalar');
 
 query I
 SELECT avg_val FROM mv_avg_scalar;
@@ -765,7 +765,7 @@ statement ok
 INSERT INTO having_test VALUES ('b', 100), ('c', 200);
 
 statement ok
-PRAGMA ivm('mv_having');
+PRAGMA refresh('mv_having');
 
 # Cross-check
 query I
@@ -809,7 +809,7 @@ statement ok
 INSERT INTO case_test VALUES ('a', 30), ('b', -100), ('c', 50);
 
 statement ok
-PRAGMA ivm('mv_case');
+PRAGMA refresh('mv_case');
 
 # Cross-check
 query I
@@ -846,7 +846,7 @@ CREATE MATERIALIZED VIEW mv_agg_null_edge AS
     FROM agg_null_edge GROUP BY grp;
 
 statement ok
-PRAGMA ivm('mv_agg_null_edge');
+PRAGMA refresh('mv_agg_null_edge');
 
 # Cross-check after initial load
 query I
@@ -872,7 +872,7 @@ statement ok
 DELETE FROM agg_null_edge WHERE val IS NULL;
 
 statement ok
-PRAGMA ivm('mv_agg_null_edge');
+PRAGMA refresh('mv_agg_null_edge');
 
 query I
 SELECT COUNT(*) FROM (
@@ -897,7 +897,7 @@ statement ok
 INSERT INTO agg_null_edge VALUES ('a', NULL), ('a', NULL);
 
 statement ok
-PRAGMA ivm('mv_agg_null_edge');
+PRAGMA refresh('mv_agg_null_edge');
 
 query I
 SELECT COUNT(*) FROM (
@@ -933,7 +933,7 @@ statement ok
 INSERT INTO agg_minmax_null_insert VALUES ('a', NULL, TIMESTAMP '2026-01-02 11:00:00');
 
 statement ok
-PRAGMA ivm('mv_agg_minmax_null_insert');
+PRAGMA refresh('mv_agg_minmax_null_insert');
 
 query ITT
 SELECT grp, placed_at, removed_at FROM mv_agg_minmax_null_insert ORDER BY grp;
@@ -955,7 +955,7 @@ CREATE MATERIALIZED VIEW mv_agg_grp_move AS
     SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp;
 
 statement ok
-PRAGMA ivm('mv_agg_grp_move');
+PRAGMA refresh('mv_agg_grp_move');
 
 # Cross-check after initial load
 query I
@@ -981,7 +981,7 @@ statement ok
 UPDATE agg_grp_move SET grp = 'y' WHERE val = 20;
 
 statement ok
-PRAGMA ivm('mv_agg_grp_move');
+PRAGMA refresh('mv_agg_grp_move');
 
 # x total: 10, y total: 50
 query I
@@ -1007,7 +1007,7 @@ statement ok
 UPDATE agg_grp_move SET grp = 'z' WHERE val = 30;
 
 statement ok
-PRAGMA ivm('mv_agg_grp_move');
+PRAGMA refresh('mv_agg_grp_move');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1062,7 +1062,7 @@ statement ok
 INSERT INTO ajh_orders VALUES (5, 2, 200);
 
 statement ok
-PRAGMA ivm('mv_big_regions');
+PRAGMA refresh('mv_big_regions');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1089,7 +1089,7 @@ statement ok
 DELETE FROM ajh_orders WHERE cust_id = 1 AND amount = 200;
 
 statement ok
-PRAGMA ivm('mv_big_regions');
+PRAGMA refresh('mv_big_regions');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1119,7 +1119,7 @@ statement ok
 INSERT INTO ajh_orders VALUES (6, 4, 500), (7, 4, 100);
 
 statement ok
-PRAGMA ivm('mv_big_regions');
+PRAGMA refresh('mv_big_regions');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1156,7 +1156,7 @@ CREATE MATERIALIZED VIEW mv_agg_vanish AS
     SELECT grp, SUM(val) AS total FROM agg_vanish GROUP BY grp;
 
 statement ok
-PRAGMA ivm('mv_agg_vanish');
+PRAGMA refresh('mv_agg_vanish');
 
 # Cross-check after initial load
 query I
@@ -1182,7 +1182,7 @@ statement ok
 DELETE FROM agg_vanish WHERE grp = 'q';
 
 statement ok
-PRAGMA ivm('mv_agg_vanish');
+PRAGMA refresh('mv_agg_vanish');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1217,7 +1217,7 @@ CREATE MATERIALIZED VIEW mv_agg_key_move AS
     SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp;
 
 statement ok
-PRAGMA ivm('mv_agg_key_move');
+PRAGMA refresh('mv_agg_key_move');
 
 # Cross-check after initial load
 query I
@@ -1243,7 +1243,7 @@ statement ok
 UPDATE agg_key_move SET grp = 'n' WHERE val = 20;
 
 statement ok
-PRAGMA ivm('mv_agg_key_move');
+PRAGMA refresh('mv_agg_key_move');
 
 # m: total=10 cnt=1, n: total=90 cnt=3
 query I
@@ -1269,7 +1269,7 @@ statement ok
 UPDATE agg_key_move SET grp = 'o' WHERE grp = 'm';
 
 statement ok
-PRAGMA ivm('mv_agg_key_move');
+PRAGMA refresh('mv_agg_key_move');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1329,7 +1329,7 @@ statement ok
 DELETE FROM lja_orders WHERE cust_id = 1;
 
 statement ok
-PRAGMA ivm('mv_cust_totals');
+PRAGMA refresh('mv_cust_totals');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1354,7 +1354,7 @@ statement ok
 DELETE FROM lja_orders;
 
 statement ok
-PRAGMA ivm('mv_cust_totals');
+PRAGMA refresh('mv_cust_totals');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1405,7 +1405,7 @@ statement ok
 INSERT INTO sd_base VALUES (7,'a',40), (8,'b',35), (9,'c',100);
 
 statement ok
-PRAGMA ivm('mv_stddev');
+PRAGMA refresh('mv_stddev');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1435,7 +1435,7 @@ statement ok
 INSERT INTO sd_base VALUES (10,'c',200), (11,'a',50);
 
 statement ok
-PRAGMA ivm('mv_stddev');
+PRAGMA refresh('mv_stddev');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1483,7 +1483,7 @@ statement ok
 INSERT INTO avg_noalias VALUES (40.0);
 
 statement ok
-PRAGMA ivm('mv_avg_noalias');
+PRAGMA refresh('mv_avg_noalias');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1498,7 +1498,7 @@ statement ok
 DELETE FROM avg_noalias WHERE val = 10.0;
 
 statement ok
-PRAGMA ivm('mv_avg_noalias');
+PRAGMA refresh('mv_avg_noalias');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1537,7 +1537,7 @@ statement ok
 DELETE FROM nonadd_cust WHERE state = 'ny';
 
 statement ok
-PRAGMA ivm('mv_upper_state');
+PRAGMA refresh('mv_upper_state');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1576,7 +1576,7 @@ statement ok
 DELETE FROM tag_events WHERE kind = 'click' AND amount = 5;
 
 statement ok
-PRAGMA ivm('mv_literal_tag');
+PRAGMA refresh('mv_literal_tag');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1619,7 +1619,7 @@ statement ok
 DELETE FROM case_sales WHERE region = 'US' AND rev = 900;
 
 statement ok
-PRAGMA ivm('mv_tier');
+PRAGMA refresh('mv_tier');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1668,7 +1668,7 @@ statement ok
 DELETE FROM list_events WHERE item_id = 101;
 
 statement ok
-PRAGMA ivm('mv_user_items');
+PRAGMA refresh('mv_user_items');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1708,7 +1708,7 @@ statement ok
 DELETE FROM simple_events WHERE amount = 10;
 
 statement ok
-PRAGMA ivm('mv_simple_literal');
+PRAGMA refresh('mv_simple_literal');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1751,7 +1751,7 @@ statement ok
 DELETE FROM multi_nonadd WHERE dept='eng' AND region='eu';
 
 statement ok
-PRAGMA ivm('mv_multi_nonadd');
+PRAGMA refresh('mv_multi_nonadd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1777,7 +1777,7 @@ statement ok
 DELETE FROM multi_nonadd WHERE dept='sales';
 
 statement ok
-PRAGMA ivm('mv_multi_nonadd');
+PRAGMA refresh('mv_multi_nonadd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1793,7 +1793,7 @@ statement ok
 INSERT INTO multi_nonadd VALUES ('sales', 'apac', 60000), ('sales', 'apac', 65000);
 
 statement ok
-PRAGMA ivm('mv_multi_nonadd');
+PRAGMA refresh('mv_multi_nonadd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1831,7 +1831,7 @@ statement ok
 INSERT INTO case_avg VALUES (1, 5000);
 
 statement ok
-PRAGMA ivm('mv_case_avg');
+PRAGMA refresh('mv_case_avg');
 
 query TT
 SELECT grp, tier FROM mv_case_avg ORDER BY grp;
@@ -1847,7 +1847,7 @@ statement ok
 INSERT INTO case_avg VALUES (2, 100), (2, 100), (2, 100), (2, 100), (2, 100);
 
 statement ok
-PRAGMA ivm('mv_case_avg');
+PRAGMA refresh('mv_case_avg');
 
 query TT
 SELECT grp, tier FROM mv_case_avg ORDER BY grp;
@@ -1877,7 +1877,7 @@ statement ok
 DELETE FROM list_varchar WHERE name = 'banana';
 
 statement ok
-PRAGMA ivm('mv_list_varchar');
+PRAGMA refresh('mv_list_varchar');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1918,7 +1918,7 @@ statement ok
 DELETE FROM bool_check WHERE grp = 2 AND v = 100;
 
 statement ok
-PRAGMA ivm('mv_bool_tier');
+PRAGMA refresh('mv_bool_tier');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1967,7 +1967,7 @@ statement ok
 DELETE FROM ua_events WHERE status='open' AND amount=10;
 
 statement ok
-PRAGMA ivm('mv_ua_counts');
+PRAGMA refresh('mv_ua_counts');
 
 query I
 SELECT COUNT(*) FROM (
@@ -2013,7 +2013,7 @@ statement ok
 INSERT INTO list_heavy VALUES (0, 'new_a'), (1, 'new_b'), (2, 'new_c'), (0, 'new_d');
 
 statement ok
-PRAGMA ivm('mv_list_heavy');
+PRAGMA refresh('mv_list_heavy');
 
 query I
 SELECT COUNT(*) FROM (
@@ -2060,7 +2060,7 @@ statement ok
 DELETE FROM sd_flat WHERE grp = 0 AND id BETWEEN 1 AND 6;
 
 statement ok
-PRAGMA ivm('mv_flat_sd');
+PRAGMA refresh('mv_flat_sd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -2126,7 +2126,7 @@ statement ok
 INSERT INTO sd_threshold VALUES (4, 999);
 
 statement ok
-PRAGMA ivm('mv_thr_sd');
+PRAGMA refresh('mv_thr_sd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -2185,7 +2185,7 @@ statement ok
 INSERT INTO hva_t VALUES (2, 100), (4, 50);
 
 statement ok
-PRAGMA ivm('mv_hva');
+PRAGMA refresh('mv_hva');
 
 query I
 SELECT count(*) FROM (
@@ -2251,7 +2251,7 @@ statement ok
 UPDATE hav_hidden_count SET amt = amt + 10 WHERE w = 1 AND i = 1;
 
 statement ok
-PRAGMA ivm('mv_hav_hidden_count');
+PRAGMA refresh('mv_hav_hidden_count');
 
 query I
 SELECT count(*) FROM (
@@ -2339,7 +2339,7 @@ statement ok
 DELETE FROM fixb_customer WHERE c_w_id = 1 AND c_balance = 10.00;
 
 statement ok
-PRAGMA ivm('fixb_mv');
+PRAGMA refresh('fixb_mv');
 
 query I
 SELECT count(*) FROM (SELECT * FROM fixb_mv EXCEPT ALL SELECT c_w_id, ROUND(AVG(c_balance), 2), ROUND(STDDEV(c_balance), 2), COUNT(*), ROUND(AVG(c_balance) / NULLIF(STDDEV(c_balance), 0), 4) FROM fixb_customer GROUP BY c_w_id);
@@ -2367,7 +2367,7 @@ statement ok
 DELETE FROM fixb_customer WHERE c_w_id = 3 AND c_balance = 100.00;
 
 statement ok
-PRAGMA ivm('fixb_cv');
+PRAGMA refresh('fixb_cv');
 
 # Use printf('%.12g', …) to absorb 1-ULP AVG(DECIMAL) drift — we only care
 # that the MV matches the base query within double precision.
@@ -2404,7 +2404,7 @@ statement ok
 DELETE FROM fixb_pay WHERE w = 1 AND d = 1 AND c_bal = 10;
 
 statement ok
-PRAGMA ivm('fixb_pay_mv');
+PRAGMA refresh('fixb_pay_mv');
 
 query I
 SELECT count(*) FROM (SELECT * FROM fixb_pay_mv EXCEPT ALL SELECT w, d, COUNT(c_bal), ROUND(SUM(c_bal) / NULLIF(COUNT(c_bal), 0), 2), ROUND(SUM(ytd) / NULLIF(SUM(pay_cnt), 0), 2) FROM fixb_pay GROUP BY w, d);
@@ -2457,7 +2457,7 @@ statement ok
 UPDATE filter_t SET val = 999, active = false WHERE id = 4;
 
 statement ok
-PRAGMA ivm('filter_mv');
+PRAGMA refresh('filter_mv');
 
 query I
 SELECT count(*) FROM (SELECT * FROM filter_mv EXCEPT ALL SELECT grp, COUNT(*) FILTER (WHERE active), SUM(val) FILTER (WHERE val > 100), AVG(val) FILTER (WHERE active) FROM filter_t GROUP BY grp);
@@ -2507,7 +2507,7 @@ statement ok
 INSERT INTO bool_t VALUES (6,'y',false);
 
 statement ok
-PRAGMA ivm('bool_mv');
+PRAGMA refresh('bool_mv');
 
 query I
 SELECT count(*) FROM (SELECT * FROM bool_mv EXCEPT ALL SELECT grp, BOOL_AND(flag), BOOL_OR(flag) FROM bool_t GROUP BY grp);
@@ -2588,7 +2588,7 @@ statement ok
 INSERT INTO cd_new_order VALUES (1, 1);
 
 statement ok
-PRAGMA ivm('mv_count_distinct_constant');
+PRAGMA refresh('mv_count_distinct_constant');
 
 query I
 SELECT COUNT(*) FROM (
@@ -2619,7 +2619,7 @@ statement ok
 INSERT INTO topk_t VALUES (9,'d',500);
 
 statement ok
-PRAGMA ivm('topk_agg');
+PRAGMA refresh('topk_agg');
 
 query I
 SELECT count(*) FROM (
@@ -2644,7 +2644,7 @@ statement ok
 DELETE FROM topk_t WHERE id = 9;
 
 statement ok
-PRAGMA ivm('topk_agg');
+PRAGMA refresh('topk_agg');
 
 query I
 SELECT count(*) FROM (
@@ -2675,7 +2675,7 @@ statement ok
 UPDATE topk_t SET val = 999 WHERE id = 3;
 
 statement ok
-PRAGMA ivm('topk_agg');
+PRAGMA refresh('topk_agg');
 
 query I
 SELECT count(*) FROM (

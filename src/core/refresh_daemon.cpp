@@ -203,7 +203,7 @@ void IVMRefreshDaemon::Run() {
 
 					if (hook_mode != "replace") {
 						auto result =
-						    refresh_con.Query("PRAGMA ivm('" + OpenIVMUtils::EscapeValue(sv.view_name) + "')");
+						    refresh_con.Query("PRAGMA refresh('" + OpenIVMUtils::EscapeValue(sv.view_name) + "')");
 						if (result->HasError()) {
 							Printer::Print("Warning: auto-refresh of '" + sv.view_name +
 							               "' failed: " + result->GetError());

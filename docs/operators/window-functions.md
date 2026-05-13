@@ -34,7 +34,7 @@ PARTITION BY columns (`dept` in this example). The view is classified as
 
 ```sql
 INSERT INTO employees VALUES (100, 'eng', 150000);
-PRAGMA ivm('top_per_dept');
+PRAGMA refresh('top_per_dept');
 ```
 
 The refresh identifies which partitions have deltas (by querying the base delta
@@ -77,8 +77,8 @@ CREATE MATERIALIZED VIEW mv_top2 AS
 
 Refresh the chain in order:
 ```sql
-PRAGMA ivm('mv_ranked');  -- partition-level recompute
-PRAGMA ivm('mv_top2');    -- reads updated mv_ranked data table
+PRAGMA refresh('mv_ranked');  -- partition-level recompute
+PRAGMA refresh('mv_top2');    -- reads updated mv_ranked data table
 ```
 
 The downstream MV reads from the window MV's updated data table. Note: the delta

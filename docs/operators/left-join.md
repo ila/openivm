@@ -27,7 +27,7 @@ Initial result:
 ```sql
 -- Bob gets an order: his NULL row is replaced with real data
 INSERT INTO orders VALUES (2, 'Bolt', 50);
-PRAGMA ivm('customer_orders');
+PRAGMA refresh('customer_orders');
 ```
 
 | name | product | amount |

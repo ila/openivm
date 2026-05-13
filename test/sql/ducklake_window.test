@@ -53,7 +53,7 @@ INSERT INTO dl.history_win VALUES
     (22, 4, 2, 4, 2, '2026-01-01 00:00:00', 267.00, 'Payment');
 
 statement ok
-PRAGMA ivm('mv_history_window');
+PRAGMA refresh('mv_history_window');
 
 query I
 SELECT count(*) FROM dl.mv_history_window;
@@ -138,7 +138,7 @@ INSERT INTO dl.window_join_events VALUES
     (20, 1, 1, 11);
 
 statement ok
-PRAGMA ivm('mv_window_join');
+PRAGMA refresh('mv_window_join');
 
 query I
 SELECT count(*) FROM (
@@ -433,13 +433,13 @@ INSERT INTO dl.accounts_crm_src VALUES
     (20, '2026-01-01 10:00:00', 'NEW', 2, 1, 200);
 
 statement ok
-PRAGMA ivm('accounts_tax');
+PRAGMA refresh('accounts_tax');
 
 statement ok
-PRAGMA ivm('accounts_crm');
+PRAGMA refresh('accounts_crm');
 
 statement ok
-PRAGMA ivm('mv_accounts_like');
+PRAGMA refresh('mv_accounts_like');
 
 statement ok
 INSERT INTO dl.accounts_crm_src VALUES
@@ -447,10 +447,10 @@ INSERT INTO dl.accounts_crm_src VALUES
     (10, '2026-01-02 10:00:00', 'UPDATE', 2, 1, 150);
 
 statement ok
-PRAGMA ivm('accounts_crm');
+PRAGMA refresh('accounts_crm');
 
 statement ok
-PRAGMA ivm('mv_accounts_like');
+PRAGMA refresh('mv_accounts_like');
 
 query I
 SELECT count(*) FROM (
@@ -694,7 +694,7 @@ INSERT INTO dl.cascade_accounts_crm_src VALUES
 # MV before the other upstream parent has been refreshed; the later parent
 # refresh must still recover the downstream MV.
 statement ok
-PRAGMA ivm('cascade_accounts_tax');
+PRAGMA refresh('cascade_accounts_tax');
 
 query I
 SELECT count(*) FROM dl.mv_cascade_accounts_like;
@@ -702,7 +702,7 @@ SELECT count(*) FROM dl.mv_cascade_accounts_like;
 0
 
 statement ok
-PRAGMA ivm('cascade_accounts_crm');
+PRAGMA refresh('cascade_accounts_crm');
 
 query I
 SELECT count(*) FROM (
@@ -791,10 +791,10 @@ INSERT INTO dl.window_upstream_src VALUES
     (2, 10, 200);
 
 statement ok
-PRAGMA ivm('window_upstream_base');
+PRAGMA refresh('window_upstream_base');
 
 statement ok
-PRAGMA ivm('mv_window_upstream');
+PRAGMA refresh('mv_window_upstream');
 
 query I
 SELECT count(*) FROM (
@@ -819,10 +819,10 @@ INSERT INTO dl.window_upstream_src VALUES
     (1, 20, 50);
 
 statement ok
-PRAGMA ivm('window_upstream_base');
+PRAGMA refresh('window_upstream_base');
 
 statement ok
-PRAGMA ivm('mv_window_upstream');
+PRAGMA refresh('mv_window_upstream');
 
 query I
 SELECT count(*) FROM (
@@ -862,7 +862,7 @@ statement ok
 INSERT INTO dl.window_join_codes VALUES (2, 'closed');
 
 statement ok
-PRAGMA ivm('mv_window_join');
+PRAGMA refresh('mv_window_join');
 
 query I
 SELECT count(*) FROM (

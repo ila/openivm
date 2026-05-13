@@ -395,7 +395,7 @@ static string ResolveDuckLakeCatalogName(Connection &con, const string &view_cat
 	if (probe && !probe->HasError() && probe->RowCount() > 1) {
 		throw Exception(ExceptionType::CATALOG,
 		                "Could not resolve DuckLake catalog unambiguously; pass the materialized view catalog "
-		                "explicitly or use PRAGMA ivm_options");
+		                "explicitly or use PRAGMA refresh_options");
 	}
 	throw Exception(ExceptionType::CATALOG, "Could not resolve attached DuckLake catalog");
 }
@@ -1290,7 +1290,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 
 void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters) {
 	OPENIVM_DEBUG_PRINT("[UPSERT] UpsertDeltaQueriesLocked START\n");
-	// PRAGMA ivm refreshes relational state, not ordered output. Force the
+	// PRAGMA refresh refreshes relational state, not ordered output. Force the
 	// OpenIVM entry point onto DuckDB's unordered execution mode even if this
 	// connection previously had a local preserve_insertion_order=true setting.
 	ClientConfig::GetConfig(context).user_settings.SetUserSetting(PreserveInsertionOrderSetting::SettingIndex,
@@ -2366,7 +2366,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		// LPTS does not cover every operator (table functions, certain WINDOW shapes,
 		// nested subqueries, etc.). If serialization fails, fall back to a full
 		// recompute of the MV — semantically correct, slower, but safe. Without
-		// this fallback the whole PRAGMA ivm() call would surface "Invalid Error:
+		// this fallback the whole PRAGMA refresh() call would surface "Invalid Error:
 		// map::at" and the user gets a cryptic crash instead of a working refresh.
 		string raw_ivm_sql;
 		if (IsEmptyDeltaPlan(plan.get())) {

@@ -5,7 +5,7 @@
 // For each combination of (query, workload, delta_size, flag_config, rep):
 //   - Fork a child (crash isolation)
 //   - Child copies the pre-built TPC-C DB, opens it, applies the flag config,
-//     creates the MV(s), warms caches, applies N delta rows, runs PRAGMA ivm,
+//     creates the MV(s), warms caches, applies N delta rows, runs PRAGMA refresh,
 //     and reports create_ms + refresh_ms to the parent.
 // The parent writes one CSV row per run and at the end computes medians per
 // (query, workload, delta_size, flag_config) and flags regressions:
@@ -344,7 +344,7 @@ static vector<QueryDef> BuildQueries(bool include_ducklake) {
 struct RunResult {
 	uint32_t ok;               // 1 = measured OK, 0 = error/crash
 	double create_ms;          // total CREATE MATERIALIZED VIEW time
-	double refresh_ms;         // total PRAGMA ivm time (summed across pipeline MVs)
+	double refresh_ms;         // total PRAGMA refresh time (summed across pipeline MVs)
 	int64_t mv_rows;           // SELECT COUNT(*) FROM last MV
 	int64_t delta_rows_issued; // number of DML statements executed (post-error-filter)
 	char error[512];           // error message (first ~500 chars)
@@ -560,9 +560,9 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 	// 7. Measure refresh(es)
 	int64_t t2 = NowMicros();
 	for (auto &mv : q.refresh_mvs) {
-		auto rr = con.Query("PRAGMA ivm('" + mv + "')");
+		auto rr = con.Query("PRAGMA refresh('" + mv + "')");
 		if (!rr || rr->HasError()) {
-			SetErr(r, "PRAGMA ivm(" + mv + ") failed: " + (rr ? rr->GetError() : "null"));
+			SetErr(r, "PRAGMA refresh(" + mv + ") failed: " + (rr ? rr->GetError() : "null"));
 			return false;
 		}
 	}

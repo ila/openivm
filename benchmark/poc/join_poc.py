@@ -4,10 +4,10 @@ POC 2 (join version): Goldilocks zone for IVM vs bypass on a 2-way join MV.
 
 Scenario: lineitem ⋈ orders, aggregated by region. MV defined over the join.
 Bypass = run the join + aggregate against the base tables.
-IVM    = PRAGMA ivm('mv') applies the delta via inclusion-exclusion, then scan.
+IVM    = PRAGMA refresh('mv') applies the delta via inclusion-exclusion, then scan.
 
 For varying delta fractions on lineitem (the "hot" fact table), measures:
-  A. IVM     — PRAGMA ivm('mv') + SELECT * FROM mv
+  A. IVM     — PRAGMA refresh('mv') + SELECT * FROM mv
   B. BYPASS  — run the join + aggregate on current base tables
 
 Expectation: since bypass has to join (cost scales with |lineitem| × selectivity),
@@ -111,8 +111,8 @@ FROM range({count}) t(i);
 
 
 def time_strategy(db_path: str, strategy: str) -> float:
-	if strategy == "ivm":
-		sql = "PRAGMA ivm('mv');\nSELECT * FROM mv;"
+	if strategy == "refresh":
+		sql = "PRAGMA refresh('mv');\nSELECT * FROM mv;"
 	elif strategy == "bypass":
 		sql = BYPASS_QUERY
 	else:
@@ -129,7 +129,7 @@ def one_run(n_orders: int, avg_li: int, delta_fraction: float, strategy: str) ->
 	n_lineitem = n_orders * avg_li
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "bench.db")
-		setup = setup_sql(n_orders, avg_li) + MV_DEFINITION + "PRAGMA ivm('mv');\n"
+		setup = setup_sql(n_orders, avg_li) + MV_DEFINITION + "PRAGMA refresh('mv');\n"
 		out, err, rc = run_sql(db, setup)
 		if rc != 0:
 			raise RuntimeError(f"setup failed: {err}")
@@ -145,7 +145,7 @@ def run_matrix(n_orders: int, avg_li: int, deltas: list[float], reps: int) -> li
 	rows = []
 	n_lineitem = n_orders * avg_li
 	for f in deltas:
-		for strategy in ("ivm", "bypass"):
+		for strategy in ("refresh", "bypass"):
 			samples = []
 			for rep in range(reps):
 				try:
@@ -183,7 +183,7 @@ def summarize(rows: list[dict]) -> None:
 	for f in sorted(by_frac):
 		pair = by_frac[f]
 		winner = min(pair, key=pair.get)
-		ivm_ms = pair.get("ivm", float("nan"))
+		ivm_ms = pair.get("refresh", float("nan"))
 		bypass_ms = pair.get("bypass", float("nan"))
 		ratio = bypass_ms / ivm_ms if ivm_ms else float("nan")
 		print(

@@ -95,7 +95,7 @@ MV_CHAIN = (
 	"FROM mv_b GROUP BY o_region;\n"
 )
 
-REFRESH_ALL = "PRAGMA ivm('mv_a');\nPRAGMA ivm('mv_b');\nPRAGMA ivm('mv_c');\n"
+REFRESH_ALL = "PRAGMA refresh('mv_a');\nPRAGMA ivm('mv_b');\nPRAGMA ivm('mv_c');\n"
 
 BYPASS = (
 	"SELECT o.o_region, SUM(l.l_qty*l.l_price) AS revenue, COUNT(*) AS cnt "
@@ -103,7 +103,7 @@ BYPASS = (
 )
 CASCADE = (
 	"SET ivm_cascade_refresh='downstream';\n"
-	"PRAGMA ivm('mv_a');\n"
+	"PRAGMA refresh('mv_a');\n"
 	"SELECT * FROM mv_c;"
 )
 STALE_RES = (

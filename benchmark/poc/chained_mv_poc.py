@@ -12,8 +12,8 @@ Compare four strategies for a query that matches mv_b's shape:
 
   A. BYPASS       — run the full base query (3-way logical: join + agg)
   B. STALE_B      — read mv_b as-is (wrong answer; baseline for zero-refresh cost)
-  C. CASCADE      — PRAGMA ivm('mv_a'); PRAGMA ivm('mv_b'); SELECT * FROM mv_b
-  D. CASCADE_AUTO — PRAGMA ivm('mv_b') (OpenIVM's cascade setting handles the chain)
+  C. CASCADE      — PRAGMA refresh('mv_a'); PRAGMA refresh('mv_b'); SELECT * FROM mv_b
+  D. CASCADE_AUTO — PRAGMA refresh('mv_b') (OpenIVM's cascade setting handles the chain)
 
 Expectation: CASCADE (C) beats BYPASS (A) for moderate delta sizes because
 mv_b's query is cheap once mv_a is refreshed. STALE_B (B) is the absolute
@@ -116,13 +116,13 @@ def time_strategy(db_path: str, strategy: str) -> float:
 		sql = "SELECT * FROM mv_b;"
 	elif strategy == "cascade":
 		# explicit chain: refresh A first, then B
-		sql = "PRAGMA ivm('mv_a');\nPRAGMA ivm('mv_b');\nSELECT * FROM mv_b;"
+		sql = "PRAGMA refresh('mv_a');\nPRAGMA ivm('mv_b');\nSELECT * FROM mv_b;"
 	elif strategy == "cascade_auto":
 		# rely on OpenIVM's cascade setting (default 'downstream' — refreshing mv_a
 		# propagates to mv_b). We still need to trigger the lowest level.
 		sql = (
 			"SET ivm_cascade_refresh='downstream';\n"
-			"PRAGMA ivm('mv_a');\n"
+			"PRAGMA refresh('mv_a');\n"
 			"SELECT * FROM mv_b;"
 		)
 	elif strategy == "stale_plus_residual":
@@ -162,8 +162,8 @@ def one_run(n_orders: int, avg_li: int, delta_fraction: float, strategy: str) ->
 			setup_sql(n_orders, avg_li)
 			+ MV_A
 			+ MV_B
-			+ "PRAGMA ivm('mv_a');\n"
-			+ "PRAGMA ivm('mv_b');\n"
+			+ "PRAGMA refresh('mv_a');\n"
+			+ "PRAGMA refresh('mv_b');\n"
 		)
 		out, err, rc = run_sql(db, setup)
 		if rc != 0:

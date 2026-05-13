@@ -15,12 +15,12 @@ CREATE MATERIALIZED VIEW distinct_colors AS
 
 -- Insert a duplicate — DISTINCT result does not change
 INSERT INTO colors VALUES (5, 'red'), (6, 'blue');
-PRAGMA ivm('distinct_colors');
+PRAGMA refresh('distinct_colors');
 -- Result: blue, green, red (unchanged)
 
 -- Insert a new value
 INSERT INTO colors VALUES (7, 'yellow');
-PRAGMA ivm('distinct_colors');
+PRAGMA refresh('distinct_colors');
 -- Result: blue, green, red, yellow
 ```
 

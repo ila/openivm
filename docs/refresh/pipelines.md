@@ -24,7 +24,7 @@ This creates the chain: `sales` -> `region_totals` -> `top_regions` -> `top_regi
 
 ## Cascade modes
 
-The `ivm_cascade_refresh` setting controls how `PRAGMA ivm()` handles dependent views in a pipeline.
+The `ivm_cascade_refresh` setting controls how `PRAGMA refresh()` handles dependent views in a pipeline.
 
 | Mode | Behavior |
 |---|---|
@@ -35,7 +35,7 @@ The `ivm_cascade_refresh` setting controls how `PRAGMA ivm()` handles dependent 
 
 ### off
 
-Each view is refreshed independently. The user must call `PRAGMA ivm()` in the correct order.
+Each view is refreshed independently. The user must call `PRAGMA refresh()` in the correct order.
 
 ```sql
 SET ivm_cascade_refresh = 'off';
@@ -43,9 +43,9 @@ SET ivm_cascade_refresh = 'off';
 INSERT INTO sales VALUES ('east', 500);
 
 -- Must refresh in topological order
-PRAGMA ivm('region_totals');
-PRAGMA ivm('top_regions');
-PRAGMA ivm('top_region_count');
+PRAGMA refresh('region_totals');
+PRAGMA refresh('top_regions');
+PRAGMA refresh('top_region_count');
 ```
 
 ### downstream (default)
@@ -58,7 +58,7 @@ SET ivm_cascade_refresh = 'downstream';
 INSERT INTO sales VALUES ('east', 500);
 
 -- Automatically refreshes top_regions and top_region_count after region_totals
-PRAGMA ivm('region_totals');
+PRAGMA refresh('region_totals');
 ```
 
 ### upstream
@@ -71,7 +71,7 @@ SET ivm_cascade_refresh = 'upstream';
 INSERT INTO sales VALUES ('east', 500);
 
 -- Automatically refreshes region_totals and top_regions first, then top_region_count
-PRAGMA ivm('top_region_count');
+PRAGMA refresh('top_region_count');
 ```
 
 ### both
@@ -84,7 +84,7 @@ SET ivm_cascade_refresh = 'both';
 INSERT INTO sales VALUES ('east', 500);
 
 -- Refreshes everything in the pipeline in correct order
-PRAGMA ivm('top_regions');
+PRAGMA refresh('top_regions');
 ```
 
 ## Out-of-order refresh

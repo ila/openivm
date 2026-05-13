@@ -27,10 +27,10 @@ statement ok
 INSERT INTO sales VALUES ('US', 'A', 100), ('US', 'B', 200), ('EU', 'A', 300);
 
 statement ok
-pragma ivm('sales_by_region');
+pragma refresh('sales_by_region');
 
 statement ok
-pragma ivm('grand_total');
+pragma refresh('grand_total');
 
 query II
 SELECT region, total FROM sales_by_region ORDER BY region;
@@ -54,10 +54,10 @@ statement ok
 INSERT INTO sales VALUES ('EU', 'B', 400), ('US', 'C', 500);
 
 statement ok
-pragma ivm('sales_by_region');
+pragma refresh('sales_by_region');
 
 statement ok
-pragma ivm('grand_total');
+pragma refresh('grand_total');
 
 query II
 SELECT region, total FROM sales_by_region ORDER BY region;
@@ -103,7 +103,7 @@ statement ok
 INSERT INTO compact_src VALUES (4, 40, 400);
 
 statement ok
-PRAGMA ivm('compact_proj');
+PRAGMA refresh('compact_proj');
 
 query I
 SELECT COUNT(*) FROM delta_compact_proj;
@@ -111,7 +111,7 @@ SELECT COUNT(*) FROM delta_compact_proj;
 1
 
 statement ok
-PRAGMA ivm('compact_join');
+PRAGMA refresh('compact_join');
 
 query III
 SELECT id, k, label FROM compact_join ORDER BY id;
@@ -151,7 +151,7 @@ statement ok
 DELETE FROM compact_cancel_src WHERE id = 3;
 
 statement ok
-PRAGMA ivm('compact_cancel_proj');
+PRAGMA refresh('compact_cancel_proj');
 
 query I
 SELECT COUNT(*) FROM delta_compact_cancel_proj;
@@ -159,7 +159,7 @@ SELECT COUNT(*) FROM delta_compact_cancel_proj;
 0
 
 statement ok
-PRAGMA ivm('compact_cancel_join');
+PRAGMA refresh('compact_cancel_join');
 
 query III
 SELECT id, k, label FROM compact_cancel_join ORDER BY id;
@@ -196,13 +196,13 @@ statement ok
 INSERT INTO orders VALUES ('alice', 'books', 3), ('bob', 'books', 5), ('alice', 'games', 2), ('charlie', 'books', 1);
 
 statement ok
-pragma ivm('orders_by_customer');
+pragma refresh('orders_by_customer');
 
 statement ok
-pragma ivm('orders_by_category');
+pragma refresh('orders_by_category');
 
 statement ok
-pragma ivm('customer_count');
+pragma refresh('customer_count');
 
 query II
 SELECT customer, total_qty FROM orders_by_customer ORDER BY customer;
@@ -233,13 +233,13 @@ statement ok
 INSERT INTO orders VALUES ('dave', 'games', 7), ('alice', 'books', 4);
 
 statement ok
-pragma ivm('orders_by_customer');
+pragma refresh('orders_by_customer');
 
 statement ok
-pragma ivm('orders_by_category');
+pragma refresh('orders_by_category');
 
 statement ok
-pragma ivm('customer_count');
+pragma refresh('customer_count');
 
 query II
 SELECT customer, total_qty FROM orders_by_customer ORDER BY customer;
@@ -268,10 +268,10 @@ statement ok
 INSERT INTO sales VALUES ('JP', 'D', 1000);
 
 statement ok
-pragma ivm('sales_by_region');
+pragma refresh('sales_by_region');
 
 statement ok
-pragma ivm('grand_total');
+pragma refresh('grand_total');
 
 query II
 SELECT region, total FROM sales_by_region ORDER BY region;
@@ -295,10 +295,10 @@ SELECT SUM(total) FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY 
 # ============================================================
 
 statement ok
-pragma ivm('sales_by_region');
+pragma refresh('sales_by_region');
 
 statement ok
-pragma ivm('grand_total');
+pragma refresh('grand_total');
 
 query I
 SELECT grand_total FROM grand_total;
@@ -313,10 +313,10 @@ statement ok
 INSERT INTO sales SELECT * FROM sales WHERE 1=0;
 
 statement ok
-pragma ivm('sales_by_region');
+pragma refresh('sales_by_region');
 
 statement ok
-pragma ivm('grand_total');
+pragma refresh('grand_total');
 
 query I
 SELECT grand_total FROM grand_total;
@@ -353,16 +353,16 @@ INSERT INTO events VALUES ('u1', 'click', 10), ('u2', 'click', 20), ('u1', 'purc
 
 # Refresh both chains
 statement ok
-pragma ivm('events_by_user');
+pragma refresh('events_by_user');
 
 statement ok
-pragma ivm('events_by_type');
+pragma refresh('events_by_type');
 
 statement ok
-pragma ivm('user_count');
+pragma refresh('user_count');
 
 statement ok
-pragma ivm('type_count');
+pragma refresh('type_count');
 
 query II
 SELECT user_id, total_value FROM events_by_user ORDER BY user_id;
@@ -406,16 +406,16 @@ statement ok
 DELETE FROM events WHERE user_id = 'u3';
 
 statement ok
-pragma ivm('events_by_user');
+pragma refresh('events_by_user');
 
 statement ok
-pragma ivm('events_by_type');
+pragma refresh('events_by_type');
 
 statement ok
-pragma ivm('user_count');
+pragma refresh('user_count');
 
 statement ok
-pragma ivm('type_count');
+pragma refresh('type_count');
 
 query II
 SELECT user_id, total_value FROM events_by_user ORDER BY user_id;
@@ -474,13 +474,13 @@ INSERT INTO transactions VALUES
     ('LA', 'electronics', 200), ('LA', 'food', 75);
 
 statement ok
-pragma ivm('store_dept_totals');
+pragma refresh('store_dept_totals');
 
 statement ok
-pragma ivm('store_totals');
+pragma refresh('store_totals');
 
 statement ok
-pragma ivm('chain_grand_total');
+pragma refresh('chain_grand_total');
 
 query III
 SELECT store, dept, total FROM store_dept_totals ORDER BY store, dept;
@@ -515,13 +515,13 @@ statement ok
 DELETE FROM transactions WHERE store = 'LA' AND dept = 'food';
 
 statement ok
-pragma ivm('store_dept_totals');
+pragma refresh('store_dept_totals');
 
 statement ok
-pragma ivm('store_totals');
+pragma refresh('store_totals');
 
 statement ok
-pragma ivm('chain_grand_total');
+pragma refresh('chain_grand_total');
 
 query III
 SELECT store, dept, total FROM store_dept_totals ORDER BY store, dept;
@@ -576,10 +576,10 @@ statement ok
 INSERT INTO purchases VALUES (1, 'book', 20), (2, 'pen', 5), (1, 'laptop', 1000);
 
 statement ok
-pragma ivm('customer_purchases');
+pragma refresh('customer_purchases');
 
 statement ok
-pragma ivm('spend_by_customer');
+pragma refresh('spend_by_customer');
 
 query III
 SELECT name, product, amount FROM customer_purchases ORDER BY name, product;
@@ -606,10 +606,10 @@ statement ok
 INSERT INTO purchases VALUES (3, 'tablet', 500), (1, 'mouse', 30);
 
 statement ok
-pragma ivm('customer_purchases');
+pragma refresh('customer_purchases');
 
 statement ok
-pragma ivm('spend_by_customer');
+pragma refresh('spend_by_customer');
 
 query II
 SELECT name, total_spend FROM spend_by_customer ORDER BY name;
@@ -631,10 +631,10 @@ statement ok
 DELETE FROM purchases WHERE product = 'pen';
 
 statement ok
-pragma ivm('customer_purchases');
+pragma refresh('customer_purchases');
 
 statement ok
-pragma ivm('spend_by_customer');
+pragma refresh('spend_by_customer');
 
 query II
 SELECT name, total_spend FROM spend_by_customer ORDER BY name;
@@ -676,10 +676,10 @@ statement ok
 INSERT INTO employees VALUES (1, 'Alice', 1, 100), (2, 'Bob', 2, 80), (3, 'Charlie', 1, 120);
 
 statement ok
-pragma ivm('emp_dept');
+pragma refresh('emp_dept');
 
 statement ok
-pragma ivm('dept_totals');
+pragma refresh('dept_totals');
 
 query III
 SELECT dept_name, total_salary, headcount FROM dept_totals ORDER BY dept_name;
@@ -699,10 +699,10 @@ statement ok
 INSERT INTO employees VALUES (4, 'Diana', 2, 90), (5, 'Eve', 1, 110);
 
 statement ok
-pragma ivm('emp_dept');
+pragma refresh('emp_dept');
 
 statement ok
-pragma ivm('dept_totals');
+pragma refresh('dept_totals');
 
 query III
 SELECT dept_name, total_salary, headcount FROM dept_totals ORDER BY dept_name;
@@ -722,10 +722,10 @@ statement ok
 DELETE FROM employees WHERE name = 'Bob';
 
 statement ok
-pragma ivm('emp_dept');
+pragma refresh('emp_dept');
 
 statement ok
-pragma ivm('dept_totals');
+pragma refresh('dept_totals');
 
 query III
 SELECT dept_name, total_salary, headcount FROM dept_totals ORDER BY dept_name;
@@ -759,10 +759,10 @@ CREATE MATERIALIZED VIEW ch_l2 AS
     SELECT SUM(total) AS grand FROM ch_l1;
 
 statement ok
-pragma ivm('ch_l1');
+pragma refresh('ch_l1');
 
 statement ok
-pragma ivm('ch_l2');
+pragma refresh('ch_l2');
 
 # Cross-check ch_l1
 query I
@@ -807,7 +807,7 @@ statement ok
 DELETE FROM ch_empty;
 
 statement ok
-pragma ivm('ch_l1');
+pragma refresh('ch_l1');
 
 # Cross-check ch_l1 (empty)
 query I
@@ -829,7 +829,7 @@ SELECT COUNT(*) FROM (
 0
 
 statement ok
-pragma ivm('ch_l2');
+pragma refresh('ch_l2');
 
 # Cross-check ch_l2 (grand should be NULL — SUM of empty)
 query I
@@ -855,10 +855,10 @@ statement ok
 INSERT INTO ch_empty VALUES ('x', 100);
 
 statement ok
-pragma ivm('ch_l1');
+pragma refresh('ch_l1');
 
 statement ok
-pragma ivm('ch_l2');
+pragma refresh('ch_l2');
 
 # Cross-check ch_l1
 query I
@@ -917,10 +917,10 @@ CREATE MATERIALIZED VIEW ch4_l2 AS
     SELECT SUM(total) AS grand FROM ch4_l1;
 
 statement ok
-pragma ivm('ch4_l1');
+pragma refresh('ch4_l1');
 
 statement ok
-pragma ivm('ch4_l2');
+pragma refresh('ch4_l2');
 
 # Cross-check ch4_l1
 query I
@@ -965,7 +965,7 @@ statement ok
 UPDATE ch_update SET grp = 'b' WHERE val = 20;
 
 statement ok
-pragma ivm('ch4_l1');
+pragma refresh('ch4_l1');
 
 # Cross-check ch4_l1 (a: total=10 cnt=1, b: total=50 cnt=2)
 query I
@@ -987,7 +987,7 @@ SELECT COUNT(*) FROM (
 0
 
 statement ok
-pragma ivm('ch4_l2');
+pragma refresh('ch4_l2');
 
 # Cross-check ch4_l2 (grand=60)
 query I
@@ -1013,10 +1013,10 @@ statement ok
 UPDATE ch_update SET grp = 'c' WHERE grp = 'b';
 
 statement ok
-pragma ivm('ch4_l1');
+pragma refresh('ch4_l1');
 
 statement ok
-pragma ivm('ch4_l2');
+pragma refresh('ch4_l2');
 
 # Cross-check ch4_l1
 query I
@@ -1080,7 +1080,7 @@ statement ok
 DELETE FROM ch_noop_base WHERE id = 3;
 
 statement ok
-PRAGMA ivm('ch_noop_l1');
+PRAGMA refresh('ch_noop_l1');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1099,7 +1099,7 @@ SELECT COUNT(*) FROM (
 0
 
 statement ok
-PRAGMA ivm('ch_noop_l2');
+PRAGMA refresh('ch_noop_l2');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1126,7 +1126,7 @@ FROM _duckdb_ivm_delta_tables
 WHERE view_name = 'ch_noop_l2';
 
 statement ok
-PRAGMA ivm('ch_noop_l2');
+PRAGMA refresh('ch_noop_l2');
 
 query I
 SELECT d.last_update = p.last_update

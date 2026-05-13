@@ -2670,7 +2670,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			// When the MV name is unqualified but the session is in a non-default catalog
 			// (e.g. USE dl.main), explicitly qualify so data/view tables land in dl rather
 			// than the physical default. Metadata tables (unqualified) stay in the physical
-			// default — PRAGMA ivm() always uses a fresh connection without USE.
+			// default — PRAGMA refresh() always uses a fresh connection without USE.
 			if (!current_catalog.empty() && current_catalog != default_db) {
 				view_catalog_prefix = QualifiedTablePrefix(current_catalog, current_schema);
 			}

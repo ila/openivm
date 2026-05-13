@@ -18,7 +18,7 @@ statement ok
 UPDATE comp_upd SET val = val + 5 WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_comp_upd');
+PRAGMA refresh('mv_comp_upd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -46,7 +46,7 @@ statement ok
 UPDATE comp_upd SET val = val - 3 WHERE id = 2;
 
 statement ok
-PRAGMA ivm('mv_comp_upd');
+PRAGMA refresh('mv_comp_upd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -74,7 +74,7 @@ statement ok
 UPDATE comp_upd SET val = val * 2 WHERE id = 3;
 
 statement ok
-PRAGMA ivm('mv_comp_upd');
+PRAGMA refresh('mv_comp_upd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -102,7 +102,7 @@ statement ok
 UPDATE comp_upd SET val = val + 1, price = price - 10.0 WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_comp_upd');
+PRAGMA refresh('mv_comp_upd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -130,7 +130,7 @@ statement ok
 UPDATE comp_upd SET val = val + 100;
 
 statement ok
-PRAGMA ivm('mv_comp_upd');
+PRAGMA refresh('mv_comp_upd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -162,7 +162,7 @@ statement ok
 DELETE FROM comp_upd WHERE id = 3;
 
 statement ok
-PRAGMA ivm('mv_comp_upd');
+PRAGMA refresh('mv_comp_upd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -196,7 +196,7 @@ statement ok
 UPDATE filt_upd SET val = val + 35 WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_filt_upd');
+PRAGMA refresh('mv_filt_upd');
 
 query I
 SELECT COUNT(*) FROM (
@@ -219,7 +219,7 @@ statement ok
 UPDATE filt_upd SET val = val - 20 WHERE id = 2;
 
 statement ok
-PRAGMA ivm('mv_filt_upd');
+PRAGMA refresh('mv_filt_upd');
 
 query I
 SELECT COUNT(*) FROM (

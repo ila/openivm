@@ -55,7 +55,7 @@ statement ok
 INSERT INTO dl.market VALUES ('A', 4, 25);
 
 statement ok
-PRAGMA ivm('mv_market');
+PRAGMA refresh('mv_market');
 
 query I
 SELECT count(*) FROM (
@@ -88,7 +88,7 @@ SELECT count(*) FROM (
 0
 
 statement ok
-PRAGMA ivm('mv_market_join');
+PRAGMA refresh('mv_market_join');
 
 query I
 SELECT count(*) FROM (

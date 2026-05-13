@@ -15,7 +15,7 @@ CREATE MATERIALIZED VIEW user_orders AS
     FROM users u INNER JOIN orders o ON u.id = o.user_id;
 
 INSERT INTO orders VALUES (1, 50);
-PRAGMA ivm('user_orders');
+PRAGMA refresh('user_orders');
 ```
 
 ## How IVM handles it

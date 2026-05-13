@@ -27,7 +27,7 @@ CREATE MATERIALIZED VIEW dl.product_summary AS
 
 -- Insert new data and refresh
 INSERT INTO dl.sales VALUES (1, 5, 50);
-PRAGMA ivm('product_summary');
+PRAGMA refresh('product_summary');
 
 SELECT * FROM dl.product_summary ORDER BY pname;
 -- Alpha | 150 | 2

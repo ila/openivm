@@ -13,7 +13,7 @@ CREATE MATERIALIZED VIEW sales_summary AS
     FROM sales GROUP BY region;
 
 INSERT INTO sales VALUES ('US', 50), ('JP', 300);
-PRAGMA ivm('sales_summary');
+PRAGMA refresh('sales_summary');
 ```
 
 ## How IVM handles it

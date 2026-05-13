@@ -40,7 +40,7 @@ statement ok
 INSERT INTO items VALUES (6, 1, 1, 50, 4.0);
 
 statement ok
-PRAGMA ivm('items_distinct');
+PRAGMA refresh('items_distinct');
 
 query I
 SELECT COUNT(*) FROM (
@@ -69,7 +69,7 @@ statement ok
 INSERT INTO items VALUES (7, 1, 1, 10, 9.0);
 
 statement ok
-PRAGMA ivm('items_distinct');
+PRAGMA refresh('items_distinct');
 
 query I
 SELECT COUNT(*) FROM (
@@ -98,7 +98,7 @@ statement ok
 DELETE FROM items WHERE id = 2;
 
 statement ok
-PRAGMA ivm('items_distinct');
+PRAGMA refresh('items_distinct');
 
 query I
 SELECT COUNT(*) FROM (
@@ -133,7 +133,7 @@ statement ok
 UPDATE items SET amount = 100.0 WHERE id = 4;
 
 statement ok
-PRAGMA ivm('items_distinct');
+PRAGMA refresh('items_distinct');
 
 query I
 SELECT COUNT(*) FROM (
@@ -229,7 +229,7 @@ statement ok
 INSERT INTO market VALUES (DATE '2019-12-31', 'A', 9, 21, 1, 50);
 
 statement ok
-PRAGMA ivm('market_rollup');
+PRAGMA refresh('market_rollup');
 
 query I
 WITH expected AS (
@@ -328,7 +328,7 @@ statement ok
 INSERT INTO orders_b VALUES ('west', 120);
 
 statement ok
-PRAGMA ivm('union_agg');
+PRAGMA refresh('union_agg');
 
 query I
 SELECT COUNT(*) FROM (
@@ -363,7 +363,7 @@ statement ok
 UPDATE orders_a SET amount = 999 WHERE region = 'west';
 
 statement ok
-PRAGMA ivm('union_agg');
+PRAGMA refresh('union_agg');
 
 query I
 SELECT COUNT(*) FROM (
@@ -387,9 +387,9 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# Empty-delta skip: no further DML → PRAGMA ivm is a no-op, MV unchanged
+# Empty-delta skip: no further DML → PRAGMA refresh is a no-op, MV unchanged
 statement ok
-PRAGMA ivm('union_agg');
+PRAGMA refresh('union_agg');
 
 query I
 SELECT COUNT(*) FROM (
@@ -456,7 +456,7 @@ statement ok
 INSERT INTO sales VALUES ('east', 'A', 300), ('south', 'C', 75);
 
 statement ok
-PRAGMA ivm('sales_rollup');
+PRAGMA refresh('sales_rollup');
 
 query I
 SELECT COUNT(*) FROM (
@@ -487,7 +487,7 @@ statement ok
 INSERT INTO sales VALUES ('north', 'A', 999);
 
 statement ok
-PRAGMA ivm('sales_rollup');
+PRAGMA refresh('sales_rollup');
 
 query I
 SELECT COUNT(*) FROM (
@@ -565,7 +565,7 @@ statement ok
 INSERT INTO ol VALUES (1, 1, 30.0), (2, 1, 50.0);
 
 statement ok
-PRAGMA ivm('avg_under_join');
+PRAGMA refresh('avg_under_join');
 
 query I
 SELECT COUNT(*) FROM (
@@ -607,7 +607,7 @@ statement ok
 INSERT INTO wh VALUES (3, 'Gamma', 0.15);
 
 statement ok
-PRAGMA ivm('avg_under_join');
+PRAGMA refresh('avg_under_join');
 
 query I
 SELECT COUNT(*) FROM (
@@ -711,7 +711,7 @@ statement ok
 INSERT INTO ol VALUES (4, 1, 50.0), (4, 1, 60.0), (4, 2, 100.0);
 
 statement ok
-PRAGMA ivm('stddev_under_join');
+PRAGMA refresh('stddev_under_join');
 
 query I
 SELECT COUNT(*) FROM (

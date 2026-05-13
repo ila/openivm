@@ -32,7 +32,7 @@ statement ok
 INSERT INTO payments VALUES (3, 1, 30);
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 query IIII
 SELECT user_name, from_uid, to_uid, amount FROM named_payments WHERE from_uid = 3 AND to_uid = 1 ORDER BY amount;
@@ -48,7 +48,7 @@ statement ok
 DELETE FROM payments WHERE from_uid = 5 AND to_uid = 1 AND amount = 42;
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 query I
 SELECT count(*) FROM named_payments WHERE from_uid = 5 AND to_uid = 1 AND amount = 42;
@@ -63,7 +63,7 @@ statement ok
 INSERT INTO gods VALUES (6, 'Hera');
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 # No payments reference uid 6 yet, so MV unchanged
 query I
@@ -76,7 +76,7 @@ statement ok
 INSERT INTO payments VALUES (1, 6, 99);
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 query III
 SELECT user_name, from_uid, amount FROM named_payments WHERE to_uid = 6;
@@ -94,7 +94,7 @@ statement ok
 INSERT INTO payments VALUES (2, 7, 500);
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 query III
 SELECT user_name, from_uid, amount FROM named_payments WHERE to_uid = 7;
@@ -109,7 +109,7 @@ statement ok
 DELETE FROM gods WHERE uid = 6;
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 query I
 SELECT count(*) FROM named_payments WHERE user_name = 'Hera';
@@ -132,7 +132,7 @@ statement ok
 DELETE FROM payments WHERE to_uid = 7;
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 query I
 SELECT count(*) FROM named_payments WHERE user_name = 'Athena';
@@ -147,7 +147,7 @@ statement ok
 INSERT INTO payments VALUES (1, 2, 10), (1, 2, 20), (1, 2, 30);
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 # Count all payments from 1 to 2 (original: 1722, 222 + new: 10, 20, 30)
 query I
@@ -160,7 +160,7 @@ SELECT count(*) FROM named_payments WHERE from_uid = 1 AND to_uid = 2;
 # ==========================================
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 query I
 SELECT count(*) FROM named_payments WHERE from_uid = 1 AND to_uid = 2;
@@ -178,7 +178,7 @@ statement ok
 INSERT INTO payments VALUES (4, 5, 777);
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 query I
 SELECT count(*) FROM named_payments WHERE from_uid = 4 AND to_uid = 5 AND amount = 777;
@@ -196,7 +196,7 @@ statement ok
 INSERT INTO payments VALUES (1, 3, 999);
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 query I
 SELECT count(*) FROM named_payments WHERE from_uid = 4 AND to_uid = 5 AND amount = 777;
@@ -222,7 +222,7 @@ statement ok
 DELETE FROM payments WHERE from_uid = 1 AND to_uid = 3 AND amount = 999;
 
 statement ok
-pragma ivm('named_payments');
+pragma refresh('named_payments');
 
 query III
 SELECT user_name, from_uid, amount FROM named_payments WHERE to_uid = 8;
@@ -266,7 +266,7 @@ statement ok
 INSERT INTO god_cities VALUES (4, 2);
 
 statement ok
-pragma ivm('god_locations');
+pragma refresh('god_locations');
 
 query II
 SELECT user_name, city_name FROM god_locations WHERE user_name = 'Poseidon';
@@ -281,7 +281,7 @@ statement ok
 INSERT INTO god_cities VALUES (1, 4);
 
 statement ok
-pragma ivm('god_locations');
+pragma refresh('god_locations');
 
 query II
 SELECT user_name, city_name FROM god_locations WHERE user_name = 'Apollo' ORDER BY city_name;
@@ -294,7 +294,7 @@ statement ok
 DELETE FROM god_cities WHERE uid = 4 AND city_id = 2;
 
 statement ok
-pragma ivm('god_locations');
+pragma refresh('god_locations');
 
 query I
 SELECT count(*) FROM god_locations WHERE user_name = 'Poseidon';
@@ -333,7 +333,7 @@ statement ok
 INSERT INTO orders_j VALUES ('US', 'A', 2), ('EU', 'A', 7);
 
 statement ok
-pragma ivm('order_totals');
+pragma refresh('order_totals');
 
 query IIII
 SELECT region, product, qty, price FROM order_totals ORDER BY region, product, qty;
@@ -359,7 +359,7 @@ statement ok
 DELETE FROM orders_j WHERE region = 'US' AND product = 'A' AND qty = 5;
 
 statement ok
-pragma ivm('order_totals');
+pragma refresh('order_totals');
 
 query IIII
 SELECT region, product, qty, price FROM order_totals ORDER BY region, product, qty;
@@ -390,7 +390,7 @@ CREATE MATERIALIZED VIEW mv_join_nz AS
     SELECT l.val, r.amount FROM jn_left_nz l INNER JOIN jn_right_nz r ON l.id = r.id;
 
 statement ok
-PRAGMA ivm('mv_join_nz');
+PRAGMA refresh('mv_join_nz');
 
 # Cross-check after initial load
 query I
@@ -419,7 +419,7 @@ statement ok
 DELETE FROM jn_right_nz WHERE id = 1 AND amount = 999;
 
 statement ok
-PRAGMA ivm('mv_join_nz');
+PRAGMA refresh('mv_join_nz');
 
 # MV unchanged
 query I
@@ -448,7 +448,7 @@ statement ok
 DELETE FROM jn_right_nz WHERE id = 2;
 
 statement ok
-PRAGMA ivm('mv_join_nz');
+PRAGMA refresh('mv_join_nz');
 
 query I
 SELECT COUNT(*) FROM (
@@ -489,7 +489,7 @@ CREATE MATERIALIZED VIEW mv_join_null AS
     SELECT l.name, r.score FROM jn_left_null l INNER JOIN jn_right_null r ON l.id = r.id;
 
 statement ok
-PRAGMA ivm('mv_join_null');
+PRAGMA refresh('mv_join_null');
 
 # Only (a,10) and (c,30) — NULL != NULL in INNER JOIN
 query I
@@ -515,7 +515,7 @@ statement ok
 INSERT INTO jn_right_null VALUES (NULL, 99);
 
 statement ok
-PRAGMA ivm('mv_join_null');
+PRAGMA refresh('mv_join_null');
 
 query I
 SELECT COUNT(*) FROM (
@@ -540,7 +540,7 @@ statement ok
 DELETE FROM jn_left_null WHERE id IS NULL;
 
 statement ok
-PRAGMA ivm('mv_join_null');
+PRAGMA refresh('mv_join_null');
 
 query I
 SELECT COUNT(*) FROM (
@@ -587,7 +587,7 @@ statement ok
 INSERT INTO people VALUES (5, 'Eve', 3);
 
 statement ok
-PRAGMA ivm('mv_reports');
+PRAGMA refresh('mv_reports');
 
 query I
 SELECT COUNT(*) FROM (
@@ -610,7 +610,7 @@ statement ok
 DELETE FROM people WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_reports');
+PRAGMA refresh('mv_reports');
 
 query I
 SELECT COUNT(*) FROM (
@@ -633,7 +633,7 @@ statement ok
 INSERT INTO people VALUES (1, 'Alice', NULL), (6, 'Frank', 1);
 
 statement ok
-PRAGMA ivm('mv_reports');
+PRAGMA refresh('mv_reports');
 
 query I
 SELECT COUNT(*) FROM (
@@ -698,7 +698,7 @@ statement ok
 INSERT INTO t4_inventory VALUES (1, 20, 30);
 
 statement ok
-PRAGMA ivm('mv_4way');
+PRAGMA refresh('mv_4way');
 
 query I
 SELECT COUNT(*) FROM (
@@ -731,7 +731,7 @@ statement ok
 INSERT INTO t4_inventory VALUES (3, 10, 75);
 
 statement ok
-PRAGMA ivm('mv_4way');
+PRAGMA refresh('mv_4way');
 
 query I
 SELECT COUNT(*) FROM (
@@ -758,7 +758,7 @@ statement ok
 DELETE FROM t4_inventory WHERE pid = 1 AND wid = 10;
 
 statement ok
-PRAGMA ivm('mv_4way');
+PRAGMA refresh('mv_4way');
 
 query I
 SELECT COUNT(*) FROM (
@@ -807,7 +807,7 @@ statement ok
 INSERT INTO jf_sales VALUES (3, 10), (2, 5);
 
 statement ok
-PRAGMA ivm('mv_expensive_sales');
+PRAGMA refresh('mv_expensive_sales');
 
 query I
 SELECT COUNT(*) FROM (
@@ -833,7 +833,7 @@ statement ok
 DELETE FROM jf_products WHERE id = 3;
 
 statement ok
-PRAGMA ivm('mv_expensive_sales');
+PRAGMA refresh('mv_expensive_sales');
 
 query I
 SELECT COUNT(*) FROM (
@@ -877,7 +877,7 @@ statement ok
 INSERT INTO jd_tags VALUES (1, 'hot');
 
 statement ok
-PRAGMA ivm('mv_unique_tags');
+PRAGMA refresh('mv_unique_tags');
 
 query I
 SELECT COUNT(*) FROM (
@@ -900,7 +900,7 @@ statement ok
 DELETE FROM jd_tags WHERE item_id = 2;
 
 statement ok
-PRAGMA ivm('mv_unique_tags');
+PRAGMA refresh('mv_unique_tags');
 
 query I
 SELECT COUNT(*) FROM (
@@ -971,7 +971,7 @@ statement ok
 DELETE FROM any_d WHERE D_ID = 10;
 
 statement ok
-PRAGMA ivm('mv_any_join');
+PRAGMA refresh('mv_any_join');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1040,7 +1040,7 @@ statement ok
 UPDATE unnest_stock SET qty = 8 WHERE s_id = 3;
 
 statement ok
-PRAGMA ivm('mv_const_unnest_join');
+PRAGMA refresh('mv_const_unnest_join');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1094,7 +1094,7 @@ statement ok
 INSERT INTO skj_left VALUES (999, 999);
 
 statement ok
-PRAGMA ivm('mv_skip_join_key');
+PRAGMA refresh('mv_skip_join_key');
 
 query I
 SELECT contains(content, 'SELECT NULL::INTEGER, NULL::INTEGER, NULL::INTEGER, NULL::INTEGER WHERE false')
@@ -1130,7 +1130,7 @@ statement ok
 INSERT INTO skj_right VALUES (2000, 2000);
 
 statement ok
-PRAGMA ivm('mv_skip_join_key');
+PRAGMA refresh('mv_skip_join_key');
 
 query I
 SELECT contains(content, 'SELECT NULL::INTEGER, NULL::INTEGER, NULL::INTEGER, NULL::INTEGER WHERE false')
@@ -1158,7 +1158,7 @@ statement ok
 INSERT INTO any_w VALUES (4);
 
 statement ok
-PRAGMA ivm('mv_cross_join');
+PRAGMA refresh('mv_cross_join');
 
 query I
 SELECT COUNT(*) FROM (

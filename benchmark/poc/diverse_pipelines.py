@@ -299,7 +299,7 @@ def time_strategy(db: str, s: Scenario, strategy: str) -> float:
 		# refresh deepest MV; OpenIVM cascades downstream
 		sql = (
 			"SET ivm_cascade_refresh='downstream';\n"
-			f"PRAGMA ivm('{s.mv_sqls[0].split()[3]}');\n"  # first MV's name (ugly but works)
+			f"PRAGMA refresh('{s.mv_sqls[0].split()[3]}');\n"  # first MV's name (ugly but works)
 			f"SELECT * FROM {s.top_mv};"
 		)
 		# Parse first mv name properly — the above is fragile; fix by extracting
@@ -307,7 +307,7 @@ def time_strategy(db: str, s: Scenario, strategy: str) -> float:
 		first_mv_name = s.mv_sqls[0].split("CREATE MATERIALIZED VIEW ")[1].split(" ")[0]
 		sql = (
 			"SET ivm_cascade_refresh='downstream';\n"
-			f"PRAGMA ivm('{first_mv_name}');\n"
+			f"PRAGMA refresh('{first_mv_name}');\n"
 			f"SELECT * FROM {s.top_mv};"
 		)
 	elif strategy == "stale_plus_residual":
@@ -333,7 +333,7 @@ def one_run(scenario_factory, n_orders: int, avg_li: int, delta_fraction: float,
 			setup += mv_sql
 		for mv_sql in s.mv_sqls:
 			first_mv_name = mv_sql.split("CREATE MATERIALIZED VIEW ")[1].split(" ")[0]
-			setup += f"PRAGMA ivm('{first_mv_name}');\n"
+			setup += f"PRAGMA refresh('{first_mv_name}');\n"
 		out, err, rc = run_sql(db, setup)
 		if rc != 0:
 			raise RuntimeError(f"setup failed: {err}\n----\n{out}")

@@ -13,7 +13,7 @@ CREATE MATERIALIZED VIEW sensor_totals AS
     FROM measurements GROUP BY sensor;
 
 INSERT INTO measurements VALUES ('A', [10.0, 20.0, 30.0]);
-PRAGMA ivm('sensor_totals');
+PRAGMA refresh('sensor_totals');
 ```
 
 ## How IVM handles it

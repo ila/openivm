@@ -3,7 +3,7 @@
 POC 1: Goldilocks zone for IVM vs bypass on a single-table aggregate MV.
 
 For varying delta fractions f, measures two strategies:
-  A. IVM       — PRAGMA ivm('mv') + SELECT * FROM mv
+  A. IVM       — PRAGMA refresh('mv') + SELECT * FROM mv
   B. BYPASS    — run the original SELECT against the current base (no MV)
 
 For single-table aggregate MVs, "rebuild" (full recompute of MV from base) is
@@ -103,12 +103,12 @@ def time_strategy(db_path: str, strategy: str) -> float:
 	"""
 	Time the named strategy on the given DB. Returns wall seconds.
 	Strategies:
-	  ivm     — PRAGMA ivm('mv') + SELECT * FROM mv
+	  ivm     — PRAGMA refresh('mv') + SELECT * FROM mv
 	  bypass  — run the query directly against base
 	  rebuild — DROP MATERIALIZED VIEW mv + CREATE MATERIALIZED VIEW mv + SELECT * FROM mv
 	"""
-	if strategy == "ivm":
-		sql = "PRAGMA ivm('mv');\nSELECT * FROM mv;"
+	if strategy == "refresh":
+		sql = "PRAGMA refresh('mv');\nSELECT * FROM mv;"
 	elif strategy == "bypass":
 		sql = BYPASS_QUERY
 	else:
@@ -128,7 +128,7 @@ def one_run(base_rows: int, delta_fraction: float, strategy: str) -> float:
 		db = os.path.join(tmp, "bench.db")
 
 		# Setup: base table + MV + sync so delta_orders starts empty.
-		setup_sql = make_base_sql(base_rows) + MV_DEFINITION + "PRAGMA ivm('mv');\n"
+		setup_sql = make_base_sql(base_rows) + MV_DEFINITION + "PRAGMA refresh('mv');\n"
 		out, err, rc = run_sql(db, setup_sql)
 		if rc != 0:
 			raise RuntimeError(f"setup failed: {err}")
@@ -148,7 +148,7 @@ def one_run(base_rows: int, delta_fraction: float, strategy: str) -> float:
 def run_matrix(base_rows: int, deltas: list[float], reps: int) -> list[dict]:
 	rows = []
 	for f in deltas:
-		for strategy in ("ivm", "bypass"):
+		for strategy in ("refresh", "bypass"):
 			samples = []
 			for rep in range(reps):
 				try:
@@ -186,7 +186,7 @@ def summarize(rows: list[dict]) -> None:
 	for f in sorted(by_frac):
 		pair = by_frac[f]
 		winner = min(pair, key=pair.get)
-		ivm_ms = pair.get("ivm", float("nan"))
+		ivm_ms = pair.get("refresh", float("nan"))
 		bypass_ms = pair.get("bypass", float("nan"))
 		ratio = bypass_ms / ivm_ms if ivm_ms else float("nan")
 		print(

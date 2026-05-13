@@ -59,7 +59,7 @@ statement ok
 INSERT INTO dl.sales_online VALUES (3, 'Widget', 5.00);
 
 statement ok
-PRAGMA ivm('mv_all_sales');
+PRAGMA refresh('mv_all_sales');
 
 # EXCEPT ALL
 query I
@@ -94,7 +94,7 @@ statement ok
 INSERT INTO dl.sales_online VALUES (4, 'Gizmo', 12.00);
 
 statement ok
-PRAGMA ivm('mv_all_sales');
+PRAGMA refresh('mv_all_sales');
 
 # EXCEPT ALL
 query I

@@ -18,9 +18,9 @@ CREATE TABLE _duckdb_ivm_refresh_hooks(
 
 | Mode | Behavior |
 |------|----------|
-| `before` | Execute `hook_sql` BEFORE `PRAGMA ivm()` runs |
-| `after` | Execute `hook_sql` AFTER `PRAGMA ivm()` completes |
-| `replace` | Execute `hook_sql` INSTEAD of `PRAGMA ivm()` — IVM is skipped |
+| `before` | Execute `hook_sql` BEFORE `PRAGMA refresh()` runs |
+| `after` | Execute `hook_sql` AFTER `PRAGMA refresh()` completes |
+| `replace` | Execute `hook_sql` INSTEAD of `PRAGMA refresh()` — IVM is skipped |
 
 ## Examples
 
@@ -61,7 +61,7 @@ You can use OpenIVM's `execute` setting to inspect the compiled IVM SQL, then pa
 ```sql
 -- Step 1: See what IVM would execute
 SET execute = false;
-PRAGMA ivm('my_view');
+PRAGMA refresh('my_view');
 -- This prints the compiled SQL without executing it
 
 -- Step 2: Copy the SQL, modify as needed, register as hook
@@ -79,12 +79,12 @@ INSERT INTO _duckdb_ivm_refresh_hooks VALUES(
 DELETE FROM _duckdb_ivm_refresh_hooks WHERE view_name = 'my_view';
 ```
 
-After removal, `PRAGMA ivm()` reverts to default IVM behavior.
+After removal, `PRAGMA refresh()` reverts to default IVM behavior.
 
 ## Interaction with Refresh Daemon
 
 Hooks are respected by both:
-- **Manual refresh**: `PRAGMA ivm('view_name')`
+- **Manual refresh**: `PRAGMA refresh('view_name')`
 - **Automatic refresh**: OpenIVM's background daemon (when `REFRESH EVERY` is configured)
 
 The daemon checks for hooks before each scheduled refresh.

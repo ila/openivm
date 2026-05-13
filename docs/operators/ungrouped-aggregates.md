@@ -14,11 +14,11 @@ CREATE MATERIALIZED VIEW total_score AS
 -- total=60, cnt=3
 
 INSERT INTO scores VALUES (40);
-PRAGMA ivm('total_score');
+PRAGMA refresh('total_score');
 -- total=100, cnt=4
 
 DELETE FROM scores WHERE val = 10;
-PRAGMA ivm('total_score');
+PRAGMA refresh('total_score');
 -- total=90, cnt=3
 ```
 

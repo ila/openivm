@@ -33,7 +33,7 @@ statement ok
 INSERT INTO orders VALUES ('A', 'apricot', 0);
 
 statement ok
-PRAGMA ivm('mv_argmin');
+PRAGMA refresh('mv_argmin');
 
 query II
 SELECT product, best_value FROM mv_argmin ORDER BY product;
@@ -54,7 +54,7 @@ statement ok
 INSERT INTO orders VALUES ('C', 'cherry', 1);
 
 statement ok
-PRAGMA ivm('mv_argmin');
+PRAGMA refresh('mv_argmin');
 
 query II
 SELECT product, best_value FROM mv_argmin ORDER BY product;
@@ -79,7 +79,7 @@ statement ok
 DELETE FROM orders WHERE product = 'B' AND key = 2;
 
 statement ok
-PRAGMA ivm('mv_argmin');
+PRAGMA refresh('mv_argmin');
 
 query II
 SELECT product, best_value FROM mv_argmin ORDER BY product;
@@ -128,7 +128,7 @@ statement ok
 INSERT INTO items VALUES ('Y', 'epsilon', 50);
 
 statement ok
-PRAGMA ivm('mv_argmax');
+PRAGMA refresh('mv_argmax');
 
 query II
 SELECT category, best_name FROM mv_argmax ORDER BY category;
@@ -152,7 +152,7 @@ statement ok
 INSERT INTO items VALUES ('X', 'zeta', 25);
 
 statement ok
-PRAGMA ivm('mv_argmax');
+PRAGMA refresh('mv_argmax');
 
 query II
 SELECT category, best_name FROM mv_argmax ORDER BY category;
@@ -169,15 +169,15 @@ SELECT category, ARG_MAX(name, score) AS best_name FROM items GROUP BY category 
 ----
 
 # =============================================================================
-# ivm_status refresh_strategy column
+# refresh_status refresh_strategy column
 # =============================================================================
 
-# PRAGMA ivm_status returns 7 columns; check it runs without error
+# PRAGMA refresh_status returns 7 columns; check it runs without error
 statement ok
-PRAGMA ivm_status('mv_argmin');
+PRAGMA refresh_status('mv_argmin');
 
 statement ok
-PRAGMA ivm_status('mv_argmax');
+PRAGMA refresh_status('mv_argmax');
 
 # Verify the stored type value directly (AGGREGATE_GROUP = 0)
 query I
@@ -213,7 +213,7 @@ statement ok
 DELETE FROM scores WHERE grp = 'A' AND key = 1;
 
 statement ok
-PRAGMA ivm('mv_shift');
+PRAGMA refresh('mv_shift');
 
 query II
 SELECT grp, best FROM mv_shift ORDER BY grp;
@@ -253,7 +253,7 @@ statement ok
 INSERT INTO events VALUES ('N', 'delta', 0, 75), ('S', 'epsilon', 5, 25);
 
 statement ok
-PRAGMA ivm('mv_mixed');
+PRAGMA refresh('mv_mixed');
 
 query III
 SELECT region, top_name, total FROM mv_mixed ORDER BY region;

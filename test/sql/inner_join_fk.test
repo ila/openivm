@@ -43,7 +43,7 @@ statement ok
 INSERT INTO dim_product VALUES (4, 'Thingamajig');
 
 statement ok
-PRAGMA ivm('fk_star');
+PRAGMA refresh('fk_star');
 
 query I
 SELECT COUNT(*) FROM (
@@ -74,7 +74,7 @@ statement ok
 INSERT INTO fact_sales VALUES (4, 4, 10, 300.0);
 
 statement ok
-PRAGMA ivm('fk_star');
+PRAGMA refresh('fk_star');
 
 query I
 SELECT COUNT(*) FROM (
@@ -111,7 +111,7 @@ statement ok
 UPDATE dim_product SET name = 'SuperWidget' WHERE product_id = 1;
 
 statement ok
-PRAGMA ivm('fk_star');
+PRAGMA refresh('fk_star');
 
 query I
 SELECT COUNT(*) FROM (
@@ -156,7 +156,7 @@ statement ok
 DELETE FROM dim_product WHERE product_id = 3;
 
 statement ok
-PRAGMA ivm('fk_star');
+PRAGMA refresh('fk_star');
 
 query I
 SELECT COUNT(*) FROM (
@@ -191,7 +191,7 @@ statement ok
 INSERT INTO fact_sales VALUES (5, 2, 30, 500.0);
 
 statement ok
-PRAGMA ivm('fk_star');
+PRAGMA refresh('fk_star');
 
 query I
 SELECT COUNT(*) FROM (
@@ -242,7 +242,7 @@ statement ok
 UPDATE fact_sales SET amount = 999.0 WHERE sale_id = 1;
 
 statement ok
-PRAGMA ivm('fk_star');
+PRAGMA refresh('fk_star');
 
 query I
 SELECT COUNT(*) FROM (
@@ -292,7 +292,7 @@ statement ok
 INSERT INTO departments VALUES (3, 'Marketing');
 
 statement ok
-PRAGMA ivm('dept_costs');
+PRAGMA refresh('dept_costs');
 
 query I
 SELECT COUNT(*) FROM (
@@ -318,7 +318,7 @@ statement ok
 INSERT INTO employees VALUES (4, 3, 90000);
 
 statement ok
-PRAGMA ivm('dept_costs');
+PRAGMA refresh('dept_costs');
 
 query III
 SELECT * FROM dept_costs ORDER BY dept_name;
@@ -372,7 +372,7 @@ statement ok
 INSERT INTO t_left VALUES (3, 30);
 
 statement ok
-PRAGMA ivm('mv_no_fk');
+PRAGMA refresh('mv_no_fk');
 
 query I
 SELECT COUNT(*) FROM (

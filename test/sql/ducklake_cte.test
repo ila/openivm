@@ -49,7 +49,7 @@ statement ok
 INSERT INTO dl.products VALUES (3, 'Widget', 5.00);
 
 statement ok
-PRAGMA ivm('mv_prices');
+PRAGMA refresh('mv_prices');
 
 # EXCEPT ALL
 query I
@@ -95,7 +95,7 @@ statement ok
 INSERT INTO dl.orders VALUES (4, 'east', 50, 'active'), (5, 'west', 75, 'cancelled');
 
 statement ok
-PRAGMA ivm('mv_active');
+PRAGMA refresh('mv_active');
 
 # EXCEPT ALL
 query I
@@ -151,7 +151,7 @@ statement ok
 INSERT INTO dl.cte_reuse VALUES (2, 15);
 
 statement ok
-PRAGMA ivm('mv_cte_reuse');
+PRAGMA refresh('mv_cte_reuse');
 
 query I
 SELECT count(*) FROM (

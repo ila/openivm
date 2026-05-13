@@ -18,7 +18,7 @@ statement ok
 INSERT INTO t VALUES (1, 100);
 
 statement ok
-PRAGMA ivm('mv');
+PRAGMA refresh('mv');
 
 query I
 SELECT total FROM mv;
@@ -40,7 +40,7 @@ statement ok
 INSERT INTO t VALUES (2, 200);
 
 statement ok
-PRAGMA ivm('mv');
+PRAGMA refresh('mv');
 
 # MV should be updated
 query I
@@ -68,7 +68,7 @@ statement ok
 INSERT INTO t VALUES (3, 300);
 
 statement ok
-PRAGMA ivm('mv');
+PRAGMA refresh('mv');
 
 # MV updated (IVM still runs)
 query I
@@ -96,7 +96,7 @@ statement ok
 INSERT INTO t VALUES (4, 400);
 
 statement ok
-PRAGMA ivm('mv');
+PRAGMA refresh('mv');
 
 # MV should NOT be updated (IVM was replaced)
 query I
@@ -121,7 +121,7 @@ statement ok
 DELETE FROM hook_log;
 
 statement ok
-PRAGMA ivm('mv');
+PRAGMA refresh('mv');
 
 # MV should now be updated (hook removed, IVM runs normally)
 query I

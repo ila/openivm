@@ -37,7 +37,7 @@ CREATE MATERIALIZED VIEW dl.customer_purchases AS
     FROM dl.customers c INNER JOIN dl.purchases p ON c.id = p.cust_id;
 
 statement ok
-PRAGMA ivm('customer_purchases');
+PRAGMA refresh('customer_purchases');
 
 # Cross-check after full refresh
 query I
@@ -63,7 +63,7 @@ statement ok
 INSERT INTO dl.purchases VALUES (1, 'Doohickey', 5), (3, 'Gizmo', 50);
 
 statement ok
-PRAGMA ivm('customer_purchases');
+PRAGMA refresh('customer_purchases');
 
 query I
 SELECT COUNT(*) FROM (
@@ -91,7 +91,7 @@ statement ok
 INSERT INTO dl.purchases VALUES (4, 'Thingamajig', 15);
 
 statement ok
-PRAGMA ivm('customer_purchases');
+PRAGMA refresh('customer_purchases');
 
 query I
 SELECT COUNT(*) FROM (
@@ -134,7 +134,7 @@ CREATE MATERIALIZED VIEW dl.product_summary AS
     GROUP BY p.pname;
 
 statement ok
-PRAGMA ivm('product_summary');
+PRAGMA refresh('product_summary');
 
 # Cross-check after initial load
 query I
@@ -162,7 +162,7 @@ statement ok
 INSERT INTO dl.sales VALUES (2, 3, 60), (3, 7, 140);
 
 statement ok
-PRAGMA ivm('product_summary');
+PRAGMA refresh('product_summary');
 
 query I
 SELECT COUNT(*) FROM (
@@ -189,7 +189,7 @@ statement ok
 DELETE FROM dl.sales WHERE pid = 1 AND qty = 10;
 
 statement ok
-PRAGMA ivm('product_summary');
+PRAGMA refresh('product_summary');
 
 query I
 SELECT COUNT(*) FROM (
@@ -233,7 +233,7 @@ CREATE MATERIALIZED VIEW dl.dept_roster AS
     FROM dl.departments d INNER JOIN dl.employees e ON d.did = e.did;
 
 statement ok
-PRAGMA ivm('dept_roster');
+PRAGMA refresh('dept_roster');
 
 # Cross-check after initial load
 query I
@@ -290,7 +290,7 @@ DELETE FROM dl.employees WHERE eid = 11;
 
 # Single refresh after all batched operations
 statement ok
-PRAGMA ivm('dept_roster');
+PRAGMA refresh('dept_roster');
 
 query I
 SELECT COUNT(*) FROM (
@@ -316,7 +316,7 @@ SELECT COUNT(*) FROM (
 
 # Refresh immediately after last refresh — all deltas empty, should be a no-op
 statement ok
-PRAGMA ivm('dept_roster');
+PRAGMA refresh('dept_roster');
 
 # MV should be unchanged
 query I
@@ -330,7 +330,7 @@ SELECT COUNT(*) FROM (
 
 # Also test empty delta on aggregate join view
 statement ok
-PRAGMA ivm('product_summary');
+PRAGMA refresh('product_summary');
 
 query I
 SELECT COUNT(*) FROM (
@@ -344,13 +344,13 @@ SELECT COUNT(*) FROM (
 
 # Multiple consecutive no-op refreshes should be safe
 statement ok
-PRAGMA ivm('customer_purchases');
+PRAGMA refresh('customer_purchases');
 
 statement ok
-PRAGMA ivm('customer_purchases');
+PRAGMA refresh('customer_purchases');
 
 statement ok
-PRAGMA ivm('customer_purchases');
+PRAGMA refresh('customer_purchases');
 
 query I
 SELECT COUNT(*) FROM (
@@ -370,7 +370,7 @@ statement ok
 INSERT INTO dl.purchases VALUES (2, 'Sprocket', 30);
 
 statement ok
-PRAGMA ivm('customer_purchases');
+PRAGMA refresh('customer_purchases');
 
 query I
 SELECT COUNT(*) FROM (
@@ -395,7 +395,7 @@ statement ok
 INSERT INTO dl.customers VALUES (5, 'Eve');
 
 statement ok
-PRAGMA ivm('customer_purchases');
+PRAGMA refresh('customer_purchases');
 
 query I
 SELECT COUNT(*) FROM (
@@ -421,18 +421,18 @@ SELECT COUNT(*) FROM (
 
 # After refresh, deltas are empty — IVM cost should be 0, decision = incremental
 statement ok
-PRAGMA ivm_cost('product_summary');
+PRAGMA refresh_cost('product_summary');
 
 # Insert data into one table, verify cost model doesn't error with DuckLake delta cardinality
 statement ok
 INSERT INTO dl.sales VALUES (3, 1, 999);
 
 statement ok
-PRAGMA ivm_cost('product_summary');
+PRAGMA refresh_cost('product_summary');
 
 # Refresh to apply the delta
 statement ok
-PRAGMA ivm('product_summary');
+PRAGMA refresh('product_summary');
 
 query I
 SELECT COUNT(*) FROM (

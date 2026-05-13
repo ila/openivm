@@ -56,7 +56,7 @@ statement ok
 INSERT INTO sales VALUES (4, 'east', 50);
 
 statement ok
-PRAGMA ivm('mv_sales');
+PRAGMA refresh('mv_sales');
 
 query III
 SELECT region, sum_amount, count_amount FROM mv_sales ORDER BY region;
@@ -87,7 +87,7 @@ statement ok
 INSERT INTO scores VALUES (5, 'a', 1);
 
 statement ok
-PRAGMA ivm('mv_scores');
+PRAGMA refresh('mv_scores');
 
 query III
 SELECT team, min_score, max_score FROM mv_scores ORDER BY team;
@@ -100,7 +100,7 @@ statement ok
 DELETE FROM scores WHERE id = 5;
 
 statement ok
-PRAGMA ivm('mv_scores');
+PRAGMA refresh('mv_scores');
 
 query III
 SELECT team, min_score, max_score FROM mv_scores ORDER BY team;
@@ -131,7 +131,7 @@ statement ok
 INSERT INTO metrics VALUES (4, 'x', 5, 50);
 
 statement ok
-PRAGMA ivm('mv_metrics');
+PRAGMA refresh('mv_metrics');
 
 query IIII
 SELECT grp, sum_a, min_b, max_b FROM mv_metrics ORDER BY grp;
@@ -161,7 +161,7 @@ statement ok
 INSERT INTO vals VALUES (4, 10);
 
 statement ok
-PRAGMA ivm('mv_vals');
+PRAGMA refresh('mv_vals');
 
 query III
 SELECT min_val, max_val, sum_val FROM mv_vals;
@@ -246,7 +246,7 @@ statement ok
 INSERT INTO t8 VALUES (3, 'carol');
 
 statement ok
-PRAGMA ivm('mv_t8');
+PRAGMA refresh('mv_t8');
 
 query II
 SELECT id, name FROM mv_t8 ORDER BY id;
@@ -311,7 +311,7 @@ statement ok
 INSERT INTO orders VALUES (4, 'east', 25, 'paid');
 
 statement ok
-PRAGMA ivm('mv_orders');
+PRAGMA refresh('mv_orders');
 
 query III
 SELECT region, total, lowest FROM mv_orders ORDER BY region;
@@ -415,7 +415,7 @@ statement ok
 INSERT INTO empty_tbl VALUES (1, 'a', 42);
 
 statement ok
-PRAGMA ivm('mv_empty');
+PRAGMA refresh('mv_empty');
 
 query II
 SELECT grp, min_val FROM mv_empty ORDER BY grp;
@@ -447,7 +447,7 @@ statement ok
 INSERT INTO nulls_tbl VALUES (4, 'b', 7);
 
 statement ok
-PRAGMA ivm('mv_nulls');
+PRAGMA refresh('mv_nulls');
 
 query IIII
 SELECT grp, min_val, max_val, cnt FROM mv_nulls ORDER BY grp;
@@ -477,7 +477,7 @@ statement ok
 INSERT INTO negatives VALUES (4, 'x', -300);
 
 statement ok
-PRAGMA ivm('mv_neg');
+PRAGMA refresh('mv_neg');
 
 query IIII
 SELECT grp, lo, hi, total FROM mv_neg;
@@ -489,7 +489,7 @@ statement ok
 DELETE FROM negatives WHERE id = 4;
 
 statement ok
-PRAGMA ivm('mv_neg');
+PRAGMA refresh('mv_neg');
 
 query IIII
 SELECT grp, lo, hi, total FROM mv_neg;
@@ -518,7 +518,7 @@ statement ok
 INSERT INTO words VALUES (4, 'fruit', 'apricot');
 
 statement ok
-PRAGMA ivm('mv_words');
+PRAGMA refresh('mv_words');
 
 query III
 SELECT cat, first_word, last_word FROM mv_words;
@@ -530,7 +530,7 @@ statement ok
 DELETE FROM words WHERE id = 2;
 
 statement ok
-PRAGMA ivm('mv_words');
+PRAGMA refresh('mv_words');
 
 query III
 SELECT cat, first_word, last_word FROM mv_words;
@@ -560,7 +560,7 @@ statement ok
 INSERT INTO t22 VALUES (4, 'a', 1);
 
 statement ok
-PRAGMA ivm('mv_t22');
+PRAGMA refresh('mv_t22');
 
 query IIII
 SELECT grp, n, lo, hi FROM mv_t22 ORDER BY grp;
@@ -572,7 +572,7 @@ statement ok
 DELETE FROM t22 WHERE id = 4;
 
 statement ok
-PRAGMA ivm('mv_t22');
+PRAGMA refresh('mv_t22');
 
 query IIII
 SELECT grp, n, lo, hi FROM mv_t22 ORDER BY grp;
@@ -604,7 +604,7 @@ statement ok
 INSERT INTO t23 VALUES (5, 'eng', 'be', 1);
 
 statement ok
-PRAGMA ivm('mv_t23');
+PRAGMA refresh('mv_t23');
 
 query IIII
 SELECT dept, team, lo, hi FROM mv_t23 ORDER BY dept, team;
@@ -672,7 +672,7 @@ statement ok
 DELETE FROM t26 WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_t26');
+PRAGMA refresh('mv_t26');
 
 query III
 SELECT grp, lo, hi FROM mv_t26 ORDER BY grp;
@@ -683,7 +683,7 @@ statement ok
 INSERT INTO t26 VALUES (2, 'only', 99);
 
 statement ok
-PRAGMA ivm('mv_t26');
+PRAGMA refresh('mv_t26');
 
 query III
 SELECT grp, lo, hi FROM mv_t26;
@@ -712,7 +712,7 @@ statement ok
 INSERT INTO t27 VALUES (3, 'a', 5);
 
 statement ok
-PRAGMA ivm('mv_t27');
+PRAGMA refresh('mv_t27');
 
 query IIIII
 SELECT grp, min_val, max_val, sum_val, count_val FROM mv_t27;
@@ -724,13 +724,13 @@ a	5	20	35	3
 # ==========================================
 
 statement ok
-PRAGMA ivm('mv_t27');
+PRAGMA refresh('mv_t27');
 
 statement ok
-PRAGMA ivm('mv_t27');
+PRAGMA refresh('mv_t27');
 
 statement ok
-PRAGMA ivm('mv_t27');
+PRAGMA refresh('mv_t27');
 
 query IIIII
 SELECT grp, min_val, max_val, sum_val, count_val FROM mv_t27;
@@ -748,7 +748,7 @@ statement ok
 DELETE FROM t27 WHERE id = 99;
 
 statement ok
-PRAGMA ivm('mv_t27');
+PRAGMA refresh('mv_t27');
 
 # Should be unchanged
 query IIIII
@@ -757,7 +757,7 @@ SELECT grp, min_val, max_val, sum_val, count_val FROM mv_t27;
 a	5	20	35	3
 
 # Note: Test 30 (large batch insert with 100+ rows) is skipped here.
-# PRAGMA ivm with large delta tables causes a segfault in the LPTS module
+# PRAGMA refresh with large delta tables causes a segfault in the LPTS module
 # when using a file-based database. This is a pre-existing issue unrelated
 # to MIN/MAX support.
 
@@ -840,7 +840,7 @@ statement ok
 INSERT INTO t31 VALUES (2, 20);
 
 statement ok
-PRAGMA ivm('mv_t31_5min');
+PRAGMA refresh('mv_t31_5min');
 
 query II
 SELECT val, cnt FROM mv_t31_5min ORDER BY val;
@@ -920,7 +920,7 @@ statement ok
 INSERT INTO t31 VALUES (3, 30);
 
 statement ok
-PRAGMA ivm('mv_t31_1min');
+PRAGMA refresh('mv_t31_1min');
 
 query I
 SELECT count(*) FROM mv_t31_1min;
@@ -963,7 +963,7 @@ statement ok
 INSERT INTO t41 VALUES (4, 'c', 50);
 
 statement ok
-PRAGMA ivm('mv_t41');
+PRAGMA refresh('mv_t41');
 
 query III
 SELECT grp, total, cnt FROM mv_t41 ORDER BY grp;
@@ -1013,7 +1013,7 @@ statement ok
 INSERT INTO t41 VALUES (5, 'a', 100);
 
 statement ok
-PRAGMA ivm('mv_t41');
+PRAGMA refresh('mv_t41');
 
 query I
 SELECT count(*) FROM (
@@ -1054,7 +1054,7 @@ statement ok
 INSERT INTO mem2.s.t VALUES (2), (3);
 
 statement ok
-PRAGMA ivm('mvq_target');
+PRAGMA refresh('mvq_target');
 
 query I
 SELECT count(*) FROM (
@@ -1094,7 +1094,7 @@ statement ok
 INSERT INTO mem2.s.t2 VALUES (20), (30);
 
 statement ok
-PRAGMA ivm('mvq_source');
+PRAGMA refresh('mvq_source');
 
 query I
 SELECT count(*) FROM (

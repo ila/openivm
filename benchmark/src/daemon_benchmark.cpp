@@ -7,7 +7,7 @@
 // then emits a JSON summary line on its result pipe before exiting. The parent
 // watches each worker via poll() and aggregates results into a JSONL file.
 //
-// Sub-tests exercise: automatic (daemon-scheduled) refresh, manual PRAGMA ivm(),
+// Sub-tests exercise: automatic (daemon-scheduled) refresh, manual PRAGMA refresh(),
 // upstream/downstream/both cascade modes, pipelines up to 10 MVs deep, parallel
 // refresh across MVs, conflicting refresh on the same MV, ALTER REFRESH EVERY
 // during a run, DML-during-refresh, and DuckLake variants.
@@ -791,7 +791,7 @@ static void ManualRefreshThread(SubtestCtx &ctx, vector<string> target_mvs, int 
 		}
 		const string &vn = target_mvs[idx % target_mvs.size()];
 		auto t0 = NowMs();
-		auto r = con.Query("PRAGMA ivm('" + vn + "')");
+		auto r = con.Query("PRAGMA refresh('" + vn + "')");
 		auto t1 = NowMs();
 		{
 			lock_guard<mutex> lk(ctx.log_mu);
@@ -1061,8 +1061,8 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 		for (auto &v : ctx.mvs) {
 			if (v.base_query.empty()) continue;
 			// Drain deltas with multiple refreshes — catches "pending after one refresh" races.
-			fin_con.Query("PRAGMA ivm('" + v.name + "')");
-			fin_con.Query("PRAGMA ivm('" + v.name + "')");
+			fin_con.Query("PRAGMA refresh('" + v.name + "')");
+			fin_con.Query("PRAGMA refresh('" + v.name + "')");
 			string q = "SELECT COUNT(*) FROM ("
 			           "  SELECT * FROM " + v.QualifiedName() + " EXCEPT ALL SELECT * FROM (" + v.base_query + ") __a"
 			           "  UNION ALL "

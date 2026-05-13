@@ -28,7 +28,7 @@ Initial result:
 ```sql
 -- Bob gets a project: his NULL row is replaced with real data
 INSERT INTO projects VALUES (40, 2, 'Delta');
-PRAGMA ivm('emp_projects');
+PRAGMA refresh('emp_projects');
 ```
 
 | name | title |

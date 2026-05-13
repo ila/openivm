@@ -12,7 +12,7 @@ CREATE MATERIALIZED VIEW emp_names AS
     SELECT id, name FROM employees;
 
 INSERT INTO employees VALUES (3, 'Charlie', 'Eng');
-PRAGMA ivm('emp_names');
+PRAGMA refresh('emp_names');
 ```
 
 Expressions in SELECT such as `a * 2`, `b + c`, and `CASE WHEN` work transparently — they are applied to the delta rows the same way they would be applied to the base rows.
@@ -32,7 +32,7 @@ CREATE MATERIALIZED VIEW cheap_products AS
     SELECT id, name, price FROM products WHERE price < 20;
 
 INSERT INTO products VALUES (3, 'Bolt', 5);
-PRAGMA ivm('cheap_products');
+PRAGMA refresh('cheap_products');
 ```
 
 ## How IVM handles it

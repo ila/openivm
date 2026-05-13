@@ -21,7 +21,7 @@ CREATE MATERIALIZED VIEW mv_staff AS SELECT id, name, dept, salary FROM staff;
 
 # Initial refresh so MV reflects the pre-seeded rows.
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 # Source table for INSERT...SELECT tests
 statement ok
@@ -38,7 +38,7 @@ statement ok
 INSERT INTO staff VALUES (3, 'Carol', 'eng', 150);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 # MV must match base table after every PRAGMA
 query I
@@ -59,7 +59,7 @@ statement ok
 INSERT INTO staff VALUES (4, 'Dave', 'sales', 250), (5, 'Eve', 'eng', 300);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -79,7 +79,7 @@ statement ok
 INSERT INTO staff VALUES (8, 'Heidi' || '', upper('eng'), 300 + 25);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -99,7 +99,7 @@ statement ok
 INSERT INTO staff SELECT * FROM temp_hires;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -119,7 +119,7 @@ statement ok
 INSERT INTO staff SELECT i + 100, 'Batch' || i::VARCHAR, 'eng', i * 10 FROM range(1, 4) t(i);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -139,7 +139,7 @@ statement ok
 DELETE FROM staff WHERE id = 3;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -159,7 +159,7 @@ statement ok
 DELETE FROM staff WHERE dept = 'sales' AND salary >= 200;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -179,7 +179,7 @@ statement ok
 DELETE FROM staff;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM mv_staff;
@@ -199,7 +199,7 @@ statement ok
 INSERT INTO staff VALUES (1, 'Alice', 'eng', 100), (2, 'Bob', 'sales', 200);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -210,7 +210,7 @@ statement ok
 UPDATE staff SET name = 'Alice2' WHERE id = 1;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -230,7 +230,7 @@ statement ok
 INSERT INTO staff VALUES (10, 'Zara', 'eng', 500);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -250,7 +250,7 @@ statement ok
 DELETE FROM staff WHERE id = 10;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -270,7 +270,7 @@ statement ok
 UPDATE staff SET name = 'Alice3' WHERE id = 1;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -314,7 +314,7 @@ statement ok
 UPDATE staff SET salary = 111 WHERE id = 1;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -334,7 +334,7 @@ statement ok
 INSERT INTO staff VALUES (30, NULL, NULL, NULL);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -354,7 +354,7 @@ statement ok
 INSERT INTO staff VALUES (31, 'O''Brien', 'eng', 100);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -378,7 +378,7 @@ statement ok
 INSERT INTO staff VALUES (40, '', '', 0);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -398,7 +398,7 @@ statement ok
 INSERT INTO staff VALUES (41, 'Negative', 'eng', -999);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -421,7 +421,7 @@ statement ok
 DELETE FROM staff WHERE id = 50;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -444,7 +444,7 @@ statement ok
 UPDATE staff SET name = 'SecondUpdate' WHERE id = 1;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -464,7 +464,7 @@ statement ok
 DELETE FROM staff WHERE id = 99999;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -484,7 +484,7 @@ statement ok
 UPDATE staff SET name = 'nobody' WHERE id = 99999;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -504,7 +504,7 @@ statement ok
 INSERT INTO staff VALUES (60, 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'eng', 1);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -539,7 +539,7 @@ statement ok
 DELETE FROM staff WHERE id = 72;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -565,7 +565,7 @@ statement ok
 INSERT INTO staff SELECT * FROM candidates WHERE dept = 'eng';
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -585,7 +585,7 @@ statement ok
 UPDATE staff SET salary = 0 WHERE dept = 'eng';
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -615,7 +615,7 @@ statement ok
 INSERT INTO staff SELECT * FROM candidates WHERE dept = 'nonexistent';
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -640,7 +640,7 @@ statement ok
 DELETE FROM staff WHERE id = -1;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -660,7 +660,7 @@ statement ok
 DELETE FROM staff WHERE dept = 'eng' AND salary > 999999;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -680,7 +680,7 @@ statement ok
 UPDATE staff SET name = 'ghost' WHERE id = -1;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -703,7 +703,7 @@ statement ok
 INSERT INTO staff SELECT * FROM empty_source;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -720,7 +720,7 @@ SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT
 # ==========================================
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -737,13 +737,13 @@ SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT
 # ==========================================
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -773,13 +773,13 @@ statement ok
 INSERT INTO staff VALUES (90, 'OrTest1', 'eng', 10), (91, 'OrTest2', 'sales', 20), (92, 'OrTest3', 'hr', 30);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 statement ok
 DELETE FROM staff WHERE id = 90 OR id = 92;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -805,13 +805,13 @@ statement ok
 INSERT INTO staff VALUES (93, 'InTest1', 'eng', 10), (94, 'InTest2', 'eng', 20), (95, 'InTest3', 'eng', 30);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 statement ok
 DELETE FROM staff WHERE id IN (93, 95);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -831,13 +831,13 @@ statement ok
 INSERT INTO staff VALUES (100, 'Bet1', 'eng', 10), (101, 'Bet2', 'eng', 20), (102, 'Bet3', 'eng', 30), (103, 'Bet4', 'eng', 40);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 statement ok
 DELETE FROM staff WHERE id BETWEEN 101 AND 102;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -857,13 +857,13 @@ statement ok
 INSERT INTO staff VALUES (110, 'LikeAlpha', 'eng', 1), (111, 'LikeBeta', 'eng', 2), (112, 'NoMatch', 'eng', 3);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 statement ok
 DELETE FROM staff WHERE name LIKE 'Like%';
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -883,13 +883,13 @@ statement ok
 INSERT INTO staff VALUES (120, NULL, 'eng', 1), (121, 'NotNull', 'eng', 2);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 statement ok
 DELETE FROM staff WHERE name IS NULL;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -909,13 +909,13 @@ statement ok
 INSERT INTO staff VALUES (130, 'Multi', 'eng', 500);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 statement ok
 UPDATE staff SET name = 'Updated', dept = 'sales', salary = 999 WHERE id = 130;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -946,7 +946,7 @@ statement ok
 INSERT INTO staff SELECT s.id + 1000, s.name, s.dept, s.salary + d.bonus FROM staff s JOIN dept_bonus d ON s.dept = d.dept WHERE s.id = 130;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -984,7 +984,7 @@ statement ok
 INSERT INTO staff VALUES (140, 'Sub1', 'temp', 1), (141, 'Sub2', 'temp', 2), (142, 'Sub3', 'keep', 3);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 # DELETE with subquery should track deleted base rows in the delta table.
 statement ok
@@ -996,7 +996,7 @@ SELECT count(*) FROM delta_staff WHERE dept = 'temp' AND _duckdb_ivm_multiplicit
 2
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -1016,13 +1016,13 @@ statement ok
 INSERT INTO staff VALUES (150, 'Range1', 'eng', 10), (151, 'Range2', 'eng', 20), (152, 'Range3', 'eng', 30);
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 statement ok
 DELETE FROM staff WHERE salary >= 10 AND salary <= 20 AND id >= 150;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -1053,7 +1053,7 @@ statement ok
 UPDATE staff SET salary = 999 WHERE id = 201;
 
 statement ok
-PRAGMA ivm_options('memory', 'main', 'mv_staff');
+PRAGMA refresh_options('memory', 'main', 'mv_staff');
 
 query I
 SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
@@ -1087,7 +1087,7 @@ statement ok
 INSERT INTO "hyphen-cat".main.hy_staff VALUES (1, 'eng');
 
 statement ok
-PRAGMA ivm('mv_hy_staff');
+PRAGMA refresh('mv_hy_staff');
 
 query I
 SELECT count(*) FROM (

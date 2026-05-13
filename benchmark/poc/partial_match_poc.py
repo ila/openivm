@@ -195,7 +195,7 @@ def correctness_check(scenario: str, n_orders: int, avg_li: int) -> dict:
 	cfg = SCENARIOS[scenario]
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "c.db")
-		setup = base_setup(n_orders, avg_li) + cfg["mv"] + f"PRAGMA ivm('{cfg['mv_name']}');\n"
+		setup = base_setup(n_orders, avg_li) + cfg["mv"] + f"PRAGMA refresh('{cfg['mv_name']}');\n"
 		run_sql(db, setup)
 		# Round floating-point aggregates before comparing to tolerate IEEE 754 drift
 		# (SUM-of-SUM composition drifts by ~1e-9 vs native SUM — known OpenIVM
@@ -229,7 +229,7 @@ def one_run(scenario: str, n_orders: int, avg_li: int, strategy: str) -> float:
 	cfg = SCENARIOS[scenario]
 	with tempfile.TemporaryDirectory() as tmp:
 		db = os.path.join(tmp, "bench.db")
-		setup = base_setup(n_orders, avg_li) + cfg["mv"] + f"PRAGMA ivm('{cfg['mv_name']}');\n"
+		setup = base_setup(n_orders, avg_li) + cfg["mv"] + f"PRAGMA refresh('{cfg['mv_name']}');\n"
 		out, err, rc = run_sql(db, setup)
 		if rc != 0:
 			raise RuntimeError(f"setup failed: {err}")

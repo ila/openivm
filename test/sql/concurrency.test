@@ -39,7 +39,7 @@ INSERT INTO sales SELECT 'region_' || (i % 10)::VARCHAR, i FROM range(1001 + ${k
 
 onlyif threadid=0
 statement ok
-PRAGMA ivm('mv_sales');
+PRAGMA refresh('mv_sales');
 
 endloop
 
@@ -104,7 +104,7 @@ INSERT INTO items SELECT i, i * 10 FROM range(101, 201) t(i);
 concurrentloop threadid 0 2
 
 statement ok
-PRAGMA ivm('mv_items');
+PRAGMA refresh('mv_items');
 
 endloop
 
@@ -149,7 +149,7 @@ INSERT INTO employees SELECT i, 'new_' || i::VARCHAR, 'dept_0' FROM range(1000 +
 
 onlyif threadid=0
 statement ok
-PRAGMA ivm('mv_emp');
+PRAGMA refresh('mv_emp');
 
 onlyif threadid>=1
 statement ok
@@ -160,7 +160,7 @@ endloop
 endloop
 
 statement ok
-PRAGMA ivm('mv_emp');
+PRAGMA refresh('mv_emp');
 
 query I
 SELECT count(*) FROM (
@@ -216,7 +216,7 @@ loop k 0 3
 
 onlyif threadid=0
 statement ok
-PRAGMA ivm('mv_keep');
+PRAGMA refresh('mv_keep');
 
 endloop
 
@@ -282,7 +282,7 @@ endloop
 
 # Single refresh after all DML
 statement ok
-PRAGMA ivm('mv_stress');
+PRAGMA refresh('mv_stress');
 
 # Cross-check
 query I

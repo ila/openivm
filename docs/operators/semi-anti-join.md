@@ -19,7 +19,7 @@ CREATE MATERIALIZED VIEW customers_with_orders AS
     );
 
 INSERT INTO orders VALUES (3, 75);
-PRAGMA ivm('customers_with_orders');
+PRAGMA refresh('customers_with_orders');
 ```
 
 `NOT EXISTS` and explicit `SEMI JOIN` / `ANTI JOIN` use the same maintenance path.

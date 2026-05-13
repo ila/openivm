@@ -156,7 +156,7 @@ CREATE MATERIALIZED VIEW sales_by_product AS
 INSERT INTO dim_product VALUES (99, 'NewProduct');
 INSERT INTO fact_sales VALUES (100, 99, 500.0);
 DELETE FROM fact_sales WHERE sale_id = 1;
-PRAGMA ivm('sales_by_product');  -- 2 terms pruned, 1 remaining
+PRAGMA refresh('sales_by_product');  -- 2 terms pruned, 1 remaining
 ```
 
 ## References

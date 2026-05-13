@@ -1,6 +1,6 @@
 # Automatic Refresh
 
-OpenIVM can automatically refresh materialized views on a schedule using `REFRESH EVERY`. A background daemon thread checks for due views every 30 seconds and refreshes them using the same `PRAGMA ivm()` pipeline.
+OpenIVM can automatically refresh materialized views on a schedule using `REFRESH EVERY`. A background daemon thread checks for due views every 30 seconds and refreshes them using the same `PRAGMA refresh()` pipeline.
 
 ## Syntax
 
@@ -10,7 +10,7 @@ CREATE MATERIALIZED VIEW mv REFRESH EVERY '5 minutes' AS
     SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
     FROM sales GROUP BY region;
 
--- No automatic refresh (default — manual PRAGMA ivm() only)
+-- No automatic refresh (default — manual PRAGMA refresh() only)
 CREATE MATERIALIZED VIEW mv AS
     SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
     FROM sales GROUP BY region;
@@ -18,7 +18,7 @@ CREATE MATERIALIZED VIEW mv AS
 
 Supported intervals: `N minutes`, `N hours`, `N days`. Minimum is 1 minute.
 
-Manual `PRAGMA ivm()` still works on views with `REFRESH EVERY` — the two mechanisms coexist.
+Manual `PRAGMA refresh()` still works on views with `REFRESH EVERY` — the two mechanisms coexist.
 
 ## How it works
 
@@ -26,7 +26,7 @@ The refresh daemon is a background `std::thread` started at extension load. It:
 
 1. Wakes every 30 seconds
 2. Queries `_duckdb_ivm_views` for views with `refresh_interval IS NOT NULL`
-3. For each view where `now() - last_update >= interval`: calls `PRAGMA ivm('view_name')`
+3. For each view where `now() - last_update >= interval`: calls `PRAGMA refresh('view_name')`
 4. Skips views that are already being refreshed (via `TryLockView`)
 
 The daemon holds a non-owning reference to the database and exits cleanly when the database is destroyed.
@@ -34,7 +34,7 @@ The daemon holds a non-owning reference to the database and exits cleanly when t
 ## Checking refresh status
 
 ```sql
-PRAGMA ivm_status('mv');
+PRAGMA refresh_status('mv');
 ```
 
 Returns a single row:
@@ -79,7 +79,7 @@ This adds two small UPDATE statements per refresh cycle (one before, one after t
 
 ## Concurrency
 
-Automatic refresh uses the same per-view locking as manual `PRAGMA ivm()`:
+Automatic refresh uses the same per-view locking as manual `PRAGMA refresh()`:
 
 - **Reads during refresh**: always safe (DuckDB MVCC — readers see a consistent snapshot)
 - **Two concurrent refreshes of the same view**: serialized by a per-view mutex. The daemon skips views that are locked (e.g., by a manual PRAGMA), and manual PRAGMAs wait for the daemon to finish.

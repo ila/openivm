@@ -1,6 +1,6 @@
 # Refresh Strategies
 
-OpenIVM supports three refresh strategies for materialized views: **auto**, **incremental**, and **full**. The strategy determines how `PRAGMA ivm('view_name')` applies pending changes.
+OpenIVM supports three refresh strategies for materialized views: **auto**, **incremental**, and **full**. The strategy determines how `PRAGMA refresh('view_name')` applies pending changes.
 
 ## Refresh modes
 
@@ -15,15 +15,15 @@ The `ivm_refresh_mode` setting controls which strategy is used at refresh time.
 ```sql
 -- Use incremental refresh (default)
 SET ivm_refresh_mode = 'incremental';
-PRAGMA ivm('monthly_totals');
+PRAGMA refresh('monthly_totals');
 
 -- Let the system decide (incremental when supported, full otherwise)
 SET ivm_refresh_mode = 'auto';
-PRAGMA ivm('monthly_totals');
+PRAGMA refresh('monthly_totals');
 
 -- Force full recomputation
 SET ivm_refresh_mode = 'full';
-PRAGMA ivm('monthly_totals');
+PRAGMA refresh('monthly_totals');
 ```
 
 ## Upsert compilation by view type
@@ -51,7 +51,7 @@ When `ivm_adaptive_refresh` is enabled, OpenIVM estimates the cost of incrementa
 
 ```sql
 SET ivm_adaptive_refresh = true;
-PRAGMA ivm('monthly_totals');
+PRAGMA refresh('monthly_totals');
 ```
 
 The cost model compares estimated cardinalities of the delta tables against the base tables. When `ivm_adaptive_refresh` is `false` (the default), the system always uses IVM for views that support it.
@@ -60,10 +60,10 @@ For FULL OUTER JOIN views, the static model applies higher upsert cost multiplie
 
 ### Inspecting the cost estimate
 
-`PRAGMA ivm_cost('view_name')` returns the cost model's recommendation without performing a refresh.
+`PRAGMA refresh_cost('view_name')` returns the cost model's recommendation without performing a refresh.
 
 ```sql
-PRAGMA ivm_cost('monthly_totals');
+PRAGMA refresh_cost('monthly_totals');
 ```
 
 Returns a single row:
@@ -97,7 +97,7 @@ Views that use operators not yet supported for IVM are classified as `FULL_REFRE
 `INNER JOIN`, `CROSS JOIN`, arbitrary-predicate joins, `LEFT JOIN`, `RIGHT JOIN`, and `FULL OUTER JOIN` are supported for incremental maintenance. Supported `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, and `NOT EXISTS` projection shapes use an aux-state path.
 
 ```sql
--- Prints a warning; subsequent PRAGMA ivm() uses full refresh
+-- Prints a warning; subsequent PRAGMA refresh() uses full refresh
 CREATE MATERIALIZED VIEW with_unsupported AS
   SELECT MEDIAN(amount) FROM orders;
 ```

@@ -59,10 +59,10 @@ statement ok
 INSERT INTO dl.sales VALUES (5, 'south', 200);
 
 statement ok
-PRAGMA ivm('mv_region');
+PRAGMA refresh('mv_region');
 
 statement ok
-PRAGMA ivm('mv_top');
+PRAGMA refresh('mv_top');
 
 # EXCEPT ALL for level 1
 query I
@@ -145,10 +145,10 @@ statement ok
 INSERT INTO chain_a.pipeline_src VALUES (3, 30);
 
 statement ok
-PRAGMA ivm_options('chain_b', 'main', 'pipeline_l1');
+PRAGMA refresh_options('chain_b', 'main', 'pipeline_l1');
 
 statement ok
-PRAGMA ivm_options('chain_a', 'main', 'pipeline_l2');
+PRAGMA refresh_options('chain_a', 'main', 'pipeline_l2');
 
 query I
 SELECT count(*) FROM (
@@ -191,10 +191,10 @@ statement ok
 DELETE FROM dl.sales WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_region');
+PRAGMA refresh('mv_region');
 
 statement ok
-PRAGMA ivm('mv_top');
+PRAGMA refresh('mv_top');
 
 # EXCEPT ALL for level 1
 query I
@@ -248,10 +248,10 @@ statement ok
 INSERT INTO dl.sales VALUES (7, 'west', 100);
 
 statement ok
-PRAGMA ivm('mv_region');
+PRAGMA refresh('mv_region');
 
 statement ok
-PRAGMA ivm('mv_top');
+PRAGMA refresh('mv_top');
 
 # EXCEPT ALL for both levels
 query I
@@ -325,7 +325,7 @@ INSERT INTO dl.bronze.cross_schema_base VALUES (2, 20);
 
 # Only refresh level 1 — level 2 should cascade in its own gold schema
 statement ok
-PRAGMA ivm_options('dl', 'silver', 'cross_schema_l1');
+PRAGMA refresh_options('dl', 'silver', 'cross_schema_l1');
 
 query II rowsort
 SELECT id, amount FROM dl.silver.cross_schema_l1 ORDER BY id;
@@ -347,7 +347,7 @@ INSERT INTO dl.bronze.cross_schema_base VALUES (3, 30);
 
 # Only refresh level 2 — level 1 should cascade in its own silver schema first
 statement ok
-PRAGMA ivm_options('dl', 'gold', 'cross_schema_l2');
+PRAGMA refresh_options('dl', 'gold', 'cross_schema_l2');
 
 query II rowsort
 SELECT id, amount FROM dl.silver.cross_schema_l1 ORDER BY id;
@@ -372,10 +372,10 @@ statement ok
 DELETE FROM dl.bronze.cross_schema_base WHERE id = 2;
 
 statement ok
-PRAGMA ivm_options('dl', 'silver', 'cross_schema_l1');
+PRAGMA refresh_options('dl', 'silver', 'cross_schema_l1');
 
 statement ok
-PRAGMA ivm_options('dl', 'gold', 'cross_schema_l2');
+PRAGMA refresh_options('dl', 'gold', 'cross_schema_l2');
 
 query I
 SELECT count(*) FROM dl.gold.cross_schema_l2;
@@ -413,10 +413,10 @@ statement ok
 INSERT INTO dl.bronze.cross_schema_base VALUES (4, 40);
 
 statement ok
-PRAGMA ivm_options('dl', 'silver', 'cross_schema_l1');
+PRAGMA refresh_options('dl', 'silver', 'cross_schema_l1');
 
 statement ok
-PRAGMA ivm_options('dl', 'gold', 'cross_schema_join_l2');
+PRAGMA refresh_options('dl', 'gold', 'cross_schema_join_l2');
 
 query I
 SELECT count(*) FROM (
@@ -463,10 +463,10 @@ statement ok
 INSERT INTO dl.bronze.catalog_chain_base VALUES (3, 30);
 
 statement ok
-PRAGMA ivm_options('dl', 'bronze', 'catalog_chain_l1');
+PRAGMA refresh_options('dl', 'bronze', 'catalog_chain_l1');
 
 statement ok
-PRAGMA ivm_options('dl', 'silver', 'catalog_chain_l2');
+PRAGMA refresh_options('dl', 'silver', 'catalog_chain_l2');
 
 query I
 SELECT count(*) FROM (
@@ -543,7 +543,7 @@ INSERT INTO dl.bronze.catalog_window_base VALUES
   ('B', DATE '2026-01-02', 28, 41);
 
 statement ok
-PRAGMA ivm_options('dl', 'bronze', 'catalog_window_l1');
+PRAGMA refresh_options('dl', 'bronze', 'catalog_window_l1');
 
 # The in-memory DuckLake test normally tracks the upstream MV through DuckLake
 # snapshots. Seed the companion delta table to emulate the benchmark's persisted
@@ -555,7 +555,7 @@ FROM dl.bronze.catalog_window_l1
 WHERE trade_date IN (DATE '2026-01-02', DATE '2026-01-03');
 
 statement ok
-PRAGMA ivm_options('dl', 'silver', 'catalog_window_l2');
+PRAGMA refresh_options('dl', 'silver', 'catalog_window_l2');
 
 query I
 SELECT count(*) FROM (
@@ -592,7 +592,7 @@ SELECT count(*) FROM (
 # A second downstream refresh with no upstream changes must probe the same
 # physical companion delta table and then skip cleanly.
 statement ok
-PRAGMA ivm_options('dl', 'silver', 'catalog_window_l2');
+PRAGMA refresh_options('dl', 'silver', 'catalog_window_l2');
 
 query I
 SELECT count(*) FROM (
@@ -623,7 +623,7 @@ INSERT INTO dl.sales VALUES (8, 'east', 1000);
 
 # Only refresh level 1 — level 2 should cascade automatically
 statement ok
-PRAGMA ivm('mv_region');
+PRAGMA refresh('mv_region');
 
 # Both levels should be correct
 query I
@@ -666,7 +666,7 @@ INSERT INTO dl.sales VALUES (9, 'west', 300);
 
 # Only refresh level 2 — level 1 should be refreshed first
 statement ok
-PRAGMA ivm('mv_top');
+PRAGMA refresh('mv_top');
 
 query I
 SELECT count(*) FROM (

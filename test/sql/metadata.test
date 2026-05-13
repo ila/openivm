@@ -119,7 +119,7 @@ statement ok
 INSERT INTO t1 VALUES (3, 'a', 5);
 
 statement ok
-PRAGMA ivm('mv1');
+PRAGMA refresh('mv1');
 
 query II
 SELECT grp, total FROM mv1 ORDER BY grp;
@@ -265,7 +265,7 @@ statement ok
 INSERT INTO t1 VALUES (5, 'a', 7);
 
 statement ok
-PRAGMA ivm('mv_shared2');
+PRAGMA refresh('mv_shared2');
 
 query II
 SELECT grp, c FROM mv_shared2 ORDER BY grp;
@@ -326,11 +326,11 @@ SELECT count(*) FROM delta_mv_t3;
 does not exist
 
 # ==========================================
-# Test 13: PRAGMA ivm on dropped MV gives clear error
+# Test 13: PRAGMA refresh on dropped MV gives clear error
 # ==========================================
 
 statement error
-PRAGMA ivm('mv_t3');
+PRAGMA refresh('mv_t3');
 ----
 does not exist
 
@@ -382,7 +382,7 @@ statement ok
 INSERT INTO fresh VALUES (2, 8);
 
 statement ok
-PRAGMA ivm('mv_fresh');
+PRAGMA refresh('mv_fresh');
 
 query I
 SELECT total FROM mv_fresh;
@@ -429,7 +429,7 @@ statement ok
 INSERT INTO recreate_base VALUES (3, 30, 'a');
 
 statement ok
-pragma ivm('mv_recreate');
+pragma refresh('mv_recreate');
 
 query II
 SELECT category, total FROM mv_recreate ORDER BY category;

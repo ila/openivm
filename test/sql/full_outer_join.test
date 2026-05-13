@@ -69,7 +69,7 @@ statement ok
 INSERT INTO projects VALUES (40, 2, 'Delta');
 
 statement ok
-PRAGMA ivm('emp_projects');
+PRAGMA refresh('emp_projects');
 
 query I
 SELECT COUNT(*) FROM (
@@ -97,7 +97,7 @@ statement ok
 INSERT INTO projects VALUES (50, 99, 'Epsilon');
 
 statement ok
-PRAGMA ivm('emp_projects');
+PRAGMA refresh('emp_projects');
 
 query I
 SELECT COUNT(*) FROM (
@@ -126,7 +126,7 @@ statement ok
 DELETE FROM projects WHERE id = 10;
 
 statement ok
-PRAGMA ivm('emp_projects');
+PRAGMA refresh('emp_projects');
 
 query I
 SELECT COUNT(*) FROM (
@@ -155,7 +155,7 @@ statement ok
 DELETE FROM projects WHERE id = 20;
 
 statement ok
-PRAGMA ivm('emp_projects');
+PRAGMA refresh('emp_projects');
 
 query I
 SELECT COUNT(*) FROM (
@@ -183,7 +183,7 @@ statement ok
 INSERT INTO employees VALUES (5, 'Eve');
 
 statement ok
-PRAGMA ivm('emp_projects');
+PRAGMA refresh('emp_projects');
 
 query I
 SELECT COUNT(*) FROM (
@@ -211,7 +211,7 @@ statement ok
 DELETE FROM projects WHERE id = 30;
 
 statement ok
-PRAGMA ivm('emp_projects');
+PRAGMA refresh('emp_projects');
 
 query I
 SELECT COUNT(*) FROM (
@@ -248,7 +248,7 @@ statement ok
 DELETE FROM projects WHERE id = 50;
 
 statement ok
-PRAGMA ivm('emp_projects');
+PRAGMA refresh('emp_projects');
 
 query I
 SELECT COUNT(*) FROM (
@@ -314,7 +314,7 @@ statement ok
 INSERT INTO staff VALUES (4, 2, 150);
 
 statement ok
-PRAGMA ivm('dept_stats');
+PRAGMA refresh('dept_stats');
 
 query I
 SELECT COUNT(*) FROM (
@@ -339,7 +339,7 @@ statement ok
 DELETE FROM staff WHERE dept_id = 1;
 
 statement ok
-PRAGMA ivm('dept_stats');
+PRAGMA refresh('dept_stats');
 
 query I
 SELECT COUNT(*) FROM (
@@ -370,7 +370,7 @@ statement ok
 DELETE FROM staff WHERE id = 3;
 
 statement ok
-PRAGMA ivm('dept_stats');
+PRAGMA refresh('dept_stats');
 
 query I
 SELECT COUNT(*) FROM (
@@ -430,7 +430,7 @@ statement ok
 INSERT INTO sales VALUES (4, 2, 150);
 
 statement ok
-PRAGMA ivm('cat_sales');
+PRAGMA refresh('cat_sales');
 
 query I
 SELECT COUNT(*) FROM (
@@ -455,7 +455,7 @@ statement ok
 INSERT INTO sales VALUES (5, 99, 400);
 
 statement ok
-PRAGMA ivm('cat_sales');
+PRAGMA refresh('cat_sales');
 
 query I
 SELECT COUNT(*) FROM (
@@ -480,7 +480,7 @@ statement ok
 DELETE FROM sales WHERE item_id = 1;
 
 statement ok
-PRAGMA ivm('cat_sales');
+PRAGMA refresh('cat_sales');
 
 query I
 SELECT COUNT(*) FROM (
@@ -505,7 +505,7 @@ statement ok
 DELETE FROM sales WHERE id = 3;
 
 statement ok
-PRAGMA ivm('cat_sales');
+PRAGMA refresh('cat_sales');
 
 query I
 SELECT COUNT(*) FROM (
@@ -530,7 +530,7 @@ statement ok
 INSERT INTO items VALUES (99, 'X');
 
 statement ok
-PRAGMA ivm('cat_sales');
+PRAGMA refresh('cat_sales');
 
 query I
 SELECT COUNT(*) FROM (
@@ -564,7 +564,7 @@ statement ok
 DELETE FROM items WHERE id = 2;
 
 statement ok
-PRAGMA ivm('cat_sales');
+PRAGMA refresh('cat_sales');
 
 query I
 SELECT COUNT(*) FROM (
@@ -610,7 +610,7 @@ statement ok
 INSERT INTO foj_attr_r VALUES (3, 2, 200);
 
 statement ok
-PRAGMA ivm('foj_attr_mv');
+PRAGMA refresh('foj_attr_mv');
 
 query I
 SELECT COUNT(*) FROM (
@@ -667,7 +667,7 @@ statement ok
 INSERT INTO empty_r VALUES (1, 10, 100), (2, 20, 200);
 
 statement ok
-PRAGMA ivm('mv_empty');
+PRAGMA refresh('mv_empty');
 
 query I
 SELECT COUNT(*) FROM (
@@ -690,7 +690,7 @@ statement ok
 INSERT INTO empty_l VALUES (10, 'X'), (30, 'Y');
 
 statement ok
-PRAGMA ivm('mv_empty');
+PRAGMA refresh('mv_empty');
 
 query I
 SELECT COUNT(*) FROM (
@@ -746,7 +746,7 @@ statement ok
 INSERT INTO nullk_r VALUES (3, NULL, 125);
 
 statement ok
-PRAGMA ivm('mv_nullkeys');
+PRAGMA refresh('mv_nullkeys');
 
 query I
 SELECT COUNT(*) FROM (
@@ -794,7 +794,7 @@ statement ok
 DELETE FROM cancel_r WHERE id = 2;
 
 statement ok
-PRAGMA ivm('mv_cancel');
+PRAGMA refresh('mv_cancel');
 
 query I
 SELECT COUNT(*) FROM (
@@ -820,7 +820,7 @@ statement ok
 DELETE FROM cancel_l WHERE id = 5;
 
 statement ok
-PRAGMA ivm('mv_cancel');
+PRAGMA refresh('mv_cancel');
 
 query I
 SELECT COUNT(*) FROM (
@@ -894,7 +894,7 @@ statement ok
 DELETE FROM trans_r WHERE id = 4;
 
 statement ok
-PRAGMA ivm('mv_trans');
+PRAGMA refresh('mv_trans');
 
 query I
 SELECT COUNT(*) FROM (
@@ -963,7 +963,7 @@ statement ok
 INSERT INTO batch_r VALUES (11, 7, 500);
 
 statement ok
-PRAGMA ivm('mv_batch');
+PRAGMA refresh('mv_batch');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1001,7 +1001,7 @@ statement ok
 INSERT INTO batch_r VALUES (14, 5, 55);
 
 statement ok
-PRAGMA ivm('mv_batch');
+PRAGMA refresh('mv_batch');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1049,7 +1049,7 @@ statement ok
 INSERT INTO simul_r VALUES (2, 10, 200), (3, 10, 300);
 
 statement ok
-PRAGMA ivm('mv_simul');
+PRAGMA refresh('mv_simul');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1075,7 +1075,7 @@ statement ok
 DELETE FROM simul_r WHERE lid = 10;
 
 statement ok
-PRAGMA ivm('mv_simul');
+PRAGMA refresh('mv_simul');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1136,7 +1136,7 @@ statement ok
 INSERT INTO multi_l VALUES (5, 'D');
 
 statement ok
-PRAGMA ivm('mv_multi_agg');
+PRAGMA refresh('mv_multi_agg');
 
 query I
 SELECT COUNT(*) FROM (
@@ -1258,13 +1258,13 @@ statement ok
 INSERT INTO chain_foj_left_src VALUES (3, 9, 2);
 
 statement ok
-PRAGMA ivm('mv_chain_foj_left');
+PRAGMA refresh('mv_chain_foj_left');
 
 statement ok
-PRAGMA ivm('mv_chain_foj_right');
+PRAGMA refresh('mv_chain_foj_right');
 
 statement ok
-PRAGMA ivm('mv_chain_foj_cross');
+PRAGMA refresh('mv_chain_foj_cross');
 
 query I
 SELECT COUNT(*) FROM (

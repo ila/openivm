@@ -658,9 +658,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							delta_idx = 0;
 						phase_reached = 4;
 
-						// Phase 4: PRAGMA ivm()
+						// Phase 4: PRAGMA refresh()
 						start = std::chrono::steady_clock::now();
-						auto refresh_result = con.Query("PRAGMA ivm('" + mv_name + "')");
+						auto refresh_result = con.Query("PRAGMA refresh('" + mv_name + "')");
 						if (refresh_result && refresh_result->HasError()) {
 							error = refresh_result->GetError();
 							if (IsFatalError(error)) {

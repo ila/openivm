@@ -300,23 +300,24 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Use the locked pragma_function_t variant: generates SQL and executes it under a
 	// per-view mutex, preventing concurrent refresh from double-applying deltas.
-	auto ivm_options = PragmaFunction::PragmaCall("ivm_options", UpsertDeltaQueriesLocked,
-	                                              {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
-	loader.RegisterFunction(ivm_options);
-	auto ivm = PragmaFunction::PragmaCall("ivm", UpsertDeltaQueriesLocked, {LogicalType::VARCHAR});
-	loader.RegisterFunction(ivm);
-	auto ivm_cost = PragmaFunction::PragmaCall("ivm_cost", IVMCostQuery, {LogicalType::VARCHAR});
-	loader.RegisterFunction(ivm_cost);
-	auto ivm_history = PragmaFunction::PragmaCall("ivm_history", IVMCostHistoryQuery, {LogicalType::VARCHAR});
-	loader.RegisterFunction(ivm_history);
-	auto ivm_cross_system = PragmaFunction::PragmaCall(
-	    "ivm_cross_system", UpsertDeltaQueriesLocked,
+	auto refresh_options =
+	    PragmaFunction::PragmaCall("refresh_options", UpsertDeltaQueriesLocked,
+	                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
+	loader.RegisterFunction(refresh_options);
+	auto refresh = PragmaFunction::PragmaCall("refresh", UpsertDeltaQueriesLocked, {LogicalType::VARCHAR});
+	loader.RegisterFunction(refresh);
+	auto refresh_cost = PragmaFunction::PragmaCall("refresh_cost", IVMCostQuery, {LogicalType::VARCHAR});
+	loader.RegisterFunction(refresh_cost);
+	auto refresh_history = PragmaFunction::PragmaCall("refresh_history", IVMCostHistoryQuery, {LogicalType::VARCHAR});
+	loader.RegisterFunction(refresh_history);
+	auto refresh_cross_system = PragmaFunction::PragmaCall(
+	    "refresh_cross_system", UpsertDeltaQueriesLocked,
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
-	loader.RegisterFunction(ivm_cross_system);
+	loader.RegisterFunction(refresh_cross_system);
 
-	// PRAGMA ivm_status('view_name') — returns refresh status for a materialized view.
-	auto ivm_status = PragmaFunction::PragmaCall(
-	    "ivm_status",
+	// PRAGMA refresh_status('view_name') — returns refresh status for a materialized view.
+	auto refresh_status = PragmaFunction::PragmaCall(
+	    "refresh_status",
 	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
 		    string view_name = StringValue::Get(parameters.values[0]);
 		    Connection con(*context.db.get());
@@ -375,11 +376,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 		           strategy_str + " AS refresh_strategy;";
 	    },
 	    {LogicalType::VARCHAR});
-	loader.RegisterFunction(ivm_status);
+	loader.RegisterFunction(refresh_status);
 
-	// PRAGMA ivm_start_daemon — (re)start the daemon on the caller's DB instance.
-	auto ivm_start_daemon =
-	    PragmaFunction::PragmaCall("ivm_start_daemon",
+	// PRAGMA refresh_start_daemon — (re)start the daemon on the caller's DB instance.
+	auto refresh_start_daemon =
+	    PragmaFunction::PragmaCall("refresh_start_daemon",
 	                               [](ClientContext &context, const FunctionParameters &) -> string {
 		                               if (global_daemon) {
 			                               global_daemon->Stop();
@@ -389,7 +390,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		                               return "SELECT true AS started;";
 	                               },
 	                               {});
-	loader.RegisterFunction(ivm_start_daemon);
+	loader.RegisterFunction(refresh_start_daemon);
 
 	// Start the refresh daemon unless disabled (e.g. shadow/compile-only DBs).
 	bool daemon_disabled = false;

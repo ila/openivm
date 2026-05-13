@@ -14,7 +14,7 @@ CREATE MATERIALIZED VIEW dept_stats AS
     SELECT dept, total, total / cnt AS avg_sal FROM dept_agg;
 
 INSERT INTO employees VALUES (4, 'Eng', 300);
-PRAGMA ivm('dept_stats');
+PRAGMA refresh('dept_stats');
 ```
 
 ## How IVM handles it

@@ -69,7 +69,7 @@ statement ok
 INSERT INTO list_filter_items VALUES (1, 60, 95), (2, 70, 30);
 
 statement ok
-pragma ivm('mv_list_filter');
+pragma refresh('mv_list_filter');
 
 query I
 SELECT COUNT(*) FROM (
@@ -99,7 +99,7 @@ statement ok
 INSERT INTO items VALUES (4, 2, list_transform(generate_series(1, 64), lambda x: 40.0::FLOAT));
 
 statement ok
-pragma ivm('mv_list');
+pragma refresh('mv_list');
 
 query I
 SELECT COUNT(*) FROM (
@@ -129,7 +129,7 @@ statement ok
 INSERT INTO items VALUES (5, 3, list_transform(generate_series(1, 64), lambda x: 50.0::FLOAT));
 
 statement ok
-pragma ivm('mv_list');
+pragma refresh('mv_list');
 
 query I
 SELECT COUNT(*) FROM (
@@ -159,7 +159,7 @@ statement ok
 DELETE FROM items WHERE id = 1;
 
 statement ok
-pragma ivm('mv_list');
+pragma refresh('mv_list');
 
 query I
 SELECT COUNT(*) FROM (
@@ -192,7 +192,7 @@ statement ok
 DELETE FROM items WHERE id = 2;
 
 statement ok
-pragma ivm('mv_list');
+pragma refresh('mv_list');
 
 query I
 SELECT COUNT(*) FROM (
@@ -219,7 +219,7 @@ SELECT COUNT(*) FROM (
 # ==========================================
 
 statement ok
-pragma ivm('mv_list');
+pragma refresh('mv_list');
 
 query I
 SELECT COUNT(*) FROM (

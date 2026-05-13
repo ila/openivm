@@ -569,8 +569,8 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
 		constexpr double RIDGE_LAMBDA = 1e-4;
 		constexpr idx_t MIN_SAMPLES = 3;
 
-		auto ivm_history = metadata.GetRefreshHistory(view_name, "incremental");
-		auto ivm_reg = FitRegression(ivm_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
+		auto incremental_history = metadata.GetRefreshHistory(view_name, "incremental");
+		auto ivm_reg = FitRegression(incremental_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
 		if (ivm_reg.calibrated) {
 			ivm_predicted_ms =
 			    std::max(0.0, ivm_reg.w_compute * ivm_compute + ivm_reg.w_upsert * ivm_upsert + ivm_reg.w_intercept);

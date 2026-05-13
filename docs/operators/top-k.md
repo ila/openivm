@@ -15,7 +15,7 @@ CREATE MATERIALIZED VIEW top_sales AS
 
 **Strategy**: fully incremental — classified as `AGGREGATE_GROUP`.
 
-The data table `_ivm_data_top_sales` stores **all groups**, not just the top-5. On every `PRAGMA ivm()`, the normal delta-MERGE path updates exactly the groups that changed. The VIEW definition wraps the data table with `ORDER BY total DESC LIMIT 5`, applying the top-k filter at read time.
+The data table `_ivm_data_top_sales` stores **all groups**, not just the top-5. On every `PRAGMA refresh()`, the normal delta-MERGE path updates exactly the groups that changed. The VIEW definition wraps the data table with `ORDER BY total DESC LIMIT 5`, applying the top-k filter at read time.
 
 **Why this is correct (DBSP decomposition)**: `GROUP BY + aggregation` is a Z-set-linear operator — each delta row updates exactly one group, independently. `ORDER BY LIMIT k` is a monotone selection over the aggregate output. Separating them lets the linear part (group maintenance) run incrementally while the monotone selection is applied at read time without any re-evaluation cost.
 

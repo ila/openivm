@@ -49,7 +49,7 @@ statement ok
 CREATE TEMP TABLE snap_before AS SELECT last_snapshot_id AS snap FROM _duckdb_ivm_delta_tables WHERE view_name = 'mv_snap';
 
 statement ok
-PRAGMA ivm('mv_snap');
+PRAGMA refresh('mv_snap');
 
 # Snapshot should have advanced after refresh
 query I
@@ -121,7 +121,7 @@ INSERT INTO dl.multi VALUES (4, 'A', 25);
 
 # Single refresh picks up all 3 batches
 statement ok
-PRAGMA ivm('mv_multi');
+PRAGMA refresh('mv_multi');
 
 query III rowsort
 SELECT name, total, cnt FROM dl.mv_multi ORDER BY name;
@@ -165,7 +165,7 @@ statement ok
 DELETE FROM dl.del_test WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_del');
+PRAGMA refresh('mv_del');
 
 query III rowsort
 SELECT * FROM dl.mv_del ORDER BY category;
@@ -206,7 +206,7 @@ statement ok
 INSERT INTO dl.replay_sales VALUES (4, 'east', 50), (5, 'north', 300);
 
 statement ok
-PRAGMA ivm('mv_replay_sales');
+PRAGMA refresh('mv_replay_sales');
 
 query III rowsort
 SELECT region, total, cnt FROM dl.mv_replay_sales ORDER BY region;
@@ -225,7 +225,7 @@ statement ok
 DELETE FROM dl.replay_sales WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_replay_sales');
+PRAGMA refresh('mv_replay_sales');
 
 query III rowsort
 SELECT region, total, cnt FROM dl.mv_replay_sales ORDER BY region;
@@ -248,7 +248,7 @@ FROM _duckdb_ivm_delta_tables
 WHERE view_name = 'mv_replay_sales';
 
 statement ok
-PRAGMA ivm('mv_replay_sales');
+PRAGMA refresh('mv_replay_sales');
 
 query I
 SELECT last_snapshot_id = (SELECT snap FROM replay_after_delete)
@@ -379,7 +379,7 @@ statement ok
 INSERT INTO dl.skip_unrelated VALUES (1);
 
 statement ok
-PRAGMA ivm('mv_skip_base');
+PRAGMA refresh('mv_skip_base');
 
 query I
 SELECT last_snapshot_id = (SELECT snap FROM skip_base_snapshot)
@@ -413,7 +413,7 @@ statement ok
 INSERT INTO dl.skip_left VALUES (3, 30);
 
 statement ok
-PRAGMA ivm('mv_skip_unchanged_join');
+PRAGMA refresh('mv_skip_unchanged_join');
 
 query I
 SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_unchanged_join.sql');
@@ -470,7 +470,7 @@ statement ok
 INSERT INTO dl.skip_key_left VALUES (999, 999);
 
 statement ok
-PRAGMA ivm('mv_skip_disjoint_key');
+PRAGMA refresh('mv_skip_disjoint_key');
 
 query I
 SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/ivm_upsert_queries_mv_skip_disjoint_key.sql');
@@ -505,7 +505,7 @@ statement ok
 DELETE FROM dl.del_test WHERE category = 'Y';
 
 statement ok
-PRAGMA ivm('mv_del');
+PRAGMA refresh('mv_del');
 
 # Y group should be gone
 query III

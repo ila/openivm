@@ -56,7 +56,7 @@ statement ok
 DELETE FROM saj_l WHERE rowid IN (SELECT rowid FROM saj_l WHERE id = 1 AND x = 10 LIMIT 1);
 
 statement ok
-PRAGMA ivm('mv_saj_semi');
+PRAGMA refresh('mv_saj_semi');
 
 query I
 SELECT COUNT(*) FROM (
@@ -81,7 +81,7 @@ statement ok
 DELETE FROM saj_r WHERE rid = 104;
 
 statement ok
-PRAGMA ivm('mv_saj_semi');
+PRAGMA refresh('mv_saj_semi');
 
 query I
 SELECT COUNT(*) FROM (
@@ -135,7 +135,7 @@ statement ok
 INSERT INTO ag_l VALUES (6, 3, 60), (7, 3, 20);
 
 statement ok
-PRAGMA ivm('mv_ag_anti');
+PRAGMA refresh('mv_ag_anti');
 
 query I
 SELECT COUNT(*) FROM (
@@ -201,7 +201,7 @@ statement ok
 INSERT INTO cj_orders VALUES (5, 30, 20);
 
 statement ok
-PRAGMA ivm('mv_chain_anti');
+PRAGMA refresh('mv_chain_anti');
 
 query I
 SELECT COUNT(*) FROM (
@@ -263,10 +263,10 @@ statement ok
 INSERT INTO sq_l VALUES (5, 50);
 
 statement ok
-PRAGMA ivm('mv_subq_semi');
+PRAGMA refresh('mv_subq_semi');
 
 statement ok
-PRAGMA ivm('mv_subq_anti');
+PRAGMA refresh('mv_subq_anti');
 
 query I
 SELECT COUNT(*) FROM (
@@ -329,7 +329,7 @@ statement ok
 INSERT INTO in_cast_r VALUES (3, 30), (4, 50);
 
 statement ok
-PRAGMA ivm('mv_not_in_cast');
+PRAGMA refresh('mv_not_in_cast');
 
 query I
 SELECT COUNT(*) FROM (
@@ -410,10 +410,10 @@ statement ok
 INSERT INTO exists_l VALUES (5, 50, true), (6, 40, true);
 
 statement ok
-PRAGMA ivm('mv_exists_semi');
+PRAGMA refresh('mv_exists_semi');
 
 statement ok
-PRAGMA ivm('mv_exists_anti');
+PRAGMA refresh('mv_exists_anti');
 
 query I
 SELECT COUNT(*) FROM (
@@ -535,10 +535,10 @@ statement ok
 INSERT INTO combo_l VALUES (6, 3, 60), (7, 1, 11);
 
 statement ok
-PRAGMA ivm('mv_exists_group');
+PRAGMA refresh('mv_exists_group');
 
 statement ok
-PRAGMA ivm('mv_exists_union');
+PRAGMA refresh('mv_exists_union');
 
 query I
 SELECT COUNT(*) FROM (
@@ -676,10 +676,10 @@ statement ok
 DELETE FROM dup_r WHERE rid = 10;
 
 statement ok
-PRAGMA ivm('mv_dup_semi');
+PRAGMA refresh('mv_dup_semi');
 
 statement ok
-PRAGMA ivm('mv_dup_anti');
+PRAGMA refresh('mv_dup_anti');
 
 query I
 SELECT COUNT(*) FROM (
@@ -717,10 +717,10 @@ statement ok
 DELETE FROM dup_r WHERE rid = 11;
 
 statement ok
-PRAGMA ivm('mv_dup_semi');
+PRAGMA refresh('mv_dup_semi');
 
 statement ok
-PRAGMA ivm('mv_dup_anti');
+PRAGMA refresh('mv_dup_anti');
 
 query I
 SELECT COUNT(*) FROM (
@@ -792,10 +792,10 @@ statement ok
 INSERT INTO upd_l VALUES (5, NULL), (5, NULL);
 
 statement ok
-PRAGMA ivm('mv_upd_semi');
+PRAGMA refresh('mv_upd_semi');
 
 statement ok
-PRAGMA ivm('mv_upd_anti');
+PRAGMA refresh('mv_upd_anti');
 
 query I
 SELECT COUNT(*) FROM (
@@ -867,10 +867,10 @@ statement ok
 INSERT INTO stack_l VALUES (7, 70);
 
 statement ok
-PRAGMA ivm('mv_stack_semi');
+PRAGMA refresh('mv_stack_semi');
 
 statement ok
-PRAGMA ivm('mv_stack_anti');
+PRAGMA refresh('mv_stack_anti');
 
 query I
 SELECT COUNT(*) FROM (
@@ -914,10 +914,10 @@ statement ok
 INSERT INTO upd_l VALUES (6, NULL);
 
 statement ok
-PRAGMA ivm('mv_upd_semi');
+PRAGMA refresh('mv_upd_semi');
 
 statement ok
-PRAGMA ivm('mv_upd_anti');
+PRAGMA refresh('mv_upd_anti');
 
 query I
 SELECT COUNT(*) FROM (
@@ -964,7 +964,7 @@ statement ok
 DELETE FROM aaj_l WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_saj_anti');
+PRAGMA refresh('mv_saj_anti');
 
 query I
 SELECT COUNT(*) FROM (

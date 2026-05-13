@@ -31,7 +31,7 @@ statement ok
 INSERT INTO wt VALUES (7,'a',25);
 
 statement ok
-PRAGMA ivm('mv_rn');
+PRAGMA refresh('mv_rn');
 
 query I
 SELECT count(*) FROM mv_rn;
@@ -63,7 +63,7 @@ statement ok
 DELETE FROM wt WHERE id = 2;
 
 statement ok
-PRAGMA ivm('mv_rn');
+PRAGMA refresh('mv_rn');
 
 query I
 SELECT count(*) FROM (
@@ -109,7 +109,7 @@ statement ok
 INSERT INTO wt2 VALUES (5,'eng',300);
 
 statement ok
-PRAGMA ivm('mv_wsum');
+PRAGMA refresh('mv_wsum');
 
 query I
 SELECT count(*) FROM (
@@ -141,7 +141,7 @@ statement ok
 UPDATE wt2 SET salary = 999 WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_wsum');
+PRAGMA refresh('mv_wsum');
 
 query I
 SELECT count(*) FROM (
@@ -177,7 +177,7 @@ statement ok
 INSERT INTO wt3 VALUES (4, 15);
 
 statement ok
-PRAGMA ivm('mv_nopart');
+PRAGMA refresh('mv_nopart');
 
 query I
 SELECT count(*) FROM (
@@ -200,7 +200,7 @@ SELECT count(*) FROM (
 # ==========================================
 
 statement ok
-PRAGMA ivm('mv_rn');
+PRAGMA refresh('mv_rn');
 
 # Should still be correct (no changes, no-op)
 query I
@@ -237,7 +237,7 @@ statement ok
 INSERT INTO w_orders VALUES (6,1,500), (7,3,10);
 
 statement ok
-PRAGMA ivm('mv_wjoin');
+PRAGMA refresh('mv_wjoin');
 
 query I
 SELECT count(*) FROM (
@@ -273,7 +273,7 @@ statement ok
 INSERT INTO w_comp VALUES (5,'eng','be',15);
 
 statement ok
-PRAGMA ivm('mv_comp');
+PRAGMA refresh('mv_comp');
 
 query I
 SELECT count(*) FROM (
@@ -322,10 +322,10 @@ statement ok
 INSERT INTO w_emp VALUES (6,'eng',300), (7,'hr',200);
 
 statement ok
-PRAGMA ivm('mv_ranked');
+PRAGMA refresh('mv_ranked');
 
 statement ok
-PRAGMA ivm('mv_top2');
+PRAGMA refresh('mv_top2');
 
 # Window MV correct
 query I
@@ -385,7 +385,7 @@ statement ok
 INSERT INTO w_multi_part VALUES (5,'eng','be',15);
 
 statement ok
-PRAGMA ivm('mv_multi_part');
+PRAGMA refresh('mv_multi_part');
 
 query I
 SELECT count(*) FROM (
@@ -443,7 +443,7 @@ statement ok
 INSERT INTO w_history_range VALUES (1, '2026-01-20 00:00:00', 50);
 
 statement ok
-PRAGMA ivm('mv_window_range');
+PRAGMA refresh('mv_window_range');
 
 query I
 SELECT COUNT(*) FROM (
@@ -515,10 +515,10 @@ statement ok
 INSERT INTO w_chain_src VALUES (DATE '2026-01-03', 'A', 7, 25);
 
 statement ok
-PRAGMA ivm('w_chain_l1');
+PRAGMA refresh('w_chain_l1');
 
 statement ok
-PRAGMA ivm('w_chain_l2');
+PRAGMA refresh('w_chain_l2');
 
 query I
 SELECT count(*) FROM delta_w_chain_l2;
@@ -526,7 +526,7 @@ SELECT count(*) FROM delta_w_chain_l2;
 1
 
 statement ok
-PRAGMA ivm('w_chain_l3');
+PRAGMA refresh('w_chain_l3');
 
 query I
 SELECT count(*) FROM (

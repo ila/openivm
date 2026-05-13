@@ -68,7 +68,7 @@ statement ok
 INSERT INTO dl.orders VALUES (4, 3, 200.00);
 
 statement ok
-PRAGMA ivm('mv_cust_orders');
+PRAGMA refresh('mv_cust_orders');
 
 query III rowsort
 SELECT * FROM dl.mv_cust_orders ORDER BY name;
@@ -114,7 +114,7 @@ statement ok
 INSERT INTO dl.orders VALUES (6, 1, 25.00);
 
 statement ok
-PRAGMA ivm('mv_cust_orders');
+PRAGMA refresh('mv_cust_orders');
 
 # EXCEPT ALL
 query I

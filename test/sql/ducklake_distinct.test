@@ -40,7 +40,7 @@ statement ok
 INSERT INTO dl.tags VALUES (5, 'red');
 
 statement ok
-PRAGMA ivm('mv_tags');
+PRAGMA refresh('mv_tags');
 
 query I rowsort
 SELECT * FROM dl.mv_tags ORDER BY tag;
@@ -54,7 +54,7 @@ statement ok
 INSERT INTO dl.tags VALUES (6, 'yellow');
 
 statement ok
-PRAGMA ivm('mv_tags');
+PRAGMA refresh('mv_tags');
 
 query I rowsort
 SELECT * FROM dl.mv_tags ORDER BY tag;
@@ -90,7 +90,7 @@ statement ok
 INSERT INTO dl.tags VALUES (8, 'blue');
 
 statement ok
-PRAGMA ivm('mv_tags');
+PRAGMA refresh('mv_tags');
 
 # EXCEPT ALL
 query I

@@ -24,7 +24,7 @@ statement ok
 INSERT INTO employees VALUES (3, 'Charlie', 'eng');
 
 statement ok
-pragma ivm('emp_names');
+pragma refresh('emp_names');
 
 query II
 SELECT id, name FROM emp_names ORDER BY id;
@@ -38,7 +38,7 @@ statement ok
 DELETE FROM employees WHERE id = 1;
 
 statement ok
-pragma ivm('emp_names');
+pragma refresh('emp_names');
 
 query II
 SELECT id, name FROM emp_names ORDER BY id;
@@ -48,7 +48,7 @@ SELECT id, name FROM emp_names ORDER BY id;
 
 # --- No-op PRAGMA ---
 statement ok
-pragma ivm('emp_names');
+pragma refresh('emp_names');
 
 query II
 SELECT id, name FROM emp_names ORDER BY id;
@@ -61,7 +61,7 @@ statement ok
 INSERT INTO employees VALUES (4, 'Diana', 'eng'), (5, 'Eve', 'sales');
 
 statement ok
-pragma ivm('emp_names');
+pragma refresh('emp_names');
 
 query II
 SELECT id, name FROM emp_names ORDER BY id;
@@ -79,7 +79,7 @@ statement ok
 DELETE FROM employees WHERE id = 2;
 
 statement ok
-pragma ivm('emp_names');
+pragma refresh('emp_names');
 
 query II
 SELECT id, name FROM emp_names ORDER BY id;
@@ -106,7 +106,7 @@ statement ok
 INSERT INTO flags VALUES (3, 'Charlie', true);
 
 statement ok
-pragma ivm('mv_flags');
+pragma refresh('mv_flags');
 
 query III
 SELECT id, name, active FROM mv_flags ORDER BY id;
@@ -119,7 +119,7 @@ statement ok
 DELETE FROM flags WHERE active = false;
 
 statement ok
-pragma ivm('mv_flags');
+pragma refresh('mv_flags');
 
 query III
 SELECT id, name, active FROM mv_flags ORDER BY id;
@@ -132,7 +132,7 @@ SELECT id, name, active FROM mv_flags ORDER BY id;
 # ==========================================
 
 statement ok
-pragma ivm('mv_flags');
+pragma refresh('mv_flags');
 
 query III
 SELECT id, name, active FROM mv_flags ORDER BY id;
@@ -158,7 +158,7 @@ statement ok
 INSERT INTO empty_proj VALUES (1, 'First'), (2, 'Second');
 
 statement ok
-pragma ivm('mv_empty_proj');
+pragma refresh('mv_empty_proj');
 
 query II
 SELECT id, name FROM mv_empty_proj ORDER BY id;
@@ -182,7 +182,7 @@ statement ok
 INSERT INTO stress VALUES (1, 'a'), (1, 'a'), (1, 'a'), (2, 'b'), (2, 'b'), (3, 'c');
 
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
@@ -199,7 +199,7 @@ statement ok
 INSERT INTO stress VALUES (1, 'a'), (1, 'a'), (3, 'c'), (3, 'c'), (4, 'd');
 
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
@@ -216,7 +216,7 @@ statement ok
 DELETE FROM stress WHERE id = 1;
 
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
@@ -233,7 +233,7 @@ statement ok
 UPDATE stress SET val = 'B' WHERE id = 2;
 
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
@@ -256,7 +256,7 @@ statement ok
 UPDATE stress SET val = 'D' WHERE id = 4;
 
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
@@ -282,7 +282,7 @@ statement ok
 DELETE FROM stress WHERE id = 99;
 
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
@@ -311,7 +311,7 @@ statement ok
 INSERT INTO stress VALUES (30, 'z'), (30, 'z');
 
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
@@ -334,7 +334,7 @@ statement ok
 INSERT INTO stress SELECT 50, 'batch' FROM generate_series(1, 37);
 
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
@@ -351,7 +351,7 @@ statement ok
 DELETE FROM stress;
 
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM mv_stress;
@@ -368,7 +368,7 @@ statement ok
 INSERT INTO stress VALUES (10, 'z'), (10, 'z'), (11, 'w');
 
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
@@ -382,7 +382,7 @@ SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FR
 
 # No-op
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
@@ -408,7 +408,7 @@ statement ok
 INSERT INTO stress VALUES (10, 'z3');
 
 statement ok
-pragma ivm('mv_stress');
+pragma refresh('mv_stress');
 
 query I
 SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
@@ -446,7 +446,7 @@ statement ok
 DELETE FROM expr_base WHERE a = 1;
 
 statement ok
-PRAGMA ivm('mv_expr');
+PRAGMA refresh('mv_expr');
 
 # Cross-check
 query I
@@ -482,7 +482,7 @@ CREATE MATERIALIZED VIEW mv_proj_null_expr AS
     SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr;
 
 statement ok
-PRAGMA ivm('mv_proj_null_expr');
+PRAGMA refresh('mv_proj_null_expr');
 
 # Cross-check after initial load
 query I
@@ -508,7 +508,7 @@ statement ok
 UPDATE proj_null_expr SET a = NULL WHERE a = 10;
 
 statement ok
-PRAGMA ivm('mv_proj_null_expr');
+PRAGMA refresh('mv_proj_null_expr');
 
 query I
 SELECT COUNT(*) FROM (
@@ -533,7 +533,7 @@ statement ok
 DELETE FROM proj_null_expr;
 
 statement ok
-PRAGMA ivm('mv_proj_null_expr');
+PRAGMA refresh('mv_proj_null_expr');
 
 query I
 SELECT COUNT(*) FROM (
@@ -558,7 +558,7 @@ statement ok
 INSERT INTO proj_null_expr VALUES (100, 2, 'test'), (NULL, NULL, 'abc');
 
 statement ok
-PRAGMA ivm('mv_proj_null_expr');
+PRAGMA refresh('mv_proj_null_expr');
 
 query I
 SELECT COUNT(*) FROM (
@@ -592,7 +592,7 @@ statement ok
 CREATE MATERIALIZED VIEW mv_proj_net_zero AS SELECT x, y FROM proj_net_zero;
 
 statement ok
-PRAGMA ivm('mv_proj_net_zero');
+PRAGMA refresh('mv_proj_net_zero');
 
 # Cross-check after initial load
 query I
@@ -621,7 +621,7 @@ statement ok
 DELETE FROM proj_net_zero WHERE x = 99;
 
 statement ok
-PRAGMA ivm('mv_proj_net_zero');
+PRAGMA refresh('mv_proj_net_zero');
 
 # MV should be unchanged (net zero delta for x=99)
 query I
@@ -650,7 +650,7 @@ statement ok
 DELETE FROM proj_net_zero WHERE x = 77;
 
 statement ok
-PRAGMA ivm('mv_proj_net_zero');
+PRAGMA refresh('mv_proj_net_zero');
 
 query I
 SELECT COUNT(*) FROM (
@@ -700,7 +700,7 @@ statement ok
 INSERT INTO jfp_prices VALUES (4, 0.1);
 
 statement ok
-PRAGMA ivm('mv_jfp');
+PRAGMA refresh('mv_jfp');
 
 query I
 SELECT COUNT(*) FROM (
@@ -728,7 +728,7 @@ statement ok
 UPDATE jfp_items SET weight = 5.0 WHERE id = 3;
 
 statement ok
-PRAGMA ivm('mv_jfp');
+PRAGMA refresh('mv_jfp');
 
 query I
 SELECT COUNT(*) FROM (
@@ -792,7 +792,7 @@ statement ok
 UPDATE pos_t SET name = 'pear' WHERE id = 1;
 
 statement ok
-PRAGMA ivm('mv_pos');
+PRAGMA refresh('mv_pos');
 
 query I
 SELECT COUNT(*) FROM (
@@ -870,7 +870,7 @@ statement ok
 UPDATE proj_join_stock SET s_quantity = 11 WHERE s_w_id = 1 AND s_i_id = 1;
 
 statement ok
-PRAGMA ivm('proj_join_mv');
+PRAGMA refresh('proj_join_mv');
 
 query I
 SELECT COUNT(*) FROM (
@@ -932,7 +932,7 @@ statement ok
 UPDATE proj_rank_w SET w_name = 'w2x' WHERE w_id = 2;
 
 statement ok
-PRAGMA ivm('proj_rank_mv');
+PRAGMA refresh('proj_rank_mv');
 
 query I
 SELECT COUNT(*) FROM (
@@ -963,7 +963,7 @@ statement ok
 INSERT INTO topkp_t VALUES (6,'frank',99);
 
 statement ok
-PRAGMA ivm('topkp_mv');
+PRAGMA refresh('topkp_mv');
 
 query I
 SELECT count(*) FROM (
@@ -988,7 +988,7 @@ statement ok
 DELETE FROM topkp_t WHERE id = 6;
 
 statement ok
-PRAGMA ivm('topkp_mv');
+PRAGMA refresh('topkp_mv');
 
 query I
 SELECT count(*) FROM (
@@ -1019,7 +1019,7 @@ statement ok
 UPDATE topkp_t SET score = 50 WHERE id = 2;
 
 statement ok
-PRAGMA ivm('topkp_mv');
+PRAGMA refresh('topkp_mv');
 
 query I
 SELECT count(*) FROM (

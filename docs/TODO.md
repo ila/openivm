@@ -47,5 +47,5 @@ The current suite covers projection, filter, grouped aggregate, 2-way join, 3-wa
 - [ ] **Broader semi/anti support.** Extend aux-state maintenance to aggregates over SEMI/ANTI, join-chain inputs, and richer subquery shapes.
 - [ ] **Window functions over joins.** Single-table windows use partition recompute. Investigate affected-partition extraction through joins.
 - [ ] **Higher-order IVM.** For join-heavy queries (3+ tables), DBToaster-style auxiliary maps eliminate joins at update time. Evaluate whether the space-time tradeoff is worthwhile for OpenIVM's SQL-to-SQL model.
-- [ ] **Automatic refresh.** Trigger-based immediate refresh on DML, similar to pg_ivm. Currently requires explicit `PRAGMA ivm()`.
+- [ ] **Automatic refresh.** Trigger-based immediate refresh on DML, similar to pg_ivm. Currently requires explicit `PRAGMA refresh()`.
 - [ ] **DISTINCT aggregates.** `COUNT(DISTINCT x)` is not incrementally maintained. Explore approximate (HyperLogLog) or exact (auxiliary set per group) approaches.
