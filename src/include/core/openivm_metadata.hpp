@@ -152,6 +152,18 @@ public:
 	};
 
 	bool GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out);
+
+	struct FilteredGroupCountAuxMeta {
+		string aux_table;
+		string source;
+		string group_col;
+		string sum_col;
+		string output_col;
+		string comparison_op;
+		string threshold_sql;
+	};
+
+	bool GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out);
 };
 
 } // namespace duckdb

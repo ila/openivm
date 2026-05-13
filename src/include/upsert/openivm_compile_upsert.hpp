@@ -91,6 +91,11 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
                                 const string &right_delta_source, const string &left_last_update,
                                 const string &right_last_update, const string &catalog_prefix = "");
 
+string CompileFilteredGroupCount(const string &view_name, const string &aux_table, const string &delta_source,
+                                 const string &last_update, const string &group_col, const string &sum_col,
+                                 const string &output_col, const string &comparison_op, const string &threshold_sql,
+                                 const string &catalog_prefix = "");
+
 } // namespace duckdb
 
 #endif // OPENIVM_COMPILE_UPSERT_HPP

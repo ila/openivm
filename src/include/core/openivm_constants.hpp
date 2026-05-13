@@ -58,7 +58,7 @@ static constexpr idx_t MAX_JOIN_TABLES = 16;
 
 // Optimizer settings disabled during IVM rewrite (these interfere with the delta plan)
 constexpr const char *DISABLED_OPTIMIZERS =
-    "compressed_materialization, column_lifetime, statistics_propagation, expression_rewriter, filter_pushdown";
+    "compressed_materialization, column_lifetime, statistics_propagation, expression_rewriter";
 
 } // namespace ivm
 

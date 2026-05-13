@@ -1962,9 +1962,28 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 	case IVMType::SIMPLE_AGGREGATE: {
 		// ARG_MIN/ARG_MAX can't be maintained by delta-sum UPDATE even for insert-only deltas.
 		bool sa_insert_only = has_argminmax ? false : insert_only;
-		upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode,
-		                                       delta_ts_filter, internal_catalog_prefix, sa_insert_only, column_types);
-		if (!has_minmax) {
+		IVMMetadata::FilteredGroupCountAuxMeta aux_meta;
+		if (metadata.GetFilteredGroupCountAuxMeta(view_name, aux_meta)) {
+			string delta_source = OpenIVMUtils::DeltaName(aux_meta.source);
+			for (auto &dt : delta_table_names) {
+				if (StringUtil::CIEquals(dt, delta_source)) {
+					delta_source = dt;
+					break;
+				}
+			}
+			string ts = metadata.GetLastUpdate(view_name, delta_source);
+			upsert_query = CompileFilteredGroupCount(
+			    view_name, aux_meta.aux_table, delta_source, ts, aux_meta.group_col, aux_meta.sum_col,
+			    aux_meta.output_col, aux_meta.comparison_op, aux_meta.threshold_sql, internal_catalog_prefix);
+			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling SIMPLE_AGGREGATE filtered-group-count aux (%s, sum=%s %s %s)\n",
+			                    aux_meta.group_col.c_str(), aux_meta.sum_col.c_str(), aux_meta.comparison_op.c_str(),
+			                    aux_meta.threshold_sql.c_str());
+		} else {
+			upsert_query =
+			    CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode, delta_ts_filter,
+			                            internal_catalog_prefix, sa_insert_only, column_types);
+		}
+		if (!has_minmax && aux_meta.aux_table.empty()) {
 			AppendSimpleAggregateEmptySourceNulling(metadata, upsert_query, view_name, column_names, data_table, con,
 			                                        view_catalog_name, view_schema_name, attached_db_catalog_name,
 			                                        attached_db_schema_name);

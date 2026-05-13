@@ -206,6 +206,12 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 		auto get = make_uniq<LogicalGet>(table_idx, std::move(scan_fn), std::move(bind_data), std::move(col_types),
 		                                 std::move(col_names));
 		get->SetColumnIds(vector<ColumnIndex>(delta_col_ids));
+		for (auto &entry : old_get->table_filters.filters) {
+			if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+				continue;
+			}
+			get->table_filters.filters[entry.first] = entry.second->Copy();
+		}
 
 		// Set parameters so LPTS can reconstruct the ducklake_table_insertions/deletions SQL.
 		get->parameters = {Value(catalog_name), Value(schema_name), Value(table_name), Value::BIGINT(start_snap),
@@ -344,6 +350,12 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	delta_get_node = make_uniq<LogicalGet>(old_get->table_index, scan_function, std::move(bind_data),
 	                                       std::move(return_types), std::move(return_names));
 	delta_get_node->SetColumnIds(std::move(column_ids));
+	for (auto &entry : old_get->table_filters.filters) {
+		if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+			continue;
+		}
+		delta_get_node->table_filters.filters[entry.first] = entry.second->Copy();
+	}
 
 	// Timestamp filter
 	Connection con(*context.db);
@@ -372,20 +384,13 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	// projection_ids
 	delta_get_node->projection_ids.clear();
 	idx_t n_base = old_get->GetColumnIds().size();
-	if (!old_get->projection_ids.empty()) {
-		for (auto &pid : old_get->projection_ids) {
-			delta_get_node->projection_ids.push_back(pid);
-		}
-	} else {
-		for (idx_t i = 0; i < n_base; i++) {
-			delta_get_node->projection_ids.push_back(i);
-		}
+	for (idx_t i = 0; i < n_base; i++) {
+		delta_get_node->projection_ids.push_back(i);
 	}
 	delta_get_node->projection_ids.push_back(n_base); // mul column
-	idx_t mul_proj_pos = delta_get_node->projection_ids.size() - 1;
-	new_mul_binding = ColumnBinding(old_get->table_index, mul_proj_pos);
 
 	delta_get_node->ResolveOperatorTypes();
+	new_mul_binding = delta_get_node->GetColumnBindings().back();
 	OPENIVM_DEBUG_PRINT("[CreateDeltaGet] Delta table: %s, mul_binding: table=%lu col=%lu, columns: %zu\n",
 	                    table_name.c_str(), (unsigned long)new_mul_binding.table_index,
 	                    (unsigned long)new_mul_binding.column_index, delta_get_node->GetColumnIds().size());

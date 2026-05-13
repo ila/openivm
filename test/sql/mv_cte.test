@@ -839,6 +839,93 @@ SELECT COUNT(*) FROM (
 0
 
 # ==========================================
+# CTE nested aggregate: count filtered inner grouped SUM via aux-state transitions
+# ==========================================
+
+statement ok
+CREATE TABLE fgc_customer (c_w_id INT, c_id INT, c_balance DOUBLE);
+
+statement ok
+INSERT INTO fgc_customer VALUES (1, 1, 100.0), (2, 1, -50.0), (3, 1, 10.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_fgc AS
+    WITH step1 AS (
+        SELECT c_w_id, SUM(c_balance) AS total
+        FROM fgc_customer
+        GROUP BY c_w_id
+    ),
+    step2 AS (
+        SELECT * FROM step1 WHERE total < 0
+    ),
+    step3 AS (
+        SELECT COUNT(*) AS neg_warehouses FROM step2
+    )
+    SELECT * FROM step3;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_fgc';
+----
+1
+
+query I
+SELECT aggregate_decomposition_json IS NOT NULL FROM _duckdb_ivm_views WHERE view_name = 'mv_fgc';
+----
+true
+
+statement ok
+INSERT INTO fgc_customer VALUES (1, 2, -200.0);
+
+statement ok
+DELETE FROM fgc_customer WHERE c_w_id = 2 AND c_id = 1;
+
+statement ok
+UPDATE fgc_customer SET c_balance = -20.0 WHERE c_w_id = 3 AND c_id = 1;
+
+statement ok
+PRAGMA ivm('mv_fgc');
+
+query I
+SELECT COUNT(*) FROM (
+    (WITH step1 AS (
+        SELECT c_w_id, SUM(c_balance) AS total
+        FROM fgc_customer
+        GROUP BY c_w_id
+    ),
+    step2 AS (
+        SELECT * FROM step1 WHERE total < 0
+    ),
+    step3 AS (
+        SELECT COUNT(*) AS neg_warehouses FROM step2
+    )
+    SELECT * FROM step3)
+    EXCEPT ALL
+    SELECT * FROM mv_fgc
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_fgc
+    EXCEPT ALL
+    (WITH step1 AS (
+        SELECT c_w_id, SUM(c_balance) AS total
+        FROM fgc_customer
+        GROUP BY c_w_id
+    ),
+    step2 AS (
+        SELECT * FROM step1 WHERE total < 0
+    ),
+    step3 AS (
+        SELECT COUNT(*) AS neg_warehouses FROM step2
+    )
+    SELECT * FROM step3)
+);
+----
+0
+
+# ==========================================
 # Reused CTE aggregate under joins: affected keys must use visible output columns
 # ==========================================
 

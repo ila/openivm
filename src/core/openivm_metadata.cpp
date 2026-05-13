@@ -445,4 +445,29 @@ bool IVMMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &o
 	return ok;
 }
 
+bool IVMMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {
+	auto result = con.Query("SELECT aggregate_decomposition_json FROM " + string(ivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + OpenIVMUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	string json = result->GetValue(0, 0).ToString();
+	if (json.empty()) {
+		return false;
+	}
+	string kind;
+	if (!ExtractJsonString(json, "kind", kind) || kind != "filtered_group_count") {
+		return false;
+	}
+	bool ok = true;
+	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= ExtractJsonString(json, "source", out.source);
+	ok &= ExtractJsonString(json, "group_col", out.group_col);
+	ok &= ExtractJsonString(json, "sum_col", out.sum_col);
+	ok &= ExtractJsonString(json, "output_col", out.output_col);
+	ok &= ExtractJsonString(json, "op", out.comparison_op);
+	ok &= ExtractJsonString(json, "threshold", out.threshold_sql);
+	return ok;
+}
+
 } // namespace duckdb

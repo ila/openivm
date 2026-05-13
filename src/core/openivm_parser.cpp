@@ -1655,6 +1655,216 @@ static bool ParseSelectOutputColumns(const string &original_sql, size_t select_p
 	return true;
 }
 
+struct FilteredGroupCountExtract {
+	string source;
+	string group_col;
+	string sum_col;
+	string sum_alias;
+	string output_col;
+	string comparison_op;
+	string threshold_sql;
+};
+
+static bool ParseSumCall(const string &expr, string &arg) {
+	string trimmed = expr;
+	StringUtil::Trim(trimmed);
+	string lower = StringUtil::Lower(trimmed);
+	if (lower.rfind("sum", 0) != 0) {
+		return false;
+	}
+	size_t open = lower.find('(');
+	if (open == string::npos) {
+		return false;
+	}
+	size_t close = FindMatchingParen(trimmed, open);
+	if (close == string::npos) {
+		return false;
+	}
+	string tail = trimmed.substr(close + 1);
+	StringUtil::Trim(tail);
+	if (!tail.empty()) {
+		return false;
+	}
+	arg = trimmed.substr(open + 1, close - open - 1);
+	StringUtil::Trim(arg);
+	return !arg.empty() && arg.find(',') == string::npos;
+}
+
+static bool ReadComparisonOp(const string &sql, size_t &pos, string &op) {
+	while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
+		pos++;
+	}
+	for (auto &candidate : {"<=", ">=", "<>", "!=", "=", "<", ">"}) {
+		string cand(candidate);
+		if (pos + cand.size() <= sql.size() && sql.compare(pos, cand.size(), cand) == 0) {
+			op = cand;
+			pos += cand.size();
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool IsZeroSqlLiteral(string expr) {
+	StringUtil::Trim(expr);
+	if (expr.size() >= 2 && expr.front() == '(' && expr.back() == ')') {
+		expr = expr.substr(1, expr.size() - 2);
+		StringUtil::Trim(expr);
+	}
+	if (!expr.empty() && (expr.front() == '+' || expr.front() == '-')) {
+		expr = expr.substr(1);
+	}
+	bool found_digit = false;
+	for (char c : expr) {
+		if (c == '.') {
+			continue;
+		}
+		if (!std::isdigit(static_cast<unsigned char>(c))) {
+			return false;
+		}
+		found_digit = true;
+		if (c != '0') {
+			return false;
+		}
+	}
+	return found_digit;
+}
+
+static size_t FindClauseEnd(const string &lower, size_t from) {
+	bool in_quote = false;
+	int depth = 0;
+	for (size_t i = from; i < lower.size(); i++) {
+		char c = lower[i];
+		if (in_quote) {
+			if (c == '\'') {
+				in_quote = false;
+			}
+			continue;
+		}
+		if (c == '\'') {
+			in_quote = true;
+			continue;
+		}
+		if (c == '(') {
+			depth++;
+			continue;
+		}
+		if (c == ')') {
+			if (depth == 0) {
+				return i;
+			}
+			depth--;
+			continue;
+		}
+		if (depth == 0 && (c == ',' || StartsKeywordToken(lower, i, "group") ||
+		                   StartsKeywordToken(lower, i, "having") || StartsKeywordToken(lower, i, "order") ||
+		                   StartsKeywordToken(lower, i, "limit") || StartsKeywordToken(lower, i, "union"))) {
+			return i;
+		}
+	}
+	return lower.size();
+}
+
+static bool ExtractFilteredGroupCount(const string &original_sql, const vector<string> &output_names,
+                                      FilteredGroupCountExtract &out) {
+	if (output_names.size() != 1) {
+		return false;
+	}
+	string lower = StringUtil::Lower(original_sql);
+	if (lower.find("count(*)") == string::npos && lower.find("count_star()") == string::npos) {
+		return false;
+	}
+
+	size_t select_pos = FindKeywordToken(lower, "select", 0);
+	while (select_pos != string::npos) {
+		size_t from_pos = FindTopLevelKeywordToken(lower, "from", select_pos + strlen("select"));
+		size_t group_pos = from_pos == string::npos ? string::npos : FindTopLevelKeywordToken(lower, "group", from_pos);
+		if (from_pos != string::npos && group_pos != string::npos) {
+			vector<SelectOutputItem> items;
+			if (ParseSelectOutputItems(original_sql, select_pos, from_pos, items) && items.size() == 2) {
+				idx_t group_idx = DConstants::INVALID_INDEX;
+				idx_t sum_idx = DConstants::INVALID_INDEX;
+				string sum_arg;
+				for (idx_t i = 0; i < items.size(); i++) {
+					string parsed_sum_arg;
+					if (ParseSumCall(items[i].expr, parsed_sum_arg)) {
+						sum_idx = i;
+						sum_arg = parsed_sum_arg;
+					} else {
+						group_idx = i;
+					}
+				}
+				if (group_idx != DConstants::INVALID_INDEX && sum_idx != DConstants::INVALID_INDEX) {
+					size_t source_pos = from_pos + strlen("from");
+					string source;
+					if (!ReadIdentifierToken(original_sql, source_pos, source)) {
+						return false;
+					}
+					string source_tail = original_sql.substr(source_pos, group_pos - source_pos);
+					StringUtil::Trim(source_tail);
+					if (source_tail.find(',') != string::npos ||
+					    FindKeywordToken(StringUtil::Lower(source_tail), "join", 0) != string::npos) {
+						return false;
+					}
+
+					size_t group_by_pos = group_pos + strlen("group");
+					while (group_by_pos < lower.size() &&
+					       std::isspace(static_cast<unsigned char>(lower[group_by_pos]))) {
+						group_by_pos++;
+					}
+					if (!StartsKeywordToken(lower, group_by_pos, "by")) {
+						return false;
+					}
+					group_by_pos += strlen("by");
+					size_t group_end = FindClauseEnd(lower, group_by_pos);
+					string group_by_expr = original_sql.substr(group_by_pos, group_end - group_by_pos);
+					StringUtil::Trim(group_by_expr);
+					if (group_by_expr.find(',') != string::npos) {
+						return false;
+					}
+					string group_col = LastIdentifierPart(items[group_idx].expr);
+					if (!StringUtil::CIEquals(LastIdentifierPart(group_by_expr), group_col)) {
+						return false;
+					}
+
+					out.source = source;
+					out.group_col = group_col;
+					out.sum_col = LastIdentifierPart(sum_arg);
+					out.sum_alias = items[sum_idx].name;
+					break;
+				}
+			}
+		}
+		select_pos = FindKeywordToken(lower, "select", select_pos + strlen("select"));
+	}
+	if (out.source.empty() || out.group_col.empty() || out.sum_col.empty() || out.sum_alias.empty()) {
+		return false;
+	}
+
+	size_t where_pos = FindKeywordToken(lower, "where", 0);
+	while (where_pos != string::npos) {
+		size_t pos = where_pos + strlen("where");
+		string lhs;
+		if (ReadIdentifierToken(original_sql, pos, lhs) &&
+		    StringUtil::CIEquals(LastIdentifierPart(lhs), out.sum_alias) &&
+		    ReadComparisonOp(original_sql, pos, out.comparison_op)) {
+			size_t threshold_end = FindClauseEnd(lower, pos);
+			out.threshold_sql = original_sql.substr(pos, threshold_end - pos);
+			StringUtil::Trim(out.threshold_sql);
+			break;
+		}
+		where_pos = FindKeywordToken(lower, "where", where_pos + strlen("where"));
+	}
+	if (out.comparison_op.empty() || out.threshold_sql.empty()) {
+		return false;
+	}
+	if ((out.comparison_op != "<" && out.comparison_op != ">") || !IsZeroSqlLiteral(out.threshold_sql)) {
+		return false;
+	}
+	out.output_col = output_names[0];
+	return !out.output_col.empty();
+}
+
 static string TrimAndConjunctions(string expr) {
 	StringUtil::Trim(expr);
 	string lower = StringUtil::Lower(expr);
@@ -3023,6 +3233,10 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		string distinct_sum_out;
 		SemiAntiExtract semi_anti_extract;
 		vector<string> semi_anti_left_cols;
+		FilteredGroupCountExtract filtered_group_count_extract;
+		bool has_filtered_group_count_aux =
+		    classification.found_nested_aggregate &&
+		    ExtractFilteredGroupCount(original_view_query, output_names, filtered_group_count_extract);
 
 		if (has_unsupported_set_operation || has_unsupported_incremental_construct) {
 			ivm_type = IVMType::FULL_REFRESH;
@@ -3514,6 +3728,38 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 			                   ",\"sum_arg\":" + JsonQuote(distinct_sum_arg) +
 			                   ",\"sum_out\":" + JsonQuote(distinct_sum_out) + "}";
 			aux_metadata_ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET distinct_aux_meta_json = '" +
+			                           OpenIVMUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
+			                           OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
+		}
+
+		if (ivm_type == IVMType::SIMPLE_AGGREGATE && has_filtered_group_count_aux) {
+			add_profile_marker("create_mv_filtered_group_count_aux");
+			string aux_table = "_ivm_filtered_group_count_" + view_name;
+			auto qualify_source_table = [&](const string &table_name) {
+				if (current_catalog.empty() || current_catalog == default_db || table_name.find('.') != string::npos ||
+				    table_name.find('(') != string::npos) {
+					return table_name;
+				}
+				return current_catalog + "." + current_schema + "." + table_name;
+			};
+			string source_table = qualify_source_table(filtered_group_count_extract.source);
+			string group_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.group_col);
+			string sum_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.sum_col);
+			string aux_create = "create table if not exists " + internal_catalog_prefix +
+			                    KeywordHelper::WriteOptionallyQuoted(aux_table) + " as select " + group_q + ", sum(" +
+			                    sum_q + ") as _ivm_sum from " + source_table + " group by " + group_q;
+			ddl.push_back(aux_create);
+			add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
+			            KeywordHelper::WriteOptionallyQuoted(aux_table));
+
+			string meta_json = "{\"kind\":\"filtered_group_count\",\"aux_table\":" + JsonQuote(aux_table) +
+			                   ",\"source\":" + JsonQuote(LastIdentifierPart(filtered_group_count_extract.source)) +
+			                   ",\"group_col\":" + JsonQuote(filtered_group_count_extract.group_col) +
+			                   ",\"sum_col\":" + JsonQuote(filtered_group_count_extract.sum_col) +
+			                   ",\"output_col\":" + JsonQuote(filtered_group_count_extract.output_col) +
+			                   ",\"op\":" + JsonQuote(filtered_group_count_extract.comparison_op) +
+			                   ",\"threshold\":" + JsonQuote(filtered_group_count_extract.threshold_sql) + "}";
+			aux_metadata_ddl.push_back("UPDATE " + string(ivm::VIEWS_TABLE) + " SET aggregate_decomposition_json = '" +
 			                           OpenIVMUtils::EscapeSingleQuotes(meta_json) + "' WHERE view_name = '" +
 			                           OpenIVMUtils::EscapeSingleQuotes(view_name) + "'");
 		}

@@ -1396,6 +1396,53 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	return sql;
 }
 
+string CompileFilteredGroupCount(const string &view_name, const string &aux_table, const string &delta_source,
+                                 const string &last_update, const string &group_col, const string &sum_col,
+                                 const string &output_col, const string &comparison_op, const string &threshold_sql,
+                                 const string &catalog_prefix) {
+	if (aux_table.empty() || delta_source.empty() || last_update.empty() || group_col.empty() || sum_col.empty() ||
+	    output_col.empty() || comparison_op.empty() || threshold_sql.empty()) {
+		return "-- CompileFilteredGroupCount called with incomplete metadata; no-op\n";
+	}
+
+	string data_table = catalog_prefix + Q(IVMTableNames::DataTableName(view_name));
+	string aux_q = catalog_prefix + Q(aux_table);
+	string delta_q = catalog_prefix + Q(delta_source);
+	string dsum_table = "_ivm_fgc_delta_" + view_name;
+	string group_q = Q(group_col);
+	string sum_q = Q(sum_col);
+	string output_q = Q(output_col);
+	string dsum_expr = "SUM(" + string(ivm::MULTIPLICITY_COL) + " * " + sum_q + ")";
+	string old_sum = "COALESCE(_aux._ivm_sum, 0)";
+	string new_sum = "(" + old_sum + " + d._ivm_delta_sum)";
+	string old_visible = "CASE WHEN " + old_sum + " " + comparison_op + " " + threshold_sql + " THEN 1 ELSE 0 END";
+	string new_visible = "CASE WHEN " + new_sum + " " + comparison_op + " " + threshold_sql + " THEN 1 ELSE 0 END";
+	string aux_match = BuildNullSafeMatch(vector<string> {group_col}, "_aux", "d");
+
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + Q(dsum_table) + " AS\n  SELECT " + group_q + ", " + dsum_expr +
+	       " AS _ivm_delta_sum\n  FROM " + delta_q + "\n  WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" +
+	       OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP\n  GROUP BY " + group_q + "\n  HAVING " + dsum_expr +
+	       " <> 0;\n\n";
+
+	sql += "WITH _ivm_transition AS (\n  SELECT SUM((" + new_visible + ") - (" + old_visible +
+	       ")) AS _ivm_delta_count\n  FROM " + Q(dsum_table) + " d LEFT JOIN " + aux_q + " _aux ON " + aux_match +
+	       "\n)\nUPDATE " + data_table + " SET " + output_q + " = COALESCE(" + output_q +
+	       ", 0) + COALESCE((SELECT _ivm_delta_count FROM _ivm_transition), 0);\n\n";
+
+	sql += "MERGE INTO " + aux_q + " _aux USING " + Q(dsum_table) + " d ON " + aux_match +
+	       "\nWHEN MATCHED THEN UPDATE SET _ivm_sum = COALESCE(_aux._ivm_sum, 0) + d._ivm_delta_sum\n"
+	       "WHEN NOT MATCHED THEN INSERT (" +
+	       group_q + ", _ivm_sum) VALUES (d." + group_q + ", d._ivm_delta_sum);\n\n";
+
+	sql += "DELETE FROM " + aux_q + " WHERE _ivm_sum = 0;\n";
+	sql += "DROP TABLE IF EXISTS " + Q(dsum_table) + ";\n";
+
+	OPENIVM_DEBUG_PRINT("[CompileFilteredGroupCount] group=%s, sum=%s, op=%s, aux=%s\n", group_col.c_str(),
+	                    sum_col.c_str(), comparison_op.c_str(), aux_table.c_str());
+	return sql;
+}
+
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter,
                               const string &catalog_prefix, const vector<string> &partition_columns,
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs) {

@@ -41,6 +41,7 @@ static idx_t CountBits(uint64_t value) {
 
 struct JoinColumnRef {
 	size_t leaf_index;
+	LogicalGet *get;
 	string table_name;
 	string delta_name;
 	string column_name;
@@ -82,6 +83,8 @@ static void CollectJoinKeyProbes(LogicalOperator *node, const unordered_map<uint
 				if (!TryGetColumnRef(*cond.left, left_binding) || !TryGetColumnRef(*cond.right, right_binding)) {
 					continue;
 				}
+				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Join key bindings: %s = %s\n", left_binding.ToString().c_str(),
+				                    right_binding.ToString().c_str());
 				auto left_entry = column_refs.find(BindingKey(left_binding));
 				auto right_entry = column_refs.find(BindingKey(right_binding));
 				if (left_entry == column_refs.end() || right_entry == column_refs.end()) {
@@ -102,14 +105,41 @@ static void CollectJoinKeyProbes(LogicalOperator *node, const unordered_map<uint
 	}
 }
 
+static string QualifyColumn(const string &alias, const string &column_name) {
+	return alias + "." + OpenIVMUtils::QuoteIdentifier(column_name);
+}
+
+static string BuildPushedFilterSQL(LogicalGet &get, const string &alias) {
+	string filters;
+	for (auto &entry : get.table_filters.filters) {
+		if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+			continue;
+		}
+		auto col_name = get.GetColumnName(ColumnIndex(entry.first));
+		if (!filters.empty()) {
+			filters += " AND ";
+		}
+		filters += "(" + entry.second->ToString(QualifyColumn(alias, col_name)) + ")";
+	}
+	return filters;
+}
+
+static string AppendFilterSQL(const string &predicate) {
+	return predicate.empty() ? string() : " AND " + predicate;
+}
+
 static bool DeltaKeyHasBaseMatch(Connection &con, const JoinColumnRef &delta_ref, const string &delta_column,
                                  const JoinColumnRef &other_ref, const string &other_column) {
-	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + OpenIVMUtils::QuoteIdentifier(delta_column) +
-	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(delta_ref.delta_name) + " WHERE " +
-	             string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(delta_ref.last_update) +
-	             "'::TIMESTAMP) _ivm_delta_keys JOIN " + OpenIVMUtils::QuoteIdentifier(other_ref.table_name) +
-	             " _ivm_other ON _ivm_delta_keys._ivm_key = _ivm_other." + OpenIVMUtils::QuoteIdentifier(other_column) +
-	             " LIMIT 1)";
+	string delta_filter = delta_ref.get ? BuildPushedFilterSQL(*delta_ref.get, "_ivm_delta") : string();
+	string other_filter = other_ref.get ? BuildPushedFilterSQL(*other_ref.get, "_ivm_other") : string();
+	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("_ivm_delta", delta_column) +
+	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(delta_ref.delta_name) + " _ivm_delta WHERE " +
+	             QualifyColumn("_ivm_delta", ivm::TIMESTAMP_COL) + " >= '" +
+	             OpenIVMUtils::EscapeValue(delta_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(delta_filter) +
+	             ") _ivm_delta_keys JOIN " + OpenIVMUtils::QuoteIdentifier(other_ref.table_name) +
+	             " _ivm_other ON _ivm_delta_keys._ivm_key = " + QualifyColumn("_ivm_other", other_column) +
+	             (other_filter.empty() ? string() : " WHERE " + other_filter) + " LIMIT 1)";
+	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Key probe SQL: %s\n", sql.c_str());
 	auto result = con.Query(sql);
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		OPENIVM_DEBUG_PRINT("[IvmJoinRule] Could not probe key-domain intersection: %s\n",
@@ -121,13 +151,17 @@ static bool DeltaKeyHasBaseMatch(Connection &con, const JoinColumnRef &delta_ref
 
 static bool DeltaKeyHasDeltaMatch(Connection &con, const JoinColumnRef &left_ref, const string &left_column,
                                   const JoinColumnRef &right_ref, const string &right_column) {
-	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + OpenIVMUtils::QuoteIdentifier(left_column) +
-	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(left_ref.delta_name) + " WHERE " +
-	             string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(left_ref.last_update) +
-	             "'::TIMESTAMP) _ivm_left_delta_keys JOIN (SELECT " + OpenIVMUtils::QuoteIdentifier(right_column) +
-	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(right_ref.delta_name) + " WHERE " +
-	             string(ivm::TIMESTAMP_COL) + " >= '" + OpenIVMUtils::EscapeValue(right_ref.last_update) +
-	             "'::TIMESTAMP) _ivm_right_delta_keys ON _ivm_left_delta_keys._ivm_key = "
+	string left_filter = left_ref.get ? BuildPushedFilterSQL(*left_ref.get, "_ivm_left_delta") : string();
+	string right_filter = right_ref.get ? BuildPushedFilterSQL(*right_ref.get, "_ivm_right_delta") : string();
+	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("_ivm_left_delta", left_column) +
+	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(left_ref.delta_name) + " _ivm_left_delta WHERE " +
+	             QualifyColumn("_ivm_left_delta", ivm::TIMESTAMP_COL) + " >= '" +
+	             OpenIVMUtils::EscapeValue(left_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(left_filter) +
+	             ") _ivm_left_delta_keys JOIN (SELECT " + QualifyColumn("_ivm_right_delta", right_column) +
+	             " AS _ivm_key FROM " + OpenIVMUtils::QuoteIdentifier(right_ref.delta_name) +
+	             " _ivm_right_delta WHERE " + QualifyColumn("_ivm_right_delta", ivm::TIMESTAMP_COL) + " >= '" +
+	             OpenIVMUtils::EscapeValue(right_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(right_filter) +
+	             ") _ivm_right_delta_keys ON _ivm_left_delta_keys._ivm_key = "
 	             "_ivm_right_delta_keys._ivm_key LIMIT 1)";
 	auto result = con.Query(sql);
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
@@ -228,13 +262,23 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		}
 		auto bindings = get->GetColumnBindings();
 		auto &column_ids = get->GetColumnIds();
-		idx_t count = std::min<idx_t>(bindings.size(), column_ids.size());
+		idx_t count = bindings.size();
 		for (idx_t col_idx = 0; col_idx < count; col_idx++) {
-			if (BindingKey(bindings[col_idx]) != BindingKey(binding) || column_ids[col_idx].IsVirtualColumn()) {
+			if (BindingKey(bindings[col_idx]) != BindingKey(binding)) {
 				continue;
 			}
+			idx_t column_id_idx = col_idx;
+			if (!get->projection_ids.empty()) {
+				if (col_idx >= get->projection_ids.size()) {
+					return false;
+				}
+				column_id_idx = get->projection_ids[col_idx];
+			}
+			if (column_id_idx >= column_ids.size() || column_ids[column_id_idx].IsVirtualColumn()) {
+				return false;
+			}
 			table_name = get->GetTable().get()->name;
-			column_name = get->GetColumnName(column_ids[col_idx]);
+			column_name = get->GetColumnName(column_ids[column_id_idx]);
 			return true;
 		}
 		return false;
@@ -253,6 +297,7 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 			}
 			return ResolveLeafBindingToBaseColumn(node->children[0].get(), child_binding, table_name, column_name);
 		}
+		return false;
 	}
 	if (node->children.size() == 1) {
 		auto bindings = node->GetColumnBindings();
@@ -693,6 +738,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 				continue;
 			}
 			leaf_refs[i].leaf_index = i;
+			leaf_refs[i].get = get;
 			leaf_refs[i].table_name = table_name;
 			leaf_refs[i].delta_name = delta_name;
 			leaf_refs[i].last_update = ts_result->GetValue(0, 0).ToString();
@@ -706,8 +752,10 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 					continue;
 				}
 				leaf_refs[i].column_name = resolved_column;
-				column_refs[BindingKey(binding)] = {i, table_name, delta_name, resolved_column,
-				                                    leaf_refs[i].last_update};
+				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Column ref leaf=%zu binding=%s -> %s.%s\n", i,
+				                    binding.ToString().c_str(), resolved_table.c_str(), resolved_column.c_str());
+				column_refs[BindingKey(binding)] = {
+				    i, get, table_name, delta_name, resolved_column, leaf_refs[i].last_update};
 			}
 		}
 		CollectJoinKeyProbes(pw.plan.get(), column_refs, key_probes);
