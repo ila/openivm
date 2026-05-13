@@ -353,7 +353,7 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 
 // ============================================================================
 
-RefreshCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name) {
+RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name) {
 	// Single connection for all cardinality queries
 	Connection con(*context.db);
 
@@ -370,7 +370,7 @@ RefreshCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &pla
 
 	// Read view type so the IVM-cost branch can reflect the strategy that will
 	// actually run at refresh time. Defaults to AGGREGATE_GROUP if the view isn't
-	// in metadata yet (e.g. test harnesses that call EstimateIVMCost on a raw plan).
+	// in metadata yet (e.g. test harnesses that call EstimateRefreshCost on a raw plan).
 	RefreshType view_type = RefreshType::AGGREGATE_GROUP;
 	{
 		RefreshMetadata vt_meta(con);
@@ -729,7 +729,7 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 	Optimizer optimizer(*planner.binder, con_ctx);
 	auto plan = optimizer.Optimize(std::move(planner.plan));
 
-	auto estimate = EstimateIVMCost(con_ctx, *plan, view_name);
+	auto estimate = EstimateRefreshCost(con_ctx, *plan, view_name);
 	con.Rollback();
 
 	// `decision`: which strategy actually runs at refresh time.
@@ -765,7 +765,7 @@ vector<StrategyCostEstimate> EstimatePerQuery(ClientContext &context, const stri
 	    !BooleanValue::Get(flag)) {
 		return {};
 	}
-	// TODO: reuse EstimateIVMCost() for the static ivm/recompute components,
+	// TODO: reuse EstimateRefreshCost() for the static incremental/recompute components,
 	// then read pending_row_estimate from `openivm_delta_tables` and
 	// per-strategy regression from `openivm_refresh_history` (filtered by
 	// `strategy`) to score each MatchStrategy.

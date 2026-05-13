@@ -38,13 +38,13 @@ struct RefreshCostEstimate {
 	}
 };
 
-/// Estimate costs of IVM vs full recompute for the given view query plan.
+/// Estimate costs of incremental refresh vs full recompute for the given view query plan.
 /// Walks the plan tree, collects base table and delta table cardinalities,
 /// and computes a cost estimate for both strategies. If sufficient execution
 /// history exists, applies learned regression to calibrate predictions.
-RefreshCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, const string &view_name);
+RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name);
 
-/// Pragma function: returns the IVM cost estimate for a view as a string.
+/// Pragma function: returns the refresh cost estimate for a view as a string.
 string RefreshCostQuery(ClientContext &context, const FunctionParameters &parameters);
 
 /// Pragma function: returns refresh history for a view.

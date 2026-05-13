@@ -1119,7 +1119,7 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 				pl.CreatePlan(cp.statements[0]->Copy());
 				Optimizer opt(*pl.binder, *cost_con.context);
 				auto plan = opt.Optimize(std::move(pl.plan));
-				cost_estimate = EstimateIVMCost(*cost_con.context, *plan, vn);
+				cost_estimate = EstimateRefreshCost(*cost_con.context, *plan, vn);
 				record_history = true;
 			}
 			cost_con.Rollback();
@@ -1699,7 +1699,7 @@ static string GenerateRefreshSQL(ClientContext &context, const string &view_cata
 		Optimizer cost_optimizer(*cost_planner.binder, *con.context);
 		auto cost_plan = cost_optimizer.Optimize(std::move(cost_planner.plan));
 
-		auto cost_estimate = EstimateIVMCost(*con.context, *cost_plan, view_name);
+		auto cost_estimate = EstimateRefreshCost(*con.context, *cost_plan, view_name);
 		con.Rollback();
 		if (cost_estimate.ShouldRecompute()) {
 			OPENIVM_DEBUG_PRINT("[ADAPTIVE] Full recompute is cheaper — skipping IVM\n");
