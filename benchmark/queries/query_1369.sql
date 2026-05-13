@@ -1,2 +1,2 @@
--- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "non_incr_reason": "op:LATERAL"}
+-- {"operators": "INNER_JOIN,LATERAL,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE"}
 SELECT i.I_ID, i.I_NAME, lat.times_ordered, lat.total_revenue FROM ITEM i JOIN LATERAL (SELECT COUNT(*) AS times_ordered, SUM(OL_AMOUNT) AS total_revenue FROM ORDER_LINE WHERE OL_I_ID = i.I_ID) lat ON TRUE;

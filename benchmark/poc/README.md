@@ -107,7 +107,7 @@ Run: `python3 join_poc.py --n-orders 1500000 --avg-li 4 --reps 3`.
 
 1. **`CREATE MATERIALIZED VIEW` parser strips newlines between `AS` and
    `SELECT`** — had to collapse to single-line SQL. Check
-   `src/core/openivm_parser.cpp`.
+   `src/core/parser.cpp`.
 2. **`DROP MATERIALIZED VIEW` returns "Cannot drop this type yet"** — blocks
    the rebuild-strategy measurement.
 

@@ -1,0 +1,2696 @@
+# name: test/sql/aggregate.test
+# description: Test IVM with all aggregate types (SUM, COUNT, MIN, MAX, AVG, grouped and ungrouped)
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE sales (id INT, region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO sales VALUES (1, 'east', 100), (2, 'west', 200), (3, 'east', 150);
+
+statement ok
+create materialized view sales_summary as (select region, sum(amount) as total, count(amount) as cnt from sales group by region);
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	250	2
+west	200	1
+
+# --- Insert into existing group ---
+statement ok
+INSERT INTO sales VALUES (4, 'east', 50);
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	300	3
+west	200	1
+
+# --- Insert into new group ---
+statement ok
+INSERT INTO sales VALUES (5, 'north', 300);
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	300	3
+north	300	1
+west	200	1
+
+# --- Delete from existing group ---
+statement ok
+DELETE FROM sales WHERE id = 1;
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	200	2
+north	300	1
+west	200	1
+
+# --- Multiple inserts in same group ---
+statement ok
+INSERT INTO sales VALUES (6, 'west', 75), (7, 'west', 25);
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	200	2
+north	300	1
+west	300	3
+
+# --- No-op PRAGMA ---
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary ORDER BY region;
+----
+east	200	2
+north	300	1
+west	300	3
+
+# --- Batch insert into multiple groups at once ---
+statement ok
+INSERT INTO sales VALUES (10, 'south', 100), (11, 'south', 200), (12, 'north', 50);
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary WHERE region IN ('south', 'north') ORDER BY region;
+----
+north	350	2
+south	300	2
+
+# --- Mixed insert + delete in same cycle ---
+statement ok
+INSERT INTO sales VALUES (13, 'west', 100);
+
+statement ok
+DELETE FROM sales WHERE id = 6;
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary WHERE region = 'west';
+----
+west	325	3
+
+# --- Delete ALL rows from a group ---
+statement ok
+DELETE FROM sales WHERE region = 'east';
+
+statement ok
+pragma ivm('sales_summary');
+
+query III
+SELECT region, total, cnt FROM sales_summary WHERE region != 'east' ORDER BY region;
+----
+north	350	2
+south	300	2
+west	325	3
+
+# ==========================================
+# NULL values as GROUP BY keys
+# ==========================================
+
+statement ok
+CREATE TABLE nullable_grp (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO nullable_grp VALUES ('a', 10), (NULL, 20), ('a', 30), (NULL, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_null_grp AS SELECT grp, SUM(val) AS total FROM nullable_grp GROUP BY grp;
+
+query II
+SELECT grp, total FROM mv_null_grp ORDER BY grp NULLS LAST;
+----
+a	40
+NULL	60
+
+statement ok
+INSERT INTO nullable_grp VALUES (NULL, 5), ('b', 100);
+
+statement ok
+pragma ivm('mv_null_grp');
+
+query II
+SELECT grp, total FROM mv_null_grp ORDER BY grp NULLS LAST;
+----
+a	40
+b	100
+NULL	65
+
+# Cross-check
+query II
+SELECT grp, SUM(val) FROM nullable_grp GROUP BY grp ORDER BY grp NULLS LAST;
+----
+a	40
+b	100
+NULL	65
+
+# Delete all NULLs
+statement ok
+DELETE FROM nullable_grp WHERE grp IS NULL;
+
+statement ok
+pragma ivm('mv_null_grp');
+
+query II
+SELECT grp, total FROM mv_null_grp ORDER BY grp;
+----
+a	40
+b	100
+
+# ==========================================
+# DECIMAL / NUMERIC columns in SUM
+# ==========================================
+
+statement ok
+CREATE TABLE decimals (category VARCHAR, amount DECIMAL(10,2));
+
+statement ok
+INSERT INTO decimals VALUES ('x', 10.50), ('x', 20.75), ('y', 100.00);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dec AS SELECT category, SUM(amount) AS total FROM decimals GROUP BY category;
+
+query II
+SELECT category, total FROM mv_dec ORDER BY category;
+----
+x	31.25
+y	100.00
+
+statement ok
+INSERT INTO decimals VALUES ('x', 0.01), ('y', 99.99);
+
+statement ok
+pragma ivm('mv_dec');
+
+query II
+SELECT category, total FROM mv_dec ORDER BY category;
+----
+x	31.26
+y	199.99
+
+# Cross-check
+query II
+SELECT category, SUM(amount) FROM decimals GROUP BY category ORDER BY category;
+----
+x	31.26
+y	199.99
+
+# ==========================================
+# BIGINT columns
+# ==========================================
+
+statement ok
+CREATE TABLE big_nums (grp INT, val BIGINT);
+
+statement ok
+INSERT INTO big_nums VALUES (1, 9223372036854775000), (1, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_big AS SELECT grp, SUM(val) AS total FROM big_nums GROUP BY grp;
+
+query II
+SELECT grp, total FROM mv_big;
+----
+1	9223372036854775100
+
+statement ok
+INSERT INTO big_nums VALUES (1, 500);
+
+statement ok
+pragma ivm('mv_big');
+
+query II
+SELECT grp, total FROM mv_big;
+----
+1	9223372036854775600
+
+# ==========================================
+# DATE columns as GROUP BY keys
+# ==========================================
+
+statement ok
+CREATE TABLE daily_sales (sale_date DATE, amount INT);
+
+statement ok
+INSERT INTO daily_sales VALUES ('2024-01-01', 100), ('2024-01-01', 200), ('2024-01-02', 300);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_daily AS SELECT sale_date, SUM(amount) AS total FROM daily_sales GROUP BY sale_date;
+
+query II
+SELECT sale_date, total FROM mv_daily ORDER BY sale_date;
+----
+2024-01-01	300
+2024-01-02	300
+
+statement ok
+INSERT INTO daily_sales VALUES ('2024-01-02', 50), ('2024-01-03', 400);
+
+statement ok
+pragma ivm('mv_daily');
+
+query II
+SELECT sale_date, total FROM mv_daily ORDER BY sale_date;
+----
+2024-01-01	300
+2024-01-02	350
+2024-01-03	400
+
+# Cross-check
+query II
+SELECT sale_date, SUM(amount) FROM daily_sales GROUP BY sale_date ORDER BY sale_date;
+----
+2024-01-01	300
+2024-01-02	350
+2024-01-03	400
+
+# ==========================================
+# Empty table → CREATE MV → INSERT → refresh
+# ==========================================
+
+statement ok
+CREATE TABLE empty_base (id INT, val INT);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_empty AS SELECT id, SUM(val) AS total FROM empty_base GROUP BY id;
+
+query II
+SELECT id, total FROM mv_empty;
+----
+
+statement ok
+INSERT INTO empty_base VALUES (1, 100), (2, 200);
+
+statement ok
+pragma ivm('mv_empty');
+
+query II
+SELECT id, total FROM mv_empty ORDER BY id;
+----
+1	100
+2	200
+
+# ==========================================
+# Large batch INSERT (1000 rows)
+# ==========================================
+
+statement ok
+CREATE TABLE batch_tbl (grp INT, val INT);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_batch AS SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM batch_tbl GROUP BY grp;
+
+statement ok
+INSERT INTO batch_tbl SELECT i % 10, i FROM range(1000) t(i);
+
+statement ok
+pragma ivm('mv_batch');
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM batch_tbl GROUP BY grp
+    EXCEPT
+    SELECT grp, total, cnt FROM mv_batch
+);
+----
+0
+
+# ==========================================
+# DELETE all rows → MV should be empty
+# ==========================================
+
+statement ok
+CREATE TABLE del_all (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO del_all VALUES ('a', 1), ('b', 2);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_del_all AS SELECT grp, SUM(val) AS total FROM del_all GROUP BY grp;
+
+statement ok
+DELETE FROM del_all;
+
+statement ok
+pragma ivm('mv_del_all');
+
+query II
+SELECT grp, total FROM mv_del_all;
+----
+
+# ==========================================
+# UNGROUPED (SCALAR) AGGREGATES
+# ==========================================
+
+
+statement ok
+CREATE TABLE scores (id INT, value INT, label VARCHAR);
+
+statement ok
+INSERT INTO scores VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c');
+
+statement ok
+create materialized view score_totals as (select sum(value) as total, count(label) as cnt from scores);
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+60	3
+
+# --- Insert ---
+statement ok
+INSERT INTO scores VALUES (4, 40, 'd');
+
+statement ok
+pragma ivm('score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+100	4
+
+# --- Delete ---
+statement ok
+DELETE FROM scores WHERE id = 1;
+
+statement ok
+pragma ivm('score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+90	3
+
+# --- Mixed insert + delete ---
+statement ok
+INSERT INTO scores VALUES (5, 50, 'e');
+
+statement ok
+DELETE FROM scores WHERE id = 2;
+
+statement ok
+pragma ivm('score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+120	3
+
+# --- No-op PRAGMA ---
+statement ok
+pragma ivm('score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+120	3
+
+# --- Batch insert ---
+statement ok
+INSERT INTO scores VALUES (6, 10, 'f'), (7, 20, 'g'), (8, 30, 'h');
+
+statement ok
+pragma ivm('score_totals');
+
+query II
+SELECT total, cnt FROM score_totals;
+----
+180	6
+
+# --- Delete multiple rows at once ---
+statement ok
+DELETE FROM scores WHERE value <= 20;
+
+statement ok
+pragma ivm('score_totals');
+
+# Remaining: id=3(30), id=4(40), id=5(50), id=8(30) = 150, cnt=4
+query II
+SELECT total, cnt FROM score_totals;
+----
+150	4
+
+
+# ==========================================
+# MIN / MAX AGGREGATES
+# ==========================================
+
+# Test 1: MIN with GROUP BY
+
+statement ok
+CREATE TABLE t1 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t1 VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_min AS SELECT grp, MIN(val) AS min_val FROM t1 GROUP BY grp;
+
+statement ok
+INSERT INTO t1 VALUES (5, 'a', 3);
+
+statement ok
+PRAGMA ivm('mv_min');
+
+query II
+SELECT grp, min_val FROM mv_min ORDER BY grp;
+----
+a	3
+b	5
+
+statement ok
+DELETE FROM t1 WHERE id = 5;
+
+statement ok
+PRAGMA ivm('mv_min');
+
+query II
+SELECT grp, min_val FROM mv_min ORDER BY grp;
+----
+a	10
+b	5
+
+# Test 2: MAX with GROUP BY
+
+statement ok
+CREATE TABLE t2 (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t2 VALUES (1, 'x', 100), (2, 'x', 200), (3, 'y', 50), (4, 'y', 75);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_max AS SELECT grp, MAX(val) AS max_val FROM t2 GROUP BY grp;
+
+statement ok
+INSERT INTO t2 VALUES (5, 'y', 300);
+
+statement ok
+PRAGMA ivm('mv_max');
+
+query II
+SELECT grp, max_val FROM mv_max ORDER BY grp;
+----
+x	200
+y	300
+
+statement ok
+DELETE FROM t2 WHERE id = 5;
+
+statement ok
+PRAGMA ivm('mv_max');
+
+query II
+SELECT grp, max_val FROM mv_max ORDER BY grp;
+----
+x	200
+y	75
+
+# Test 3: Mixed aggregates (SUM + MIN + MAX)
+
+statement ok
+CREATE TABLE t3 (id INT, grp VARCHAR, a INT, b INT, c INT);
+
+statement ok
+INSERT INTO t3 VALUES (1, 'g1', 10, 100, 1), (2, 'g1', 20, 200, 2), (3, 'g2', 30, 300, 3);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_mixed AS SELECT grp, SUM(a) AS sum_a, MIN(b) AS min_b, MAX(c) AS max_c FROM t3 GROUP BY grp;
+
+statement ok
+INSERT INTO t3 VALUES (4, 'g1', 5, 50, 10);
+
+statement ok
+PRAGMA ivm('mv_mixed');
+
+query IIII
+SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
+----
+g1	35	50	10
+g2	30	300	3
+
+statement ok
+DELETE FROM t3 WHERE id = 4;
+
+statement ok
+PRAGMA ivm('mv_mixed');
+
+query IIII
+SELECT grp, sum_a, min_b, max_c FROM mv_mixed ORDER BY grp;
+----
+g1	30	100	2
+g2	30	300	3
+
+# Test 5: Ungrouped MIN aggregate
+
+statement ok
+CREATE TABLE t5 (id INT, val INT);
+
+statement ok
+INSERT INTO t5 VALUES (1, 100), (2, 50), (3, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_simple_min AS SELECT MIN(val) AS min_val FROM t5;
+
+statement ok
+INSERT INTO t5 VALUES (4, 10);
+
+statement ok
+PRAGMA ivm('mv_simple_min');
+
+query I
+SELECT min_val FROM mv_simple_min;
+----
+10
+
+statement ok
+DELETE FROM t5 WHERE id = 4;
+
+statement ok
+PRAGMA ivm('mv_simple_min');
+
+query I
+SELECT min_val FROM mv_simple_min;
+----
+50
+
+# Test 6: MIN/MAX with JOIN + GROUP BY
+
+statement ok
+CREATE TABLE departments (dept_id INT, dept_name VARCHAR);
+
+statement ok
+INSERT INTO departments VALUES (1, 'engineering'), (2, 'sales');
+
+statement ok
+CREATE TABLE employees (id INT, dept_id INT, salary INT);
+
+statement ok
+INSERT INTO employees VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150), (4, 2, 300);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dept_salaries AS
+    SELECT d.dept_name, MIN(e.salary) AS min_salary, MAX(e.salary) AS max_salary
+    FROM departments d INNER JOIN employees e ON e.dept_id = d.dept_id
+    GROUP BY d.dept_name;
+
+statement ok
+INSERT INTO employees VALUES (5, 1, 50);
+
+statement ok
+PRAGMA ivm('mv_dept_salaries');
+
+query III
+SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
+----
+engineering	50	200
+sales	150	300
+
+statement ok
+DELETE FROM employees WHERE id = 5;
+
+statement ok
+PRAGMA ivm('mv_dept_salaries');
+
+query III
+SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
+----
+engineering	100	200
+sales	150	300
+
+statement ok
+INSERT INTO departments VALUES (3, 'marketing');
+
+statement ok
+INSERT INTO employees VALUES (6, 3, 75);
+
+statement ok
+PRAGMA ivm('mv_dept_salaries');
+
+query III
+SELECT dept_name, min_salary, max_salary FROM mv_dept_salaries ORDER BY dept_name;
+----
+engineering	100	200
+marketing	75	75
+sales	150	300
+
+# ==========================================
+# AVG aggregate (group-recompute strategy)
+# ==========================================
+
+statement ok
+CREATE TABLE avg_data (grp VARCHAR, val DOUBLE);
+
+statement ok
+INSERT INTO avg_data VALUES ('a', 10), ('a', 20), ('b', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_avg AS SELECT grp, AVG(val) AS avg_val FROM avg_data GROUP BY grp;
+
+query II
+SELECT grp, avg_val FROM mv_avg ORDER BY grp;
+----
+a	15.0
+b	30.0
+
+statement ok
+INSERT INTO avg_data VALUES ('a', 40), ('c', 100);
+
+statement ok
+pragma ivm('mv_avg');
+
+query II
+SELECT grp, avg_val FROM mv_avg ORDER BY grp;
+----
+a	23.333333333333332
+b	30.0
+c	100.0
+
+# Cross-check
+query II
+SELECT grp, AVG(val) FROM avg_data GROUP BY grp ORDER BY grp;
+----
+a	23.333333333333332
+b	30.0
+c	100.0
+
+# Delete from group
+statement ok
+DELETE FROM avg_data WHERE grp = 'a' AND val = 10;
+
+statement ok
+pragma ivm('mv_avg');
+
+query II
+SELECT grp, avg_val FROM mv_avg ORDER BY grp;
+----
+a	30.0
+b	30.0
+c	100.0
+
+# Ungrouped AVG
+statement ok
+CREATE TABLE avg_ungrouped (val INT);
+
+statement ok
+INSERT INTO avg_ungrouped VALUES (10), (20), (30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_avg_scalar AS SELECT AVG(val) AS avg_val FROM avg_ungrouped;
+
+query I
+SELECT avg_val FROM mv_avg_scalar;
+----
+20.0
+
+statement ok
+INSERT INTO avg_ungrouped VALUES (40);
+
+statement ok
+pragma ivm('mv_avg_scalar');
+
+query I
+SELECT avg_val FROM mv_avg_scalar;
+----
+25.0
+
+# Cross-check
+query I
+SELECT AVG(val) FROM avg_ungrouped;
+----
+25.0
+
+# ==========================================
+# HAVING clause (optimized to FILTER above AGGREGATE by DuckDB)
+# ==========================================
+
+statement ok
+CREATE TABLE having_test (region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO having_test VALUES ('a', 100), ('a', 200), ('b', 50), ('c', 10);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_having AS SELECT region, SUM(amount) AS total FROM having_test GROUP BY region HAVING SUM(amount) > 60;
+
+query II
+SELECT region, total FROM mv_having ORDER BY region;
+----
+a	300
+
+statement ok
+INSERT INTO having_test VALUES ('b', 100), ('c', 200);
+
+statement ok
+PRAGMA ivm('mv_having');
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(amount) AS total FROM having_test GROUP BY region HAVING SUM(amount) > 60
+    EXCEPT ALL
+    SELECT region, total FROM mv_having
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total FROM mv_having
+    EXCEPT ALL
+    SELECT region, SUM(amount) AS total FROM having_test GROUP BY region HAVING SUM(amount) > 60
+);
+----
+0
+
+# ==========================================
+# CASE WHEN in aggregates
+# ==========================================
+
+statement ok
+CREATE TABLE case_test (category VARCHAR, value INT);
+
+statement ok
+INSERT INTO case_test VALUES ('a', 10), ('a', -5), ('b', 20), ('b', -3);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_case AS SELECT category, SUM(CASE WHEN value > 0 THEN value ELSE 0 END) AS pos_sum FROM case_test GROUP BY category;
+
+query II
+SELECT category, pos_sum FROM mv_case ORDER BY category;
+----
+a	10
+b	20
+
+statement ok
+INSERT INTO case_test VALUES ('a', 30), ('b', -100), ('c', 50);
+
+statement ok
+PRAGMA ivm('mv_case');
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (
+    SELECT category, SUM(CASE WHEN value > 0 THEN value ELSE 0 END) AS pos_sum FROM case_test GROUP BY category
+    EXCEPT ALL
+    SELECT category, pos_sum FROM mv_case
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT category, pos_sum FROM mv_case
+    EXCEPT ALL
+    SELECT category, SUM(CASE WHEN value > 0 THEN value ELSE 0 END) AS pos_sum FROM case_test GROUP BY category
+);
+----
+0
+
+# ==========================================
+# NULL values in aggregate columns with edge case deletions
+# ==========================================
+
+statement ok
+CREATE TABLE agg_null_edge (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO agg_null_edge VALUES ('a', 10), ('a', NULL), ('b', NULL), ('b', NULL), ('c', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg_null_edge AS
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val
+    FROM agg_null_edge GROUP BY grp;
+
+statement ok
+PRAGMA ivm('mv_agg_null_edge');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+);
+----
+0
+
+# Delete all NULL vals — group 'b' loses all rows (cnt becomes 0 → group removed)
+statement ok
+DELETE FROM agg_null_edge WHERE val IS NULL;
+
+statement ok
+PRAGMA ivm('mv_agg_null_edge');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+);
+----
+0
+
+# Insert only NULLs into 'a': SUM unchanged, COUNT(*) increases, COUNT(val) unchanged
+statement ok
+INSERT INTO agg_null_edge VALUES ('a', NULL), ('a', NULL);
+
+statement ok
+PRAGMA ivm('mv_agg_null_edge');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt, cnt_val FROM mv_agg_null_edge
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt, COUNT(val) AS cnt_val FROM agg_null_edge GROUP BY grp
+);
+----
+0
+
+# Insert-only MIN/MAX must handle NULL -> value transitions.
+statement ok
+CREATE TABLE agg_minmax_null_insert (grp VARCHAR, placed TIMESTAMP, removed TIMESTAMP);
+
+statement ok
+INSERT INTO agg_minmax_null_insert VALUES ('a', TIMESTAMP '2026-01-01 10:00:00', NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg_minmax_null_insert AS
+    SELECT grp, MIN(placed) AS placed_at, MAX(removed) AS removed_at
+    FROM agg_minmax_null_insert GROUP BY grp;
+
+statement ok
+INSERT INTO agg_minmax_null_insert VALUES ('a', NULL, TIMESTAMP '2026-01-02 11:00:00');
+
+statement ok
+PRAGMA ivm('mv_agg_minmax_null_insert');
+
+query ITT
+SELECT grp, placed_at, removed_at FROM mv_agg_minmax_null_insert ORDER BY grp;
+----
+a	2026-01-01 10:00:00	2026-01-02 11:00:00
+
+# ==========================================
+# UPDATE that changes GROUP BY key (row moves between groups)
+# ==========================================
+
+statement ok
+CREATE TABLE agg_grp_move (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO agg_grp_move VALUES ('x', 10), ('x', 20), ('y', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg_grp_move AS
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp;
+
+statement ok
+PRAGMA ivm('mv_agg_grp_move');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM mv_agg_grp_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_agg_grp_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+);
+----
+0
+
+# Move row from x to y: UPDATE val=20 row's grp from 'x' to 'y'
+statement ok
+UPDATE agg_grp_move SET grp = 'y' WHERE val = 20;
+
+statement ok
+PRAGMA ivm('mv_agg_grp_move');
+
+# x total: 10, y total: 50
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM mv_agg_grp_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_agg_grp_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+);
+----
+0
+
+# Move row from y to new group z: UPDATE val=30 row's grp from 'y' to 'z'
+statement ok
+UPDATE agg_grp_move SET grp = 'z' WHERE val = 30;
+
+statement ok
+PRAGMA ivm('mv_agg_grp_move');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM mv_agg_grp_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_agg_grp_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM agg_grp_move GROUP BY grp
+);
+----
+0
+
+
+# ==========================================
+# JOIN + GROUP BY + HAVING
+# ==========================================
+
+statement ok
+CREATE TABLE ajh_orders (id INT, cust_id INT, amount INT);
+
+statement ok
+CREATE TABLE ajh_customers (id INT, region VARCHAR);
+
+statement ok
+INSERT INTO ajh_customers VALUES (1, 'US'), (2, 'EU'), (3, 'US');
+
+statement ok
+INSERT INTO ajh_orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150), (4, 3, 50);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_big_regions AS
+    SELECT c.region, SUM(o.amount) AS total, COUNT(*) AS cnt
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region
+    HAVING SUM(o.amount) > 200;
+
+# Only US qualifies (350 > 200), EU has 150
+query III
+SELECT region, total, cnt FROM mv_big_regions ORDER BY region;
+----
+US	350	3
+
+# Add orders to EU so it crosses the threshold
+statement ok
+INSERT INTO ajh_orders VALUES (5, 2, 200);
+
+statement ok
+PRAGMA ivm('mv_big_regions');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+    EXCEPT ALL SELECT * FROM mv_big_regions
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_big_regions
+    EXCEPT ALL SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+);
+----
+0
+
+# Delete enough from US to drop below threshold
+statement ok
+DELETE FROM ajh_orders WHERE cust_id = 1 AND amount = 200;
+
+statement ok
+PRAGMA ivm('mv_big_regions');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+    EXCEPT ALL SELECT * FROM mv_big_regions
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_big_regions
+    EXCEPT ALL SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+);
+----
+0
+
+# Insert new customer + orders in one batch
+statement ok
+INSERT INTO ajh_customers VALUES (4, 'APAC');
+
+statement ok
+INSERT INTO ajh_orders VALUES (6, 4, 500), (7, 4, 100);
+
+statement ok
+PRAGMA ivm('mv_big_regions');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+    EXCEPT ALL SELECT * FROM mv_big_regions
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_big_regions
+    EXCEPT ALL SELECT c.region, SUM(o.amount), COUNT(*)
+    FROM ajh_orders o INNER JOIN ajh_customers c ON o.cust_id = c.id
+    GROUP BY c.region HAVING SUM(o.amount) > 200
+);
+----
+0
+
+# ==========================================
+# GROUP disappears entirely (single-row group deleted)
+# ==========================================
+
+statement ok
+CREATE TABLE agg_vanish (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO agg_vanish VALUES ('p', 10), ('q', 20), ('r', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg_vanish AS
+    SELECT grp, SUM(val) AS total FROM agg_vanish GROUP BY grp;
+
+statement ok
+PRAGMA ivm('mv_agg_vanish');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM agg_vanish GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_agg_vanish
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_agg_vanish
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM agg_vanish GROUP BY grp
+);
+----
+0
+
+# Delete the only row in group 'q' — group should vanish
+statement ok
+DELETE FROM agg_vanish WHERE grp = 'q';
+
+statement ok
+PRAGMA ivm('mv_agg_vanish');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM agg_vanish GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_agg_vanish
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_agg_vanish
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM agg_vanish GROUP BY grp
+);
+----
+0
+
+# ==========================================
+# UPDATE moves rows between groups (changes GROUP BY key)
+# ==========================================
+
+statement ok
+CREATE TABLE agg_key_move (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO agg_key_move VALUES ('m', 10), ('m', 20), ('n', 30), ('n', 40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_agg_key_move AS
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp;
+
+statement ok
+PRAGMA ivm('mv_agg_key_move');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_agg_key_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_agg_key_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+);
+----
+0
+
+# Move val=20 from 'm' to 'n'
+statement ok
+UPDATE agg_key_move SET grp = 'n' WHERE val = 20;
+
+statement ok
+PRAGMA ivm('mv_agg_key_move');
+
+# m: total=10 cnt=1, n: total=90 cnt=3
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_agg_key_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_agg_key_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+);
+----
+0
+
+# Move remaining 'm' row to brand-new group 'o' — 'm' vanishes, 'o' appears
+statement ok
+UPDATE agg_key_move SET grp = 'o' WHERE grp = 'm';
+
+statement ok
+PRAGMA ivm('mv_agg_key_move');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_agg_key_move
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_agg_key_move
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM agg_key_move GROUP BY grp
+);
+----
+0
+
+# ==========================================
+# LEFT JOIN + AGGREGATE (SUM over NULL-extended rows)
+# ==========================================
+
+statement ok
+CREATE TABLE lja_customers (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE lja_orders (cust_id INT, amount INT);
+
+statement ok
+INSERT INTO lja_customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+
+statement ok
+INSERT INTO lja_orders VALUES (1, 100), (1, 200), (2, 50);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cust_totals AS
+    SELECT c.name, SUM(o.amount) AS total, COUNT(o.amount) AS cnt
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id
+    GROUP BY c.name;
+
+# Carol has no orders → total=NULL, cnt=0
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id GROUP BY c.name
+    EXCEPT ALL SELECT * FROM mv_cust_totals
+);
+----
+0
+
+# Add order for Carol + delete all orders for Alice
+statement ok
+INSERT INTO lja_orders VALUES (3, 75);
+
+statement ok
+DELETE FROM lja_orders WHERE cust_id = 1;
+
+statement ok
+PRAGMA ivm('mv_cust_totals');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id GROUP BY c.name
+    EXCEPT ALL SELECT * FROM mv_cust_totals
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cust_totals
+    EXCEPT ALL SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id GROUP BY c.name
+);
+----
+0
+
+# Delete all orders — everyone NULL-extended
+statement ok
+DELETE FROM lja_orders;
+
+statement ok
+PRAGMA ivm('mv_cust_totals');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id GROUP BY c.name
+    EXCEPT ALL SELECT * FROM mv_cust_totals
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cust_totals
+    EXCEPT ALL SELECT c.name, SUM(o.amount), COUNT(o.amount)
+    FROM lja_customers c LEFT JOIN lja_orders o ON c.id = o.cust_id GROUP BY c.name
+);
+----
+0
+
+# ==========================================
+# STDDEV and VARIANCE decomposition
+# ==========================================
+
+statement ok
+CREATE TABLE sd_base (id INT, grp VARCHAR, val DOUBLE);
+
+statement ok
+INSERT INTO sd_base VALUES (1,'a',10), (2,'a',20), (3,'a',30), (4,'b',5), (5,'b',15), (6,'b',25);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_stddev AS
+    SELECT grp, stddev(val) as sd, variance(val) as vr, stddev_pop(val) as sdp, var_pop(val) as vrp
+    FROM sd_base GROUP BY grp;
+
+# Cross-check initial
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, round(sd,6), round(vr,6), round(sdp,6), round(vrp,6) FROM mv_stddev
+    EXCEPT ALL
+    SELECT grp, round(stddev(val),6), round(variance(val),6), round(stddev_pop(val),6), round(var_pop(val),6)
+    FROM sd_base GROUP BY grp
+);
+----
+0
+
+# --- INSERT into existing groups + new group ---
+statement ok
+INSERT INTO sd_base VALUES (7,'a',40), (8,'b',35), (9,'c',100);
+
+statement ok
+PRAGMA ivm('mv_stddev');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, round(sd,6), round(vr,6), round(sdp,6), round(vrp,6) FROM mv_stddev
+    EXCEPT ALL
+    SELECT grp, round(stddev(val),6), round(variance(val),6), round(stddev_pop(val),6), round(var_pop(val),6)
+    FROM sd_base GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, round(stddev(val),6), round(variance(val),6), round(stddev_pop(val),6), round(var_pop(val),6)
+    FROM sd_base GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, round(sd,6), round(vr,6), round(sdp,6), round(vrp,6) FROM mv_stddev
+);
+----
+0
+
+# --- DELETE + mixed DML ---
+statement ok
+DELETE FROM sd_base WHERE id IN (1, 4);
+
+statement ok
+INSERT INTO sd_base VALUES (10,'c',200), (11,'a',50);
+
+statement ok
+PRAGMA ivm('mv_stddev');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, round(sd,6), round(vr,6), round(sdp,6), round(vrp,6) FROM mv_stddev
+    EXCEPT ALL
+    SELECT grp, round(stddev(val),6), round(variance(val),6), round(stddev_pop(val),6), round(var_pop(val),6)
+    FROM sd_base GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, round(stddev(val),6), round(variance(val),6), round(stddev_pop(val),6), round(var_pop(val),6)
+    FROM sd_base GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, round(sd,6), round(vr,6), round(sdp,6), round(vrp,6) FROM mv_stddev
+);
+----
+0
+
+# --- AVG without explicit alias (column name sanitization) ---
+# Regression test: DuckDB auto-sets bound.alias = "avg(col)" for unaliased AVG.
+# Before fix, this produced _ivm_sum_avg(col) — invalid SQL identifier in EXCLUDE clause.
+
+statement ok
+CREATE TABLE avg_noalias (val DECIMAL(10,2));
+
+statement ok
+INSERT INTO avg_noalias VALUES (10.0),(20.0),(30.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_avg_noalias AS SELECT AVG(val) FROM avg_noalias;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_avg_noalias EXCEPT ALL SELECT AVG(val) FROM avg_noalias
+    UNION ALL
+    SELECT AVG(val) FROM avg_noalias EXCEPT ALL SELECT * FROM mv_avg_noalias
+);
+----
+0
+
+statement ok
+INSERT INTO avg_noalias VALUES (40.0);
+
+statement ok
+PRAGMA ivm('mv_avg_noalias');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_avg_noalias EXCEPT ALL SELECT AVG(val) FROM avg_noalias
+    UNION ALL
+    SELECT AVG(val) FROM avg_noalias EXCEPT ALL SELECT * FROM mv_avg_noalias
+);
+----
+0
+
+statement ok
+DELETE FROM avg_noalias WHERE val = 10.0;
+
+statement ok
+PRAGMA ivm('mv_avg_noalias');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_avg_noalias EXCEPT ALL SELECT AVG(val) FROM avg_noalias
+    UNION ALL
+    SELECT AVG(val) FROM avg_noalias EXCEPT ALL SELECT * FROM mv_avg_noalias
+);
+----
+0
+
+# ============================================================
+# Non-summable columns in aggregate MVs — the delta MERGE path
+# emits `sum(case mult=false then -<col> else <col> end)` for
+# every non-key column, which fails type-checking for VARCHAR /
+# BOOLEAN / LIST columns and gives wrong results for CASE over
+# aggregates. These cases must fall back to group-recompute:
+# delete affected groups, re-insert from the view query.
+# ============================================================
+
+# UPPER(group_key) — VARCHAR column deterministic in the group key
+statement ok
+CREATE TABLE nonadd_cust (w_id INT, state VARCHAR, bal DECIMAL(10,2));
+
+statement ok
+INSERT INTO nonadd_cust VALUES (1, 'ca', 100), (1, 'ca', 200), (1, 'ny', 150);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_upper_state AS
+    SELECT w_id, state, UPPER(state) AS state_upper, COUNT(*) AS cnt
+    FROM nonadd_cust GROUP BY w_id, state;
+
+statement ok
+INSERT INTO nonadd_cust VALUES (1, 'ca', 300), (2, 'tx', 400);
+
+statement ok
+DELETE FROM nonadd_cust WHERE state = 'ny';
+
+statement ok
+PRAGMA ivm('mv_upper_state');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_upper_state
+    EXCEPT ALL
+    SELECT w_id, state, UPPER(state), COUNT(*) FROM nonadd_cust GROUP BY w_id, state
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, state, UPPER(state), COUNT(*) FROM nonadd_cust GROUP BY w_id, state
+    EXCEPT ALL
+    SELECT * FROM mv_upper_state
+);
+----
+0
+
+# VARCHAR literal column (common in UNION-ALL-of-aggregates)
+statement ok
+CREATE TABLE tag_events (kind VARCHAR, amount INT);
+
+statement ok
+INSERT INTO tag_events VALUES ('click', 5), ('click', 7), ('view', 3);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_literal_tag AS
+    SELECT 'stat' AS label, kind, SUM(amount) AS total, COUNT(*) AS n
+    FROM tag_events GROUP BY kind;
+
+statement ok
+INSERT INTO tag_events VALUES ('click', 10), ('view', 5);
+
+statement ok
+DELETE FROM tag_events WHERE kind = 'click' AND amount = 5;
+
+statement ok
+PRAGMA ivm('mv_literal_tag');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_literal_tag
+    EXCEPT ALL
+    SELECT 'stat', kind, SUM(amount), COUNT(*) FROM tag_events GROUP BY kind
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT 'stat', kind, SUM(amount), COUNT(*) FROM tag_events GROUP BY kind
+    EXCEPT ALL SELECT * FROM mv_literal_tag
+);
+----
+0
+
+# CASE over aggregate — value changes whenever the aggregate state changes,
+# so neither summing deltas nor pass-through is correct. Group-recompute is.
+statement ok
+CREATE TABLE case_sales (region VARCHAR, rev INT);
+
+statement ok
+INSERT INTO case_sales VALUES ('EU', 100), ('EU', 500), ('US', 200), ('US', 900);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_tier AS
+    SELECT region,
+           SUM(rev) AS total,
+           COUNT(*) AS n,
+           CASE WHEN SUM(rev) > 1000 THEN 'high' ELSE 'low' END AS tier
+    FROM case_sales GROUP BY region;
+
+# Push EU past the 1000 threshold, push US below by deleting the big row
+statement ok
+INSERT INTO case_sales VALUES ('EU', 500);
+
+statement ok
+DELETE FROM case_sales WHERE region = 'US' AND rev = 900;
+
+statement ok
+PRAGMA ivm('mv_tier');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_tier
+    EXCEPT ALL
+    SELECT region, SUM(rev), COUNT(*),
+           CASE WHEN SUM(rev) > 1000 THEN 'high' ELSE 'low' END
+    FROM case_sales GROUP BY region
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(rev), COUNT(*),
+           CASE WHEN SUM(rev) > 1000 THEN 'high' ELSE 'low' END
+    FROM case_sales GROUP BY region
+    EXCEPT ALL SELECT * FROM mv_tier
+);
+----
+0
+
+# Verify the CASE value actually flipped for both groups
+query TT
+SELECT region, tier FROM mv_tier ORDER BY region;
+----
+EU	high
+US	low
+
+# LIST aggregate — lists are not element-wise summable, must re-list per group
+statement ok
+CREATE TABLE list_events (user_id INT, item_id INT);
+
+statement ok
+INSERT INTO list_events VALUES (1, 100), (1, 101), (2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_user_items AS
+    SELECT user_id, LIST(item_id ORDER BY item_id) AS items, COUNT(*) AS cnt
+    FROM list_events GROUP BY user_id;
+
+statement ok
+INSERT INTO list_events VALUES (1, 102), (2, 201), (3, 300);
+
+statement ok
+DELETE FROM list_events WHERE item_id = 101;
+
+statement ok
+PRAGMA ivm('mv_user_items');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_user_items
+    EXCEPT ALL
+    SELECT user_id, LIST(item_id ORDER BY item_id), COUNT(*)
+    FROM list_events GROUP BY user_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT user_id, LIST(item_id ORDER BY item_id), COUNT(*)
+    FROM list_events GROUP BY user_id
+    EXCEPT ALL SELECT * FROM mv_user_items
+);
+----
+0
+
+# Simple aggregate (no GROUP BY) with VARCHAR literal — SIMPLE_AGGREGATE path
+statement ok
+CREATE TABLE simple_events (amount INT);
+
+statement ok
+INSERT INTO simple_events VALUES (10), (20), (30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_simple_literal AS
+    SELECT 'all' AS bucket, COUNT(*) AS n, SUM(amount) AS total
+    FROM simple_events;
+
+statement ok
+INSERT INTO simple_events VALUES (40);
+
+statement ok
+DELETE FROM simple_events WHERE amount = 10;
+
+statement ok
+PRAGMA ivm('mv_simple_literal');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_simple_literal
+    EXCEPT ALL
+    SELECT 'all', COUNT(*), SUM(amount) FROM simple_events
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT 'all', COUNT(*), SUM(amount) FROM simple_events
+    EXCEPT ALL SELECT * FROM mv_simple_literal
+);
+----
+0
+
+# Multiple non-additive columns in one MV
+statement ok
+CREATE TABLE multi_nonadd (dept VARCHAR, region VARCHAR, salary INT);
+
+statement ok
+INSERT INTO multi_nonadd VALUES ('eng', 'us', 100000), ('eng', 'eu', 90000), ('sales', 'us', 80000);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_multi_nonadd AS
+    SELECT dept, region,
+           UPPER(dept) AS dept_upper,
+           LOWER(region) AS region_lower,
+           'live' AS label,
+           SUM(salary) AS total_sal,
+           COUNT(*) AS cnt
+    FROM multi_nonadd GROUP BY dept, region;
+
+statement ok
+INSERT INTO multi_nonadd VALUES ('eng', 'us', 120000), ('sales', 'eu', 70000);
+
+statement ok
+DELETE FROM multi_nonadd WHERE dept='eng' AND region='eu';
+
+statement ok
+PRAGMA ivm('mv_multi_nonadd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_multi_nonadd
+    EXCEPT ALL
+    SELECT dept, region, UPPER(dept), LOWER(region), 'live', SUM(salary), COUNT(*)
+    FROM multi_nonadd GROUP BY dept, region
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT dept, region, UPPER(dept), LOWER(region), 'live', SUM(salary), COUNT(*)
+    FROM multi_nonadd GROUP BY dept, region
+    EXCEPT ALL SELECT * FROM mv_multi_nonadd
+);
+----
+0
+
+# Group key becomes empty (all rows for a group deleted) then repopulated
+statement ok
+DELETE FROM multi_nonadd WHERE dept='sales';
+
+statement ok
+PRAGMA ivm('mv_multi_nonadd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_multi_nonadd
+    EXCEPT ALL
+    SELECT dept, region, UPPER(dept), LOWER(region), 'live', SUM(salary), COUNT(*)
+    FROM multi_nonadd GROUP BY dept, region
+);
+----
+0
+
+statement ok
+INSERT INTO multi_nonadd VALUES ('sales', 'apac', 60000), ('sales', 'apac', 65000);
+
+statement ok
+PRAGMA ivm('mv_multi_nonadd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_multi_nonadd
+    EXCEPT ALL
+    SELECT dept, region, UPPER(dept), LOWER(region), 'live', SUM(salary), COUNT(*)
+    FROM multi_nonadd GROUP BY dept, region
+);
+----
+0
+
+# CASE over AVG — aggregate state changes across the threshold repeatedly
+statement ok
+CREATE TABLE case_avg (grp INT, v DECIMAL(10,2));
+
+statement ok
+INSERT INTO case_avg VALUES (1, 100), (1, 200), (2, 1500), (2, 2500);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_case_avg AS
+    SELECT grp,
+           AVG(v) AS avg_v,
+           COUNT(*) AS n,
+           CASE WHEN AVG(v) > 1000 THEN 'big' ELSE 'small' END AS tier
+    FROM case_avg GROUP BY grp;
+
+query TT
+SELECT grp, tier FROM mv_case_avg ORDER BY grp;
+----
+1	small
+2	big
+
+# Batch 1: flip grp=1 above threshold by adding a huge row
+statement ok
+INSERT INTO case_avg VALUES (1, 5000);
+
+statement ok
+PRAGMA ivm('mv_case_avg');
+
+query TT
+SELECT grp, tier FROM mv_case_avg ORDER BY grp;
+----
+1	big
+2	big
+
+# Batch 2: remove the huge row in grp=1, push grp=2 below threshold
+statement ok
+DELETE FROM case_avg WHERE grp=1 AND v=5000;
+
+statement ok
+INSERT INTO case_avg VALUES (2, 100), (2, 100), (2, 100), (2, 100), (2, 100);
+
+statement ok
+PRAGMA ivm('mv_case_avg');
+
+query TT
+SELECT grp, tier FROM mv_case_avg ORDER BY grp;
+----
+1	small
+2	small
+
+# LIST<VARCHAR> with ORDER BY — element order in the list must match the order
+# produced by the view query (LIST(col ORDER BY another_col)).
+statement ok
+CREATE TABLE list_varchar (cat VARCHAR, name VARCHAR, rank INT);
+
+statement ok
+INSERT INTO list_varchar VALUES
+    ('fruit', 'apple', 1), ('fruit', 'banana', 2), ('fruit', 'cherry', 3),
+    ('veg', 'broccoli', 1), ('veg', 'carrot', 2);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_list_varchar AS
+    SELECT cat, LIST(name ORDER BY rank) AS names, COUNT(*) AS n
+    FROM list_varchar GROUP BY cat;
+
+statement ok
+INSERT INTO list_varchar VALUES ('fruit', 'date', 4), ('veg', 'asparagus', 0);
+
+statement ok
+DELETE FROM list_varchar WHERE name = 'banana';
+
+statement ok
+PRAGMA ivm('mv_list_varchar');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_varchar
+    EXCEPT ALL
+    SELECT cat, LIST(name ORDER BY rank), COUNT(*) FROM list_varchar GROUP BY cat
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT cat, LIST(name ORDER BY rank), COUNT(*) FROM list_varchar GROUP BY cat
+    EXCEPT ALL SELECT * FROM mv_list_varchar
+);
+----
+0
+
+# BOOLEAN scalar in projection above aggregate
+statement ok
+CREATE TABLE bool_check (grp INT, v INT);
+
+statement ok
+INSERT INTO bool_check VALUES (1, 5), (1, 10), (2, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_bool_tier AS
+    SELECT grp,
+           SUM(v) AS total,
+           (SUM(v) > 50) AS is_big,
+           COUNT(*) AS n
+    FROM bool_check GROUP BY grp;
+
+statement ok
+INSERT INTO bool_check VALUES (1, 100), (2, 5);
+
+statement ok
+DELETE FROM bool_check WHERE grp = 2 AND v = 100;
+
+statement ok
+PRAGMA ivm('mv_bool_tier');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_bool_tier
+    EXCEPT ALL
+    SELECT grp, SUM(v), (SUM(v) > 50), COUNT(*) FROM bool_check GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(v), (SUM(v) > 50), COUNT(*) FROM bool_check GROUP BY grp
+    EXCEPT ALL SELECT * FROM mv_bool_tier
+);
+----
+0
+
+# Verify the boolean flipped
+query IT
+SELECT grp, is_big FROM mv_bool_tier ORDER BY grp;
+----
+1	true
+2	false
+
+# UNION-ALL-of-aggregates-with-literals — exercises SIMPLE_AGGREGATE
+# (each branch has its own literal tag and an aggregate)
+statement ok
+CREATE TABLE ua_events (status VARCHAR, amount INT);
+
+statement ok
+INSERT INTO ua_events VALUES ('open', 10), ('open', 20), ('closed', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ua_counts AS
+    SELECT 'open' AS kind, COUNT(*) AS n FROM ua_events WHERE status = 'open'
+    UNION ALL
+    SELECT 'closed', COUNT(*) FROM ua_events WHERE status = 'closed'
+    UNION ALL
+    SELECT 'total', COUNT(*) FROM ua_events;
+
+statement ok
+INSERT INTO ua_events VALUES ('open', 40), ('closed', 50);
+
+statement ok
+DELETE FROM ua_events WHERE status='open' AND amount=10;
+
+statement ok
+PRAGMA ivm('mv_ua_counts');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_ua_counts
+    EXCEPT ALL
+    SELECT * FROM (
+        SELECT 'open', COUNT(*) FROM ua_events WHERE status='open'
+        UNION ALL SELECT 'closed', COUNT(*) FROM ua_events WHERE status='closed'
+        UNION ALL SELECT 'total', COUNT(*) FROM ua_events
+    ) q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        SELECT 'open', COUNT(*) FROM ua_events WHERE status='open'
+        UNION ALL SELECT 'closed', COUNT(*) FROM ua_events WHERE status='closed'
+        UNION ALL SELECT 'total', COUNT(*) FROM ua_events
+    ) q
+    EXCEPT ALL SELECT * FROM mv_ua_counts
+);
+----
+0
+
+# LIST with large batch of mixed inserts/deletes
+statement ok
+CREATE TABLE list_heavy (bucket INT, token VARCHAR);
+
+statement ok
+INSERT INTO list_heavy SELECT i % 3, 'tok' || i FROM range(1, 20) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_list_heavy AS
+    SELECT bucket, LIST(token ORDER BY token) AS toks, COUNT(*) AS n
+    FROM list_heavy GROUP BY bucket;
+
+statement ok
+DELETE FROM list_heavy WHERE token IN ('tok5', 'tok10', 'tok15');
+
+statement ok
+INSERT INTO list_heavy VALUES (0, 'new_a'), (1, 'new_b'), (2, 'new_c'), (0, 'new_d');
+
+statement ok
+PRAGMA ivm('mv_list_heavy');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_heavy
+    EXCEPT ALL
+    SELECT bucket, LIST(token ORDER BY token), COUNT(*) FROM list_heavy GROUP BY bucket
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT bucket, LIST(token ORDER BY token), COUNT(*) FROM list_heavy GROUP BY bucket
+    EXCEPT ALL SELECT * FROM mv_list_heavy
+);
+----
+0
+
+# ============================================================
+# STDDEV/VARIANCE on flat-valued data — regression for crashes
+# and drift after INSERT+DELETE. Without the MERGE-path CASE-WHEN +
+# GREATEST(0, ...) clamp, sqrt() is called on a tiny-negative value
+# (floating-point reassociation of (sum_sq - sum²/count)) and crashes.
+# ============================================================
+
+statement ok
+CREATE TABLE sd_flat (id INT, grp INT, v DOUBLE);
+
+statement ok
+INSERT INTO sd_flat SELECT i, (i-1) % 3, 100.5 FROM range(1, 30) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_flat_sd AS
+    SELECT grp, STDDEV(v) AS sd, VARIANCE(v) AS vr,
+           STDDEV_POP(v) AS sdp, VAR_POP(v) AS vrp, COUNT(*) AS n
+    FROM sd_flat GROUP BY grp;
+
+# Batch of inserts + deletes on flat data — variance is algebraically 0
+# but floating-point makes it drift negative.
+statement ok
+INSERT INTO sd_flat SELECT i, (i-1) % 3, 100.5 FROM range(30, 60) t(i);
+
+statement ok
+DELETE FROM sd_flat WHERE grp = 0 AND id BETWEEN 1 AND 6;
+
+statement ok
+PRAGMA ivm('mv_flat_sd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_flat_sd
+    EXCEPT ALL
+    SELECT grp, STDDEV(v), VARIANCE(v), STDDEV_POP(v), VAR_POP(v), COUNT(*)
+    FROM sd_flat GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, STDDEV(v), VARIANCE(v), STDDEV_POP(v), VAR_POP(v), COUNT(*)
+    FROM sd_flat GROUP BY grp
+    EXCEPT ALL SELECT * FROM mv_flat_sd
+);
+----
+0
+
+# ============================================================
+# STDDEV/VARIANCE with groups crossing the count threshold:
+# sample needs count > 1, population needs count > 0. When a DELETE
+# drops a group to count=1 (or count=0), the MV must store NULL —
+# not NaN or 0 from the raw algebraic formula.
+# ============================================================
+
+statement ok
+CREATE TABLE sd_threshold (grp INT, v DOUBLE);
+
+statement ok
+INSERT INTO sd_threshold VALUES
+    (1, 10), (1, 20), (1, 30),  -- grp 1: 3 rows
+    (2, 100), (2, 200),          -- grp 2: 2 rows
+    (3, 500);                    -- grp 3: 1 row (already below sample threshold)
+
+statement ok
+CREATE MATERIALIZED VIEW mv_thr_sd AS
+    SELECT grp, STDDEV(v) AS sd, VARIANCE(v) AS vr,
+           STDDEV_POP(v) AS sdp, VAR_POP(v) AS vrp, COUNT(*) AS n
+    FROM sd_threshold GROUP BY grp;
+
+# Cross-check initial state (grp=3 should have sd/vr = NULL, sdp/vrp = 0)
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_thr_sd
+    EXCEPT ALL
+    SELECT grp, STDDEV(v), VARIANCE(v), STDDEV_POP(v), VAR_POP(v), COUNT(*)
+    FROM sd_threshold GROUP BY grp
+);
+----
+0
+
+# Batch: DELETE brings grp=1 down to count=1, grp=2 down to count=0,
+# and adds a new group that only ever has 1 row.
+statement ok
+DELETE FROM sd_threshold WHERE grp = 1 AND v IN (20, 30);
+
+statement ok
+DELETE FROM sd_threshold WHERE grp = 2;
+
+statement ok
+INSERT INTO sd_threshold VALUES (4, 999);
+
+statement ok
+PRAGMA ivm('mv_thr_sd');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_thr_sd WHERE n > 0
+    EXCEPT ALL
+    SELECT grp, STDDEV(v), VARIANCE(v), STDDEV_POP(v), VAR_POP(v), COUNT(*)
+    FROM sd_threshold GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, STDDEV(v), VARIANCE(v), STDDEV_POP(v), VAR_POP(v), COUNT(*)
+    FROM sd_threshold GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_thr_sd WHERE n > 0
+);
+----
+0
+
+# --- HAVING AVG(x) > k decomposes AVG (q0929 regression) ---
+# Bug: RewriteDerivedAggregates only fired when plan->children[0] was directly
+# LOGICAL_AGGREGATE_AND_GROUP_BY, but HAVING sits PROJECTION → FILTER → AGGREGATE,
+# so AVG wasn't decomposed. The MV stored raw avg() and the delta CTE tried to
+# SUM per-group averages, producing drift on any delta that touched the agg'd
+# column.
+# Fix: walk through a single LOGICAL_FILTER at the top level to reach the agg.
+
+statement ok
+CREATE TABLE hva_t(grp INT, v INT);
+
+statement ok
+INSERT INTO hva_t VALUES (1,10), (1,20), (2,-5), (2,-15), (3,100);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hva AS
+    SELECT grp, AVG(v) AS a FROM hva_t GROUP BY grp HAVING AVG(v) > 0;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_hva
+    EXCEPT ALL SELECT grp, AVG(v) FROM hva_t GROUP BY grp HAVING AVG(v) > 0
+);
+----
+0
+
+# MV should have hidden sum+count columns (decomposition succeeded).
+query I
+SELECT count(*) FROM pragma_table_info('_ivm_data_mv_hva') WHERE name LIKE '_ivm_sum_%';
+----
+1
+
+# Delta: push an existing group over the HAVING threshold and add a new group.
+statement ok
+INSERT INTO hva_t VALUES (2, 100), (4, 50);
+
+statement ok
+PRAGMA ivm('mv_hva');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_hva
+    EXCEPT ALL SELECT grp, AVG(v) FROM hva_t GROUP BY grp HAVING AVG(v) > 0
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, AVG(v) FROM hva_t GROUP BY grp HAVING AVG(v) > 0
+    EXCEPT ALL SELECT * FROM mv_hva
+);
+----
+0
+
+# ============================================================
+# HAVING that references aggregates NOT in the SELECT list.
+# The stripped predicate must reference hidden columns we add to the
+# projection (`_ivm_having_N`) — otherwise it falls back to rendering
+# the aggregate's raw text (`sum(COALESCE(H_AMOUNT, 0))`, `count_star()`)
+# into the view WHERE clause, where the base columns don't exist.
+# ============================================================
+
+# HAVING COUNT(*) > N when COUNT(*) isn't selected
+statement ok
+CREATE TABLE hav_hidden_count (w INT, i INT, amt INT);
+
+statement ok
+INSERT INTO hav_hidden_count VALUES (1,1,500),(1,1,600),(1,2,100),(1,2,50),(1,2,50),(1,2,50),(1,2,50);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hav_hidden_count AS
+    SELECT w, i, SUM(amt) AS revenue FROM hav_hidden_count GROUP BY w, i
+    HAVING SUM(amt) > 200 AND COUNT(*) > 3;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_hav_hidden_count
+    EXCEPT ALL
+    SELECT w, i, SUM(amt) FROM hav_hidden_count GROUP BY w, i HAVING SUM(amt) > 200 AND COUNT(*) > 3
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT w, i, SUM(amt) FROM hav_hidden_count GROUP BY w, i HAVING SUM(amt) > 200 AND COUNT(*) > 3
+    EXCEPT ALL SELECT * FROM mv_hav_hidden_count
+);
+----
+0
+
+# Batched DML: flip one group below the COUNT threshold, push another past both thresholds
+statement ok
+DELETE FROM hav_hidden_count WHERE w = 1 AND i = 2 AND amt = 50;
+
+statement ok
+INSERT INTO hav_hidden_count VALUES (1,1,300),(1,1,50),(1,3,500),(1,3,500),(1,3,500),(1,3,500);
+
+statement ok
+UPDATE hav_hidden_count SET amt = amt + 10 WHERE w = 1 AND i = 1;
+
+statement ok
+PRAGMA ivm('mv_hav_hidden_count');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_hav_hidden_count
+    EXCEPT ALL
+    SELECT w, i, SUM(amt) FROM hav_hidden_count GROUP BY w, i HAVING SUM(amt) > 200 AND COUNT(*) > 3
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT w, i, SUM(amt) FROM hav_hidden_count GROUP BY w, i HAVING SUM(amt) > 200 AND COUNT(*) > 3
+    EXCEPT ALL SELECT * FROM mv_hav_hidden_count
+);
+----
+0
+
+# HAVING SUM(COALESCE(x, 0)) — same aggregate function over a different expression
+# than the one in SELECT. Left join produces NULLs that COALESCE treats as 0,
+# so SUM(H_AMOUNT) and SUM(COALESCE(H_AMOUNT, 0)) diverge for unmatched groups.
+statement ok
+CREATE TABLE hav_coalesce_c (id INT, w INT, bal INT);
+
+statement ok
+CREATE TABLE hav_coalesce_h (c_id INT, c_w INT, amt INT);
+
+statement ok
+INSERT INTO hav_coalesce_c VALUES (1,1,100),(2,1,200),(3,1,50);
+
+statement ok
+INSERT INTO hav_coalesce_h VALUES (1,1,30),(2,1,250);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hav_coalesce AS
+    SELECT c.w, SUM(c.bal) AS balance, SUM(h.amt) AS payments
+    FROM hav_coalesce_c c LEFT JOIN hav_coalesce_h h ON c.id = h.c_id AND c.w = h.c_w
+    GROUP BY c.w
+    HAVING SUM(c.bal) > SUM(COALESCE(h.amt, 0));
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_hav_coalesce
+    EXCEPT ALL
+    SELECT c.w, SUM(c.bal), SUM(h.amt)
+    FROM hav_coalesce_c c LEFT JOIN hav_coalesce_h h ON c.id = h.c_id AND c.w = h.c_w
+    GROUP BY c.w HAVING SUM(c.bal) > SUM(COALESCE(h.amt, 0))
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT c.w, SUM(c.bal), SUM(h.amt)
+    FROM hav_coalesce_c c LEFT JOIN hav_coalesce_h h ON c.id = h.c_id AND c.w = h.c_w
+    GROUP BY c.w HAVING SUM(c.bal) > SUM(COALESCE(h.amt, 0))
+    EXCEPT ALL SELECT * FROM mv_hav_coalesce
+);
+----
+0
+
+# Fix B: CTE with AVG/STDDEV + non-pass-through expression in outer SELECT.
+# The CTE alias (avg_bal) differs from the top-level alias (avg after ROUND),
+# so the hidden _ivm_sum_avg_bal / _ivm_count_avg_bal columns can't directly
+# reconstruct `avg`. CompileAggregateGroups detects the orphan derived alias
+# and falls back to group-recompute (delete affected groups, re-insert via the
+# full view query).
+statement ok
+CREATE TABLE fixb_customer (c_w_id INT, c_balance DECIMAL(12,2));
+
+statement ok
+INSERT INTO fixb_customer VALUES (1, 10.00), (1, 20.00), (2, 30.00);
+
+statement ok
+CREATE MATERIALIZED VIEW fixb_mv AS WITH per_warehouse AS (SELECT c_w_id, AVG(c_balance) AS avg_bal, STDDEV(c_balance) AS std_bal, COUNT(*) AS cnt FROM fixb_customer GROUP BY c_w_id) SELECT c_w_id, ROUND(avg_bal, 2) AS avg_r, ROUND(std_bal, 2) AS std_r, cnt, ROUND(avg_bal / NULLIF(std_bal, 0), 4) AS cv FROM per_warehouse;
+
+# Batched DML before refresh — INSERT + DELETE + UPDATE on the same rows.
+statement ok
+INSERT INTO fixb_customer VALUES (1, 40.00), (2, 50.00), (3, 100.00);
+
+statement ok
+UPDATE fixb_customer SET c_balance = 15.00 WHERE c_w_id = 1 AND c_balance = 20.00;
+
+statement ok
+DELETE FROM fixb_customer WHERE c_w_id = 1 AND c_balance = 10.00;
+
+statement ok
+PRAGMA ivm('fixb_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM fixb_mv EXCEPT ALL SELECT c_w_id, ROUND(AVG(c_balance), 2), ROUND(STDDEV(c_balance), 2), COUNT(*), ROUND(AVG(c_balance) / NULLIF(STDDEV(c_balance), 0), 4) FROM fixb_customer GROUP BY c_w_id);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT c_w_id, ROUND(AVG(c_balance), 2), ROUND(STDDEV(c_balance), 2), COUNT(*), ROUND(AVG(c_balance) / NULLIF(STDDEV(c_balance), 0), 4) FROM fixb_customer GROUP BY c_w_id EXCEPT ALL SELECT * FROM fixb_mv);
+----
+0
+
+# Fix B variant: outer SELECT exposes AVG/STDDEV directly AS avg_b and std_b,
+# but adds a computed `cv` column that references both. `cv` has no direct
+# aggregate in the plan, so the orphan detection switches to group-recompute.
+statement ok
+CREATE MATERIALIZED VIEW fixb_cv AS WITH stats AS (SELECT c_w_id, AVG(c_balance) AS avg_b, STDDEV(c_balance) AS std_b FROM fixb_customer GROUP BY c_w_id) SELECT c_w_id, avg_b, std_b, ROUND(avg_b / NULLIF(std_b, 0), 4) AS cv FROM stats;
+
+statement ok
+INSERT INTO fixb_customer VALUES (1, 60.00), (3, 200.00);
+
+statement ok
+UPDATE fixb_customer SET c_balance = 80.00 WHERE c_w_id = 2 AND c_balance = 50.00;
+
+statement ok
+DELETE FROM fixb_customer WHERE c_w_id = 3 AND c_balance = 100.00;
+
+statement ok
+PRAGMA ivm('fixb_cv');
+
+# Use printf('%.12g', …) to absorb 1-ULP AVG(DECIMAL) drift — we only care
+# that the MV matches the base query within double precision.
+query I
+SELECT count(*) FROM (SELECT c_w_id, printf('%.12g', avg_b), printf('%.12g', std_b), printf('%.12g', cv) FROM fixb_cv EXCEPT ALL SELECT c_w_id, printf('%.12g', AVG(c_balance)::DOUBLE), printf('%.12g', STDDEV(c_balance)), printf('%.12g', ROUND(AVG(c_balance)::DOUBLE / NULLIF(STDDEV(c_balance), 0), 4)) FROM fixb_customer GROUP BY c_w_id);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT c_w_id, printf('%.12g', AVG(c_balance)::DOUBLE), printf('%.12g', STDDEV(c_balance)), printf('%.12g', ROUND(AVG(c_balance)::DOUBLE / NULLIF(STDDEV(c_balance), 0), 4)) FROM fixb_customer GROUP BY c_w_id EXCEPT ALL SELECT c_w_id, printf('%.12g', avg_b), printf('%.12g', std_b), printf('%.12g', cv) FROM fixb_cv);
+----
+0
+
+# Fix B variant: ROUND(SUM(x) / NULLIF(COUNT(y), 0), N) — no AVG but two raw
+# aggregates consumed in one computed column. The "type excess" detection
+# (more aggregate_types entries than aggregate columns) triggers
+# group-recompute.
+statement ok
+CREATE TABLE fixb_pay (w INT, d INT, c_bal DECIMAL(12,2), ytd DECIMAL(12,2), pay_cnt INT);
+
+statement ok
+INSERT INTO fixb_pay VALUES (1, 1, 10, 50, 2), (1, 1, 20, 60, 3), (1, 2, 30, 70, 1), (2, 1, 100, 120, 4);
+
+statement ok
+CREATE MATERIALIZED VIEW fixb_pay_mv AS SELECT w, d, COUNT(c_bal) AS cust, ROUND(SUM(c_bal) / NULLIF(COUNT(c_bal), 0), 2) AS avg_bal, ROUND(SUM(ytd) / NULLIF(SUM(pay_cnt), 0), 2) AS avg_pay FROM fixb_pay GROUP BY w, d;
+
+statement ok
+INSERT INTO fixb_pay VALUES (1, 1, 40, 80, 2), (2, 1, 50, 90, 1);
+
+statement ok
+UPDATE fixb_pay SET c_bal = 5, ytd = 15, pay_cnt = 1 WHERE w = 1 AND d = 2;
+
+statement ok
+DELETE FROM fixb_pay WHERE w = 1 AND d = 1 AND c_bal = 10;
+
+statement ok
+PRAGMA ivm('fixb_pay_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM fixb_pay_mv EXCEPT ALL SELECT w, d, COUNT(c_bal), ROUND(SUM(c_bal) / NULLIF(COUNT(c_bal), 0), 2), ROUND(SUM(ytd) / NULLIF(SUM(pay_cnt), 0), 2) FROM fixb_pay GROUP BY w, d);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT w, d, COUNT(c_bal), ROUND(SUM(c_bal) / NULLIF(COUNT(c_bal), 0), 2), ROUND(SUM(ytd) / NULLIF(SUM(pay_cnt), 0), 2) FROM fixb_pay GROUP BY w, d EXCEPT ALL SELECT * FROM fixb_pay_mv);
+----
+0
+
+# ============================================================
+# AGGREGATE FILTER (WHERE p) rewrite
+# AGG(x) FILTER (WHERE p) → AGG(CASE WHEN p THEN x END) before
+# the compatibility checker, so FILTER views are incremental.
+# ============================================================
+
+statement ok
+CREATE TABLE filter_t (id INT, grp VARCHAR, val INT, active BOOL);
+
+statement ok
+INSERT INTO filter_t VALUES (1,'a',10,true),(2,'a',200,true),(3,'a',50,false),(4,'b',300,true),(5,'b',80,false);
+
+statement ok
+CREATE MATERIALIZED VIEW filter_mv AS
+  SELECT grp,
+         COUNT(*) FILTER (WHERE active)       AS active_cnt,
+         SUM(val)  FILTER (WHERE val > 100)   AS big_sum,
+         AVG(val)  FILTER (WHERE active)      AS avg_active
+  FROM filter_t GROUP BY grp;
+
+query I
+SELECT count(*) FROM (SELECT * FROM filter_mv EXCEPT ALL SELECT grp, COUNT(*) FILTER (WHERE active), SUM(val) FILTER (WHERE val > 100), AVG(val) FILTER (WHERE active) FROM filter_t GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, COUNT(*) FILTER (WHERE active), SUM(val) FILTER (WHERE val > 100), AVG(val) FILTER (WHERE active) FROM filter_t GROUP BY grp EXCEPT ALL SELECT * FROM filter_mv);
+----
+0
+
+# --- stress: batch conflicting DML then single refresh ---
+statement ok
+INSERT INTO filter_t VALUES (6,'a',500,true),(7,'b',400,false),(8,'c',150,true);
+
+statement ok
+DELETE FROM filter_t WHERE id = 2;
+
+statement ok
+UPDATE filter_t SET val = 999, active = false WHERE id = 4;
+
+statement ok
+PRAGMA ivm('filter_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM filter_mv EXCEPT ALL SELECT grp, COUNT(*) FILTER (WHERE active), SUM(val) FILTER (WHERE val > 100), AVG(val) FILTER (WHERE active) FROM filter_t GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, COUNT(*) FILTER (WHERE active), SUM(val) FILTER (WHERE val > 100), AVG(val) FILTER (WHERE active) FROM filter_t GROUP BY grp EXCEPT ALL SELECT * FROM filter_mv);
+----
+0
+
+# ============================================================
+# BOOL_AND / BOOL_OR support
+# BOOLEAN is non-summable → group-recompute path (Z-set correct).
+# ============================================================
+
+statement ok
+CREATE TABLE bool_t (id INT, grp VARCHAR, flag BOOL);
+
+statement ok
+INSERT INTO bool_t VALUES (1,'x',true),(2,'x',false),(3,'y',true),(4,'y',true),(5,'z',false);
+
+statement ok
+CREATE MATERIALIZED VIEW bool_mv AS
+  SELECT grp, BOOL_AND(flag) AS all_flag, BOOL_OR(flag) AS any_flag FROM bool_t GROUP BY grp;
+
+query I
+SELECT count(*) FROM (SELECT * FROM bool_mv EXCEPT ALL SELECT grp, BOOL_AND(flag), BOOL_OR(flag) FROM bool_t GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, BOOL_AND(flag), BOOL_OR(flag) FROM bool_t GROUP BY grp EXCEPT ALL SELECT * FROM bool_mv);
+----
+0
+
+# --- delete the only false in x → BOOL_AND flips to true ---
+statement ok
+DELETE FROM bool_t WHERE id = 2;
+
+# --- delete one of two trues in y (BOOL_AND and BOOL_OR stay true) ---
+statement ok
+DELETE FROM bool_t WHERE id = 3;
+
+# --- insert a false into y → BOOL_AND should become false ---
+statement ok
+INSERT INTO bool_t VALUES (6,'y',false);
+
+statement ok
+PRAGMA ivm('bool_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM bool_mv EXCEPT ALL SELECT grp, BOOL_AND(flag), BOOL_OR(flag) FROM bool_t GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, BOOL_AND(flag), BOOL_OR(flag) FROM bool_t GROUP BY grp EXCEPT ALL SELECT * FROM bool_mv);
+----
+0
+
+# ============================================================
+# Aggregate top-k: GROUP BY + ORDER BY + LIMIT
+# All groups maintained in _ivm_data_mv; ORDER BY LIMIT k
+# applied in the VIEW definition at read time.
+# ============================================================
+
+statement ok
+CREATE TABLE topk_t (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO topk_t VALUES
+  (1,'a',100),(2,'a',200),(3,'b',50),(4,'b',300),
+  (5,'c',150),(6,'c',250),(7,'d',10),(8,'d',5);
+
+statement ok
+CREATE MATERIALIZED VIEW topk_agg AS
+  SELECT grp, SUM(val) AS total FROM topk_t GROUP BY grp ORDER BY total DESC LIMIT 3;
+
+# Initial state: top 3 by total (a=300, b=350, c=400, d=15 → c,b,a top 3)
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topk_agg
+  EXCEPT ALL
+  SELECT * FROM (SELECT grp, SUM(val) AS total FROM topk_t GROUP BY grp ORDER BY total DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT grp, SUM(val) AS total FROM topk_t GROUP BY grp ORDER BY total DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topk_agg
+);
+----
+0
+
+# ============================================================
+# COUNT(DISTINCT constant) over duplicate join rows
+# ============================================================
+
+statement ok
+CREATE TABLE cd_order (id INT, w_id INT);
+
+statement ok
+CREATE TABLE cd_new_order (o_id INT, w_id INT);
+
+statement ok
+INSERT INTO cd_order VALUES (1, 1), (2, 1);
+
+statement ok
+INSERT INTO cd_new_order VALUES (1, 1), (1, 1), (2, 1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_count_distinct_constant AS
+  SELECT o.id, MIN(1) AS mn, MAX(1) AS mx, COUNT(DISTINCT 1) AS uniq
+  FROM cd_order o
+  JOIN cd_new_order no ON o.id = no.o_id AND o.w_id = no.w_id
+  GROUP BY o.id;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_count_distinct_constant';
+----
+6
+
+statement ok
+INSERT INTO cd_new_order VALUES (1, 1);
+
+statement ok
+PRAGMA ivm('mv_count_distinct_constant');
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT * FROM mv_count_distinct_constant
+  EXCEPT ALL
+  SELECT o.id, MIN(1) AS mn, MAX(1) AS mx, COUNT(DISTINCT 1) AS uniq
+  FROM cd_order o
+  JOIN cd_new_order no ON o.id = no.o_id AND o.w_id = no.w_id
+  GROUP BY o.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT o.id, MIN(1) AS mn, MAX(1) AS mx, COUNT(DISTINCT 1) AS uniq
+  FROM cd_order o
+  JOIN cd_new_order no ON o.id = no.o_id AND o.w_id = no.w_id
+  GROUP BY o.id
+  EXCEPT ALL
+  SELECT * FROM mv_count_distinct_constant
+);
+----
+0
+
+# Insert rows that change the ranking (d now has 515, displacing a=300)
+statement ok
+INSERT INTO topk_t VALUES (9,'d',500);
+
+statement ok
+PRAGMA ivm('topk_agg');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topk_agg
+  EXCEPT ALL
+  SELECT * FROM (SELECT grp, SUM(val) AS total FROM topk_t GROUP BY grp ORDER BY total DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT grp, SUM(val) AS total FROM topk_t GROUP BY grp ORDER BY total DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topk_agg
+);
+----
+0
+
+# Delete the big insert, d drops back below a
+statement ok
+DELETE FROM topk_t WHERE id = 9;
+
+statement ok
+PRAGMA ivm('topk_agg');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topk_agg
+  EXCEPT ALL
+  SELECT * FROM (SELECT grp, SUM(val) AS total FROM topk_t GROUP BY grp ORDER BY total DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT grp, SUM(val) AS total FROM topk_t GROUP BY grp ORDER BY total DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topk_agg
+);
+----
+0
+
+# --- stress: batch conflicting DML then single refresh ---
+statement ok
+INSERT INTO topk_t VALUES (10,'e',1000),(11,'f',2);
+
+statement ok
+DELETE FROM topk_t WHERE id IN (1,2);
+
+statement ok
+UPDATE topk_t SET val = 999 WHERE id = 3;
+
+statement ok
+PRAGMA ivm('topk_agg');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topk_agg
+  EXCEPT ALL
+  SELECT * FROM (SELECT grp, SUM(val) AS total FROM topk_t GROUP BY grp ORDER BY total DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT grp, SUM(val) AS total FROM topk_t GROUP BY grp ORDER BY total DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topk_agg
+);
+----
+0

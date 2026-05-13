@@ -1,2 +1,2 @@
--- {"operators": "AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "medium", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY", "non_incr_reason": "op:SUBQUERY_FILTER"}
+-- {"operators": "AGGREGATE,FILTER,SUBQUERY_FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "CUSTOMER,HISTORY"}
 SELECT c.C_W_ID, c.C_ID, c.C_LAST, (SELECT MIN(H_DATE) FROM HISTORY WHERE H_C_ID = c.C_ID AND H_C_W_ID = c.C_W_ID) AS first_payment, (SELECT MAX(H_DATE) FROM HISTORY WHERE H_C_ID = c.C_ID AND H_C_W_ID = c.C_W_ID) AS last_payment FROM CUSTOMER c WHERE c.C_BALANCE > 500;

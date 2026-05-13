@@ -9,7 +9,7 @@ make test
 ## Run a Single Test
 
 ```bash
-build/release/test/unittest "test/sql/mv_inner_join.test"
+build/release/test/unittest "test/sql/inner_join.test"
 ```
 
 ## Test Files
@@ -18,24 +18,24 @@ All tests live in `test/sql/*.test` using DuckDB's SQLLogicTest format.
 
 | Test file | Coverage |
 |---|---|
-| `mv_aggregate.test` | SUM, COUNT, AVG, MIN/MAX, STDDEV/VARIANCE aggregations |
-| `mv_projection.test` | Column projection, expression projection, bag-delete consolidation |
-| `mv_filter.test` | WHERE clause filtering |
-| `mv_inner_join.test` | Inner joins, cross joins, arbitrary predicates, multi-table joins |
-| `mv_left_join.test` | LEFT JOIN, RIGHT JOIN, mixed INNER+LEFT, NULL keys |
-| `mv_full_outer_join.test` | FULL OUTER JOIN projection and aggregate maintenance |
-| `mv_semi_anti_join.test` | SEMI JOIN, ANTI JOIN, EXISTS, NOT EXISTS aux-state maintenance |
-| `mv_lateral.test` | LATERAL / DELIM_JOIN refresh, scalar correlated subqueries |
-| `mv_union.test` | UNION ALL views |
-| `mv_chained.test` | Chained (multi-level) materialized views |
-| `mv_window.test` | Partition-level window recompute |
-| `ivm_checker.test` | Query constraint validation |
-| `mv_pipeline.test` | End-to-end refresh pipeline |
-| `ivm_metadata.test` | Catalog and metadata tables |
-| `ivm_parser.test` | SQL parsing and rewriting |
-| `ivm_insert_rule.test` | Insert rules and delta generation |
-| `ivm_auto_refresh.test` | Automatic refresh triggers |
-| `ivm_list.test` | LIST aggregate support |
+| `aggregate.test` | SUM, COUNT, AVG, MIN/MAX, STDDEV/VARIANCE aggregations |
+| `projection.test` | Column projection, expression projection, bag-delete consolidation |
+| `filter.test` | WHERE clause filtering |
+| `inner_join.test` | Inner joins, cross joins, arbitrary predicates, multi-table joins |
+| `left_join.test` | LEFT JOIN, RIGHT JOIN, mixed INNER+LEFT, NULL keys |
+| `full_outer_join.test` | FULL OUTER JOIN projection and aggregate maintenance |
+| `semi_anti_join.test` | SEMI JOIN, ANTI JOIN, EXISTS, NOT EXISTS aux-state maintenance |
+| `lateral.test` | LATERAL / DELIM_JOIN refresh, scalar correlated subqueries |
+| `union.test` | UNION ALL views |
+| `chained.test` | Chained (multi-level) materialized views |
+| `window.test` | Partition-level window recompute |
+| `incremental_checker.test` | Query constraint validation |
+| `pipeline.test` | End-to-end refresh pipeline |
+| `metadata.test` | Catalog and metadata tables |
+| `parser.test` | SQL parsing and rewriting |
+| `insert_rule.test` | Insert rules and delta generation |
+| `auto_refresh.test` | Automatic refresh triggers |
+| `list.test` | LIST aggregate support |
 
 ## Verification Pattern
 

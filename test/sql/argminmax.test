@@ -1,0 +1,272 @@
+# name: test/sql/argminmax.test
+# description: Test IVM with ARG_MIN and ARG_MAX aggregates (two-argument, group-recompute path)
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE orders (product VARCHAR, value VARCHAR, key INTEGER);
+
+statement ok
+INSERT INTO orders VALUES ('A', 'apple', 3), ('A', 'avocado', 1), ('B', 'banana', 2), ('B', 'blueberry', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_argmin AS SELECT product, ARG_MIN(value, key) AS best_value FROM orders GROUP BY product;
+
+query II
+SELECT product, best_value FROM mv_argmin ORDER BY product;
+----
+A	avocado
+B	banana
+
+# Bag equality: MV == base query
+query II
+SELECT * FROM mv_argmin EXCEPT ALL SELECT product, ARG_MIN(value, key) AS best_value FROM orders GROUP BY product;
+----
+
+query II
+SELECT product, ARG_MIN(value, key) AS best_value FROM orders GROUP BY product EXCEPT ALL SELECT * FROM mv_argmin;
+----
+
+# --- Insert new row that becomes the new ARG_MIN for A ---
+statement ok
+INSERT INTO orders VALUES ('A', 'apricot', 0);
+
+statement ok
+PRAGMA ivm('mv_argmin');
+
+query II
+SELECT product, best_value FROM mv_argmin ORDER BY product;
+----
+A	apricot
+B	banana
+
+query II
+SELECT * FROM mv_argmin EXCEPT ALL SELECT product, ARG_MIN(value, key) AS best_value FROM orders GROUP BY product;
+----
+
+query II
+SELECT product, ARG_MIN(value, key) AS best_value FROM orders GROUP BY product EXCEPT ALL SELECT * FROM mv_argmin;
+----
+
+# --- Insert into new group ---
+statement ok
+INSERT INTO orders VALUES ('C', 'cherry', 1);
+
+statement ok
+PRAGMA ivm('mv_argmin');
+
+query II
+SELECT product, best_value FROM mv_argmin ORDER BY product;
+----
+A	apricot
+B	banana
+C	cherry
+
+query II
+SELECT * FROM mv_argmin EXCEPT ALL SELECT product, ARG_MIN(value, key) AS best_value FROM orders GROUP BY product;
+----
+
+query II
+SELECT product, ARG_MIN(value, key) AS best_value FROM orders GROUP BY product EXCEPT ALL SELECT * FROM mv_argmin;
+----
+
+# --- Batch: insert + delete on same group ---
+statement ok
+INSERT INTO orders VALUES ('B', 'blackberry', 1);
+
+statement ok
+DELETE FROM orders WHERE product = 'B' AND key = 2;
+
+statement ok
+PRAGMA ivm('mv_argmin');
+
+query II
+SELECT product, best_value FROM mv_argmin ORDER BY product;
+----
+A	apricot
+B	blackberry
+C	cherry
+
+query II
+SELECT * FROM mv_argmin EXCEPT ALL SELECT product, ARG_MIN(value, key) AS best_value FROM orders GROUP BY product;
+----
+
+query II
+SELECT product, ARG_MIN(value, key) AS best_value FROM orders GROUP BY product EXCEPT ALL SELECT * FROM mv_argmin;
+----
+
+# =============================================================================
+# ARG_MAX
+# =============================================================================
+
+statement ok
+CREATE TABLE items (category VARCHAR, name VARCHAR, score INTEGER);
+
+statement ok
+INSERT INTO items VALUES ('X', 'alpha', 10), ('X', 'beta', 30), ('Y', 'gamma', 20), ('Y', 'delta', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_argmax AS SELECT category, ARG_MAX(name, score) AS best_name FROM items GROUP BY category;
+
+query II
+SELECT category, best_name FROM mv_argmax ORDER BY category;
+----
+X	beta
+Y	gamma
+
+query II
+SELECT * FROM mv_argmax EXCEPT ALL SELECT category, ARG_MAX(name, score) AS best_name FROM items GROUP BY category;
+----
+
+query II
+SELECT category, ARG_MAX(name, score) AS best_name FROM items GROUP BY category EXCEPT ALL SELECT * FROM mv_argmax;
+----
+
+# --- Insert row that becomes new ARG_MAX for Y ---
+statement ok
+INSERT INTO items VALUES ('Y', 'epsilon', 50);
+
+statement ok
+PRAGMA ivm('mv_argmax');
+
+query II
+SELECT category, best_name FROM mv_argmax ORDER BY category;
+----
+X	beta
+Y	epsilon
+
+query II
+SELECT * FROM mv_argmax EXCEPT ALL SELECT category, ARG_MAX(name, score) AS best_name FROM items GROUP BY category;
+----
+
+query II
+SELECT category, ARG_MAX(name, score) AS best_name FROM items GROUP BY category EXCEPT ALL SELECT * FROM mv_argmax;
+----
+
+# --- Delete the current max for X, insert a new one ---
+statement ok
+DELETE FROM items WHERE category = 'X' AND score = 30;
+
+statement ok
+INSERT INTO items VALUES ('X', 'zeta', 25);
+
+statement ok
+PRAGMA ivm('mv_argmax');
+
+query II
+SELECT category, best_name FROM mv_argmax ORDER BY category;
+----
+X	zeta
+Y	epsilon
+
+query II
+SELECT * FROM mv_argmax EXCEPT ALL SELECT category, ARG_MAX(name, score) AS best_name FROM items GROUP BY category;
+----
+
+query II
+SELECT category, ARG_MAX(name, score) AS best_name FROM items GROUP BY category EXCEPT ALL SELECT * FROM mv_argmax;
+----
+
+# =============================================================================
+# ivm_status refresh_strategy column
+# =============================================================================
+
+# PRAGMA ivm_status returns 7 columns; check it runs without error
+statement ok
+PRAGMA ivm_status('mv_argmin');
+
+statement ok
+PRAGMA ivm_status('mv_argmax');
+
+# Verify the stored type value directly (AGGREGATE_GROUP = 0)
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_argmin';
+----
+0
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'mv_argmax';
+----
+0
+
+# =============================================================================
+# Delete-only delta that shifts arg_min to a different existing row
+# =============================================================================
+
+statement ok
+CREATE TABLE scores (grp VARCHAR, val VARCHAR, key INTEGER);
+
+statement ok
+INSERT INTO scores VALUES ('A', 'first', 1), ('A', 'second', 2), ('A', 'third', 3);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_shift AS SELECT grp, ARG_MIN(val, key) AS best FROM scores GROUP BY grp;
+
+query II
+SELECT grp, best FROM mv_shift ORDER BY grp;
+----
+A	first
+
+# Delete the current argmin row — argmin must shift to the next-smallest key
+statement ok
+DELETE FROM scores WHERE grp = 'A' AND key = 1;
+
+statement ok
+PRAGMA ivm('mv_shift');
+
+query II
+SELECT grp, best FROM mv_shift ORDER BY grp;
+----
+A	second
+
+query II
+SELECT * FROM mv_shift EXCEPT ALL SELECT grp, ARG_MIN(val, key) AS best FROM scores GROUP BY grp;
+----
+
+query II
+SELECT grp, ARG_MIN(val, key) AS best FROM scores GROUP BY grp EXCEPT ALL SELECT * FROM mv_shift;
+----
+
+# =============================================================================
+# Mixed ARG_MIN + SUM in the same view
+# =============================================================================
+
+statement ok
+CREATE TABLE events (region VARCHAR, name VARCHAR, priority INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO events VALUES ('N', 'alpha', 3, 100), ('N', 'beta', 1, 200), ('S', 'gamma', 2, 50);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_mixed AS
+  SELECT region, ARG_MIN(name, priority) AS top_name, SUM(amount) AS total
+  FROM events GROUP BY region;
+
+query III
+SELECT region, top_name, total FROM mv_mixed ORDER BY region;
+----
+N	beta	300
+S	gamma	50
+
+statement ok
+INSERT INTO events VALUES ('N', 'delta', 0, 75), ('S', 'epsilon', 5, 25);
+
+statement ok
+PRAGMA ivm('mv_mixed');
+
+query III
+SELECT region, top_name, total FROM mv_mixed ORDER BY region;
+----
+N	delta	375
+S	gamma	75
+
+query III
+SELECT * FROM mv_mixed EXCEPT ALL
+  SELECT region, ARG_MIN(name, priority) AS top_name, SUM(amount) AS total FROM events GROUP BY region;
+----
+
+query III
+SELECT region, ARG_MIN(name, priority) AS top_name, SUM(amount) AS total FROM events GROUP BY region
+  EXCEPT ALL SELECT * FROM mv_mixed;
+----

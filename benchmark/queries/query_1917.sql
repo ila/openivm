@@ -1,2 +1,2 @@
--- {"operators": "LATERAL,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": false, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE", "non_incr_reason": "op:LATERAL"}
+-- {"operators": "LATERAL,AGGREGATE,FILTER,SUBQUERY", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ITEM,ORDER_LINE"}
 SELECT i.I_ID, i.I_NAME, i.I_PRICE, revenue.tot, revenue.avg FROM ITEM i, LATERAL (SELECT COALESCE(SUM(OL_AMOUNT), 0) AS tot, COALESCE(AVG(OL_AMOUNT), 0) AS avg FROM ORDER_LINE WHERE OL_I_ID = i.I_ID) revenue;

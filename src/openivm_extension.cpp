@@ -2,13 +2,13 @@
 
 #include "core/openivm_extension.hpp"
 #include "core/openivm_constants.hpp"
-#include "core/openivm_metadata.hpp"
-#include "core/openivm_refresh_daemon.hpp"
-#include "core/openivm_refresh_locks.hpp"
+#include "core/refresh_metadata.hpp"
+#include "core/refresh_daemon.hpp"
+#include "core/refresh_locks.hpp"
 #include "core/openivm_utils.hpp"
 #include "rules/column_hider.hpp"
-#include "upsert/openivm_cost_model.hpp"
-#include "upsert/openivm_upsert.hpp"
+#include "upsert/refresh_cost_model.hpp"
+#include "upsert/refresh.hpp"
 
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
@@ -27,9 +27,9 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
-#include "core/openivm_parser.hpp"
-#include "rules/openivm_rewrite_rule.hpp"
-#include "rules/openivm_insert_rule.hpp"
+#include "core/parser.hpp"
+#include "rules/incremental_rewrite_rule.hpp"
+#include "rules/refresh_insert_rule.hpp"
 #include "core/openivm_debug.hpp"
 
 #include <map>

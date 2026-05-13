@@ -4,7 +4,7 @@ Materialized views can be created using any SQL construct. Unsupported operators
 automatically fall back to full refresh (the entire view is recomputed from scratch
 on each `PRAGMA ivm()` call). This page consolidates all known limitations.
 
-The IVM-compatibility check lives in `src/core/ivm_checker.cpp` (`AnalyzeNode`);
+The IVM-compatibility check lives in `src/core/incremental_checker.cpp` (`AnalyzeNode`);
 anything it flags as `ivm_compatible = false` routes to `IVMType::FULL_REFRESH`.
 
 ## Constructs that trigger full refresh

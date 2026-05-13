@@ -1,0 +1,1040 @@
+# name: test/sql/projection.test
+# description: Test IVM with simple projections (no aggregation)
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE employees (id INT, name VARCHAR, dept VARCHAR);
+
+statement ok
+INSERT INTO employees VALUES (1, 'Alice', 'eng'), (2, 'Bob', 'sales');
+
+statement ok
+create materialized view emp_names as (select id, name from employees);
+
+query II
+SELECT id, name FROM emp_names ORDER BY id;
+----
+1	Alice
+2	Bob
+
+# --- Insert a new employee ---
+statement ok
+INSERT INTO employees VALUES (3, 'Charlie', 'eng');
+
+statement ok
+pragma ivm('emp_names');
+
+query II
+SELECT id, name FROM emp_names ORDER BY id;
+----
+1	Alice
+2	Bob
+3	Charlie
+
+# --- Delete an employee ---
+statement ok
+DELETE FROM employees WHERE id = 1;
+
+statement ok
+pragma ivm('emp_names');
+
+query II
+SELECT id, name FROM emp_names ORDER BY id;
+----
+2	Bob
+3	Charlie
+
+# --- No-op PRAGMA ---
+statement ok
+pragma ivm('emp_names');
+
+query II
+SELECT id, name FROM emp_names ORDER BY id;
+----
+2	Bob
+3	Charlie
+
+# --- Batch insert ---
+statement ok
+INSERT INTO employees VALUES (4, 'Diana', 'eng'), (5, 'Eve', 'sales');
+
+statement ok
+pragma ivm('emp_names');
+
+query II
+SELECT id, name FROM emp_names ORDER BY id;
+----
+2	Bob
+3	Charlie
+4	Diana
+5	Eve
+
+# --- Mixed insert + delete ---
+statement ok
+INSERT INTO employees VALUES (6, 'Frank', 'ops');
+
+statement ok
+DELETE FROM employees WHERE id = 2;
+
+statement ok
+pragma ivm('emp_names');
+
+query II
+SELECT id, name FROM emp_names ORDER BY id;
+----
+3	Charlie
+4	Diana
+5	Eve
+6	Frank
+
+# ==========================================
+# BOOLEAN columns in projection
+# ==========================================
+
+statement ok
+CREATE TABLE flags (id INT, name VARCHAR, active BOOLEAN);
+
+statement ok
+INSERT INTO flags VALUES (1, 'Alice', true), (2, 'Bob', false);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_flags AS SELECT id, name, active FROM flags;
+
+statement ok
+INSERT INTO flags VALUES (3, 'Charlie', true);
+
+statement ok
+pragma ivm('mv_flags');
+
+query III
+SELECT id, name, active FROM mv_flags ORDER BY id;
+----
+1	Alice	true
+2	Bob	false
+3	Charlie	true
+
+statement ok
+DELETE FROM flags WHERE active = false;
+
+statement ok
+pragma ivm('mv_flags');
+
+query III
+SELECT id, name, active FROM mv_flags ORDER BY id;
+----
+1	Alice	true
+3	Charlie	true
+
+# ==========================================
+# Idempotent refresh — no changes
+# ==========================================
+
+statement ok
+pragma ivm('mv_flags');
+
+query III
+SELECT id, name, active FROM mv_flags ORDER BY id;
+----
+1	Alice	true
+3	Charlie	true
+
+# ==========================================
+# Empty table → create MV → insert → refresh
+# ==========================================
+
+statement ok
+CREATE TABLE empty_proj (id INT, name VARCHAR);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_empty_proj AS SELECT id, name FROM empty_proj;
+
+query II
+SELECT id, name FROM mv_empty_proj;
+----
+
+statement ok
+INSERT INTO empty_proj VALUES (1, 'First'), (2, 'Second');
+
+statement ok
+pragma ivm('mv_empty_proj');
+
+query II
+SELECT id, name FROM mv_empty_proj ORDER BY id;
+----
+1	First
+2	Second
+
+# ==========================================
+# Bag semantics stress test: duplicates, mixed DML, delta consolidation
+# Every refresh is cross-checked with EXCEPT ALL in both directions.
+# ==========================================
+
+statement ok
+CREATE TABLE stress (id INT, val VARCHAR);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_stress AS SELECT id, val FROM stress;
+
+# --- Round 1: Batch insert with duplicates + mixed values ---
+statement ok
+INSERT INTO stress VALUES (1, 'a'), (1, 'a'), (1, 'a'), (2, 'b'), (2, 'b'), (3, 'c');
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# --- Round 2: More duplicates of existing + new, single refresh ---
+statement ok
+INSERT INTO stress VALUES (1, 'a'), (1, 'a'), (3, 'c'), (3, 'c'), (4, 'd');
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# --- Round 3: Delete all of one id, keep others ---
+statement ok
+DELETE FROM stress WHERE id = 1;
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# --- Round 4: Update all copies of a value ---
+statement ok
+UPDATE stress SET val = 'B' WHERE id = 2;
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# --- Round 5: Mixed INSERT + DELETE + UPDATE, single refresh ---
+statement ok
+INSERT INTO stress VALUES (5, 'e'), (5, 'e'), (6, 'f');
+
+statement ok
+DELETE FROM stress WHERE id = 3;
+
+statement ok
+UPDATE stress SET val = 'D' WHERE id = 4;
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# --- Round 6: Insert + delete same value = net zero, single refresh ---
+statement ok
+INSERT INTO stress VALUES (99, 'ghost'), (99, 'ghost'), (99, 'ghost');
+
+statement ok
+DELETE FROM stress WHERE id = 99;
+
+statement ok
+INSERT INTO stress VALUES (99, 'ghost');
+
+statement ok
+DELETE FROM stress WHERE id = 99;
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# --- Round 7: Conflicting ops on same row — insert, delete, insert, update, insert ---
+statement ok
+INSERT INTO stress VALUES (30, 'x'), (30, 'x'), (30, 'x');
+
+statement ok
+DELETE FROM stress WHERE id = 30;
+
+statement ok
+INSERT INTO stress VALUES (30, 'y');
+
+statement ok
+UPDATE stress SET val = 'z' WHERE id = 30;
+
+statement ok
+INSERT INTO stress VALUES (30, 'z'), (30, 'z');
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# --- Round 8: Large batch insert + delete + partial re-insert ---
+statement ok
+INSERT INTO stress SELECT 50, 'batch' FROM generate_series(1, 100);
+
+statement ok
+DELETE FROM stress WHERE id = 50;
+
+statement ok
+INSERT INTO stress SELECT 50, 'batch' FROM generate_series(1, 37);
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# --- Round 9: Delete everything ---
+statement ok
+DELETE FROM stress;
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM mv_stress;
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+# --- Round 10: Re-insert after empty + no-op refresh ---
+statement ok
+INSERT INTO stress VALUES (10, 'z'), (10, 'z'), (11, 'w');
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# No-op
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# --- Round 11: Multiple updates to same rows, accumulating ---
+statement ok
+UPDATE stress SET val = 'z1' WHERE id = 10;
+
+statement ok
+UPDATE stress SET val = 'z2' WHERE id = 10;
+
+statement ok
+UPDATE stress SET val = 'z3' WHERE id = 10;
+
+statement ok
+INSERT INTO stress VALUES (10, 'z3');
+
+statement ok
+pragma ivm('mv_stress');
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM stress EXCEPT ALL SELECT id, val FROM mv_stress);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT id, val FROM mv_stress EXCEPT ALL SELECT id, val FROM stress);
+----
+0
+
+# ==========================================
+# Expressions in SELECT (computed columns)
+# ==========================================
+
+statement ok
+CREATE TABLE expr_base (a INT, b INT, c INT);
+
+statement ok
+INSERT INTO expr_base VALUES (1, 10, 100), (2, 20, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_expr AS SELECT a * 2 AS doubled, b + c AS total, c - b AS diff FROM expr_base;
+
+query III
+SELECT doubled, total, diff FROM mv_expr ORDER BY doubled;
+----
+2	110	90
+4	220	180
+
+statement ok
+INSERT INTO expr_base VALUES (3, 30, 300), (4, 40, 400);
+
+statement ok
+DELETE FROM expr_base WHERE a = 1;
+
+statement ok
+PRAGMA ivm('mv_expr');
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (
+    SELECT a * 2 AS doubled, b + c AS total, c - b AS diff FROM expr_base
+    EXCEPT ALL
+    SELECT doubled, total, diff FROM mv_expr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT doubled, total, diff FROM mv_expr
+    EXCEPT ALL
+    SELECT a * 2 AS doubled, b + c AS total, c - b AS diff FROM expr_base
+);
+----
+0
+
+# ==========================================
+# Expressions with NULL propagation and type coercion
+# ==========================================
+
+statement ok
+CREATE TABLE proj_null_expr (a INT, b INT, c VARCHAR);
+
+statement ok
+INSERT INTO proj_null_expr VALUES (10, 0, 'hello'), (NULL, 5, 'world'), (20, NULL, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_proj_null_expr AS
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr;
+
+statement ok
+PRAGMA ivm('mv_proj_null_expr');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+    EXCEPT ALL
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+    EXCEPT ALL
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+);
+----
+0
+
+# UPDATE: set a = NULL where a = 10 — product becomes NULL, safe_a becomes -1
+statement ok
+UPDATE proj_null_expr SET a = NULL WHERE a = 10;
+
+statement ok
+PRAGMA ivm('mv_proj_null_expr');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+    EXCEPT ALL
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+    EXCEPT ALL
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+);
+----
+0
+
+# DELETE all rows, then refresh (MV should be empty)
+statement ok
+DELETE FROM proj_null_expr;
+
+statement ok
+PRAGMA ivm('mv_proj_null_expr');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+    EXCEPT ALL
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+    EXCEPT ALL
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+);
+----
+0
+
+# INSERT new rows and refresh
+statement ok
+INSERT INTO proj_null_expr VALUES (100, 2, 'test'), (NULL, NULL, 'abc');
+
+statement ok
+PRAGMA ivm('mv_proj_null_expr');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+    EXCEPT ALL
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, safe_a, product, clen FROM mv_proj_null_expr
+    EXCEPT ALL
+    SELECT a, COALESCE(a, -1) AS safe_a, a * b AS product, LENGTH(c) AS clen FROM proj_null_expr
+);
+----
+0
+
+# ==========================================
+# INSERT and DELETE identical rows in same batch (net zero)
+# ==========================================
+
+statement ok
+CREATE TABLE proj_net_zero (x INT, y VARCHAR);
+
+statement ok
+INSERT INTO proj_net_zero VALUES (1, 'a'), (2, 'b');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_proj_net_zero AS SELECT x, y FROM proj_net_zero;
+
+statement ok
+PRAGMA ivm('mv_proj_net_zero');
+
+# Cross-check after initial load
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM mv_proj_net_zero
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM mv_proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM proj_net_zero
+);
+----
+0
+
+# Insert a row then delete it in the same batch — net zero for the new row
+statement ok
+INSERT INTO proj_net_zero VALUES (99, 'tmp');
+
+statement ok
+DELETE FROM proj_net_zero WHERE x = 99;
+
+statement ok
+PRAGMA ivm('mv_proj_net_zero');
+
+# MV should be unchanged (net zero delta for x=99)
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM mv_proj_net_zero
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM mv_proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM proj_net_zero
+);
+----
+0
+
+# Now do a real insert alongside a net-zero insert-delete
+statement ok
+INSERT INTO proj_net_zero VALUES (50, 'keep'), (77, 'gone');
+
+statement ok
+DELETE FROM proj_net_zero WHERE x = 77;
+
+statement ok
+PRAGMA ivm('mv_proj_net_zero');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM mv_proj_net_zero
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, y FROM mv_proj_net_zero
+    EXCEPT ALL
+    SELECT x, y FROM proj_net_zero
+);
+----
+0
+
+# ==========================================
+# JOIN + FILTER + PROJECTION (computed expressions on filtered join)
+# ==========================================
+
+statement ok
+CREATE TABLE jfp_items (id INT, name VARCHAR, weight DOUBLE);
+
+statement ok
+CREATE TABLE jfp_prices (item_id INT, unit_price DOUBLE);
+
+statement ok
+INSERT INTO jfp_items VALUES (1, 'Bolt', 0.5), (2, 'Nut', 0.1), (3, 'Beam', 50.0);
+
+statement ok
+INSERT INTO jfp_prices VALUES (1, 2.0), (2, 0.5), (3, 100.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_jfp AS
+    SELECT i.name, i.weight * p.unit_price AS cost
+    FROM jfp_items i INNER JOIN jfp_prices p ON i.id = p.item_id
+    WHERE i.weight < 10.0;
+
+# Only Bolt and Nut match (weight < 10). Bolt cost=1.0, Nut cost=0.05
+statement ok
+INSERT INTO jfp_items VALUES (4, 'Washer', 0.02);
+
+statement ok
+INSERT INTO jfp_prices VALUES (4, 0.1);
+
+statement ok
+PRAGMA ivm('mv_jfp');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.name, i.weight * p.unit_price
+    FROM jfp_items i INNER JOIN jfp_prices p ON i.id = p.item_id WHERE i.weight < 10.0
+    EXCEPT ALL SELECT * FROM mv_jfp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_jfp
+    EXCEPT ALL SELECT i.name, i.weight * p.unit_price
+    FROM jfp_items i INNER JOIN jfp_prices p ON i.id = p.item_id WHERE i.weight < 10.0
+);
+----
+0
+
+# Delete Bolt from items + update Beam weight to be under threshold
+statement ok
+DELETE FROM jfp_items WHERE id = 1;
+
+statement ok
+UPDATE jfp_items SET weight = 5.0 WHERE id = 3;
+
+statement ok
+PRAGMA ivm('mv_jfp');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT i.name, i.weight * p.unit_price
+    FROM jfp_items i INNER JOIN jfp_prices p ON i.id = p.item_id WHERE i.weight < 10.0
+    EXCEPT ALL SELECT * FROM mv_jfp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_jfp
+    EXCEPT ALL SELECT i.name, i.weight * p.unit_price
+    FROM jfp_items i INNER JOIN jfp_prices p ON i.id = p.item_id WHERE i.weight < 10.0
+);
+----
+0
+
+# ============================================================
+# POSITION(x IN y) and other keyword-syntax function calls.
+# DuckDB's parser treats `position(x, y)` as invalid — the `position` identifier
+# is reserved for the `POSITION(x IN y)` form — but accepts `"position"(x, y)`
+# as a regular function call. LPTS emits the quoted form so view_query round-
+# trips through the binder.
+# ============================================================
+
+statement ok
+CREATE TABLE pos_t (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO pos_t VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry'), (4, 'date');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_pos AS
+    SELECT id, POSITION('a' IN name) AS pos_a FROM pos_t;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_pos
+    EXCEPT ALL SELECT id, POSITION('a' IN name) AS pos_a FROM pos_t
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, POSITION('a' IN name) AS pos_a FROM pos_t
+    EXCEPT ALL SELECT * FROM mv_pos
+);
+----
+0
+
+statement ok
+INSERT INTO pos_t VALUES (5, 'apricot'), (6, 'fig');
+
+statement ok
+DELETE FROM pos_t WHERE id = 4;
+
+statement ok
+UPDATE pos_t SET name = 'pear' WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_pos');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_pos
+    EXCEPT ALL SELECT id, POSITION('a' IN name) AS pos_a FROM pos_t
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, POSITION('a' IN name) AS pos_a FROM pos_t
+    EXCEPT ALL SELECT * FROM mv_pos
+);
+----
+0
+
+# ============================================================
+# Projection top-k: ORDER BY + LIMIT without GROUP BY
+# Maintains the unlimited projection incrementally; the view applies top-k at read time.
+# ============================================================
+
+statement ok
+CREATE TABLE topkp_t (id INT, name VARCHAR, score INT);
+
+statement ok
+INSERT INTO topkp_t VALUES (1,'alice',80),(2,'bob',95),(3,'carol',70),(4,'dave',88),(5,'eve',92);
+
+statement ok
+CREATE MATERIALIZED VIEW topkp_mv AS
+  SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3;
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topkp_mv
+  EXCEPT ALL
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topkp_mv
+);
+----
+0
+
+# ==========================================
+# Join projection over a derived-table leaf
+# ==========================================
+
+statement ok
+CREATE TABLE proj_join_item(i_id INT, i_price INT, i_name VARCHAR);
+
+statement ok
+CREATE TABLE proj_join_stock(s_w_id INT, s_i_id INT, s_quantity INT);
+
+statement ok
+INSERT INTO proj_join_item VALUES (1, 60, 'a'), (2, 40, 'b');
+
+statement ok
+INSERT INTO proj_join_stock VALUES (1, 1, 10), (1, 2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW proj_join_mv AS
+    SELECT s.s_w_id, s.s_i_id, s.s_quantity, iv.i_name
+    FROM proj_join_stock s
+    JOIN (SELECT i_id, i_name FROM proj_join_item WHERE i_price > 50) iv
+      ON s.s_i_id = iv.i_id;
+
+statement ok
+UPDATE proj_join_stock SET s_quantity = 11 WHERE s_w_id = 1 AND s_i_id = 1;
+
+statement ok
+PRAGMA ivm('proj_join_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM proj_join_mv
+    EXCEPT ALL
+    SELECT s.s_w_id, s.s_i_id, s.s_quantity, iv.i_name
+    FROM proj_join_stock s
+    JOIN (SELECT i_id, i_name FROM proj_join_item WHERE i_price > 50) iv
+      ON s.s_i_id = iv.i_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s.s_w_id, s.s_i_id, s.s_quantity, iv.i_name
+    FROM proj_join_stock s
+    JOIN (SELECT i_id, i_name FROM proj_join_item WHERE i_price > 50) iv
+      ON s.s_i_id = iv.i_id
+    EXCEPT ALL
+    SELECT * FROM proj_join_mv
+);
+----
+0
+
+# Projection delete should rank only affected join candidates while preserving bag semantics.
+statement ok
+CREATE TABLE proj_rank_w(w_id INT, w_name VARCHAR);
+
+statement ok
+CREATE TABLE proj_rank_d(d_w_id INT, d_id INT);
+
+statement ok
+CREATE TABLE proj_rank_c(c_w_id INT, c_id INT);
+
+statement ok
+INSERT INTO proj_rank_w VALUES (1, 'w1'), (2, 'w2');
+
+statement ok
+INSERT INTO proj_rank_d VALUES (1, 10), (1, 10), (2, 20);
+
+statement ok
+INSERT INTO proj_rank_c VALUES (1, 100), (1, 100), (2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW proj_rank_mv AS
+    SELECT w.w_id, d.d_id, c.c_id
+    FROM proj_rank_w w
+    JOIN proj_rank_d d ON w.w_id = d.d_w_id
+    JOIN proj_rank_c c ON d.d_w_id = c.c_w_id;
+
+statement ok
+DELETE FROM proj_rank_c WHERE rowid = (SELECT min(rowid) FROM proj_rank_c WHERE c_w_id = 1 AND c_id = 100);
+
+statement ok
+INSERT INTO proj_rank_d VALUES (2, 20), (2, 21);
+
+statement ok
+UPDATE proj_rank_w SET w_name = 'w2x' WHERE w_id = 2;
+
+statement ok
+PRAGMA ivm('proj_rank_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM proj_rank_mv
+    EXCEPT ALL
+    SELECT w.w_id, d.d_id, c.c_id
+    FROM proj_rank_w w
+    JOIN proj_rank_d d ON w.w_id = d.d_w_id
+    JOIN proj_rank_c c ON d.d_w_id = c.c_w_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w.w_id, d.d_id, c.c_id
+    FROM proj_rank_w w
+    JOIN proj_rank_d d ON w.w_id = d.d_w_id
+    JOIN proj_rank_c c ON d.d_w_id = c.c_w_id
+    EXCEPT ALL
+    SELECT * FROM proj_rank_mv
+);
+----
+0
+
+# Insert a new top-scorer
+statement ok
+INSERT INTO topkp_t VALUES (6,'frank',99);
+
+statement ok
+PRAGMA ivm('topkp_mv');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topkp_mv
+  EXCEPT ALL
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topkp_mv
+);
+----
+0
+
+# Delete a top-scorer
+statement ok
+DELETE FROM topkp_t WHERE id = 6;
+
+statement ok
+PRAGMA ivm('topkp_mv');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topkp_mv
+  EXCEPT ALL
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topkp_mv
+);
+----
+0
+
+# --- stress: batch INSERT + DELETE + UPDATE before single refresh ---
+statement ok
+INSERT INTO topkp_t VALUES (7,'grace',100),(8,'heidi',60);
+
+statement ok
+DELETE FROM topkp_t WHERE id IN (1,3);
+
+statement ok
+UPDATE topkp_t SET score = 50 WHERE id = 2;
+
+statement ok
+PRAGMA ivm('topkp_mv');
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM topkp_mv
+  EXCEPT ALL
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (SELECT id, name, score FROM topkp_t ORDER BY score DESC LIMIT 3) _q
+  EXCEPT ALL
+  SELECT * FROM topkp_mv
+);
+----
+0

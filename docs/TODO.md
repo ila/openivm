@@ -2,7 +2,7 @@
 
 ## P0: Cost Model Audit
 
-- [ ] **Review cost model heuristics.** The current model (`src/upsert/openivm_cost_model.cpp`) uses `COUNT(*)` queries for cardinality at refresh time — expensive and blocks the refresh. Consider caching or using DuckDB's statistics instead.
+- [ ] **Review cost model heuristics.** The current model (`src/upsert/refresh_cost_model.cpp`) uses `COUNT(*)` queries for cardinality at refresh time — expensive and blocks the refresh. Consider caching or using DuckDB's statistics instead.
 - [ ] **Join cost is oversimplified.** `2^(N-1) * total_base_scan` ignores join selectivity, index availability, and join type (LEFT JOIN partial recompute is much cheaper than inclusion-exclusion).
 - [ ] **Recompute cost ignores processing.** `total_base_scan + mv_card` doesn't account for join or aggregate processing overhead during full recomputation.
 - [ ] **Fanout estimate is naive.** `mv_card / base_card` assumes uniform distribution — heavily skewed joins will produce wildly wrong estimates.

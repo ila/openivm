@@ -1,0 +1,748 @@
+# name: test/sql/recompute.test
+# description: Test IVM RECOMPUTE type (UNION ALL over agg, ROLLUP, AVG-under-join) and COUNT DISTINCT group-recompute
+# group: [sql]
+
+require openivm
+
+# ==========================================
+# COUNT(DISTINCT) — group-recompute
+# ==========================================
+
+statement ok
+CREATE TABLE items (id INT, warehouse INT, district INT, item INT, amount DOUBLE);
+
+statement ok
+INSERT INTO items VALUES
+    (1, 1, 1, 10, 5.0),
+    (2, 1, 1, 20, 3.0),
+    (3, 1, 1, 10, 2.0),
+    (4, 1, 2, 30, 8.0),
+    (5, 2, 1, 40, 1.0);
+
+statement ok
+CREATE MATERIALIZED VIEW items_distinct AS
+    SELECT warehouse, district,
+           COUNT(DISTINCT item) AS unique_items,
+           COUNT(*) AS total_lines,
+           SUM(amount) AS total_amount
+    FROM items
+    GROUP BY warehouse, district;
+
+query IIIRR
+SELECT warehouse, district, unique_items, total_lines, total_amount FROM items_distinct ORDER BY warehouse, district;
+----
+1	1	2	3	10.0
+1	2	1	1	8.0
+2	1	1	1	1.0
+
+# Insert a new item for an existing group (item 50 is distinct → unique_items increases)
+statement ok
+INSERT INTO items VALUES (6, 1, 1, 50, 4.0);
+
+statement ok
+PRAGMA ivm('items_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM items_distinct
+    EXCEPT ALL
+    SELECT warehouse, district,
+           COUNT(DISTINCT item), COUNT(*), SUM(amount)
+    FROM items GROUP BY warehouse, district
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT warehouse, district,
+           COUNT(DISTINCT item), COUNT(*), SUM(amount)
+    FROM items GROUP BY warehouse, district
+    EXCEPT ALL
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM items_distinct
+);
+----
+0
+
+# Insert a duplicate item for an existing group (item 10 already exists → unique_items stays same)
+statement ok
+INSERT INTO items VALUES (7, 1, 1, 10, 9.0);
+
+statement ok
+PRAGMA ivm('items_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM items_distinct
+    EXCEPT ALL
+    SELECT warehouse, district,
+           COUNT(DISTINCT item), COUNT(*), SUM(amount)
+    FROM items GROUP BY warehouse, district
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT warehouse, district,
+           COUNT(DISTINCT item), COUNT(*), SUM(amount)
+    FROM items GROUP BY warehouse, district
+    EXCEPT ALL
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM items_distinct
+);
+----
+0
+
+# Delete a row (item 20 removed — unique_items should decrease for group 1,1)
+statement ok
+DELETE FROM items WHERE id = 2;
+
+statement ok
+PRAGMA ivm('items_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM items_distinct
+    EXCEPT ALL
+    SELECT warehouse, district,
+           COUNT(DISTINCT item), COUNT(*), SUM(amount)
+    FROM items GROUP BY warehouse, district
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT warehouse, district,
+           COUNT(DISTINCT item), COUNT(*), SUM(amount)
+    FROM items GROUP BY warehouse, district
+    EXCEPT ALL
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM items_distinct
+);
+----
+0
+
+# Stress: batch INSERTs, DELETEs, UPDATE across groups then single refresh
+statement ok
+INSERT INTO items VALUES (8, 1, 1, 60, 1.0), (9, 2, 1, 10, 7.0), (10, 3, 1, 99, 2.0);
+
+statement ok
+DELETE FROM items WHERE id IN (3, 5);
+
+statement ok
+UPDATE items SET amount = 100.0 WHERE id = 4;
+
+statement ok
+PRAGMA ivm('items_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM items_distinct
+    EXCEPT ALL
+    SELECT warehouse, district,
+           COUNT(DISTINCT item), COUNT(*), SUM(amount)
+    FROM items GROUP BY warehouse, district
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT warehouse, district,
+           COUNT(DISTINCT item), COUNT(*), SUM(amount)
+    FROM items GROUP BY warehouse, district
+    EXCEPT ALL
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM items_distinct
+);
+----
+0
+
+# ==========================================
+# Group recompute with repeated source table
+# ==========================================
+
+statement ok
+CREATE TABLE market (
+    dm_date DATE,
+    dm_s_symb VARCHAR,
+    dm_close DOUBLE,
+    dm_high DOUBLE,
+    dm_low DOUBLE,
+    dm_vol BIGINT
+);
+
+statement ok
+INSERT INTO market VALUES
+    (DATE '2020-01-01', 'A', 10, 11, 9, 100),
+    (DATE '2020-01-02', 'A', 12, 13, 8, 200),
+    (DATE '2020-01-03', 'A', 11, 14, 10, 150);
+
+statement ok
+CREATE MATERIALIZED VIEW market_rollup AS
+    WITH s1 AS (
+        SELECT
+            a.dm_date,
+            a.dm_s_symb,
+            a.dm_close,
+            a.dm_high,
+            a.dm_low,
+            a.dm_vol,
+            MIN(b.dm_low) AS fifty_two_week_low,
+            MAX(b.dm_high) AS fifty_two_week_high
+        FROM market a
+        JOIN market b
+            ON a.dm_s_symb = b.dm_s_symb
+            AND b.dm_date BETWEEN a.dm_date - INTERVAL '12' MONTH AND a.dm_date
+        GROUP BY a.dm_date, a.dm_s_symb, a.dm_close, a.dm_high, a.dm_low, a.dm_vol
+    )
+    SELECT
+        a.dm_date,
+        a.dm_s_symb,
+        a.dm_close,
+        a.dm_high,
+        a.dm_low,
+        a.dm_vol,
+        a.fifty_two_week_low,
+        a.fifty_two_week_high,
+        MIN(b.dm_date) AS fifty_two_week_low_date,
+        MIN(c.dm_date) AS fifty_two_week_high_date
+    FROM s1 a
+    JOIN market b
+        ON a.dm_s_symb = b.dm_s_symb
+        AND a.fifty_two_week_low = b.dm_low
+        AND b.dm_date BETWEEN a.dm_date - INTERVAL '12' MONTH AND a.dm_date
+    JOIN market c
+        ON a.dm_s_symb = c.dm_s_symb
+        AND a.fifty_two_week_high = c.dm_high
+        AND c.dm_date BETWEEN a.dm_date - INTERVAL '12' MONTH AND a.dm_date
+    GROUP BY
+        a.dm_date,
+        a.dm_s_symb,
+        a.dm_close,
+        a.dm_high,
+        a.dm_low,
+        a.dm_vol,
+        a.fifty_two_week_low,
+        a.fifty_two_week_high;
+
+statement ok
+INSERT INTO market VALUES (DATE '2019-12-31', 'A', 9, 21, 1, 50);
+
+statement ok
+PRAGMA ivm('market_rollup');
+
+query I
+WITH expected AS (
+    WITH s1 AS (
+        SELECT
+            a.dm_date,
+            a.dm_s_symb,
+            a.dm_close,
+            a.dm_high,
+            a.dm_low,
+            a.dm_vol,
+            MIN(b.dm_low) AS fifty_two_week_low,
+            MAX(b.dm_high) AS fifty_two_week_high
+        FROM market a
+        JOIN market b
+            ON a.dm_s_symb = b.dm_s_symb
+            AND b.dm_date BETWEEN a.dm_date - INTERVAL '12' MONTH AND a.dm_date
+        GROUP BY a.dm_date, a.dm_s_symb, a.dm_close, a.dm_high, a.dm_low, a.dm_vol
+    )
+    SELECT
+        a.dm_date,
+        a.dm_s_symb,
+        a.dm_close,
+        a.dm_high,
+        a.dm_low,
+        a.dm_vol,
+        a.fifty_two_week_low,
+        a.fifty_two_week_high,
+        MIN(b.dm_date) AS fifty_two_week_low_date,
+        MIN(c.dm_date) AS fifty_two_week_high_date
+    FROM s1 a
+    JOIN market b
+        ON a.dm_s_symb = b.dm_s_symb
+        AND a.fifty_two_week_low = b.dm_low
+        AND b.dm_date BETWEEN a.dm_date - INTERVAL '12' MONTH AND a.dm_date
+    JOIN market c
+        ON a.dm_s_symb = c.dm_s_symb
+        AND a.fifty_two_week_high = c.dm_high
+        AND c.dm_date BETWEEN a.dm_date - INTERVAL '12' MONTH AND a.dm_date
+    GROUP BY
+        a.dm_date,
+        a.dm_s_symb,
+        a.dm_close,
+        a.dm_high,
+        a.dm_low,
+        a.dm_vol,
+        a.fifty_two_week_low,
+        a.fifty_two_week_high
+)
+SELECT count(*) FROM (
+    SELECT * FROM market_rollup
+    EXCEPT ALL
+    SELECT * FROM expected
+    UNION ALL
+    SELECT * FROM expected
+    EXCEPT ALL
+    SELECT * FROM market_rollup
+);
+----
+0
+
+# ==========================================
+# UNION ALL over aggregates — RECOMPUTE type
+# ==========================================
+
+statement ok
+CREATE TABLE orders_a (region VARCHAR, amount INT);
+
+statement ok
+CREATE TABLE orders_b (region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO orders_a VALUES ('east', 100), ('west', 200), ('east', 50);
+
+statement ok
+INSERT INTO orders_b VALUES ('east', 300), ('south', 75);
+
+statement ok
+CREATE MATERIALIZED VIEW union_agg AS
+    SELECT region, SUM(amount) AS total, 'A' AS src FROM orders_a GROUP BY region
+    UNION ALL
+    SELECT region, SUM(amount) AS total, 'B' AS src FROM orders_b GROUP BY region;
+
+query III
+SELECT region, total, src FROM union_agg ORDER BY src, region;
+----
+east	150	A
+west	200	A
+east	300	B
+south	75	B
+
+statement ok
+INSERT INTO orders_a VALUES ('north', 500);
+
+statement ok
+INSERT INTO orders_b VALUES ('west', 120);
+
+statement ok
+PRAGMA ivm('union_agg');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total, src FROM union_agg
+    EXCEPT ALL
+    (SELECT region, SUM(amount), 'A' FROM orders_a GROUP BY region
+     UNION ALL
+     SELECT region, SUM(amount), 'B' FROM orders_b GROUP BY region)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT region, SUM(amount), 'A' FROM orders_a GROUP BY region
+     UNION ALL
+     SELECT region, SUM(amount), 'B' FROM orders_b GROUP BY region)
+    EXCEPT ALL
+    SELECT region, total, src FROM union_agg
+);
+----
+0
+
+# Delete + batch refresh
+statement ok
+DELETE FROM orders_a WHERE region = 'east';
+
+statement ok
+INSERT INTO orders_b VALUES ('east', 10), ('south', 25);
+
+statement ok
+UPDATE orders_a SET amount = 999 WHERE region = 'west';
+
+statement ok
+PRAGMA ivm('union_agg');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total, src FROM union_agg
+    EXCEPT ALL
+    (SELECT region, SUM(amount), 'A' FROM orders_a GROUP BY region
+     UNION ALL
+     SELECT region, SUM(amount), 'B' FROM orders_b GROUP BY region)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT region, SUM(amount), 'A' FROM orders_a GROUP BY region
+     UNION ALL
+     SELECT region, SUM(amount), 'B' FROM orders_b GROUP BY region)
+    EXCEPT ALL
+    SELECT region, total, src FROM union_agg
+);
+----
+0
+
+# Empty-delta skip: no further DML → PRAGMA ivm is a no-op, MV unchanged
+statement ok
+PRAGMA ivm('union_agg');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total, src FROM union_agg
+    EXCEPT ALL
+    (SELECT region, SUM(amount), 'A' FROM orders_a GROUP BY region
+     UNION ALL
+     SELECT region, SUM(amount), 'B' FROM orders_b GROUP BY region)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT region, SUM(amount), 'A' FROM orders_a GROUP BY region
+     UNION ALL
+     SELECT region, SUM(amount), 'B' FROM orders_b GROUP BY region)
+    EXCEPT ALL
+    SELECT region, total, src FROM union_agg
+);
+----
+0
+
+# ==========================================
+# GROUP BY ROLLUP — RECOMPUTE type
+# ==========================================
+
+statement ok
+CREATE TABLE sales (region VARCHAR, dept VARCHAR, amount INT);
+
+statement ok
+INSERT INTO sales VALUES
+    ('east', 'A', 100),
+    ('east', 'B', 200),
+    ('west', 'A', 150),
+    ('west', 'B', 50);
+
+statement ok
+CREATE MATERIALIZED VIEW sales_rollup AS
+    SELECT region, dept, SUM(amount) AS total, COUNT(*) AS cnt
+    FROM sales
+    GROUP BY ROLLUP(region, dept);
+
+# ROLLUP produces rows for (region, dept), (region, NULL), (NULL, NULL)
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, dept, total, cnt FROM sales_rollup
+    EXCEPT ALL
+    SELECT region, dept, SUM(amount), COUNT(*) FROM sales GROUP BY ROLLUP(region, dept)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, dept, SUM(amount), COUNT(*) FROM sales GROUP BY ROLLUP(region, dept)
+    EXCEPT ALL
+    SELECT region, dept, total, cnt FROM sales_rollup
+);
+----
+0
+
+statement ok
+INSERT INTO sales VALUES ('east', 'A', 300), ('south', 'C', 75);
+
+statement ok
+PRAGMA ivm('sales_rollup');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, dept, total, cnt FROM sales_rollup
+    EXCEPT ALL
+    SELECT region, dept, SUM(amount), COUNT(*) FROM sales GROUP BY ROLLUP(region, dept)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, dept, SUM(amount), COUNT(*) FROM sales GROUP BY ROLLUP(region, dept)
+    EXCEPT ALL
+    SELECT region, dept, total, cnt FROM sales_rollup
+);
+----
+0
+
+# Delete + update batch
+statement ok
+DELETE FROM sales WHERE region = 'west' AND dept = 'B';
+
+statement ok
+UPDATE sales SET amount = 500 WHERE region = 'east' AND dept = 'B';
+
+statement ok
+INSERT INTO sales VALUES ('north', 'A', 999);
+
+statement ok
+PRAGMA ivm('sales_rollup');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, dept, total, cnt FROM sales_rollup
+    EXCEPT ALL
+    SELECT region, dept, SUM(amount), COUNT(*) FROM sales GROUP BY ROLLUP(region, dept)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, dept, SUM(amount), COUNT(*) FROM sales GROUP BY ROLLUP(region, dept)
+    EXCEPT ALL
+    SELECT region, dept, total, cnt FROM sales_rollup
+);
+----
+0
+
+# ==========================================
+# AVG under join (CTE pattern) — incrementally maintained as AGGREGATE_GROUP
+# (group-recompute fires on the inner aggregate's affected groups; AVG output
+# is treated as a non-summable column and re-evaluated from the view query).
+# ==========================================
+
+statement ok
+CREATE TABLE wh (w_id INT, w_name VARCHAR, w_tax DOUBLE);
+
+statement ok
+CREATE TABLE ol (ol_w_id INT, ol_d_id INT, ol_amount DOUBLE);
+
+statement ok
+INSERT INTO wh VALUES (1, 'Alpha', 0.1), (2, 'Beta', 0.05);
+
+statement ok
+INSERT INTO ol VALUES (1, 1, 10.0), (1, 1, 20.0), (1, 2, 5.0), (2, 1, 30.0);
+
+statement ok
+CREATE MATERIALIZED VIEW avg_under_join AS
+    WITH district_avg AS (
+        SELECT ol_w_id, ol_d_id, AVG(ol_amount) AS avg_rev, COUNT(*) AS line_count
+        FROM ol GROUP BY ol_w_id, ol_d_id
+    )
+    SELECT w.w_id, w.w_name, da.ol_d_id, da.avg_rev, da.line_count,
+           da.avg_rev * (1 + w.w_tax) AS taxed_avg
+    FROM wh w JOIN district_avg da ON w.w_id = da.ol_w_id;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, w_name, ol_d_id, avg_rev, line_count, taxed_avg FROM avg_under_join
+    EXCEPT ALL
+    SELECT w.w_id, w.w_name, da.ol_d_id, da.avg_rev, da.line_count, da.avg_rev * (1 + w.w_tax)
+    FROM wh w JOIN (
+        SELECT ol_w_id, ol_d_id, AVG(ol_amount) AS avg_rev, COUNT(*) AS line_count
+        FROM ol GROUP BY ol_w_id, ol_d_id
+    ) da ON w.w_id = da.ol_w_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w.w_id, w.w_name, da.ol_d_id, da.avg_rev, da.line_count, da.avg_rev * (1 + w.w_tax)
+    FROM wh w JOIN (
+        SELECT ol_w_id, ol_d_id, AVG(ol_amount) AS avg_rev, COUNT(*) AS line_count
+        FROM ol GROUP BY ol_w_id, ol_d_id
+    ) da ON w.w_id = da.ol_w_id
+    EXCEPT ALL
+    SELECT w_id, w_name, ol_d_id, avg_rev, line_count, taxed_avg FROM avg_under_join
+);
+----
+0
+
+statement ok
+INSERT INTO ol VALUES (1, 1, 30.0), (2, 1, 50.0);
+
+statement ok
+PRAGMA ivm('avg_under_join');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, w_name, ol_d_id, avg_rev, line_count, taxed_avg FROM avg_under_join
+    EXCEPT ALL
+    SELECT w.w_id, w.w_name, da.ol_d_id, da.avg_rev, da.line_count, da.avg_rev * (1 + w.w_tax)
+    FROM wh w JOIN (
+        SELECT ol_w_id, ol_d_id, AVG(ol_amount) AS avg_rev, COUNT(*) AS line_count
+        FROM ol GROUP BY ol_w_id, ol_d_id
+    ) da ON w.w_id = da.ol_w_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w.w_id, w.w_name, da.ol_d_id, da.avg_rev, da.line_count, da.avg_rev * (1 + w.w_tax)
+    FROM wh w JOIN (
+        SELECT ol_w_id, ol_d_id, AVG(ol_amount) AS avg_rev, COUNT(*) AS line_count
+        FROM ol GROUP BY ol_w_id, ol_d_id
+    ) da ON w.w_id = da.ol_w_id
+    EXCEPT ALL
+    SELECT w_id, w_name, ol_d_id, avg_rev, line_count, taxed_avg FROM avg_under_join
+);
+----
+0
+
+# Stress: batch INSERT + DELETE + UPDATE then single refresh
+statement ok
+INSERT INTO ol VALUES (1, 3, 100.0), (2, 2, 40.0);
+
+statement ok
+DELETE FROM ol WHERE ol_w_id = 1 AND ol_d_id = 2;
+
+statement ok
+UPDATE ol SET ol_amount = 999.0 WHERE ol_w_id = 2 AND ol_d_id = 1 AND ol_amount = 50.0;
+
+statement ok
+INSERT INTO wh VALUES (3, 'Gamma', 0.15);
+
+statement ok
+PRAGMA ivm('avg_under_join');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, w_name, ol_d_id, avg_rev, line_count, taxed_avg FROM avg_under_join
+    EXCEPT ALL
+    SELECT w.w_id, w.w_name, da.ol_d_id, da.avg_rev, da.line_count, da.avg_rev * (1 + w.w_tax)
+    FROM wh w JOIN (
+        SELECT ol_w_id, ol_d_id, AVG(ol_amount) AS avg_rev, COUNT(*) AS line_count
+        FROM ol GROUP BY ol_w_id, ol_d_id
+    ) da ON w.w_id = da.ol_w_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w.w_id, w.w_name, da.ol_d_id, da.avg_rev, da.line_count, da.avg_rev * (1 + w.w_tax)
+    FROM wh w JOIN (
+        SELECT ol_w_id, ol_d_id, AVG(ol_amount) AS avg_rev, COUNT(*) AS line_count
+        FROM ol GROUP BY ol_w_id, ol_d_id
+    ) da ON w.w_id = da.ol_w_id
+    EXCEPT ALL
+    SELECT w_id, w_name, ol_d_id, avg_rev, line_count, taxed_avg FROM avg_under_join
+);
+----
+0
+
+# Classification: avg_under_join must NOT be FULL_REFRESH (3). Join-over-aggregate
+# with dimension-side pass-through columns uses affected-key group recompute.
+# Type 6 = GROUP_RECOMPUTE.
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'avg_under_join';
+----
+6
+
+query I
+SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'avg_under_join';
+----
+ol_d_id,w_id
+
+# ==========================================
+# STDDEV / VARIANCE under join (CTE pattern) — same shape, exercises the other
+# half of RewriteDerivedAggregates' decomposition (SUM(x*x) + SUM + COUNT).
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW stddev_under_join AS
+    WITH district_stats AS (
+        SELECT ol_w_id, ol_d_id,
+               STDDEV(ol_amount) AS s_rev,
+               VARIANCE(ol_amount) AS v_rev,
+               COUNT(*) AS line_count
+        FROM ol GROUP BY ol_w_id, ol_d_id
+    )
+    SELECT w.w_id, w.w_name, ds.ol_d_id, ds.s_rev, ds.v_rev, ds.line_count
+    FROM wh w JOIN district_stats ds ON w.w_id = ds.ol_w_id;
+
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'stddev_under_join';
+----
+6
+
+query I
+SELECT group_columns FROM _duckdb_ivm_views WHERE view_name = 'stddev_under_join';
+----
+ol_d_id,w_id
+
+# Cross-check initial state. STDDEV/VARIANCE on DOUBLE has 1–2 ULP drift vs
+# the base query (documented in docs/limitations.md), so round to 10 places.
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, w_name, ol_d_id,
+           ROUND(s_rev, 10), ROUND(v_rev, 10), line_count
+    FROM stddev_under_join
+    EXCEPT ALL
+    SELECT w.w_id, w.w_name, ds.ol_d_id,
+           ROUND(ds.s_rev, 10), ROUND(ds.v_rev, 10), ds.line_count
+    FROM wh w JOIN (
+        SELECT ol_w_id, ol_d_id, STDDEV(ol_amount) AS s_rev,
+               VARIANCE(ol_amount) AS v_rev, COUNT(*) AS line_count
+        FROM ol GROUP BY ol_w_id, ol_d_id
+    ) ds ON w.w_id = ds.ol_w_id
+);
+----
+0
+
+# Mixed delta batch (insert + delete + update + group disappears + group appears)
+statement ok
+INSERT INTO ol VALUES (1, 4, 7.0), (1, 4, 9.0), (1, 4, 11.0);
+
+statement ok
+DELETE FROM ol WHERE ol_w_id = 2 AND ol_d_id = 2;
+
+statement ok
+UPDATE ol SET ol_amount = 12.5 WHERE ol_w_id = 1 AND ol_d_id = 1 AND ol_amount = 30.0;
+
+statement ok
+INSERT INTO wh VALUES (4, 'Delta', 0.2);
+
+statement ok
+INSERT INTO ol VALUES (4, 1, 50.0), (4, 1, 60.0), (4, 2, 100.0);
+
+statement ok
+PRAGMA ivm('stddev_under_join');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, w_name, ol_d_id,
+           ROUND(s_rev, 10), ROUND(v_rev, 10), line_count
+    FROM stddev_under_join
+    EXCEPT ALL
+    SELECT w.w_id, w.w_name, ds.ol_d_id,
+           ROUND(ds.s_rev, 10), ROUND(ds.v_rev, 10), ds.line_count
+    FROM wh w JOIN (
+        SELECT ol_w_id, ol_d_id, STDDEV(ol_amount) AS s_rev,
+               VARIANCE(ol_amount) AS v_rev, COUNT(*) AS line_count
+        FROM ol GROUP BY ol_w_id, ol_d_id
+    ) ds ON w.w_id = ds.ol_w_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w.w_id, w.w_name, ds.ol_d_id,
+           ROUND(ds.s_rev, 10), ROUND(ds.v_rev, 10), ds.line_count
+    FROM wh w JOIN (
+        SELECT ol_w_id, ol_d_id, STDDEV(ol_amount) AS s_rev,
+               VARIANCE(ol_amount) AS v_rev, COUNT(*) AS line_count
+        FROM ol GROUP BY ol_w_id, ol_d_id
+    ) ds ON w.w_id = ds.ol_w_id
+    EXCEPT ALL
+    SELECT w_id, w_name, ol_d_id,
+           ROUND(s_rev, 10), ROUND(v_rev, 10), line_count
+    FROM stddev_under_join
+);
+----
+0

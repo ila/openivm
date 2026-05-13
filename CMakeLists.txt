@@ -12,17 +12,17 @@ include_directories(src/include ${LPTS_DIR}/src/include ${LPTS_DIR}/third_party/
 
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
-    src/core/openivm_parser.cpp
+    src/core/parser.cpp
     src/core/openivm_utils.cpp
-    src/core/openivm_metadata.cpp
-    src/core/ivm_checker.cpp
-    src/core/ivm_plan_rewrite.cpp
-    src/upsert/openivm_upsert.cpp
-    src/upsert/openivm_compile_upsert.cpp
-    src/upsert/openivm_cost_model.cpp
-    src/upsert/openivm_index_regen.cpp
-    src/rules/openivm_rewrite_rule.cpp
-    src/rules/openivm_insert_rule.cpp
+    src/core/refresh_metadata.cpp
+    src/core/incremental_checker.cpp
+    src/core/plan_rewrite.cpp
+    src/upsert/refresh.cpp
+    src/upsert/refresh_compiler.cpp
+    src/upsert/refresh_cost_model.cpp
+    src/upsert/refresh_index_regen.cpp
+    src/rules/incremental_rewrite_rule.cpp
+    src/rules/refresh_insert_rule.cpp
     src/rules/helpers.cpp
     src/rules/scan.cpp
     src/rules/filter.cpp
@@ -36,8 +36,8 @@ set(EXTENSION_SOURCES
     src/rules/window.cpp
     src/rules/topk.cpp
     src/rules/column_hider.cpp
-    src/core/openivm_refresh_locks.cpp
-    src/core/openivm_refresh_daemon.cpp
+    src/core/refresh_locks.cpp
+    src/core/refresh_daemon.cpp
     src/match/plan_canonical.cpp
     src/match/predicate_oracle.cpp
     src/match/equivalence_classes.cpp

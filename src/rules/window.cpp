@@ -1,6 +1,6 @@
 #include "rules/window.hpp"
 #include "core/openivm_debug.hpp"
-#include "rules/openivm_rewrite_rule.hpp"
+#include "rules/incremental_rewrite_rule.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 
 namespace duckdb {

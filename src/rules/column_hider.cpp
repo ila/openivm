@@ -5,8 +5,8 @@
 // only the user's columns via SELECT * EXCLUDE (...).
 //
 // This file is intentionally minimal — the naming logic lives in ivm_column_hider.hpp.
-// The parser (openivm_parser.cpp) creates the view during CREATE MATERIALIZED VIEW,
-// and the insert rule (openivm_insert_rule.cpp) drops it during DROP TABLE.
+// The parser (parser.cpp) creates the view during CREATE MATERIALIZED VIEW,
+// and the insert rule (refresh_insert_rule.cpp) drops it during DROP TABLE.
 
 #include "rules/column_hider.hpp"
 

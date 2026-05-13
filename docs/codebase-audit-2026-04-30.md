@@ -22,8 +22,8 @@ tests first, then split and simplify the orchestration code behind those tests.
 ### 1. MAJOR: MV creation and refresh are over-centralized
 
 Locations:
-- `src/core/openivm_parser.cpp:443`
-- `src/upsert/openivm_upsert.cpp:486`
+- `src/core/parser.cpp:443`
+- `src/upsert/refresh.cpp:486`
 
 `IVMPlanFunction` handles catalog routing, PAC forwarding, parsing, planning, multiple plan rewrites, compatibility
 classification, LPTS fallback, table DDL, metadata DML, top-k handling, DuckLake special cases, and output SQL file
@@ -46,7 +46,7 @@ downstream-delta handling, cursor/snapshot advance, cleanup.
 
 ### 2. MAJOR: The plan rewrite pipeline walks and mutates the same plan too many times
 
-Location: `src/core/ivm_plan_rewrite.cpp:1134`
+Location: `src/core/plan_rewrite.cpp:1134`
 
 `IVMPlanRewrite` runs many recursive passes in sequence: CTE inlining, aggregate FILTER rewrite, DISTINCT rewrite,
 derived aggregate rewrite, hidden count injection, hidden-column propagation, left-join key rewrite, match-count rewrite.
@@ -66,12 +66,12 @@ LEFT/FULL OUTER JOIN, and top-k.
 
 ### 3. MAJOR: Delta capture for DML is still string-serialization based in important paths
 
-Location: `src/rules/openivm_insert_rule.cpp:315`
+Location: `src/rules/refresh_insert_rule.cpp:315`
 
 The insert/delete/update rule builds SQL strings to write delta rows. Simple constant inserts are handled directly, but
 `INSERT ... SELECT`, complex DELETE, CSV import, and UPDATE paths depend on `LogicalPlanToAst`, `Expression::ToString`,
 or table-filter serialization. Unsupported cases throw at DML time, for example `DELETE ... WHERE dept IN (SELECT ...)`
-is still expected to error in `test/sql/ivm_insert_rule.test:969`.
+is still expected to error in `test/sql/insert_rule.test:969`.
 
 Why it matters:
 - Base-table DML behavior is part of user-facing correctness. If delta capture misses or mis-serializes a predicate, the
@@ -88,9 +88,9 @@ Fix direction:
 ### 4. MAJOR: SQL assembly and metadata encoding are duplicated and under-typed
 
 Locations:
-- `src/upsert/openivm_compile_upsert.cpp:127`
-- `src/core/openivm_metadata.cpp:158`
-- `src/core/openivm_parser.cpp:1986`
+- `src/upsert/refresh_compiler.cpp:127`
+- `src/core/refresh_metadata.cpp:158`
+- `src/core/parser.cpp:1986`
 
 Refresh SQL, DDL, metadata values, group columns, aggregate type lists, DuckLake snapshot updates, and cleanup queries are
 mostly built with string concatenation. Some metadata is comma-separated text (`group_columns`, `aggregate_types`) and
@@ -109,7 +109,7 @@ Fix direction:
 
 ### 5. MAJOR: Outer-join aggregate behavior is complicated and still documents known incorrect cases
 
-Location: `src/upsert/openivm_compile_upsert.cpp:550`
+Location: `src/upsert/refresh_compiler.cpp:550`
 
 The LEFT JOIN MERGE path contains detailed logic around `_ivm_match_count`, including a comment that left-side non-count
 aggregates are "incorrect for those but rare in practice" and another known limitation for folded projections around
@@ -136,7 +136,7 @@ Locations:
 - `src/match/predicate_oracle.cpp:18`
 - `src/match/equivalence_classes.cpp:8`
 - `src/match/constraint_cache.cpp:12`
-- `src/upsert/openivm_cost_model.cpp:752`
+- `src/upsert/refresh_cost_model.cpp:752`
 
 The match subsystem exposes settings and system tables, but core components return empty/default results or
 `UNDECIDED`. This is gated by `ivm_enable_view_matching=false`, but the code looks production-adjacent.
@@ -153,11 +153,11 @@ the first useful tier.
 ### 7. MAJOR: Tests are broad but uneven; some files do not verify MV equality
 
 Evidence:
-- Strong files: `mv_aggregate.test`, `mv_full_outer_join.test`, `mv_projection.test`, `mv_left_join.test`,
-  `mv_distinct.test`, and DuckLake aggregate/projection tests contain many bidirectional `EXCEPT ALL` checks.
-- Weak files: `mv_list.test` has one MV and no `EXCEPT ALL`; `ivm_hooks.test` and `ivm_metadata.test` mostly validate
-  hooks/metadata; `ivm_parser.test` has many MVs but only a few equality checks.
-- `ivm_insert_rule.test` has many delta-capture tests, but some sections check delta-row counts rather than refreshing
+- Strong files: `aggregate.test`, `full_outer_join.test`, `projection.test`, `left_join.test`,
+  `distinct.test`, and DuckLake aggregate/projection tests contain many bidirectional `EXCEPT ALL` checks.
+- Weak files: `list.test` has one MV and no `EXCEPT ALL`; `refresh_hooks.test` and `metadata.test` mostly validate
+  hooks/metadata; `parser.test` has many MVs but only a few equality checks.
+- `insert_rule.test` has many delta-capture tests, but some sections check delta-row counts rather than refreshing
   an MV and comparing against base tables.
 
 Why it matters:
@@ -174,13 +174,13 @@ Fix direction:
 
 ### Stale or contradictory docs/comments
 
-- `docs/limitations.md:19` lists `ARG_MIN` and `ARG_MAX` as unsupported, but `src/core/ivm_checker.cpp:20` supports them
-  and `test/sql/mv_argminmax.test` exercises them.
+- `docs/limitations.md:19` lists `ARG_MIN` and `ARG_MAX` as unsupported, but `src/core/incremental_checker.cpp:20` supports them
+  and `test/sql/argminmax.test` exercises them.
 - `docs/limitations.md:50` says projection top-k is "genuinely incremental", while `docs/operators/top-k.md:38` says it
   is full recompute on refresh.
-- `src/upsert/openivm_upsert.cpp:1248` says `TOP_K` is unreachable, but top-k tests and docs indicate it is now a real
+- `src/upsert/refresh.cpp:1248` says `TOP_K` is unreachable, but top-k tests and docs indicate it is now a real
   classification.
-- `docs/limitations.md:51` still references "see plan section 5 in repo"; `src/core/openivm_parser.cpp:1343` references
+- `docs/limitations.md:51` still references "see plan section 5 in repo"; `src/core/parser.cpp:1343` references
   "plan section 7". These should become issue links, docs links, or be removed.
 
 ### Comments are often patch history instead of invariants
@@ -191,7 +191,7 @@ invariants, and unsupported-shape rationale. Move historical notes into regressi
 
 ### Cost model is useful but should not drive correctness
 
-Location: `src/upsert/openivm_cost_model.cpp:356`
+Location: `src/upsert/refresh_cost_model.cpp:356`
 
 The cost model is a heuristic with learned regression fallback. It is gated by `ivm_adaptive_refresh`, which is good.
 However, the comments and estimates should be treated as operational tuning only. It should never compensate for
@@ -199,7 +199,7 @@ classifier uncertainty. If a shape is correctness-risky, route it to a correctne
 
 ### Lock helpers need RAII coverage
 
-Location: `src/core/openivm_refresh_locks.cpp:27`
+Location: `src/core/refresh_locks.cpp:27`
 
 The lock map is simple and understandable, but direct `LockView`/`UnlockView` calls are exception-sensitive. Delta writes
 use `DeltaLockGuard`; view locks should get the same RAII treatment everywhere cleanup or cascade code can throw.
@@ -207,8 +207,8 @@ use `DeltaLockGuard`; view locks should get the same RAII treatment everywhere c
 ## Recommended execution order
 
 1. Test hardening:
-   - Add bidirectional equality checks to `mv_list.test`.
-   - Audit `ivm_insert_rule.test` sections that only count delta rows and add refresh-plus-equality checks.
+   - Add bidirectional equality checks to `list.test`.
+   - Audit `insert_rule.test` sections that only count delta rows and add refresh-plus-equality checks.
    - Add explicit regression tests for the LEFT/FULL OUTER aggregate shapes currently described as limitations.
 
 2. Documentation cleanup:

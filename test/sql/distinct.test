@@ -1,0 +1,882 @@
+# name: test/sql/distinct.test
+# description: Test IVM with SELECT DISTINCT
+# group: [sql]
+
+require openivm
+
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+# ============================================================
+# Basic DISTINCT
+# ============================================================
+
+statement ok
+CREATE TABLE colors (id INT, color VARCHAR);
+
+statement ok
+INSERT INTO colors VALUES (1, 'red'), (2, 'blue'), (3, 'red'), (4, 'green');
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_colors AS SELECT DISTINCT color FROM colors;
+
+query I
+SELECT * FROM distinct_colors ORDER BY color;
+----
+blue
+green
+red
+
+# Insert duplicate — should not change DISTINCT result
+statement ok
+INSERT INTO colors VALUES (5, 'red'), (6, 'blue');
+
+statement ok
+PRAGMA ivm('distinct_colors');
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+----
+0
+
+# Insert new value
+statement ok
+INSERT INTO colors VALUES (7, 'yellow');
+
+statement ok
+PRAGMA ivm('distinct_colors');
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+----
+0
+
+# Delete all of one color — should remove from DISTINCT result
+statement ok
+DELETE FROM colors WHERE color = 'green';
+
+statement ok
+PRAGMA ivm('distinct_colors');
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+----
+0
+
+# ============================================================
+# DISTINCT with multiple columns
+# ============================================================
+
+statement ok
+CREATE TABLE pairs (a VARCHAR, b INT);
+
+statement ok
+INSERT INTO pairs VALUES ('x', 1), ('x', 2), ('y', 1), ('x', 1);
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_pairs AS SELECT DISTINCT a, b FROM pairs;
+
+query II
+SELECT a, b FROM distinct_pairs ORDER BY a, b;
+----
+x	1
+x	2
+y	1
+
+# Insert duplicate pair — no change
+statement ok
+INSERT INTO pairs VALUES ('x', 1), ('y', 1);
+
+statement ok
+PRAGMA ivm('distinct_pairs');
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT a, b FROM pairs EXCEPT ALL SELECT a, b FROM distinct_pairs);
+----
+0
+
+# Delete one copy of a duplicate — should still exist
+statement ok
+DELETE FROM pairs WHERE a = 'x' AND b = 1;
+
+statement ok
+PRAGMA ivm('distinct_pairs');
+
+# x,1 still exists in pairs (was inserted twice before, deleted once)
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT a, b FROM pairs EXCEPT ALL SELECT a, b FROM distinct_pairs);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT a, b FROM distinct_pairs EXCEPT ALL SELECT DISTINCT a, b FROM pairs);
+----
+0
+
+# ============================================================
+# Mixed INSERT + DELETE + INSERT before single refresh
+# ============================================================
+
+statement ok
+INSERT INTO colors VALUES (10, 'purple'), (11, 'purple'), (12, 'orange');
+
+statement ok
+DELETE FROM colors WHERE color = 'yellow';
+
+statement ok
+INSERT INTO colors VALUES (13, 'yellow');
+
+statement ok
+PRAGMA ivm('distinct_colors');
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT color FROM colors EXCEPT ALL SELECT * FROM distinct_colors);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM distinct_colors EXCEPT ALL SELECT DISTINCT color FROM colors);
+----
+0
+
+# ============================================================
+# DISTINCT with all-NULL rows
+# ============================================================
+
+statement ok
+CREATE TABLE dist_all_null (a INT, b VARCHAR);
+
+statement ok
+INSERT INTO dist_all_null VALUES (NULL, NULL), (NULL, NULL), (1, NULL), (NULL, 'x');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dist_all_null AS SELECT DISTINCT a, b FROM dist_all_null;
+
+statement ok
+PRAGMA ivm('mv_dist_all_null');
+
+# Should have 3 distinct rows: (NULL, NULL), (1, NULL), (NULL, 'x')
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT a, b FROM dist_all_null
+    EXCEPT ALL
+    SELECT a, b FROM mv_dist_all_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, b FROM mv_dist_all_null
+    EXCEPT ALL
+    SELECT DISTINCT a, b FROM dist_all_null
+);
+----
+0
+
+# Delete both copies of (NULL, NULL) — it should disappear from DISTINCT
+statement ok
+DELETE FROM dist_all_null WHERE a IS NULL AND b IS NULL;
+
+statement ok
+PRAGMA ivm('mv_dist_all_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT a, b FROM dist_all_null
+    EXCEPT ALL
+    SELECT a, b FROM mv_dist_all_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, b FROM mv_dist_all_null
+    EXCEPT ALL
+    SELECT DISTINCT a, b FROM dist_all_null
+);
+----
+0
+
+# Insert (NULL, NULL) back — it should reappear
+statement ok
+INSERT INTO dist_all_null VALUES (NULL, NULL);
+
+statement ok
+PRAGMA ivm('mv_dist_all_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT a, b FROM dist_all_null
+    EXCEPT ALL
+    SELECT a, b FROM mv_dist_all_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT a, b FROM mv_dist_all_null
+    EXCEPT ALL
+    SELECT DISTINCT a, b FROM dist_all_null
+);
+----
+0
+
+# ============================================================
+# DISTINCT with expression that collapses values
+# ============================================================
+
+statement ok
+CREATE TABLE dist_collapse (val INT);
+
+statement ok
+INSERT INTO dist_collapse VALUES (-5), (5), (-10), (10), (0), (0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dist_collapse AS SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse;
+
+statement ok
+PRAGMA ivm('mv_dist_collapse');
+
+# Should have 3 distinct abs values: 0, 5, 10
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+    EXCEPT ALL
+    SELECT * FROM mv_dist_collapse
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_dist_collapse
+    EXCEPT ALL
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+);
+----
+0
+
+# Delete val=-5 — ABS(5) still exists from val=5, so no change in DISTINCT
+statement ok
+DELETE FROM dist_collapse WHERE val = -5;
+
+statement ok
+PRAGMA ivm('mv_dist_collapse');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+    EXCEPT ALL
+    SELECT * FROM mv_dist_collapse
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_dist_collapse
+    EXCEPT ALL
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+);
+----
+0
+
+# Delete val=5 — now ABS(5) has no source left, should be removed
+statement ok
+DELETE FROM dist_collapse WHERE val = 5;
+
+statement ok
+PRAGMA ivm('mv_dist_collapse');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+    EXCEPT ALL
+    SELECT * FROM mv_dist_collapse
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_dist_collapse
+    EXCEPT ALL
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+);
+----
+0
+
+# Insert two -5s — ABS(5) comes back
+statement ok
+INSERT INTO dist_collapse VALUES (-5), (-5);
+
+statement ok
+PRAGMA ivm('mv_dist_collapse');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+    EXCEPT ALL
+    SELECT * FROM mv_dist_collapse
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_dist_collapse
+    EXCEPT ALL
+    SELECT DISTINCT ABS(val) AS abs_val FROM dist_collapse
+);
+----
+0
+
+# ==========================================
+# DISTINCT on a 2-table join
+# ==========================================
+
+statement ok
+CREATE TABLE dist_j_orders (id INT, product VARCHAR);
+
+statement ok
+CREATE TABLE dist_j_products (name VARCHAR, category VARCHAR);
+
+statement ok
+INSERT INTO dist_j_products VALUES ('A', 'X'), ('B', 'X'), ('C', 'Y');
+
+statement ok
+INSERT INTO dist_j_orders VALUES (1, 'A'), (2, 'A'), (3, 'B'), (4, 'C');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dist_join AS
+    SELECT DISTINCT p.category FROM dist_j_orders o INNER JOIN dist_j_products p ON o.product = p.name;
+
+query I
+SELECT * FROM mv_dist_join ORDER BY 1;
+----
+X
+Y
+
+# Insert more orders for same categories — DISTINCT should not change
+statement ok
+INSERT INTO dist_j_orders VALUES (5, 'B'), (6, 'A');
+
+statement ok
+PRAGMA ivm('mv_dist_join');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT p.category FROM dist_j_orders o INNER JOIN dist_j_products p ON o.product = p.name
+    EXCEPT ALL SELECT * FROM mv_dist_join
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_dist_join
+    EXCEPT ALL SELECT DISTINCT p.category FROM dist_j_orders o INNER JOIN dist_j_products p ON o.product = p.name
+);
+----
+0
+
+# Delete all orders for category Y — it should disappear
+statement ok
+DELETE FROM dist_j_orders WHERE product = 'C';
+
+statement ok
+PRAGMA ivm('mv_dist_join');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT p.category FROM dist_j_orders o INNER JOIN dist_j_products p ON o.product = p.name
+    EXCEPT ALL SELECT * FROM mv_dist_join
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_dist_join
+    EXCEPT ALL SELECT DISTINCT p.category FROM dist_j_orders o INNER JOIN dist_j_products p ON o.product = p.name
+);
+----
+0
+
+# ============================================================
+# UNION (implicit DISTINCT) — regression for rewriter_benchmark
+# query_0076 etc.: a projection above the DISTINCT referenced
+# the UNION's output bindings; replacing DISTINCT with an
+# AGGREGATE left those BCRs dangling and LPTS emitted the old
+# table-index column names.
+# ============================================================
+
+statement ok
+CREATE TABLE u_dist_a (id INT);
+
+statement ok
+CREATE TABLE u_dist_b (id INT);
+
+statement ok
+CREATE TABLE u_dist_c (id INT);
+
+statement ok
+INSERT INTO u_dist_a VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO u_dist_b VALUES (2), (3), (4);
+
+statement ok
+INSERT INTO u_dist_c VALUES (3), (4), (5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_union_distinct AS
+    SELECT id FROM u_dist_a
+    UNION
+    SELECT id FROM u_dist_b
+    UNION
+    SELECT id FROM u_dist_c;
+
+# Batch: insert into all three + delete from one, single refresh.
+# id=1 gets deleted from a and simultaneously inserted into c — net
+# effect on the UNION is zero (c already carries it).
+statement ok
+INSERT INTO u_dist_a VALUES (10);
+
+statement ok
+INSERT INTO u_dist_b VALUES (5), (5);
+
+statement ok
+INSERT INTO u_dist_c VALUES (1);
+
+statement ok
+DELETE FROM u_dist_a WHERE id = 1;
+
+statement ok
+PRAGMA ivm('mv_union_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id FROM u_dist_a UNION SELECT id FROM u_dist_b UNION SELECT id FROM u_dist_c)
+    EXCEPT ALL SELECT * FROM mv_union_distinct
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_union_distinct
+    EXCEPT ALL
+    (SELECT id FROM u_dist_a UNION SELECT id FROM u_dist_b UNION SELECT id FROM u_dist_c)
+);
+----
+0
+
+# UNION with a literal column forcing a projection above the DISTINCT
+statement ok
+CREATE MATERIALIZED VIEW mv_union_labeled AS
+    SELECT id, 'a' AS src FROM u_dist_a
+    UNION
+    SELECT id, 'b' FROM u_dist_b;
+
+statement ok
+INSERT INTO u_dist_a VALUES (100);
+
+statement ok
+DELETE FROM u_dist_b WHERE id = 4;
+
+statement ok
+PRAGMA ivm('mv_union_labeled');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT id, 'a' AS src FROM u_dist_a UNION SELECT id, 'b' FROM u_dist_b)
+    EXCEPT ALL SELECT * FROM mv_union_labeled
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_union_labeled
+    EXCEPT ALL
+    (SELECT id, 'a' AS src FROM u_dist_a UNION SELECT id, 'b' FROM u_dist_b)
+);
+----
+0
+
+# ============================================================
+# DISTINCT with parent operators that referenced the pre-rewrite bindings.
+# IVMPlanRewrite replaces LogicalDistinct with LogicalAggregate, but parent
+# nodes (ORDER BY, MARK JOIN, FILTER) keep their original column bindings
+# because DISTINCT was a pass-through. LPTS must re-resolve these through
+# the aggregate's new group-output column names — otherwise the generated
+# CTE SQL references the pre-aggregate CTE alias (e.g. t1_col) and the
+# binder reports "column not found".
+# ============================================================
+
+# DISTINCT + ORDER BY — stale ORDER BY binding
+statement ok
+CREATE TABLE dist_order (w_id INT, d_id INT, local INT);
+
+statement ok
+INSERT INTO dist_order VALUES (1, 1, 1), (1, 2, 0), (2, 1, 1), (1, 1, 1), (3, 2, 1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dist_order AS
+    SELECT DISTINCT w_id, d_id FROM dist_order WHERE local = 1 ORDER BY w_id;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT w_id, d_id FROM dist_order WHERE local = 1
+    EXCEPT ALL SELECT w_id, d_id FROM mv_dist_order
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, d_id FROM mv_dist_order
+    EXCEPT ALL SELECT DISTINCT w_id, d_id FROM dist_order WHERE local = 1
+);
+----
+0
+
+# Apply a batch of conflicting DML ops before a single refresh
+statement ok
+INSERT INTO dist_order VALUES (4, 3, 1), (5, 1, 1), (5, 1, 1);
+
+statement ok
+DELETE FROM dist_order WHERE w_id = 1 AND d_id = 1;
+
+statement ok
+INSERT INTO dist_order VALUES (1, 1, 1);
+
+statement ok
+UPDATE dist_order SET local = 0 WHERE w_id = 2;
+
+statement ok
+PRAGMA ivm('mv_dist_order');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT w_id, d_id FROM dist_order WHERE local = 1
+    EXCEPT ALL SELECT w_id, d_id FROM mv_dist_order
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, d_id FROM mv_dist_order
+    EXCEPT ALL SELECT DISTINCT w_id, d_id FROM dist_order WHERE local = 1
+);
+----
+0
+
+# IN (SELECT DISTINCT ...) — stale MARK JOIN condition binding
+statement ok
+CREATE TABLE dist_mark (w_id INT);
+
+statement ok
+INSERT INTO dist_mark VALUES (1), (2), (3), (3), (5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dist_mark AS
+    SELECT n FROM generate_series(1, 10) t(n) WHERE n IN (SELECT DISTINCT w_id FROM dist_mark);
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT n FROM generate_series(1, 10) t(n) WHERE n IN (SELECT DISTINCT w_id FROM dist_mark)
+    EXCEPT ALL SELECT n FROM mv_dist_mark
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT n FROM mv_dist_mark
+    EXCEPT ALL
+    SELECT n FROM generate_series(1, 10) t(n) WHERE n IN (SELECT DISTINCT w_id FROM dist_mark)
+);
+----
+0
+
+# ============================================================
+# Inner DISTINCT under an outer aggregate (regression — pre-fix
+# IvmDistinctRule turned DISTINCT into GROUP BY all_cols COUNT(*),
+# which emits a +1 row for every duplicate input. A parent SUM
+# then double-counted duplicates that the underlying DISTINCT
+# would dedup. The classifier now routes such views to RECOMPUTE.)
+# ============================================================
+
+statement ok
+CREATE TABLE idist_u (grp INT, machine VARCHAR, cores INT);
+
+statement ok
+INSERT INTO idist_u VALUES (1, 'm1', 8), (1, 'm1', 8), (1, 'm2', 16), (2, 'm3', 4);
+
+statement ok
+CREATE MATERIALIZED VIEW idist_mv AS
+    SELECT grp, SUM(cores) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL) d
+    GROUP BY grp;
+
+# Initial check: dedups (1,'m1',8) → only one copy contributes.
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM idist_mv
+);
+----
+0
+
+# Insert a duplicate of an existing distinct tuple — must NOT
+# affect the SUM (this is the bug case).
+statement ok
+INSERT INTO idist_u VALUES (2, 'm3', 4);
+
+statement ok
+PRAGMA ivm('idist_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM idist_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM idist_mv
+    EXCEPT ALL
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+);
+----
+0
+
+# Mixed deltas in one refresh: a brand-new distinct tuple, more
+# duplicates of existing tuples, and a NULL-machine row that the
+# WHERE filter excludes.
+statement ok
+INSERT INTO idist_u VALUES (1, 'm4', 32), (1, 'm1', 8), (2, NULL, 999), (3, 'm5', 1);
+
+statement ok
+PRAGMA ivm('idist_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM idist_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM idist_mv
+    EXCEPT ALL
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+);
+----
+0
+
+# View type 6 = GROUP_RECOMPUTE; PRAGMA ivm_cost('idist_mv') reports
+# `decision = group_recompute` (verified manually — sqllogictest can't run
+# PRAGMA inside CREATE TABLE AS, so the test only asserts the type column).
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'idist_mv';
+----
+6
+
+# Flag `ivm_distinct_aux_state` routes single-source inner-DISTINCT-under-AGG
+# views to IVMType::DISTINCT_INCREMENTAL (8) at CREATE time. The actual
+# aux-state SQL pipeline isn't wired yet — it falls through to the
+# GROUP_RECOMPUTE compile path as a stub — but the classification surface
+# is stable so the eventual implementation can replace just the upsert SQL
+# without touching parser/dispatch.
+statement ok
+SET ivm_distinct_aux_state = true;
+
+statement ok
+CREATE TABLE idist_u2 (grp INT, machine VARCHAR, cores INT);
+
+statement ok
+INSERT INTO idist_u2 VALUES (1, 'm1', 8), (1, 'm1', 8), (1, 'm2', 16), (2, 'm3', 4);
+
+statement ok
+CREATE MATERIALIZED VIEW idist_mv_aux AS
+    SELECT grp, SUM(cores) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cores FROM idist_u2 WHERE machine IS NOT NULL) d
+    GROUP BY grp;
+
+# Single-source view classifies as DISTINCT_INCREMENTAL (type 8).
+query I
+SELECT type FROM _duckdb_ivm_views WHERE view_name = 'idist_mv_aux';
+----
+8
+
+# Refresh still produces correct results (via the GROUP_RECOMPUTE fallback for now).
+statement ok
+INSERT INTO idist_u2 VALUES (2, 'm3', 4), (1, 'm5', 32);
+
+statement ok
+PRAGMA ivm('idist_mv_aux');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u2 WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM idist_mv_aux
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM idist_mv_aux
+    EXCEPT ALL
+    SELECT grp, SUM(cores) FROM (
+        SELECT DISTINCT grp, machine, cores FROM idist_u2 WHERE machine IS NOT NULL
+    ) d GROUP BY grp
+);
+----
+0
+
+statement ok
+SET ivm_distinct_aux_state = false;
+
+# Aux-table assertions: with the flag on, the aux state actually evolves on each
+# refresh and reflects per-distinct-tuple counts. Pre-fix the dispatch fell
+# through to GROUP_RECOMPUTE so no aux table was consulted; this asserts the
+# full DBSP pipeline runs.
+statement ok
+SET ivm_distinct_aux_state = true;
+
+statement ok
+CREATE TABLE idist_u3 (grp INT, machine VARCHAR, cores INT);
+
+statement ok
+INSERT INTO idist_u3 VALUES (1, 'm1', 8), (1, 'm1', 8), (1, 'm2', 16);
+
+statement ok
+CREATE MATERIALIZED VIEW idist_aux_v3 AS
+    SELECT grp, SUM(cores) AS s
+    FROM (SELECT DISTINCT grp, machine, cores FROM idist_u3 WHERE machine IS NOT NULL) d
+    GROUP BY grp;
+
+# Aux table seeded from the (DISTINCT-stripped) input subquery: (1,m1,8) has
+# count 2 (two duplicate input rows), (1,m2,16) has count 1.
+query III
+SELECT machine, cores, _count FROM _ivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+----
+m1	8	2
+m2	16	1
+
+# Insert another duplicate of (1, m1, 8). Aux count goes 2→3; MV must NOT change
+# (Z-set distinct(R)[t] = sgn(R[t]); the transition didn't cross zero).
+statement ok
+INSERT INTO idist_u3 VALUES (1, 'm1', 8);
+
+statement ok
+PRAGMA ivm('idist_aux_v3');
+
+query II
+SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
+----
+1	24
+
+query III
+SELECT machine, cores, _count FROM _ivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+----
+m1	8	3
+m2	16	1
+
+# Insert a brand-new distinct tuple. Aux gets a new row; MV's SUM grows.
+statement ok
+INSERT INTO idist_u3 VALUES (1, 'm9', 100);
+
+statement ok
+PRAGMA ivm('idist_aux_v3');
+
+query II
+SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
+----
+1	124
+
+query III
+SELECT machine, cores, _count FROM _ivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+----
+m1	8	3
+m2	16	1
+m9	100	1
+
+# Delete one of three duplicate (1, m1, 8). Aux count goes 3→2; MV unchanged.
+statement ok
+DELETE FROM idist_u3 WHERE rowid IN (SELECT rowid FROM idist_u3 WHERE grp=1 AND machine='m1' AND cores=8 LIMIT 1);
+
+statement ok
+PRAGMA ivm('idist_aux_v3');
+
+query II
+SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
+----
+1	124
+
+query III
+SELECT machine, cores, _count FROM _ivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+----
+m1	8	2
+m2	16	1
+m9	100	1
+
+# Delete the remaining (1, m1, 8) rows. Aux row dropped; MV's SUM loses 8.
+statement ok
+DELETE FROM idist_u3 WHERE grp=1 AND machine='m1' AND cores=8;
+
+statement ok
+PRAGMA ivm('idist_aux_v3');
+
+query II
+SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
+----
+1	116
+
+query III
+SELECT machine, cores, _count FROM _ivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+----
+m2	16	1
+m9	100	1
+
+statement ok
+SET ivm_distinct_aux_state = false;

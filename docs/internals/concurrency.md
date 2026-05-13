@@ -45,7 +45,7 @@ Each `(view, base_table)` pair tracks two timestamps in `_duckdb_ivm_delta_table
 4. We set `last_update = now()` (which is *less than* this row's ts).
 5. The next refresh's filter `ts >= last_update` includes this row again → double-application → MV drift.
 
-Anchoring `last_update` to the maximum timestamp we *actually* processed eliminates the gap: the next refresh's filter excludes everything we've seen and includes everything we haven't. See `src/upsert/openivm_upsert.cpp:1370–1403` for the implementation.
+Anchoring `last_update` to the maximum timestamp we *actually* processed eliminates the gap: the next refresh's filter excludes everything we've seen and includes everything we haven't. See `src/upsert/refresh.cpp:1370–1403` for the implementation.
 
 ## Lock hierarchy
 

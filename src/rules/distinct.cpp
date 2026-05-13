@@ -1,7 +1,7 @@
 #include "rules/distinct.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "rules/openivm_rewrite_rule.hpp"
+#include "rules/incremental_rewrite_rule.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"

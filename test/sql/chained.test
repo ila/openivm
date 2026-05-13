@@ -1,0 +1,1139 @@
+# name: test/sql/chained.test
+# description: Test chained materialized view IVM (table -> MV1 -> MV2 -> ...)
+# group: [sql]
+
+require openivm
+
+# Explicit ordering — tests manage refresh order manually
+statement ok
+SET ivm_cascade_refresh = 'off';
+
+# ============================================================
+# Two-level chain: table -> MV1 -> MV2
+# ============================================================
+
+statement ok
+CREATE TABLE sales (region VARCHAR, product VARCHAR, amount INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW sales_by_region AS
+    SELECT region, SUM(amount) AS total FROM sales GROUP BY region;
+
+statement ok
+CREATE MATERIALIZED VIEW grand_total AS
+    SELECT SUM(total) AS grand_total FROM sales_by_region;
+
+statement ok
+INSERT INTO sales VALUES ('US', 'A', 100), ('US', 'B', 200), ('EU', 'A', 300);
+
+statement ok
+pragma ivm('sales_by_region');
+
+statement ok
+pragma ivm('grand_total');
+
+query II
+SELECT region, total FROM sales_by_region ORDER BY region;
+----
+EU	300
+US	300
+
+query I
+SELECT grand_total FROM grand_total;
+----
+600
+
+# Cross-check
+query I
+SELECT SUM(total) FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY region);
+----
+600
+
+# Second batch of inserts
+statement ok
+INSERT INTO sales VALUES ('EU', 'B', 400), ('US', 'C', 500);
+
+statement ok
+pragma ivm('sales_by_region');
+
+statement ok
+pragma ivm('grand_total');
+
+query II
+SELECT region, total FROM sales_by_region ORDER BY region;
+----
+EU	700
+US	800
+
+query I
+SELECT grand_total FROM grand_total;
+----
+1500
+
+query I
+SELECT SUM(total) FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY region);
+----
+1500
+
+# Downstream delta compaction: a tiny upstream projection change should not
+# produce a full old/new MV snapshot for dependent views.
+statement ok
+CREATE TABLE compact_src (id INT, k INT, v INT);
+
+statement ok
+CREATE TABLE compact_dim (k INT, label VARCHAR);
+
+statement ok
+INSERT INTO compact_src VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+
+statement ok
+INSERT INTO compact_dim VALUES (10, 'a'), (20, 'b'), (30, 'c'), (40, 'd');
+
+statement ok
+CREATE MATERIALIZED VIEW compact_proj AS
+    SELECT id, k, v FROM compact_src;
+
+statement ok
+CREATE MATERIALIZED VIEW compact_join AS
+    SELECT p.id, p.k, d.label
+    FROM compact_proj p
+    JOIN compact_dim d USING (k);
+
+statement ok
+INSERT INTO compact_src VALUES (4, 40, 400);
+
+statement ok
+PRAGMA ivm('compact_proj');
+
+query I
+SELECT COUNT(*) FROM delta_compact_proj;
+----
+1
+
+statement ok
+PRAGMA ivm('compact_join');
+
+query III
+SELECT id, k, label FROM compact_join ORDER BY id;
+----
+1	10	a
+2	20	b
+3	30	c
+4	40	d
+
+# Canceling source deltas should leave no pending upstream delta for downstream.
+statement ok
+CREATE TABLE compact_cancel_src (id INT, k INT, v INT);
+
+statement ok
+CREATE TABLE compact_cancel_dim (k INT, label VARCHAR);
+
+statement ok
+INSERT INTO compact_cancel_src VALUES (1, 10, 100), (2, 20, 200);
+
+statement ok
+INSERT INTO compact_cancel_dim VALUES (10, 'a'), (20, 'b'), (30, 'c');
+
+statement ok
+CREATE MATERIALIZED VIEW compact_cancel_proj AS
+    SELECT id, k, v FROM compact_cancel_src;
+
+statement ok
+CREATE MATERIALIZED VIEW compact_cancel_join AS
+    SELECT p.id, p.k, d.label
+    FROM compact_cancel_proj p
+    JOIN compact_cancel_dim d USING (k);
+
+statement ok
+INSERT INTO compact_cancel_src VALUES (3, 30, 300);
+
+statement ok
+DELETE FROM compact_cancel_src WHERE id = 3;
+
+statement ok
+PRAGMA ivm('compact_cancel_proj');
+
+query I
+SELECT COUNT(*) FROM delta_compact_cancel_proj;
+----
+0
+
+statement ok
+PRAGMA ivm('compact_cancel_join');
+
+query III
+SELECT id, k, label FROM compact_cancel_join ORDER BY id;
+----
+1	10	a
+2	20	b
+
+# ============================================================
+# Three-level chain: table -> MV1 -> MV2 -> MV3
+# ============================================================
+
+statement ok
+CREATE TABLE orders (customer VARCHAR, category VARCHAR, qty INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW orders_by_customer AS
+    SELECT customer, SUM(qty) AS total_qty FROM orders GROUP BY customer;
+
+statement ok
+CREATE MATERIALIZED VIEW orders_by_category AS
+    SELECT category, SUM(qty) AS total_qty FROM orders GROUP BY category;
+
+# SUM-based chain MV
+statement ok
+CREATE MATERIALIZED VIEW total_orders AS
+    SELECT SUM(total_qty) AS all_orders FROM orders_by_customer;
+
+# COUNT-based chain MV (uses virtual column fix in ivm_helpers.cpp)
+statement ok
+CREATE MATERIALIZED VIEW customer_count AS
+    SELECT COUNT(*) AS num_customers FROM orders_by_customer;
+
+statement ok
+INSERT INTO orders VALUES ('alice', 'books', 3), ('bob', 'books', 5), ('alice', 'games', 2), ('charlie', 'books', 1);
+
+statement ok
+pragma ivm('orders_by_customer');
+
+statement ok
+pragma ivm('orders_by_category');
+
+statement ok
+pragma ivm('customer_count');
+
+query II
+SELECT customer, total_qty FROM orders_by_customer ORDER BY customer;
+----
+alice	5
+bob	5
+charlie	1
+
+query II
+SELECT category, total_qty FROM orders_by_category ORDER BY category;
+----
+books	9
+games	2
+
+query I
+SELECT num_customers FROM customer_count;
+----
+3
+
+# Cross-check all three levels
+query I
+SELECT COUNT(*) FROM (SELECT customer, SUM(qty) FROM orders GROUP BY customer);
+----
+3
+
+# Add more data and propagate through the full chain
+statement ok
+INSERT INTO orders VALUES ('dave', 'games', 7), ('alice', 'books', 4);
+
+statement ok
+pragma ivm('orders_by_customer');
+
+statement ok
+pragma ivm('orders_by_category');
+
+statement ok
+pragma ivm('customer_count');
+
+query II
+SELECT customer, total_qty FROM orders_by_customer ORDER BY customer;
+----
+alice	9
+bob	5
+charlie	1
+dave	7
+
+query I
+SELECT num_customers FROM customer_count;
+----
+4
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (SELECT customer, SUM(qty) FROM orders GROUP BY customer);
+----
+4
+
+# ============================================================
+# New region appears in second refresh (tests INSERT OR REPLACE)
+# ============================================================
+
+statement ok
+INSERT INTO sales VALUES ('JP', 'D', 1000);
+
+statement ok
+pragma ivm('sales_by_region');
+
+statement ok
+pragma ivm('grand_total');
+
+query II
+SELECT region, total FROM sales_by_region ORDER BY region;
+----
+EU	700
+JP	1000
+US	800
+
+query I
+SELECT grand_total FROM grand_total;
+----
+2500
+
+query I
+SELECT SUM(total) FROM (SELECT region, SUM(amount) AS total FROM sales GROUP BY region);
+----
+2500
+
+# ============================================================
+# Multiple refreshes without new data (idempotent)
+# ============================================================
+
+statement ok
+pragma ivm('sales_by_region');
+
+statement ok
+pragma ivm('grand_total');
+
+query I
+SELECT grand_total FROM grand_total;
+----
+2500
+
+# ============================================================
+# Empty insert (no new rows) then refresh
+# ============================================================
+
+statement ok
+INSERT INTO sales SELECT * FROM sales WHERE 1=0;
+
+statement ok
+pragma ivm('sales_by_region');
+
+statement ok
+pragma ivm('grand_total');
+
+query I
+SELECT grand_total FROM grand_total;
+----
+2500
+
+# ============================================================
+# Fan-out: one base table feeds two independent MV chains
+# ============================================================
+
+statement ok
+CREATE TABLE events (user_id VARCHAR, event_type VARCHAR, value INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW events_by_user AS
+    SELECT user_id, SUM(value) AS total_value FROM events GROUP BY user_id;
+
+statement ok
+CREATE MATERIALIZED VIEW events_by_type AS
+    SELECT event_type, SUM(value) AS total_value FROM events GROUP BY event_type;
+
+# MV3 depends on events_by_user
+statement ok
+CREATE MATERIALIZED VIEW user_count AS
+    SELECT COUNT(*) AS num_users FROM events_by_user;
+
+# MV4 depends on events_by_type
+statement ok
+CREATE MATERIALIZED VIEW type_count AS
+    SELECT COUNT(*) AS num_types FROM events_by_type;
+
+statement ok
+INSERT INTO events VALUES ('u1', 'click', 10), ('u2', 'click', 20), ('u1', 'purchase', 100), ('u3', 'click', 5);
+
+# Refresh both chains
+statement ok
+pragma ivm('events_by_user');
+
+statement ok
+pragma ivm('events_by_type');
+
+statement ok
+pragma ivm('user_count');
+
+statement ok
+pragma ivm('type_count');
+
+query II
+SELECT user_id, total_value FROM events_by_user ORDER BY user_id;
+----
+u1	110
+u2	20
+u3	5
+
+query II
+SELECT event_type, total_value FROM events_by_type ORDER BY event_type;
+----
+click	35
+purchase	100
+
+query I
+SELECT num_users FROM user_count;
+----
+3
+
+query I
+SELECT num_types FROM type_count;
+----
+2
+
+# Cross-check
+query I
+SELECT COUNT(*) FROM (SELECT user_id, SUM(value) FROM events GROUP BY user_id);
+----
+3
+
+query I
+SELECT COUNT(*) FROM (SELECT event_type, SUM(value) FROM events GROUP BY event_type);
+----
+2
+
+# Second batch for fan-out — test deletes and updates propagating through
+statement ok
+INSERT INTO events VALUES ('u4', 'purchase', 50), ('u1', 'click', 15);
+
+statement ok
+DELETE FROM events WHERE user_id = 'u3';
+
+statement ok
+pragma ivm('events_by_user');
+
+statement ok
+pragma ivm('events_by_type');
+
+statement ok
+pragma ivm('user_count');
+
+statement ok
+pragma ivm('type_count');
+
+query II
+SELECT user_id, total_value FROM events_by_user ORDER BY user_id;
+----
+u1	125
+u2	20
+u4	50
+
+query I
+SELECT num_users FROM user_count;
+----
+3
+
+# Cross-check
+query II
+SELECT user_id, SUM(value) FROM events GROUP BY user_id ORDER BY user_id;
+----
+u1	125
+u2	20
+u4	50
+
+query II
+SELECT event_type, SUM(value) FROM events GROUP BY event_type ORDER BY event_type;
+----
+click	45
+purchase	150
+
+query II
+SELECT event_type, total_value FROM events_by_type ORDER BY event_type;
+----
+click	45
+purchase	150
+
+# ============================================================
+# 4-level chain: table → MV1 → MV2 → MV3 → MV4
+# ============================================================
+
+statement ok
+CREATE TABLE transactions (store VARCHAR, dept VARCHAR, amount INT);
+
+statement ok
+CREATE MATERIALIZED VIEW store_dept_totals AS
+    SELECT store, dept, SUM(amount) AS total FROM transactions GROUP BY store, dept;
+
+statement ok
+CREATE MATERIALIZED VIEW store_totals AS
+    SELECT store, SUM(total) AS grand_total FROM store_dept_totals GROUP BY store;
+
+statement ok
+CREATE MATERIALIZED VIEW chain_grand_total AS
+    SELECT SUM(grand_total) AS all_stores FROM store_totals;
+
+statement ok
+INSERT INTO transactions VALUES
+    ('NYC', 'electronics', 100), ('NYC', 'food', 50),
+    ('LA', 'electronics', 200), ('LA', 'food', 75);
+
+statement ok
+pragma ivm('store_dept_totals');
+
+statement ok
+pragma ivm('store_totals');
+
+statement ok
+pragma ivm('chain_grand_total');
+
+query III
+SELECT store, dept, total FROM store_dept_totals ORDER BY store, dept;
+----
+LA	electronics	200
+LA	food	75
+NYC	electronics	100
+NYC	food	50
+
+query II
+SELECT store, grand_total FROM store_totals ORDER BY store;
+----
+LA	275
+NYC	150
+
+query I
+SELECT all_stores FROM chain_grand_total;
+----
+425
+
+# Cross-check
+query I
+SELECT SUM(amount) FROM transactions;
+----
+425
+
+# Second batch + delete
+statement ok
+INSERT INTO transactions VALUES ('NYC', 'electronics', 300), ('SF', 'food', 500);
+
+statement ok
+DELETE FROM transactions WHERE store = 'LA' AND dept = 'food';
+
+statement ok
+pragma ivm('store_dept_totals');
+
+statement ok
+pragma ivm('store_totals');
+
+statement ok
+pragma ivm('chain_grand_total');
+
+query III
+SELECT store, dept, total FROM store_dept_totals ORDER BY store, dept;
+----
+LA	electronics	200
+NYC	electronics	400
+NYC	food	50
+SF	food	500
+
+query II
+SELECT store, grand_total FROM store_totals ORDER BY store;
+----
+LA	200
+NYC	450
+SF	500
+
+query I
+SELECT all_stores FROM chain_grand_total;
+----
+1150
+
+# Cross-check
+query I
+SELECT SUM(amount) FROM transactions;
+----
+1150
+
+# ============================================================
+# Chained MV with INNER JOIN: table + table -> join MV -> agg MV
+# ============================================================
+
+statement ok
+CREATE TABLE customers (id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE purchases (customer_id INT, product VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+
+statement ok
+CREATE MATERIALIZED VIEW customer_purchases AS
+    SELECT c.name, p.product, p.amount
+    FROM customers c INNER JOIN purchases p ON c.id = p.customer_id;
+
+statement ok
+CREATE MATERIALIZED VIEW spend_by_customer AS
+    SELECT name, SUM(amount) AS total_spend FROM customer_purchases GROUP BY name;
+
+# Initial insert
+statement ok
+INSERT INTO purchases VALUES (1, 'book', 20), (2, 'pen', 5), (1, 'laptop', 1000);
+
+statement ok
+pragma ivm('customer_purchases');
+
+statement ok
+pragma ivm('spend_by_customer');
+
+query III
+SELECT name, product, amount FROM customer_purchases ORDER BY name, product;
+----
+Alice	book	20
+Alice	laptop	1000
+Bob	pen	5
+
+query II
+SELECT name, total_spend FROM spend_by_customer ORDER BY name;
+----
+Alice	1020
+Bob	5
+
+# Cross-check
+query II
+SELECT c.name, SUM(p.amount) FROM customers c INNER JOIN purchases p ON c.id = p.customer_id GROUP BY c.name ORDER BY c.name;
+----
+Alice	1020
+Bob	5
+
+# Second batch — new customer appears, existing customer buys more
+statement ok
+INSERT INTO purchases VALUES (3, 'tablet', 500), (1, 'mouse', 30);
+
+statement ok
+pragma ivm('customer_purchases');
+
+statement ok
+pragma ivm('spend_by_customer');
+
+query II
+SELECT name, total_spend FROM spend_by_customer ORDER BY name;
+----
+Alice	1050
+Bob	5
+Charlie	500
+
+# Cross-check
+query II
+SELECT c.name, SUM(p.amount) FROM customers c INNER JOIN purchases p ON c.id = p.customer_id GROUP BY c.name ORDER BY c.name;
+----
+Alice	1050
+Bob	5
+Charlie	500
+
+# Delete a purchase
+statement ok
+DELETE FROM purchases WHERE product = 'pen';
+
+statement ok
+pragma ivm('customer_purchases');
+
+statement ok
+pragma ivm('spend_by_customer');
+
+query II
+SELECT name, total_spend FROM spend_by_customer ORDER BY name;
+----
+Alice	1050
+Charlie	500
+
+# Cross-check
+query II
+SELECT c.name, SUM(p.amount) FROM customers c INNER JOIN purchases p ON c.id = p.customer_id GROUP BY c.name ORDER BY c.name;
+----
+Alice	1050
+Charlie	500
+
+# ============================================================
+# Join MV -> aggregate MV -> aggregate MV (3-level with join at base)
+# ============================================================
+
+statement ok
+CREATE TABLE departments (id INT, dept_name VARCHAR);
+
+statement ok
+CREATE TABLE employees (id INT, name VARCHAR, dept_id INT, salary INTEGER);
+
+statement ok
+INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Sales');
+
+statement ok
+CREATE MATERIALIZED VIEW emp_dept AS
+    SELECT e.name, d.dept_name, e.salary
+    FROM employees e INNER JOIN departments d ON e.dept_id = d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW dept_totals AS
+    SELECT dept_name, SUM(salary) AS total_salary, COUNT(*) AS headcount
+    FROM emp_dept GROUP BY dept_name;
+
+statement ok
+INSERT INTO employees VALUES (1, 'Alice', 1, 100), (2, 'Bob', 2, 80), (3, 'Charlie', 1, 120);
+
+statement ok
+pragma ivm('emp_dept');
+
+statement ok
+pragma ivm('dept_totals');
+
+query III
+SELECT dept_name, total_salary, headcount FROM dept_totals ORDER BY dept_name;
+----
+Engineering	220	2
+Sales	80	1
+
+# Cross-check
+query III
+SELECT d.dept_name, SUM(e.salary), COUNT(*) FROM employees e INNER JOIN departments d ON e.dept_id = d.id GROUP BY d.dept_name ORDER BY d.dept_name;
+----
+Engineering	220	2
+Sales	80	1
+
+# Add more employees
+statement ok
+INSERT INTO employees VALUES (4, 'Diana', 2, 90), (5, 'Eve', 1, 110);
+
+statement ok
+pragma ivm('emp_dept');
+
+statement ok
+pragma ivm('dept_totals');
+
+query III
+SELECT dept_name, total_salary, headcount FROM dept_totals ORDER BY dept_name;
+----
+Engineering	330	3
+Sales	170	2
+
+# Cross-check
+query III
+SELECT d.dept_name, SUM(e.salary), COUNT(*) FROM employees e INNER JOIN departments d ON e.dept_id = d.id GROUP BY d.dept_name ORDER BY d.dept_name;
+----
+Engineering	330	3
+Sales	170	2
+
+# Delete an employee
+statement ok
+DELETE FROM employees WHERE name = 'Bob';
+
+statement ok
+pragma ivm('emp_dept');
+
+statement ok
+pragma ivm('dept_totals');
+
+query III
+SELECT dept_name, total_salary, headcount FROM dept_totals ORDER BY dept_name;
+----
+Engineering	330	3
+Sales	90	1
+
+# Cross-check
+query III
+SELECT d.dept_name, SUM(e.salary), COUNT(*) FROM employees e INNER JOIN departments d ON e.dept_id = d.id GROUP BY d.dept_name ORDER BY d.dept_name;
+----
+Engineering	330	3
+Sales	90	1
+
+# ============================================================
+# Chain where intermediate MV becomes completely empty
+# ============================================================
+
+statement ok
+CREATE TABLE ch_empty (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO ch_empty VALUES ('a', 10), ('b', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW ch_l1 AS
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW ch_l2 AS
+    SELECT SUM(total) AS grand FROM ch_l1;
+
+statement ok
+pragma ivm('ch_l1');
+
+statement ok
+pragma ivm('ch_l2');
+
+# Cross-check ch_l1
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM ch_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM ch_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+);
+----
+0
+
+# Cross-check ch_l2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+);
+----
+0
+
+# Delete all data — intermediate MV becomes empty
+statement ok
+DELETE FROM ch_empty;
+
+statement ok
+pragma ivm('ch_l1');
+
+# Cross-check ch_l1 (empty)
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM ch_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM ch_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+);
+----
+0
+
+statement ok
+pragma ivm('ch_l2');
+
+# Cross-check ch_l2 (grand should be NULL — SUM of empty)
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+);
+----
+0
+
+# Repopulate
+statement ok
+INSERT INTO ch_empty VALUES ('x', 100);
+
+statement ok
+pragma ivm('ch_l1');
+
+statement ok
+pragma ivm('ch_l2');
+
+# Cross-check ch_l1
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM ch_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM ch_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp
+);
+----
+0
+
+# Cross-check ch_l2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_empty GROUP BY grp)
+);
+----
+0
+
+# ============================================================
+# 4-level chain with UPDATE that moves data between groups
+# ============================================================
+
+statement ok
+CREATE TABLE ch_update (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO ch_update VALUES ('a', 10), ('a', 20), ('b', 30);
+
+statement ok
+CREATE MATERIALIZED VIEW ch4_l1 AS
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW ch4_l2 AS
+    SELECT SUM(total) AS grand FROM ch4_l1;
+
+statement ok
+pragma ivm('ch4_l1');
+
+statement ok
+pragma ivm('ch4_l2');
+
+# Cross-check ch4_l1
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt FROM ch4_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt FROM ch4_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+);
+----
+0
+
+# Cross-check ch4_l2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch4_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch4_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+);
+----
+0
+
+# UPDATE: move val=20 from group 'a' to group 'b'
+statement ok
+UPDATE ch_update SET grp = 'b' WHERE val = 20;
+
+statement ok
+pragma ivm('ch4_l1');
+
+# Cross-check ch4_l1 (a: total=10 cnt=1, b: total=50 cnt=2)
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt FROM ch4_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt FROM ch4_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+);
+----
+0
+
+statement ok
+pragma ivm('ch4_l2');
+
+# Cross-check ch4_l2 (grand=60)
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch4_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch4_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+);
+----
+0
+
+# UPDATE: move all 'b' rows to group 'c' (b disappears, c appears)
+statement ok
+UPDATE ch_update SET grp = 'c' WHERE grp = 'b';
+
+statement ok
+pragma ivm('ch4_l1');
+
+statement ok
+pragma ivm('ch4_l2');
+
+# Cross-check ch4_l1
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total, cnt FROM ch4_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total, cnt FROM ch4_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ch_update GROUP BY grp
+);
+----
+0
+
+# Cross-check ch4_l2
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM ch4_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM ch4_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM ch_update GROUP BY grp)
+);
+----
+0
+
+# ==========================================
+# Empty upstream delta (INSERT then DELETE cancels out)
+# ==========================================
+
+statement ok
+CREATE TABLE ch_noop_base (id INT, val INT);
+
+statement ok
+INSERT INTO ch_noop_base VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW ch_noop_l1 AS SELECT id, SUM(val) AS total FROM ch_noop_base GROUP BY id;
+
+statement ok
+CREATE MATERIALIZED VIEW ch_noop_l2 AS SELECT SUM(total) AS grand FROM ch_noop_l1;
+
+# INSERT then DELETE same row — net zero delta
+statement ok
+INSERT INTO ch_noop_base VALUES (3, 999);
+
+statement ok
+DELETE FROM ch_noop_base WHERE id = 3;
+
+statement ok
+PRAGMA ivm('ch_noop_l1');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, SUM(val) AS total FROM ch_noop_base GROUP BY id
+    EXCEPT ALL SELECT * FROM ch_noop_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ch_noop_l1
+    EXCEPT ALL SELECT id, SUM(val) AS total FROM ch_noop_base GROUP BY id
+);
+----
+0
+
+statement ok
+PRAGMA ivm('ch_noop_l2');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM ch_noop_l1
+    EXCEPT ALL SELECT * FROM ch_noop_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ch_noop_l2
+    EXCEPT ALL SELECT SUM(total) AS grand FROM ch_noop_l1
+);
+----
+0
+
+# Re-refreshing a downstream view with only stale already-consumed delta rows
+# should be skipped, not treated as a new delta.
+statement ok
+CREATE TEMP TABLE ch_noop_l2_last_update AS
+SELECT last_update
+FROM _duckdb_ivm_delta_tables
+WHERE view_name = 'ch_noop_l2';
+
+statement ok
+PRAGMA ivm('ch_noop_l2');
+
+query I
+SELECT d.last_update = p.last_update
+FROM _duckdb_ivm_delta_tables d, ch_noop_l2_last_update p
+WHERE d.view_name = 'ch_noop_l2';
+----
+true
+
+statement ok
+DROP TABLE ch_noop_l2_last_update;

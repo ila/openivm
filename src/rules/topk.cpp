@@ -1,6 +1,6 @@
 #include "rules/topk.hpp"
 #include "core/openivm_debug.hpp"
-#include "rules/openivm_rewrite_rule.hpp"
+#include "rules/incremental_rewrite_rule.hpp"
 
 namespace duckdb {
 
