@@ -92,9 +92,9 @@ void CreateTPCDISchema(duckdb::Connection &con) {
 	con.Query(std::string("CREATE TABLE batch3_prospect ") + prospect_ddl);
 
 	// ── Raw finwire + CRM staging tables (bronze-layer input) ───────────────
-	// batch1_finwire: fixed-width lines parsed by ivm0008/0009/0010.
-	// batch1_customer_mgmt: XML struct parsed by ivm0007.
-	// batch2/3_customer + batch2/3_account: CDC flat files for ivm0007 batches 2/3.
+	// batch1_finwire: fixed-width lines parsed by query0008/0009/0010.
+	// batch1_customer_mgmt: XML struct parsed by query0007.
+	// batch2/3_customer + batch2/3_account: CDC flat files for query0007 batches 2/3.
 	con.Query("CREATE TABLE batch1_finwire(pts TIMESTAMP, rec_type VARCHAR, line VARCHAR)");
 
 	con.Query("CREATE TABLE batch1_customer_mgmt("

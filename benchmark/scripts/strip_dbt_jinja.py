@@ -218,7 +218,7 @@ def main():
             header = f"-- {json.dumps(meta)}"
             out_sql = header + "\n" + stripped
 
-            out_name = f"tpcdi_ivm{i:04d}_{model_name}.sql"
+            out_name = f"tpcdi_query{i:04d}_{model_name}.sql"
             out_path = os.path.join(args.out, out_name)
             with open(out_path, "w") as f:
                 f.write(out_sql + "\n")
