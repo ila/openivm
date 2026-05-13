@@ -3216,8 +3216,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
 		}
 
 		bool ducklake_window_partition =
-		    ivm_type == IVMType::WINDOW_PARTITION &&
-		    (target_is_ducklake || !dl_table_info_for_classification.empty());
+		    ivm_type == IVMType::WINDOW_PARTITION && (target_is_ducklake || !dl_table_info_for_classification.empty());
 		if (ducklake_window_partition && !lpts_fallback) {
 			// Window-partition refresh recomputes affected partitions from the user's query,
 			// so the initial data table does not need LPTS-normalized SQL. For DuckLake,

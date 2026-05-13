@@ -30,6 +30,15 @@ static uint64_t BindingKey(const ColumnBinding &binding) {
 	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
 }
 
+static idx_t CountBits(uint64_t value) {
+	idx_t count = 0;
+	while (value) {
+		count += value & 1ULL;
+		value >>= 1ULL;
+	}
+	return count;
+}
+
 struct JoinColumnRef {
 	size_t leaf_index;
 	string table_name;
@@ -430,13 +439,14 @@ struct DeltaStatus {
 	uint64_t insert_only_mask; // bit i=1: leaf i has no delete rows (insert-only or empty)
 	uint64_t empty_mask;       // bit i=1: leaf i has zero pending delta rows
 	uint64_t constant_mask;    // bit i=1: leaf has no mutable source table
+	uint64_t tiny_mask;        // bit i=1: leaf has a tiny non-empty delta
 };
 
 /// For each leaf, detect delta status in a single query per table.
 /// Returns both insert_only_mask (no deletes) and empty_mask (no rows at all).
 static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_name,
                                      const vector<JoinLeafInfo> &leaves) {
-	DeltaStatus status = {0, 0, 0};
+	DeltaStatus status = {0, 0, 0, 0};
 	Connection con(*context.db);
 	con.SetAutoCommit(false);
 
@@ -481,25 +491,43 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 		}
 		string last_update = ts_result->GetValue(0, 0).ToString();
 
-		// Single query: get total row count and delete count since last_update
+		// Single query: get pending delta count, delete count, and current base
+		// cardinality. The base count lets us define "tiny" as <= max(8 rows,
+		// 5% of the source table), avoiding both a hard-coded absolute-only
+		// threshold and silly behavior on very small tables.
 		auto result =
-		    con.Query("SELECT COUNT(*), COUNT(*) FILTER (WHERE " + string(ivm::MULTIPLICITY_COL) + " < 0) FROM " +
+		    con.Query("SELECT "
+		              "(SELECT COUNT(*) FROM " +
 		              OpenIVMUtils::QuoteIdentifier(delta_name) + " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" +
-		              OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP");
+		              OpenIVMUtils::EscapeValue(last_update) +
+		              "'::TIMESTAMP), "
+		              "(SELECT COUNT(*) FROM " +
+		              OpenIVMUtils::QuoteIdentifier(delta_name) + " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" +
+		              OpenIVMUtils::EscapeValue(last_update) + "'::TIMESTAMP AND " + string(ivm::MULTIPLICITY_COL) +
+		              " < 0), "
+		              "(SELECT COUNT(*) FROM " +
+		              OpenIVMUtils::QuoteIdentifier(table_ref.get()->name) + ")");
 		if (result->HasError()) {
 			continue;
 		}
 		int64_t total_count = result->GetValue(0, 0).GetValue<int64_t>();
 		int64_t delete_count = result->GetValue(1, 0).GetValue<int64_t>();
+		int64_t base_count = result->GetValue(2, 0).GetValue<int64_t>();
 
 		if (total_count == 0) {
 			status.empty_mask |= (1ULL << i);
 			status.insert_only_mask |= (1ULL << i); // empty is trivially insert-only
 			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (%s) has empty delta\n", i, table_ref.get()->name.c_str());
-		} else if (delete_count == 0) {
-			status.insert_only_mask |= (1ULL << i);
-			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (%s) has insert-only delta\n", i,
-			                    table_ref.get()->name.c_str());
+		} else {
+			int64_t tiny_limit = std::max<int64_t>(8, (base_count + 19) / 20);
+			if (total_count <= tiny_limit) {
+				status.tiny_mask |= (1ULL << i);
+			}
+			if (delete_count == 0) {
+				status.insert_only_mask |= (1ULL << i);
+				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (%s) has insert-only delta\n", i,
+				                    table_ref.get()->name.c_str());
+			}
 		}
 	}
 	return status;
@@ -600,6 +628,9 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	// Detect delta status for all leaves (single query per table: total + delete count).
 	// Used by both FK pruning and empty-delta skipping.
 	DeltaStatus delta_status = DetectDeltaStatus(context, pw.view, leaves);
+	uint64_t total_terms = (1ULL << N) - 1;
+	uint64_t non_empty_mask = total_terms & ~delta_status.empty_mask & ~delta_status.constant_mask;
+	idx_t non_empty_leaf_count = CountBits(non_empty_mask);
 
 	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
 	Value fk_pruning_val;
@@ -608,7 +639,12 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 		fk_pruning_enabled = fk_pruning_val.GetValue<bool>();
 	}
 	uint64_t skip_bits = 0;
-	if (fk_pruning_enabled) {
+	// FK pruning pays for catalog constraint inspection. When every leaf changed
+	// in a small 2/3-way join, the remaining inclusion-exclusion space is tiny and
+	// the flag benchmark shows the inspection cost can dominate. Keep it for the
+	// main win case: one-sided PK/dimension changes.
+	bool fk_pruning_worthwhile = non_empty_leaf_count == 1;
+	if (fk_pruning_enabled && fk_pruning_worthwhile) {
 		auto fk_relations = DetectFKRelations(context, leaves, pw.plan.get());
 		if (!fk_relations.empty()) {
 			skip_bits = ComputeSkipBits(fk_relations, delta_status.insert_only_mask);
@@ -623,12 +659,21 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 		skip_empty_enabled = skip_empty_val.GetValue<bool>();
 	}
 	uint64_t empty_mask = skip_empty_enabled ? delta_status.empty_mask : 0;
-	uint64_t total_terms = (1ULL << N) - 1;
 
 	Connection key_probe_con(*context.db);
 	vector<JoinColumnRef> leaf_refs(N);
 	vector<vector<JoinKeyProbe>> key_probes(N);
-	if (skip_empty_enabled && !has_left_join) {
+	// Key-domain pruning can erase the last remaining term when exactly one input
+	// changed and its delta keys cannot match the unchanged side. That is the
+	// important performance case covered by mv_inner_join. When multiple leaves
+	// changed in a small join with many pending delta rows, these probes are extra
+	// EXISTS joins on top of work we will still have to do, and the flag benchmark
+	// shows that overhead can dominate. Keep probing for single-source changes and
+	// for tiny multi-source changes where the probe is cheap.
+	bool all_non_empty_deltas_are_tiny = non_empty_mask && ((non_empty_mask & ~delta_status.tiny_mask) == 0);
+	bool key_domain_probe_enabled =
+	    skip_empty_enabled && !has_left_join && (non_empty_leaf_count == 1 || all_non_empty_deltas_are_tiny);
+	if (key_domain_probe_enabled) {
 		unordered_map<uint64_t, JoinColumnRef> column_refs;
 		for (size_t i = 0; i < N; i++) {
 			LogicalGet *get = GetLeafScan(leaves[i]);
@@ -687,7 +732,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 			continue;
 		}
 		bool key_domain_empty = false;
-		if (skip_empty_enabled && !has_left_join) {
+		if (key_domain_probe_enabled) {
 			for (size_t i = 0; i < N && !key_domain_empty; i++) {
 				if (!(mask & (1ULL << i)) || key_probes[i].empty() || leaf_refs[i].last_update.empty()) {
 					continue;

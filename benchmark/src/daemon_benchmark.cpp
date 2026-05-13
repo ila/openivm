@@ -539,6 +539,27 @@ static void BuildShape(SubtestCtx &ctx) {
 // ---------------------------------------------------------------------------
 // DML, refresh, checker threads
 
+static bool IsTransientDmlConflict(const string &msg) {
+	return msg.find("TransactionContext Error: Conflict on update") != string::npos ||
+	       msg.find("TransactionContext Error: Conflict on tuple deletion") != string::npos;
+}
+
+static string ExecuteDmlWithRetry(duckdb::Connection &con, const string &sql) {
+	constexpr int MAX_DML_ATTEMPTS = 5;
+	for (int attempt = 0; attempt < MAX_DML_ATTEMPTS; attempt++) {
+		auto r = con.Query(sql);
+		if (r && !r->HasError()) {
+			return "";
+		}
+		string msg = r ? r->GetError() : "(null result)";
+		if (!IsTransientDmlConflict(msg) || attempt + 1 == MAX_DML_ATTEMPTS) {
+			return msg;
+		}
+		this_thread::sleep_for(chrono::milliseconds(2 * (attempt + 1)));
+	}
+	return "(unreachable)";
+}
+
 static void DMLThread(SubtestCtx &ctx, int interval_ms, size_t delta_start_offset) {
 	duckdb::Connection con(*ctx.db);
 	// DuckLake sub-tests need DML to hit dl.main.* (so each write advances the
@@ -548,18 +569,17 @@ static void DMLThread(SubtestCtx &ctx, int interval_ms, size_t delta_start_offse
 	}
 	size_t idx = delta_start_offset;
 	while (!ctx.stop.load()) {
-		auto r = con.Query(ctx.deltas[idx % ctx.deltas.size()]);
+		string error = ExecuteDmlWithRetry(con, ctx.deltas[idx % ctx.deltas.size()]);
 		{
 			lock_guard<mutex> lk(ctx.log_mu);
 			ctx.summary.dml_ops++;
-			if (!r || r->HasError()) {
+			if (!error.empty()) {
 				ctx.summary.dml_errors++;
-				string msg = r ? r->GetError() : "(null result)";
 				// Truncate & bucket: keep only the first 80 chars to group similar errors.
-				if (msg.size() > 80) msg = msg.substr(0, 80);
-				auto it = ctx.summary.dml_error_samples.find(msg);
+				if (error.size() > 80) error = error.substr(0, 80);
+				auto it = ctx.summary.dml_error_samples.find(error);
 				if (it != ctx.summary.dml_error_samples.end() || ctx.summary.dml_error_samples.size() < 20) {
-					ctx.summary.dml_error_samples[msg]++;
+					ctx.summary.dml_error_samples[error]++;
 				}
 			}
 		}

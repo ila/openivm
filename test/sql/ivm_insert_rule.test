@@ -72,7 +72,27 @@ SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT
 0
 
 # ==========================================
-# Test 3: INSERT...SELECT (subquery path)
+# Test 3: INSERT VALUES with bound scalar expressions
+# ==========================================
+
+statement ok
+INSERT INTO staff VALUES (8, 'Heidi' || '', upper('eng'), 300 + 25);
+
+statement ok
+PRAGMA ivm_options('memory', 'main', 'mv_staff');
+
+query I
+SELECT count(*) FROM (SELECT * FROM mv_staff EXCEPT ALL SELECT id, name, dept, salary FROM staff);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT * FROM mv_staff);
+----
+0
+
+# ==========================================
+# Test 4: INSERT...SELECT (subquery path)
 # ==========================================
 
 statement ok
@@ -92,7 +112,7 @@ SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT
 0
 
 # ==========================================
-# Test 4: INSERT...SELECT FROM range() (table function)
+# Test 5: INSERT...SELECT FROM range() (table function)
 # ==========================================
 
 statement ok
@@ -112,7 +132,7 @@ SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT
 0
 
 # ==========================================
-# Test 5: DELETE — single row with WHERE
+# Test 6: DELETE — single row with WHERE
 # ==========================================
 
 statement ok

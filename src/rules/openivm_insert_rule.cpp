@@ -78,6 +78,32 @@ static string BuildDeltaSelectFrom(TableCatalogEntry &delta_entry, const string 
 	return "SELECT " + cols + ", " + mul_val + ", now()::timestamp FROM " + source;
 }
 
+static string BuildDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry &delta_entry,
+                                       const string &full_delta_table_name, unique_ptr<LogicalOperator> &source_plan) {
+	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
+	auto ast = LogicalPlanToAst(context, source_plan);
+	auto cte_list = AstToCteList(*ast);
+	string subquery_string = cte_list->ToQuery(false);
+	if (!subquery_string.empty() && subquery_string.back() == ';') {
+		subquery_string.pop_back();
+	}
+	return prefix + " SELECT *, 1, now()::timestamp FROM (" + subquery_string + ")";
+}
+
+static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry &delta_entry,
+                                             const string &full_delta_table_name,
+                                             unique_ptr<LogicalOperator> &source_plan) {
+	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
+	string data_cols = BuildDeltaDataColumns(delta_entry);
+	auto ast = LogicalPlanToAst(context, source_plan);
+	auto cte_list = AstToCteList(*ast);
+	string subquery_string = cte_list->ToQuery(false);
+	if (!subquery_string.empty() && subquery_string.back() == ';') {
+		subquery_string.pop_back();
+	}
+	return prefix + " SELECT " + data_cols + ", -1, now()::timestamp FROM (" + subquery_string + ") _ivm_deleted_rows";
+}
+
 static bool PlanReferencesColumn(LogicalOperator &op, const string &table_name, const string &col_name) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
@@ -362,30 +388,39 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 					if (projection->children[0]->type == LogicalOperatorType::LOGICAL_EXPRESSION_GET) {
 						insert_query += " VALUES ";
 						auto expression_get = dynamic_cast<LogicalExpressionGet *>(projection->children[0].get());
+						bool all_values_are_constants = true;
 						for (auto &expression : expression_get->expressions) {
-							string values = "(";
 							for (auto &value : expression) {
-								if (value->type == ExpressionType::VALUE_CONSTANT) {
-									auto constant = dynamic_cast<BoundConstantExpression *>(value.get());
-									values += constant->value.ToSQLString() + ",";
-								} else {
-									throw NotImplementedException("Only constant values are supported for now!");
+								if (value->type != ExpressionType::VALUE_CONSTANT) {
+									all_values_are_constants = false;
+									break;
 								}
 							}
-							values += "1, now()::timestamp),";
-							insert_query += values;
+							if (!all_values_are_constants) {
+								break;
+							}
 						}
-						insert_query.pop_back();
+						if (!all_values_are_constants) {
+							// DuckDB may bind VALUES literals through casts or other scalar expressions. Serialize the
+							// planned insert source instead of rejecting an otherwise valid base-table write.
+							insert_query = BuildDeltaInsertFromPlan(*con.context, delta_entry_ins,
+							                                        full_delta_table_name, insert_node->children[0]);
+						} else {
+							for (auto &expression : expression_get->expressions) {
+								string values = "(";
+								for (auto &value : expression) {
+									auto constant = dynamic_cast<BoundConstantExpression *>(value.get());
+									values += constant->value.ToSQLString() + ",";
+								}
+								values += "1, now()::timestamp),";
+								insert_query += values;
+							}
+							insert_query.pop_back();
+						}
 					} else {
 						auto &delta_entry = delta_table_catalog_entry->Cast<TableCatalogEntry>();
-						string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
-						auto ast = LogicalPlanToAst(*con.context, insert_node->children[0]);
-						auto cte_list = AstToCteList(*ast);
-						string subquery_string = cte_list->ToQuery(false);
-						if (!subquery_string.empty() && subquery_string.back() == ';') {
-							subquery_string.pop_back();
-						}
-						insert_query = prefix + " SELECT *, 1, now()::timestamp FROM (" + subquery_string + ")";
+						insert_query = BuildDeltaInsertFromPlan(*con.context, delta_entry, full_delta_table_name,
+						                                        insert_node->children[0]);
 					}
 					OPENIVM_DEBUG_PRINT("[INSERT RULE] insert_query: %s\n", insert_query.c_str());
 					{
@@ -450,12 +485,21 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
 				                       BuildDeltaSelectFrom(delta_entry_del, "-1", full_table_name);
 				if (plan->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
 					auto filter = dynamic_cast<LogicalFilter *>(plan->children[0].get());
-					insert_string += " where ";
-					for (idx_t i = 0; i < filter->expressions.size(); i++) {
-						if (i > 0) {
-							insert_string += " AND ";
+					bool has_subquery = false;
+					for (auto &expr : filter->expressions) {
+						has_subquery = has_subquery || expr->HasSubquery();
+					}
+					if (has_subquery) {
+						insert_string = BuildDeleteDeltaInsertFromPlan(*con.context, delta_entry_del,
+						                                               full_delta_table_name, plan->children[0]);
+					} else {
+						insert_string += " where ";
+						for (idx_t i = 0; i < filter->expressions.size(); i++) {
+							if (i > 0) {
+								insert_string += " AND ";
+							}
+							insert_string += filter->expressions[i]->ToString();
 						}
-						insert_string += filter->expressions[i]->ToString();
 					}
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
 					auto get = dynamic_cast<LogicalGet *>(plan->children[0].get());
