@@ -186,15 +186,26 @@ string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_
 string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_query_sql,
                                   const string &affected_subquery, const string &target_alias,
                                   const string &recompute_alias, const string &affected_alias,
-                                  const string &target_match, const string &recompute_match) {
+                                  const string &target_match, const string &recompute_match,
+                                  const string &affected_temp_table) {
 	string affected_block = "(\n" + affected_subquery + "\n)";
+	string affected_source = affected_temp_table.empty() ? affected_block : affected_temp_table;
 	string delete_where =
-	    "EXISTS (\n  SELECT 1 FROM " + affected_block + " AS " + affected_alias + " WHERE " + target_match + "\n)";
+	    "EXISTS (\n  SELECT 1 FROM " + affected_source + " AS " + affected_alias + " WHERE " + target_match + "\n)";
 	string insert_where =
-	    "EXISTS (\n  SELECT 1 FROM " + affected_block + " AS " + affected_alias + " WHERE " + recompute_match + "\n)";
-	return "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" + "INSERT INTO " +
-	       data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " + insert_where +
-	       ";\n";
+	    "EXISTS (\n  SELECT 1 FROM " + affected_source + " AS " + affected_alias + " WHERE " + recompute_match + "\n)";
+
+	string result;
+	if (!affected_temp_table.empty()) {
+		result += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_subquery + ";\n\n";
+	}
+	result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" +
+	          "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " +
+	          insert_where + ";\n";
+	if (!affected_temp_table.empty()) {
+		result += "\nDROP TABLE IF EXISTS " + affected_temp_table + ";\n";
+	}
+	return result;
 }
 
 bool IsEmptyDeltaPlan(LogicalOperator *op) {

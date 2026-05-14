@@ -921,15 +921,16 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		}
 	}
 
-	// EXISTS-based, NULL-safe match (IS NOT DISTINCT FROM). DuckDB inlines the subquery into both
-	// the DELETE and the INSERT — the affected-keys set is computed once per usage in practice but
-	// the planner can fuse them; if profiling shows this is hot, materialize to a TEMP TABLE first.
+	// EXISTS-based, NULL-safe match (IS NOT DISTINCT FROM). The affected-keys subquery is shared by
+	// DELETE and INSERT, so materialize it once per refresh instead of recomputing the same delta-
+	// scoped view query twice.
 	string match_clause = SqlUtils::BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_tgt");
+	string affected_temp_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
 
 	OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] %zu group cols, %zu source deltas\n", group_columns.size(),
 	                    delta_table_specs.size());
 	return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_subquery, "openivm_tgt", "AS openivm_tgt",
-	                                  "openivm_aff", match_clause, match_clause);
+	                                  "openivm_aff", match_clause, match_clause, affected_temp_table);
 }
 
 } // namespace duckdb

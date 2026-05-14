@@ -43,7 +43,8 @@ string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_
 string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_query_sql,
                                   const string &affected_subquery, const string &target_alias,
                                   const string &recompute_alias, const string &affected_alias,
-                                  const string &target_match, const string &recompute_match);
+                                  const string &target_match, const string &recompute_match,
+                                  const string &affected_temp_table = "");
 
 string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_name,
                                   const string &attached_db_catalog_name);
