@@ -37,6 +37,13 @@ string BuildEmptyDeltaInsert(const string &view_name, const vector<string> &colu
                              const vector<LogicalType> &column_types);
 string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_view_name,
                                 const vector<string> &column_names, const string &delta_ts_filter);
+string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_query_sql,
+                                   const string &recompute_alias, const string &delete_where,
+                                   const string &insert_where, const string &statement_prefix = "");
+string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_query_sql,
+                                  const string &affected_subquery, const string &target_alias,
+                                  const string &recompute_alias, const string &affected_alias,
+                                  const string &target_match, const string &recompute_match);
 
 string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_name,
                                   const string &attached_db_catalog_name);

@@ -490,18 +490,19 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 					if (last_snap == ducklake_current_snap) {
 						continue;
 					}
-					auto has_changes = snap_con.Query(
-					    "SELECT EXISTS(SELECT 1 FROM ("
-					    "(SELECT 1 FROM ducklake_table_insertions('" +
-					    SqlUtils::EscapeValue(loc.catalog_name) + "', '" + SqlUtils::EscapeValue(loc.schema_name) +
-					    "', '" + SqlUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
-					    to_string(ducklake_current_snap) +
-					    ") LIMIT 1) "
-					    "UNION ALL "
-					    "(SELECT 1 FROM ducklake_table_deletions('" +
-					    SqlUtils::EscapeValue(loc.catalog_name) + "', '" + SqlUtils::EscapeValue(loc.schema_name) +
-					    "', '" + SqlUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " +
-					    to_string(ducklake_current_snap) + ") LIMIT 1)) openivm_delta_probe LIMIT 1)");
+					string insertions =
+					    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
+					                                    loc.table_name, last_snap, ducklake_current_snap);
+					string deletions =
+					    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
+					                                    loc.table_name, last_snap, ducklake_current_snap);
+					auto has_changes = snap_con.Query("SELECT EXISTS(SELECT 1 FROM ("
+					                                  "(SELECT 1 FROM " +
+					                                  insertions +
+					                                  " LIMIT 1) "
+					                                  "UNION ALL "
+					                                  "(SELECT 1 FROM " +
+					                                  deletions + " LIMIT 1)) openivm_delta_probe LIMIT 1)");
 					if (has_changes->HasError() || has_changes->RowCount() == 0 ||
 					    has_changes->GetValue(0, 0).IsNull() || has_changes->GetValue(0, 0).GetValue<bool>()) {
 						all_empty = false;

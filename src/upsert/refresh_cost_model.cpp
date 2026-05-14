@@ -79,17 +79,15 @@ static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_na
 	}
 
 	double count = 0;
-	auto ins_result =
-	    con.Query("SELECT COUNT(*) FROM ducklake_table_insertions('" + SqlUtils::EscapeValue(catalog_name) + "', '" +
-	              SqlUtils::EscapeValue(schema_name) + "', '" + SqlUtils::EscapeValue(table_name) + "', " +
-	              to_string(last_snap) + ", " + to_string(cur_snap) + ")");
+	auto insertions = SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", catalog_name, schema_name,
+	                                                  table_name, last_snap, cur_snap);
+	auto deletions = SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", catalog_name, schema_name, table_name,
+	                                                 last_snap, cur_snap);
+	auto ins_result = con.Query("SELECT COUNT(*) FROM " + insertions);
 	if (!ins_result->HasError() && ins_result->RowCount() > 0) {
 		count += ins_result->GetValue(0, 0).GetValue<double>();
 	}
-	auto del_result =
-	    con.Query("SELECT COUNT(*) FROM ducklake_table_deletions('" + SqlUtils::EscapeValue(catalog_name) + "', '" +
-	              SqlUtils::EscapeValue(schema_name) + "', '" + SqlUtils::EscapeValue(table_name) + "', " +
-	              to_string(last_snap) + ", " + to_string(cur_snap) + ")");
+	auto del_result = con.Query("SELECT COUNT(*) FROM " + deletions);
 	if (!del_result->HasError() && del_result->RowCount() > 0) {
 		count += del_result->GetValue(0, 0).GetValue<double>();
 	}

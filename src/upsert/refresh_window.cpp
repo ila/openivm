@@ -100,14 +100,12 @@ static string BuildSingleSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, 
 	}
 	string temp_affected = string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name;
 	string qtemp_affected = KeywordHelper::WriteOptionallyQuoted(temp_affected);
-	string insertions = "SELECT " + affected_select + " FROM ducklake_table_insertions('" +
-	                    SqlUtils::EscapeValue(loc.catalog_name) + "', '" + SqlUtils::EscapeValue(loc.schema_name) +
-	                    "', '" + SqlUtils::EscapeValue(loc.table_name) + "', " + to_string(old_snap) + ", " +
-	                    to_string(current_snap) + ")";
-	string deletions = "SELECT " + affected_select + " FROM ducklake_table_deletions('" +
-	                   SqlUtils::EscapeValue(loc.catalog_name) + "', '" + SqlUtils::EscapeValue(loc.schema_name) +
-	                   "', '" + SqlUtils::EscapeValue(loc.table_name) + "', " + to_string(old_snap) + ", " +
-	                   to_string(current_snap) + ")";
+	string insertions = "SELECT " + affected_select + " FROM " +
+	                    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
+	                                                    loc.table_name, old_snap, current_snap);
+	string deletions = "SELECT " + affected_select + " FROM " +
+	                   SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
+	                                                   loc.table_name, old_snap, current_snap);
 	string affected_filter;
 	if (partition_cols.size() == 1) {
 		affected_filter = affected_tuple + " IN (SELECT " + affected_cols + " FROM " + qtemp_affected + ")";
@@ -116,9 +114,8 @@ static string BuildSingleSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, 
 	}
 	string upsert_query = "CREATE TEMP TABLE " + qtemp_affected + " AS SELECT DISTINCT " + affected_cols + " FROM ((" +
 	                      insertions + ") UNION ALL (" + deletions + ")) openivm_changed_partitions;\n";
-	upsert_query += "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
-	upsert_query += "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") openivm_recompute\nWHERE " +
-	                affected_filter + ";\n";
+	upsert_query +=
+	    BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter, affected_filter);
 	upsert_query += "DROP TABLE " + qtemp_affected + ";\n";
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake change-feed, %zu "
 	                    "partition cols, old_snap=%ld, current_snap=%ld)\n",
@@ -162,8 +159,8 @@ static string BuildMultiSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, C
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake view-diff, %zu "
 	                    "partition cols, %zu sources)\n",
 	                    partition_cols.size(), delta_table_names.size());
-	return "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n" + "INSERT INTO " + data_table +
-	       "\nSELECT * FROM (" + view_query_sql + ") openivm_recompute\nWHERE " + affected_filter + ";\n";
+	return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter,
+	                                   affected_filter);
 }
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,

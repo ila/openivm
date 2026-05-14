@@ -13,6 +13,11 @@ include_directories(src/include ${LPTS_DIR}/src/include ${LPTS_DIR}/third_party/
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
     src/core/parser.cpp
+    src/core/parser_create_mv_helpers.cpp
+    src/core/parser_ddl.cpp
+    src/core/parser_parse.cpp
+    src/core/parser_plan_helpers.cpp
+    src/core/parser_sql_extractors.cpp
     src/core/sql_utils.cpp
     src/core/refresh_metadata.cpp
     src/core/incremental_checker.cpp

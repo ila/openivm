@@ -561,6 +561,28 @@ string SqlUtils::DeltaName(const string &name) {
 	return string(openivm::DELTA_PREFIX) + name;
 }
 
+string SqlUtils::LastIdentifierPart(string name) {
+	StringUtil::Trim(name);
+	idx_t dot_pos = DConstants::INVALID_INDEX;
+	bool in_quote = false;
+	for (idx_t i = 0; i < name.size(); i++) {
+		if (name[i] == '"') {
+			in_quote = !in_quote;
+			continue;
+		}
+		if (!in_quote && name[i] == '.') {
+			dot_pos = i;
+		}
+	}
+	if (dot_pos != DConstants::INVALID_INDEX) {
+		name = name.substr(dot_pos + 1);
+	}
+	if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
+		name = name.substr(1, name.size() - 2);
+	}
+	return name;
+}
+
 string SqlUtils::FullName(const string &catalog, const string &schema, const string &table) {
 	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(table);
 }
@@ -602,6 +624,40 @@ string SqlUtils::QuoteQualifiedPrefix(const string &prefix) {
 		quoted += QuoteIdentifier(part) + ".";
 	}
 	return quoted;
+}
+
+string SqlUtils::JsonQuote(const string &value) {
+	string result = "\"";
+	for (char c : value) {
+		if (c == '"' || c == '\\') {
+			result += '\\';
+			result += c;
+		} else if (c == '\n') {
+			result += "\\n";
+		} else {
+			result += c;
+		}
+	}
+	result += "\"";
+	return result;
+}
+
+string SqlUtils::JsonArray(const vector<string> &values) {
+	string result = "[";
+	for (idx_t i = 0; i < values.size(); i++) {
+		if (i > 0) {
+			result += ",";
+		}
+		result += JsonQuote(values[i]);
+	}
+	result += "]";
+	return result;
+}
+
+string SqlUtils::DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
+                                       const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id) {
+	return function_name + "('" + EscapeValue(catalog) + "', '" + EscapeValue(schema) + "', '" + EscapeValue(table) +
+	       "', " + to_string(last_snapshot_id) + ", " + to_string(current_snapshot_id) + ")";
 }
 
 bool SqlUtils::IsDelta(const string &name) {
@@ -708,6 +764,44 @@ bool SqlUtils::IdentifierMatchesTable(const string &identifier, const string &ta
 	}
 	auto suffix = identifier.substr(identifier.size() - table_name.size());
 	return identifier[identifier.size() - table_name.size() - 1] == '.' && StringUtil::CIEquals(suffix, table_name);
+}
+
+string SqlUtils::FindTableReference(const string &sql, const string &table_name) {
+	bool in_single_quote = false;
+	bool expect_table = false;
+	for (idx_t i = 0; i < sql.size();) {
+		char c = sql[i];
+		if (c == '\'') {
+			i++;
+			if (in_single_quote && i < sql.size() && sql[i] == '\'') {
+				i++;
+				continue;
+			}
+			in_single_quote = !in_single_quote;
+			continue;
+		}
+		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
+			idx_t start = i;
+			idx_t end = i;
+			string qualified_identifier;
+			if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier)) {
+				if (expect_table && IdentifierMatchesTable(qualified_identifier, table_name)) {
+					return sql.substr(start, end - start);
+				}
+				i = end;
+				expect_table = StringUtil::CIEquals(qualified_identifier, "from") ||
+				               StringUtil::CIEquals(qualified_identifier, "join") ||
+				               StringUtil::CIEquals(qualified_identifier, "update") ||
+				               StringUtil::CIEquals(qualified_identifier, "into");
+				continue;
+			}
+		}
+		if (!std::isspace(static_cast<unsigned char>(c))) {
+			expect_table = false;
+		}
+		i++;
+	}
+	return "";
 }
 
 string SqlUtils::ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement) {

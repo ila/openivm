@@ -155,8 +155,7 @@ string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const strin
 	    "EXISTS (SELECT 1 FROM (" + affected + "\n) _a WHERE " + ncmp_del + ") OR (" + null_check + ")";
 	string where_insert =
 	    "EXISTS (SELECT 1 FROM (" + affected + "\n) _a WHERE " + ncmp_ins + ") OR (" + null_check + ")";
-	return "DELETE FROM " + data_table + " WHERE " + where_delete + ";\n" + "INSERT INTO " + data_table +
-	       "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " + where_insert + ";\n";
+	return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, recompute_alias, where_delete, where_insert);
 }
 
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col) {
@@ -174,6 +173,28 @@ string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool 
 		return "";
 	}
 	return string(openivm::TIMESTAMP_COL) + " > '" + ts.ToString() + "'::TIMESTAMP";
+}
+
+string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_query_sql,
+                                   const string &recompute_alias, const string &delete_where,
+                                   const string &insert_where, const string &statement_prefix) {
+	return statement_prefix + "DELETE FROM " + data_table + " WHERE " + delete_where + ";\n" + statement_prefix +
+	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " +
+	       insert_where + ";\n";
+}
+
+string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_query_sql,
+                                  const string &affected_subquery, const string &target_alias,
+                                  const string &recompute_alias, const string &affected_alias,
+                                  const string &target_match, const string &recompute_match) {
+	string affected_block = "(\n" + affected_subquery + "\n)";
+	string delete_where =
+	    "EXISTS (\n  SELECT 1 FROM " + affected_block + " AS " + affected_alias + " WHERE " + target_match + "\n)";
+	string insert_where =
+	    "EXISTS (\n  SELECT 1 FROM " + affected_block + " AS " + affected_alias + " WHERE " + recompute_match + "\n)";
+	return "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" + "INSERT INTO " +
+	       data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " + insert_where +
+	       ";\n";
 }
 
 bool IsEmptyDeltaPlan(LogicalOperator *op) {
@@ -260,23 +281,9 @@ string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_vie
 		return "";
 	}
 
-	string col_list;
-	string data_select;
-	string group_by;
-	for (size_t i = 0; i < data_columns.size(); i++) {
-		if (i > 0) {
-			data_select += ", ";
-			group_by += ", ";
-		}
-		data_select += SqlUtils::QuoteIdentifier(data_columns[i]);
-		group_by += SqlUtils::QuoteIdentifier(data_columns[i]);
-	}
-	for (size_t i = 0; i < column_names.size(); i++) {
-		if (i > 0) {
-			col_list += ", ";
-		}
-		col_list += SqlUtils::QuoteIdentifier(column_names[i]);
-	}
+	string col_list = SqlUtils::JoinQuotedColumns(column_names);
+	string data_select = SqlUtils::JoinQuotedColumns(data_columns);
+	string group_by = data_select;
 
 	string where_clause = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 	string delete_filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
@@ -384,107 +391,8 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 		where_clause = "TRUE";
 	}
 
-	return affected_ctes + "DELETE FROM " + data_table + " WHERE " + where_clause + ";\n" + affected_ctes +
-	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") openivm_foj\nWHERE " + where_clause +
-	       ";\n";
-}
-
-static bool IsIdentifierStart(char c) {
-	return std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"';
-}
-
-static bool IsIdentifierBody(char c) {
-	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-}
-
-static bool ReadIdentifierPart(const string &sql, idx_t &pos, string &normalized) {
-	if (pos >= sql.size()) {
-		return false;
-	}
-	if (sql[pos] == '"') {
-		pos++;
-		while (pos < sql.size()) {
-			char c = sql[pos++];
-			if (c == '"') {
-				if (pos < sql.size() && sql[pos] == '"') {
-					normalized += '"';
-					pos++;
-					continue;
-				}
-				return true;
-			}
-			normalized += c;
-		}
-		return false;
-	}
-	if (!(std::isalpha(static_cast<unsigned char>(sql[pos])) || sql[pos] == '_')) {
-		return false;
-	}
-	idx_t start = pos++;
-	while (pos < sql.size() && IsIdentifierBody(sql[pos])) {
-		pos++;
-	}
-	normalized = sql.substr(start, pos - start);
-	return true;
-}
-
-static bool ReadQualifiedIdentifierForRefresh(const string &sql, idx_t start, idx_t &end, string &raw,
-                                              string &normalized) {
-	idx_t pos = start;
-	string part;
-	if (!ReadIdentifierPart(sql, pos, part)) {
-		return false;
-	}
-	normalized = part;
-	while (pos < sql.size() && sql[pos] == '.') {
-		idx_t dot_pos = pos++;
-		part.clear();
-		if (!ReadIdentifierPart(sql, pos, part)) {
-			pos = dot_pos;
-			break;
-		}
-		normalized += "." + part;
-	}
-	end = pos;
-	raw = sql.substr(start, end - start);
-	return true;
-}
-
-static string FindTableReferenceForRefresh(const string &sql, const string &table_name) {
-	bool in_single_quote = false;
-	bool expect_table = false;
-	for (idx_t i = 0; i < sql.size();) {
-		char c = sql[i];
-		if (c == '\'') {
-			i++;
-			if (in_single_quote && i < sql.size() && sql[i] == '\'') {
-				i++;
-				continue;
-			}
-			in_single_quote = !in_single_quote;
-			continue;
-		}
-		if (!in_single_quote && IsIdentifierStart(c)) {
-			idx_t start = i;
-			idx_t end = i;
-			string raw;
-			string normalized;
-			if (ReadQualifiedIdentifierForRefresh(sql, start, end, raw, normalized)) {
-				if (expect_table && SqlUtils::IdentifierMatchesTable(normalized, table_name)) {
-					return raw;
-				}
-				i = end;
-				expect_table = StringUtil::CIEquals(normalized, "from") || StringUtil::CIEquals(normalized, "join") ||
-				               StringUtil::CIEquals(normalized, "update") || StringUtil::CIEquals(normalized, "into");
-				continue;
-			}
-		}
-		if (!std::isspace(static_cast<unsigned char>(c))) {
-			expect_table = false;
-		}
-		i++;
-	}
-	return "";
+	return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_foj", where_clause, where_clause,
+	                                   affected_ctes);
 }
 
 static string TryBuildLeftJoinAffectedPushdown(const string &view_name, const string &data_table,
@@ -507,7 +415,7 @@ static string TryBuildLeftJoinAffectedPushdown(const string &view_name, const st
 		return "";
 	}
 
-	auto source_ref = FindTableReferenceForRefresh(view_query_sql, security_table);
+	auto source_ref = SqlUtils::FindTableReference(view_query_sql, security_table);
 	if (source_ref.empty()) {
 		return "";
 	}
@@ -535,9 +443,8 @@ static string TryBuildLeftJoinAffectedPushdown(const string &view_name, const st
 	// false negatives unless lineage proves the affected key comes from this source binding.
 	// We also benchmarked dropping the final guard at SF25/SF50; it was only marginally
 	// faster, so the guarded shape is the safer default until lineage proves exactness.
-	return affected_cte + "DELETE FROM " + data_table + " WHERE " + affected + data_table + "." + lk + ");\n" +
-	       affected_cte + "INSERT INTO " + data_table + "\nSELECT * FROM (" + pushed_query + ") openivm_lj\nWHERE " +
-	       affected + "openivm_lj." + lk + ");\n";
+	return BuildDeleteInsertRefreshSQL(data_table, pushed_query, "openivm_lj", affected + data_table + "." + lk + ")",
+	                                   affected + "openivm_lj." + lk + ")", affected_cte);
 }
 
 static string BuildLeftJoinProjectionRefresh(const string &view_name, const string &data_table,
@@ -552,9 +459,9 @@ static string BuildLeftJoinProjectionRefresh(const string &view_name, const stri
 	if (!pushed_refresh.empty()) {
 		return pushed_refresh;
 	}
-	return "DELETE FROM " + data_table + " WHERE " + affected + data_table + "." + lk + delta_where + ");\n" +
-	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") openivm_lj\nWHERE " + affected +
-	       "openivm_lj." + lk + delta_where + ");\n";
+	return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_lj",
+	                                   affected + data_table + "." + lk + delta_where + ")",
+	                                   affected + "openivm_lj." + lk + delta_where + ")");
 }
 
 string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,

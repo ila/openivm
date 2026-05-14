@@ -26,10 +26,15 @@ public:
 	static vector<string> SplitSQLStatements(const string &sql);
 	static string SQLStatementPreview(const string &statement);
 	static string DeltaName(const string &name);
+	static string LastIdentifierPart(string name);
 	static string FullName(const string &catalog, const string &schema, const string &table);
 	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
 	static string QualifiedPrefix(const string &catalog, const string &schema);
 	static string QuoteQualifiedPrefix(const string &prefix);
+	static string JsonQuote(const string &value);
+	static string JsonArray(const vector<string> &values);
+	static string DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
+	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
 	static bool IsDelta(const string &name);
 	static string GenerateDeltaTable(string &query);
 	static string JoinQuotedColumns(const vector<string> &columns);
@@ -46,6 +51,7 @@ public:
 	static vector<string> ReplaceEachTableReference(const string &sql, const string &table_name,
 	                                                const string &replacement);
 	static bool IdentifierMatchesTable(const string &identifier, const string &table_name);
+	static string FindTableReference(const string &sql, const string &table_name);
 
 	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.
 	/// Returns -1 if no interval clause found. Throws on invalid format or < 60 seconds.

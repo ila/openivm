@@ -36,15 +36,12 @@ static void AccumulateDuckLakeDeltaSummary(DeltaChangeSummary &summary, RefreshM
 	if (last_snap == cur_snap) {
 		return;
 	}
-	auto count_result = con.Query(
-	    "SELECT "
-	    "(SELECT COUNT(*) FROM ducklake_table_insertions('" +
-	    SqlUtils::EscapeValue(loc.catalog_name) + "', '" + SqlUtils::EscapeValue(loc.schema_name) + "', '" +
-	    SqlUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " + to_string(cur_snap) +
-	    ")), "
-	    "(SELECT COUNT(*) FROM ducklake_table_deletions('" +
-	    SqlUtils::EscapeValue(loc.catalog_name) + "', '" + SqlUtils::EscapeValue(loc.schema_name) + "', '" +
-	    SqlUtils::EscapeValue(loc.table_name) + "', " + to_string(last_snap) + ", " + to_string(cur_snap) + "))");
+	string insertions = SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
+	                                                    loc.table_name, last_snap, cur_snap);
+	string deletions = SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
+	                                                   loc.table_name, last_snap, cur_snap);
+	auto count_result =
+	    con.Query("SELECT (SELECT COUNT(*) FROM " + insertions + "), (SELECT COUNT(*) FROM " + deletions + ")");
 	if (count_result->HasError()) {
 		summary.any_has_deletes = true;
 		summary.tables_with_changes++;

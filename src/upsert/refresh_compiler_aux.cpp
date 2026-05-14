@@ -4,6 +4,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
+#include "upsert/refresh_internal.hpp"
 
 namespace duckdb {
 
@@ -60,14 +61,7 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	    "\n)\n";
 
 	string insert_cols = group_cols_csv + ", " + sum_out_q + ", " + count_q;
-	string insert_vals;
-	for (size_t i = 0; i < group_columns.size(); i++) {
-		if (i > 0) {
-			insert_vals += ", ";
-		}
-		insert_vals += "d." + SqlUtils::QuoteIdentifier(group_columns[i]);
-	}
-	insert_vals += ", d.d_sum, d.d_count";
+	string insert_vals = SqlUtils::JoinQualifiedQuotedColumns(group_columns, "d") + ", d.d_sum, d.d_count";
 
 	sql += ddist_cte + "MERGE INTO " + data_table + " v USING dagg d ON " + mv_match +
 	       "\nWHEN MATCHED THEN UPDATE SET " + sum_out_q + " = COALESCE(v." + sum_out_q + ", 0) + d.d_sum, " + count_q +
@@ -80,14 +74,7 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	       aux_match_aliased +
 	       "\nWHEN MATCHED THEN UPDATE SET _count = _aux._count + i.dmult\nWHEN NOT MATCHED AND i.dmult > 0 "
 	       "THEN INSERT (" +
-	       distinct_cols_csv + ", _count) VALUES (";
-	for (size_t i = 0; i < distinct_cols.size(); i++) {
-		if (i > 0) {
-			sql += ", ";
-		}
-		sql += "i." + SqlUtils::QuoteIdentifier(distinct_cols[i]);
-	}
-	sql += ", i.dmult);\n\n";
+	       distinct_cols_csv + ", _count) VALUES (" + distinct_cols_csv_i + ", i.dmult);\n\n";
 
 	sql += "DELETE FROM " + aux_q + " WHERE _count <= 0;\n\n";
 	sql += "DROP TABLE IF EXISTS " + SqlUtils::QuoteIdentifier(dinput_table) + ";\n";
@@ -298,12 +285,9 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		    output_col + " IN (SELECT DISTINCT " + source_col + " FROM " + delta_table + delta_where + ")";
 	}
 
-	string delete_query = "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
-	string insert_query = "INSERT INTO " + data_table + "\n" + "SELECT * FROM (" + view_query_sql +
-	                      ") openivm_recompute\n" + "WHERE " + affected_filter + ";\n";
-
 	OPENIVM_DEBUG_PRINT("[CompileWindowRecompute] Partition columns: %zu\n", partition_columns.size());
-	return delete_query + "\n" + insert_query;
+	return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter,
+	                                   affected_filter);
 }
 
 } // namespace duckdb

@@ -4,6 +4,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
+#include "upsert/refresh_internal.hpp"
 
 namespace duckdb {
 
@@ -17,6 +18,18 @@ static string BuildUpdatedAggregateColumn(const string &col) {
 static string BuildNullSafeExtremumUpdate(const string &col, const string &fn) {
 	return "CASE WHEN v." + col + " IS NULL THEN d." + col + " WHEN d." + col + " IS NULL THEN v." + col + " ELSE " +
 	       fn + "(v." + col + ", d." + col + ") END";
+}
+
+static string JoinPrefixedSQLFragments(const vector<string> &fragments, const string &prefix) {
+	return StringUtil::Join(fragments, fragments.size(), ", ",
+	                        [&](const string &fragment) { return prefix + fragment; });
+}
+
+static string BuildNullSafeSQLFragmentMatch(const vector<string> &columns, const string &left_prefix,
+                                            const string &right_prefix) {
+	return StringUtil::Join(columns, columns.size(), " AND ", [&](const string &column) {
+		return left_prefix + column + " IS NOT DISTINCT FROM " + right_prefix + column;
+	});
 }
 
 /// Detect AVG and STDDEV/VARIANCE decomposition columns from the column list.
@@ -364,38 +377,18 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// for VARCHAR etc. regardless of whether the negative branch is reached.
 		// For MIN/MAX without non-summable cols, insert_only uses GREATEST/LEAST in
 		// the MERGE path below.
-		string keys_tuple;
-		string match_delete;
-		string match_insert;
-		for (size_t i = 0; i < keys.size(); i++) {
-			keys_tuple += keys[i];
-			if (i != keys.size() - 1) {
-				keys_tuple += ", ";
-			}
-			if (!match_delete.empty()) {
-				match_delete += " AND ";
-				match_insert += " AND ";
-			}
-			match_delete += "openivm_aff." + keys[i] + " IS NOT DISTINCT FROM openivm_tgt." + keys[i];
-			match_insert += "openivm_aff." + keys[i] + " IS NOT DISTINCT FROM openivm_recompute." + keys[i];
-		}
+		string keys_tuple = StringUtil::Join(keys, ", ");
+		string match_delete = BuildNullSafeSQLFragmentMatch(keys, "openivm_aff.", "openivm_tgt.");
+		string match_insert = BuildNullSafeSQLFragmentMatch(keys, "openivm_aff.", "openivm_recompute.");
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 		string affected = "select distinct " + keys_tuple + " from " + delta_view + delta_where;
-		string affected_block = "(\n  " + affected + "\n)";
-		string delete_query = "delete from " + data_table + " AS openivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " +
-		                      affected_block + " AS openivm_aff WHERE " + match_delete + "\n);\n";
-		string insert_query = "insert into " + data_table + "\n" + "select * from (" + view_query_sql +
-		                      ") openivm_recompute\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_block +
-		                      " AS openivm_aff WHERE " + match_insert + "\n);\n";
-		return delete_query + "\n" + insert_query;
+		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, "  " + affected, "openivm_tgt",
+		                                  "openivm_recompute", "openivm_aff", match_delete, match_insert);
 	}
 
 	// CTE: consolidate deltas per group
-	string cte_string = "with refresh_cte AS (\n";
 	string cte_select_string = "select ";
-	for (auto &key : keys) {
-		cte_select_string = cte_select_string + key + ", ";
-	}
+	cte_select_string += StringUtil::Join(keys, ", ") + ", ";
 	for (auto &column : aggregates) {
 		string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
 		if (insert_only && agg_type == "min") {
@@ -423,23 +416,13 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		cte_from_string += " WHERE " + delta_ts_filter;
 	}
 	cte_from_string += "\n";
-	string cte_group_by_string = "group by ";
-	for (auto &key : keys) {
-		cte_group_by_string = cte_group_by_string + key + ", ";
-	}
-	cte_group_by_string.erase(cte_group_by_string.size() - 2, 2);
+	string cte_group_by_string = "group by " + StringUtil::Join(keys, ", ");
 
 	string cte_body = cte_select_string + cte_from_string + cte_group_by_string;
 
 	// MERGE: single-pass upsert — UPDATE existing groups, INSERT new groups.
 	// Uses IS NOT DISTINCT FROM for NULL-safe key matching.
-	string on_clause;
-	for (size_t i = 0; i < keys.size(); i++) {
-		if (i > 0) {
-			on_clause += " AND ";
-		}
-		on_clause += "v." + keys[i] + " IS NOT DISTINCT FROM d." + keys[i];
-	}
+	string on_clause = BuildNullSafeSQLFragmentMatch(keys, "v.", "d.");
 
 	auto &derived_cols = decomp.derived_cols;
 	auto &d_sum_cols = decomp.sum_cols;
@@ -538,15 +521,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				insert_vals += "d." + column;
 			}
 		}
-		for (auto &key : keys) {
-			insert_cols += key + ", ";
-		}
-		for (size_t i = 0; i < aggregates.size(); i++) {
-			insert_cols += aggregates[i];
-			if (i < aggregates.size() - 1) {
-				insert_cols += ", ";
-			}
-		}
+		insert_cols = StringUtil::Join(keys, ", ") + ", " + StringUtil::Join(aggregates, ", ");
 	}
 
 	string merge_query;
@@ -633,18 +608,12 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		merge_query = "WITH refresh_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table +
 		              " v USING refresh_cte d\n" + "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " +
 		              lj_update_set + "\n" + "WHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (";
-		for (auto &key : keys) {
-			merge_query += "d." + key + ", ";
-		}
-		merge_query += cond_insert_vals + ");\n";
+		merge_query += JoinPrefixedSQLFragments(keys, "d.") + ", " + cond_insert_vals + ");\n";
 	} else {
 		merge_query = "WITH refresh_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table +
 		              " v USING refresh_cte d\n" + "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " +
 		              update_set + "\n" + "WHEN NOT MATCHED THEN INSERT (" + insert_cols + ") VALUES (";
-		for (auto &key : keys) {
-			merge_query += "d." + key + ", ";
-		}
-		merge_query += insert_vals + ");\n";
+		merge_query += JoinPrefixedSQLFragments(keys, "d.") + ", " + insert_vals + ");\n";
 	}
 
 	string upsert_query = merge_query + "\n";
@@ -900,13 +869,14 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		string delta_subselect;
 		if (spec.is_ducklake) {
 			delta_subselect =
-			    "(SELECT * FROM ducklake_table_insertions('" + SqlUtils::EscapeValue(spec.ducklake_catalog) + "', '" +
-			    SqlUtils::EscapeValue(spec.ducklake_schema) + "', '" + SqlUtils::EscapeValue(base) + "', " +
-			    to_string(spec.last_snapshot_id) + ", " + to_string(spec.current_snapshot_id) +
-			    ")\nUNION ALL\nSELECT * FROM ducklake_table_deletions('" +
-			    SqlUtils::EscapeValue(spec.ducklake_catalog) + "', '" + SqlUtils::EscapeValue(spec.ducklake_schema) +
-			    "', '" + SqlUtils::EscapeValue(base) + "', " + to_string(spec.last_snapshot_id) + ", " +
-			    to_string(spec.current_snapshot_id) + "))";
+			    "(SELECT * FROM " +
+			    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.ducklake_catalog,
+			                                    spec.ducklake_schema, base, spec.last_snapshot_id,
+			                                    spec.current_snapshot_id) +
+			    "\nUNION ALL\nSELECT * FROM " +
+			    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.ducklake_catalog, spec.ducklake_schema,
+			                                    base, spec.last_snapshot_id, spec.current_snapshot_id) +
+			    ")";
 		} else {
 			string delta_basename = string(openivm::DELTA_PREFIX) + base;
 			string delta_filter;
@@ -955,17 +925,11 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	// the DELETE and the INSERT — the affected-keys set is computed once per usage in practice but
 	// the planner can fuse them; if profiling shows this is hot, materialize to a TEMP TABLE first.
 	string match_clause = SqlUtils::BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_tgt");
-	string aff_block = "(\n" + affected_subquery + "\n)";
-
-	string delete_query = "DELETE FROM " + data_table + " AS openivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " +
-	                      aff_block + " AS openivm_aff WHERE " + match_clause + "\n);\n";
-	string insert_query = "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql +
-	                      ") AS openivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + aff_block + " AS openivm_aff WHERE " +
-	                      match_clause + "\n);\n";
 
 	OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] %zu group cols, %zu source deltas\n", group_columns.size(),
 	                    delta_table_specs.size());
-	return delete_query + "\n" + insert_query;
+	return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_subquery, "openivm_tgt", "AS openivm_tgt",
+	                                  "openivm_aff", match_clause, match_clause);
 }
 
 } // namespace duckdb

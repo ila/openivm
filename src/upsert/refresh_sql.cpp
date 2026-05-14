@@ -32,37 +32,12 @@ struct SemiAntiSourceInput {
 	string last_update;
 };
 
-static string LastIdentifierPartForRefresh(string name) {
-	StringUtil::Trim(name);
-	if (name.empty()) {
-		return name;
-	}
-	idx_t dot_pos = DConstants::INVALID_INDEX;
-	bool in_quote = false;
-	for (idx_t i = 0; i < name.size(); i++) {
-		if (name[i] == '"') {
-			in_quote = !in_quote;
-			continue;
-		}
-		if (!in_quote && name[i] == '.') {
-			dot_pos = i;
-		}
-	}
-	if (dot_pos != DConstants::INVALID_INDEX) {
-		name = name.substr(dot_pos + 1);
-	}
-	if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
-		name = name.substr(1, name.size() - 2);
-	}
-	return name;
-}
-
 static string ResolveSemiAntiMetadataKey(const string &table_name, const vector<string> &delta_table_names) {
 	vector<string> candidates;
 	candidates.push_back(table_name);
-	candidates.push_back(LastIdentifierPartForRefresh(table_name));
+	candidates.push_back(SqlUtils::LastIdentifierPart(table_name));
 	candidates.push_back(SqlUtils::DeltaName(table_name));
-	candidates.push_back(SqlUtils::DeltaName(LastIdentifierPartForRefresh(table_name)));
+	candidates.push_back(SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name)));
 	for (auto &dt : delta_table_names) {
 		for (auto &candidate : candidates) {
 			if (StringUtil::CIEquals(dt, candidate)) {
@@ -70,21 +45,19 @@ static string ResolveSemiAntiMetadataKey(const string &table_name, const vector<
 			}
 		}
 	}
-	return SqlUtils::DeltaName(LastIdentifierPartForRefresh(table_name));
+	return SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name));
 }
 
 static string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
                                                int64_t current_snapshot_id) {
-	string cat = SqlUtils::EscapeValue(loc.catalog_name);
-	string schema = SqlUtils::EscapeValue(loc.schema_name);
-	string table = SqlUtils::EscapeValue(loc.table_name);
-	string snapshots = ", " + to_string(last_snapshot_id) + ", " + to_string(current_snapshot_id) + ")";
 	string insertions = "SELECT *, 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", TIMESTAMP '" +
-	                    DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL) +
-	                    " FROM ducklake_table_insertions('" + cat + "', '" + schema + "', '" + table + "'" + snapshots;
+	                    DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL) + " FROM " +
+	                    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
+	                                                    loc.table_name, last_snapshot_id, current_snapshot_id);
 	string deletions = "SELECT *, -1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", TIMESTAMP '" +
-	                   DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL) +
-	                   " FROM ducklake_table_deletions('" + cat + "', '" + schema + "', '" + table + "'" + snapshots;
+	                   DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL) + " FROM " +
+	                   SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
+	                                                   loc.table_name, last_snapshot_id, current_snapshot_id);
 	return "(" + insertions + "\nUNION ALL\n" + deletions + ")";
 }
 
@@ -596,14 +569,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				raw_refresh_sql.replace(insert_pos, insert_target_bare.size(), "INSERT INTO " + delta_view_name);
 				insert_pos = raw_refresh_sql.find("INSERT INTO " + delta_view_name);
 			}
-			string col_list = "(";
-			for (size_t i = 0; i < column_names.size(); i++) {
-				if (i > 0) {
-					col_list += ", ";
-				}
-				col_list += SqlUtils::QuoteIdentifier(column_names[i]);
-			}
-			col_list += ") ";
+			string col_list = "(" + SqlUtils::JoinQuotedColumns(column_names) + ") ";
 			string full_insert = "INSERT INTO " + delta_view_name;
 			raw_refresh_sql.insert(insert_pos + full_insert.size(), " " + col_list);
 		}
@@ -623,7 +589,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				keys_set.insert(column_names[kid]);
 			}
 
-			string col_list, val_list, join_cond;
+			string col_list, val_list;
 			for (auto &col : column_names) {
 				if (!col_list.empty()) {
 					col_list += ", ";
@@ -638,12 +604,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					val_list += "0";
 				}
 			}
-			for (size_t i = 0; i < keys.size(); i++) {
-				if (i > 0) {
-					join_cond += " AND ";
-				}
-				join_cond += "d." + keys[i] + " IS NOT DISTINCT FROM m." + keys[i];
-			}
+			string join_cond = SqlUtils::BuildNullSafeMatch(keys, "d", "m");
 
 			companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list + " FROM " +
 			                  delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) + " > 0";
