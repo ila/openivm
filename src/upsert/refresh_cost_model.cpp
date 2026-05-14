@@ -70,11 +70,10 @@ static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_na
                                        const string &table_name, const string &view_name) {
 	RefreshMetadata metadata(con);
 	auto last_snap = metadata.GetLastSnapshotId(view_name, table_name);
-	auto cur_snap_result = con.Query("SELECT id FROM " + catalog_name + ".current_snapshot()");
-	if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0 || cur_snap_result->GetValue(0, 0).IsNull()) {
+	auto cur_snap = metadata.GetCurrentDuckLakeSnapshot(catalog_name);
+	if (cur_snap < 0) {
 		return 0;
 	}
-	auto cur_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
 	if (last_snap == cur_snap) {
 		return 0;
 	}

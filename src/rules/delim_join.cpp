@@ -134,6 +134,73 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, B
 
 static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &replacer);
 
+static uint64_t BindingKey(const ColumnBinding &binding) {
+	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
+}
+
+static void AddColumnBindingReplacements(const vector<ColumnBinding> &old_bindings,
+                                         const vector<ColumnBinding> &new_bindings,
+                                         vector<ReplacementBinding> &replacement_bindings,
+                                         const ColumnBinding *stop_binding = nullptr) {
+	const idx_t count = std::min(old_bindings.size(), new_bindings.size());
+	for (idx_t i = 0; i < count; i++) {
+		if (stop_binding && new_bindings[i] == *stop_binding) {
+			break;
+		}
+		replacement_bindings.emplace_back(old_bindings[i], new_bindings[i]);
+	}
+}
+
+static void AddLeafBindingReplacements(const vector<ColumnBinding> &old_bindings,
+                                       const vector<ColumnBinding> &new_bindings,
+                                       vector<ReplacementBinding> &replacement_bindings,
+                                       const ColumnBinding &mul_binding) {
+	for (auto &old_binding : old_bindings) {
+		for (auto &new_binding : new_bindings) {
+			if (new_binding == mul_binding) {
+				continue;
+			}
+			if (old_binding.column_index != new_binding.column_index) {
+				continue;
+			}
+			replacement_bindings.emplace_back(old_binding, new_binding);
+			break;
+		}
+	}
+}
+
+static ColumnBinding MapTermBinding(ColumnBinding binding, const unordered_map<old_idx, new_idx> &idx_map,
+                                    const vector<ReplacementBinding> &replacement_bindings) {
+	auto idx_entry = idx_map.find(binding.table_index);
+	if (idx_entry != idx_map.end()) {
+		binding.table_index = idx_entry->second;
+	}
+
+	for (idx_t pass = 0; pass <= replacement_bindings.size(); pass++) {
+		bool replaced = false;
+		for (auto &replacement : replacement_bindings) {
+			if (binding == replacement.old_binding) {
+				binding = replacement.new_binding;
+				replaced = true;
+				break;
+			}
+		}
+		if (!replaced) {
+			return binding;
+		}
+	}
+	return binding;
+}
+
+static ColumnBinding FindOutputBinding(const vector<ColumnBinding> &term_bindings, ColumnBinding target) {
+	for (auto &binding : term_bindings) {
+		if (binding == target) {
+			return binding;
+		}
+	}
+	throw InternalException("IncrementalDelimJoinRule: original output binding not found in rewritten term");
+}
+
 static bool ReplaceDelimGets(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node,
                              vector<ReplacementBinding> &replacement_bindings,
                              LogicalComparisonJoin *active_delim_join = nullptr) {
@@ -225,7 +292,7 @@ static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &rep
 
 static void CollectMulBindings(const vector<ColumnBinding> &mul_bindings, unordered_set<uint64_t> &mul_set) {
 	for (auto &mb : mul_bindings) {
-		mul_set.insert((uint64_t)mb.table_index ^ ((uint64_t)mb.column_index * 0x9e3779b97f4a7c15ULL));
+		mul_set.insert(BindingKey(mb));
 	}
 }
 
@@ -321,35 +388,38 @@ ModifiedPlan IncrementalDelimJoinRule::Rewrite(PlanWrapper pw) {
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);
 		vector<ColumnBinding> mul_bindings;
+		vector<ReplacementBinding> output_replacements;
 
 		for (size_t i = 0; i < leaves.size(); i++) {
 			if (!(mask & (1ULL << i))) {
 				continue;
 			}
+			auto &leaf_ref = GetNodeAtPath(term, leaves[i].path);
+			auto leaf_bindings = leaf_ref->GetColumnBindings();
 			DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, pw.view);
+			auto delta_bindings = delta_i.node->GetColumnBindings();
+			AddLeafBindingReplacements(leaf_bindings, delta_bindings, output_replacements, delta_i.mul_binding);
 			mul_bindings.push_back(delta_i.mul_binding);
-			GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
+			leaf_ref = std::move(delta_i.node);
 			UpdateProjectionMapForLeaf(term, leaves[i]);
 		}
 
 		vector<ReplacementBinding> delim_replacements;
 		ReplaceDelimGets(context, binder, term, delim_replacements);
+		output_replacements.insert(output_replacements.end(), delim_replacements.begin(), delim_replacements.end());
 
 		auto term_bindings = term->GetColumnBindings();
 		vector<unique_ptr<Expression>> exprs;
 		unordered_set<uint64_t> mul_set;
 		CollectMulBindings(mul_bindings, mul_set);
-		idx_t output_idx = 0;
-		for (idx_t i = 0; i < term_bindings.size(); i++) {
-			uint64_t key = (uint64_t)term_bindings[i].table_index ^
-			               ((uint64_t)term_bindings[i].column_index * 0x9e3779b97f4a7c15ULL);
-			if (!mul_set.count(key)) {
-				if (output_idx >= output_types.size()) {
-					throw InternalException(
-					    "IncrementalDelimJoinRule: term output binding count exceeds original output types");
-				}
-				exprs.push_back(make_uniq<BoundColumnRefExpression>(output_types[output_idx++], term_bindings[i]));
+		for (idx_t output_idx = 0; output_idx < original_bindings.size(); output_idx++) {
+			auto mapped_binding =
+			    MapTermBinding(original_bindings[output_idx], renumbered.idx_map, output_replacements);
+			if (mul_set.count(BindingKey(mapped_binding))) {
+				throw InternalException("IncrementalDelimJoinRule: original output remapped to multiplicity binding");
 			}
+			auto output_binding = FindOutputBinding(term_bindings, mapped_binding);
+			exprs.push_back(make_uniq<BoundColumnRefExpression>(output_types[output_idx], output_binding));
 		}
 		exprs.push_back(BuildMultiplicityProduct(binder, pw.mul_type, mul_bindings));
 

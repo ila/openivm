@@ -13,6 +13,7 @@
 #include <duckdb/planner/operator/logical_dependent_join.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_set_operation.hpp>
+#include <duckdb/planner/operator/logical_unnest.hpp>
 
 namespace duckdb {
 
@@ -88,6 +89,18 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 		table_reassign[current_idx] = new_idx;
 		proj_ptr->children = std::move(rec_children);
 		return {std::move(proj_ptr), table_reassign, current_bindings};
+	}
+	case LogicalOperatorType::LOGICAL_UNNEST: {
+		auto &unnest = plan->Cast<LogicalUnnest>();
+		const idx_t current_idx = unnest.unnest_index;
+		const idx_t new_idx = binder.GenerateTableIndex();
+		unnest.unnest_index = new_idx;
+		table_reassign[current_idx] = new_idx;
+#if OPENIVM_DEBUG
+		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_UNNEST: Change %zu -> %zu\n", current_idx, new_idx);
+#endif
+		plan->children = std::move(rec_children);
+		return {std::move(plan), table_reassign, current_bindings};
 	}
 	case LogicalOperatorType::LOGICAL_UNION:
 	case LogicalOperatorType::LOGICAL_EXCEPT:

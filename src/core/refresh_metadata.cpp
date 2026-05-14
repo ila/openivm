@@ -89,6 +89,60 @@ string RefreshMetadata::GetLastUpdate(const string &view_name, const string &tab
 	return result->GetValue(0, 0).ToString();
 }
 
+RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string &view_name, const string &table_name,
+                                                                   const string &fallback_catalog,
+                                                                   const string &fallback_schema) {
+	SourceLocation loc;
+	loc.catalog_name = fallback_catalog;
+	loc.schema_name = fallback_schema;
+	loc.table_name = table_name;
+	auto result = con.Query("SELECT source_catalog, source_schema FROM " + string(openivm::DELTA_TABLES_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	                        SqlUtils::EscapeValue(table_name) + "'");
+	if (!result->HasError() && result->RowCount() > 0) {
+		if (!result->GetValue(0, 0).IsNull()) {
+			loc.catalog_name = result->GetValue(0, 0).ToString();
+		}
+		if (!result->GetValue(1, 0).IsNull()) {
+			loc.schema_name = result->GetValue(1, 0).ToString();
+		}
+	}
+	return loc;
+}
+
+string RefreshMetadata::ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
+                                                  const string &fallback_catalog, const string &fallback_schema) {
+	auto loc = GetSourceLocation(view_name, delta_table_name, fallback_catalog, fallback_schema);
+	if (loc.catalog_name.empty()) {
+		return SqlUtils::QuoteIdentifier(delta_table_name);
+	}
+	if (loc.schema_name.empty()) {
+		loc.schema_name = "main";
+	}
+	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, delta_table_name);
+}
+
+RefreshMetadata::DeltaChangeStats RefreshMetadata::GetStandardDeltaChangeStats(const string &delta_table_sql,
+                                                                               const string &last_update) {
+	DeltaChangeStats stats;
+	if (last_update.empty()) {
+		return stats;
+	}
+	auto result =
+	    con.Query("SELECT COUNT(*), SUM(CASE WHEN " + string(openivm::MULTIPLICITY_COL) +
+	              " < 0 THEN 1 ELSE 0 END) FROM " + delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) +
+	              " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return stats;
+	}
+	stats.ok = true;
+	stats.total = result->GetValue(0, 0).GetValue<int64_t>();
+	if (!result->GetValue(1, 0).IsNull()) {
+		stats.deletes = result->GetValue(1, 0).GetValue<int64_t>();
+	}
+	return stats;
+}
+
 void RefreshMetadata::UpdateTimestamp(const string &view_name) {
 	auto result = con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
 	                        " SET last_update = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
@@ -249,6 +303,27 @@ string RefreshMetadata::GetCatalogType(const string &view_name, const string &ta
 
 bool RefreshMetadata::IsDuckLakeTable(const string &view_name, const string &table_name) {
 	return GetCatalogType(view_name, table_name) == "ducklake";
+}
+
+bool RefreshMetadata::IsDuckLakeCatalog(const string &catalog_name) {
+	if (catalog_name.empty()) {
+		return false;
+	}
+	auto result = con.Query("SELECT type FROM duckdb_databases() WHERE database_name = '" +
+	                        SqlUtils::EscapeValue(catalog_name) + "' LIMIT 1");
+	return !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
+	       StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "ducklake");
+}
+
+int64_t RefreshMetadata::GetCurrentDuckLakeSnapshot(const string &catalog_name) {
+	if (catalog_name.empty()) {
+		return -1;
+	}
+	auto result = con.Query("SELECT id FROM " + SqlUtils::QuoteIdentifier(catalog_name) + ".current_snapshot()");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return -1;
+	}
+	return result->GetValue(0, 0).GetValue<int64_t>();
 }
 
 int64_t RefreshMetadata::GetLastSnapshotId(const string &view_name, const string &table_name) {

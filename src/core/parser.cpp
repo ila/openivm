@@ -3,6 +3,7 @@
 #include "core/incremental_checker.hpp"
 #include "core/plan_rewrite.hpp"
 #include "core/openivm_constants.hpp"
+#include "core/refresh_metadata.hpp"
 #include "lpts_pipeline.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
@@ -129,33 +130,6 @@ static void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_p
 static bool BoolSetting(ClientContext &context, const string &name) {
 	Value value;
 	return context.TryGetCurrentSetting(name, value) && !value.IsNull() && BooleanValue::Get(value);
-}
-
-static const char *ParserRefreshTypeName(RefreshType type) {
-	switch (type) {
-	case RefreshType::AGGREGATE_HAVING:
-		return "AGGREGATE_HAVING";
-	case RefreshType::AGGREGATE_GROUP:
-		return "AGGREGATE_GROUP";
-	case RefreshType::SIMPLE_AGGREGATE:
-		return "SIMPLE_AGGREGATE";
-	case RefreshType::SIMPLE_PROJECTION:
-		return "SIMPLE_PROJECTION";
-	case RefreshType::WINDOW_PARTITION:
-		return "WINDOW_PARTITION";
-	case RefreshType::GROUP_RECOMPUTE:
-		return "GROUP_RECOMPUTE";
-	case RefreshType::DISTINCT_INCREMENTAL:
-		return "DISTINCT_INCREMENTAL";
-	case RefreshType::SEMI_ANTI_RECOMPUTE:
-		return "SEMI_ANTI_RECOMPUTE";
-	case RefreshType::TOP_K:
-		return "TOP_K";
-	case RefreshType::FULL_REFRESH:
-		return "FULL_REFRESH";
-	default:
-		return "UNKNOWN";
-	}
 }
 
 static string StripTrailingSemicolon(string sql) {
@@ -483,41 +457,6 @@ static void CollectSourceTables(LogicalOperator *op, unordered_map<string, Sourc
 	for (auto &child : op->children) {
 		CollectSourceTables(child.get(), source_table_info);
 	}
-}
-
-static string QualifiedTablePrefix(const string &catalog_name, const string &schema_name) {
-	return KeywordHelper::WriteOptionallyQuoted(catalog_name) + "." +
-	       KeywordHelper::WriteOptionallyQuoted(schema_name) + ".";
-}
-
-static string QuoteQualifiedPrefix(const string &prefix) {
-	string result;
-	size_t start = 0;
-	while (start < prefix.size()) {
-		size_t dot = prefix.find('.', start);
-		string part = prefix.substr(start, dot == string::npos ? string::npos : dot - start);
-		if (!part.empty()) {
-			if (!result.empty()) {
-				result += ".";
-			}
-			result += KeywordHelper::WriteOptionallyQuoted(part);
-		}
-		if (dot == string::npos) {
-			break;
-		}
-		start = dot + 1;
-	}
-	return result.empty() ? "" : result + ".";
-}
-
-static bool CatalogIsDuckLake(Connection &con, const string &catalog_name) {
-	if (catalog_name.empty()) {
-		return false;
-	}
-	auto result = con.Query("SELECT type FROM duckdb_databases() WHERE database_name = '" +
-	                        SqlUtils::EscapeValue(catalog_name) + "' LIMIT 1");
-	return !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
-	       StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "ducklake");
 }
 
 static bool RelationExists(Connection &con, const string &qualified_name) {
@@ -2657,7 +2596,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		auto dot_pos = full_view_name.rfind('.');
 		if (dot_pos != string::npos) {
 			auto raw_prefix = full_view_name.substr(0, dot_pos);
-			view_catalog_prefix = QuoteQualifiedPrefix(raw_prefix + ".");
+			view_catalog_prefix = SqlUtils::QuoteQualifiedPrefix(raw_prefix + ".");
 			auto schema_dot_pos = raw_prefix.rfind('.');
 			if (schema_dot_pos != string::npos) {
 				view_target_catalog = raw_prefix.substr(0, schema_dot_pos);
@@ -2674,16 +2613,17 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			// than the physical default. Metadata tables (unqualified) stay in the physical
 			// default — PRAGMA refresh() always uses a fresh connection without USE.
 			if (!current_catalog.empty() && current_catalog != default_db) {
-				view_catalog_prefix = QualifiedTablePrefix(current_catalog, current_schema);
+				view_catalog_prefix = SqlUtils::QualifiedPrefix(current_catalog, current_schema);
 			}
 		}
-		bool target_is_ducklake = CatalogIsDuckLake(con, view_target_catalog);
+		RefreshMetadata metadata(con);
+		bool target_is_ducklake = metadata.IsDuckLakeCatalog(view_target_catalog);
 		string internal_catalog_prefix = view_catalog_prefix;
 		// Native MVs created from another active catalog keep OpenIVM state in the physical
 		// default DB. DuckLake-targeted MVs store their data/delta tables in DuckLake so
 		// initial materialization follows the same storage path as DuckLake CTAS.
 		if (!target_is_ducklake && !view_catalog_prefix.empty() && default_db != "memory") {
-			internal_catalog_prefix = QualifiedTablePrefix(default_db, default_schema);
+			internal_catalog_prefix = SqlUtils::QualifiedPrefix(default_db, default_schema);
 		}
 		string data_table = IncrementalTableNames::DataTableName(view_name);
 		string qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
@@ -3447,17 +3387,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, projection=%d, group_cols=%zu)\n",
-		                    refresh_type == RefreshType::AGGREGATE_GROUP        ? "AGGREGATE_GROUP"
-		                    : refresh_type == RefreshType::SIMPLE_AGGREGATE     ? "SIMPLE_AGGREGATE"
-		                    : refresh_type == RefreshType::SIMPLE_PROJECTION    ? "SIMPLE_PROJECTION"
-		                    : refresh_type == RefreshType::FULL_REFRESH         ? "FULL_REFRESH"
-		                    : refresh_type == RefreshType::WINDOW_PARTITION     ? "WINDOW_PARTITION"
-		                    : refresh_type == RefreshType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
-		                    : refresh_type == RefreshType::DISTINCT_INCREMENTAL ? "DISTINCT_INCREMENTAL"
-		                    : refresh_type == RefreshType::SEMI_ANTI_RECOMPUTE  ? "SEMI_ANTI_RECOMPUTE"
-		                                                                        : "UNKNOWN",
-		                    (int)classification.found_aggregation, (int)classification.found_projection,
-		                    aggregate_columns.size());
+		                    RefreshTypeName(refresh_type), (int)classification.found_aggregation,
+		                    (int)classification.found_projection, aggregate_columns.size());
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
 		for (const auto &t : table_names) {
 			OPENIVM_DEBUG_PRINT(" %s", t.c_str());
@@ -3478,7 +3409,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 		// --- System tables DDL ---
 		add_profile_marker("create_mv_system_tables",
-		                   "refresh_type=" + string(ParserRefreshTypeName(refresh_type)) +
+		                   "refresh_type=" + string(RefreshTypeName(refresh_type)) +
 		                       "; lpts_fallback=" + string(lpts_fallback ? "true" : "false"));
 		// Matcher metadata columns (signature_hash..nullified_columns_json) stay
 		// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
@@ -3882,9 +3813,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		if (!dl_table_info.empty()) {
 			// Use the first entry's catalog — all source tables in one MV share one catalog.
 			string cat = dl_table_info.begin()->second.catalog_name;
-			auto snap_result = con.Query("SELECT id FROM " + cat + ".current_snapshot()");
-			if (!snap_result->HasError() && snap_result->RowCount() > 0) {
-				dl_snapshot_val = snap_result->GetValue(0, 0).ToString();
+			auto snapshot_id = metadata.GetCurrentDuckLakeSnapshot(cat);
+			if (snapshot_id >= 0) {
+				dl_snapshot_val = to_string(snapshot_id);
 			}
 		}
 
@@ -3943,9 +3874,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// OpenIVM metadata in the physical default catalog. CREATE/REFRESH split metadata
 		// writes from DuckLake data writes because DuckDB cannot commit one transaction
 		// across both catalogs.
-		string stage_table = "openivm_stage_" + view_name;
-		string qstage =
-		    QualifiedTablePrefix(default_db, default_schema) + KeywordHelper::WriteOptionallyQuoted(stage_table);
 		if (BoolSetting(context, "openivm_explain_initial_load")) {
 			// This diagnostic intentionally reports the exact first heavy statement that
 			// CREATE MV will run. DuckLake-targeted MVs should now write openivm_data_*
@@ -3957,7 +3885,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			string diagnostic;
 			diagnostic += "\n[OpenIVM initial-load diagnostic]\n";
 			diagnostic += "view_name: " + view_name + "\n";
-			diagnostic += "refresh_type: " + string(ParserRefreshTypeName(refresh_type)) + "\n";
+			diagnostic += "refresh_type: " + string(RefreshTypeName(refresh_type)) + "\n";
 			diagnostic += "lpts_fallback: " + string(lpts_fallback ? "true" : "false") + "\n";
 			diagnostic += "uses_staging_table: false\n";
 			diagnostic += "initial_load_statement:\n" + initial_load_statement + "\n\n";
@@ -4000,7 +3928,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 		add_cleanup("DROP VIEW IF EXISTS " + qvn);
 		add_cleanup("DROP TABLE IF EXISTS " + qdt);
-		add_cleanup("DROP TABLE IF EXISTS " + qstage);
 		if (pac_loaded) {
 			add_profile_marker("create_mv_session_settings", "pac");
 			ddl.push_back("SET pac_check = false");
@@ -4082,7 +4009,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				schema_value = Value(current_schema.empty() ? "main" : current_schema);
 			}
 
-			auto catalog_schema = QualifiedTablePrefix(catalog_value.ToString(), schema_value.ToString());
+			auto catalog_schema = SqlUtils::QualifiedPrefix(catalog_value.ToString(), schema_value.ToString());
 
 			ddl.push_back("create table if not exists " + catalog_schema +
 			              KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(table_name)) +

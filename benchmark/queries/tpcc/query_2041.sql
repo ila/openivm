@@ -1,2 +1,2 @@
--- {"operators": "UNNEST,TABLE_FUNCTION,INNER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK", "non_incr_reason": "op:UNNEST"}
+-- {"operators": "UNNEST,TABLE_FUNCTION,INNER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK"}
 SELECT u.flag, COUNT(*) AS rows_seen, SUM(s.S_QUANTITY * i.I_PRICE) AS value_seen FROM STOCK s JOIN ITEM i ON s.S_I_ID = i.I_ID CROSS JOIN UNNEST([s.S_QUANTITY < 20, i.I_PRICE > 50]) AS u(flag) GROUP BY u.flag;

@@ -46,6 +46,25 @@ public:
 	// Get the last_update timestamp for a specific delta table entry.
 	string GetLastUpdate(const string &view_name, const string &table_name);
 
+	struct SourceLocation {
+		string catalog_name;
+		string schema_name;
+		string table_name;
+	};
+
+	SourceLocation GetSourceLocation(const string &view_name, const string &table_name,
+	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
+	string ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
+	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
+
+	struct DeltaChangeStats {
+		bool ok = false;
+		int64_t total = 0;
+		int64_t deletes = 0;
+	};
+
+	DeltaChangeStats GetStandardDeltaChangeStats(const string &delta_table_sql, const string &last_update);
+
 	// Update the last_update timestamp to now() for all delta tables of a view.
 	void UpdateTimestamp(const string &view_name);
 
@@ -90,6 +109,10 @@ public:
 
 	// Check if a base table entry is backed by DuckLake.
 	bool IsDuckLakeTable(const string &view_name, const string &table_name);
+
+	bool IsDuckLakeCatalog(const string &catalog_name);
+
+	int64_t GetCurrentDuckLakeSnapshot(const string &catalog_name);
 
 	// Get the DuckLake snapshot ID at last refresh. Returns -1 if not set.
 	int64_t GetLastSnapshotId(const string &view_name, const string &table_name);

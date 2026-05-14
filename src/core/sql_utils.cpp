@@ -3,15 +3,20 @@
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
 
+#include <cctype>
+#include <cstring>
 #include <fstream>
 #include <regex>
 #include <sstream>
-#include <cstring>
 
 namespace duckdb {
 
 static bool IsIdentifierChar(char c) {
 	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static bool IsQualifiedIdentifierChar(char c) {
+	return IsIdentifierChar(c) || c == '.';
 }
 
 static void SkipWhitespace(const string &sql, size_t &pos) {
@@ -133,6 +138,60 @@ static bool ReadCreateTargetName(const string &sql, const string &object_keyword
 		}
 		out += parts[i];
 	}
+	return true;
+}
+
+static bool ReadIdentifierSegment(const string &sql, idx_t &pos, string &segment) {
+	if (pos >= sql.size()) {
+		return false;
+	}
+	idx_t start = pos;
+	if (sql[pos] == '"') {
+		pos++;
+		string unquoted;
+		while (pos < sql.size()) {
+			char c = sql[pos++];
+			if (c == '"') {
+				if (pos < sql.size() && sql[pos] == '"') {
+					unquoted += '"';
+					pos++;
+					continue;
+				}
+				segment = unquoted;
+				return true;
+			}
+			unquoted += c;
+		}
+		pos = start;
+		return false;
+	}
+	if (!(std::isalpha(static_cast<unsigned char>(sql[pos])) || sql[pos] == '_')) {
+		return false;
+	}
+	pos++;
+	while (pos < sql.size() && IsIdentifierChar(sql[pos])) {
+		pos++;
+	}
+	segment = sql.substr(start, pos - start);
+	return true;
+}
+
+static bool ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end, string &identifier) {
+	idx_t pos = start;
+	string segment;
+	if (!ReadIdentifierSegment(sql, pos, segment)) {
+		return false;
+	}
+	identifier = segment;
+	while (pos < sql.size() && sql[pos] == '.') {
+		idx_t dot_pos = pos++;
+		if (!ReadIdentifierSegment(sql, pos, segment)) {
+			pos = dot_pos;
+			break;
+		}
+		identifier += "." + segment;
+	}
+	end = pos;
 	return true;
 }
 
@@ -515,9 +574,295 @@ string SqlUtils::FullDeltaName(const string &catalog, const string &schema, cons
 	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(DeltaName(base));
 }
 
+string SqlUtils::QualifiedPrefix(const string &catalog, const string &schema) {
+	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + ".";
+}
+
+string SqlUtils::QuoteQualifiedPrefix(const string &prefix) {
+	if (prefix.empty()) {
+		return "";
+	}
+	vector<string> parts;
+	string current;
+	for (auto c : prefix) {
+		if (c == '.') {
+			if (!current.empty()) {
+				parts.push_back(current);
+				current.clear();
+			}
+			continue;
+		}
+		current += c;
+	}
+	if (!current.empty()) {
+		parts.push_back(current);
+	}
+	string quoted;
+	for (auto &part : parts) {
+		quoted += QuoteIdentifier(part) + ".";
+	}
+	return quoted;
+}
+
 bool SqlUtils::IsDelta(const string &name) {
 	static const string prefix(openivm::DELTA_PREFIX);
 	return name.size() >= prefix.size() && name.rfind(prefix, 0) == 0;
+}
+
+string SqlUtils::JoinQuotedColumns(const vector<string> &columns) {
+	string result;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += QuoteIdentifier(columns[i]);
+	}
+	return result;
+}
+
+string SqlUtils::JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias) {
+	string result;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += ", ";
+		}
+		result += alias + "." + QuoteIdentifier(columns[i]);
+	}
+	return result;
+}
+
+string SqlUtils::BuildAllNullPredicate(const vector<string> &columns) {
+	string result;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += " AND ";
+		}
+		result += QuoteIdentifier(columns[i]) + " IS NULL";
+	}
+	return result;
+}
+
+string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias) {
+	string result;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += " AND ";
+		}
+		result += lhs_alias + "." + QuoteIdentifier(columns[i]) + " IS NOT DISTINCT FROM " + rhs_alias + "." +
+		          QuoteIdentifier(columns[i]);
+	}
+	return result;
+}
+
+string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
+                                           const string &right_prefix) {
+	string result;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += " AND ";
+		}
+		auto column = QuoteIdentifier(columns[i]);
+		result += left_prefix + column + " IS NOT DISTINCT FROM " + right_prefix + column;
+	}
+	return result;
+}
+
+string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql) {
+	return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
+}
+
+string SqlUtils::ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement) {
+	if (needle.empty()) {
+		return haystack;
+	}
+	size_t pos = 0;
+	while ((pos = haystack.find(needle, pos)) != string::npos) {
+		haystack.replace(pos, needle.size(), replacement);
+		pos += replacement.size();
+	}
+	return haystack;
+}
+
+vector<string> SqlUtils::ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
+                                                    const string &replacement) {
+	vector<string> variants;
+	if (needle.empty()) {
+		return variants;
+	}
+	size_t pos = 0;
+	while ((pos = haystack.find(needle, pos)) != string::npos) {
+		string variant = haystack;
+		variant.replace(pos, needle.size(), replacement);
+		variants.push_back(std::move(variant));
+		pos += needle.size();
+	}
+	return variants;
+}
+
+bool SqlUtils::IdentifierMatchesTable(const string &identifier, const string &table_name) {
+	if (StringUtil::CIEquals(identifier, table_name)) {
+		return true;
+	}
+	if (identifier.size() <= table_name.size()) {
+		return false;
+	}
+	auto suffix = identifier.substr(identifier.size() - table_name.size());
+	return identifier[identifier.size() - table_name.size() - 1] == '.' && StringUtil::CIEquals(suffix, table_name);
+}
+
+string SqlUtils::ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement) {
+	if (table_name.empty()) {
+		return sql;
+	}
+	string result;
+	result.reserve(sql.size());
+	bool in_single_quote = false;
+	bool expect_table = false;
+	for (idx_t i = 0; i < sql.size();) {
+		char c = sql[i];
+		if (c == '\'') {
+			result += c;
+			i++;
+			if (in_single_quote && i < sql.size() && sql[i] == '\'') {
+				result += sql[i++];
+				continue;
+			}
+			in_single_quote = !in_single_quote;
+			continue;
+		}
+		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
+			idx_t start = i;
+			if (expect_table) {
+				idx_t end = i;
+				string qualified_identifier;
+				if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier) &&
+				    IdentifierMatchesTable(qualified_identifier, table_name)) {
+					idx_t at_pos = end;
+					while (at_pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[at_pos]))) {
+						at_pos++;
+					}
+					if (StringUtil::CIStartsWith(sql.substr(at_pos), "AT (")) {
+						idx_t depth = 0;
+						while (at_pos < sql.size()) {
+							if (sql[at_pos] == '(') {
+								depth++;
+							} else if (sql[at_pos] == ')') {
+								depth--;
+								if (depth == 0) {
+									at_pos++;
+									break;
+								}
+							}
+							at_pos++;
+						}
+						end = at_pos;
+					}
+					result += replacement;
+					i = end;
+					expect_table = false;
+					continue;
+				}
+			}
+			bool in_identifier_quote = c == '"';
+			i++;
+			while (i < sql.size()) {
+				char nc = sql[i];
+				if (in_identifier_quote) {
+					i++;
+					if (nc == '"') {
+						break;
+					}
+					continue;
+				}
+				if (!IsQualifiedIdentifierChar(nc)) {
+					break;
+				}
+				i++;
+			}
+			string token = sql.substr(start, i - start);
+			string unquoted = token;
+			if (unquoted.size() >= 2 && unquoted.front() == '"' && unquoted.back() == '"') {
+				unquoted = unquoted.substr(1, unquoted.size() - 2);
+			}
+			if (expect_table && IdentifierMatchesTable(unquoted, table_name)) {
+				result += replacement;
+				expect_table = false;
+				continue;
+			}
+			result += token;
+			string lower = StringUtil::Lower(unquoted);
+			expect_table = lower == "from" || lower == "join" || lower == "update" || lower == "into";
+			continue;
+		}
+		result += c;
+		if (!std::isspace(static_cast<unsigned char>(c))) {
+			expect_table = false;
+		}
+		i++;
+	}
+	return result;
+}
+
+vector<string> SqlUtils::ReplaceEachTableReference(const string &sql, const string &table_name,
+                                                   const string &replacement) {
+	vector<string> variants;
+	if (table_name.empty()) {
+		return variants;
+	}
+	bool in_single_quote = false;
+	bool expect_table = false;
+	for (idx_t i = 0; i < sql.size();) {
+		char c = sql[i];
+		if (c == '\'') {
+			i++;
+			if (in_single_quote && i < sql.size() && sql[i] == '\'') {
+				i++;
+				continue;
+			}
+			in_single_quote = !in_single_quote;
+			continue;
+		}
+		if (!in_single_quote && (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '"')) {
+			idx_t start = i;
+			idx_t end = i;
+			string qualified_identifier;
+			if (expect_table && ReadQualifiedIdentifier(sql, start, end, qualified_identifier) &&
+			    IdentifierMatchesTable(qualified_identifier, table_name)) {
+				string variant = sql;
+				variant.replace(start, end - start, replacement);
+				variants.push_back(std::move(variant));
+			}
+			bool in_identifier_quote = c == '"';
+			i++;
+			while (i < sql.size()) {
+				char nc = sql[i];
+				if (in_identifier_quote) {
+					i++;
+					if (nc == '"') {
+						break;
+					}
+					continue;
+				}
+				if (!IsQualifiedIdentifierChar(nc)) {
+					break;
+				}
+				i++;
+			}
+			string token = sql.substr(start, i - start);
+			string unquoted = token;
+			if (unquoted.size() >= 2 && unquoted.front() == '"' && unquoted.back() == '"') {
+				unquoted = unquoted.substr(1, unquoted.size() - 2);
+			}
+			string lower = StringUtil::Lower(unquoted);
+			expect_table = lower == "from" || lower == "join" || lower == "update" || lower == "into";
+			continue;
+		}
+		if (!std::isspace(static_cast<unsigned char>(c))) {
+			expect_table = false;
+		}
+		i++;
+	}
+	return variants;
 }
 
 int64_t SqlUtils::ParseRefreshInterval(const string &interval_str) {

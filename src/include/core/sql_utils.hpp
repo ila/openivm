@@ -28,8 +28,24 @@ public:
 	static string DeltaName(const string &name);
 	static string FullName(const string &catalog, const string &schema, const string &table);
 	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
+	static string QualifiedPrefix(const string &catalog, const string &schema);
+	static string QuoteQualifiedPrefix(const string &prefix);
 	static bool IsDelta(const string &name);
 	static string GenerateDeltaTable(string &query);
+	static string JoinQuotedColumns(const vector<string> &columns);
+	static string JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias);
+	static string BuildAllNullPredicate(const vector<string> &columns);
+	static string BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias);
+	static string BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
+	                                        const string &right_prefix);
+	static string BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql);
+	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);
+	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
+	                                                 const string &replacement);
+	static string ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement);
+	static vector<string> ReplaceEachTableReference(const string &sql, const string &table_name,
+	                                                const string &replacement);
+	static bool IdentifierMatchesTable(const string &identifier, const string &table_name);
 
 	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.
 	/// Returns -1 if no interval clause found. Throws on invalid format or < 60 seconds.

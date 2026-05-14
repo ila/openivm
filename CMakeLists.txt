@@ -17,8 +17,14 @@ set(EXTENSION_SOURCES
     src/core/refresh_metadata.cpp
     src/core/incremental_checker.cpp
     src/core/plan_rewrite.cpp
+    src/core/plan_rewrite_aggregates.cpp
     src/upsert/refresh.cpp
+    src/upsert/refresh_delta_fast_paths.cpp
+    src/upsert/refresh_helpers.cpp
+    src/upsert/refresh_sql.cpp
+    src/upsert/refresh_window.cpp
     src/upsert/refresh_compiler.cpp
+    src/upsert/refresh_compiler_aux.cpp
     src/upsert/refresh_cost_model.cpp
     src/upsert/refresh_index_regen.cpp
     src/rules/incremental_rewrite_rule.cpp
@@ -29,6 +35,7 @@ set(EXTENSION_SOURCES
     src/rules/projection.cpp
     src/rules/aggregate.cpp
     src/rules/join.cpp
+    src/rules/join_output.cpp
     src/rules/delim_join.cpp
     src/rules/ducklake_join.cpp
     src/rules/union.cpp

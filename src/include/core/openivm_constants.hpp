@@ -75,6 +75,33 @@ enum class RefreshType : uint8_t {
 	SEMI_ANTI_RECOMPUTE   // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
 };
 
+inline const char *RefreshTypeName(RefreshType type) {
+	switch (type) {
+	case RefreshType::AGGREGATE_HAVING:
+		return "AGGREGATE_HAVING";
+	case RefreshType::AGGREGATE_GROUP:
+		return "AGGREGATE_GROUP";
+	case RefreshType::SIMPLE_AGGREGATE:
+		return "SIMPLE_AGGREGATE";
+	case RefreshType::SIMPLE_PROJECTION:
+		return "SIMPLE_PROJECTION";
+	case RefreshType::WINDOW_PARTITION:
+		return "WINDOW_PARTITION";
+	case RefreshType::GROUP_RECOMPUTE:
+		return "GROUP_RECOMPUTE";
+	case RefreshType::DISTINCT_INCREMENTAL:
+		return "DISTINCT_INCREMENTAL";
+	case RefreshType::SEMI_ANTI_RECOMPUTE:
+		return "SEMI_ANTI_RECOMPUTE";
+	case RefreshType::TOP_K:
+		return "TOP_K";
+	case RefreshType::FULL_REFRESH:
+		return "FULL_REFRESH";
+	default:
+		return "UNKNOWN";
+	}
+}
+
 } // namespace duckdb
 
 #endif // OPENIVM_CONSTANTS_HPP

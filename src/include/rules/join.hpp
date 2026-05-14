@@ -25,6 +25,12 @@ void DemoteLeftJoins(LogicalOperator *node);
 
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf);
 
+unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
+                                                 const vector<LogicalType> &types, Binder &binder);
+
+ColumnBinding ReplaceJoinOutputBindings(const vector<ColumnBinding> &original_bindings,
+                                        unique_ptr<LogicalOperator> &result, LogicalOperator &root);
+
 class IncrementalJoinRule : public IncrementalRule {
 public:
 	ModifiedPlan Rewrite(PlanWrapper pw) override;

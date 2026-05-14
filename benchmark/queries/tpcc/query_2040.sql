@@ -1,2 +1,2 @@
--- {"operators": "UNNEST,TABLE_FUNCTION,CTE,AGGREGATE", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK", "non_incr_reason": "op:UNNEST"}
+-- {"operators": "UNNEST,TABLE_FUNCTION,CTE,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK"}
 WITH exploded AS (SELECT s.S_W_ID, s.S_I_ID, d.dist_code FROM STOCK s CROSS JOIN UNNEST([s.S_DIST_01, s.S_DIST_02, s.S_DIST_03, s.S_DIST_04]) AS d(dist_code)) SELECT S_W_ID, COUNT(DISTINCT dist_code) AS dist_codes FROM exploded GROUP BY S_W_ID;

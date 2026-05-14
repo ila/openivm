@@ -19,10 +19,8 @@
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
-#include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/operator/logical_set_operation.hpp"
 
 namespace duckdb {
 
@@ -934,65 +932,6 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
 	return terms;
 }
 
-// ============================================================================
-// AssembleUnionAll: combine terms with UNION ALL + clean projection
-// ============================================================================
-static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
-                                                    const vector<LogicalType> &types, Binder &binder) {
-	if (terms.empty()) {
-		vector<ColumnBinding> bindings;
-		auto table_index = binder.GenerateTableIndex();
-		for (idx_t i = 0; i < types.size(); i++) {
-			bindings.emplace_back(table_index, i);
-		}
-		auto empty = make_uniq<LogicalEmptyResult>(types, std::move(bindings));
-		empty->ResolveOperatorTypes();
-		return std::move(empty);
-	}
-	auto result = std::move(terms[0]);
-	for (size_t i = 1; i < terms.size(); i++) {
-		auto union_table_index = binder.GenerateTableIndex();
-		result = make_uniq<LogicalSetOperation>(union_table_index, types.size(), std::move(result), std::move(terms[i]),
-		                                        LogicalOperatorType::LOGICAL_UNION, true);
-		result->types = types;
-	}
-
-	// Clean projection to disambiguate column names for LPTS
-	auto union_bindings = result->GetColumnBindings();
-	vector<unique_ptr<Expression>> clean_exprs;
-	for (idx_t i = 0; i < union_bindings.size(); i++) {
-		clean_exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], union_bindings[i]));
-	}
-	auto clean_proj = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(clean_exprs));
-	clean_proj->children.push_back(std::move(result));
-	clean_proj->ResolveOperatorTypes();
-	return std::move(clean_proj);
-}
-
-// ============================================================================
-// ReplaceOutputBindings: map original bindings to new UNION ALL output
-// ============================================================================
-static ColumnBinding ReplaceOutputBindings(const vector<ColumnBinding> &original_bindings,
-                                           unique_ptr<LogicalOperator> &result, LogicalOperator &root) {
-	auto union_bindings = result->GetColumnBindings();
-	if (union_bindings.size() < 2) {
-		throw InternalException("Join rewrite produced too few bindings (%zu)", union_bindings.size());
-	}
-	ColumnBindingReplacer replacer;
-	idx_t map_count = std::min(original_bindings.size(), union_bindings.size() - 1);
-	OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Binding replacement: %zu mappings (original=%zu, union=%zu)\n",
-	                    map_count, original_bindings.size(), union_bindings.size());
-	for (idx_t col_idx = 0; col_idx < map_count; ++col_idx) {
-		replacer.replacement_bindings.emplace_back(original_bindings[col_idx], union_bindings[col_idx]);
-	}
-	replacer.stop_operator = result;
-	replacer.VisitOperator(root);
-	return union_bindings.back();
-}
-
-// ============================================================================
-// IncrementalJoinRule::Rewrite — main entry point
-// ============================================================================
 ModifiedPlan IncrementalJoinRule::Rewrite(PlanWrapper pw) {
 	ClientContext &context = pw.input.context;
 	Binder &binder = pw.input.optimizer.binder;
@@ -1045,10 +984,10 @@ ModifiedPlan IncrementalJoinRule::Rewrite(PlanWrapper pw) {
 	                          : BuildInclusionExclusionTerms(pw, context, binder, leaves, has_left_join);
 
 	// 4. UNION ALL
-	auto result = AssembleUnionAll(terms, types, binder);
+	auto result = AssembleJoinUnionAll(terms, types, binder);
 
 	// 5. Rebind parent references
-	ColumnBinding new_mul_binding = ReplaceOutputBindings(original_bindings, result, *pw.root);
+	ColumnBinding new_mul_binding = ReplaceJoinOutputBindings(original_bindings, result, *pw.root);
 
 	pw.plan = std::move(result);
 	OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Done, %zu terms unioned, mul_binding: table=%lu col=%lu\n", terms.size(),
