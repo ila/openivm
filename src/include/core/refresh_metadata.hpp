@@ -176,6 +176,18 @@ public:
 
 	bool GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out);
 
+	struct WindowPartitionLineageOp {
+		string kind;
+		string output_col;
+		string source;
+		string source_col;
+		string lookup;
+		string lookup_col;
+		string lookup_out;
+	};
+
+	bool GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out);
+
 	struct FilteredGroupCountAuxMeta {
 		string aux_table;
 		string source;

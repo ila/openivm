@@ -961,18 +961,25 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			}
 		}
 
-		// 10 trailing NULLs: 8 matcher metadata columns + distinct/semi-anti aux metadata.
+		// 11 trailing NULLs: 8 matcher metadata columns plus aux/lineage metadata.
 		// Matcher metadata is populated by the Stage I block below when
-		// openivm_enable_view_matching=true. distinct_aux_meta_json is populated by a
-		// follow-up UPDATE if refresh_type == DISTINCT_INCREMENTAL and the extractor
-		// recognised the DISTINCT shape.
+		// openivm_enable_view_matching=true. The aux/lineage columns are populated by
+		// follow-up UPDATEs when the corresponding refresh strategy recognizes a shape.
 		metadata_ddl.push_back("insert or replace into " + string(openivm::VIEWS_TABLE) + " values ('" + view_name +
 		                       "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
 		                       to_string((int)refresh_type) + ", " + (classification.found_minmax ? "true" : "false") +
 		                       ", " + (classification.found_left_join ? "true" : "false") + ", now(), " + refresh_val +
 		                       ", false, " + group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
 		                       (classification.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val +
-		                       ", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
+		                       ", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
+
+		if (refresh_type == RefreshType::WINDOW_PARTITION) {
+			string lineage_json = BuildWindowPartitionLineageJson(plan.get(), window_partition_columns);
+			if (!lineage_json.empty()) {
+				aux_metadata_ddl.push_back(
+				    BuildUpdateViewJsonSQL("window_partition_lineage_json", lineage_json, view_name));
+			}
+		}
 
 		Value match_flag_val;
 		bool view_matching_enabled = context.TryGetCurrentSetting("openivm_enable_view_matching", match_flag_val) &&

@@ -470,6 +470,58 @@ static bool ExtractJsonStringArray(const string &json, const string &key, vector
 	return true;
 }
 
+static vector<string> ExtractJsonObjectsFromArray(const string &json, const string &key) {
+	vector<string> objects;
+	string needle = "\"" + key + "\":[";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return objects;
+	}
+	pos += needle.size();
+	int depth = 0;
+	bool in_string = false;
+	bool escaped = false;
+	size_t object_start = string::npos;
+	for (; pos < json.size(); pos++) {
+		char c = json[pos];
+		if (in_string) {
+			if (escaped) {
+				escaped = false;
+			} else if (c == '\\') {
+				escaped = true;
+			} else if (c == '"') {
+				in_string = false;
+			}
+			continue;
+		}
+		if (c == '"') {
+			in_string = true;
+			continue;
+		}
+		if (c == '{') {
+			if (depth == 0) {
+				object_start = pos;
+			}
+			depth++;
+			continue;
+		}
+		if (c == '}') {
+			if (depth > 0) {
+				depth--;
+				if (depth == 0 && object_start != string::npos) {
+					objects.push_back(json.substr(object_start, pos - object_start + 1));
+					object_start = string::npos;
+				}
+			}
+			continue;
+		}
+		if (c == ']' && depth == 0) {
+			break;
+		}
+	}
+	return objects;
+}
+
 } // namespace
 
 bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
@@ -517,6 +569,38 @@ bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMet
 	ExtractJsonStringArray(json, "left_exprs", out.left_exprs);
 	ok &= ExtractJsonStringArray(json, "output_cols", out.output_cols);
 	return ok;
+}
+
+bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out) {
+	auto result = con.Query("SELECT window_partition_lineage_json FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	string json = result->GetValue(0, 0).ToString();
+	if (json.empty()) {
+		return false;
+	}
+	vector<string> objects = ExtractJsonObjectsFromArray(json, "ops");
+	for (auto &object : objects) {
+		WindowPartitionLineageOp op;
+		if (!ExtractJsonString(object, "kind", op.kind) || !ExtractJsonString(object, "out", op.output_col) ||
+		    !ExtractJsonString(object, "source", op.source) ||
+		    !ExtractJsonString(object, "source_col", op.source_col)) {
+			continue;
+		}
+		if (op.kind == "lookup") {
+			if (!ExtractJsonString(object, "lookup", op.lookup) ||
+			    !ExtractJsonString(object, "lookup_col", op.lookup_col) ||
+			    !ExtractJsonString(object, "lookup_out", op.lookup_out)) {
+				continue;
+			}
+		} else if (op.kind != "direct") {
+			continue;
+		}
+		out.push_back(std::move(op));
+	}
+	return !out.empty();
 }
 
 bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {

@@ -10,11 +10,13 @@
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_window.hpp"
 #include "storage/ducklake_scan.hpp"
 #include "storage/ducklake_table_entry.hpp"
 
@@ -706,6 +708,273 @@ static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr,
 		column_index = next.binding.column_index;
 	}
 	return "";
+}
+
+struct BaseColumnRef {
+	string table;
+	string column;
+};
+
+static bool ResolveBindingToBaseRef(ColumnBinding binding,
+                                    const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                    const unordered_map<idx_t, LogicalGet *> &get_by_index, BaseColumnRef &out) {
+	idx_t table_index = binding.table_index;
+	idx_t column_index = binding.column_index;
+	for (int depth = 0; depth < 16; depth++) {
+		auto get_it = get_by_index.find(table_index);
+		if (get_it != get_by_index.end()) {
+			auto *get = get_it->second;
+			if (get->GetTable().get()) {
+				out.table = get->GetTable().get()->name;
+				auto &ids = get->GetColumnIds();
+				if (column_index < ids.size()) {
+					auto base_idx = ids[column_index].GetPrimaryIndex();
+					auto &cols = get->GetTable().get()->GetColumns();
+					if (base_idx < cols.LogicalColumnCount()) {
+						out.column = cols.GetColumn(LogicalIndex(base_idx)).Name();
+						return true;
+					}
+				}
+			}
+			if (column_index < get->names.size()) {
+				out.column = get->names[column_index];
+				return !out.table.empty();
+			}
+			return false;
+		}
+		auto proj_it = proj_by_index.find(table_index);
+		if (proj_it == proj_by_index.end()) {
+			return false;
+		}
+		auto *proj = proj_it->second;
+		if (column_index >= proj->expressions.size()) {
+			return false;
+		}
+		auto *next = GetColumnRefThroughCasts(proj->expressions[column_index].get());
+		if (!next) {
+			return false;
+		}
+		table_index = next->binding.table_index;
+		column_index = next->binding.column_index;
+	}
+	return false;
+}
+
+struct WindowLineageOp {
+	string kind;
+	string output_col;
+	string source_table;
+	string source_col;
+	string lookup_table;
+	string lookup_col;
+	string lookup_output_col;
+};
+
+static void CollectInnerJoinEdges(LogicalOperator *op, const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                  const unordered_map<idx_t, LogicalGet *> &get_by_index,
+                                  vector<pair<BaseColumnRef, BaseColumnRef>> &edges) {
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op->Cast<LogicalComparisonJoin>();
+		if (join.join_type == JoinType::INNER) {
+			for (auto &cond : join.conditions) {
+				auto *left = GetColumnRefThroughCasts(cond.left.get());
+				auto *right = GetColumnRefThroughCasts(cond.right.get());
+				if (!left || !right) {
+					continue;
+				}
+				BaseColumnRef lref, rref;
+				if (ResolveBindingToBaseRef(left->binding, proj_by_index, get_by_index, lref) &&
+				    ResolveBindingToBaseRef(right->binding, proj_by_index, get_by_index, rref)) {
+					edges.emplace_back(std::move(lref), std::move(rref));
+				}
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		CollectInnerJoinEdges(child.get(), proj_by_index, get_by_index, edges);
+	}
+}
+
+static void CollectWindowPartitionRefs(LogicalOperator *op,
+                                       const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                       const unordered_map<idx_t, LogicalGet *> &get_by_index,
+                                       const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops) {
+	if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
+		auto &window = op->Cast<LogicalWindow>();
+		for (auto &expr : window.expressions) {
+			if (expr->expression_class != ExpressionClass::BOUND_WINDOW) {
+				continue;
+			}
+			auto &win_expr = expr->Cast<BoundWindowExpression>();
+			for (auto &part : win_expr.partitions) {
+				auto *bcr = GetColumnRefThroughCasts(part.get());
+				if (!bcr) {
+					continue;
+				}
+				BaseColumnRef base;
+				if (!ResolveBindingToBaseRef(bcr->binding, proj_by_index, get_by_index, base)) {
+					continue;
+				}
+				for (auto &stored : partition_columns) {
+					auto pos = stored.find('=');
+					string output_col = pos == string::npos ? stored : stored.substr(0, pos);
+					string source_col = pos == string::npos ? stored : stored.substr(pos + 1);
+					if (!StringUtil::CIEquals(source_col, base.column)) {
+						continue;
+					}
+					WindowLineageOp op;
+					op.kind = "direct";
+					op.output_col = output_col;
+					op.source_table = base.table;
+					op.source_col = base.column;
+					direct_ops.push_back(std::move(op));
+				}
+			}
+		}
+	}
+	for (auto &child : op->children) {
+		CollectWindowPartitionRefs(child.get(), proj_by_index, get_by_index, partition_columns, direct_ops);
+	}
+}
+
+static bool SameRef(const BaseColumnRef &a, const BaseColumnRef &b) {
+	return StringUtil::CIEquals(a.table, b.table) && StringUtil::CIEquals(a.column, b.column);
+}
+
+static bool SameOp(const WindowLineageOp &a, const WindowLineageOp &b) {
+	return a.kind == b.kind && StringUtil::CIEquals(a.output_col, b.output_col) &&
+	       StringUtil::CIEquals(a.source_table, b.source_table) && StringUtil::CIEquals(a.source_col, b.source_col) &&
+	       StringUtil::CIEquals(a.lookup_table, b.lookup_table) && StringUtil::CIEquals(a.lookup_col, b.lookup_col) &&
+	       StringUtil::CIEquals(a.lookup_output_col, b.lookup_output_col);
+}
+
+static void AddUniqueLineageOp(vector<WindowLineageOp> &ops, WindowLineageOp op) {
+	for (auto &existing : ops) {
+		if (SameOp(existing, op)) {
+			return;
+		}
+	}
+	ops.push_back(std::move(op));
+}
+
+static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const BaseColumnRef &ref,
+                                      const string &output_col) {
+	for (auto &op : ops) {
+		if (op.kind == "direct" && StringUtil::CIEquals(op.output_col, output_col) &&
+		    StringUtil::CIEquals(op.source_table, ref.table) && StringUtil::CIEquals(op.source_col, ref.column)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+string BuildWindowPartitionLineageJson(LogicalOperator *plan, const vector<string> &partition_columns) {
+	if (!plan || partition_columns.empty()) {
+		return "";
+	}
+	unordered_map<idx_t, LogicalProjection *> proj_by_index;
+	unordered_map<idx_t, LogicalGet *> get_by_index;
+	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
+
+	vector<WindowLineageOp> direct_ops;
+	CollectWindowPartitionRefs(plan, proj_by_index, get_by_index, partition_columns, direct_ops);
+	if (direct_ops.empty()) {
+		return "";
+	}
+
+	vector<pair<BaseColumnRef, BaseColumnRef>> edges;
+	CollectInnerJoinEdges(plan, proj_by_index, get_by_index, edges);
+
+	vector<WindowLineageOp> partition_ops;
+	for (auto &op : direct_ops) {
+		AddUniqueLineageOp(partition_ops, op);
+	}
+
+	bool changed = true;
+	while (changed) {
+		changed = false;
+		vector<WindowLineageOp> next_ops = partition_ops;
+		for (auto &edge : edges) {
+			for (auto &direct : partition_ops) {
+				BaseColumnRef direct_ref {direct.source_table, direct.source_col};
+				BaseColumnRef other;
+				bool found = false;
+				if (SameRef(edge.first, direct_ref)) {
+					other = edge.second;
+					found = true;
+				} else if (SameRef(edge.second, direct_ref)) {
+					other = edge.first;
+					found = true;
+				}
+				if (!found || HasEquivalentPartitionRef(next_ops, other, direct.output_col)) {
+					continue;
+				}
+				WindowLineageOp equivalent;
+				equivalent.kind = "direct";
+				equivalent.output_col = direct.output_col;
+				equivalent.source_table = other.table;
+				equivalent.source_col = other.column;
+				AddUniqueLineageOp(next_ops, std::move(equivalent));
+				changed = true;
+			}
+		}
+		partition_ops = std::move(next_ops);
+	}
+
+	vector<WindowLineageOp> ops;
+	for (auto &op : partition_ops) {
+		AddUniqueLineageOp(ops, op);
+	}
+
+	for (auto &edge : edges) {
+		for (auto &direct : partition_ops) {
+			BaseColumnRef lookup_output {direct.source_table, direct.source_col};
+			BaseColumnRef lookup_join;
+			BaseColumnRef changed_join;
+			bool found = false;
+			if (StringUtil::CIEquals(edge.first.table, direct.source_table) && !SameRef(edge.first, lookup_output)) {
+				lookup_join = edge.first;
+				changed_join = edge.second;
+				found = true;
+			} else if (StringUtil::CIEquals(edge.second.table, direct.source_table) &&
+			           !SameRef(edge.second, lookup_output)) {
+				lookup_join = edge.second;
+				changed_join = edge.first;
+				found = true;
+			}
+			if (!found) {
+				continue;
+			}
+			WindowLineageOp lookup;
+			lookup.kind = "lookup";
+			lookup.output_col = direct.output_col;
+			lookup.source_table = changed_join.table;
+			lookup.source_col = changed_join.column;
+			lookup.lookup_table = direct.source_table;
+			lookup.lookup_col = lookup_join.column;
+			lookup.lookup_output_col = direct.source_col;
+			AddUniqueLineageOp(ops, std::move(lookup));
+		}
+	}
+
+	string json = "{\"ops\":[";
+	for (idx_t i = 0; i < ops.size(); i++) {
+		if (i > 0) {
+			json += ",";
+		}
+		auto &op = ops[i];
+		json += "{\"kind\":" + SqlUtils::JsonQuote(op.kind) + ",\"out\":" + SqlUtils::JsonQuote(op.output_col) +
+		        ",\"source\":" + SqlUtils::JsonQuote(op.source_table) +
+		        ",\"source_col\":" + SqlUtils::JsonQuote(op.source_col);
+		if (op.kind == "lookup") {
+			json += ",\"lookup\":" + SqlUtils::JsonQuote(op.lookup_table) +
+			        ",\"lookup_col\":" + SqlUtils::JsonQuote(op.lookup_col) +
+			        ",\"lookup_out\":" + SqlUtils::JsonQuote(op.lookup_output_col);
+		}
+		json += "}";
+	}
+	json += "]}";
+	return json;
 }
 
 void ResolveWindowPartitionOutputNames(LogicalOperator *plan, vector<string> &partition_columns,
