@@ -200,6 +200,24 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
+	// Compile-only mode. When true, `PRAGMA refresh(...)` (and the
+	// `PRAGMA compile_refresh(...)` convenience) generate the refresh SQL
+	// artifact (controlled by `openivm_files_path`) but skip the actual
+	// execution. Used by openivm-spark to compile refresh plans without
+	// mutating the source DuckDB database.
+	db_config.AddExtensionOption("openivm_compile_only",
+	                             "when true, PRAGMA refresh writes the SQL artifact but does not execute it",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+
+	// Target SQL dialect for the lpts pipeline. Forwarded to LogicalPlanToAst
+	// and AstToCteList at every refresh-SQL generation call site so the
+	// emitted SQL is in the requested dialect ('duckdb' (default), 'postgres',
+	// or 'spark').
+	db_config.AddExtensionOption("openivm_target_dialect",
+	                             "target SQL dialect for refresh-SQL generation "
+	                             "('duckdb' (default), 'postgres', or 'spark')",
+	                             LogicalType::VARCHAR, Value("duckdb"));
+
 	Connection con(instance);
 
 	// Migration: add new columns to existing openivm_views tables
@@ -320,6 +338,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "refresh_cross_system", UpsertDeltaQueriesLocked,
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cross_system);
+
+	// PRAGMA compile_refresh('view_name') — compile-only path used by openivm-spark.
+	//
+	// Generates the refresh SQL for `view_name` using the current value of
+	// `openivm_target_dialect` (defaults to 'duckdb'), but never executes it.
+	// The artifact file under `openivm_files_path` is still written as a
+	// side effect.
+	//
+	// The PRAGMA emits a single result row with the columns:
+	//   refresh_type        INTEGER  — RefreshType enum value (see openivm_constants.hpp).
+	//   refresh_type_name   VARCHAR  — human-readable form (e.g. 'AGGREGATE_GROUP').
+	//   sql                 VARCHAR  — assembled refresh SQL in the target dialect.
+	auto compile_refresh =
+	    PragmaFunction::PragmaCall("compile_refresh", CompileRefreshQuery, {LogicalType::VARCHAR});
+	loader.RegisterFunction(compile_refresh);
 
 	// PRAGMA refresh_status('view_name') — returns refresh status for a materialized view.
 	auto refresh_status = PragmaFunction::PragmaCall(

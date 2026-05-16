@@ -1,0 +1,144 @@
+# name: test/sql/compile_refresh.test
+# description: PRAGMA compile_refresh — compile-only refresh path (openivm-spark integration).
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Setup: a simple SUM/GROUP BY materialized view
+# ==========================================
+
+statement ok
+CREATE TABLE sales (region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO sales VALUES ('east', 100), ('west', 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_region AS
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales GROUP BY region;
+
+# Snapshot the MV state before the compile call so we can prove it is
+# untouched by `PRAGMA compile_refresh` afterwards.
+statement ok
+CREATE TABLE mv_region_before AS SELECT * FROM mv_region;
+
+# Mutate the base table — the deltas are now non-empty.
+statement ok
+INSERT INTO sales VALUES ('east', 50), ('north', 75);
+
+statement ok
+DELETE FROM sales WHERE region = 'west';
+
+# ==========================================
+# Test 1: compile_refresh succeeds (returns rows of refresh_type, refresh_type_name, sql)
+# ==========================================
+
+query ITT
+PRAGMA compile_refresh('mv_region');
+----
+0	AGGREGATE_GROUP	<REGEX>:.*INSERT INTO.*openivm_delta_mv_region.*
+
+# ==========================================
+# Test 2: compile_refresh did NOT mutate the materialized view
+# ==========================================
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT * FROM mv_region) EXCEPT ALL (SELECT * FROM mv_region_before))) = 0 AND
+       (SELECT count(*) FROM ((SELECT * FROM mv_region_before) EXCEPT ALL (SELECT * FROM mv_region))) = 0 AS unchanged;
+----
+true
+
+# Sanity: the deltas are still pending — a real refresh would commit them.
+query I
+SELECT total FROM mv_region WHERE region = 'east';
+----
+100
+
+# ==========================================
+# Test 3: PRAGMA refresh still works after compile_refresh
+# (i.e. compile_refresh did not leak openivm_compile_only=true)
+# ==========================================
+
+statement ok
+PRAGMA refresh('mv_region');
+
+query III
+SELECT region, total, cnt FROM mv_region ORDER BY region;
+----
+east	150	2
+north	75	1
+
+# ==========================================
+# Test 4: PRAGMA refresh respects openivm_compile_only globally
+# ==========================================
+
+statement ok
+INSERT INTO sales VALUES ('south', 42);
+
+statement ok
+SET openivm_compile_only=true;
+
+statement ok
+PRAGMA refresh('mv_region');
+
+# The 'south' row was NOT applied — the refresh was a no-op for execution.
+query I
+SELECT count(*) FROM mv_region WHERE region = 'south';
+----
+0
+
+statement ok
+SET openivm_compile_only=false;
+
+statement ok
+PRAGMA refresh('mv_region');
+
+query I
+SELECT total FROM mv_region WHERE region = 'south';
+----
+42
+
+# ==========================================
+# Test 5: openivm_target_dialect='spark' is a valid setting and the lpts
+# SPARK pipeline runs without error. Specific identifier-quoting / function
+# remap correctness is verified end-to-end in spark-ext integration tests
+# (lpts is only exercised in some refresh paths — projection / window /
+# semi-anti — so we don't pin a regex on a single MV shape here).
+# ==========================================
+
+# ==========================================
+# Test 5: openivm_target_dialect — the setting is accepted and the
+# compile path runs cleanly. Specific identifier-quoting / function
+# remap correctness is verified end-to-end in spark-ext integration tests
+# (the AGGREGATE_GROUP refresh assembly happens outside lpts for this view
+# shape; lpts is exercised on SIMPLE_PROJECTION / SEMI_ANTI / WINDOW shapes).
+# ==========================================
+
+statement ok
+SET openivm_target_dialect='spark';
+
+statement ok
+INSERT INTO sales VALUES ('mid', 11);
+
+statement ok
+PRAGMA compile_refresh('mv_region');
+
+statement ok
+SET openivm_target_dialect='duckdb';
+
+statement ok
+PRAGMA compile_refresh('mv_region');
+
+# ==========================================
+# Test 6: compile_refresh on a non-existent view fails cleanly
+# ==========================================
+
+statement error
+PRAGMA compile_refresh('does_not_exist');
+----
+materialized view 'does_not_exist' not found
+

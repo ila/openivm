@@ -183,6 +183,20 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		profiler.AddStep("generate_refresh_sql", generate_start,
 		                 "sql_bytes=" + to_string(sql.size()) + ", meta_pre_bytes=" + to_string(meta_pre_sql.size()) +
 		                     ", meta_post_bytes=" + to_string(meta_post_sql.size()));
+
+		// Compile-only mode: the SQL artifact has been written (via the
+		// `openivm_files_path` side effect inside GenerateRefreshSQL); skip
+		// the execution + transaction + history-recording machinery. Used by
+		// openivm-spark to compile refresh plans without mutating the source
+		// DuckDB database.
+		Value compile_only_val;
+		if (context.TryGetCurrentSetting("openivm_compile_only", compile_only_val) &&
+		    !compile_only_val.IsNull() && compile_only_val.GetValue<bool>()) {
+			OPENIVM_DEBUG_PRINT("[UPSERT] openivm_compile_only=true; skipping execution for '%s'\n", vn.c_str());
+			profiler.AddTotal();
+			profiler.Flush(*context.db.get());
+			return;
+		}
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs (N-term telescoping
 		// over 7+ tables produces hundreds of chained projections). Lift the default 1000
 		// expression-depth limit so the binder doesn't reject legitimate plans.
@@ -574,6 +588,123 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 			                  dep_location.cross_system, attached_db_catalog_name, attached_db_schema_name);
 		}
 	}
+}
+
+//------------------------------------------------------------------------------
+// PRAGMA compile_refresh('view_name')
+//
+// Returns the refresh SQL for a single materialized view without executing it.
+// Honours `openivm_target_dialect` (default 'duckdb') so callers — chiefly the
+// openivm-spark Scala bridge — can request 'spark'-dialect output.
+//
+// Unlike `PRAGMA refresh`, this does NOT cascade through upstream/downstream
+// dependents, and it does NOT acquire per-view locks (no mutations are
+// applied). The artifact file under `openivm_files_path` is still written by
+// GenerateRefreshSQL as a side effect, mirroring the existing `compile_only=true`
+// invariant.
+//
+// Output shape:
+//   refresh_type        INTEGER  — RefreshType enum value
+//   refresh_type_name   VARCHAR  — e.g. 'AGGREGATE_GROUP'
+//   sql                 VARCHAR  — assembled refresh SQL in the chosen dialect
+//------------------------------------------------------------------------------
+string CompileRefreshQuery(ClientContext &context, const FunctionParameters &parameters) {
+	if (parameters.values.empty()) {
+		throw InvalidInputException("compile_refresh requires a view name argument");
+	}
+	string view_name = StringValue::Get(parameters.values[0]);
+
+	// Resolve catalog/schema for the view, mirroring UpsertDeltaQueriesLocked's
+	// single-arg branch (default catalog → information_schema fallback).
+	string view_catalog_name;
+	string view_schema_name;
+	bool cross_system = false;
+	{
+		auto &search_path = ClientData::Get(context).catalog_search_path;
+		auto default_entry = search_path->GetDefault();
+		view_catalog_name = default_entry.catalog;
+		view_schema_name = default_entry.schema;
+	}
+
+	Connection con(*context.db.get());
+	{
+		QueryErrorContext err_ctx;
+		auto entry = Catalog::GetEntry(context, view_catalog_name, view_schema_name,
+		                               EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, err_ctx),
+		                               OnEntryNotFound::RETURN_NULL);
+		if (!entry) {
+			auto found = con.Query("SELECT table_catalog, table_schema FROM information_schema.tables "
+			                       "WHERE table_type = 'VIEW' AND table_name = '" +
+			                       SqlUtils::EscapeValue(view_name) + "' ORDER BY table_catalog, table_schema LIMIT 1");
+			if (!found->HasError() && found->RowCount() > 0) {
+				view_catalog_name = found->GetValue(0, 0).ToString();
+				view_schema_name = found->GetValue(1, 0).ToString();
+				if (view_catalog_name != "memory") {
+					cross_system = true;
+				}
+			} else {
+				throw CatalogException("compile_refresh: materialized view '%s' not found", view_name.c_str());
+			}
+		}
+	}
+	if (!view_catalog_name.empty()) {
+		Connection probe(*context.db.get());
+		auto res = probe.Query("SELECT current_database()");
+		if (!res->HasError() && res->RowCount() > 0) {
+			string probe_default = res->GetValue(0, 0).ToString();
+			if (!probe_default.empty() && view_catalog_name != probe_default) {
+				cross_system = true;
+			}
+		}
+	}
+
+	// Look up the classified RefreshType for this MV.
+	RefreshMetadata metadata(con);
+	RefreshType type = metadata.GetViewType(view_name);
+
+	// GenerateRefreshSQL is side-effect-free w.r.t. the source DuckDB database
+	// (it only writes the artifact file under `openivm_files_path`). It does NOT
+	// read `openivm_compile_only`, so we don't need to toggle that setting — the
+	// compile path is naturally read-only.
+	string sql;
+	string out_pre_meta;
+	string out_post_meta;
+	sql = GenerateRefreshSQL(context, view_catalog_name, view_schema_name, view_name, cross_system,
+	                         /*attached_db_catalog_name=*/"", /*attached_db_schema_name=*/"",
+	                         cross_system ? &out_pre_meta : nullptr, cross_system ? &out_post_meta : nullptr);
+
+	// Encode the resulting SQL strings into a SELECT that DuckDB will execute
+	// in place of this PRAGMA call, surfacing the result row to the caller.
+	string combined_sql;
+	if (cross_system) {
+		// Sandwich the data SQL between any metadata pre/post blocks for cross-
+		// system (DuckLake) views so downstream consumers see the full refresh
+		// program. The DuckLake placeholder is unresolved at compile time —
+		// callers must handle DUCKLAKE_SNAPSHOT_PLACEHOLDER token replacement.
+		if (!out_pre_meta.empty()) {
+			combined_sql += out_pre_meta;
+			if (combined_sql.back() != ';') {
+				combined_sql += ";";
+			}
+			combined_sql += "\n";
+		}
+		combined_sql += sql;
+		if (!out_post_meta.empty()) {
+			if (!combined_sql.empty() && combined_sql.back() != ';') {
+				combined_sql += ";";
+			}
+			combined_sql += "\n";
+			combined_sql += out_post_meta;
+		}
+	} else {
+		combined_sql = std::move(sql);
+	}
+
+	string escaped_sql = SqlUtils::EscapeValue(combined_sql);
+	int32_t type_int = static_cast<int32_t>(type);
+	string type_name = string(RefreshTypeName(type));
+	return "SELECT CAST(" + to_string(type_int) + " AS INTEGER) AS refresh_type, '" +
+	       SqlUtils::EscapeValue(type_name) + "' AS refresh_type_name, '" + escaped_sql + "' AS sql;";
 }
 
 } // namespace duckdb

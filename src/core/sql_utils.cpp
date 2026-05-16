@@ -11,6 +11,14 @@
 
 namespace duckdb {
 
+SqlDialect ReadOpenIvmTargetDialect(ClientContext &context) {
+	Value dialect_val;
+	if (context.TryGetCurrentSetting("openivm_target_dialect", dialect_val) && !dialect_val.IsNull()) {
+		return ParseSqlDialect(dialect_val.GetValue<string>());
+	}
+	return SqlDialect::DUCKDB;
+}
+
 static bool IsIdentifierChar(char c) {
 	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
 }

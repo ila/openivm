@@ -558,8 +558,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                    view_name.c_str());
 		} else {
 			try {
-				auto ast = LogicalPlanToAst(con_ctx, plan);
-				auto cte_list = AstToCteList(*ast);
+				SqlDialect dialect = ReadOpenIvmTargetDialect(con_ctx);
+				auto ast = LogicalPlanToAst(con_ctx, plan, dialect);
+				auto cte_list = AstToCteList(*ast, dialect);
 				raw_refresh_sql = cte_list->ToQuery(false);
 				OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_refresh_sql.c_str());
 			} catch (const std::exception &e) {

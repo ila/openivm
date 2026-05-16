@@ -81,8 +81,9 @@ static string BuildDeltaSelectFrom(TableCatalogEntry &delta_entry, const string 
 static string BuildDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry &delta_entry,
                                        const string &full_delta_table_name, unique_ptr<LogicalOperator> &source_plan) {
 	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
-	auto ast = LogicalPlanToAst(context, source_plan);
-	auto cte_list = AstToCteList(*ast);
+	SqlDialect dialect = ReadOpenIvmTargetDialect(context);
+	auto ast = LogicalPlanToAst(context, source_plan, dialect);
+	auto cte_list = AstToCteList(*ast, dialect);
 	string subquery_string = cte_list->ToQuery(false);
 	if (!subquery_string.empty() && subquery_string.back() == ';') {
 		subquery_string.pop_back();
@@ -95,8 +96,9 @@ static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalo
                                              unique_ptr<LogicalOperator> &source_plan) {
 	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
 	string data_cols = BuildDeltaDataColumns(delta_entry);
-	auto ast = LogicalPlanToAst(context, source_plan);
-	auto cte_list = AstToCteList(*ast);
+	SqlDialect dialect = ReadOpenIvmTargetDialect(context);
+	auto ast = LogicalPlanToAst(context, source_plan, dialect);
+	auto cte_list = AstToCteList(*ast, dialect);
 	string subquery_string = cte_list->ToQuery(false);
 	if (!subquery_string.empty() && subquery_string.back() == ';') {
 		subquery_string.pop_back();
@@ -529,8 +531,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 						try {
 							string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
 							string data_cols = BuildDeltaDataColumns(delta_entry_del);
-							auto ast = LogicalPlanToAst(*con.context, join->children[1]);
-							auto cte_list = AstToCteList(*ast);
+							SqlDialect dialect = ReadOpenIvmTargetDialect(*con.context);
+							auto ast = LogicalPlanToAst(*con.context, join->children[1], dialect);
+							auto cte_list = AstToCteList(*ast, dialect);
 							string rowid_sql = cte_list->ToQuery(false);
 							if (!rowid_sql.empty() && rowid_sql.back() == ';') {
 								rowid_sql.pop_back();
@@ -545,8 +548,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 						try {
 							string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
 							string data_cols = BuildDeltaDataColumns(delta_entry_del);
-							auto ast = LogicalPlanToAst(*con.context, plan->children[0]);
-							auto cte_list = AstToCteList(*ast);
+							SqlDialect dialect = ReadOpenIvmTargetDialect(*con.context);
+							auto ast = LogicalPlanToAst(*con.context, plan->children[0], dialect);
+							auto cte_list = AstToCteList(*ast, dialect);
 							string subquery_string = cte_list->ToQuery(false);
 							if (!subquery_string.empty() && subquery_string.back() == ';') {
 								subquery_string.pop_back();
@@ -562,8 +566,9 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				} else {
 					try {
 						string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
-						auto ast = LogicalPlanToAst(*con.context, plan->children[0]);
-						auto cte_list = AstToCteList(*ast);
+						SqlDialect dialect = ReadOpenIvmTargetDialect(*con.context);
+						auto ast = LogicalPlanToAst(*con.context, plan->children[0], dialect);
+						auto cte_list = AstToCteList(*ast, dialect);
 						string subquery_string = cte_list->ToQuery(false);
 						if (!subquery_string.empty() && subquery_string.back() == ';') {
 							subquery_string.pop_back();

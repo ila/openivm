@@ -308,8 +308,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				                    view_query.c_str());
 			} else {
 				try {
-					auto ast = LogicalPlanToAst(*con.context, select_plan);
-					auto cte_list = AstToCteList(*ast);
+					SqlDialect dialect = ReadOpenIvmTargetDialect(*con.context);
+					auto ast = LogicalPlanToAst(*con.context, select_plan, dialect);
+					auto cte_list = AstToCteList(*ast, dialect);
 					view_query = cte_list->ToQuery(true, output_names);
 					if (!view_query.empty() && view_query.back() == ';') {
 						view_query.pop_back();
