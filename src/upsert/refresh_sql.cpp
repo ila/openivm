@@ -612,18 +612,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                 "delta_sql_bytes=" + to_string(raw_refresh_sql.size()));
 				OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_refresh_sql.c_str());
 			} catch (const std::exception &e) {
-				Printer::Print("Warning: materialized view '" + view_name +
-				               "' uses constructs not supported by IVM's SQL serializer (" + e.what() +
-				               "). Falling back to full recompute for this refresh.");
-				OPENIVM_DEBUG_PRINT("[UPSERT] LPTS fallback (%s) for view '%s' → full recompute\n", e.what(),
+				OPENIVM_DEBUG_PRINT("[UPSERT] LPTS serialization failed (%s) for view '%s'\n", e.what(),
 				                    view_name.c_str());
-				auto recompute_start = profile_now();
-				auto recompute_query =
-				    BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
-				                        attached_db_schema_name, internal_catalog_prefix, out_post_meta);
-				add_profile_step("generate_refresh_sql.lpts_fallback_recompute", recompute_start,
-				                 "sql_bytes=" + to_string(recompute_query.size()));
-				return recompute_query;
+				throw Exception(ExceptionType::EXECUTOR, "IVM: failed to serialize incremental delta plan for view '" +
+				                                             view_name + "': " + e.what());
 			}
 		}
 		string insert_target_bare = "INSERT INTO " + SqlUtils::DeltaName(view_name);
