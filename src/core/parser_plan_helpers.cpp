@@ -1591,56 +1591,9 @@ vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<str
 	return output_names;
 }
 
-static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
-	return fn_name == "quantile_cont" || fn_name == "quantile_disc" || fn_name == "percentile_cont" ||
-	       fn_name == "percentile_disc" || fn_name == "approx_quantile" || fn_name == "mad" || fn_name == "median" ||
-	       fn_name == "mode" ||
-	       // Two-argument aggregates whose children LPTS re-aliases to internal
-	       // `tN_col` names; the serialized SQL refers to those names against the
-	       // original FROM clause and fails binding at CREATE-table time.
-	       fn_name == "corr" || fn_name == "covar_pop" || fn_name == "covar_samp" || fn_name == "regr_avgx" ||
-	       fn_name == "regr_avgy" || fn_name == "regr_count" || fn_name == "regr_intercept" || fn_name == "regr_r2" ||
-	       fn_name == "regr_slope" || fn_name == "regr_sxx" || fn_name == "regr_sxy" || fn_name == "regr_syy" ||
-	       fn_name == "arg_min" || fn_name == "arg_max";
-}
-
-bool QueryNeedsOriginalSqlForLpts(const string &query) {
-	string lower = StringUtil::Lower(query);
-	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos;
-}
-
 bool QueryHasUnsupportedIncrementalConstruct(const string &query) {
 	string lower = StringUtil::Lower(query);
 	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos;
-}
-
-bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op) {
-	if (!op) {
-		return false;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
-		return true;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		auto *agg = dynamic_cast<LogicalAggregate *>(op);
-		if (agg) {
-			for (auto &expr : agg->expressions) {
-				if (expr->type != ExpressionType::BOUND_AGGREGATE) {
-					continue;
-				}
-				auto &bound_agg = expr->Cast<BoundAggregateExpression>();
-				if (IsAggregateFunctionUnsupportedByLpts(bound_agg.function.name)) {
-					return true;
-				}
-			}
-		}
-	}
-	for (auto &child : op->children) {
-		if (PlanNeedsOriginalSqlForLpts(child.get())) {
-			return true;
-		}
-	}
-	return false;
 }
 
 LogicalAggregate *FindOuterAggregate(LogicalOperator *op) {

@@ -114,7 +114,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 		auto name_resolution_start = create_profile_now();
 		auto full_view_name = SqlUtils::ExtractTableName(statement->query);
-		bool statement_needs_original_sql_for_lpts = QueryNeedsOriginalSqlForLpts(statement->query);
 		// Keep the user's raw AS-query as the source of truth for original-SQL fallback.
 		// Do not recover this from DuckDB's parsed QueryNode::ToString(): that path is a
 		// best-effort pretty-printer and has segfaulted on set-operation query nodes with
@@ -342,47 +341,25 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			                        "output_cols=" + to_string(output_names.size()));
 
 			auto lpts_start = create_profile_now();
-			if (statement_needs_original_sql_for_lpts || QueryNeedsOriginalSqlForLpts(original_view_query)) {
+			try {
+				auto ast = LogicalPlanToAst(*con.context, select_plan);
+				auto cte_list = AstToCteList(*ast);
+				view_query = cte_list->ToQuery(true, output_names);
+				if (!view_query.empty() && view_query.back() == ';') {
+					view_query.pop_back();
+				}
+				StringUtil::Trim(view_query);
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
+			} catch (const std::exception &e) {
 				view_query = original_view_query;
 				lpts_fallback = true;
-				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — using original SQL: %s\n",
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (%s) to original query: %s\n", e.what(),
 				                    view_query.c_str());
-			} else {
-				try {
-					auto ast = LogicalPlanToAst(*con.context, select_plan);
-					auto cte_list = AstToCteList(*ast);
-					view_query = cte_list->ToQuery(true, output_names);
-					if (!view_query.empty() && view_query.back() == ';') {
-						view_query.pop_back();
-					}
-					StringUtil::Trim(view_query);
-					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
-				} catch (const std::exception &e) {
-					// LPTS doesn't support all operators (e.g., WINDOW). Fall back to original SQL.
-					// This is fine for partition-recompute views that don't need LPTS-rewritten queries.
-					view_query = original_view_query;
-					lpts_fallback = true;
-					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (%s) to original query: %s\n", e.what(),
-					                    view_query.c_str());
-				} catch (...) {
-					view_query = original_view_query;
-					lpts_fallback = true;
-					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to original query: %s\n",
-					                    view_query.c_str());
-				}
-			}
-			// For views that LPTS silently mis-serializes (GROUPING SETS / ROLLUP / CUBE
-			// → plain GROUP BY; STRUCT_PACK field names → tN_col aliases; etc.), detect
-			// structurally and prefer the original SQL. Those constructs never need the
-			// LPTS-rewritten form anyway — they're maintained by recompute-style paths
-			// using the original SQL, so the rewriter-rule path (which needs LPTS) isn't used.
-			{
-				if (PlanNeedsOriginalSqlForLpts(select_plan.get())) {
-					view_query = original_view_query;
-					lpts_fallback = true;
-					OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — using original SQL: %s\n",
-					                    view_query.c_str());
-				}
+			} catch (...) {
+				view_query = original_view_query;
+				lpts_fallback = true;
+				OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to original query: %s\n",
+				                    view_query.c_str());
 			}
 			add_create_profile_step("create_compile_lpts", lpts_start,
 			                        "fallback=" + string(lpts_fallback ? "true" : "false") +
