@@ -221,10 +221,10 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 			has_argminmax = true;
 		}
 	}
-	// ARG_MIN/ARG_MAX always use group-recompute (LPTS can't round-trip the two-arg form,
-	// so view_query_sql is the original SQL without openivm_count_star). Skip injection so
-	// the data table schema matches. Checked after the loop so count_star / distinct_count
-	// in the same view still short-circuit correctly regardless of expression order.
+	// ARG_MIN/ARG_MAX always use group-recompute. Skip hidden count injection so the
+	// data table schema remains the user-visible aggregate output. Checked after the
+	// loop so count_star / distinct_count in the same view still short-circuit
+	// correctly regardless of expression order.
 	if (has_argminmax) {
 		return;
 	}

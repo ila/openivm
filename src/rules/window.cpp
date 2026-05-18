@@ -12,8 +12,8 @@ ModifiedPlan IncrementalWindowRule::Rewrite(PlanWrapper pw) {
 	// Passthrough: recurse into the child (which has scans/joins/aggregates),
 	// then pass the WINDOW operator through unchanged. The multiplicity column
 	// from the child propagates through — the window doesn't consume or produce it.
-	// Note: LPTS doesn't support WINDOW, so ComputeDelta is skipped for WINDOW_PARTITION views.
-	// The rewrite rule exists for plan correctness and future LPTS support.
+	// WINDOW_PARTITION refresh skips ComputeDelta and uses partition recompute; this
+	// rule keeps the plan structurally valid for callers that still rewrite through it.
 	auto child_mul = IncrementalRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
 	pw.plan->children[0] = std::move(child_mul.op);
 

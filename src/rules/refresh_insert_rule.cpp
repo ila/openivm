@@ -20,7 +20,6 @@
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/planner/expression.hpp"
-#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
@@ -29,7 +28,6 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
-#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
@@ -91,7 +89,7 @@ static string BuildDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry
 }
 
 static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry &delta_entry,
-                                             const string &full_delta_table_name,
+                                             const string &full_delta_table_name, const string &full_table_name,
                                              unique_ptr<LogicalOperator> &source_plan) {
 	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
 	string data_cols = BuildDeltaDataColumns(delta_entry);
@@ -101,8 +99,10 @@ static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalo
 	if (!subquery_string.empty() && subquery_string.back() == ';') {
 		subquery_string.pop_back();
 	}
-	return prefix + " SELECT " + data_cols + ", -1, now()::timestamp FROM (" + subquery_string +
-	       ") openivm_deleted_rows";
+	// DuckDB DELETE children identify physical rows by rowid; read the base table
+	// columns back through that rowid set to materialize the negative delta tuple.
+	return prefix + " SELECT " + data_cols + ", -1, now()::timestamp FROM " + full_table_name +
+	       " WHERE rowid IN (SELECT rowid FROM (" + subquery_string + ") openivm_deleted_rows)";
 }
 
 static bool PlanReferencesColumn(LogicalOperator &op, const string &table_name, const string &col_name) {
@@ -156,26 +156,6 @@ static string FindMVReferencingColumn(Connection &con, const string &delta_name,
 		}
 	}
 	return "";
-}
-
-static bool IsRowIdColumn(const unique_ptr<Expression> &expr) {
-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
-		return false;
-	}
-	auto &col_ref = expr->Cast<BoundColumnRefExpression>();
-	return StringUtil::CIEquals(col_ref.GetName(), "rowid") || StringUtil::CIEquals(col_ref.alias, "rowid");
-}
-
-static bool IsSemiJoinOnRowId(LogicalComparisonJoin &join) {
-	if (join.join_type != JoinType::SEMI) {
-		return false;
-	}
-	for (auto &condition : join.conditions) {
-		if (IsRowIdColumn(condition.left) || IsRowIdColumn(condition.right)) {
-			return true;
-		}
-	}
-	return false;
 }
 
 RefreshInsertRule::RefreshInsertRule() {
@@ -491,8 +471,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 						has_subquery = has_subquery || expr->HasSubquery();
 					}
 					if (has_subquery) {
-						insert_string = BuildDeleteDeltaInsertFromPlan(*con.context, delta_entry_del,
-						                                               full_delta_table_name, plan->children[0]);
+						insert_string = BuildDeleteDeltaInsertFromPlan(
+						    *con.context, delta_entry_del, full_delta_table_name, full_table_name, plan->children[0]);
 					} else {
 						insert_string += " where ";
 						for (idx_t i = 0; i < filter->expressions.size(); i++) {
@@ -519,45 +499,12 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
 					return;
 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-					// DELETE FROM t WHERE rowid IN (subquery) compiles to a SEMI JOIN on rowid.
-					// LPTS can't serialize the full SEMI JOIN correctly because `rowid` is a
-					// virtual column that loses its binding after the join. Instead, serialize
-					// only the right child (the subquery that returns rowids) and wrap it as
-					// WHERE rowid IN (...) against the base table.
-					auto *join = dynamic_cast<LogicalComparisonJoin *>(plan->children[0].get());
-					if (join && IsSemiJoinOnRowId(*join) && !join->children.empty()) {
-						try {
-							string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
-							string data_cols = BuildDeltaDataColumns(delta_entry_del);
-							auto ast = LogicalPlanToAst(*con.context, join->children[1]);
-							auto cte_list = AstToCteList(*ast);
-							string rowid_sql = cte_list->ToQuery(false);
-							if (!rowid_sql.empty() && rowid_sql.back() == ';') {
-								rowid_sql.pop_back();
-							}
-							insert_string = prefix_del + " SELECT " + data_cols + ", -1, now()::timestamp FROM " +
-							                full_table_name + " WHERE rowid IN (" + rowid_sql + ")";
-						} catch (...) {
-							throw NotImplementedException(
-							    "DELETE with rowid IN (subquery) is not yet fully supported for IVM delta tracking");
-						}
-					} else {
-						try {
-							string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
-							string data_cols = BuildDeltaDataColumns(delta_entry_del);
-							auto ast = LogicalPlanToAst(*con.context, plan->children[0]);
-							auto cte_list = AstToCteList(*ast);
-							string subquery_string = cte_list->ToQuery(false);
-							if (!subquery_string.empty() && subquery_string.back() == ';') {
-								subquery_string.pop_back();
-							}
-							insert_string = prefix_del + " SELECT " + data_cols + ", -1, now()::timestamp FROM " +
-							                full_table_name + " WHERE rowid IN (SELECT rowid FROM (" + subquery_string +
-							                ") openivm_delete_rows)";
-						} catch (...) {
-							throw NotImplementedException(
-							    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");
-						}
+					try {
+						insert_string = BuildDeleteDeltaInsertFromPlan(
+						    *con.context, delta_entry_del, full_delta_table_name, full_table_name, plan->children[0]);
+					} catch (...) {
+						throw NotImplementedException(
+						    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");
 					}
 				} else {
 					try {
