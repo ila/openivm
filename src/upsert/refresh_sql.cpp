@@ -474,6 +474,30 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                                  " WHERE table_name = '" + SqlUtils::EscapeValue(delta_view_name_bare) + "'");
 	bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
 	                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
+	// openivm_force_view_delta_cascade: when set, force the AGGREGATE_GROUP /
+	// AGGREGATE_HAVING refresh path to also emit the per-key retract companion
+	// (refresh_sql.cpp:620 `companion_query`) even if no other MV currently
+	// references this MV's delta view. Used by openivm-spark when compiling
+	// each MV in an isolated DuckDB subprocess — the metadata table is empty
+	// there, but the Spark side may register downstream MVs against this MV's
+	// delta after the compile returns.
+	//
+	// Scope: ONLY enabled for AGGREGATE_GROUP and AGGREGATE_HAVING. The
+	// SIMPLE_AGGREGATE snapshot-companion (refresh_sql.cpp:477 build_snapshot_companion)
+	// uses a CREATE TEMP TABLE / DROP TABLE pre/post-pair which openivm-spark's
+	// SparkRefreshRewriter does not currently transform; enabling it would
+	// generate Spark-unparseable SQL. WINDOW_PARTITION / GROUP_RECOMPUTE /
+	// DISTINCT_INCREMENTAL / SEMI_ANTI_RECOMPUTE also use the snapshot path
+	// and are left untouched.
+	{
+		Value force_cascade_val;
+		if (context.TryGetCurrentSetting("openivm_force_view_delta_cascade", force_cascade_val) &&
+		    !force_cascade_val.IsNull() && force_cascade_val.GetValue<bool>() &&
+		    (view_query_type == RefreshType::AGGREGATE_GROUP ||
+		     view_query_type == RefreshType::AGGREGATE_HAVING)) {
+			has_downstream = true;
+		}
+	}
 	auto build_snapshot_companion = [&]() {
 		string col_list;
 		for (auto &col : column_names) {
@@ -600,29 +624,90 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				keys_set.insert(column_names[kid]);
 			}
 
-			string col_list, val_list;
+			string col_list, val_list_neg, val_list_pos;
+			bool has_count_star_col = false;
 			for (auto &col : column_names) {
 				if (!col_list.empty()) {
 					col_list += ", ";
-					val_list += ", ";
+					val_list_neg += ", ";
+					val_list_pos += ", ";
 				}
 				col_list += col;
+				if (col == string(openivm::COUNT_STAR_COL)) {
+					has_count_star_col = true;
+				}
 				if (keys_set.count(col)) {
-					val_list += "d." + col;
+					val_list_neg += "d." + col;
+					val_list_pos += "d." + col;
 				} else if (col == openivm::MULTIPLICITY_COL) {
-					val_list += "-1";
+					val_list_neg += "-1";
+					val_list_pos += "1";
 				} else {
-					val_list += "0";
+					// NULL — not 0 — for non-key non-mult columns. The MERGE
+					// reads the view-delta via `sum(mult * col)` group-by-key,
+					// and SQL's SUM ignores NULLs. Using NULL guarantees the
+					// companion row contributes NOTHING to the aggregate state
+					// (whether the underlying aggregate is SUM, COUNT, AVG-as-
+					// SUM+COUNT, etc.). Using 0 would break NULL preservation
+					// for SUM columns whose input values are NULL (e.g. SUM(x)
+					// over a group where x is NULL — expected SUM=NULL,
+					// 0-companion would force it to 0).
+					val_list_neg += "NULL";
+					val_list_pos += "NULL";
 				}
 			}
 			string join_cond = SqlUtils::BuildNullSafeMatch(keys, "d", "m");
 
-			companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list + " FROM " +
-			                  delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) + " > 0";
+			// Positive companion: for every ADD row (mult>0) whose key already
+			// exists pre-merge, emit a zero-value retract (-1) so downstream
+			// COUNT(*)/DISTINCT cascade doesn't double-count the group.
+			companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list_neg +
+			                  " FROM " + delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) + " > 0";
 			if (!delta_ts_filter.empty()) {
 				companion_query += " AND d." + delta_ts_filter;
 			}
 			companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + ");\n";
+
+			// Negative companion: for every DELETE/UPDATE row (mult<0), if the
+			// group will STILL EXIST after the merge (group's count_star post
+			// delta is > 0), emit a zero-value add-back (+1) so downstream
+			// cascade doesn't spuriously decrement COUNT(*) for a group that's
+			// only being partially deleted. Without this, a DELETE that
+			// doesn't fully retract a group emits a -1 row that the downstream
+			// interprets as "group disappeared", which is incorrect.
+			//
+			// Crucially: gate on `d.openivm_count_star > 0` (any non-zero
+			// count_star, since the per-group delta emits |count_star| as a
+			// positive aggregate of input rows for the group). The positive
+			// companion's own output rows have `openivm_count_star = 0` and
+			// `openivm_multiplicity = -1`; this gate excludes them so the two
+			// companions don't feed each other.
+			//
+			// Post-merge survival check: m.openivm_count_star (pre-merge,
+			// always positive in data table) PLUS d.openivm_multiplicity *
+			// d.openivm_count_star (signed delta) > 0. We multiply by
+			// multiplicity to recover the sign of the count_star delta — the
+			// CTAS-emitted count_star is always positive, but the actual
+			// count_star delta is signed by mult.
+			//
+			// Only emitted when the data table carries the synthetic
+			// `openivm_count_star` column. MVs with a user-supplied COUNT(*)
+			// alias use that alias as the count-monoid instead — discovering
+			// which user column to substitute would require classifier-level
+			// metadata that refresh_sql.cpp doesn't currently see. Those MVs
+			// fall back to additive-only cascade.
+			if (has_count_star_col) {
+				companion_query += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list_pos +
+				                   " FROM " + delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) +
+				                   " < 0 AND d." + string(openivm::COUNT_STAR_COL) + " > 0";
+				if (!delta_ts_filter.empty()) {
+					companion_query += " AND d." + delta_ts_filter;
+				}
+				companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + " AND m." +
+				                   string(openivm::COUNT_STAR_COL) + " + d." + string(openivm::MULTIPLICITY_COL) +
+				                   " * d." + string(openivm::COUNT_STAR_COL) + " > 0);\n";
+			}
+			OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
 			OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
 		}
 	}

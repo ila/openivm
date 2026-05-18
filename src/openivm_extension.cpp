@@ -209,6 +209,24 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "when true, PRAGMA refresh writes the SQL artifact but does not execute it",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
+	// Force-emit the AGGREGATE_GROUP / AGGREGATE_HAVING downstream "retract
+	// companion" INSERT into openivm_delta_<view> even when no downstream MV
+	// is registered yet. In native DuckDB mode the companion is gated by a
+	// runtime metadata check (`openivm_delta_tables` rows referencing this
+	// MV's delta view); openivm-spark compiles each MV in an isolated DuckDB
+	// subprocess where no such entries exist, so without this flag the
+	// AGGREGATE_GROUP refresh produces an additive-only view-delta that
+	// breaks cascade for downstream MVs whose semantics depend on multiset
+	// retraction (COUNT(*), MIN/MAX, DISTINCT etc.). Setting this flag to
+	// true makes the compiled SQL self-contained for the cascade case.
+	//
+	// Defaults to false to preserve native DuckDB-mode behavior. openivm-spark
+	// sets it to true in its compile script.
+	db_config.AddExtensionOption("openivm_force_view_delta_cascade",
+	                             "force emission of the AGGREGATE_GROUP retract companion to openivm_delta_<view> "
+	                             "even when no downstream MV is registered (compile-for-cascade mode)",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+
 	// Target SQL dialect for the lpts pipeline. Forwarded to LogicalPlanToAst
 	// and AstToCteList at every refresh-SQL generation call site so the
 	// emitted SQL is in the requested dialect ('duckdb' (default), 'postgres',
