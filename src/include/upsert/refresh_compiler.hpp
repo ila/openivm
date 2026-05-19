@@ -42,7 +42,8 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
                                  bool insert_only = false);
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter = "",
                               const string &catalog_prefix = "", const vector<string> &partition_columns = {},
-                              const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {});
+                              const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {},
+                              bool emit_cascade_delta = false);
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
 
 /// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE` (inner-DISTINCT under
@@ -60,7 +61,8 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 /// when the catalog is default), so we can substitute the exact `cat.schema.tbl` pattern.
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs,
-                             const string &catalog_prefix = "", const string &lpts_table_prefix = "");
+                             const string &catalog_prefix = "", const string &lpts_table_prefix = "",
+                             bool emit_cascade_delta = false);
 
 /// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM aggregate.
 /// Generates a multi-statement SQL batch:

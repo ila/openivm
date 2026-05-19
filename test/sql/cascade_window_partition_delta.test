@@ -1,0 +1,183 @@
+# name: test/sql/cascade_window_partition_delta.test
+# description: WINDOW_PARTITION emits signed cascade deltas when pragma-enabled
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_emit_cascade_delta_for_recompute=false;
+
+statement ok
+CREATE TABLE cw_src (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO cw_src VALUES
+    (1, 'a', 10),
+    (2, 'a', 20),
+    (3, 'b', 5),
+    (4, 'b', 15);
+
+statement ok
+CREATE MATERIALIZED VIEW cw_mv AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+    FROM cw_src;
+
+query ITT
+PRAGMA compile_refresh('cw_mv');
+----
+5	WINDOW_PARTITION	<REGEX>:.*DELETE FROM .*openivm_data_cw_mv.*INSERT INTO .*openivm_data_cw_mv.*DELETE FROM openivm_delta_cw_mv.*
+
+statement ok
+SET openivm_emit_cascade_delta_for_recompute=true;
+
+query ITT
+PRAGMA compile_refresh('cw_mv');
+----
+5	WINDOW_PARTITION	<REGEX>:.*CREATE OR REPLACE TEMP TABLE openivm_old_cw_mv AS.*CREATE OR REPLACE TEMP TABLE openivm_new_cw_mv AS.*INSERT INTO openivm_delta_cw_mv.*CAST.*-1.*INTEGER.*CURRENT_TIMESTAMP.*UNION ALL.*CAST.*1.*INTEGER.*CURRENT_TIMESTAMP.*DROP TABLE IF EXISTS openivm_old_cw_mv.*DROP TABLE IF EXISTS openivm_new_cw_mv.*
+
+statement ok
+INSERT INTO cw_src VALUES (5, 'a', 15);
+
+statement ok
+PRAGMA refresh('cw_mv');
+
+query ITIII rowsort
+SELECT id, grp, val, rn, openivm_multiplicity FROM openivm_delta_cw_mv;
+----
+1	a	10	1	-1
+1	a	10	1	1
+2	a	20	2	-1
+2	a	20	3	1
+5	a	15	2	1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM openivm_data_cw_mv
+    EXCEPT ALL
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
+    EXCEPT ALL
+    SELECT * FROM openivm_data_cw_mv
+);
+----
+0
+
+statement ok
+DELETE FROM openivm_delta_cw_mv;
+
+# No-op recompute: the producer must still emit both -1 and +1 rows.
+statement ok
+UPDATE cw_src SET val = 15 WHERE id = 5;
+
+statement ok
+PRAGMA refresh('cw_mv');
+
+query ITIII rowsort
+SELECT id, grp, val, rn, openivm_multiplicity FROM openivm_delta_cw_mv;
+----
+1	a	10	1	-1
+1	a	10	1	1
+2	a	20	3	-1
+2	a	20	3	1
+5	a	15	2	-1
+5	a	15	2	1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM openivm_data_cw_mv
+    EXCEPT ALL
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
+    EXCEPT ALL
+    SELECT * FROM openivm_data_cw_mv
+);
+----
+0
+
+statement ok
+DELETE FROM openivm_delta_cw_mv;
+
+statement ok
+UPDATE cw_src SET val = 12 WHERE id = 2;
+
+statement ok
+PRAGMA refresh('cw_mv');
+
+query ITIII rowsort
+SELECT id, grp, val, rn, openivm_multiplicity FROM openivm_delta_cw_mv;
+----
+1	a	10	1	-1
+1	a	10	1	1
+2	a	12	2	1
+2	a	20	3	-1
+5	a	15	2	-1
+5	a	15	3	1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM openivm_data_cw_mv
+    EXCEPT ALL
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
+    EXCEPT ALL
+    SELECT * FROM openivm_data_cw_mv
+);
+----
+0
+
+statement ok
+DELETE FROM openivm_delta_cw_mv;
+
+statement ok
+DELETE FROM cw_src WHERE id = 1;
+
+statement ok
+PRAGMA refresh('cw_mv');
+
+query ITIII rowsort
+SELECT id, grp, val, rn, openivm_multiplicity FROM openivm_delta_cw_mv;
+----
+1	a	10	1	-1
+2	a	12	1	1
+2	a	12	2	-1
+5	a	15	2	1
+5	a	15	3	-1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM openivm_data_cw_mv
+    EXCEPT ALL
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
+    EXCEPT ALL
+    SELECT * FROM openivm_data_cw_mv
+);
+----
+0

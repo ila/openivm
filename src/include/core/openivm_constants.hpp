@@ -53,6 +53,9 @@ constexpr const char *INDEX_SUFFIX = "openivm_index";
 // Temporary table prefix for companion row snapshots
 constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";
 
+// Session settings
+constexpr const char *EMIT_CASCADE_DELTA_FOR_RECOMPUTE = "openivm_emit_cascade_delta_for_recompute";
+
 // Limits
 static constexpr idx_t MAX_JOIN_TABLES = 16;
 

@@ -848,7 +848,7 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs, const string &catalog_prefix,
-                             const string &lpts_table_prefix) {
+                             const string &lpts_table_prefix, bool emit_cascade_delta) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// No GROUP BY columns or no source deltas registered → can't scope; fall back to full.
@@ -927,10 +927,34 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	string match_clause = SqlUtils::BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_tgt");
 	string affected_temp_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
 
-	OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] %zu group cols, %zu source deltas\n", group_columns.size(),
-	                    delta_table_specs.size());
-	return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_subquery, "openivm_tgt", "AS openivm_tgt",
-	                                  "openivm_aff", match_clause, match_clause, affected_temp_table);
+	OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] %zu group cols, %zu source deltas, cascade delta: %s\n",
+	                    group_columns.size(), delta_table_specs.size(), emit_cascade_delta ? "enabled" : "disabled");
+	if (!emit_cascade_delta) {
+		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_subquery, "openivm_tgt",
+		                                  "AS openivm_tgt", "openivm_aff", match_clause, match_clause,
+		                                  affected_temp_table);
+	}
+
+	string delete_where =
+	    "EXISTS (\n  SELECT 1 FROM " + affected_temp_table + " AS openivm_aff WHERE " + match_clause + "\n)";
+	string insert_where =
+	    "EXISTS (\n  SELECT 1 FROM " + affected_temp_table + " AS openivm_aff WHERE " + match_clause + "\n)";
+	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
+	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_subquery + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table +
+	       " AS openivm_tgt\nWHERE " + delete_where + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+	       ") AS openivm_tgt\nWHERE " + insert_where + ";\n\n";
+	sql += "DELETE FROM " + data_table + " AS openivm_tgt\nWHERE " + delete_where + ";\n\n";
+	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
+	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+	sql += "\nDROP TABLE IF EXISTS " + affected_temp_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
+	return sql;
 }
 
 } // namespace duckdb

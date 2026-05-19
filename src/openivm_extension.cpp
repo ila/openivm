@@ -227,6 +227,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "even when no downstream MV is registered (compile-for-cascade mode)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
+	// Force-emit signed cascade rows for WINDOW_PARTITION / GROUP_RECOMPUTE even
+	// when no downstream MV is registered yet. Used by openivm-spark's
+	// compile-only bridge, which runs each MV in an isolated DuckDB subprocess
+	// with an empty openivm_delta_tables catalog.
+	db_config.AddExtensionOption(openivm::EMIT_CASCADE_DELTA_FOR_RECOMPUTE,
+	                             "force emission of signed cascade rows for WINDOW_PARTITION / GROUP_RECOMPUTE "
+	                             "into openivm_delta_<view> even when no downstream MV is registered",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+
 	// Target SQL dialect for the lpts pipeline. Forwarded to LogicalPlanToAst
 	// and AstToCteList at every refresh-SQL generation call site so the
 	// emitted SQL is in the requested dialect ('duckdb' (default), 'postgres',
@@ -368,8 +377,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	//   refresh_type        INTEGER  — RefreshType enum value (see openivm_constants.hpp).
 	//   refresh_type_name   VARCHAR  — human-readable form (e.g. 'AGGREGATE_GROUP').
 	//   sql                 VARCHAR  — assembled refresh SQL in the target dialect.
-	auto compile_refresh =
-	    PragmaFunction::PragmaCall("compile_refresh", CompileRefreshQuery, {LogicalType::VARCHAR});
+	auto compile_refresh = PragmaFunction::PragmaCall("compile_refresh", CompileRefreshQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(compile_refresh);
 
 	// PRAGMA refresh_status('view_name') — returns refresh status for a materialized view.

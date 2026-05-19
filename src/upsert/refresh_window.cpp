@@ -356,7 +356,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &delta_ts_filter, const string &internal_catalog_prefix,
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
-                                   bool cross_system) {
+                                   bool cross_system, bool emit_cascade_delta) {
 	auto partition_cols = metadata.GetGroupColumns(view_name); // reuses group_columns field
 	auto partition_delta_specs =
 	    BuildWindowPartitionDeltaSpecs(metadata, con, view_name, delta_table_names, partition_cols, cross_system);
@@ -381,7 +381,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols)\n",
 	                    partition_cols.size());
 	return CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, internal_catalog_prefix, partition_cols,
-	                              partition_delta_specs);
+	                              partition_delta_specs, emit_cascade_delta);
 }
 
 } // namespace duckdb

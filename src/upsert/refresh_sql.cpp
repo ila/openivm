@@ -155,6 +155,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
 	RefreshType view_query_type = metadata.GetViewType(view_name);
+	bool emit_cascade_delta_for_recompute = false;
+	{
+		Value emit_cascade_val;
+		if (context.TryGetCurrentSetting(openivm::EMIT_CASCADE_DELTA_FOR_RECOMPUTE, emit_cascade_val) &&
+		    !emit_cascade_val.IsNull() && emit_cascade_val.GetValue<bool>() &&
+		    (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE)) {
+			emit_cascade_delta_for_recompute = true;
+		}
+	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
 	auto delta_table_names = metadata.GetDeltaTables(view_name);
@@ -378,10 +387,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		break;
 	}
 	case RefreshType::WINDOW_PARTITION: {
-		upsert_query = BuildWindowPartitionRefresh(metadata, con, view_name, view_query_sql, delta_table_names,
-		                                           column_names, data_table, delta_ts_filter, internal_catalog_prefix,
-		                                           view_catalog_name, view_schema_name, attached_db_catalog_name,
-		                                           attached_db_schema_name, cross_system);
+		upsert_query = BuildWindowPartitionRefresh(
+		    metadata, con, view_name, view_query_sql, delta_table_names, column_names, data_table, delta_ts_filter,
+		    internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
+		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute);
 		break;
 	}
 	case RefreshType::DISTINCT_INCREMENTAL: {
@@ -449,8 +458,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
 		string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
 		string lpts_table_prefix = SqlUtils::QualifiedPrefix(lpts_cat, lpts_sch);
-		upsert_query = CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs,
-		                                     internal_catalog_prefix, lpts_table_prefix);
+		upsert_query =
+		    CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs, internal_catalog_prefix,
+		                          lpts_table_prefix, emit_cascade_delta_for_recompute);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE (%zu group cols, %zu sources)\n",
 		                    group_columns.size(), delta_specs.size());
 		break;
@@ -486,18 +496,26 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// SIMPLE_AGGREGATE snapshot-companion (refresh_sql.cpp:477 build_snapshot_companion)
 	// uses a CREATE TEMP TABLE / DROP TABLE pre/post-pair which openivm-spark's
 	// SparkRefreshRewriter does not currently transform; enabling it would
-	// generate Spark-unparseable SQL. WINDOW_PARTITION / GROUP_RECOMPUTE /
-	// DISTINCT_INCREMENTAL / SEMI_ANTI_RECOMPUTE also use the snapshot path
-	// and are left untouched.
+	// generate Spark-unparseable SQL. WINDOW_PARTITION / GROUP_RECOMPUTE use the
+	// dedicated pragma below.
 	{
 		Value force_cascade_val;
 		if (context.TryGetCurrentSetting("openivm_force_view_delta_cascade", force_cascade_val) &&
 		    !force_cascade_val.IsNull() && force_cascade_val.GetValue<bool>() &&
-		    (view_query_type == RefreshType::AGGREGATE_GROUP ||
-		     view_query_type == RefreshType::AGGREGATE_HAVING)) {
+		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
 			has_downstream = true;
 		}
 	}
+	// openivm_emit_cascade_delta_for_recompute: WINDOW_PARTITION / GROUP_RECOMPUTE
+	// compile their own signed-multiset view-delta into openivm_delta_<view>.
+	// Treat the MV as cascade-capable so cleanup retains the emitted rows even
+	// in compile-for-cascade sessions with no registered downstream metadata.
+	if (emit_cascade_delta_for_recompute) {
+		has_downstream = true;
+	}
+	bool recompute_handles_own_cascade_delta =
+	    emit_cascade_delta_for_recompute &&
+	    (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE);
 	auto build_snapshot_companion = [&]() {
 		string col_list;
 		for (auto &col : column_names) {
@@ -552,7 +570,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                    : view_query_type == RefreshType::GROUP_RECOMPUTE      ? "GROUP_RECOMPUTE"
 		                                                                           : "WINDOW_PARTITION");
 		delta_query = "";
-		if (has_downstream) {
+		if (has_downstream && !recompute_handles_own_cascade_delta) {
 			build_snapshot_companion();
 		}
 	} else {
@@ -713,7 +731,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	}
 
 	if (has_downstream) {
-		if (skip_empty_enabled) {
+		if (skip_empty_enabled && !recompute_handles_own_cascade_delta) {
 			compact_delta_view_query =
 			    BuildCompactDeltaViewSQL(view_name, delta_view_name, column_names, delta_ts_filter);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n", compact_delta_view_query.c_str());

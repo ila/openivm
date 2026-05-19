@@ -264,7 +264,7 @@ string CompileFilteredGroupCount(const string &view_name, const string &aux_tabl
 
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter,
                               const string &catalog_prefix, const vector<string> &partition_columns,
-                              const vector<WindowPartitionDeltaSpec> &partition_delta_specs) {
+                              const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta) {
 	if (partition_columns.empty() || partition_delta_specs.empty()) {
 		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
 	}
@@ -285,9 +285,27 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		    output_col + " IN (SELECT DISTINCT " + source_col + " FROM " + delta_table + delta_where + ")";
 	}
 
-	OPENIVM_DEBUG_PRINT("[CompileWindowRecompute] Partition columns: %zu\n", partition_columns.size());
-	return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter,
-	                                   affected_filter);
+	OPENIVM_DEBUG_PRINT("[CompileWindowRecompute] Partition columns: %zu, cascade delta: %s\n",
+	                    partition_columns.size(), emit_cascade_delta ? "enabled" : "disabled");
+	if (!emit_cascade_delta) {
+		return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter,
+		                                   affected_filter);
+	}
+
+	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
+	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + "\nWHERE " +
+	       affected_filter + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+	       ") openivm_recompute\nWHERE " + affected_filter + ";\n\n";
+	sql += "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
+	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
+	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+	sql += "\nDROP TABLE IF EXISTS " + old_temp_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
+	return sql;
 }
 
 } // namespace duckdb
