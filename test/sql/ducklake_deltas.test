@@ -369,6 +369,13 @@ statement ok
 CREATE MATERIALIZED VIEW dl.mv_skip_base AS
 SELECT id, v FROM dl.skip_base;
 
+query I
+SELECT source_table_id IS NOT NULL
+FROM openivm_delta_tables
+WHERE view_name = 'mv_skip_base';
+----
+true
+
 statement ok
 CREATE TEMP TABLE skip_base_snapshot AS
 SELECT last_snapshot_id AS snap
@@ -392,6 +399,40 @@ statement ok
 DROP TABLE skip_base_snapshot;
 
 statement ok
+UPDATE openivm_delta_tables
+SET source_table_id = NULL
+WHERE view_name = 'mv_skip_base';
+
+statement ok
+CREATE TEMP TABLE skip_base_snapshot_backfill AS
+SELECT last_snapshot_id AS snap
+FROM openivm_delta_tables
+WHERE view_name = 'mv_skip_base';
+
+statement ok
+INSERT INTO dl.skip_unrelated VALUES (2);
+
+statement ok
+PRAGMA refresh('mv_skip_base');
+
+query I
+SELECT source_table_id IS NOT NULL
+FROM openivm_delta_tables
+WHERE view_name = 'mv_skip_base';
+----
+true
+
+query I
+SELECT last_snapshot_id > (SELECT snap FROM skip_base_snapshot_backfill)
+FROM openivm_delta_tables
+WHERE view_name = 'mv_skip_base';
+----
+true
+
+statement ok
+DROP TABLE skip_base_snapshot_backfill;
+
+statement ok
 INSERT INTO dl.skip_base VALUES (2, 20);
 
 statement ok
@@ -408,12 +449,124 @@ SELECT count(*) FROM (
 
 query I
 SELECT count(*) FROM (
-  SELECT id, v FROM dl.skip_base
+SELECT id, v FROM dl.skip_base
   EXCEPT ALL
   SELECT id, v FROM dl.mv_skip_base
 );
 ----
 0
+
+statement ok
+CREATE SCHEMA dl.same_a;
+
+statement ok
+CREATE SCHEMA dl.same_b;
+
+statement ok
+CREATE TABLE dl.same_a.same_name (id INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.same_b.same_name (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.same_a.same_name VALUES (1, 100);
+
+statement ok
+INSERT INTO dl.same_b.same_name VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_same_schema AS
+SELECT id, v FROM dl.same_b.same_name;
+
+query I
+SELECT source_table_id = (
+  SELECT t.table_id
+  FROM __ducklake_metadata_dl.ducklake_table t
+  JOIN __ducklake_metadata_dl.ducklake_schema s ON t.schema_id = s.schema_id
+  WHERE t.end_snapshot IS NULL
+    AND s.end_snapshot IS NULL
+    AND t.table_name = 'same_name'
+    AND s.schema_name = 'same_b'
+)
+FROM openivm_delta_tables
+WHERE view_name = 'mv_same_schema';
+----
+true
+
+statement ok
+UPDATE openivm_delta_tables
+SET source_table_id = source_table_id + 100000
+WHERE view_name = 'mv_same_schema';
+
+statement ok
+CREATE TEMP TABLE same_schema_snapshot AS
+SELECT last_snapshot_id AS snap
+FROM openivm_delta_tables
+WHERE view_name = 'mv_same_schema';
+
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+INSERT INTO dl.same_a.same_name VALUES (2, 200);
+
+statement ok
+PRAGMA refresh('mv_same_schema');
+
+query I
+SELECT count(*)
+FROM openivm_refresh_profile
+WHERE view_name = 'mv_same_schema'
+  AND step_name = 'generate_refresh_sql.dispatch'
+  AND detail LIKE '%metadata_requires_full_refresh=true%';
+----
+1
+
+statement ok
+SET openivm_profile_refresh = false;
+
+query I
+SELECT last_snapshot_id > (SELECT snap FROM same_schema_snapshot)
+FROM openivm_delta_tables
+WHERE view_name = 'mv_same_schema';
+----
+true
+
+query I
+SELECT source_table_id = (
+  SELECT t.table_id
+  FROM __ducklake_metadata_dl.ducklake_table t
+  JOIN __ducklake_metadata_dl.ducklake_schema s ON t.schema_id = s.schema_id
+  WHERE t.end_snapshot IS NULL
+    AND s.end_snapshot IS NULL
+    AND t.table_name = 'same_name'
+    AND s.schema_name = 'same_b'
+)
+FROM openivm_delta_tables
+WHERE view_name = 'mv_same_schema';
+----
+true
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v FROM dl.mv_same_schema
+  EXCEPT ALL
+  SELECT id, v FROM dl.same_b.same_name
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, v FROM dl.same_b.same_name
+  EXCEPT ALL
+  SELECT id, v FROM dl.mv_same_schema
+);
+----
+0
+
+statement ok
+DROP TABLE same_schema_snapshot;
 
 statement ok
 CREATE TABLE dl.skip_left (id INTEGER, v INTEGER);

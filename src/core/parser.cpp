@@ -1208,6 +1208,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		for (const auto &table_name : table_names) {
 			string catalog_type = "duckdb";
 			string snapshot_val = "null";
+			string source_table_id_val = "null";
 			string meta_table_name = SqlUtils::DeltaName(table_name);
 			string source_catalog_val = current_catalog.empty() ? "memory" : current_catalog;
 			string source_schema_val = current_schema.empty() ? "main" : current_schema;
@@ -1225,6 +1226,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				ducklake_tables.insert(it->second.table_name);
 				ducklake_tables.insert(table_name); // also insert SQL-parsed name
 				snapshot_val = dl_snapshot_val;
+				if (it->second.table_id >= 0) {
+					source_table_id_val = to_string(it->second.table_id);
+				}
 				source_catalog_val = it->second.catalog_name;
 				source_schema_val = it->second.schema_name;
 				OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake table '%s' → meta_name='%s', snap=%s\n", table_name.c_str(),
@@ -1240,14 +1244,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				continue;
 			}
 
-			source_metadata_ddl.push_back("insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
-			                              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
-			                              "last_refresh_ts, source_catalog, source_schema) "
-			                              "values ('" +
-			                              view_name + "', '" + SqlUtils::EscapeSingleQuotes(meta_table_name) +
-			                              "', now(), '" + catalog_type + "', " + snapshot_val + ", now(), '" +
-			                              SqlUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
-			                              SqlUtils::EscapeSingleQuotes(source_schema_val) + "')");
+			source_metadata_ddl.push_back(
+			    "insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
+			    " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
+			    "last_refresh_ts, source_catalog, source_schema, source_table_id) "
+			    "values ('" +
+			    view_name + "', '" + SqlUtils::EscapeSingleQuotes(meta_table_name) + "', now(), '" + catalog_type +
+			    "', " + snapshot_val + ", now(), '" + SqlUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
+			    SqlUtils::EscapeSingleQuotes(source_schema_val) + "', " + source_table_id_val + ")");
 		}
 
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---

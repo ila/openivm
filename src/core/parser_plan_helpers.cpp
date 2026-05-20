@@ -368,7 +368,12 @@ void CollectDuckLakeTables(LogicalOperator *op, const string &current_catalog,
 					}
 					cat = current_catalog;
 				}
-				dl_table_info[lc] = {info.table_name, cat, info.table.schema.name};
+				DuckLakeSourceTableInfo source_info;
+				source_info.table_name = info.table_name;
+				source_info.catalog_name = cat;
+				source_info.schema_name = info.table.schema.name;
+				source_info.table_id = static_cast<int64_t>(info.table_id.index);
+				dl_table_info[lc] = source_info;
 			}
 		}
 	}

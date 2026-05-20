@@ -4,6 +4,7 @@
 #include "rules/incremental_rewrite_rule.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "upsert/refresh_index_regen.hpp"
@@ -16,6 +17,7 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "storage/ducklake_scan.hpp"
+#include "upsert/refresh_internal.hpp"
 
 namespace duckdb {
 
@@ -201,9 +203,19 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 	// building the term so unchanged tables do not force a full plan copy/rewrite.
 	vector<bool> empty_table_delta(N, false);
 	if (skip_empty_enabled && current_snapshot >= 0) {
+		RefreshMetadata metadata(con);
 		for (size_t i = 0; i < N; i++) {
 			if (old_snapshots[i] == current_snapshot) {
 				empty_table_delta[i] = true;
+				continue;
+			}
+			auto metadata_activity =
+			    ProbeDuckLakeSnapshotActivity(metadata, con, pw.view, table_names[i], table_catalogs[i],
+			                                  table_schemas[i], old_snapshots[i], current_snapshot);
+			if (metadata_activity.ok) {
+				if (!metadata_activity.has_changes) {
+					empty_table_delta[i] = true;
+				}
 				continue;
 			}
 			string has_changes_sql =

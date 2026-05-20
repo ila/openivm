@@ -117,6 +117,17 @@ public:
 	// Get the DuckLake snapshot ID at last refresh. Returns -1 if not set.
 	int64_t GetLastSnapshotId(const string &view_name, const string &table_name);
 
+	struct DuckLakeSourceIdentity {
+		int64_t stored_table_id = -1;
+		int64_t current_table_id = -1;
+		bool resolved = false;
+		bool changed = false;
+	};
+
+	// Resolve the DuckLake table id recorded for a source table and repair stale/missing metadata.
+	DuckLakeSourceIdentity ResolveDuckLakeSourceIdentity(const string &view_name, const string &table_name,
+	                                                     const string &catalog_name, const string &schema_name);
+
 	static string BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
 	                                              const string &snapshot_expr);
 	void UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name, int64_t snapshot_id);

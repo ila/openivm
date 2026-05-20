@@ -167,6 +167,164 @@ SELECT id, k, label FROM compact_cancel_join ORDER BY id;
 1	10	a
 2	20	b
 
+# Downstream projection over an aggregate MV must receive row-replacement
+# deltas (-old/+new), not additive aggregate deltas.
+statement ok
+CREATE TABLE agg_proj_sales (id INT, region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO agg_proj_sales VALUES (1, 'east', 10), (2, 'east', 20), (3, 'west', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW agg_proj_region AS
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
+    FROM agg_proj_sales GROUP BY region;
+
+statement ok
+CREATE MATERIALIZED VIEW agg_proj_top AS
+    SELECT region, total, cnt FROM agg_proj_region WHERE total > 0;
+
+statement ok
+INSERT INTO agg_proj_sales VALUES (4, 'east', 7), (5, 'west', 8), (6, 'north', 9);
+
+statement ok
+PRAGMA refresh('agg_proj_region');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total, cnt FROM agg_proj_region
+    EXCEPT ALL
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region
+    EXCEPT ALL
+    SELECT region, total, cnt FROM agg_proj_region
+);
+----
+0
+
+statement ok
+PRAGMA refresh('agg_proj_top');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total, cnt FROM agg_proj_top
+    EXCEPT ALL
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region HAVING SUM(amount) > 0
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region HAVING SUM(amount) > 0
+    EXCEPT ALL
+    SELECT region, total, cnt FROM agg_proj_top
+);
+----
+0
+
+statement ok
+UPDATE agg_proj_sales SET amount = amount + 3 WHERE id IN (1, 4);
+
+statement ok
+DELETE FROM agg_proj_sales WHERE id = 5;
+
+statement ok
+INSERT INTO agg_proj_sales VALUES (7, 'west', 11), (8, 'south', 4);
+
+statement ok
+PRAGMA refresh('agg_proj_region');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total, cnt FROM agg_proj_region
+    EXCEPT ALL
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region
+    EXCEPT ALL
+    SELECT region, total, cnt FROM agg_proj_region
+);
+----
+0
+
+statement ok
+PRAGMA refresh('agg_proj_top');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total, cnt FROM agg_proj_top
+    EXCEPT ALL
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region HAVING SUM(amount) > 0
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region HAVING SUM(amount) > 0
+    EXCEPT ALL
+    SELECT region, total, cnt FROM agg_proj_top
+);
+----
+0
+
+statement ok
+DELETE FROM agg_proj_sales WHERE region = 'north';
+
+statement ok
+PRAGMA refresh('agg_proj_region');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total, cnt FROM agg_proj_region
+    EXCEPT ALL
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region
+    EXCEPT ALL
+    SELECT region, total, cnt FROM agg_proj_region
+);
+----
+0
+
+statement ok
+PRAGMA refresh('agg_proj_top');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, total, cnt FROM agg_proj_top
+    EXCEPT ALL
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region HAVING SUM(amount) > 0
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT region, SUM(amount), COUNT(*) FROM agg_proj_sales GROUP BY region HAVING SUM(amount) > 0
+    EXCEPT ALL
+    SELECT region, total, cnt FROM agg_proj_top
+);
+----
+0
+
 # ============================================================
 # Three-level chain: table -> MV1 -> MV2 -> MV3
 # ============================================================

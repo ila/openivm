@@ -336,6 +336,50 @@ int64_t RefreshMetadata::GetLastSnapshotId(const string &view_name, const string
 	return result->GetValue(0, 0).GetValue<int64_t>();
 }
 
+RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceIdentity(const string &view_name,
+                                                                                       const string &table_name,
+                                                                                       const string &catalog_name,
+                                                                                       const string &schema_name) {
+	DuckLakeSourceIdentity identity;
+	auto result =
+	    con.Query("SELECT source_table_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
+		identity.stored_table_id = result->GetValue(0, 0).GetValue<int64_t>();
+	}
+	if (catalog_name.empty()) {
+		return identity;
+	}
+
+	string catalog_prefix = SqlUtils::QuoteIdentifier("__ducklake_metadata_" + catalog_name) + ".";
+	string schema_filter = schema_name.empty() ? "main" : schema_name;
+	auto current_result =
+	    con.Query("SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
+	              "ducklake_schema s ON t.schema_id = s.schema_id WHERE t.end_snapshot IS NULL AND "
+	              "s.end_snapshot IS NULL AND t.table_name = '" +
+	              SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" + SqlUtils::EscapeValue(schema_filter) +
+	              "' ORDER BY t.table_id DESC LIMIT 1");
+	if (current_result->HasError() || current_result->RowCount() == 0 || current_result->GetValue(0, 0).IsNull()) {
+		return identity;
+	}
+
+	identity.resolved = true;
+	identity.current_table_id = current_result->GetValue(0, 0).GetValue<int64_t>();
+	identity.changed = identity.stored_table_id >= 0 && identity.stored_table_id != identity.current_table_id;
+	if (identity.stored_table_id == identity.current_table_id) {
+		return identity;
+	}
+	auto update =
+	    con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
+	              " SET source_table_id = " + to_string(identity.current_table_id) + " WHERE view_name = '" +
+	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+	if (update->HasError()) {
+		OPENIVM_DEBUG_PRINT("[DuckLake] Could not backfill source_table_id for %s.%s: %s\n", view_name.c_str(),
+		                    table_name.c_str(), update->GetError().c_str());
+	}
+	return identity;
+}
+
 string RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
                                                         const string &snapshot_expr) {
 	return "UPDATE " + string(openivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = " + snapshot_expr +

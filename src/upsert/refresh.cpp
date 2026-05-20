@@ -157,7 +157,7 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 			profiler.Flush(*context.db.get());
 			return true;
 		}
-		if (!delta_activity.active_delta_table_names.empty()) {
+		if (!delta_activity.active_delta_table_names.empty() || delta_activity.requires_full_refresh) {
 			precomputed_delta_activity = &delta_activity;
 		}
 	}
@@ -406,7 +406,7 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
 	auto delta_tables = metadata.GetDeltaTables(view_name);
 	auto activity = BuildDeltaActivityResult(metadata, con, view_name, view_query_sql, delta_tables, view_catalog_name,
 	                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
-	if (!activity.active_delta_table_names.empty()) {
+	if (!activity.active_delta_table_names.empty() || activity.requires_full_refresh) {
 		if (active_activity) {
 			*active_activity = std::move(activity);
 		}

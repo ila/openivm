@@ -18,6 +18,7 @@ struct DuckLakeSourceTableInfo {
 	string table_name;
 	string catalog_name;
 	string schema_name;
+	int64_t table_id = -1;
 };
 
 struct SourceTableInfo {

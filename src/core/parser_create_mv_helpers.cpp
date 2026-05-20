@@ -100,6 +100,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " pending_estimate_ts timestamp default null,"
 	              " source_catalog varchar default null,"
 	              " source_schema varchar default null,"
+	              " source_table_id bigint default null,"
 	              " primary key(view_name, table_name))");
 	// Backfill for existing databases without the columns (added post-release).
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "last_refresh_ts timestamp default null");
@@ -107,6 +108,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "pending_estimate_ts timestamp default null");
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_catalog varchar default null");
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_schema varchar default null");
+	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_table_id bigint default null");
 
 	// Refresh history: stores execution stats for learned cost model calibration.
 	// Stage A.5 adds `strategy` (default 'incremental') for per-strategy regression.

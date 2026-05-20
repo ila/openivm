@@ -212,14 +212,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			force_full_refresh = true;
 		}
 	}
+	bool metadata_requires_full_refresh =
+	    precomputed_delta_activity && precomputed_delta_activity->requires_full_refresh;
 
-	if (force_full_refresh || view_query_type == RefreshType::FULL_REFRESH) {
+	if (force_full_refresh || metadata_requires_full_refresh || view_query_type == RefreshType::FULL_REFRESH) {
 		auto full_refresh_start = profile_now();
 		auto recompute_query =
 		    BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
 		                        attached_db_schema_name, internal_catalog_prefix, out_post_meta);
 		add_profile_step("generate_refresh_sql.dispatch", full_refresh_start,
-		                 "full_recompute=true; sql_bytes=" + to_string(recompute_query.size()));
+		                 "full_recompute=true; metadata_requires_full_refresh=" +
+		                     string(metadata_requires_full_refresh ? "true" : "false") +
+		                     "; sql_bytes=" + to_string(recompute_query.size()));
 		return recompute_query;
 	}
 	bool adaptive_refresh = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
@@ -554,6 +558,56 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		OPENIVM_DEBUG_PRINT("[UPSERT] Pre-companion: %s\n", pre_companion.c_str());
 		OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
 	};
+	auto build_affected_snapshot_companion = [&](const vector<string> &keys) {
+		string col_list = SqlUtils::JoinQuotedColumns(column_names);
+		string select_old, select_new;
+		bool first = true;
+		for (auto &col : column_names) {
+			if (!first) {
+				select_old += ", ";
+				select_new += ", ";
+			}
+			first = false;
+			if (col == string(openivm::MULTIPLICITY_COL)) {
+				select_old += "-1";
+				select_new += "1";
+			} else {
+				select_old += "openivm_old." + SqlUtils::QuoteIdentifier(col);
+				select_new += "openivm_new." + SqlUtils::QuoteIdentifier(col);
+			}
+		}
+
+		string qdvn = delta_view_name.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(delta_view_name)
+		                                                        : delta_view_name;
+		string affected_temp =
+		    KeywordHelper::WriteOptionallyQuoted(string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name);
+		string old_temp =
+		    KeywordHelper::WriteOptionallyQuoted(string(openivm::TEMP_TABLE_PREFIX) + "snapshot_" + view_name);
+		string key_cols = SqlUtils::JoinQuotedColumns(keys);
+		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+		string target_match = SqlUtils::BuildNullSafeMatch(keys, "openivm_aff", "openivm_data");
+		string new_match = SqlUtils::BuildNullSafeMatch(keys, "openivm_aff", "openivm_new");
+
+		companion_query = "CREATE TEMP TABLE " + affected_temp + " AS SELECT DISTINCT " + key_cols + " FROM " + qdvn +
+		                  delta_where + ";\n";
+		companion_query += "CREATE TEMP TABLE " + old_temp + " AS SELECT openivm_data.* FROM " + data_table +
+		                   " openivm_data WHERE EXISTS (SELECT 1 FROM " + affected_temp + " openivm_aff WHERE " +
+		                   target_match + ");\n";
+
+		post_companion = "DELETE FROM " + qdvn + " WHERE 1=1";
+		if (!delta_ts_filter.empty()) {
+			post_companion += " AND " + delta_ts_filter;
+		}
+		post_companion += ";\n";
+		post_companion += "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_old + " FROM " + old_temp +
+		                  " openivm_old;\n";
+		post_companion += "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_new + " FROM " + data_table +
+		                  " openivm_new WHERE EXISTS (SELECT 1 FROM " + affected_temp + " openivm_aff WHERE " +
+		                  new_match + ");\n";
+		post_companion += "DROP TABLE " + old_temp + ";\nDROP TABLE " + affected_temp + ";\n";
+		OPENIVM_DEBUG_PRINT("[UPSERT] Affected companion query:\n%s\n", companion_query.c_str());
+		OPENIVM_DEBUG_PRINT("[UPSERT] Affected post-companion:\n%s\n", post_companion.c_str());
+	};
 
 	if (skip_compute_delta_for_refresh || view_query_type == RefreshType::WINDOW_PARTITION ||
 	    view_query_type == RefreshType::GROUP_RECOMPUTE || view_query_type == RefreshType::DISTINCT_INCREMENTAL ||
@@ -632,36 +686,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto *idx = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
 			auto key_ids = idx->column_ids;
 			vector<string> keys;
-			unordered_set<string> keys_set;
 			for (auto &kid : key_ids) {
 				keys.push_back(column_names[kid]);
-				keys_set.insert(column_names[kid]);
 			}
-
-			string col_list, val_list;
-			for (auto &col : column_names) {
-				if (!col_list.empty()) {
-					col_list += ", ";
-					val_list += ", ";
-				}
-				col_list += col;
-				if (keys_set.count(col)) {
-					val_list += "d." + col;
-				} else if (col == openivm::MULTIPLICITY_COL) {
-					val_list += "-1";
-				} else {
-					val_list += "0";
-				}
-			}
-			string join_cond = SqlUtils::BuildNullSafeMatch(keys, "d", "m");
-
-			companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list + " FROM " +
-			                  delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) + " > 0";
-			if (!delta_ts_filter.empty()) {
-				companion_query += " AND d." + delta_ts_filter;
-			}
-			companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + ");\n";
-			OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
+			build_affected_snapshot_companion(keys);
 		}
 	}
 

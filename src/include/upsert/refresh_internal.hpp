@@ -51,8 +51,16 @@ struct DeltaActivityResult {
 	idx_t tables_with_changes = 0;
 	bool any_has_deletes = false;
 	bool all_ducklake = true;
+	bool requires_full_refresh = false;
 	vector<string> active_delta_table_names;
 	vector<DuckLakeSnapshotAdvance> ducklake_snapshot_advances;
+};
+
+struct DuckLakeTableActivity {
+	bool ok = false;
+	bool has_changes = false;
+	bool has_deletes = false;
+	bool requires_full_refresh = false;
 };
 
 struct RefreshCompileProfileStep {
@@ -149,6 +157,10 @@ DeltaActivityResult BuildDeltaActivityResult(RefreshMetadata &metadata, Connecti
                                              const string &view_catalog_name, const string &view_schema_name,
                                              const string &attached_db_catalog_name,
                                              const string &attached_db_schema_name);
+DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                                    const string &table_name, const string &catalog_name,
+                                                    const string &schema_name, int64_t last_snapshot_id,
+                                                    int64_t current_snapshot_id);
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                    const string &view_query_sql, const vector<string> &delta_table_names,

@@ -563,6 +563,20 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql) + "\n";
 	string update_ts_sql = "UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
 	                       " SET last_update = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
+	auto delta_tables = metadata.GetDeltaTables(view_name);
+	for (auto &dt : delta_tables) {
+		if (!metadata.IsDuckLakeTable(view_name, dt)) {
+			continue;
+		}
+		auto loc = metadata.GetSourceLocation(view_name, dt, attached_catalog, attached_schema);
+		if (loc.catalog_name.empty()) {
+			continue;
+		}
+		string snapshot_expr =
+		    cross_system ? DuckLakeSnapshotPlaceholder(loc.catalog_name)
+		                 : "(SELECT id FROM " + SqlUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot())";
+		update_ts_sql += RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, snapshot_expr);
+	}
 	string update_ts;
 	if (!cross_system) {
 		update_ts = update_ts_sql;
@@ -571,7 +585,6 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 	}
 
 	string delta_cleanup;
-	auto delta_tables = metadata.GetDeltaTables(view_name);
 	for (auto &dt : delta_tables) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
 			continue;
