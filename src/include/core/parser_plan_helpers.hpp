@@ -94,6 +94,7 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(LogicalOperator *plan, vector<s
                                                  const vector<string> &output_names);
 string ExtractFullOuterJoinMetadata(LogicalOperator *plan);
 vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<string> &planner_names);
+vector<LogicalType> PrepareOutputTypes(LogicalOperator *select_plan, const vector<LogicalType> &planner_types);
 bool QueryHasUnsupportedIncrementalConstruct(const string &query);
 LogicalAggregate *FindOuterAggregate(LogicalOperator *op);
 bool IsPacLoaded(ClientContext &context);

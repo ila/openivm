@@ -233,6 +233,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 		vector<string> output_names;
+		vector<LogicalType> output_types;
 		string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 		bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
 		bool original_has_repeated_cte_ref_under_join = false;
@@ -269,6 +270,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
 
 			output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
+			output_types = PrepareOutputTypes(select_plan.get(), select_planner.types);
 			// Strip HAVING filter from plan — data table stores all groups.
 			// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 			having_predicate = StripHavingFilter(select_plan, output_names);
@@ -1203,7 +1205,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			}
 		}
 
-		vector<string> source_metadata_ddl;
+		vector<string> source_metadata_values;
+		unordered_map<string, vector<string>> snapshot_update_tables_by_catalog;
 		unordered_set<string> inserted_meta_table_names;
 		for (const auto &table_name : table_names) {
 			string catalog_type = "duckdb";
@@ -1231,6 +1234,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				}
 				source_catalog_val = it->second.catalog_name;
 				source_schema_val = it->second.schema_name;
+				snapshot_update_tables_by_catalog[source_catalog_val].push_back(meta_table_name);
 				OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake table '%s' → meta_name='%s', snap=%s\n", table_name.c_str(),
 				                    meta_table_name.c_str(), snapshot_val.c_str());
 			}
@@ -1244,14 +1248,19 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				continue;
 			}
 
-			source_metadata_ddl.push_back(
-			    "insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
-			    " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
-			    "last_refresh_ts, source_catalog, source_schema, source_table_id) "
-			    "values ('" +
-			    view_name + "', '" + SqlUtils::EscapeSingleQuotes(meta_table_name) + "', now(), '" + catalog_type +
-			    "', " + snapshot_val + ", now(), '" + SqlUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
-			    SqlUtils::EscapeSingleQuotes(source_schema_val) + "', " + source_table_id_val + ")");
+			source_metadata_values.push_back("('" + SqlUtils::EscapeSingleQuotes(view_name) + "', '" +
+			                                 SqlUtils::EscapeSingleQuotes(meta_table_name) + "', now(), '" +
+			                                 SqlUtils::EscapeSingleQuotes(catalog_type) + "', " + snapshot_val +
+			                                 ", now(), '" + SqlUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
+			                                 SqlUtils::EscapeSingleQuotes(source_schema_val) + "', " +
+			                                 source_table_id_val + ")");
+		}
+		vector<string> source_metadata_ddl;
+		if (!source_metadata_values.empty()) {
+			source_metadata_ddl.push_back("insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
+			                              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
+			                              "last_refresh_ts, source_catalog, source_schema, source_table_id) values " +
+			                              StringUtil::Join(source_metadata_values, ", "));
 		}
 
 		// --- Compiled DDL (MV creation, delta tables, delta view) ---
@@ -1395,10 +1404,38 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Delta table for the MV — based on the DATA table (has all columns)
 		add_profile_marker("create_mv_mv_delta_table");
 		string qdv = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
-		ddl.push_back("create table if not exists " + qdv + " as select *, 1::INTEGER as " +
-		              string(openivm::MULTIPLICITY_COL) + ", now()::timestamp as " + string(openivm::TIMESTAMP_COL) +
-		              " from " + qdt + " limit 0");
-		ddl.push_back("alter table " + qdv + " alter " + string(openivm::TIMESTAMP_COL) + " set default now()");
+		bool can_create_delta_from_schema = !output_names.empty() && output_names.size() == output_types.size();
+		string delta_schema_sql;
+		if (can_create_delta_from_schema) {
+			vector<string> delta_columns;
+			for (idx_t i = 0; i < output_names.size(); i++) {
+				if (output_names[i].empty() || StringUtil::CIEquals(output_names[i], openivm::MULTIPLICITY_COL) ||
+				    StringUtil::CIEquals(output_names[i], openivm::TIMESTAMP_COL)) {
+					can_create_delta_from_schema = false;
+					break;
+				}
+				auto type_sql = output_types[i].ToString();
+				if (type_sql.empty()) {
+					can_create_delta_from_schema = false;
+					break;
+				}
+				delta_columns.push_back(KeywordHelper::WriteOptionallyQuoted(output_names[i]) + " " + type_sql);
+			}
+			if (can_create_delta_from_schema) {
+				delta_columns.push_back(string(openivm::MULTIPLICITY_COL) + " INTEGER DEFAULT 1");
+				delta_columns.push_back(string(openivm::TIMESTAMP_COL) + " TIMESTAMP DEFAULT now()");
+				delta_schema_sql =
+				    "create table if not exists " + qdv + " (" + StringUtil::Join(delta_columns, ", ") + ")";
+			}
+		}
+		if (can_create_delta_from_schema) {
+			ddl.push_back(delta_schema_sql);
+		} else {
+			ddl.push_back("create table if not exists " + qdv + " as select *, 1::INTEGER as " +
+			              string(openivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
+			              string(openivm::TIMESTAMP_COL) + " from " + qdt + " limit 0");
+			ddl.push_back("alter table " + qdv + " alter " + string(openivm::TIMESTAMP_COL) + " set default now()");
+		}
 		add_cleanup("DROP TABLE IF EXISTS " + qdv);
 
 		// --- Index DDL (for aggregate group queries) ---
@@ -1432,28 +1469,27 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// to the current snapshot. This ensures the first refresh only sees changes
 		// made AFTER the MV was created (not the initial data load).
 		add_profile_marker("create_mv_snapshot_metadata");
-		for (const auto &table_name : table_names) {
-			string table_lc = StringUtil::Lower(table_name);
-			if (ducklake_tables.count(table_name) || ducklake_tables.count(table_lc)) {
-				// Use the DuckLake catalog for current_snapshot() — NOT view_catalog_prefix
-				// or current_catalog. For cross-system MVs (native MV reading from dl.*),
-				// view_catalog_prefix is empty and current_catalog is the physical-default
-				// (e.g. the file DB) which doesn't have `current_snapshot()`.
-				// table_names entries may be lowercased by the parser; the metadata row was
-				// inserted above with the case-preserved DuckLake name (`dl_table_info`).
-				string table_lc_for_lookup = StringUtil::Lower(table_name);
-				auto info_it = dl_table_info.find(table_lc_for_lookup);
-				if (info_it == dl_table_info.end() || info_it->second.catalog_name.empty()) {
-					throw CatalogException("Could not resolve DuckLake catalog for source table '" + table_name +
-					                       "' while creating materialized view '" + view_name + "'");
+		for (auto &entry : snapshot_update_tables_by_catalog) {
+			unordered_set<string> seen_tables;
+			vector<string> table_literals;
+			for (auto &table_name : entry.second) {
+				if (!seen_tables.insert(table_name).second) {
+					continue;
 				}
-				string meta_table_name = info_it->second.table_name;
-				string dl_cat_name = info_it->second.catalog_name;
-				ddl.push_back("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
-				              " SET last_snapshot_id = (SELECT id FROM " + dl_cat_name +
-				              ".current_snapshot()) WHERE view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) +
-				              "' AND table_name = '" + SqlUtils::EscapeSingleQuotes(meta_table_name) + "'");
+				table_literals.push_back("'" + SqlUtils::EscapeSingleQuotes(table_name) + "'");
 			}
+			if (table_literals.empty()) {
+				continue;
+			}
+			// Use the DuckLake catalog for current_snapshot() — NOT view_catalog_prefix
+			// or current_catalog. For cross-system MVs (native MV reading from dl.*),
+			// view_catalog_prefix is empty and current_catalog is the physical-default
+			// (e.g. the file DB) which doesn't have `current_snapshot()`.
+			string snapshot_catalog = KeywordHelper::WriteOptionallyQuoted(entry.first);
+			ddl.push_back("UPDATE " + string(openivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = (SELECT id FROM " +
+			              snapshot_catalog + ".current_snapshot()) WHERE view_name = '" +
+			              SqlUtils::EscapeSingleQuotes(view_name) + "' AND table_name IN (" +
+			              StringUtil::Join(table_literals, ", ") + ")");
 		}
 
 		// Publish the MV metadata last. CREATE MV touches both the physical DuckDB catalog

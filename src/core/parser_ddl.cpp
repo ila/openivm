@@ -154,6 +154,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	CreateMVProfiler profiler(context);
 	string current_profile_step = "create_mv_unclassified";
 	string current_profile_detail;
+	vector<string> pending_ddl;
 	auto preserve_result = conn->Query("SET preserve_insertion_order=false");
 	if (preserve_result->HasError()) {
 		throw CatalogException("Failed to configure OpenIVM DDL connection: " + preserve_result->GetError());
@@ -169,8 +170,47 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			}
 		}
 	};
+	auto flush_pending = [&]() {
+		if (pending_ddl.empty()) {
+			return;
+		}
+		string query;
+		size_t bytes = 0;
+		for (idx_t i = 0; i < pending_ddl.size(); i++) {
+			if (i > 0) {
+				query += ";\n";
+			}
+			query += pending_ddl[i];
+			bytes += pending_ddl[i].size();
+		}
+		OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Executing DDL batch (%lu statements): %s\n",
+		                    (unsigned long)pending_ddl.size(), query.c_str());
+		auto ddl_start = std::chrono::steady_clock::now();
+		auto r = conn->Query(query);
+		profiler.AddStep(current_profile_step, ddl_start,
+		                 current_profile_detail + "; statements=" + to_string(pending_ddl.size()) +
+		                     "; bytes=" + to_string(bytes));
+		if (r->HasError()) {
+			bool is_unique_index = pending_ddl.size() == 1 &&
+			                       StringUtil::Contains(StringUtil::Lower(pending_ddl[0]), "create unique index") &&
+			                       StringUtil::Contains(r->GetError(), "Data contains duplicates");
+			if (is_unique_index) {
+				Printer::Print("Warning: could not create unique index for MV — group_columns "
+				               "are not unique in MV output. Refresh will still work (no index).");
+				pending_ddl.clear();
+				return;
+			}
+			run_cleanup();
+			profiler.AddTotal();
+			profiler.Flush(db);
+			restore_outer_transaction();
+			throw CatalogException("Failed to execute IVM DDL: " + r->GetError());
+		}
+		pending_ddl.clear();
+	};
 	for (auto &q : ddl) {
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
+			flush_pending();
 			string marker_view_name;
 			string measured_step_name;
 			string measured_detail;
@@ -184,6 +224,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			continue;
 		}
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_PROFILE_PREFIX)) {
+			flush_pending();
 			string marker_view_name;
 			ParseCreateMVProfileMarker(q.substr(strlen(OPENIVM_DDL_PROFILE_PREFIX)), marker_view_name,
 			                           current_profile_step, current_profile_detail);
@@ -196,25 +237,9 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			cleanup_ddl.push_back(q.substr(strlen(OPENIVM_DDL_CLEANUP_PREFIX)));
 			continue;
 		}
-		OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Executing DDL: %s\n", q.c_str());
-		auto ddl_start = std::chrono::steady_clock::now();
-		auto r = conn->Query(q);
-		profiler.AddStep(current_profile_step, ddl_start, current_profile_detail + "; bytes=" + to_string(q.size()));
-		if (r->HasError()) {
-			bool is_unique_index = StringUtil::Contains(StringUtil::Lower(q), "create unique index") &&
-			                       StringUtil::Contains(r->GetError(), "Data contains duplicates");
-			if (is_unique_index) {
-				Printer::Print("Warning: could not create unique index for MV — group_columns "
-				               "are not unique in MV output. Refresh will still work (no index).");
-				continue;
-			}
-			run_cleanup();
-			profiler.AddTotal();
-			profiler.Flush(db);
-			restore_outer_transaction();
-			throw CatalogException("Failed to execute IVM DDL: " + r->GetError());
-		}
+		pending_ddl.push_back(q);
 	}
+	flush_pending();
 	profiler.AddTotal();
 	profiler.Flush(db);
 	restore_outer_transaction();

@@ -74,6 +74,11 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj'
 ----
 2
 
+query I
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'create_mv_mv_delta_table' AND contains(detail, 'statements=1');
+----
+1
+
 statement ok
 INSERT INTO profile_proj_base VALUES (2, 'two');
 

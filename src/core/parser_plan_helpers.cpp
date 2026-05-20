@@ -1634,6 +1634,41 @@ static void AppendHiddenOutputNames(LogicalOperator *plan, vector<string> &outpu
 	}
 }
 
+static void AppendHiddenOutputTypes(LogicalOperator *plan, vector<LogicalType> &output_types) {
+	auto output_count = plan->GetColumnBindings().size();
+	auto *type_source = FindTopNameSource(plan);
+	if (!type_source) {
+		return;
+	}
+	if (type_source->types.size() == output_count) {
+		while (output_types.size() < output_count) {
+			output_types.push_back(type_source->types[output_types.size()]);
+		}
+		return;
+	}
+	if (type_source->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &projection = type_source->Cast<LogicalProjection>();
+		while (output_types.size() < output_count && output_types.size() < projection.expressions.size()) {
+			output_types.push_back(projection.expressions[output_types.size()]->return_type);
+		}
+		return;
+	}
+	auto &aggregate = type_source->Cast<LogicalAggregate>();
+	idx_t group_count = aggregate.groups.size();
+	while (output_types.size() < output_count) {
+		idx_t idx = output_types.size();
+		if (idx < group_count) {
+			output_types.push_back(aggregate.groups[idx]->return_type);
+		} else {
+			idx_t expr_idx = idx - group_count;
+			if (expr_idx >= aggregate.expressions.size()) {
+				break;
+			}
+			output_types.push_back(aggregate.expressions[expr_idx]->return_type);
+		}
+	}
+}
+
 static void DeduplicateOutputNames(vector<string> &output_names) {
 	unordered_set<string> seen;
 	for (auto &name : output_names) {
@@ -1656,6 +1691,12 @@ vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<str
 	AppendHiddenOutputNames(select_plan, output_names);
 	DeduplicateOutputNames(output_names);
 	return output_names;
+}
+
+vector<LogicalType> PrepareOutputTypes(LogicalOperator *select_plan, const vector<LogicalType> &planner_types) {
+	auto output_types = planner_types;
+	AppendHiddenOutputTypes(select_plan, output_types);
+	return output_types;
 }
 
 bool QueryHasUnsupportedIncrementalConstruct(const string &query) {
