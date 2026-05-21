@@ -1,2 +1,2 @@
--- {"operators": "PIVOT,AGGREGATE,UNION", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": true, "has_case": false, "tables": "STOCK,ORDER_LINE", "non_incr_reason": "op:PIVOT"}
+-- {"operators": "PIVOT,AGGREGATE,UNION", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": true, "has_case": false, "tables": "STOCK,ORDER_LINE"}
 SELECT * FROM (PIVOT (SELECT S_W_ID AS w_id, S_I_ID AS item_id, S_QUANTITY AS qty FROM STOCK UNION ALL SELECT OL_SUPPLY_W_ID, OL_I_ID, CAST(OL_QUANTITY AS INT) FROM ORDER_LINE) ON w_id IN (1, 2, 3) USING SUM(qty) GROUP BY item_id) p;

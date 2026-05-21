@@ -1,2 +1,2 @@
--- {"operators": "PIVOT,AGGREGATE,HAVING", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE", "non_incr_reason": "op:PIVOT"}
+-- {"operators": "PIVOT,AGGREGATE,HAVING", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE"}
 SELECT * FROM (PIVOT (SELECT OL_W_ID, OL_D_ID, SUM(OL_AMOUNT) AS total_amount FROM ORDER_LINE GROUP BY OL_W_ID, OL_D_ID HAVING SUM(OL_AMOUNT) > 0) ON OL_W_ID IN (1, 2, 3) USING SUM(total_amount) GROUP BY OL_D_ID) p;
