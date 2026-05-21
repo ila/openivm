@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -135,6 +136,65 @@ void ParseCreateMVProfileRecord(const string &payload, string &view_name, string
 	detail = payload.substr(third + 1);
 }
 
+struct DeltaSchemaDDL {
+	string sql;
+	idx_t column_count = 0;
+};
+
+void ParseCreateDeltaFromDataPayload(const string &payload, string &delta_table, string &data_table) {
+	auto first = payload.find('\t');
+	if (first == string::npos) {
+		return;
+	}
+	delta_table = payload.substr(0, first);
+	data_table = payload.substr(first + 1);
+}
+
+DeltaSchemaDDL BuildCreateDeltaFromDataSQL(Connection &conn, const string &delta_table, const string &data_table) {
+	auto described = conn.Query("DESCRIBE SELECT * FROM " + data_table);
+	if (described->HasError()) {
+		throw CatalogException("Could not derive IVM delta schema from data table '" + data_table +
+		                       "': " + described->GetError());
+	}
+	if (described->RowCount() == 0) {
+		throw CatalogException("Could not derive IVM delta schema from empty column list for data table '" +
+		                       data_table + "'");
+	}
+
+	vector<string> columns;
+	unordered_set<string> seen_column_names;
+	for (idx_t row = 0; row < described->RowCount(); row++) {
+		if (described->GetValue(0, row).IsNull() || described->GetValue(1, row).IsNull()) {
+			throw CatalogException("Could not derive IVM delta schema from data table '" + data_table +
+			                       "': DESCRIBE returned a NULL column name or type");
+		}
+		auto column_name = described->GetValue(0, row).ToString();
+		auto column_type = described->GetValue(1, row).ToString();
+		if (column_name.empty() || column_type.empty()) {
+			throw CatalogException("Could not derive IVM delta schema from data table '" + data_table +
+			                       "': DESCRIBE returned an empty column name or type");
+		}
+		auto column_name_lc = StringUtil::Lower(column_name);
+		if (!seen_column_names.insert(column_name_lc).second) {
+			throw CatalogException("Could not derive IVM delta schema from data table '" + data_table +
+			                       "': duplicate column '" + column_name + "'");
+		}
+		if (StringUtil::CIEquals(column_name, openivm::MULTIPLICITY_COL) ||
+		    StringUtil::CIEquals(column_name, openivm::TIMESTAMP_COL)) {
+			throw CatalogException("Could not derive IVM delta schema from data table '" + data_table +
+			                       "': reserved OpenIVM column '" + column_name + "' is already present");
+		}
+		columns.push_back(SqlUtils::QuoteIdentifier(column_name) + " " + column_type);
+	}
+
+	columns.push_back(string(openivm::MULTIPLICITY_COL) + " INTEGER DEFAULT 1");
+	columns.push_back(string(openivm::TIMESTAMP_COL) + " TIMESTAMP DEFAULT now()");
+	DeltaSchemaDDL result;
+	result.sql = "create table if not exists " + delta_table + " (" + StringUtil::Join(columns, ", ") + ")";
+	result.column_count = described->RowCount();
+	return result;
+}
+
 void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	if (ddl.empty()) {
 		return;
@@ -170,6 +230,13 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			}
 		}
 	};
+	auto fail_ddl = [&](const string &message) {
+		run_cleanup();
+		profiler.AddTotal();
+		profiler.Flush(db);
+		restore_outer_transaction();
+		throw CatalogException("Failed to execute IVM DDL: " + message);
+	};
 	auto flush_pending = [&]() {
 		if (pending_ddl.empty()) {
 			return;
@@ -200,11 +267,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 				pending_ddl.clear();
 				return;
 			}
-			run_cleanup();
-			profiler.AddTotal();
-			profiler.Flush(db);
-			restore_outer_transaction();
-			throw CatalogException("Failed to execute IVM DDL: " + r->GetError());
+			fail_ddl(r->GetError());
 		}
 		pending_ddl.clear();
 	};
@@ -230,6 +293,33 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			                           current_profile_step, current_profile_detail);
 			if (!marker_view_name.empty()) {
 				profiler.SetViewName(marker_view_name);
+			}
+			continue;
+		}
+		if (StringUtil::StartsWith(q, OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
+			flush_pending();
+			string delta_table;
+			string data_table;
+			ParseCreateDeltaFromDataPayload(q.substr(strlen(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)), delta_table,
+			                                data_table);
+			if (delta_table.empty() || data_table.empty()) {
+				fail_ddl("malformed delta-schema payload");
+			}
+			auto ddl_start = std::chrono::steady_clock::now();
+			DeltaSchemaDDL derived;
+			try {
+				derived = BuildCreateDeltaFromDataSQL(*conn, delta_table, data_table);
+			} catch (std::exception &ex) {
+				profiler.AddStep(current_profile_step, ddl_start,
+				                 current_profile_detail + "; delta_schema_derivation_failed=true");
+				fail_ddl(ex.what());
+			}
+			auto r = conn->Query(derived.sql);
+			profiler.AddStep(current_profile_step, ddl_start,
+			                 current_profile_detail + "; statements=1; bytes=" + to_string(derived.sql.size()) +
+			                     "; derived_from_data_schema=true; columns=" + to_string(derived.column_count));
+			if (r->HasError()) {
+				fail_ddl(r->GetError());
 			}
 			continue;
 		}

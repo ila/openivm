@@ -91,6 +91,159 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# LIST FILTER fallback with hidden AVG columns must create the MV delta table
+# from the actual data table schema so downstream refresh snapshots bind.
+statement ok
+CREATE TABLE list_filter_avg_items (grp INT, item INT, qty INT, price DOUBLE);
+
+statement ok
+INSERT INTO list_filter_avg_items VALUES
+    (1, 10, 90, 12.0), (1, 20, 10, 20.0), (1, 30, 80, 18.0),
+    (2, 40, 20,  9.0), (2, 50, 70, 15.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_list_filter_avg_parent AS
+    SELECT grp,
+           AVG(price) AS avg_price,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+    FROM list_filter_avg_items GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_list_filter_avg_child AS
+    SELECT grp, avg_price FROM mv_list_filter_avg_parent WHERE avg_price > 10;
+
+statement ok
+INSERT INTO list_filter_avg_items VALUES
+    (1, 60, 95, 30.0),
+    (2, 70, 75, 21.0);
+
+statement ok
+DELETE FROM list_filter_avg_items WHERE grp = 1 AND item = 20;
+
+statement ok
+PRAGMA refresh('mv_list_filter_avg_parent');
+
+statement ok
+PRAGMA refresh('mv_list_filter_avg_child');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_filter_avg_parent
+    EXCEPT ALL
+    SELECT grp,
+           AVG(price) AS avg_price,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+    FROM list_filter_avg_items GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp,
+           AVG(price) AS avg_price,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+    FROM list_filter_avg_items GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_list_filter_avg_parent
+);
+----
+0
+
+# Delta-schema derivation failures on the LPTS fallback path must clean up the
+# data table and user view that were already created before schema derivation.
+statement ok
+CREATE TABLE list_schema_cleanup_items (grp INT, item INT, qty INT, price DOUBLE);
+
+statement ok
+INSERT INTO list_schema_cleanup_items VALUES
+    (1, 10, 90, 12.0), (1, 20, 10, 20.0), (1, 30, 80, 18.0),
+    (2, 40, 20,  9.0), (2, 50, 70, 15.0);
+
+statement error
+CREATE MATERIALIZED VIEW mv_list_schema_cleanup AS
+    SELECT grp,
+           AVG(price) AS openivm_multiplicity,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+    FROM list_schema_cleanup_items GROUP BY grp;
+----
+reserved OpenIVM column
+
+query I
+SELECT COUNT(*) FROM information_schema.tables
+WHERE table_name IN (
+    'mv_list_schema_cleanup',
+    'openivm_data_mv_list_schema_cleanup',
+    'openivm_delta_mv_list_schema_cleanup'
+);
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW mv_list_schema_cleanup AS
+    SELECT grp,
+           AVG(price) AS avg_price,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+    FROM list_schema_cleanup_items GROUP BY grp;
+
+statement ok
+INSERT INTO list_schema_cleanup_items VALUES (2, 60, 95, 30.0);
+
+statement ok
+PRAGMA refresh('mv_list_schema_cleanup');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_schema_cleanup
+    EXCEPT ALL
+    SELECT grp,
+           AVG(price) AS avg_price,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+    FROM list_schema_cleanup_items GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp,
+           AVG(price) AS avg_price,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+    FROM list_schema_cleanup_items GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_list_schema_cleanup
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_filter_avg_child
+    EXCEPT ALL
+    SELECT grp, avg_price FROM (
+        SELECT grp,
+               AVG(price) AS avg_price,
+               LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+        FROM list_filter_avg_items GROUP BY grp
+    ) expected WHERE avg_price > 10
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, avg_price FROM (
+        SELECT grp,
+               AVG(price) AS avg_price,
+               LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+        FROM list_filter_avg_items GROUP BY grp
+    ) expected WHERE avg_price > 10
+    EXCEPT ALL
+    SELECT * FROM mv_list_filter_avg_child
+);
+----
+0
+
 # ==========================================
 # 1. Insert into existing group
 # ==========================================

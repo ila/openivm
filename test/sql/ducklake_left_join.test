@@ -63,6 +63,41 @@ SELECT count(*) FROM (
 ----
 0
 
+# The MV delta table must be derived from the physical openivm_data_* table,
+# not from planner output columns. LEFT JOIN rewrites may carry hidden lineage
+# columns that do not survive into the stored data table.
+query I
+SELECT count(*) FROM (
+  SELECT column_name, ordinal_position, data_type
+  FROM information_schema.columns
+  WHERE table_schema = 'main'
+    AND table_name = 'openivm_data_mv_cust_orders'
+  EXCEPT ALL
+  SELECT column_name, ordinal_position, data_type
+  FROM information_schema.columns
+  WHERE table_schema = 'main'
+    AND table_name = 'openivm_delta_mv_cust_orders'
+    AND column_name NOT IN ('openivm_multiplicity', 'openivm_timestamp')
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT column_name, ordinal_position, data_type
+  FROM information_schema.columns
+  WHERE table_schema = 'main'
+    AND table_name = 'openivm_delta_mv_cust_orders'
+    AND column_name NOT IN ('openivm_multiplicity', 'openivm_timestamp')
+  EXCEPT ALL
+  SELECT column_name, ordinal_position, data_type
+  FROM information_schema.columns
+  WHERE table_schema = 'main'
+    AND table_name = 'openivm_data_mv_cust_orders'
+);
+----
+0
+
 # --- Insert order for customer with no orders ---
 statement ok
 INSERT INTO dl.orders VALUES (4, 3, 200.00);

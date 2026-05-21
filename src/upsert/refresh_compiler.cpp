@@ -61,6 +61,26 @@ static string BuildNullSafeExtremumUpdate(const string &col, const string &fn) {
 	       fn + "(v." + col + ", d." + col + ") END";
 }
 
+static string BuildAvgFormula(const string &sum_expr, const string &count_expr) {
+	return sum_expr + "::DOUBLE / NULLIF(" + count_expr + ", 0)";
+}
+
+static string BuildVarianceFormula(const string &sum_expr, const string &sum_sq_expr, const string &count_expr,
+                                   bool is_population, bool needs_sqrt, bool clamp_variance) {
+	string denom = is_population ? "NULLIF(" + count_expr + ", 0)" : "NULLIF(" + count_expr + " - 1, 0)";
+	string var_raw =
+	    "((" + sum_sq_expr + ") - (" + sum_expr + ") * (" + sum_expr + ") / (" + count_expr + ")) / " + denom;
+	string var_safe = clamp_variance ? "GREATEST(" + var_raw + ", 0::DOUBLE)" : var_raw;
+	return needs_sqrt ? "sqrt(" + var_safe + ")" : var_safe;
+}
+
+static string BuildGuardedVarianceFormula(const string &sum_expr, const string &sum_sq_expr, const string &count_expr,
+                                          bool is_population, bool needs_sqrt) {
+	int threshold = is_population ? 0 : 1;
+	return "CASE WHEN " + count_expr + " > " + std::to_string(threshold) + " THEN " +
+	       BuildVarianceFormula(sum_expr, sum_sq_expr, count_expr, is_population, needs_sqrt, true) + " ELSE NULL END";
+}
+
 static string JoinPrefixedSQLFragments(const vector<string> &fragments, const string &prefix) {
 	return StringUtil::Join(fragments, fragments.size(), ", ",
 	                        [&](const string &fragment) { return prefix + fragment; });
@@ -98,54 +118,52 @@ static string MatchPrefix(const string &col, const string &prefix) {
 	return "";
 }
 
+static bool IsDecomposedAggregateType(const string &aggregate_type) {
+	static const unordered_set<string> DECOMPOSED_TYPES = {"avg",      "stddev",   "stddev_samp", "stddev_pop",
+	                                                       "variance", "var_samp", "var_pop"};
+	return DECOMPOSED_TYPES.count(aggregate_type);
+}
+
 static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &columns) {
 	DerivedAggDecomposition result;
-	static const string sum_prefix(openivm::SUM_COL_PREFIX);
-	static const string count_prefix(openivm::COUNT_COL_PREFIX);
-	// Sum-of-squares prefixes (check longer ones first to avoid false matches)
-	static const string sum_sqp_prefix(openivm::SUM_SQP_COL_PREFIX); // stddev_pop
-	static const string var_sqp_prefix(openivm::VAR_SQP_COL_PREFIX); // var_pop
-	static const string sum_sq_prefix(openivm::SUM_SQ_COL_PREFIX);   // stddev_samp
-	static const string var_sq_prefix(openivm::VAR_SQ_COL_PREFIX);   // var_samp
-
 	for (auto &col : columns) {
 		// Check sum-of-squares prefixes BEFORE sum (they start with openivm_sum_ or openivm_var_)
 		// Assignments moved out of if-conditions to satisfy bugprone-assignment-in-if-condition.
 		string alias;
-		alias = MatchPrefix(col, sum_sqp_prefix);
+		alias = MatchPrefix(col, openivm::SUM_SQP_COL_PREFIX);
 		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = true;
 			result.is_population[alias] = true;
 			continue;
 		}
-		alias = MatchPrefix(col, var_sqp_prefix);
+		alias = MatchPrefix(col, openivm::VAR_SQP_COL_PREFIX);
 		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = false;
 			result.is_population[alias] = true;
 			continue;
 		}
-		alias = MatchPrefix(col, sum_sq_prefix);
+		alias = MatchPrefix(col, openivm::SUM_SQ_COL_PREFIX);
 		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = true;
 			result.is_population[alias] = false;
 			continue;
 		}
-		alias = MatchPrefix(col, var_sq_prefix);
+		alias = MatchPrefix(col, openivm::VAR_SQ_COL_PREFIX);
 		if (!alias.empty()) {
 			result.sum_sq_cols[alias] = col;
 			result.needs_sqrt[alias] = false;
 			result.is_population[alias] = false;
 			continue;
 		}
-		alias = MatchPrefix(col, sum_prefix);
+		alias = MatchPrefix(col, openivm::SUM_COL_PREFIX);
 		if (!alias.empty()) {
 			result.sum_cols[alias] = col;
 			continue;
 		}
-		alias = MatchPrefix(col, count_prefix);
+		alias = MatchPrefix(col, openivm::COUNT_COL_PREFIX);
 		if (!alias.empty()) {
 			result.count_cols[alias] = col;
 		}
@@ -249,8 +267,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// computed expression — sum-of-deltas is wrong for that expression.
 	bool has_computed_over_derived = false;
 	if (!aggregate_types.empty()) {
-		static const unordered_set<string> DECOMPOSED_TYPES_CHK = {"avg",      "stddev",   "stddev_samp", "stddev_pop",
-		                                                           "variance", "var_samp", "var_pop"};
 		// Pass 1 — "type excess": more non-decomposed aggregate types than
 		// aggregate columns (INCLUDING hidden helpers like openivm_match_count and
 		// openivm_*) means at least one aggregate is consumed inside a computed
@@ -260,7 +276,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// RewriteLeftJoinMatchCount adds a real COUNT to the plan).
 		idx_t non_decomposed_type_count = 0;
 		for (auto &t : aggregate_types) {
-			if (!DECOMPOSED_TYPES_CHK.count(t)) {
+			if (!IsDecomposedAggregateType(t)) {
 				non_decomposed_type_count++;
 			}
 		}
@@ -310,7 +326,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				if (decomp.derived_cols.count(column) || column.find("openivm_") != string::npos) {
 					continue;
 				}
-				while (probe_idx < aggregate_types.size() && DECOMPOSED_TYPES_CHK.count(aggregate_types[probe_idx])) {
+				while (probe_idx < aggregate_types.size() && IsDecomposedAggregateType(aggregate_types[probe_idx])) {
 					probe_idx++;
 				}
 				if (probe_idx >= aggregate_types.size()) {
@@ -366,8 +382,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// aggregate_types has one entry per ORIGINAL aggregate expression (before plan rewrites).
 	// Decomposed aggregates (avg, stddev, variance) are replaced by hidden columns in the
 	// plan rewrite, so we skip their entries to keep the mapping aligned with user-visible columns.
-	static const unordered_set<string> DECOMPOSED_TYPES = {"avg",      "stddev",   "stddev_samp", "stddev_pop",
-	                                                       "variance", "var_samp", "var_pop"};
 	unordered_map<string, string> col_agg_type;
 	if (!aggregate_types.empty()) {
 		idx_t type_idx = 0;
@@ -376,7 +390,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				continue;
 			}
 			// Skip decomposed aggregate_types entries (avg → SUM+COUNT hidden cols)
-			while (type_idx < aggregate_types.size() && DECOMPOSED_TYPES.count(aggregate_types[type_idx])) {
+			while (type_idx < aggregate_types.size() && IsDecomposedAggregateType(aggregate_types[type_idx])) {
 				type_idx++;
 			}
 			if (type_idx < aggregate_types.size()) {
@@ -462,7 +476,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	string update_set;
 	string insert_cols, insert_vals;
 	{
-		const string &zeros_list = ZEROS_LIST;
 		bool first_agg = true;
 
 		// Build update_set and insert_vals in the SAME column order as aggregates.
@@ -499,29 +512,16 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 					string new_n = BuildUpdatedAggregateColumn(count_col);
 					bool is_pop = decomp.is_population.count(column) && decomp.is_population.at(column);
 					bool do_sqrt = decomp.needs_sqrt.count(column) && decomp.needs_sqrt.at(column);
-					int threshold = is_pop ? 0 : 1;
-
-					string denom = is_pop ? "NULLIF(" + new_n + ", 0)" : "NULLIF(" + new_n + " - 1, 0)";
-					string var_raw =
-					    "((" + new_sq + ") - (" + new_sum + ") * (" + new_sum + ") / (" + new_n + ")) / " + denom;
 					// 0::DOUBLE so GREATEST binds to DOUBLE, not INTEGER (would up-cast silently).
-					string var_safe = "GREATEST(" + var_raw + ", 0::DOUBLE)";
-					string formula = do_sqrt ? "sqrt(" + var_safe + ")" : var_safe;
-					update_set += column + " = CASE WHEN " + new_n + " > " + std::to_string(threshold) + " THEN " +
-					              formula + " ELSE NULL END";
-
-					string d_denom = is_pop ? "NULLIF(d." + count_col + ", 0)" : "NULLIF(d." + count_col + " - 1, 0)";
-					string d_var_raw = "((d." + sum_sq_col + ") - (d." + sum_col + ") * (d." + sum_col + ") / (d." +
-					                   count_col + ")) / " + d_denom;
-					string d_var_safe = "GREATEST(" + d_var_raw + ", 0::DOUBLE)";
-					string d_formula = do_sqrt ? "sqrt(" + d_var_safe + ")" : d_var_safe;
-					insert_vals += "CASE WHEN d." + count_col + " > " + std::to_string(threshold) + " THEN " +
-					               d_formula + " ELSE NULL END";
+					update_set += column + " = " + BuildGuardedVarianceFormula(new_sum, new_sq, new_n, is_pop, do_sqrt);
+					insert_vals += BuildGuardedVarianceFormula("d." + sum_col, "d." + sum_sq_col, "d." + count_col,
+					                                           is_pop, do_sqrt);
 				} else {
 					// AVG
-					update_set += column + " = " + BuildUpdatedAggregateColumn(sum_col) + "::DOUBLE / NULLIF(" +
-					              BuildUpdatedAggregateColumn(count_col) + ", 0)";
-					insert_vals += "d." + sum_col + "::DOUBLE / NULLIF(d." + count_col + ", 0)";
+					update_set +=
+					    column + " = " +
+					    BuildAvgFormula(BuildUpdatedAggregateColumn(sum_col), BuildUpdatedAggregateColumn(count_col));
+					insert_vals += BuildAvgFormula("d." + sum_col, "d." + count_col);
 				}
 			} else {
 				// Regular aggregate column
@@ -718,7 +718,6 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 	string cte = "WITH openivm_delta AS (\n  SELECT ";
 	string update_set;
 	bool first = true;
-	string zeros_list = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 
 	for (auto &raw_col : column_names) {
 		if (raw_col == mul || d_derived.count(raw_col)) {
@@ -735,8 +734,8 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 			// list_reduce-add. NULL-list COALESCE preserves the previous semantics
 			// for empty groups.
 			cte += "COALESCE(list_reduce(list(list_transform(" + column + ", lambda x: " + mul +
-			       " * x)), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])), " + zeros_list +
-			       ") AS d_" + column;
+			       " * x)), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])), " +
+			       string(ZEROS_LIST) + ") AS d_" + column;
 			update_set += column + " = list_transform(list_zip(" + column + ", (SELECT d_" + column +
 			              " FROM openivm_delta)), lambda x: x[1] + x[2])";
 		} else {
@@ -764,15 +763,11 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 			string sum_sq_col = d_sum_sq.at(alias);
 			bool is_pop = decomp.is_population.count(alias) && decomp.is_population.at(alias);
 			bool do_sqrt = decomp.needs_sqrt.count(alias) && decomp.needs_sqrt.at(alias);
-			string denom = is_pop ? "NULLIF(" + count_col + ", 0)" : "NULLIF(" + count_col + " - 1, 0)";
-			string var_expr =
-			    "((" + sum_sq_col + ") - (" + sum_col + ") * (" + sum_col + ") / (" + count_col + ")) / " + denom;
-			string formula = do_sqrt ? "sqrt(" + var_expr + ")" : var_expr;
+			string formula = BuildVarianceFormula(sum_col, sum_sq_col, count_col, is_pop, do_sqrt, false);
 			result += "UPDATE " + data_table + " SET " + alias + " = " + formula + ";\n";
 		} else {
 			// AVG: recompute from sum/count
-			result += "UPDATE " + data_table + " SET " + alias + " = " + sum_col + "::DOUBLE / NULLIF(" + count_col +
-			          ", 0);\n";
+			result += "UPDATE " + data_table + " SET " + alias + " = " + BuildAvgFormula(sum_col, count_col) + ";\n";
 		}
 	}
 

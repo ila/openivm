@@ -147,62 +147,6 @@ string ExplainInitialLoadQuery(Connection &con, const string &label, const strin
 	return result;
 }
 
-bool HasUnionBeforeAggregate(const LogicalOperator *op, bool seen_agg_above) {
-	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		seen_agg_above = true;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_UNION && !seen_agg_above) {
-		return true;
-	}
-	for (auto &child : op->children) {
-		if (HasUnionBeforeAggregate(child.get(), seen_agg_above)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-bool HasUnsupportedSetOperation(const LogicalOperator *op) {
-	if (!op) {
-		return false;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_INTERSECT || op->type == LogicalOperatorType::LOGICAL_EXCEPT) {
-		return true;
-	}
-	for (auto &child : op->children) {
-		if (HasUnsupportedSetOperation(child.get())) {
-			return true;
-		}
-	}
-	return false;
-}
-
-LogicalProjection *FindFirstProjection(LogicalOperator *op) {
-	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		return &op->Cast<LogicalProjection>();
-	}
-	for (auto &child : op->children) {
-		auto *projection = FindFirstProjection(child.get());
-		if (projection) {
-			return projection;
-		}
-	}
-	return nullptr;
-}
-
-LogicalComparisonJoin *FindFirstComparisonJoin(LogicalOperator *op) {
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		return &op->Cast<LogicalComparisonJoin>();
-	}
-	for (auto &child : op->children) {
-		auto *join = FindFirstComparisonJoin(child.get());
-		if (join) {
-			return join;
-		}
-	}
-	return nullptr;
-}
-
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols) {
 	if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
 		return;
@@ -236,32 +180,6 @@ static void UnionBindings(unordered_map<string, string> &parents, const string &
 	}
 }
 
-static void CollectJoinEquivalences(LogicalOperator *op, unordered_map<string, string> &parents,
-                                    vector<BoundColumnRefExpression *> &join_refs) {
-	if (!op) {
-		return;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto &join = op->Cast<LogicalComparisonJoin>();
-		for (auto &cond : join.conditions) {
-			if (cond.left->type != ExpressionType::BOUND_COLUMN_REF ||
-			    cond.right->type != ExpressionType::BOUND_COLUMN_REF) {
-				continue;
-			}
-			auto &left = cond.left->Cast<BoundColumnRefExpression>();
-			auto &right = cond.right->Cast<BoundColumnRefExpression>();
-			string left_key = BindingKey(left);
-			string right_key = BindingKey(right);
-			UnionBindings(parents, left_key, right_key);
-			join_refs.push_back(&left);
-			join_refs.push_back(&right);
-		}
-	}
-	for (auto &child : op->children) {
-		CollectJoinEquivalences(child.get(), parents, join_refs);
-	}
-}
-
 static bool IsPurePassThroughExpression(const Expression *expr) {
 	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
 		return true;
@@ -287,9 +205,9 @@ static bool ExpressionReferencesNonGroupBinding(Expression *expr, idx_t group_in
 	return refs_non_group;
 }
 
-bool OuterJoinAggregateNeedsRecompute(LogicalOperator *op, idx_t group_index) {
-	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		auto &agg = op->Cast<LogicalAggregate>();
+bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t group_index) {
+	for (auto *agg_ptr : facts.aggregates) {
+		auto &agg = *agg_ptr;
 		for (auto &expr : agg.expressions) {
 			if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
 				continue;
@@ -302,8 +220,8 @@ bool OuterJoinAggregateNeedsRecompute(LogicalOperator *op, idx_t group_index) {
 			}
 		}
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &proj = op->Cast<LogicalProjection>();
+	for (auto *proj_ptr : facts.projections) {
+		auto &proj = *proj_ptr;
 		for (auto &expr : proj.expressions) {
 			if (!IsPurePassThroughExpression(expr.get()) &&
 			    ExpressionReferencesNonGroupBinding(expr.get(), group_index)) {
@@ -311,141 +229,167 @@ bool OuterJoinAggregateNeedsRecompute(LogicalOperator *op, idx_t group_index) {
 			}
 		}
 	}
-	for (auto &child : op->children) {
-		if (OuterJoinAggregateNeedsRecompute(child.get(), group_index)) {
-			return true;
-		}
-	}
 	return false;
 }
 
-static void CountCteRefsUnderJoin(const LogicalOperator *op, bool under_join, std::map<idx_t, int> &cte_ref_count) {
+static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMVPlanFacts &facts,
+                        unordered_map<string, idx_t> &next_occurrence) {
+	facts.gets_by_index[get.table_index] = &get;
+	auto table_ref = get.GetTable();
+	if (table_ref.get()) {
+		auto &table = *table_ref.get();
+		string table_name = table.name;
+		if (!table_name.empty() && !SqlUtils::IsDelta(table_name)) {
+			facts.source_table_info[table_name] = {table_name, table.ParentCatalog().GetName(), table.schema.name};
+		}
+		string table_lc = StringUtil::Lower(table_name);
+		ProjectionSourceOccurrence source;
+		source.table = table_name;
+		source.occurrence = next_occurrence[table_lc]++;
+		source.table_index = get.table_index;
+		facts.occurrence_by_index[get.table_index] = source;
+		facts.source_occurrences.push_back(std::move(source));
+	}
+	if (get.function.name != "ducklake_scan" || !get.function.function_info) {
+		return;
+	}
+	auto &info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
+	string lc = StringUtil::Lower(info.table_name);
+	if (facts.ducklake_table_info.find(lc) != facts.ducklake_table_info.end()) {
+		return;
+	}
+	string cat = info.table.ParentCatalog().GetName();
+	if (cat.empty()) {
+		if (current_catalog.empty()) {
+			throw CatalogException("Could not resolve DuckLake catalog for table '" + info.table_name + "'");
+		}
+		cat = current_catalog;
+	}
+	DuckLakeSourceTableInfo source_info;
+	source_info.table_name = info.table_name;
+	source_info.catalog_name = cat;
+	source_info.schema_name = info.table.schema.name;
+	source_info.table_id = static_cast<int64_t>(info.table_id.index);
+	facts.ducklake_table_info[lc] = source_info;
+}
+
+static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_catalog, CreateMVPlanFacts &facts,
+                                       unordered_map<string, idx_t> &next_occurrence, bool seen_agg_above,
+                                       bool under_join) {
+	if (!op) {
+		return "";
+	}
+	string first_table;
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		seen_agg_above = true;
+		auto &agg = op->Cast<LogicalAggregate>();
+		facts.aggregates.push_back(&agg);
+	} else if (op->type == LogicalOperatorType::LOGICAL_UNION) {
+		if (!seen_agg_above) {
+			facts.has_union_before_aggregate = true;
+		}
+		auto &setop = op->Cast<LogicalSetOperation>();
+		facts.setops_by_index[setop.table_index] = &setop;
+	} else if (op->type == LogicalOperatorType::LOGICAL_INTERSECT || op->type == LogicalOperatorType::LOGICAL_EXCEPT) {
+		facts.has_unsupported_set_operation = true;
+	} else if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
+		facts.has_pivot = true;
+	}
 	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
 	    op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
 		under_join = true;
 	}
-	if (under_join && op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
-		auto &cte_ref = op->Cast<LogicalCTERef>();
-		cte_ref_count[cte_ref.cte_index]++;
-	}
-	for (auto &child : op->children) {
-		CountCteRefsUnderJoin(child.get(), under_join, cte_ref_count);
-	}
-}
-
-bool HasRepeatedCteRefUnderJoin(const LogicalOperator *plan) {
-	std::map<idx_t, int> cte_ref_count;
-	CountCteRefsUnderJoin(plan, false, cte_ref_count);
-	for (auto &entry : cte_ref_count) {
-		if (entry.second >= 2) {
-			return true;
-		}
-	}
-	return false;
-}
-
-void CollectDuckLakeTables(LogicalOperator *op, const string &current_catalog,
-                           unordered_map<string, DuckLakeSourceTableInfo> &dl_table_info) {
-	if (!op) {
-		return;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op->Cast<LogicalGet>();
-		if (get.function.name == "ducklake_scan" && get.function.function_info) {
-			auto &info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
-			string lc = StringUtil::Lower(info.table_name);
-			if (dl_table_info.find(lc) == dl_table_info.end()) {
-				// Always pull the catalog from the DuckLakeTableEntry — it's the
-				// one the `dl.ORDER_LINE` reference actually resolved to. Falling
-				// back to `current_catalog` is wrong for cross-system MVs (native
-				// MV reading from dl.*) because `current_catalog` is the physical
-				// default, not the DuckLake catalog.
-				string cat = info.table.ParentCatalog().GetName();
-				if (cat.empty()) {
-					if (current_catalog.empty()) {
-						throw CatalogException("Could not resolve DuckLake catalog for table '" + info.table_name +
-						                       "'");
-					}
-					cat = current_catalog;
-				}
-				DuckLakeSourceTableInfo source_info;
-				source_info.table_name = info.table_name;
-				source_info.catalog_name = cat;
-				source_info.schema_name = info.table.schema.name;
-				source_info.table_id = static_cast<int64_t>(info.table_id.index);
-				dl_table_info[lc] = source_info;
-			}
-		}
-	}
-	for (auto &child : op->children) {
-		CollectDuckLakeTables(child.get(), current_catalog, dl_table_info);
-	}
-}
-
-void CollectSourceTables(LogicalOperator *op, unordered_map<string, SourceTableInfo> &source_table_info) {
-	if (!op) {
-		return;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op->Cast<LogicalGet>();
-		auto table_ref = get.GetTable();
-		if (table_ref.get()) {
-			auto &table = *table_ref.get();
-			string table_name = table.name;
-			if (!table_name.empty() && !SqlUtils::IsDelta(table_name)) {
-				source_table_info[table_name] = {table_name, table.ParentCatalog().GetName(), table.schema.name};
-			}
-		}
-	}
-	for (auto &child : op->children) {
-		CollectSourceTables(child.get(), source_table_info);
-	}
-}
-
-bool RelationExists(Connection &con, const string &qualified_name) {
-	auto result = con.Query("SELECT * FROM " + qualified_name + " LIMIT 0");
-	return !result->HasError();
-}
-
-struct BindingResolverIndex {
-	unordered_map<idx_t, LogicalProjection *> projections_by_index;
-	unordered_map<idx_t, LogicalSetOperation *> setops_by_index;
-	unordered_map<idx_t, LogicalCTERef *> cte_refs_by_table_index;
-	unordered_map<idx_t, LogicalOperator *> cte_defs_by_index;
-};
-
-static void CollectBindingResolverIndex(LogicalOperator *op, BindingResolverIndex &index) {
-	if (!op) {
-		return;
-	}
 	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &proj = op->Cast<LogicalProjection>();
-		index.projections_by_index[proj.table_index] = &proj;
-	} else if (op->type == LogicalOperatorType::LOGICAL_UNION) {
-		auto &setop = op->Cast<LogicalSetOperation>();
-		index.setops_by_index[setop.table_index] = &setop;
+		if (!facts.first_projection) {
+			facts.first_projection = &proj;
+		}
+		facts.projections.push_back(&proj);
+		facts.projections_by_index[proj.table_index] = &proj;
+	} else if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	           op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		auto &join = op->Cast<LogicalComparisonJoin>();
+		if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN && !facts.first_comparison_join) {
+			facts.first_comparison_join = &join;
+		}
+		if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+			facts.comparison_joins.push_back(&join);
+			for (auto &cond : join.conditions) {
+				auto *left = cond.left.get();
+				auto *right = cond.right.get();
+				if (left->type != ExpressionType::BOUND_COLUMN_REF || right->type != ExpressionType::BOUND_COLUMN_REF) {
+					continue;
+				}
+				auto &left_ref = left->Cast<BoundColumnRefExpression>();
+				auto &right_ref = right->Cast<BoundColumnRefExpression>();
+				UnionBindings(facts.join_parents, BindingKey(left_ref), BindingKey(right_ref));
+				facts.join_refs.push_back(&left_ref);
+				facts.join_refs.push_back(&right_ref);
+			}
+		}
+		if (op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN && join.join_type == JoinType::SINGLE) {
+			for (auto &expr : join.duplicate_eliminated_columns) {
+				if (expr && expr->type == ExpressionType::BOUND_COLUMN_REF) {
+					facts.single_delim_key_bindings.insert(BindingKey(expr->Cast<BoundColumnRefExpression>()));
+				}
+			}
+			for (auto &cond : join.conditions) {
+				if (cond.left && cond.left->type == ExpressionType::BOUND_COLUMN_REF) {
+					facts.single_delim_key_bindings.insert(BindingKey(cond.left->Cast<BoundColumnRefExpression>()));
+				}
+				if (cond.right && cond.right->type == ExpressionType::BOUND_COLUMN_REF) {
+					facts.single_delim_key_bindings.insert(BindingKey(cond.right->Cast<BoundColumnRefExpression>()));
+				}
+			}
+		}
+	} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op->Cast<LogicalGet>();
+		AddGetFacts(get, current_catalog, facts, next_occurrence);
+		auto table_ref = get.GetTable();
+		if (table_ref.get()) {
+			first_table = table_ref.get()->name;
+		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &cte_ref = op->Cast<LogicalCTERef>();
-		index.cte_refs_by_table_index[cte_ref.table_index] = &cte_ref;
+		facts.cte_refs_by_table_index[cte_ref.table_index] = &cte_ref;
+		if (under_join) {
+			if (++facts.cte_refs_under_join_count[cte_ref.cte_index] >= 2) {
+				facts.has_repeated_cte_ref_under_join = true;
+			}
+		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && op->children.size() >= 2) {
 		auto &cte = op->Cast<LogicalMaterializedCTE>();
-		index.cte_defs_by_index[cte.table_index] = op->children[0].get();
+		facts.cte_defs_by_index[cte.table_index] = op->children[0].get();
+	} else if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
+		facts.windows.push_back(&op->Cast<LogicalWindow>());
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		facts.first_table_name[op] = first_table;
+		return first_table;
 	}
 	for (auto &child : op->children) {
-		CollectBindingResolverIndex(child.get(), index);
+		string child_first =
+		    CollectCreateMVPlanFacts(child.get(), current_catalog, facts, next_occurrence, seen_agg_above, under_join);
+		if (first_table.empty()) {
+			first_table = std::move(child_first);
+		}
 	}
+	if (!first_table.empty()) {
+		facts.first_table_name[op] = first_table;
+	}
+	return first_table;
 }
 
 static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
-                                   const BindingResolverIndex &index, int depth = 0) {
+                                   const CreateMVPlanFacts &facts, int depth = 0) {
 	if (depth > 16) {
 		return false;
 	}
 	if (table_index == group_index) {
 		return column_index < static_cast<idx_t>(group_count);
 	}
-	auto projection_it = index.projections_by_index.find(table_index);
-	if (projection_it != index.projections_by_index.end()) {
+	auto projection_it = facts.projections_by_index.find(table_index);
+	if (projection_it != facts.projections_by_index.end()) {
 		auto &proj = *projection_it->second;
 		if (column_index >= proj.expressions.size()) {
 			return false;
@@ -456,12 +400,10 @@ static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t 
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
 		return ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
-		                              index, depth + 1);
+		                              facts, depth + 1);
 	}
-	auto setop_it = index.setops_by_index.find(table_index);
-	if (setop_it != index.setops_by_index.end()) {
-		// UNION outputs keep branch columns by position; follow that binding instead of
-		// guessing that the first N final outputs are the group keys.
+	auto setop_it = facts.setops_by_index.find(table_index);
+	if (setop_it != facts.setops_by_index.end()) {
 		auto &setop = *setop_it->second;
 		if (column_index >= setop.column_count) {
 			return false;
@@ -472,18 +414,18 @@ static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t 
 				continue;
 			}
 			auto &binding = bindings[column_index];
-			if (ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, index,
+			if (ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, facts,
 			                           depth + 1)) {
 				return true;
 			}
 		}
 		return false;
 	}
-	auto cte_ref_it = index.cte_refs_by_table_index.find(table_index);
-	if (cte_ref_it != index.cte_refs_by_table_index.end()) {
+	auto cte_ref_it = facts.cte_refs_by_table_index.find(table_index);
+	if (cte_ref_it != facts.cte_refs_by_table_index.end()) {
 		auto &cte_ref = *cte_ref_it->second;
-		auto cte_def_it = index.cte_defs_by_index.find(cte_ref.cte_index);
-		if (cte_def_it == index.cte_defs_by_index.end()) {
+		auto cte_def_it = facts.cte_defs_by_index.find(cte_ref.cte_index);
+		if (cte_def_it == facts.cte_defs_by_index.end()) {
 			return false;
 		}
 		auto bindings = cte_def_it->second->GetColumnBindings();
@@ -491,10 +433,15 @@ static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t 
 			return false;
 		}
 		auto &binding = bindings[column_index];
-		return ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, index,
+		return ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, facts,
 		                              depth + 1);
 	}
 	return false;
+}
+
+bool RelationExists(Connection &con, const string &qualified_name) {
+	auto result = con.Query("SELECT * FROM " + qualified_name + " LIMIT 0");
+	return !result->HasError();
 }
 
 static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,
@@ -520,7 +467,7 @@ static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
 	return &expr->Cast<BoundColumnRefExpression>();
 }
 
-static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const BindingResolverIndex &index, idx_t group_index,
+static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const CreateMVPlanFacts &facts, idx_t group_index,
                                           size_t group_count, const vector<string> &output_names,
                                           vector<string> &group_names) {
 	bool matched = false;
@@ -531,7 +478,7 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const Binding
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
 		if (!ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
-		                            index)) {
+		                            facts)) {
 			continue;
 		}
 		string col_name = ProjectionOutputName(expr, expr_i, output_names, bcr);
@@ -543,14 +490,14 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const Binding
 	return matched;
 }
 
-static bool AddGroupColumnsFromBindings(LogicalOperator &op, const BindingResolverIndex &index, idx_t group_index,
+static bool AddGroupColumnsFromBindings(LogicalOperator &op, const CreateMVPlanFacts &facts, idx_t group_index,
                                         size_t group_count, const vector<string> &output_names,
                                         vector<string> &group_names) {
 	bool matched = false;
 	auto bindings = op.GetColumnBindings();
 	for (idx_t col_idx = 0; col_idx < bindings.size() && col_idx < output_names.size(); col_idx++) {
 		auto &binding = bindings[col_idx];
-		if (!ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, index)) {
+		if (!ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, facts)) {
 			continue;
 		}
 		if (!output_names[col_idx].empty() && !IncrementalTableNames::IsInternalColumn(output_names[col_idx])) {
@@ -561,44 +508,42 @@ static bool AddGroupColumnsFromBindings(LogicalOperator &op, const BindingResolv
 	return matched;
 }
 
-static bool FindGroupColumns(LogicalOperator *op, const BindingResolverIndex &index, idx_t group_index,
-                             size_t group_count, const vector<string> &output_names, vector<string> &group_names) {
+static bool FindGroupColumns(LogicalOperator *op, const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
+                             const vector<string> &output_names, vector<string> &group_names) {
 	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &proj = op->Cast<LogicalProjection>();
-		return AddGroupColumnsFromProjection(proj, index, group_index, group_count, output_names, group_names);
+		return AddGroupColumnsFromProjection(proj, facts, group_index, group_count, output_names, group_names);
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_UNION) {
-		if (AddGroupColumnsFromBindings(*op, index, group_index, group_count, output_names, group_names)) {
+		if (AddGroupColumnsFromBindings(*op, facts, group_index, group_count, output_names, group_names)) {
 			return true;
 		}
 		return false;
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 		if (op->children.size() >= 2) {
-			if (FindGroupColumns(op->children[1].get(), index, group_index, group_count, output_names, group_names)) {
+			if (FindGroupColumns(op->children[1].get(), facts, group_index, group_count, output_names, group_names)) {
 				return true;
 			}
-			return FindGroupColumns(op->children[0].get(), index, group_index, group_count, output_names, group_names);
+			return FindGroupColumns(op->children[0].get(), facts, group_index, group_count, output_names, group_names);
 		}
 		return false;
 	}
 	for (auto &child : op->children) {
-		if (FindGroupColumns(child.get(), index, group_index, group_count, output_names, group_names)) {
+		if (FindGroupColumns(child.get(), facts, group_index, group_count, output_names, group_names)) {
 			return true;
 		}
 	}
 	return false;
 }
 
-vector<string> DeriveGroupColumnNames(LogicalOperator *plan, idx_t group_index, size_t group_count,
+vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
                                       const vector<string> &output_names) {
 	vector<string> group_names;
-	BindingResolverIndex index;
-	CollectBindingResolverIndex(plan, index);
-	if (AddGroupColumnsFromBindings(*plan, index, group_index, group_count, output_names, group_names)) {
+	if (AddGroupColumnsFromBindings(*facts.root, facts, group_index, group_count, output_names, group_names)) {
 		return group_names;
 	}
-	FindGroupColumns(plan, index, group_index, group_count, output_names, group_names);
+	FindGroupColumns(facts.root, facts, group_index, group_count, output_names, group_names);
 	return group_names;
 }
 
@@ -617,38 +562,9 @@ static void AddUniqueGroupNames(vector<string> &group_names, const vector<string
 	}
 }
 
-static void CollectSingleDelimKeyBindings(LogicalOperator *op, unordered_set<string> &key_bindings) {
-	if (!op) {
-		return;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
-		auto &join = op->Cast<LogicalComparisonJoin>();
-		if (join.join_type == JoinType::SINGLE) {
-			for (auto &expr : join.duplicate_eliminated_columns) {
-				if (expr && expr->type == ExpressionType::BOUND_COLUMN_REF) {
-					key_bindings.insert(BindingKey(expr->Cast<BoundColumnRefExpression>()));
-				}
-			}
-			for (auto &cond : join.conditions) {
-				if (cond.left && cond.left->type == ExpressionType::BOUND_COLUMN_REF) {
-					key_bindings.insert(BindingKey(cond.left->Cast<BoundColumnRefExpression>()));
-				}
-				if (cond.right && cond.right->type == ExpressionType::BOUND_COLUMN_REF) {
-					key_bindings.insert(BindingKey(cond.right->Cast<BoundColumnRefExpression>()));
-				}
-			}
-		}
-	}
-	for (auto &child : op->children) {
-		CollectSingleDelimKeyBindings(child.get(), key_bindings);
-	}
-}
-
-vector<string> DeriveScalarDelimKeyColumnNames(LogicalOperator *plan, const vector<string> &output_names) {
+vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names) {
 	vector<string> group_names;
-	unordered_set<string> key_bindings;
-	CollectSingleDelimKeyBindings(plan, key_bindings);
-	auto *top_projection = FindFirstProjection(plan);
+	auto *top_projection = facts.first_projection;
 	if (top_projection) {
 		for (idx_t expr_idx = 0; expr_idx < top_projection->expressions.size() && expr_idx < output_names.size();
 		     expr_idx++) {
@@ -656,7 +572,7 @@ vector<string> DeriveScalarDelimKeyColumnNames(LogicalOperator *plan, const vect
 			if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
 				continue;
 			}
-			if (!key_bindings.count(BindingKey(expr->Cast<BoundColumnRefExpression>()))) {
+			if (!facts.single_delim_key_bindings.count(BindingKey(expr->Cast<BoundColumnRefExpression>()))) {
 				continue;
 			}
 			if (!output_names[expr_idx].empty() && !IncrementalTableNames::IsInternalColumn(output_names[expr_idx])) {
@@ -673,93 +589,38 @@ vector<string> DeriveScalarDelimKeyColumnNames(LogicalOperator *plan, const vect
 	return group_names;
 }
 
-static void CollectAggregateGroupColumns(LogicalOperator *root, LogicalOperator *op, const BindingResolverIndex &index,
-                                         const vector<string> &output_names, vector<string> &group_names,
-                                         bool include_first_aggregate, bool &seen_aggregate) {
-	if (!op) {
-		return;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		auto &agg = op->Cast<LogicalAggregate>();
+vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                               bool include_first_aggregate) {
+	vector<string> group_names;
+	bool seen_aggregate = false;
+	for (auto *agg_ptr : facts.aggregates) {
+		auto &agg = *agg_ptr;
 		bool include_this = include_first_aggregate || seen_aggregate;
 		seen_aggregate = true;
 		if (include_this && !agg.groups.empty()) {
 			vector<string> nested_names;
-			if (FindGroupColumns(root, index, agg.group_index, agg.groups.size(), output_names, nested_names)) {
+			if (FindGroupColumns(facts.root, facts, agg.group_index, agg.groups.size(), output_names, nested_names)) {
 				AddUniqueGroupNames(group_names, nested_names);
 			}
 		}
 	}
-	for (auto &child : op->children) {
-		CollectAggregateGroupColumns(root, child.get(), index, output_names, group_names, include_first_aggregate,
-		                             seen_aggregate);
-	}
-}
-
-vector<string> DeriveAggregateGroupColumnNames(LogicalOperator *plan, const vector<string> &output_names,
-                                               bool include_first_aggregate) {
-	vector<string> group_names;
-	BindingResolverIndex index;
-	CollectBindingResolverIndex(plan, index);
-	bool seen_aggregate = false;
-	CollectAggregateGroupColumns(plan, plan, index, output_names, group_names, include_first_aggregate, seen_aggregate);
 	return group_names;
 }
 
-static string FindFirstTableName(LogicalOperator *node) {
-	if (node->type == LogicalOperatorType::LOGICAL_GET) {
-		auto *get = dynamic_cast<LogicalGet *>(node);
-		if (get && get->GetTable().get()) {
-			return get->GetTable().get()->name;
-		}
-	}
-	for (auto &child : node->children) {
-		string name = FindFirstTableName(child.get());
-		if (!name.empty()) {
-			return name;
-		}
-	}
-	return "";
-}
+static bool GetLogicalGetColumnName(LogicalGet &get, idx_t column_index, string &column);
 
-static void IndexProjectionsAndGets(LogicalOperator *op, unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                    unordered_map<idx_t, LogicalGet *> &get_by_index) {
-	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &proj = op->Cast<LogicalProjection>();
-		proj_by_index[proj.table_index] = &proj;
-	} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op->Cast<LogicalGet>();
-		get_by_index[get.table_index] = &get;
-	}
-	for (auto &child : op->children) {
-		IndexProjectionsAndGets(child.get(), proj_by_index, get_by_index);
-	}
-}
-
-static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr,
-                                         const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                         const unordered_map<idx_t, LogicalGet *> &get_by_index) {
+static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr, const CreateMVPlanFacts &facts) {
 	idx_t table_index = bcr->binding.table_index;
 	idx_t column_index = bcr->binding.column_index;
 	for (int depth = 0; depth < 16; depth++) {
-		auto get_it = get_by_index.find(table_index);
-		if (get_it != get_by_index.end()) {
+		auto get_it = facts.gets_by_index.find(table_index);
+		if (get_it != facts.gets_by_index.end()) {
 			auto *get = get_it->second;
-			auto &ids = get->GetColumnIds();
-			if (column_index < ids.size() && get->GetTable().get()) {
-				auto base_idx = ids[column_index].GetPrimaryIndex();
-				auto &cols = get->GetTable().get()->GetColumns();
-				if (base_idx < cols.LogicalColumnCount()) {
-					return cols.GetColumn(LogicalIndex(base_idx)).Name();
-				}
-			}
-			if (column_index < get->names.size()) {
-				return get->names[column_index];
-			}
-			return "";
+			string column;
+			return GetLogicalGetColumnName(*get, column_index, column) ? column : "";
 		}
-		auto proj_it = proj_by_index.find(table_index);
-		if (proj_it == proj_by_index.end()) {
+		auto proj_it = facts.projections_by_index.find(table_index);
+		if (proj_it == facts.projections_by_index.end()) {
 			return "";
 		}
 		auto *proj = proj_it->second;
@@ -776,28 +637,6 @@ static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr,
 	}
 	return "";
 }
-
-struct BaseColumnRef {
-	string table;
-	string column;
-};
-
-struct OccurrenceColumnRef {
-	string table;
-	idx_t occurrence = 0;
-	string column;
-};
-
-struct ProjectionSourceOccurrence {
-	string table;
-	idx_t occurrence = 0;
-	idx_t table_index = 0;
-};
-
-struct ProjectionLineageEdge {
-	OccurrenceColumnRef from;
-	OccurrenceColumnRef to;
-};
 
 struct ProjectionLineageStep {
 	string table;
@@ -821,112 +660,37 @@ static string OccurrenceKey(const OccurrenceColumnRef &ref) {
 	return OccurrenceKey(ref.table, ref.occurrence);
 }
 
-static bool ResolveBindingToBaseRef(ColumnBinding binding,
-                                    const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                    const unordered_map<idx_t, LogicalGet *> &get_by_index, BaseColumnRef &out) {
-	idx_t table_index = binding.table_index;
-	idx_t column_index = binding.column_index;
-	for (int depth = 0; depth < 16; depth++) {
-		auto get_it = get_by_index.find(table_index);
-		if (get_it != get_by_index.end()) {
-			auto *get = get_it->second;
-			if (get->GetTable().get()) {
-				out.table = get->GetTable().get()->name;
-				auto &ids = get->GetColumnIds();
-				if (column_index < ids.size()) {
-					auto base_idx = ids[column_index].GetPrimaryIndex();
-					auto &cols = get->GetTable().get()->GetColumns();
-					if (base_idx < cols.LogicalColumnCount()) {
-						out.column = cols.GetColumn(LogicalIndex(base_idx)).Name();
-						return true;
-					}
-				}
-			}
-			if (column_index < get->names.size()) {
-				out.column = get->names[column_index];
-				return !out.table.empty();
-			}
-			return false;
-		}
-		auto proj_it = proj_by_index.find(table_index);
-		if (proj_it == proj_by_index.end()) {
-			return false;
-		}
-		auto *proj = proj_it->second;
-		if (column_index >= proj->expressions.size()) {
-			return false;
-		}
-		auto *next = GetColumnRefThroughCasts(proj->expressions[column_index].get());
-		if (!next) {
-			return false;
-		}
-		table_index = next->binding.table_index;
-		column_index = next->binding.column_index;
-	}
-	return false;
-}
-
-static void CollectProjectionSourceOccurrences(LogicalOperator *op,
-                                               unordered_map<idx_t, ProjectionSourceOccurrence> &occurrence_by_index,
-                                               vector<ProjectionSourceOccurrence> &occurrences,
-                                               unordered_map<string, idx_t> &next_occurrence) {
-	if (!op) {
-		return;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op->Cast<LogicalGet>();
-		if (get.GetTable().get()) {
-			string table = get.GetTable().get()->name;
-			idx_t occurrence = next_occurrence[StringUtil::Lower(table)]++;
-			ProjectionSourceOccurrence source;
-			source.table = table;
-			source.occurrence = occurrence;
-			source.table_index = get.table_index;
-			occurrence_by_index[get.table_index] = source;
-			occurrences.push_back(std::move(source));
-		}
-	}
-	for (auto &child : op->children) {
-		CollectProjectionSourceOccurrences(child.get(), occurrence_by_index, occurrences, next_occurrence);
-	}
-}
-
-static bool ResolveBindingToOccurrenceRef(ColumnBinding binding,
-                                          const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                          const unordered_map<idx_t, LogicalGet *> &get_by_index,
-                                          const unordered_map<idx_t, ProjectionSourceOccurrence> &occurrence_by_index,
-                                          OccurrenceColumnRef &out) {
-	idx_t table_index = binding.table_index;
-	idx_t column_index = binding.column_index;
-	for (int depth = 0; depth < 16; depth++) {
-		auto get_it = get_by_index.find(table_index);
-		if (get_it != get_by_index.end()) {
-			auto *get = get_it->second;
-			auto occ_it = occurrence_by_index.find(table_index);
-			if (occ_it == occurrence_by_index.end()) {
-				return false;
-			}
-			out.table = occ_it->second.table;
-			out.occurrence = occ_it->second.occurrence;
-			if (get->GetTable().get()) {
-				auto &ids = get->GetColumnIds();
-				if (column_index < ids.size()) {
-					auto base_idx = ids[column_index].GetPrimaryIndex();
-					auto &cols = get->GetTable().get()->GetColumns();
-					if (base_idx < cols.LogicalColumnCount()) {
-						out.column = cols.GetColumn(LogicalIndex(base_idx)).Name();
-						return true;
-					}
-				}
-			}
-			if (column_index < get->names.size()) {
-				out.column = get->names[column_index];
+static bool GetLogicalGetColumnName(LogicalGet &get, idx_t column_index, string &column) {
+	if (get.GetTable().get()) {
+		auto &ids = get.GetColumnIds();
+		if (column_index < ids.size()) {
+			auto base_idx = ids[column_index].GetPrimaryIndex();
+			auto &cols = get.GetTable().get()->GetColumns();
+			if (base_idx < cols.LogicalColumnCount()) {
+				column = cols.GetColumn(LogicalIndex(base_idx)).Name();
 				return true;
 			}
-			return false;
 		}
-		auto proj_it = proj_by_index.find(table_index);
-		if (proj_it == proj_by_index.end()) {
+	}
+	if (column_index < get.names.size()) {
+		column = get.names[column_index];
+		return true;
+	}
+	return false;
+}
+
+static bool ResolveBindingToGetColumn(ColumnBinding binding, const CreateMVPlanFacts &facts, LogicalGet *&get,
+                                      string &column) {
+	idx_t table_index = binding.table_index;
+	idx_t column_index = binding.column_index;
+	for (int depth = 0; depth < 16; depth++) {
+		auto get_it = facts.gets_by_index.find(table_index);
+		if (get_it != facts.gets_by_index.end()) {
+			get = get_it->second;
+			return GetLogicalGetColumnName(*get, column_index, column);
+		}
+		auto proj_it = facts.projections_by_index.find(table_index);
+		if (proj_it == facts.projections_by_index.end()) {
 			return false;
 		}
 		auto *proj = proj_it->second;
@@ -943,40 +707,67 @@ static bool ResolveBindingToOccurrenceRef(ColumnBinding binding,
 	return false;
 }
 
-static void CollectProjectionJoinEdges(LogicalOperator *op,
-                                       const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                       const unordered_map<idx_t, LogicalGet *> &get_by_index,
-                                       const unordered_map<idx_t, ProjectionSourceOccurrence> &occurrence_by_index,
-                                       vector<ProjectionLineageEdge> &edges) {
-	if (!op) {
-		return;
+static bool ResolveBindingToBaseRef(ColumnBinding binding, const CreateMVPlanFacts &facts, BaseColumnRef &out) {
+	LogicalGet *get = nullptr;
+	if (!ResolveBindingToGetColumn(binding, facts, get, out.column) || !get->GetTable().get()) {
+		return false;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto &join = op->Cast<LogicalComparisonJoin>();
-		if (join.join_type == JoinType::INNER) {
-			for (auto &cond : join.conditions) {
-				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
-					continue;
-				}
-				auto *left = GetColumnRefThroughCasts(cond.left.get());
-				auto *right = GetColumnRefThroughCasts(cond.right.get());
-				if (!left || !right) {
-					continue;
-				}
-				OccurrenceColumnRef lref, rref;
-				if (ResolveBindingToOccurrenceRef(left->binding, proj_by_index, get_by_index, occurrence_by_index,
-				                                  lref) &&
-				    ResolveBindingToOccurrenceRef(right->binding, proj_by_index, get_by_index, occurrence_by_index,
-				                                  rref)) {
-					edges.push_back({lref, rref});
-					edges.push_back({rref, lref});
-				}
+	out.table = get->GetTable().get()->name;
+	return true;
+}
+
+static bool ResolveBindingToOccurrenceRef(ColumnBinding binding, const CreateMVPlanFacts &facts,
+                                          OccurrenceColumnRef &out) {
+	LogicalGet *get = nullptr;
+	if (!ResolveBindingToGetColumn(binding, facts, get, out.column)) {
+		return false;
+	}
+	auto occurrence_it = facts.occurrence_by_index.find(get->table_index);
+	if (occurrence_it == facts.occurrence_by_index.end()) {
+		return false;
+	}
+	out.table = occurrence_it->second.table;
+	out.occurrence = occurrence_it->second.occurrence;
+	return true;
+}
+
+static void AddJoinEdgesFromFacts(CreateMVPlanFacts &facts) {
+	for (auto *join : facts.comparison_joins) {
+		if (join->join_type != JoinType::INNER) {
+			continue;
+		}
+		for (auto &cond : join->conditions) {
+			auto *left = GetColumnRefThroughCasts(cond.left.get());
+			auto *right = GetColumnRefThroughCasts(cond.right.get());
+			if (!left || !right) {
+				continue;
+			}
+			BaseColumnRef lbase, rbase;
+			if (ResolveBindingToBaseRef(left->binding, facts, lbase) &&
+			    ResolveBindingToBaseRef(right->binding, facts, rbase)) {
+				facts.inner_join_edges.emplace_back(std::move(lbase), std::move(rbase));
+			}
+			if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+				continue;
+			}
+			OccurrenceColumnRef lref, rref;
+			if (ResolveBindingToOccurrenceRef(left->binding, facts, lref) &&
+			    ResolveBindingToOccurrenceRef(right->binding, facts, rref)) {
+				facts.projection_lineage_edges.push_back({lref, rref});
+				facts.projection_lineage_edges.push_back({rref, lref});
 			}
 		}
 	}
-	for (auto &child : op->children) {
-		CollectProjectionJoinEdges(child.get(), proj_by_index, get_by_index, occurrence_by_index, edges);
-	}
+}
+
+CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog) {
+	CreateMVPlanFacts facts;
+	facts.root = plan;
+	facts.analysis = AnalyzePlan(plan);
+	unordered_map<string, idx_t> next_occurrence;
+	CollectCreateMVPlanFacts(plan, current_catalog, facts, next_occurrence, false, false);
+	AddJoinEdgesFromFacts(facts);
+	return facts;
 }
 
 static bool FindProjectionPath(const ProjectionSourceOccurrence &source, const OccurrenceColumnRef &key_ref,
@@ -1070,30 +861,18 @@ string BuildRefreshLineageJson(const vector<string> &entries) {
 	       StringUtil::Join(entries, entries.size(), ",", [](const string &entry) { return entry; }) + "]}";
 }
 
-string BuildProjectionKeyLineageEntryJson(LogicalOperator *plan, const vector<string> &output_names) {
-	if (!plan) {
+string BuildProjectionKeyLineageEntryJson(const CreateMVPlanFacts &facts, const vector<string> &output_names) {
+	if (!facts.root) {
 		return "";
 	}
-	auto *top_projection = FindFirstProjection(plan);
+	auto *top_projection = facts.first_projection;
 	if (!top_projection) {
 		return "";
 	}
-
-	unordered_map<idx_t, LogicalProjection *> proj_by_index;
-	unordered_map<idx_t, LogicalGet *> get_by_index;
-	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
-
-	unordered_map<idx_t, ProjectionSourceOccurrence> occurrence_by_index;
-	vector<ProjectionSourceOccurrence> occurrences;
-	unordered_map<string, idx_t> next_occurrence;
-	CollectProjectionSourceOccurrences(plan, occurrence_by_index, occurrences, next_occurrence);
-	if (occurrences.size() < 3) {
+	if (facts.source_occurrences.size() < 3) {
 		return "";
 	}
-
-	vector<ProjectionLineageEdge> edges;
-	CollectProjectionJoinEdges(plan, proj_by_index, get_by_index, occurrence_by_index, edges);
-	if (edges.empty()) {
+	if (facts.projection_lineage_edges.empty()) {
 		return "";
 	}
 
@@ -1104,7 +883,7 @@ string BuildProjectionKeyLineageEntryJson(LogicalOperator *plan, const vector<st
 			continue;
 		}
 		OccurrenceColumnRef key_ref;
-		if (!ResolveBindingToOccurrenceRef(bcr->binding, proj_by_index, get_by_index, occurrence_by_index, key_ref)) {
+		if (!ResolveBindingToOccurrenceRef(bcr->binding, facts, key_ref)) {
 			continue;
 		}
 		string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
@@ -1114,9 +893,9 @@ string BuildProjectionKeyLineageEntryJson(LogicalOperator *plan, const vector<st
 
 		vector<ProjectionLineageArm> arms;
 		bool covered = true;
-		for (auto &occurrence : occurrences) {
+		for (auto &occurrence : facts.source_occurrences) {
 			vector<ProjectionLineageEdge> path;
-			if (!FindProjectionPath(occurrence, key_ref, edges, path)) {
+			if (!FindProjectionPath(occurrence, key_ref, facts.projection_lineage_edges, path)) {
 				covered = false;
 				break;
 			}
@@ -1157,37 +936,10 @@ struct WindowLineageOp {
 	string lookup_output_col;
 };
 
-static void CollectInnerJoinEdges(LogicalOperator *op, const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                  const unordered_map<idx_t, LogicalGet *> &get_by_index,
-                                  vector<pair<BaseColumnRef, BaseColumnRef>> &edges) {
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto &join = op->Cast<LogicalComparisonJoin>();
-		if (join.join_type == JoinType::INNER) {
-			for (auto &cond : join.conditions) {
-				auto *left = GetColumnRefThroughCasts(cond.left.get());
-				auto *right = GetColumnRefThroughCasts(cond.right.get());
-				if (!left || !right) {
-					continue;
-				}
-				BaseColumnRef lref, rref;
-				if (ResolveBindingToBaseRef(left->binding, proj_by_index, get_by_index, lref) &&
-				    ResolveBindingToBaseRef(right->binding, proj_by_index, get_by_index, rref)) {
-					edges.emplace_back(std::move(lref), std::move(rref));
-				}
-			}
-		}
-	}
-	for (auto &child : op->children) {
-		CollectInnerJoinEdges(child.get(), proj_by_index, get_by_index, edges);
-	}
-}
-
-static void CollectWindowPartitionRefs(LogicalOperator *op,
-                                       const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                       const unordered_map<idx_t, LogicalGet *> &get_by_index,
-                                       const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops) {
-	if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
-		auto &window = op->Cast<LogicalWindow>();
+static void CollectWindowPartitionRefs(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
+                                       vector<WindowLineageOp> &direct_ops) {
+	for (auto *window_ptr : facts.windows) {
+		auto &window = *window_ptr;
 		for (auto &expr : window.expressions) {
 			if (expr->expression_class != ExpressionClass::BOUND_WINDOW) {
 				continue;
@@ -1199,7 +951,7 @@ static void CollectWindowPartitionRefs(LogicalOperator *op,
 					continue;
 				}
 				BaseColumnRef base;
-				if (!ResolveBindingToBaseRef(bcr->binding, proj_by_index, get_by_index, base)) {
+				if (!ResolveBindingToBaseRef(bcr->binding, facts, base)) {
 					continue;
 				}
 				for (auto &stored : partition_columns) {
@@ -1218,9 +970,6 @@ static void CollectWindowPartitionRefs(LogicalOperator *op,
 				}
 			}
 		}
-	}
-	for (auto &child : op->children) {
-		CollectWindowPartitionRefs(child.get(), proj_by_index, get_by_index, partition_columns, direct_ops);
 	}
 }
 
@@ -1255,22 +1004,15 @@ static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const 
 	return false;
 }
 
-string BuildWindowPartitionLineageEntryJson(LogicalOperator *plan, const vector<string> &partition_columns) {
-	if (!plan || partition_columns.empty()) {
+string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, const vector<string> &partition_columns) {
+	if (!facts.root || partition_columns.empty()) {
 		return "";
 	}
-	unordered_map<idx_t, LogicalProjection *> proj_by_index;
-	unordered_map<idx_t, LogicalGet *> get_by_index;
-	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
-
 	vector<WindowLineageOp> direct_ops;
-	CollectWindowPartitionRefs(plan, proj_by_index, get_by_index, partition_columns, direct_ops);
+	CollectWindowPartitionRefs(facts, partition_columns, direct_ops);
 	if (direct_ops.empty()) {
 		return "";
 	}
-
-	vector<pair<BaseColumnRef, BaseColumnRef>> edges;
-	CollectInnerJoinEdges(plan, proj_by_index, get_by_index, edges);
 
 	vector<WindowLineageOp> partition_ops;
 	for (auto &op : direct_ops) {
@@ -1281,7 +1023,7 @@ string BuildWindowPartitionLineageEntryJson(LogicalOperator *plan, const vector<
 	while (changed) {
 		changed = false;
 		vector<WindowLineageOp> next_ops = partition_ops;
-		for (auto &edge : edges) {
+		for (auto &edge : facts.inner_join_edges) {
 			for (auto &direct : partition_ops) {
 				BaseColumnRef direct_ref {direct.source_table, direct.source_col};
 				BaseColumnRef other;
@@ -1313,7 +1055,7 @@ string BuildWindowPartitionLineageEntryJson(LogicalOperator *plan, const vector<
 		AddUniqueLineageOp(ops, op);
 	}
 
-	for (auto &edge : edges) {
+	for (auto &edge : facts.inner_join_edges) {
 		for (auto &direct : partition_ops) {
 			BaseColumnRef lookup_output {direct.source_table, direct.source_col};
 			BaseColumnRef lookup_join;
@@ -1364,19 +1106,15 @@ string BuildWindowPartitionLineageEntryJson(LogicalOperator *plan, const vector<
 	return json;
 }
 
-void ResolveWindowPartitionOutputNames(LogicalOperator *plan, vector<string> &partition_columns,
+void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,
                                        const vector<string> &output_names) {
 	if (partition_columns.empty()) {
 		return;
 	}
-	auto *top_projection = FindFirstProjection(plan);
+	auto *top_projection = facts.first_projection;
 	if (!top_projection) {
 		return;
 	}
-
-	unordered_map<idx_t, LogicalProjection *> proj_by_index;
-	unordered_map<idx_t, LogicalGet *> get_by_index;
-	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
 
 	for (auto &partition_column : partition_columns) {
 		if (partition_column.find('=') != string::npos) {
@@ -1388,7 +1126,7 @@ void ResolveWindowPartitionOutputNames(LogicalOperator *plan, vector<string> &pa
 			if (!bcr) {
 				continue;
 			}
-			string base_col = ResolveBindingToBaseColumn(bcr, proj_by_index, get_by_index);
+			string base_col = ResolveBindingToBaseColumn(bcr, facts);
 			if (!StringUtil::CIEquals(base_col, partition_column) &&
 			    !StringUtil::CIEquals(bcr->GetName(), partition_column)) {
 				continue;
@@ -1402,24 +1140,17 @@ void ResolveWindowPartitionOutputNames(LogicalOperator *plan, vector<string> &pa
 	}
 }
 
-void ResolveAggregateGroupColumnsThroughJoinKeys(LogicalOperator *plan, vector<string> &aggregate_columns,
+void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,
                                                  const vector<string> &output_names) {
 	if (aggregate_columns.empty()) {
 		return;
 	}
-	auto *top_projection = FindFirstProjection(plan);
+	auto *top_projection = facts.first_projection;
 	if (!top_projection) {
 		return;
 	}
-
-	unordered_map<idx_t, LogicalProjection *> proj_by_index;
-	unordered_map<idx_t, LogicalGet *> get_by_index;
-	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
-
-	unordered_map<string, string> parents;
-	vector<BoundColumnRefExpression *> join_refs;
-	CollectJoinEquivalences(plan, parents, join_refs);
-	if (join_refs.empty()) {
+	auto parents = facts.join_parents;
+	if (facts.join_refs.empty()) {
 		return;
 	}
 
@@ -1451,8 +1182,8 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(LogicalOperator *plan, vector<s
 		if (already_visible) {
 			continue;
 		}
-		for (auto *ref : join_refs) {
-			string ref_col = ResolveBindingToBaseColumn(ref, proj_by_index, get_by_index);
+		for (auto *ref : facts.join_refs) {
+			string ref_col = ResolveBindingToBaseColumn(ref, facts);
 			if (ref_col.empty()) {
 				ref_col = ref->GetName();
 			}
@@ -1501,9 +1232,7 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(LogicalOperator *plan, vector<s
 	}
 }
 
-static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr,
-                                      const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                      const unordered_map<idx_t, LogicalGet *> &get_by_index) {
+static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr, const CreateMVPlanFacts &facts) {
 	if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
 		return "";
 	}
@@ -1511,42 +1240,33 @@ static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr,
 	if (!ref) {
 		return "";
 	}
-	string col_name = ResolveBindingToBaseColumn(ref, proj_by_index, get_by_index);
+	string col_name = ResolveBindingToBaseColumn(ref, facts);
 	return col_name.empty() ? ref->GetName() : col_name;
 }
 
-static bool ExtractFullOuterJoinCols(LogicalOperator *node,
-                                     const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
-                                     const unordered_map<idx_t, LogicalGet *> &get_by_index, string &result) {
-	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (join && join->join_type == JoinType::OUTER && !join->conditions.empty()) {
-			auto &condition = join->conditions[0];
-			string left_col_name = FullOuterJoinColumnName(condition.left, proj_by_index, get_by_index);
-			string right_col_name = FullOuterJoinColumnName(condition.right, proj_by_index, get_by_index);
-			string left_table = !join->children.empty() ? FindFirstTableName(join->children[0].get()) : "";
-			string right_table = join->children.size() > 1 ? FindFirstTableName(join->children[1].get()) : "";
-			if (!left_col_name.empty() && !right_col_name.empty() && !left_table.empty() && !right_table.empty()) {
-				result = left_table + ":" + left_col_name + "," + right_table + ":" + right_col_name;
-				return true;
-			}
+string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
+	for (auto *join : facts.comparison_joins) {
+		if (join->join_type != JoinType::OUTER || join->conditions.empty()) {
+			continue;
+		}
+		auto &condition = join->conditions[0];
+		string left_col_name = FullOuterJoinColumnName(condition.left, facts);
+		string right_col_name = FullOuterJoinColumnName(condition.right, facts);
+		string left_table;
+		string right_table;
+		if (!join->children.empty()) {
+			auto it = facts.first_table_name.find(join->children[0].get());
+			left_table = it == facts.first_table_name.end() ? string() : it->second;
+		}
+		if (join->children.size() > 1) {
+			auto it = facts.first_table_name.find(join->children[1].get());
+			right_table = it == facts.first_table_name.end() ? string() : it->second;
+		}
+		if (!left_col_name.empty() && !right_col_name.empty() && !left_table.empty() && !right_table.empty()) {
+			return left_table + ":" + left_col_name + "," + right_table + ":" + right_col_name;
 		}
 	}
-	for (auto &child : node->children) {
-		if (ExtractFullOuterJoinCols(child.get(), proj_by_index, get_by_index, result)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-string ExtractFullOuterJoinMetadata(LogicalOperator *plan) {
-	unordered_map<idx_t, LogicalProjection *> proj_by_index;
-	unordered_map<idx_t, LogicalGet *> get_by_index;
-	IndexProjectionsAndGets(plan, proj_by_index, get_by_index);
-	string result;
-	ExtractFullOuterJoinCols(plan, proj_by_index, get_by_index, result);
-	return result;
+	return "";
 }
 
 static string SanitizeOutputName(const string &name) {
@@ -1568,12 +1288,6 @@ static string SanitizeOutputName(const string &name) {
 		clean.pop_back();
 	}
 	return clean.empty() ? name : clean;
-}
-
-static void SanitizeOutputNames(vector<string> &output_names) {
-	for (auto &name : output_names) {
-		name = SanitizeOutputName(name);
-	}
 }
 
 static LogicalOperator *FindTopNameSource(LogicalOperator *plan) {
@@ -1634,41 +1348,6 @@ static void AppendHiddenOutputNames(LogicalOperator *plan, vector<string> &outpu
 	}
 }
 
-static void AppendHiddenOutputTypes(LogicalOperator *plan, vector<LogicalType> &output_types) {
-	auto output_count = plan->GetColumnBindings().size();
-	auto *type_source = FindTopNameSource(plan);
-	if (!type_source) {
-		return;
-	}
-	if (type_source->types.size() == output_count) {
-		while (output_types.size() < output_count) {
-			output_types.push_back(type_source->types[output_types.size()]);
-		}
-		return;
-	}
-	if (type_source->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &projection = type_source->Cast<LogicalProjection>();
-		while (output_types.size() < output_count && output_types.size() < projection.expressions.size()) {
-			output_types.push_back(projection.expressions[output_types.size()]->return_type);
-		}
-		return;
-	}
-	auto &aggregate = type_source->Cast<LogicalAggregate>();
-	idx_t group_count = aggregate.groups.size();
-	while (output_types.size() < output_count) {
-		idx_t idx = output_types.size();
-		if (idx < group_count) {
-			output_types.push_back(aggregate.groups[idx]->return_type);
-		} else {
-			idx_t expr_idx = idx - group_count;
-			if (expr_idx >= aggregate.expressions.size()) {
-				break;
-			}
-			output_types.push_back(aggregate.expressions[expr_idx]->return_type);
-		}
-	}
-}
-
 static void DeduplicateOutputNames(vector<string> &output_names) {
 	unordered_set<string> seen;
 	for (auto &name : output_names) {
@@ -1687,21 +1366,12 @@ static void DeduplicateOutputNames(vector<string> &output_names) {
 
 vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<string> &planner_names) {
 	auto output_names = planner_names;
-	SanitizeOutputNames(output_names);
+	for (auto &name : output_names) {
+		name = SanitizeOutputName(name);
+	}
 	AppendHiddenOutputNames(select_plan, output_names);
 	DeduplicateOutputNames(output_names);
 	return output_names;
-}
-
-vector<LogicalType> PrepareOutputTypes(LogicalOperator *select_plan, const vector<LogicalType> &planner_types) {
-	auto output_types = planner_types;
-	AppendHiddenOutputTypes(select_plan, output_types);
-	return output_types;
-}
-
-bool QueryHasUnsupportedIncrementalConstruct(const string &query) {
-	string lower = StringUtil::Lower(query);
-	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos;
 }
 
 LogicalAggregate *FindOuterAggregate(LogicalOperator *op) {

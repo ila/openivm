@@ -1,6 +1,5 @@
 #include "core/parser.hpp"
 
-#include "core/incremental_checker.hpp"
 #include "core/plan_rewrite.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/parser_ddl.hpp"
@@ -210,33 +209,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		auto plan = std::move(planner.plan);
 		add_create_profile_step("create_compile_full_plan", full_plan_start);
 
-		// Inline CTEs in this plan too so AnalyzePlan / find_group_cols / HasLeftJoin
-		// walks see the folded structure. DuckDB's binder defaults to
-		// CTE_MATERIALIZE_ALWAYS, which makes CTEInlining bail — relax to DEFAULT first.
-		// (The SELECT-only `select_plan` below does the same for LPTS serialization.)
-		auto source_discovery_start = create_profile_now();
+		// Inline CTEs so create-MV facts see the folded structure.
 		InlineCtesIfPresent(context, *planner.binder, plan);
-
-		unordered_map<string, SourceTableInfo> source_table_info;
-		CollectSourceTables(plan.get(), source_table_info);
-		if (!source_table_info.empty()) {
-			table_names.clear();
-			for (const auto &entry : source_table_info) {
-				table_names.insert(entry.second.table_name);
-			}
-		}
-		unordered_map<string, DuckLakeSourceTableInfo> dl_table_info_for_classification;
-		CollectDuckLakeTables(plan.get(), current_catalog, dl_table_info_for_classification);
-		add_create_profile_step("create_compile_source_discovery", source_discovery_start,
-		                        "sources=" + to_string(table_names.size()) +
-		                            "; ducklake_sources=" + to_string(dl_table_info_for_classification.size()));
 
 		// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 		vector<string> output_names;
-		vector<LogicalType> output_types;
 		string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 		bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
-		bool original_has_repeated_cte_ref_under_join = false;
 		{
 			auto select_parse_plan_start = create_profile_now();
 			Parser select_parser;
@@ -244,25 +223,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			Planner select_planner(*con.context);
 			select_planner.CreatePlan(std::move(select_parser.statements[0]));
 			auto select_plan = std::move(select_planner.plan);
-			original_has_repeated_cte_ref_under_join = HasRepeatedCteRefUnderJoin(select_plan.get());
 			add_create_profile_step("create_compile_select_plan", select_parse_plan_start);
 
-			// Inline CTEs so the refresh rewriter sees one maintainable operator tree.
-			// Query-bound CTEs become LOGICAL_MATERIALIZED_CTE + LOGICAL_CTE_REF nodes
-			// in the bound plan; CTEInlining rewrites small/non-recursive ones into
-			// direct subqueries. Running the full DuckDB optimizer here would also
-			// reorder joins / push filters, which conflicts with IVM's subsequent plan
-			// rewrites — so we run only the CTE-inlining pass, and only when a CTE
-			// reference actually appears in the plan (the optimizer isn't always a
-			// no-op on CTE-free plans — e.g. it can rewrite DISTINCT subqueries in ways
-			// that confuse the downstream structural rewrites).
-			// DuckDB's binder sets LogicalMaterializedCTE::materialize to
-			// CTE_MATERIALIZE_ALWAYS by default. CTEInlining bails early on ALWAYS
-			// and leaves the CTE as a materialized node. The refresh path has no
-			// delta-consolidation rule for LOGICAL_CTE_REF, so relax every CTE to
-			// CTE_MATERIALIZE_DEFAULT before inlining. Single-ref CTEs always inline;
-			// multi-ref CTEs inline when they're cheap and don't end in an aggregate
-			// that would be wastefully re-materialized.
+			// Inline CTEs without running the full optimizer, which can reshape plans
+			// before OpenIVM's structural rewrites.
 			auto select_rewrite_start = create_profile_now();
 			InlineCtesIfPresent(context, *select_planner.binder, select_plan);
 
@@ -270,47 +234,31 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
 
 			output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
-			output_types = PrepareOutputTypes(select_plan.get(), select_planner.types);
 			// Strip HAVING filter from plan — data table stores all groups.
 			// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 			having_predicate = StripHavingFilter(select_plan, output_names);
 
-			// For aggregate+top-k: extract the ORDER BY/LIMIT suffix, then strip the top-k
-			// wrapper(s) so LPTS serializes only the inner aggregate query. The suffix is
-			// appended to the CREATE VIEW definition so ORDER BY LIMIT is applied at read
-			// time over the fully-maintained data table.
-			//
-			// Two plan shapes depending on whether top_n optimizer ran:
-			//   (A) LOGICAL_TOP_N → child  [top_n disabled by LPTS — never reached here]
-			//   (B) LOGICAL_LIMIT → LOGICAL_ORDER_BY → child  [LPTS active — common case]
-			//
-			// Projection top-k uses the same split: maintain the unlimited projection in
-			// the data table and apply ORDER BY ... LIMIT in the user-facing view.
+			// Keep data tables unlimited/unordered; apply ORDER BY/LIMIT in the user-facing view.
 			{
 				LogicalOperator *limit_node = nullptr;
 				LogicalOperator *order_node = nullptr;
 
 				if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_TOP_N) {
-					// Shape (A): fused top-n node
 					limit_node = select_plan.get();
 					order_node = select_plan.get(); // same node holds both orders + limit
 				} else if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_LIMIT &&
 				           !select_plan->children.empty() &&
 				           select_plan->children[0]->type == LogicalOperatorType::LOGICAL_ORDER_BY) {
-					// Shape (B): separate LIMIT + ORDER_BY nodes
 					limit_node = select_plan.get();
 					order_node = select_plan->children[0].get();
 				}
 
 				if (limit_node) {
-					// Strip top-k unconditionally. The data table stores the unlimited result,
-					// while the user-facing view applies ORDER BY ... LIMIT at read time.
 					if (limit_node->type == LogicalOperatorType::LOGICAL_TOP_N) {
 						auto &top_n = limit_node->Cast<LogicalTopN>();
 						top_k_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names);
 						select_plan = std::move(select_plan->children[0]);
 					} else {
-						// Shape (B): extract from the two separate nodes
 						auto &order_op = order_node->Cast<LogicalOrder>();
 						auto &limit_op = limit_node->Cast<LogicalLimit>();
 						idx_t lval = 0;
@@ -322,7 +270,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 							oval = limit_op.offset_val.GetConstantValue();
 						}
 						top_k_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names);
-						// Strip: select_plan = LOGICAL_ORDER_BY's child
 						select_plan = std::move(select_plan->children[0]->children[0]);
 					}
 					OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped top-k wrapper, suffix='%s'\n", top_k_suffix.c_str());
@@ -379,10 +326,18 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		auto analysis_start = create_profile_now();
 		RewriteAggregateFilters(context, plan);
 
-		// Single-pass plan analysis: validates IVM compatibility AND extracts metadata
-		auto analysis = AnalyzePlan(plan.get());
+		auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
+		if (!facts.source_table_info.empty()) {
+			table_names.clear();
+			for (const auto &entry : facts.source_table_info) {
+				table_names.insert(entry.second.table_name);
+			}
+		}
+		auto analysis = facts.analysis;
 		MVClassificationState classification(analysis);
-		add_create_profile_step("create_compile_analyze_plan", analysis_start);
+		add_create_profile_step("create_compile_analyze_plan", analysis_start,
+		                        "sources=" + to_string(table_names.size()) +
+		                            "; ducklake_sources=" + to_string(facts.ducklake_table_info.size()));
 		if (analysis.found_delim_join && !classification.found_aggregation && !analysis.found_single_join) {
 			// Preserve DuckDB's dependent/DELIM_JOIN plan shape for refresh. LPTS can
 			// round-trip lateral table functions, but its CTE-normalized SQL lowers them
@@ -397,21 +352,22 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			OPENIVM_DEBUG_PRINT("[CREATE MV] LIST FILTER requires original SQL for group-recompute: %s\n",
 			                    view_query.c_str());
 		}
-		// Derive GROUP BY column names by walking the plan's projection above the aggregate.
-		// The projection maps GROUP BY bindings (group_index, i) to SELECT-list aliases — these
-		// aliases are the actual column names in the data table. Plan-walk aliases on agg.groups
-		// are unreliable for CASE/COALESCE expressions.
-		// For DISTINCT views, the checker already extracts aggregate_columns from distinct_targets.
+		// Derive stored group-key names from the rewritten plan's output aliases.
 		auto classification_start = create_profile_now();
 		size_t group_count = analysis.group_count;
 		idx_t group_index = analysis.group_index;
 		vector<string> aggregate_columns;
 		bool join_key_group_fallback = false;
-		// DISTINCT is only the MV's grouping when its targets actually appear in the MV's
-		// output columns. An inner-subquery DISTINCT (e.g. `SELECT COUNT(*) FROM (SELECT
-		// DISTINCT x FROM t)`, or a CTE like `WITH cte AS (SELECT DISTINCT x FROM t) ...`)
-		// exposes columns that never reach the data table, so its targets can't drive
-		// AGGREGATE_GROUP classification or the unique index.
+		auto append_visible_group_names = [&](const vector<string> &names) {
+			auto before = aggregate_columns.size();
+			for (auto &name : names) {
+				if (!IncrementalTableNames::IsInternalColumn(name)) {
+					aggregate_columns.push_back(name);
+				}
+			}
+			return aggregate_columns.size() > before;
+		};
+		// DISTINCT groups the MV only when its targets are visible data-table columns.
 		bool distinct_at_top = false;
 		if (classification.found_distinct && !analysis.aggregate_columns.empty() && !output_names.empty()) {
 			unordered_set<string> output_lc;
@@ -427,34 +383,24 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				}
 			}
 		}
-		// Detect UNION / UNION ALL over aggregates once for the classification chain (to route
-		// to RECOMPUTE).
-		// True only when the UNION node is an ancestor of the aggregate (union-of-aggs pattern).
-		// For agg-over-union (e.g. SELECT ... FROM (t1 UNION ALL t2) GROUP BY ...) the
-		// UNION is a descendant of the aggregate — that is a normal AGGREGATE_GROUP view.
-		bool has_union_over_agg = classification.found_aggregation && HasUnionBeforeAggregate(plan.get());
+		bool has_union_over_agg = classification.found_aggregation && facts.has_union_before_aggregate;
 		bool union_distinct_over_agg = classification.found_distinct && distinct_at_top && has_union_over_agg;
 
 		if (union_distinct_over_agg) {
-			aggregate_columns = DeriveGroupColumnNames(plan.get(), group_index, group_count, output_names);
+			aggregate_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 		} else if (distinct_at_top) {
 			aggregate_columns = std::move(analysis.aggregate_columns);
 		} else if (classification.found_distinct && analysis.aggregate_columns.empty()) {
 			// Plain DISTINCT (no explicit targets) — trust the checker.
 			aggregate_columns = std::move(analysis.aggregate_columns);
 		} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
-			auto group_names_list = DeriveGroupColumnNames(plan.get(), group_index, group_count, output_names);
+			auto group_names_list = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 			for (auto &name : group_names_list) {
 				aggregate_columns.push_back(name);
 			}
 		}
 
-		// LATERAL/correlated subquery aggregates are represented by DEPENDENT/DELIM joins.
-		// The inner aggregate's group binding is not projected as a top-level GROUP BY, so
-		// the normal group-column derivation above leaves aggregate_columns empty and would
-		// misclassify the MV as a scalar SIMPLE_AGGREGATE. For this shape, the visible
-		// non-aggregate output columns are the affected-key columns that scope
-		// GROUP_RECOMPUTE.
+		// DELIM/correlated aggregate keys are the visible non-aggregate outputs.
 		bool delim_aggregate_group_fallback = false;
 		if (analysis.found_delim_join && classification.found_aggregation && aggregate_columns.empty() &&
 		    output_names.size() > analysis.aggregate_types.size()) {
@@ -475,11 +421,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		bool scalar_delim_projection_group_fallback = false;
 		if (analysis.found_delim_join && classification.found_single_join && !classification.found_aggregation &&
 		    aggregate_columns.empty()) {
-			auto delim_key_names = DeriveScalarDelimKeyColumnNames(plan.get(), output_names);
-			for (auto &name : delim_key_names) {
-				aggregate_columns.push_back(name);
-			}
-			scalar_delim_projection_group_fallback = !aggregate_columns.empty();
+			scalar_delim_projection_group_fallback =
+			    append_visible_group_names(DeriveScalarDelimKeyColumnNames(facts, output_names));
 			if (scalar_delim_projection_group_fallback) {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] Scalar DELIM/DEPENDENT projection: using %zu visible key columns "
 				                    "for GROUP_RECOMPUTE\n",
@@ -489,13 +432,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 		bool nested_aggregate_group_fallback = false;
 		if (classification.found_nested_aggregate && aggregate_columns.empty()) {
-			auto nested_group_names = DeriveAggregateGroupColumnNames(plan.get(), output_names, false);
-			for (auto &name : nested_group_names) {
-				if (!IncrementalTableNames::IsInternalColumn(name)) {
-					aggregate_columns.push_back(name);
-				}
-			}
-			nested_aggregate_group_fallback = !aggregate_columns.empty();
+			nested_aggregate_group_fallback =
+			    append_visible_group_names(DeriveAggregateGroupColumnNames(facts, output_names, false));
 			if (nested_aggregate_group_fallback) {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] Nested aggregate: using %zu visible inner group columns for "
 				                    "GROUP_RECOMPUTE\n",
@@ -505,13 +443,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 		bool repeated_cte_aggregate_group_fallback = false;
 		if (classification.found_aggregation && aggregate_columns.empty()) {
-			auto cte_group_names = DeriveAggregateGroupColumnNames(plan.get(), output_names, true);
-			for (auto &name : cte_group_names) {
-				if (!IncrementalTableNames::IsInternalColumn(name)) {
-					aggregate_columns.push_back(name);
-				}
-			}
-			repeated_cte_aggregate_group_fallback = !aggregate_columns.empty();
+			repeated_cte_aggregate_group_fallback =
+			    append_visible_group_names(DeriveAggregateGroupColumnNames(facts, output_names, true));
 			if (repeated_cte_aggregate_group_fallback) {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] Repeated CTE aggregate under join: using %zu visible group columns "
 				                    "for GROUP_RECOMPUTE\n",
@@ -519,13 +452,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			}
 		}
 
-		// Deduplicate aggregate_columns the same way we deduped output_names above.
-		// When the user writes `SELECT DISTINCT w_id, w_id` (or groups twice on the
-		// same column), the data table has columns `w_id, w_id_1` after the output_names
-		// dedup — the unique index and MERGE ON/UPDATE SET clauses read group names
-		// from aggregate_columns, so they must match the data table's deduped names.
-		// Without this, the second occurrence gets treated as an aggregate column in
-		// `UPDATE SET w_id_1 = v.w_id_1 + d.w_id_1` and values are summed instead of matched.
+		// Keep duplicated group keys aligned with PrepareOutputNames' suffixing.
 		{
 			unordered_set<string> seen_group;
 			for (auto &name : aggregate_columns) {
@@ -543,29 +470,18 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 		auto aggregate_types = std::move(analysis.aggregate_types);
 		auto window_partition_columns = std::move(analysis.window_partition_columns);
-		ResolveWindowPartitionOutputNames(plan.get(), window_partition_columns, output_names);
+		ResolveWindowPartitionOutputNames(facts, window_partition_columns, output_names);
 
-		// Fallback group-key extraction for inner-aggregate-in-join patterns.
-		// When the top-level SELECT joins against a subquery/CTE that performs GROUP BY,
-		// find_group_cols fails (the inner aggregate's group_index isn't referenced by the
-		// outer projection — the join key comes from the non-aggregate arm). Recover group
-		// keys by matching the outermost JOIN's condition BCRs against the top projection.
-		//
-		// Use GROUP_RECOMPUTE for these views: AGGREGATE_GROUP would try to SUM pass-through
-		// attributes (e.g. W_YTD from WAREHOUSE) as if they were aggregate results.
+		// Recover keys for join-over-aggregate shapes where the inner group binding is hidden.
 		if (classification.found_join && group_count > 0 && !has_union_over_agg) {
-			// plan root is LOGICAL_CREATE_TABLE; descend to find the SELECT output
-			// projection and outermost comparison join.
-			auto *top_proj_ptr = FindFirstProjection(plan.get());
-			auto *cjoin = FindFirstComparisonJoin(plan.get());
+			auto *top_proj_ptr = facts.first_projection;
+			auto *cjoin = facts.first_comparison_join;
 			if (top_proj_ptr && cjoin) {
-				// Collect (table_index, column_index) pairs that appear in join conditions.
 				unordered_map<idx_t, unordered_set<idx_t>> join_key_cols;
 				for (auto &cond : cjoin->conditions) {
 					AddJoinKeyColumn(cond.left, join_key_cols);
 					AddJoinKeyColumn(cond.right, join_key_cols);
 				}
-				// Match those bindings against the top projection's output expressions.
 				auto &top_proj = *top_proj_ptr;
 				for (idx_t expr_i = 0; expr_i < top_proj.expressions.size(); expr_i++) {
 					auto &expr = top_proj.expressions[expr_i];
@@ -603,7 +519,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			}
 		}
 		if (classification.found_join && classification.found_aggregation && !aggregate_columns.empty()) {
-			ResolveAggregateGroupColumnsThroughJoinKeys(plan.get(), aggregate_columns, output_names);
+			ResolveAggregateGroupColumnsThroughJoinKeys(facts, aggregate_columns, output_names);
 		}
 
 		bool join_aggregate_projection_fallback = false;
@@ -617,16 +533,12 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			}
 		}
 
-		// Window over join: non-DuckLake delta tables may not expose the partition key for
-		// every changed source, so native window recompute could miss partitions. DuckLake
-		// can compare the old/new view result at source snapshots, so it can safely keep
-		// partition keys even for multi-source window joins.
+		// Non-DuckLake window joins need all changed sources to expose partition keys.
 		bool all_sources_are_ducklake = !table_names.empty();
 		if (all_sources_are_ducklake) {
 			for (const auto &table_name : table_names) {
 				string table_lc = StringUtil::Lower(table_name);
-				bool is_ducklake_scan =
-				    dl_table_info_for_classification.find(table_lc) != dl_table_info_for_classification.end();
+				bool is_ducklake_scan = facts.ducklake_table_info.find(table_lc) != facts.ducklake_table_info.end();
 				// DuckLake views created by OpenIVM expose a DuckLake catalog view over an
 				// internal physical openivm_data_* table. When DuckDB expands such a view while
 				// planning a chained MV, the scan is physical even though the source's change
@@ -646,20 +558,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			window_partition_columns.clear();
 		}
 
-		// LEFT/RIGHT/OUTER JOIN aggregate with a non-trivial aggregate argument
-		// (e.g. `SUM(COALESCE(h.x, 0))`, `AVG(1)`, `SUM(CASE …)`) or a non-BCR
-		// projection wrapping an aggregate output (e.g. `COALESCE(SUM(…), 0)`)
-		// breaks the Larson & Zhou MERGE logic: the NULL-semantics shortcut that
-		// resets right-side aggregates to NULL when match_count=0 produces the
-		// wrong value when the stored expression would evaluate to the COALESCE
-		// default (0). Route these to group-recompute by setting found_minmax so
-		// the view is compiled with has_minmax=true. Detection runs only when
-		// the view already has a LEFT/RIGHT/OUTER JOIN and an AGGREGATE.
-		//   query_1502: COALESCE(SUM(ol.OL_QUANTITY), 0) AS ordered
-		//   query_1696/1699: SUM(COALESCE(h.H_AMOUNT, 0))
-		//   query_1746/1749: SUM(COALESCE(1, 0)), AVG(1)
+		// Computed outer-join aggregate arguments need group recompute for NULL semantics.
 		if ((classification.found_left_join || classification.found_full_outer) && classification.found_aggregation) {
-			if (OuterJoinAggregateNeedsRecompute(plan.get(), analysis.group_index)) {
+			if (OuterJoinAggregateNeedsRecompute(facts, analysis.group_index)) {
 				OPENIVM_DEBUG_PRINT(
 				    "[CREATE MV] LEFT/OUTER JOIN aggregate with computed aggregate or projection wrapper — "
 				    "using group-recompute (found_minmax=true)\n");
@@ -667,23 +568,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			}
 		}
 
-		// FULL OUTER JOIN with aggregate (above OR below) cannot be safely maintained
-		// via inclusion-exclusion deltas: outer-side null-padded rows don't survive
-		// deletion deltas correctly, so SUM/COUNT over them drift. Force RECOMPUTE
-		// regardless of how the aggregate's expressions are structured.
-		// Catches q1353/q1355 (FULL OUTER JOIN + GROUP BY + SUM).
 		bool has_full_outer_aggregate = classification.found_full_outer && classification.found_aggregation;
 
-		// Materialized CTE referenced 2+ times below a JOIN: the planner emits one
-		// base-table scan inside the CTE and shares it via CTE_REF nodes, so the
-		// IncrementalJoinRule sees a single physical scan instead of an N-way self-join.
-		// Inclusion-exclusion can't generate the right delta terms — rows for the
-		// shared scan aren't replicated across both join sides. Route to RECOMPUTE.
-		// Catches ducklake_0240 (CTE referenced twice on both sides of an INNER JOIN).
-		bool has_cte_self_join = HasRepeatedCteRefUnderJoin(plan.get());
-		bool has_unsupported_set_operation = HasUnsupportedSetOperation(plan.get());
-		bool has_unsupported_incremental_construct = QueryHasUnsupportedIncrementalConstruct(original_view_query);
-		if (has_unsupported_set_operation || has_unsupported_incremental_construct) {
+		bool has_cte_self_join = facts.has_repeated_cte_ref_under_join;
+		bool has_unsupported_incremental_construct = facts.has_unsupported_set_operation || facts.has_pivot;
+		if (has_unsupported_incremental_construct) {
 			// These views are maintained by full refresh, so store the user's query directly.
 			// The CREATE-time IVM rewrites can add hidden columns for incremental paths (e.g.
 			// LEFT JOIN match keys) that do not survive SQL set-operation arity rules.
@@ -710,7 +599,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		    classification.found_nested_aggregate &&
 		    ExtractFilteredGroupCount(original_view_query, output_names, filtered_group_count_extract);
 
-		if (has_unsupported_set_operation || has_unsupported_incremental_construct) {
+		if (has_unsupported_incremental_construct) {
 			refresh_type = RefreshType::FULL_REFRESH;
 		} else if (classification.found_window) {
 			// Window functions use partition-level recompute (not full IVM, but better than full refresh)
@@ -902,15 +791,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			               "' has an unrecognized query pattern. Full refresh will be used.");
 		}
 
-		bool ducklake_window_partition = refresh_type == RefreshType::WINDOW_PARTITION &&
-		                                 (target_is_ducklake || !dl_table_info_for_classification.empty());
+		bool ducklake_window_partition =
+		    refresh_type == RefreshType::WINDOW_PARTITION && (target_is_ducklake || !facts.ducklake_table_info.empty());
 		if (ducklake_window_partition && !lpts_fallback) {
-			// Window-partition refresh recomputes affected partitions from the user's query,
-			// so the initial data table does not need LPTS-normalized SQL. For DuckLake,
-			// the normalized form can duplicate CTE/subplan work around global aggregates
-			// and cross joins; executing that shape as CTAS from inside CREATE MATERIALIZED
-			// VIEW can leave DuckLake's metadata commit waiting on its own transaction. Use
-			// the original SQL here, matching the refresh path and ordinary CTAS behavior.
 			view_query = original_view_query;
 			lpts_fallback = true;
 			OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake window MV uses original SQL for initial data table: %s\n",
@@ -929,7 +812,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 		OPENIVM_DEBUG_PRINT("\n");
 
-		// Build DDL vector directly in memory
 		vector<string> ddl;
 		vector<string> cleanup_ddl;
 		vector<string> metadata_ddl;
@@ -948,13 +830,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			add_profile_record(step.step_name, step.duration_ms, step.detail);
 		}
 
-		// --- System tables DDL ---
 		add_profile_marker("create_mv_system_tables",
 		                   "refresh_type=" + string(RefreshTypeName(refresh_type)) +
 		                       "; lpts_fallback=" + string(lpts_fallback ? "true" : "false"));
 		AppendCreateMVSystemTablesDDL(ddl, view_name, parse_data_ref.is_replace);
 
-		// --- OR REPLACE: drop old MV if it exists ---
 		if (parse_data_ref.is_replace) {
 			add_profile_marker("create_mv_replace_cleanup");
 			string qvn_drop = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
@@ -962,34 +842,25 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			                  KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
 			string qdv_drop =
 			    internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
-			// Drop the user-facing VIEW, data table, and delta view table
 			ddl.push_back("DROP VIEW IF EXISTS " + qvn_drop);
 			ddl.push_back("DROP TABLE IF EXISTS " + qdt_drop);
 			ddl.push_back("DROP TABLE IF EXISTS " + qdv_drop);
-			// Clean metadata (the INSERT OR REPLACE below handles openivm_views)
 			ddl.push_back("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 			              SqlUtils::EscapeSingleQuotes(view_name) + "'");
 			ddl.push_back("DELETE FROM " + string(openivm::HISTORY_TABLE) + " WHERE view_name = '" +
 			              SqlUtils::EscapeSingleQuotes(view_name) + "'");
 		}
 
-		// Store the LPTS query in metadata — it has hidden columns (DISTINCT count, AVG sum/count,
-		// LEFT JOIN key) and preserves user column names.
 		string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
-		// Store GROUP BY or PARTITION BY columns (mutually exclusive in our type system).
-		// For WINDOW_PARTITION, store the PARTITION BY columns so the upsert compiler
-		// can identify affected partitions from deltas.
 		auto &cols_to_store = classification.found_window ? window_partition_columns : aggregate_columns;
 		string group_cols_val = SqlCsvLiteralOrNull(cols_to_store);
-		// Store per-column aggregate types for insert-only MIN/MAX optimization
 		string agg_types_val = SqlCsvLiteralOrNull(aggregate_types);
 		string having_val =
 		    having_predicate.empty() ? "null" : "'" + SqlUtils::EscapeSingleQuotes(having_predicate) + "'";
 
-		// Extract FULL OUTER JOIN condition: "left_table:left_col,right_table:right_col"
 		string full_outer_join_cols_val = "null";
 		if (classification.found_full_outer) {
-			string foj_cols = ExtractFullOuterJoinMetadata(plan.get());
+			string foj_cols = ExtractFullOuterJoinMetadata(facts);
 			if (!foj_cols.empty()) {
 				full_outer_join_cols_val = "'" + SqlUtils::EscapeSingleQuotes(foj_cols) + "'";
 			}
@@ -1009,13 +880,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		vector<string> refresh_lineage_entries;
 		auto lineage_start = create_profile_now();
 		if (refresh_type == RefreshType::WINDOW_PARTITION) {
-			string lineage_entry = BuildWindowPartitionLineageEntryJson(plan.get(), window_partition_columns);
+			string lineage_entry = BuildWindowPartitionLineageEntryJson(facts, window_partition_columns);
 			if (!lineage_entry.empty()) {
 				refresh_lineage_entries.push_back(std::move(lineage_entry));
 			}
 		} else if (refresh_type == RefreshType::SIMPLE_PROJECTION && !classification.found_left_join &&
 		           !classification.found_full_outer) {
-			string lineage_entry = BuildProjectionKeyLineageEntryJson(plan.get(), output_names);
+			string lineage_entry = BuildProjectionKeyLineageEntryJson(facts, output_names);
 			if (!lineage_entry.empty()) {
 				refresh_lineage_entries.push_back(std::move(lineage_entry));
 			}
@@ -1184,14 +1055,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("semi_anti_aux_meta_json", meta_json, view_name));
 		}
 
-		// Classify each base table by catalog type (duckdb vs ducklake).
-		// DuckLake tables use native change tracking; DuckDB tables use delta tables.
-		//
-		// Catalog::GetEntry inside BeginTransaction() cannot see DuckLake entries:
-		// DuckLake requires its own transaction protocol. Walk the logical plan's
-		// DUCKLAKE_SCAN nodes instead — same approach used in ducklake_join.cpp.
-		unordered_map<string, DuckLakeSourceTableInfo> dl_table_info; // keyed by lowercased name
-		CollectDuckLakeTables(plan.get(), current_catalog, dl_table_info);
+		const auto &source_table_info = facts.source_table_info;
+		const auto &dl_table_info = facts.ducklake_table_info; // keyed by lowercased name
 
 		unordered_set<string> ducklake_tables;
 		// Single snapshot query per DuckLake catalog (all tables share the same snapshot).
@@ -1404,38 +1269,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Delta table for the MV — based on the DATA table (has all columns)
 		add_profile_marker("create_mv_mv_delta_table");
 		string qdv = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
-		bool can_create_delta_from_schema = !output_names.empty() && output_names.size() == output_types.size();
-		string delta_schema_sql;
-		if (can_create_delta_from_schema) {
-			vector<string> delta_columns;
-			for (idx_t i = 0; i < output_names.size(); i++) {
-				if (output_names[i].empty() || StringUtil::CIEquals(output_names[i], openivm::MULTIPLICITY_COL) ||
-				    StringUtil::CIEquals(output_names[i], openivm::TIMESTAMP_COL)) {
-					can_create_delta_from_schema = false;
-					break;
-				}
-				auto type_sql = output_types[i].ToString();
-				if (type_sql.empty()) {
-					can_create_delta_from_schema = false;
-					break;
-				}
-				delta_columns.push_back(KeywordHelper::WriteOptionallyQuoted(output_names[i]) + " " + type_sql);
-			}
-			if (can_create_delta_from_schema) {
-				delta_columns.push_back(string(openivm::MULTIPLICITY_COL) + " INTEGER DEFAULT 1");
-				delta_columns.push_back(string(openivm::TIMESTAMP_COL) + " TIMESTAMP DEFAULT now()");
-				delta_schema_sql =
-				    "create table if not exists " + qdv + " (" + StringUtil::Join(delta_columns, ", ") + ")";
-			}
-		}
-		if (can_create_delta_from_schema) {
-			ddl.push_back(delta_schema_sql);
-		} else {
-			ddl.push_back("create table if not exists " + qdv + " as select *, 1::INTEGER as " +
-			              string(openivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
-			              string(openivm::TIMESTAMP_COL) + " from " + qdt + " limit 0");
-			ddl.push_back("alter table " + qdv + " alter " + string(openivm::TIMESTAMP_COL) + " set default now()");
-		}
+		ddl.push_back(string(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX) + qdv + "\t" + qdt);
 		add_cleanup("DROP TABLE IF EXISTS " + qdv);
 
 		// --- Index DDL (for aggregate group queries) ---
@@ -1523,6 +1357,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				}
 				if (visible_ddl_idx < 3) {
 					system_tables_sql += ddl[i] + ";\n\n";
+				} else if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
+					compiled_sql += "-- OpenIVM derives the MV delta-table schema from the physical data table "
+					                "at DDL execution time.\n\n";
 				} else {
 					compiled_sql += ddl[i] + ";\n\n";
 				}
