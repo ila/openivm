@@ -9,6 +9,7 @@
 #include "lpts_pipeline.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
+#include "upsert/refresh_compiler.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/main/client_config.hpp"
@@ -949,26 +950,24 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		if (refresh_type == RefreshType::DISTINCT_INCREMENTAL) {
 			add_profile_marker("create_mv_distinct_aux");
 			string aux_table = "openivm_distinct_count_" + view_name;
-			string cols_csv = StringUtil::Join(distinct_extracted_cols, ", ");
-			// CREATE+POPULATE the aux table from the extracted DISTINCT input SQL.
-			// _count is a signed BIGINT (deltas can transiently push it negative during
-			// concurrent refreshes; the post-update DELETE drops rows whose count <= 0).
-			string aux_create = "create table if not exists " + internal_catalog_prefix +
-			                    KeywordHelper::WriteOptionallyQuoted(aux_table) + " as select " + cols_csv +
-			                    ", count(*)::BIGINT as _count from (" + distinct_extracted_input_sql + ") group by " +
-			                    cols_csv;
+			string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(aux_table);
+			string aux_create =
+			    BuildDistinctAuxStateCreateSQL(aux_target, distinct_extracted_cols, distinct_extracted_cols,
+			                                   "(" + distinct_extracted_input_sql + ")", "",
+			                                   /*replace=*/false);
 			ddl.push_back(aux_create);
 			add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
 			            KeywordHelper::WriteOptionallyQuoted(aux_table));
-			// Build a JSON metadata blob that the refresh-time compile reads back.
-			string meta_json = "{\"aux_table\":" + SqlUtils::JsonQuote(aux_table) +
-			                   ",\"cols\":" + SqlUtils::JsonArray(distinct_extracted_cols) +
-			                   ",\"input_sql\":" + SqlUtils::JsonQuote(distinct_extracted_input_sql) +
-			                   ",\"source\":" + SqlUtils::JsonQuote(distinct_extracted_source) +
-			                   ",\"filter\":" + SqlUtils::JsonQuote(distinct_extracted_filter) +
-			                   ",\"sum_arg\":" + SqlUtils::JsonQuote(distinct_sum_arg) +
-			                   ",\"sum_out\":" + SqlUtils::JsonQuote(distinct_sum_out) + "}";
-			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("distinct_aux_meta_json", meta_json, view_name));
+			RefreshMetadata::DistinctAuxMeta meta {aux_table,
+			                                       distinct_extracted_cols,
+			                                       distinct_extracted_cols,
+			                                       distinct_extracted_input_sql,
+			                                       distinct_extracted_source,
+			                                       distinct_extracted_filter,
+			                                       distinct_sum_arg,
+			                                       distinct_sum_out};
+			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("distinct_aux_meta_json",
+			                                                  RefreshMetadata::DistinctAuxMetaToJson(meta), view_name));
 		}
 
 		if (refresh_type == RefreshType::SIMPLE_AGGREGATE && has_filtered_group_count_aux) {
@@ -978,22 +977,26 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			                                               current_schema, default_db);
 			string group_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.group_col);
 			string sum_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.sum_col);
-			string aux_create = "create table if not exists " + internal_catalog_prefix +
-			                    KeywordHelper::WriteOptionallyQuoted(aux_table) + " as select " + group_q + ", sum(" +
-			                    sum_q + ") as openivm_sum from " + source_table + " group by " + group_q;
+			string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(aux_table);
+			string aux_create = BuildFilteredGroupCountAuxStateCreateSQL(
+			    aux_target, source_table, filtered_group_count_extract.group_col, filtered_group_count_extract.sum_col,
+			    group_q, sum_q, /*replace=*/false);
 			ddl.push_back(aux_create);
 			add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
 			            KeywordHelper::WriteOptionallyQuoted(aux_table));
 
-			string meta_json =
-			    "{\"kind\":\"filtered_group_count\",\"aux_table\":" + SqlUtils::JsonQuote(aux_table) + ",\"source\":" +
-			    SqlUtils::JsonQuote(SqlUtils::LastIdentifierPart(filtered_group_count_extract.source)) +
-			    ",\"group_col\":" + SqlUtils::JsonQuote(filtered_group_count_extract.group_col) +
-			    ",\"sum_col\":" + SqlUtils::JsonQuote(filtered_group_count_extract.sum_col) +
-			    ",\"output_col\":" + SqlUtils::JsonQuote(filtered_group_count_extract.output_col) +
-			    ",\"op\":" + SqlUtils::JsonQuote(filtered_group_count_extract.comparison_op) +
-			    ",\"threshold\":" + SqlUtils::JsonQuote(filtered_group_count_extract.threshold_sql) + "}";
-			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("aggregate_decomposition_json", meta_json, view_name));
+			RefreshMetadata::FilteredGroupCountAuxMeta meta {
+			    aux_table,
+			    SqlUtils::LastIdentifierPart(filtered_group_count_extract.source),
+			    filtered_group_count_extract.group_col,
+			    filtered_group_count_extract.sum_col,
+			    group_q,
+			    sum_q,
+			    filtered_group_count_extract.output_col,
+			    filtered_group_count_extract.comparison_op,
+			    filtered_group_count_extract.threshold_sql};
+			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
+			    "aggregate_decomposition_json", RefreshMetadata::FilteredGroupCountAuxMetaToJson(meta), view_name));
 		}
 
 		if (refresh_type == RefreshType::SEMI_ANTI_RECOMPUTE) {
@@ -1003,18 +1006,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			    QualifyCreateSourceTable(semi_anti_extract.left_table, current_catalog, current_schema, default_db);
 			string right_source_table =
 			    QualifyCreateSourceTable(semi_anti_extract.right_table, current_catalog, current_schema, default_db);
-			string left_cols_csv = SqlUtils::JoinQuotedColumns(semi_anti_left_cols);
-			string left_source_select;
-			string left_cols_qualified =
-			    SqlUtils::JoinQualifiedQuotedColumns(semi_anti_left_cols, semi_anti_extract.left_alias);
-			string left_cols_lc = SqlUtils::JoinQualifiedQuotedColumns(semi_anti_left_cols, "lc");
-			string left_cols_mc = SqlUtils::JoinQualifiedQuotedColumns(semi_anti_left_cols, "mc");
-			string lc_mc_match = SqlUtils::BuildNullSafeMatch(semi_anti_left_cols, "lc", "mc");
 			vector<string> semi_anti_left_exprs;
 			for (size_t i = 0; i < semi_anti_left_cols.size(); i++) {
-				if (i > 0) {
-					left_source_select += ", ";
-				}
 				string qcol = KeywordHelper::WriteOptionallyQuoted(semi_anti_left_cols[i]);
 				string source_expr = semi_anti_extract.left_alias + "." + qcol;
 				for (size_t j = 0; j < semi_anti_extract.output_cols.size(); j++) {
@@ -1025,41 +1018,29 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 					}
 				}
 				semi_anti_left_exprs.push_back(source_expr);
-				left_source_select += source_expr + " AS " + qcol;
 			}
-			string left_source_filter;
-			if (!semi_anti_extract.post_filter.empty()) {
-				left_source_filter = " WHERE " + semi_anti_extract.post_filter;
-			}
-			string aux_create = "create table if not exists " + internal_catalog_prefix +
-			                    KeywordHelper::WriteOptionallyQuoted(aux_table) + " as with left_source as (select " +
-			                    left_source_select + " from " + left_source_table + " " + semi_anti_extract.left_alias +
-			                    left_source_filter + "), left_counts as (select " + left_cols_csv +
-			                    ", count(*)::BIGINT as _left_count from left_source group by " + left_cols_csv +
-			                    "), match_counts as (select " + left_cols_qualified +
-			                    ", count(*)::BIGINT as _match_count from (select distinct " + left_cols_csv +
-			                    " from left_source) " + semi_anti_extract.left_alias + " join " + right_source_table +
-			                    " " + semi_anti_extract.right_alias + " on " + semi_anti_extract.predicate +
-			                    " group by " + left_cols_qualified + ") select " + left_cols_lc +
-			                    ", lc._left_count, coalesce(mc._match_count, 0)::BIGINT as _match_count from "
-			                    "left_counts lc left join match_counts mc on " +
-			                    lc_mc_match;
+			string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(aux_table);
+			string aux_create = BuildSemiAntiAuxStateCreateSQL(
+			    aux_target, left_source_table, semi_anti_extract.left_alias, right_source_table,
+			    semi_anti_extract.right_alias, semi_anti_extract.predicate, semi_anti_extract.post_filter,
+			    semi_anti_left_cols, semi_anti_left_exprs, /*replace=*/false);
 			ddl.push_back(aux_create);
 			add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
 			            KeywordHelper::WriteOptionallyQuoted(aux_table));
 
-			string meta_json = "{\"aux_table\":" + SqlUtils::JsonQuote(aux_table) +
-			                   ",\"join_type\":" + SqlUtils::JsonQuote(semi_anti_extract.join_type) +
-			                   ",\"left_table\":" + SqlUtils::JsonQuote(semi_anti_extract.left_table) +
-			                   ",\"left_alias\":" + SqlUtils::JsonQuote(semi_anti_extract.left_alias) +
-			                   ",\"right_table\":" + SqlUtils::JsonQuote(semi_anti_extract.right_table) +
-			                   ",\"right_alias\":" + SqlUtils::JsonQuote(semi_anti_extract.right_alias) +
-			                   ",\"predicate\":" + SqlUtils::JsonQuote(semi_anti_extract.predicate) +
-			                   ",\"post_filter\":" + SqlUtils::JsonQuote(semi_anti_extract.post_filter) +
-			                   ",\"left_cols\":" + SqlUtils::JsonArray(semi_anti_left_cols) +
-			                   ",\"left_exprs\":" + SqlUtils::JsonArray(semi_anti_left_exprs) +
-			                   ",\"output_cols\":" + SqlUtils::JsonArray(semi_anti_extract.output_cols) + "}";
-			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("semi_anti_aux_meta_json", meta_json, view_name));
+			RefreshMetadata::SemiAntiAuxMeta meta {aux_table,
+			                                       semi_anti_extract.join_type,
+			                                       semi_anti_extract.left_table,
+			                                       semi_anti_extract.left_alias,
+			                                       semi_anti_extract.right_table,
+			                                       semi_anti_extract.right_alias,
+			                                       semi_anti_extract.predicate,
+			                                       semi_anti_extract.post_filter,
+			                                       semi_anti_left_cols,
+			                                       semi_anti_left_exprs,
+			                                       semi_anti_extract.output_cols};
+			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("semi_anti_aux_meta_json",
+			                                                  RefreshMetadata::SemiAntiAuxMetaToJson(meta), view_name));
 		}
 
 		const auto &source_table_info = facts.source_table_info;

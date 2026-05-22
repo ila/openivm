@@ -145,38 +145,51 @@ static bool ReadCreateTargetName(const string &sql, const string &object_keyword
 	return true;
 }
 
-static bool ReadIdentifierSegment(const string &sql, idx_t &pos, string &segment) {
+struct IdentifierSegmentSpan {
+	idx_t start;
+	idx_t end;
+	string value;
+};
+
+static bool ReadIdentifierSegmentSpan(const string &sql, idx_t &pos, IdentifierSegmentSpan &segment) {
 	if (pos >= sql.size()) {
 		return false;
 	}
-	idx_t start = pos;
+	segment.start = pos;
+	segment.value.clear();
 	if (sql[pos] == '"') {
 		pos++;
-		string unquoted;
 		while (pos < sql.size()) {
-			char c = sql[pos++];
-			if (c == '"') {
-				if (pos < sql.size() && sql[pos] == '"') {
-					unquoted += '"';
-					pos++;
+			if (sql[pos] == '"') {
+				if (pos + 1 < sql.size() && sql[pos + 1] == '"') {
+					segment.value += '"';
+					pos += 2;
 					continue;
 				}
-				segment = unquoted;
+				pos++;
+				segment.end = pos;
 				return true;
 			}
-			unquoted += c;
+			segment.value += sql[pos++];
 		}
-		pos = start;
 		return false;
 	}
 	if (!(std::isalpha(static_cast<unsigned char>(sql[pos])) || sql[pos] == '_')) {
 		return false;
 	}
-	pos++;
 	while (pos < sql.size() && IsIdentifierChar(sql[pos])) {
-		pos++;
+		segment.value += sql[pos++];
 	}
-	segment = sql.substr(start, pos - start);
+	segment.end = pos;
+	return true;
+}
+
+static bool ReadIdentifierSegment(const string &sql, idx_t &pos, string &segment) {
+	IdentifierSegmentSpan span;
+	if (!ReadIdentifierSegmentSpan(sql, pos, span)) {
+		return false;
+	}
+	segment = std::move(span.value);
 	return true;
 }
 
@@ -197,6 +210,80 @@ static bool ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end, 
 	}
 	end = pos;
 	return true;
+}
+
+static bool ReadQualifiedIdentifierSpans(const string &sql, idx_t start, idx_t &end,
+                                         vector<IdentifierSegmentSpan> &segments) {
+	idx_t pos = start;
+	IdentifierSegmentSpan segment;
+	if (!ReadIdentifierSegmentSpan(sql, pos, segment)) {
+		return false;
+	}
+	segments.push_back(std::move(segment));
+	while (pos < sql.size() && sql[pos] == '.') {
+		idx_t next = pos + 1;
+		IdentifierSegmentSpan next_segment;
+		if (!ReadIdentifierSegmentSpan(sql, next, next_segment)) {
+			break;
+		}
+		pos = next;
+		segments.push_back(std::move(next_segment));
+	}
+	end = pos;
+	return true;
+}
+
+static bool QualifierMatches(const vector<IdentifierSegmentSpan> &segments, const unordered_set<string> &qualifiers) {
+	if (segments.size() <= 1) {
+		return false;
+	}
+	for (idx_t i = 0; i + 1 < segments.size(); i++) {
+		if (qualifiers.count(StringUtil::Lower(segments[i].value))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static idx_t CopySingleQuotedLiteral(const string &sql, idx_t start, string &out) {
+	idx_t i = start + 1;
+	while (i < sql.size()) {
+		if (sql[i] == '\'' && i + 1 < sql.size() && sql[i + 1] == '\'') {
+			i += 2;
+			continue;
+		}
+		if (sql[i++] == '\'') {
+			break;
+		}
+	}
+	out += sql.substr(start, i - start);
+	return i;
+}
+
+static idx_t CopyLineComment(const string &sql, idx_t start, string &out) {
+	idx_t i = start + 2;
+	while (i < sql.size() && sql[i] != '\n') {
+		i++;
+	}
+	if (i < sql.size()) {
+		i++;
+	}
+	out += sql.substr(start, i - start);
+	return i;
+}
+
+static idx_t CopyBlockComment(const string &sql, idx_t start, string &out) {
+	idx_t i = start + 2;
+	while (i + 1 < sql.size()) {
+		if (sql[i] == '*' && sql[i + 1] == '/') {
+			i += 2;
+			out += sql.substr(start, i - start);
+			return i;
+		}
+		i++;
+	}
+	out += sql.substr(start);
+	return sql.size();
 }
 
 void SqlUtils::WriteFile(const string &filename, bool append, const string &compiled_query) {
@@ -689,6 +776,55 @@ bool SqlUtils::IdentifierMatchesTable(const string &identifier, const string &ta
 	}
 	auto suffix = identifier.substr(identifier.size() - table_name.size());
 	return identifier[identifier.size() - table_name.size() - 1] == '.' && StringUtil::CIEquals(suffix, table_name);
+}
+
+bool SqlUtils::RewriteColumnReferences(string &sql, const string &old_name, const string &new_name,
+                                       const unordered_set<string> &qualifiers, bool allow_unqualified) {
+	string rewritten;
+	rewritten.reserve(sql.size());
+	bool changed = false;
+	for (idx_t i = 0; i < sql.size();) {
+		if (sql[i] == '\'') {
+			i = CopySingleQuotedLiteral(sql, i, rewritten);
+			continue;
+		}
+		if (sql[i] == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+			i = CopyLineComment(sql, i, rewritten);
+			continue;
+		}
+		if (sql[i] == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+			i = CopyBlockComment(sql, i, rewritten);
+			continue;
+		}
+		if (sql[i] != '"' && !(std::isalpha(static_cast<unsigned char>(sql[i])) || sql[i] == '_')) {
+			rewritten += sql[i++];
+			continue;
+		}
+
+		idx_t end = i;
+		vector<IdentifierSegmentSpan> segments;
+		if (!ReadQualifiedIdentifierSpans(sql, i, end, segments)) {
+			rewritten += sql[i++];
+			continue;
+		}
+		auto &last = segments.back();
+		bool replace = StringUtil::CIEquals(last.value, old_name) &&
+		               ((segments.size() == 1 && allow_unqualified) || QualifierMatches(segments, qualifiers));
+		if (!replace) {
+			rewritten += sql.substr(i, end - i);
+			i = end;
+			continue;
+		}
+		rewritten += sql.substr(i, last.start - i);
+		rewritten += QuoteIdentifier(new_name);
+		rewritten += sql.substr(last.end, end - last.end);
+		i = end;
+		changed = true;
+	}
+	if (changed) {
+		sql = std::move(rewritten);
+	}
+	return changed;
 }
 
 struct TableReferenceMatch {

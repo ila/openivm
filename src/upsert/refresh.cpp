@@ -368,6 +368,36 @@ static bool SkipEmptyDeltasEnabled(ClientContext &context) {
 	return SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 }
 
+struct AuxCatalogTarget {
+	string catalog_name;
+	string schema_name;
+};
+
+static AuxCatalogTarget ResolveAuxCatalogTarget(RefreshMetadata &metadata, Connection &con,
+                                                const string &view_catalog_name, const string &view_schema_name) {
+	string default_db;
+	string default_schema = "main";
+	auto db_res = con.Query("SELECT current_database()");
+	if (!db_res->HasError() && db_res->RowCount() > 0 && !db_res->GetValue(0, 0).IsNull()) {
+		default_db = db_res->GetValue(0, 0).ToString();
+	}
+	auto schema_res = con.Query("SELECT current_schema()");
+	if (!schema_res->HasError() && schema_res->RowCount() > 0 && !schema_res->GetValue(0, 0).IsNull()) {
+		default_schema = schema_res->GetValue(0, 0).ToString();
+	}
+
+	AuxCatalogTarget target;
+	target.catalog_name = view_catalog_name.empty() ? default_db : view_catalog_name;
+	target.schema_name = view_schema_name.empty() ? default_schema : view_schema_name;
+	bool target_is_ducklake = metadata.IsDuckLakeCatalog(view_catalog_name);
+	if (!target_is_ducklake && !default_db.empty() && default_db != "memory" && !view_catalog_name.empty() &&
+	    view_catalog_name != default_db) {
+		target.catalog_name = default_db;
+		target.schema_name = default_schema;
+	}
+	return target;
+}
+
 static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadata, Connection &con,
                                 const string &view_catalog_name, const string &view_schema_name,
                                 const string &view_name, const string &attached_db_catalog_name,
@@ -376,6 +406,10 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
 		return false;
 	}
 	if (metadata.GetViewType(view_name) == RefreshType::FULL_REFRESH) {
+		return false;
+	}
+	auto aux_target = ResolveAuxCatalogTarget(metadata, con, view_catalog_name, view_schema_name);
+	if (metadata.AuxStateNeedsRepair(view_name, aux_target.catalog_name, aux_target.schema_name)) {
 		return false;
 	}
 

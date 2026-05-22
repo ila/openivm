@@ -110,13 +110,41 @@ SELECT count(*) FROM (
 0
 
 # ==========================================
-# Test 5: RENAME referenced column — blocked with error
+# Test 5: RENAME referenced column — metadata rewritten, MV output preserved
 # ==========================================
 
-statement error
+statement ok
 ALTER TABLE t RENAME COLUMN val TO amount;
+
+statement ok
+INSERT INTO t VALUES (9, 30, 900);
+
+statement ok
+UPDATE t SET amount = 40 WHERE id = 6;
+
+statement ok
+DELETE FROM t WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT val, total, cnt FROM mv
+    EXCEPT ALL
+    SELECT amount AS val, SUM(amount), COUNT(*) FROM t GROUP BY amount
+);
 ----
-referenced by materialized view
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT amount AS val, SUM(amount), COUNT(*) FROM t GROUP BY amount
+    EXCEPT ALL
+    SELECT val, total, cnt FROM mv
+);
+----
+0
 
 # ==========================================
 # Test 6: ADD + DROP cycle — multiple schema changes, IVM stays correct
@@ -150,16 +178,496 @@ query I
 SELECT count(*) FROM (
     SELECT val, total, cnt FROM mv
     EXCEPT ALL
-    SELECT val, SUM(val), COUNT(*) FROM t GROUP BY val
+    SELECT amount AS val, SUM(amount), COUNT(*) FROM t GROUP BY amount
 );
 ----
 0
 
 query I
 SELECT count(*) FROM (
-    SELECT val, SUM(val), COUNT(*) FROM t GROUP BY val
+    SELECT amount AS val, SUM(amount), COUNT(*) FROM t GROUP BY amount
     EXCEPT ALL
     SELECT val, total, cnt FROM mv
+);
+----
+0
+
+# ==========================================
+# Test 7: DISTINCT aux state survives referenced rename and aux-only repair
+# ==========================================
+
+statement ok
+SET openivm_distinct_aux_state = true;
+
+statement ok
+CREATE TABLE se_dist (grp INT, machine VARCHAR, cores INT, spare INT);
+
+statement ok
+INSERT INTO se_dist VALUES
+    (1, 'm1', 8, 0),
+    (1, 'm1', 8, 0),
+    (1, 'm2', 16, 0),
+    (2, 'm3', 4, 0);
+
+statement ok
+CREATE MATERIALIZED VIEW se_dist_mv AS
+    SELECT grp, SUM(cores) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cores FROM se_dist WHERE machine IS NOT NULL) d
+    GROUP BY grp;
+
+statement ok
+ALTER TABLE se_dist RENAME COLUMN cores TO cpu;
+
+statement ok
+INSERT INTO se_dist VALUES (1, 'm4', 32, 0);
+
+statement ok
+DELETE FROM se_dist WHERE machine = 'm1' AND cpu = 8;
+
+statement ok
+UPDATE se_dist SET cpu = 5 WHERE machine = 'm3';
+
+statement ok
+PRAGMA refresh('se_dist_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_dist_mv
+    EXCEPT ALL
+    SELECT grp, SUM(cpu) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cpu FROM se_dist WHERE machine IS NOT NULL) d
+    GROUP BY grp
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(cpu) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cpu FROM se_dist WHERE machine IS NOT NULL) d
+    GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM se_dist_mv
+);
+----
+0
+
+query III
+SELECT machine, cores, _count FROM openivm_distinct_count_se_dist_mv ORDER BY machine;
+----
+m2	16	1
+m3	5	1
+m4	32	1
+
+statement error
+ALTER TABLE se_dist DROP COLUMN cpu;
+----
+referenced by materialized view
+
+statement ok
+DROP TABLE openivm_distinct_count_se_dist_mv;
+
+statement ok
+PRAGMA refresh('se_dist_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_dist_mv
+    EXCEPT ALL
+    SELECT grp, SUM(cpu) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cpu FROM se_dist WHERE machine IS NOT NULL) d
+    GROUP BY grp
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(cpu) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cpu FROM se_dist WHERE machine IS NOT NULL) d
+    GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM se_dist_mv
+);
+----
+0
+
+statement ok
+SET openivm_distinct_aux_state = false;
+
+# ==========================================
+# Test 8: filtered group-count aux uses renamed source column incrementally
+# ==========================================
+
+statement ok
+CREATE TABLE se_fgc (wid INT, cid INT, balance DOUBLE, extra INT);
+
+statement ok
+INSERT INTO se_fgc VALUES (1, 1, 100.0, 0), (2, 1, -50.0, 0), (3, 1, 10.0, 0);
+
+statement ok
+CREATE MATERIALIZED VIEW se_fgc_mv AS
+    SELECT COUNT(*) AS neg_groups
+    FROM (SELECT wid, SUM(balance) AS total FROM se_fgc GROUP BY wid) grouped
+    WHERE total < 0;
+
+statement ok
+ALTER TABLE se_fgc RENAME COLUMN balance TO bal;
+
+statement ok
+INSERT INTO se_fgc VALUES (1, 2, -200.0, 0);
+
+statement ok
+DELETE FROM se_fgc WHERE wid = 2 AND cid = 1;
+
+statement ok
+UPDATE se_fgc SET bal = -20.0 WHERE wid = 3 AND cid = 1;
+
+statement ok
+PRAGMA refresh('se_fgc_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_fgc_mv
+    EXCEPT ALL
+    SELECT COUNT(*) AS neg_groups
+    FROM (SELECT wid, SUM(bal) AS total FROM se_fgc GROUP BY wid) grouped
+    WHERE total < 0
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT COUNT(*) AS neg_groups
+    FROM (SELECT wid, SUM(bal) AS total FROM se_fgc GROUP BY wid) grouped
+    WHERE total < 0
+    EXCEPT ALL
+    SELECT * FROM se_fgc_mv
+);
+----
+0
+
+# ==========================================
+# Test 8b: filtered group-count aux quotes stored source expressions
+# ==========================================
+
+statement ok
+CREATE TABLE se_fgc_quote ("Order" INT, cid INT, "Value" DOUBLE);
+
+statement ok
+INSERT INTO se_fgc_quote VALUES (1, 1, 100.0), (2, 1, -50.0), (3, 1, 10.0);
+
+statement ok
+CREATE MATERIALIZED VIEW se_fgc_quote_mv AS
+    SELECT COUNT(*) AS neg_groups
+    FROM (SELECT "Order", SUM("Value") AS total FROM se_fgc_quote GROUP BY "Order") grouped
+    WHERE total < 0;
+
+statement ok
+INSERT INTO se_fgc_quote VALUES (1, 2, -200.0);
+
+statement ok
+DELETE FROM se_fgc_quote WHERE "Order" = 2 AND cid = 1;
+
+statement ok
+UPDATE se_fgc_quote SET "Value" = -20.0 WHERE "Order" = 3 AND cid = 1;
+
+statement ok
+PRAGMA refresh('se_fgc_quote_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_fgc_quote_mv
+    EXCEPT ALL
+    SELECT COUNT(*) AS neg_groups
+    FROM (SELECT "Order", SUM("Value") AS total FROM se_fgc_quote GROUP BY "Order") grouped
+    WHERE total < 0
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT COUNT(*) AS neg_groups
+    FROM (SELECT "Order", SUM("Value") AS total FROM se_fgc_quote GROUP BY "Order") grouped
+    WHERE total < 0
+    EXCEPT ALL
+    SELECT * FROM se_fgc_quote_mv
+);
+----
+0
+
+# ==========================================
+# Test 8c: aux repair resolves source schema instead of same-name table
+# ==========================================
+
+statement ok
+CREATE SCHEMA se_fgc_schema;
+
+statement ok
+CREATE TABLE se_fgc_schema.same_name (wid INT, amount DOUBLE);
+
+statement ok
+CREATE TABLE same_name (wid INT, amount DOUBLE);
+
+statement ok
+INSERT INTO se_fgc_schema.same_name VALUES (1, -5.0), (2, 10.0);
+
+statement ok
+INSERT INTO same_name VALUES (99, -1000.0);
+
+statement ok
+CREATE MATERIALIZED VIEW se_fgc_schema_mv AS
+    SELECT COUNT(*) AS neg_groups
+    FROM (SELECT wid, SUM(amount) AS total FROM se_fgc_schema.same_name GROUP BY wid) grouped
+    WHERE total < 0;
+
+statement ok
+DROP TABLE openivm_filtered_group_count_se_fgc_schema_mv;
+
+statement ok
+PRAGMA refresh('se_fgc_schema_mv');
+
+query II
+SELECT wid, openivm_sum FROM openivm_filtered_group_count_se_fgc_schema_mv ORDER BY wid;
+----
+1	-5.0
+2	10.0
+
+statement ok
+INSERT INTO se_fgc_schema.same_name VALUES (3, -7.0);
+
+statement ok
+PRAGMA refresh('se_fgc_schema_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_fgc_schema_mv
+    EXCEPT ALL
+    SELECT COUNT(*) AS neg_groups
+    FROM (SELECT wid, SUM(amount) AS total FROM se_fgc_schema.same_name GROUP BY wid) grouped
+    WHERE total < 0
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT COUNT(*) AS neg_groups
+    FROM (SELECT wid, SUM(amount) AS total FROM se_fgc_schema.same_name GROUP BY wid) grouped
+    WHERE total < 0
+    EXCEPT ALL
+    SELECT * FROM se_fgc_schema_mv
+);
+----
+0
+
+# ==========================================
+# Test 9: semi/anti aux predicate metadata uses renamed right-side column
+# ==========================================
+
+statement ok
+CREATE TABLE se_l (id INT, x INT, keep BOOLEAN);
+
+statement ok
+CREATE TABLE se_r (rid INT, y INT, active BOOLEAN);
+
+statement ok
+INSERT INTO se_l VALUES (1, 10, true), (1, 10, true), (2, 20, true), (3, 30, false), (4, 40, true);
+
+statement ok
+INSERT INTO se_r VALUES (10, 8, true), (11, 20, false), (12, 99, true);
+
+statement ok
+CREATE MATERIALIZED VIEW se_exists_mv AS
+    SELECT l.id, l.x
+    FROM se_l l
+    WHERE l.keep AND EXISTS (
+        SELECT 1 FROM se_r r
+        WHERE r.active AND abs(l.x - r.y) <= 2
+    );
+
+statement ok
+ALTER TABLE se_r RENAME COLUMN y TO yy;
+
+statement ok
+INSERT INTO se_r VALUES (13, 41, true), (14, 30, true);
+
+statement ok
+UPDATE se_r SET active = true WHERE rid = 11;
+
+statement ok
+DELETE FROM se_r WHERE rid = 10;
+
+statement ok
+UPDATE se_l SET keep = true WHERE id = 3;
+
+statement ok
+INSERT INTO se_l VALUES (5, 50, true), (6, 40, true);
+
+statement ok
+PRAGMA refresh('se_exists_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_exists_mv
+    EXCEPT ALL
+    SELECT l.id, l.x
+    FROM se_l l
+    WHERE l.keep AND EXISTS (
+        SELECT 1 FROM se_r r
+        WHERE r.active AND abs(l.x - r.yy) <= 2
+    )
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT l.id, l.x
+    FROM se_l l
+    WHERE l.keep AND EXISTS (
+        SELECT 1 FROM se_r r
+        WHERE r.active AND abs(l.x - r.yy) <= 2
+    )
+    EXCEPT ALL
+    SELECT * FROM se_exists_mv
+);
+----
+0
+
+statement ok
+ALTER TABLE se_l RENAME COLUMN x TO xx;
+
+statement ok
+INSERT INTO se_l VALUES (7, 41, true);
+
+statement ok
+UPDATE se_l SET xx = 21 WHERE id = 2;
+
+statement ok
+DELETE FROM se_l WHERE id = 5;
+
+statement ok
+PRAGMA refresh('se_exists_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_exists_mv
+    EXCEPT ALL
+    SELECT l.id, l.xx AS x
+    FROM se_l l
+    WHERE l.keep AND EXISTS (
+        SELECT 1 FROM se_r r
+        WHERE r.active AND abs(l.xx - r.yy) <= 2
+    )
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT l.id, l.xx AS x
+    FROM se_l l
+    WHERE l.keep AND EXISTS (
+        SELECT 1 FROM se_r r
+        WHERE r.active AND abs(l.xx - r.yy) <= 2
+    )
+    EXCEPT ALL
+    SELECT * FROM se_exists_mv
+);
+----
+0
+
+# ==========================================
+# Test 10: aux repair is blocked when source deltas are pending
+# ==========================================
+
+statement ok
+SET openivm_distinct_aux_state = true;
+
+statement ok
+CREATE TABLE se_pending_aux (grp INT, machine VARCHAR, cores INT);
+
+statement ok
+INSERT INTO se_pending_aux VALUES (1, 'm1', 8), (1, 'm2', 16);
+
+statement ok
+CREATE MATERIALIZED VIEW se_pending_aux_mv AS
+    SELECT grp, SUM(cores) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cores FROM se_pending_aux WHERE machine IS NOT NULL) d
+    GROUP BY grp;
+
+statement ok
+DROP TABLE openivm_distinct_count_se_pending_aux_mv;
+
+statement ok
+INSERT INTO se_pending_aux VALUES (1, 'm3', 32);
+
+statement error
+PRAGMA refresh('se_pending_aux_mv');
+----
+Cannot repair auxiliary state table
+
+statement ok
+SET openivm_distinct_aux_state = false;
+
+# ==========================================
+# Test 11: unqualified nested references are scoped during rename rewrite
+# ==========================================
+
+statement ok
+CREATE TABLE se_scope_t (a INT, b INT);
+
+statement ok
+CREATE TABLE se_scope_u (a INT);
+
+statement ok
+INSERT INTO se_scope_t VALUES (1, 10), (2, 20), (3, 10);
+
+statement ok
+INSERT INTO se_scope_u VALUES (10), (20);
+
+statement ok
+CREATE MATERIALIZED VIEW se_scope_mv AS
+    SELECT t.a AS ta, s.a AS ua
+    FROM se_scope_t t
+    JOIN (SELECT a FROM se_scope_u) s ON t.b = s.a;
+
+statement ok
+ALTER TABLE se_scope_t RENAME COLUMN a TO aa;
+
+statement ok
+INSERT INTO se_scope_t VALUES (4, 20);
+
+statement ok
+UPDATE se_scope_t SET aa = 5 WHERE b = 10 AND aa = 1;
+
+statement ok
+DELETE FROM se_scope_t WHERE aa = 2;
+
+statement ok
+PRAGMA refresh('se_scope_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_scope_mv
+    EXCEPT ALL
+    SELECT t.aa AS ta, s.a AS ua
+    FROM se_scope_t t
+    JOIN (SELECT a FROM se_scope_u) s ON t.b = s.a
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT t.aa AS ta, s.a AS ua
+    FROM se_scope_t t
+    JOIN (SELECT a FROM se_scope_u) s ON t.b = s.a
+    EXCEPT ALL
+    SELECT * FROM se_scope_mv
 );
 ----
 0

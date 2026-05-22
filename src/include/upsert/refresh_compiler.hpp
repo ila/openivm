@@ -82,9 +82,13 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 /// argument and output column. `count_star_col` is the auto-injected `openivm_count_star`
 /// column name on the data table (almost always literal `openivm_count_star`).
 string CompileDistinctIncremental(const string &view_name, const string &aux_table, const vector<string> &distinct_cols,
-                                  const string &delta_source, const string &last_update, const string &filter_sql,
+                                  const vector<string> &source_exprs, const string &delta_source,
+                                  const string &last_update, const string &filter_sql,
                                   const vector<string> &group_columns, const string &sum_arg, const string &sum_out,
                                   const string &count_star_col, const string &catalog_prefix = "");
+string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
+                                      const vector<string> &source_exprs, const string &source_relation,
+                                      const string &filter_sql, bool replace);
 
 string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,
@@ -93,11 +97,20 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
                                 const vector<string> &output_cols, const string &left_delta_source,
                                 const string &right_delta_source, const string &left_last_update,
                                 const string &right_last_update, const string &catalog_prefix = "");
+string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &left_source, const string &left_alias,
+                                      const string &right_source, const string &right_alias, const string &predicate,
+                                      const string &post_filter, const vector<string> &left_cols,
+                                      const vector<string> &left_exprs, bool replace);
 
 string CompileFilteredGroupCount(const string &view_name, const string &aux_table, const string &delta_source,
                                  const string &last_update, const string &group_col, const string &sum_col,
+                                 const string &source_group_expr, const string &source_sum_expr,
                                  const string &output_col, const string &comparison_op, const string &threshold_sql,
                                  const string &catalog_prefix = "");
+string BuildFilteredGroupCountAuxStateCreateSQL(const string &target_table, const string &source_table,
+                                                const string &group_col, const string &sum_col,
+                                                const string &source_group_expr, const string &source_sum_expr,
+                                                bool replace);
 
 } // namespace duckdb
 

@@ -1,4 +1,5 @@
 #include "rules/refresh_insert_rule.hpp"
+#include "rules/schema_evolution.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
@@ -151,6 +152,7 @@ static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalo
 	return prefix + " SELECT " + data_cols + ", -1, now()::timestamp FROM " + full_table_name +
 	       " WHERE rowid IN (SELECT rowid FROM (" + subquery_string + ") openivm_deleted_rows)";
 }
+
 
 static bool IsRowIdColumn(const unique_ptr<Expression> &expr) {
 	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
@@ -357,7 +359,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				break;
 			}
 			string col_name = remove_info->removed_column;
-			string referencing_mv = FindMVReferencingColumn(con, delta_name, table_name, col_name);
+			string referencing_mv = FirstMVReferencingColumn(con, delta_name, table_name, col_name);
 			if (!referencing_mv.empty()) {
 				throw CatalogException("Cannot drop column '" + col_name +
 				                       "': it is referenced by materialized view '" + referencing_mv +
@@ -375,12 +377,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			}
 			string old_name = rename_info->old_name;
 			string new_name = rename_info->new_name;
-			string referencing_mv = FindMVReferencingColumn(con, delta_name, table_name, old_name);
-			if (!referencing_mv.empty()) {
-				throw CatalogException("Cannot rename column '" + old_name +
-				                       "': it is referenced by materialized view '" + referencing_mv +
-				                       "'. Drop the view first.");
-			}
+			RewriteDependentViewMetadataForRename(con, delta_name, table_name, old_name, new_name);
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE RENAME COLUMN '%s' → '%s' — syncing delta table\n",
 			                    old_name.c_str(), new_name.c_str());
 			con.Query("ALTER TABLE " + qdelta + " RENAME COLUMN " + KeywordHelper::WriteOptionallyQuoted(old_name) +

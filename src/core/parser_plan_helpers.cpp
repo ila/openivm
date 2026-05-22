@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/main/settings.hpp"
@@ -633,19 +634,8 @@ static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr, const Cr
 	return "";
 }
 
-struct ProjectionLineageStep {
-	string table;
-	idx_t occurrence = 0;
-	string lookup_col;
-	string lookup_out;
-};
-
-struct ProjectionLineageArm {
-	string source_table;
-	idx_t source_occurrence = 0;
-	string source_col;
-	vector<ProjectionLineageStep> steps;
-};
+using ProjectionLineageStep = RefreshMetadata::ProjectionKeyLineageStep;
+using ProjectionLineageArm = RefreshMetadata::ProjectionKeyLineageArm;
 
 static string OccurrenceKey(const string &table, idx_t occurrence) {
 	return StringUtil::Lower(table) + "#" + to_string(occurrence);
@@ -811,8 +801,8 @@ static bool FindProjectionPath(const ProjectionSourceOccurrence &source, const O
 
 static bool BuildProjectionLineageArm(const ProjectionSourceOccurrence &source, const OccurrenceColumnRef &key_ref,
                                       const vector<ProjectionLineageEdge> &path, ProjectionLineageArm &arm) {
-	arm.source_table = source.table;
-	arm.source_occurrence = source.occurrence;
+	arm.source = source.table;
+	arm.occurrence = source.occurrence;
 	arm.steps.clear();
 	if (path.empty()) {
 		arm.source_col = key_ref.column;
@@ -828,24 +818,6 @@ static bool BuildProjectionLineageArm(const ProjectionSourceOccurrence &source, 
 		arm.steps.push_back(std::move(step));
 	}
 	return true;
-}
-
-static string ProjectionLineageStepString(const ProjectionLineageStep &step) {
-	return step.table + "|" + to_string(step.occurrence) + "|" + step.lookup_col + "|" + step.lookup_out;
-}
-
-static string ProjectionLineageArmJson(const ProjectionLineageArm &arm) {
-	string json = "{\"source\":" + SqlUtils::JsonQuote(arm.source_table) +
-	              ",\"occ\":" + SqlUtils::JsonQuote(to_string(arm.source_occurrence)) +
-	              ",\"source_col\":" + SqlUtils::JsonQuote(arm.source_col) + ",\"steps\":[";
-	for (idx_t i = 0; i < arm.steps.size(); i++) {
-		if (i > 0) {
-			json += ",";
-		}
-		json += SqlUtils::JsonQuote(ProjectionLineageStepString(arm.steps[i]));
-	}
-	json += "]}";
-	return json;
 }
 
 string BuildRefreshLineageJson(const vector<string> &entries) {
@@ -905,18 +877,13 @@ string BuildProjectionKeyLineageEntryJson(const CreateMVPlanFacts &facts, const 
 			continue;
 		}
 
-		string json = "{\"k\":\"projection_key\",\"out\":" + SqlUtils::JsonQuote(output_col) +
-		              ",\"key_source\":" + SqlUtils::JsonQuote(key_ref.table) +
-		              ",\"key_occ\":" + SqlUtils::JsonQuote(to_string(key_ref.occurrence)) +
-		              ",\"key_col\":" + SqlUtils::JsonQuote(key_ref.column) + ",\"arms\":[";
-		for (idx_t i = 0; i < arms.size(); i++) {
-			if (i > 0) {
-				json += ",";
-			}
-			json += ProjectionLineageArmJson(arms[i]);
-		}
-		json += "]}";
-		return json;
+		RefreshMetadata::ProjectionKeyLineage lineage;
+		lineage.output_col = output_col;
+		lineage.key_source = key_ref.table;
+		lineage.key_occurrence = key_ref.occurrence;
+		lineage.key_col = key_ref.column;
+		lineage.arms = std::move(arms);
+		return RefreshMetadata::ProjectionKeyLineageToJson(lineage);
 	}
 	return "";
 }

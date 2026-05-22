@@ -146,6 +146,47 @@ RefreshMetadata::DeltaChangeStats RefreshMetadata::GetStandardDeltaChangeStats(c
 	return stats;
 }
 
+static string InformationSchemaRelationFilter(const string &catalog_name, const string &schema_name,
+                                              const string &table_name) {
+	string filter = "table_name = '" + SqlUtils::EscapeValue(table_name) + "'";
+	if (!catalog_name.empty()) {
+		filter += " AND table_catalog = '" + SqlUtils::EscapeValue(catalog_name) + "'";
+	}
+	if (!schema_name.empty()) {
+		filter += " AND table_schema = '" + SqlUtils::EscapeValue(schema_name) + "'";
+	}
+	return filter;
+}
+
+vector<string> RefreshMetadata::GetTableColumns(const string &catalog_name, const string &schema_name,
+                                                const string &table_name) {
+	vector<string> columns;
+	auto result = con.Query("SELECT column_name FROM information_schema.columns WHERE " +
+	                        InformationSchemaRelationFilter(catalog_name, schema_name, table_name) +
+	                        " ORDER BY ordinal_position");
+	if (result->HasError()) {
+		return columns;
+	}
+	for (idx_t i = 0; i < result->RowCount(); i++) {
+		columns.push_back(result->GetValue(0, i).ToString());
+	}
+	return columns;
+}
+
+bool RefreshMetadata::TableColumnsMatch(const string &catalog_name, const string &schema_name, const string &table_name,
+                                        const vector<string> &expected) {
+	auto actual = GetTableColumns(catalog_name, schema_name, table_name);
+	if (actual.size() != expected.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < actual.size(); i++) {
+		if (!StringUtil::CIEquals(actual[i], expected[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void RefreshMetadata::UpdateTimestamp(const string &view_name) {
 	auto result = con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
 	                        " SET last_update = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
@@ -645,6 +686,7 @@ bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMet
 	bool ok = true;
 	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
 	ok &= ExtractJsonStringArray(json, "cols", out.cols);
+	ExtractJsonStringArray(json, "source_exprs", out.source_exprs);
 	ok &= ExtractJsonString(json, "input_sql", out.input_sql);
 	ok &= ExtractJsonString(json, "source", out.source);
 	// filter is optional — empty when the user didn't write a WHERE clause.
@@ -652,6 +694,14 @@ bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMet
 	ok &= ExtractJsonString(json, "sum_arg", out.sum_arg);
 	ok &= ExtractJsonString(json, "sum_out", out.sum_out);
 	return ok;
+}
+
+string RefreshMetadata::DistinctAuxMetaToJson(const DistinctAuxMeta &meta) {
+	return "{\"aux_table\":" + SqlUtils::JsonQuote(meta.aux_table) + ",\"cols\":" + SqlUtils::JsonArray(meta.cols) +
+	       ",\"source_exprs\":" + SqlUtils::JsonArray(meta.source_exprs) +
+	       ",\"input_sql\":" + SqlUtils::JsonQuote(meta.input_sql) + ",\"source\":" + SqlUtils::JsonQuote(meta.source) +
+	       ",\"filter\":" + SqlUtils::JsonQuote(meta.filter) + ",\"sum_arg\":" + SqlUtils::JsonQuote(meta.sum_arg) +
+	       ",\"sum_out\":" + SqlUtils::JsonQuote(meta.sum_out) + "}";
 }
 
 bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out) {
@@ -677,6 +727,20 @@ bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMet
 	ExtractJsonStringArray(json, "left_exprs", out.left_exprs);
 	ok &= ExtractJsonStringArray(json, "output_cols", out.output_cols);
 	return ok;
+}
+
+string RefreshMetadata::SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta) {
+	return "{\"aux_table\":" + SqlUtils::JsonQuote(meta.aux_table) +
+	       ",\"join_type\":" + SqlUtils::JsonQuote(meta.join_type) +
+	       ",\"left_table\":" + SqlUtils::JsonQuote(meta.left_table) +
+	       ",\"left_alias\":" + SqlUtils::JsonQuote(meta.left_alias) +
+	       ",\"right_table\":" + SqlUtils::JsonQuote(meta.right_table) +
+	       ",\"right_alias\":" + SqlUtils::JsonQuote(meta.right_alias) +
+	       ",\"predicate\":" + SqlUtils::JsonQuote(meta.predicate) +
+	       ",\"post_filter\":" + SqlUtils::JsonQuote(meta.post_filter) +
+	       ",\"left_cols\":" + SqlUtils::JsonArray(meta.left_cols) +
+	       ",\"left_exprs\":" + SqlUtils::JsonArray(meta.left_exprs) +
+	       ",\"output_cols\":" + SqlUtils::JsonArray(meta.output_cols) + "}";
 }
 
 bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out) {
@@ -705,6 +769,27 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<
 		out.push_back(std::move(op));
 	}
 	return !out.empty();
+}
+
+string RefreshMetadata::WindowPartitionLineageToJson(const vector<WindowPartitionLineageOp> &ops) {
+	string json = "{\"k\":\"window_partition\",\"ops\":[";
+	for (idx_t i = 0; i < ops.size(); i++) {
+		auto &op = ops[i];
+		if (i > 0) {
+			json += ",";
+		}
+		json += "{\"k\":" + SqlUtils::JsonQuote(op.kind) + ",\"out\":" + SqlUtils::JsonQuote(op.output_col) +
+		        ",\"source\":" + SqlUtils::JsonQuote(op.source) +
+		        ",\"source_col\":" + SqlUtils::JsonQuote(op.source_col);
+		if (op.kind == "lookup") {
+			json += ",\"lookup\":" + SqlUtils::JsonQuote(op.lookup) +
+			        ",\"lookup_col\":" + SqlUtils::JsonQuote(op.lookup_col) +
+			        ",\"lookup_out\":" + SqlUtils::JsonQuote(op.lookup_out);
+		}
+		json += "}";
+	}
+	json += "]}";
+	return json;
 }
 
 bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out) {
@@ -747,6 +832,33 @@ bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, Projectio
 	return !out.arms.empty();
 }
 
+string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &lineage) {
+	string json = "{\"k\":\"projection_key\",\"out\":" + SqlUtils::JsonQuote(lineage.output_col) +
+	              ",\"key_source\":" + SqlUtils::JsonQuote(lineage.key_source) +
+	              ",\"key_occ\":" + SqlUtils::JsonQuote(to_string(lineage.key_occurrence)) +
+	              ",\"key_col\":" + SqlUtils::JsonQuote(lineage.key_col) + ",\"arms\":[";
+	for (idx_t i = 0; i < lineage.arms.size(); i++) {
+		auto &arm = lineage.arms[i];
+		if (i > 0) {
+			json += ",";
+		}
+		json += "{\"source\":" + SqlUtils::JsonQuote(arm.source) +
+		        ",\"occ\":" + SqlUtils::JsonQuote(to_string(arm.occurrence)) +
+		        ",\"source_col\":" + SqlUtils::JsonQuote(arm.source_col) + ",\"steps\":[";
+		for (idx_t j = 0; j < arm.steps.size(); j++) {
+			auto &step = arm.steps[j];
+			if (j > 0) {
+				json += ",";
+			}
+			json += SqlUtils::JsonQuote(step.table + "|" + to_string(step.occurrence) + "|" + step.lookup_col + "|" +
+			                            step.lookup_out);
+		}
+		json += "]}";
+	}
+	json += "]}";
+	return json;
+}
+
 bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {
 	auto result = con.Query("SELECT aggregate_decomposition_json FROM " + string(openivm::VIEWS_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
@@ -766,10 +878,61 @@ bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, Filt
 	ok &= ExtractJsonString(json, "source", out.source);
 	ok &= ExtractJsonString(json, "group_col", out.group_col);
 	ok &= ExtractJsonString(json, "sum_col", out.sum_col);
+	ExtractJsonString(json, "source_group_expr", out.source_group_expr);
+	ExtractJsonString(json, "source_sum_expr", out.source_sum_expr);
 	ok &= ExtractJsonString(json, "output_col", out.output_col);
 	ok &= ExtractJsonString(json, "op", out.comparison_op);
 	ok &= ExtractJsonString(json, "threshold", out.threshold_sql);
 	return ok;
+}
+
+string RefreshMetadata::FilteredGroupCountAuxMetaToJson(const FilteredGroupCountAuxMeta &meta) {
+	return "{\"kind\":\"filtered_group_count\",\"aux_table\":" + SqlUtils::JsonQuote(meta.aux_table) +
+	       ",\"source\":" + SqlUtils::JsonQuote(meta.source) + ",\"group_col\":" + SqlUtils::JsonQuote(meta.group_col) +
+	       ",\"sum_col\":" + SqlUtils::JsonQuote(meta.sum_col) +
+	       ",\"source_group_expr\":" + SqlUtils::JsonQuote(meta.source_group_expr) +
+	       ",\"source_sum_expr\":" + SqlUtils::JsonQuote(meta.source_sum_expr) +
+	       ",\"output_col\":" + SqlUtils::JsonQuote(meta.output_col) +
+	       ",\"op\":" + SqlUtils::JsonQuote(meta.comparison_op) +
+	       ",\"threshold\":" + SqlUtils::JsonQuote(meta.threshold_sql) + "}";
+}
+
+vector<string> RefreshMetadata::ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta) {
+	auto expected = meta.cols;
+	expected.push_back("_count");
+	return expected;
+}
+
+vector<string> RefreshMetadata::ExpectedFilteredGroupCountAuxColumns(const FilteredGroupCountAuxMeta &meta) {
+	return vector<string> {meta.group_col, "openivm_sum"};
+}
+
+vector<string> RefreshMetadata::ExpectedSemiAntiAuxColumns(const SemiAntiAuxMeta &meta) {
+	auto expected = meta.left_cols;
+	expected.push_back("_left_count");
+	expected.push_back("_match_count");
+	return expected;
+}
+
+bool RefreshMetadata::AuxStateNeedsRepair(const string &view_name, const string &catalog_name,
+                                          const string &schema_name) {
+	DistinctAuxMeta distinct;
+	if (GetDistinctAuxMeta(view_name, distinct) &&
+	    !TableColumnsMatch(catalog_name, schema_name, distinct.aux_table, ExpectedDistinctAuxColumns(distinct))) {
+		return true;
+	}
+	FilteredGroupCountAuxMeta filtered;
+	if (GetFilteredGroupCountAuxMeta(view_name, filtered) &&
+	    !TableColumnsMatch(catalog_name, schema_name, filtered.aux_table,
+	                       ExpectedFilteredGroupCountAuxColumns(filtered))) {
+		return true;
+	}
+	SemiAntiAuxMeta semi;
+	if (GetSemiAntiAuxMeta(view_name, semi) &&
+	    !TableColumnsMatch(catalog_name, schema_name, semi.aux_table, ExpectedSemiAntiAuxColumns(semi))) {
+		return true;
+	}
+	return false;
 }
 
 } // namespace duckdb
