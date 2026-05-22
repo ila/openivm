@@ -901,10 +901,64 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto *idx = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
 			auto key_ids = idx->column_ids;
 			vector<string> keys;
+			unordered_set<string> keys_set;
 			for (auto &kid : key_ids) {
 				keys.push_back(column_names[kid]);
+				keys_set.insert(column_names[kid]);
 			}
-			build_affected_snapshot_companion(keys);
+
+			// PR #2 cascade-companion: emit per-key zero-valued retract/add-back
+			// rows directly into the delta-view as inline INSERTs (no TEMP TABLE
+			// scratch). The Spark-side rewriter (SparkRefreshRewriter) splits the
+			// refresh program statement-by-statement and recreates each delta
+			// table fresh per refresh — temp tables created mid-program from
+			// upstream's build_affected_snapshot_companion(keys) helper do not
+			// survive across the rewriter's split, so use NULLs in non-key
+			// columns instead and rely on SUM(NULL)=NULL preservation.
+			string col_list, val_list_neg, val_list_pos;
+			bool has_count_star_col = false;
+			for (auto &col : column_names) {
+				if (!col_list.empty()) {
+					col_list += ", ";
+					val_list_neg += ", ";
+					val_list_pos += ", ";
+				}
+				col_list += col;
+				if (col == string(openivm::COUNT_STAR_COL)) {
+					has_count_star_col = true;
+				}
+				if (keys_set.count(col)) {
+					val_list_neg += "d." + col;
+					val_list_pos += "d." + col;
+				} else if (col == openivm::MULTIPLICITY_COL) {
+					val_list_neg += "-1";
+					val_list_pos += "1";
+				} else {
+					val_list_neg += "NULL";
+					val_list_pos += "NULL";
+				}
+			}
+			string join_cond = SqlUtils::BuildNullSafeMatch(keys, "d", "m");
+
+			companion_query = "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list_neg +
+			                  " FROM " + delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) + " > 0";
+			if (!delta_ts_filter.empty()) {
+				companion_query += " AND d." + delta_ts_filter;
+			}
+			companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + ");\n";
+
+			if (has_count_star_col) {
+				companion_query += "INSERT INTO " + delta_view_name + " (" + col_list + ") SELECT " + val_list_pos +
+				                   " FROM " + delta_view_name + " d WHERE d." + string(openivm::MULTIPLICITY_COL) +
+				                   " < 0 AND d." + string(openivm::COUNT_STAR_COL) + " > 0";
+				if (!delta_ts_filter.empty()) {
+					companion_query += " AND d." + delta_ts_filter;
+				}
+				companion_query += " AND EXISTS (SELECT 1 FROM " + data_table + " m WHERE " + join_cond + " AND m." +
+				                   string(openivm::COUNT_STAR_COL) + " + d." + string(openivm::MULTIPLICITY_COL) +
+				                   " * d." + string(openivm::COUNT_STAR_COL) + " > 0);\n";
+			}
+			OPENIVM_DEBUG_PRINT("[UPSERT] Companion query:\n%s\n", companion_query.c_str());
 		}
 	}
 
