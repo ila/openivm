@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/main/settings.hpp"
@@ -633,19 +634,8 @@ static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr, const Cr
 	return "";
 }
 
-struct ProjectionLineageStep {
-	string table;
-	idx_t occurrence = 0;
-	string lookup_col;
-	string lookup_out;
-};
-
-struct ProjectionLineageArm {
-	string source_table;
-	idx_t source_occurrence = 0;
-	string source_col;
-	vector<ProjectionLineageStep> steps;
-};
+using ProjectionLineageStep = RefreshMetadata::ProjectionKeyLineageStep;
+using ProjectionLineageArm = RefreshMetadata::ProjectionKeyLineageArm;
 
 static string OccurrenceKey(const string &table, idx_t occurrence) {
 	return StringUtil::Lower(table) + "#" + to_string(occurrence);
@@ -811,8 +801,8 @@ static bool FindProjectionPath(const ProjectionSourceOccurrence &source, const O
 
 static bool BuildProjectionLineageArm(const ProjectionSourceOccurrence &source, const OccurrenceColumnRef &key_ref,
                                       const vector<ProjectionLineageEdge> &path, ProjectionLineageArm &arm) {
-	arm.source_table = source.table;
-	arm.source_occurrence = source.occurrence;
+	arm.source = source.table;
+	arm.occurrence = source.occurrence;
 	arm.steps.clear();
 	if (path.empty()) {
 		arm.source_col = key_ref.column;
@@ -828,24 +818,6 @@ static bool BuildProjectionLineageArm(const ProjectionSourceOccurrence &source, 
 		arm.steps.push_back(std::move(step));
 	}
 	return true;
-}
-
-static string ProjectionLineageStepString(const ProjectionLineageStep &step) {
-	return step.table + "|" + to_string(step.occurrence) + "|" + step.lookup_col + "|" + step.lookup_out;
-}
-
-static string ProjectionLineageArmJson(const ProjectionLineageArm &arm) {
-	string json = "{\"source\":" + SqlUtils::JsonQuote(arm.source_table) +
-	              ",\"occ\":" + SqlUtils::JsonQuote(to_string(arm.source_occurrence)) +
-	              ",\"source_col\":" + SqlUtils::JsonQuote(arm.source_col) + ",\"steps\":[";
-	for (idx_t i = 0; i < arm.steps.size(); i++) {
-		if (i > 0) {
-			json += ",";
-		}
-		json += SqlUtils::JsonQuote(ProjectionLineageStepString(arm.steps[i]));
-	}
-	json += "]}";
-	return json;
 }
 
 string BuildRefreshLineageJson(const vector<string> &entries) {
@@ -905,31 +877,18 @@ string BuildProjectionKeyLineageEntryJson(const CreateMVPlanFacts &facts, const 
 			continue;
 		}
 
-		string json = "{\"k\":\"projection_key\",\"out\":" + SqlUtils::JsonQuote(output_col) +
-		              ",\"key_source\":" + SqlUtils::JsonQuote(key_ref.table) +
-		              ",\"key_occ\":" + SqlUtils::JsonQuote(to_string(key_ref.occurrence)) +
-		              ",\"key_col\":" + SqlUtils::JsonQuote(key_ref.column) + ",\"arms\":[";
-		for (idx_t i = 0; i < arms.size(); i++) {
-			if (i > 0) {
-				json += ",";
-			}
-			json += ProjectionLineageArmJson(arms[i]);
-		}
-		json += "]}";
-		return json;
+		RefreshMetadata::ProjectionKeyLineage lineage;
+		lineage.output_col = output_col;
+		lineage.key_source = key_ref.table;
+		lineage.key_occurrence = key_ref.occurrence;
+		lineage.key_col = key_ref.column;
+		lineage.arms = std::move(arms);
+		return RefreshMetadata::ProjectionKeyLineageToJson(lineage);
 	}
 	return "";
 }
 
-struct WindowLineageOp {
-	string kind;
-	string output_col;
-	string source_table;
-	string source_col;
-	string lookup_table;
-	string lookup_col;
-	string lookup_output_col;
-};
+using WindowLineageOp = RefreshMetadata::WindowPartitionLineageOp;
 
 static void CollectWindowPartitionRefs(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                        vector<WindowLineageOp> &direct_ops) {
@@ -959,7 +918,7 @@ static void CollectWindowPartitionRefs(const CreateMVPlanFacts &facts, const vec
 					WindowLineageOp op;
 					op.kind = "direct";
 					op.output_col = output_col;
-					op.source_table = base.table;
+					op.source = base.table;
 					op.source_col = base.column;
 					direct_ops.push_back(std::move(op));
 				}
@@ -974,9 +933,9 @@ static bool SameRef(const BaseColumnRef &a, const BaseColumnRef &b) {
 
 static bool SameOp(const WindowLineageOp &a, const WindowLineageOp &b) {
 	return a.kind == b.kind && StringUtil::CIEquals(a.output_col, b.output_col) &&
-	       StringUtil::CIEquals(a.source_table, b.source_table) && StringUtil::CIEquals(a.source_col, b.source_col) &&
-	       StringUtil::CIEquals(a.lookup_table, b.lookup_table) && StringUtil::CIEquals(a.lookup_col, b.lookup_col) &&
-	       StringUtil::CIEquals(a.lookup_output_col, b.lookup_output_col);
+	       StringUtil::CIEquals(a.source, b.source) && StringUtil::CIEquals(a.source_col, b.source_col) &&
+	       StringUtil::CIEquals(a.lookup, b.lookup) && StringUtil::CIEquals(a.lookup_col, b.lookup_col) &&
+	       StringUtil::CIEquals(a.lookup_out, b.lookup_out);
 }
 
 static void AddUniqueLineageOp(vector<WindowLineageOp> &ops, WindowLineageOp op) {
@@ -992,7 +951,7 @@ static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const 
                                       const string &output_col) {
 	for (auto &op : ops) {
 		if (op.kind == "direct" && StringUtil::CIEquals(op.output_col, output_col) &&
-		    StringUtil::CIEquals(op.source_table, ref.table) && StringUtil::CIEquals(op.source_col, ref.column)) {
+		    StringUtil::CIEquals(op.source, ref.table) && StringUtil::CIEquals(op.source_col, ref.column)) {
 			return true;
 		}
 	}
@@ -1020,7 +979,7 @@ string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, cons
 		vector<WindowLineageOp> next_ops = partition_ops;
 		for (auto &edge : facts.inner_join_edges) {
 			for (auto &direct : partition_ops) {
-				BaseColumnRef direct_ref {direct.source_table, direct.source_col};
+				BaseColumnRef direct_ref {direct.source, direct.source_col};
 				BaseColumnRef other;
 				bool found = false;
 				if (SameRef(edge.first, direct_ref)) {
@@ -1036,7 +995,7 @@ string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, cons
 				WindowLineageOp equivalent;
 				equivalent.kind = "direct";
 				equivalent.output_col = direct.output_col;
-				equivalent.source_table = other.table;
+				equivalent.source = other.table;
 				equivalent.source_col = other.column;
 				AddUniqueLineageOp(next_ops, std::move(equivalent));
 				changed = true;
@@ -1052,16 +1011,15 @@ string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, cons
 
 	for (auto &edge : facts.inner_join_edges) {
 		for (auto &direct : partition_ops) {
-			BaseColumnRef lookup_output {direct.source_table, direct.source_col};
+			BaseColumnRef lookup_output {direct.source, direct.source_col};
 			BaseColumnRef lookup_join;
 			BaseColumnRef changed_join;
 			bool found = false;
-			if (StringUtil::CIEquals(edge.first.table, direct.source_table) && !SameRef(edge.first, lookup_output)) {
+			if (StringUtil::CIEquals(edge.first.table, direct.source) && !SameRef(edge.first, lookup_output)) {
 				lookup_join = edge.first;
 				changed_join = edge.second;
 				found = true;
-			} else if (StringUtil::CIEquals(edge.second.table, direct.source_table) &&
-			           !SameRef(edge.second, lookup_output)) {
+			} else if (StringUtil::CIEquals(edge.second.table, direct.source) && !SameRef(edge.second, lookup_output)) {
 				lookup_join = edge.second;
 				changed_join = edge.first;
 				found = true;
@@ -1072,33 +1030,16 @@ string BuildWindowPartitionLineageEntryJson(const CreateMVPlanFacts &facts, cons
 			WindowLineageOp lookup;
 			lookup.kind = "lookup";
 			lookup.output_col = direct.output_col;
-			lookup.source_table = changed_join.table;
+			lookup.source = changed_join.table;
 			lookup.source_col = changed_join.column;
-			lookup.lookup_table = direct.source_table;
+			lookup.lookup = direct.source;
 			lookup.lookup_col = lookup_join.column;
-			lookup.lookup_output_col = direct.source_col;
+			lookup.lookup_out = direct.source_col;
 			AddUniqueLineageOp(ops, std::move(lookup));
 		}
 	}
 
-	string json = "{\"k\":\"window_partition\",\"ops\":[";
-	for (idx_t i = 0; i < ops.size(); i++) {
-		if (i > 0) {
-			json += ",";
-		}
-		auto &op = ops[i];
-		json += "{\"k\":" + SqlUtils::JsonQuote(op.kind) + ",\"out\":" + SqlUtils::JsonQuote(op.output_col) +
-		        ",\"source\":" + SqlUtils::JsonQuote(op.source_table) +
-		        ",\"source_col\":" + SqlUtils::JsonQuote(op.source_col);
-		if (op.kind == "lookup") {
-			json += ",\"lookup\":" + SqlUtils::JsonQuote(op.lookup_table) +
-			        ",\"lookup_col\":" + SqlUtils::JsonQuote(op.lookup_col) +
-			        ",\"lookup_out\":" + SqlUtils::JsonQuote(op.lookup_output_col);
-		}
-		json += "}";
-	}
-	json += "]}";
-	return json;
+	return RefreshMetadata::WindowPartitionLineageToJson(ops);
 }
 
 void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<string> &partition_columns,

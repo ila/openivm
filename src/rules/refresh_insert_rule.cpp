@@ -1,4 +1,5 @@
 #include "rules/refresh_insert_rule.hpp"
+#include "rules/schema_evolution.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
@@ -149,59 +150,6 @@ static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalo
 	       " WHERE rowid IN (SELECT rowid FROM (" + subquery_string + ") openivm_deleted_rows)";
 }
 
-static bool PlanReferencesColumn(LogicalOperator &op, const string &table_name, const string &col_name) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op.Cast<LogicalGet>();
-		auto tbl = get.GetTable();
-		if (tbl.get() && tbl->name == table_name) {
-			for (auto &cid : get.GetColumnIds()) {
-				if (get.GetColumnName(cid) == col_name) {
-					return true;
-				}
-			}
-		}
-	}
-	for (auto &child : op.children) {
-		if (PlanReferencesColumn(*child, table_name, col_name)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static string FindMVReferencingColumn(Connection &con, const string &delta_name, const string &table_name,
-                                      const string &col_name) {
-	RefreshMetadata metadata(con);
-	auto mvs = con.Query("SELECT DISTINCT d.view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	                     " d WHERE d.table_name = '" + SqlUtils::EscapeValue(delta_name) + "'");
-	if (mvs->HasError()) {
-		return "";
-	}
-	for (size_t i = 0; i < mvs->RowCount(); i++) {
-		string view_name = mvs->GetValue(0, i).ToString();
-		string sql = metadata.GetViewQuery(view_name);
-		if (sql.empty()) {
-			continue;
-		}
-		try {
-			con.BeginTransaction();
-			Parser p;
-			p.ParseQuery(sql);
-			Planner planner(*con.context);
-			planner.CreatePlan(p.statements[0]->Copy());
-			auto view_plan = std::move(planner.plan);
-			con.Rollback();
-
-			if (PlanReferencesColumn(*view_plan, table_name, col_name)) {
-				return view_name;
-			}
-		} catch (...) {
-			con.Rollback();
-		}
-	}
-	return "";
-}
-
 RefreshInsertRule::RefreshInsertRule() {
 	optimize_function = RefreshInsertRuleFunction;
 	optimizer_info = make_shared_ptr<RefreshInsertOptimizerInfo>();
@@ -334,7 +282,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				break;
 			}
 			string col_name = remove_info->removed_column;
-			string referencing_mv = FindMVReferencingColumn(con, delta_name, table_name, col_name);
+			string referencing_mv = FirstMVReferencingColumn(con, delta_name, table_name, col_name);
 			if (!referencing_mv.empty()) {
 				throw CatalogException("Cannot drop column '" + col_name +
 				                       "': it is referenced by materialized view '" + referencing_mv +
@@ -352,12 +300,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			}
 			string old_name = rename_info->old_name;
 			string new_name = rename_info->new_name;
-			string referencing_mv = FindMVReferencingColumn(con, delta_name, table_name, old_name);
-			if (!referencing_mv.empty()) {
-				throw CatalogException("Cannot rename column '" + old_name +
-				                       "': it is referenced by materialized view '" + referencing_mv +
-				                       "'. Drop the view first.");
-			}
+			RewriteDependentViewMetadataForRename(con, delta_name, table_name, old_name, new_name);
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE RENAME COLUMN '%s' → '%s' — syncing delta table\n",
 			                    old_name.c_str(), new_name.c_str());
 			con.Query("ALTER TABLE " + qdelta + " RENAME COLUMN " + KeywordHelper::WriteOptionallyQuoted(old_name) +

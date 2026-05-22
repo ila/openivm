@@ -32,7 +32,7 @@ struct SemiAntiSourceInput {
 	string last_update;
 };
 
-static string ResolveSemiAntiMetadataKey(const string &table_name, const vector<string> &delta_table_names) {
+static string ResolveDeltaMetadataKey(const string &table_name, const vector<string> &delta_table_names) {
 	vector<string> candidates;
 	candidates.push_back(table_name);
 	candidates.push_back(SqlUtils::LastIdentifierPart(table_name));
@@ -46,6 +46,22 @@ static string ResolveSemiAntiMetadataKey(const string &table_name, const vector<
 		}
 	}
 	return SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name));
+}
+
+static string ResolveSourceTableSQL(RefreshMetadata &metadata, const string &view_name, const string &metadata_key,
+                                    const string &table_name, const string &view_catalog_name,
+                                    const string &view_schema_name, const string &attached_db_catalog_name,
+                                    const string &attached_db_schema_name) {
+	string fallback_catalog = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
+	string fallback_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
+	auto loc = metadata.GetSourceLocation(view_name, metadata_key, fallback_catalog, fallback_schema);
+	if (loc.catalog_name.empty()) {
+		return table_name;
+	}
+	if (loc.schema_name.empty()) {
+		loc.schema_name = "main";
+	}
+	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, SqlUtils::LastIdentifierPart(table_name));
 }
 
 static string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
@@ -68,7 +84,7 @@ static SemiAntiSourceInput ResolveSemiAntiSourceInput(RefreshMetadata &metadata,
                                                       const string &attached_db_catalog_name,
                                                       const string &attached_db_schema_name) {
 	SemiAntiSourceInput input;
-	string metadata_key = ResolveSemiAntiMetadataKey(table_name, delta_table_names);
+	string metadata_key = ResolveDeltaMetadataKey(table_name, delta_table_names);
 	if (metadata.IsDuckLakeTable(view_name, metadata_key)) {
 		auto loc = ResolveDuckLakeSourceLocation(con, view_name, metadata_key, view_catalog_name, view_schema_name,
 		                                         attached_db_catalog_name, attached_db_schema_name);
@@ -85,10 +101,117 @@ static SemiAntiSourceInput ResolveSemiAntiSourceInput(RefreshMetadata &metadata,
 		return input;
 	}
 
-	input.table_sql = table_name;
-	input.delta_sql = metadata_key;
+	input.table_sql = ResolveSourceTableSQL(metadata, view_name, metadata_key, table_name, view_catalog_name,
+	                                        view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+	input.delta_sql = metadata.ResolveDeltaQualifiedName(view_name, metadata_key, view_catalog_name, view_schema_name);
 	input.last_update = metadata.GetLastUpdate(view_name, metadata_key);
 	return input;
+}
+
+static bool HasPendingDeltaRows(RefreshMetadata &metadata, const string &view_name, const string &delta_table,
+                                const string &view_catalog_name, const string &view_schema_name) {
+	string last_update = metadata.GetLastUpdate(view_name, delta_table);
+	if (last_update.empty()) {
+		return false;
+	}
+	string delta_table_sql =
+	    metadata.ResolveDeltaQualifiedName(view_name, delta_table, view_catalog_name, view_schema_name);
+	auto stats = metadata.GetStandardDeltaChangeStats(delta_table_sql, last_update);
+	return !stats.ok || stats.total > 0;
+}
+
+static void RequireNoPendingAuxRepairDeltas(RefreshMetadata &metadata, const string &view_name,
+                                            const vector<string> &delta_tables, const string &aux_table,
+                                            const string &view_catalog_name, const string &view_schema_name) {
+	for (auto &delta_table : delta_tables) {
+		if (HasPendingDeltaRows(metadata, view_name, delta_table, view_catalog_name, view_schema_name)) {
+			throw CatalogException("Cannot repair auxiliary state table '" + aux_table + "' for materialized view '" +
+			                       view_name +
+			                       "' while source deltas are pending. Recreate the view or restore the aux table.");
+		}
+	}
+}
+
+template <class BuildSQL>
+static void EnsureAuxState(RefreshMetadata &metadata, Connection &con, const string &view_name, const string &aux_table,
+                           const vector<string> &expected_columns, const string &internal_catalog_name,
+                           const string &internal_schema_name, const vector<string> &pending_delta_tables,
+                           const string &view_catalog_name, const string &view_schema_name, BuildSQL build_sql) {
+	if (metadata.TableColumnsMatch(internal_catalog_name, internal_schema_name, aux_table, expected_columns)) {
+		return;
+	}
+	RequireNoPendingAuxRepairDeltas(metadata, view_name, pending_delta_tables, aux_table, view_catalog_name,
+	                                view_schema_name);
+	auto result = con.Query(build_sql());
+	if (result->HasError()) {
+		throw CatalogException("Could not repair auxiliary state table '" + aux_table + "' for materialized view '" +
+		                       view_name + "': " + result->GetError());
+	}
+}
+
+static void EnsureDistinctAuxState(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                   const RefreshMetadata::DistinctAuxMeta &meta,
+                                   const vector<string> &delta_table_names, const string &internal_catalog_name,
+                                   const string &internal_schema_name, const string &catalog_prefix,
+                                   const string &view_catalog_name, const string &view_schema_name,
+                                   const string &attached_db_catalog_name, const string &attached_db_schema_name) {
+	string delta_source = ResolveDeltaMetadataKey(meta.source, delta_table_names);
+	EnsureAuxState(metadata, con, view_name, meta.aux_table, RefreshMetadata::ExpectedDistinctAuxColumns(meta),
+	               internal_catalog_name, internal_schema_name, vector<string> {delta_source}, view_catalog_name,
+	               view_schema_name, [&]() {
+		               string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(meta.aux_table);
+		               string source_table =
+		                   ResolveSourceTableSQL(metadata, view_name, delta_source, meta.source, view_catalog_name,
+		                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+		               return BuildDistinctAuxStateCreateSQL(aux_q, meta.cols, meta.source_exprs, source_table,
+		                                                     meta.filter, /*replace=*/true);
+	               });
+}
+
+static void EnsureFilteredGroupCountAuxState(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                             const RefreshMetadata::FilteredGroupCountAuxMeta &meta,
+                                             const vector<string> &delta_table_names,
+                                             const string &internal_catalog_name, const string &internal_schema_name,
+                                             const string &catalog_prefix, const string &view_catalog_name,
+                                             const string &view_schema_name, const string &attached_db_catalog_name,
+                                             const string &attached_db_schema_name) {
+	string delta_source = ResolveDeltaMetadataKey(meta.source, delta_table_names);
+	EnsureAuxState(metadata, con, view_name, meta.aux_table,
+	               RefreshMetadata::ExpectedFilteredGroupCountAuxColumns(meta), internal_catalog_name,
+	               internal_schema_name, vector<string> {delta_source}, view_catalog_name, view_schema_name, [&]() {
+		               string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(meta.aux_table);
+		               string source_table =
+		                   ResolveSourceTableSQL(metadata, view_name, delta_source, meta.source, view_catalog_name,
+		                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+		               return BuildFilteredGroupCountAuxStateCreateSQL(aux_q, source_table, meta.group_col,
+		                                                               meta.sum_col, meta.source_group_expr,
+		                                                               meta.source_sum_expr,
+		                                                               /*replace=*/true);
+	               });
+}
+
+static void EnsureSemiAntiAuxState(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                   const RefreshMetadata::SemiAntiAuxMeta &meta,
+                                   const vector<string> &delta_table_names, const string &internal_catalog_name,
+                                   const string &internal_schema_name, const string &catalog_prefix,
+                                   const string &view_catalog_name, const string &view_schema_name,
+                                   const string &attached_db_catalog_name, const string &attached_db_schema_name) {
+	string left_delta = ResolveDeltaMetadataKey(meta.left_table, delta_table_names);
+	string right_delta = ResolveDeltaMetadataKey(meta.right_table, delta_table_names);
+	EnsureAuxState(metadata, con, view_name, meta.aux_table, RefreshMetadata::ExpectedSemiAntiAuxColumns(meta),
+	               internal_catalog_name, internal_schema_name, vector<string> {left_delta, right_delta},
+	               view_catalog_name, view_schema_name, [&]() {
+		               string left_source =
+		                   ResolveSourceTableSQL(metadata, view_name, left_delta, meta.left_table, view_catalog_name,
+		                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+		               string right_source =
+		                   ResolveSourceTableSQL(metadata, view_name, right_delta, meta.right_table, view_catalog_name,
+		                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+		               string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(meta.aux_table);
+		               return BuildSemiAntiAuxStateCreateSQL(aux_q, left_source, meta.left_alias, right_source,
+		                                                     meta.right_alias, meta.predicate, meta.post_filter,
+		                                                     meta.left_cols, meta.left_exprs, /*replace=*/true);
+	               });
 }
 
 } // namespace
@@ -384,17 +507,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		bool sa_insert_only = has_argminmax ? false : insert_only;
 		RefreshMetadata::FilteredGroupCountAuxMeta aux_meta;
 		if (metadata.GetFilteredGroupCountAuxMeta(view_name, aux_meta)) {
-			string delta_source = SqlUtils::DeltaName(aux_meta.source);
-			for (auto &dt : delta_table_names) {
-				if (StringUtil::CIEquals(dt, delta_source)) {
-					delta_source = dt;
-					break;
-				}
-			}
+			EnsureFilteredGroupCountAuxState(metadata, con, view_name, aux_meta, delta_table_names,
+			                                 internal_catalog_name, internal_schema_name, internal_catalog_prefix,
+			                                 view_catalog_name, view_schema_name, attached_db_catalog_name,
+			                                 attached_db_schema_name);
+			string delta_source = ResolveDeltaMetadataKey(aux_meta.source, delta_table_names);
+			string delta_source_sql =
+			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
 			string ts = metadata.GetLastUpdate(view_name, delta_source);
 			upsert_query = CompileFilteredGroupCount(
-			    view_name, aux_meta.aux_table, delta_source, ts, aux_meta.group_col, aux_meta.sum_col,
-			    aux_meta.output_col, aux_meta.comparison_op, aux_meta.threshold_sql, internal_catalog_prefix);
+			    view_name, aux_meta.aux_table, delta_source_sql, ts, aux_meta.group_col, aux_meta.sum_col,
+			    aux_meta.source_group_expr, aux_meta.source_sum_expr, aux_meta.output_col, aux_meta.comparison_op,
+			    aux_meta.threshold_sql, internal_catalog_prefix);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling SIMPLE_AGGREGATE filtered-group-count aux (%s, sum=%s %s %s)\n",
 			                    aux_meta.group_col.c_str(), aux_meta.sum_col.c_str(), aux_meta.comparison_op.c_str(),
 			                    aux_meta.threshold_sql.c_str());
@@ -420,12 +544,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::DISTINCT_INCREMENTAL: {
 		RefreshMetadata::DistinctAuxMeta aux_meta;
 		if (metadata.GetDistinctAuxMeta(view_name, aux_meta)) {
+			EnsureDistinctAuxState(metadata, con, view_name, aux_meta, delta_table_names, internal_catalog_name,
+			                       internal_schema_name, internal_catalog_prefix, view_catalog_name, view_schema_name,
+			                       attached_db_catalog_name, attached_db_schema_name);
 			auto group_columns = metadata.GetGroupColumns(view_name);
-			string delta_source = SqlUtils::DeltaName(aux_meta.source);
+			string delta_source = ResolveDeltaMetadataKey(aux_meta.source, delta_table_names);
+			string delta_source_sql =
+			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
 			string ts = metadata.GetLastUpdate(view_name, delta_source);
-			upsert_query = CompileDistinctIncremental(
-			    view_name, aux_meta.aux_table, aux_meta.cols, delta_source, ts, aux_meta.filter, group_columns,
-			    aux_meta.sum_arg, aux_meta.sum_out, string(openivm::COUNT_STAR_COL), internal_catalog_prefix);
+			upsert_query =
+			    CompileDistinctIncremental(view_name, aux_meta.aux_table, aux_meta.cols, aux_meta.source_exprs,
+			                               delta_source_sql, ts, aux_meta.filter, group_columns, aux_meta.sum_arg,
+			                               aux_meta.sum_out, string(openivm::COUNT_STAR_COL), internal_catalog_prefix);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: DISTINCT_INCREMENTAL (%zu distinct cols, "
 			                    "%zu group cols, sum_arg=%s, sum_out=%s)\n",
 			                    aux_meta.cols.size(), group_columns.size(), aux_meta.sum_arg.c_str(),
@@ -439,6 +569,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::SEMI_ANTI_RECOMPUTE: {
 		RefreshMetadata::SemiAntiAuxMeta aux_meta;
 		if (metadata.GetSemiAntiAuxMeta(view_name, aux_meta)) {
+			EnsureSemiAntiAuxState(metadata, con, view_name, aux_meta, delta_table_names, internal_catalog_name,
+			                       internal_schema_name, internal_catalog_prefix, view_catalog_name, view_schema_name,
+			                       attached_db_catalog_name, attached_db_schema_name);
 			auto left_input = ResolveSemiAntiSourceInput(metadata, con, view_name, aux_meta.left_table,
 			                                             delta_table_names, view_catalog_name, view_schema_name,
 			                                             attached_db_catalog_name, attached_db_schema_name);

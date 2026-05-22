@@ -5,6 +5,7 @@
 #include "duckdb/parser/keyword_helper.hpp"
 
 #include <string>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -58,6 +59,8 @@ public:
 	static vector<string> ReplaceEachTableReference(const string &sql, const string &table_name,
 	                                                const string &replacement);
 	static bool IdentifierMatchesTable(const string &identifier, const string &table_name);
+	static bool RewriteColumnReferences(string &sql, const string &old_name, const string &new_name,
+	                                    const unordered_set<string> &qualifiers, bool allow_unqualified);
 	static string FindTableReference(const string &sql, const string &table_name);
 	static idx_t CountTableReferences(const string &sql, const string &table_name);
 

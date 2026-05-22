@@ -11,16 +11,59 @@ namespace duckdb {
 namespace {
 
 static string DeltaSourceRef(const string &source, const string &catalog_prefix) {
-	if (!source.empty() && source[0] == '(') {
+	if (!source.empty() && (source[0] == '(' || source.find('.') != string::npos)) {
 		return source;
 	}
 	return catalog_prefix + SqlUtils::QuoteIdentifier(source);
 }
 
+static string CreateAuxTablePrefix(const string &target_table, bool replace) {
+	return string(replace ? "CREATE OR REPLACE TABLE " : "CREATE TABLE IF NOT EXISTS ") + target_table;
+}
+
+static string SourceExprForColumn(const vector<string> &cols, const vector<string> &source_exprs, idx_t column_idx,
+                                  const string &fallback_alias = string()) {
+	if (column_idx < source_exprs.size() && !source_exprs[column_idx].empty()) {
+		return source_exprs[column_idx];
+	}
+	string col = SqlUtils::QuoteIdentifier(cols[column_idx]);
+	if (!fallback_alias.empty()) {
+		return fallback_alias + "." + col;
+	}
+	return cols[column_idx];
+}
+
+static void BuildAliasedSourceLists(const vector<string> &cols, const vector<string> &source_exprs, string &select_list,
+                                    string &group_list, const string &fallback_alias = string()) {
+	select_list.clear();
+	group_list.clear();
+	for (idx_t i = 0; i < cols.size(); i++) {
+		if (i > 0) {
+			select_list += ", ";
+			group_list += ", ";
+		}
+		string expr = SourceExprForColumn(cols, source_exprs, i, fallback_alias);
+		select_list += expr + " AS " + SqlUtils::QuoteIdentifier(cols[i]);
+		group_list += expr;
+	}
+}
+
 } // namespace
 
+string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
+                                      const vector<string> &source_exprs, const string &source_relation,
+                                      const string &filter_sql, bool replace) {
+	string select_list;
+	string group_list;
+	BuildAliasedSourceLists(distinct_cols, source_exprs, select_list, group_list);
+	string filter = filter_sql.empty() ? "" : " WHERE " + filter_sql;
+	return CreateAuxTablePrefix(target_table, replace) + " AS SELECT " + select_list +
+	       ", count(*)::BIGINT AS _count FROM " + source_relation + filter + " GROUP BY " + group_list;
+}
+
 string CompileDistinctIncremental(const string &view_name, const string &aux_table, const vector<string> &distinct_cols,
-                                  const string &delta_source, const string &last_update, const string &filter_sql,
+                                  const vector<string> &source_exprs, const string &delta_source,
+                                  const string &last_update, const string &filter_sql,
                                   const vector<string> &group_columns, const string &sum_arg, const string &sum_out,
                                   const string &count_star_col, const string &catalog_prefix) {
 	if (distinct_cols.empty() || group_columns.empty() || sum_arg.empty() || sum_out.empty()) {
@@ -28,7 +71,7 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	}
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(aux_table);
-	string delta_q = catalog_prefix + SqlUtils::QuoteIdentifier(delta_source);
+	string delta_q = DeltaSourceRef(delta_source, catalog_prefix);
 	string sum_arg_q = SqlUtils::QuoteIdentifier(sum_arg);
 	string sum_out_q = SqlUtils::QuoteIdentifier(sum_out);
 	string count_q = SqlUtils::QuoteIdentifier(count_star_col);
@@ -37,6 +80,9 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	string distinct_cols_csv_i = SqlUtils::JoinQualifiedQuotedColumns(distinct_cols, "i");
 	string group_cols_csv = SqlUtils::JoinQuotedColumns(group_columns);
 	string mv_match = SqlUtils::BuildNullSafeMatch(group_columns, "v", "d");
+	string source_select;
+	string source_group;
+	BuildAliasedSourceLists(distinct_cols, source_exprs, source_select, source_group);
 
 	string dinput_table = "openivm_dinput_" + view_name;
 	string ts_filter =
@@ -45,8 +91,8 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 
 	string sql;
 	sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dinput_table) + " AS\n  SELECT " +
-	       distinct_cols_csv + ", SUM(" + string(openivm::MULTIPLICITY_COL) + ")::BIGINT AS dmult\n  FROM " + delta_q +
-	       ts_filter + filter_clause + "\n  GROUP BY " + distinct_cols_csv + "\n  HAVING SUM(" +
+	       source_select + ", SUM(" + string(openivm::MULTIPLICITY_COL) + ")::BIGINT AS dmult\n  FROM " + delta_q +
+	       ts_filter + filter_clause + "\n  GROUP BY " + source_group + "\n  HAVING SUM(" +
 	       string(openivm::MULTIPLICITY_COL) + ") <> 0;\n\n";
 
 	string aux_match_aliased = SqlUtils::BuildNullSafeMatch(distinct_cols, "_aux", "i");
@@ -83,6 +129,31 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	                    distinct_cols.size(), group_columns.size(), "SUM", sum_arg.c_str(), sum_out.c_str(),
 	                    aux_table.c_str());
 	return sql;
+}
+
+string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &left_source, const string &left_alias,
+                                      const string &right_source, const string &right_alias, const string &predicate,
+                                      const string &post_filter, const vector<string> &left_cols,
+                                      const vector<string> &left_exprs, bool replace) {
+	string left_cols_csv = SqlUtils::JoinQuotedColumns(left_cols);
+	string left_cols_qualified = SqlUtils::JoinQualifiedQuotedColumns(left_cols, left_alias);
+	string left_cols_lc = SqlUtils::JoinQualifiedQuotedColumns(left_cols, "lc");
+	string left_cols_mc = SqlUtils::JoinQualifiedQuotedColumns(left_cols, "mc");
+	string lc_mc_match = SqlUtils::BuildNullSafeMatch(left_cols, "lc", "mc");
+	string left_source_select;
+	string unused_group_list;
+	BuildAliasedSourceLists(left_cols, left_exprs, left_source_select, unused_group_list, left_alias);
+	string left_source_filter = post_filter.empty() ? "" : " WHERE " + post_filter;
+	return CreateAuxTablePrefix(target_table, replace) + " AS WITH left_source AS (SELECT " + left_source_select +
+	       " FROM " + left_source + " " + left_alias + left_source_filter + "), left_counts AS (SELECT " +
+	       left_cols_csv + ", count(*)::BIGINT AS _left_count FROM left_source GROUP BY " + left_cols_csv +
+	       "), match_counts AS (SELECT " + left_cols_qualified +
+	       ", count(*)::BIGINT AS _match_count FROM (SELECT DISTINCT " + left_cols_csv + " FROM left_source) " +
+	       left_alias + " JOIN " + right_source + " " + right_alias + " ON " + predicate + " GROUP BY " +
+	       left_cols_qualified + ") SELECT " + left_cols_lc +
+	       ", lc._left_count, coalesce(mc._match_count, 0)::BIGINT AS _match_count FROM left_counts lc LEFT JOIN "
+	       "match_counts mc ON " +
+	       lc_mc_match;
 }
 
 string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
@@ -127,17 +198,7 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	string data_match = SqlUtils::BuildNullSafeMatch(output_cols, "_v", "_d");
 	string left_delta_select;
 	string left_delta_group;
-	for (size_t i = 0; i < left_cols.size(); i++) {
-		if (i > 0) {
-			left_delta_select += ", ";
-			left_delta_group += ", ";
-		}
-		string expr = i < left_exprs.size() && !left_exprs[i].empty()
-		                  ? left_exprs[i]
-		                  : left_alias + "." + SqlUtils::QuoteIdentifier(left_cols[i]);
-		left_delta_select += expr + " AS " + SqlUtils::QuoteIdentifier(left_cols[i]);
-		left_delta_group += expr;
-	}
+	BuildAliasedSourceLists(left_cols, left_exprs, left_delta_select, left_delta_group, left_alias);
 
 	string left_ts =
 	    string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(left_last_update) + "'::TIMESTAMP";
@@ -215,8 +276,21 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	return sql;
 }
 
+string BuildFilteredGroupCountAuxStateCreateSQL(const string &target_table, const string &source_table,
+                                                const string &group_col, const string &sum_col,
+                                                const string &source_group_expr, const string &source_sum_expr,
+                                                bool replace) {
+	string group_q = SqlUtils::QuoteIdentifier(group_col);
+	string sum_q = SqlUtils::QuoteIdentifier(sum_col);
+	string group_expr = source_group_expr.empty() ? group_q : source_group_expr;
+	string sum_expr = source_sum_expr.empty() ? sum_q : source_sum_expr;
+	return CreateAuxTablePrefix(target_table, replace) + " AS SELECT " + group_expr + " AS " + group_q + ", sum(" +
+	       sum_expr + ") AS openivm_sum FROM " + source_table + " GROUP BY " + group_expr;
+}
+
 string CompileFilteredGroupCount(const string &view_name, const string &aux_table, const string &delta_source,
                                  const string &last_update, const string &group_col, const string &sum_col,
+                                 const string &source_group_expr, const string &source_sum_expr,
                                  const string &output_col, const string &comparison_op, const string &threshold_sql,
                                  const string &catalog_prefix) {
 	if (aux_table.empty() || delta_source.empty() || last_update.empty() || group_col.empty() || sum_col.empty() ||
@@ -226,12 +300,14 @@ string CompileFilteredGroupCount(const string &view_name, const string &aux_tabl
 
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(aux_table);
-	string delta_q = catalog_prefix + SqlUtils::QuoteIdentifier(delta_source);
+	string delta_q = DeltaSourceRef(delta_source, catalog_prefix);
 	string dsum_table = "openivm_fgc_delta_" + view_name;
 	string group_q = SqlUtils::QuoteIdentifier(group_col);
 	string sum_q = SqlUtils::QuoteIdentifier(sum_col);
+	string source_group = source_group_expr.empty() ? group_q : source_group_expr;
+	string source_sum = source_sum_expr.empty() ? sum_q : source_sum_expr;
 	string output_q = SqlUtils::QuoteIdentifier(output_col);
-	string dsum_expr = "SUM(" + string(openivm::MULTIPLICITY_COL) + " * " + sum_q + ")";
+	string dsum_expr = "SUM(" + string(openivm::MULTIPLICITY_COL) + " * " + source_sum + ")";
 	string old_sum = "COALESCE(_aux.openivm_sum, 0)";
 	string new_sum = "(" + old_sum + " + d.openivm_delta_sum)";
 	string old_visible = "CASE WHEN " + old_sum + " " + comparison_op + " " + threshold_sql + " THEN 1 ELSE 0 END";
@@ -239,10 +315,10 @@ string CompileFilteredGroupCount(const string &view_name, const string &aux_tabl
 	string aux_match = SqlUtils::BuildNullSafeMatch(vector<string> {group_col}, "_aux", "d");
 
 	string sql;
-	sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dsum_table) + " AS\n  SELECT " + group_q + ", " +
-	       dsum_expr + " AS openivm_delta_sum\n  FROM " + delta_q + "\n  WHERE " + string(openivm::TIMESTAMP_COL) +
-	       " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP\n  GROUP BY " + group_q + "\n  HAVING " +
-	       dsum_expr + " <> 0;\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dsum_table) + " AS\n  SELECT " + source_group +
+	       " AS " + group_q + ", " + dsum_expr + " AS openivm_delta_sum\n  FROM " + delta_q + "\n  WHERE " +
+	       string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP\n  GROUP BY " +
+	       source_group + "\n  HAVING " + dsum_expr + " <> 0;\n\n";
 
 	sql += "WITH openivm_transition AS (\n  SELECT SUM((" + new_visible + ") - (" + old_visible +
 	       ")) AS openivm_delta_count\n  FROM " + SqlUtils::QuoteIdentifier(dsum_table) + " d LEFT JOIN " + aux_q +

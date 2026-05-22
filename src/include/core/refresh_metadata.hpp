@@ -65,6 +65,10 @@ public:
 
 	DeltaChangeStats GetStandardDeltaChangeStats(const string &delta_table_sql, const string &last_update);
 
+	vector<string> GetTableColumns(const string &catalog_name, const string &schema_name, const string &table_name);
+	bool TableColumnsMatch(const string &catalog_name, const string &schema_name, const string &table_name,
+	                       const vector<string> &expected);
+
 	// Update the last_update timestamp to now() for all delta tables of a view.
 	void UpdateTimestamp(const string &view_name);
 
@@ -161,6 +165,7 @@ public:
 	struct DistinctAuxMeta {
 		string aux_table;
 		vector<string> cols;
+		vector<string> source_exprs;
 		string input_sql;
 		string source;
 		string filter;
@@ -171,6 +176,7 @@ public:
 	// Read the JSON-encoded distinct-aux metadata. Returns false if the column is NULL
 	// (view isn't DISTINCT_INCREMENTAL) or parsing fails.
 	bool GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out);
+	static string DistinctAuxMetaToJson(const DistinctAuxMeta &meta);
 
 	struct SemiAntiAuxMeta {
 		string aux_table;
@@ -187,6 +193,7 @@ public:
 	};
 
 	bool GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out);
+	static string SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta);
 
 	struct WindowPartitionLineageOp {
 		string kind;
@@ -199,6 +206,7 @@ public:
 	};
 
 	bool GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out);
+	static string WindowPartitionLineageToJson(const vector<WindowPartitionLineageOp> &ops);
 
 	struct ProjectionKeyLineageStep {
 		string table;
@@ -223,18 +231,27 @@ public:
 	};
 
 	bool GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out);
+	static string ProjectionKeyLineageToJson(const ProjectionKeyLineage &lineage);
 
 	struct FilteredGroupCountAuxMeta {
 		string aux_table;
 		string source;
 		string group_col;
 		string sum_col;
+		string source_group_expr;
+		string source_sum_expr;
 		string output_col;
 		string comparison_op;
 		string threshold_sql;
 	};
 
 	bool GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out);
+	static string FilteredGroupCountAuxMetaToJson(const FilteredGroupCountAuxMeta &meta);
+
+	static vector<string> ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta);
+	static vector<string> ExpectedFilteredGroupCountAuxColumns(const FilteredGroupCountAuxMeta &meta);
+	static vector<string> ExpectedSemiAntiAuxColumns(const SemiAntiAuxMeta &meta);
+	bool AuxStateNeedsRepair(const string &view_name, const string &catalog_name, const string &schema_name);
 };
 
 } // namespace duckdb

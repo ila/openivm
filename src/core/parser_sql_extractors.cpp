@@ -476,6 +476,7 @@ static bool IsZeroSqlLiteral(string expr) {
 
 static size_t FindClauseEnd(const string &lower, size_t from) {
 	bool in_quote = false;
+	bool in_identifier_quote = false;
 	int depth = 0;
 	for (size_t i = from; i < lower.size(); i++) {
 		char c = lower[i];
@@ -485,8 +486,22 @@ static size_t FindClauseEnd(const string &lower, size_t from) {
 			}
 			continue;
 		}
+		if (in_identifier_quote) {
+			if (c == '"' && i + 1 < lower.size() && lower[i + 1] == '"') {
+				i++;
+				continue;
+			}
+			if (c == '"') {
+				in_identifier_quote = false;
+			}
+			continue;
+		}
 		if (c == '\'') {
 			in_quote = true;
+			continue;
+		}
+		if (c == '"') {
+			in_identifier_quote = true;
 			continue;
 		}
 		if (c == '(') {

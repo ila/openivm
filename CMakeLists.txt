@@ -35,6 +35,7 @@ set(EXTENSION_SOURCES
     src/upsert/refresh_index_regen.cpp
     src/rules/incremental_rewrite_rule.cpp
     src/rules/refresh_insert_rule.cpp
+    src/rules/schema_evolution.cpp
     src/rules/helpers.cpp
     src/rules/scan.cpp
     src/rules/filter.cpp
