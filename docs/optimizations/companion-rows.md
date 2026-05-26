@@ -16,18 +16,18 @@ MV1 currently has `{(US, 100), (EU, 200)}`, so MV2 = `{num_regions: 2}`.
 Now a new sale is inserted: `INSERT INTO sales VALUES ('US', 50)`. The IVM delta for MV1 is:
 
 ```
-openivm_delta_mv1:  (region='US', total=50, mul=true)
+openivm_delta_mv1:  (region='US', total=50, mul=+1)
 ```
 
-MV1 is updated to `(US, 150)`. But the downstream MV2 sees one new `true` row and increments: `num_regions = 2 + 1 = 3`. **Wrong** — the US region already existed; the count should still be 2.
+MV1 is updated to `(US, 150)`. But the downstream MV2 sees one new `+1` row and increments: `num_regions = 2 + 1 = 3`. **Wrong** — the US region already existed; the count should still be 2.
 
-The problem: the delta says "here's a change for US" but doesn't say "US was already there." The downstream view has no way to know whether this is a new group or an update to an existing one. Companion rows solve this by emitting a canceling `false` row for existing groups.
+The problem: the delta says "here's a change for US" but doesn't say "US was already there." The downstream view has no way to know whether this is a new group or an update to an existing one. Companion rows solve this by emitting a canceling `-1` row for existing groups.
 
 ## Solution by View Type
 
 ### AGGREGATE_GROUP Views
 
-For each key that appears in the incoming delta, emit a **zero-valued false row**
+For each key that appears in the incoming delta, emit a **zero-valued retraction row**
 representing the old state of that group. This tells downstream consumers "the old
 contribution from this group is being cancelled."
 
@@ -41,7 +41,7 @@ Suppose `sales_summary` has `(US, total=100, cnt=5)` and the IVM delta adds 50 t
 
 ```sql
 -- The IVM query inserts the delta into the delta view table
-INSERT INTO openivm_delta_sales_summary VALUES ('US', 50, 2, true);
+INSERT INTO openivm_delta_sales_summary VALUES ('US', 50, 2, 1);
 ```
 
 The companion query inserts a retraction row (multiplicity `-1`) for the existing group:
@@ -84,11 +84,11 @@ DELETE FROM openivm_delta_emp_names WHERE openivm_timestamp >= '{ts}';
 
 -- Emit old state as deletions: each old row is "removed" for downstream consumers
 INSERT INTO openivm_delta_emp_names (id, name, openivm_multiplicity)
-SELECT id, name, false FROM openivm_old_emp_names;
+SELECT id, name, -1 FROM openivm_old_emp_names;
 
 -- Emit new state as insertions: each new row is "added" for downstream consumers
 INSERT INTO openivm_delta_emp_names (id, name, openivm_multiplicity)
-SELECT id, name, true FROM emp_names;
+SELECT id, name, 1 FROM emp_names;
 
 DROP TABLE openivm_old_emp_names;
 ```

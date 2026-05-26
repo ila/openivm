@@ -62,9 +62,11 @@ The match predicate is **NULL-safe** — `EXISTS (SELECT 1 FROM affected _a WHER
 
 ### Aggregate views (with GROUP BY)
 
-Two modes, controlled by `openivm_full_outer_merge` (default: off):
+Two modes are available, controlled by `openivm_full_outer_merge` (default: on):
 
-**Group-recompute mode (default):** identifies affected GROUP BY keys from 4 sources:
+**MERGE mode (default):** uses the Larson & Zhou `openivm_match_count` column to track how many right rows match each left group. When the count transitions between 0 and positive, right-side aggregate columns transition between NULL and actual values. The NULL group (unmatched-right rows) is recomputed separately to handle cross-group transfers.
+
+**Group-recompute mode** (`SET openivm_full_outer_merge = false`) identifies affected GROUP BY keys from 4 sources:
 1. Delta view (matched-row group keys)
 2. Left delta table (group column directly available for unmatched-left changes)
 3. Left base table lookup (maps right-side join keys to group keys)
@@ -72,13 +74,11 @@ Two modes, controlled by `openivm_full_outer_merge` (default: off):
 
 DELETE + re-INSERT only the affected groups.
 
-**MERGE mode** (`SET openivm_full_outer_merge = true`): uses the Larson & Zhou `openivm_match_count` column to track how many right rows match each left group. When the count transitions between 0 and positive, right-side aggregate columns transition between NULL and actual values. The NULL group (unmatched-right rows) is always recomputed separately to handle cross-group transfers.
-
 ## Settings
 
 | Setting | Default | Description |
 |---|---|---|
-| `openivm_full_outer_merge` | `false` | Use incremental MERGE for aggregate views instead of group-recompute |
+| `openivm_full_outer_merge` | `true` | Use incremental MERGE for aggregate views instead of group-recompute |
 
 ## Limitations
 

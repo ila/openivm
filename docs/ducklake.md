@@ -50,7 +50,7 @@ column and timestamp. DuckLake tables don't need delta tables — DuckLake's bui
 change tracking provides the same information natively.
 
 OpenIVM reads rows inserted and deleted between two snapshots directly from DuckLake.
-Insertions get multiplicity `true`; deletions get multiplicity `false`. This produces
+Insertions get multiplicity `+1`; deletions get multiplicity `-1`. This produces
 the same delta format as standard delta tables but without maintaining a separate copy.
 
 The last-refreshed snapshot ID is stored in `openivm_delta_tables` and updated
@@ -106,11 +106,10 @@ DuckLake-backed views support the same operator families as standard DuckDB tabl
 - Left, right, and full outer joins use the standard partial-recompute/MERGE paths
 - UNION ALL
 - DISTINCT
+- Semi/anti joins for supported aux-state shapes
 - Window functions on supported single-table shapes
 - CTEs and decorrelated subqueries
 - Chained/cascading materialized views
-
-Semi/anti aux-state support is currently documented for standard delta-table maintenance. DuckLake semi/anti views should be verified before relying on incremental refresh.
 
 ## Limitations
 

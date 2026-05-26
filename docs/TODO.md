@@ -15,7 +15,7 @@
 - [ ] **Transaction isolation during refresh.** The refresh opens a separate `Connection` — verify what snapshot it reads from and whether concurrent DML during refresh can produce inconsistent results.
 - [ ] **Error recovery.** If refresh fails mid-way (e.g., out of memory during MERGE), is the MV left in a consistent state? Consider wrapping the full refresh in a single transaction.
 - [ ] **Large delta handling.** When delta rows exceed the base table size, IVM is likely slower than full recompute. The cost model should catch this, but verify the threshold experimentally.
-- [ ] **DROP MATERIALIZED VIEW.** Not implemented. Needs to clean up: MV table, all delta tables, delta view table, `openivm_views` entry, `openivm_delta_tables` entries, ART index.
+- [ ] **DROP MATERIALIZED VIEW syntax.** `DROP VIEW <mv>` cleans OpenIVM metadata and internal tables. The `DROP MATERIALIZED VIEW` syntax is still not routed through the extension parser.
 - [ ] **NULL group keys edge cases.** `IS NOT DISTINCT FROM` in MERGE handles NULLs, but audit the full path (delta computation → consolidation → MERGE) for correctness with composite NULL keys.
 
 ## P2: Documentation

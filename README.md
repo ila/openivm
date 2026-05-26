@@ -30,7 +30,7 @@ SELECT * FROM regional_totals ORDER BY region;
 
 Views with `REFRESH EVERY` are maintained automatically by a background daemon. See [automatic refresh](docs/refresh/automatic-refresh.md).
 
-Base table schema changes (ADD/DROP/RENAME COLUMN) are propagated by our engine — delta tables are synced and IVM continues to work. Dropping or renaming a column referenced by an MV is blocked with an error.
+Base table schema changes (`ADD`, `DROP`, `RENAME COLUMN`) are propagated by OpenIVM. Delta tables are synced, referenced renames update MV metadata, and referenced drops are blocked with an error.
 
 ## Data pipelines and DuckLake
 
@@ -91,6 +91,10 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `openivm_adaptive_refresh` | BOOLEAN | `false` | Enable adaptive cost model (learned regression) | [Refresh strategies](docs/refresh/refresh-strategies.md) |
 | `openivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh takes longer than interval | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_disable_daemon` | BOOLEAN | `false` | Disable the background refresh daemon | [Automatic refresh](docs/refresh/automatic-refresh.md) |
+| `openivm_skip_empty_deltas` | BOOLEAN | `true` | Skip refresh work when no pending deltas exist | [Empty delta skip](docs/optimizations/empty-delta-skip.md) |
+| `openivm_compact_deltas` | BOOLEAN | `true` | Compact raw delta rows into net Z-set deltas before refresh | [Delta consolidation](docs/optimizations/delta-consolidation.md) |
+| `openivm_distinct_aux_state` | BOOLEAN | `false` | Use aux-state maintenance for supported inner-DISTINCT-under-aggregate shapes | [Distinct](docs/operators/distinct.md) |
+| `openivm_profile_refresh` | BOOLEAN | `false` | Record per-step refresh timings in `openivm_refresh_profile` | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files | [Internals](docs/internals/delta-tables.md) |
 
 

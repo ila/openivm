@@ -73,7 +73,7 @@ latest checked result was:
 | MV creation OK | 2386 |
 | Refresh OK | 2386 |
 | Correct | 2386 |
-| Incremental | 2243 |
-| Full refresh | 143 |
+| Incremental | 2273 |
+| Full refresh | 113 |
 | Crashed | 0 |
 | Metadata mismatches | 0 |

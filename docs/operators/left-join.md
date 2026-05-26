@@ -61,6 +61,8 @@ This avoids the complexity of tracking NULL↔non-NULL transitions incrementally
 
 The parser injects a hidden `openivm_left_key` column containing the preserved-side join key (see [Metadata Columns](../internals/metadata-columns.md#openivm_left_key)).
 
+For grouped aggregates over LEFT/RIGHT JOINs, OpenIVM uses the Larson & Zhou MERGE path by default (`openivm_left_join_merge=true`) when the aggregate shape is safe. Unsafe aggregate shapes use affected-group recompute instead.
+
 ## Compiled SQL (2-table join, 3 terms)
 
 ### IVM query (delta propagation)
@@ -150,6 +152,12 @@ The inclusion-exclusion generates 2^3 - 1 = 7 terms. Terms where only `bonuses` 
 ## Limitations
 
 - Partial recompute is proportional to the number of affected left keys, not the number of changed rows. If many left keys are affected, the recompute may scan a large portion of the base tables.
-- `AGGREGATE_GROUP` views with LEFT JOIN sources use group recompute (not the standard MERGE), since NULL handling in aggregate deltas is not decomposable.
+- `AGGREGATE_GROUP` views with LEFT JOIN sources use MERGE only for supported aggregate shapes. If `openivm_left_join_merge=false`, or if the aggregate shape is unsafe, OpenIVM uses affected-group recompute.
 - **LEFT JOIN with a *computed* aggregate argument** (anything other than a plain bound column reference — `COALESCE`, `CASE`, an arithmetic expression, a constant) is also forced onto the group-recompute path even when the delta is insert-only. The Larson-Zhou MERGE template doesn't correctly handle the case where a new right-side row converts an existing NULL-padded row into a match for these expressions, so the classifier sets `has_minmax=true` (overloaded as a "use group-recompute" signal) and skips the MERGE fast path. See `src/upsert/refresh_compiler.cpp:289–315`.
 - Maximum 16 tables in the join (same limit as [inner join](inner-join.md)).
+
+## Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `openivm_left_join_merge` | `true` | Use incremental MERGE for supported LEFT/RIGHT JOIN aggregate views |

@@ -19,9 +19,9 @@ Delta tables have two metadata columns appended to the base table schema. See [D
 
 These columns live on the physical data table (`openivm_data_<view_name>`) and are hidden from the user via the view.
 
-### `openivm_left_key`
+### `openivm_left_key` and `openivm_right_key`
 
-Added when the view contains a LEFT or RIGHT JOIN. Stores the preserved-side join key so the upsert can do partial recompute — delete all MV rows for affected keys and re-insert from the original query filtered to those keys. See [Left Join](../operators/left-join.md) for the upsert strategy.
+Added when a join refresh path needs key-based partial recompute. `openivm_left_key` stores the preserved-side key for LEFT/RIGHT JOINs. FULL OUTER JOIN projection views can also store `openivm_right_key` so either side's changed key can delete and reinsert the affected rows. See [Left Join](../operators/left-join.md) and [Full Outer Join](../operators/full-outer-join.md).
 
 ```sql
 -- Original
@@ -35,16 +35,21 @@ FROM customers c LEFT JOIN orders o ON c.id = o.customer_id;
 
 The type matches the join key's type.
 
-### `openivm_sum_*` and `openivm_count_*`
+### Aggregate helper columns
 
-Added when the view uses `AVG()`. The parser decomposes each `AVG(x) AS alias` into two hidden columns that can be maintained incrementally:
+Added when an aggregate needs decomposed state that can be maintained incrementally:
 
 | Hidden column | Source | Updated via |
 |---|---|---|
-| `openivm_sum_<alias>` | `SUM(x)` | MERGE adds delta sum to existing value |
-| `openivm_count_<alias>` | `COUNT(x)` | MERGE adds delta count to existing value |
+| `openivm_sum_<alias>` | `SUM(x)` for AVG/STDDEV/VARIANCE | MERGE adds delta sum to existing value |
+| `openivm_count_<alias>` | `COUNT(x)` for AVG/STDDEV/VARIANCE | MERGE adds delta count to existing value |
+| `openivm_sum_sq_<alias>` | `SUM(x*x)` for STDDEV sample | MERGE adds delta sum-of-squares |
+| `openivm_var_sq_<alias>` | `SUM(x*x)` for VARIANCE sample | MERGE adds delta sum-of-squares |
+| `openivm_sum_sqp_<alias>` | `SUM(x*x)` for STDDEV population | MERGE adds delta sum-of-squares |
+| `openivm_var_sqp_<alias>` | `SUM(x*x)` for VARIANCE population | MERGE adds delta sum-of-squares |
+| `openivm_count_star` | Hidden `COUNT(*)` for some grouped aggregates | Tracks group cardinality so empty groups can be deleted safely |
 
-The user-visible `AVG` column is recomputed after each MERGE as `openivm_sum / NULLIF(openivm_count, 0)`.
+User-visible AVG, STDDEV, and VARIANCE columns are recomputed from the merged helper columns.
 
 ```sql
 -- Original
@@ -61,6 +66,10 @@ FROM sales GROUP BY region;
 ### `openivm_distinct_count`
 
 Added when the view uses `SELECT DISTINCT`, which the parser rewrites to `GROUP BY` + a hidden `COUNT(*)`. See [Distinct](../operators/distinct.md).
+
+### `openivm_match_count` and `openivm_right_match_count`
+
+Added by outer-join aggregate maintenance. These helper counts track whether a preserved-side row currently has matches, so MERGE refresh can handle NULL-padding transitions. FULL OUTER JOIN paths may keep counts for both sides.
 
 ## The user-facing view
 

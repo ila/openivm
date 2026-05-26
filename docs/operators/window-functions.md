@@ -55,8 +55,8 @@ still benefits from empty-delta skipping — no-op when nothing changed.
 
 Window functions work with other operators:
 
-- **Window over JOIN:** `SELECT ..., ROW_NUMBER() OVER (...) FROM t1 JOIN t2 ON ...` — 
-  uses full recompute (partition-level recompute not available for joins, see limitations).
+- **Window over JOIN:** `SELECT ..., ROW_NUMBER() OVER (...) FROM t1 JOIN t2 ON ...` —
+  uses partition recompute when OpenIVM can derive affected partition values from source lineage. Other join shapes use full recompute.
 - **Window with WHERE:** `SELECT ..., RANK() OVER (...) FROM t WHERE active = true` —
   the filter is part of the base query used for partition recompute.
 - **Composite PARTITION BY:** Multiple columns are supported:
@@ -81,22 +81,22 @@ PRAGMA refresh('mv_ranked');  -- partition-level recompute
 PRAGMA refresh('mv_top2');    -- reads updated mv_ranked data table
 ```
 
-The downstream MV reads from the window MV's updated data table. Note: the delta
-view for window MVs is not populated (due to LPTS limitations), so the downstream
-refresh is a full recompute of the downstream query, not incremental.
+The downstream MV reads from the window MV's updated data table. Window refresh bypasses
+the generic `ComputeDelta` plan, but refresh still records old-to-new delta rows for
+downstream views. This lets chained MVs consume window recompute changes incrementally.
 
 ## Limitations
 
-- **Window over JOIN uses full recompute.** When a window view involves a JOIN,
-  partition columns may come from a joined table whose delta doesn't contain them.
-  Without LPTS support for WINDOW, we cannot resolve partition values through the join
-  at refresh time. Single-table window views use efficient partition-level recompute.
+- **Some window-over-join shapes use full recompute.** Partition recompute needs the
+  changed partition values. If those values cannot be derived from the changed source
+  table or lineage metadata, OpenIVM falls back to full recompute. Single-table windows
+  and supported lineage shapes use partition recompute.
 - **No insert-only optimization.** Unlike grouped aggregates, window functions always
   require full partition recompute regardless of delta type. A single insertion can
   change the numbering of all rows in the partition.
-- **Delta view not populated.** The ComputeDelta/LPTS pipeline is bypassed for window views
-  because LPTS does not support the WINDOW operator. Downstream chained MVs do a full
-  recompute when refreshed (reading from the window MV's data table directly).
+- **ComputeDelta bypass.** Window views use a dedicated partition-recompute refresh path
+  instead of the generic ComputeDelta/LPTS pipeline. Downstream delta rows are generated
+  from the recomputed old-to-new transition.
 - **LPTS fallback.** The view query is stored as the original user SQL, not the
   LPTS-rewritten form. This means plan-level rewrites (AVG/STDDEV decomposition) are
   not applied within window view queries.

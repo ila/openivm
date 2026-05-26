@@ -47,6 +47,7 @@ Returns a single row:
 | `next_refresh` | TIMESTAMP | Estimated next refresh (last_refresh + interval) |
 | `status` | VARCHAR | `idle` or `refreshing` |
 | `effective_interval` | BIGINT | Current interval after backoff (same as configured if no backoff) |
+| `refresh_strategy` | VARCHAR | Stored refresh type, such as `aggregate_group`, `window_partition`, or `full_refresh` |
 
 ## Adaptive backoff
 
@@ -90,6 +91,9 @@ Automatic refresh uses the same per-view locking as manual `PRAGMA refresh()`:
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `openivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh takes longer than the interval |
+| `openivm_disable_daemon` | BOOLEAN | `false` | Disable the background refresh daemon at extension load |
+| `openivm_profile_refresh` | BOOLEAN | `false` | Record per-step refresh timings in `openivm_refresh_profile` |
+| `openivm_profile_retention_days` | BIGINT | `31` | Delete profile rows older than this many days when profiling writes new rows |
 
 The refresh interval itself is per-view, set at creation time via `REFRESH EVERY`.
 

@@ -49,7 +49,7 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 | Inner `DISTINCT` directly inside a subquery feeding an outer `AGGREGATE` (e.g. `SELECT g, SUM(c) FROM (SELECT DISTINCT g, m, c FROM t) GROUP BY g`) | Two paths are available. **Default (`GROUP_RECOMPUTE`)**: for each base table with a non-empty delta, the LPTS view query is scoped to delta-touched rows; the affected-keys set drives `DELETE` + `INSERT` on `openivm_data_<view>`. Correct but does more work than strictly necessary. **Aux-state path (`openivm_distinct_aux_state = true`, `RefreshType::DISTINCT_INCREMENTAL`)**: DBSP-correct Z-set maintenance via a per-tuple count auxiliary table `openivm_distinct_count_<view>`. Δdistinct fires only when the input count crosses zero (`sgn(R[t])`), driving ±1 into the parent SUM/COUNT MERGE. Strictly minimal delta; only v0 (single base-table DISTINCT, single SUM aggregate). Multi-source DISTINCT demotes to `GROUP_RECOMPUTE`. |
 | `LATERAL` / correlated subquery shapes represented as `DELIM_JOIN` / `DEPENDENT_JOIN` | Affected-key `GROUP_RECOMPUTE`: visible correlated output columns are used as recompute keys, then only those keys are deleted/reinserted from the view query. This supports correlated aggregate lateral shapes and scalar correlated subqueries planned as `SINGLE` `DELIM_JOIN`. It is correct and incremental, but less precise than a fully algebraic correlated delta. |
 | Window functions (`ROW_NUMBER`, `RANK`, `NTILE`, `LAG`, `LEAD`, …) on a single table | Partition-recompute: only partitions with delta rows are re-evaluated. See [operators/window-functions.md](operators/window-functions.md). **Caveat**: NTILE / RANK / ROW_NUMBER with ties on the `ORDER BY` key are inherently non-deterministic — multiple recomputes of the same data may legitimately produce different bucket / rank assignments. |
-| Window functions over JOINs | Full recompute (partition columns may come from a joined table whose delta doesn't carry them, so we can't identify affected partitions). |
+| Window functions over JOINs | Partition recompute when affected partition values can be derived from source lineage; otherwise full recompute. |
 | `LEFT JOIN` / `RIGHT JOIN` aggregates | Incremental MERGE for supported aggregate shapes when `openivm_left_join_merge=true`; group-recompute fallback for shapes where NULL-padding does not compose with delta MERGE. See [operators/left-join.md](operators/left-join.md). |
 | `FULL OUTER JOIN` projection views | Bidirectional key-based partial recompute (Zhang & Larson). |
 | `FULL OUTER JOIN` aggregate views | MERGE plus targeted recompute for unmatched changes when `openivm_full_outer_merge=true`; group-recompute fallback is available when the setting is disabled or the aggregate shape is unsafe. |
@@ -81,31 +81,31 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 | `BOOL_AND`, `BOOL_OR` | Yes (via group-recompute) | BOOLEAN is a non-summable type; detected in `CompileAggregateGroups` and routed to group-recompute. Z-set correct: `BOOL_AND` = `false_count = 0`, `BOOL_OR` = `true_count > 0`. |
 | `AGG(...) FILTER (WHERE p)` | Yes | Rewritten by `RewriteAggregateFilters` to `AGG(CASE WHEN p THEN arg END)` before plan analysis. All COUNT/SUM/AVG/MIN/MAX/STDDEV variants work; group-recompute is used when the rewritten aggregate makes the column non-summable. |
 | `LIST`, `LIST(x ORDER BY y)` | Yes | Numeric fixed-shape list-valued outputs can use element-wise list arithmetic. `LIST(...) FILTER` and non-summable list shapes use affected-group recompute so DuckDB's NULL-element semantics are preserved. |
-| Any visible MV column with a non-summable type (VARCHAR literal, UPPER(group_col), CASE over aggregate, BOOLEAN predicate on aggregate, LIST) | Yes (via group-recompute) | The delta `sum(case mult=false then -col else col end)` formula can't type-check for these columns; detected in `CompileAggregateGroups` via the delta-view column types and routed to group-recompute. Unified path with `LIST` and `MIN`/`MAX` above. |
+| Any visible MV column with a non-summable type (VARCHAR literal, UPPER(group_col), CASE over aggregate, BOOLEAN predicate on aggregate, LIST) | Yes (via group-recompute) | The delta `SUM(openivm_multiplicity * col)` formula can't type-check for these columns; detected in `CompileAggregateGroups` via the delta-view column types and routed to group-recompute. Unified path with `LIST` and `MIN`/`MAX` above. |
 | `HAVING` | Partial | Group-recompute for affected groups; `openivm_having_merge=true` (default) uses the MERGE path when the stored data table holds all groups. |
 
 ## Other limitations
 
-- **DROP MATERIALIZED VIEW** is not fully implemented. Dropping the view via `DROP VIEW`
-  removes the view but leaves behind the data table, delta tables, and metadata entries.
-  Use `DROP TABLE` on the data table and delta tables manually, and clean up
-  `openivm_delta_tables` and `openivm_views`.
+- **DROP MATERIALIZED VIEW syntax** is not supported because DuckDB's parser intercepts
+  it before the extension can rewrite it. Use `DROP VIEW <mv_name>` instead. OpenIVM
+  cleans the user-facing view, data table, MV delta table, base delta tables that are no
+  longer shared, and metadata rows.
 
 - **Schema evolution** is supported for `ADD COLUMN`, `DROP COLUMN`, and `RENAME COLUMN`
-  on base tables. `ALTER COLUMN TYPE` is not handled. Dropping or renaming a column
-  referenced by an MV is blocked with an error.
+  on base tables. `ALTER COLUMN TYPE` is not handled. Dropping a referenced column is
+  blocked with an error. Renaming a referenced column rewrites stored MV SQL and refresh
+  metadata, including supported aux-state and lineage metadata.
 
 - **Transaction isolation during refresh** uses a separate Connection with snapshot
   isolation. Concurrent DML during refresh does not affect the in-progress refresh, but
   the interaction has not been exhaustively audited.
 
-- **Window functions over DuckLake with non-output partition keys or multi-table inputs**
-  fall back to full recompute (`DELETE FROM data; INSERT INTO data SELECT * FROM view_query`).
-  Partition-level recompute (delete + re-insert only affected partitions via DuckLake
-  snapshot-diff) is used when all partition columns appear in the MV's output and there
-  is a single base table. When the PARTITION BY column is dropped by the outer SELECT
-  (e.g. `WITH cte AS (… PARTITION BY a, b, c …) SELECT a, c, … FROM cte` where `b` is
-  projected out), the outer `WHERE <b> IN (…)` can't resolve the column, so we can't
-  identify affected rows in the data table. Similarly for `UNION ALL` / multi-base-table
-  windows. A proper incremental fix requires rewriting the view query to push the
-  partition filter into the base scan; not yet implemented.
+- **Window functions over DuckLake with non-output partition keys or unsupported lineage
+  shapes** fall back to full recompute (`DELETE FROM data; INSERT INTO data SELECT * FROM
+  view_query`). Partition-level recompute is used when changed partition values can be
+  derived from DuckLake snapshot diffs and lineage metadata. When the PARTITION BY column
+  is dropped by the outer SELECT (e.g. `WITH cte AS (… PARTITION BY a, b, c …) SELECT a,
+  c, … FROM cte` where `b` is projected out), the outer `WHERE <b> IN (…)` can't resolve
+  the column, so OpenIVM can't identify affected rows in the data table. A proper
+  incremental fix requires rewriting the view query to push the partition filter into the
+  base scan; not yet implemented.
