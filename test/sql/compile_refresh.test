@@ -103,14 +103,6 @@ SELECT total FROM mv_region WHERE region = 'south';
 42
 
 # ==========================================
-# Test 5: openivm_target_dialect='spark' is a valid setting and the lpts
-# SPARK pipeline runs without error. Specific identifier-quoting / function
-# remap correctness is verified end-to-end in spark-ext integration tests
-# (lpts is only exercised in some refresh paths — projection / window /
-# semi-anti — so we don't pin a regex on a single MV shape here).
-# ==========================================
-
-# ==========================================
 # Test 5: openivm_target_dialect — the setting is accepted and the
 # compile path runs cleanly. Specific identifier-quoting / function
 # remap correctness is verified end-to-end in spark-ext integration tests
