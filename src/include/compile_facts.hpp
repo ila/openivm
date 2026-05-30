@@ -95,6 +95,22 @@ private:
 	bool installed;
 };
 
+// Forward declarations for the table function implementation. These mirror
+// the existing `compile_refresh` PRAGMA but emit one row per top-level SQL
+// statement so consumers don't have to split on `;` themselves.
+struct TableFunctionBindInput;
+struct TableFunctionInitInput;
+struct TableFunctionInput;
+class DataChunk;
+class LogicalType;
+class FunctionData;
+class GlobalTableFunctionState;
+
+unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                     vector<LogicalType> &return_types, vector<string> &names);
+unique_ptr<GlobalTableFunctionState> OpenIvmCompileWithFactsInit(ClientContext &context, TableFunctionInitInput &input);
+void OpenIvmCompileWithFactsExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output);
+
 } // namespace openivm
 } // namespace duckdb
 

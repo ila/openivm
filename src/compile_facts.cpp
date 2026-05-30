@@ -1,7 +1,15 @@
 #include "compile_facts.hpp"
 
+#include "core/openivm_constants.hpp"
+#include "core/refresh_metadata.hpp"
+#include "core/sql_utils.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/connection.hpp"
+#include "upsert/refresh_internal.hpp"
 
 #include <cctype>
 #include <cstdlib>
@@ -437,6 +445,159 @@ CompileFacts CompileFactsContextSlot::Get(ClientContext &ctx) {
 		return CompileFacts::Default();
 	}
 	return *state->facts;
+}
+
+//------------------------------------------------------------------------------
+// openivm_compile_with_facts(view_name VARCHAR, facts_json VARCHAR) table function
+//
+// Schema: (refresh_type INTEGER, refresh_type_name VARCHAR,
+//          stmt_order INTEGER, stmt_kind VARCHAR, sql VARCHAR)
+//
+// The bind step parses the JSON into a `CompileFacts`, installs it onto
+// `ClientContext::registered_state` via `CompileFactsContextSlot`, then
+// invokes `GenerateRefreshSQL`. The resulting SQL is split into logical
+// buckets (meta_pre / companion / data / cleanup / meta_post) and each
+// top-level statement becomes its own output row. The slot is removed
+// before bind returns so optimizer rules in later refresh calls don't see
+// stale facts.
+//
+// The actual row-per-statement splitting is added in a later commit; this
+// commit emits a single concatenated SQL row to keep the diff manageable.
+//------------------------------------------------------------------------------
+
+namespace {
+
+struct CompileWithFactsBindData : public TableFunctionData {
+	int32_t refresh_type_int = 0;
+	string refresh_type_name;
+	vector<string> stmt_kinds;
+	vector<string> stmt_sqls;
+};
+
+struct CompileWithFactsGlobalState : public GlobalTableFunctionState {
+	idx_t offset = 0;
+};
+
+// Splits a SQL fragment on top-level `;` boundaries (ignoring `;` inside
+// quoted strings) and pushes each non-empty trimmed statement, tagged
+// with `kind`, into the bind result.
+static void PushBucket(CompileWithFactsBindData &bd, const string &kind, const string &sql_block) {
+	if (sql_block.empty()) {
+		return;
+	}
+	string current;
+	current.reserve(sql_block.size());
+	char in_quote = 0; // either 0, '\'', or '"'
+	for (size_t i = 0; i < sql_block.size(); i++) {
+		char c = sql_block[i];
+		if (in_quote) {
+			current += c;
+			if (c == in_quote) {
+				in_quote = 0;
+			} else if (c == '\\' && i + 1 < sql_block.size()) {
+				current += sql_block[++i];
+			}
+			continue;
+		}
+		if (c == '\'' || c == '"') {
+			in_quote = c;
+			current += c;
+			continue;
+		}
+		if (c == ';') {
+			string trimmed = StringUtil::Trim(current);
+			if (!trimmed.empty()) {
+				bd.stmt_kinds.push_back(kind);
+				bd.stmt_sqls.push_back(trimmed + ";");
+			}
+			current.clear();
+		} else {
+			current += c;
+		}
+	}
+	string tail = StringUtil::Trim(current);
+	if (!tail.empty()) {
+		bd.stmt_kinds.push_back(kind);
+		bd.stmt_sqls.push_back(tail + ";");
+	}
+}
+
+} // namespace
+
+unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                     vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs.size() < 2) {
+		throw InvalidInputException(
+		    "openivm_compile_with_facts(view_name, facts_json) requires exactly two arguments");
+	}
+	string view_name = StringValue::Get(input.inputs[0]);
+	string facts_json = StringValue::Get(input.inputs[1]);
+
+	if (view_name.find('.') != string::npos) {
+		throw InvalidInputException(
+		    "openivm_compile_with_facts: cannot resolve qualified view_name '%s'; pass unqualified short name only",
+		    view_name.c_str());
+	}
+
+	auto facts_owned = make_shared_ptr<CompileFacts>(ParseFactsJson(facts_json));
+
+	Connection con(*context.db.get());
+	auto resolved = ResolveViewCatalogFromContext(context, con, view_name, /*throw_if_not_found=*/true);
+	RefreshMetadata metadata(con);
+	RefreshType type = metadata.GetViewType(view_name);
+
+	string sql;
+	string out_pre_meta;
+	string out_post_meta;
+	{
+		CompileFactsContextSlot slot(context, facts_owned);
+		sql = GenerateRefreshSQL(context, resolved.view_catalog_name, resolved.view_schema_name, view_name,
+		                         resolved.cross_system, "", "", resolved.cross_system ? &out_pre_meta : nullptr,
+		                         resolved.cross_system ? &out_post_meta : nullptr);
+	}
+
+	auto result = make_uniq<CompileWithFactsBindData>();
+	result->refresh_type_int = static_cast<int32_t>(type);
+	result->refresh_type_name = string(RefreshTypeName(type));
+
+	PushBucket(*result, "meta_pre", out_pre_meta);
+	PushBucket(*result, "data", sql);
+	PushBucket(*result, "meta_post", out_post_meta);
+
+	return_types.emplace_back(LogicalType::INTEGER);
+	names.emplace_back("refresh_type");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("refresh_type_name");
+	return_types.emplace_back(LogicalType::INTEGER);
+	names.emplace_back("stmt_order");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("stmt_kind");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("sql");
+
+	return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> OpenIvmCompileWithFactsInit(ClientContext &context, TableFunctionInitInput &input) {
+	return make_uniq<CompileWithFactsGlobalState>();
+}
+
+void OpenIvmCompileWithFactsExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bd = data_p.bind_data->Cast<CompileWithFactsBindData>();
+	auto &state = data_p.global_state->Cast<CompileWithFactsGlobalState>();
+
+	idx_t total = bd.stmt_sqls.size();
+	idx_t emitted = 0;
+	while (state.offset < total && emitted < STANDARD_VECTOR_SIZE) {
+		output.SetValue(0, emitted, Value::INTEGER(bd.refresh_type_int));
+		output.SetValue(1, emitted, Value(bd.refresh_type_name));
+		output.SetValue(2, emitted, Value::INTEGER(static_cast<int32_t>(state.offset)));
+		output.SetValue(3, emitted, Value(bd.stmt_kinds[state.offset]));
+		output.SetValue(4, emitted, Value(bd.stmt_sqls[state.offset]));
+		state.offset++;
+		emitted++;
+	}
+	output.SetCardinality(emitted);
 }
 
 } // namespace openivm

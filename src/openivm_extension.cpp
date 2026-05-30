@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "core/openivm_extension.hpp"
+#include "compile_facts.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_daemon.hpp"
@@ -352,6 +353,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 	compute_delta_function.named_parameters["view_name"];
 	CreateTableFunctionInfo compute_delta_function_info(compute_delta_function);
 	catalog.CreateTableFunction(*con.context, &compute_delta_function_info);
+
+	// openivm_compile_with_facts(view_name VARCHAR, facts_json VARCHAR)
+	//   → (refresh_type INTEGER, refresh_type_name VARCHAR, stmt_order INTEGER,
+	//      stmt_kind VARCHAR, sql VARCHAR)
+	//
+	// Per-call compile-only entry point. Replaces the legacy `compile_refresh`
+	// PRAGMA + the three process-wide PRAGMAs (openivm_compile_only,
+	// openivm_target_dialect, openivm_force_view_delta_cascade). Every knob is
+	// passed via the JSON facts blob; see B1-facts-schema.md.
+	TableFunction openivm_compile_with_facts_function(
+	    "openivm_compile_with_facts", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	    openivm::OpenIvmCompileWithFactsExecute, openivm::OpenIvmCompileWithFactsBind,
+	    openivm::OpenIvmCompileWithFactsInit);
+	CreateTableFunctionInfo openivm_compile_with_facts_info(openivm_compile_with_facts_function);
+	catalog.CreateTableFunction(*con.context, &openivm_compile_with_facts_info);
+
 	con.Commit();
 
 	// Use the locked pragma_function_t variant: generates SQL and executes it under a
