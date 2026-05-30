@@ -1,14 +1,11 @@
 # name: test/sql/cascade_group_recompute_delta.test
-# description: GROUP_RECOMPUTE emits signed cascade deltas when pragma-enabled
+# description: GROUP_RECOMPUTE emits signed cascade deltas when facts.force_view_delta_cascade=true
 # group: [sql]
 
 require openivm
 
 statement ok
 SET openivm_files_path='__TEST_DIR__';
-
-statement ok
-SET openivm_emit_cascade_delta_for_recompute=false;
 
 statement ok
 CREATE TABLE cgr_items (id INT, warehouse INT, district INT, item INT, amount INT);
@@ -30,18 +27,82 @@ CREATE MATERIALIZED VIEW cgr_mv AS
     FROM cgr_items
     GROUP BY warehouse, district;
 
-query ITT
-PRAGMA compile_refresh('cgr_mv');
-----
-6	GROUP_RECOMPUTE	<REGEX>:.*CREATE OR REPLACE TEMP TABLE openivm_affected_cgr_mv AS.*DELETE FROM .*openivm_data_cgr_mv.*INSERT INTO .*openivm_data_cgr_mv.*DROP TABLE IF EXISTS openivm_affected_cgr_mv.*
+# ==========================================
+# Compile-only: force_view_delta_cascade=false should emit the
+# in-place GROUP_RECOMPUTE program (affected temp + DELETE/INSERT on data)
+# with no signed-cascade INSERT into openivm_delta_cgr_mv.
+# ==========================================
 
-statement ok
-SET openivm_emit_cascade_delta_for_recompute=true;
-
-query ITT
-PRAGMA compile_refresh('cgr_mv');
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'cgr_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+LIMIT 1;
 ----
-6	GROUP_RECOMPUTE	<REGEX>:.*CREATE OR REPLACE TEMP TABLE openivm_old_cgr_mv AS.*CREATE OR REPLACE TEMP TABLE openivm_new_cgr_mv AS.*INSERT INTO openivm_delta_cgr_mv.*CAST.*-1.*INTEGER.*CURRENT_TIMESTAMP.*UNION ALL.*CAST.*1.*INTEGER.*CURRENT_TIMESTAMP.*DROP TABLE IF EXISTS openivm_affected_cgr_mv.*DROP TABLE IF EXISTS openivm_old_cgr_mv.*DROP TABLE IF EXISTS openivm_new_cgr_mv.*
+6	GROUP_RECOMPUTE
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_affected_cgr_mv AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data_cgr_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_cgr_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_affected_cgr_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO openivm_delta_cgr_mv%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cgr_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================
+# Compile-only: force_view_delta_cascade=true must emit the
+# old/new temp tables and a signed INSERT into openivm_delta_cgr_mv with
+# both -1 and +1 multiplicity legs.
+# ==========================================
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'cgr_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+6	GROUP_RECOMPUTE
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_cgr_mv AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_cgr_mv AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cgr_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_affected_cgr_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old_cgr_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new_cgr_mv%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cgr_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================
+# Runtime correctness: PRAGMA refresh uses default CompileFacts (no cascade),
+# but still applies the GROUP_RECOMPUTE program to openivm_data_cgr_mv so the
+# user-visible MV stays bidirectionally consistent with the base query.
+# The signed-delta emission into openivm_delta_cgr_mv requires
+# force_view_delta_cascade=true and is covered by spark-ext integration
+# tests that drive the compile_with_facts surface end-to-end.
+# ==========================================
 
 statement ok
 INSERT INTO cgr_items VALUES (6, 1, 1, 50, 4);
@@ -49,13 +110,6 @@ INSERT INTO cgr_items VALUES (6, 1, 1, 50, 4);
 statement ok
 PRAGMA refresh('cgr_mv');
 
-query IIIIII rowsort
-SELECT warehouse, district, unique_items, total_lines, total_amount, openivm_multiplicity
-FROM openivm_delta_cgr_mv;
-----
-1	1	2	3	10	-1
-1	1	3	4	14	1
-
 query I
 SELECT COUNT(*) FROM (
     SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data_cgr_mv
@@ -76,23 +130,12 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-statement ok
-DELETE FROM openivm_delta_cgr_mv;
-
-# No-op recompute: the producer must still emit both -1 and +1 rows.
 statement ok
 UPDATE cgr_items SET amount = 4 WHERE id = 6;
 
 statement ok
 PRAGMA refresh('cgr_mv');
 
-query IIIIII rowsort
-SELECT warehouse, district, unique_items, total_lines, total_amount, openivm_multiplicity
-FROM openivm_delta_cgr_mv;
-----
-1	1	3	4	14	-1
-1	1	3	4	14	1
-
 query I
 SELECT COUNT(*) FROM (
     SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data_cgr_mv
@@ -112,58 +155,12 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
-
-statement ok
-DELETE FROM openivm_delta_cgr_mv;
-
-statement ok
-UPDATE cgr_items SET amount = 7 WHERE id = 6;
-
-statement ok
-PRAGMA refresh('cgr_mv');
-
-query IIIIII rowsort
-SELECT warehouse, district, unique_items, total_lines, total_amount, openivm_multiplicity
-FROM openivm_delta_cgr_mv;
-----
-1	1	3	4	14	-1
-1	1	3	4	17	1
-
-query I
-SELECT COUNT(*) FROM (
-    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data_cgr_mv
-    EXCEPT ALL
-    SELECT warehouse, district, COUNT(DISTINCT item), COUNT(*), SUM(amount)
-    FROM cgr_items GROUP BY warehouse, district
-);
-----
-0
-
-query I
-SELECT COUNT(*) FROM (
-    SELECT warehouse, district, COUNT(DISTINCT item), COUNT(*), SUM(amount)
-    FROM cgr_items GROUP BY warehouse, district
-    EXCEPT ALL
-    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data_cgr_mv
-);
-----
-0
-
-statement ok
-DELETE FROM openivm_delta_cgr_mv;
 
 statement ok
 DELETE FROM cgr_items WHERE id = 2;
 
 statement ok
 PRAGMA refresh('cgr_mv');
-
-query IIIIII rowsort
-SELECT warehouse, district, unique_items, total_lines, total_amount, openivm_multiplicity
-FROM openivm_delta_cgr_mv;
-----
-1	1	2	3	14	1
-1	1	3	4	17	-1
 
 query I
 SELECT COUNT(*) FROM (
