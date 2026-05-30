@@ -1,5 +1,5 @@
 # name: test/sql/compile_refresh.test
-# description: PRAGMA compile_refresh — compile-only refresh path (openivm-spark integration).
+# description: openivm_compile_with_facts — compile-only refresh path (openivm-spark integration).
 # group: [sql]
 
 require openivm
@@ -22,7 +22,7 @@ CREATE MATERIALIZED VIEW mv_region AS
     SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales GROUP BY region;
 
 # Snapshot the MV state before the compile call so we can prove it is
-# untouched by `PRAGMA compile_refresh` afterwards.
+# untouched by `openivm_compile_with_facts` afterwards.
 statement ok
 CREATE TABLE mv_region_before AS SELECT * FROM mv_region;
 
@@ -34,16 +34,24 @@ statement ok
 DELETE FROM sales WHERE region = 'west';
 
 # ==========================================
-# Test 1: compile_refresh succeeds (returns rows of refresh_type, refresh_type_name, sql)
+# Test 1: openivm_compile_with_facts succeeds and emits at least one
+# data-bucket row carrying the upsert SQL for the AGGREGATE_GROUP view.
 # ==========================================
 
 query ITT
-PRAGMA compile_refresh('mv_region');
+SELECT refresh_type, refresh_type_name, sql
+FROM openivm_compile_with_facts(
+    'mv_region',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data' AND sql LIKE '%openivm_delta_mv_region%'
+ORDER BY stmt_order
+LIMIT 1;
 ----
 0	AGGREGATE_GROUP	<REGEX>:.*INSERT INTO.*openivm_delta_mv_region.*
 
 # ==========================================
-# Test 2: compile_refresh did NOT mutate the materialized view
+# Test 2: openivm_compile_with_facts did NOT mutate the materialized view
 # ==========================================
 
 query I
@@ -59,8 +67,8 @@ SELECT total FROM mv_region WHERE region = 'east';
 100
 
 # ==========================================
-# Test 3: PRAGMA refresh still works after compile_refresh
-# (i.e. compile_refresh did not leak openivm_compile_only=true)
+# Test 3: PRAGMA refresh still works after the table-function compile call
+# (i.e. the per-call CompileFacts slot did not leak state into PRAGMA refresh)
 # ==========================================
 
 statement ok
@@ -73,64 +81,36 @@ east	150	2
 north	75	1
 
 # ==========================================
-# Test 4: PRAGMA refresh respects openivm_compile_only globally
+# Test 4: target_dialect='spark' — the facts.target_dialect override
+# is accepted and the compile path runs cleanly. Specific identifier-quoting /
+# function remap correctness is verified end-to-end in spark-ext integration tests
+# (the AGGREGATE_GROUP refresh assembly happens outside lpts for this view shape;
+# lpts is exercised on SIMPLE_PROJECTION / SEMI_ANTI / WINDOW shapes).
 # ==========================================
-
-statement ok
-INSERT INTO sales VALUES ('south', 42);
-
-statement ok
-SET openivm_compile_only=true;
-
-statement ok
-PRAGMA refresh('mv_region');
-
-# The 'south' row was NOT applied — the refresh was a no-op for execution.
-query I
-SELECT count(*) FROM mv_region WHERE region = 'south';
-----
-0
-
-statement ok
-SET openivm_compile_only=false;
-
-statement ok
-PRAGMA refresh('mv_region');
-
-query I
-SELECT total FROM mv_region WHERE region = 'south';
-----
-42
-
-# ==========================================
-# Test 5: openivm_target_dialect — the setting is accepted and the
-# compile path runs cleanly. Specific identifier-quoting / function
-# remap correctness is verified end-to-end in spark-ext integration tests
-# (the AGGREGATE_GROUP refresh assembly happens outside lpts for this view
-# shape; lpts is exercised on SIMPLE_PROJECTION / SEMI_ANTI / WINDOW shapes).
-# ==========================================
-
-statement ok
-SET openivm_target_dialect='spark';
 
 statement ok
 INSERT INTO sales VALUES ('mid', 11);
 
 statement ok
-PRAGMA compile_refresh('mv_region');
+SELECT count(*) FROM openivm_compile_with_facts(
+    'mv_region',
+    '{"target_dialect":"spark","compile_only":true}'
+);
 
 statement ok
-SET openivm_target_dialect='duckdb';
-
-statement ok
-PRAGMA compile_refresh('mv_region');
+SELECT count(*) FROM openivm_compile_with_facts(
+    'mv_region',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
 
 # ==========================================
-# Test 6: compile_refresh on a non-existent view fails cleanly
+# Test 5: openivm_compile_with_facts on a non-existent view fails cleanly
 # ==========================================
 
 statement error
-PRAGMA compile_refresh('does_not_exist');
+SELECT * FROM openivm_compile_with_facts(
+    'does_not_exist',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
 ----
 materialized view 'does_not_exist' not found
-
