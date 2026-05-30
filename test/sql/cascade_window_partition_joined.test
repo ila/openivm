@@ -1,14 +1,11 @@
 # name: test/sql/cascade_window_partition_joined.test
-# description: Joined WINDOW_PARTITION emits signed cascade deltas when pragma-enabled
+# description: Joined WINDOW_PARTITION emits signed cascade deltas when facts.force_view_delta_cascade=true
 # group: [sql]
 
 require openivm
 
 statement ok
 SET openivm_files_path='__TEST_DIR__';
-
-statement ok
-SET openivm_emit_cascade_delta_for_recompute=false;
 
 statement ok
 CREATE TABLE cwj_customer (id INT, grp VARCHAR, tax_id INT, action_ts INT);
@@ -42,32 +39,87 @@ CREATE MATERIALIZED VIEW cwj_mv AS
     LEFT JOIN cwj_tax t
       ON c.tax_id = t.tx_id;
 
-query ITT
-PRAGMA compile_refresh('cwj_mv');
-----
-5	WINDOW_PARTITION	<REGEX>:.*CREATE OR REPLACE TEMP TABLE openivm_affected_cwj_mv AS.*DELETE FROM .*openivm_data_cwj_mv.*INSERT INTO .*openivm_data_cwj_mv.*DELETE FROM openivm_delta_cwj_mv.*
+# ==========================================
+# Compile-only: force_view_delta_cascade=false should emit the
+# in-place WINDOW_PARTITION program with no signed-cascade INSERT
+# into openivm_delta_cwj_mv.
+# ==========================================
 
-statement ok
-SET openivm_emit_cascade_delta_for_recompute=true;
-
-query ITT
-PRAGMA compile_refresh('cwj_mv');
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'cwj_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+LIMIT 1;
 ----
-5	WINDOW_PARTITION	<REGEX>:.*CREATE OR REPLACE TEMP TABLE openivm_affected_cwj_mv AS.*CREATE OR REPLACE TEMP TABLE openivm_old_cwj_mv AS.*CREATE OR REPLACE TEMP TABLE openivm_new_cwj_mv AS.*INSERT INTO openivm_delta_cwj_mv.*CAST.*-1.*INTEGER.*CURRENT_TIMESTAMP.*UNION ALL.*CAST.*1.*INTEGER.*CURRENT_TIMESTAMP.*DROP TABLE IF EXISTS openivm_affected_cwj_mv.*DROP TABLE IF EXISTS openivm_old_cwj_mv.*DROP TABLE IF EXISTS openivm_new_cwj_mv.*
+5	WINDOW_PARTITION
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_affected_cwj_mv AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data_cwj_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_cwj_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM openivm_delta_cwj_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO openivm_delta_cwj_mv%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cwj_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================
+# Compile-only: force_view_delta_cascade=true must emit affected/old/new
+# temp tables and a signed INSERT INTO openivm_delta_cwj_mv with both legs.
+# ==========================================
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'cwj_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+5	WINDOW_PARTITION
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_affected_cwj_mv AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_cwj_mv AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_cwj_mv AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cwj_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_affected_cwj_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old_cwj_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new_cwj_mv%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cwj_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================
+# Runtime correctness: PRAGMA refresh uses default CompileFacts (cascade
+# off), but still applies the in-place WINDOW_PARTITION program to
+# openivm_data_cwj_mv so the view stays consistent with the base
+# LEFT JOIN + ROW_NUMBER query. End-to-end signed cascade emission is
+# covered by spark-ext integration tests.
+# ==========================================
 
 statement ok
 UPDATE cwj_tax SET rate = 7 WHERE tx_id = 10;
 
 statement ok
 PRAGMA refresh('cwj_mv');
-
-query ITIIII rowsort
-SELECT id, grp, tax_id, rate, rn, openivm_multiplicity FROM openivm_delta_cwj_mv;
-----
-1	a	10	1	2	-1
-1	a	10	7	1	1
-2	a	20	5	1	-1
-2	a	20	5	2	1
 
 query I
 SELECT COUNT(*) FROM (
