@@ -102,10 +102,10 @@ private:
 // The signatures intentionally use the duckdb:: types directly (no forward
 // decls in this namespace — otherwise the C++ name-lookup picks
 // `duckdb::openivm::TableFunctionInput` first and shadows the real type).
-unique_ptr<duckdb::FunctionData>
-OpenIvmCompileWithFactsBind(duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
-                            duckdb::vector<duckdb::LogicalType> &return_types,
-                            duckdb::vector<duckdb::string> &names);
+unique_ptr<duckdb::FunctionData> OpenIvmCompileWithFactsBind(duckdb::ClientContext &context,
+                                                             duckdb::TableFunctionBindInput &input,
+                                                             duckdb::vector<duckdb::LogicalType> &return_types,
+                                                             duckdb::vector<duckdb::string> &names);
 unique_ptr<duckdb::GlobalTableFunctionState> OpenIvmCompileWithFactsInit(duckdb::ClientContext &context,
                                                                          duckdb::TableFunctionInitInput &input);
 void OpenIvmCompileWithFactsExecute(duckdb::ClientContext &context, duckdb::TableFunctionInput &data_p,

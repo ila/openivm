@@ -529,8 +529,7 @@ static void PushBucket(CompileWithFactsBindData &bd, const string &kind, const s
 unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, TableFunctionBindInput &input,
                                                      vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs.size() < 2) {
-		throw InvalidInputException(
-		    "openivm_compile_with_facts(view_name, facts_json) requires exactly two arguments");
+		throw InvalidInputException("openivm_compile_with_facts(view_name, facts_json) requires exactly two arguments");
 	}
 	string view_name = StringValue::Get(input.inputs[0]);
 	string facts_json = StringValue::Get(input.inputs[1]);
@@ -582,7 +581,8 @@ unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, Tab
 	return std::move(result);
 }
 
-unique_ptr<GlobalTableFunctionState> OpenIvmCompileWithFactsInit(ClientContext &context, TableFunctionInitInput &input) {
+unique_ptr<GlobalTableFunctionState> OpenIvmCompileWithFactsInit(ClientContext &context,
+                                                                 TableFunctionInitInput &input) {
 	return make_uniq<CompileWithFactsGlobalState>();
 }
 

@@ -260,8 +260,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	//   3. A default-constructed CompileFacts (compile_only=false,
 	//      target_dialect=DUCKDB, no downstreams). This preserves native
 	//      PRAGMA refresh behaviour for callers that never construct a slot.
-	openivm::CompileFacts active_facts =
-	    facts_in ? *facts_in : openivm::CompileFactsContextSlot::Get(context);
+	openivm::CompileFacts active_facts = facts_in ? *facts_in : openivm::CompileFactsContextSlot::Get(context);
 	auto profile_now = []() {
 		return std::chrono::steady_clock::now();
 	};
@@ -491,10 +490,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	OPENIVM_DEBUG_PRINT("[UPSERT] has_left_join=%d has_full_outer=%d\n", has_left_join, has_full_outer);
 
 	auto fast_path_start = profile_now();
-	auto fast_paths =
-	    ResolveDeltaFastPathFlags(context, metadata, con, view_name, view_query_sql, delta_table_names,
-	                              view_catalog_name, view_schema_name, attached_db_catalog_name,
-	                              attached_db_schema_name, cross_system, precomputed_delta_activity, &active_facts);
+	auto fast_paths = ResolveDeltaFastPathFlags(
+	    context, metadata, con, view_name, view_query_sql, delta_table_names, view_catalog_name, view_schema_name,
+	    attached_db_catalog_name, attached_db_schema_name, cross_system, precomputed_delta_activity, &active_facts);
 	add_profile_step("generate_refresh_sql.delta_fast_paths", fast_path_start,
 	                 "insert_only=" + string(fast_paths.insert_only ? "true" : "false") +
 	                     "; skip_agg_delete=" + string(fast_paths.skip_agg_delete ? "true" : "false") +

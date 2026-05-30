@@ -458,8 +458,8 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		view_schema_name = resolved.view_schema_name;
 		view_name = StringValue::Get(parameters.values[0]);
 		cross_system = resolved.cross_system;
-		OPENIVM_DEBUG_PRINT("[UPSERT] Resolved catalog='%s', schema='%s', cross_system=%d\n",
-		                    view_catalog_name.c_str(), view_schema_name.c_str(), cross_system ? 1 : 0);
+		OPENIVM_DEBUG_PRINT("[UPSERT] Resolved catalog='%s', schema='%s', cross_system=%d\n", view_catalog_name.c_str(),
+		                    view_schema_name.c_str(), cross_system ? 1 : 0);
 	}
 
 	// cross_system detection: the view's catalog differs from the fresh connection's physical
@@ -553,6 +553,5 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		}
 	}
 }
-
 
 } // namespace duckdb
