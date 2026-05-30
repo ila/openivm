@@ -1,2 +1,2 @@
--- {"operators": "PIVOT,AGGREGATE,UNNEST,TABLE_FUNCTION", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK", "non_incr_reason": "op:PIVOT"}
+-- {"operators": "PIVOT,AGGREGATE,UNNEST,TABLE_FUNCTION", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK"}
 SELECT * FROM (PIVOT (SELECT s.S_W_ID, s.S_I_ID, u.metric_value FROM STOCK s CROSS JOIN UNNEST([s.S_QUANTITY, s.S_ORDER_CNT, s.S_REMOTE_CNT]) AS u(metric_value)) ON S_W_ID IN (1, 2, 3) USING SUM(metric_value) GROUP BY S_I_ID) p;
