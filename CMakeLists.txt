@@ -12,6 +12,7 @@ include_directories(src/include ${LPTS_DIR}/src/include ${LPTS_DIR}/third_party/
 
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
+    src/compile_facts.cpp
     src/core/parser.cpp
     src/core/parser_create_mv_helpers.cpp
     src/core/parser_ddl.cpp
