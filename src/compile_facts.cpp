@@ -553,7 +553,9 @@ unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, Tab
 		CompileFactsContextSlot slot(context, facts_owned);
 		sql = GenerateRefreshSQL(context, resolved.view_catalog_name, resolved.view_schema_name, view_name,
 		                         resolved.cross_system, "", "", resolved.cross_system ? &out_pre_meta : nullptr,
-		                         resolved.cross_system ? &out_post_meta : nullptr);
+		                         resolved.cross_system ? &out_post_meta : nullptr,
+		                         /*compile_profile=*/nullptr, /*precomputed_delta_activity=*/nullptr,
+		                         /*out_adaptive_estimate=*/nullptr, /*facts=*/facts_owned.get());
 	}
 
 	auto result = make_uniq<CompileWithFactsBindData>();

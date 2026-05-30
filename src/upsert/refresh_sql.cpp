@@ -1,5 +1,6 @@
 #include "upsert/refresh_internal.hpp"
 
+#include "compile_facts.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
@@ -124,9 +125,14 @@ static void CopyOpenIvmSetting(ClientContext &from, ClientContext &to, const str
 }
 
 static void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to) {
+	// openivm_compile_only and openivm_target_dialect have been replaced by
+	// the per-call CompileFacts (see compile_facts.hpp). Only the remaining
+	// session-scoped planning settings still need to be mirrored onto the
+	// fresh planning connection.
 	static const char *PLANNING_SETTINGS[] = {
-	    "openivm_compile_only", "openivm_target_dialect", "openivm_skip_empty_deltas",
-	    "openivm_fk_pruning",   "openivm_ducklake_nterm",
+	    "openivm_skip_empty_deltas",
+	    "openivm_fk_pruning",
+	    "openivm_ducklake_nterm",
 	};
 	for (auto setting_name : PLANNING_SETTINGS) {
 		CopyOpenIvmSetting(from, to, setting_name);
@@ -245,7 +251,17 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta, string *out_post_meta,
                           RefreshCompileProfile *compile_profile, const DeltaActivityResult *precomputed_delta_activity,
-                          RefreshCostEstimate *out_adaptive_estimate) {
+                          RefreshCostEstimate *out_adaptive_estimate, const openivm::CompileFacts *facts_in) {
+	// Resolve the active CompileFacts. Three sources, in priority order:
+	//   1. Explicit `facts_in` (set by direct C++ callers that own a facts
+	//      instance — e.g. the openivm_compile_with_facts table function
+	//      passes its parsed JSON facts here in a future commit).
+	//   2. The ClientContext slot installed by CompileFactsContextSlot.
+	//   3. A default-constructed CompileFacts (compile_only=false,
+	//      target_dialect=DUCKDB, no downstreams). This preserves native
+	//      PRAGMA refresh behaviour for callers that never construct a slot.
+	openivm::CompileFacts active_facts =
+	    facts_in ? *facts_in : openivm::CompileFactsContextSlot::Get(context);
 	auto profile_now = []() {
 		return std::chrono::steady_clock::now();
 	};
@@ -314,15 +330,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
 	RefreshType view_query_type = metadata.GetViewType(view_name);
-	bool emit_cascade_delta_for_recompute = false;
-	{
-		Value emit_cascade_val;
-		if (context.TryGetCurrentSetting(openivm::EMIT_CASCADE_DELTA_FOR_RECOMPUTE, emit_cascade_val) &&
-		    !emit_cascade_val.IsNull() && emit_cascade_val.GetValue<bool>() &&
-		    (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE)) {
-			emit_cascade_delta_for_recompute = true;
-		}
-	}
+	// Was: PRAGMA openivm_emit_cascade_delta_for_recompute. Now folded into
+	// facts.force_view_delta_cascade — the cascade-delta-for-recompute flag
+	// only ever fired on top of force_view_delta_cascade in real use.
+	bool emit_cascade_delta_for_recompute =
+	    active_facts.force_view_delta_cascade &&
+	    (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE);
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
 	auto delta_table_names = metadata.GetDeltaTables(view_name);
@@ -517,15 +530,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string aggregate_recompute_lpts_prefix;
 	const vector<GroupRecomputeDeltaSpec> *aggregate_cascade_specs_ptr = nullptr;
 	{
-		Value force_cascade_val;
-		bool force_view_delta_cascade =
-		    context.TryGetCurrentSetting("openivm_force_view_delta_cascade", force_cascade_val) &&
-		    !force_cascade_val.IsNull() && force_cascade_val.GetValue<bool>();
+		bool force_view_delta_cascade = active_facts.force_view_delta_cascade;
 		bool eligible_refresh_type = (view_query_type == RefreshType::AGGREGATE_GROUP);
 		if (force_view_delta_cascade && eligible_refresh_type && !source_has_full_outer && !group_cols.empty()) {
 			auto active_delta_table_names = fast_paths.active_delta_table_names;
-			bool compile_only_active = SqlUtils::GetBoolSetting(context, "openivm_compile_only", false);
-			if (active_delta_table_names.empty() && compile_only_active) {
+			if (active_delta_table_names.empty() && active_facts.compile_only) {
 				active_delta_table_names = delta_table_names;
 			}
 			if (!active_delta_table_names.empty()) {
@@ -706,7 +715,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::GROUP_RECOMPUTE: {
 		auto group_columns = metadata.GetGroupColumns(view_name);
 		auto active_delta_table_names = fast_paths.active_delta_table_names;
-		bool compile_only_active = SqlUtils::GetBoolSetting(context, "openivm_compile_only", false);
+		bool compile_only_active = active_facts.compile_only;
 		if (active_delta_table_names.empty()) {
 			if (!compile_only_active) {
 				upsert_query = "";
@@ -784,9 +793,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// generate Spark-unparseable SQL. WINDOW_PARTITION / GROUP_RECOMPUTE use the
 	// dedicated pragma below.
 	{
-		Value force_cascade_val;
-		if (context.TryGetCurrentSetting("openivm_force_view_delta_cascade", force_cascade_val) &&
-		    !force_cascade_val.IsNull() && force_cascade_val.GetValue<bool>() &&
+		if (active_facts.force_view_delta_cascade &&
 		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
 			has_downstream = true;
 		}
@@ -940,7 +947,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		} else {
 			try {
 				auto lpts_start = profile_now();
-				SqlDialect dialect = ReadOpenIvmTargetDialect(con_ctx);
+				SqlDialect dialect = active_facts.target_dialect;
 				auto ast = LogicalPlanToAst(con_ctx, plan, dialect);
 				auto cte_list = AstToCteList(*ast, dialect);
 				raw_refresh_sql = cte_list->ToQuery(false);
@@ -990,14 +997,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			//     recreates each delta table fresh per refresh, so the upstream TEMP TABLE scratch
 			//     does not survive across the split. NULLs in non-key columns rely on
 			//     SUM(NULL)=NULL preservation downstream.
-			bool spark_inline_companion = false;
-			{
-				Value force_cascade_val;
-				if (context.TryGetCurrentSetting("openivm_force_view_delta_cascade", force_cascade_val) &&
-				    !force_cascade_val.IsNull() && force_cascade_val.GetValue<bool>()) {
-					spark_inline_companion = true;
-				}
-			}
+			bool spark_inline_companion = active_facts.force_view_delta_cascade;
 
 			if (!spark_inline_companion) {
 				build_affected_snapshot_companion(keys);

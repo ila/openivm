@@ -1,6 +1,7 @@
 #ifndef OPENIVM_REFRESH_INTERNAL_HPP
 #define OPENIVM_REFRESH_INTERNAL_HPP
 
+#include "compile_facts.hpp"
 #include "core/refresh_metadata.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -200,7 +201,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           const string &attached_db_schema_name, string *out_pre_meta = nullptr,
                           string *out_post_meta = nullptr, RefreshCompileProfile *compile_profile = nullptr,
                           const DeltaActivityResult *precomputed_delta_activity = nullptr,
-                          RefreshCostEstimate *out_adaptive_estimate = nullptr);
+                          RefreshCostEstimate *out_adaptive_estimate = nullptr,
+                          const openivm::CompileFacts *facts = nullptr);
 
 } // namespace duckdb
 
