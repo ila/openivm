@@ -173,59 +173,6 @@ static bool IsSemiJoinOnRowId(LogicalComparisonJoin &join) {
 	return false;
 }
 
-static bool PlanReferencesColumn(LogicalOperator &op, const string &table_name, const string &col_name) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op.Cast<LogicalGet>();
-		auto tbl = get.GetTable();
-		if (tbl.get() && tbl->name == table_name) {
-			for (auto &cid : get.GetColumnIds()) {
-				if (get.GetColumnName(cid) == col_name) {
-					return true;
-				}
-			}
-		}
-	}
-	for (auto &child : op.children) {
-		if (PlanReferencesColumn(*child, table_name, col_name)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static string FindMVReferencingColumn(Connection &con, const string &delta_name, const string &table_name,
-                                      const string &col_name) {
-	RefreshMetadata metadata(con);
-	auto mvs = con.Query("SELECT DISTINCT d.view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	                     " d WHERE d.table_name = '" + SqlUtils::EscapeValue(delta_name) + "'");
-	if (mvs->HasError()) {
-		return "";
-	}
-	for (size_t i = 0; i < mvs->RowCount(); i++) {
-		string view_name = mvs->GetValue(0, i).ToString();
-		string sql = metadata.GetViewQuery(view_name);
-		if (sql.empty()) {
-			continue;
-		}
-		try {
-			con.BeginTransaction();
-			Parser p;
-			p.ParseQuery(sql);
-			Planner planner(*con.context);
-			planner.CreatePlan(p.statements[0]->Copy());
-			auto view_plan = std::move(planner.plan);
-			con.Rollback();
-
-			if (PlanReferencesColumn(*view_plan, table_name, col_name)) {
-				return view_name;
-			}
-		} catch (...) {
-			con.Rollback();
-		}
-	}
-	return "";
-}
-
 RefreshInsertRule::RefreshInsertRule() {
 	optimize_function = RefreshInsertRuleFunction;
 	optimizer_info = make_shared_ptr<RefreshInsertOptimizerInfo>();
