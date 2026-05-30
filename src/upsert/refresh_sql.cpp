@@ -275,6 +275,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	QueryErrorContext error_context = QueryErrorContext();
 	Connection con(*context.db.get());
 	PropagateRefreshPlanningSettings(context, *con.context);
+	// Mirror the active CompileFacts onto the inner connection's ClientContext
+	// so the optimizer rules invoked via `Optimizer(*con.context)` below
+	// (cost estimator + main IVM rewriter) see the same facts as the outer
+	// caller. Without this, ClientContext::registered_state lookups in
+	// `join.cpp` / `refresh_insert_rule.cpp` would silently fall back to
+	// `CompileFacts::Default()` and lose `compile_only` semantics, producing
+	// `SELECT NULL ... WHERE false` placeholders for views compiled with
+	// no pending deltas.
+	auto inner_facts_slot_facts = make_shared_ptr<openivm::CompileFacts>(active_facts);
+	openivm::CompileFactsContextSlot inner_facts_slot(*con.context, inner_facts_slot_facts);
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 	string default_db;
 	string default_schema = "main";
