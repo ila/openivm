@@ -1,7 +1,9 @@
 #ifndef INCREMENTAL_REWRITE_RULE_HPP
 #define INCREMENTAL_REWRITE_RULE_HPP
 
-#include "rules/rule.hpp"
+#include "duckdb.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/binder.hpp"
 
 namespace duckdb {
 
@@ -13,10 +15,6 @@ public:
 
 	static void AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
 	                          string &view_name, string &view_catalog_name, string &view_schema_name);
-
-	/// Orchestrator: dispatches to the correct IncrementalRule based on operator type.
-	static ModifiedPlan RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan, string &view,
-	                                LogicalOperator *&root);
 
 	static void IncrementalRewriteRuleFunction(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
 };

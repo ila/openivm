@@ -11,6 +11,7 @@ AggregateFunction BindAggregateByName(ClientContext &context, const string &name
 LogicalOperator *FindProjectionAggregateInput(unique_ptr<LogicalOperator> &plan, bool allow_having_filter);
 void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator> &plan, Optimizer &opt,
                               bool is_top = true);
+bool RewriteSafeSemiAntiDelimGets(ClientContext &context, unique_ptr<LogicalOperator> &plan);
 
 } // namespace duckdb
 

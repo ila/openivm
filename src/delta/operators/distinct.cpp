@@ -1,7 +1,6 @@
-#include "rules/distinct.hpp"
+#include "delta/delta_operator.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "rules/incremental_rewrite_rule.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -11,29 +10,30 @@
 
 namespace duckdb {
 
-ModifiedPlan IncrementalDistinctRule::Rewrite(PlanWrapper pw) {
-	auto *distinct_node = dynamic_cast<LogicalDistinct *>(pw.plan.get());
-	OPENIVM_DEBUG_PRINT("[IncrementalDistinctRule] Rewriting DISTINCT node, %zu targets\n",
+DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
+	auto *distinct_node = dynamic_cast<LogicalDistinct *>(input.plan.get());
+	LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::DISTINCT_COUNT_AGGREGATE);
+	OPENIVM_DEBUG_PRINT("[DeltaDistinct] Rewriting DISTINCT node, %zu targets\n",
 	                    distinct_node->distinct_targets.size());
 
 	// Save the DISTINCT's output bindings before rewrite — these are what parent operators
 	// currently reference via BoundColumnRefExpression. After we replace DISTINCT with
 	// AGGREGATE, the aggregate uses fresh group_index/aggregate_index, so we must remap.
-	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
+	const vector<ColumnBinding> original_bindings = input.plan->GetColumnBindings();
 
 	// 1. Recurse into child first (gets delta with multiplicity)
-	auto child_mul = IncrementalRewriteRule::RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
+	auto child_mul = input.CompileChild(input.plan->children[0], input.root);
 	auto rewritten_child = std::move(child_mul.op);
 	ColumnBinding input_mul_binding = child_mul.mul_binding;
 
-	Binder &binder = pw.input.optimizer.binder;
+	Binder &binder = input.context.input.optimizer.binder;
 	auto child_bindings = rewritten_child->GetColumnBindings();
 	auto child_types = rewritten_child->types;
 
 	// 2. Build a LOGICAL_AGGREGATE_AND_GROUP_BY that replaces the DISTINCT node.
 	// Group-by keys = all child columns EXCEPT multiplicity
 	// Aggregate = COUNT(*) as openivm_distinct_count
-	// Multiplicity is added as a group-by key (same as IncrementalAggregateRule)
+	// Multiplicity is added as a group-by key (same pattern as aggregate delta)
 	idx_t group_index = binder.GenerateTableIndex();
 	idx_t aggregate_index = binder.GenerateTableIndex();
 
@@ -62,15 +62,15 @@ ModifiedPlan IncrementalDistinctRule::Rewrite(PlanWrapper pw) {
 		agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(child_types[i])));
 	}
 
-	// Add multiplicity as the last group-by key (same pattern as IncrementalAggregateRule)
+	// Add multiplicity as the last group-by key (same pattern as aggregate delta)
 	ColumnBinding mod_mul_binding;
 	mod_mul_binding.column_index = agg_node->groups.size();
 	mod_mul_binding.table_index = group_index;
 
-	auto mul_expr = make_uniq<BoundColumnRefExpression>(openivm::MULTIPLICITY_COL, pw.mul_type, input_mul_binding);
+	auto mul_expr = make_uniq<BoundColumnRefExpression>(openivm::MULTIPLICITY_COL, input.mul_type, input_mul_binding);
 	grouping_set.insert(agg_node->groups.size());
 	agg_node->groups.push_back(std::move(mul_expr));
-	agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(pw.mul_type)));
+	agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(input.mul_type)));
 
 	agg_node->grouping_sets.push_back(std::move(grouping_set));
 
@@ -97,10 +97,10 @@ ModifiedPlan IncrementalDistinctRule::Rewrite(PlanWrapper pw) {
 		replacer.replacement_bindings.emplace_back(original_bindings[i], new_binding);
 		group_position++;
 	}
-	replacer.stop_operator = pw.plan.get();
-	replacer.VisitOperator(*pw.root);
+	replacer.stop_operator = input.plan.get();
+	replacer.VisitOperator(*input.root);
 
-	OPENIVM_DEBUG_PRINT("[IncrementalDistinctRule] Done, replaced with AGGREGATE (%zu groups + 1 count), mul_binding: "
+	OPENIVM_DEBUG_PRINT("[DeltaDistinct] Done, replaced with AGGREGATE (%zu groups + 1 count), mul_binding: "
 	                    "table=%lu col=%lu\n",
 	                    agg_node->groups.size() - 1, (unsigned long)mod_mul_binding.table_index,
 	                    (unsigned long)mod_mul_binding.column_index);

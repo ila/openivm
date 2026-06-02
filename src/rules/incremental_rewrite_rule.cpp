@@ -1,33 +1,17 @@
 #include "rules/incremental_rewrite_rule.hpp"
 
-#include "rules/aggregate.hpp"
-#include "rules/delim_join.hpp"
-#include "rules/distinct.hpp"
-#include "rules/filter.hpp"
-#include "rules/join.hpp"
-#include "rules/projection.hpp"
-#include "rules/scan.hpp"
-#include "rules/topk.hpp"
-#include "rules/union.hpp"
-#include "rules/window.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/parser_plan_helpers.hpp"
 #include "core/sql_utils.hpp"
-#include "duckdb/planner/operator/logical_cte.hpp"
-#include "duckdb/planner/operator/logical_cteref.hpp"
-#include "upsert/refresh_index_regen.hpp"
-
-#include "lpts_pipeline.hpp"
+#include "delta/delta_compiler.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/operator/logical_insert.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/operator/logical_aggregate.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_column_data_get.hpp"
-#include "duckdb/planner/planner.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/planner.hpp"
 
 namespace duckdb {
 
@@ -41,23 +25,6 @@ static idx_t FindMaxTableIndex(LogicalOperator *node) {
 		max_idx = std::max(max_idx, FindMaxTableIndex(child.get()));
 	}
 	return max_idx;
-}
-
-/// Update CTE_REF nodes matching the given CTE table_index with the multiplicity column.
-static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, const LogicalType &mul_type) {
-	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
-		auto &ref = node->Cast<LogicalCTERef>();
-		if (ref.cte_index == cte_table_index &&
-		    (ref.bound_columns.empty() || ref.bound_columns.back() != openivm::MULTIPLICITY_COL)) {
-			ref.chunk_types.push_back(mul_type);
-			ref.bound_columns.push_back(openivm::MULTIPLICITY_COL);
-			OPENIVM_DEBUG_PRINT("[CTE]   Updated CTE_REF cte_index=%lu with mul column\n",
-			                    (unsigned long)cte_table_index);
-		}
-	}
-	for (auto &child : node->children) {
-		UpdateCteRefsWithMul(child.get(), cte_table_index, mul_type);
-	}
 }
 
 void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
@@ -87,129 +54,6 @@ void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binde
 
 	insert_node->children.emplace_back(std::move(plan));
 	plan = std::move(insert_node);
-}
-
-ModifiedPlan IncrementalRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,
-                                                 string &view, LogicalOperator *&root) {
-	PlanWrapper pw(input, plan, view, root);
-
-	OPENIVM_DEBUG_PRINT("[RewritePlan] Visiting node: %s\n", LogicalOperatorToString(plan->type).c_str());
-	OPENIVM_DEBUG_PRINT("[RewritePlan] Node detail: %s\n", plan->ToString().c_str());
-
-	switch (plan->type) {
-	case LogicalOperatorType::LOGICAL_GET: {
-		IncrementalScanRule rule;
-		return rule.Rewrite(pw);
-	}
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_JOIN:
-	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-	case LogicalOperatorType::LOGICAL_ANY_JOIN: {
-		IncrementalJoinRule rule;
-		return rule.Rewrite(pw);
-	}
-	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN: {
-		IncrementalDelimJoinRule rule;
-		return rule.Rewrite(pw);
-	}
-	case LogicalOperatorType::LOGICAL_PROJECTION: {
-		IncrementalProjectionRule rule;
-		return rule.Rewrite(pw);
-	}
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
-		IncrementalAggregateRule rule;
-		return rule.Rewrite(pw);
-	}
-	case LogicalOperatorType::LOGICAL_FILTER: {
-		IncrementalFilterRule rule;
-		return rule.Rewrite(pw);
-	}
-	case LogicalOperatorType::LOGICAL_UNION: {
-		IncrementalUnionRule rule;
-		return rule.Rewrite(pw);
-	}
-	case LogicalOperatorType::LOGICAL_DISTINCT: {
-		IncrementalDistinctRule rule;
-		return rule.Rewrite(pw);
-	}
-	case LogicalOperatorType::LOGICAL_WINDOW: {
-		IncrementalWindowRule rule;
-		return rule.Rewrite(pw);
-	}
-	case LogicalOperatorType::LOGICAL_TOP_N:
-	case LogicalOperatorType::LOGICAL_LIMIT:
-	case LogicalOperatorType::LOGICAL_ORDER_BY: {
-		IncrementalTopKRule rule;
-		return rule.Rewrite(pw);
-	}
-	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
-		// CTE wrapper: children[0] = CTE definition, children[1] = consumer.
-		auto &cte = pw.plan->Cast<LogicalCTE>();
-		idx_t cte_table_index = cte.table_index;
-
-		// 1. Rewrite the CTE definition (contains the actual operators like JOINs).
-		auto def_mul = RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
-		pw.plan->children[0] = std::move(def_mul.op);
-
-		// 2. Update the CTE's column_count to include the new multiplicity column.
-		cte.column_count = pw.plan->children[0]->GetColumnBindings().size();
-
-		// 3. Update all CTE_REF nodes that reference this CTE (by cte_index == table_index).
-		//    Add the multiplicity type and column name so downstream operators see the extra column.
-		OPENIVM_DEBUG_PRINT("[CTE] Looking for CTE_REFs with cte_index=%lu\n", (unsigned long)cte_table_index);
-		// Search the entire tree from this node down
-		UpdateCteRefsWithMul(pw.plan.get(), cte_table_index, pw.mul_type);
-
-		// 4. Rewrite the consumer (which reads from CTE_REFs).
-		auto cons_mul = RewritePlan(pw.input, pw.plan->children[1], pw.view, pw.root);
-		pw.plan->children[1] = std::move(cons_mul.op);
-		pw.plan->ResolveOperatorTypes();
-		return {std::move(pw.plan), cons_mul.mul_binding};
-	}
-	case LogicalOperatorType::LOGICAL_CTE_REF: {
-		// CTE reference: leaf that reads from a rewritten CTE definition.
-		// The multiplicity column was added by the MATERIALIZED_CTE handler above.
-		auto bindings = pw.plan->GetColumnBindings();
-		ColumnBinding mul_binding = bindings.back();
-		return {std::move(pw.plan), mul_binding};
-	}
-	case LogicalOperatorType::LOGICAL_CHUNK_GET: {
-		// CHUNK_GET is a constant in-memory VALUES node (used for IN-list MARK joins, etc.).
-		// It has no delta table. DetectDeltaStatus marks it as empty so IncrementalJoinRule skips all
-		// terms that include this leaf in the delta mask. If we somehow reach here anyway, return
-		// it unchanged with a dummy multiplicity binding (column 0 of the chunk).
-		auto bindings = pw.plan->GetColumnBindings();
-		if (bindings.empty()) {
-			throw NotImplementedException("CHUNK_GET has no column bindings");
-		}
-		OPENIVM_DEBUG_PRINT("[RewritePlan] CHUNK_GET leaf — returning unchanged (constant, no delta)\n");
-		return {std::move(pw.plan), bindings[0]};
-	}
-	case LogicalOperatorType::LOGICAL_DUMMY_SCAN: {
-		// DUMMY_SCAN is a constant one-row relation. Join delta pruning should
-		// normally remove delta terms containing it, but a standalone constant
-		// subtree can still reach this leaf.
-		auto bindings = pw.plan->GetColumnBindings();
-		if (bindings.empty()) {
-			throw NotImplementedException("DUMMY_SCAN has no column bindings");
-		}
-		OPENIVM_DEBUG_PRINT("[RewritePlan] DUMMY_SCAN leaf — returning unchanged (constant, no delta)\n");
-		return {std::move(pw.plan), bindings[0]};
-	}
-	case LogicalOperatorType::LOGICAL_EXPRESSION_GET: {
-		// VALUES clauses are constant inputs. Join delta pruning marks them as empty;
-		// if a standalone rewrite reaches this leaf, preserve it unchanged.
-		auto bindings = pw.plan->GetColumnBindings();
-		if (bindings.empty()) {
-			throw NotImplementedException("EXPRESSION_GET has no column bindings");
-		}
-		OPENIVM_DEBUG_PRINT("[RewritePlan] EXPRESSION_GET leaf — returning unchanged (constant, no delta)\n");
-		return {std::move(pw.plan), bindings[0]};
-	}
-	default:
-		throw NotImplementedException("Operator type %s not supported", LogicalOperatorToString(plan->type));
-	}
 }
 
 void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionInput &input,
@@ -281,8 +125,13 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		throw NotImplementedException("Plan contains single node, this is not supported");
 	}
 
+	auto output_names = PrepareOutputNames(optimized_plan.get(), planner.names);
+	DeltaCompileAssumptions assumptions;
+	auto delta_model = BuildRefreshDeltaViewModel(input, con, view, optimized_plan.get(), output_names, &assumptions);
+	LogDeltaModelSummary(delta_model);
+
 	// Advance the main binder past all table indices in the plan to prevent collisions.
-	// IncrementalJoinRule uses input.optimizer.binder which may not have been advanced by the
+	// Join delta compilation uses input.optimizer.binder which may not have been advanced by the
 	// local optimizer. Walk the plan to find the highest table index used.
 	{
 		idx_t max_idx = FindMaxTableIndex(optimized_plan.get());
@@ -290,13 +139,16 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		}
 	}
 
-	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === Starting RewritePlan ===\n");
+	DeltaCompiler compiler(input, con, view, delta_model, assumptions);
+
+	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === Starting IR delta compilation ===\n");
 	auto root = optimized_plan.get();
-	ModifiedPlan modified_plan = RewritePlan(input, optimized_plan, view, root);
-	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === RewritePlan done, running AddInsertNode ===\n");
-	AddInsertNode(input.context, input.optimizer.binder, modified_plan.op, view, view_catalog, view_schema);
-	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === FINAL PLAN ===\n%s\n", modified_plan.op->ToString().c_str());
-	plan = std::move(modified_plan.op);
+	DeltaPlanFragment fragment = compiler.Compile(optimized_plan, root);
+	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === Delta compilation done, running AddInsertNode ===\n");
+	AddInsertNode(input.context, input.optimizer.binder, fragment.op, view, view_catalog, view_schema);
+	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === FINAL PLAN ===\n%s\n", fragment.op->ToString().c_str());
+	plan = std::move(fragment.op);
 	return;
 }
+
 } // namespace duckdb

@@ -1,9 +1,8 @@
-#include "rules/delim_join.hpp"
+#include "delta/delta_operator.hpp"
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "rules/join.hpp"
-#include "rules/incremental_rewrite_rule.hpp"
+#include "delta/operators/join.hpp"
 #include "upsert/refresh_index_regen.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
@@ -240,7 +239,7 @@ static ColumnBinding FindOutputBinding(const vector<ColumnBinding> &term_binding
 			return binding;
 		}
 	}
-	throw InternalException("IncrementalDelimJoinRule: original output binding not found in rewritten term");
+	throw InternalException("DeltaDelimJoin: original output binding not found in rewritten term");
 }
 
 static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator> &node,
@@ -349,8 +348,7 @@ static unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const Log
 		ErrorData err;
 		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
 		if (!product) {
-			throw InternalException("IncrementalDelimJoinRule: failed to bind multiplicity product: %s",
-			                        err.RawMessage());
+			throw InternalException("DeltaDelimJoin: failed to bind multiplicity product: %s", err.RawMessage());
 		}
 	}
 	if (mul_bindings.size() % 2 == 0) {
@@ -360,7 +358,7 @@ static unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const Log
 		ErrorData err;
 		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
 		if (!product) {
-			throw InternalException("IncrementalDelimJoinRule: failed to bind multiplicity sign: %s", err.RawMessage());
+			throw InternalException("DeltaDelimJoin: failed to bind multiplicity sign: %s", err.RawMessage());
 		}
 	}
 	return product;
@@ -459,32 +457,33 @@ bool RewriteSafeSemiAntiDelimGets(ClientContext &context, unique_ptr<LogicalOper
 	return ReplaceSafeSemiAntiDelimGets(context, plan);
 }
 
-ModifiedPlan IncrementalDelimJoinRule::Rewrite(PlanWrapper pw) {
-	ClientContext &context = pw.input.context;
-	Binder &binder = pw.input.optimizer.binder;
-	const vector<ColumnBinding> original_bindings = pw.plan->GetColumnBindings();
+DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
+	ClientContext &context = input.context.input.context;
+	Binder &binder = input.context.input.optimizer.binder;
+	const vector<ColumnBinding> original_bindings = input.plan->GetColumnBindings();
 
-	VerifyDelimJoinTypes(pw.plan.get());
+	LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::DELIM_JOIN_INCLUSION_EXCLUSION);
+	VerifyDelimJoinTypes(input.plan.get());
 	vector<BaseLeafInfo> leaves;
-	CollectBaseLeaves(pw.plan.get(), {}, leaves);
+	CollectBaseLeaves(input.plan.get(), {}, leaves);
 	if (leaves.empty()) {
-		throw InternalException("IncrementalDelimJoinRule: no mutable base leaves found");
+		throw InternalException("DeltaDelimJoin: no mutable base leaves found");
 	}
 	if (leaves.size() > openivm::MAX_JOIN_TABLES) {
 		throw NotImplementedException("DELIM_JOIN IVM not supported for joins with more than 16 base tables");
 	}
 
-	pw.plan->ResolveOperatorTypes();
-	auto output_types = pw.plan->types;
+	input.plan->ResolveOperatorTypes();
+	auto output_types = input.plan->types;
 	auto types = output_types;
-	types.emplace_back(pw.mul_type);
+	types.emplace_back(input.mul_type);
 
 	vector<unique_ptr<LogicalOperator>> terms;
 	const uint64_t term_count = (1ULL << leaves.size()) - 1;
-	OPENIVM_DEBUG_PRINT("[IncrementalDelimJoinRule] Rewriting DELIM_JOIN with %zu base leaves (%llu terms)\n",
-	                    leaves.size(), (unsigned long long)term_count);
+	OPENIVM_DEBUG_PRINT("[DeltaDelimJoin] Rewriting DELIM_JOIN with %zu base leaves (%llu terms)\n", leaves.size(),
+	                    (unsigned long long)term_count);
 	for (uint64_t mask = 1; mask <= term_count; mask++) {
-		auto term = pw.plan->Copy(context);
+		auto term = input.plan->Copy(context);
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);
 		vector<ColumnBinding> mul_bindings;
@@ -496,7 +495,7 @@ ModifiedPlan IncrementalDelimJoinRule::Rewrite(PlanWrapper pw) {
 			}
 			auto &leaf_ref = GetNodeAtPath(term, leaves[i].path);
 			auto leaf_bindings = leaf_ref->GetColumnBindings();
-			DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, pw.view);
+			DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, input.context.view);
 			auto delta_bindings = delta_i.node->GetColumnBindings();
 			AddLeafBindingReplacements(leaf_bindings, delta_bindings, output_replacements, delta_i.mul_binding);
 			mul_bindings.push_back(delta_i.mul_binding);
@@ -516,12 +515,12 @@ ModifiedPlan IncrementalDelimJoinRule::Rewrite(PlanWrapper pw) {
 			auto mapped_binding =
 			    MapTermBinding(original_bindings[output_idx], renumbered.idx_map, output_replacements);
 			if (mul_set.count(BindingKey(mapped_binding))) {
-				throw InternalException("IncrementalDelimJoinRule: original output remapped to multiplicity binding");
+				throw InternalException("DeltaDelimJoin: original output remapped to multiplicity binding");
 			}
 			auto output_binding = FindOutputBinding(term_bindings, mapped_binding);
 			exprs.push_back(make_uniq<BoundColumnRefExpression>(output_types[output_idx], output_binding));
 		}
-		exprs.push_back(BuildMultiplicityProduct(binder, pw.mul_type, mul_bindings));
+		exprs.push_back(BuildMultiplicityProduct(binder, input.mul_type, mul_bindings));
 
 		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(exprs));
 		projection->children.push_back(std::move(term));
@@ -530,9 +529,9 @@ ModifiedPlan IncrementalDelimJoinRule::Rewrite(PlanWrapper pw) {
 	}
 
 	auto result = AssembleUnionAll(terms, types, binder);
-	ColumnBinding new_mul_binding = ReplaceOutputBindings(original_bindings, result, *pw.root);
-	pw.plan = std::move(result);
-	return {std::move(pw.plan), new_mul_binding};
+	ColumnBinding new_mul_binding = ReplaceOutputBindings(original_bindings, result, *input.root);
+	input.plan = std::move(result);
+	return {std::move(input.plan), new_mul_binding};
 }
 
 } // namespace duckdb

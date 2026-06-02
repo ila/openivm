@@ -345,7 +345,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	if (analysis.found_delim_join && !analysis.found_aggregation && !analysis.found_single_join) {
 		// Preserve DuckDB's dependent/DELIM_JOIN plan shape for refresh. LPTS can
 		// round-trip lateral table functions, but its CTE-normalized SQL lowers them
-		// into ordinary joins/table-function scans; that bypasses IncrementalDelimJoinRule
+		// into ordinary joins/table-function scans; that bypasses delim-join delta compilation
 		// and sends the refresh plan through the generic N-way join rule instead.
 		view_query = original_view_query;
 		lpts_fallback = true;

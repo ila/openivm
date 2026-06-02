@@ -356,7 +356,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 
 	case LogicalOperatorType::LOGICAL_ORDER_BY: {
 		// ORDER BY alone (without LIMIT) is meaningless on an MV (a table has no inherent
-		// order). The IncrementalTopKRule drops the node from the delta plan; we still capture
+		// order). Top-k delta compilation drops the node from the delta plan; we still capture
 		// the order columns so a sibling LIMIT below this node — see plan shapes where
 		// LPTS keeps them as separate ORDER_BY → LIMIT nodes — has them available for
 		// top-k suffix handling.

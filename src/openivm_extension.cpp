@@ -199,7 +199,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_explain_initial_load_only",
 	                             "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
-
 	Connection con(instance);
 
 	// Migration: add new columns to existing openivm_views tables

@@ -1,7 +1,5 @@
-#include "rules/ducklake_join.hpp"
-#include "rules/join.hpp"
-#include "rules/rule.hpp"
-#include "rules/incremental_rewrite_rule.hpp"
+#include "delta/operators/ducklake_join.hpp"
+#include "delta/operators/join.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
@@ -154,8 +152,9 @@ static void PinToOldSnapshot(LogicalOperator &op, idx_t table_index, idx_t old_s
 // BuildDuckLakeJoinTerms: N-term telescoping delta product
 // ============================================================================
 
-vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, ClientContext &context, Binder &binder,
-                                                           const vector<JoinLeafInfo> &leaves, bool has_left_join) {
+vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput input, ClientContext &context,
+                                                           Binder &binder, const vector<JoinLeafInfo> &leaves,
+                                                           bool has_left_join) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
@@ -175,11 +174,11 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 		table_schemas[i] = table_ref->schema.name;
 		table_names[i] = table_name;
 		auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) +
-		                             " WHERE view_name = '" + SqlUtils::EscapeValue(pw.view) + "' AND table_name = '" +
-		                             SqlUtils::EscapeValue(table_name) + "'");
+		                             " WHERE view_name = '" + SqlUtils::EscapeValue(input.context.view) +
+		                             "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
 		if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
 			throw Exception(ExceptionType::CATALOG, "IVM: no snapshot ID recorded for DuckLake table '" + table_name +
-			                                            "' in view '" + pw.view + "'");
+			                                            "' in view '" + input.context.view + "'");
 		}
 		old_snapshots[i] = snap_result->GetValue(0, 0).GetValue<int64_t>();
 		if (get->function.name == "ducklake_scan" && get->function.function_info) {
@@ -206,7 +205,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 				continue;
 			}
 			auto metadata_activity =
-			    ProbeDuckLakeSnapshotActivity(metadata, con, pw.view, table_names[i], table_catalogs[i],
+			    ProbeDuckLakeSnapshotActivity(metadata, con, input.context.view, table_names[i], table_catalogs[i],
 			                                  table_schemas[i], old_snapshots[i], current_snapshots[i]);
 			if (metadata_activity.ok) {
 				if (!metadata_activity.has_changes) {
@@ -267,7 +266,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 				                                                               get->GetColumnName(column_ids[col_idx])};
 			}
 		}
-		CollectDuckLakeKeyProbes(pw.plan.get(), column_refs, key_probes);
+		CollectDuckLakeKeyProbes(input.plan.get(), column_refs, key_probes);
 	}
 
 	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building N-term telescoping delta terms (%zu leaves)\n", N);
@@ -301,7 +300,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 			continue;
 		}
 
-		auto term = pw.plan->Copy(context);
+		auto term = input.plan->Copy(context);
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);
 
@@ -326,13 +325,13 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 		ColumnBinding mul_binding;
 		if (term_leaves[i].get) {
 			// Simple GET leaf — replace directly.
-			DeltaGetResult delta_result = CreateDeltaGetNode(context, binder, term_leaves[i].get, pw.view);
+			DeltaGetResult delta_result = CreateDeltaGetNode(context, binder, term_leaves[i].get, input.context.view);
 			mul_binding = delta_result.mul_binding;
 			GetNodeAtPath(term, term_leaves[i].path) = std::move(delta_result.node);
 		} else {
 			// GET wrapped in projections/filters — rewrite the entire subtree.
 			auto &subtree_ref = GetNodeAtPath(term, term_leaves[i].path);
-			auto rewritten = IncrementalRewriteRule::RewritePlan(pw.input, subtree_ref, pw.view, term_root);
+			auto rewritten = input.CompileCopiedSubtree(subtree_ref, term_root);
 			mul_binding = rewritten.mul_binding;
 			subtree_ref = std::move(rewritten.op);
 		}
@@ -369,7 +368,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
 			}
 		}
 		// Append multiplicity as the last column.
-		proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(pw.mul_type, mul_binding));
+		proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(input.mul_type, mul_binding));
 
 		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(proj_exprs));
 		projection->children.push_back(std::move(term));

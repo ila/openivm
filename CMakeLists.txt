@@ -25,6 +25,23 @@ set(EXTENSION_SOURCES
     src/core/incremental_checker.cpp
     src/core/plan_rewrite.cpp
     src/core/plan_rewrite_aggregates.cpp
+    src/delta/delta_compiler.cpp
+    src/delta/delta_helpers.cpp
+    src/delta/operators/aggregate.cpp
+    src/delta/operators/constant.cpp
+    src/delta/operators/cte.cpp
+    src/delta/operators/delim_join.cpp
+    src/delta/operators/dispatch.cpp
+    src/delta/operators/distinct.cpp
+    src/delta/operators/ducklake_join.cpp
+    src/delta/operators/filter.cpp
+    src/delta/operators/join.cpp
+    src/delta/operators/join_output.cpp
+    src/delta/operators/projection.cpp
+    src/delta/operators/scan.cpp
+    src/delta/operators/topk.cpp
+    src/delta/operators/union.cpp
+    src/delta/operators/window.cpp
     src/upsert/refresh.cpp
     src/upsert/refresh_delta_fast_paths.cpp
     src/upsert/refresh_group_measure.cpp
@@ -38,19 +55,6 @@ set(EXTENSION_SOURCES
     src/rules/incremental_rewrite_rule.cpp
     src/rules/refresh_insert_rule.cpp
     src/rules/schema_evolution.cpp
-    src/rules/helpers.cpp
-    src/rules/scan.cpp
-    src/rules/filter.cpp
-    src/rules/projection.cpp
-    src/rules/aggregate.cpp
-    src/rules/join.cpp
-    src/rules/join_output.cpp
-    src/rules/delim_join.cpp
-    src/rules/ducklake_join.cpp
-    src/rules/union.cpp
-    src/rules/distinct.cpp
-    src/rules/window.cpp
-    src/rules/topk.cpp
     src/rules/column_hider.cpp
     src/core/refresh_locks.cpp
     src/core/refresh_daemon.cpp

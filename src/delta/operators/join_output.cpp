@@ -1,4 +1,4 @@
-#include "rules/join.hpp"
+#include "delta/operators/join.hpp"
 
 #include "core/openivm_debug.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -47,8 +47,8 @@ ColumnBinding ReplaceJoinOutputBindings(const vector<ColumnBinding> &original_bi
 	}
 	ColumnBindingReplacer replacer;
 	idx_t map_count = std::min(original_bindings.size(), union_bindings.size() - 1);
-	OPENIVM_DEBUG_PRINT("[IncrementalJoinRule] Binding replacement: %zu mappings (original=%zu, union=%zu)\n",
-	                    map_count, original_bindings.size(), union_bindings.size());
+	OPENIVM_DEBUG_PRINT("[DeltaJoin] Binding replacement: %zu mappings (original=%zu, union=%zu)\n", map_count,
+	                    original_bindings.size(), union_bindings.size());
 	for (idx_t col_idx = 0; col_idx < map_count; ++col_idx) {
 		replacer.replacement_bindings.emplace_back(original_bindings[col_idx], union_bindings[col_idx]);
 	}

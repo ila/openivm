@@ -111,6 +111,7 @@ static DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
 		return DeltaModelNodeKind::UNION;
 	case LogicalOperatorType::LOGICAL_TOP_N:
 	case LogicalOperatorType::LOGICAL_LIMIT:
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
 		return DeltaModelNodeKind::TOP_K;
 	case LogicalOperatorType::LOGICAL_UNNEST:
 		return DeltaModelNodeKind::UNNEST;
@@ -328,6 +329,7 @@ static idx_t BuildModelNodeForPlan(DeltaViewModel &model, LogicalOperator *op, c
 	DeltaModelNode node;
 	node.kind = NodeKindForOperator(*op);
 	node.rule = RuleKindForNode(node.kind, *op, model, facts.analysis);
+	node.plan_node = op;
 	node.children = std::move(children);
 	node.source_tables = SourceTablesFromChildren(model, node.children);
 	AddNodeAuxRequirements(node, model);
@@ -524,6 +526,7 @@ void ValidateDeltaViewModelInvariants(const DeltaViewModel &model) {
 	D_ASSERT(model.root_node == DConstants::INVALID_INDEX || model.root_node < model.nodes.size());
 	for (auto &node : model.nodes) {
 		D_ASSERT(node.id < model.nodes.size());
+		D_ASSERT(node.plan_node);
 		if (node.kind == DeltaModelNodeKind::SCAN && !node.source_table.empty()) {
 			D_ASSERT(node.source_occurrence != DConstants::INVALID_INDEX);
 			D_ASSERT(node.source_table_index != DConstants::INVALID_INDEX);

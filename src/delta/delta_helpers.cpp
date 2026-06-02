@@ -1,4 +1,4 @@
-#include "rules/rule.hpp"
+#include "delta/delta_helpers.hpp"
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"

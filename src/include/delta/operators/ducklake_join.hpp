@@ -1,12 +1,12 @@
 #ifndef DUCKLAKE_JOIN_HPP
 #define DUCKLAKE_JOIN_HPP
 
+#include "delta/delta_operator.hpp"
 #include "duckdb.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
 namespace duckdb {
 
-struct PlanWrapper;
 struct JoinLeafInfo;
 
 /// Build N join delta terms using DuckLake time-travel (AT VERSION).
@@ -18,8 +18,9 @@ struct JoinLeafInfo;
 /// Tables before index i read current state; tables after index i read old
 /// state via AT VERSION => last_snapshot_id. This captures all cross-terms
 /// and is provably equivalent to inclusion-exclusion.
-vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, ClientContext &context, Binder &binder,
-                                                           const vector<JoinLeafInfo> &leaves, bool has_left_join);
+vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput input, ClientContext &context,
+                                                           Binder &binder, const vector<JoinLeafInfo> &leaves,
+                                                           bool has_left_join);
 
 } // namespace duckdb
 

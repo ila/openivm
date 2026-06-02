@@ -1,0 +1,443 @@
+# name: test/sql/recursive_rewriter.test
+# description: Smoke tests for the IR-driven recursive delta rewriter
+# group: [sql]
+
+require openivm
+
+# Linear + aggregate operators: scan, filter, projection, aggregate
+statement ok
+CREATE TABLE rr_sales(id INT, region INT, amount INT);
+
+statement ok
+INSERT INTO rr_sales VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW rr_sales_mv AS
+	SELECT region, sum(amount) AS total, count(*) AS cnt
+	FROM rr_sales
+	WHERE amount >= 20
+	GROUP BY region;
+
+statement ok
+INSERT INTO rr_sales VALUES (5, 1, 50), (6, 3, 60);
+
+statement ok
+DELETE FROM rr_sales WHERE id = 3;
+
+statement ok
+UPDATE rr_sales SET amount = 25 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('rr_sales_mv');
+
+query I
+WITH expected AS (
+	SELECT region, sum(amount) AS total, count(*) AS cnt
+	FROM rr_sales
+	WHERE amount >= 20
+	GROUP BY region
+), diff AS (
+	(SELECT * FROM rr_sales_mv EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM rr_sales_mv)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+# HAVING aggregate path
+statement ok
+CREATE MATERIALIZED VIEW rr_having_mv AS
+	SELECT region, sum(amount) AS total
+	FROM rr_sales
+	GROUP BY region
+	HAVING sum(amount) >= 30;
+
+statement ok
+INSERT INTO rr_sales VALUES (8, 5, 35), (9, 1, 15);
+
+statement ok
+UPDATE rr_sales SET amount = 2 WHERE id = 4;
+
+statement ok
+PRAGMA refresh('rr_having_mv');
+
+query I
+WITH expected AS (
+	SELECT region, sum(amount) AS total
+	FROM rr_sales
+	GROUP BY region
+	HAVING sum(amount) >= 30
+), diff AS (
+	(SELECT * FROM rr_having_mv EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM rr_having_mv)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+# Multi-way inner join and self-join occurrence identity
+statement ok
+CREATE TABLE rr_accounts(id INT, rep_id INT);
+
+statement ok
+CREATE TABLE rr_reps(id INT, region_id INT);
+
+statement ok
+CREATE TABLE rr_regions(id INT, name VARCHAR);
+
+statement ok
+INSERT INTO rr_accounts VALUES (1, 10), (2, 20), (3, 10);
+
+statement ok
+INSERT INTO rr_reps VALUES (10, 100), (20, 200);
+
+statement ok
+INSERT INTO rr_regions VALUES (100, 'north'), (200, 'south');
+
+statement ok
+CREATE MATERIALIZED VIEW rr_three_join_mv AS
+	SELECT rr_accounts.id, rr_regions.name
+	FROM rr_accounts
+	JOIN rr_reps ON rr_accounts.rep_id = rr_reps.id
+	JOIN rr_regions ON rr_reps.region_id = rr_regions.id;
+
+statement ok
+INSERT INTO rr_accounts VALUES (4, 20);
+
+statement ok
+UPDATE rr_regions SET name = 'north-east' WHERE id = 100;
+
+statement ok
+DELETE FROM rr_accounts WHERE id = 2;
+
+statement ok
+PRAGMA refresh('rr_three_join_mv');
+
+query I
+WITH expected AS (
+	SELECT rr_accounts.id, rr_regions.name
+	FROM rr_accounts
+	JOIN rr_reps ON rr_accounts.rep_id = rr_reps.id
+	JOIN rr_regions ON rr_reps.region_id = rr_regions.id
+), diff AS (
+	(SELECT * FROM rr_three_join_mv EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM rr_three_join_mv)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+statement ok
+CREATE TABLE rr_nodes(id INT, parent INT);
+
+statement ok
+INSERT INTO rr_nodes VALUES (1, NULL), (2, 1), (3, 1), (4, 2);
+
+statement ok
+CREATE MATERIALIZED VIEW rr_self_join_mv AS
+	SELECT child.id AS child_id, parent.id AS parent_id
+	FROM rr_nodes child
+	JOIN rr_nodes parent ON child.parent = parent.id;
+
+statement ok
+INSERT INTO rr_nodes VALUES (5, 2);
+
+statement ok
+DELETE FROM rr_nodes WHERE id = 3;
+
+statement ok
+PRAGMA refresh('rr_self_join_mv');
+
+query I
+WITH expected AS (
+	SELECT child.id AS child_id, parent.id AS parent_id
+	FROM rr_nodes child
+	JOIN rr_nodes parent ON child.parent = parent.id
+), diff AS (
+	(SELECT * FROM rr_self_join_mv EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM rr_self_join_mv)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+# CTE + join path
+statement ok
+CREATE TABLE rr_users(id INT, name VARCHAR);
+
+statement ok
+CREATE TABLE rr_events(user_id INT, score INT);
+
+statement ok
+INSERT INTO rr_users VALUES (1, 'amy'), (2, 'bo'), (3, 'cy');
+
+statement ok
+INSERT INTO rr_events VALUES (1, 5), (2, 7), (3, 11);
+
+statement ok
+CREATE MATERIALIZED VIEW rr_cte_join_mv AS
+	WITH active_events AS (
+		SELECT user_id, score FROM rr_events WHERE score >= 7
+	)
+	SELECT rr_users.name, active_events.score
+	FROM rr_users JOIN active_events ON rr_users.id = active_events.user_id;
+
+statement ok
+INSERT INTO rr_events VALUES (1, 13), (4, 17);
+
+statement ok
+DELETE FROM rr_events WHERE user_id = 2;
+
+statement ok
+UPDATE rr_users SET name = 'cyd' WHERE id = 3;
+
+statement ok
+PRAGMA refresh('rr_cte_join_mv');
+
+query I
+WITH expected AS (
+	WITH active_events AS (
+		SELECT user_id, score FROM rr_events WHERE score >= 7
+	)
+	SELECT rr_users.name, active_events.score
+	FROM rr_users JOIN active_events ON rr_users.id = active_events.user_id
+), diff AS (
+	(SELECT * FROM rr_cte_join_mv EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM rr_cte_join_mv)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+# Outer join paths
+statement ok
+CREATE TABLE rr_customers(id INT, city VARCHAR);
+
+statement ok
+CREATE TABLE rr_orders(customer_id INT, amount INT);
+
+statement ok
+INSERT INTO rr_customers VALUES (1, 'ams'), (2, 'nyc'), (3, 'sfo');
+
+statement ok
+INSERT INTO rr_orders VALUES (1, 10), (3, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW rr_left_join_mv AS
+	SELECT rr_customers.id, rr_orders.amount
+	FROM rr_customers LEFT JOIN rr_orders ON rr_customers.id = rr_orders.customer_id;
+
+statement ok
+INSERT INTO rr_orders VALUES (2, 20);
+
+statement ok
+UPDATE rr_customers SET city = 'sf' WHERE id = 3;
+
+statement ok
+PRAGMA refresh('rr_left_join_mv');
+
+query I
+WITH expected AS (
+	SELECT rr_customers.id, rr_orders.amount
+	FROM rr_customers LEFT JOIN rr_orders ON rr_customers.id = rr_orders.customer_id
+), diff AS (
+	(SELECT * FROM rr_left_join_mv EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM rr_left_join_mv)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+statement ok
+CREATE TABLE rr_fo_a(k INT, a VARCHAR);
+
+statement ok
+CREATE TABLE rr_fo_b(k INT, b VARCHAR);
+
+statement ok
+INSERT INTO rr_fo_a VALUES (1, 'a1'), (2, 'a2');
+
+statement ok
+INSERT INTO rr_fo_b VALUES (2, 'b2'), (3, 'b3');
+
+statement ok
+CREATE MATERIALIZED VIEW rr_full_join_mv AS
+	SELECT coalesce(rr_fo_a.k, rr_fo_b.k) AS k, rr_fo_a.a, rr_fo_b.b
+	FROM rr_fo_a FULL OUTER JOIN rr_fo_b ON rr_fo_a.k = rr_fo_b.k;
+
+statement ok
+INSERT INTO rr_fo_a VALUES (3, 'a3');
+
+statement ok
+DELETE FROM rr_fo_b WHERE k = 2;
+
+statement ok
+PRAGMA refresh('rr_full_join_mv');
+
+query I
+WITH expected AS (
+	SELECT coalesce(rr_fo_a.k, rr_fo_b.k) AS k, rr_fo_a.a, rr_fo_b.b
+	FROM rr_fo_a FULL OUTER JOIN rr_fo_b ON rr_fo_a.k = rr_fo_b.k
+), diff AS (
+	(SELECT * FROM rr_full_join_mv EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM rr_full_join_mv)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+# UNION ALL path
+statement ok
+CREATE TABLE rr_left(id INT, k INT);
+
+statement ok
+CREATE TABLE rr_right(id INT, k INT);
+
+statement ok
+INSERT INTO rr_left VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO rr_right VALUES (3, 30), (4, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW rr_union_mv AS
+	(SELECT id, k FROM rr_left UNION ALL SELECT id, k FROM rr_right);
+
+statement ok
+INSERT INTO rr_left VALUES (5, 50);
+
+statement ok
+DELETE FROM rr_right WHERE id = 3;
+
+statement ok
+UPDATE rr_left SET k = 25 WHERE id = 2;
+
+statement ok
+PRAGMA refresh('rr_union_mv');
+
+query I
+WITH expected AS (
+	SELECT id, k FROM rr_left
+	UNION ALL
+	SELECT id, k FROM rr_right
+), diff AS (
+	(SELECT * FROM rr_union_mv EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM rr_union_mv)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+# DISTINCT and semi/anti paths
+statement ok
+CREATE TABLE rr_distinct_base(x INT, y INT);
+
+statement ok
+INSERT INTO rr_distinct_base VALUES (1, 10), (1, 20), (2, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW rr_distinct_mv AS
+	SELECT DISTINCT x FROM rr_distinct_base;
+
+statement ok
+INSERT INTO rr_distinct_base VALUES (3, 40);
+
+statement ok
+DELETE FROM rr_distinct_base WHERE y = 10;
+
+statement ok
+PRAGMA refresh('rr_distinct_mv');
+
+query I
+WITH expected AS (
+	SELECT DISTINCT x FROM rr_distinct_base
+), diff AS (
+	(SELECT * FROM rr_distinct_mv EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM rr_distinct_mv)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+statement ok
+CREATE TABLE rr_exists_customers(id INT);
+
+statement ok
+CREATE TABLE rr_exists_orders(customer_id INT);
+
+statement ok
+INSERT INTO rr_exists_customers VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO rr_exists_orders VALUES (1), (3);
+
+statement ok
+CREATE MATERIALIZED VIEW rr_exists_mv AS
+	SELECT id FROM rr_exists_customers
+	WHERE EXISTS (
+		SELECT 1 FROM rr_exists_orders
+		WHERE rr_exists_orders.customer_id = rr_exists_customers.id
+	);
+
+statement ok
+INSERT INTO rr_exists_orders VALUES (2);
+
+statement ok
+DELETE FROM rr_exists_orders WHERE customer_id = 1;
+
+statement ok
+PRAGMA refresh('rr_exists_mv');
+
+query I
+WITH expected AS (
+	SELECT id FROM rr_exists_customers
+	WHERE EXISTS (
+		SELECT 1 FROM rr_exists_orders
+		WHERE rr_exists_orders.customer_id = rr_exists_customers.id
+	)
+), diff AS (
+	(SELECT * FROM rr_exists_mv EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM rr_exists_mv)
+)
+SELECT count(*) FROM diff;
+----
+0
+
+# Top-k wrapper path
+statement ok
+CREATE MATERIALIZED VIEW rr_top_mv AS
+	SELECT id, amount FROM rr_sales ORDER BY amount DESC LIMIT 3;
+
+statement ok
+INSERT INTO rr_sales VALUES (7, 4, 100);
+
+statement ok
+DELETE FROM rr_sales WHERE id = 6;
+
+statement ok
+UPDATE rr_sales SET amount = 5 WHERE id = 5;
+
+statement ok
+PRAGMA refresh('rr_top_mv');
+
+query I
+WITH expected AS (
+	SELECT id, amount FROM rr_sales ORDER BY amount DESC LIMIT 3
+), diff AS (
+	(SELECT * FROM rr_top_mv EXCEPT ALL SELECT * FROM expected)
+	UNION ALL
+	(SELECT * FROM expected EXCEPT ALL SELECT * FROM rr_top_mv)
+)
+SELECT count(*) FROM diff;
+----
+0

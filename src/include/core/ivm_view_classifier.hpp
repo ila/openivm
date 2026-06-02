@@ -118,6 +118,7 @@ struct DeltaModelNode {
 	idx_t id = DConstants::INVALID_INDEX;
 	DeltaModelNodeKind kind = DeltaModelNodeKind::OTHER;
 	DeltaRuleKind rule = DeltaRuleKind::FULL_ONLY;
+	const LogicalOperator *plan_node = nullptr;
 	vector<idx_t> children;
 	string source_table;
 	idx_t source_occurrence = DConstants::INVALID_INDEX;
