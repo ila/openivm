@@ -407,11 +407,21 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		SemiAntiExtract semi_anti_extract;
 		vector<string> semi_anti_left_cols;
 		FilteredGroupCountExtract filtered_group_count_extract;
-		bool has_filtered_group_count_aux =
-		    analysis.found_nested_aggregate &&
-		    ExtractFilteredGroupCount(original_view_query, output_names, filtered_group_count_extract);
+		FilteredGroupCountAuxRequirement filtered_group_count_aux_candidate;
+		if (analysis.found_nested_aggregate &&
+		    ExtractFilteredGroupCount(original_view_query, output_names, filtered_group_count_extract)) {
+			string aux_table = "openivm_filtered_group_count_" + view_name;
+			string group_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.group_col);
+			string sum_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.sum_col);
+			filtered_group_count_aux_candidate = {
+			    {aux_table, SqlUtils::LastIdentifierPart(filtered_group_count_extract.source),
+			     filtered_group_count_extract.group_col, filtered_group_count_extract.sum_col, group_q, sum_q,
+			     filtered_group_count_extract.output_col, filtered_group_count_extract.comparison_op,
+			     filtered_group_count_extract.threshold_sql},
+			    filtered_group_count_extract.source};
+			model_input.filtered_group_count_aux_candidate = &filtered_group_count_aux_candidate;
+		}
 
-		bool semi_anti_recompute_supported = false;
 		if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
 			if (ExtractSemiAntiQuery(original_view_query, semi_anti_extract)) {
 				string left_table_name = SqlUtils::LastIdentifierPart(semi_anti_extract.left_table);
@@ -441,17 +451,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 							add_semi_anti_left_col(col_result->GetValue(0, i).ToString());
 						}
 					}
-					semi_anti_recompute_supported = !semi_anti_left_cols.empty();
 				} else if (!col_result->HasError() && col_result->RowCount() > 0) {
 					for (idx_t i = 0; i < col_result->RowCount(); i++) {
 						add_semi_anti_left_col(col_result->GetValue(0, i).ToString());
 					}
-					semi_anti_recompute_supported = true;
 				}
 			}
 		}
 
-		bool distinct_incremental_supported = false;
 		if (analysis.found_distinct && !prelim_view_model.distinct_at_top && analysis.found_aggregation) {
 			// Inner DISTINCT under an aggregate. Two paths:
 			//   - `openivm_distinct_aux_state = true` AND single-source body → DISTINCT_INCREMENTAL.
@@ -533,10 +540,56 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			}
 		}
 
-		distinct_incremental_supported = !distinct_sum_arg.empty() && !distinct_sum_out.empty();
-		model_input.distinct_incremental_supported = distinct_incremental_supported;
-		model_input.semi_anti_recompute_supported = semi_anti_recompute_supported;
+		RefreshMetadata::DistinctAuxMeta distinct_aux_candidate;
+		if (!distinct_sum_arg.empty() && !distinct_sum_out.empty()) {
+			string aux_table = "openivm_distinct_count_" + view_name;
+			distinct_aux_candidate = {aux_table,
+			                          distinct_extracted_cols,
+			                          distinct_extracted_cols,
+			                          distinct_extracted_input_sql,
+			                          distinct_extracted_source,
+			                          distinct_extracted_filter,
+			                          distinct_sum_arg,
+			                          distinct_sum_out};
+			model_input.distinct_aux_candidate = &distinct_aux_candidate;
+		}
+		RefreshMetadata::SemiAntiAuxMeta semi_anti_aux_candidate;
+		if (!semi_anti_left_cols.empty()) {
+			vector<string> semi_anti_left_exprs;
+			for (size_t i = 0; i < semi_anti_left_cols.size(); i++) {
+				string qcol = KeywordHelper::WriteOptionallyQuoted(semi_anti_left_cols[i]);
+				string source_expr = semi_anti_extract.left_alias + "." + qcol;
+				for (size_t j = 0; j < semi_anti_extract.output_cols.size(); j++) {
+					if (StringUtil::CIEquals(semi_anti_extract.output_cols[j], semi_anti_left_cols[i]) &&
+					    j < semi_anti_extract.output_exprs.size()) {
+						source_expr = semi_anti_extract.output_exprs[j];
+						break;
+					}
+				}
+				semi_anti_left_exprs.push_back(source_expr);
+			}
+			string aux_table = "openivm_semi_anti_state_" + view_name;
+			semi_anti_aux_candidate = {aux_table,
+			                           semi_anti_extract.join_type,
+			                           semi_anti_extract.left_table,
+			                           semi_anti_extract.left_alias,
+			                           semi_anti_extract.right_table,
+			                           semi_anti_extract.right_alias,
+			                           semi_anti_extract.predicate,
+			                           semi_anti_extract.post_filter,
+			                           semi_anti_left_cols,
+			                           semi_anti_left_exprs,
+			                           semi_anti_extract.output_cols};
+			model_input.semi_anti_aux_candidate = &semi_anti_aux_candidate;
+		}
 		auto view_model = BuildDeltaViewModel(model_input);
+		auto lineage_start = create_profile_now();
+		PopulateDeltaViewModelLineage(view_model, facts, output_names);
+		string lineage_json = BuildRefreshLineageJson(view_model.lineage_entries);
+		int64_t lineage_duration_ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - lineage_start)
+		        .count();
+		idx_t lineage_entry_count = view_model.lineage_entries.size();
 		RefreshType refresh_type = view_model.type;
 		auto aggregate_columns = std::move(view_model.group_columns);
 		auto aggregate_types = std::move(view_model.aggregate_types);
@@ -544,17 +597,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		bool has_minmax_metadata = view_model.has_minmax_metadata;
 		string full_outer_join_cols = std::move(view_model.full_outer_join_cols);
 
-		if (refresh_type != RefreshType::DISTINCT_INCREMENTAL) {
-			distinct_extracted_cols.clear();
-			distinct_extracted_input_sql.clear();
-			distinct_extracted_source.clear();
-			distinct_extracted_filter.clear();
-			distinct_sum_arg.clear();
-			distinct_sum_out.clear();
-		}
-		if (refresh_type != RefreshType::SEMI_ANTI_RECOMPUTE) {
-			semi_anti_left_cols.clear();
-		}
 		if (view_model.warn_unsupported_incremental) {
 			Printer::Print("Warning: materialized view '" + view_name +
 			               "' uses constructs not supported for incremental maintenance. "
@@ -652,29 +694,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		                       group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
 		                       (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
 
-		vector<string> refresh_lineage_entries;
-		auto lineage_start = create_profile_now();
-		if (refresh_type == RefreshType::WINDOW_PARTITION) {
-			string lineage_entry = BuildWindowPartitionLineageEntryJson(facts, window_partition_columns);
-			if (!lineage_entry.empty()) {
-				refresh_lineage_entries.push_back(std::move(lineage_entry));
-			}
-		} else if (refresh_type == RefreshType::SIMPLE_PROJECTION && !analysis.found_left_join &&
-		           !analysis.found_full_outer) {
-			string lineage_entry = BuildProjectionKeyLineageEntryJson(facts, output_names);
-			if (!lineage_entry.empty()) {
-				refresh_lineage_entries.push_back(std::move(lineage_entry));
-			}
-		}
-		string lineage_json = BuildRefreshLineageJson(refresh_lineage_entries);
 		if (!lineage_json.empty()) {
 			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));
 		}
-		add_profile_record(
-		    "create_compile_lineage",
-		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - lineage_start)
-		        .count(),
-		    "entries=" + to_string(refresh_lineage_entries.size()));
+		add_profile_record("create_compile_lineage", lineage_duration_ms, "entries=" + to_string(lineage_entry_count));
 
 		Value match_flag_val;
 		bool view_matching_enabled = context.TryGetCurrentSetting("openivm_enable_view_matching", match_flag_val) &&
@@ -714,98 +737,51 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// metadata so refresh-time can find the source SQL, the column list, and the aux
 		// table name. The aux table is populated from the (DISTINCT-stripped) input SQL
 		// at CREATE time; refresh-time MERGE keeps it in sync with delta multiplicities.
-		if (refresh_type == RefreshType::DISTINCT_INCREMENTAL) {
+		if (view_model.HasDistinctAux()) {
 			add_profile_marker("create_mv_distinct_aux");
-			string aux_table = "openivm_distinct_count_" + view_name;
-			string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(aux_table);
+			const auto &meta = view_model.distinct_aux;
+			string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(meta.aux_table);
 			string aux_create =
-			    BuildDistinctAuxStateCreateSQL(aux_target, distinct_extracted_cols, distinct_extracted_cols,
-			                                   "(" + distinct_extracted_input_sql + ")", "",
+			    BuildDistinctAuxStateCreateSQL(aux_target, meta.cols, meta.source_exprs, "(" + meta.input_sql + ")", "",
 			                                   /*replace=*/false);
 			ddl.push_back(aux_create);
 			add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
-			            KeywordHelper::WriteOptionallyQuoted(aux_table));
-			RefreshMetadata::DistinctAuxMeta meta {aux_table,
-			                                       distinct_extracted_cols,
-			                                       distinct_extracted_cols,
-			                                       distinct_extracted_input_sql,
-			                                       distinct_extracted_source,
-			                                       distinct_extracted_filter,
-			                                       distinct_sum_arg,
-			                                       distinct_sum_out};
+			            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
 			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("distinct_aux_meta_json",
 			                                                  RefreshMetadata::DistinctAuxMetaToJson(meta), view_name));
 		}
 
-		if (refresh_type == RefreshType::SIMPLE_AGGREGATE && has_filtered_group_count_aux) {
+		if (view_model.HasFilteredGroupCountAux()) {
 			add_profile_marker("create_mv_filtered_group_count_aux");
-			string aux_table = "openivm_filtered_group_count_" + view_name;
-			string source_table = QualifyCreateSourceTable(filtered_group_count_extract.source, current_catalog,
-			                                               current_schema, default_db);
-			string group_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.group_col);
-			string sum_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.sum_col);
-			string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(aux_table);
+			const auto &req = view_model.filtered_group_count_aux;
+			const auto &meta = req.meta;
+			string source_table =
+			    QualifyCreateSourceTable(req.create_source, current_catalog, current_schema, default_db);
+			string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(meta.aux_table);
 			string aux_create = BuildFilteredGroupCountAuxStateCreateSQL(
-			    aux_target, source_table, filtered_group_count_extract.group_col, filtered_group_count_extract.sum_col,
-			    group_q, sum_q, /*replace=*/false);
+			    aux_target, source_table, meta.group_col, meta.sum_col, meta.source_group_expr, meta.source_sum_expr,
+			    /*replace=*/false);
 			ddl.push_back(aux_create);
 			add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
-			            KeywordHelper::WriteOptionallyQuoted(aux_table));
-
-			RefreshMetadata::FilteredGroupCountAuxMeta meta {
-			    aux_table,
-			    SqlUtils::LastIdentifierPart(filtered_group_count_extract.source),
-			    filtered_group_count_extract.group_col,
-			    filtered_group_count_extract.sum_col,
-			    group_q,
-			    sum_q,
-			    filtered_group_count_extract.output_col,
-			    filtered_group_count_extract.comparison_op,
-			    filtered_group_count_extract.threshold_sql};
+			            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
 			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
 			    "aggregate_decomposition_json", RefreshMetadata::FilteredGroupCountAuxMetaToJson(meta), view_name));
 		}
 
-		if (refresh_type == RefreshType::SEMI_ANTI_RECOMPUTE) {
+		if (view_model.HasSemiAntiAux()) {
 			add_profile_marker("create_mv_semi_anti_aux");
-			string aux_table = "openivm_semi_anti_state_" + view_name;
+			const auto &meta = view_model.semi_anti_aux;
 			string left_source_table =
-			    QualifyCreateSourceTable(semi_anti_extract.left_table, current_catalog, current_schema, default_db);
+			    QualifyCreateSourceTable(meta.left_table, current_catalog, current_schema, default_db);
 			string right_source_table =
-			    QualifyCreateSourceTable(semi_anti_extract.right_table, current_catalog, current_schema, default_db);
-			vector<string> semi_anti_left_exprs;
-			for (size_t i = 0; i < semi_anti_left_cols.size(); i++) {
-				string qcol = KeywordHelper::WriteOptionallyQuoted(semi_anti_left_cols[i]);
-				string source_expr = semi_anti_extract.left_alias + "." + qcol;
-				for (size_t j = 0; j < semi_anti_extract.output_cols.size(); j++) {
-					if (StringUtil::CIEquals(semi_anti_extract.output_cols[j], semi_anti_left_cols[i]) &&
-					    j < semi_anti_extract.output_exprs.size()) {
-						source_expr = semi_anti_extract.output_exprs[j];
-						break;
-					}
-				}
-				semi_anti_left_exprs.push_back(source_expr);
-			}
-			string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(aux_table);
+			    QualifyCreateSourceTable(meta.right_table, current_catalog, current_schema, default_db);
+			string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(meta.aux_table);
 			string aux_create = BuildSemiAntiAuxStateCreateSQL(
-			    aux_target, left_source_table, semi_anti_extract.left_alias, right_source_table,
-			    semi_anti_extract.right_alias, semi_anti_extract.predicate, semi_anti_extract.post_filter,
-			    semi_anti_left_cols, semi_anti_left_exprs, /*replace=*/false);
+			    aux_target, left_source_table, meta.left_alias, right_source_table, meta.right_alias, meta.predicate,
+			    meta.post_filter, meta.left_cols, meta.left_exprs, /*replace=*/false);
 			ddl.push_back(aux_create);
 			add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
-			            KeywordHelper::WriteOptionallyQuoted(aux_table));
-
-			RefreshMetadata::SemiAntiAuxMeta meta {aux_table,
-			                                       semi_anti_extract.join_type,
-			                                       semi_anti_extract.left_table,
-			                                       semi_anti_extract.left_alias,
-			                                       semi_anti_extract.right_table,
-			                                       semi_anti_extract.right_alias,
-			                                       semi_anti_extract.predicate,
-			                                       semi_anti_extract.post_filter,
-			                                       semi_anti_left_cols,
-			                                       semi_anti_left_exprs,
-			                                       semi_anti_extract.output_cols};
+			            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
 			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("semi_anti_aux_meta_json",
 			                                                  RefreshMetadata::SemiAntiAuxMetaToJson(meta), view_name));
 		}

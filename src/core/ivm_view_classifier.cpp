@@ -193,8 +193,8 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 }
 
 static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis,
-                              bool has_unsupported_incremental_construct, bool distinct_incremental_supported,
-                              bool semi_anti_recompute_supported) {
+                              bool has_unsupported_incremental_construct, bool has_distinct_aux_candidate,
+                              bool has_semi_anti_aux_candidate) {
 	if (has_unsupported_incremental_construct) {
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_window) {
@@ -204,7 +204,7 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (analysis.found_semi_anti_join && analysis.found_aggregation) {
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
-		model.type = semi_anti_recompute_supported ? RefreshType::SEMI_ANTI_RECOMPUTE : RefreshType::FULL_REFRESH;
+		model.type = has_semi_anti_aux_candidate ? RefreshType::SEMI_ANTI_RECOMPUTE : RefreshType::FULL_REFRESH;
 	} else if (!analysis.incremental_compatible) {
 		model.type = RefreshType::FULL_REFRESH;
 		model.warn_unsupported_incremental = true;
@@ -215,7 +215,7 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (analysis.found_count_distinct && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && !model.distinct_at_top && analysis.found_aggregation) {
-		model.type = distinct_incremental_supported ? RefreshType::DISTINCT_INCREMENTAL : RefreshType::GROUP_RECOMPUTE;
+		model.type = has_distinct_aux_candidate ? RefreshType::DISTINCT_INCREMENTAL : RefreshType::GROUP_RECOMPUTE;
 	} else if (model.union_distinct_over_agg && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && model.distinct_at_top && !model.group_columns.empty()) {
@@ -233,6 +233,20 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else {
 		model.type = RefreshType::FULL_REFRESH;
 		model.warn_unrecognized_pattern = true;
+	}
+}
+
+static void AttachAuxRequirements(DeltaViewModel &model, const DeltaViewModelInput &input) {
+	if (model.type == RefreshType::DISTINCT_INCREMENTAL) {
+		D_ASSERT(input.distinct_aux_candidate);
+		model.distinct_aux = *input.distinct_aux_candidate;
+	}
+	if (model.type == RefreshType::SIMPLE_AGGREGATE && input.filtered_group_count_aux_candidate) {
+		model.filtered_group_count_aux = *input.filtered_group_count_aux_candidate;
+	}
+	if (model.type == RefreshType::SEMI_ANTI_RECOMPUTE) {
+		D_ASSERT(input.semi_anti_aux_candidate);
+		model.semi_anti_aux = *input.semi_anti_aux_candidate;
 	}
 }
 
@@ -311,8 +325,28 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 	}
 
 	SelectRefreshType(model, analysis, input.has_unsupported_incremental_construct,
-	                  input.distinct_incremental_supported, input.semi_anti_recompute_supported);
+	                  input.distinct_aux_candidate != nullptr, input.semi_anti_aux_candidate != nullptr);
+	AttachAuxRequirements(model, input);
 	return model;
+}
+
+void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFacts &facts,
+                                   const vector<string> &output_names) {
+	model.lineage_entries.clear();
+	const auto &analysis = facts.analysis;
+	if (model.type == RefreshType::WINDOW_PARTITION) {
+		string lineage_entry = BuildWindowPartitionLineageEntryJson(facts, model.window_partition_columns);
+		if (!lineage_entry.empty()) {
+			model.lineage_entries.push_back(std::move(lineage_entry));
+		}
+		return;
+	}
+	if (model.type == RefreshType::SIMPLE_PROJECTION && !analysis.found_left_join && !analysis.found_full_outer) {
+		string lineage_entry = BuildProjectionKeyLineageEntryJson(facts, output_names);
+		if (!lineage_entry.empty()) {
+			model.lineage_entries.push_back(std::move(lineage_entry));
+		}
+	}
 }
 
 } // namespace duckdb

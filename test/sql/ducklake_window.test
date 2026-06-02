@@ -46,6 +46,11 @@ SELECT group_columns FROM openivm_views WHERE view_name = 'mv_history_window';
 ----
 H_W_ID=H_W_ID
 
+query I
+SELECT (lineage_json LIKE '{"v":1,"items":[{"k":"window_partition"%')::INT FROM openivm_views WHERE view_name = 'mv_history_window';
+----
+1
+
 statement ok
 INSERT INTO dl.history_win VALUES
     (4, 8, 3, 8, 3, '2026-01-01 00:00:00', 469.00, 'Payment'),
