@@ -3,7 +3,6 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
-#include "core/parser.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"

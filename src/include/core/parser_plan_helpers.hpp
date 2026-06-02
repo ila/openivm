@@ -3,7 +3,6 @@
 
 #include "core/incremental_checker.hpp"
 #include "core/refresh_metadata.hpp"
-#include "core/parser.hpp"
 #include "duckdb.hpp"
 #include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -84,8 +83,6 @@ struct CreateMVPlanFacts {
 	bool has_pivot = false;
 };
 
-string SqlCsvLiteralOrNull(const vector<string> &values);
-void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result);
 string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
                        const vector<string> &output_col_names);
 void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
@@ -115,8 +112,6 @@ vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<str
 LogicalAggregate *FindOuterAggregate(LogicalOperator *op);
 bool IsPacLoaded(ClientContext &context);
 void ForwardPacSettingsIfLoaded(ClientContext &context, Connection &con);
-void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name, bool is_replace);
-string BuildUpdateViewJsonSQL(const string &column_name, const string &json, const string &view_name);
 
 } // namespace duckdb
 

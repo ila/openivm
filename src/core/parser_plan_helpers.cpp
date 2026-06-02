@@ -543,18 +543,18 @@ vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t grou
 	return group_names;
 }
 
+static void AddUniqueGroupName(vector<string> &group_names, const string &new_name) {
+	for (auto &existing : group_names) {
+		if (StringUtil::CIEquals(existing, new_name)) {
+			return;
+		}
+	}
+	group_names.push_back(new_name);
+}
+
 static void AddUniqueGroupNames(vector<string> &group_names, const vector<string> &new_names) {
 	for (auto &name : new_names) {
-		bool exists = false;
-		for (auto &existing : group_names) {
-			if (StringUtil::CIEquals(existing, name)) {
-				exists = true;
-				break;
-			}
-		}
-		if (!exists) {
-			group_names.push_back(name);
-		}
+		AddUniqueGroupName(group_names, name);
 	}
 }
 
@@ -572,7 +572,7 @@ vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, c
 				continue;
 			}
 			if (!output_names[expr_idx].empty() && !IncrementalTableNames::IsInternalColumn(output_names[expr_idx])) {
-				AddUniqueGroupNames(group_names, vector<string> {output_names[expr_idx]});
+				AddUniqueGroupName(group_names, output_names[expr_idx]);
 			}
 		}
 	}
@@ -756,7 +756,8 @@ CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &cu
 }
 
 static bool FindProjectionPath(const ProjectionSourceOccurrence &source, const OccurrenceColumnRef &key_ref,
-                               const vector<ProjectionLineageEdge> &edges, vector<ProjectionLineageEdge> &path) {
+                               const unordered_map<string, vector<ProjectionLineageEdge>> &adjacency,
+                               vector<ProjectionLineageEdge> &path) {
 	string source_key = OccurrenceKey(source.table, source.occurrence);
 	string target_key = OccurrenceKey(key_ref);
 	if (source_key == target_key) {
@@ -772,10 +773,11 @@ static bool FindProjectionPath(const ProjectionSourceOccurrence &source, const O
 	seen[source_key] = true;
 	for (idx_t pos = 0; pos < queue.size(); pos++) {
 		string node = queue[pos];
-		for (auto &edge : edges) {
-			if (OccurrenceKey(edge.from) != node) {
-				continue;
-			}
+		auto adjacency_it = adjacency.find(node);
+		if (adjacency_it == adjacency.end()) {
+			continue;
+		}
+		for (auto &edge : adjacency_it->second) {
 			string next = OccurrenceKey(edge.to);
 			if (seen[next]) {
 				continue;
@@ -844,6 +846,11 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 		return false;
 	}
 
+	unordered_map<string, vector<ProjectionLineageEdge>> adjacency;
+	for (auto &edge : facts.projection_lineage_edges) {
+		adjacency[OccurrenceKey(edge.from)].push_back(edge);
+	}
+
 	for (idx_t expr_i = 0; expr_i < top_projection->expressions.size(); expr_i++) {
 		auto &expr = top_projection->expressions[expr_i];
 		auto *bcr = GetColumnRefThroughCasts(expr.get());
@@ -863,7 +870,7 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 		bool covered = true;
 		for (auto &occurrence : facts.source_occurrences) {
 			vector<ProjectionLineageEdge> path;
-			if (!FindProjectionPath(occurrence, key_ref, facts.projection_lineage_edges, path)) {
+			if (!FindProjectionPath(occurrence, key_ref, adjacency, path)) {
 				covered = false;
 				break;
 			}

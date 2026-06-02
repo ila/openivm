@@ -2,9 +2,9 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "core/parser.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/common/printer.hpp"
+#include "duckdb/function/table_function.hpp"
 
 #include <chrono>
 #include <cstring>
@@ -101,6 +101,25 @@ private:
 	std::chrono::steady_clock::time_point total_start;
 	vector<CreateMVProfileStep> steps;
 };
+
+struct DDLExecutorBindData : public TableFunctionData {
+	explicit DDLExecutorBindData(bool result) : result(result) {
+	}
+
+	bool result;
+	vector<string> ddl;
+};
+
+struct DDLExecutorGlobalData : public GlobalTableFunctionState {
+	DDLExecutorGlobalData() : offset(0) {
+	}
+
+	idx_t offset;
+};
+
+unique_ptr<GlobalTableFunctionState> DDLExecutorInitFunction(ClientContext &context, TableFunctionInitInput &input) {
+	return make_uniq<DDLExecutorGlobalData>();
+}
 
 void ParseCreateMVProfileMarker(const string &payload, string &view_name, string &step_name, string &detail) {
 	auto first = payload.find('\t');
@@ -335,11 +354,9 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	restore_outer_transaction();
 }
 
-} // namespace
-
 unique_ptr<FunctionData> DDLExecutorBindFunction(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<string> &names) {
-	auto bind_data = make_uniq<DDLExecutorFunction::DDLExecutorBindData>(true);
+	auto bind_data = make_uniq<DDLExecutorBindData>(true);
 	for (auto &param : input.inputs) {
 		auto q = param.GetValue<string>();
 		if (!q.empty()) {
@@ -352,8 +369,8 @@ unique_ptr<FunctionData> DDLExecutorBindFunction(ClientContext &context, TableFu
 }
 
 void DDLExecutorExecuteFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &bind_data = data_p.bind_data->Cast<DDLExecutorFunction::DDLExecutorBindData>();
-	auto &gdata = dynamic_cast<DDLExecutorFunction::DDLExecutorGlobalData &>(*data_p.global_state);
+	auto &bind_data = data_p.bind_data->Cast<DDLExecutorBindData>();
+	auto &gdata = dynamic_cast<DDLExecutorGlobalData &>(*data_p.global_state);
 	if (gdata.offset >= 1) {
 		return;
 	}
@@ -361,6 +378,15 @@ void DDLExecutorExecuteFunction(ClientContext &context, TableFunctionInput &data
 	output.SetValue(0, 0, Value::BOOLEAN(bind_data.result));
 	output.SetCardinality(1);
 	gdata.offset++;
+}
+
+} // namespace
+
+void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result) {
+	result.function = TableFunction("openivm_ddl_executor", {}, DDLExecutorExecuteFunction, DDLExecutorBindFunction,
+	                                DDLExecutorInitFunction);
+	result.requires_valid_transaction = true;
+	result.return_type = StatementReturnType::QUERY_RESULT;
 }
 
 } // namespace duckdb

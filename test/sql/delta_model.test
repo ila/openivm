@@ -1,0 +1,115 @@
+# name: test/sql/delta_model.test
+# description: Test CREATE-time delta model IR metadata
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_profile_refresh = true;
+
+# ==========================================
+# Simple projection exposes node-local model facts
+# ==========================================
+
+statement ok
+CREATE TABLE dm_profile_base (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO dm_profile_base VALUES (1, 'one');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dm_profile AS SELECT id, name FROM dm_profile_base;
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'mv_dm_profile'
+  AND step_name = 'create_compile_classification'
+  AND contains(detail, 'model_nodes=')
+  AND contains(detail, 'scan_occurrences=1')
+  AND contains(detail, 'node_semantics=')
+  AND contains(detail, 'delta_only_nodes=');
+----
+1
+
+# ==========================================
+# Aggregate nodes expose stateful maintenance facts
+# ==========================================
+
+statement ok
+CREATE TABLE dm_group_base (k INT, v INT);
+
+statement ok
+INSERT INTO dm_group_base VALUES (1, 10), (1, 20), (2, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dm_group AS
+    SELECT k, SUM(v) AS total
+    FROM dm_group_base GROUP BY k;
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'mv_dm_group'
+  AND step_name = 'create_compile_classification'
+  AND contains(detail, 'refresh_type=AGGREGATE_GROUP')
+  AND contains(detail, 'delta_state_nodes=1');
+----
+1
+
+# ==========================================
+# Repeated-source self join keeps scan occurrence identity
+# ==========================================
+
+statement ok
+CREATE TABLE dm_self_join (id INT, parent INT);
+
+statement ok
+INSERT INTO dm_self_join VALUES (1, NULL), (2, 1), (3, 1), (4, 2);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_dm_self_join AS
+    SELECT child.id AS child_id, parent.id AS parent_id
+    FROM dm_self_join child
+    JOIN dm_self_join parent ON child.parent = parent.id;
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'mv_dm_self_join'
+  AND step_name = 'create_compile_classification'
+  AND contains(detail, 'scan_occurrences=2')
+  AND contains(detail, 'model_nodes=')
+  AND contains(detail, 'delta_state_nodes=1');
+----
+1
+
+statement ok
+INSERT INTO dm_self_join VALUES (5, 2), (6, 4);
+
+statement ok
+DELETE FROM dm_self_join WHERE id = 3;
+
+statement ok
+PRAGMA refresh('mv_dm_self_join');
+
+query I
+SELECT count(*) FROM (
+    SELECT child.id AS child_id, parent.id AS parent_id
+    FROM dm_self_join child
+    JOIN dm_self_join parent ON child.parent = parent.id
+    EXCEPT ALL SELECT child_id, parent_id FROM mv_dm_self_join
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT child_id, parent_id FROM mv_dm_self_join
+    EXCEPT ALL
+    SELECT child.id AS child_id, parent.id AS parent_id
+    FROM dm_self_join child
+    JOIN dm_self_join parent ON child.parent = parent.id
+);
+----
+0
+
+statement ok
+SET openivm_profile_refresh = false;

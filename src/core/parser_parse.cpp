@@ -47,8 +47,8 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 		// Pass the UPDATE SQL through MaterializedViewParseData; PlanFunction will execute it
 		Parser alter_parser;
 		alter_parser.ParseQuery("SELECT 1");
-		auto parse_data = make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(
-		    std::move(alter_parser.statements[0]), true);
+		auto parse_data =
+		    make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(std::move(alter_parser.statements[0]));
 		dynamic_cast<MaterializedViewParseData &>(*parse_data).alter_sql = update_sql;
 		return ParserExtensionParseResult(std::move(parse_data));
 	}
@@ -83,7 +83,7 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 	p.ParseQuery(query_lower);
 
 	auto parse_data = make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(std::move(p.statements[0]),
-	                                                                                      true, refresh_interval);
+	                                                                                      refresh_interval);
 	dynamic_cast<MaterializedViewParseData &>(*parse_data).is_replace = is_replace;
 	return ParserExtensionParseResult(std::move(parse_data));
 }

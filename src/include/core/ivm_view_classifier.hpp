@@ -52,6 +52,10 @@ enum class DeltaModelNodeKind {
 
 enum class DeltaRuleKind { LINEAR, PRODUCT, STATEFUL, NON_LINEAR, FULL_ONLY };
 
+enum class DeltaMaintenanceMode { DELTA_ONLY, DELTA_WITH_STATE, AFFECTED_DOMAIN_RECOMPUTE, FULL_RECOMPUTE };
+
+enum class DeltaMaintenanceStateKind { NONE, CURRENT_RELATION, MV_DATA, AUX_TABLE };
+
 enum class DeltaUnsupportedReason {
 	UNSUPPORTED_SET_OPERATION,
 	UNSUPPORTED_PIVOT,
@@ -84,20 +88,14 @@ enum class DeltaAffectedDomainKind { GROUP, WINDOW_PARTITION, PROJECTION_KEY, SE
 
 enum class DeltaLineageKind { WINDOW_PARTITION, PROJECTION_KEY, SEMI_ANTI_PREDICATE };
 
-struct DeltaModelNode {
-	idx_t id = DConstants::INVALID_INDEX;
-	DeltaModelNodeKind kind = DeltaModelNodeKind::OTHER;
-	DeltaRuleKind rule = DeltaRuleKind::FULL_ONLY;
-	vector<idx_t> children;
-	vector<string> source_tables;
-	vector<string> output_columns;
-	vector<string> hidden_columns;
-	vector<string> affected_key_columns;
-	vector<DeltaAuxStateKind> required_aux_states;
+struct DeltaNodeMaintenance {
+	DeltaMaintenanceMode mode = DeltaMaintenanceMode::FULL_RECOMPUTE;
+	DeltaMaintenanceStateKind state = DeltaMaintenanceStateKind::NONE;
 };
 
 struct DeltaAffectedDomain {
 	DeltaAffectedDomainKind kind = DeltaAffectedDomainKind::GROUP;
+	idx_t node_id = DConstants::INVALID_INDEX;
 	vector<string> key_columns;
 	vector<string> source_tables;
 	bool delta_local = false;
@@ -106,8 +104,9 @@ struct DeltaAffectedDomain {
 
 struct DeltaLineageFact {
 	DeltaLineageKind kind = DeltaLineageKind::WINDOW_PARTITION;
+	idx_t node_id = DConstants::INVALID_INDEX;
 	string source_table;
-	idx_t source_occurrence = 0;
+	idx_t source_occurrence = DConstants::INVALID_INDEX;
 	string source_column;
 	string output_column;
 	string lookup_table;
@@ -115,10 +114,24 @@ struct DeltaLineageFact {
 	string lookup_output_column;
 };
 
-struct DeltaPlanDecision {
-	RefreshType refresh_type = RefreshType::FULL_REFRESH;
-	vector<string> reasons;
-	bool exact_refresh_type = true;
+struct DeltaModelNode {
+	idx_t id = DConstants::INVALID_INDEX;
+	DeltaModelNodeKind kind = DeltaModelNodeKind::OTHER;
+	DeltaRuleKind rule = DeltaRuleKind::FULL_ONLY;
+	vector<idx_t> children;
+	string source_table;
+	idx_t source_occurrence = DConstants::INVALID_INDEX;
+	idx_t source_table_index = DConstants::INVALID_INDEX;
+	vector<string> source_tables;
+	vector<string> output_columns;
+	vector<string> hidden_columns;
+	vector<string> affected_key_columns;
+	DeltaNodeMaintenance maintenance;
+	vector<DeltaUpdateSemantics> update_semantics;
+	vector<DeltaUnsupportedReason> unsupported_reasons;
+	vector<DeltaAuxStateKind> required_aux_states;
+	vector<DeltaAffectedDomain> affected_domains;
+	vector<DeltaLineageFact> lineage_facts;
 };
 
 struct FilteredGroupCountAuxRequirement {
@@ -134,7 +147,6 @@ struct DeltaViewModelInput {
 	const RefreshMetadata::SemiAntiAuxMeta *semi_anti_aux_candidate = nullptr;
 	bool has_unsupported_incremental_construct = false;
 	bool keep_window_join_partitions = true;
-	bool build_operator_model = true;
 };
 
 struct DeltaViewModel {
@@ -185,11 +197,6 @@ const char *DeltaUpdateSemanticsName(DeltaUpdateSemantics semantics);
 const char *DeltaAffectedDomainKindName(DeltaAffectedDomainKind kind);
 bool IsDistinctAtTop(const PlanAnalysis &analysis, const vector<string> &output_names);
 DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input);
-DeltaPlanDecision BuildDeltaPlanDecision(const DeltaViewModel &model);
-bool DeltaPlanDecisionMatchesModel(const DeltaPlanDecision &decision, const DeltaViewModel &model);
-void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFacts &facts,
-                                   const vector<string> &output_names);
-string BuildDeltaViewModelLineageJson(const DeltaViewModel &model);
 
 } // namespace duckdb
 

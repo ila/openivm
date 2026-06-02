@@ -1,7 +1,6 @@
-#include "core/parser_plan_helpers.hpp"
+#include "core/parser_create_mv_helpers.hpp"
 
 #include "core/openivm_constants.hpp"
-#include "core/parser_ddl.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 
@@ -24,13 +23,6 @@ string SqlCsvLiteralOrNull(const vector<string> &values) {
 
 static void AddColumnIfNotExists(vector<string> &ddl, const string &table_name, const string &column_definition) {
 	ddl.push_back("alter table " + table_name + " add column if not exists " + column_definition);
-}
-
-void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result) {
-	result.function = TableFunction("openivm_ddl_executor", {}, DDLExecutorExecuteFunction, DDLExecutorBindFunction,
-	                                DDLExecutorFunction::DDLExecutorInit);
-	result.requires_valid_transaction = true;
-	result.return_type = StatementReturnType::QUERY_RESULT;
 }
 
 string BuildUpdateViewJsonSQL(const string &column_name, const string &json, const string &view_name) {
