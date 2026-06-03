@@ -287,6 +287,15 @@ vector<string> RefreshMetadata::GetAggregateTypes(const string &view_name) {
 	return types;
 }
 
+string RefreshMetadata::GetHavingPredicate(const string &view_name) {
+	auto result = con.Query("SELECT having_predicate FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return "";
+	}
+	return result->GetValue(0, 0).ToString();
+}
+
 int64_t RefreshMetadata::GetRefreshInterval(const string &view_name) {
 	auto result = con.Query("SELECT refresh_interval FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");

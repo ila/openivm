@@ -103,6 +103,10 @@ public:
 	// Get per-column aggregate function types (min, max, sum, count_star, etc.).
 	vector<string> GetAggregateTypes(const string &view_name);
 
+	// Get the HAVING predicate extracted into the user-facing view. Empty means no
+	// predicate was extracted, which can happen when HAVING is nested inside a CTE.
+	string GetHavingPredicate(const string &view_name);
+
 	// --- DuckLake support ---
 
 	// Get the catalog type for a base table entry ('duckdb' or 'ducklake').

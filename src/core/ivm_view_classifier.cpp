@@ -126,7 +126,7 @@ static void BuildUnsupportedReasons(DeltaViewModel &model, const CreateMVPlanFac
 	if (analysis.found_filtered_list && model.group_columns.empty()) {
 		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::FILTERED_LIST_NO_KEYS);
 	}
-	if (analysis.found_semi_anti_join && analysis.found_aggregation) {
+	if (analysis.found_semi_anti_join && analysis.found_aggregation && model.group_columns.empty()) {
 		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::SEMI_ANTI_WITH_AGGREGATE);
 	}
 	if (analysis.found_semi_anti_join && !analysis.found_aggregation && !input.semi_anti_aux_candidate) {
@@ -301,6 +301,9 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	if (analysis.found_nested_aggregate) {
 		AddUnique(model.strategy_reasons, DeltaStrategyReason::NESTED_AGGREGATE_GROUP_FALLBACK);
 	}
+	if (analysis.found_semi_anti_join && analysis.found_aggregation && !model.group_columns.empty()) {
+		AddUnique(model.strategy_reasons, DeltaStrategyReason::SEMI_ANTI_AGGREGATE_GROUP_FALLBACK);
+	}
 }
 
 static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis,
@@ -312,7 +315,7 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (analysis.found_grouping_sets) {
 		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_semi_anti_join && analysis.found_aggregation) {
-		model.type = RefreshType::FULL_REFRESH;
+		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
 		model.type = model.HasFeature(DeltaModelFeature::SEMI_ANTI_STATEFUL) ? RefreshType::SEMI_ANTI_RECOMPUTE
 		                                                                     : RefreshType::FULL_REFRESH;
@@ -380,6 +383,8 @@ const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
 		return "NESTED_AGGREGATE_GROUP_FALLBACK";
 	case DeltaStrategyReason::REPEATED_CTE_AGGREGATE_GROUP_FALLBACK:
 		return "REPEATED_CTE_AGGREGATE_GROUP_FALLBACK";
+	case DeltaStrategyReason::SEMI_ANTI_AGGREGATE_GROUP_FALLBACK:
+		return "SEMI_ANTI_AGGREGATE_GROUP_FALLBACK";
 	case DeltaStrategyReason::OUTER_JOIN_AGGREGATE_RECOMPUTE:
 		return "OUTER_JOIN_AGGREGATE_RECOMPUTE";
 	default:

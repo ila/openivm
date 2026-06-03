@@ -596,6 +596,11 @@ CREATE MATERIALIZED VIEW mv_exists_group AS
     )
     GROUP BY l.grp;
 
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_exists_group';
+----
+6
+
 statement ok
 CREATE MATERIALIZED VIEW mv_exists_union AS
     SELECT l.id, l.x

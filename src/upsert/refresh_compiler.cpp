@@ -169,7 +169,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
                               bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
                               const string &catalog_prefix, bool insert_only, const vector<string> &aggregate_types,
-                              const vector<LogicalType> &column_types) {
+                              const vector<LogicalType> &column_types, bool use_current_diff_affected_keys) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 
@@ -396,6 +396,11 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// for VARCHAR etc. regardless of whether the negative branch is reached.
 		// For MIN/MAX without non-summable cols, insert_only uses GREATEST/LEAST in
 		// the MERGE path below.
+		if (use_current_diff_affected_keys && !view_query_sql.empty()) {
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] using current-diff affected keys for '%s'\n",
+			                    view_name.c_str());
+			return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, keys);
+		}
 		string keys_tuple = SqlUtils::JoinQuotedColumns(keys);
 		string match_delete = SqlUtils::BuildNullSafeKeyPredicate(keys, "openivm_aff.", "openivm_tgt.");
 		string match_insert = SqlUtils::BuildNullSafeKeyPredicate(keys, "openivm_aff.", "openivm_recompute.");

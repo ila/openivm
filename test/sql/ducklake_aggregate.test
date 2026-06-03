@@ -749,6 +749,488 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# ==========================================
+# DuckLake aggregate with CTEs, FILTER, HAVING, MIN/MAX
+# ==========================================
+
+statement ok
+CREATE TABLE dl.minmax_filter_having_src (
+    id INTEGER,
+    grp VARCHAR,
+    credit VARCHAR,
+    balance DOUBLE,
+    amount DOUBLE
+);
+
+statement ok
+INSERT INTO dl.minmax_filter_having_src VALUES
+    (1, 'north', 'GC', -10.0, 5.0),
+    (2, 'north', 'GC', 250.0, 7.0),
+    (3, 'north', 'BC', 30.0, 11.0),
+    (4, 'south', 'GC', 40.0, 13.0),
+    (5, 'west', 'GC', 250.0, 5.0);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_minmax_filter_having AS
+    WITH
+    params AS (
+        SELECT 'GC' AS good_credit, 100.0::DOUBLE AS high_balance_cutoff, 0.0::DOUBLE AS zero_amount
+    ),
+    base AS (
+        SELECT
+            s.grp,
+            COALESCE(s.credit, 'BC') AS credit_code,
+            CAST(s.balance AS DOUBLE) AS balance_amount,
+            CAST(s.amount AS DOUBLE) AS amount,
+            CASE WHEN s.amount > 10 THEN 'busy' ELSE 'quiet' END AS activity_bucket
+        FROM dl.minmax_filter_having_src s
+        WHERE s.id > 0
+    ),
+    layered AS (
+        SELECT
+            b.grp,
+            b.credit_code,
+            b.activity_bucket,
+            b.balance_amount,
+            COALESCE(b.amount, 0.0) AS safe_amount
+        FROM base b
+    ),
+    rollup AS (
+        SELECT
+            l.grp,
+            l.credit_code,
+            l.activity_bucket,
+            COUNT(*) AS row_count,
+            COUNT(*) FILTER (WHERE l.credit_code = (SELECT good_credit FROM params)) AS good_credit_rows,
+            SUM(l.balance_amount) FILTER (WHERE l.balance_amount > (SELECT high_balance_cutoff FROM params)) AS high_balance_sum,
+            SUM(l.safe_amount) AS total_amount,
+            MIN(l.balance_amount) AS min_balance,
+            MAX(l.balance_amount) AS max_balance
+        FROM layered l
+        GROUP BY l.grp, l.credit_code, l.activity_bucket
+        HAVING
+            COUNT(*) FILTER (WHERE l.credit_code IS NOT NULL) > 0
+            AND (
+                SUM(l.safe_amount) FILTER (WHERE l.activity_bucket = 'busy') IS NOT NULL
+                OR SUM(l.balance_amount) FILTER (WHERE l.balance_amount <= (SELECT high_balance_cutoff FROM params)) IS NOT NULL
+            )
+    )
+    SELECT
+        grp,
+        credit_code,
+        activity_bucket,
+        row_count,
+        good_credit_rows,
+        COALESCE(high_balance_sum, (SELECT zero_amount FROM params)) AS high_balance_sum,
+        total_amount,
+        min_balance,
+        max_balance
+    FROM rollup;
+
+statement ok
+UPDATE dl.minmax_filter_having_src SET balance = 500.0 WHERE id = 1;
+
+statement ok
+UPDATE dl.minmax_filter_having_src SET balance = 50.0 WHERE id = 2;
+
+statement ok
+UPDATE dl.minmax_filter_having_src SET balance = 50.0 WHERE id = 5;
+
+statement ok
+PRAGMA refresh('mv_minmax_filter_having');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, credit_code, activity_bucket, row_count, good_credit_rows, high_balance_sum, total_amount, min_balance, max_balance
+    FROM dl.mv_minmax_filter_having
+    EXCEPT ALL
+    SELECT * FROM (
+        WITH
+        params AS (
+            SELECT 'GC' AS good_credit, 100.0::DOUBLE AS high_balance_cutoff, 0.0::DOUBLE AS zero_amount
+        ),
+        base AS (
+            SELECT
+                s.grp,
+                COALESCE(s.credit, 'BC') AS credit_code,
+                CAST(s.balance AS DOUBLE) AS balance_amount,
+                CAST(s.amount AS DOUBLE) AS amount,
+                CASE WHEN s.amount > 10 THEN 'busy' ELSE 'quiet' END AS activity_bucket
+            FROM dl.minmax_filter_having_src s
+            WHERE s.id > 0
+        ),
+        layered AS (
+            SELECT
+                b.grp,
+                b.credit_code,
+                b.activity_bucket,
+                b.balance_amount,
+                COALESCE(b.amount, 0.0) AS safe_amount
+            FROM base b
+        ),
+        rollup AS (
+            SELECT
+                l.grp,
+                l.credit_code,
+                l.activity_bucket,
+                COUNT(*) AS row_count,
+                COUNT(*) FILTER (WHERE l.credit_code = (SELECT good_credit FROM params)) AS good_credit_rows,
+                SUM(l.balance_amount) FILTER (WHERE l.balance_amount > (SELECT high_balance_cutoff FROM params)) AS high_balance_sum,
+                SUM(l.safe_amount) AS total_amount,
+                MIN(l.balance_amount) AS min_balance,
+                MAX(l.balance_amount) AS max_balance
+            FROM layered l
+            GROUP BY l.grp, l.credit_code, l.activity_bucket
+            HAVING
+                COUNT(*) FILTER (WHERE l.credit_code IS NOT NULL) > 0
+                AND (
+                    SUM(l.safe_amount) FILTER (WHERE l.activity_bucket = 'busy') IS NOT NULL
+                    OR SUM(l.balance_amount) FILTER (WHERE l.balance_amount <= (SELECT high_balance_cutoff FROM params)) IS NOT NULL
+                )
+        )
+        SELECT
+            grp,
+            credit_code,
+            activity_bucket,
+            row_count,
+            good_credit_rows,
+            COALESCE(high_balance_sum, (SELECT zero_amount FROM params)) AS high_balance_sum,
+            total_amount,
+            min_balance,
+            max_balance
+        FROM rollup
+    ) _q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        WITH
+        params AS (
+            SELECT 'GC' AS good_credit, 100.0::DOUBLE AS high_balance_cutoff, 0.0::DOUBLE AS zero_amount
+        ),
+        base AS (
+            SELECT
+                s.grp,
+                COALESCE(s.credit, 'BC') AS credit_code,
+                CAST(s.balance AS DOUBLE) AS balance_amount,
+                CAST(s.amount AS DOUBLE) AS amount,
+                CASE WHEN s.amount > 10 THEN 'busy' ELSE 'quiet' END AS activity_bucket
+            FROM dl.minmax_filter_having_src s
+            WHERE s.id > 0
+        ),
+        layered AS (
+            SELECT
+                b.grp,
+                b.credit_code,
+                b.activity_bucket,
+                b.balance_amount,
+                COALESCE(b.amount, 0.0) AS safe_amount
+            FROM base b
+        ),
+        rollup AS (
+            SELECT
+                l.grp,
+                l.credit_code,
+                l.activity_bucket,
+                COUNT(*) AS row_count,
+                COUNT(*) FILTER (WHERE l.credit_code = (SELECT good_credit FROM params)) AS good_credit_rows,
+                SUM(l.balance_amount) FILTER (WHERE l.balance_amount > (SELECT high_balance_cutoff FROM params)) AS high_balance_sum,
+                SUM(l.safe_amount) AS total_amount,
+                MIN(l.balance_amount) AS min_balance,
+                MAX(l.balance_amount) AS max_balance
+            FROM layered l
+            GROUP BY l.grp, l.credit_code, l.activity_bucket
+            HAVING
+                COUNT(*) FILTER (WHERE l.credit_code IS NOT NULL) > 0
+                AND (
+                    SUM(l.safe_amount) FILTER (WHERE l.activity_bucket = 'busy') IS NOT NULL
+                    OR SUM(l.balance_amount) FILTER (WHERE l.balance_amount <= (SELECT high_balance_cutoff FROM params)) IS NOT NULL
+                )
+        )
+        SELECT
+            grp,
+            credit_code,
+            activity_bucket,
+            row_count,
+            good_credit_rows,
+            COALESCE(high_balance_sum, (SELECT zero_amount FROM params)) AS high_balance_sum,
+            total_amount,
+            min_balance,
+            max_balance
+        FROM rollup
+    ) _q
+    EXCEPT ALL
+    SELECT grp, credit_code, activity_bucket, row_count, good_credit_rows, high_balance_sum, total_amount, min_balance, max_balance
+    FROM dl.mv_minmax_filter_having
+);
+----
+0
+
+# Nested HAVING stays inside the stored data query. A source update can make a
+# previously invisible joined group satisfy HAVING without changing its GROUP BY key.
+statement ok
+CREATE TABLE dl.minmax_join_dim (
+    grp VARCHAR,
+    region_state VARCHAR,
+    tax_band VARCHAR
+);
+
+statement ok
+CREATE TABLE dl.minmax_join_orders (
+    grp VARCHAR,
+    order_amount DOUBLE
+);
+
+statement ok
+CREATE TABLE dl.minmax_join_customer (
+    id INTEGER,
+    grp VARCHAR,
+    credit VARCHAR,
+    balance DOUBLE
+);
+
+statement ok
+INSERT INTO dl.minmax_join_dim VALUES
+    ('north', 'ST', 'mid'),
+    ('west', 'ST', 'mid');
+
+statement ok
+INSERT INTO dl.minmax_join_orders VALUES ('north', 300.0);
+
+statement ok
+INSERT INTO dl.minmax_join_customer VALUES
+    (1, 'north', 'GC', 10000.0),
+    (2, 'west', 'GC', 10000.0);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_minmax_join_having AS
+    WITH
+    params AS (
+        SELECT 100.0::DOUBLE AS cutoff, 0.0::DOUBLE AS zero_amount
+    ),
+    dim AS (
+        SELECT d.grp, d.region_state, d.tax_band
+        FROM dl.minmax_join_dim d
+    ),
+    orders AS (
+        SELECT o.grp, SUM(o.order_amount) AS order_amount
+        FROM dl.minmax_join_orders o
+        GROUP BY o.grp
+    ),
+    base AS (
+        SELECT
+            c.grp,
+            d.region_state,
+            d.tax_band,
+            COALESCE(c.credit, 'BC') AS credit_code,
+            CAST(c.balance AS DOUBLE) AS balance_amount,
+            COALESCE(o.order_amount, 0.0) AS order_amount,
+            CASE
+                WHEN o.order_amount IS NULL THEN 'closed'
+                WHEN o.order_amount > 100 THEN 'large'
+                ELSE 'open'
+            END AS activity_bucket
+        FROM dl.minmax_join_customer c
+        JOIN dim d ON d.grp = c.grp
+        LEFT JOIN orders o ON o.grp = c.grp
+    ),
+    rollup AS (
+        SELECT
+            grp,
+            region_state,
+            tax_band,
+            credit_code,
+            activity_bucket,
+            COUNT(*) AS row_count,
+            COUNT(*) FILTER (WHERE credit_code = 'GC') AS good_credit_rows,
+            SUM(balance_amount) FILTER (WHERE balance_amount > (SELECT cutoff FROM params)) AS high_balance_sum,
+            SUM(order_amount) FILTER (WHERE activity_bucket IN ('open', 'large')) AS active_order_sum,
+            MIN(balance_amount) AS min_balance,
+            MAX(balance_amount) AS max_balance
+        FROM base
+        GROUP BY grp, region_state, tax_band, credit_code, activity_bucket
+        HAVING
+            COUNT(*) FILTER (WHERE credit_code IS NOT NULL) > 0
+            AND (
+                SUM(order_amount) FILTER (WHERE activity_bucket IN ('open', 'large')) IS NOT NULL
+                OR SUM(balance_amount) FILTER (WHERE balance_amount <= (SELECT cutoff FROM params)) IS NOT NULL
+            )
+    )
+    SELECT
+        grp,
+        region_state,
+        tax_band,
+        credit_code,
+        activity_bucket,
+        row_count,
+        good_credit_rows,
+        COALESCE(high_balance_sum, (SELECT zero_amount FROM params)) AS high_balance_sum,
+        COALESCE(active_order_sum, (SELECT zero_amount FROM params)) AS active_order_sum,
+        min_balance,
+        max_balance
+    FROM rollup;
+
+statement ok
+UPDATE dl.minmax_join_customer SET balance = -154.0 WHERE id = 2;
+
+statement ok
+PRAGMA refresh('mv_minmax_join_having');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, region_state, tax_band, credit_code, activity_bucket, row_count, good_credit_rows, high_balance_sum, active_order_sum, min_balance, max_balance
+    FROM dl.mv_minmax_join_having
+    EXCEPT ALL
+    SELECT * FROM (
+        WITH
+        params AS (
+            SELECT 100.0::DOUBLE AS cutoff, 0.0::DOUBLE AS zero_amount
+        ),
+        dim AS (
+            SELECT d.grp, d.region_state, d.tax_band
+            FROM dl.minmax_join_dim d
+        ),
+        orders AS (
+            SELECT o.grp, SUM(o.order_amount) AS order_amount
+            FROM dl.minmax_join_orders o
+            GROUP BY o.grp
+        ),
+        base AS (
+            SELECT
+                c.grp,
+                d.region_state,
+                d.tax_band,
+                COALESCE(c.credit, 'BC') AS credit_code,
+                CAST(c.balance AS DOUBLE) AS balance_amount,
+                COALESCE(o.order_amount, 0.0) AS order_amount,
+                CASE
+                    WHEN o.order_amount IS NULL THEN 'closed'
+                    WHEN o.order_amount > 100 THEN 'large'
+                    ELSE 'open'
+                END AS activity_bucket
+            FROM dl.minmax_join_customer c
+            JOIN dim d ON d.grp = c.grp
+            LEFT JOIN orders o ON o.grp = c.grp
+        ),
+        rollup AS (
+            SELECT
+                grp,
+                region_state,
+                tax_band,
+                credit_code,
+                activity_bucket,
+                COUNT(*) AS row_count,
+                COUNT(*) FILTER (WHERE credit_code = 'GC') AS good_credit_rows,
+                SUM(balance_amount) FILTER (WHERE balance_amount > (SELECT cutoff FROM params)) AS high_balance_sum,
+                SUM(order_amount) FILTER (WHERE activity_bucket IN ('open', 'large')) AS active_order_sum,
+                MIN(balance_amount) AS min_balance,
+                MAX(balance_amount) AS max_balance
+            FROM base
+            GROUP BY grp, region_state, tax_band, credit_code, activity_bucket
+            HAVING
+                COUNT(*) FILTER (WHERE credit_code IS NOT NULL) > 0
+                AND (
+                    SUM(order_amount) FILTER (WHERE activity_bucket IN ('open', 'large')) IS NOT NULL
+                    OR SUM(balance_amount) FILTER (WHERE balance_amount <= (SELECT cutoff FROM params)) IS NOT NULL
+                )
+        )
+        SELECT
+            grp,
+            region_state,
+            tax_band,
+            credit_code,
+            activity_bucket,
+            row_count,
+            good_credit_rows,
+            COALESCE(high_balance_sum, (SELECT zero_amount FROM params)) AS high_balance_sum,
+            COALESCE(active_order_sum, (SELECT zero_amount FROM params)) AS active_order_sum,
+            min_balance,
+            max_balance
+        FROM rollup
+    ) _q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        WITH
+        params AS (
+            SELECT 100.0::DOUBLE AS cutoff, 0.0::DOUBLE AS zero_amount
+        ),
+        dim AS (
+            SELECT d.grp, d.region_state, d.tax_band
+            FROM dl.minmax_join_dim d
+        ),
+        orders AS (
+            SELECT o.grp, SUM(o.order_amount) AS order_amount
+            FROM dl.minmax_join_orders o
+            GROUP BY o.grp
+        ),
+        base AS (
+            SELECT
+                c.grp,
+                d.region_state,
+                d.tax_band,
+                COALESCE(c.credit, 'BC') AS credit_code,
+                CAST(c.balance AS DOUBLE) AS balance_amount,
+                COALESCE(o.order_amount, 0.0) AS order_amount,
+                CASE
+                    WHEN o.order_amount IS NULL THEN 'closed'
+                    WHEN o.order_amount > 100 THEN 'large'
+                    ELSE 'open'
+                END AS activity_bucket
+            FROM dl.minmax_join_customer c
+            JOIN dim d ON d.grp = c.grp
+            LEFT JOIN orders o ON o.grp = c.grp
+        ),
+        rollup AS (
+            SELECT
+                grp,
+                region_state,
+                tax_band,
+                credit_code,
+                activity_bucket,
+                COUNT(*) AS row_count,
+                COUNT(*) FILTER (WHERE credit_code = 'GC') AS good_credit_rows,
+                SUM(balance_amount) FILTER (WHERE balance_amount > (SELECT cutoff FROM params)) AS high_balance_sum,
+                SUM(order_amount) FILTER (WHERE activity_bucket IN ('open', 'large')) AS active_order_sum,
+                MIN(balance_amount) AS min_balance,
+                MAX(balance_amount) AS max_balance
+            FROM base
+            GROUP BY grp, region_state, tax_band, credit_code, activity_bucket
+            HAVING
+                COUNT(*) FILTER (WHERE credit_code IS NOT NULL) > 0
+                AND (
+                    SUM(order_amount) FILTER (WHERE activity_bucket IN ('open', 'large')) IS NOT NULL
+                    OR SUM(balance_amount) FILTER (WHERE balance_amount <= (SELECT cutoff FROM params)) IS NOT NULL
+                )
+        )
+        SELECT
+            grp,
+            region_state,
+            tax_band,
+            credit_code,
+            activity_bucket,
+            row_count,
+            good_credit_rows,
+            COALESCE(high_balance_sum, (SELECT zero_amount FROM params)) AS high_balance_sum,
+            COALESCE(active_order_sum, (SELECT zero_amount FROM params)) AS active_order_sum,
+            min_balance,
+            max_balance
+        FROM rollup
+    ) _q
+    EXCEPT ALL
+    SELECT grp, region_state, tax_band, credit_code, activity_bucket, row_count, good_credit_rows, high_balance_sum, active_order_sum, min_balance, max_balance
+    FROM dl.mv_minmax_join_having
+);
+----
+0
+
 # Insert new rows (grape enters top-3, displaces banana/date)
 statement ok
 INSERT INTO dl.topk_sales VALUES (6,'grape',600);

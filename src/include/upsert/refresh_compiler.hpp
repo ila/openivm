@@ -32,7 +32,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               bool list_mode = false, const string &delta_ts_filter = "",
                               const vector<string> &group_column_names = {}, const string &catalog_prefix = "",
                               bool insert_only = false, const vector<string> &aggregate_types = {},
-                              const vector<LogicalType> &column_types = {});
+                              const vector<LogicalType> &column_types = {},
+                              bool use_current_diff_affected_keys = false);
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql = "", bool has_minmax = false, bool list_mode = false,
                                const string &delta_ts_filter = "", const string &catalog_prefix = "",

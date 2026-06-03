@@ -508,6 +508,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	refresh_plan.delta_flags = fast_paths;
 	auto group_cols = metadata.GetGroupColumns(view_name);
 	auto agg_types = metadata.GetAggregateTypes(view_name);
+	bool has_unstripped_having =
+	    view_query_type == RefreshType::AGGREGATE_HAVING && metadata.GetHavingPredicate(view_name).empty();
 	bool has_argminmax = std::any_of(agg_types.begin(), agg_types.end(),
 	                                 [](const string &t) { return t == "arg_min" || t == "arg_max"; });
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(view_query_type));
@@ -516,15 +518,17 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::AGGREGATE_HAVING: {
 		bool having_merge = SqlUtils::GetBoolSetting(context, "openivm_having_merge", true);
 		if (having_merge) {
-			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
-			upsert_query = CompileAggregateGroups(
-			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
-			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types);
-		} else {
+			bool effective_insert_only =
+			    has_argminmax ? false : (has_minmax ? (insert_only && minmax_incremental) : skip_agg_delete);
 			upsert_query =
 			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-			                           /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols,
-			                           internal_catalog_prefix, /*insert_only=*/false, agg_types, column_types);
+			                           has_minmax, list_mode, delta_ts_filter, group_cols, internal_catalog_prefix,
+			                           effective_insert_only, agg_types, column_types, has_unstripped_having);
+		} else {
+			upsert_query = CompileAggregateGroups(
+			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
+			    /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols, internal_catalog_prefix,
+			    /*insert_only=*/false, agg_types, column_types, has_unstripped_having);
 		}
 		break;
 	}
@@ -543,7 +547,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                                                   data_table, view_query_sql, delta_ts_filter,
 			                                                   internal_catalog_prefix, "openivm_unmatched");
 		} else {
-			bool effective_insert_only = has_argminmax ? false : (has_minmax ? minmax_incremental : skip_agg_delete);
+			bool effective_insert_only =
+			    has_argminmax ? false : (has_minmax ? (insert_only && minmax_incremental) : skip_agg_delete);
 			upsert_query = CompileAggregateGroups(
 			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
 			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types);

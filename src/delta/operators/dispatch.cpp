@@ -156,6 +156,7 @@ DeltaPlanFragment CompileCopiedDeltaSubtree(DeltaOperatorInput input) {
 	case LogicalOperatorType::LOGICAL_LIMIT:
 	case LogicalOperatorType::LOGICAL_ORDER_BY:
 		return CompileTopKDelta(input);
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
 	case LogicalOperatorType::LOGICAL_CTE_REF:
 		return CompileCteDelta(input);
 	case LogicalOperatorType::LOGICAL_UNNEST:
