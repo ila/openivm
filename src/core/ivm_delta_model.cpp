@@ -1,6 +1,7 @@
 #include "core/ivm_delta_model.hpp"
 
 #include "core/parser_plan_helpers.hpp"
+#include "core/vector_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -11,16 +12,6 @@
 namespace duckdb {
 
 namespace {
-
-template <class T>
-static void AddUnique(vector<T> &entries, T entry) {
-	for (auto existing : entries) {
-		if (existing == entry) {
-			return;
-		}
-	}
-	entries.push_back(entry);
-}
 
 static bool ContainsStringCI(const vector<string> &values, const string &candidate) {
 	for (auto &value : values) {

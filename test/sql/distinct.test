@@ -728,6 +728,59 @@ statement ok
 SET openivm_distinct_aux_state = true;
 
 statement ok
+CREATE TABLE idist_token_src (grp INT, machine VARCHAR, cores INT);
+
+statement ok
+INSERT INTO idist_token_src VALUES
+    (1, 'm1', 8),
+    (1, 'm1', 8),
+    (1, 'm2', 16),
+    (2, 'm3', 4);
+
+statement ok
+CREATE MATERIALIZED VIEW idist_mv_token_literal AS
+    SELECT grp, SUM(cores) AS total_cores
+    FROM (
+        SELECT ' select distinct is a literal' AS marker, grp, machine, cores
+        FROM (SELECT DISTINCT grp, machine, cores FROM idist_token_src WHERE machine IS NOT NULL) d0
+    ) d
+    GROUP BY grp;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'idist_mv_token_literal';
+----
+8
+
+statement ok
+INSERT INTO idist_token_src VALUES (2, 'm3', 4), (1, 'm4', 32);
+
+statement ok
+PRAGMA refresh('idist_mv_token_literal');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(cores) FROM (
+        SELECT ' select distinct is a literal' AS marker, grp, machine, cores
+        FROM (SELECT DISTINCT grp, machine, cores FROM idist_token_src WHERE machine IS NOT NULL) d0
+    ) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM idist_mv_token_literal
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM idist_mv_token_literal
+    EXCEPT ALL
+    SELECT grp, SUM(cores) FROM (
+        SELECT ' select distinct is a literal' AS marker, grp, machine, cores
+        FROM (SELECT DISTINCT grp, machine, cores FROM idist_token_src WHERE machine IS NOT NULL) d0
+    ) d GROUP BY grp
+);
+----
+0
+
+statement ok
 CREATE TABLE idist_u2 (grp INT, machine VARCHAR, cores INT);
 
 statement ok

@@ -6,6 +6,8 @@
 
 namespace duckdb {
 
+struct DeltaActivityResult;
+
 struct RefreshCostEstimate {
 	// Static model components
 	double incremental_compute;
@@ -42,7 +44,8 @@ struct RefreshCostEstimate {
 /// Walks the plan tree, collects base table and delta table cardinalities,
 /// and computes a cost estimate for both strategies. If sufficient execution
 /// history exists, applies learned regression to calibrate predictions.
-RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name);
+RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name,
+                                        const DeltaActivityResult *delta_activity = nullptr);
 
 /// Pragma function: returns the refresh cost estimate for a view as a string.
 string RefreshCostQuery(ClientContext &context, const FunctionParameters &parameters);

@@ -69,9 +69,6 @@ public:
 	bool TableColumnsMatch(const string &catalog_name, const string &schema_name, const string &table_name,
 	                       const vector<string> &expected);
 
-	// Update the last_update timestamp to now() for all delta tables of a view.
-	void UpdateTimestamp(const string &view_name);
-
 	// Get all upstream MV dependencies in topological order (ancestors first).
 	// For table→mv1→mv2→mv3, GetUpstreamViews("mv3") returns ["mv1", "mv2"].
 	vector<string> GetUpstreamViews(const string &view_name);

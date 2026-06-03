@@ -187,14 +187,6 @@ bool RefreshMetadata::TableColumnsMatch(const string &catalog_name, const string
 	return true;
 }
 
-void RefreshMetadata::UpdateTimestamp(const string &view_name) {
-	auto result = con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
-	                        " SET last_update = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError()) {
-		throw Exception(ExceptionType::EXECUTOR, "Cannot update IVM metadata timestamp: " + result->GetError());
-	}
-}
-
 vector<string> RefreshMetadata::GetUpstreamViews(const string &view_name) {
 	// Walk upstream: for view V, find its delta tables. If a delta table is "delta_X"
 	// and X is a registered MV, then X is an upstream dependency. Recurse.

@@ -38,7 +38,7 @@ combined_w = (-1)^(k-1) × ∏ wᵢ      over leaves i in the mask
 
 — the **Möbius inclusion-exclusion sign** times the **Z-set bilinear product** of leaf multiplicities. The Möbius sign is required precisely because the non-delta legs read the current (post-DML) state; without it, the sum over masks double- (and quadruple-, …) counts the cross-terms.
 
-This is *not* the textbook DBSP all-positive delta-join formula, which would apply if non-delta legs read `R_old` instead of `R_now`. OpenIVM chose to read `R_now` because the insert rule has already committed the delta rows to the source — see `src/rules/join.cpp:425–467` for the full algebraic derivation and a truth-table verification against the previous BOOLEAN-XOR encoding.
+This is *not* the textbook DBSP all-positive delta-join formula, which would apply if non-delta legs read `R_old` instead of `R_now`. OpenIVM chose to read `R_now` because the insert rule has already committed the delta rows to the source — see `src/delta/operators/join.cpp` for the inclusion-exclusion implementation and term-pruning logic.
 
 The same rule is used for `INNER JOIN`, `CROSS JOIN`, and DuckDB's arbitrary-predicate join plan (`LOGICAL_ANY_JOIN`). A cross product is just the same join with no predicate. Non-equality predicates are kept in the generated join terms.
 

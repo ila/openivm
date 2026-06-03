@@ -213,7 +213,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		if (skip_empty_enabled && empty_table_delta[i]) {
 			OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Skipping term %zu: no changes in %s.%s.%s (%ld -> %ld)\n", i,
 			                    table_catalogs[i].c_str(), table_schemas[i].c_str(), table_names[i].c_str(),
-			                    (long)old_snapshots[i], (long)current_snapshot);
+			                    (long)old_snapshots[i], (long)current_snapshots[i]);
 			continue;
 		}
 		bool key_domain_empty = false;

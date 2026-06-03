@@ -2,6 +2,7 @@
 
 #include "core/ivm_delta_model.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/vector_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -11,16 +12,6 @@
 namespace duckdb {
 
 namespace {
-
-template <class T>
-static void AddUnique(vector<T> &entries, T entry) {
-	for (auto existing : entries) {
-		if (existing == entry) {
-			return;
-		}
-	}
-	entries.push_back(entry);
-}
 
 static void AddVisibleGroupNames(vector<string> &group_columns, const vector<string> &names) {
 	for (auto &name : names) {

@@ -7,12 +7,45 @@
 
 namespace duckdb {
 
+static bool IsIdentifierTokenChar(char c) {
+	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
 static size_t FindKeywordToken(const string &text, const string &keyword, size_t from) {
-	size_t pos = from;
-	while (true) {
-		pos = text.find(keyword, pos);
-		if (pos == string::npos) {
-			return string::npos;
+	bool in_string = false;
+	bool in_identifier_quote = false;
+	for (size_t pos = from; pos + keyword.size() <= text.size(); pos++) {
+		char c = text[pos];
+		if (in_string) {
+			if (c == '\'' && pos + 1 < text.size() && text[pos + 1] == '\'') {
+				pos++;
+				continue;
+			}
+			if (c == '\'') {
+				in_string = false;
+			}
+			continue;
+		}
+		if (in_identifier_quote) {
+			if (c == '"' && pos + 1 < text.size() && text[pos + 1] == '"') {
+				pos++;
+				continue;
+			}
+			if (c == '"') {
+				in_identifier_quote = false;
+			}
+			continue;
+		}
+		if (c == '\'') {
+			in_string = true;
+			continue;
+		}
+		if (c == '"') {
+			in_identifier_quote = true;
+			continue;
+		}
+		if (text.compare(pos, keyword.size(), keyword) != 0) {
+			continue;
 		}
 		bool ok_left = (pos == 0) || std::isspace(static_cast<unsigned char>(text[pos - 1])) || text[pos - 1] == '(';
 		bool ok_right = (pos + keyword.size() == text.size()) ||
@@ -21,8 +54,8 @@ static size_t FindKeywordToken(const string &text, const string &keyword, size_t
 		if (ok_left && ok_right) {
 			return pos;
 		}
-		pos++;
 	}
+	return string::npos;
 }
 
 static bool StartsKeywordToken(const string &text, size_t pos, const string &keyword) {
@@ -32,8 +65,7 @@ static bool StartsKeywordToken(const string &text, size_t pos, const string &key
 	if (text.compare(pos, keyword.size(), keyword) != 0) {
 		return false;
 	}
-	return (pos + keyword.size() == text.size()) ||
-	       !std::isalnum(static_cast<unsigned char>(text[pos + keyword.size()]));
+	return (pos + keyword.size() == text.size()) || !IsIdentifierTokenChar(text[pos + keyword.size()]);
 }
 
 static bool StartsAnyKeywordToken(const string &text, size_t pos, std::initializer_list<const char *> keywords) {

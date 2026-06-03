@@ -912,6 +912,56 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+statement ok
+CREATE TABLE proj_unnest_filter_src(id INT, arr INT[]);
+
+statement ok
+INSERT INTO proj_unnest_filter_src VALUES
+  (1, [5, 15]),
+  (2, [20]),
+  (3, []),
+  (4, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW proj_unnest_filter_mv AS
+  SELECT elem
+  FROM (SELECT unnest(arr) AS elem FROM proj_unnest_filter_src) u
+  WHERE elem > 10;
+
+statement ok
+INSERT INTO proj_unnest_filter_src VALUES (5, [9, 11, 12]);
+
+statement ok
+UPDATE proj_unnest_filter_src SET arr = [1, 100] WHERE id = 1;
+
+statement ok
+DELETE FROM proj_unnest_filter_src WHERE id = 2;
+
+statement ok
+PRAGMA refresh('proj_unnest_filter_mv');
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT elem FROM proj_unnest_filter_mv
+  EXCEPT ALL
+  SELECT elem
+  FROM (SELECT unnest(arr) AS elem FROM proj_unnest_filter_src) u
+  WHERE elem > 10
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT elem
+  FROM (SELECT unnest(arr) AS elem FROM proj_unnest_filter_src) u
+  WHERE elem > 10
+  EXCEPT ALL
+  SELECT elem FROM proj_unnest_filter_mv
+);
+----
+0
+
 # ==========================================
 # Join projection over a derived-table leaf
 # ==========================================

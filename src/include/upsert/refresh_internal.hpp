@@ -54,6 +54,22 @@ struct DeltaActivityResult {
 	bool requires_full_refresh = false;
 	vector<string> active_delta_table_names;
 	vector<DuckLakeSnapshotAdvance> ducklake_snapshot_advances;
+	struct Source {
+		string delta_table_name;
+		string source_table_name;
+		string catalog_name;
+		string schema_name;
+		bool ducklake = false;
+		bool ok = false;
+		bool has_changes = false;
+		bool has_deletes = false;
+		bool requires_full_refresh = false;
+		int64_t pending_rows = -1;
+		int64_t pending_deletes = -1;
+		int64_t last_snapshot_id = -1;
+		int64_t current_snapshot_id = -1;
+	};
+	vector<Source> sources;
 };
 
 struct DuckLakeTableActivity {
@@ -61,6 +77,21 @@ struct DuckLakeTableActivity {
 	bool has_changes = false;
 	bool has_deletes = false;
 	bool requires_full_refresh = false;
+};
+
+class DeltaActivityProvider {
+public:
+	static DeltaActivityProvider Build(RefreshMetadata &metadata, Connection &con, const string &view_name,
+	                                   const string &view_query_sql, const vector<string> &delta_table_names,
+	                                   const string &view_catalog_name, const string &view_schema_name,
+	                                   const string &attached_db_catalog_name, const string &attached_db_schema_name);
+
+	const DeltaActivityResult &Summary() const {
+		return summary;
+	}
+
+private:
+	DeltaActivityResult summary;
 };
 
 struct RefreshCostEstimate;

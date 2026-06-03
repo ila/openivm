@@ -7,7 +7,9 @@
 #include "core/openivm_debug.hpp"
 #include "rules/column_hider.hpp"
 #include "storage/ducklake_scan.hpp"
+#include "upsert/refresh_internal.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -31,8 +33,33 @@ static double GetTableRowCount(Connection &con, const string &table_name) {
 	return result->GetValue(0, 0).GetValue<double>();
 }
 
+static const DeltaActivityResult::Source *FindDeltaActivitySource(const DeltaActivityResult *activity,
+                                                                  const string &delta_table_name,
+                                                                  const string &source_table_name) {
+	if (!activity) {
+		return nullptr;
+	}
+	string source_from_delta = BaseTableNameFromDeltaKey(delta_table_name);
+	for (auto &source : activity->sources) {
+		if (StringUtil::CIEquals(source.delta_table_name, delta_table_name) ||
+		    StringUtil::CIEquals(source.source_table_name, source_table_name) ||
+		    (!source_from_delta.empty() && StringUtil::CIEquals(source.source_table_name, source_from_delta))) {
+			return &source;
+		}
+	}
+	return nullptr;
+}
+
 /// Get the number of pending delta rows for a given base delta table and view.
-static double GetDeltaRowCount(Connection &con, const string &delta_table_name, const string &view_name) {
+static double GetDeltaRowCount(Connection &con, const string &delta_table_name, const string &view_name,
+                               const DeltaActivityResult *activity) {
+	auto source = FindDeltaActivitySource(activity, delta_table_name, BaseTableNameFromDeltaKey(delta_table_name));
+	if (source && source->pending_rows >= 0) {
+		return static_cast<double>(source->pending_rows);
+	}
+	if (source && source->ok && !source->has_changes) {
+		return 0;
+	}
 	auto ts_string = RefreshMetadata(con).GetLastUpdate(view_name, delta_table_name);
 	if (ts_string.empty()) {
 		return 0;
@@ -67,7 +94,15 @@ struct PlanStats {
 
 /// Get delta cardinality for a DuckLake table by counting changes between snapshots.
 static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_name, const string &schema_name,
-                                       const string &table_name, const string &view_name) {
+                                       const string &table_name, const string &view_name,
+                                       const DeltaActivityResult *activity) {
+	auto source = FindDeltaActivitySource(activity, table_name, table_name);
+	if (source && source->pending_rows >= 0) {
+		return static_cast<double>(source->pending_rows);
+	}
+	if (source && source->ok && !source->has_changes) {
+		return 0;
+	}
 	RefreshMetadata metadata(con);
 	auto last_snap = metadata.GetLastSnapshotId(view_name, table_name);
 	auto cur_snap = metadata.GetCurrentDuckLakeSnapshot(catalog_name);
@@ -96,7 +131,8 @@ static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_na
 
 /// Walk the plan tree once, collecting table stats, join info, and aggregate presence.
 static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, LogicalOperator &op,
-                                      const string &view_name, PlanStats &stats) {
+                                      const string &view_name, const DeltaActivityResult *delta_activity,
+                                      PlanStats &stats) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET: {
 		auto &get = op.Cast<LogicalGet>();
@@ -121,11 +157,12 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 				string cat_name = get.GetTable()->ParentCatalog().GetName();
 				string schema_name = get.GetTable()->schema.name;
 				ts.delta_table_name = ts.table_name; // DuckLake stores bare name
-				ts.delta_card = GetDuckLakeDeltaRowCount(con, cat_name, schema_name, ts.table_name, view_name);
+				ts.delta_card =
+				    GetDuckLakeDeltaRowCount(con, cat_name, schema_name, ts.table_name, view_name, delta_activity);
 			} else {
 				stats.all_ducklake = false;
 				ts.delta_table_name = SqlUtils::DeltaName(ts.table_name);
-				ts.delta_card = GetDeltaRowCount(con, ts.delta_table_name, view_name);
+				ts.delta_card = GetDeltaRowCount(con, ts.delta_table_name, view_name, delta_activity);
 			}
 
 			stats.table_stats.push_back(ts);
@@ -164,7 +201,7 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 		break;
 	}
 	for (auto &child : op.children) {
-		CollectPlanStatsRecursive(context, con, *child, view_name, stats);
+		CollectPlanStatsRecursive(context, con, *child, view_name, delta_activity, stats);
 	}
 }
 
@@ -350,7 +387,8 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 
 // ============================================================================
 
-RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name) {
+RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name,
+                                        const DeltaActivityResult *delta_activity) {
 	// Single connection for all cardinality queries
 	Connection con(*context.db);
 
@@ -373,7 +411,7 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 
 	// 1. Collect all plan statistics in one tree walk
 	PlanStats plan_stats;
-	CollectPlanStatsRecursive(context, con, plan, view_name, plan_stats);
+	CollectPlanStatsRecursive(context, con, plan, view_name, delta_activity, plan_stats);
 
 	auto &table_stats = plan_stats.table_stats;
 	size_t N = table_stats.size();

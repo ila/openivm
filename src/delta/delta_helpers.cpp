@@ -2,11 +2,10 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/plan_rewrite_internal.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
-#include "duckdb/function/function_binder.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -23,19 +22,6 @@
 #include "storage/ducklake_scan.hpp"
 
 namespace duckdb {
-
-static AggregateFunction BindAggregateByName(ClientContext &context, const string &name,
-                                             const vector<LogicalType> &arg_types) {
-	auto &catalog = Catalog::GetSystemCatalog(context);
-	auto &entry = catalog.GetEntry<AggregateFunctionCatalogEntry>(context, DEFAULT_SCHEMA, name);
-	FunctionBinder function_binder(context);
-	ErrorData error;
-	auto best = function_binder.BindFunction(entry.name, entry.functions, arg_types, error);
-	if (!best.IsValid()) {
-		throw InternalException("OpenIVM: failed to bind aggregate '%s'", name);
-	}
-	return entry.functions.GetFunctionByOffset(best.GetIndex());
-}
 
 static bool CompactDeltasEnabled(ClientContext &context) {
 	Value compact_val;
