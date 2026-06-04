@@ -579,6 +579,11 @@ CREATE MATERIALIZED VIEW mv_min_having AS
     GROUP BY grp
     HAVING COUNT(*) > 0;
 
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_min_having';
+----
+4
+
 statement ok
 DELETE FROM t_min_having WHERE id = 1;
 
@@ -611,6 +616,172 @@ SELECT COUNT(*) FROM (
     HAVING COUNT(*) > 0
     EXCEPT ALL
     SELECT grp, min_val, cnt FROM mv_min_having
+);
+----
+0
+
+# MAX + HAVING should also stay on AGGREGATE_HAVING so insert-only refresh can
+# use the min/max MERGE fast path instead of GROUP_RECOMPUTE.
+statement ok
+CREATE TABLE t_max_having (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t_max_having VALUES (1, 'h1', 10), (2, 'h1', 20), (3, 'h2', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_max_having AS
+    SELECT grp, MAX(val) AS max_val
+    FROM t_max_having
+    GROUP BY grp
+    HAVING MAX(val) > 0;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_max_having';
+----
+4
+
+statement ok
+INSERT INTO t_max_having VALUES (4, 'h1', 30), (5, 'h3', 40);
+
+statement ok
+PRAGMA refresh('mv_max_having');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, max_val FROM mv_max_having
+    EXCEPT ALL
+    SELECT grp, MAX(val) AS max_val
+    FROM t_max_having
+    GROUP BY grp
+    HAVING MAX(val) > 0
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, MAX(val) AS max_val
+    FROM t_max_having
+    GROUP BY grp
+    HAVING MAX(val) > 0
+    EXCEPT ALL
+    SELECT grp, max_val FROM mv_max_having
+);
+----
+0
+
+# Computed MIN/MAX projections cannot use the AGGREGATE_HAVING merge path:
+# the computed output has to be recomputed for affected groups, not summed.
+statement ok
+CREATE TABLE t_computed_min_having (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t_computed_min_having VALUES (1, 'h1', 10), (2, 'h1', 20), (3, 'h2', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_computed_min_having AS
+    SELECT grp, MIN(val) + 0 AS min_plus_zero, COUNT(*) AS cnt
+    FROM t_computed_min_having
+    GROUP BY grp
+    HAVING COUNT(*) > 0;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_computed_min_having';
+----
+6
+
+statement ok
+INSERT INTO t_computed_min_having VALUES (4, 'h1', 1), (5, 'h3', 30);
+
+statement ok
+DELETE FROM t_computed_min_having WHERE id = 5;
+
+statement ok
+PRAGMA refresh('mv_computed_min_having');
+
+query III
+SELECT grp, min_plus_zero, cnt FROM mv_computed_min_having ORDER BY grp;
+----
+h1	1	3
+h2	5	1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_computed_min_having
+    EXCEPT ALL
+    SELECT grp, MIN(val) + 0 AS min_plus_zero, COUNT(*) AS cnt
+    FROM t_computed_min_having
+    GROUP BY grp
+    HAVING COUNT(*) > 0
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, MIN(val) + 0 AS min_plus_zero, COUNT(*) AS cnt
+    FROM t_computed_min_having
+    GROUP BY grp
+    HAVING COUNT(*) > 0
+    EXCEPT ALL
+    SELECT * FROM mv_computed_min_having
+);
+----
+0
+
+# MIN/MAX used only in HAVING is stored as a hidden openivm_having_* column.
+# It must use group-recompute; aggregate MERGE can otherwise maintain the hidden
+# MAX as a SUM and expose groups that still fail the HAVING predicate.
+statement ok
+CREATE TABLE t_hidden_max_having (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO t_hidden_max_having VALUES (1, 'h1', 5), (2, 'h2', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hidden_max_having AS
+    SELECT grp, COUNT(*) AS cnt
+    FROM t_hidden_max_having
+    GROUP BY grp
+    HAVING MAX(val) > 10;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_hidden_max_having';
+----
+6
+
+statement ok
+INSERT INTO t_hidden_max_having VALUES (3, 'h1', 7), (4, 'h3', 30);
+
+statement ok
+UPDATE t_hidden_max_having SET val = 25 WHERE id = 2;
+
+statement ok
+DELETE FROM t_hidden_max_having WHERE id = 4;
+
+statement ok
+PRAGMA refresh('mv_hidden_max_having');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_hidden_max_having
+    EXCEPT ALL
+    SELECT grp, COUNT(*) AS cnt
+    FROM t_hidden_max_having
+    GROUP BY grp
+    HAVING MAX(val) > 10
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, COUNT(*) AS cnt
+    FROM t_hidden_max_having
+    GROUP BY grp
+    HAVING MAX(val) > 10
+    EXCEPT ALL
+    SELECT * FROM mv_hidden_max_having
 );
 ----
 0

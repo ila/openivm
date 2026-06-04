@@ -91,6 +91,291 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# LIST FILTER fallback with top-level HAVING must relax affected keys even when
+# the stored query falls back to the original SQL.
+statement ok
+CREATE TABLE list_filter_having_items (grp INT, item INT, qty INT);
+
+statement ok
+INSERT INTO list_filter_having_items VALUES
+    (1, 10, 90),
+    (2, 20, 80), (2, 30, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_list_filter_having AS
+    SELECT grp, LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked
+    FROM list_filter_having_items GROUP BY grp
+    HAVING COUNT(*) > 1;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_list_filter_having';
+----
+6
+
+query T
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_list_filter_having';
+----
+source_delta_relax_aggregate_filter
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_filter_having
+    EXCEPT ALL
+    SELECT grp, LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50)
+    FROM list_filter_having_items GROUP BY grp
+    HAVING COUNT(*) > 1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50)
+    FROM list_filter_having_items GROUP BY grp
+    HAVING COUNT(*) > 1
+    EXCEPT ALL
+    SELECT * FROM mv_list_filter_having
+);
+----
+0
+
+statement ok
+INSERT INTO list_filter_having_items VALUES (1, 40, 70), (2, 50, 60);
+
+statement ok
+DELETE FROM list_filter_having_items WHERE grp = 2 AND item = 30;
+
+statement ok
+UPDATE list_filter_having_items SET qty = 65 WHERE grp = 2 AND item = 20;
+
+statement ok
+PRAGMA refresh('mv_list_filter_having');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_filter_having
+    EXCEPT ALL
+    SELECT grp, LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50)
+    FROM list_filter_having_items GROUP BY grp
+    HAVING COUNT(*) > 1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50)
+    FROM list_filter_having_items GROUP BY grp
+    HAVING COUNT(*) > 1
+    EXCEPT ALL
+    SELECT * FROM mv_list_filter_having
+);
+----
+0
+
+# Retained ORDER BY/LIMIT fallback must use current-vs-stored affected keys.
+# The unchanged second-place group has to enter the LIMIT after the old top group
+# loses rows, even though that second-place group has no delta.
+statement ok
+CREATE TABLE list_filter_topk_items (grp INT, item INT, qty INT);
+
+statement ok
+INSERT INTO list_filter_topk_items VALUES
+    (1, 10, 90), (1, 11, 80), (1, 12, 70),
+    (2, 20, 85), (2, 21, 75),
+    (3, 30, 95);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_list_filter_topk AS
+    SELECT grp,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked,
+           COUNT(*) AS cnt
+    FROM list_filter_topk_items
+    GROUP BY grp
+    HAVING COUNT(*) > 0
+    ORDER BY cnt DESC, grp
+    LIMIT 1;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_list_filter_topk';
+----
+6
+
+query T
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_list_filter_topk';
+----
+current_diff
+
+query I
+WITH expected AS (
+    SELECT grp,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked,
+           COUNT(*) AS cnt
+    FROM list_filter_topk_items
+    GROUP BY grp
+    HAVING COUNT(*) > 0
+    ORDER BY cnt DESC, grp
+    LIMIT 1
+)
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_filter_topk
+    EXCEPT ALL
+    SELECT * FROM expected
+);
+----
+0
+
+query I
+WITH expected AS (
+    SELECT grp,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked,
+           COUNT(*) AS cnt
+    FROM list_filter_topk_items
+    GROUP BY grp
+    HAVING COUNT(*) > 0
+    ORDER BY cnt DESC, grp
+    LIMIT 1
+)
+SELECT COUNT(*) FROM (
+    SELECT * FROM expected
+    EXCEPT ALL
+    SELECT * FROM mv_list_filter_topk
+);
+----
+0
+
+statement ok
+DELETE FROM list_filter_topk_items WHERE grp = 1 AND item IN (10, 11);
+
+statement ok
+INSERT INTO list_filter_topk_items VALUES (3, 31, 65);
+
+statement ok
+PRAGMA refresh('mv_list_filter_topk');
+
+query I
+WITH expected AS (
+    SELECT grp,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked,
+           COUNT(*) AS cnt
+    FROM list_filter_topk_items
+    GROUP BY grp
+    HAVING COUNT(*) > 0
+    ORDER BY cnt DESC, grp
+    LIMIT 1
+)
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_filter_topk
+    EXCEPT ALL
+    SELECT * FROM expected
+);
+----
+0
+
+query I
+WITH expected AS (
+    SELECT grp,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked,
+           COUNT(*) AS cnt
+    FROM list_filter_topk_items
+    GROUP BY grp
+    HAVING COUNT(*) > 0
+    ORDER BY cnt DESC, grp
+    LIMIT 1
+)
+SELECT COUNT(*) FROM (
+    SELECT * FROM expected
+    EXCEPT ALL
+    SELECT * FROM mv_list_filter_topk
+);
+----
+0
+
+# Fallback top-k views store the already-limited original query in the data table,
+# but the user-facing view still needs ORDER BY. This catches stale physical order
+# after only the second group changes.
+statement ok
+CREATE TABLE list_filter_order_items (grp INT, item INT, qty INT);
+
+statement ok
+INSERT INTO list_filter_order_items VALUES
+    (1, 10, 90), (1, 11, 80), (1, 12, 70),
+    (2, 20, 85), (2, 21, 75),
+    (3, 30, 95);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_list_filter_order AS
+    SELECT grp,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked,
+           COUNT(*) AS cnt
+    FROM list_filter_order_items
+    GROUP BY grp
+    HAVING COUNT(*) > 0
+    ORDER BY cnt DESC, grp DESC
+    LIMIT 2;
+
+query I
+SELECT grp FROM mv_list_filter_order;
+----
+1
+2
+
+statement ok
+INSERT INTO list_filter_order_items VALUES (2, 22, 65);
+
+statement ok
+UPDATE list_filter_order_items SET qty = 96 WHERE grp = 3 AND item = 30;
+
+statement ok
+DELETE FROM list_filter_order_items WHERE grp = 3 AND item = 30;
+
+statement ok
+PRAGMA refresh('mv_list_filter_order');
+
+query I
+SELECT grp FROM mv_list_filter_order;
+----
+2
+1
+
+query I
+WITH expected AS (
+    SELECT grp,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked,
+           COUNT(*) AS cnt
+    FROM list_filter_order_items
+    GROUP BY grp
+    HAVING COUNT(*) > 0
+    ORDER BY cnt DESC, grp DESC
+    LIMIT 2
+)
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_list_filter_order
+    EXCEPT ALL
+    SELECT * FROM expected
+);
+----
+0
+
+query I
+WITH expected AS (
+    SELECT grp,
+           LIST(item ORDER BY qty DESC) FILTER (WHERE qty > 50) AS well_stocked,
+           COUNT(*) AS cnt
+    FROM list_filter_order_items
+    GROUP BY grp
+    HAVING COUNT(*) > 0
+    ORDER BY cnt DESC, grp DESC
+    LIMIT 2
+)
+SELECT COUNT(*) FROM (
+    SELECT * FROM expected
+    EXCEPT ALL
+    SELECT * FROM mv_list_filter_order
+);
+----
+0
+
 # LIST FILTER fallback with hidden AVG columns must create the MV delta table
 # from the actual data table schema so downstream refresh snapshots bind.
 statement ok

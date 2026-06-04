@@ -74,6 +74,19 @@ struct RefreshPlan {
 	}
 };
 
+static void
+ApplyGroupRecomputeSourceOccurrences(vector<GroupRecomputeDeltaSpec> &delta_specs,
+                                     const vector<RefreshMetadata::GroupRecomputeSourceOccurrence> &occurrences) {
+	for (auto &spec : delta_specs) {
+		for (auto &occurrence : occurrences) {
+			if (StringUtil::CIEquals(spec.base_table, occurrence.table_name)) {
+				spec.source_occurrences = occurrence.count == 0 ? 1 : occurrence.count;
+				break;
+			}
+		}
+	}
+}
+
 static string ResolveDeltaMetadataKey(const string &table_name, const vector<string> &delta_table_names) {
 	vector<string> candidates;
 	candidates.push_back(table_name);
@@ -691,13 +704,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		string recompute_ducklake_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
 		auto delta_specs = BuildGroupRecomputeDeltaSpecs(metadata, view_name, con, active_delta_table_names,
 		                                                 recompute_ducklake_catalog, recompute_ducklake_schema);
+		ApplyGroupRecomputeSourceOccurrences(delta_specs, metadata.GetGroupRecomputeSourceOccurrences(view_name));
+		auto affected_mode = metadata.GetGroupRecomputeAffectedMode(view_name);
 		string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
 		string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
 		string lpts_table_prefix = SqlUtils::QualifiedPrefix(lpts_cat, lpts_sch);
 		upsert_query = CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs,
-		                                     internal_catalog_prefix, lpts_table_prefix);
-		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE (%zu group cols, %zu sources)\n",
-		                    group_columns.size(), delta_specs.size());
+		                                     internal_catalog_prefix, lpts_table_prefix, affected_mode);
+		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE (%zu group cols, %zu sources, "
+		                    "affected_mode=%s)\n",
+		                    group_columns.size(), delta_specs.size(), GroupRecomputeAffectedModeName(affected_mode));
 		break;
 	}
 	case RefreshType::TOP_K:

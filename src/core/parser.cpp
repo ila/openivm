@@ -32,6 +32,45 @@
 
 namespace duckdb {
 
+static vector<RefreshMetadata::GroupRecomputeSourceOccurrence>
+BuildGroupRecomputeSourceOccurrences(const CreateMVPlanFacts &facts) {
+	vector<RefreshMetadata::GroupRecomputeSourceOccurrence> occurrences;
+	unordered_map<string, idx_t> occurrence_index;
+	for (auto &source : facts.source_occurrences) {
+		if (source.table.empty()) {
+			continue;
+		}
+		string key = StringUtil::Lower(source.table);
+		auto it = occurrence_index.find(key);
+		if (it == occurrence_index.end()) {
+			occurrence_index[key] = occurrences.size();
+			RefreshMetadata::GroupRecomputeSourceOccurrence occurrence;
+			occurrence.table_name = source.table;
+			occurrence.count = 1;
+			occurrences.push_back(std::move(occurrence));
+		} else {
+			occurrences[it->second].count++;
+		}
+	}
+	return occurrences;
+}
+
+static bool HasDuckLakeSourceForModel(const CreateMVPlanFacts &facts, const unordered_set<string> &table_names,
+                                      bool target_is_ducklake) {
+	if (!facts.ducklake_table_info.empty()) {
+		return true;
+	}
+	if (!target_is_ducklake) {
+		return false;
+	}
+	for (auto &table_name : table_names) {
+		if (StringUtil::StartsWith(table_name, openivm::DATA_TABLE_PREFIX)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 ParserExtensionPlanResult
 MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientContext &context,
                                               unique_ptr<ParserExtensionParseData> parse_data) {
@@ -168,6 +207,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
 	string view_query = original_view_query; // will be overwritten by LPTS for DDL
 	string top_k_suffix;                     // ORDER BY … LIMIT k, appended to the CREATE VIEW
+	string top_k_order_suffix;               // ORDER BY only, used when fallback stored SQL already applied LIMIT
 	add_create_profile_step("create_compile_name_resolution", name_resolution_start,
 	                        "target_ducklake=" + string(target_is_ducklake ? "true" : "false"));
 
@@ -222,6 +262,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	vector<string> output_names;
 	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
+	bool stored_query_has_aggregate_filter = false;
+	bool has_hidden_minmax_having = false;
+	bool has_computed_minmax_aggregate_projection = false;
 	{
 		auto select_parse_plan_start = create_profile_now();
 		Parser select_parser;
@@ -243,6 +286,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 		having_predicate = StripHavingFilter(select_plan, output_names);
+		stored_query_has_aggregate_filter = PlanContainsAggregateFilter(select_plan.get());
+		has_hidden_minmax_having = PlanHasHiddenMinMaxHavingColumn(select_plan.get());
+		has_computed_minmax_aggregate_projection = PlanHasComputedMinMaxAggregateProjection(select_plan.get());
 
 		// Keep data tables unlimited/unordered; apply ORDER BY/LIMIT in the user-facing view.
 		{
@@ -263,6 +309,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				if (limit_node->type == LogicalOperatorType::LOGICAL_TOP_N) {
 					auto &top_n = limit_node->Cast<LogicalTopN>();
 					top_k_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names);
+					top_k_order_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names, false);
 					select_plan = std::move(select_plan->children[0]);
 				} else {
 					auto &order_op = order_node->Cast<LogicalOrder>();
@@ -276,6 +323,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 						oval = limit_op.offset_val.GetConstantValue();
 					}
 					top_k_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names);
+					top_k_order_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names, false);
 					select_plan = std::move(select_plan->children[0]->children[0]);
 				}
 				OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped top-k wrapper, suffix='%s'\n", top_k_suffix.c_str());
@@ -289,6 +337,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		    !select_plan->children.empty()) {
 			auto &order_op = select_plan->Cast<LogicalOrder>();
 			top_k_suffix = BuildTopKSuffix(order_op.orders, 0, 0, output_names);
+			top_k_order_suffix = top_k_suffix;
 			select_plan = std::move(select_plan->children[0]);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
 		}
@@ -388,12 +437,19 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		view_query = original_view_query;
 		lpts_fallback = true;
 	}
+	bool stored_query_retains_having = !having_predicate.empty() && lpts_fallback;
+	bool stored_query_retains_top_k = !top_k_suffix.empty() && lpts_fallback;
 
 	DeltaViewModelInput model_input;
 	model_input.facts = &facts;
 	model_input.output_names = &output_names;
 	model_input.has_unsupported_incremental_construct = has_unsupported_incremental_construct;
 	model_input.keep_window_join_partitions = keep_window_join_partitions;
+	model_input.stored_query_has_aggregate_filter = stored_query_has_aggregate_filter || stored_query_retains_having;
+	model_input.stored_query_has_top_k = stored_query_retains_top_k;
+	model_input.has_hidden_minmax_having = has_hidden_minmax_having;
+	model_input.has_computed_minmax_aggregate_projection = has_computed_minmax_aggregate_projection;
+	model_input.has_ducklake_source = HasDuckLakeSourceForModel(facts, table_names, target_is_ducklake);
 	const bool distinct_at_top = IsDistinctAtTop(analysis, output_names);
 
 	// Populated by ExtractInnerDistinct when classified as DISTINCT_INCREMENTAL.
@@ -598,6 +654,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	auto aggregate_types = std::move(view_model.aggregate_types);
 	auto window_partition_columns = std::move(view_model.window_partition_columns);
 	bool has_minmax_metadata = view_model.has_minmax_metadata;
+	auto group_recompute_affected_mode = view_model.group_recompute_affected_mode;
+	auto group_recompute_source_occurrences = BuildGroupRecomputeSourceOccurrences(facts);
 	string full_outer_join_cols = std::move(view_model.full_outer_join_cols);
 
 	if (view_model.warn_unsupported_incremental) {
@@ -700,7 +758,16 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	auto &cols_to_store = analysis.found_window ? window_partition_columns : aggregate_columns;
 	string group_cols_val = SqlCsvLiteralOrNull(cols_to_store);
 	string agg_types_val = SqlCsvLiteralOrNull(aggregate_types);
-	string having_val = having_predicate.empty() ? "null" : "'" + SqlUtils::EscapeSingleQuotes(having_predicate) + "'";
+	string having_val = (having_predicate.empty() || stored_query_retains_having)
+	                        ? "null"
+	                        : "'" + SqlUtils::EscapeSingleQuotes(having_predicate) + "'";
+	string group_recompute_mode_val = "'" + string(GroupRecomputeAffectedModeName(group_recompute_affected_mode)) + "'";
+	string group_recompute_source_occurrences_json =
+	    RefreshMetadata::GroupRecomputeSourceOccurrencesToJson(group_recompute_source_occurrences);
+	string group_recompute_source_occurrences_val =
+	    group_recompute_source_occurrences.empty()
+	        ? "null"
+	        : "'" + SqlUtils::EscapeSingleQuotes(group_recompute_source_occurrences_json) + "'";
 
 	string full_outer_join_cols_val = "null";
 	if (analysis.found_full_outer) {
@@ -712,11 +779,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	metadata_ddl.push_back("insert or replace into " + string(openivm::VIEWS_TABLE) +
 	                       " (view_name, sql_string, type, has_minmax, has_left_join, last_update, "
 	                       "refresh_interval, refresh_in_progress, group_columns, aggregate_types, "
-	                       "having_predicate, has_full_outer, full_outer_join_cols) values ('" +
+	                       "having_predicate, group_recompute_affected_mode, "
+	                       "group_recompute_source_occurrences_json, has_full_outer, full_outer_join_cols) values ('" +
 	                       view_name + "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
 	                       to_string((int)refresh_type) + ", " + (has_minmax_metadata ? "true" : "false") + ", " +
 	                       (analysis.found_left_join ? "true" : "false") + ", now(), " + refresh_val + ", false, " +
-	                       group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
+	                       group_cols_val + ", " + agg_types_val + ", " + having_val + ", " + group_recompute_mode_val +
+	                       ", " + group_recompute_source_occurrences_val + ", " +
 	                       (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
 
 	if (!lineage_json.empty()) {
@@ -961,10 +1030,18 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				}
 			}
 		}
-		string having_where = having_predicate.empty() ? "" : " where " + having_predicate;
-		// For aggregate+top-k the VIEW appends ORDER BY … LIMIT k after the HAVING WHERE.
-		// The data table stores ALL groups; the ORDER BY LIMIT is applied at read time.
-		string view_tail = having_where + (top_k_suffix.empty() ? "" : " " + top_k_suffix);
+		string having_where =
+		    (having_predicate.empty() || stored_query_retains_having) ? "" : " where " + having_predicate;
+		// For aggregate+top-k the VIEW appends ORDER BY ... LIMIT k after the HAVING WHERE.
+		// If the stored query fell back to the original SQL, the data table is already limited,
+		// but the user-facing view still needs ORDER BY for deterministic MV semantics.
+		string top_k_view_suffix;
+		if (stored_query_retains_top_k) {
+			top_k_view_suffix = top_k_order_suffix.empty() ? "" : " " + top_k_order_suffix;
+		} else {
+			top_k_view_suffix = top_k_suffix.empty() ? "" : " " + top_k_suffix;
+		}
+		string view_tail = having_where + top_k_view_suffix;
 		if (internal_cols.empty()) {
 			ddl.push_back("create view " + qvn + " as select * from " + qdt + view_tail);
 		} else {

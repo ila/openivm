@@ -151,6 +151,11 @@ struct DeltaViewModelInput {
 	const RefreshMetadata::SemiAntiAuxMeta *semi_anti_aux_candidate = nullptr;
 	bool has_unsupported_incremental_construct = false;
 	bool keep_window_join_partitions = true;
+	bool stored_query_has_aggregate_filter = false;
+	bool stored_query_has_top_k = false;
+	bool has_hidden_minmax_having = false;
+	bool has_computed_minmax_aggregate_projection = false;
+	bool has_ducklake_source = false;
 };
 
 struct DeltaViewModel {
@@ -169,6 +174,7 @@ struct DeltaViewModel {
 	RefreshMetadata::ProjectionKeyLineage projection_lineage;
 	idx_t root_node = DConstants::INVALID_INDEX;
 	string full_outer_join_cols;
+	GroupRecomputeAffectedMode group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
 	RefreshMetadata::DistinctAuxMeta distinct_aux;
 	FilteredGroupCountAuxRequirement filtered_group_count_aux;
 	RefreshMetadata::SemiAntiAuxMeta semi_anti_aux;

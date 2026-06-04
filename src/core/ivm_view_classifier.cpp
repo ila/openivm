@@ -315,13 +315,11 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	}
 }
 
-static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis,
-                              bool has_unsupported_incremental_construct) {
-	auto has_nonlinear_aggregate =
-	    std::any_of(analysis.aggregate_types.begin(), analysis.aggregate_types.end(), [](const string &agg_type) {
-		    return agg_type == "min" || agg_type == "max" || agg_type == "arg_min" || agg_type == "arg_max";
-	    });
-	if (has_unsupported_incremental_construct) {
+static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
+	auto has_argminmax =
+	    std::any_of(analysis.aggregate_types.begin(), analysis.aggregate_types.end(),
+	                [](const string &agg_type) { return agg_type == "arg_min" || agg_type == "arg_max"; });
+	if (input.has_unsupported_incremental_construct) {
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_window) {
 		model.type = RefreshType::WINDOW_PARTITION;
@@ -352,8 +350,11 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = RefreshType::AGGREGATE_GROUP;
 	} else if (!model.strategy_reasons.empty() && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
-	} else if (analysis.found_having && analysis.found_aggregation && has_nonlinear_aggregate &&
+	} else if (analysis.found_having && analysis.found_aggregation &&
+	           (input.has_hidden_minmax_having || input.has_computed_minmax_aggregate_projection) &&
 	           !model.group_columns.empty()) {
+		model.type = RefreshType::GROUP_RECOMPUTE;
+	} else if (analysis.found_having && analysis.found_aggregation && has_argminmax && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_having && analysis.found_aggregation && !model.group_columns.empty()) {
 		model.type = RefreshType::AGGREGATE_HAVING;
@@ -366,6 +367,23 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else {
 		model.type = RefreshType::FULL_REFRESH;
 		model.warn_unrecognized_pattern = true;
+	}
+}
+
+static void SelectGroupRecomputeAffectedMode(DeltaViewModel &model, const DeltaViewModelInput &input) {
+	if (model.type != RefreshType::GROUP_RECOMPUTE) {
+		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
+		return;
+	}
+	bool aggregate_filter_join =
+	    input.stored_query_has_aggregate_filter && input.facts && input.facts->analysis.found_join;
+	if (input.stored_query_has_top_k || aggregate_filter_join ||
+	    (input.stored_query_has_aggregate_filter && input.has_ducklake_source)) {
+		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF;
+	} else if (input.stored_query_has_aggregate_filter) {
+		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER;
+	} else {
+		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
 	}
 }
 
@@ -635,7 +653,8 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 
 	BuildUnsupportedReasons(model, facts, input);
 	BuildModelFeatures(model, analysis, input);
-	SelectRefreshType(model, analysis, input.has_unsupported_incremental_construct);
+	SelectRefreshType(model, analysis, input);
+	SelectGroupRecomputeAffectedMode(model, input);
 	if (model.warn_unrecognized_pattern) {
 		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNRECOGNIZED_PATTERN);
 		AddUnique(model.features, DeltaModelFeature::FULL_ONLY);

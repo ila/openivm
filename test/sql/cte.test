@@ -449,12 +449,14 @@ SELECT COUNT(*) FROM (
 #      — otherwise it extracts the predicate with bindings that don't line up with
 #      the view's top-level column names, producing a view WHERE like
 #      `(I_NAME > 100)` on a VARCHAR column.
-#   2. The parser must relax CTE_MATERIALIZE_ALWAYS → CTE_MATERIALIZE_DEFAULT before
+#   2. The parser must relax CTE_MATERIALIZE_ALWAYS -> CTE_MATERIALIZE_DEFAULT before
 #      calling CTEInlining. DuckDB's binder defaults to ALWAYS, which makes
 #      CTEInlining bail out and keep LOGICAL_MATERIALIZED_CTE in the plan — but IVM
 #      has no delta-consolidation rule for LOGICAL_CTE_REF. Relaxing the flag lets
-#      the CTE body fold into the outer plan so the whole view becomes a regular
-#      AGGREGATE_HAVING view and incrementally refreshes correctly.
+#      the CTE body fold into the outer plan. Because the stored aggregate-filter
+#      query is backed by a join, GROUP_RECOMPUTE must use current-vs-stored diff
+#      affected keys; source-delta affected keys can miss batched deletes on both
+#      join inputs.
 # ============================================================
 
 statement ok
@@ -477,6 +479,21 @@ CREATE MATERIALIZED VIEW mv_cte_having AS
     )
     SELECT i.i_id, i.i_name, i.i_price, ir.rev
     FROM cte_hav_item i JOIN item_revenue ir ON i.i_id = ir.ol_i_id;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_cte_having';
+----
+6
+
+query T
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_cte_having';
+----
+current_diff
+
+query I
+SELECT group_recompute_source_occurrences_json IS NOT NULL FROM openivm_views WHERE view_name = 'mv_cte_having';
+----
+true
 
 query I
 SELECT count(*) FROM (
@@ -509,6 +526,51 @@ INSERT INTO cte_hav_item VALUES (4, 'd', 40);
 
 statement ok
 INSERT INTO cte_hav_ol VALUES (4, 150);
+
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+PRAGMA refresh('mv_cte_having');
+
+query I
+SELECT count(*) > 0 FROM openivm_refresh_profile
+WHERE view_name = 'mv_cte_having'
+  AND step_name = 'execute_refresh_sql_stmt'
+  AND contains(detail, 'openivm_current_mv_cte_having');
+----
+true
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_cte_having
+    EXCEPT ALL
+    (WITH item_revenue AS (SELECT ol_i_id, SUM(ol_amount) AS rev FROM cte_hav_ol GROUP BY ol_i_id HAVING SUM(ol_amount) > 100)
+     SELECT i.i_id, i.i_name, i.i_price, ir.rev FROM cte_hav_item i JOIN item_revenue ir ON i.i_id = ir.ol_i_id)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (WITH item_revenue AS (SELECT ol_i_id, SUM(ol_amount) AS rev FROM cte_hav_ol GROUP BY ol_i_id HAVING SUM(ol_amount) > 100)
+     SELECT i.i_id, i.i_name, i.i_price, ir.rev FROM cte_hav_item i JOIN item_revenue ir ON i.i_id = ir.ol_i_id)
+    EXCEPT ALL SELECT * FROM mv_cte_having
+);
+----
+0
+
+statement ok
+SET openivm_profile_refresh = false;
+
+# Batched delete from both sides of the join. Source-delta affected keys can miss
+# this because each replaced source sees the other side's post-DML table and
+# produces no joined row for the deleted key.
+statement ok
+DELETE FROM cte_hav_item WHERE i_id = 4;
+
+statement ok
+DELETE FROM cte_hav_ol WHERE ol_i_id = 4;
 
 statement ok
 PRAGMA refresh('mv_cte_having');

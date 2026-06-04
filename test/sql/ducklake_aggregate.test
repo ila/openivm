@@ -1073,6 +1073,16 @@ CREATE MATERIALIZED VIEW dl.mv_minmax_join_having AS
         max_balance
     FROM rollup;
 
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_minmax_join_having';
+----
+6
+
+query T
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_minmax_join_having';
+----
+current_diff
+
 statement ok
 UPDATE dl.minmax_join_customer SET balance = -154.0 WHERE id = 2;
 

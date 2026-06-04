@@ -15,24 +15,32 @@ static constexpr const char *ZEROS_LIST = "[0.0::FLOAT FOR x IN generate_series(
 static constexpr idx_t GROUP_RECOMPUTE_DIFF_OCCURRENCE_THRESHOLD = 32;
 static constexpr idx_t GROUP_RECOMPUTE_DIFF_SQL_BYTES_THRESHOLD = 16ULL * 1024ULL * 1024ULL;
 
-static idx_t EstimateGroupRecomputeAffectedVariants(const string &view_query_sql,
-                                                    const vector<GroupRecomputeDeltaSpec> &delta_table_specs) {
+static idx_t EstimateGroupRecomputeAffectedVariants(const vector<GroupRecomputeDeltaSpec> &delta_table_specs) {
 	idx_t variants = 0;
 	for (auto &spec : delta_table_specs) {
-		variants += SqlUtils::CountTableReferences(view_query_sql, spec.base_table);
+		variants += spec.source_occurrences == 0 ? 1 : spec.source_occurrences;
 	}
 	return variants;
 }
 
 static bool ShouldUseCurrentDiffGroupRecompute(const string &view_query_sql,
                                                const vector<GroupRecomputeDeltaSpec> &delta_table_specs) {
-	idx_t variants = EstimateGroupRecomputeAffectedVariants(view_query_sql, delta_table_specs);
+	idx_t variants = EstimateGroupRecomputeAffectedVariants(delta_table_specs);
 	return variants >= GROUP_RECOMPUTE_DIFF_OCCURRENCE_THRESHOLD ||
 	       variants * view_query_sql.size() >= GROUP_RECOMPUTE_DIFF_SQL_BYTES_THRESHOLD;
 }
 
 static bool IsSqlIdentifierChar(char c) {
 	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static bool IsKeywordTokenAt(const string &lower, size_t pos, const string &keyword) {
+	if (pos + keyword.size() > lower.size() || lower.compare(pos, keyword.size(), keyword) != 0) {
+		return false;
+	}
+	bool left_boundary = pos == 0 || !IsSqlIdentifierChar(lower[pos - 1]);
+	bool right_boundary = pos + keyword.size() == lower.size() || !IsSqlIdentifierChar(lower[pos + keyword.size()]);
+	return left_boundary && right_boundary;
 }
 
 static bool ContainsKeywordToken(const string &sql, const string &keyword) {
@@ -53,16 +61,177 @@ static bool ContainsKeywordToken(const string &sql, const string &keyword) {
 			in_double_quote = !in_double_quote;
 			continue;
 		}
-		if (in_single_quote || in_double_quote || lower.compare(i, keyword.size(), keyword) != 0) {
+		if (in_single_quote || in_double_quote || !IsKeywordTokenAt(lower, i, keyword)) {
 			continue;
 		}
-		bool left_boundary = i == 0 || !IsSqlIdentifierChar(lower[i - 1]);
-		bool right_boundary = i + keyword.size() == lower.size() || !IsSqlIdentifierChar(lower[i + keyword.size()]);
-		if (left_boundary && right_boundary) {
-			return true;
-		}
+		return true;
 	}
 	return false;
+}
+
+static void AdvanceSqlScanner(const string &sql, size_t &i, bool &in_single_quote, bool &in_double_quote,
+                              size_t &depth) {
+	char c = sql[i];
+	if (c == '\'' && !in_double_quote) {
+		if (in_single_quote && i + 1 < sql.size() && sql[i + 1] == '\'') {
+			i++;
+			return;
+		}
+		in_single_quote = !in_single_quote;
+		return;
+	}
+	if (c == '"' && !in_single_quote) {
+		in_double_quote = !in_double_quote;
+		return;
+	}
+	if (in_single_quote || in_double_quote) {
+		return;
+	}
+	if (c == '(') {
+		depth++;
+	} else if (c == ')' && depth > 0) {
+		depth--;
+	}
+}
+
+static size_t FindTopLevelKeyword(const string &sql, const string &keyword, size_t start_pos = 0) {
+	auto lower = StringUtil::Lower(sql);
+	bool in_single_quote = false;
+	bool in_double_quote = false;
+	size_t depth = 0;
+	for (size_t i = start_pos; i + keyword.size() <= lower.size(); i++) {
+		if (!in_single_quote && !in_double_quote && depth == 0 && IsKeywordTokenAt(lower, i, keyword)) {
+			return i;
+		}
+		AdvanceSqlScanner(sql, i, in_single_quote, in_double_quote, depth);
+	}
+	return string::npos;
+}
+
+static size_t FindFirstTopLevelClause(const string &sql, const vector<string> &keywords, size_t start_pos) {
+	size_t best = string::npos;
+	for (auto &keyword : keywords) {
+		size_t pos = FindTopLevelKeyword(sql, keyword, start_pos);
+		if (pos != string::npos && (best == string::npos || pos < best)) {
+			best = pos;
+		}
+	}
+	return best;
+}
+
+static size_t FindMatchingParen(const string &sql, size_t open_pos) {
+	bool in_single_quote = false;
+	bool in_double_quote = false;
+	size_t depth = 0;
+	for (size_t i = open_pos; i < sql.size(); i++) {
+		char c = sql[i];
+		AdvanceSqlScanner(sql, i, in_single_quote, in_double_quote, depth);
+		if (!in_single_quote && !in_double_quote && c == ')' && depth == 0) {
+			return i;
+		}
+	}
+	return string::npos;
+}
+
+static size_t FindCteBodyOpen(const string &sql, size_t cte_name_pos) {
+	auto lower = StringUtil::Lower(sql);
+	bool in_single_quote = false;
+	bool in_double_quote = false;
+	size_t depth = 0;
+	for (size_t i = cte_name_pos; i < sql.size(); i++) {
+		if (!in_single_quote && !in_double_quote && depth == 0 && IsKeywordTokenAt(lower, i, "as")) {
+			size_t body_open = i + strlen("as");
+			while (body_open < sql.size() && std::isspace(static_cast<unsigned char>(sql[body_open]))) {
+				body_open++;
+			}
+			return body_open < sql.size() && sql[body_open] == '(' ? body_open : string::npos;
+		}
+		AdvanceSqlScanner(sql, i, in_single_quote, in_double_quote, depth);
+	}
+	return string::npos;
+}
+
+static bool BodyReadsAggregateCte(const string &body, size_t from_pos) {
+	auto lower = StringUtil::Lower(body);
+	size_t cursor = from_pos + strlen("from");
+	while (cursor < lower.size() && std::isspace(static_cast<unsigned char>(lower[cursor]))) {
+		cursor++;
+	}
+	static const string aggregate_prefix = "aggregate_";
+	return cursor + aggregate_prefix.size() <= lower.size() &&
+	       lower.compare(cursor, aggregate_prefix.size(), aggregate_prefix) == 0;
+}
+
+static bool TryStripAggregateFilterCtes(const string &sql, string &out) {
+	auto lower = StringUtil::Lower(sql);
+	string result;
+	size_t copy_pos = 0;
+	size_t search_pos = 0;
+	bool changed = false;
+	while (true) {
+		size_t pos = lower.find("filter_", search_pos);
+		if (pos == string::npos) {
+			break;
+		}
+		if (pos > 0 && IsSqlIdentifierChar(lower[pos - 1])) {
+			search_pos = pos + strlen("filter_");
+			continue;
+		}
+		size_t body_open = FindCteBodyOpen(sql, pos);
+		if (body_open == string::npos) {
+			search_pos = pos + strlen("filter_");
+			continue;
+		}
+		size_t body_close = FindMatchingParen(sql, body_open);
+		if (body_close == string::npos) {
+			return false;
+		}
+		string body = sql.substr(body_open + 1, body_close - body_open - 1);
+		size_t from_pos = FindTopLevelKeyword(body, "from");
+		size_t where_pos = FindTopLevelKeyword(body, "where");
+		if (from_pos == string::npos || where_pos == string::npos || from_pos > where_pos ||
+		    !BodyReadsAggregateCte(body, from_pos)) {
+			search_pos = body_close + 1;
+			continue;
+		}
+		string stripped_body = body.substr(0, where_pos);
+		StringUtil::Trim(stripped_body);
+		result += sql.substr(copy_pos, body_open + 1 - copy_pos);
+		result += stripped_body;
+		copy_pos = body_close;
+		search_pos = body_close + 1;
+		changed = true;
+	}
+	if (!changed) {
+		return false;
+	}
+	result += sql.substr(copy_pos);
+	out = std::move(result);
+	return true;
+}
+
+static bool TryStripTopLevelHaving(const string &sql, string &out) {
+	size_t having_pos = FindTopLevelKeyword(sql, "having");
+	if (having_pos == string::npos) {
+		return false;
+	}
+	size_t suffix_pos =
+	    FindFirstTopLevelClause(sql, {"order", "limit", "union", "except", "intersect"}, having_pos + strlen("having"));
+	string prefix = sql.substr(0, having_pos);
+	StringUtil::Trim(prefix);
+	string suffix;
+	if (suffix_pos != string::npos) {
+		suffix = sql.substr(suffix_pos);
+		StringUtil::Trim(suffix);
+	}
+	out = prefix;
+	if (!suffix.empty()) {
+		if (!out.empty()) {
+			out += "\n";
+		}
+		out += suffix;
+	}
+	return !out.empty() && out != sql;
 }
 
 static bool ContainsAggregateFilterCte(const string &sql) {
@@ -80,6 +249,36 @@ static bool ContainsAggregateFilterCte(const string &sql) {
 		pos += string("filter_").size();
 	}
 	return false;
+}
+
+static bool TryBuildGroupRecomputeAffectedQuery(const string &view_query_sql, string &affected_query_sql) {
+	affected_query_sql = view_query_sql;
+	bool has_aggregate_filter_cte = ContainsAggregateFilterCte(affected_query_sql);
+	bool has_having = ContainsKeywordToken(affected_query_sql, "having");
+	if (!has_aggregate_filter_cte && !has_having) {
+		return true;
+	}
+	if (has_aggregate_filter_cte) {
+		string stripped_filters;
+		if (!TryStripAggregateFilterCtes(affected_query_sql, stripped_filters)) {
+			return false;
+		}
+		affected_query_sql = std::move(stripped_filters);
+		if (ContainsAggregateFilterCte(affected_query_sql)) {
+			return false;
+		}
+	}
+	if (ContainsKeywordToken(affected_query_sql, "having")) {
+		string stripped_having;
+		if (!TryStripTopLevelHaving(affected_query_sql, stripped_having)) {
+			return false;
+		}
+		affected_query_sql = std::move(stripped_having);
+		if (ContainsKeywordToken(affected_query_sql, "having")) {
+			return false;
+		}
+	}
+	return true;
 }
 
 static string BuildCurrentDiffGroupRecomputeSQL(const string &view_name, const string &data_table,
@@ -906,7 +1105,7 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs, const string &catalog_prefix,
-                             const string &lpts_table_prefix) {
+                             const string &lpts_table_prefix, GroupRecomputeAffectedMode affected_mode) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// No GROUP BY columns or no source deltas registered → can't scope; fall back to full.
@@ -916,9 +1115,19 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
 
-	if (ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs) ||
-	    ContainsKeywordToken(view_query_sql, "having") || ContainsAggregateFilterCte(view_query_sql)) {
-		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys\n");
+	if (ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys for large affected query\n");
+		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns);
+	}
+	if (affected_mode == GroupRecomputeAffectedMode::CURRENT_DIFF) {
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys from model metadata\n");
+		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns);
+	}
+	string affected_view_query_sql = view_query_sql;
+	if (affected_mode == GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER &&
+	    !TryBuildGroupRecomputeAffectedQuery(view_query_sql, affected_view_query_sql)) {
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys; aggregate filter relaxation "
+		                    "was ambiguous\n");
 		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns);
 	}
 
@@ -956,14 +1165,15 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		// table names, so fall back to identifier-safe bare replacement when the exact LPTS
 		// form is absent.
 		string source_full = (lpts_table_prefix.empty() ? catalog_prefix : lpts_table_prefix) + base;
-		auto filtered_variants = SqlUtils::ReplaceEachPlainOccurrence(view_query_sql, source_full, delta_subselect);
+		auto filtered_variants =
+		    SqlUtils::ReplaceEachPlainOccurrence(affected_view_query_sql, source_full, delta_subselect);
 		if (filtered_variants.empty()) {
-			filtered_variants = SqlUtils::ReplaceEachTableReference(view_query_sql, base, delta_subselect);
+			filtered_variants = SqlUtils::ReplaceEachTableReference(affected_view_query_sql, base, delta_subselect);
 		}
 		if (filtered_variants.empty()) {
-			string filtered = SqlUtils::ReplaceAllOccurrences(view_query_sql, source_full, delta_subselect);
-			if (filtered == view_query_sql) {
-				filtered = SqlUtils::ReplaceTableReferences(view_query_sql, base, delta_subselect);
+			string filtered = SqlUtils::ReplaceAllOccurrences(affected_view_query_sql, source_full, delta_subselect);
+			if (filtered == affected_view_query_sql) {
+				filtered = SqlUtils::ReplaceTableReferences(affected_view_query_sql, base, delta_subselect);
 			}
 			filtered_variants.push_back(std::move(filtered));
 		}

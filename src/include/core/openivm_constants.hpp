@@ -75,6 +75,8 @@ enum class RefreshType : uint8_t {
 	SEMI_ANTI_RECOMPUTE   // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
 };
 
+enum class GroupRecomputeAffectedMode : uint8_t { SOURCE_DELTA, SOURCE_DELTA_RELAX_AGGREGATE_FILTER, CURRENT_DIFF };
+
 inline const char *RefreshTypeName(RefreshType type) {
 	switch (type) {
 	case RefreshType::AGGREGATE_HAVING:
@@ -99,6 +101,19 @@ inline const char *RefreshTypeName(RefreshType type) {
 		return "FULL_REFRESH";
 	default:
 		return "UNKNOWN";
+	}
+}
+
+inline const char *GroupRecomputeAffectedModeName(GroupRecomputeAffectedMode mode) {
+	switch (mode) {
+	case GroupRecomputeAffectedMode::SOURCE_DELTA:
+		return "source_delta";
+	case GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER:
+		return "source_delta_relax_aggregate_filter";
+	case GroupRecomputeAffectedMode::CURRENT_DIFF:
+		return "current_diff";
+	default:
+		return "current_diff";
 	}
 }
 

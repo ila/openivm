@@ -107,6 +107,15 @@ public:
 	// predicate was extracted, which can happen when HAVING is nested inside a CTE.
 	string GetHavingPredicate(const string &view_name);
 
+	struct GroupRecomputeSourceOccurrence {
+		string table_name;
+		idx_t count = 0;
+	};
+
+	GroupRecomputeAffectedMode GetGroupRecomputeAffectedMode(const string &view_name);
+	vector<GroupRecomputeSourceOccurrence> GetGroupRecomputeSourceOccurrences(const string &view_name);
+	static string GroupRecomputeSourceOccurrencesToJson(const vector<GroupRecomputeSourceOccurrence> &occurrences);
+
 	// --- DuckLake support ---
 
 	// Get the catalog type for a base table entry ('duckdb' or 'ducklake').

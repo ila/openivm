@@ -660,6 +660,7 @@ string BuildDeltaViewModelProfileDetail(const DeltaViewModel &model) {
 	}
 	return "refresh_type=" + string(RefreshTypeName(model.type)) +
 	       "; group_cols=" + to_string(model.group_columns.size()) + "; model_nodes=" + to_string(model.nodes.size()) +
+	       "; group_recompute_mode=" + string(GroupRecomputeAffectedModeName(model.group_recompute_affected_mode)) +
 	       "; scan_occurrences=" + to_string(scan_occurrences) +
 	       "; model_domains=" + to_string(model.affected_domains.size()) + "; node_domains=" + to_string(node_domains) +
 	       "; lineage_entries=" + to_string(model.LineageEntryCount()) +

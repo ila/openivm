@@ -1,6 +1,7 @@
 #ifndef REFRESH_COMPILER_HPP
 #define REFRESH_COMPILER_HPP
 
+#include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -13,6 +14,7 @@ namespace duckdb {
 struct GroupRecomputeDeltaSpec {
 	string base_table;
 	string last_update;
+	idx_t source_occurrences = 1;
 	bool is_ducklake = false;
 	string ducklake_catalog;
 	string ducklake_schema;
@@ -61,7 +63,8 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 /// when the catalog is default), so we can substitute the exact `cat.schema.tbl` pattern.
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs,
-                             const string &catalog_prefix = "", const string &lpts_table_prefix = "");
+                             const string &catalog_prefix = "", const string &lpts_table_prefix = "",
+                             GroupRecomputeAffectedMode affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF);
 
 /// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM aggregate.
 /// Generates a multi-statement SQL batch:
