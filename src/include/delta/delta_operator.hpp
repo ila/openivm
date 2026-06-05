@@ -24,7 +24,10 @@ enum class DeltaOperatorStrategy {
 	CTE_REF,
 	UNNEST_LINEAR,
 	CONSTANT_ZERO_DELTA,
-	CONSTANT_STATIC
+	CONSTANT_STATIC,
+	ASOF_AFFECTED_RECOMPUTE,
+	POSITIONAL_GLOBAL_RECOMPUTE,
+	SAMPLE_GLOBAL_RECOMPUTE
 };
 
 struct DeltaOperatorInput {
@@ -73,6 +76,9 @@ DeltaPlanFragment CompileCteDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileUnnestDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileConstantZeroDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileStaticConstantLeaf(DeltaOperatorInput input);
+DeltaPlanFragment CompileAsofJoinDelta(DeltaOperatorInput input);
+DeltaPlanFragment CompilePositionalJoinDelta(DeltaOperatorInput input);
+DeltaPlanFragment CompileSampleDelta(DeltaOperatorInput input);
 
 } // namespace duckdb
 

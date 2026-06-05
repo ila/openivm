@@ -32,7 +32,9 @@ struct RefreshCostEstimate {
 	// (inner DISTINCT under aggregate) it's "group_recompute" and the IVM cost
 	// fields hold the affected-groups recompute cost instead. For
 	// `RefreshType::WINDOW_PARTITION` it's "window_partition" (partition recompute).
-	// Always one of: "incremental", "group_recompute", "window_partition".
+	// For `RefreshType::CURRENT_DIFF_RECOMPUTE` it is "current_diff_recompute".
+	// Always one of: "incremental", "group_recompute", "window_partition",
+	// "current_diff_recompute".
 	string strategy_label;
 
 	bool ShouldRecompute() const {

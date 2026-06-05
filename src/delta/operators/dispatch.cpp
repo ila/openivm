@@ -69,6 +69,12 @@ const char *DeltaOperatorStrategyName(DeltaOperatorStrategy strategy) {
 		return "CONSTANT_ZERO_DELTA";
 	case DeltaOperatorStrategy::CONSTANT_STATIC:
 		return "CONSTANT_STATIC";
+	case DeltaOperatorStrategy::ASOF_AFFECTED_RECOMPUTE:
+		return "ASOF_AFFECTED_RECOMPUTE";
+	case DeltaOperatorStrategy::POSITIONAL_GLOBAL_RECOMPUTE:
+		return "POSITIONAL_GLOBAL_RECOMPUTE";
+	case DeltaOperatorStrategy::SAMPLE_GLOBAL_RECOMPUTE:
+		return "SAMPLE_GLOBAL_RECOMPUTE";
 	default:
 		return "UNKNOWN";
 	}
@@ -117,6 +123,12 @@ DeltaPlanFragment CompileDeltaOperatorWithModel(const DeltaOperatorInput &input,
 		return CompileUnnestDelta(node_input);
 	case DeltaModelNodeKind::CONSTANT:
 		return CompileConstantZeroDelta(node_input);
+	case DeltaModelNodeKind::ASOF_JOIN:
+		return CompileAsofJoinDelta(node_input);
+	case DeltaModelNodeKind::POSITIONAL_JOIN:
+		return CompilePositionalJoinDelta(node_input);
+	case DeltaModelNodeKind::SAMPLE:
+		return CompileSampleDelta(node_input);
 	case DeltaModelNodeKind::OTHER:
 		throw NotImplementedException("Delta model node kind %s not supported", DeltaModelNodeKindName(node.kind));
 	default:
@@ -161,6 +173,12 @@ DeltaPlanFragment CompileCopiedDeltaSubtree(DeltaOperatorInput input) {
 		return CompileCteDelta(input);
 	case LogicalOperatorType::LOGICAL_UNNEST:
 		return CompileUnnestDelta(input);
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+		return CompileAsofJoinDelta(input);
+	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
+		return CompilePositionalJoinDelta(input);
+	case LogicalOperatorType::LOGICAL_SAMPLE:
+		return CompileSampleDelta(input);
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:

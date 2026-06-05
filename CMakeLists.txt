@@ -38,6 +38,7 @@ set(EXTENSION_SOURCES
     src/delta/operators/filter.cpp
     src/delta/operators/join.cpp
     src/delta/operators/join_output.cpp
+    src/delta/operators/nonlocal.cpp
     src/delta/operators/projection.cpp
     src/delta/operators/scan.cpp
     src/delta/operators/topk.cpp

@@ -1,0 +1,833 @@
+# name: test/sql/nonlocal_operator_recompute.test
+# description: ASOF, SAMPLE, and POSITIONAL refresh strategies
+# group: [sql]
+
+require openivm
+
+# ==========================================
+# ASOF projections use exact current/new diff recompute
+# ==========================================
+
+statement ok
+CREATE TABLE oprec_asof_trades (symbol VARCHAR, ts TIMESTAMP, qty INT);
+
+statement ok
+CREATE TABLE oprec_asof_prices (symbol VARCHAR, ts TIMESTAMP, price INT);
+
+statement ok
+INSERT INTO oprec_asof_trades VALUES
+    ('A', TIMESTAMP '2024-01-01 10:00:00', 1),
+    ('A', TIMESTAMP '2024-01-01 10:20:00', 2),
+    ('B', TIMESTAMP '2024-01-01 10:15:00', 3);
+
+statement ok
+INSERT INTO oprec_asof_prices VALUES
+    ('A', TIMESTAMP '2024-01-01 09:00:00', 100),
+    ('A', TIMESTAMP '2024-01-01 10:18:00', 180),
+    ('B', TIMESTAMP '2024-01-01 10:12:00', 120);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_asof_projection AS
+    SELECT
+        t.symbol AS symbol,
+        t.ts AS trade_ts,
+        t.qty AS qty,
+        p.ts AS price_ts,
+        p.price AS price
+    FROM oprec_asof_trades t
+    ASOF JOIN oprec_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_projection';
+----
+10
+
+statement ok
+INSERT INTO oprec_asof_prices VALUES ('A', TIMESTAMP '2024-01-01 10:19:00', 190);
+
+statement ok
+INSERT INTO oprec_asof_trades VALUES ('A', TIMESTAMP '2024-01-01 10:21:00', 4);
+
+statement ok
+DELETE FROM oprec_asof_prices WHERE symbol = 'B' AND ts = TIMESTAMP '2024-01-01 10:12:00';
+
+statement ok
+UPDATE oprec_asof_trades SET qty = 6 WHERE symbol = 'A' AND ts = TIMESTAMP '2024-01-01 10:00:00';
+
+statement ok
+PRAGMA refresh('mv_oprec_asof_projection');
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        t.symbol AS symbol,
+        t.ts AS trade_ts,
+        t.qty AS qty,
+        p.ts AS price_ts,
+        p.price AS price
+    FROM oprec_asof_trades t
+    ASOF JOIN oprec_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+    EXCEPT ALL
+    SELECT symbol, trade_ts, qty, price_ts, price FROM mv_oprec_asof_projection
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT symbol, trade_ts, qty, price_ts, price FROM mv_oprec_asof_projection
+    EXCEPT ALL
+    SELECT
+        t.symbol AS symbol,
+        t.ts AS trade_ts,
+        t.qty AS qty,
+        p.ts AS price_ts,
+        p.price AS price
+    FROM oprec_asof_trades t
+    ASOF JOIN oprec_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+);
+----
+0
+
+# Grouped ASOF outputs use group recompute with current/new affected keys.
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_asof_group AS
+    SELECT
+        t.symbol AS symbol,
+        COUNT(*) AS cnt,
+        SUM(p.price) AS total_price
+    FROM oprec_asof_trades t
+    ASOF JOIN oprec_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+    GROUP BY t.symbol;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_group';
+----
+6
+
+query T
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_oprec_asof_group';
+----
+current_diff
+
+statement ok
+INSERT INTO oprec_asof_prices VALUES ('B', TIMESTAMP '2024-01-01 10:00:00', 130);
+
+statement ok
+INSERT INTO oprec_asof_prices VALUES ('A', TIMESTAMP '2024-01-01 10:20:00', 200);
+
+statement ok
+DELETE FROM oprec_asof_trades WHERE symbol = 'A' AND ts = TIMESTAMP '2024-01-01 10:00:00';
+
+statement ok
+UPDATE oprec_asof_trades SET qty = 5 WHERE symbol = 'A' AND ts = TIMESTAMP '2024-01-01 10:21:00';
+
+statement ok
+PRAGMA refresh('mv_oprec_asof_group');
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        t.symbol AS symbol,
+        COUNT(*) AS cnt,
+        SUM(p.price) AS total_price
+    FROM oprec_asof_trades t
+    ASOF JOIN oprec_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+    GROUP BY t.symbol
+    EXCEPT ALL
+    SELECT symbol, cnt, total_price FROM mv_oprec_asof_group
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT symbol, cnt, total_price FROM mv_oprec_asof_group
+    EXCEPT ALL
+    SELECT
+        t.symbol AS symbol,
+        COUNT(*) AS cnt,
+        SUM(p.price) AS total_price
+    FROM oprec_asof_trades t
+    ASOF JOIN oprec_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+    GROUP BY t.symbol
+);
+----
+0
+
+# ==========================================
+# ASOF under a partitioned window stays partition-recompute
+# ==========================================
+
+statement ok
+CREATE TABLE oprec_asof_win_trades (symbol VARCHAR, ts TIMESTAMP, qty INT);
+
+statement ok
+CREATE TABLE oprec_asof_win_prices (symbol VARCHAR, ts TIMESTAMP, price INT);
+
+statement ok
+INSERT INTO oprec_asof_win_trades VALUES
+    ('A', TIMESTAMP '2024-02-01 10:00:00', 1),
+    ('A', TIMESTAMP '2024-02-01 10:20:00', 2),
+    ('B', TIMESTAMP '2024-02-01 10:15:00', 3),
+    ('C', TIMESTAMP '2024-02-01 10:10:00', 4);
+
+statement ok
+INSERT INTO oprec_asof_win_prices VALUES
+    ('A', TIMESTAMP '2024-02-01 09:00:00', 100),
+    ('A', TIMESTAMP '2024-02-01 10:18:00', 180),
+    ('B', TIMESTAMP '2024-02-01 10:12:00', 120),
+    ('C', TIMESTAMP '2024-02-01 10:00:00', 130);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_asof_window AS
+    SELECT
+        symbol,
+        trade_ts,
+        qty,
+        price_ts,
+        price,
+        row_number() OVER (PARTITION BY symbol ORDER BY trade_ts, price_ts) AS rn
+    FROM (
+        SELECT
+            t.symbol AS symbol,
+            t.ts AS trade_ts,
+            t.qty AS qty,
+            p.ts AS price_ts,
+            p.price AS price
+        FROM oprec_asof_win_trades t
+        ASOF JOIN oprec_asof_win_prices p
+          ON t.symbol = p.symbol
+         AND t.ts >= p.ts
+    ) q;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_window';
+----
+5
+
+statement ok
+INSERT INTO oprec_asof_win_prices VALUES ('A', TIMESTAMP '2024-02-01 10:19:00', 190);
+
+statement ok
+DELETE FROM oprec_asof_win_trades WHERE symbol = 'C';
+
+statement ok
+UPDATE oprec_asof_win_trades SET qty = 7 WHERE symbol = 'B';
+
+statement ok
+PRAGMA refresh('mv_oprec_asof_window');
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        symbol,
+        trade_ts,
+        qty,
+        price_ts,
+        price,
+        row_number() OVER (PARTITION BY symbol ORDER BY trade_ts, price_ts) AS rn
+    FROM (
+        SELECT
+            t.symbol AS symbol,
+            t.ts AS trade_ts,
+            t.qty AS qty,
+            p.ts AS price_ts,
+            p.price AS price
+        FROM oprec_asof_win_trades t
+        ASOF JOIN oprec_asof_win_prices p
+          ON t.symbol = p.symbol
+         AND t.ts >= p.ts
+    ) q
+    EXCEPT ALL
+    SELECT symbol, trade_ts, qty, price_ts, price, rn FROM mv_oprec_asof_window
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT symbol, trade_ts, qty, price_ts, price, rn FROM mv_oprec_asof_window
+    EXCEPT ALL
+    SELECT
+        symbol,
+        trade_ts,
+        qty,
+        price_ts,
+        price,
+        row_number() OVER (PARTITION BY symbol ORDER BY trade_ts, price_ts) AS rn
+    FROM (
+        SELECT
+            t.symbol AS symbol,
+            t.ts AS trade_ts,
+            t.qty AS qty,
+            p.ts AS price_ts,
+            p.price AS price
+        FROM oprec_asof_win_trades t
+        ASOF JOIN oprec_asof_win_prices p
+          ON t.symbol = p.symbol
+         AND t.ts >= p.ts
+    ) q
+);
+----
+0
+
+# ASOF windows whose partition key comes from the RHS match must use current/new diff:
+# a newer RHS row can move existing left rows out of the old matched partition.
+
+statement ok
+CREATE TABLE oprec_asof_rhs_win_trades (symbol VARCHAR, ts TIMESTAMP, qty INT);
+
+statement ok
+CREATE TABLE oprec_asof_rhs_win_prices (symbol VARCHAR, ts TIMESTAMP, price INT);
+
+statement ok
+INSERT INTO oprec_asof_rhs_win_trades VALUES
+    ('A', TIMESTAMP '2024-02-02 10:00:00', 1),
+    ('A', TIMESTAMP '2024-02-02 10:20:00', 2),
+    ('B', TIMESTAMP '2024-02-02 10:15:00', 3);
+
+statement ok
+INSERT INTO oprec_asof_rhs_win_prices VALUES
+    ('A', TIMESTAMP '2024-02-02 09:00:00', 100),
+    ('A', TIMESTAMP '2024-02-02 10:10:00', 110),
+    ('B', TIMESTAMP '2024-02-02 10:00:00', 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_asof_rhs_window AS
+    SELECT
+        symbol,
+        trade_ts,
+        qty,
+        price,
+        row_number() OVER (PARTITION BY price ORDER BY trade_ts, symbol) AS rn
+    FROM (
+        SELECT
+            t.symbol AS symbol,
+            t.ts AS trade_ts,
+            t.qty AS qty,
+            p.price AS price
+        FROM oprec_asof_rhs_win_trades t
+        ASOF JOIN oprec_asof_rhs_win_prices p
+          ON t.symbol = p.symbol
+         AND t.ts >= p.ts
+    ) q;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_rhs_window';
+----
+10
+
+statement ok
+INSERT INTO oprec_asof_rhs_win_prices VALUES ('A', TIMESTAMP '2024-02-02 10:15:00', 150);
+
+statement ok
+INSERT INTO oprec_asof_rhs_win_trades VALUES ('A', TIMESTAMP '2024-02-02 10:30:00', 4);
+
+statement ok
+DELETE FROM oprec_asof_rhs_win_prices WHERE symbol = 'B' AND ts = TIMESTAMP '2024-02-02 10:00:00';
+
+statement ok
+UPDATE oprec_asof_rhs_win_trades SET qty = 5 WHERE symbol = 'A' AND ts = TIMESTAMP '2024-02-02 10:00:00';
+
+statement ok
+PRAGMA refresh('mv_oprec_asof_rhs_window');
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        symbol,
+        trade_ts,
+        qty,
+        price,
+        row_number() OVER (PARTITION BY price ORDER BY trade_ts, symbol) AS rn
+    FROM (
+        SELECT
+            t.symbol AS symbol,
+            t.ts AS trade_ts,
+            t.qty AS qty,
+            p.price AS price
+        FROM oprec_asof_rhs_win_trades t
+        ASOF JOIN oprec_asof_rhs_win_prices p
+          ON t.symbol = p.symbol
+         AND t.ts >= p.ts
+    ) q
+    EXCEPT ALL
+    SELECT symbol, trade_ts, qty, price, rn FROM mv_oprec_asof_rhs_window
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT symbol, trade_ts, qty, price, rn FROM mv_oprec_asof_rhs_window
+    EXCEPT ALL
+    SELECT
+        symbol,
+        trade_ts,
+        qty,
+        price,
+        row_number() OVER (PARTITION BY price ORDER BY trade_ts, symbol) AS rn
+    FROM (
+        SELECT
+            t.symbol AS symbol,
+            t.ts AS trade_ts,
+            t.qty AS qty,
+            p.price AS price
+        FROM oprec_asof_rhs_win_trades t
+        ASOF JOIN oprec_asof_rhs_win_prices p
+          ON t.symbol = p.symbol
+         AND t.ts >= p.ts
+    ) q
+);
+----
+0
+
+# ==========================================
+# SAMPLE is exact current/new diff recompute, not a local delta
+# ==========================================
+
+statement ok
+CREATE TABLE oprec_sample (id INT, grp INT, v INT);
+
+statement ok
+INSERT INTO oprec_sample VALUES
+    (1, 1, 10),
+    (2, 1, 20),
+    (3, 1, 30),
+    (4, 2, 40),
+    (5, 2, 50),
+    (6, 2, 60);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_sample AS
+    SELECT
+        id,
+        grp,
+        v,
+        row_number() OVER (PARTITION BY grp ORDER BY v DESC, id) AS rn
+    FROM oprec_sample USING SAMPLE reservoir(4 ROWS) REPEATABLE (17);
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_sample';
+----
+10
+
+statement ok
+INSERT INTO oprec_sample VALUES (7, 1, 70), (8, 3, 80);
+
+statement ok
+DELETE FROM oprec_sample WHERE id = 2;
+
+statement ok
+UPDATE oprec_sample SET v = 15 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_oprec_sample');
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        id,
+        grp,
+        v,
+        row_number() OVER (PARTITION BY grp ORDER BY v DESC, id) AS rn
+    FROM oprec_sample USING SAMPLE reservoir(4 ROWS) REPEATABLE (17)
+    EXCEPT ALL
+    SELECT id, grp, v, rn FROM mv_oprec_sample
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, v, rn FROM mv_oprec_sample
+    EXCEPT ALL
+    SELECT
+        id,
+        grp,
+        v,
+        row_number() OVER (PARTITION BY grp ORDER BY v DESC, id) AS rn
+    FROM oprec_sample USING SAMPLE reservoir(4 ROWS) REPEATABLE (17)
+);
+----
+0
+
+# Volatile samples keep the existing full-refresh behavior.
+
+statement ok
+CREATE TABLE oprec_sample_volatile (id INT);
+
+statement ok
+INSERT INTO oprec_sample_volatile VALUES (1), (2), (3);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_sample_volatile AS
+    SELECT id FROM oprec_sample_volatile USING SAMPLE reservoir(1 ROWS);
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_sample_volatile';
+----
+3
+
+# ==========================================
+# POSITIONAL JOIN is exact current/new diff recompute
+# ==========================================
+
+statement ok
+CREATE TABLE oprec_pos_l (id INT, lval VARCHAR);
+
+statement ok
+CREATE TABLE oprec_pos_r (rid INT, rval VARCHAR);
+
+statement ok
+INSERT INTO oprec_pos_l VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+INSERT INTO oprec_pos_r VALUES (10, 'x'), (20, 'y');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_positional AS
+    SELECT
+        l.id AS id,
+        l.lval AS lval,
+        r.rid AS rid,
+        r.rval AS rval,
+        row_number() OVER (
+            ORDER BY
+                coalesce(l.id, 1000000),
+                coalesce(r.rid, 1000000)
+        ) AS rn
+    FROM oprec_pos_l l
+    POSITIONAL JOIN oprec_pos_r r;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_positional';
+----
+10
+
+statement ok
+INSERT INTO oprec_pos_l VALUES (4, 'd');
+
+statement ok
+DELETE FROM oprec_pos_r WHERE rid = 20;
+
+statement ok
+UPDATE oprec_pos_l SET lval = 'aa' WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_oprec_positional');
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        l.id AS id,
+        l.lval AS lval,
+        r.rid AS rid,
+        r.rval AS rval,
+        row_number() OVER (
+            ORDER BY
+                coalesce(l.id, 1000000),
+                coalesce(r.rid, 1000000)
+        ) AS rn
+    FROM oprec_pos_l l
+    POSITIONAL JOIN oprec_pos_r r
+    EXCEPT ALL
+    SELECT id, lval, rid, rval, rn FROM mv_oprec_positional
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, lval, rid, rval, rn FROM mv_oprec_positional
+    EXCEPT ALL
+    SELECT
+        l.id AS id,
+        l.lval AS lval,
+        r.rid AS rid,
+        r.rval AS rval,
+        row_number() OVER (
+            ORDER BY
+                coalesce(l.id, 1000000),
+                coalesce(r.rid, 1000000)
+        ) AS rn
+    FROM oprec_pos_l l
+    POSITIONAL JOIN oprec_pos_r r
+);
+----
+0
+
+# ==========================================
+# Hidden non-local operators inside materialized CTEs are still classified conservatively
+# ==========================================
+
+statement ok
+CREATE TABLE oprec_cte_asof_trades (symbol VARCHAR, ts TIMESTAMP, qty INT);
+
+statement ok
+CREATE TABLE oprec_cte_asof_prices (symbol VARCHAR, ts TIMESTAMP, price INT);
+
+statement ok
+INSERT INTO oprec_cte_asof_trades VALUES
+    ('A', TIMESTAMP '2024-03-01 10:00:00', 1),
+    ('A', TIMESTAMP '2024-03-01 10:10:00', 2),
+    ('B', TIMESTAMP '2024-03-01 10:05:00', 3);
+
+statement ok
+INSERT INTO oprec_cte_asof_prices VALUES
+    ('A', TIMESTAMP '2024-03-01 09:55:00', 100),
+    ('A', TIMESTAMP '2024-03-01 10:08:00', 180),
+    ('B', TIMESTAMP '2024-03-01 10:00:00', 120);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_cte_asof AS
+    WITH matched AS MATERIALIZED (
+        SELECT
+            t.symbol AS symbol,
+            t.ts AS trade_ts,
+            p.price AS price
+        FROM oprec_cte_asof_trades t
+        ASOF JOIN oprec_cte_asof_prices p
+          ON t.symbol = p.symbol
+         AND t.ts >= p.ts
+    )
+    SELECT
+        m1.symbol AS symbol,
+        COUNT(*) AS pair_count,
+        SUM(m2.price) AS total_peer_price
+    FROM matched m1
+    JOIN matched m2 ON m1.symbol = m2.symbol
+    GROUP BY m1.symbol;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_cte_asof';
+----
+6
+
+query T
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_oprec_cte_asof';
+----
+current_diff
+
+statement ok
+INSERT INTO oprec_cte_asof_prices VALUES ('A', TIMESTAMP '2024-03-01 10:09:00', 190);
+
+statement ok
+INSERT INTO oprec_cte_asof_trades VALUES ('A', TIMESTAMP '2024-03-01 10:12:00', 4);
+
+statement ok
+DELETE FROM oprec_cte_asof_prices WHERE symbol = 'B' AND ts = TIMESTAMP '2024-03-01 10:00:00';
+
+statement ok
+UPDATE oprec_cte_asof_trades SET qty = 5 WHERE symbol = 'A' AND ts = TIMESTAMP '2024-03-01 10:00:00';
+
+statement ok
+PRAGMA refresh('mv_oprec_cte_asof');
+
+query I
+SELECT count(*) FROM (
+    WITH matched AS MATERIALIZED (
+        SELECT
+            t.symbol AS symbol,
+            t.ts AS trade_ts,
+            p.price AS price
+        FROM oprec_cte_asof_trades t
+        ASOF JOIN oprec_cte_asof_prices p
+          ON t.symbol = p.symbol
+         AND t.ts >= p.ts
+    )
+    SELECT
+        m1.symbol AS symbol,
+        COUNT(*) AS pair_count,
+        SUM(m2.price) AS total_peer_price
+    FROM matched m1
+    JOIN matched m2 ON m1.symbol = m2.symbol
+    GROUP BY m1.symbol
+    EXCEPT ALL
+    SELECT symbol, pair_count, total_peer_price FROM mv_oprec_cte_asof
+);
+----
+0
+
+query I
+WITH matched AS MATERIALIZED (
+    SELECT
+        t.symbol AS symbol,
+        t.ts AS trade_ts,
+        p.price AS price
+    FROM oprec_cte_asof_trades t
+    ASOF JOIN oprec_cte_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+)
+SELECT count(*) FROM (
+    SELECT symbol, pair_count, total_peer_price FROM mv_oprec_cte_asof
+    EXCEPT ALL
+    SELECT m1.symbol AS symbol, COUNT(*) AS pair_count, SUM(m2.price) AS total_peer_price
+    FROM matched m1
+    JOIN matched m2 ON m1.symbol = m2.symbol
+    GROUP BY m1.symbol
+);
+----
+0
+
+statement ok
+CREATE TABLE oprec_cte_sample (id INT, grp INT, v INT);
+
+statement ok
+INSERT INTO oprec_cte_sample VALUES
+    (1, 1, 10),
+    (2, 1, 20),
+    (3, 1, 30),
+    (4, 2, 40),
+    (5, 2, 50),
+    (6, 3, 60);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_cte_sample AS
+    WITH sampled AS MATERIALIZED (
+        SELECT id, grp, v
+        FROM oprec_cte_sample USING SAMPLE reservoir(4 ROWS) REPEATABLE (23)
+    )
+    SELECT grp, COUNT(*) AS cnt, SUM(v) AS total_v
+    FROM sampled
+    GROUP BY grp;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_cte_sample';
+----
+10
+
+statement ok
+INSERT INTO oprec_cte_sample VALUES (7, 2, 70), (8, 4, 80);
+
+statement ok
+DELETE FROM oprec_cte_sample WHERE id = 2;
+
+statement ok
+UPDATE oprec_cte_sample SET v = 15 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_oprec_cte_sample');
+
+query I
+SELECT count(*) FROM (
+    WITH sampled AS MATERIALIZED (
+        SELECT id, grp, v
+        FROM oprec_cte_sample USING SAMPLE reservoir(4 ROWS) REPEATABLE (23)
+    )
+    SELECT grp, COUNT(*) AS cnt, SUM(v) AS total_v
+    FROM sampled
+    GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, cnt, total_v FROM mv_oprec_cte_sample
+);
+----
+0
+
+query I
+WITH sampled AS MATERIALIZED (
+    SELECT id, grp, v
+    FROM oprec_cte_sample USING SAMPLE reservoir(4 ROWS) REPEATABLE (23)
+)
+SELECT count(*) FROM (
+    SELECT grp, cnt, total_v FROM mv_oprec_cte_sample
+    EXCEPT ALL
+    SELECT grp, COUNT(*) AS cnt, SUM(v) AS total_v
+    FROM sampled
+    GROUP BY grp
+);
+----
+0
+
+statement ok
+CREATE TABLE oprec_cte_pos_l (id INT, lval INT);
+
+statement ok
+CREATE TABLE oprec_cte_pos_r (rid INT, rval INT);
+
+statement ok
+INSERT INTO oprec_cte_pos_l VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+INSERT INTO oprec_cte_pos_r VALUES (10, 100), (20, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_cte_positional AS
+    WITH paired AS MATERIALIZED (
+        SELECT l.id AS id, l.lval AS lval, r.rid AS rid, r.rval AS rval
+        FROM oprec_cte_pos_l l
+        POSITIONAL JOIN oprec_cte_pos_r r
+    )
+    SELECT
+        COUNT(*) AS cnt,
+        SUM(coalesce(id, 0) + coalesce(rid, 0)) AS total_ids,
+        SUM(coalesce(lval, 0) + coalesce(rval, 0)) AS total_vals
+    FROM paired;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_cte_positional';
+----
+10
+
+statement ok
+INSERT INTO oprec_cte_pos_l VALUES (4, 40);
+
+statement ok
+DELETE FROM oprec_cte_pos_r WHERE rid = 20;
+
+statement ok
+UPDATE oprec_cte_pos_l SET lval = 15 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_oprec_cte_positional');
+
+query I
+SELECT count(*) FROM (
+    WITH paired AS MATERIALIZED (
+        SELECT l.id AS id, l.lval AS lval, r.rid AS rid, r.rval AS rval
+        FROM oprec_cte_pos_l l
+        POSITIONAL JOIN oprec_cte_pos_r r
+    )
+    SELECT
+        COUNT(*) AS cnt,
+        SUM(coalesce(id, 0) + coalesce(rid, 0)) AS total_ids,
+        SUM(coalesce(lval, 0) + coalesce(rval, 0)) AS total_vals
+    FROM paired
+    EXCEPT ALL
+    SELECT cnt, total_ids, total_vals FROM mv_oprec_cte_positional
+);
+----
+0
+
+query I
+WITH paired AS MATERIALIZED (
+    SELECT l.id AS id, l.lval AS lval, r.rid AS rid, r.rval AS rval
+    FROM oprec_cte_pos_l l
+    POSITIONAL JOIN oprec_cte_pos_r r
+)
+SELECT count(*) FROM (
+    SELECT cnt, total_ids, total_vals FROM mv_oprec_cte_positional
+    EXCEPT ALL
+    SELECT
+        COUNT(*) AS cnt,
+        SUM(coalesce(id, 0) + coalesce(rid, 0)) AS total_ids,
+        SUM(coalesce(lval, 0) + coalesce(rval, 0)) AS total_vals
+    FROM paired
+);
+----
+0

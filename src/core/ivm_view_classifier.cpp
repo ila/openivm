@@ -145,8 +145,17 @@ static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analys
 		AddUnique(model.features, DeltaModelFeature::LINEAR);
 	}
 	if (analysis.found_join && !analysis.found_left_join && !analysis.found_full_outer &&
-	    !analysis.found_semi_anti_join) {
+	    !analysis.found_semi_anti_join && !analysis.found_asof_join && !analysis.found_positional_join) {
 		AddUnique(model.features, DeltaModelFeature::BILINEAR);
+	}
+	if (analysis.found_asof_join) {
+		AddUnique(model.features, DeltaModelFeature::ASOF_STATEFUL);
+	}
+	if (analysis.found_sample) {
+		AddUnique(model.features, DeltaModelFeature::SAMPLE_GLOBAL_RECOMPUTE);
+	}
+	if (analysis.found_positional_join) {
+		AddUnique(model.features, DeltaModelFeature::POSITIONAL_GLOBAL_RECOMPUTE);
 	}
 	if (analysis.found_left_join || analysis.found_full_outer) {
 		AddUnique(model.features, DeltaModelFeature::OUTER_JOIN_STATEFUL);
@@ -287,10 +296,11 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 
 	DeduplicateGroupColumns(model.group_columns);
 
-	if (analysis.found_join && group_count > 0 && !has_union_over_agg) {
+	if (!analysis.found_asof_join && analysis.found_join && group_count > 0 && !has_union_over_agg) {
 		AddJoinKeyGroupColumns(facts, output_names, model.group_columns, model.strategy_reasons);
 	}
-	if (analysis.found_join && analysis.found_aggregation && !model.group_columns.empty()) {
+	if (!analysis.found_asof_join && analysis.found_join && analysis.found_aggregation &&
+	    !model.group_columns.empty()) {
 		ResolveAggregateGroupColumnsThroughJoinKeys(facts, model.group_columns, output_names);
 	}
 
@@ -319,11 +329,27 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	auto has_argminmax =
 	    std::any_of(analysis.aggregate_types.begin(), analysis.aggregate_types.end(),
 	                [](const string &agg_type) { return agg_type == "arg_min" || agg_type == "arg_max"; });
+	auto select_current_diff = [&](DeltaStrategyReason reason) {
+		model.type = RefreshType::CURRENT_DIFF_RECOMPUTE;
+		AddUnique(model.features, DeltaModelFeature::CURRENT_DIFF_RECOMPUTE);
+		AddUnique(model.strategy_reasons, reason);
+	};
 	if (input.has_unsupported_incremental_construct) {
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (!analysis.incremental_compatible) {
 		model.type = RefreshType::FULL_REFRESH;
 		model.warn_unsupported_incremental = true;
+	} else if (analysis.found_sample) {
+		select_current_diff(DeltaStrategyReason::SAMPLE_CURRENT_DIFF_RECOMPUTE);
+	} else if (analysis.found_positional_join) {
+		select_current_diff(DeltaStrategyReason::POSITIONAL_CURRENT_DIFF_RECOMPUTE);
+	} else if (analysis.found_asof_join && analysis.found_window && !model.window_partition_columns.empty()) {
+		model.type = RefreshType::WINDOW_PARTITION;
+	} else if (analysis.found_asof_join && analysis.found_aggregation && !model.group_columns.empty()) {
+		model.type = RefreshType::GROUP_RECOMPUTE;
+		AddUnique(model.strategy_reasons, DeltaStrategyReason::ASOF_CURRENT_DIFF_RECOMPUTE);
+	} else if (analysis.found_asof_join) {
+		select_current_diff(DeltaStrategyReason::ASOF_CURRENT_DIFF_RECOMPUTE);
 	} else if (analysis.found_window) {
 		model.type = RefreshType::WINDOW_PARTITION;
 	} else if (analysis.found_grouping_sets) {
@@ -377,8 +403,8 @@ static void SelectGroupRecomputeAffectedMode(DeltaViewModel &model, const DeltaV
 	}
 	bool aggregate_filter_join =
 	    input.stored_query_has_aggregate_filter && input.facts && input.facts->analysis.found_join;
-	if (input.stored_query_has_top_k || aggregate_filter_join ||
-	    (input.stored_query_has_aggregate_filter && input.has_ducklake_source)) {
+	if ((input.facts && input.facts->analysis.found_asof_join) || input.stored_query_has_top_k ||
+	    aggregate_filter_join || (input.stored_query_has_aggregate_filter && input.has_ducklake_source)) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF;
 	} else if (input.stored_query_has_aggregate_filter) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER;
@@ -425,6 +451,12 @@ const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
 		return "SEMI_ANTI_AGGREGATE_GROUP_FALLBACK";
 	case DeltaStrategyReason::OUTER_JOIN_AGGREGATE_RECOMPUTE:
 		return "OUTER_JOIN_AGGREGATE_RECOMPUTE";
+	case DeltaStrategyReason::ASOF_CURRENT_DIFF_RECOMPUTE:
+		return "ASOF_CURRENT_DIFF_RECOMPUTE";
+	case DeltaStrategyReason::SAMPLE_CURRENT_DIFF_RECOMPUTE:
+		return "SAMPLE_CURRENT_DIFF_RECOMPUTE";
+	case DeltaStrategyReason::POSITIONAL_CURRENT_DIFF_RECOMPUTE:
+		return "POSITIONAL_CURRENT_DIFF_RECOMPUTE";
 	default:
 		return "UNKNOWN";
 	}
@@ -456,6 +488,14 @@ const char *DeltaModelFeatureName(DeltaModelFeature feature) {
 		return "WINDOW_AFFECTED_PARTITION";
 	case DeltaModelFeature::SEMI_ANTI_STATEFUL:
 		return "SEMI_ANTI_STATEFUL";
+	case DeltaModelFeature::ASOF_STATEFUL:
+		return "ASOF_STATEFUL";
+	case DeltaModelFeature::SAMPLE_GLOBAL_RECOMPUTE:
+		return "SAMPLE_GLOBAL_RECOMPUTE";
+	case DeltaModelFeature::POSITIONAL_GLOBAL_RECOMPUTE:
+		return "POSITIONAL_GLOBAL_RECOMPUTE";
+	case DeltaModelFeature::CURRENT_DIFF_RECOMPUTE:
+		return "CURRENT_DIFF_RECOMPUTE";
 	case DeltaModelFeature::FULL_ONLY:
 		return "FULL_ONLY";
 	default:
@@ -487,6 +527,12 @@ const char *DeltaModelNodeKindName(DeltaModelNodeKind kind) {
 		return "TOP_K";
 	case DeltaModelNodeKind::UNNEST:
 		return "UNNEST";
+	case DeltaModelNodeKind::ASOF_JOIN:
+		return "ASOF_JOIN";
+	case DeltaModelNodeKind::POSITIONAL_JOIN:
+		return "POSITIONAL_JOIN";
+	case DeltaModelNodeKind::SAMPLE:
+		return "SAMPLE";
 	case DeltaModelNodeKind::CTE:
 		return "CTE";
 	case DeltaModelNodeKind::CONSTANT:

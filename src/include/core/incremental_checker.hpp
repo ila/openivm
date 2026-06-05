@@ -23,6 +23,9 @@ struct PlanAnalysis {
 	bool found_join = false;
 	bool found_delim_join = false;
 	bool found_single_join = false;
+	bool found_asof_join = false;
+	bool found_positional_join = false;
+	bool found_sample = false;
 	bool found_window = false;
 	bool found_top_k = false;
 	bool found_count_distinct = false;   // COUNT(DISTINCT x) — handled via group-recompute

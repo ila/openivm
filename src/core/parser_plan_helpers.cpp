@@ -291,7 +291,8 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	} else if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
 		facts.has_pivot = true;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN || op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
 	    op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
 		under_join = true;
 	}
@@ -303,12 +304,16 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		facts.projections.push_back(&proj);
 		facts.projections_by_index[proj.table_index] = &proj;
 	} else if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	           op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN ||
 	           op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
 		auto &join = op->Cast<LogicalComparisonJoin>();
-		if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN && !facts.first_comparison_join) {
+		if ((op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+		     op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) &&
+		    !facts.first_comparison_join) {
 			facts.first_comparison_join = &join;
 		}
-		if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+		    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 			facts.comparison_joins.push_back(&join);
 			for (auto &cond : join.conditions) {
 				auto *left = cond.left.get();
@@ -1121,7 +1126,8 @@ static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMV
 
 static void CollectInnerJoinEdgesOccurrence(LogicalOperator *op, const CreateMVPlanFacts &facts,
                                             vector<pair<OccurrenceColumnRef, OccurrenceColumnRef>> &edges) {
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 		auto &join = op->Cast<LogicalComparisonJoin>();
 		if (join.join_type == JoinType::INNER) {
 			for (auto &cond : join.conditions) {
@@ -1148,7 +1154,8 @@ static void CollectInnerJoinEdgesOccurrence(LogicalOperator *op, const CreateMVP
 
 static void CollectWindowLookupEdges(LogicalOperator *op, const CreateMVPlanFacts &facts,
                                      vector<WindowLookupEdge> &edges) {
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 		auto &join = op->Cast<LogicalComparisonJoin>();
 		auto add_lookup_edge = [&](OccurrenceColumnRef lookup_ref, OccurrenceColumnRef changed_ref) {
 			edges.push_back({std::move(lookup_ref), std::move(changed_ref)});
@@ -1267,9 +1274,25 @@ static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const 
 	return false;
 }
 
+static RefreshMetadata::WindowPartitionLineageOp ToMetadataWindowLineageOp(const WindowLineageOp &op) {
+	RefreshMetadata::WindowPartitionLineageOp metadata_op;
+	metadata_op.kind = op.kind;
+	metadata_op.output_col = op.output_col;
+	metadata_op.source = op.source_table;
+	metadata_op.source_col = op.source_col;
+	metadata_op.lookup = op.lookup_table;
+	metadata_op.lookup_col = op.lookup_col;
+	metadata_op.lookup_out = op.lookup_output_col;
+	return metadata_op;
+}
+
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
-                                    vector<RefreshMetadata::WindowPartitionLineageOp> &out) {
+                                    vector<RefreshMetadata::WindowPartitionLineageOp> &out,
+                                    vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out) {
 	out.clear();
+	if (direct_out) {
+		direct_out->clear();
+	}
 	if (!facts.root || partition_columns.empty()) {
 		return false;
 	}
@@ -1282,6 +1305,11 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	CollectWindowPartitionRefs(plan, facts, partition_columns, direct_ops);
 	if (direct_ops.empty()) {
 		return false;
+	}
+	if (direct_out) {
+		for (auto &op : direct_ops) {
+			direct_out->push_back(ToMetadataWindowLineageOp(op));
+		}
 	}
 
 	vector<pair<OccurrenceColumnRef, OccurrenceColumnRef>> edges;
@@ -1360,15 +1388,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	}
 
 	for (auto &op : ops) {
-		RefreshMetadata::WindowPartitionLineageOp metadata_op;
-		metadata_op.kind = std::move(op.kind);
-		metadata_op.output_col = std::move(op.output_col);
-		metadata_op.source = std::move(op.source_table);
-		metadata_op.source_col = std::move(op.source_col);
-		metadata_op.lookup = std::move(op.lookup_table);
-		metadata_op.lookup_col = std::move(op.lookup_col);
-		metadata_op.lookup_out = std::move(op.lookup_output_col);
-		out.push_back(std::move(metadata_op));
+		out.push_back(ToMetadataWindowLineageOp(op));
 	}
 	return !out.empty();
 }

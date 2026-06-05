@@ -8,6 +8,7 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -106,6 +107,12 @@ static DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
 		return DeltaModelNodeKind::TOP_K;
 	case LogicalOperatorType::LOGICAL_UNNEST:
 		return DeltaModelNodeKind::UNNEST;
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+		return DeltaModelNodeKind::ASOF_JOIN;
+	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
+		return DeltaModelNodeKind::POSITIONAL_JOIN;
+	case LogicalOperatorType::LOGICAL_SAMPLE:
+		return DeltaModelNodeKind::SAMPLE;
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
@@ -153,6 +160,11 @@ static DeltaRuleKind RuleKindForNode(DeltaModelNodeKind kind, LogicalOperator &o
 		}
 		return DeltaRuleKind::PRODUCT;
 	}
+	case DeltaModelNodeKind::ASOF_JOIN:
+		return DeltaRuleKind::STATEFUL;
+	case DeltaModelNodeKind::POSITIONAL_JOIN:
+	case DeltaModelNodeKind::SAMPLE:
+		return DeltaRuleKind::NON_LINEAR;
 	case DeltaModelNodeKind::AGGREGATE:
 		return analysis.found_minmax || analysis.found_count_distinct || analysis.found_list ||
 		               analysis.found_filtered_list
@@ -240,8 +252,10 @@ static void AddNodeUpdateSemantics(DeltaModelNode &node, const DeltaViewModel &m
 			AddUnique(node.update_semantics, DeltaUpdateSemantics::MINMAX_INSERT_ONLY_SAFE);
 		}
 	}
-	if (node.kind == DeltaModelNodeKind::JOIN || node.kind == DeltaModelNodeKind::WINDOW ||
-	    node.kind == DeltaModelNodeKind::DISTINCT || node.kind == DeltaModelNodeKind::SEMI_ANTI) {
+	if (node.kind == DeltaModelNodeKind::JOIN || node.kind == DeltaModelNodeKind::ASOF_JOIN ||
+	    node.kind == DeltaModelNodeKind::POSITIONAL_JOIN || node.kind == DeltaModelNodeKind::SAMPLE ||
+	    node.kind == DeltaModelNodeKind::WINDOW || node.kind == DeltaModelNodeKind::DISTINCT ||
+	    node.kind == DeltaModelNodeKind::SEMI_ANTI) {
 		AddUnique(node.update_semantics, DeltaUpdateSemantics::DELETE_SENSITIVE);
 		AddUnique(node.update_semantics, DeltaUpdateSemantics::UPDATE_SENSITIVE);
 	}
@@ -272,6 +286,12 @@ static DeltaNodeMaintenance BuildNodeMaintenance(const DeltaModelNode &node, con
 	case DeltaModelNodeKind::JOIN:
 		maintenance.mode = DeltaMaintenanceMode::DELTA_WITH_STATE;
 		maintenance.state = DeltaMaintenanceStateKind::CURRENT_RELATION;
+		break;
+	case DeltaModelNodeKind::ASOF_JOIN:
+	case DeltaModelNodeKind::POSITIONAL_JOIN:
+	case DeltaModelNodeKind::SAMPLE:
+		maintenance.mode = DeltaMaintenanceMode::AFFECTED_DOMAIN_RECOMPUTE;
+		maintenance.state = DeltaMaintenanceStateKind::MV_DATA;
 		break;
 	case DeltaModelNodeKind::AGGREGATE:
 		if (model.type == RefreshType::GROUP_RECOMPUTE) {
@@ -451,6 +471,52 @@ static void RefreshDeltaNodeMaintenance(DeltaViewModel &model) {
 	}
 }
 
+static bool WindowLineageCoversAllSources(const vector<RefreshMetadata::WindowPartitionLineageOp> &lineage_ops,
+                                          const CreateMVPlanFacts &facts) {
+	unordered_set<string> covered_sources;
+	for (auto &op : lineage_ops) {
+		covered_sources.insert(StringUtil::Lower(op.source));
+	}
+	for (auto &occurrence : facts.source_occurrences) {
+		if (!covered_sources.count(StringUtil::Lower(occurrence.table))) {
+			return false;
+		}
+	}
+	return !covered_sources.empty();
+}
+
+static vector<string> AsofRightSourceTables(const DeltaViewModel &model) {
+	vector<string> tables;
+	for (auto &node : model.nodes) {
+		if (node.kind != DeltaModelNodeKind::ASOF_JOIN || node.children.size() < 2) {
+			continue;
+		}
+		auto right_id = node.children[1];
+		if (right_id >= model.nodes.size()) {
+			continue;
+		}
+		for (auto &source : model.nodes[right_id].source_tables) {
+			AddStringCI(tables, source);
+		}
+	}
+	return tables;
+}
+
+static bool
+AsofWindowPartitionReadsRightSideDirectly(const vector<RefreshMetadata::WindowPartitionLineageOp> &lineage_ops,
+                                          const DeltaViewModel &model) {
+	auto rhs_sources = AsofRightSourceTables(model);
+	if (rhs_sources.empty()) {
+		return false;
+	}
+	for (auto &op : lineage_ops) {
+		if (op.kind == "direct" && ContainsStringCI(rhs_sources, op.source)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 } // namespace
 
 const char *DeltaMaintenanceModeName(DeltaMaintenanceMode mode) {
@@ -557,7 +623,20 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 	}
 	const auto &analysis = facts.analysis;
 	if (model.type == RefreshType::WINDOW_PARTITION) {
-		if (BuildWindowPartitionLineageOps(facts, model.window_partition_columns, model.window_lineage_ops)) {
+		vector<RefreshMetadata::WindowPartitionLineageOp> direct_lineage_ops;
+		bool has_lineage = BuildWindowPartitionLineageOps(facts, model.window_partition_columns,
+		                                                  model.window_lineage_ops, &direct_lineage_ops);
+		if (analysis.found_asof_join &&
+		    (!has_lineage || AsofWindowPartitionReadsRightSideDirectly(direct_lineage_ops, model) ||
+		     !WindowLineageCoversAllSources(model.window_lineage_ops, facts))) {
+			model.type = RefreshType::CURRENT_DIFF_RECOMPUTE;
+			model.window_lineage_ops.clear();
+			AddUnique(model.features, DeltaModelFeature::CURRENT_DIFF_RECOMPUTE);
+			AddUnique(model.strategy_reasons, DeltaStrategyReason::ASOF_CURRENT_DIFF_RECOMPUTE);
+			ValidateDeltaViewModelInvariants(model);
+			return;
+		}
+		if (has_lineage) {
 			DeltaAffectedDomain domain;
 			domain.kind = DeltaAffectedDomainKind::WINDOW_PARTITION;
 			domain.node_id = FindFirstNodeId(model, DeltaModelNodeKind::WINDOW);

@@ -10,6 +10,8 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_dependent_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
+#include "duckdb/planner/operator/logical_positional_join.hpp"
+#include "duckdb/planner/operator/logical_sample.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
@@ -101,6 +103,21 @@ static bool HasNonFoldableUnnestExpression(vector<unique_ptr<Expression>> &expre
 	return false;
 }
 
+static void MergeCompatibilityAndNonLocalFacts(PlanAnalysis &result, const PlanAnalysis &body) {
+	result.incremental_compatible = result.incremental_compatible && body.incremental_compatible;
+	result.found_volatile_expression = result.found_volatile_expression || body.found_volatile_expression;
+	result.found_non_foldable_unnest = result.found_non_foldable_unnest || body.found_non_foldable_unnest;
+	result.found_unsupported_aggregate = result.found_unsupported_aggregate || body.found_unsupported_aggregate;
+	result.found_unsupported_filtered_aggregate =
+	    result.found_unsupported_filtered_aggregate || body.found_unsupported_filtered_aggregate;
+	result.found_unsupported_join_type = result.found_unsupported_join_type || body.found_unsupported_join_type;
+	result.found_unsupported_order_by = result.found_unsupported_order_by || body.found_unsupported_order_by;
+	result.found_unsupported_operator = result.found_unsupported_operator || body.found_unsupported_operator;
+	result.found_asof_join = result.found_asof_join || body.found_asof_join;
+	result.found_positional_join = result.found_positional_join || body.found_positional_join;
+	result.found_sample = result.found_sample || body.found_sample;
+}
+
 /// Single-pass recursive plan analysis: validates IVM compatibility AND extracts metadata.
 static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	switch (node->type) {
@@ -130,8 +147,13 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		// pass-through, otherwise classify from the outer alone.
 		if (node->children.size() >= 2) {
 			AnalyzeNode(node->children[1].get(), result);
-			if (!result.found_aggregation && !result.found_distinct && !result.found_join) {
+			const bool outer_passthrough = !result.found_aggregation && !result.found_distinct && !result.found_join;
+			if (outer_passthrough) {
 				AnalyzeNode(node->children[0].get(), result);
+			} else {
+				PlanAnalysis body_analysis;
+				AnalyzeNode(node->children[0].get(), body_analysis);
+				MergeCompatibilityAndNonLocalFacts(result, body_analysis);
 			}
 		}
 		return;
@@ -171,6 +193,16 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		}
 		break;
 
+	case LogicalOperatorType::LOGICAL_SAMPLE: {
+		result.found_sample = true;
+		auto &sample = node->Cast<LogicalSample>();
+		if (!sample.sample_options || !sample.sample_options->seed.IsValid()) {
+			result.incremental_compatible = false;
+			result.found_volatile_expression = true;
+		}
+		break;
+	}
+
 	case LogicalOperatorType::LOGICAL_DISTINCT: {
 		result.found_distinct = true;
 		if (HasVolatileExpression(node->expressions)) {
@@ -193,12 +225,16 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 	}
 
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
 	case LogicalOperatorType::LOGICAL_ANY_JOIN:
 	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
 	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
 	case LogicalOperatorType::LOGICAL_JOIN:
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
 		result.found_join = true;
+		if (node->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
+			result.found_asof_join = true;
+		}
 		if (node->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
 		    node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
 			result.found_delim_join = true;
@@ -229,6 +265,11 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		}
 		break;
 	}
+
+	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
+		result.found_join = true;
+		result.found_positional_join = true;
+		break;
 
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
 		result.found_aggregation = true;

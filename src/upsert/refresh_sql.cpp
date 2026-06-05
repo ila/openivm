@@ -54,7 +54,7 @@ struct RefreshPlan {
 	bool SkipsDeltaProduction() const {
 		return skip_projection_key_delta || refresh_type == RefreshType::WINDOW_PARTITION ||
 		       refresh_type == RefreshType::GROUP_RECOMPUTE || refresh_type == RefreshType::DISTINCT_INCREMENTAL ||
-		       refresh_type == RefreshType::SEMI_ANTI_RECOMPUTE;
+		       refresh_type == RefreshType::SEMI_ANTI_RECOMPUTE || refresh_type == RefreshType::CURRENT_DIFF_RECOMPUTE;
 	}
 
 	const char *DeltaProductionSkipReason() const {
@@ -70,6 +70,8 @@ struct RefreshPlan {
 			return "GROUP_RECOMPUTE";
 		case RefreshType::WINDOW_PARTITION:
 			return "WINDOW_PARTITION";
+		case RefreshType::CURRENT_DIFF_RECOMPUTE:
+			return "CURRENT_DIFF_RECOMPUTE";
 		default:
 			return "UNKNOWN";
 		}
@@ -397,7 +399,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	RefreshType view_query_type = metadata.GetViewType(view_name);
 	bool emit_cascade_delta_for_recompute =
 	    active_facts.force_view_delta_cascade &&
-	    (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE);
+	    (view_query_type == RefreshType::WINDOW_PARTITION || view_query_type == RefreshType::GROUP_RECOMPUTE ||
+	     view_query_type == RefreshType::CURRENT_DIFF_RECOMPUTE);
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
 	auto delta_table_names = metadata.GetDeltaTables(view_name);
@@ -848,6 +851,17 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE (%zu group cols, %zu sources, "
 		                    "affected_mode=%s)\n",
 		                    group_columns.size(), delta_specs.size(), GroupRecomputeAffectedModeName(affected_mode));
+		break;
+	}
+	case RefreshType::CURRENT_DIFF_RECOMPUTE: {
+		if (skip_empty_enabled && refresh_plan.delta_flags.active_delta_table_names.empty() &&
+		    !active_facts.compile_only) {
+			upsert_query = "";
+			OPENIVM_DEBUG_PRINT("[UPSERT] CURRENT_DIFF_RECOMPUTE has no active deltas after filtering\n");
+			break;
+		}
+		upsert_query = CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix);
+		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: CURRENT_DIFF_RECOMPUTE\n");
 		break;
 	}
 	case RefreshType::TOP_K:

@@ -96,6 +96,97 @@ WHERE stmt_kind = 'data';
 1
 
 # ==========================================
+# ASOF GROUP_RECOMPUTE with RHS-derived keys must preserve the
+# current-diff affected-key path when cascade deltas are forced.
+# Source-delta substitution only sees the new ASOF key and misses the
+# old key when a newer RHS row moves existing LHS rows between groups.
+# ==========================================
+
+statement ok
+CREATE TABLE cgr_asof_trades (symbol VARCHAR, ts TIMESTAMP, qty INT);
+
+statement ok
+CREATE TABLE cgr_asof_prices (symbol VARCHAR, ts TIMESTAMP, price INT);
+
+statement ok
+INSERT INTO cgr_asof_trades VALUES
+    ('A', TIMESTAMP '2024-01-01 10:00:00', 1),
+    ('A', TIMESTAMP '2024-01-01 10:20:00', 2);
+
+statement ok
+INSERT INTO cgr_asof_prices VALUES
+    ('A', TIMESTAMP '2024-01-01 09:00:00', 100),
+    ('A', TIMESTAMP '2024-01-01 10:10:00', 150);
+
+statement ok
+CREATE MATERIALIZED VIEW cgr_asof_mv AS
+    SELECT p.price AS price, COUNT(*) AS cnt
+    FROM cgr_asof_trades t
+    ASOF JOIN cgr_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+    GROUP BY p.price;
+
+query IT
+SELECT type, group_recompute_affected_mode
+FROM openivm_views
+WHERE view_name = 'cgr_asof_mv';
+----
+6	current_diff
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_current_cgr_asof_mv AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%EXCEPT ALL SELECT * FROM %openivm_data_cgr_asof_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_cgr_asof_mv AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_cgr_asof_mv AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cgr_asof_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%SELECT DISTINCT price FROM%openivm_delta_cgr_asof_prices%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%SELECT DISTINCT price FROM%openivm_delta_cgr_asof_trades%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cgr_asof_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+INSERT INTO cgr_asof_prices VALUES ('A', TIMESTAMP '2024-01-01 10:18:00', 180);
+
+statement ok
+PRAGMA refresh('cgr_asof_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT price, cnt FROM cgr_asof_mv
+    EXCEPT ALL
+    SELECT p.price AS price, COUNT(*) AS cnt
+    FROM cgr_asof_trades t
+    ASOF JOIN cgr_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+    GROUP BY p.price
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.price AS price, COUNT(*) AS cnt
+    FROM cgr_asof_trades t
+    ASOF JOIN cgr_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+    GROUP BY p.price
+    EXCEPT ALL
+    SELECT price, cnt FROM cgr_asof_mv
+);
+----
+0
+
+# ==========================================
 # Runtime correctness: PRAGMA refresh uses default CompileFacts (no cascade),
 # but still applies the GROUP_RECOMPUTE program to openivm_data_cgr_mv so the
 # user-visible MV stays bidirectionally consistent with the base query.

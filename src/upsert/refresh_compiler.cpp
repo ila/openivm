@@ -282,7 +282,8 @@ static bool TryBuildGroupRecomputeAffectedQuery(const string &view_query_sql, st
 }
 
 static string BuildCurrentDiffGroupRecomputeSQL(const string &view_name, const string &data_table,
-                                                const string &view_query_sql, const vector<string> &group_columns) {
+                                                const string &view_query_sql, const vector<string> &group_columns,
+                                                const string &catalog_prefix = "", bool emit_cascade_delta = false) {
 	string current_temp = SqlUtils::QuoteIdentifier("openivm_current_" + view_name);
 	string affected_temp = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
@@ -295,6 +296,26 @@ static string BuildCurrentDiffGroupRecomputeSQL(const string &view_name, const s
 	       "\nFROM (\n  (SELECT * FROM " + current_temp + " EXCEPT ALL SELECT * FROM " + data_table +
 	       ")\n  UNION ALL\n  (SELECT * FROM " + data_table + " EXCEPT ALL SELECT * FROM " + current_temp +
 	       ")\n) openivm_changed;\n\n";
+	if (emit_cascade_delta) {
+		string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+		string old_temp = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
+		string new_temp = SqlUtils::QuoteIdentifier("openivm_new_" + view_name);
+		sql += "CREATE OR REPLACE TEMP TABLE " + old_temp + " AS\nSELECT * FROM " + data_table +
+		       " AS openivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_temp + " AS openivm_aff WHERE " +
+		       target_match + "\n);\n\n";
+		sql += "CREATE OR REPLACE TEMP TABLE " + new_temp + " AS\nSELECT * FROM " + current_temp +
+		       " AS openivm_recompute\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_temp + " AS openivm_aff WHERE " +
+		       recompute_match + "\n);\n\n";
+		sql += "DELETE FROM " + data_table + " AS openivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_temp +
+		       " AS openivm_aff WHERE " + target_match + "\n);\n\n";
+		sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp + ";\n";
+		sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp, new_temp);
+		sql += "\nDROP TABLE IF EXISTS " + affected_temp + ";\n";
+		sql += "DROP TABLE IF EXISTS " + old_temp + ";\n";
+		sql += "DROP TABLE IF EXISTS " + new_temp + ";\n";
+		sql += "DROP TABLE IF EXISTS " + current_temp + ";\n";
+		return sql;
+	}
 	sql += "DELETE FROM " + data_table + " AS openivm_tgt\nWHERE EXISTS (\n  SELECT 1 FROM " + affected_temp +
 	       " AS openivm_aff WHERE " + target_match + "\n);\n\n";
 	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + current_temp +
@@ -657,7 +678,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				*out_handled_cascade_delta = true;
 			}
 			return CompileGroupRecompute(view_name, view_query_sql, group_column_names, *cascade_delta_specs,
-			                             catalog_prefix, cascade_lpts_table_prefix, /*emit_cascade_delta=*/true);
+			                             catalog_prefix, cascade_lpts_table_prefix, /*emit_cascade_delta=*/true,
+			                             GroupRecomputeAffectedMode::SOURCE_DELTA);
 		}
 		// Group-recompute strategy: delete affected groups, re-insert from original query.
 		// Always triggered by non-summable columns (LIST aggregates, VARCHAR literals,
@@ -1134,23 +1156,23 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
 
-	if (!emit_cascade_delta && ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
+	if (ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
 		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys for large affected query\n");
-		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns);
+		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns, catalog_prefix,
+		                                         emit_cascade_delta);
 	}
-	if (!emit_cascade_delta && affected_mode == GroupRecomputeAffectedMode::CURRENT_DIFF) {
+	if (affected_mode == GroupRecomputeAffectedMode::CURRENT_DIFF) {
 		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys from model metadata\n");
-		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns);
+		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns, catalog_prefix,
+		                                         emit_cascade_delta);
 	}
 	string affected_view_query_sql = view_query_sql;
 	if (affected_mode == GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER &&
 	    !TryBuildGroupRecomputeAffectedQuery(view_query_sql, affected_view_query_sql)) {
 		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys; aggregate filter relaxation "
 		                    "was ambiguous\n");
-		if (!emit_cascade_delta) {
-			return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns);
-		}
-		affected_view_query_sql = view_query_sql;
+		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns, catalog_prefix,
+		                                         emit_cascade_delta);
 	}
 
 	// For each source table T_i, build a "view query restricted to T_i's delta" variant by

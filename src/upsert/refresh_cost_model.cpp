@@ -171,6 +171,8 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
 	case LogicalOperatorType::LOGICAL_JOIN: {
 		stats.has_join = true;
 		if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
@@ -651,7 +653,11 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	string strategy_label;
 	double strategy_compute = incremental_compute;
 	double strategy_upsert = incremental_upsert;
-	if (view_type == RefreshType::GROUP_RECOMPUTE) {
+	if (view_type == RefreshType::CURRENT_DIFF_RECOMPUTE) {
+		strategy_label = "current_diff_recompute";
+		strategy_compute = recompute_compute;
+		strategy_upsert = recompute_replace;
+	} else if (view_type == RefreshType::GROUP_RECOMPUTE) {
 		strategy_label = "group_recompute";
 		// Estimated affected MV keys = Σᵢ delta_Tᵢ × (mv_card / actual_card_Tᵢ).
 		// Each source contributes a per-table view-query variant (substitute T_i
