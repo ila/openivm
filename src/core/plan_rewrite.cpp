@@ -1042,36 +1042,54 @@ static void ReadColumnRefBinding(const unique_ptr<Expression> &expr, ColumnBindi
 	type = ref->return_type;
 }
 
-static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan) {
-	OuterJoinBindings bindings;
+struct OuterJoinScan {
+	OuterJoinBindings first;      // first outer join in pre-order (== the former FindFirstOuterJoinBindings result)
+	bool any_under_setop = false; // some outer join lies beneath a UNION/EXCEPT/INTERSECT node
+};
 
-	std::function<bool(LogicalOperator *)> find = [&](LogicalOperator *node) {
+// Single traversal answering both questions the outer-join rewrite needs: the bindings of the first outer
+// join, and whether any outer join sits beneath a set operation (which makes the key/match-count rewrite
+// unsafe — see PlanHasOuterJoinBeneathSetOperation). Replaces the former pair of independent full-plan
+// walks (FindFirstOuterJoinBindings + PlanHasOuterJoinBeneathSetOperation).
+static OuterJoinScan ScanOuterJoins(LogicalOperator *plan) {
+	OuterJoinScan scan;
+	if (!plan) {
+		return scan;
+	}
+
+	std::function<void(LogicalOperator *, bool)> walk = [&](LogicalOperator *node, bool under_setop) {
 		if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 			auto &join = node->Cast<LogicalComparisonJoin>();
 			if (IsOuterJoin(join.join_type) && !join.conditions.empty()) {
-				auto &condition = join.conditions[0];
-				bindings.found = true;
-				bindings.is_full_outer = join.join_type == JoinType::OUTER;
+				if (under_setop) {
+					scan.any_under_setop = true;
+				}
+				if (!scan.first.found) {
+					auto &condition = join.conditions[0];
+					auto &bindings = scan.first;
+					bindings.found = true;
+					bindings.is_full_outer = join.join_type == JoinType::OUTER;
 
-				auto &preserved_key = join.join_type == JoinType::RIGHT ? condition.right : condition.left;
-				ReadColumnRefBinding(preserved_key, bindings.preserved_key_binding, bindings.preserved_key_type);
-				ReadColumnRefBinding(condition.right, bindings.right_key_binding, bindings.right_key_type);
+					auto &preserved_key = join.join_type == JoinType::RIGHT ? condition.right : condition.left;
+					ReadColumnRefBinding(preserved_key, bindings.preserved_key_binding, bindings.preserved_key_type);
+					ReadColumnRefBinding(condition.right, bindings.right_key_binding, bindings.right_key_type);
 
-				auto &null_side = join.join_type == JoinType::RIGHT ? condition.left : condition.right;
-				ReadColumnRefBinding(null_side, bindings.null_side_binding, bindings.null_side_type);
-				ReadColumnRefBinding(condition.left, bindings.left_side_binding, bindings.left_side_type);
-				return true;
+					auto &null_side = join.join_type == JoinType::RIGHT ? condition.left : condition.right;
+					ReadColumnRefBinding(null_side, bindings.null_side_binding, bindings.null_side_type);
+					ReadColumnRefBinding(condition.left, bindings.left_side_binding, bindings.left_side_type);
+				}
 			}
 		}
+		bool is_set_operation = node->type == LogicalOperatorType::LOGICAL_UNION ||
+		                        node->type == LogicalOperatorType::LOGICAL_EXCEPT ||
+		                        node->type == LogicalOperatorType::LOGICAL_INTERSECT;
+		bool child_under_setop = under_setop || is_set_operation;
 		for (auto &child : node->children) {
-			if (find(child.get())) {
-				return true;
-			}
+			walk(child.get(), child_under_setop);
 		}
-		return false;
 	};
-	find(plan);
-	return bindings;
+	walk(plan, false);
+	return scan;
 }
 
 static bool PlanContainsOperator(LogicalOperator *plan, LogicalOperatorType type) {
@@ -1294,31 +1312,15 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 // skipped here AND the view is routed to FULL_REFRESH at classification time (the incremental
 // outer-join path would otherwise produce wrong results because the match-count state is missing).
 bool PlanHasOuterJoinBeneathSetOperation(LogicalOperator *op) {
-	if (!op) {
-		return false;
-	}
-	bool is_set_operation = op->type == LogicalOperatorType::LOGICAL_UNION ||
-	                        op->type == LogicalOperatorType::LOGICAL_EXCEPT ||
-	                        op->type == LogicalOperatorType::LOGICAL_INTERSECT;
-	if (is_set_operation && FindFirstOuterJoinBindings(op).found) {
-		return true;
-	}
-	for (auto &child : op->children) {
-		if (PlanHasOuterJoinBeneathSetOperation(child.get())) {
-			return true;
-		}
-	}
-	return false;
+	return ScanOuterJoins(op).any_under_setop;
 }
 
 static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
-	if (PlanHasOuterJoinBeneathSetOperation(plan.get())) {
+	auto scan = ScanOuterJoins(plan.get());
+	if (scan.any_under_setop || !scan.first.found) {
 		return;
 	}
-	auto outer_join = FindFirstOuterJoinBindings(plan.get());
-	if (!outer_join.found) {
-		return;
-	}
+	auto &outer_join = scan.first;
 
 	if (PlanContainsOperator(plan.get(), LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY)) {
 		RewriteLeftJoinMatchCount(context, binder, plan, outer_join);

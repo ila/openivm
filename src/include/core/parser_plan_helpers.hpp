@@ -90,10 +90,15 @@ string QualifyCreateSourceTable(const string &table_name, const string &current_
                                 const string &default_db);
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog);
-bool PlanContainsAggregateFilter(LogicalOperator *plan);
 bool PlanContainsBoundAggregateFilter(LogicalOperator *plan);
-bool PlanHasHiddenMinMaxHavingColumn(LogicalOperator *plan);
-bool PlanHasComputedMinMaxAggregateProjection(LogicalOperator *plan);
+
+// Results of the single-pass CREATE-MV aggregate analysis (see AnalyzeCreateMvAggregateProbes).
+struct CreateMvAggregateProbes {
+	bool has_aggregate_filter = false;                     // FILTER directly over an AGGREGATE node
+	bool has_hidden_minmax_having = false;                 // hidden HAVING column references a MIN/MAX aggregate
+	bool has_computed_minmax_aggregate_projection = false; // computed projection expr references a MIN/MAX aggregate
+};
+CreateMvAggregateProbes AnalyzeCreateMvAggregateProbes(LogicalOperator *plan);
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols);
 bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t group_index);
 bool RelationExists(Connection &con, const string &qualified_name);

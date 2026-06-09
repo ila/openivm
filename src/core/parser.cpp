@@ -310,9 +310,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 		having_predicate = StripHavingFilter(select_plan, output_names);
-		stored_query_has_aggregate_filter = PlanContainsAggregateFilter(select_plan.get());
-		has_hidden_minmax_having = PlanHasHiddenMinMaxHavingColumn(select_plan.get());
-		has_computed_minmax_aggregate_projection = PlanHasComputedMinMaxAggregateProjection(select_plan.get());
+		auto aggregate_probes = AnalyzeCreateMvAggregateProbes(select_plan.get());
+		stored_query_has_aggregate_filter = aggregate_probes.has_aggregate_filter;
+		has_hidden_minmax_having = aggregate_probes.has_hidden_minmax_having;
+		has_computed_minmax_aggregate_projection = aggregate_probes.has_computed_minmax_aggregate_projection;
 
 		// Keep data tables unlimited/unordered; apply ORDER BY/LIMIT in the user-facing view.
 		{
