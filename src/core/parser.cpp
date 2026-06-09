@@ -454,7 +454,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	FilteredGroupCountExtract filtered_group_count_extract;
 	FilteredGroupCountAuxRequirement filtered_group_count_aux_candidate;
 	if (analysis.found_nested_aggregate &&
-	    ExtractFilteredGroupCount(original_view_query, output_names, filtered_group_count_extract)) {
+	    RecognizeFilteredGroupCount(facts, output_names, filtered_group_count_extract)) {
 		string aux_table = "openivm_filtered_group_count_" + view_name;
 		string group_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.group_col);
 		string sum_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.sum_col);

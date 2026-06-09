@@ -2,6 +2,7 @@
 #define OPENIVM_PARSER_PLAN_HELPERS_HPP
 
 #include "core/incremental_checker.hpp"
+#include "core/parser_sql_extractors.hpp"
 #include "core/refresh_metadata.hpp"
 #include "duckdb.hpp"
 #include "duckdb/planner/bound_result_modifier.hpp"
@@ -99,6 +100,13 @@ struct CreateMvAggregateProbes {
 	bool has_computed_minmax_aggregate_projection = false; // computed projection expr references a MIN/MAX aggregate
 };
 CreateMvAggregateProbes AnalyzeCreateMvAggregateProbes(LogicalOperator *plan);
+
+// Plan-based recognizer for the filtered-group-count shape
+//   SELECT COUNT(*) FROM (SELECT g, SUM(x) FROM src GROUP BY g) WHERE <sum> < 0   (or > 0)
+// Reads the already-collected CreateMVPlanFacts (no extra traversal) and fills `out` the same way the
+// former string extractor ExtractFilteredGroupCount did. Returns true only for the exact shape.
+bool RecognizeFilteredGroupCount(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                 FilteredGroupCountExtract &out);
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols);
 bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t group_index);
 bool RelationExists(Connection &con, const string &qualified_name);

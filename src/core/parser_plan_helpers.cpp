@@ -11,9 +11,12 @@
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
@@ -892,6 +895,195 @@ CreateMvAggregateProbes AnalyzeCreateMvAggregateProbes(LogicalOperator *plan) {
 	}
 
 	return probes;
+}
+
+static bool IsCountStarAggregate(const Expression &expr) {
+	if (expr.expression_class != ExpressionClass::BOUND_AGGREGATE) {
+		return false;
+	}
+	auto &agg = expr.Cast<BoundAggregateExpression>();
+	return agg.function.name == "count_star" || (agg.function.name == "count" && agg.children.empty());
+}
+
+// Last identifier part of a bound expression's rendered form — mirrors how the former string extractor
+// derived the source column name (e.g. "se_fgc.wid" / `"wid"` → "wid").
+static string PlanExpressionColumnName(const Expression &expr) {
+	return SqlUtils::LastIdentifierPart(expr.ToString());
+}
+
+// True iff `expr` is a numeric zero constant, looking through CAST wrappers (e.g. CAST(0 AS DOUBLE)).
+static bool IsZeroConstantExpression(const Expression &expr) {
+	const Expression *e = &expr;
+	while (e->expression_class == ExpressionClass::BOUND_CAST) {
+		e = e->Cast<BoundCastExpression>().child.get();
+	}
+	if (e->expression_class != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	auto &value = e->Cast<BoundConstantExpression>().value;
+	if (value.IsNull() || !value.type().IsNumeric()) {
+		return false;
+	}
+	return value.GetValue<double>() == 0.0;
+}
+
+// Follow `binding` down through the projections sitting between the filter and the inner aggregate,
+// remapping it whenever it points at a projection slot that is a plain column reference. Returns true
+// if it ultimately lands on the inner aggregate's aggregate output (i.e. the SUM, not the group key).
+static bool ColumnRefResolvesToAggregateOutput(ColumnBinding binding, const vector<LogicalProjection *> &projections,
+                                               idx_t aggregate_index) {
+	for (size_t guard = 0; guard <= projections.size(); guard++) {
+		if (binding.table_index == aggregate_index) {
+			return true;
+		}
+		bool advanced = false;
+		for (auto *projection : projections) {
+			if (projection->table_index != binding.table_index) {
+				continue;
+			}
+			if (binding.column_index >= projection->expressions.size()) {
+				return false;
+			}
+			auto &slot = projection->expressions[binding.column_index];
+			if (slot->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+				return false;
+			}
+			binding = slot->Cast<BoundColumnRefExpression>().binding;
+			advanced = true;
+			break;
+		}
+		if (!advanced) {
+			break;
+		}
+	}
+	return binding.table_index == aggregate_index;
+}
+
+bool RecognizeFilteredGroupCount(const CreateMVPlanFacts &facts, const vector<string> &output_names,
+                                 FilteredGroupCountExtract &out) {
+	if (output_names.size() != 1 || output_names[0].empty()) {
+		return false;
+	}
+	if (facts.aggregates.size() != 2) {
+		return false;
+	}
+
+	// Identify the outer COUNT(*) aggregate (no groups) and the inner single-group / single-SUM
+	// aggregate by role, so we don't depend on traversal order.
+	LogicalAggregate *outer = nullptr;
+	LogicalAggregate *inner = nullptr;
+	for (auto *agg : facts.aggregates) {
+		if (agg->groups.empty() && agg->expressions.size() == 1 && IsCountStarAggregate(*agg->expressions[0])) {
+			outer = agg;
+		} else if (agg->groups.size() == 1 && agg->expressions.size() == 1 &&
+		           agg->expressions[0]->expression_class == ExpressionClass::BOUND_AGGREGATE &&
+		           agg->expressions[0]->Cast<BoundAggregateExpression>().function.name == "sum") {
+			inner = agg;
+		}
+	}
+	if (!outer || !inner) {
+		return false;
+	}
+
+	auto &sum_agg = inner->expressions[0]->Cast<BoundAggregateExpression>();
+	if (sum_agg.children.size() != 1 || sum_agg.children[0]->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	string group_col = PlanExpressionColumnName(*inner->groups[0]);
+	string sum_col = PlanExpressionColumnName(*sum_agg.children[0]);
+	if (group_col.empty() || sum_col.empty()) {
+		return false;
+	}
+
+	// The inner aggregate must read a single base table (no joins / set operations underneath).
+	LogicalGet *get = nullptr;
+	for (LogicalOperator *node = inner->children.empty() ? nullptr : inner->children[0].get(); node;) {
+		if (node->type == LogicalOperatorType::LOGICAL_GET) {
+			get = &node->Cast<LogicalGet>();
+			break;
+		}
+		if (node->children.size() != 1) {
+			break;
+		}
+		node = node->children[0].get();
+	}
+	if (!get || !get->GetTable()) {
+		return false;
+	}
+
+	// Walk from the outer aggregate down to the inner one: the path must hold exactly one FILTER
+	// (the `<sum> </> 0` predicate) and only projections otherwise.
+	LogicalFilter *filter = nullptr;
+	vector<LogicalProjection *> path_projections;
+	bool reached_inner = false;
+	for (LogicalOperator *node = outer->children.empty() ? nullptr : outer->children[0].get(); node;) {
+		if (node == inner) {
+			reached_inner = true;
+			break;
+		}
+		if (node->type == LogicalOperatorType::LOGICAL_FILTER) {
+			if (filter) {
+				return false;
+			}
+			filter = &node->Cast<LogicalFilter>();
+		} else if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			path_projections.push_back(&node->Cast<LogicalProjection>());
+		} else {
+			return false;
+		}
+		if (node->children.size() != 1) {
+			return false;
+		}
+		node = node->children[0].get();
+	}
+	if (!reached_inner || !filter || filter->expressions.size() != 1) {
+		return false;
+	}
+
+	auto &condition = *filter->expressions[0];
+	if (condition.expression_class != ExpressionClass::BOUND_COMPARISON) {
+		return false;
+	}
+	auto &cmp = condition.Cast<BoundComparisonExpression>();
+	string op;
+	if (cmp.type == ExpressionType::COMPARE_LESSTHAN) {
+		op = "<";
+	} else if (cmp.type == ExpressionType::COMPARE_GREATERTHAN) {
+		op = ">";
+	} else {
+		return false;
+	}
+
+	// One side is the SUM column reference, the other a zero constant. If the SUM is on the right
+	// (0 < sum), flip the operator so the stored form is always `<sum> <op> 0`.
+	Expression *col_side = nullptr;
+	bool sum_on_left = false;
+	if (cmp.left->expression_class == ExpressionClass::BOUND_COLUMN_REF && IsZeroConstantExpression(*cmp.right)) {
+		col_side = cmp.left.get();
+		sum_on_left = true;
+	} else if (cmp.right->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+	           IsZeroConstantExpression(*cmp.left)) {
+		col_side = cmp.right.get();
+	} else {
+		return false;
+	}
+	if (!ColumnRefResolvesToAggregateOutput(col_side->Cast<BoundColumnRefExpression>().binding, path_projections,
+	                                        inner->aggregate_index)) {
+		return false;
+	}
+	if (!sum_on_left) {
+		op = (op == "<") ? ">" : "<";
+	}
+
+	out = FilteredGroupCountExtract {};
+	out.source = get->GetTable()->name;
+	out.group_col = group_col;
+	out.sum_col = sum_col;
+	out.sum_alias = string();
+	out.output_col = output_names[0];
+	out.comparison_op = op;
+	out.threshold_sql = "0";
+	return true;
 }
 
 static bool FindProjectionPath(const ProjectionSourceOccurrence &source, const OccurrenceColumnRef &key_ref,

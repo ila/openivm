@@ -29,8 +29,6 @@ struct FilteredGroupCountExtract {
 
 bool ExtractInnerDistinct(const string &original_sql, vector<string> &out_cols, string &out_input_sql,
                           string &out_source, string &out_filter_sql);
-bool ExtractFilteredGroupCount(const string &original_sql, const vector<string> &output_names,
-                               FilteredGroupCountExtract &out);
 bool ExtractSemiAntiQuery(const string &original_sql, SemiAntiExtract &out);
 
 } // namespace duckdb
