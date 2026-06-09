@@ -204,7 +204,7 @@ SELECT type FROM openivm_views WHERE view_name = 'mv_list_filter_topk';
 query T
 SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_list_filter_topk';
 ----
-current_diff
+source_delta_relax_aggregate_filter
 
 query I
 WITH expected AS (

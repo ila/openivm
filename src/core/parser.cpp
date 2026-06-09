@@ -207,7 +207,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
 	string view_query = original_view_query; // will be overwritten by LPTS for DDL
 	string top_k_suffix;                     // ORDER BY … LIMIT k, appended to the CREATE VIEW
-	string top_k_order_suffix;               // ORDER BY only, used when fallback stored SQL already applied LIMIT
 	add_create_profile_step("create_compile_name_resolution", name_resolution_start,
 	                        "target_ducklake=" + string(target_is_ducklake ? "true" : "false"));
 
@@ -260,8 +259,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
-	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
-	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
+	string having_predicate; // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool stored_query_has_aggregate_filter = false;
 	bool pre_rewrite_has_aggregate_filter = false;
 	bool has_hidden_minmax_having = false;
@@ -280,6 +278,30 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		auto select_rewrite_start = create_profile_now();
 		InlineCtesIfPresent(context, *select_planner.binder, select_plan);
 		pre_rewrite_has_aggregate_filter = PlanContainsBoundAggregateFilter(select_plan.get());
+
+		// Strip a bare top-level LIMIT (no ORDER BY) BEFORE the IVM rewrites so the hidden-column
+		// rewrites (group COUNT(*), AVG/STDDEV decomposition, LEFT JOIN match keys) see the aggregate
+		// or join underneath. A bare LIMIT is presentation-only — the data table holds the full
+		// relation and the user-facing view applies the LIMIT. If the LIMIT node stays on top here,
+		// InjectGroupCountStar etc. don't descend into it, so the view is maintained without
+		// group-emptiness / match-count state (deleted groups linger as zero rows; LEFT JOIN counts
+		// wrong). ORDER-BY-LIMIT / TOP_N keep their post-rewrite handling below (they need output_names
+		// to render the ORDER BY suffix, and are genuine top-k shapes).
+		if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_LIMIT && !select_plan->children.empty() &&
+		    select_plan->children[0]->type != LogicalOperatorType::LOGICAL_ORDER_BY &&
+		    select_plan->Cast<LogicalLimit>().limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+			auto &limit_op = select_plan->Cast<LogicalLimit>();
+			idx_t lval = limit_op.limit_val.GetConstantValue();
+			idx_t oval = limit_op.offset_val.Type() == LimitNodeType::CONSTANT_VALUE
+			                 ? limit_op.offset_val.GetConstantValue()
+			                 : 0;
+			top_k_suffix = "LIMIT " + to_string(lval);
+			if (oval > 0) {
+				top_k_suffix += " OFFSET " + to_string(oval);
+			}
+			select_plan = std::move(select_plan->children[0]);
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped bare LIMIT before rewrite, suffix='%s'\n", top_k_suffix.c_str());
+		}
 
 		// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 		PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
@@ -306,12 +328,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				limit_node = select_plan.get();
 				order_node = select_plan->children[0].get();
 			}
+			// Note: a bare LIMIT (no ORDER BY) is already stripped before PlanRewrite above, so the
+			// hidden-column rewrites see the aggregate/join underneath. Only TOP_N / ORDER-BY-LIMIT
+			// (genuine top-k, needing the ORDER BY suffix) are handled here.
 
 			if (limit_node) {
 				if (limit_node->type == LogicalOperatorType::LOGICAL_TOP_N) {
 					auto &top_n = limit_node->Cast<LogicalTopN>();
 					top_k_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names);
-					top_k_order_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names, false);
 					select_plan = std::move(select_plan->children[0]);
 				} else {
 					auto &order_op = order_node->Cast<LogicalOrder>();
@@ -325,7 +349,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 						oval = limit_op.offset_val.GetConstantValue();
 					}
 					top_k_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names);
-					top_k_order_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names, false);
 					select_plan = std::move(select_plan->children[0]->children[0]);
 				}
 				OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped top-k wrapper, suffix='%s'\n", top_k_suffix.c_str());
@@ -339,7 +362,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		    !select_plan->children.empty()) {
 			auto &order_op = select_plan->Cast<LogicalOrder>();
 			top_k_suffix = BuildTopKSuffix(order_op.orders, 0, 0, output_names);
-			top_k_order_suffix = top_k_suffix;
 			select_plan = std::move(select_plan->children[0]);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
 		}
@@ -360,24 +382,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			StringUtil::Trim(view_query);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
 		} catch (const std::exception &e) {
-			view_query = original_view_query;
-			lpts_fallback = true;
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (%s) to original query: %s\n", e.what(), view_query.c_str());
-		} catch (...) {
-			view_query = original_view_query;
-			lpts_fallback = true;
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to original query: %s\n",
-			                    view_query.c_str());
+			// LPTS must be able to serialize every plan DuckDB can produce. A failure here is a bug
+			// in LPTS (third_party/lpts), not something to silently work around — fail loudly so the
+			// gap gets fixed instead of storing un-normalized SQL the refresh path can't maintain.
+			throw NotImplementedException("IVM: LPTS could not serialize the plan for materialized view '" + view_name +
+			                              "': " + string(e.what()) +
+			                              ". LPTS must support every query; fix it in third_party/lpts.");
 		}
-		if (PlanNeedsOriginalSqlForLpts(select_plan.get())) {
-			view_query = original_view_query;
-			lpts_fallback = true;
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — using original SQL: %s\n",
-			                    view_query.c_str());
-		}
-		add_create_profile_step("create_compile_lpts", lpts_start,
-		                        "fallback=" + string(lpts_fallback ? "true" : "false") +
-		                            "; query_bytes=" + to_string(view_query.size()));
+		add_create_profile_step("create_compile_lpts", lpts_start, "query_bytes=" + to_string(view_query.size()));
 	}
 	con.Rollback();
 
@@ -405,20 +417,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	add_create_profile_step("create_compile_analyze_plan", analysis_start,
 	                        "sources=" + to_string(table_names.size()) +
 	                            "; ducklake_sources=" + to_string(facts.ducklake_table_info.size()));
-	if (analysis.found_delim_join && !analysis.found_aggregation && !analysis.found_single_join) {
-		// Preserve DuckDB's dependent/DELIM_JOIN plan shape for refresh. LPTS can
-		// round-trip lateral table functions, but its CTE-normalized SQL lowers them
-		// into ordinary joins/table-function scans; that bypasses delim-join delta compilation
-		// and sends the refresh plan through the generic N-way join rule instead.
-		view_query = original_view_query;
-		lpts_fallback = true;
-	}
-	if (analysis.found_filtered_list) {
-		view_query = original_view_query;
-		lpts_fallback = true;
-		OPENIVM_DEBUG_PRINT("[CREATE MV] LIST FILTER requires original SQL for group-recompute: %s\n",
-		                    view_query.c_str());
-	}
 	auto classification_start = create_profile_now();
 	// Keep partition metadata for joined windows. The refresh compiler uses plan-walk lineage when it can cover all
 	// changed sources and otherwise falls back to full recompute, so dropping the metadata here only prevents safe
@@ -426,16 +424,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	bool keep_window_join_partitions = true;
 	bool has_full_outer_aggregate = analysis.found_full_outer && analysis.found_aggregation;
 	bool has_cte_self_join = facts.has_repeated_cte_ref_under_join;
-	bool has_unsupported_incremental_construct = facts.has_unsupported_set_operation || facts.has_pivot;
-	if (has_unsupported_incremental_construct) {
-		// These views are maintained by full refresh, so store the user's query directly.
-		// The CREATE-time IVM rewrites can add hidden columns for incremental paths (e.g.
-		// LEFT JOIN match keys) that do not survive SQL set-operation arity rules.
-		view_query = original_view_query;
-		lpts_fallback = true;
-	}
-	bool stored_query_retains_having = !having_predicate.empty() && lpts_fallback;
-	bool stored_query_retains_top_k = !top_k_suffix.empty() && lpts_fallback;
+	// An outer join beneath a set operation cannot get its match-count/key rewrite (it would break
+	// set-op branch arity), so it cannot be incrementally maintained as a join — route to FULL_REFRESH
+	// (the stored normalized SQL recomputes correctly). Without this, such a view would be classified
+	// incremental but maintained with missing match-count state, producing wrong results.
+	bool has_outer_join_under_setop = PlanHasOuterJoinBeneathSetOperation(plan.get());
+	bool has_unsupported_incremental_construct =
+	    facts.has_unsupported_set_operation || facts.has_pivot || has_outer_join_under_setop;
 
 	DeltaViewModelInput model_input;
 	model_input.facts = &facts;
@@ -443,8 +438,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	model_input.has_unsupported_incremental_construct = has_unsupported_incremental_construct;
 	model_input.keep_window_join_partitions = keep_window_join_partitions;
 	model_input.stored_query_has_aggregate_filter =
-	    stored_query_has_aggregate_filter || pre_rewrite_has_aggregate_filter || stored_query_retains_having;
-	model_input.stored_query_has_top_k = stored_query_retains_top_k;
+	    stored_query_has_aggregate_filter || pre_rewrite_has_aggregate_filter;
+	model_input.stored_query_has_top_k = false;
 	model_input.has_hidden_minmax_having = has_hidden_minmax_having;
 	model_input.has_computed_minmax_aggregate_projection = has_computed_minmax_aggregate_projection;
 	model_input.has_ducklake_source = HasDuckLakeSourceForModel(facts, table_names, target_is_ducklake);
@@ -666,14 +661,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		               "' has an unrecognized query pattern. Full refresh will be used.");
 	}
 
-	bool ducklake_window_partition =
-	    refresh_type == RefreshType::WINDOW_PARTITION && (target_is_ducklake || !facts.ducklake_table_info.empty());
-	if (ducklake_window_partition && !lpts_fallback) {
-		view_query = original_view_query;
-		lpts_fallback = true;
-		OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake window MV uses original SQL for initial data table: %s\n",
-		                    view_query.c_str());
-	}
 	add_create_profile_step("create_compile_classification", classification_start, model_profile_detail);
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, projection=%d, group_cols=%zu)\n",
@@ -732,8 +719,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		add_profile_record(step.step_name, step.duration_ms, step.detail);
 	}
 
-	add_profile_marker("create_mv_system_tables", "refresh_type=" + string(RefreshTypeName(refresh_type)) +
-	                                                  "; lpts_fallback=" + string(lpts_fallback ? "true" : "false"));
+	add_profile_marker("create_mv_system_tables", "refresh_type=" + string(RefreshTypeName(refresh_type)));
 	AppendCreateMVSystemTablesDDL(ddl, view_name, parse_data_ref.is_replace);
 
 	if (parse_data_ref.is_replace) {
@@ -756,9 +742,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	auto &cols_to_store = analysis.found_window ? window_partition_columns : aggregate_columns;
 	string group_cols_val = SqlCsvLiteralOrNull(cols_to_store);
 	string agg_types_val = SqlCsvLiteralOrNull(aggregate_types);
-	string having_val = (having_predicate.empty() || stored_query_retains_having)
-	                        ? "null"
-	                        : "'" + SqlUtils::EscapeSingleQuotes(having_predicate) + "'";
+	string having_val = having_predicate.empty() ? "null" : "'" + SqlUtils::EscapeSingleQuotes(having_predicate) + "'";
 	string group_recompute_mode_val = "'" + string(GroupRecomputeAffectedModeName(group_recompute_affected_mode)) + "'";
 	string group_recompute_source_occurrences_json =
 	    RefreshMetadata::GroupRecomputeSourceOccurrencesToJson(group_recompute_source_occurrences);
@@ -967,7 +951,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		diagnostic += "\n[OpenIVM initial-load diagnostic]\n";
 		diagnostic += "view_name: " + view_name + "\n";
 		diagnostic += "refresh_type: " + string(RefreshTypeName(refresh_type)) + "\n";
-		diagnostic += "lpts_fallback: " + string(lpts_fallback ? "true" : "false") + "\n";
 		diagnostic += "uses_staging_table: false\n";
 		diagnostic += "initial_load_statement:\n" + initial_load_statement + "\n\n";
 		diagnostic += "original_view_query:\n" + original_view_query + "\n\n";
@@ -1021,24 +1004,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	{
 		// Collect internal column names from the LPTS output
 		vector<string> internal_cols;
-		if (!lpts_fallback) {
-			for (auto &name : output_names) {
-				if (IncrementalTableNames::IsInternalColumn(name)) {
-					internal_cols.push_back(name);
-				}
+		for (auto &name : output_names) {
+			if (IncrementalTableNames::IsInternalColumn(name)) {
+				internal_cols.push_back(name);
 			}
 		}
-		string having_where =
-		    (having_predicate.empty() || stored_query_retains_having) ? "" : " where " + having_predicate;
+		string having_where = having_predicate.empty() ? "" : " where " + having_predicate;
 		// For aggregate+top-k the VIEW appends ORDER BY ... LIMIT k after the HAVING WHERE.
-		// If the stored query fell back to the original SQL, the data table is already limited,
-		// but the user-facing view still needs ORDER BY for deterministic MV semantics.
-		string top_k_view_suffix;
-		if (stored_query_retains_top_k) {
-			top_k_view_suffix = top_k_order_suffix.empty() ? "" : " " + top_k_order_suffix;
-		} else {
-			top_k_view_suffix = top_k_suffix.empty() ? "" : " " + top_k_suffix;
-		}
+		string top_k_view_suffix = top_k_suffix.empty() ? "" : " " + top_k_suffix;
 		string view_tail = having_where + top_k_view_suffix;
 		if (internal_cols.empty()) {
 			ddl.push_back("create view " + qvn + " as select * from " + qdt + view_tail);

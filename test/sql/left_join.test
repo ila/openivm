@@ -1048,3 +1048,78 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Regression: a LEFT JOIN beneath a UNION ALL cannot get the outer-join match-count rewrite
+# (it would break set-op branch arity), so the view must be routed to FULL_REFRESH and recompute
+# correctly — NOT left as an incremental projection with missing match-count state (which produced
+# wrong results: EXCEPT ALL fwd=1/rev=2 before the fix).
+statement ok
+CREATE TABLE ljua_a(k INT, va INT);
+
+statement ok
+CREATE TABLE ljua_b(k INT, vb INT);
+
+statement ok
+CREATE TABLE ljua_c(k INT, vc INT);
+
+statement ok
+CREATE TABLE ljua_d(k INT, vd INT);
+
+statement ok
+INSERT INTO ljua_a VALUES (1,1),(2,2);
+
+statement ok
+INSERT INTO ljua_b VALUES (1,10);
+
+statement ok
+INSERT INTO ljua_c VALUES (3,3);
+
+statement ok
+INSERT INTO ljua_d VALUES (3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ljua AS
+    SELECT ljua_a.k, ljua_b.vb FROM ljua_a LEFT JOIN ljua_b USING(k)
+    UNION ALL
+    SELECT ljua_c.k, ljua_d.vd FROM ljua_c LEFT JOIN ljua_d USING(k);
+
+# Outer join beneath UNION ALL → FULL_REFRESH (type 3)
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_ljua';
+----
+3
+
+# Batched conflicting DML across all four sources before a single refresh
+statement ok
+INSERT INTO ljua_b VALUES (2,20);
+
+statement ok
+DELETE FROM ljua_b WHERE k=1;
+
+statement ok
+INSERT INTO ljua_a VALUES (4,4);
+
+statement ok
+DELETE FROM ljua_d WHERE k=3;
+
+statement ok
+PRAGMA refresh('mv_ljua');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT ljua_a.k, ljua_b.vb FROM ljua_a LEFT JOIN ljua_b USING(k)
+     UNION ALL SELECT ljua_c.k, ljua_d.vd FROM ljua_c LEFT JOIN ljua_d USING(k))
+    EXCEPT ALL SELECT * FROM mv_ljua
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_ljua
+    EXCEPT ALL
+    (SELECT ljua_a.k, ljua_b.vb FROM ljua_a LEFT JOIN ljua_b USING(k)
+     UNION ALL SELECT ljua_c.k, ljua_d.vd FROM ljua_c LEFT JOIN ljua_d USING(k))
+);
+----
+0

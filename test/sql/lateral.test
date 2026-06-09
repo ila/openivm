@@ -524,6 +524,47 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Batched conflicting DML (INSERT + DELETE + UPDATE) before a single refresh — exercises the
+# base-invariant delim leaf (IsBaseInvariantDelimLeaf) under deletes/updates of the correlated
+# key, which the single-INSERT case above does not cover.
+statement ok
+INSERT INTO lat_wh VALUES (5, 'w5');
+
+statement ok
+DELETE FROM lat_wh WHERE w_id = 2;
+
+statement ok
+UPDATE lat_wh SET w_id = 4 WHERE w_id = 1;
+
+statement ok
+PRAGMA refresh('mv_lat_series');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT w_id, slot
+    FROM lat_wh w
+    CROSS JOIN LATERAL (
+        SELECT generate_series AS slot FROM generate_series(1, w.w_id)
+    ) t(slot)
+    EXCEPT ALL
+    SELECT * FROM mv_lat_series
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_series
+    EXCEPT ALL
+    SELECT w_id, slot
+    FROM lat_wh w
+    CROSS JOIN LATERAL (
+        SELECT generate_series AS slot FROM generate_series(1, w.w_id)
+    ) t(slot)
+);
+----
+0
+
 statement ok
 INSERT INTO lat_history VALUES (1, 1, 7);
 

@@ -114,11 +114,17 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 		result.column_list += cname;
 		if (!result.normalized.empty())
 			result.normalized += ", ";
-		if (type == "DOUBLE" || type == "FLOAT" || type == "REAL") {
+		// DECIMAL/NUMERIC are tolerated too: AVG(DECIMAL) is maintained via SUM/COUNT decomposition,
+		// which drifts 1-2 ULP from DuckDB's native compensated AVG(DECIMAL) (docs/limitations.md) —
+		// the same benign drift already tolerated for DOUBLE AVG. CAST AS DOUBLE then format to 12
+		// significant digits (printf needs a float; the cast is a no-op for DOUBLE/FLOAT/REAL).
+		bool is_float = (type == "DOUBLE" || type == "FLOAT" || type == "REAL");
+		bool is_decimal = (type.rfind("DECIMAL", 0) == 0 || type.rfind("NUMERIC", 0) == 0);
+		if (is_float || is_decimal) {
 			// Format with 12 significant digits (relative precision, not absolute).
 			// NULLs stay as NULL — DuckDB's printf('%.12g', NULL) returns NULL, and
 			// EXCEPT ALL treats NULL-rows as equal on both sides.
-			string normalized_col = "printf('%.12g', " + cname + ") AS " + cname;
+			string normalized_col = "printf('%.12g', CAST(" + cname + " AS DOUBLE)) AS " + cname;
 			result.normalized += normalized_col;
 			result.normalized_columns.push_back(std::move(normalized_col));
 			result.has_float = true;
@@ -135,9 +141,43 @@ static string LowerASCII(string s) {
 	return s;
 }
 
+static bool KeywordAt(const string &lower, size_t i, const char *kw, size_t len) {
+	if (i + len > lower.size() || lower.compare(i, len, kw) != 0) {
+		return false;
+	}
+	auto is_word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+	bool left_ok = (i == 0) || !is_word(lower[i - 1]);
+	bool right_ok = (i + len == lower.size()) || !is_word(lower[i + len]);
+	return left_ok && right_ok;
+}
+
 static vector<string> SplitTopLevelSelectList(const string &query) {
 	string lower = LowerASCII(query);
-	size_t select_pos = lower.find("select");
+	// Find the OUTER (final) SELECT: the first `select` keyword at paren-depth 0, outside quotes.
+	// A plain `find("select")` returns a CTE's inner SELECT for `WITH c AS (SELECT ...) SELECT ...`,
+	// which would make window-column detection scan the wrong projection list.
+	size_t select_pos = string::npos;
+	{
+		int d = 0;
+		bool sq = false, dq = false;
+		for (size_t i = 0; i < query.size(); i++) {
+			char c = query[i];
+			if (c == '\'' && !dq) {
+				sq = !sq;
+			} else if (c == '"' && !sq) {
+				dq = !dq;
+			} else if (!sq && !dq) {
+				if (c == '(') {
+					d++;
+				} else if (c == ')' && d > 0) {
+					d--;
+				} else if (d == 0 && KeywordAt(lower, i, "select", 6)) {
+					select_pos = i;
+					break;
+				}
+			}
+		}
+	}
 	if (select_pos == string::npos) {
 		return {};
 	}
@@ -212,6 +252,46 @@ static vector<idx_t> WindowOutputColumns(const string &query, idx_t column_count
 		}
 	}
 	return result;
+}
+
+// If `query` ends with a top-level LIMIT that is NOT preceded by a top-level ORDER BY, the selected
+// row SET is non-deterministic (LIMIT k without an ordering picks arbitrary rows). The maintained
+// relation is still deterministic, so the verifier compares the full pre-LIMIT state instead.
+// Returns the query with that trailing LIMIT stripped; returns "" when there is no such bare LIMIT
+// (no top-level LIMIT, or a top-level ORDER BY precedes it → deterministic top-k).
+static string StripBareTrailingLimit(const string &query) {
+	string lower = LowerASCII(query);
+	int depth = 0;
+	bool in_single = false, in_double = false;
+	size_t limit_pos = string::npos, order_pos = string::npos;
+	for (size_t i = 0; i < query.size(); i++) {
+		char c = query[i];
+		if (c == '\'' && !in_double) {
+			in_single = !in_single;
+		} else if (c == '"' && !in_single) {
+			in_double = !in_double;
+		} else if (!in_single && !in_double) {
+			if (c == '(') {
+				depth++;
+			} else if (c == ')' && depth > 0) {
+				depth--;
+			} else if (depth == 0) {
+				if (KeywordAt(lower, i, "limit", 5)) {
+					limit_pos = i; // keep the last top-level LIMIT
+				} else if (KeywordAt(lower, i, "order", 5)) {
+					order_pos = i;
+				}
+			}
+		}
+	}
+	if (limit_pos == string::npos || (order_pos != string::npos && order_pos < limit_pos)) {
+		return "";
+	}
+	string stripped = query.substr(0, limit_pos);
+	while (!stripped.empty() && std::isspace(static_cast<unsigned char>(stripped.back()))) {
+		stripped.pop_back();
+	}
+	return stripped;
 }
 
 // Parse is_incremental from the query file's first-line metadata comment.
@@ -846,6 +926,43 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							}
 							auto end_verify = std::chrono::steady_clock::now();
 							time_verify_ms = std::chrono::duration<double, std::milli>(end_verify - start).count();
+
+							// Bare-LIMIT relaxation — runs AFTER the timer stops so it never inflates
+							// time_verify_ms (it recomputes the full pre-LIMIT relation, which is larger
+							// than the user's LIMITed query). A top-level LIMIT with no ORDER BY selects a
+							// non-deterministic row set; the maintained relation is deterministic, so compare
+							// the full pre-LIMIT state: the MV's data table (projected to the view's user
+							// columns, by name, so internal openivm_*/primary_key columns are dropped) vs the
+							// base query with the trailing LIMIT stripped. Degrades gracefully (no-op) if the
+							// data table or columns can't be resolved.
+							if (!is_correct && !nv.column_list.empty()) {
+								string stripped = StripBareTrailingLimit(query);
+								if (!stripped.empty()) {
+									auto vinfo = con.Query("PRAGMA table_info('" + mv_name + "')");
+									if (vinfo && !vinfo->HasError() && vinfo->RowCount() > 0) {
+										string real_cols;
+										for (idx_t r = 0; r < vinfo->RowCount(); r++) {
+											if (!real_cols.empty()) {
+												real_cols += ", ";
+											}
+											real_cols += "\"" + vinfo->GetValue(1, r).ToString() + "\"";
+										}
+										string sel = nv.has_float ? nv.normalized : nv.column_list;
+										string data_tbl = "openivm_data_" + mv_name;
+										string relaxed_limit_query =
+										    "WITH mv_r(" + nv.column_list + ") AS (SELECT " + real_cols + " FROM " +
+										    data_tbl + "), gt_r(" + nv.column_list + ") AS (SELECT * FROM (" + stripped +
+										    ") __gt) SELECT COUNT(*) FROM (SELECT " + sel + " FROM mv_r EXCEPT ALL SELECT " +
+										    sel + " FROM gt_r UNION ALL SELECT " + sel + " FROM gt_r EXCEPT ALL SELECT " +
+										    sel + " FROM mv_r) __diff";
+										auto rr = con.Query(relaxed_limit_query);
+										if (rr && !rr->HasError() && rr->RowCount() > 0 &&
+										    rr->GetValue(0, 0).GetValue<int64_t>() == 0) {
+											is_correct = 1;
+										}
+									}
+								}
+							}
 							phase_reached = (is_correct ? PHASE_OK : PHASE_VERIFY_FAILED);
 						}
 					}

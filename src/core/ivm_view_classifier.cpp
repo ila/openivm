@@ -6,6 +6,7 @@
 #include "rules/column_hider.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 
 #include <unordered_set>
 
@@ -325,6 +326,30 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	}
 }
 
+// Descend to the view-body output operator: the CREATE MATERIALIZED VIEW plan is a
+// LOGICAL_CREATE_TABLE (CTAS) wrapping the SELECT, so skip that wrapper and any top projections.
+static LogicalOperator *SkipToViewBody(LogicalOperator *op) {
+	while (op && !op->children.empty() &&
+	       (op->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
+	        op->type == LogicalOperatorType::LOGICAL_PROJECTION)) {
+		op = op->children[0].get();
+	}
+	return op;
+}
+
+// A genuine SIMPLE_AGGREGATE produces exactly one row, so the view's top-level operator (modulo
+// projections) must be an ungrouped aggregate. When the only aggregate is nested below a join (e.g.
+// a join over a SUM-aggregate CTE with no top-level GROUP BY), the output is many rows; the
+// SIMPLE_AGGREGATE upsert accumulates every output column into a single row, corrupting join-key and
+// passthrough columns. Such views must NOT be classified SIMPLE_AGGREGATE.
+static bool TopLevelIsUngroupedAggregate(LogicalOperator *root) {
+	auto *op = SkipToViewBody(root);
+	if (!op || op->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return false;
+	}
+	return op->Cast<LogicalAggregate>().groups.empty();
+}
+
 static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
 	auto has_argminmax =
 	    std::any_of(analysis.aggregate_types.begin(), analysis.aggregate_types.end(),
@@ -386,7 +411,8 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = RefreshType::AGGREGATE_HAVING;
 	} else if (analysis.found_aggregation && !model.group_columns.empty()) {
 		model.type = RefreshType::AGGREGATE_GROUP;
-	} else if (analysis.found_aggregation && model.group_columns.empty()) {
+	} else if (analysis.found_aggregation && model.group_columns.empty() && input.facts &&
+	           TopLevelIsUngroupedAggregate(input.facts->root)) {
 		model.type = RefreshType::SIMPLE_AGGREGATE;
 	} else if (analysis.found_projection && !analysis.found_aggregation) {
 		model.type = RefreshType::SIMPLE_PROJECTION;

@@ -843,6 +843,132 @@ SELECT count(*) FROM (
 ----
 0
 
+# ============================================================
+# Bare LIMIT (no ORDER BY) over an aggregate
+# Regression: the bare LIMIT must be stripped BEFORE the IVM plan rewrites so the
+# hidden group COUNT(*) is injected. Otherwise a deleted group lingers as a zero
+# row in the data table instead of being removed. The data table holds the full
+# (unlimited) relation; the user view applies the LIMIT.
+# ============================================================
+
+statement ok
+CREATE TABLE barelim_agg_t (k INT, v INT);
+
+statement ok
+INSERT INTO barelim_agg_t VALUES (1,10),(2,20),(3,30),(4,40);
+
+statement ok
+CREATE MATERIALIZED VIEW barelim_agg_mv AS
+  SELECT k, SUM(v) AS s FROM barelim_agg_t GROUP BY k LIMIT 2;
+
+# Hidden group COUNT(*) must be present so emptied groups are deleted.
+query I
+SELECT count(*) FROM pragma_table_info('openivm_data_barelim_agg_mv') WHERE name = 'openivm_count_star';
+----
+1
+
+# User view applies the LIMIT.
+query I
+SELECT count(*) FROM barelim_agg_mv;
+----
+2
+
+# Batch conflicting DML (insert + delete + update on overlapping groups) before one refresh.
+statement ok
+INSERT INTO barelim_agg_t VALUES (5,50),(2,5);
+
+statement ok
+DELETE FROM barelim_agg_t WHERE k=3;
+
+statement ok
+UPDATE barelim_agg_t SET v = v + 1 WHERE k=1;
+
+statement ok
+PRAGMA refresh('barelim_agg_mv');
+
+# Full maintained state (data table) must equal the unlimited base query, both directions.
+query I
+SELECT count(*) FROM (
+  SELECT k, SUM(v) AS s FROM barelim_agg_t GROUP BY k
+  EXCEPT ALL
+  SELECT k, s FROM openivm_data_barelim_agg_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT k, s FROM openivm_data_barelim_agg_mv
+  EXCEPT ALL
+  SELECT k, SUM(v) AS s FROM barelim_agg_t GROUP BY k
+);
+----
+0
+
+# Deleted group k=3 must be gone from the data table.
+query I
+SELECT count(*) FROM openivm_data_barelim_agg_mv WHERE k=3;
+----
+0
+
+# ============================================================
+# Bare LIMIT (no ORDER BY) over a LEFT JOIN
+# Regression: bare LIMIT stripped before rewrites so the LEFT JOIN match-count
+# keys are injected and the join is maintained incrementally over the full state.
+# ============================================================
+
+statement ok
+CREATE TABLE barelim_l (id INT, lv INT);
+
+statement ok
+CREATE TABLE barelim_r (id INT, rv INT);
+
+statement ok
+INSERT INTO barelim_l VALUES (1,10),(2,20),(3,30),(4,40),(5,50);
+
+statement ok
+INSERT INTO barelim_r VALUES (1,100),(2,200),(3,300);
+
+statement ok
+CREATE MATERIALIZED VIEW barelim_lj_mv AS
+  SELECT l.id, l.lv, r.rv FROM barelim_l l LEFT JOIN barelim_r r ON l.id=r.id LIMIT 3;
+
+statement ok
+INSERT INTO barelim_l VALUES (6,60),(7,70);
+
+statement ok
+DELETE FROM barelim_l WHERE id=2;
+
+statement ok
+UPDATE barelim_r SET rv=999 WHERE id=1;
+
+statement ok
+INSERT INTO barelim_r VALUES (4,400);
+
+statement ok
+DELETE FROM barelim_r WHERE id=3;
+
+statement ok
+PRAGMA refresh('barelim_lj_mv');
+
+query I
+SELECT count(*) FROM (
+  SELECT l.id, l.lv, r.rv FROM barelim_l l LEFT JOIN barelim_r r ON l.id=r.id
+  EXCEPT ALL
+  SELECT id, lv, rv FROM openivm_data_barelim_lj_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, lv, rv FROM openivm_data_barelim_lj_mv
+  EXCEPT ALL
+  SELECT l.id, l.lv, r.rv FROM barelim_l l LEFT JOIN barelim_r r ON l.id=r.id
+);
+----
+0
+
 # ==========================================
 # Source-dependent UNNEST projection
 # ==========================================

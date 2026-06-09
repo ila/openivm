@@ -135,6 +135,16 @@ LogicalOperator *FindProjectionAggregateInput(unique_ptr<LogicalOperator> &plan,
 	return nullptr;
 }
 void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator> &plan, Optimizer &opt, bool is_top) {
+	// AVG/STDDEV decomposition adds hidden SUM/COUNT/SUM-OF-SQUARES columns to the aggregate it
+	// rewrites. Inside a set-operation branch that asymmetrically widens one branch relative to its
+	// siblings, producing an arity-mismatched UNION/EXCEPT/INTERSECT that is not valid SQL (LPTS then
+	// cannot serialize it). Such views are maintained by recompute/full-refresh anyway, so the
+	// decomposition serves no purpose here — stop at the set-op boundary and leave the branches intact.
+	// Decomposition of aggregates *above* a set operation is unaffected (handled before we recurse in).
+	if (plan->type == LogicalOperatorType::LOGICAL_UNION || plan->type == LogicalOperatorType::LOGICAL_EXCEPT ||
+	    plan->type == LogicalOperatorType::LOGICAL_INTERSECT) {
+		return;
+	}
 	for (auto &child : plan->children) {
 		RewriteDerivedAggregates(context, child, opt, false);
 	}

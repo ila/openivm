@@ -37,6 +37,13 @@ void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOpera
 /// references the hidden column names instead of re-rendering the aggregate expression.
 string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &output_names);
 
+/// True when an outer join (LEFT/RIGHT/FULL) sits beneath a set operation in the plan. The outer-join
+/// match-count/key rewrite cannot be applied there (it would break set-op branch arity), so such views
+/// cannot be incrementally maintained as joins and must be routed to FULL_REFRESH. Shared by
+/// RewriteOuterJoinSupport (which skips the rewrite) and CREATE-time classification (which forces
+/// full refresh), so the two conditions cannot drift.
+bool PlanHasOuterJoinBeneathSetOperation(LogicalOperator *op);
+
 } // namespace duckdb
 
 #endif // PLAN_REWRITE_HPP

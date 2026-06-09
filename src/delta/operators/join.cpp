@@ -285,6 +285,52 @@ unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, co
 	return *current;
 }
 
+// True if any LOGICAL_GET in the subtree is backed by a real catalog table (i.e. a mutable source).
+static bool SubtreeHasMutableBaseGet(LogicalOperator *node) {
+	if (!node) {
+		return false;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_GET) {
+		auto *get = dynamic_cast<LogicalGet *>(node);
+		return get && get->GetTable().get() != nullptr;
+	}
+	for (auto &child : node->children) {
+		if (SubtreeHasMutableBaseGet(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool SubtreeContainsDelim(LogicalOperator *node) {
+	if (!node) {
+		return false;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+	    node->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+	    node->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+		return true;
+	}
+	for (auto &child : node->children) {
+		if (SubtreeContainsDelim(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// A join leaf that contains a DELIM_JOIN/DELIM_GET (a correlated keyed expansion such as
+// CROSS JOIN LATERAL generate_series(1, w.w_id)) but has NO mutable base table under it is
+// base-invariant: its own delta is empty. The row-level delta flows through the correlated source
+// (the shared base/CTE) on the *other* side of the enclosing join, so inclusion-exclusion need only
+// keep this side full — yielding the correct ΔA⋈B term and avoiding the "no mutable base leaves"
+// dead end inside CompileDelimJoinDelta. The `SubtreeContainsDelim` guard excludes a plain CTE_REF
+// leaf (which carries the actual delta and must NOT be treated as constant). The leaf root may be a
+// projection wrapping the delim join, so both checks recurse.
+static bool IsBaseInvariantDelimLeaf(LogicalOperator *node) {
+	return node && SubtreeContainsDelim(node) && !SubtreeHasMutableBaseGet(node);
+}
+
 /// Verify all joins in the subtree are supported. Returns true if any LEFT/RIGHT/OUTER found.
 /// MARK/SEMI/ANTI joins (from IN-list, EXISTS, etc.) are allowed: LPTS converts MARK→LEFT JOIN,
 /// and their constant right-side (VALUES list) has no delta so inclusion-exclusion reduces trivially.
@@ -445,6 +491,14 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 				status.insert_only_mask |= (1ULL << i);
 				status.constant_mask |= (1ULL << i);
 				OPENIVM_DEBUG_PRINT("[DeltaJoin] Leaf %zu (constant values) has empty delta\n", i);
+			} else if (IsBaseInvariantDelimLeaf(leaves[i].node)) {
+				// Correlated keyed expansion (e.g. CROSS JOIN LATERAL generate_series(1, w.w_id)) with no
+				// mutable base under the delim join — its delta is empty; the row-level delta flows through
+				// the correlated source on the other side of this join. Keep it full in every term.
+				status.empty_mask |= (1ULL << i);
+				status.insert_only_mask |= (1ULL << i);
+				status.constant_mask |= (1ULL << i);
+				OPENIVM_DEBUG_PRINT("[DeltaJoin] Leaf %zu (base-invariant delim expansion) has empty delta\n", i);
 			}
 			continue;
 		}

@@ -1270,7 +1270,33 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	                    is_full_outer ? " + openivm_right_match_count" : "");
 }
 
+// True when some set-operation node has an outer join in its subtree. Adding outer-join key /
+// match-count columns there would widen one branch relative to its siblings, yielding an
+// arity-mismatched set operation that is not valid SQL (LPTS cannot serialize it). The rewrite is
+// skipped here AND the view is routed to FULL_REFRESH at classification time (the incremental
+// outer-join path would otherwise produce wrong results because the match-count state is missing).
+bool PlanHasOuterJoinBeneathSetOperation(LogicalOperator *op) {
+	if (!op) {
+		return false;
+	}
+	bool is_set_operation = op->type == LogicalOperatorType::LOGICAL_UNION ||
+	                        op->type == LogicalOperatorType::LOGICAL_EXCEPT ||
+	                        op->type == LogicalOperatorType::LOGICAL_INTERSECT;
+	if (is_set_operation && FindFirstOuterJoinBindings(op).found) {
+		return true;
+	}
+	for (auto &child : op->children) {
+		if (PlanHasOuterJoinBeneathSetOperation(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
+	if (PlanHasOuterJoinBeneathSetOperation(plan.get())) {
+		return;
+	}
 	auto outer_join = FindFirstOuterJoinBindings(plan.get());
 	if (!outer_join.found) {
 		return;
