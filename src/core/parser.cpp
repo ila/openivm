@@ -373,12 +373,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			// CREATE MATERIALIZED VIEW always stores the view body in DuckDB's own dialect.
 			// Refresh-time target dialects are selected per CompileFacts.
 			SqlDialect dialect = SqlDialect::DUCKDB;
-			auto ast = LogicalPlanToAst(*con.context, select_plan, dialect);
-			auto cte_list = AstToCteList(*ast, dialect);
-			view_query = cte_list->ToQuery(true, output_names);
-			if (!view_query.empty() && view_query.back() == ';') {
-				view_query.pop_back();
-			}
+			view_query = SqlUtils::PlanToSql(*con.context, select_plan, dialect, /*use_newlines=*/true, output_names);
 			StringUtil::Trim(view_query);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
 		} catch (const std::exception &e) {

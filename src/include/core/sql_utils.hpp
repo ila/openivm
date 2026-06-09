@@ -52,10 +52,14 @@ public:
 	                                        const string &right_prefix);
 	static string BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql);
 	/// Single entry point for the LPTS plan->SQL round-trip:
-	/// LogicalPlanToAst -> AstToCteList -> CteList::ToQuery, with the trailing ';' stripped.
+	/// LogicalPlanToAst -> AstToCteList -> CteList::ToQuery. By default the trailing ';' is stripped,
+	/// which is what callers embedding the result as a subquery (`FROM (...)`) or trimming it want.
+	/// Statement-level callers that concatenate further statements after the result pass
+	/// strip_trailing_semicolon=false to keep the terminator.
 	/// Callers keep their own error policy by wrapping this in try/catch as needed.
 	static string PlanToSql(ClientContext &context, unique_ptr<LogicalOperator> &plan, SqlDialect dialect,
-	                        bool use_newlines = false, const vector<string> &output_names = {});
+	                        bool use_newlines = false, const vector<string> &output_names = {},
+	                        bool strip_trailing_semicolon = true);
 	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);
 	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
 	                                                 const string &replacement);

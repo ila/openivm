@@ -731,6 +731,17 @@ string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &v
 	return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 }
 
+string SqlUtils::PlanToSql(ClientContext &context, unique_ptr<LogicalOperator> &plan, SqlDialect dialect,
+                           bool use_newlines, const vector<string> &output_names, bool strip_trailing_semicolon) {
+	auto ast = LogicalPlanToAst(context, plan, dialect);
+	auto cte_list = AstToCteList(*ast, dialect);
+	string sql = cte_list->ToQuery(use_newlines, output_names);
+	if (strip_trailing_semicolon && !sql.empty() && sql.back() == ';') {
+		sql.pop_back();
+	}
+	return sql;
+}
+
 string SqlUtils::ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement) {
 	if (needle.empty()) {
 		return haystack;

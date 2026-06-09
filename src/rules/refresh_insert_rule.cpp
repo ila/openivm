@@ -126,12 +126,7 @@ static string BuildDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry
                                        const string &full_delta_table_name, unique_ptr<LogicalOperator> &source_plan) {
 	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
 	SqlDialect dialect = openivm::CompileFactsContextSlot::Get(context).target_dialect;
-	auto ast = LogicalPlanToAst(context, source_plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect);
-	string subquery_string = cte_list->ToQuery(false);
-	if (!subquery_string.empty() && subquery_string.back() == ';') {
-		subquery_string.pop_back();
-	}
+	string subquery_string = SqlUtils::PlanToSql(context, source_plan, dialect);
 	return prefix + " SELECT *, 1, now()::timestamp FROM (" + subquery_string + ")";
 }
 
@@ -141,12 +136,7 @@ static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalo
 	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
 	string data_cols = BuildDeltaDataColumns(delta_entry);
 	SqlDialect dialect = openivm::CompileFactsContextSlot::Get(context).target_dialect;
-	auto ast = LogicalPlanToAst(context, source_plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect);
-	string subquery_string = cte_list->ToQuery(false);
-	if (!subquery_string.empty() && subquery_string.back() == ';') {
-		subquery_string.pop_back();
-	}
+	string subquery_string = SqlUtils::PlanToSql(context, source_plan, dialect);
 	// DuckDB DELETE children identify physical rows by rowid; read the base table
 	// columns back through that rowid set to materialize the negative delta tuple.
 	return prefix + " SELECT " + data_cols + ", -1, now()::timestamp FROM " + full_table_name +
@@ -523,12 +513,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 							string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
 							string data_cols = BuildDeltaDataColumns(delta_entry_del);
 							SqlDialect dialect = openivm::CompileFactsContextSlot::Get(*con.context).target_dialect;
-							auto ast = LogicalPlanToAst(*con.context, join->children[1], dialect);
-							auto cte_list = AstToCteList(*ast, dialect);
-							string rowid_sql = cte_list->ToQuery(false);
-							if (!rowid_sql.empty() && rowid_sql.back() == ';') {
-								rowid_sql.pop_back();
-							}
+							string rowid_sql = SqlUtils::PlanToSql(*con.context, join->children[1], dialect);
 							insert_string = prefix_del + " SELECT " + data_cols + ", -1, now()::timestamp FROM " +
 							                full_table_name + " WHERE rowid IN (" + rowid_sql + ")";
 						} catch (...) {
@@ -549,12 +534,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 					try {
 						string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
 						SqlDialect dialect = openivm::CompileFactsContextSlot::Get(*con.context).target_dialect;
-						auto ast = LogicalPlanToAst(*con.context, plan->children[0], dialect);
-						auto cte_list = AstToCteList(*ast, dialect);
-						string subquery_string = cte_list->ToQuery(false);
-						if (!subquery_string.empty() && subquery_string.back() == ';') {
-							subquery_string.pop_back();
-						}
+						string subquery_string = SqlUtils::PlanToSql(*con.context, plan->children[0], dialect);
 						insert_string = prefix_del + " SELECT *, -1, now()::timestamp FROM (" + subquery_string + ")";
 					} catch (...) {
 						throw NotImplementedException(

@@ -1046,9 +1046,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			try {
 				auto lpts_start = profile_now();
 				SqlDialect dialect = active_facts.target_dialect;
-				auto ast = LogicalPlanToAst(con_ctx, plan, dialect);
-				auto cte_list = AstToCteList(*ast, dialect);
-				raw_refresh_sql = cte_list->ToQuery(false);
+				// Statement-level result: keep the trailing ';' so the statements concatenated after
+				// it below stay separated.
+				raw_refresh_sql =
+				    SqlUtils::PlanToSql(con_ctx, plan, dialect, /*use_newlines=*/false, /*output_names=*/ {},
+				                        /*strip_trailing_semicolon=*/false);
 				add_profile_step("generate_refresh_sql.lpts", lpts_start,
 				                 "delta_sql_bytes=" + to_string(raw_refresh_sql.size()));
 				OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_refresh_sql.c_str());
