@@ -1124,6 +1124,101 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# A grouped aggregate above LEFT JOINs beneath UNION ALL can avoid the hidden match-count
+# rewrite and use current-diff group recompute instead.
+statement ok
+CREATE TABLE ljua_ag_a(k INT, va INT);
+
+statement ok
+CREATE TABLE ljua_ag_b(k INT, vb INT);
+
+statement ok
+CREATE TABLE ljua_ag_c(k INT, vc INT);
+
+statement ok
+CREATE TABLE ljua_ag_d(k INT, vd INT);
+
+statement ok
+INSERT INTO ljua_ag_a VALUES (1,1),(2,2);
+
+statement ok
+INSERT INTO ljua_ag_b VALUES (1,10);
+
+statement ok
+INSERT INTO ljua_ag_c VALUES (3,3);
+
+statement ok
+INSERT INTO ljua_ag_d VALUES (3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ljua_ag AS
+    SELECT k, SUM(v) AS total_v, MIN(vb) AS min_vb, COUNT(*) AS row_count
+    FROM (
+        SELECT ljua_ag_a.k, COALESCE(ljua_ag_b.vb, 0) AS v, ljua_ag_b.vb
+        FROM ljua_ag_a LEFT JOIN ljua_ag_b USING(k)
+        UNION ALL
+        SELECT ljua_ag_c.k, COALESCE(ljua_ag_d.vd, 0) AS v, ljua_ag_d.vd AS vb
+        FROM ljua_ag_c LEFT JOIN ljua_ag_d USING(k)
+    ) u
+    GROUP BY k
+    HAVING COUNT(*) >= 0;
+
+query IT
+SELECT type, group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_ljua_ag';
+----
+6	current_diff
+
+# Batched conflicting DML changes both old and new output groups before one refresh.
+statement ok
+INSERT INTO ljua_ag_b VALUES (2,20);
+
+statement ok
+DELETE FROM ljua_ag_b WHERE k=1;
+
+statement ok
+INSERT INTO ljua_ag_a VALUES (4,4);
+
+statement ok
+DELETE FROM ljua_ag_d WHERE k=3;
+
+statement ok
+PRAGMA refresh('mv_ljua_ag');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT k, SUM(v) AS total_v, MIN(vb) AS min_vb, COUNT(*) AS row_count
+     FROM (
+         SELECT ljua_ag_a.k, COALESCE(ljua_ag_b.vb, 0) AS v, ljua_ag_b.vb
+         FROM ljua_ag_a LEFT JOIN ljua_ag_b USING(k)
+         UNION ALL
+         SELECT ljua_ag_c.k, COALESCE(ljua_ag_d.vd, 0) AS v, ljua_ag_d.vd AS vb
+         FROM ljua_ag_c LEFT JOIN ljua_ag_d USING(k)
+     ) u
+     GROUP BY k
+     HAVING COUNT(*) >= 0)
+    EXCEPT ALL SELECT * FROM mv_ljua_ag
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_ljua_ag
+    EXCEPT ALL
+    (SELECT k, SUM(v) AS total_v, MIN(vb) AS min_vb, COUNT(*) AS row_count
+     FROM (
+         SELECT ljua_ag_a.k, COALESCE(ljua_ag_b.vb, 0) AS v, ljua_ag_b.vb
+         FROM ljua_ag_a LEFT JOIN ljua_ag_b USING(k)
+         UNION ALL
+         SELECT ljua_ag_c.k, COALESCE(ljua_ag_d.vd, 0) AS v, ljua_ag_d.vd AS vb
+         FROM ljua_ag_c LEFT JOIN ljua_ag_d USING(k)
+     ) u
+     GROUP BY k
+     HAVING COUNT(*) >= 0)
+);
+----
+0
+
 # ============================================================
 # LEFT JOIN with a table-function / VALUES preserved side and a
 # cast or derived (EXTRACT) join key.

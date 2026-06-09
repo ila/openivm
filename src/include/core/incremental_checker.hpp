@@ -19,6 +19,10 @@ struct PlanAnalysis {
 	bool found_filtered_list = false; // LIST(...) FILTER needs group-recompute with original SQL
 	bool found_left_join = false;
 	bool found_full_outer = false;
+	// An outer (LEFT/RIGHT/FULL) join sits beneath a UNION/EXCEPT/INTERSECT. Adding outer-join key /
+	// match-count columns there would arity-mismatch the set-op branches, so such views are routed to
+	// FULL_REFRESH. Collected during this walk to avoid a separate full-plan traversal at classification.
+	bool found_outer_join_under_setop = false;
 	bool found_semi_anti_join = false;
 	bool found_join = false;
 	bool found_delim_join = false;

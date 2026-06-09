@@ -555,6 +555,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		db.LoadStaticExtension<duckdb::OpenivmExtension>();
 		duckdb::Connection con(db);
 		con.Query("PRAGMA threads=4");
+		con.Query("SET max_expression_depth TO 10000");
 
 		// Figure out the default (native) catalog name so we can switch back
 		// after a ducklake query. When `db_path` is a file like

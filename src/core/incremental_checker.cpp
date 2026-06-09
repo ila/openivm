@@ -115,7 +115,32 @@ static void MergeCompatibilityAndNonLocalFacts(PlanAnalysis &result, const PlanA
 	result.found_unsupported_operator = result.found_unsupported_operator || body.found_unsupported_operator;
 	result.found_asof_join = result.found_asof_join || body.found_asof_join;
 	result.found_positional_join = result.found_positional_join || body.found_positional_join;
+	result.found_outer_join_under_setop = result.found_outer_join_under_setop || body.found_outer_join_under_setop;
 	result.found_sample = result.found_sample || body.found_sample;
+}
+
+/// True iff `node`'s subtree contains a comparison join with an outer (LEFT/RIGHT/FULL) join type and
+/// a non-empty condition list. Mirrors the `found` semantics of FindFirstOuterJoinBindings in
+/// plan_rewrite.cpp (which is file-local there), so the flag derived from this is identical to the
+/// standalone PlanHasOuterJoinBeneathSetOperation probe it replaces.
+static bool SubtreeHasOuterComparisonJoin(LogicalOperator *node) {
+	if (!node) {
+		return false;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = node->Cast<LogicalComparisonJoin>();
+		if ((join.join_type == JoinType::LEFT || join.join_type == JoinType::RIGHT ||
+		     join.join_type == JoinType::OUTER) &&
+		    !join.conditions.empty()) {
+			return true;
+		}
+	}
+	for (auto &child : node->children) {
+		if (SubtreeHasOuterComparisonJoin(child.get())) {
+			return true;
+		}
+	}
+	return false;
 }
 
 /// Single-pass recursive plan analysis: validates IVM compatibility AND extracts metadata.
@@ -448,6 +473,15 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		result.incremental_compatible = false;
 		result.found_unsupported_operator = true;
 		break;
+	}
+
+	// Detect an outer join beneath a set operation here (covers UNION/EXCEPT/INTERSECT regardless of
+	// which have dedicated cases above), folding the former standalone PlanHasOuterJoinBeneathSetOperation
+	// full-plan walk into this single analysis pass.
+	if (node->type == LogicalOperatorType::LOGICAL_UNION || node->type == LogicalOperatorType::LOGICAL_EXCEPT ||
+	    node->type == LogicalOperatorType::LOGICAL_INTERSECT) {
+		result.found_outer_join_under_setop =
+		    result.found_outer_join_under_setop || SubtreeHasOuterComparisonJoin(node);
 	}
 
 	for (auto &child : node->children) {

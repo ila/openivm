@@ -188,3 +188,144 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Join over aggregate CTE without visible aggregate keys
+# ==========================================
+
+statement ok
+CREATE TABLE dl.joa_customer (w INTEGER, d INTEGER, c INTEGER, discount DOUBLE);
+
+statement ok
+CREATE TABLE dl.joa_orderline (w INTEGER, d INTEGER, o INTEGER, amount DOUBLE);
+
+statement ok
+INSERT INTO dl.joa_customer VALUES (1, 10, 100, 0.10), (1, 10, 101, 0.20), (2, 20, 200, 0.00);
+
+statement ok
+INSERT INTO dl.joa_orderline VALUES (1, 10, 500, 30.0), (1, 10, 500, 20.0), (2, 20, 700, 15.0);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_join_over_agg_hidden_key AS
+  WITH grand_total AS (
+    SELECT SUM(amount) AS amt
+    FROM dl.joa_orderline
+  )
+  SELECT c.w AS w, c.c AS c, grand_total.amt AS total_amt
+  FROM dl.joa_customer c
+  CROSS JOIN grand_total;
+
+query II
+SELECT type, group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_join_over_agg_hidden_key';
+----
+6	current_diff
+
+statement ok
+INSERT INTO dl.joa_orderline VALUES (1, 10, 501, 40.0);
+
+statement ok
+DELETE FROM dl.joa_orderline WHERE w = 1 AND d = 10 AND o = 500 AND amount = 20.0;
+
+statement ok
+INSERT INTO dl.joa_customer VALUES (2, 20, 201, 0.50);
+
+statement ok
+PRAGMA refresh('mv_join_over_agg_hidden_key');
+
+query I
+SELECT count(*) FROM (
+  SELECT w, c, total_amt FROM dl.mv_join_over_agg_hidden_key
+  EXCEPT ALL
+  SELECT * FROM (
+    WITH grand_total AS (
+      SELECT SUM(amount) AS amt
+      FROM dl.joa_orderline
+    )
+    SELECT c.w AS w, c.c AS c, grand_total.amt AS total_amt
+    FROM dl.joa_customer c
+    CROSS JOIN grand_total
+  ) expected
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM (
+    WITH grand_total AS (
+      SELECT SUM(amount) AS amt
+      FROM dl.joa_orderline
+    )
+    SELECT c.w AS w, c.c AS c, grand_total.amt AS total_amt
+    FROM dl.joa_customer c
+    CROSS JOIN grand_total
+  ) expected
+  EXCEPT ALL
+  SELECT w, c, total_amt FROM dl.mv_join_over_agg_hidden_key
+);
+----
+0
+
+# ==========================================
+# COUNT DISTINCT join aggregate with projected group key
+# ==========================================
+
+statement ok
+CREATE TABLE dl.joa_district (w INTEGER, d INTEGER);
+
+statement ok
+INSERT INTO dl.joa_district VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_count_distinct_projected_key AS
+  SELECT COALESCE(c.w, -1) AS w,
+         COUNT(DISTINCT c.d) AS districts_count,
+         SUM(c.c) AS customer_sum
+  FROM dl.joa_customer c
+  JOIN dl.joa_district d ON c.w = d.w AND c.d = d.d
+  GROUP BY c.w;
+
+query II
+SELECT type, group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_count_distinct_projected_key';
+----
+6	current_diff
+
+statement ok
+INSERT INTO dl.joa_district VALUES (3, 30);
+
+statement ok
+INSERT INTO dl.joa_customer VALUES (3, 30, 300, 0.25), (3, 30, 301, 0.30);
+
+statement ok
+DELETE FROM dl.joa_customer WHERE w = 1 AND d = 10 AND c = 101;
+
+statement ok
+PRAGMA refresh('mv_count_distinct_projected_key');
+
+query I
+SELECT count(*) FROM (
+  SELECT w, districts_count, customer_sum FROM dl.mv_count_distinct_projected_key
+  EXCEPT ALL
+  SELECT COALESCE(c.w, -1) AS w,
+         COUNT(DISTINCT c.d) AS districts_count,
+         SUM(c.c) AS customer_sum
+  FROM dl.joa_customer c
+  JOIN dl.joa_district d ON c.w = d.w AND c.d = d.d
+  GROUP BY c.w
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT COALESCE(c.w, -1) AS w,
+         COUNT(DISTINCT c.d) AS districts_count,
+         SUM(c.c) AS customer_sum
+  FROM dl.joa_customer c
+  JOIN dl.joa_district d ON c.w = d.w AND c.d = d.d
+  GROUP BY c.w
+  EXCEPT ALL
+  SELECT w, districts_count, customer_sum FROM dl.mv_count_distinct_projected_key
+);
+----
+0

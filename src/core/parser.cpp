@@ -420,12 +420,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	bool has_full_outer_aggregate = analysis.found_full_outer && analysis.found_aggregation;
 	bool has_cte_self_join = facts.has_repeated_cte_ref_under_join;
 	// An outer join beneath a set operation cannot get its match-count/key rewrite (it would break
-	// set-op branch arity), so it cannot be incrementally maintained as a join — route to FULL_REFRESH
-	// (the stored normalized SQL recomputes correctly). Without this, such a view would be classified
-	// incremental but maintained with missing match-count state, producing wrong results.
-	bool has_outer_join_under_setop = PlanHasOuterJoinBeneathSetOperation(plan.get());
-	bool has_unsupported_incremental_construct =
-	    facts.has_unsupported_set_operation || facts.has_pivot || has_outer_join_under_setop;
+	// set-op branch arity). Non-aggregate shapes stay FULL_REFRESH in the classifier; aggregate shapes
+	// with stable visible group keys can use GROUP_RECOMPUTE with current-diff affected keys instead.
+	bool has_unsupported_incremental_construct = facts.has_unsupported_set_operation || facts.has_pivot;
 
 	DeltaViewModelInput model_input;
 	model_input.facts = &facts;

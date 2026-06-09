@@ -1104,6 +1104,120 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Reused CTE whose body contains LEFT JOIN under UNION ALL. The analyzer must merge
+# found_outer_join_under_setop out of the materialized CTE body so the grouped outer
+# query uses current-diff group recompute instead of source-delta affected keys.
+statement ok
+CREATE TABLE cte_lju_a(k INT, va INT);
+
+statement ok
+CREATE TABLE cte_lju_b(k INT, vb INT);
+
+statement ok
+CREATE TABLE cte_lju_c(k INT, vc INT);
+
+statement ok
+CREATE TABLE cte_lju_d(k INT, vd INT);
+
+statement ok
+CREATE TABLE cte_lju_dim(k INT, label VARCHAR);
+
+statement ok
+INSERT INTO cte_lju_a VALUES (1, 1), (2, 2);
+
+statement ok
+INSERT INTO cte_lju_b VALUES (1, 10);
+
+statement ok
+INSERT INTO cte_lju_c VALUES (3, 3);
+
+statement ok
+INSERT INTO cte_lju_d VALUES (3, 30);
+
+statement ok
+INSERT INTO cte_lju_dim VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cte_lju_reused AS
+WITH joined_rows AS (
+    SELECT a.k, COALESCE(b.vb, 0) AS v, b.vb AS right_v
+    FROM cte_lju_a a LEFT JOIN cte_lju_b b USING(k)
+    UNION ALL
+    SELECT c.k, COALESCE(d.vd, 0) AS v, d.vd AS right_v
+    FROM cte_lju_c c LEFT JOIN cte_lju_d d USING(k)
+)
+SELECT j1.k, dim.label, SUM(j1.v + COALESCE(j2.right_v, 0)) AS total_v,
+       MIN(j1.right_v) AS min_right_v, COUNT(*) AS row_count
+FROM joined_rows j1
+JOIN joined_rows j2 ON j1.k = j2.k
+JOIN cte_lju_dim dim ON dim.k = j1.k
+GROUP BY j1.k, dim.label
+HAVING COUNT(*) >= 0;
+
+query IT
+SELECT type, group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_cte_lju_reused';
+----
+6	current_diff
+
+statement ok
+INSERT INTO cte_lju_b VALUES (2, 20);
+
+statement ok
+DELETE FROM cte_lju_b WHERE k = 1;
+
+statement ok
+INSERT INTO cte_lju_a VALUES (4, 4);
+
+statement ok
+DELETE FROM cte_lju_d WHERE k = 3;
+
+statement ok
+PRAGMA refresh('mv_cte_lju_reused');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cte_lju_reused
+    EXCEPT ALL
+    SELECT * FROM (WITH joined_rows AS (
+        SELECT a.k, COALESCE(b.vb, 0) AS v, b.vb AS right_v
+        FROM cte_lju_a a LEFT JOIN cte_lju_b b USING(k)
+        UNION ALL
+        SELECT c.k, COALESCE(d.vd, 0) AS v, d.vd AS right_v
+        FROM cte_lju_c c LEFT JOIN cte_lju_d d USING(k)
+    )
+    SELECT j1.k, dim.label, SUM(j1.v + COALESCE(j2.right_v, 0)) AS total_v,
+           MIN(j1.right_v) AS min_right_v, COUNT(*) AS row_count
+    FROM joined_rows j1
+    JOIN joined_rows j2 ON j1.k = j2.k
+    JOIN cte_lju_dim dim ON dim.k = j1.k
+    GROUP BY j1.k, dim.label
+    HAVING COUNT(*) >= 0) _expected
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (WITH joined_rows AS (
+        SELECT a.k, COALESCE(b.vb, 0) AS v, b.vb AS right_v
+        FROM cte_lju_a a LEFT JOIN cte_lju_b b USING(k)
+        UNION ALL
+        SELECT c.k, COALESCE(d.vd, 0) AS v, d.vd AS right_v
+        FROM cte_lju_c c LEFT JOIN cte_lju_d d USING(k)
+    )
+    SELECT j1.k, dim.label, SUM(j1.v + COALESCE(j2.right_v, 0)) AS total_v,
+           MIN(j1.right_v) AS min_right_v, COUNT(*) AS row_count
+    FROM joined_rows j1
+    JOIN joined_rows j2 ON j1.k = j2.k
+    JOIN cte_lju_dim dim ON dim.k = j1.k
+    GROUP BY j1.k, dim.label
+    HAVING COUNT(*) >= 0) _expected
+    EXCEPT ALL
+    SELECT * FROM mv_cte_lju_reused
+);
+----
+0
+
 # Second refresh with deletions
 statement ok
 DELETE FROM cra_customer WHERE c_d_id = 3;

@@ -719,6 +719,75 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# UNION ALL over scalar aggregate branches has no stable per-branch group key.
+# It must not use SIMPLE_AGGREGATE, but it can use current-diff GROUP_RECOMPUTE
+# keyed by the visible output row.
+
+statement ok
+CREATE TABLE uoa_status_orders (id INT, delivered BOOLEAN);
+
+statement ok
+CREATE TABLE uoa_status_new (id INT);
+
+statement ok
+INSERT INTO uoa_status_orders VALUES (1, false), (2, true), (3, true);
+
+statement ok
+INSERT INTO uoa_status_new VALUES (10), (11);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_uoa_scalar AS
+    SELECT 'active' AS status, COUNT(*) AS n FROM uoa_status_orders WHERE delivered = false
+    UNION ALL
+    SELECT 'delivered', COUNT(*) FROM uoa_status_orders WHERE delivered = true
+    UNION ALL
+    SELECT 'new', COUNT(*) FROM uoa_status_new;
+
+query II
+SELECT type, group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_uoa_scalar';
+----
+6	current_diff
+
+statement ok
+INSERT INTO uoa_status_orders VALUES (4, false), (5, true);
+
+statement ok
+DELETE FROM uoa_status_orders WHERE id = 2;
+
+statement ok
+INSERT INTO uoa_status_new VALUES (12);
+
+statement ok
+DELETE FROM uoa_status_new WHERE id = 10;
+
+statement ok
+PRAGMA refresh('mv_uoa_scalar');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT 'active' AS status, COUNT(*) AS n FROM uoa_status_orders WHERE delivered = false
+     UNION ALL
+     SELECT 'delivered', COUNT(*) FROM uoa_status_orders WHERE delivered = true
+     UNION ALL
+     SELECT 'new', COUNT(*) FROM uoa_status_new)
+    EXCEPT ALL SELECT * FROM mv_uoa_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_uoa_scalar
+    EXCEPT ALL
+    (SELECT 'active' AS status, COUNT(*) AS n FROM uoa_status_orders WHERE delivered = false
+     UNION ALL
+     SELECT 'delivered', COUNT(*) FROM uoa_status_orders WHERE delivered = true
+     UNION ALL
+     SELECT 'new', COUNT(*) FROM uoa_status_new)
+);
+----
+0
+
 # ==========================================
 # UNION ALL with constant branch
 # ==========================================

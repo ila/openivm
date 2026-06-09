@@ -14,6 +14,8 @@ namespace duckdb {
 
 namespace {
 
+static bool TopLevelIsUngroupedAggregate(LogicalOperator *root);
+
 static void AddVisibleGroupNames(vector<string> &group_columns, const vector<string> &names) {
 	for (auto &name : names) {
 		if (!IncrementalTableNames::IsInternalColumn(name)) {
@@ -35,6 +37,14 @@ static void DeduplicateGroupColumns(vector<string> &group_columns) {
 		}
 		seen_group.insert(candidate);
 		name = candidate;
+	}
+}
+
+static void AddAllVisibleOutputColumns(vector<string> &group_columns, const vector<string> &output_names) {
+	for (auto &name : output_names) {
+		if (!name.empty() && !IncrementalTableNames::IsInternalColumn(name)) {
+			group_columns.push_back(name);
+		}
 	}
 }
 
@@ -132,6 +142,9 @@ static void BuildUnsupportedReasons(DeltaViewModel &model, const CreateMVPlanFac
 	}
 	if (analysis.found_semi_anti_join && !analysis.found_aggregation && !input.semi_anti_aux_candidate) {
 		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::SEMI_ANTI_MISSING_AUX);
+	}
+	if (analysis.found_outer_join_under_setop && (!analysis.found_aggregation || model.group_columns.empty())) {
+		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_OPERATOR);
 	}
 	if (!analysis.incremental_compatible && model.unsupported_reasons.empty()) {
 		AddUnique(model.unsupported_reasons, DeltaUnsupportedReason::UNSUPPORTED_OPERATOR);
@@ -324,6 +337,49 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	if (analysis.found_semi_anti_join && analysis.found_aggregation && !model.group_columns.empty()) {
 		AddUnique(model.strategy_reasons, DeltaStrategyReason::SEMI_ANTI_AGGREGATE_GROUP_FALLBACK);
 	}
+	if (analysis.found_outer_join_under_setop && analysis.found_aggregation && !model.group_columns.empty()) {
+		AddUnique(model.strategy_reasons, DeltaStrategyReason::OUTER_JOIN_SETOP_CURRENT_DIFF_RECOMPUTE);
+	}
+}
+
+static bool NeedsVisibleOutputCurrentDiffFallback(const DeltaViewModel &model, const PlanAnalysis &analysis,
+                                                  const DeltaViewModelInput &input) {
+	if (!analysis.found_aggregation || !model.group_columns.empty()) {
+		return false;
+	}
+	if (input.facts && TopLevelIsUngroupedAggregate(input.facts->root)) {
+		return false;
+	}
+	if (analysis.found_grouping_sets || analysis.found_filtered_list || analysis.found_semi_anti_join) {
+		return false;
+	}
+	return analysis.found_join || analysis.found_nested_aggregate ||
+	       (input.facts && input.facts->has_union_before_aggregate);
+}
+
+static void AddVisibleOutputCurrentDiffFallback(DeltaViewModel &model, const PlanAnalysis &analysis,
+                                                const DeltaViewModelInput &input, const vector<string> &output_names) {
+	if (!NeedsVisibleOutputCurrentDiffFallback(model, analysis, input)) {
+		return;
+	}
+	AddAllVisibleOutputColumns(model.group_columns, output_names);
+	DeduplicateGroupColumns(model.group_columns);
+	if (!model.group_columns.empty()) {
+		AddUnique(model.strategy_reasons, DeltaStrategyReason::VISIBLE_OUTPUT_CURRENT_DIFF_RECOMPUTE);
+		AddUnique(model.features, DeltaModelFeature::CURRENT_DIFF_RECOMPUTE);
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Nested aggregate has no stable visible group key -- using %zu visible "
+		                    "output columns for CURRENT_DIFF GROUP_RECOMPUTE\n",
+		                    model.group_columns.size());
+	}
+}
+
+static bool HasStrategyReason(const DeltaViewModel &model, DeltaStrategyReason reason) {
+	for (auto existing : model.strategy_reasons) {
+		if (existing == reason) {
+			return true;
+		}
+	}
+	return false;
 }
 
 // Descend to the view-body output operator: the CREATE MATERIALIZED VIEW plan is a
@@ -368,6 +424,8 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		select_current_diff(DeltaStrategyReason::SAMPLE_CURRENT_DIFF_RECOMPUTE);
 	} else if (analysis.found_positional_join) {
 		select_current_diff(DeltaStrategyReason::POSITIONAL_CURRENT_DIFF_RECOMPUTE);
+	} else if (analysis.found_outer_join_under_setop && (!analysis.found_aggregation || model.group_columns.empty())) {
+		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_asof_join && analysis.found_window && !model.window_partition_columns.empty()) {
 		model.type = RefreshType::WINDOW_PARTITION;
 	} else if (analysis.found_asof_join && analysis.found_aggregation && !model.group_columns.empty()) {
@@ -430,7 +488,9 @@ static void SelectGroupRecomputeAffectedMode(DeltaViewModel &model, const DeltaV
 	bool aggregate_filter_join =
 	    input.stored_query_has_aggregate_filter && input.facts && input.facts->analysis.found_join;
 	if ((input.facts && input.facts->analysis.found_asof_join) || input.stored_query_has_top_k ||
-	    aggregate_filter_join || (input.stored_query_has_aggregate_filter && input.has_ducklake_source)) {
+	    aggregate_filter_join || (input.stored_query_has_aggregate_filter && input.has_ducklake_source) ||
+	    HasStrategyReason(model, DeltaStrategyReason::OUTER_JOIN_SETOP_CURRENT_DIFF_RECOMPUTE) ||
+	    HasStrategyReason(model, DeltaStrategyReason::VISIBLE_OUTPUT_CURRENT_DIFF_RECOMPUTE)) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF;
 	} else if (input.stored_query_has_aggregate_filter) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER;
@@ -483,6 +543,10 @@ const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
 		return "SAMPLE_CURRENT_DIFF_RECOMPUTE";
 	case DeltaStrategyReason::POSITIONAL_CURRENT_DIFF_RECOMPUTE:
 		return "POSITIONAL_CURRENT_DIFF_RECOMPUTE";
+	case DeltaStrategyReason::OUTER_JOIN_SETOP_CURRENT_DIFF_RECOMPUTE:
+		return "OUTER_JOIN_SETOP_CURRENT_DIFF_RECOMPUTE";
+	case DeltaStrategyReason::VISIBLE_OUTPUT_CURRENT_DIFF_RECOMPUTE:
+		return "VISIBLE_OUTPUT_CURRENT_DIFF_RECOMPUTE";
 	default:
 		return "UNKNOWN";
 	}
@@ -710,6 +774,7 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 	model.has_minmax_metadata = analysis.found_minmax || analysis.found_count_distinct || analysis.found_list;
 	model.distinct_at_top = IsDistinctAtTop(analysis, output_names);
 	BuildGroupColumns(model, facts, output_names);
+	AddVisibleOutputCurrentDiffFallback(model, analysis, input, output_names);
 
 	if ((analysis.found_left_join || analysis.found_full_outer) && analysis.found_aggregation &&
 	    OuterJoinAggregateNeedsRecompute(facts, analysis.group_index)) {

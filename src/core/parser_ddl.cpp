@@ -238,6 +238,11 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	if (preserve_result->HasError()) {
 		throw CatalogException("Failed to configure OpenIVM DDL connection: " + preserve_result->GetError());
 	}
+	auto expression_depth_result = conn->Query("SET max_expression_depth TO 10000");
+	if (expression_depth_result->HasError()) {
+		throw CatalogException("Failed to configure OpenIVM DDL expression depth: " +
+		                       expression_depth_result->GetError());
+	}
 	vector<string> cleanup_ddl;
 	auto run_cleanup = [&]() {
 		for (const auto &cleanup : cleanup_ddl) {
