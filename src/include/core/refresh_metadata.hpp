@@ -5,6 +5,8 @@
 #include "duckdb/main/connection.hpp"
 #include "core/openivm_constants.hpp"
 
+#include <unordered_map>
+
 namespace duckdb {
 
 // Centralized access to IVM metadata stored in system tables.
@@ -12,6 +14,25 @@ namespace duckdb {
 // behind typed methods. Takes a Connection reference — does NOT create its own.
 class RefreshMetadata {
 	Connection &con;
+
+	// The definition-stable columns of one openivm_views row. These are written once at
+	// CREATE (a CREATE OR REPLACE is a fresh statement with a fresh RefreshMetadata) and never
+	// mutated during a refresh, so they are memoized per-instance to collapse the half-dozen
+	// single-column round-trips that GenerateRefreshSQL used to issue per refresh.
+	struct ViewMetaRow {
+		bool found = false;
+		string sql_string;
+		RefreshType type {};
+		bool has_minmax = false;
+		bool has_left_join = false;
+		bool has_full_outer = false;
+		string full_outer_join_cols;
+	};
+	const ViewMetaRow &GetViewMeta(const string &view_name);
+	std::unordered_map<string, ViewMetaRow> view_meta_cache;
+	std::unordered_map<string, vector<string>> group_columns_cache;
+	std::unordered_map<string, vector<string>> aggregate_types_cache;
+	std::unordered_map<string, vector<string>> delta_tables_cache;
 
 public:
 	explicit RefreshMetadata(Connection &con) : con(con) {
@@ -242,6 +263,11 @@ public:
 
 	bool GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out);
 	static string ProjectionKeyLineageToJson(const ProjectionKeyLineage &lineage);
+
+	// openivm_left_key → preserved-side source lineage, persisted as a "left_join_key" entry. Reuses the
+	// ProjectionKeyLineage shape (a single identity arm). Drives the generic LEFT JOIN affected-key pushdown.
+	bool GetLeftJoinKeyLineage(const string &view_name, ProjectionKeyLineage &out);
+	static string LeftJoinKeyLineageToJson(const ProjectionKeyLineage &lineage);
 
 	struct FilteredGroupCountAuxMeta {
 		string aux_table;

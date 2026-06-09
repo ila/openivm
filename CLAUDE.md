@@ -19,7 +19,7 @@ Never execute git commands that could lose code. Always ask the user for permiss
 - **Every IVM refresh in a test MUST be cross-checked** with `EXCEPT ALL` in both directions to verify full bag equality between the MV and the base query. Never just check COUNT or specific values.
 - **Stress tests must batch many conflicting DML ops** (INSERT + DELETE + UPDATE on same rows) before a single refresh. Don't do 1 insert → refresh → 1 delete → refresh — that's not testing delta consolidation.
 - **Before implementing anything, search the existing codebase** for similar patterns or solutions. Check if a helper function, utility, or prior approach already addresses the problem. Reuse before reinventing.
-- **Use helper functions.** Factor shared logic into helpers rather than duplicating code. Check `src/include/rules/rule.hpp`, `src/rules/helpers.cpp`, and `src/include/core/sql_utils.hpp` for existing utilities.
+- **Use helper functions.** Factor shared logic into helpers rather than duplicating code. Check `src/delta/delta_helpers.cpp`, `src/upsert/refresh_helpers.cpp`, and `src/include/core/sql_utils.hpp` for existing utilities.
 - **Never edit the `duckdb/` submodule.** The DuckDB source is read-only. All IVM logic lives in `src/` and `test/`. If you need DuckDB internals, use the public API or ask the user.
 - **Keep the paper in mind.** OpenIVM is described in [OpenIVM: a SQL-to-SQL Compiler for Incremental Computations](https://arxiv.org/abs/2404.16486). Refer to it for the theoretical foundations (DBSP framework, Z-sets, delta rules) before making changes to core rewrite or upsert logic.
 - **Add `OPENIVM_DEBUG_PRINT` statements** at major code flow points (entry/exit of rewrite rules, upsert compilation, cost model decisions). Use the existing `OPENIVM_DEBUG_PRINT` macro from `src/include/core/openivm_debug.hpp` — it's compiled out when `OPENIVM_DEBUG` is 0.
@@ -62,24 +62,39 @@ When `PRAGMA refresh('view_name')` is called:
 2. **Upsert compilation** generates SQL to apply the deltas to the materialized view
 3. **Cost model** (when `openivm_adaptive_refresh = true`) decides whether IVM or full recompute is cheaper
 
-### Operator-Specific Rewrite Rules
+### Delta IR + Operator Dispatch
 
-`src/rules/incremental_rewrite_rule.cpp` dispatches based on operator type:
+Refresh planning builds a typed `DeltaViewModel` (a graph of `DeltaModelNode`, each carrying a kind,
+rule kind, maintenance mode, aux-state requirements, and lineage facts) from the optimized view plan —
+see `src/core/ivm_delta_model.cpp` and `src/core/ivm_view_classifier.cpp`. The `DeltaCompiler`
+(`src/delta/delta_compiler.cpp`) then walks the plan and lowers each node to a delta `DeltaPlanFragment`.
 
-| Operator | Rule Class | File |
+Dispatch is **single-sourced**: `NodeKindForOperator` (in `ivm_delta_model.cpp`) maps an operator type to
+a `DeltaModelNodeKind`, and `DispatchDeltaCompile` (`src/delta/operators/dispatch.cpp`) is the one switch
+that routes each kind to its `Compile*Delta` function. The model-driven path uses the node's kind; the
+copied-subtree path (join inclusion-exclusion terms, whose pointers aren't in the model) derives the kind
+from the operator type via the same `NodeKindForOperator`. Every returned fragment is checked for a valid
+multiplicity binding (`ValidateDeltaFragment`, a real exception in release builds).
+
+| Operator (`DeltaModelNodeKind`) | Compile function | File |
 |---|---|---|
-| Table Scan | `IncrementalScanRule` | `src/rules/scan.cpp` |
-| Inner/outer joins, cross product, any join | `IncrementalJoinRule` | `src/rules/join.cpp` |
-| DuckLake joins | N-term helper | `src/rules/ducklake_join.cpp` |
-| Projection | `IncrementalProjectionRule` | `src/rules/projection.cpp` |
-| Aggregate | `IncrementalAggregateRule` | `src/rules/aggregate.cpp` |
-| Filter | `IncrementalFilterRule` | `src/rules/filter.cpp` |
-| UNION ALL | `IncrementalUnionRule` | `src/rules/union.cpp` |
-| DISTINCT | `IncrementalDistinctRule` | `src/rules/distinct.cpp` |
-| Window | `IncrementalWindowRule` | `src/rules/window.cpp` |
-| ORDER BY / LIMIT / TOP_N | `IncrementalTopKRule` | `src/rules/topk.cpp` |
+| Table Scan (`SCAN`) | `CompileScanDelta` | `src/delta/operators/scan.cpp` |
+| Inner/outer joins, cross product, any join (`JOIN`/`SEMI_ANTI`) | `CompileJoinDelta` | `src/delta/operators/join.cpp` |
+| DuckLake / delim joins | `CompileDelimJoinDelta`, `Compile*` | `src/delta/operators/delim_join.cpp`, `ducklake_join.cpp` |
+| Projection (`PROJECT`) | `CompileProjectionDelta` | `src/delta/operators/` |
+| Aggregate (`AGGREGATE`) | `CompileAggregateDelta` | `src/delta/operators/` |
+| Filter (`FILTER`) | `CompileFilterDelta` | `src/delta/operators/` |
+| UNION ALL (`UNION`) | `CompileUnionDelta` | `src/delta/operators/` |
+| DISTINCT (`DISTINCT`) | `CompileDistinctDelta` | `src/delta/operators/` |
+| Window (`WINDOW`) | `CompileWindowDelta` | `src/delta/operators/` |
+| ORDER BY / LIMIT / TOP_N (`TOP_K`) | `CompileTopKDelta` | `src/delta/operators/` |
+| Constant leaf (`CONSTANT`) | `CompileConstantZeroDelta` (delta side) / `CompileStaticConstantLeaf` (copied base side) | `src/delta/operators/constant.cpp` |
 
-All rules inherit from `IncrementalRule` (`src/include/rules/rule.hpp`). Shared rule helpers live in `src/rules/helpers.cpp`.
+Shared delta-rule helpers live in `src/delta/delta_helpers.cpp` and the join helpers
+(`BuildMultiplicityProduct`, `CollectJoinLeaves`, …) in `src/delta/operators/join.cpp` /
+`src/include/delta/operators/`. The optimizer entry point is
+`src/rules/incremental_rewrite_rule.cpp` (detects the COMPUTEDELTA marker, builds the model, runs the
+compiler, adds the INSERT node).
 
 ### Join Delta Rule (Inclusion-Exclusion)
 
@@ -125,13 +140,16 @@ MIN/MAX and ARG_MIN/ARG_MAX usually force group-recompute unless insert-only fas
 - `src/core/parser.cpp` — parser extension for `CREATE MATERIALIZED VIEW`
 - `src/core/incremental_checker.cpp` — single-pass plan analysis and `RefreshType` classification metadata
 - `src/core/plan_rewrite.cpp` — CREATE-time logical-plan normalizations before LPTS and classification
-- `src/core/refresh_metadata.cpp` — system table queries (view definitions, delta tables, timestamps)
+- `src/core/refresh_metadata.cpp` — system table queries (view definitions, delta tables, timestamps); a `RefreshMetadata` instance memoizes definition-stable view columns
+- `src/core/ivm_delta_model.cpp` — `DeltaViewModel`/`DeltaModelNode` IR construction, `NodeKindForOperator`, lineage population (including the left-join-key lineage)
 - `src/core/sql_utils.cpp` — SQL string manipulation, file I/O, table name extraction
-- `src/rules/incremental_rewrite_rule.cpp` — rule dispatcher (routes to operator-specific rules)
+- `src/delta/delta_compiler.cpp` — `DeltaCompiler`: builds the refresh-time model and recursively lowers the plan to a delta plan
+- `src/delta/operators/dispatch.cpp` — single kind-based `DispatchDeltaCompile` + fragment-contract validation
+- `src/delta/operators/join.cpp` — join incrementalization (inclusion-exclusion; `BuildMultiplicityProduct`)
+- `src/delta/operators/ducklake_join.cpp` — DuckLake N-term telescoping join rule
+- `src/delta/delta_helpers.cpp` — shared delta-rule utilities (CreateDeltaGetNode, DuckLake delta nodes)
+- `src/rules/incremental_rewrite_rule.cpp` — optimizer entry point (COMPUTEDELTA marker → model → compile → INSERT)
 - `src/rules/refresh_insert_rule.cpp` — adds INSERT operators to inject deltas into views
-- `src/rules/join.cpp` — join incrementalization (inclusion-exclusion)
-- `src/rules/ducklake_join.cpp` — DuckLake N-term telescoping join rule
-- `src/rules/helpers.cpp` — shared rule utilities (CreateDeltaGetNode, DuckLake delta nodes)
 - `src/upsert/refresh.cpp` — PRAGMA refresh() handler, orchestrates delta computation
 - `src/upsert/refresh_compiler.cpp` — generates upsert SQL queries
 - `src/upsert/refresh_cost_model.cpp` — incremental refresh vs recompute cost estimation

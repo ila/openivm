@@ -24,13 +24,27 @@ unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, co
 
 void DemoteLeftJoins(LogicalOperator *node);
 
-void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf);
+// Append the multiplicity column to the parent join's projection map for the leaf at `path`.
+// include_delim_parents=false matches only plain comparison joins (the inclusion-exclusion path);
+// =true also matches delim/dependent joins (the delim-join path). Behavior-preserving union of the
+// former join-side and delim-side helpers.
+void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const vector<size_t> &path,
+                               LogicalOperator *leaf_node, bool include_delim_parents);
 
 unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
                                                  const vector<LogicalType> &types, Binder &binder);
 
 ColumnBinding ReplaceJoinOutputBindings(const vector<ColumnBinding> &original_bindings,
                                         unique_ptr<LogicalOperator> &result, LogicalOperator &root);
+
+// Build the combined multiplicity expression for one inclusion-exclusion term:
+//   (-1)^(k-1) * ∏ wᵢ   where k = mul_bindings.size()
+// i.e. the Z-set bilinear product of the per-leaf multiplicities times the Möbius
+// inclusion-exclusion sign (flip only when k is even). Shared by the 2^N-1 join rule
+// and the delim-join rule. See the call site in CompileJoinDelta for why the sign is
+// required by OpenIVM's "current base = R_old + ΔR" data layout.
+unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const LogicalType &mul_type,
+                                                const vector<ColumnBinding> &mul_bindings);
 
 } // namespace duckdb
 

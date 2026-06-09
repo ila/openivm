@@ -1185,15 +1185,8 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 
 		string delta_subselect;
 		if (spec.is_ducklake) {
-			delta_subselect =
-			    "(SELECT * FROM " +
-			    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.ducklake_catalog,
-			                                    spec.ducklake_schema, base, spec.last_snapshot_id,
-			                                    spec.current_snapshot_id) +
-			    "\nUNION ALL\nSELECT * FROM " +
-			    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.ducklake_catalog, spec.ducklake_schema,
-			                                    base, spec.last_snapshot_id, spec.current_snapshot_id) +
-			    ")";
+			delta_subselect = SqlUtils::BuildDuckLakeChangeFeed(spec.ducklake_catalog, spec.ducklake_schema, base,
+			                                                    spec.last_snapshot_id, spec.current_snapshot_id, "*");
 		} else {
 			string delta_basename = string(openivm::DELTA_PREFIX) + base;
 			delta_subselect =

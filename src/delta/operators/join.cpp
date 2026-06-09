@@ -4,6 +4,7 @@
 #include "delta/operators/join_key_probe.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "upsert/refresh_index_regen.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -436,26 +437,31 @@ static void DemoteLeftJoinsForMask(LogicalOperator *node, const vector<JoinLeafI
 	DemoteLeftJoinsForMaskRec(node, leaves, mask, path);
 }
 
-void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf) {
-	if (leaf.path.empty()) {
+void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const vector<size_t> &path,
+                               LogicalOperator *leaf_node, bool include_delim_parents) {
+	if (path.empty()) {
 		return;
 	}
-	size_t child_side = leaf.path.back();
+	size_t child_side = path.back();
 	unique_ptr<LogicalOperator> *parent = &term;
-	for (size_t s = 0; s + 1 < leaf.path.size(); s++) {
-		parent = &((*parent)->children[leaf.path[s]]);
+	for (size_t s = 0; s + 1 < path.size(); s++) {
+		parent = &((*parent)->children[path[s]]);
 	}
-	if ((*parent)->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto *join = dynamic_cast<LogicalComparisonJoin *>((*parent).get());
-		if (join) {
-			auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
-			if (!proj_map.empty()) {
-				idx_t mul_idx = leaf.node->GetColumnBindings().size();
-				proj_map.push_back(mul_idx);
-				OPENIVM_DEBUG_PRINT("[DeltaJoin] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
-				                    child_side == 0 ? "left" : "right");
-			}
-		}
+	auto *join = dynamic_cast<LogicalComparisonJoin *>((*parent).get());
+	if (!join) {
+		return;
+	}
+	// The inclusion-exclusion path only patches plain comparison joins; the delim-join path also patches
+	// delim/dependent joins (also LogicalComparisonJoin subclasses).
+	if (!include_delim_parents && (*parent)->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		return;
+	}
+	auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
+	if (!proj_map.empty()) {
+		idx_t mul_idx = leaf_node->GetColumnBindings().size();
+		proj_map.push_back(mul_idx);
+		OPENIVM_DEBUG_PRINT("[DeltaJoin] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
+		                    child_side == 0 ? "left" : "right");
 	}
 }
 
@@ -478,6 +484,7 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 	DeltaStatus status = {0, 0, 0, 0};
 	Connection con(*context.db);
 	con.SetAutoCommit(false);
+	RefreshMetadata metadata(con);
 
 	for (size_t i = 0; i < leaves.size(); i++) {
 		LogicalGet *get = GetLeafScan(leaves[i]);
@@ -519,14 +526,11 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 			continue;
 		}
 		string delta_name = SqlUtils::DeltaName(table_ref.get()->name);
-		// Get last_update timestamp for this view+table pair
-		auto ts_result = con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
-		                           " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
-		                           SqlUtils::EscapeValue(delta_name) + "'");
-		if (ts_result->HasError() || ts_result->RowCount() == 0) {
+		// Get last_update timestamp for this view+table pair (empty == no tracked delta row → skip).
+		string last_update = metadata.GetLastUpdate(view_name, delta_name);
+		if (last_update.empty()) {
 			continue;
 		}
-		string last_update = ts_result->GetValue(0, 0).ToString();
 
 		// Single query: get pending delta count, delete count, and current base
 		// cardinality. The base count lets us define "tiny" as <= max(8 rows,
@@ -652,6 +656,34 @@ static uint64_t ComputeSkipBits(const vector<FKRelation> &fk_relations, uint64_t
 	return skip_bits;
 }
 
+unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const LogicalType &mul_type,
+                                                const vector<ColumnBinding> &mul_bindings) {
+	FunctionBinder fbinder(binder);
+	unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[0]);
+	for (size_t i = 1; i < mul_bindings.size(); i++) {
+		vector<unique_ptr<Expression>> args;
+		args.push_back(std::move(product));
+		args.push_back(make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[i]));
+		ErrorData err;
+		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true /* is_operator */);
+		if (!product) {
+			throw InternalException("DeltaJoin: failed to bind '*' for combined multiplicity: %s", err.RawMessage());
+		}
+	}
+	// Apply Möbius inclusion-exclusion sign: (-1)^(k-1). Only flip when k is even.
+	if (mul_bindings.size() % 2 == 0) {
+		vector<unique_ptr<Expression>> args;
+		args.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
+		args.push_back(std::move(product));
+		ErrorData err;
+		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
+		if (!product) {
+			throw InternalException("DeltaJoin: failed to bind '*' for Möbius sign: %s", err.RawMessage());
+		}
+	}
+	return product;
+}
+
 // ============================================================================
 // BuildInclusionExclusionTerms: create 2^N - 1 delta terms
 // ============================================================================
@@ -694,6 +726,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 	}
 
 	Connection key_probe_con(*context.db);
+	RefreshMetadata key_probe_metadata(key_probe_con);
 	vector<JoinColumnRef> leaf_refs(N);
 	vector<vector<DeltaJoinKeyProbe>> key_probes(N);
 	// Key-domain pruning can erase the last remaining term when exactly one input
@@ -719,17 +752,15 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 			}
 			string table_name = table_ref.get()->name;
 			string delta_name = SqlUtils::DeltaName(table_name);
-			auto ts_result = key_probe_con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
-			                                     " WHERE view_name = '" + SqlUtils::EscapeValue(input.context.view) +
-			                                     "' AND table_name = '" + SqlUtils::EscapeValue(delta_name) + "'");
-			if (ts_result->HasError() || ts_result->RowCount() == 0 || ts_result->GetValue(0, 0).IsNull()) {
+			string last_update = key_probe_metadata.GetLastUpdate(input.context.view, delta_name);
+			if (last_update.empty()) {
 				continue;
 			}
 			leaf_refs[i].leaf_index = i;
 			leaf_refs[i].get = get;
 			leaf_refs[i].table_name = table_name;
 			leaf_refs[i].delta_name = delta_name;
-			leaf_refs[i].last_update = ts_result->GetValue(0, 0).ToString();
+			leaf_refs[i].last_update = last_update;
 
 			auto leaf_bindings = leaves[i].node->GetColumnBindings();
 			for (auto &binding : leaf_bindings) {
@@ -836,7 +867,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 					mul_bindings.push_back(rewritten.mul_binding);
 					subtree_ref = std::move(rewritten.op);
 				}
-				UpdateParentProjectionMap(term, leaves[i]);
+				UpdateParentProjectionMap(term, leaves[i].path, leaves[i].node, /*include_delim_parents=*/false);
 			}
 		}
 
@@ -878,31 +909,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 		//   k=3: w_1·w_2·w_3         (no sign flip)
 		//   k=4: -w_1·w_2·w_3·w_4    (sign flip)
 		// — verified algebraically on all sign combinations.
-		FunctionBinder fbinder(binder);
-		unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(input.mul_type, mul_bindings[0]);
-		for (size_t i = 1; i < mul_bindings.size(); i++) {
-			vector<unique_ptr<Expression>> args;
-			args.push_back(std::move(product));
-			args.push_back(make_uniq<BoundColumnRefExpression>(input.mul_type, mul_bindings[i]));
-			ErrorData err;
-			product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true /* is_operator */);
-			if (!product) {
-				throw InternalException("DeltaJoin: failed to bind '*' for combined multiplicity: %s",
-				                        err.RawMessage());
-			}
-		}
-		// Apply Möbius sign: (-1)^(k-1). Only flip when k is even.
-		if (mul_bindings.size() % 2 == 0) {
-			vector<unique_ptr<Expression>> args;
-			args.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
-			args.push_back(std::move(product));
-			ErrorData err;
-			product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
-			if (!product) {
-				throw InternalException("DeltaJoin: failed to bind '*' for Möbius sign: %s", err.RawMessage());
-			}
-		}
-		proj_exprs.push_back(std::move(product));
+		proj_exprs.push_back(BuildMultiplicityProduct(binder, input.mul_type, mul_bindings));
 
 		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(proj_exprs));
 		projection->children.push_back(std::move(term));

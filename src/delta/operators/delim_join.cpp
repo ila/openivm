@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "delta/operators/join.hpp"
+#include "delta/operators/join_key_probe.hpp"
 #include "upsert/refresh_index_regen.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
@@ -94,29 +95,6 @@ static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
 	return !join.duplicate_eliminated_columns.empty();
 }
 
-static void UpdateProjectionMapForLeaf(unique_ptr<LogicalOperator> &term, const BaseLeafInfo &leaf) {
-	if (leaf.path.empty()) {
-		return;
-	}
-	size_t child_side = leaf.path.back();
-	unique_ptr<LogicalOperator> *parent = &term;
-	for (size_t s = 0; s + 1 < leaf.path.size(); s++) {
-		parent = &((*parent)->children[leaf.path[s]]);
-	}
-	if (!IsJoinNode((*parent)->type)) {
-		return;
-	}
-	auto *join = dynamic_cast<LogicalComparisonJoin *>((*parent).get());
-	if (!join) {
-		return;
-	}
-	auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
-	if (!proj_map.empty()) {
-		idx_t mul_idx = leaf.node->GetColumnBindings().size();
-		proj_map.push_back(mul_idx);
-	}
-}
-
 static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, LogicalComparisonJoin &delim_join,
                                                        LogicalDelimGet &delim_get, bool allow_ordinal_fallback) {
 	if (delim_join.children.size() != 2) {
@@ -174,10 +152,6 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 }
 
 static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &replacer);
-
-static uint64_t BindingKey(const ColumnBinding &binding) {
-	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
-}
 
 static void AddColumnBindingReplacements(const vector<ColumnBinding> &old_bindings,
                                          const vector<ColumnBinding> &new_bindings,
@@ -333,35 +307,8 @@ static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &rep
 
 static void CollectMulBindings(const vector<ColumnBinding> &mul_bindings, unordered_set<uint64_t> &mul_set) {
 	for (auto &mb : mul_bindings) {
-		mul_set.insert(BindingKey(mb));
+		mul_set.insert(DeltaJoinBindingKey(mb));
 	}
-}
-
-static unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const LogicalType &mul_type,
-                                                       const vector<ColumnBinding> &mul_bindings) {
-	FunctionBinder fbinder(binder);
-	unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[0]);
-	for (size_t i = 1; i < mul_bindings.size(); i++) {
-		vector<unique_ptr<Expression>> args;
-		args.push_back(std::move(product));
-		args.push_back(make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[i]));
-		ErrorData err;
-		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
-		if (!product) {
-			throw InternalException("DeltaDelimJoin: failed to bind multiplicity product: %s", err.RawMessage());
-		}
-	}
-	if (mul_bindings.size() % 2 == 0) {
-		vector<unique_ptr<Expression>> args;
-		args.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
-		args.push_back(std::move(product));
-		ErrorData err;
-		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
-		if (!product) {
-			throw InternalException("DeltaDelimJoin: failed to bind multiplicity sign: %s", err.RawMessage());
-		}
-	}
-	return product;
 }
 
 static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
@@ -500,7 +447,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 			AddLeafBindingReplacements(leaf_bindings, delta_bindings, output_replacements, delta_i.mul_binding);
 			mul_bindings.push_back(delta_i.mul_binding);
 			leaf_ref = std::move(delta_i.node);
-			UpdateProjectionMapForLeaf(term, leaves[i]);
+			UpdateParentProjectionMap(term, leaves[i].path, leaves[i].node, /*include_delim_parents=*/true);
 		}
 
 		vector<ReplacementBinding> delim_replacements;
@@ -514,7 +461,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 		for (idx_t output_idx = 0; output_idx < original_bindings.size(); output_idx++) {
 			auto mapped_binding =
 			    MapTermBinding(original_bindings[output_idx], renumbered.idx_map, output_replacements);
-			if (mul_set.count(BindingKey(mapped_binding))) {
+			if (mul_set.count(DeltaJoinBindingKey(mapped_binding))) {
 				throw InternalException("DeltaDelimJoin: original output remapped to multiplicity binding");
 			}
 			auto output_binding = FindOutputBinding(term_bindings, mapped_binding);

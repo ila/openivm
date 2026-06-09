@@ -28,6 +28,9 @@ public:
 	static string SQLStatementPreview(const string &statement);
 	static string DeltaName(const string &name);
 	static string LastIdentifierPart(string name);
+	// Last identifier part with the IVM data-table prefix stripped (and the delta prefix too when
+	// strip_delta is set). Used to compare tracked table names against their logical base names.
+	static string StripTrackedTablePrefix(const string &name, bool strip_delta = false);
 	static string FullName(const string &catalog, const string &schema, const string &table);
 	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
 	static string QualifiedPrefix(const string &catalog, const string &schema);
@@ -36,6 +39,12 @@ public:
 	static string JsonArray(const vector<string> &values);
 	static string DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
+	// Build a DuckLake change feed for [last_snapshot_id, current_snapshot_id):
+	//   (<select_list> FROM ...insertions UNION ALL <select_list> FROM ...deletions)
+	// select_list is applied to both branches (e.g. "*", or "col AS alias").
+	static string BuildDuckLakeChangeFeed(const string &catalog, const string &schema, const string &table,
+	                                      int64_t last_snapshot_id, int64_t current_snapshot_id,
+	                                      const string &select_list);
 	static bool GetBoolSetting(ClientContext &context, const string &setting_name, bool default_value) {
 		Value setting_value;
 		if (context.TryGetCurrentSetting(setting_name, setting_value) && !setting_value.IsNull()) {

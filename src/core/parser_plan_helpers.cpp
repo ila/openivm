@@ -1228,6 +1228,56 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 	return false;
 }
 
+// First outer join in pre-order — matches ScanOuterJoins, which is the join RewriteLeftJoinKey traces
+// openivm_left_key from. Returns null if there is none.
+static LogicalComparisonJoin *FindFirstOuterJoin(LogicalOperator *node) {
+	if (!node) {
+		return nullptr;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = node->Cast<LogicalComparisonJoin>();
+		if ((join.join_type == JoinType::LEFT || join.join_type == JoinType::RIGHT) && !join.conditions.empty()) {
+			return &join;
+		}
+	}
+	for (auto &child : node->children) {
+		if (auto *found = FindFirstOuterJoin(child.get())) {
+			return found;
+		}
+	}
+	return nullptr;
+}
+
+bool BuildLeftJoinKeyLineage(const CreateMVPlanFacts &facts, RefreshMetadata::ProjectionKeyLineage &out) {
+	auto *outer = FindFirstOuterJoin(facts.root);
+	if (!outer) {
+		return false;
+	}
+	// Preserved side carries the surviving key (LEFT keeps left, RIGHT keeps right).
+	auto &condition = outer->conditions[0];
+	auto &preserved = outer->join_type == JoinType::RIGHT ? condition.right : condition.left;
+	auto *bcr = GetColumnRefThroughCasts(preserved.get());
+	if (!bcr) {
+		return false; // derived / non-column key — fall back to full recompute
+	}
+	OccurrenceColumnRef ref;
+	if (!ResolveBindingToOccurrenceRef(bcr->binding, facts, ref)) {
+		return false; // could not pin the key to a single source binding
+	}
+	RefreshMetadata::ProjectionKeyLineage lineage;
+	lineage.output_col = string(openivm::LEFT_KEY_COL);
+	lineage.key_source = ref.table;
+	lineage.key_occurrence = ref.occurrence;
+	lineage.key_col = ref.column;
+	RefreshMetadata::ProjectionKeyLineageArm arm;
+	arm.source = ref.table;
+	arm.occurrence = ref.occurrence;
+	arm.source_col = ref.column;
+	lineage.arms.push_back(std::move(arm));
+	out = std::move(lineage);
+	return true;
+}
+
 struct WindowLineageOp {
 	string kind;
 	string output_col;
@@ -1332,7 +1382,7 @@ static void CollectInnerJoinEdgesOccurrence(LogicalOperator *op, const CreateMVP
 }
 
 static void CollectWindowLookupEdges(LogicalOperator *op, const CreateMVPlanFacts &facts,
-                                     vector<WindowLookupEdge> &edges) {
+                                     vector<WindowLookupEdge> &edges, bool &has_unsafe_lookup_key) {
 	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 		auto &join = op->Cast<LogicalComparisonJoin>();
@@ -1347,6 +1397,15 @@ static void CollectWindowLookupEdges(LogicalOperator *op, const CreateMVPlanFact
 			auto *right = GetColumnRefThroughCasts(cond.right.get());
 			if (!left || !right) {
 				continue;
+			}
+			// The affected-keys lookup reproduces this equi-join as a raw `col IN (lookup_col)` probe over the
+			// base columns. If the join wrapped the keys in a cast to make incomparable types match (e.g.
+			// CAST(cik AS VARCHAR) = company_id, BIGINT vs VARCHAR), that probe would either fail to bind or
+			// silently under-count, so mark the lineage unsafe and let the view fall back to a full recompute.
+			// Differing-but-numeric types (e.g. INTEGER vs BIGINT) bind and compare by value, so they are safe.
+			if (left->return_type != right->return_type &&
+			    !(left->return_type.IsNumeric() && right->return_type.IsNumeric())) {
+				has_unsafe_lookup_key = true;
 			}
 			OccurrenceColumnRef lref, rref;
 			if (!ResolveBindingToOccurrenceRef(left->binding, facts, lref) ||
@@ -1372,7 +1431,7 @@ static void CollectWindowLookupEdges(LogicalOperator *op, const CreateMVPlanFact
 		}
 	}
 	for (auto &child : op->children) {
-		CollectWindowLookupEdges(child.get(), facts, edges);
+		CollectWindowLookupEdges(child.get(), facts, edges, has_unsafe_lookup_key);
 	}
 }
 
@@ -1467,10 +1526,14 @@ static RefreshMetadata::WindowPartitionLineageOp ToMetadataWindowLineageOp(const
 
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> &out,
-                                    vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out) {
+                                    vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out,
+                                    bool *out_unsafe_lookup) {
 	out.clear();
 	if (direct_out) {
 		direct_out->clear();
+	}
+	if (out_unsafe_lookup) {
+		*out_unsafe_lookup = false;
 	}
 	if (!facts.root || partition_columns.empty()) {
 		return false;
@@ -1494,7 +1557,11 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	vector<pair<OccurrenceColumnRef, OccurrenceColumnRef>> edges;
 	CollectInnerJoinEdgesOccurrence(plan, facts, edges);
 	vector<WindowLookupEdge> lookup_edges;
-	CollectWindowLookupEdges(plan, facts, lookup_edges);
+	bool unsafe_lookup_key = false;
+	CollectWindowLookupEdges(plan, facts, lookup_edges, unsafe_lookup_key);
+	if (out_unsafe_lookup) {
+		*out_unsafe_lookup = unsafe_lookup_key;
+	}
 
 	vector<WindowLineageOp> partition_ops;
 	for (auto &op : direct_ops) {

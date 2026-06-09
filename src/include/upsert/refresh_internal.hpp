@@ -27,6 +27,27 @@ struct DuckLakeSourceLocation {
 	string table_name;
 };
 
+// A DuckLake source table resolved for snapshot-diff refresh: its metadata key, physical location, and the
+// [old_snap, current_snap) range to diff. Shared by the projection-key and window-partition refresh paths.
+struct DuckLakeSourceSpec {
+	string metadata_key;
+	DuckLakeSourceLocation loc;
+	int64_t old_snap = -1;
+	int64_t current_snap = -1;
+};
+
+// Resolve every delta source for a view to a DuckLakeSourceSpec. Returns false (caller falls back) if any
+// source is not DuckLake-backed or its location/snapshots cannot be resolved.
+bool BuildDuckLakeSourceSpecs(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                              const vector<string> &delta_table_names, const string &view_catalog_name,
+                              const string &view_schema_name, const string &attached_db_catalog_name,
+                              const string &attached_db_schema_name, vector<DuckLakeSourceSpec> &specs);
+// Find the spec whose metadata key or physical table name matches table_name (prefix-insensitive).
+const DuckLakeSourceSpec *FindDuckLakeSourceSpec(const vector<DuckLakeSourceSpec> &specs, const string &table_name);
+// (insertions UNION ALL deletions) over a DuckLake source's snapshot range, projecting source_col AS output_col.
+string BuildDuckLakeChangedValuesSQL(const DuckLakeSourceSpec &spec, const string &source_col,
+                                     const string &output_col);
+
 struct DeltaFastPathFlags {
 	bool insert_only = false;
 	bool skip_agg_delete = false;

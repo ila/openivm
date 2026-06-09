@@ -1,0 +1,146 @@
+# name: test/sql/left_join_affected_pushdown.test
+# description: Generic lineage-driven LEFT JOIN affected-key pushdown (replaces the former fact_market_history hardcode)
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# ============================================================
+# D1: inner joins feeding a LEFT JOIN; the preserved-side left key
+# flows from a single source (security). Same shape as fact_market_history.
+# ============================================================
+
+statement ok
+CREATE TABLE company(cid INT, cname VARCHAR);
+
+statement ok
+CREATE TABLE security(sk INT, cid INT, sname VARCHAR);
+
+statement ok
+CREATE TABLE market(sk INT, px INT);
+
+statement ok
+INSERT INTO company VALUES (10, 'Acme'), (20, 'Globex');
+
+statement ok
+INSERT INTO security VALUES (1, 10, 'ACM'), (2, 20, 'GLX');
+
+statement ok
+INSERT INTO market VALUES (1, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW mh AS
+    SELECT sec.sk, sec.sname, c.cname, m.px
+    FROM company c JOIN security sec ON c.cid = sec.cid
+    LEFT JOIN market m ON sec.sk = m.sk;
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT sec.sk, sec.sname, c.cname, m.px FROM company c JOIN security sec ON c.cid = sec.cid
+  LEFT JOIN market m ON sec.sk = m.sk
+  EXCEPT ALL SELECT * FROM mh
+);
+----
+0
+
+# Batch a mix of INSERT + DELETE across all three sources before one refresh.
+statement ok
+INSERT INTO market VALUES (2, 200);
+
+statement ok
+INSERT INTO security VALUES (3, 10, 'ACM2');
+
+statement ok
+INSERT INTO company VALUES (30, 'Initech');
+
+statement ok
+DELETE FROM market WHERE sk = 1;
+
+statement ok
+PRAGMA refresh('mh');
+
+# The lineage-driven pushdown must FIRE: the recompute query pushes an EXISTS on
+# the affected keys into the key's source binding.
+query I
+SELECT contains(content, 'openivm_lj_src') AND contains(content, 'openivm_affected')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mh.sql');
+----
+true
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT sec.sk, sec.sname, c.cname, m.px FROM company c JOIN security sec ON c.cid = sec.cid
+  LEFT JOIN market m ON sec.sk = m.sk
+  EXCEPT ALL SELECT * FROM mh
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT * FROM mh
+  EXCEPT ALL
+  SELECT sec.sk, sec.sname, c.cname, m.px FROM company c JOIN security sec ON c.cid = sec.cid
+  LEFT JOIN market m ON sec.sk = m.sk
+);
+----
+0
+
+# ============================================================
+# D2: derived (non-identity) left key -> no lineage -> full-recompute
+# fallback. Results must still be correct (the optimization is skipped, not wrong).
+# ============================================================
+
+statement ok
+CREATE TABLE la(k INT, v INT);
+
+statement ok
+CREATE TABLE lb(k INT, w INT);
+
+statement ok
+INSERT INTO la VALUES (1, 5), (2, 6);
+
+statement ok
+INSERT INTO lb VALUES (2, 99);
+
+statement ok
+CREATE MATERIALIZED VIEW mh2 AS
+    SELECT la.k, la.v, lb.w
+    FROM la LEFT JOIN lb ON la.k + 1 = lb.k;
+
+statement ok
+INSERT INTO lb VALUES (3, 100);
+
+statement ok
+INSERT INTO la VALUES (3, 7);
+
+statement ok
+PRAGMA refresh('mh2');
+
+# Derived join key: pushdown does not fire; falls back to full LEFT JOIN recompute.
+query I
+SELECT contains(content, 'openivm_lj_src') FROM read_text('__TEST_DIR__/openivm_upsert_queries_mh2.sql');
+----
+false
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT la.k, la.v, lb.w FROM la LEFT JOIN lb ON la.k + 1 = lb.k
+  EXCEPT ALL SELECT * FROM mh2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT * FROM mh2
+  EXCEPT ALL
+  SELECT la.k, la.v, lb.w FROM la LEFT JOIN lb ON la.k + 1 = lb.k
+);
+----
+0

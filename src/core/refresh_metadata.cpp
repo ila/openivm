@@ -16,61 +16,66 @@ bool RefreshMetadata::IsBaseTable(const string &table_name) {
 	return !result->HasError() && result->RowCount() == 0;
 }
 
-string RefreshMetadata::GetViewQuery(const string &view_name) {
-	auto result = con.Query("SELECT sql_string FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0) {
-		return "";
+const RefreshMetadata::ViewMetaRow &RefreshMetadata::GetViewMeta(const string &view_name) {
+	auto cached = view_meta_cache.find(view_name);
+	if (cached != view_meta_cache.end()) {
+		return cached->second;
 	}
-	return result->GetValue(0, 0).ToString();
+	ViewMetaRow row;
+	auto result =
+	    con.Query("SELECT sql_string, type, has_minmax, has_left_join, has_full_outer, full_outer_join_cols FROM " +
+	              string(openivm::VIEWS_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	if (!result->HasError() && result->RowCount() > 0) {
+		row.found = true;
+		if (!result->GetValue(0, 0).IsNull()) {
+			row.sql_string = result->GetValue(0, 0).ToString();
+		}
+		if (!result->GetValue(1, 0).IsNull()) {
+			row.type = static_cast<RefreshType>(result->GetValue(1, 0).GetValue<int8_t>());
+		}
+		row.has_minmax = !result->GetValue(2, 0).IsNull() && result->GetValue(2, 0).GetValue<bool>();
+		row.has_left_join = !result->GetValue(3, 0).IsNull() && result->GetValue(3, 0).GetValue<bool>();
+		row.has_full_outer = !result->GetValue(4, 0).IsNull() && result->GetValue(4, 0).GetValue<bool>();
+		if (!result->GetValue(5, 0).IsNull()) {
+			row.full_outer_join_cols = result->GetValue(5, 0).ToString();
+		}
+	}
+	return view_meta_cache.emplace(view_name, std::move(row)).first->second;
+}
+
+string RefreshMetadata::GetViewQuery(const string &view_name) {
+	return GetViewMeta(view_name).sql_string;
 }
 
 RefreshType RefreshMetadata::GetViewType(const string &view_name) {
-	auto result = con.Query("SELECT type FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0) {
+	auto &meta = GetViewMeta(view_name);
+	if (!meta.found) {
 		throw ParserException("Materialized view '%s' does not exist in IVM metadata.", view_name);
 	}
-	return static_cast<RefreshType>(result->GetValue(0, 0).GetValue<int8_t>());
+	return meta.type;
 }
 
 bool RefreshMetadata::HasMinMax(const string &view_name) {
-	auto result = con.Query("SELECT has_minmax FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	return result->GetValue(0, 0).GetValue<bool>();
+	return GetViewMeta(view_name).has_minmax;
 }
 
 bool RefreshMetadata::HasLeftJoin(const string &view_name) {
-	auto result = con.Query("SELECT has_left_join FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	return result->GetValue(0, 0).GetValue<bool>();
+	return GetViewMeta(view_name).has_left_join;
 }
 
 bool RefreshMetadata::HasFullOuter(const string &view_name) {
-	auto result = con.Query("SELECT has_full_outer FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	return result->GetValue(0, 0).GetValue<bool>();
+	return GetViewMeta(view_name).has_full_outer;
 }
 
 string RefreshMetadata::GetFullOuterJoinCols(const string &view_name) {
-	auto result = con.Query("SELECT full_outer_join_cols FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return "";
-	}
-	return result->GetValue(0, 0).ToString();
+	return GetViewMeta(view_name).full_outer_join_cols;
 }
 
 vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
+	auto cached = delta_tables_cache.find(view_name);
+	if (cached != delta_tables_cache.end()) {
+		return cached->second;
+	}
 	auto result = con.Query("SELECT table_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<string> tables;
@@ -79,6 +84,7 @@ vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
 			tables.push_back(result->GetValue(0, i).ToString());
 		}
 	}
+	delta_tables_cache.emplace(view_name, tables);
 	return tables;
 }
 
@@ -251,39 +257,47 @@ vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
 }
 
 vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
+	auto cached = group_columns_cache.find(view_name);
+	if (cached != group_columns_cache.end()) {
+		return cached->second;
+	}
 	auto result = con.Query("SELECT group_columns FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<string> cols;
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return cols;
-	}
-	string raw = result->GetValue(0, 0).ToString();
-	// Split comma-separated column names
-	std::istringstream ss(raw);
-	string token;
-	while (std::getline(ss, token, ',')) {
-		if (!token.empty()) {
-			cols.push_back(token);
+	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
+		string raw = result->GetValue(0, 0).ToString();
+		// Split comma-separated column names
+		std::istringstream ss(raw);
+		string token;
+		while (std::getline(ss, token, ',')) {
+			if (!token.empty()) {
+				cols.push_back(token);
+			}
 		}
 	}
+	group_columns_cache.emplace(view_name, cols);
 	return cols;
 }
 
 vector<string> RefreshMetadata::GetAggregateTypes(const string &view_name) {
+	auto cached = aggregate_types_cache.find(view_name);
+	if (cached != aggregate_types_cache.end()) {
+		return cached->second;
+	}
 	auto result = con.Query("SELECT aggregate_types FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<string> types;
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return types;
-	}
-	string raw = result->GetValue(0, 0).ToString();
-	std::istringstream ss(raw);
-	string token;
-	while (std::getline(ss, token, ',')) {
-		if (!token.empty()) {
-			types.push_back(token);
+	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
+		string raw = result->GetValue(0, 0).ToString();
+		std::istringstream ss(raw);
+		string token;
+		while (std::getline(ss, token, ',')) {
+			if (!token.empty()) {
+				types.push_back(token);
+			}
 		}
 	}
+	aggregate_types_cache.emplace(view_name, types);
 	return types;
 }
 
@@ -848,11 +862,7 @@ string RefreshMetadata::WindowPartitionLineageToJson(const vector<WindowPartitio
 	return json;
 }
 
-bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out) {
-	string json;
-	if (!ReadRefreshLineageEntry(con, view_name, "projection_key", json)) {
-		return false;
-	}
+static bool ParseProjectionKeyLineageJson(const string &json, RefreshMetadata::ProjectionKeyLineage &out) {
 	if (!ExtractJsonString(json, "out", out.output_col) || !ExtractJsonString(json, "key_source", out.key_source) ||
 	    !ParseJsonIndex(json, "key_occ", out.key_occurrence) || !ExtractJsonString(json, "key_col", out.key_col)) {
 		return false;
@@ -860,7 +870,7 @@ bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, Projectio
 	out.arms.clear();
 	auto objects = ExtractJsonObjectsFromArray(json, "arms");
 	for (auto &object : objects) {
-		ProjectionKeyLineageArm arm;
+		RefreshMetadata::ProjectionKeyLineageArm arm;
 		if (!ExtractJsonString(object, "source", arm.source) || !ParseJsonIndex(object, "occ", arm.occurrence) ||
 		    !ExtractJsonString(object, "source_col", arm.source_col)) {
 			continue;
@@ -872,7 +882,7 @@ bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, Projectio
 			if (fields.size() != 4) {
 				continue;
 			}
-			ProjectionKeyLineageStep step;
+			RefreshMetadata::ProjectionKeyLineageStep step;
 			step.table = fields[0];
 			try {
 				step.occurrence = static_cast<idx_t>(std::stoull(fields[1]));
@@ -888,8 +898,25 @@ bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, Projectio
 	return !out.arms.empty();
 }
 
-string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &lineage) {
-	string json = "{\"k\":\"projection_key\",\"out\":" + SqlUtils::JsonQuote(lineage.output_col) +
+bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out) {
+	string json;
+	if (!ReadRefreshLineageEntry(con, view_name, "projection_key", json)) {
+		return false;
+	}
+	return ParseProjectionKeyLineageJson(json, out);
+}
+
+bool RefreshMetadata::GetLeftJoinKeyLineage(const string &view_name, ProjectionKeyLineage &out) {
+	string json;
+	if (!ReadRefreshLineageEntry(con, view_name, "left_join_key", json)) {
+		return false;
+	}
+	return ParseProjectionKeyLineageJson(json, out);
+}
+
+static string ProjectionKeyLineageToJsonWithKind(const RefreshMetadata::ProjectionKeyLineage &lineage,
+                                                 const char *kind) {
+	string json = "{\"k\":" + SqlUtils::JsonQuote(kind) + ",\"out\":" + SqlUtils::JsonQuote(lineage.output_col) +
 	              ",\"key_source\":" + SqlUtils::JsonQuote(lineage.key_source) +
 	              ",\"key_occ\":" + SqlUtils::JsonQuote(to_string(lineage.key_occurrence)) +
 	              ",\"key_col\":" + SqlUtils::JsonQuote(lineage.key_col) + ",\"arms\":[";
@@ -913,6 +940,14 @@ string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &l
 	}
 	json += "]}";
 	return json;
+}
+
+string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &lineage) {
+	return ProjectionKeyLineageToJsonWithKind(lineage, "projection_key");
+}
+
+string RefreshMetadata::LeftJoinKeyLineageToJson(const ProjectionKeyLineage &lineage) {
+	return ProjectionKeyLineageToJsonWithKind(lineage, "left_join_key");
 }
 
 bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {

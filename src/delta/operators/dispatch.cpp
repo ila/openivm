@@ -31,6 +31,70 @@ static bool IsDelimJoinShape(LogicalOperatorType type) {
 	return type == LogicalOperatorType::LOGICAL_DELIM_JOIN || type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN;
 }
 
+// Every delta fragment must expose exactly one multiplicity column as a real output binding — that is the
+// compositional contract the parent operator relies on. Enforce it at every dispatch boundary (a real
+// exception, not a D_ASSERT, so the invariant holds in release builds too).
+static void ValidateDeltaFragment(const DeltaPlanFragment &fragment, LogicalOperatorType op_type,
+                                  DeltaModelNodeKind kind) {
+	if (!fragment.op) {
+		throw InternalException("Delta compile produced a null fragment for %s (kind %s)",
+		                        LogicalOperatorToString(op_type), DeltaModelNodeKindName(kind));
+	}
+	if (fragment.mul_binding.table_index == DConstants::INVALID_INDEX) {
+		throw InternalException("Delta fragment for %s (kind %s) has no multiplicity binding",
+		                        LogicalOperatorToString(op_type), DeltaModelNodeKindName(kind));
+	}
+}
+
+// Single source of truth for delta compilation. Both the model-driven path and the copied-subtree path
+// route through here keyed on DeltaModelNodeKind, so there is exactly one operator->compiler table to keep
+// in sync. The only state-dependent case is a constant leaf: inside a copied "current-base" join term it
+// must emit its static content (multiplicity +1), everywhere else it emits an empty (zero) delta.
+static DeltaPlanFragment DispatchDeltaCompile(const DeltaOperatorInput &input, DeltaModelNodeKind kind) {
+	auto op_type = input.plan->type;
+	DeltaPlanFragment fragment = [&]() -> DeltaPlanFragment {
+		switch (kind) {
+		case DeltaModelNodeKind::SCAN:
+			return CompileScanDelta(input);
+		case DeltaModelNodeKind::FILTER:
+			return CompileFilterDelta(input);
+		case DeltaModelNodeKind::PROJECT:
+			return CompileProjectionDelta(input);
+		case DeltaModelNodeKind::AGGREGATE:
+			return CompileAggregateDelta(input);
+		case DeltaModelNodeKind::JOIN:
+		case DeltaModelNodeKind::SEMI_ANTI:
+			return IsDelimJoinShape(op_type) ? CompileDelimJoinDelta(input) : CompileJoinDelta(input);
+		case DeltaModelNodeKind::UNION:
+			return CompileUnionDelta(input);
+		case DeltaModelNodeKind::DISTINCT:
+			return CompileDistinctDelta(input);
+		case DeltaModelNodeKind::WINDOW:
+			return CompileWindowDelta(input);
+		case DeltaModelNodeKind::TOP_K:
+			return CompileTopKDelta(input);
+		case DeltaModelNodeKind::CTE:
+			return CompileCteDelta(input);
+		case DeltaModelNodeKind::UNNEST:
+			return CompileUnnestDelta(input);
+		case DeltaModelNodeKind::CONSTANT:
+			return input.copied_subtree ? CompileStaticConstantLeaf(input) : CompileConstantZeroDelta(input);
+		case DeltaModelNodeKind::ASOF_JOIN:
+			return CompileAsofJoinDelta(input);
+		case DeltaModelNodeKind::POSITIONAL_JOIN:
+			return CompilePositionalJoinDelta(input);
+		case DeltaModelNodeKind::SAMPLE:
+			return CompileSampleDelta(input);
+		case DeltaModelNodeKind::OTHER:
+		default:
+			throw NotImplementedException("Delta compiler: operator %s (kind %s) not supported",
+			                              LogicalOperatorToString(op_type), DeltaModelNodeKindName(kind));
+		}
+	}();
+	ValidateDeltaFragment(fragment, op_type, kind);
+	return fragment;
+}
+
 } // namespace
 
 const char *DeltaOperatorStrategyName(DeltaOperatorStrategy strategy) {
@@ -95,98 +159,16 @@ void LogDeltaOperatorStrategy(const DeltaOperatorInput &input, DeltaOperatorStra
 
 DeltaPlanFragment CompileDeltaOperatorWithModel(const DeltaOperatorInput &input, const DeltaModelNode &node) {
 	ValidateCompileNode(node, input.plan.get());
-	auto node_input = input.WithNode(node);
-	switch (node.kind) {
-	case DeltaModelNodeKind::SCAN:
-		return CompileScanDelta(node_input);
-	case DeltaModelNodeKind::FILTER:
-		return CompileFilterDelta(node_input);
-	case DeltaModelNodeKind::PROJECT:
-		return CompileProjectionDelta(node_input);
-	case DeltaModelNodeKind::AGGREGATE:
-		return CompileAggregateDelta(node_input);
-	case DeltaModelNodeKind::JOIN:
-	case DeltaModelNodeKind::SEMI_ANTI:
-		return IsDelimJoinShape(node_input.plan->type) ? CompileDelimJoinDelta(node_input)
-		                                               : CompileJoinDelta(node_input);
-	case DeltaModelNodeKind::UNION:
-		return CompileUnionDelta(node_input);
-	case DeltaModelNodeKind::DISTINCT:
-		return CompileDistinctDelta(node_input);
-	case DeltaModelNodeKind::WINDOW:
-		return CompileWindowDelta(node_input);
-	case DeltaModelNodeKind::TOP_K:
-		return CompileTopKDelta(node_input);
-	case DeltaModelNodeKind::CTE:
-		return CompileCteDelta(node_input);
-	case DeltaModelNodeKind::UNNEST:
-		return CompileUnnestDelta(node_input);
-	case DeltaModelNodeKind::CONSTANT:
-		return CompileConstantZeroDelta(node_input);
-	case DeltaModelNodeKind::ASOF_JOIN:
-		return CompileAsofJoinDelta(node_input);
-	case DeltaModelNodeKind::POSITIONAL_JOIN:
-		return CompilePositionalJoinDelta(node_input);
-	case DeltaModelNodeKind::SAMPLE:
-		return CompileSampleDelta(node_input);
-	case DeltaModelNodeKind::OTHER:
-		throw NotImplementedException("Delta model node kind %s not supported", DeltaModelNodeKindName(node.kind));
-	default:
-		throw NotImplementedException("Delta model node kind %s not supported", DeltaModelNodeKindName(node.kind));
-	}
+	return DispatchDeltaCompile(input.WithNode(node), node.kind);
 }
 
 DeltaPlanFragment CompileCopiedDeltaSubtree(DeltaOperatorInput input) {
 	OPENIVM_DEBUG_PRINT("[Copied Delta Subtree] Visiting node: %s\n",
 	                    LogicalOperatorToString(input.plan->type).c_str());
 	OPENIVM_DEBUG_PRINT("[Copied Delta Subtree] Node detail: %s\n", input.plan->ToString().c_str());
-
-	switch (input.plan->type) {
-	case LogicalOperatorType::LOGICAL_GET:
-		return CompileScanDelta(input);
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_JOIN:
-	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-	case LogicalOperatorType::LOGICAL_ANY_JOIN:
-		return CompileJoinDelta(input);
-	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
-		return CompileDelimJoinDelta(input);
-	case LogicalOperatorType::LOGICAL_PROJECTION:
-		return CompileProjectionDelta(input);
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
-		return CompileAggregateDelta(input);
-	case LogicalOperatorType::LOGICAL_FILTER:
-		return CompileFilterDelta(input);
-	case LogicalOperatorType::LOGICAL_UNION:
-		return CompileUnionDelta(input);
-	case LogicalOperatorType::LOGICAL_DISTINCT:
-		return CompileDistinctDelta(input);
-	case LogicalOperatorType::LOGICAL_WINDOW:
-		return CompileWindowDelta(input);
-	case LogicalOperatorType::LOGICAL_TOP_N:
-	case LogicalOperatorType::LOGICAL_LIMIT:
-	case LogicalOperatorType::LOGICAL_ORDER_BY:
-		return CompileTopKDelta(input);
-	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-	case LogicalOperatorType::LOGICAL_CTE_REF:
-		return CompileCteDelta(input);
-	case LogicalOperatorType::LOGICAL_UNNEST:
-		return CompileUnnestDelta(input);
-	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
-		return CompileAsofJoinDelta(input);
-	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
-		return CompilePositionalJoinDelta(input);
-	case LogicalOperatorType::LOGICAL_SAMPLE:
-		return CompileSampleDelta(input);
-	case LogicalOperatorType::LOGICAL_CHUNK_GET:
-	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
-	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
-		return CompileStaticConstantLeaf(input);
-	default:
-		throw NotImplementedException("Copied subtree operator type %s not supported",
-		                              LogicalOperatorToString(input.plan->type));
-	}
+	// Copied subtrees (join inclusion-exclusion terms) carry fresh operator pointers that are not in the
+	// model, so derive the kind from the operator type — the same mapping the model itself was built from.
+	return DispatchDeltaCompile(input, NodeKindForOperator(*input.plan));
 }
 
 DeltaPlanFragment CompileNonModelLeaf(DeltaOperatorInput input) {

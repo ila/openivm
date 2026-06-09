@@ -664,6 +664,31 @@ string SqlUtils::DuckLakeTableFunction(const string &function_name, const string
 	       "', " + to_string(last_snapshot_id) + ", " + to_string(current_snapshot_id) + ")";
 }
 
+string SqlUtils::StripTrackedTablePrefix(const string &name, bool strip_delta) {
+	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
+	static const string delta_prefix(openivm::DELTA_PREFIX);
+	string last = LastIdentifierPart(name);
+	if (last.size() > data_prefix.size() && last.rfind(data_prefix, 0) == 0) {
+		return last.substr(data_prefix.size());
+	}
+	if (strip_delta && last.size() > delta_prefix.size() && last.rfind(delta_prefix, 0) == 0) {
+		return last.substr(delta_prefix.size());
+	}
+	return last;
+}
+
+string SqlUtils::BuildDuckLakeChangeFeed(const string &catalog, const string &schema, const string &table,
+                                         int64_t last_snapshot_id, int64_t current_snapshot_id,
+                                         const string &select_list) {
+	string insertions = "SELECT " + select_list + " FROM " +
+	                    DuckLakeTableFunction("ducklake_table_insertions", catalog, schema, table, last_snapshot_id,
+	                                          current_snapshot_id);
+	string deletions = "SELECT " + select_list + " FROM " +
+	                   DuckLakeTableFunction("ducklake_table_deletions", catalog, schema, table, last_snapshot_id,
+	                                         current_snapshot_id);
+	return "(" + insertions + "\nUNION ALL\n" + deletions + ")";
+}
+
 bool SqlUtils::IsDelta(const string &name) {
 	static const string prefix(openivm::DELTA_PREFIX);
 	return name.size() >= prefix.size() && name.rfind(prefix, 0) == 0;

@@ -12,6 +12,62 @@
 
 namespace duckdb {
 
+// Map a logical operator to its delta-model node kind. This is the single source of truth for
+// operator-type -> kind, used both at model-build time and by the delta compiler's dispatch when no
+// model node exists (copied join subtrees, whose pointers are not in the model).
+DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET:
+		return DeltaModelNodeKind::SCAN;
+	case LogicalOperatorType::LOGICAL_FILTER:
+		return DeltaModelNodeKind::FILTER;
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+		return DeltaModelNodeKind::PROJECT;
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		return DeltaModelNodeKind::AGGREGATE;
+	case LogicalOperatorType::LOGICAL_WINDOW:
+		return DeltaModelNodeKind::WINDOW;
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+		return DeltaModelNodeKind::DISTINCT;
+	case LogicalOperatorType::LOGICAL_UNION:
+		return DeltaModelNodeKind::UNION;
+	case LogicalOperatorType::LOGICAL_TOP_N:
+	case LogicalOperatorType::LOGICAL_LIMIT:
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+		return DeltaModelNodeKind::TOP_K;
+	case LogicalOperatorType::LOGICAL_UNNEST:
+		return DeltaModelNodeKind::UNNEST;
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+		return DeltaModelNodeKind::ASOF_JOIN;
+	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
+		return DeltaModelNodeKind::POSITIONAL_JOIN;
+	case LogicalOperatorType::LOGICAL_SAMPLE:
+		return DeltaModelNodeKind::SAMPLE;
+	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
+	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
+	case LogicalOperatorType::LOGICAL_CHUNK_GET:
+		return DeltaModelNodeKind::CONSTANT;
+	case LogicalOperatorType::LOGICAL_CTE_REF:
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+		return DeltaModelNodeKind::CTE;
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+	case LogicalOperatorType::LOGICAL_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
+		auto *join = dynamic_cast<LogicalJoin *>(&op);
+		if (join && (join->join_type == JoinType::SEMI || join->join_type == JoinType::ANTI ||
+		             join->join_type == JoinType::MARK)) {
+			return DeltaModelNodeKind::SEMI_ANTI;
+		}
+		return DeltaModelNodeKind::JOIN;
+	}
+	default:
+		return DeltaModelNodeKind::OTHER;
+	}
+}
+
 namespace {
 
 static bool ContainsStringCI(const vector<string> &values, const string &candidate) {
@@ -83,59 +139,6 @@ static vector<string> SourceTablesFromChildren(const DeltaViewModel &model, cons
 		}
 	}
 	return tables;
-}
-
-static DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
-	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_GET:
-		return DeltaModelNodeKind::SCAN;
-	case LogicalOperatorType::LOGICAL_FILTER:
-		return DeltaModelNodeKind::FILTER;
-	case LogicalOperatorType::LOGICAL_PROJECTION:
-		return DeltaModelNodeKind::PROJECT;
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
-		return DeltaModelNodeKind::AGGREGATE;
-	case LogicalOperatorType::LOGICAL_WINDOW:
-		return DeltaModelNodeKind::WINDOW;
-	case LogicalOperatorType::LOGICAL_DISTINCT:
-		return DeltaModelNodeKind::DISTINCT;
-	case LogicalOperatorType::LOGICAL_UNION:
-		return DeltaModelNodeKind::UNION;
-	case LogicalOperatorType::LOGICAL_TOP_N:
-	case LogicalOperatorType::LOGICAL_LIMIT:
-	case LogicalOperatorType::LOGICAL_ORDER_BY:
-		return DeltaModelNodeKind::TOP_K;
-	case LogicalOperatorType::LOGICAL_UNNEST:
-		return DeltaModelNodeKind::UNNEST;
-	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
-		return DeltaModelNodeKind::ASOF_JOIN;
-	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
-		return DeltaModelNodeKind::POSITIONAL_JOIN;
-	case LogicalOperatorType::LOGICAL_SAMPLE:
-		return DeltaModelNodeKind::SAMPLE;
-	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
-	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
-	case LogicalOperatorType::LOGICAL_CHUNK_GET:
-		return DeltaModelNodeKind::CONSTANT;
-	case LogicalOperatorType::LOGICAL_CTE_REF:
-	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-		return DeltaModelNodeKind::CTE;
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_ANY_JOIN:
-	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
-	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-	case LogicalOperatorType::LOGICAL_JOIN:
-	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT: {
-		auto *join = dynamic_cast<LogicalJoin *>(&op);
-		if (join && (join->join_type == JoinType::SEMI || join->join_type == JoinType::ANTI ||
-		             join->join_type == JoinType::MARK)) {
-			return DeltaModelNodeKind::SEMI_ANTI;
-		}
-		return DeltaModelNodeKind::JOIN;
-	}
-	default:
-		return DeltaModelNodeKind::OTHER;
-	}
 }
 
 static DeltaRuleKind RuleKindForNode(DeltaModelNodeKind kind, LogicalOperator &op, const DeltaViewModel &model,
@@ -624,8 +627,18 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 	const auto &analysis = facts.analysis;
 	if (model.type == RefreshType::WINDOW_PARTITION) {
 		vector<RefreshMetadata::WindowPartitionLineageOp> direct_lineage_ops;
-		bool has_lineage = BuildWindowPartitionLineageOps(facts, model.window_partition_columns,
-		                                                  model.window_lineage_ops, &direct_lineage_ops);
+		bool unsafe_lookup = false;
+		bool has_lineage = BuildWindowPartitionLineageOps(
+		    facts, model.window_partition_columns, model.window_lineage_ops, &direct_lineage_ops, &unsafe_lookup);
+		// A cast-incomparable lookup join key (e.g. CAST(cik AS VARCHAR) = company_id) can't be reproduced as a
+		// safe affected-keys probe — fall back to a full current-diff recompute rather than risk under-counting.
+		if (unsafe_lookup) {
+			model.type = RefreshType::CURRENT_DIFF_RECOMPUTE;
+			model.window_lineage_ops.clear();
+			AddUnique(model.features, DeltaModelFeature::CURRENT_DIFF_RECOMPUTE);
+			ValidateDeltaViewModelInvariants(model);
+			return;
+		}
 		if (analysis.found_asof_join &&
 		    (!has_lineage || AsofWindowPartitionReadsRightSideDirectly(direct_lineage_ops, model) ||
 		     !WindowLineageCoversAllSources(model.window_lineage_ops, facts))) {
@@ -693,6 +706,9 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 			AddAffectedDomain(model, std::move(domain));
 		}
 	}
+	if (model.type == RefreshType::SIMPLE_PROJECTION && analysis.found_left_join && !analysis.found_full_outer) {
+		model.has_left_join_key_lineage = BuildLeftJoinKeyLineage(facts, model.left_join_key_lineage);
+	}
 	if (model.HasSemiAntiAux()) {
 		for (auto &col : model.semi_anti_aux.left_cols) {
 			DeltaLineageFact fact;
@@ -713,6 +729,9 @@ string BuildDeltaViewModelLineageJson(const DeltaViewModel &model) {
 	}
 	if (model.has_projection_lineage) {
 		entries.push_back(RefreshMetadata::ProjectionKeyLineageToJson(model.projection_lineage));
+	}
+	if (model.has_left_join_key_lineage) {
+		entries.push_back(RefreshMetadata::LeftJoinKeyLineageToJson(model.left_join_key_lineage));
 	}
 	return BuildRefreshLineageJson(entries);
 }

@@ -120,9 +120,14 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 string BuildRefreshLineageJson(const vector<string> &entries);
 bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector<string> &partition_columns,
                                     vector<RefreshMetadata::WindowPartitionLineageOp> &out,
-                                    vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
+                                    vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr,
+                                    bool *out_unsafe_lookup = nullptr);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                RefreshMetadata::ProjectionKeyLineage &out);
+// Trace the hidden openivm_left_key column to the preserved-side source binding of the first outer join,
+// producing a single-arm ProjectionKeyLineage. Returns false (caller falls back to full LEFT JOIN
+// recompute) when the key is derived/multi-source or the source cannot be resolved.
+bool BuildLeftJoinKeyLineage(const CreateMVPlanFacts &facts, RefreshMetadata::ProjectionKeyLineage &out);
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,
                                                  const vector<string> &output_names);
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts);
