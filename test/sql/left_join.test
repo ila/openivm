@@ -1123,3 +1123,123 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# LEFT JOIN with a table-function / VALUES preserved side and a
+# cast or derived (EXTRACT) join key.
+# Regression: RewriteOuterJoinSupport's ReadColumnRefBinding only read a bare
+# BOUND_COLUMN_REF, so a CAST/EXTRACT-wrapped null-side key left the match-count
+# binding at the default ColumnBinding (INVALID_INDEX), which then could not be
+# serialized by LPTS (NotImplementedException). Now the inner column ref is
+# unwrapped. The generate_series/range/VALUES side is constant; only the base
+# table produces deltas.
+# ============================================================
+
+statement ok
+CREATE TABLE tflj_cust (C_ID INT, C_W_ID INT);
+
+statement ok
+INSERT INTO tflj_cust VALUES (1,1),(2,2),(3,3),(4,1),(5,2);
+
+# (a) cast on the null-side equi key (INT col = BIGINT series)
+statement ok
+CREATE MATERIALIZED VIEW tflj_cast_mv AS
+  SELECT s AS wid, COUNT(c.C_ID) AS cust_count
+  FROM generate_series(1, 5) t(s) LEFT JOIN tflj_cust c ON c.C_W_ID = t.s GROUP BY s;
+
+# (b) EXTRACT-derived null-side key
+statement ok
+CREATE TABLE tflj_ord (O_ID INT, O_ENTRY_D TIMESTAMP);
+
+statement ok
+INSERT INTO tflj_ord VALUES (1,'2024-01-15'),(2,'2024-03-20'),(3,'2024-03-25');
+
+statement ok
+CREATE MATERIALIZED VIEW tflj_extract_mv AS
+  SELECT g.m AS month_num, COUNT(o.O_ID) AS orders
+  FROM generate_series(1, 12) g(m) LEFT JOIN tflj_ord o ON EXTRACT(MONTH FROM o.O_ENTRY_D) = g.m GROUP BY g.m;
+
+# (c) inequality null-side key with a cast, over VALUES
+statement ok
+CREATE MATERIALIZED VIEW tflj_ineq_mv AS
+  SELECT m.lbl, COUNT(c.C_ID) AS customers
+  FROM (VALUES (1,'a'),(2,'b'),(3,'c')) AS m(thr, lbl) LEFT JOIN tflj_cust c ON c.C_W_ID <= m.thr GROUP BY m.lbl;
+
+# Batch conflicting DML across both base tables before one refresh.
+statement ok
+INSERT INTO tflj_cust VALUES (6,3),(7,1),(8,5);
+
+statement ok
+DELETE FROM tflj_cust WHERE C_ID=2;
+
+statement ok
+UPDATE tflj_cust SET C_W_ID=4 WHERE C_ID=4;
+
+statement ok
+INSERT INTO tflj_ord VALUES (4,'2024-03-10'),(5,'2024-05-05');
+
+statement ok
+DELETE FROM tflj_ord WHERE O_ID=1;
+
+statement ok
+UPDATE tflj_ord SET O_ENTRY_D='2024-03-28' WHERE O_ID=3;
+
+statement ok
+PRAGMA refresh('tflj_cast_mv');
+
+statement ok
+PRAGMA refresh('tflj_extract_mv');
+
+statement ok
+PRAGMA refresh('tflj_ineq_mv');
+
+# (a) cast — EXCEPT ALL both directions
+query I
+SELECT COUNT(*) FROM (
+  (SELECT s AS wid, COUNT(c.C_ID) AS cust_count FROM generate_series(1, 5) t(s) LEFT JOIN tflj_cust c ON c.C_W_ID = t.s GROUP BY s)
+  EXCEPT ALL SELECT * FROM tflj_cast_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT * FROM tflj_cast_mv
+  EXCEPT ALL (SELECT s AS wid, COUNT(c.C_ID) AS cust_count FROM generate_series(1, 5) t(s) LEFT JOIN tflj_cust c ON c.C_W_ID = t.s GROUP BY s)
+);
+----
+0
+
+# (b) EXTRACT — EXCEPT ALL both directions
+query I
+SELECT COUNT(*) FROM (
+  (SELECT g.m AS month_num, COUNT(o.O_ID) AS orders FROM generate_series(1, 12) g(m) LEFT JOIN tflj_ord o ON EXTRACT(MONTH FROM o.O_ENTRY_D) = g.m GROUP BY g.m)
+  EXCEPT ALL SELECT * FROM tflj_extract_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT * FROM tflj_extract_mv
+  EXCEPT ALL (SELECT g.m AS month_num, COUNT(o.O_ID) AS orders FROM generate_series(1, 12) g(m) LEFT JOIN tflj_ord o ON EXTRACT(MONTH FROM o.O_ENTRY_D) = g.m GROUP BY g.m)
+);
+----
+0
+
+# (c) inequality over VALUES — EXCEPT ALL both directions
+query I
+SELECT COUNT(*) FROM (
+  (SELECT m.lbl, COUNT(c.C_ID) AS customers FROM (VALUES (1,'a'),(2,'b'),(3,'c')) AS m(thr, lbl) LEFT JOIN tflj_cust c ON c.C_W_ID <= m.thr GROUP BY m.lbl)
+  EXCEPT ALL SELECT * FROM tflj_ineq_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT * FROM tflj_ineq_mv
+  EXCEPT ALL (SELECT m.lbl, COUNT(c.C_ID) AS customers FROM (VALUES (1,'a'),(2,'b'),(3,'c')) AS m(thr, lbl) LEFT JOIN tflj_cust c ON c.C_W_ID <= m.thr GROUP BY m.lbl)
+);
+----
+0

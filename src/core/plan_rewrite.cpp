@@ -1015,13 +1015,31 @@ static bool IsOuterJoin(JoinType join_type) {
 	return join_type == JoinType::LEFT || join_type == JoinType::RIGHT || join_type == JoinType::OUTER;
 }
 
+// Find the first BOUND_COLUMN_REF anywhere inside `expr`. Join condition keys are not always bare
+// column refs: a type mismatch wraps the key in a CAST (e.g. generate_series yields BIGINT joined to
+// an INTEGER column → CAST(col AS BIGINT)), and a derived key wraps it in a function (e.g.
+// EXTRACT(MONTH FROM ts)). DuckDB guarantees a comparison condition's left/right side only references
+// the corresponding join child, so the first column ref found identifies the right base column.
+static const BoundColumnRefExpression *FindFirstColumnRef(const Expression &expr) {
+	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+		return &expr.Cast<BoundColumnRefExpression>();
+	}
+	const BoundColumnRefExpression *result = nullptr;
+	ExpressionIterator::EnumerateChildren(const_cast<Expression &>(expr), [&](Expression &child) {
+		if (!result) {
+			result = FindFirstColumnRef(child);
+		}
+	});
+	return result;
+}
+
 static void ReadColumnRefBinding(const unique_ptr<Expression> &expr, ColumnBinding &binding, LogicalType &type) {
-	if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+	const auto *ref = FindFirstColumnRef(*expr);
+	if (!ref) {
 		return;
 	}
-	auto &ref = expr->Cast<BoundColumnRefExpression>();
-	binding = ref.binding;
-	type = ref.return_type;
+	binding = ref->binding;
+	type = ref->return_type;
 }
 
 static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan) {
