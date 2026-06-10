@@ -247,17 +247,17 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	add_create_profile_step("create_compile_get_table_names", table_names_start,
 	                        "tables=" + to_string(table_names.size()));
 
-	// Plan the full CREATE TABLE AS SELECT statement (for plan walking)
-	auto full_plan_start = create_profile_now();
-	Planner planner(*con.context);
-	planner.CreatePlan(statement->Copy());
-	auto plan = std::move(planner.plan);
-	add_create_profile_step("create_compile_full_plan", full_plan_start);
+	// Plan the raw SELECT query once. The same plan serves both roles below:
+	//   - select_plan: gets the full PlanRewrite (DISTINCT→GROUP BY, AVG→SUM+COUNT, …) and is
+	//     serialized to the stored view_query via LPTS.
+	//   - facts_plan: a copy taken BEFORE PlanRewrite, with only the tree-preserving light rewrites
+	//     (FILTER→CASE, constant-subquery folding) applied, so the classifier and FindOuterAggregate
+	//     see DISTINCT/AVG/etc. in their original shape. Deriving facts from the same SELECT that
+	//     gets maintained also keeps classification consistent with the stored definition.
+	// (Previously the full CREATE statement was parsed+planned a second time just for this; the
+	//  CREATE wrapper is transparent to AnalyzeNode, so a copy of the SELECT body is equivalent.)
+	unique_ptr<LogicalOperator> facts_plan;
 
-	// Inline CTEs so create-MV facts see the folded structure.
-	InlineCtesIfPresent(context, *planner.binder, plan);
-
-	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
 	string having_predicate; // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool stored_query_has_aggregate_filter = false;
@@ -278,6 +278,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		auto select_rewrite_start = create_profile_now();
 		InlineCtesIfPresent(context, *select_planner.binder, select_plan);
 		pre_rewrite_has_aggregate_filter = PlanContainsBoundAggregateFilter(select_plan.get());
+
+		// Snapshot the plan for classification BEFORE the structural PlanRewrite below. The checker
+		// must see DISTINCT/AVG/etc. unrewritten, so we apply only the two light, tree-preserving
+		// rewrites here (same order as the former full-plan path: FILTER→CASE, then constant folding).
+		facts_plan = select_plan->Copy(*con.context);
+		RewriteAggregateFilters(context, facts_plan);
+		FoldConstantScalarSubqueries(context, facts_plan);
 
 		// Strip a bare top-level LIMIT (no ORDER BY) BEFORE the IVM rewrites so the hidden-column
 		// rewrites (group COUNT(*), AVG/STDDEV decomposition, LEFT JOIN match keys) see the aggregate
@@ -391,18 +398,12 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] View name: %s\n", view_name.c_str());
 	OPENIVM_DEBUG_PRINT("[CREATE MV] View query: %s\n", view_query.c_str());
-	OPENIVM_DEBUG_PRINT("[CREATE MV] Logical plan:\n%s\n", plan->ToString().c_str());
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Logical plan:\n%s\n", facts_plan->ToString().c_str());
 
-	// Normalize FILTER aggregates in the full plan before analysis so the checker
-	// sees CASE expressions instead of raw FILTER and doesn't set incremental_compatible=false.
-	// (PlanRewrite already rewrote select_plan for the LPTS view_query above.)
+	// facts_plan was snapshotted from select_plan before PlanRewrite and already carries the two
+	// light rewrites (FILTER→CASE, constant folding) the checker needs — see the copy site above.
 	auto analysis_start = create_profile_now();
-	RewriteAggregateFilters(context, plan);
-	// Fold uncorrelated constant scalar subqueries so the checker sees literals instead of the
-	// scalar-subquery guard's ungrouped first() aggregate. (PlanRewrite already did this for select_plan.)
-	FoldConstantScalarSubqueries(context, plan);
-
-	auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
+	auto facts = BuildCreateMVPlanFacts(facts_plan.get(), current_catalog);
 	if (!facts.source_table_info.empty()) {
 		table_names.clear();
 		for (const auto &entry : facts.source_table_info) {
@@ -540,7 +541,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// is allowed alongside it. Anything else (AVG, COUNT, MIN/MAX, multiple SUMs)
 		// demotes back to GROUP_RECOMPUTE.
 		if (!distinct_extracted_cols.empty()) {
-			LogicalAggregate *outer_agg = FindOuterAggregate(plan.get());
+			LogicalAggregate *outer_agg = FindOuterAggregate(facts_plan.get());
 			int sum_count = 0;
 			bool unsupported_agg = false;
 			if (outer_agg) {

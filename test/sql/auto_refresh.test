@@ -70,7 +70,7 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj'
 1
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name IN ('create_compile_full_plan', 'create_compile_lpts') AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name IN ('create_compile_select_plan', 'create_compile_lpts') AND duration_ms >= 0;
 ----
 2
 
