@@ -340,6 +340,13 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	if (analysis.found_outer_join_under_setop && analysis.found_aggregation && !model.group_columns.empty()) {
 		AddUnique(model.strategy_reasons, DeltaStrategyReason::OUTER_JOIN_SETOP_CURRENT_DIFF_RECOMPUTE);
 	}
+	// A non-linear construct hidden in a materialized-CTE definition (see found_cte_nonlinear_construct):
+	// the outer aggregate can't take the linear MERGE path, so recompute affected groups. The strategy
+	// reason routes to GROUP_RECOMPUTE in SelectRefreshType after the type-specific branches, so a hidden
+	// window/distinct/etc. doesn't misroute to WINDOW_PARTITION/DISTINCT_INCREMENTAL.
+	if (analysis.found_cte_nonlinear_construct && analysis.found_aggregation && !model.group_columns.empty()) {
+		AddUnique(model.strategy_reasons, DeltaStrategyReason::CTE_NONLINEAR_GROUP_RECOMPUTE);
+	}
 }
 
 static bool NeedsVisibleOutputCurrentDiffFallback(const DeltaViewModel &model, const PlanAnalysis &analysis,
@@ -547,6 +554,8 @@ const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
 		return "OUTER_JOIN_SETOP_CURRENT_DIFF_RECOMPUTE";
 	case DeltaStrategyReason::VISIBLE_OUTPUT_CURRENT_DIFF_RECOMPUTE:
 		return "VISIBLE_OUTPUT_CURRENT_DIFF_RECOMPUTE";
+	case DeltaStrategyReason::CTE_NONLINEAR_GROUP_RECOMPUTE:
+		return "CTE_NONLINEAR_GROUP_RECOMPUTE";
 	default:
 		return "UNKNOWN";
 	}

@@ -116,7 +116,23 @@ static void MergeCompatibilityAndNonLocalFacts(PlanAnalysis &result, const PlanA
 	result.found_asof_join = result.found_asof_join || body.found_asof_join;
 	result.found_positional_join = result.found_positional_join || body.found_positional_join;
 	result.found_outer_join_under_setop = result.found_outer_join_under_setop || body.found_outer_join_under_setop;
+	// An outer join hidden inside a (multi-reference) CTE definition still drives classification: when its
+	// right side gains a matching group the outer aggregate can't retract the null-extended rows via the
+	// incremental MERGE path, so the view must use group-recompute. These also feed has_left_join /
+	// full_outer_join_cols metadata, so propagate them directly.
+	result.found_left_join = result.found_left_join || body.found_left_join;
+	result.found_full_outer = result.found_full_outer || body.found_full_outer;
 	result.found_sample = result.found_sample || body.found_sample;
+	// Any OTHER non-linear construct hidden in the CTE definition (window, distinct, count-distinct,
+	// grouping-sets, semi/anti, filtered-list, nested aggregate, min/max, list) is invisible to the
+	// top-level type-routing flags, which stay scoped to the outer query. Don't copy those booleans
+	// (that would misroute — e.g. a hidden window must NOT become WINDOW_PARTITION when the outer is an
+	// aggregate); instead raise one signal that forces GROUP_RECOMPUTE for the outer aggregate, which
+	// recomputes affected groups from the original SQL and is correct regardless of the construct.
+	result.found_cte_nonlinear_construct =
+	    result.found_cte_nonlinear_construct || body.found_left_join || body.found_full_outer || body.found_window ||
+	    body.found_distinct || body.found_count_distinct || body.found_grouping_sets || body.found_semi_anti_join ||
+	    body.found_filtered_list || body.found_nested_aggregate || body.found_minmax || body.found_list;
 }
 
 /// True iff `node`'s subtree contains a comparison join with an outer (LEFT/RIGHT/FULL) join type and

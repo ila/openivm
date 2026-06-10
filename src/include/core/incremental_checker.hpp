@@ -36,6 +36,12 @@ struct PlanAnalysis {
 	bool found_grouping_sets = false;    // ROLLUP/CUBE/GROUPING SETS — handled via RECOMPUTE
 	bool found_nested_aggregate = false; // outer aggregate over inner aggregate (CTE re-agg); COUNT(*) in outer is
 	                                     // non-linear over source deltas → group-recompute
+	// A non-linear / recompute-forcing construct lives inside a multi-reference materialized CTE
+	// definition whose results feed a non-passthrough outer query. DuckDB keeps such CTEs materialized
+	// (single-ref ones are inlined and seen directly), so the construct is otherwise invisible to the
+	// top-level classification; this forces GROUP_RECOMPUTE for an outer aggregate. Set in
+	// MergeCompatibilityAndNonLocalFacts.
+	bool found_cte_nonlinear_construct = false;
 	bool found_volatile_expression = false;
 	bool found_non_foldable_unnest = false;
 	bool found_unsupported_aggregate = false;

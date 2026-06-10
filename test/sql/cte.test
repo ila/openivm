@@ -1248,3 +1248,153 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================================
+# Regression: LEFT JOIN to an aggregate, hidden inside a CTE that is referenced
+# by multiple UNION branches under an outer aggregate. DuckDB's CTEInlining keeps
+# the multi-reference CTE materialized, so the LEFT JOIN lives in the CTE
+# definition. The CREATE-time analysis must still see it (found_left_join) and
+# classify the view as GROUP_RECOMPUTE — otherwise the incremental AGGREGATE_GROUP
+# MERGE path can't retract the null-extended rows when the join's right side gains
+# a matching group (a new aggregate group), and bucket counts drift.
+# (Minimised from rewriter benchmark query ducklake_0260.)
+# ============================================================================
+
+statement ok
+CREATE TABLE rcte_cust(cid INT, bal INT);
+
+statement ok
+INSERT INTO rcte_cust VALUES (1,-5),(2,10),(3,20),(4,-1),(5,30);
+
+statement ok
+CREATE TABLE rcte_hist(h_cid INT, amt INT);
+
+statement ok
+INSERT INTO rcte_hist VALUES (1, 50), (3, 70);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_rcte_leftjoin AS
+WITH ca AS (
+    SELECT c.cid, c.bal, COALESCE(hr.cnt, 0) AS hrows, COALESCE(hr.total, 0) AS htot
+    FROM rcte_cust c
+    LEFT JOIN (SELECT h_cid, COUNT(*) AS cnt, SUM(amt) AS total FROM rcte_hist GROUP BY h_cid) hr
+      ON hr.h_cid = c.cid),
+balance_branch AS (SELECT cid, 'balance' AS metric, CASE WHEN bal < 0 THEN 'neg' ELSE 'nonneg' END AS bucket, bal AS val FROM ca),
+history_branch AS (SELECT cid, 'history' AS metric, CASE WHEN hrows > 0 THEN 'has' ELSE 'none' END AS bucket, htot AS val FROM ca),
+u AS (SELECT * FROM balance_branch UNION ALL SELECT * FROM history_branch)
+SELECT metric, bucket, COUNT(*) AS n, SUM(val) AS total_val FROM u GROUP BY metric, bucket;
+
+# Must be group-recompute (type 6), not plain incremental AGGREGATE_GROUP (type 0).
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_rcte_leftjoin';
+----
+6
+
+# Batch conflicting DML before a single refresh: new history group (cust 2 -> matched),
+# delete an existing history group (cust 1 -> unmatched), update a balance, and add a customer.
+statement ok
+INSERT INTO rcte_hist VALUES (2, 497), (2, 3);
+
+statement ok
+DELETE FROM rcte_hist WHERE h_cid = 1;
+
+statement ok
+UPDATE rcte_cust SET bal = -99 WHERE cid = 2;
+
+statement ok
+INSERT INTO rcte_cust VALUES (6, -7);
+
+statement ok
+PRAGMA refresh('mv_rcte_leftjoin');
+
+# Cross-check full bag equality in BOTH directions.
+query I
+SELECT count(*) FROM (
+  (SELECT metric, bucket, n, total_val FROM mv_rcte_leftjoin)
+  EXCEPT ALL
+  (WITH ca AS (SELECT c.cid, c.bal, COALESCE(hr.cnt,0) AS hrows, COALESCE(hr.total,0) AS htot FROM rcte_cust c LEFT JOIN (SELECT h_cid, COUNT(*) AS cnt, SUM(amt) AS total FROM rcte_hist GROUP BY h_cid) hr ON hr.h_cid=c.cid),
+        bb AS (SELECT cid,'balance' AS metric, CASE WHEN bal<0 THEN 'neg' ELSE 'nonneg' END AS bucket, bal AS val FROM ca),
+        hb AS (SELECT cid,'history' AS metric, CASE WHEN hrows>0 THEN 'has' ELSE 'none' END AS bucket, htot AS val FROM ca),
+        u AS (SELECT * FROM bb UNION ALL SELECT * FROM hb)
+   SELECT metric, bucket, COUNT(*) AS n, SUM(val) AS total_val FROM u GROUP BY metric, bucket)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (WITH ca AS (SELECT c.cid, c.bal, COALESCE(hr.cnt,0) AS hrows, COALESCE(hr.total,0) AS htot FROM rcte_cust c LEFT JOIN (SELECT h_cid, COUNT(*) AS cnt, SUM(amt) AS total FROM rcte_hist GROUP BY h_cid) hr ON hr.h_cid=c.cid),
+        bb AS (SELECT cid,'balance' AS metric, CASE WHEN bal<0 THEN 'neg' ELSE 'nonneg' END AS bucket, bal AS val FROM ca),
+        hb AS (SELECT cid,'history' AS metric, CASE WHEN hrows>0 THEN 'has' ELSE 'none' END AS bucket, htot AS val FROM ca),
+        u AS (SELECT * FROM bb UNION ALL SELECT * FROM hb)
+   SELECT metric, bucket, COUNT(*) AS n, SUM(val) AS total_val FROM u GROUP BY metric, bucket)
+  EXCEPT ALL
+  (SELECT metric, bucket, n, total_val FROM mv_rcte_leftjoin)
+);
+----
+0
+
+# ============================================================================
+# Regression (issue class of the above): a NON-LINEAR construct other than an
+# outer join, hidden in a multi-reference materialized CTE, must also force
+# GROUP_RECOMPUTE — and must NOT misroute to its construct-specific type. Here a
+# window function lives in the shared CTE under an outer aggregate: the view must
+# be GROUP_RECOMPUTE (6), not WINDOW_PARTITION (5). (found_cte_nonlinear_construct)
+# ============================================================================
+
+statement ok
+CREATE TABLE rcte_win_src(cid INT, grp INT, v INT);
+
+statement ok
+INSERT INTO rcte_win_src VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,2,5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_rcte_window AS
+WITH ca AS (SELECT cid, grp, v, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY v) AS rn FROM rcte_win_src),
+b1 AS (SELECT grp, 'a' AS tag, CASE WHEN rn = 1 THEN 'first' ELSE 'rest' END AS bucket FROM ca),
+b2 AS (SELECT grp, 'b' AS tag, CASE WHEN rn = 1 THEN 'first' ELSE 'rest' END AS bucket FROM ca),
+u AS (SELECT * FROM b1 UNION ALL SELECT * FROM b2)
+SELECT tag, bucket, COUNT(*) AS n FROM u GROUP BY tag, bucket;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_rcte_window';
+----
+6
+
+statement ok
+INSERT INTO rcte_win_src VALUES (6, 2, 1);
+
+statement ok
+UPDATE rcte_win_src SET v = 100 WHERE cid = 1;
+
+statement ok
+DELETE FROM rcte_win_src WHERE cid = 4;
+
+statement ok
+PRAGMA refresh('mv_rcte_window');
+
+query I
+SELECT count(*) FROM (
+  (SELECT tag, bucket, n FROM mv_rcte_window)
+  EXCEPT ALL
+  (WITH ca AS (SELECT cid, grp, v, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY v) AS rn FROM rcte_win_src),
+        b1 AS (SELECT grp,'a' AS tag, CASE WHEN rn=1 THEN 'first' ELSE 'rest' END AS bucket FROM ca),
+        b2 AS (SELECT grp,'b' AS tag, CASE WHEN rn=1 THEN 'first' ELSE 'rest' END AS bucket FROM ca),
+        u AS (SELECT * FROM b1 UNION ALL SELECT * FROM b2)
+   SELECT tag, bucket, COUNT(*) AS n FROM u GROUP BY tag, bucket)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (WITH ca AS (SELECT cid, grp, v, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY v) AS rn FROM rcte_win_src),
+        b1 AS (SELECT grp,'a' AS tag, CASE WHEN rn=1 THEN 'first' ELSE 'rest' END AS bucket FROM ca),
+        b2 AS (SELECT grp,'b' AS tag, CASE WHEN rn=1 THEN 'first' ELSE 'rest' END AS bucket FROM ca),
+        u AS (SELECT * FROM b1 UNION ALL SELECT * FROM b2)
+   SELECT tag, bucket, COUNT(*) AS n FROM u GROUP BY tag, bucket)
+  EXCEPT ALL
+  (SELECT tag, bucket, n FROM mv_rcte_window)
+);
+----
+0

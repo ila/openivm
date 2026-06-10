@@ -22,7 +22,12 @@ enum class DeltaStrategyReason {
 	SAMPLE_CURRENT_DIFF_RECOMPUTE,
 	POSITIONAL_CURRENT_DIFF_RECOMPUTE,
 	OUTER_JOIN_SETOP_CURRENT_DIFF_RECOMPUTE,
-	VISIBLE_OUTPUT_CURRENT_DIFF_RECOMPUTE
+	VISIBLE_OUTPUT_CURRENT_DIFF_RECOMPUTE,
+	// A non-linear / recompute-forcing construct (window, distinct, count-distinct, grouping-sets,
+	// semi/anti, filtered-list, min/max, list, outer join, asof, nested aggregate) is hidden inside a
+	// multi-reference materialized CTE definition whose results feed a non-passthrough outer aggregate.
+	// The outer aggregate can't take the linear MERGE path, so recompute the affected groups.
+	CTE_NONLINEAR_GROUP_RECOMPUTE
 };
 
 enum class DeltaModelFeature {
