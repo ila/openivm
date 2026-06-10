@@ -1020,12 +1020,12 @@ static bool IsOuterJoin(JoinType join_type) {
 // an INTEGER column → CAST(col AS BIGINT)), and a derived key wraps it in a function (e.g.
 // EXTRACT(MONTH FROM ts)). DuckDB guarantees a comparison condition's left/right side only references
 // the corresponding join child, so the first column ref found identifies the right base column.
-static const BoundColumnRefExpression *FindFirstColumnRef(const Expression &expr) {
+static const BoundColumnRefExpression *FindFirstColumnRef(Expression &expr) {
 	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
 		return &expr.Cast<BoundColumnRefExpression>();
 	}
 	const BoundColumnRefExpression *result = nullptr;
-	ExpressionIterator::EnumerateChildren(const_cast<Expression &>(expr), [&](Expression &child) {
+	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
 		if (!result) {
 			result = FindFirstColumnRef(child);
 		}

@@ -6,3 +6,7 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
+
+ifneq (,$(findstring windows,$(DUCKDB_PLATFORM)))
+TEST_PATH=/test/unittest.exe
+endif

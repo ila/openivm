@@ -76,9 +76,9 @@ DeltaPlanFragment CompileCteDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileUnnestDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileConstantZeroDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileStaticConstantLeaf(DeltaOperatorInput input);
-DeltaPlanFragment CompileAsofJoinDelta(DeltaOperatorInput input);
-DeltaPlanFragment CompilePositionalJoinDelta(DeltaOperatorInput input);
-DeltaPlanFragment CompileSampleDelta(DeltaOperatorInput input);
+DeltaPlanFragment CompileAsofJoinDelta(const DeltaOperatorInput &input);
+DeltaPlanFragment CompilePositionalJoinDelta(const DeltaOperatorInput &input);
+DeltaPlanFragment CompileSampleDelta(const DeltaOperatorInput &input);
 
 } // namespace duckdb
 
