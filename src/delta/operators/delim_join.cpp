@@ -447,7 +447,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 			AddLeafBindingReplacements(leaf_bindings, delta_bindings, output_replacements, delta_i.mul_binding);
 			mul_bindings.push_back(delta_i.mul_binding);
 			leaf_ref = std::move(delta_i.node);
-			UpdateParentProjectionMap(term, leaves[i].path, leaves[i].node, /*include_delim_parents=*/true);
+			UpdateParentProjectionMap(term, leaves[i].path, delta_i.mul_binding, /*include_delim_parents=*/true);
 		}
 
 		vector<ReplacementBinding> delim_replacements;

@@ -24,12 +24,12 @@ unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, co
 
 void DemoteLeftJoins(LogicalOperator *node);
 
-// Append the multiplicity column to the parent join's projection map for the leaf at `path`.
-// include_delim_parents=false matches only plain comparison joins (the inclusion-exclusion path);
-// =true also matches delim/dependent joins (the delim-join path). Behavior-preserving union of the
-// former join-side and delim-side helpers.
+// Append the multiplicity column to the parent join's projection map for the leaf at `path`, locating
+// it by searching the delta-replaced child's bindings for `mul_binding` (arity can change vs the
+// original leaf). include_delim_parents=false matches only plain comparison joins (the
+// inclusion-exclusion path); =true also matches delim/dependent joins (the delim-join path).
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const vector<size_t> &path,
-                               LogicalOperator *leaf_node, bool include_delim_parents);
+                               const ColumnBinding &mul_binding, bool include_delim_parents);
 
 unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
                                                  const vector<LogicalType> &types, Binder &binder);

@@ -57,7 +57,10 @@ constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";
 static constexpr idx_t MAX_JOIN_TABLES = 16;
 
 // Optimizer settings that are still sensitive during IVM rewrite/planning.
-constexpr const char *DISABLED_OPTIMIZERS = "column_lifetime, statistics_propagation";
+// column_lifetime is enabled: it only adds projection_map prune-hints, and both the delta
+// operators (filter.cpp / join.cpp re-add the multiplicity column) and LPTS (explicit SELECT
+// column lists for pruned Filter/Order nodes) already cope with it.
+constexpr const char *DISABLED_OPTIMIZERS = "statistics_propagation";
 
 } // namespace openivm
 

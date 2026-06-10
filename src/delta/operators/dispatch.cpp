@@ -1,5 +1,6 @@
 #include "delta/delta_operator.hpp"
 
+#include "core/ivm_delta_model.hpp"
 #include "core/openivm_debug.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 

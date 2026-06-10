@@ -438,7 +438,7 @@ static void DemoteLeftJoinsForMask(LogicalOperator *node, const vector<JoinLeafI
 }
 
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const vector<size_t> &path,
-                               LogicalOperator *leaf_node, bool include_delim_parents) {
+                               const ColumnBinding &mul_binding, bool include_delim_parents) {
 	if (path.empty()) {
 		return;
 	}
@@ -457,12 +457,27 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const vector<s
 		return;
 	}
 	auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
-	if (!proj_map.empty()) {
-		idx_t mul_idx = leaf_node->GetColumnBindings().size();
-		proj_map.push_back(mul_idx);
-		OPENIVM_DEBUG_PRINT("[DeltaJoin] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
-		                    child_side == 0 ? "left" : "right");
+	// proj_map is only populated when column_lifetime prunes this join side. When it is, the pruned set
+	// drops the multiplicity column, so re-add it. Locate its real index by searching the (already
+	// delta-replaced) child's bindings — the leaf's delta rewrite can change arity (e.g. a wrapped
+	// projection/filter over a scan), so the multiplicity is not necessarily at the original leaf size.
+	if (proj_map.empty()) {
+		return;
 	}
+	auto child_binds = join->children[child_side]->GetColumnBindings();
+	idx_t mul_idx = child_binds.size();
+	for (idx_t i = child_binds.size(); i-- > 0;) {
+		if (child_binds[i] == mul_binding) {
+			mul_idx = i;
+			break;
+		}
+	}
+	if (mul_idx == child_binds.size()) {
+		throw InternalException("IVM: join child does not expose the multiplicity column for projection_map pruning");
+	}
+	proj_map.push_back(mul_idx);
+	OPENIVM_DEBUG_PRINT("[DeltaJoin] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
+	                    child_side == 0 ? "left" : "right");
 }
 
 // ============================================================================
@@ -867,7 +882,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 					mul_bindings.push_back(rewritten.mul_binding);
 					subtree_ref = std::move(rewritten.op);
 				}
-				UpdateParentProjectionMap(term, leaves[i].path, leaves[i].node, /*include_delim_parents=*/false);
+				UpdateParentProjectionMap(term, leaves[i].path, mul_bindings.back(), /*include_delim_parents=*/false);
 			}
 		}
 
