@@ -118,6 +118,8 @@ static const char *StrategyLabelForRefreshType(RefreshType view_type) {
 	}
 }
 
+static constexpr double UNCALIBRATED_STRATEGY_FIXED_COST = 5000.0;
+
 static bool IsLinearCostNode(DeltaModelNodeKind kind) {
 	return kind == DeltaModelNodeKind::SCAN || kind == DeltaModelNodeKind::FILTER ||
 	       kind == DeltaModelNodeKind::PROJECT || kind == DeltaModelNodeKind::UNION ||
@@ -543,9 +545,11 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	// 2. Compute basic metrics
 	double total_base_scan = 0;
 	double delta_fraction_sum = 0;
+	bool has_active_delta = false;
 	for (auto &ts : table_stats) {
 		total_base_scan += ts.base_card;
 		delta_fraction_sum += ts.delta_card / ts.base_card;
+		has_active_delta = has_active_delta || ts.delta_card > 0;
 	}
 
 	double mv_card = GetTableRowCount(con, IncrementalTableNames::DataTableName(view_name));
@@ -719,6 +723,9 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 			OPENIVM_DEBUG_PRINT("[COST MODEL] Recompute regression: w_compute=%.4f, w_replace=%.4f, intercept=%.1f\n",
 			                    rc_reg.w_compute, rc_reg.w_upsert, rc_reg.w_intercept);
 		}
+	}
+	if (adaptive_on && !calibrated && strategy_label != "full" && (has_active_delta || !skip_empty_enabled)) {
+		strategy_predicted_ms += UNCALIBRATED_STRATEGY_FIXED_COST;
 	}
 
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s, FullOuter: %s, DuckLake: %s, FK: %s\n", N,

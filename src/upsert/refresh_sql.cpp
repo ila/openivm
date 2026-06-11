@@ -187,9 +187,8 @@ static void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext 
 	// session-scoped planning settings still need to be mirrored onto the fresh
 	// planning connection.
 	static const char *PLANNING_SETTINGS[] = {
-	    "openivm_skip_empty_deltas",
-	    "openivm_fk_pruning",
-	    "openivm_ducklake_nterm",
+	    "openivm_adaptive_refresh", "openivm_cost_decay",     "openivm_skip_empty_deltas",
+	    "openivm_fk_pruning",       "openivm_ducklake_nterm",
 	};
 	for (auto setting_name : PLANNING_SETTINGS) {
 		CopyOpenIvmSetting(from, to, setting_name);
