@@ -56,8 +56,17 @@ constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";
 // Limits
 static constexpr idx_t MAX_JOIN_TABLES = 16;
 
-// Optimizer settings that are still sensitive during IVM rewrite/planning.
-constexpr const char *DISABLED_OPTIMIZERS = "column_lifetime, statistics_propagation";
+// Optimizer settings disabled when planning a view query into a delta-maintenance template.
+// The old-main helper name is retained for later compatibility, but this Raki-based branch keeps
+// column_lifetime disabled with statistics_propagation.
+constexpr const char *TEMPLATE_DATA_DEPENDENT_OPTIMIZERS = "column_lifetime, statistics_propagation";
+constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
+
+// Disabled wherever the deeply-nested generated refresh SQL is planned/executed. deliminator
+// recurses through OpenIVM's chained CTE/subquery expansions (N-term telescoping over many tables)
+// and overflows the optimizer; the generated plan is already explicitly decorrelated so it has no
+// DELIM joins to eliminate. Pure robustness guard — not flag-gated.
+constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator";
 
 } // namespace openivm
 
