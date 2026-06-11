@@ -91,6 +91,7 @@ struct ModeResult {
 	string method;
 	int64_t base_rows = 0;
 	int64_t mv_rows = 0;
+	int64_t dml_statements = 0;
 	int64_t delta_rows = 0;
 	string error;
 	CostEstimate cost;
@@ -855,7 +856,15 @@ static string DeltaTableName(const string &table) {
 	for (auto &ch : name) {
 		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 	}
-	return "delta_" + name;
+	return "openivm_delta_" + name;
+}
+
+static int64_t CountPendingDeltaRows(duckdb::Connection &con, const QueryDef &q) {
+	int64_t rows = 0;
+	for (auto &table : q.touched_tables) {
+		rows += CountRows(con, DeltaTableName(table));
+	}
+	return rows;
 }
 
 static void WarmScenario(duckdb::Connection &con, const QueryDef &q) {
@@ -900,6 +909,39 @@ static CostEstimate ReadCost(duckdb::Connection &con, const string &view_name) {
 	cost.calibrated = result->GetValue(5, 0).GetValue<bool>();
 	cost.ok = true;
 	return cost;
+}
+
+static CostEstimate CombinePipelineCosts(const vector<CostEstimate> &costs) {
+	if (costs.size() == 1) {
+		return costs[0];
+	}
+	CostEstimate total;
+	total.ok = true;
+	for (auto &cost : costs) {
+		if (!cost.ok) {
+			return cost;
+		}
+		total.incremental_cost += cost.incremental_cost;
+		total.recompute_cost += cost.recompute_cost;
+		total.incremental_predicted_ms += cost.incremental_predicted_ms;
+		total.recompute_predicted_ms += cost.recompute_predicted_ms;
+		total.calibrated = total.calibrated || cost.calibrated;
+	}
+	total.decision = total.recompute_predicted_ms < total.incremental_predicted_ms ? "full" : "incremental";
+	return total;
+}
+
+static string CombinePipelineMethods(const vector<string> &methods) {
+	bool saw_incremental = false;
+	for (auto &method : methods) {
+		if (method == "full" || method == "forced_full") {
+			return "full";
+		}
+		if (method != "skipped_or_unrecorded") {
+			saw_incremental = true;
+		}
+	}
+	return saw_incremental ? "incremental" : "skipped_or_unrecorded";
 }
 
 static bool ValidateMV(duckdb::Connection &con, const string &mv_name, const string &base_sql, string &error) {
@@ -1005,25 +1047,38 @@ static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload
 			WarmScenario(con, q);
 		}
 		ConfigureMode(con, mode);
-		if (read_cost) {
-			out.cost = ReadCost(con, q.refresh_mvs.back());
-			if (!out.cost.ok) {
-				out.error = "refresh_cost failed: " + out.cost.error;
-				return out;
-			}
-		}
+		vector<CostEstimate> stage_costs;
+		vector<string> stage_methods;
 		int64_t t0 = NowMicros();
 		for (auto &mv : q.refresh_mvs) {
+			if (read_cost) {
+				auto stage_cost = ReadCost(con, mv);
+				if (!stage_cost.ok) {
+					out.error = "refresh_cost failed for " + mv + ": " + stage_cost.error;
+					return out;
+				}
+				stage_costs.push_back(std::move(stage_cost));
+			}
+			auto refresh_start = NowMicros();
 			auto result = con.Query("PRAGMA refresh('" + mv + "')");
 			if (!result || result->HasError()) {
 				out.error = "PRAGMA refresh failed: " + (result ? result->GetError() : "null result");
 				return out;
 			}
+			if (mode == RefreshMode::AUTO) {
+				stage_methods.push_back(LastHistoryMethod(con, mv));
+			}
+			int64_t refresh_end = NowMicros();
+			out.refresh_ms += (refresh_end - refresh_start) / 1000.0;
 		}
 		int64_t t1 = NowMicros();
-		out.refresh_ms = (t1 - t0) / 1000.0;
+		if (!read_cost) {
+			out.refresh_ms = (t1 - t0) / 1000.0;
+		} else {
+			out.cost = CombinePipelineCosts(stage_costs);
+		}
 		if (mode == RefreshMode::AUTO) {
-			out.method = LastHistoryMethod(con, q.refresh_mvs.back());
+			out.method = CombinePipelineMethods(stage_methods);
 		} else if (mode == RefreshMode::INCREMENTAL) {
 			out.method = "forced_incremental";
 		} else {
@@ -1175,8 +1230,8 @@ int main(int argc, char **argv) {
 	std::ofstream out(out_csv);
 	out << "scale,query_id,description,workload,delta_pct,flag_config,rep,view_name,"
 	       "cost_decision,incremental_cost,recompute_cost,incremental_predicted_ms,recompute_predicted_ms,calibrated,"
-	       "auto_method,auto_ms,incremental_ms,full_ms,best_method,regret_ratio,correct,base_rows,mv_rows,delta_rows,"
-	       "error\n";
+	       "auto_method,auto_ms,incremental_ms,full_ms,best_method,regret_ratio,correct,base_rows,mv_rows,"
+	       "dml_statements,delta_rows,error\n";
 
 	int total = 0;
 	for (auto &q : queries) {
@@ -1285,7 +1340,8 @@ int main(int argc, char **argv) {
 						    << "," << std::setprecision(3) << auto_result.refresh_ms << "," << inc_result.refresh_ms
 						    << "," << full_result.refresh_ms << "," << CsvQuote(best) << "," << std::setprecision(6)
 						    << regret << "," << (correct ? "true" : "false") << "," << auto_result.base_rows << ","
-						    << auto_result.mv_rows << "," << auto_result.delta_rows << "," << CsvQuote(error) << "\n";
+						    << auto_result.mv_rows << "," << auto_result.dml_statements << ","
+						    << auto_result.delta_rows << "," << CsvQuote(error) << "\n";
 						out.flush();
 					}
 				}

@@ -47,16 +47,32 @@ MERGE requires a key to match source and target rows. `AGGREGATE_GROUP` views ha
 
 > **Note:** This feature is experimental. The cost model heuristics may change in future releases.
 
-When `openivm_adaptive_refresh` is enabled, OpenIVM estimates the cost of incremental refresh versus full recomputation before each refresh and picks the cheaper option. This is useful when delta sizes vary unpredictably.
+When `openivm_adaptive_refresh` is enabled, OpenIVM estimates the cost of the
+incremental refresh path versus full recomputation before each refresh. It picks the
+cheaper option, which helps when delta sizes vary unpredictably.
 
 ```sql
 SET openivm_adaptive_refresh = true;
 PRAGMA refresh('monthly_totals');
 ```
 
-The cost model compares estimated cardinalities of the delta tables against the base tables. When `openivm_adaptive_refresh` is `false` (the default), the system always uses IVM for views that support it.
+The cost model compares the estimated cost of the view's refresh strategy with a full
+DELETE + INSERT recompute. When `openivm_adaptive_refresh` is `false` (the default),
+OpenIVM uses the strategy selected at view creation.
 
-For FULL OUTER JOIN views, the static model applies higher upsert cost multipliers (3x for aggregates, 1.5x for projections) to account for the additional recompute phases (unmatched-row key extraction, NULL group recompute). The learned regression model self-corrects from execution history after a few refreshes.
+The static estimate is operator-based:
+
+| Operator class | Cost signal |
+|---|---|
+| Linear operators (`SCAN`, `FILTER`, `PROJECT`, `UNION ALL`) | Pending delta rows, adjusted for filter selectivity. |
+| Joins | Active join terms. Empty source deltas remove terms; DuckLake N-term joins count one term per changed source. |
+| Aggregates | Estimated affected groups, capped by MV cardinality. |
+| Affected-domain recompute | Estimated touched groups, partitions, or rows rather than the full MV. |
+| Full recompute | Base scan plus replacing all MV rows. |
+
+For FULL OUTER JOIN views, the static model applies higher upsert cost multipliers
+(3x for aggregates, 1.5x for projections) to account for additional recompute phases.
+The learned regression model self-corrects from execution history after a few refreshes.
 
 ### Inspecting the cost estimate
 
@@ -68,13 +84,20 @@ PRAGMA refresh_cost('monthly_totals');
 
 Returns a single row:
 
-| decision | incremental_cost | recompute_cost |
-|---|---|---|
-| incremental | 1200.0 | 50000.0 |
+| decision | incremental_cost | recompute_cost | incremental_predicted_ms | recompute_predicted_ms | calibrated |
+|---|---:|---:|---:|---:|---|
+| incremental | 1200.0 | 50000.0 | 1200.0 | 50000.0 | false |
 
-- `decision`: `incremental` or `full`, based on which cost is lower.
-- `incremental_cost`: estimated cost of applying deltas.
+- `decision`: the selected strategy. Values include `incremental`, `group_recompute`, `window_partition`, `current_diff_recompute`, `distinct_incremental`, `semi_anti_recompute`, and `full`.
+- `incremental_cost`: estimated cost of the selected non-full strategy. For affected-domain strategies, this is not a pure delta-only cost.
 - `recompute_cost`: estimated cost of a full DELETE + INSERT.
+- `incremental_predicted_ms`: learned prediction for the selected non-full strategy, or the static estimate before calibration.
+- `recompute_predicted_ms`: learned prediction for full recompute, or the static estimate before calibration.
+- `calibrated`: `true` when refresh history was sufficient to fit the learned model.
+
+Use `PRAGMA refresh_history('view_name')` to inspect the refresh records used by the learned model.
+For broader validation, run the cost-model benchmark and compare the automatic decision
+with forced incremental and forced full refresh on representative workloads.
 
 ## Automatic full-refresh detection
 
