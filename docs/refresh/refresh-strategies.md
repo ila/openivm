@@ -96,8 +96,8 @@ Returns a single row:
 - `calibrated`: `true` when refresh history was sufficient to fit the learned model.
 
 Use `PRAGMA refresh_history('view_name')` to inspect the refresh records used by the learned model.
-For broader validation, run the cost-model benchmark and compare the automatic decision
-with forced incremental and forced full refresh on representative workloads.
+For implementation details and preliminary validation results, see
+[Cost Model](../internals/cost_model.md).
 
 ## Automatic full-refresh detection
 
