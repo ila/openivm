@@ -137,8 +137,10 @@ static string CsvQuote(const string &s) {
 	return out;
 }
 
-static vector<int> ParseIntList(const string &s) {
-	vector<int> out;
+// Parse a comma-separated list of (possibly fractional) percentages, e.g. "0,0.01,1,2,5,10,20,50".
+// Fractional percentages matter at large scale factors where 0.01% of the base is still many rows.
+static vector<double> ParseDoubleList(const string &s) {
+	vector<double> out;
 	size_t start = 0;
 	while (start < s.size()) {
 		size_t end = s.find(',', start);
@@ -146,7 +148,7 @@ static vector<int> ParseIntList(const string &s) {
 			end = s.size();
 		}
 		if (end > start) {
-			out.push_back(std::stoi(s.substr(start, end - start)));
+			out.push_back(std::stod(s.substr(start, end - start)));
 		}
 		start = end + 1;
 	}
@@ -581,7 +583,7 @@ static int64_t CountRows(duckdb::Connection &con, const string &table) {
 	return result->GetValue(0, 0).GetValue<int64_t>();
 }
 
-static vector<int> AllocateDeltas(duckdb::Connection &con, const vector<string> &tables, int pct) {
+static vector<int> AllocateDeltas(duckdb::Connection &con, const vector<string> &tables, double pct) {
 	vector<int64_t> counts;
 	int64_t total_rows = 0;
 	for (auto &table : tables) {
@@ -606,8 +608,8 @@ static vector<int> AllocateDeltas(duckdb::Connection &con, const vector<string> 
 	return allocated;
 }
 
-static int64_t ApplyDML(duckdb::Connection &con, const QueryDef &q, Workload workload, int delta_pct, int scale) {
-	if (workload == Workload::EMPTY_DELTA || delta_pct == 0) {
+static int64_t ApplyDML(duckdb::Connection &con, const QueryDef &q, Workload workload, double delta_pct, int scale) {
+	if (workload == Workload::EMPTY_DELTA || delta_pct <= 0.0) {
 		return 0;
 	}
 	auto allocations = AllocateDeltas(con, q.touched_tables, delta_pct);
@@ -767,7 +769,7 @@ static void ConfigureMode(duckdb::Connection &con, RefreshMode mode) {
 	}
 }
 
-static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload workload, int delta_pct,
+static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload workload, double delta_pct,
                           FlagConfig flag_config, int scale, int rep, RefreshMode mode, bool read_cost, bool warm) {
 	ModeResult out;
 	string tag = q.id + "_" + WorkloadName(workload) + "_" + to_string(delta_pct) + "_" + FlagConfigName(flag_config) +
@@ -895,7 +897,7 @@ static double RegretRatio(const string &auto_method, double incremental_ms, doub
 
 static void PrintUsage() {
 	fprintf(stderr, "cost_model_benchmark --scale N --db PATH --out CSV [--reps 3]\n"
-	                "                     [--delta-pcts 0,1,5,10,20,50] [--filter Q01,S06,...] [--no-warm]\n");
+	                "                     [--delta-pcts 0,0.01,1,2,5,10,20,50] [--filter Q01,S06,...] [--no-warm]\n");
 }
 
 int main(int argc, char **argv) {
@@ -903,7 +905,7 @@ int main(int argc, char **argv) {
 	string db_path;
 	string out_csv = "cost_model_benchmark_results.csv";
 	int reps = 3;
-	vector<int> delta_pcts = {0, 1, 5, 10, 20, 50};
+	vector<double> delta_pcts = {0, 0.01, 1, 2, 5, 10, 20, 50};
 	set<string> query_filter;
 	bool warm = true;
 
@@ -926,7 +928,7 @@ int main(int argc, char **argv) {
 		} else if (arg == "--reps") {
 			reps = std::stoi(next("--reps"));
 		} else if (arg == "--delta-pcts") {
-			delta_pcts = ParseIntList(next("--delta-pcts"));
+			delta_pcts = ParseDoubleList(next("--delta-pcts"));
 		} else if (arg == "--filter") {
 			string f = next("--filter");
 			size_t start = 0;
@@ -973,11 +975,11 @@ int main(int argc, char **argv) {
 			continue;
 		}
 		for (auto wl : q.workloads) {
-			for (int pct : delta_pcts) {
-				if (wl == Workload::EMPTY_DELTA && pct != 0) {
+			for (double pct : delta_pcts) {
+				if (wl == Workload::EMPTY_DELTA && pct > 0.0) {
 					continue;
 				}
-				if (wl != Workload::EMPTY_DELTA && pct == 0) {
+				if (wl != Workload::EMPTY_DELTA && pct <= 0.0) {
 					continue;
 				}
 				total += static_cast<int>(configs.size()) * reps;
@@ -993,11 +995,11 @@ int main(int argc, char **argv) {
 			continue;
 		}
 		for (auto wl : q.workloads) {
-			for (int pct : delta_pcts) {
-				if (wl == Workload::EMPTY_DELTA && pct != 0) {
+			for (double pct : delta_pcts) {
+				if (wl == Workload::EMPTY_DELTA && pct > 0.0) {
 					continue;
 				}
-				if (wl != Workload::EMPTY_DELTA && pct == 0) {
+				if (wl != Workload::EMPTY_DELTA && pct <= 0.0) {
 					continue;
 				}
 				for (auto config : configs) {
