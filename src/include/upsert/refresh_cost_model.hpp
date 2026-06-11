@@ -26,15 +26,12 @@ struct RefreshCostEstimate {
 	// Whether regression was used (true) or static fallback (false)
 	bool calibrated;
 
-	// Strategy this view actually uses on refresh — drives both the history label
-	// and the meaning of `incremental_compute` / `incremental_upsert`. For most views this is
-	// "incremental" (delta-driven IVM); for `RefreshType::GROUP_RECOMPUTE` views
-	// (inner DISTINCT under aggregate) it's "group_recompute" and the IVM cost
-	// fields hold the affected-groups recompute cost instead. For
-	// `RefreshType::WINDOW_PARTITION` it's "window_partition" (partition recompute).
-	// For `RefreshType::CURRENT_DIFF_RECOMPUTE` it is "current_diff_recompute".
-	// Always one of: "incremental", "group_recompute", "window_partition",
-	// "current_diff_recompute".
+	// Strategy this view uses on refresh — drives both the history label and the
+	// meaning of `incremental_compute` / `incremental_upsert`. For "incremental"
+	// views the fields hold delta-driven IVM cost. For fixed strategy views they
+	// hold that strategy's affected-domain cost. Known labels: "incremental",
+	// "group_recompute", "window_partition", "current_diff_recompute",
+	// "distinct_incremental", "semi_anti_recompute", and "full".
 	string strategy_label;
 
 	bool ShouldRecompute() const {

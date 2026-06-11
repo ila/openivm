@@ -131,4 +131,9 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
     add_executable(flag_benchmark benchmark/src/flag_benchmark.cpp)
     target_link_libraries(flag_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
     target_include_directories(flag_benchmark PUBLIC benchmark benchmark/src)
+
+    # Cost-model accuracy benchmark
+    add_executable(cost_model_benchmark benchmark/src/cost_model_benchmark.cpp)
+    target_link_libraries(cost_model_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
+    target_include_directories(cost_model_benchmark PUBLIC benchmark benchmark/src)
 endif()
