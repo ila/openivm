@@ -114,16 +114,16 @@ recompute_cost = recompute_compute + recompute_replace
 
 ### Strategy Overrides
 
-Some refresh types do not use pure delta MERGE. Their non-full costs are adjusted to
+Some maintenance strategies do not use pure delta MERGE. Their non-full costs are adjusted to
 match the refresh path that actually runs:
 
-- `GROUP_RECOMPUTE` prices affected-key recompute variants and DELETE + INSERT of
+- **Affected-group recompute** prices the recompute variants and DELETE + INSERT of
   affected groups.
-- `WINDOW_PARTITION` prices delta scanning plus the affected partition fraction of the
+- **Window partition recompute** prices delta scanning plus the affected partition fraction of the
   base scan.
-- `CURRENT_DIFF_RECOMPUTE` prices the same compute and replace work as full recompute.
-- `DISTINCT_INCREMENTAL` adds aux-state maintenance over affected distinct tuples.
-- `SEMI_ANTI_RECOMPUTE` prices aux-state/domain recompute for supported semi/anti
+- **Current-diff recompute** prices the same compute and replace work as full recompute.
+- **Aux-state DISTINCT** maintenance adds aux-state upkeep over affected distinct tuples.
+- **Aux-state semi/anti** maintenance prices aux-state/domain recompute for supported semi/anti
   projection shapes.
 
 ## Learned Calibration

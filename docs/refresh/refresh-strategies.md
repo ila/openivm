@@ -9,7 +9,7 @@ The `openivm_refresh_mode` setting controls which strategy is used at refresh ti
 | Mode            | Behavior |
 |-----------------|---|
 | `auto`          | The system decides. Uses incremental refresh when the view supports it; falls back to full refresh otherwise. |
-| `incremental`  (default)  | Forces the IVM delta pipeline. Fails if the view was classified as `FULL_REFRESH` at creation time. |
+| `incremental`  (default)  | Forces the IVM delta pipeline. Fails if the view was classified as full-refresh-only at creation time. |
 | `full`          | Forces a complete DELETE + INSERT recomputation, regardless of whether the view supports IVM. |
 
 ```sql
@@ -28,17 +28,17 @@ PRAGMA refresh('monthly_totals');
 
 ## Upsert compilation by view type
 
-The incremental refresh compiles different SQL depending on the view's `RefreshType` (see [Parser: IVM compatibility classification](../internals/parser.md#ivm-compatibility-classification)).
+The incremental refresh compiles different SQL depending on how the view is classified (see [Parser: IVM compatibility classification](../internals/parser.md#ivm-compatibility-classification)).
 
 | View type | Strategy | Why |
 |---|---|---|
-| `AGGREGATE_GROUP` | `MERGE INTO` on GROUP BY keys | Each group is a unique row. MERGE updates existing groups and inserts new ones in a single pass. |
-| `SIMPLE_AGGREGATE` | `UPDATE` (single row) | No GROUP BY means the MV always has exactly one row (SQL guarantees ungrouped aggregates return one row, even on empty input). A plain UPDATE is sufficient. |
-| `SIMPLE_PROJECTION` | `DELETE` (rowid + ROW_NUMBER) then `INSERT` (generate_series) | No keys at all — the MV is a bag of tuples with valid duplicates. MERGE cannot target specific duplicate copies, so row-level addressing via rowid is required. |
+| Grouped aggregate | `MERGE INTO` on GROUP BY keys | Each group is a unique row. MERGE updates existing groups and inserts new ones in a single pass. |
+| Ungrouped aggregate | `UPDATE` (single row) | No GROUP BY means the MV always has exactly one row (SQL guarantees ungrouped aggregates return one row, even on empty input). A plain UPDATE is sufficient. |
+| Projection / filter | `DELETE` (rowid + ROW_NUMBER) then `INSERT` (generate_series) | No keys at all — the MV is a bag of tuples with valid duplicates. MERGE cannot target specific duplicate copies, so row-level addressing via rowid is required. |
 
-For views containing `MIN`, `MAX`, or `HAVING`, a **group-recompute** strategy is used instead: affected groups are deleted and re-inserted from the original query.
+For views containing `MIN`, `MAX`, or `HAVING`, an **affected-group recompute** strategy is used instead: affected groups are deleted and re-inserted from the original query.
 
-MERGE requires a key to match source and target rows. `AGGREGATE_GROUP` views have natural keys (the GROUP BY columns), but the other two types do not:
+MERGE requires a key to match source and target rows. Grouped-aggregate views have natural keys (the GROUP BY columns), but the other two types do not:
 
 - **Simple aggregates** have a single row with no key columns. MERGE would work (match on a dummy condition, always UPDATE), but adds complexity over a plain UPDATE for no benefit.
 - **Projections/filters** allow duplicate rows. MERGE cannot express "delete exactly 3 copies of tuple (a, b) out of 7" — that requires rowid-based targeting.
@@ -105,7 +105,7 @@ OpenIVM automatically classifies a view as full-refresh-only at creation time if
 
 ### Non-deterministic functions
 
-Views that reference non-deterministic functions such as `RANDOM()` or `NOW()` are classified as `FULL_REFRESH`. The result of these functions can change between evaluations, so incremental deltas would be incorrect.
+Views that reference non-deterministic functions such as `RANDOM()` or `NOW()` fall back to full refresh. The result of these functions can change between evaluations, so incremental deltas would be incorrect.
 
 ```sql
 -- Automatically uses full refresh (RANDOM is non-deterministic)
@@ -115,7 +115,7 @@ CREATE MATERIALIZED VIEW sampled AS
 
 ### Unsupported operators
 
-Views that use operators not yet supported for IVM are classified as `FULL_REFRESH` with a warning printed at creation time. Unsupported constructs include window functions over joins, unsupported semi/anti shapes, and aggregate functions outside the supported set.
+Views that use operators not yet supported for IVM fall back to full refresh with a warning printed at creation time. Unsupported constructs include window functions over joins, unsupported semi/anti shapes, and aggregate functions outside the supported set.
 
 `INNER JOIN`, `CROSS JOIN`, arbitrary-predicate joins, `LEFT JOIN`, `RIGHT JOIN`, and `FULL OUTER JOIN` are supported for incremental maintenance. Supported `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, and `NOT EXISTS` projection shapes use an aux-state path.
 

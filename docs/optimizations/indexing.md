@@ -1,9 +1,9 @@
 # Indexing
 
-## Automatic ART Index (AGGREGATE_GROUP Views)
+## Automatic index on grouped-aggregate views
 
 At materialized view creation time, OpenIVM creates an ART index on the `GROUP BY`
-columns of `AGGREGATE_GROUP` views.
+columns of grouped-aggregate views.
 
 ```sql
 CREATE MATERIALIZED VIEW mv AS

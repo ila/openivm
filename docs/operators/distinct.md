@@ -1,6 +1,6 @@
 # DISTINCT
 
-> Linearity: **NON_LINEAR** (DBSP `δ` operator — drops duplicates; group-recompute via COUNT(*) sentinel). ([what does this mean?](../internals/linearity.md))
+> Maintained incrementally: `SELECT DISTINCT` becomes a `GROUP BY` with a hidden per-row count, so duplicates and removals are tracked additively. ([linearity background](../internals/linearity.md))
 
 ## Example
 
@@ -35,14 +35,12 @@ SELECT DISTINCT cols FROM T
 
 The parser rewrites `SELECT DISTINCT` into a `GROUP BY` with a hidden `COUNT(*)` column before planning. The hidden `openivm_distinct_count` column tracks how many source rows map to each distinct output row. You never see it in query results.
 
-The view is classified as `AGGREGATE_GROUP` and maintained incrementally using the same MERGE upsert as any other grouped aggregate:
+The view is maintained incrementally using the same MERGE upsert as any other grouped aggregate:
 
 - **Insert a duplicate:** `openivm_distinct_count` increments (e.g., 1 → 2). No visible change.
 - **Delete a duplicate:** `openivm_distinct_count` decrements (e.g., 2 → 1). No visible change.
 - **Delete the last copy:** `openivm_distinct_count` reaches 0. The row is removed from the MV.
 - **Insert a new value:** `openivm_distinct_count` starts at 1. The row appears in the MV.
-
-There is no separate `DISTINCT` enum in `RefreshType` — it reuses `AGGREGATE_GROUP`.
 
 ## Compiled SQL
 

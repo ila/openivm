@@ -25,7 +25,7 @@ The problem: the delta says "here's a change for US" but doesn't say "US was alr
 
 ## Solution by View Type
 
-### AGGREGATE_GROUP Views
+### Grouped-aggregate views
 
 For each key that appears in the incoming delta, emit a **zero-valued retraction row**
 representing the old state of that group. This tells downstream consumers "the old
@@ -67,7 +67,7 @@ After the MERGE upsert updates the MV to `(US, total=150, cnt=7)`, the delta vie
 
 A downstream `COUNT(*)` over region sees: `+1 + (-1) = 0` net change for 'US'. Correct — the group already existed.
 
-### SIMPLE_AGGREGATE and PROJECTION Views
+### Ungrouped-aggregate and projection views
 
 These views use a **snapshot-based approach** — replace the entire IVM delta with absolute old-to-new transitions:
 

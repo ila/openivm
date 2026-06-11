@@ -86,3 +86,8 @@ CREATE VIEW mv_name AS
 ```
 
 All IVM operations (upsert, delta tracking, MERGE) target the data table, never the view. The view is purely cosmetic.
+
+## See also
+
+For the bigger picture — which views keep auxiliary state tables, how much space each view type
+costs, and the per-view JSON metadata facts — see [State and storage overhead](state-and-overhead.md).

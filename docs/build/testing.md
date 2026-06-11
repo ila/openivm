@@ -25,7 +25,7 @@ All tests live in `test/sql/*.test` using DuckDB's SQLLogicTest format.
 | `left_join.test` | LEFT JOIN, RIGHT JOIN, mixed INNER+LEFT, NULL keys |
 | `full_outer_join.test` | FULL OUTER JOIN projection and aggregate maintenance |
 | `semi_anti_join.test` | SEMI JOIN, ANTI JOIN, EXISTS, NOT EXISTS aux-state maintenance |
-| `lateral.test` | LATERAL / DELIM_JOIN refresh, scalar correlated subqueries |
+| `lateral.test` | LATERAL refresh, scalar correlated subqueries |
 | `union.test` | UNION ALL views |
 | `chained.test` | Chained (multi-level) materialized views |
 | `window.test` | Partition-level window recompute |

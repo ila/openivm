@@ -13,7 +13,7 @@ CREATE MATERIALIZED VIEW top_sales AS
   LIMIT 5;
 ```
 
-**Strategy**: fully incremental — classified as `AGGREGATE_GROUP`.
+**Strategy**: fully incremental (grouped-aggregate maintenance).
 
 The data table `openivm_data_top_sales` stores **all groups**, not just the top-5. On every `PRAGMA refresh()`, the normal delta-MERGE path updates exactly the groups that changed. The VIEW definition wraps the data table with `ORDER BY total DESC LIMIT 5`, applying the top-k filter at read time.
 
@@ -35,7 +35,7 @@ CREATE MATERIALIZED VIEW top_scores AS
   LIMIT 10;
 ```
 
-**Strategy**: incremental maintenance of the unlimited projection — classified as `SIMPLE_PROJECTION`.
+**Strategy**: incremental maintenance of the unlimited projection.
 
 `ORDER BY LIMIT k` over a projection is not Z-set linear:
 
@@ -51,8 +51,4 @@ OpenIVM handles this with the same DBSP-style split used for aggregate top-k: th
 - Same tie-breaking caveat as aggregate top-k.
 - `OFFSET` is supported; `LIMIT WITH TIES` is not.
 
-## Implementation notes
-
-- DuckDB's `top_n` optimizer normally fuses `ORDER BY + LIMIT` into a single `LOGICAL_TOP_N` node, but LPTS disables `top_n`, so the planner emits separate `LOGICAL_LIMIT → LOGICAL_ORDER_BY` nodes. The checker handles both shapes transparently.
-- For aggregate top-k, the parser strips `LOGICAL_LIMIT + LOGICAL_ORDER_BY` from `select_plan` before LPTS serialization, so the stored `sql_string` contains only the aggregate query. The `ORDER BY … LIMIT k` suffix is appended to the `CREATE VIEW` DDL.
-- For projection top-k, the parser performs the same split: the stored `sql_string` contains the unlimited projection, and the `ORDER BY … LIMIT k` suffix is appended to the `CREATE VIEW` DDL.
+In both cases the `ORDER BY … LIMIT k` is stripped from the maintained query and applied by the user-facing view at read time, so the stored data table holds the full (unlimited) result and the top-k is a read-time selection.

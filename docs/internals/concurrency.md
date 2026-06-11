@@ -6,9 +6,9 @@ Each materialized view has a per-view mutex. When `PRAGMA refresh('view_name')` 
 acquires the view's lock before generating or executing any SQL. This prevents two
 concurrent refresh calls from applying overlapping deltas to the same view.
 
-The [automatic refresh daemon](../refresh/automatic-refresh.md) uses `TryLockView()` —
-if the view is already being refreshed, the daemon skips it and retries at the next
-interval.
+The [automatic refresh daemon](../refresh/automatic-refresh.md) uses a non-blocking
+try-lock — if the view is already being refreshed, the daemon skips it and retries at
+the next interval.
 
 ## Delta table safety
 
@@ -45,7 +45,7 @@ Each `(view, base_table)` pair tracks two timestamps in `openivm_delta_tables`:
 4. We set `last_update = now()` (which is *less than* this row's ts).
 5. The next refresh's filter `ts >= last_update` includes this row again → double-application → MV drift.
 
-Anchoring `last_update` to the maximum timestamp we *actually* processed eliminates the gap: the next refresh's filter excludes everything we've seen and includes everything we haven't. See `src/upsert/refresh.cpp:1370–1403` for the implementation.
+Anchoring `last_update` to the maximum timestamp we *actually* processed eliminates the gap: the next refresh's filter excludes everything we've seen and includes everything we haven't.
 
 ## Lock hierarchy
 

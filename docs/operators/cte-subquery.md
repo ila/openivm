@@ -28,8 +28,8 @@ join/aggregate/projection operators.
 This means:
 
 - **CTEs** work with any supported operator inside them (aggregates, joins, filters, etc.)
-- **Scalar subqueries** may be decorrelated to left joins with aggregation, or to
-  DuckDB's scalar `SINGLE` `DELIM_JOIN` shape
+- **Scalar subqueries** may be decorrelated to left joins with aggregation, or to a
+  single-value correlated form maintained by affected-key recompute
 - **EXISTS** subqueries can be maintained through the [semi-join aux-state path](semi-anti-join.md)
 - **NOT EXISTS** subqueries can be maintained through the [anti-join aux-state path](semi-anti-join.md)
 
@@ -37,10 +37,10 @@ The IVM delta rules apply to the decorrelated plan as usual. If DuckDB decorrela
 
 ## Scalar correlated subqueries
 
-Scalar correlated subqueries that DuckDB plans as `SINGLE` `DELIM_JOIN` are maintained
-with affected-key `GROUP_RECOMPUTE`. OpenIVM extracts the visible correlated outer
-columns as recompute keys, deletes only those keys from the MV data table, then
-re-inserts their current results from the stored view query.
+Scalar correlated subqueries (the decorrelated single-value form) are maintained with
+affected-key recompute. OpenIVM extracts the visible correlated outer columns as
+recompute keys, deletes only those keys from the MV data table, then re-inserts their
+current results from the stored view query.
 
 ```sql
 CREATE TABLE warehouse (w_id INT, w_name VARCHAR);
@@ -58,7 +58,6 @@ semantics, including transitions between a matched value and `NULL`.
 ## Limitations
 
 - **Recursive CTEs** are not supported. Views with recursive CTEs fall back to full refresh.
-- **Lateral joins** are incremental when they lower to supported `DELIM_JOIN` /
-  `DEPENDENT_JOIN` shapes with visible correlated keys. Other lateral shapes fall back
-  to full refresh.
+- **Lateral joins** are incremental when they lower to supported correlated-subquery
+  shapes with visible correlated keys. Other lateral shapes fall back to full refresh.
 - **IN** and **NOT IN** are not documented as aux-state semi/anti support because their NULL semantics may require MARK joins. Those views are incremental only when the final decorrelated plan uses supported operators.

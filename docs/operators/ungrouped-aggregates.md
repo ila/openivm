@@ -92,7 +92,7 @@ INSERT INTO total_score SELECT MIN(val) AS min_val, COUNT(*) AS cnt FROM scores;
 | `AVG` | Incremental (decomposed) | Hidden SUM + COUNT columns maintained independently; AVG recomputed as SUM / NULLIF(COUNT, 0). |
 | `STDDEV`, `VARIANCE` | Incremental (decomposed) | Hidden SUM, SUM-of-squares, and COUNT columns maintained independently; final value recomputed after UPDATE. |
 | `MIN`, `MAX` | Full recompute | Entire MV deleted and re-inserted from original query. |
-| `STRING_AGG`, `LISTAGG`, `MEDIAN`, quantiles | Full refresh | View classified as `FULL_REFRESH` at creation time. |
+| `STRING_AGG`, `LISTAGG`, `MEDIAN`, quantiles | Full refresh | Unsupported aggregate; the view falls back to full refresh at creation time. |
 
 ## Limitations
 

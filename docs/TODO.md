@@ -2,7 +2,7 @@
 
 ## P0: Cost Model Audit
 
-- [ ] **Reduce cardinality probe cost.** The current model (`src/upsert/refresh_cost_model.cpp`) still issues `COUNT(*)` queries for base tables, delta tables, and DuckLake insertion/deletion sets. Reuse refresh delta activity, cache recent counts, or use DuckDB statistics where the estimate is good enough.
+- [ ] **Reduce cardinality probe cost.** The cost model still issues `COUNT(*)` queries for base tables, delta tables, and DuckLake insertion/deletion sets. Reuse refresh delta activity, cache recent counts, or use DuckDB statistics where the estimate is good enough.
 - [ ] **Calibrate join refresh cost.** The model counts active join terms and empty-delta skips, but still prices joins mostly from input sizes and term counts. Validate selectivity, skew, join type, FK pruning, and CPU/write costs against measured refresh time.
 - [ ] **Calibrate recompute cost.** Full recompute estimates still undercount join, aggregate, window, distinct, and write-side processing overhead.
 - [ ] **Validate fanout estimates.** The model uses MV cardinality and table cardinality as a fanout proxy. Measure skewed joins and selective filters where average fanout is misleading.
@@ -47,4 +47,4 @@
 - [ ] **Window functions over joins.** Single-table windows use partition recompute. Investigate affected-partition extraction through joins.
 - [ ] **Higher-order IVM.** For join-heavy queries (3+ tables), DBToaster-style auxiliary maps eliminate joins at update time. Evaluate whether the space-time tradeoff is worthwhile for OpenIVM's SQL-to-SQL model.
 - [ ] **Automatic refresh.** Trigger-based immediate refresh on DML, similar to pg_ivm. Currently requires explicit `PRAGMA refresh()`.
-- [ ] **DISTINCT aggregates.** `COUNT(DISTINCT x)` is not incrementally maintained. Explore approximate (HyperLogLog) or exact (auxiliary set per group) approaches.
+- [ ] **DISTINCT aggregates — minimal maintenance.** `COUNT(DISTINCT x)` and friends are maintained today by affected-group recompute (exact, but re-derives whole groups). Explore minimal-delta maintenance via approximate (HyperLogLog) or exact per-group auxiliary set state.

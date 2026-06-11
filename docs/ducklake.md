@@ -114,5 +114,6 @@ DuckLake-backed views support the same operator families as standard DuckDB tabl
 ## Limitations
 
 - **No FK constraints.** DuckLake does not support `FOREIGN KEY` constraints, so the [FK-aware pruning](optimizations/fk-aware-pruning.md) optimization is not available. The [empty-delta term skipping](#empty-delta-term-skipping) optimization covers the most common case (unchanged dimension tables).
-- **No ART indexes.** DuckLake tables don't support ART index creation. For `AGGREGATE_GROUP` views, group column identification falls back to metadata instead of the index catalog.
+- **No native indexes.** DuckLake tables don't support ART index creation. For grouped-aggregate views, group column identification falls back to metadata instead of the index catalog.
 - **Single DuckLake catalog.** All base tables in a DuckLake-backed materialized view must be in the same DuckLake catalog.
+- **Structural changes force a full refresh.** A row-level delta can express inserts and deletes, but not schema-level changes. When a referenced DuckLake table or column is altered or dropped between refreshes, the change can't be incrementalized, so the next refresh recomputes the affected view in full.

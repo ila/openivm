@@ -27,7 +27,7 @@ The refresh daemon is a background `std::thread` started at extension load. It:
 1. Wakes every 30 seconds
 2. Queries `openivm_views` for views with `refresh_interval IS NOT NULL`
 3. For each view where `now() - last_update >= interval`: calls `PRAGMA refresh('view_name')`
-4. Skips views that are already being refreshed (via `TryLockView`)
+4. Skips views that are already being refreshed (via a non-blocking try-lock)
 
 The daemon holds a non-owning reference to the database and exits cleanly when the database is destroyed.
 

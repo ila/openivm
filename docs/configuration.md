@@ -8,8 +8,7 @@ SET openivm_refresh_mode = 'full';
 SELECT current_setting('openivm_adaptive_refresh');
 ```
 
-This page is the authoritative list of every setting OpenIVM registers (see
-`src/openivm_extension.cpp`). Two things to know up front:
+This page is the authoritative list of every setting OpenIVM registers. Two things to know up front:
 
 - **Precedence:** `openivm_refresh_mode = 'full'` is a hard override — it forces full recompute
   regardless of the cost model. `openivm_adaptive_refresh` (the cost-based incremental-vs-full
@@ -58,7 +57,7 @@ effect). Correctness does not depend on them.
 | `openivm_having_merge` | BOOLEAN | `true` | Use MERGE for HAVING views (store all groups; the user-facing view applies the predicate) instead of group-recompute. |
 | `openivm_left_join_merge` | BOOLEAN | `true` | Use incremental MERGE for LEFT JOIN aggregates (Larson & Zhou) instead of group-recompute. |
 | `openivm_full_outer_merge` | BOOLEAN | `true` | Use incremental MERGE for FULL OUTER JOIN aggregates (Zhang & Larson) instead of group-recompute. |
-| `openivm_distinct_aux_state` | BOOLEAN | `false` | Use auxiliary count state for inner DISTINCT under an aggregate (DBSP `distinct(R)=sgn(R[t])` — emit ±1 only on count transitions across zero) instead of GROUP_RECOMPUTE. Single-source views only in v0. |
+| `openivm_distinct_aux_state` | BOOLEAN | `false` | Use auxiliary count state for inner DISTINCT under an aggregate (emit ±1 only on count transitions across zero) instead of affected-group recompute. Single-source views only in v0. |
 | `openivm_enable_data_dependent_optimizers` | BOOLEAN | `false` | Experimental / unsafe: keep data-dependent optimizers (`statistics_propagation`) enabled while planning the delta template. Off by default because the template is reused against future data — folding current contents (count→constant, predicate→empty, COALESCE→column) freezes/corrupts the delta. |
 
 See also: [`optimizations/empty-delta-skip.md`](optimizations/empty-delta-skip.md),
@@ -80,4 +79,4 @@ See also: [`optimizations/empty-delta-skip.md`](optimizations/empty-delta-skip.m
 | `openivm_explain_initial_load` | BOOLEAN | `false` | Print the `CREATE MATERIALIZED VIEW` initial-load SQL and its EXPLAIN plans. |
 | `openivm_explain_initial_load_only` | BOOLEAN | `false` | Print only the initial-load explain output, then stop (do not run the initial load). |
 
-See also: [`internals/profiling`](internals/) and [`refresh/automatic-refresh.md`](refresh/automatic-refresh.md).
+See also: [`refresh/automatic-refresh.md`](refresh/automatic-refresh.md).

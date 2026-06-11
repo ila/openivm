@@ -30,7 +30,7 @@ When a referenced column is renamed, OpenIVM updates the metadata needed by futu
 
 ## How it works
 
-The `RefreshInsertRule` optimizer extension intercepts `LOGICAL_ALTER` nodes. For each `AlterTableInfo`:
+OpenIVM intercepts `ALTER TABLE` statements on tracked base tables. For each alter:
 
 1. Checks if the altered table has a delta table (i.e., it's tracked by IVM)
 2. Determines the alter type (ADD, DROP, RENAME)

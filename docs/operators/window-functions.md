@@ -26,9 +26,9 @@ CREATE MATERIALIZED VIEW top_per_dept AS
     FROM employees;
 ```
 
-At creation time, OpenIVM detects the LOGICAL_WINDOW operator and extracts the
-PARTITION BY columns (`dept` in this example). The view is classified as
-`WINDOW_PARTITION` and the partition columns are stored in metadata.
+At creation time, OpenIVM detects the window operator and extracts the
+PARTITION BY columns (`dept` in this example). The view is maintained by
+partition-level recompute, and the partition columns are stored in metadata.
 
 ### Refresh
 

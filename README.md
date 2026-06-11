@@ -69,14 +69,19 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `GROUP BY` + `SUM`, `COUNT`, `AVG` | Incremental | [Grouped aggregates](docs/operators/grouped-aggregates.md) |
 | `STDDEV`, `VARIANCE` (all variants) | Incremental | [Grouped aggregates](docs/operators/grouped-aggregates.md) |
 | `MIN`, `MAX` | Incremental (insert-only) / group-recompute | [Grouped aggregates](docs/operators/grouped-aggregates.md) |
+| `COUNT(DISTINCT)` | Affected-group recompute | [Count distinct](docs/operators/count-distinct.md) |
+| `GROUPING SETS`, `ROLLUP`, `CUBE` | Affected-group recompute | [Grouping sets](docs/operators/grouping-sets.md) |
 | `HAVING` | Incremental | [Grouped aggregates](docs/operators/grouped-aggregates.md) |
 | Ungrouped aggregates | Incremental | [Ungrouped aggregates](docs/operators/ungrouped-aggregates.md) |
 | `INNER JOIN`, `CROSS JOIN`, arbitrary join predicates | Incremental | [Inner join](docs/operators/inner-join.md) |
 | `LEFT JOIN`, `RIGHT JOIN` | Incremental | [Left join](docs/operators/left-join.md) |
 | `FULL OUTER JOIN` | Incremental (MERGE + recompute) | [Full outer join](docs/operators/full-outer-join.md) |
+| `ASOF JOIN` | Affected-row recompute | [ASOF join](docs/operators/asof-join.md) |
+| `POSITIONAL JOIN` | Affected-row recompute | [Positional join](docs/operators/positional-join.md) |
 | `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, `NOT EXISTS` | Aux-state incremental for supported projection shapes | [Semi & anti join](docs/operators/semi-anti-join.md) |
 | `UNION ALL` | Incremental | [Union all](docs/operators/union-all.md) |
 | `DISTINCT` | Incremental | [Distinct](docs/operators/distinct.md) |
+| `UNNEST` | Incremental | [Unnest](docs/operators/unnest.md) |
 | Window functions (`ROW_NUMBER`, `RANK`, etc.) | Partition-level recompute | [Window functions](docs/operators/window-functions.md) |
 | `LIST` aggregates | Incremental | [List aggregates](docs/operators/list-aggregates.md) |
 | `WITH` (CTEs), decorrelated subqueries, scalar correlated subqueries | Incremental when the lowered plan uses supported operators; scalar `SINGLE` delim shapes use affected-key recompute | [CTEs & subqueries](docs/operators/cte-subquery.md) |
@@ -117,6 +122,6 @@ These are the common settings; see **[Configuration](docs/configuration.md)** fo
 - **[Operators](docs/operators/)** — How each SQL operator is incrementalized
 - **[Refresh](docs/refresh/)** — Refresh strategies and view pipelines
 - **[Optimizations](docs/optimizations/)** — Delta consolidation, FK pruning, empty-delta skip, indexing
-- **[Internals](docs/internals/)** — Delta tables, parser, concurrency
+- **[Internals](docs/internals/)** — Delta tables, parser, concurrency, state & storage overhead, performance
 - **[Limitations](docs/limitations.md)** — Unsupported operators, known restrictions
 - **[Build](docs/build/)** — Building, testing, benchmarks

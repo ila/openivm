@@ -22,7 +22,7 @@ The HAVING clause is split from the SELECT before aggregate aliasing and re-atta
 
 ## DISTINCT rewriting
 
-The parser rewrites `SELECT DISTINCT` into `GROUP BY` + hidden `COUNT(*)` before planning, classifying it as `AGGREGATE_GROUP`. See [Distinct](../operators/distinct.md) for details.
+The parser rewrites `SELECT DISTINCT` into `GROUP BY` + hidden `COUNT(*)` before planning, so it is maintained as an ordinary grouped aggregate. See [Distinct](../operators/distinct.md) for details.
 
 ## AVG decomposition
 
@@ -45,22 +45,23 @@ The parsed interval (300 seconds) is stored in the `refresh_interval` column of 
 
 ## IVM compatibility classification
 
-After rewriting, the parser plans the query and walks the logical plan to classify the view into a refresh type:
+After rewriting, the parser plans the query and walks the logical plan to classify the view into a maintenance strategy. The strategy is stored as a small integer code in the `type` column of `openivm_views`:
 
-| Type | Code | Condition |
-|---|---|---|
-| `AGGREGATE_GROUP` | 0 | Aggregation with GROUP BY columns (including rewritten DISTINCT). |
-| `SIMPLE_AGGREGATE` | 1 | Aggregation without GROUP BY (global aggregate). |
-| `SIMPLE_PROJECTION` | 2 | Projection or filter, no aggregation. |
-| `FULL_REFRESH` | 3 | Contains unsupported constructs. |
-| `AGGREGATE_HAVING` | 4 | Aggregation with GROUP BY and HAVING clause. Uses group-recompute since groups may enter/leave the result set. |
-| `WINDOW_PARTITION` | 5 | Window functions maintained by partition recompute. |
-| `GROUP_RECOMPUTE` | 6 | Affected-key DELETE + INSERT for non-linear group shapes. |
-| `TOP_K` | 7 | Legacy enum value. Current top-k support stores the full data table and applies ORDER BY/LIMIT in the user-facing view. |
-| `DISTINCT_INCREMENTAL` | 8 | Aux-state path for supported inner-DISTINCT-under-aggregate shapes. |
-| `SEMI_ANTI_RECOMPUTE` | 9 | Aux-state path for supported SEMI/ANTI/EXISTS projection shapes. |
+| Code | Maintenance strategy |
+|---|---|
+| 0 | Grouped aggregate — incremental MERGE (includes rewritten `SELECT DISTINCT`). |
+| 1 | Ungrouped (global) aggregate — incremental. |
+| 2 | Projection / filter — incremental. |
+| 3 | Full refresh — recompute the whole view (unsupported construct). |
+| 4 | Grouped aggregate with `HAVING` — groups may enter/leave the result. |
+| 5 | Window functions — affected-partition recompute. |
+| 6 | Affected-group recompute — non-linear group shapes (distinct aggregates, multi-level groupings, non-summable outputs, inner-DISTINCT-under-aggregate). |
+| 7 | (Legacy.) Top-k stores the full data table and applies `ORDER BY`/`LIMIT` in the user-facing view. |
+| 8 | Auxiliary-state DISTINCT maintenance for supported inner-DISTINCT-under-aggregate shapes. |
+| 9 | Auxiliary-state maintenance for supported `SEMI`/`ANTI`/`EXISTS` projection shapes. |
+| 10 | Current-diff recompute — exact re-derivation of the affected rows inside an incremental refresh (e.g. `ASOF`/`POSITIONAL` joins, some union-of-aggregate shapes). |
 
-The IVM compatibility checker validates the entire plan tree, flagging unsupported join shapes, unsupported aggregate functions, and non-deterministic functions (e.g., `RANDOM()`, `NOW()`). Supported join plans include inner joins, cross products, arbitrary-predicate joins, left/right/full outer joins, and the aux-state semi/anti projection shapes. Supported aggregate functions include `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `LIST`, `STDDEV`/`VARIANCE`, `BOOL_AND`, `BOOL_OR`, `ARG_MIN`, and `ARG_MAX`. If any unsupported construct is found, the view is classified as `FULL_REFRESH` and a warning is printed.
+The compatibility check validates the entire plan tree, flagging unsupported join shapes, unsupported aggregate functions, and non-deterministic functions (e.g., `RANDOM()`, `NOW()`). Supported join plans include inner joins, cross products, arbitrary-predicate joins, left/right/full outer joins, ASOF and positional joins, and the aux-state semi/anti projection shapes. Supported aggregate functions include `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `LIST`, `STDDEV`/`VARIANCE`, `BOOL_AND`, `BOOL_OR`, `ARG_MIN`, and `ARG_MAX` (the `DISTINCT` variants of these are maintained by affected-group recompute). If any unsupported construct is found, the view falls back to full refresh and a warning is printed.
 
 ## Generated DDL
 
@@ -71,7 +72,7 @@ The parser produces a sequence of DDL statements executed during the bind phase:
 3. **MV table**: `CREATE TABLE <view_name> AS <query>` to materialize the initial result.
 4. **Delta tables**: One `openivm_delta_<table_name>` per source table, with `openivm_multiplicity` and `openivm_timestamp` columns.
 5. **Delta view table**: `openivm_delta_<view_name>` for downstream chained MV support, with `DEFAULT now()` on the timestamp column.
-6. **Index** (AGGREGATE_GROUP only): A unique index on the GROUP BY columns, used by the MERGE INTO upsert strategy.
+6. **Index** (grouped aggregates only): A unique index on the GROUP BY columns, used by the MERGE INTO upsert strategy.
 
 ## System tables
 

@@ -73,7 +73,7 @@ SET openivm_skip_empty_deltas = false;  -- disable: always run the refresh pipel
 ## When It Does Not Apply
 
 - At least one delta table contains rows (standard) or snapshot IDs differ (DuckLake)
-- View type is `FULL_REFRESH` (unsupported operators always recompute)
+- The view is full-refresh-only (unsupported operators always recompute)
 - `openivm_skip_empty_deltas` is set to `false`
 
 When the setting is `false`, an empty-delta refresh still executes the selected refresh

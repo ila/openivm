@@ -152,8 +152,8 @@ The inclusion-exclusion generates 2^3 - 1 = 7 terms. Terms where only `bonuses` 
 ## Limitations
 
 - Partial recompute is proportional to the number of affected left keys, not the number of changed rows. If many left keys are affected, the recompute may scan a large portion of the base tables.
-- `AGGREGATE_GROUP` views with LEFT JOIN sources use MERGE only for supported aggregate shapes. If `openivm_left_join_merge=false`, or if the aggregate shape is unsafe, OpenIVM uses affected-group recompute.
-- **LEFT JOIN with a *computed* aggregate argument** (anything other than a plain bound column reference — `COALESCE`, `CASE`, an arithmetic expression, a constant) is also forced onto the group-recompute path even when the delta is insert-only. The Larson-Zhou MERGE template doesn't correctly handle the case where a new right-side row converts an existing NULL-padded row into a match for these expressions, so the classifier sets `has_minmax=true` (overloaded as a "use group-recompute" signal) and skips the MERGE fast path. See `src/upsert/refresh_compiler.cpp:289–315`.
+- Grouped-aggregate views with LEFT JOIN sources use MERGE only for supported aggregate shapes. If `openivm_left_join_merge=false`, or if the aggregate shape is unsafe, OpenIVM uses affected-group recompute.
+- **LEFT JOIN with a *computed* aggregate argument** (anything other than a plain column reference — `COALESCE`, `CASE`, an arithmetic expression, a constant) is forced onto the affected-group recompute path even when the delta is insert-only. The incremental MERGE template doesn't correctly handle the case where a new right-side row converts an existing NULL-padded row into a match for these expressions, so the MERGE fast path is skipped.
 - Maximum 16 tables in the join (same limit as [inner join](inner-join.md)).
 
 ## Settings

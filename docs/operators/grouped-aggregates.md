@@ -95,7 +95,7 @@ DELETE FROM sales_summary WHERE total = 0 AND cnt = 0;
 
 ## FILTER (WHERE predicate)
 
-`AGG(x) FILTER (WHERE p)` is rewritten to `AGG(CASE WHEN p THEN x END)` by the `RewriteAggregateFilters` normalisation pass before the IVM checker sees the plan. This is semantically exact under Z-set algebra: a delta row with weight `w` contributes `w × (p ? x : NULL)`, which is a linear transformation of the Z-set. All of `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV` work correctly through this rewrite.
+`AGG(x) FILTER (WHERE p)` is rewritten to `AGG(CASE WHEN p THEN x END)` by a normalization pass before the view is analyzed for incrementality. This is semantically exact under Z-set algebra: a delta row with weight `w` contributes `w × (p ? x : NULL)`, which is a linear transformation of the Z-set. All of `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV` work correctly through this rewrite.
 
 ```sql
 CREATE MATERIALIZED VIEW active_stats AS
