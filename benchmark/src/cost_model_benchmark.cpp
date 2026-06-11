@@ -3,7 +3,7 @@
 // auto / forced-incremental / forced-full refresh times.
 //
 // Usage:
-//   cost_model_benchmark --scale 10 --delta-pcts 0,1,30,100 --reps 3 --out cost_model_sf10.csv
+//   cost_model_benchmark --scale 10 --delta-pcts 0,1,5,10,20,50 --reps 3 --out cost_model_sf10.csv
 //
 
 #include "duckdb.hpp"
@@ -80,6 +80,8 @@ struct ModeResult {
 	bool correct = false;
 	double refresh_ms = 0;
 	string method;
+	int64_t base_rows = 0;
+	int64_t mv_rows = 0;
 	int64_t delta_rows = 0;
 	string error;
 	CostEstimate cost;
@@ -596,6 +598,22 @@ static void WarmScenario(duckdb::Connection &con, const QueryDef &q) {
 	con.Query("SELECT COUNT(*) FROM (" + q.base_sql + ") warm_base");
 }
 
+static int64_t ReadCount(duckdb::Connection &con, const string &sql) {
+	auto result = con.Query(sql);
+	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return 0;
+	}
+	return result->GetValue(0, 0).GetValue<int64_t>();
+}
+
+static int64_t ReadBaseRows(duckdb::Connection &con, const QueryDef &q) {
+	int64_t rows = 0;
+	for (auto &table : q.touched_tables) {
+		rows += ReadCount(con, "SELECT COUNT(*) FROM " + table);
+	}
+	return rows;
+}
+
 static CostEstimate ReadCost(duckdb::Connection &con, const string &view_name) {
 	CostEstimate cost;
 	auto result = con.Query("PRAGMA refresh_cost('" + view_name + "')");
@@ -698,6 +716,8 @@ static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload
 			}
 		}
 		out.delta_rows = ApplyDML(con, q, workload, delta_pct, scale);
+		out.base_rows = ReadBaseRows(con, q);
+		out.mv_rows = ReadCount(con, "SELECT COUNT(*) FROM " + q.refresh_mvs.back());
 		if (warm) {
 			WarmScenario(con, q);
 		}
@@ -834,7 +854,8 @@ int main(int argc, char **argv) {
 	std::ofstream out(out_csv);
 	out << "scale,query_id,description,workload,delta_pct,flag_config,rep,view_name,"
 	       "cost_decision,incremental_cost,recompute_cost,incremental_predicted_ms,recompute_predicted_ms,calibrated,"
-	       "auto_method,auto_ms,incremental_ms,full_ms,best_method,regret_ratio,correct,delta_rows,error\n";
+	       "auto_method,auto_ms,incremental_ms,full_ms,best_method,regret_ratio,correct,base_rows,mv_rows,delta_rows,"
+	       "error\n";
 
 	int total = 0;
 	for (auto &q : queries) {
@@ -909,6 +930,9 @@ int main(int argc, char **argv) {
 							msg << "[MISCLASS] " << q.id << " wl=" << WorkloadName(wl) << " pct=" << pct
 							    << " flags=" << FlagConfigName(config) << " rep=" << rep
 							    << " cost_decision=" << auto_result.cost.decision
+							    << " pred_inc_ms=" << auto_result.cost.incremental_predicted_ms
+							    << " pred_full_ms=" << auto_result.cost.recompute_predicted_ms
+							    << " calibrated=" << (auto_result.cost.calibrated ? "true" : "false")
 							    << " auto_method=" << auto_result.method << " best=" << best
 							    << " auto_ms=" << std::fixed << std::setprecision(3) << auto_result.refresh_ms
 							    << " chosen_path_ms=" << chosen_ms << " incremental_ms=" << inc_result.refresh_ms
@@ -925,8 +949,8 @@ int main(int argc, char **argv) {
 						    << (auto_result.cost.calibrated ? "true" : "false") << "," << CsvQuote(auto_result.method)
 						    << "," << std::setprecision(3) << auto_result.refresh_ms << "," << inc_result.refresh_ms
 						    << "," << full_result.refresh_ms << "," << CsvQuote(best) << "," << std::setprecision(6)
-						    << regret << "," << (correct ? "true" : "false") << "," << auto_result.delta_rows << ","
-						    << CsvQuote(error) << "\n";
+						    << regret << "," << (correct ? "true" : "false") << "," << auto_result.base_rows << ","
+						    << auto_result.mv_rows << "," << auto_result.delta_rows << "," << CsvQuote(error) << "\n";
 						out.flush();
 					}
 				}
