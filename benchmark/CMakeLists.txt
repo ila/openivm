@@ -20,6 +20,11 @@ add_executable(flag_benchmark src/flag_benchmark.cpp src/tpcc_helpers.cpp)
 target_link_libraries(flag_benchmark PRIVATE DuckDB::DuckDB)
 target_include_directories(flag_benchmark PRIVATE ${DUCKDB_INCLUDE_DIRS})
 
+# Cost-model benchmark: compares refresh_cost estimates to measured refresh modes
+add_executable(cost_model_benchmark src/cost_model_benchmark.cpp src/tpcc_helpers.cpp)
+target_link_libraries(cost_model_benchmark PRIVATE DuckDB::DuckDB)
+target_include_directories(cost_model_benchmark PRIVATE ${DUCKDB_INCLUDE_DIRS})
+
 # Daemon benchmark: tests scheduled background refresh
 add_executable(daemon_benchmark src/daemon_benchmark.cpp src/tpcc_helpers.cpp)
 target_link_libraries(daemon_benchmark PRIVATE DuckDB::DuckDB)
@@ -31,4 +36,4 @@ target_link_libraries(tpcc_setup PRIVATE DuckDB::DuckDB)
 target_include_directories(tpcc_setup PRIVATE ${DUCKDB_INCLUDE_DIRS})
 
 # Installation
-install(TARGETS rewriter_benchmark flag_benchmark daemon_benchmark tpcc_setup DESTINATION bin)
+install(TARGETS rewriter_benchmark flag_benchmark cost_model_benchmark daemon_benchmark tpcc_setup DESTINATION bin)

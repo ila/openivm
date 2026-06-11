@@ -994,11 +994,249 @@ SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt';
 ----
 0
 
+# ==========================================
+# Test 21: Cost model records fixed strategy labels
+# ==========================================
+
+statement ok
+CREATE TABLE cm_dist_src (grp INT, machine VARCHAR, cores INT);
+
+statement ok
+INSERT INTO cm_dist_src VALUES
+    (1, 'm1', 8),
+    (1, 'm1', 8),
+    (1, 'm2', 16),
+    (2, 'm3', 4);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cm_group_recompute AS
+    SELECT grp, SUM(cores) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cores FROM cm_dist_src WHERE machine IS NOT NULL) d
+    GROUP BY grp;
+
+statement ok
+INSERT INTO cm_dist_src VALUES (1, 'm4', 32), (2, 'm3', 4);
+
+statement ok
+PRAGMA refresh('mv_cm_group_recompute');
+
+query T
+SELECT method FROM openivm_refresh_history WHERE view_name = 'mv_cm_group_recompute' ORDER BY refresh_timestamp DESC LIMIT 1;
+----
+group_recompute
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(cores) FROM (SELECT DISTINCT grp, machine, cores FROM cm_dist_src WHERE machine IS NOT NULL) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM mv_cm_group_recompute
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_cm_group_recompute
+    EXCEPT ALL
+    SELECT grp, SUM(cores) FROM (SELECT DISTINCT grp, machine, cores FROM cm_dist_src WHERE machine IS NOT NULL) d GROUP BY grp
+);
+----
+0
+
+statement ok
+SET openivm_distinct_aux_state = true;
+
+statement ok
+CREATE TABLE cm_dist_aux_src (grp INT, machine VARCHAR, cores INT);
+
+statement ok
+INSERT INTO cm_dist_aux_src VALUES
+    (1, 'm1', 8),
+    (1, 'm1', 8),
+    (1, 'm2', 16),
+    (2, 'm3', 4);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cm_distinct_incremental AS
+    SELECT grp, SUM(cores) AS total_cores
+    FROM (SELECT DISTINCT grp, machine, cores FROM cm_dist_aux_src WHERE machine IS NOT NULL) d
+    GROUP BY grp;
+
+statement ok
+INSERT INTO cm_dist_aux_src VALUES (1, 'm4', 32);
+
+statement ok
+PRAGMA refresh('mv_cm_distinct_incremental');
+
+query T
+SELECT method FROM openivm_refresh_history WHERE view_name = 'mv_cm_distinct_incremental' ORDER BY refresh_timestamp DESC LIMIT 1;
+----
+distinct_incremental
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(cores) FROM (SELECT DISTINCT grp, machine, cores FROM cm_dist_aux_src WHERE machine IS NOT NULL) d GROUP BY grp
+    EXCEPT ALL SELECT * FROM mv_cm_distinct_incremental
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_cm_distinct_incremental
+    EXCEPT ALL
+    SELECT grp, SUM(cores) FROM (SELECT DISTINCT grp, machine, cores FROM cm_dist_aux_src WHERE machine IS NOT NULL) d GROUP BY grp
+);
+----
+0
+
+statement ok
+SET openivm_distinct_aux_state = false;
+
+statement ok
+CREATE TABLE cm_saj_l (id INT, x INT);
+
+statement ok
+CREATE TABLE cm_saj_r (y INT);
+
+statement ok
+INSERT INTO cm_saj_l VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+INSERT INTO cm_saj_r VALUES (9), (21);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cm_semi_anti AS
+    SELECT l.id, l.x FROM cm_saj_l l SEMI JOIN cm_saj_r r ON abs(l.x - r.y) <= 1;
+
+statement ok
+INSERT INTO cm_saj_r VALUES (30);
+
+statement ok
+PRAGMA refresh('mv_cm_semi_anti');
+
+query T
+SELECT method FROM openivm_refresh_history WHERE view_name = 'mv_cm_semi_anti' ORDER BY refresh_timestamp DESC LIMIT 1;
+----
+semi_anti_recompute
+
+query I
+SELECT count(*) FROM (
+    SELECT l.id, l.x FROM cm_saj_l l SEMI JOIN cm_saj_r r ON abs(l.x - r.y) <= 1
+    EXCEPT ALL SELECT * FROM mv_cm_semi_anti
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_cm_semi_anti
+    EXCEPT ALL SELECT l.id, l.x FROM cm_saj_l l SEMI JOIN cm_saj_r r ON abs(l.x - r.y) <= 1
+);
+----
+0
+
+statement ok
+CREATE TABLE cm_win_src (id INT, grp INT, val INT);
+
+statement ok
+INSERT INTO cm_win_src VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cm_window_partition AS
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) AS rn FROM cm_win_src;
+
+statement ok
+INSERT INTO cm_win_src VALUES (4, 1, 15);
+
+statement ok
+PRAGMA refresh('mv_cm_window_partition');
+
+query T
+SELECT method FROM openivm_refresh_history WHERE view_name = 'mv_cm_window_partition' ORDER BY refresh_timestamp DESC LIMIT 1;
+----
+window_partition
+
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) FROM cm_win_src
+    EXCEPT ALL SELECT * FROM mv_cm_window_partition
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_cm_window_partition
+    EXCEPT ALL SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) FROM cm_win_src
+);
+----
+0
+
+statement ok
+CREATE TABLE cm_asof_trades (symbol VARCHAR, ts TIMESTAMP, qty INT);
+
+statement ok
+CREATE TABLE cm_asof_prices (symbol VARCHAR, ts TIMESTAMP, price INT);
+
+statement ok
+INSERT INTO cm_asof_trades VALUES
+    ('A', TIMESTAMP '2024-01-01 10:00:00', 1),
+    ('A', TIMESTAMP '2024-01-01 10:20:00', 2);
+
+statement ok
+INSERT INTO cm_asof_prices VALUES
+    ('A', TIMESTAMP '2024-01-01 09:00:00', 100),
+    ('A', TIMESTAMP '2024-01-01 10:18:00', 180);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cm_current_diff AS
+    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
+    FROM cm_asof_trades t
+    ASOF JOIN cm_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts;
+
+statement ok
+INSERT INTO cm_asof_prices VALUES ('A', TIMESTAMP '2024-01-01 10:19:00', 190);
+
+statement ok
+PRAGMA refresh('mv_cm_current_diff');
+
+query T
+SELECT method FROM openivm_refresh_history WHERE view_name = 'mv_cm_current_diff' ORDER BY refresh_timestamp DESC LIMIT 1;
+----
+current_diff_recompute
+
+query I
+SELECT count(*) FROM (
+    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
+    FROM cm_asof_trades t
+    ASOF JOIN cm_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+    EXCEPT ALL SELECT * FROM mv_cm_current_diff
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_cm_current_diff
+    EXCEPT ALL
+    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
+    FROM cm_asof_trades t
+    ASOF JOIN cm_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+);
+----
+0
+
 statement ok
 SET openivm_adaptive_refresh = false;
 
 # ==========================================
-# Test 21: Empty-delta term skipping — 3-way join, only 1 table changes
+# Test 22: Empty-delta term skipping — 3-way join, only 1 table changes
 # ==========================================
 
 statement ok
@@ -1059,6 +1297,17 @@ SELECT count(*) FROM (SELECT * FROM mv_ed EXCEPT ALL SELECT a.val, b.label, c.ta
 # Now insert into ONLY table A (B and C have empty deltas)
 statement ok
 INSERT INTO ed_a VALUES (52, 999);
+
+statement ok
+SET openivm_skip_empty_deltas = false;
+
+query IIIIII
+PRAGMA refresh_cost('mv_ed');
+----
+full	1084.544109	307.000000	1084.544109	307.000000	false
+
+statement ok
+SET openivm_skip_empty_deltas = true;
 
 statement ok
 PRAGMA refresh('mv_ed');

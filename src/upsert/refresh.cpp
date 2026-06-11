@@ -182,7 +182,7 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 		// The generated refresh SQL already contains an explicit decorrelated plan. DuckDB's
 		// deliminator can recurse through very deep stress-query CTE/subquery expansions and
 		// overflow in the optimizer before the refresh query runs.
-		exec_con.Query("SET disabled_optimizers='" + string(openivm::DISABLED_OPTIMIZERS) + ", deliminator'");
+		exec_con.Query("SET disabled_optimizers='" + string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "'");
 		// Refreshes update relational MV state; physical insertion order is not part of
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.
@@ -310,11 +310,10 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 			// Determine which method was used. Priority:
 			//   1) `openivm_refresh_mode = 'full'` overrides everything → "full".
-			//   2) `cost_estimate.strategy_label` if set (group_recompute, window_partition).
-			//      For these fixed-strategy views the IVM-vs-full decision never fires.
-			//   3) For "incremental" views, the adaptive cost model may have picked full recompute.
+			//   2) If the adaptive cost model picked full recompute, record "full".
+			//   3) Otherwise record the selected refresh strategy label.
 			string method = cost_estimate.strategy_label.empty() ? "incremental" : cost_estimate.strategy_label;
-			if (method == "incremental" && cost_estimate.ShouldRecompute()) {
+			if (cost_estimate.ShouldRecompute()) {
 				method = "full";
 			}
 			Value mode_val;
