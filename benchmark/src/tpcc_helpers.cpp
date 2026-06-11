@@ -84,63 +84,43 @@ void CreateTPCCSchema(duckdb::Connection &con) {
 }
 
 void InsertTPCCData(duckdb::Connection &con, int scale_factor) {
-	int num_warehouses = scale_factor;
-	int num_items = 100;
+	// Per-warehouse cardinality. These are far larger than a row-per-INSERT loop could
+	// populate cheaply, so generation is set-based (INSERT ... SELECT over range() cross
+	// products) — fast even at high scale. scale_factor == number of warehouses, so total
+	// data grows linearly with it. At SF1 ORDER_LINE ~10k rows; at SF100 ~1M rows.
+	const int num_warehouses = scale_factor;
+	const int districts_per_wh = 10;
+	const int customers_per_district = 100;
+	const int orders_per_district = 100; // ~one order per customer
+	const int order_lines_per_order = 10;
+	const int num_items = 1000;
+	auto N = std::to_string(num_warehouses + 1);
+	auto D = std::to_string(districts_per_wh + 1);
+	auto C = std::to_string(customers_per_district + 1);
+	auto O = std::to_string(orders_per_district + 1);
+	auto OL = std::to_string(order_lines_per_order + 1);
+	auto I = std::to_string(num_items + 1);
 
-	for (int w = 1; w <= num_warehouses; w++) {
-		con.Query("INSERT INTO WAREHOUSE VALUES (" + std::to_string(w) +
-		          ", 300000.00, 0.0500, 'Warehouse" + std::to_string(w) +
-		          "', 'Street1', 'Street2', 'City', 'ST', '123456789')");
-	}
-	for (int w = 1; w <= num_warehouses; w++) {
-		for (int d = 1; d <= 10; d++) {
-			con.Query("INSERT INTO DISTRICT VALUES (" + std::to_string(w) + ", " + std::to_string(d) +
-			          ", 30000.00, 0.0500, 1, 'District" + std::to_string(d) +
-			          "', 'Street1', 'Street2', 'City', 'ST', '123456789')");
-		}
-	}
-	for (int w = 1; w <= num_warehouses; w++) {
-		for (int d = 1; d <= 10; d++) {
-			for (int c = 1; c <= 30; c++) {
-				con.Query("INSERT INTO CUSTOMER VALUES (" + std::to_string(w) + ", " + std::to_string(d) + ", " +
-				          std::to_string(c) +
-				          ", 0.05, 'GC', 'LastName', 'FirstName', 50000.00, 10000.00, 0.0, 0, 0, 'St1', 'St2', "
-				          "'City', 'ST', '123456789', '1234567890123456', NOW(), 'M', 'data')");
-			}
-		}
-	}
-	for (int i = 1; i <= num_items; i++) {
-		con.Query("INSERT INTO ITEM VALUES (" + std::to_string(i) + ", 'Item" + std::to_string(i) + "', " +
-		          std::to_string(10 + (i % 90)) + ".99, 'ItemData', " + std::to_string((i % 10) + 1) + ")");
-	}
-	for (int w = 1; w <= num_warehouses; w++) {
-		for (int i = 1; i <= num_items; i++) {
-			con.Query("INSERT INTO STOCK VALUES (" + std::to_string(w) + ", " + std::to_string(i) + ", " +
-			          std::to_string(50 + (i % 50)) +
-			          ", 0.00, 0, 0, 'StockData', 'Dist1', 'Dist2', 'Dist3', 'Dist4', 'Dist5', 'Dist6', 'Dist7', "
-			          "'Dist8', 'Dist9', 'Dist10')");
-		}
-	}
-	for (int w = 1; w <= num_warehouses; w++) {
-		for (int d = 1; d <= 10; d++) {
-			for (int o = 1; o <= 5; o++) {
-				con.Query("INSERT INTO OORDER VALUES (" + std::to_string(w) + ", " + std::to_string(d) + ", " +
-				          std::to_string(o) + ", " + std::to_string((o % 30) + 1) + ", NULL, 5, 1, NOW())");
-			}
-		}
-	}
-	for (int w = 1; w <= num_warehouses; w++) {
-		for (int d = 1; d <= 10; d++) {
-			for (int o = 1; o <= 5; o++) {
-				for (int ol = 1; ol <= 3; ol++) {
-					con.Query("INSERT INTO ORDER_LINE VALUES (" + std::to_string(w) + ", " + std::to_string(d) + ", " +
-					          std::to_string(o) + ", " + std::to_string(ol) + ", " + std::to_string((ol % 10) + 1) +
-					          ", NULL, " + std::to_string(10 + (ol * 5)) + ".00, " + std::to_string(w) +
-					          ", 5.00, 'DistInfo')");
-				}
-			}
-		}
-	}
+	con.Query("INSERT INTO WAREHOUSE SELECT w, 300000.00, 0.0500, 'WH'||w, 'Street1', 'Street2', 'City', 'ST', "
+	          "'123456789' FROM range(1, " +
+	          N + ") t(w)");
+	con.Query("INSERT INTO DISTRICT SELECT w, d, 30000.00, 0.0500, 1, 'D'||d, 'Street1', 'Street2', 'City', 'ST', "
+	          "'123456789' FROM range(1, " +
+	          N + ") t(w), range(1, " + D + ") g(d)");
+	con.Query("INSERT INTO CUSTOMER SELECT w, d, c, 0.05, 'GC', 'LastName', 'FirstName', 50000.00, 10000.00, 0.0, 0, "
+	          "0, 'St1', 'St2', 'City', 'ST', '123456789', '1234567890123456', NOW(), 'M', 'data' FROM range(1, " +
+	          N + ") t(w), range(1, " + D + ") g(d), range(1, " + C + ") cc(c)");
+	con.Query("INSERT INTO ITEM SELECT i, 'Item'||i, (10 + (i % 90)) + 0.99, 'ItemData', (i % 10) + 1 FROM range(1, " +
+	          I + ") t(i)");
+	con.Query("INSERT INTO STOCK SELECT w, i, 50 + (i % 50), 0.00, 0, 0, 'StockData', 'Dist1', 'Dist2', 'Dist3', "
+	          "'Dist4', 'Dist5', 'Dist6', 'Dist7', 'Dist8', 'Dist9', 'Dist10' FROM range(1, " +
+	          N + ") t(w), range(1, " + I + ") g(i)");
+	con.Query("INSERT INTO OORDER SELECT w, d, o, (o % " + C +
+	          ") + 1, NULL, 5, 1, NOW() FROM range(1, " + N + ") t(w), range(1, " + D + ") g(d), range(1, " + O +
+	          ") oo(o)");
+	con.Query("INSERT INTO ORDER_LINE SELECT w, d, o, ol, (ol % 10) + 1, NULL, (10 + ol * 5) + 0.00, w, 5.00, "
+	          "'DistInfo' FROM range(1, " +
+	          N + ") t(w), range(1, " + D + ") g(d), range(1, " + O + ") oo(o), range(1, " + OL + ") l(ol)");
 }
 
 std::vector<std::string> GenerateDeltaPool(int scale_factor) {
