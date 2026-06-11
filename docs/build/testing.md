@@ -77,3 +77,20 @@ latest checked result was:
 | Full refresh | 113 |
 | Crashed | 0 |
 | Metadata mismatches | 0 |
+
+## Cost Model Benchmark Checks
+
+Use the cost-model benchmark to compare automatic refresh decisions against forced
+incremental and forced full refresh. Run it on representative data sizes and delta
+ratios before changing the adaptive cost model.
+
+```bash
+build/release/extension/openivm/cost_model_benchmark \
+    --scale 10 \
+    --delta-pcts 0,1,5,10,20,50 \
+    --reps 3 \
+    --out /tmp/openivm_cost_model.csv
+```
+
+The benchmark writes a CSV with the model's decision, predicted cost, actual refresh
+time, and the fastest forced strategy for each case.

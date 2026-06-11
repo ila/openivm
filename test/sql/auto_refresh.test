@@ -977,6 +977,27 @@ PRAGMA refresh_cost('mv_cold');
 ----
 full	8.643856	401.000000	5008.643856	401.000000	0
 
+# Empty delta with skip-empty disabled still executes the refresh path, so it pays fixed overhead.
+statement ok
+CREATE TABLE empty_cost_base (id INT, val INT);
+
+statement ok
+INSERT INTO empty_cost_base SELECT i, i FROM range(1, 101) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_empty_cost AS SELECT id, val FROM empty_cost_base;
+
+statement ok
+SET openivm_skip_empty_deltas = false;
+
+query IIIIII
+PRAGMA refresh_cost('mv_empty_cost');
+----
+full	0.000000	400.000000	5000.000000	400.000000	false
+
+statement ok
+SET openivm_skip_empty_deltas = true;
+
 # ==========================================
 # Test 20: Learned cost model — history cleanup on REPLACE
 # ==========================================

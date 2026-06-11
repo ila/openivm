@@ -3,11 +3,11 @@
 ## P0: Cost Model Audit
 
 - [ ] **Reduce cardinality probe cost.** The current model (`src/upsert/refresh_cost_model.cpp`) still issues `COUNT(*)` queries for base tables, delta tables, and DuckLake insertion/deletion sets. Reuse refresh delta activity, cache recent counts, or use DuckDB statistics where the estimate is good enough.
-- [ ] **Calibrate join refresh cost.** The model accounts for DuckLake N-term joins and FK pruning, but still prices joins mostly from input sizes and term counts. Validate selectivity, skew, join type, and CPU/write costs against measured refresh time.
+- [ ] **Calibrate join refresh cost.** The model counts active join terms and empty-delta skips, but still prices joins mostly from input sizes and term counts. Validate selectivity, skew, join type, FK pruning, and CPU/write costs against measured refresh time.
 - [ ] **Calibrate recompute cost.** Full recompute estimates still undercount join, aggregate, window, distinct, and write-side processing overhead.
 - [ ] **Validate fanout estimates.** The model uses MV cardinality and table cardinality as a fanout proxy. Measure skewed joins and selective filters where average fanout is misleading.
-- [ ] **Complete strategy-specific estimates.** Audit costs for counting-based upsert, group recompute, window partition recompute, outer-join MERGE, DISTINCT aux-state, and semi/anti aux-state refresh.
-- [ ] **Test learned model calibration.** Track predicted vs actual refresh time per strategy, expose/use the refresh-history `strategy` column consistently, and verify cold-start thresholds.
+- [ ] **Improve strategy-specific estimates.** The model has first-pass estimates for group recompute, window partition recompute, current-diff recompute, DISTINCT aux-state, and semi/anti aux-state refresh. Audit these against measured workloads.
+- [ ] **Test learned model calibration.** Track predicted vs actual refresh time per strategy and verify cold-start thresholds.
 - [ ] **Validate with real workloads.** Run the cost model on TPC-derived and synthetic stress views. Report decision accuracy, predicted/actual latency, and regret when the model chooses the slower strategy.
 
 ## P1: Correctness & Robustness
@@ -34,12 +34,10 @@
 
 ## P4: Benchmarking Suite
 
-The current suite covers projection, filter, grouped aggregate, and common join shapes at 1K–1M rows with 1%–50% delta ratios.
-
-- [ ] **Audit benchmark operator coverage.** Add targeted cases for any missing FULL OUTER JOIN, SEMI/ANTI, window, LIST, STDDEV/VARIANCE, DISTINCT aux-state, and mixed operator stack behavior.
-- [ ] **Cost-model accuracy benchmark.** Record predicted incremental/full time, actual refresh time, decision, calibration state, and regret ratio.
-- [ ] **Mixed DML workload.** INSERT + DELETE + UPDATE interleaved in the same refresh cycle to stress delta consolidation.
-- [ ] **TPC-H derived queries.** Q1 (grouped aggregates + filter), Q3 (3-way join + aggregate), Q5 (multi-join + aggregate), Q6 (filter + aggregate) as materialized views with incremental refresh after base table inserts.
+- [ ] **Audit benchmark operator coverage.** Keep representative coverage for supported refresh strategies and mixed operator stacks.
+- [ ] **Cost-model accuracy benchmark.** Compare automatic decisions with forced incremental and forced full refresh across representative workloads.
+- [ ] **Mixed DML workload.** Include INSERT, DELETE, and UPDATE in the same refresh cycle to stress delta consolidation.
+- [ ] **TPC-derived queries.** Keep a small set of realistic query shapes for validating refresh decisions.
 - [ ] **Latency distribution.** Report p50/p95/p99 refresh times, not just median, to catch tail latency from large deltas or skewed groups.
 - [ ] **CI integration.** Run a lightweight benchmark subset on every PR to catch performance regressions.
 

@@ -82,6 +82,7 @@ struct ModeResult {
 	string method;
 	int64_t base_rows = 0;
 	int64_t mv_rows = 0;
+	int64_t dml_statements = 0;
 	int64_t delta_rows = 0;
 	string error;
 	CostEstimate cost;
@@ -282,6 +283,51 @@ static vector<string> GenerateUpdates(const string &table, int n, int scale) {
 	return out;
 }
 
+static bool SupportsUpdates(const string &table) {
+	return table == "CUSTOMER" || table == "WAREHOUSE" || table == "DISTRICT" || table == "OORDER" ||
+	       table == "ORDER_LINE" || table == "cm_dist_src" || table == "cm_dist_aux_src" || table == "cm_win_src" ||
+	       table == "cm_asof_prices";
+}
+
+static vector<string> GenerateExistingDeletes(const string &table, int n, int scale) {
+	vector<string> out;
+	out.reserve(n);
+	for (int i = 0; i < n; i++) {
+		int safe_scale = std::max(scale, 1);
+		int w = 1 + ((i / 300) % safe_scale);
+		int d = 1 + ((i / 30) % 10);
+		int c = 1 + (i % 30);
+		if (table == "CUSTOMER") {
+			out.push_back("DELETE FROM CUSTOMER WHERE C_W_ID = " + to_string(w) + " AND C_D_ID = " + to_string(d) +
+			              " AND C_ID = " + to_string(c));
+		} else if (table == "WAREHOUSE") {
+			out.push_back("DELETE FROM WAREHOUSE WHERE W_ID = " + to_string(1 + (i % safe_scale)));
+		} else if (table == "DISTRICT") {
+			out.push_back("DELETE FROM DISTRICT WHERE D_W_ID = " + to_string(1 + ((i / 10) % safe_scale)) +
+			              " AND D_ID = " + to_string(1 + (i % 10)));
+		} else if (table == "OORDER") {
+			out.push_back("DELETE FROM OORDER WHERE O_W_ID = " + to_string(1 + ((i / 50) % safe_scale)) +
+			              " AND O_D_ID = " + to_string(1 + ((i / 5) % 10)) +
+			              " AND O_ID = " + to_string(1 + (i % 5)));
+		} else if (table == "ORDER_LINE") {
+			out.push_back("DELETE FROM ORDER_LINE WHERE OL_W_ID = " + to_string(1 + ((i / 250) % safe_scale)) +
+			              " AND OL_D_ID = " + to_string(1 + ((i / 25) % 10)) +
+			              " AND OL_O_ID = " + to_string(1 + ((i / 5) % 5)) +
+			              " AND OL_NUMBER = " + to_string(1 + (i % 5)));
+		} else if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
+			static const char *machines[] = {"m1", "m2", "m3"};
+			out.push_back("DELETE FROM " + table + " WHERE machine = '" + string(machines[i % 3]) + "'");
+		} else if (table == "cm_saj_r") {
+			out.push_back("DELETE FROM cm_saj_r WHERE y = " + to_string((10 * (1 + (i % 50))) + 1));
+		} else if (table == "cm_win_src") {
+			out.push_back("DELETE FROM cm_win_src WHERE id = " + to_string(1 + (i % 500)));
+		} else if (table == "cm_asof_prices") {
+			out.push_back("DELETE FROM cm_asof_prices WHERE price = " + to_string(100 + (i % 500)));
+		}
+	}
+	return out;
+}
+
 static vector<string> BuildWorkload(const string &table, int size, int scale, Workload wl, int64_t pk_offset) {
 	if (wl == Workload::EMPTY_DELTA || size <= 0) {
 		return {};
@@ -290,34 +336,39 @@ static vector<string> BuildWorkload(const string &table, int size, int scale, Wo
 		return GenerateInserts(table, size, scale, pk_offset);
 	}
 
-	int n_ins = size / 2;
-	int n_upd = (size * 30) / 100;
-	int n_del = size - n_ins - n_upd;
+	int n_ins;
+	int n_upd;
+	int n_del;
+	if (size == 1) {
+		n_ins = 0;
+		n_upd = 0;
+		n_del = 1;
+	} else if (size == 2) {
+		n_ins = 1;
+		n_upd = 0;
+		n_del = 1;
+	} else {
+		n_ins = std::max(1, size / 2);
+		n_upd = std::max(1, (size * 30) / 100);
+		n_del = size - n_ins - n_upd;
+		if (n_del <= 0) {
+			n_del = 1;
+			if (n_ins > 1) {
+				n_ins--;
+			} else {
+				n_upd--;
+			}
+		}
+	}
+	if (!SupportsUpdates(table)) {
+		n_del += n_upd;
+		n_upd = 0;
+	}
 	auto out = GenerateInserts(table, n_ins, scale, pk_offset);
 	auto updates = GenerateUpdates(table, n_upd, scale);
 	out.insert(out.end(), updates.begin(), updates.end());
-	for (int i = 0; i < n_del; i++) {
-		int64_t pk = kPkBase + pk_offset + i;
-		if (table == "CUSTOMER") {
-			out.push_back("DELETE FROM CUSTOMER WHERE C_ID = " + to_string(pk));
-		} else if (table == "WAREHOUSE") {
-			out.push_back("DELETE FROM WAREHOUSE WHERE W_ID = " + to_string(pk));
-		} else if (table == "DISTRICT") {
-			out.push_back("DELETE FROM DISTRICT WHERE D_ID = " + to_string(pk));
-		} else if (table == "OORDER") {
-			out.push_back("DELETE FROM OORDER WHERE O_ID = " + to_string(pk));
-		} else if (table == "ORDER_LINE") {
-			out.push_back("DELETE FROM ORDER_LINE WHERE OL_O_ID = " + to_string(pk));
-		} else if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
-			out.push_back("DELETE FROM " + table + " WHERE machine = 'm" + to_string(pk) + "'");
-		} else if (table == "cm_saj_r") {
-			out.push_back("DELETE FROM cm_saj_r WHERE y = " + to_string(10 + (i % 1000)));
-		} else if (table == "cm_win_src") {
-			out.push_back("DELETE FROM cm_win_src WHERE id = " + to_string(pk));
-		} else if (table == "cm_asof_prices") {
-			out.push_back("DELETE FROM cm_asof_prices WHERE price = " + to_string(100 + (i % 500)));
-		}
-	}
+	auto deletes = GenerateExistingDeletes(table, n_del, scale);
+	out.insert(out.end(), deletes.begin(), deletes.end());
 	return out;
 }
 
@@ -584,7 +635,15 @@ static string DeltaTableName(const string &table) {
 	for (auto &ch : name) {
 		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 	}
-	return "delta_" + name;
+	return "openivm_delta_" + name;
+}
+
+static int64_t CountPendingDeltaRows(duckdb::Connection &con, const QueryDef &q) {
+	int64_t rows = 0;
+	for (auto &table : q.touched_tables) {
+		rows += CountRows(con, DeltaTableName(table));
+	}
+	return rows;
 }
 
 static void WarmScenario(duckdb::Connection &con, const QueryDef &q) {
@@ -629,6 +688,39 @@ static CostEstimate ReadCost(duckdb::Connection &con, const string &view_name) {
 	cost.calibrated = result->GetValue(5, 0).GetValue<bool>();
 	cost.ok = true;
 	return cost;
+}
+
+static CostEstimate CombinePipelineCosts(const vector<CostEstimate> &costs) {
+	if (costs.size() == 1) {
+		return costs[0];
+	}
+	CostEstimate total;
+	total.ok = true;
+	for (auto &cost : costs) {
+		if (!cost.ok) {
+			return cost;
+		}
+		total.incremental_cost += cost.incremental_cost;
+		total.recompute_cost += cost.recompute_cost;
+		total.incremental_predicted_ms += cost.incremental_predicted_ms;
+		total.recompute_predicted_ms += cost.recompute_predicted_ms;
+		total.calibrated = total.calibrated || cost.calibrated;
+	}
+	total.decision = total.recompute_predicted_ms < total.incremental_predicted_ms ? "full" : "incremental";
+	return total;
+}
+
+static string CombinePipelineMethods(const vector<string> &methods) {
+	bool saw_incremental = false;
+	for (auto &method : methods) {
+		if (method == "full" || method == "forced_full") {
+			return "full";
+		}
+		if (method != "skipped_or_unrecorded") {
+			saw_incremental = true;
+		}
+	}
+	return saw_incremental ? "incremental" : "skipped_or_unrecorded";
 }
 
 static bool ValidateMV(duckdb::Connection &con, const string &mv_name, const string &base_sql, string &error) {
@@ -715,32 +807,50 @@ static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload
 				return out;
 			}
 		}
-		out.delta_rows = ApplyDML(con, q, workload, delta_pct, scale);
+		out.dml_statements = ApplyDML(con, q, workload, delta_pct, scale);
+		out.delta_rows = CountPendingDeltaRows(con, q);
+		if (workload == Workload::MIXED && delta_pct > 0 && out.delta_rows <= 0) {
+			out.error = "mixed workload produced no pending delta rows";
+			return out;
+		}
 		out.base_rows = ReadBaseRows(con, q);
 		out.mv_rows = ReadCount(con, "SELECT COUNT(*) FROM " + q.refresh_mvs.back());
 		if (warm) {
 			WarmScenario(con, q);
 		}
 		ConfigureMode(con, mode);
-		if (read_cost) {
-			out.cost = ReadCost(con, q.refresh_mvs.back());
-			if (!out.cost.ok) {
-				out.error = "refresh_cost failed: " + out.cost.error;
-				return out;
-			}
-		}
+		vector<CostEstimate> stage_costs;
+		vector<string> stage_methods;
 		int64_t t0 = NowMicros();
 		for (auto &mv : q.refresh_mvs) {
+			if (read_cost) {
+				auto stage_cost = ReadCost(con, mv);
+				if (!stage_cost.ok) {
+					out.error = "refresh_cost failed for " + mv + ": " + stage_cost.error;
+					return out;
+				}
+				stage_costs.push_back(std::move(stage_cost));
+			}
+			auto refresh_start = NowMicros();
 			auto result = con.Query("PRAGMA refresh('" + mv + "')");
 			if (!result || result->HasError()) {
 				out.error = "PRAGMA refresh failed: " + (result ? result->GetError() : "null result");
 				return out;
 			}
+			if (mode == RefreshMode::AUTO) {
+				stage_methods.push_back(LastHistoryMethod(con, mv));
+			}
+			int64_t refresh_end = NowMicros();
+			out.refresh_ms += (refresh_end - refresh_start) / 1000.0;
 		}
 		int64_t t1 = NowMicros();
-		out.refresh_ms = (t1 - t0) / 1000.0;
+		if (!read_cost) {
+			out.refresh_ms = (t1 - t0) / 1000.0;
+		} else {
+			out.cost = CombinePipelineCosts(stage_costs);
+		}
 		if (mode == RefreshMode::AUTO) {
-			out.method = LastHistoryMethod(con, q.refresh_mvs.back());
+			out.method = CombinePipelineMethods(stage_methods);
 		} else if (mode == RefreshMode::INCREMENTAL) {
 			out.method = "forced_incremental";
 		} else {
@@ -854,8 +964,8 @@ int main(int argc, char **argv) {
 	std::ofstream out(out_csv);
 	out << "scale,query_id,description,workload,delta_pct,flag_config,rep,view_name,"
 	       "cost_decision,incremental_cost,recompute_cost,incremental_predicted_ms,recompute_predicted_ms,calibrated,"
-	       "auto_method,auto_ms,incremental_ms,full_ms,best_method,regret_ratio,correct,base_rows,mv_rows,delta_rows,"
-	       "error\n";
+	       "auto_method,auto_ms,incremental_ms,full_ms,best_method,regret_ratio,correct,base_rows,mv_rows,"
+	       "dml_statements,delta_rows,error\n";
 
 	int total = 0;
 	for (auto &q : queries) {
@@ -950,7 +1060,8 @@ int main(int argc, char **argv) {
 						    << "," << std::setprecision(3) << auto_result.refresh_ms << "," << inc_result.refresh_ms
 						    << "," << full_result.refresh_ms << "," << CsvQuote(best) << "," << std::setprecision(6)
 						    << regret << "," << (correct ? "true" : "false") << "," << auto_result.base_rows << ","
-						    << auto_result.mv_rows << "," << auto_result.delta_rows << "," << CsvQuote(error) << "\n";
+						    << auto_result.mv_rows << "," << auto_result.dml_statements << ","
+						    << auto_result.delta_rows << "," << CsvQuote(error) << "\n";
 						out.flush();
 					}
 				}
