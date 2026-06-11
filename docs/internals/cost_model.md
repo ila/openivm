@@ -1,25 +1,25 @@
 # Cost Model
 
 OpenIVM uses the cost model when `openivm_adaptive_refresh` is enabled. The model
-compares the selected incremental refresh strategy with a full recompute, then chooses
-the lower predicted cost.
-
-The implementation lives in `src/upsert/refresh_cost_model.cpp`.
+compares the view's normal maintenance path with a full recompute, then chooses the
+lower predicted cost.
 
 ## Decision Target
 
-The model does not invent a new refresh strategy. It prices the strategy assigned to the
-view at creation time and compares it with a full DELETE + INSERT recompute.
+Each materialized view has a maintenance path determined by its query shape. For example,
+a grouped aggregate usually uses a keyed MERGE, while a window query may recompute only
+affected partitions. In `auto` mode, the cost model asks one question: is that normal
+maintenance path cheaper than rebuilding the whole materialized view?
 
-| View classification | Priced non-full strategy |
+| Query shape | Normal maintenance path |
 |---|---|
-| Regular projection, filter, join, aggregate | `incremental` |
-| `GROUP_RECOMPUTE` | `group_recompute` |
-| `WINDOW_PARTITION` | `window_partition` |
-| `CURRENT_DIFF_RECOMPUTE` | `current_diff_recompute` |
-| `DISTINCT_INCREMENTAL` | `distinct_incremental` |
-| `SEMI_ANTI_RECOMPUTE` | `semi_anti_recompute` |
-| `FULL_REFRESH` or `TOP_K` | `full` |
+| Projection, filter, join, grouped aggregate | Incremental delta maintenance |
+| Non-linear grouped aggregate shape | Affected-group recompute |
+| Window function | Affected-partition recompute |
+| Current-diff shape | Current result diff against the old MV data |
+| Supported inner DISTINCT under aggregate | DISTINCT aux-state maintenance |
+| Supported SEMI/ANTI projection | SEMI/ANTI aux-state recompute |
+| Unsupported or full-refresh-only shape | Full recompute |
 
 `PRAGMA refresh_cost('view_name')` returns the selected decision and the static or
 calibrated predictions used to make it:
@@ -59,8 +59,8 @@ functions between the last consumed snapshot and the current snapshot.
 For joins, compute cost is driven by the number of delta join terms.
 
 If `openivm_skip_empty_deltas` is enabled, only sources with non-empty deltas are priced.
-If the setting is disabled, all join leaves are priced, because the refresh compiler also
-builds terms that contain inactive sources.
+If the setting is disabled, all join leaves are priced, because refresh still evaluates
+terms that contain unchanged sources.
 
 | Join mode | Term estimate |
 |---|---|
@@ -151,6 +151,42 @@ when adaptive refresh is enabled and either:
 
 This biases small-data cases toward full recompute until enough history exists. True
 empty-delta no-ops with empty-delta skipping enabled do not pay this overhead.
+
+## Example
+
+Consider a materialized view over a 3-table join:
+
+```sql
+CREATE MATERIALIZED VIEW order_summary AS
+    SELECT c_region, SUM(ol_amount) AS revenue
+    FROM customer
+    JOIN orders ON c_id = o_c_id
+    JOIN order_line ON o_id = ol_o_id
+    GROUP BY c_region;
+```
+
+If only `order_line` has pending changes and empty-delta skipping is enabled, the join
+delta has one active source. The standard inclusion-exclusion rule prices one join term:
+
+```text
+2^1 - 1 = 1
+```
+
+If both `orders` and `order_line` changed, the model prices three terms:
+
+```text
+2^2 - 1 = 3
+```
+
+Those terms estimate the compute side of incremental maintenance. The aggregate MERGE
+cost is then based on the estimated number of affected `c_region` groups. The full
+recompute alternative scans the base tables, produces the full result, deletes the old
+MV rows, and inserts the new rows.
+
+For a small database, the fixed cost of planning and executing the incremental path can
+make full recompute cheaper even for a 1% change. For a larger database, the same 1%
+change should usually favor incremental maintenance if the affected join fanout is not
+too large.
 
 ## Preliminary Benchmark Results
 
