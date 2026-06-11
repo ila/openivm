@@ -1,0 +1,120 @@
+# name: test/sql/data_dependent_template.test
+# description: data-dependent optimizers must stay off while planning the delta template, so the
+# group: [sql]
+
+#   view query is not specialized to current table contents. Regression for statistics_propagation
+#   folding the template (count/min/max -> constant, predicate -> EMPTY_RESULT, COALESCE -> column).
+#   The unittest harness runs with query verification on, which forces the exact-cardinality stats
+#   that trigger these folds — so these refreshes exercise the disable directly.
+
+require openivm
+
+# Setting is off by default.
+query I
+SELECT current_setting('openivm_enable_data_dependent_optimizers');
+----
+false
+
+# --- Family 1: ungrouped COUNT(*) folded to a constant via TryExecuteAggregates ---
+statement ok
+CREATE TABLE ddt(i INT);
+
+statement ok
+INSERT INTO ddt VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW dd_count AS SELECT COUNT(*) AS c FROM ddt;
+
+statement ok
+INSERT INTO ddt VALUES (2), (3);
+
+statement ok
+PRAGMA refresh('dd_count');
+
+query I
+SELECT count(*) FROM ((SELECT c FROM dd_count) EXCEPT ALL (SELECT COUNT(*) FROM ddt));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT COUNT(*) FROM ddt) EXCEPT ALL (SELECT c FROM dd_count));
+----
+0
+
+# --- Family 1b: ungrouped MIN/MAX folded from partition stats ---
+statement ok
+CREATE TABLE ddm(v INT);
+
+statement ok
+INSERT INTO ddm VALUES (5), (3), (8);
+
+statement ok
+CREATE MATERIALIZED VIEW dd_minmax AS SELECT MIN(v) AS mn, MAX(v) AS mx FROM ddm;
+
+statement ok
+INSERT INTO ddm VALUES (1), (10);
+
+statement ok
+PRAGMA refresh('dd_minmax');
+
+query I
+SELECT count(*) FROM ((SELECT mn, mx FROM dd_minmax) EXCEPT ALL (SELECT MIN(v), MAX(v) FROM ddm));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT MIN(v), MAX(v) FROM ddm) EXCEPT ALL (SELECT mn, mx FROM dd_minmax));
+----
+0
+
+# --- Family 2: filter proven empty on current stats -> EMPTY_RESULT (future rows must still flow) ---
+statement ok
+CREATE TABLE ddf(x INT);
+
+statement ok
+INSERT INTO ddf VALUES (1), (2);
+
+statement ok
+CREATE MATERIALIZED VIEW dd_filter AS SELECT x FROM ddf WHERE x > 100;
+
+statement ok
+INSERT INTO ddf VALUES (200), (5);
+
+statement ok
+PRAGMA refresh('dd_filter');
+
+query I
+SELECT count(*) FROM ((SELECT x FROM dd_filter) EXCEPT ALL (SELECT x FROM ddf WHERE x > 100));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT x FROM ddf WHERE x > 100) EXCEPT ALL (SELECT x FROM dd_filter));
+----
+0
+
+# --- Family 3: COALESCE simplified away because the column currently has no NULLs ---
+statement ok
+CREATE TABLE ddc(a INT, b INT);
+
+statement ok
+INSERT INTO ddc VALUES (1, 1), (2, 2);
+
+statement ok
+CREATE MATERIALIZED VIEW dd_coal AS SELECT COALESCE(a, -1) AS sa, b FROM ddc;
+
+statement ok
+INSERT INTO ddc VALUES (NULL, 3);
+
+statement ok
+PRAGMA refresh('dd_coal');
+
+query I
+SELECT count(*) FROM ((SELECT sa, b FROM dd_coal) EXCEPT ALL (SELECT COALESCE(a, -1), b FROM ddc));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT COALESCE(a, -1), b FROM ddc) EXCEPT ALL (SELECT sa, b FROM dd_coal));
+----
+0
