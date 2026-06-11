@@ -416,7 +416,7 @@ static vector<QueryDef> BuildQueries() {
 	AddQuery(qs, {"P1",
 	              "cascade pipeline",
 	              {},
-	              {},
+	              {"SET openivm_cascade_refresh = 'off'"},
 	              {"CREATE MATERIALIZED VIEW mv_p1_a AS SELECT C_W_ID, C_D_ID, SUM(C_BALANCE) AS s FROM CUSTOMER "
 	               "GROUP BY C_W_ID, C_D_ID",
 	               "CREATE MATERIALIZED VIEW mv_p1_b AS SELECT C_W_ID, SUM(s) AS s_tot FROM mv_p1_a GROUP BY C_W_ID",

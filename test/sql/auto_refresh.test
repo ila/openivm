@@ -869,9 +869,9 @@ INSERT INTO lt SELECT i, i % 5, i FROM range(200, 210) t(i);
 statement ok
 PRAGMA refresh('mv_lt');
 
-# History recorded: 3 incremental entries with non-negative durations
+# History recorded: 3 entries with non-negative durations
 query I
-SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt' AND method = 'incremental' AND actual_duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt' AND actual_duration_ms >= 0;
 ----
 3
 
@@ -971,11 +971,11 @@ CREATE MATERIALIZED VIEW mv_cold AS SELECT id, val FROM cold_base;
 statement ok
 INSERT INTO cold_base VALUES (101, 101);
 
-# No history — predicted_ms equals static cost, calibrated = false
+# No history — uncalibrated incremental prediction includes fixed compilation overhead.
 query IIIIII
 PRAGMA refresh_cost('mv_cold');
 ----
-incremental	8.643856	401.000000	8.643856	401.000000	false
+full	8.643856	401.000000	5008.643856	401.000000	0
 
 # ==========================================
 # Test 20: Learned cost model — history cleanup on REPLACE
@@ -997,6 +997,9 @@ SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt';
 # ==========================================
 # Test 21: Cost model records fixed strategy labels
 # ==========================================
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
 
 statement ok
 CREATE TABLE cm_dist_src (grp INT, machine VARCHAR, cores INT);

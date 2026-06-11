@@ -538,6 +538,86 @@ SELECT grand FROM cascade_l2;
 185
 
 # ============================================================
+# L. Forced full upstream refresh still emits downstream deltas
+# ============================================================
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+statement ok
+CREATE TABLE full_pipe_base (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO full_pipe_base VALUES ('a', 10), ('b', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW full_pipe_l1 AS
+    SELECT grp, SUM(val) AS total FROM full_pipe_base GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW full_pipe_l2 AS
+    SELECT SUM(total) AS grand FROM full_pipe_l1;
+
+statement ok
+INSERT INTO full_pipe_base VALUES ('a', 5), ('c', 15);
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+statement ok
+PRAGMA refresh('full_pipe_l1');
+
+query I
+SELECT COUNT(*) FROM openivm_delta_full_pipe_l1;
+----
+3
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+statement ok
+PRAGMA refresh('full_pipe_l2');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(val) AS total FROM full_pipe_base GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM full_pipe_l1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM full_pipe_l1
+    EXCEPT ALL
+    SELECT grp, SUM(val) AS total FROM full_pipe_base GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM full_pipe_base GROUP BY grp)
+    EXCEPT ALL
+    SELECT grand FROM full_pipe_l2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grand FROM full_pipe_l2
+    EXCEPT ALL
+    SELECT SUM(total) AS grand FROM (SELECT grp, SUM(val) AS total FROM full_pipe_base GROUP BY grp)
+);
+----
+0
+
+# ============================================================
 # Full cascade through 3 levels where base becomes empty then repopulated
 # ============================================================
 

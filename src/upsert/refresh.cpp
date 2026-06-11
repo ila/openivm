@@ -308,20 +308,22 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 		if (!cost_estimate.strategy_label.empty()) {
 			auto history_start = std::chrono::steady_clock::now();
 			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-			// Determine which method was used. Priority:
-			//   1) `openivm_refresh_mode = 'full'` overrides everything → "full".
-			//   2) If the adaptive cost model picked full recompute, record "full".
-			//   3) Otherwise record the selected refresh strategy label.
+			// Determine which method was used. Forced modes override the adaptive estimate:
+			// full records "full"; incremental records the selected non-full strategy.
+			// In auto mode, record "full" only when the cost model actually picked recompute.
 			string method = cost_estimate.strategy_label.empty() ? "incremental" : cost_estimate.strategy_label;
-			if (cost_estimate.ShouldRecompute()) {
-				method = "full";
-			}
+			bool force_incremental = false;
 			Value mode_val;
 			if (context.TryGetCurrentSetting("openivm_refresh_mode", mode_val) && !mode_val.IsNull()) {
 				auto mode = StringUtil::Lower(mode_val.ToString());
 				if (mode == "full") {
 					method = "full";
+				} else if (mode == "incremental") {
+					force_incremental = true;
 				}
+			}
+			if (!force_incremental && cost_estimate.ShouldRecompute()) {
+				method = "full";
 			}
 
 			RefreshMetadata(exec_con).RecordRefreshHistory(
@@ -393,6 +395,11 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
                                 const string &view_name, const string &attached_db_catalog_name,
                                 const string &attached_db_schema_name, DeltaActivityResult *active_activity) {
 	if (!SkipEmptyDeltasEnabled(context)) {
+		return false;
+	}
+	Value refresh_mode_val;
+	if (context.TryGetCurrentSetting("openivm_refresh_mode", refresh_mode_val) && !refresh_mode_val.IsNull() &&
+	    StringUtil::Lower(refresh_mode_val.ToString()) == "full") {
 		return false;
 	}
 	if (metadata.GetViewType(view_name) == RefreshType::FULL_REFRESH) {
