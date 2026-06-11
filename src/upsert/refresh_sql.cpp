@@ -1031,7 +1031,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		planner.CreatePlan(std::move(p.statements[0]));
 		auto plan = std::move(planner.plan);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Plan created. Running optimizer...\n");
-		ScopedDisabledOptimizers disabled_optimizers(con_ctx, string(openivm::DISABLED_OPTIMIZERS) + ", deliminator");
+		// deliminator: overflow guard on the deep generated SQL. Template set: keep the serialized
+		// delta plan data-independent (the rewrite rule fires within this Optimize()).
+		ScopedDisabledOptimizers disabled_optimizers(con_ctx, string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "," +
+		                                                          TemplateDisabledOptimizers(con_ctx));
 		Optimizer optimizer(*planner.binder, con_ctx);
 		plan = optimizer.Optimize(std::move(plan)); // this transforms the plan into an incremental plan
 		OPENIVM_DEBUG_PRINT("[UPSERT] Optimizer done.\n");

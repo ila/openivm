@@ -112,7 +112,9 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Unoptimized plan: \n%s\n", planner.plan->ToString().c_str());
 #endif
-	ScopedDisabledOptimizers disabled_optimizers(input.context, openivm::DISABLED_OPTIMIZERS);
+	// This optimized plan is the delta-compilation TEMPLATE — keep it data-independent (see
+	// TemplateDisabledOptimizers / TEMPLATE_DATA_DEPENDENT_OPTIMIZERS).
+	ScopedDisabledOptimizers disabled_optimizers(input.context, TemplateDisabledOptimizers(input.context));
 	Optimizer optimizer(*planner.binder, input.context);
 	auto optimized_plan = optimizer.Optimize(std::move(planner.plan));
 

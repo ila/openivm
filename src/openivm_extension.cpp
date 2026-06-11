@@ -126,6 +126,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
+	// When true, do NOT disable data-dependent optimizers (statistics_propagation) while planning the
+	// delta template. Off by default: the template is reused against future data, so data-dependent
+	// folding (count(*)->constant, predicate->EMPTY_RESULT, COALESCE simplification) corrupts the delta.
+	db_config.AddExtensionOption("openivm_enable_data_dependent_optimizers",
+	                             "experimental: keep data-dependent optimizers on while planning the delta "
+	                             "template (unsafe — bakes current table contents into the template)",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+
 	// Per-optimization flags (default: all enabled)
 	db_config.AddExtensionOption("openivm_skip_empty_deltas", "skip refresh or join terms when deltas are empty",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
