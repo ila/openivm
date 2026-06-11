@@ -717,6 +717,13 @@ static string BestMethod(double incremental_ms, double full_ms) {
 	return incremental_ms <= full_ms ? "incremental" : "full";
 }
 
+static string MethodClass(const string &method) {
+	if (method == "full" || method == "forced_full") {
+		return "full";
+	}
+	return "incremental";
+}
+
 static double RegretRatio(const string &auto_method, double auto_ms, double incremental_ms, double full_ms) {
 	double best_ms = std::min(incremental_ms, full_ms);
 	if (best_ms <= 0) {
@@ -728,7 +735,7 @@ static double RegretRatio(const string &auto_method, double auto_ms, double incr
 
 static void PrintUsage() {
 	fprintf(stderr, "cost_model_benchmark --scale N --db PATH --out CSV [--reps 3]\n"
-	                "                     [--delta-pcts 0,1,30,100] [--filter Q01,S06,...]\n");
+	                "                     [--delta-pcts 0,1,5,10,20,50] [--filter Q01,S06,...]\n");
 }
 
 int main(int argc, char **argv) {
@@ -736,7 +743,7 @@ int main(int argc, char **argv) {
 	string db_path;
 	string out_csv = "cost_model_benchmark_results.csv";
 	int reps = 3;
-	vector<int> delta_pcts = {0, 1, 30, 100};
+	vector<int> delta_pcts = {0, 1, 5, 10, 20, 50};
 	set<string> query_filter;
 
 	for (int i = 1; i < argc; i++) {
@@ -858,6 +865,20 @@ int main(int argc, char **argv) {
 						string best = BestMethod(inc_result.refresh_ms, full_result.refresh_ms);
 						double regret = RegretRatio(auto_result.method, auto_result.refresh_ms, inc_result.refresh_ms,
 						                            full_result.refresh_ms);
+						if (!ok || !correct) {
+							Log("[ERROR] " + q.id + " wl=" + WorkloadName(wl) + " pct=" + to_string(pct) +
+							    " flags=" + FlagConfigName(config) + " rep=" + to_string(rep) + " error=" + error);
+						} else if (MethodClass(auto_result.method) != best) {
+							std::ostringstream msg;
+							msg << "[MISCLASS] " << q.id << " wl=" << WorkloadName(wl) << " pct=" << pct
+							    << " flags=" << FlagConfigName(config) << " rep=" << rep
+							    << " cost_decision=" << auto_result.cost.decision
+							    << " auto_method=" << auto_result.method << " best=" << best
+							    << " auto_ms=" << std::fixed << std::setprecision(3) << auto_result.refresh_ms
+							    << " incremental_ms=" << inc_result.refresh_ms << " full_ms=" << full_result.refresh_ms
+							    << " regret=" << std::setprecision(3) << regret;
+							Log(msg.str());
+						}
 						out << scale << "," << q.id << "," << CsvQuote(q.description) << "," << WorkloadName(wl) << ","
 						    << pct << "," << FlagConfigName(config) << "," << rep << "," << q.refresh_mvs.back() << ","
 						    << CsvQuote(auto_result.cost.decision) << "," << std::fixed << std::setprecision(6)
