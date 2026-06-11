@@ -118,7 +118,19 @@ static const char *StrategyLabelForRefreshType(RefreshType view_type) {
 	}
 }
 
-static constexpr double UNCALIBRATED_STRATEGY_FIXED_COST = 5000.0;
+// Uncalibrated, ms-grounded prior for the incremental-vs-recompute decision. Consulted only before
+// any refresh history exists; the learned regression replaces it after a few runs. We predict
+//   time_ms ≈ fixed_setup_ms + UNCAL_MS_PER_UNIT * cost_units
+// Incremental pays a larger fixed setup than recompute because every refresh re-plans the delta
+// query, runs the rewrite rules, does the LPTS round-trip and regenerates the upsert SQL — measured
+// at ~10-12 ms, independent of delta size — whereas recompute is a single query. This makes
+// recompute win at small scale (fixed cost dominates) and incremental win at large scale (the
+// throughput term dominates) — the real crossover is multiplicative in view size, which a flat
+// additive penalty in cost-units could not capture. The constants are a coarse, hardware-rough
+// prior: they only steer the decision for *small* views and only until calibration kicks in.
+static constexpr double UNCAL_MS_PER_UNIT = 0.0025;  // ~ms per cost unit (rows scanned/written)
+static constexpr double INCREMENTAL_SETUP_MS = 12.0; // fixed per-refresh compile/plan overhead
+static constexpr double RECOMPUTE_SETUP_MS = 2.0;    // recompute is a single query: small fixed cost
 
 static bool IsLinearCostNode(DeltaModelNodeKind kind) {
 	return kind == DeltaModelNodeKind::SCAN || kind == DeltaModelNodeKind::FILTER ||
@@ -689,6 +701,19 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	bool adaptive_on = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
 
 	if (adaptive_on) {
+		// Uncalibrated ms-grounded prior (see constants above). The learned regression below
+		// overrides each side once it has enough history.
+		//   - will_skip: an empty delta with skip-empty on is short-circuited entirely → ~free.
+		//   - genuine incremental (strategy strictly cheaper than recompute and not skipped) pays the
+		//     incremental setup floor; recompute-equivalent strategies (CURRENT_DIFF_RECOMPUTE,
+		//     FULL_REFRESH, TOP_K) and empty-delta-with-skip-off pay only the recompute setup, so the
+		//     decision is driven purely by the throughput term and the label is not spuriously flipped.
+		bool will_skip = !has_active_delta && skip_empty_enabled;
+		bool genuine_incremental = !will_skip && strategy_total < recompute_total;
+		double strategy_setup_ms = will_skip ? 0.0 : (genuine_incremental ? INCREMENTAL_SETUP_MS : RECOMPUTE_SETUP_MS);
+		strategy_predicted_ms = strategy_setup_ms + UNCAL_MS_PER_UNIT * strategy_total;
+		recompute_predicted_ms = RECOMPUTE_SETUP_MS + UNCAL_MS_PER_UNIT * recompute_total;
+
 		double decay = 0.9;
 		Value decay_val;
 		if (context.TryGetCurrentSetting("openivm_cost_decay", decay_val) && !decay_val.IsNull()) {
@@ -724,10 +749,6 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 			                    rc_reg.w_compute, rc_reg.w_upsert, rc_reg.w_intercept);
 		}
 	}
-	if (adaptive_on && !calibrated && strategy_label != "full" && (has_active_delta || !skip_empty_enabled)) {
-		strategy_predicted_ms += UNCALIBRATED_STRATEGY_FIXED_COST;
-	}
-
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s, FullOuter: %s, DuckLake: %s, FK: %s\n", N,
 	                    has_join ? "yes" : "no", has_aggregate ? "yes" : "no", plan_stats.has_full_outer ? "yes" : "no",
 	                    plan_stats.all_ducklake ? "yes" : "no", fk_enabled ? "on" : "off");

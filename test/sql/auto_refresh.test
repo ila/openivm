@@ -971,13 +971,16 @@ CREATE MATERIALIZED VIEW mv_cold AS SELECT id, val FROM cold_base;
 statement ok
 INSERT INTO cold_base VALUES (101, 101);
 
-# No history — uncalibrated incremental prediction includes fixed compilation overhead.
+# No history — uncalibrated, ms-grounded prediction: incremental pays a fixed compile/plan setup
+# (~12ms) on top of a small throughput term, while recompute of this tiny view is cheaper, so the
+# model correctly prefers full recompute at this scale.
 query IIIIII
 PRAGMA refresh_cost('mv_cold');
 ----
-full	8.643856	401.000000	5008.643856	401.000000	0
+full	8.643856	401.000000	12.021610	3.002500	0
 
-# Empty delta with skip-empty disabled still executes the refresh path, so it pays fixed overhead.
+# Empty delta with skip-empty disabled still executes the refresh path, so it pays the fixed
+# incremental setup (~12ms); recompute of this tiny view is cheaper, so full wins.
 statement ok
 CREATE TABLE empty_cost_base (id INT, val INT);
 
@@ -993,7 +996,7 @@ SET openivm_skip_empty_deltas = false;
 query IIIIII
 PRAGMA refresh_cost('mv_empty_cost');
 ----
-full	0.000000	400.000000	5000.000000	400.000000	false
+full	0.000000	400.000000	12.000000	3.000000	false
 
 statement ok
 SET openivm_skip_empty_deltas = true;
