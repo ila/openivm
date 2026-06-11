@@ -1,7 +1,15 @@
 # Delta Skipping Rules
 
-`openivm_skip_empty_deltas` should gate all optimizations that prove a source delta
-cannot affect a refresh, or that a smaller equivalent delta can be used.
+Consolidated catalog of the rules under `openivm_skip_empty_deltas`: each proves a source
+delta cannot affect a refresh, or that a smaller equivalent delta can be used, so the
+corresponding work is skipped. Several rules have a dedicated page with the implemented
+behavior and examples — this page is the unified reference and design rationale.
+
+See also: [Empty delta skip](empty-delta-skip.md) (rules 1–3: the early-exit + per-term join
+skip), [FK-aware pruning](fk-aware-pruning.md) (rule 5), [Append-only optimizations](append-only.md)
+(rules 4 and 6), [DuckLake integration](../ducklake.md) (rule 1), and
+[Pipelines](../refresh/pipelines.md) (rule 7, downstream cascade). The controlling setting is in
+[Configuration](../configuration.md).
 
 ## 1. DuckLake Table No-Op Skip
 

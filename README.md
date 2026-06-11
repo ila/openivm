@@ -97,6 +97,8 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `openivm_profile_refresh` | BOOLEAN | `false` | Record per-step refresh timings in `openivm_refresh_profile` | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files | [Internals](docs/internals/delta-tables.md) |
 
+These are the common settings; see **[Configuration](docs/configuration.md)** for the complete list, including the advanced optimization toggles.
+
 
 ## Pragmas
 
@@ -110,6 +112,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 
 ## Documentation
 
+- **[Configuration](docs/configuration.md)** — Complete reference for all settings
 - **[DuckLake integration](docs/ducklake.md)** — IVM over DuckLake tables with native change tracking
 - **[Operators](docs/operators/)** — How each SQL operator is incrementalized
 - **[Refresh](docs/refresh/)** — Refresh strategies and view pipelines
