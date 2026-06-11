@@ -724,13 +724,16 @@ static string MethodClass(const string &method) {
 	return "incremental";
 }
 
-static double RegretRatio(const string &auto_method, double auto_ms, double incremental_ms, double full_ms) {
+static double ChosenPathMs(const string &auto_method, double incremental_ms, double full_ms) {
+	return MethodClass(auto_method) == "full" ? full_ms : incremental_ms;
+}
+
+static double RegretRatio(const string &auto_method, double incremental_ms, double full_ms) {
 	double best_ms = std::min(incremental_ms, full_ms);
 	if (best_ms <= 0) {
 		return 0;
 	}
-	(void)auto_method;
-	return auto_ms / best_ms;
+	return ChosenPathMs(auto_method, incremental_ms, full_ms) / best_ms;
 }
 
 static void PrintUsage() {
@@ -863,8 +866,9 @@ int main(int argc, char **argv) {
 							error += "full: " + full_result.error;
 						}
 						string best = BestMethod(inc_result.refresh_ms, full_result.refresh_ms);
-						double regret = RegretRatio(auto_result.method, auto_result.refresh_ms, inc_result.refresh_ms,
-						                            full_result.refresh_ms);
+						double chosen_ms =
+						    ChosenPathMs(auto_result.method, inc_result.refresh_ms, full_result.refresh_ms);
+						double regret = RegretRatio(auto_result.method, inc_result.refresh_ms, full_result.refresh_ms);
 						if (!ok || !correct) {
 							Log("[ERROR] " + q.id + " wl=" + WorkloadName(wl) + " pct=" + to_string(pct) +
 							    " flags=" + FlagConfigName(config) + " rep=" + to_string(rep) + " error=" + error);
@@ -875,8 +879,9 @@ int main(int argc, char **argv) {
 							    << " cost_decision=" << auto_result.cost.decision
 							    << " auto_method=" << auto_result.method << " best=" << best
 							    << " auto_ms=" << std::fixed << std::setprecision(3) << auto_result.refresh_ms
-							    << " incremental_ms=" << inc_result.refresh_ms << " full_ms=" << full_result.refresh_ms
-							    << " regret=" << std::setprecision(3) << regret;
+							    << " chosen_path_ms=" << chosen_ms << " incremental_ms=" << inc_result.refresh_ms
+							    << " full_ms=" << full_result.refresh_ms << " regret=" << std::setprecision(3)
+							    << regret;
 							Log(msg.str());
 						}
 						out << scale << "," << q.id << "," << CsvQuote(q.description) << "," << WorkloadName(wl) << ","
