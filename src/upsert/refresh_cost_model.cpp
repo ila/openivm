@@ -192,7 +192,7 @@ static JoinTermEstimate EstimateJoinTerms(Connection &con, const PlanStats &stat
 			active_idx = i;
 		}
 	}
-	if (!stats.has_join || result.active_sources == 0) {
+	if (!stats.has_join || (result.active_sources == 0 && skip_empty_enabled)) {
 		return result;
 	}
 	idx_t priced_sources = skip_empty_enabled ? result.active_sources : stats.table_stats.size();
