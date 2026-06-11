@@ -56,11 +56,26 @@ constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";
 // Limits
 static constexpr idx_t MAX_JOIN_TABLES = 16;
 
-// Optimizer settings that are still sensitive during IVM rewrite/planning.
-// column_lifetime is enabled: it only adds projection_map prune-hints, and both the delta
-// operators (filter.cpp / join.cpp re-add the multiplicity column) and LPTS (explicit SELECT
-// column lists for pruned Filter/Order nodes) already cope with it.
-constexpr const char *DISABLED_OPTIMIZERS = "statistics_propagation";
+// Data-dependent optimizers disabled when planning a view query into a delta-maintenance
+// TEMPLATE (the rewrite rule). The template's base scans are later swapped for delta scans and it
+// is reused against future data, so any pass that specializes the plan to CURRENT table contents
+// is unsafe: statistics_propagation folds count(*)/min/max over a known-cardinality GET to a
+// constant (TryExecuteAggregates), prunes provably-empty subtrees to EMPTY_RESULT, and simplifies
+// stats-derived expressions (e.g. COALESCE(a,-1)->a when a currently has no NULLs). Disabling
+// statistics_propagation also disables its compressed_materialization sub-pass. Gated by the
+// openivm_enable_data_dependent_optimizers setting via TemplateDisabledOptimizers().
+// (column_lifetime is structural/data-independent and stays enabled everywhere.)
+constexpr const char *TEMPLATE_DATA_DEPENDENT_OPTIMIZERS = "statistics_propagation";
+
+// Backward-compatible name for the template optimizer guard used by older code
+// paths and checkouts.
+constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
+
+// Disabled wherever the deeply-nested generated refresh SQL is planned/executed. deliminator
+// recurses through OpenIVM's chained CTE/subquery expansions (N-term telescoping over many tables)
+// and overflows the optimizer; the generated plan is already explicitly decorrelated so it has no
+// DELIM joins to eliminate. Pure robustness guard — not flag-gated.
+constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator";
 
 } // namespace openivm
 
