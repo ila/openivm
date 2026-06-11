@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -572,6 +573,29 @@ static int64_t ApplyDML(duckdb::Connection &con, const QueryDef &q, Workload wor
 	return issued;
 }
 
+static string DeltaTableName(const string &table) {
+	string name = table;
+	auto dot = name.find('.');
+	if (dot != string::npos) {
+		name = name.substr(dot + 1);
+	}
+	for (auto &ch : name) {
+		ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	}
+	return "delta_" + name;
+}
+
+static void WarmScenario(duckdb::Connection &con, const QueryDef &q) {
+	for (auto &table : q.touched_tables) {
+		con.Query("SELECT COUNT(*) FROM " + table);
+		con.Query("SELECT COUNT(*) FROM " + DeltaTableName(table));
+	}
+	for (auto &mv : q.refresh_mvs) {
+		con.Query("SELECT COUNT(*) FROM " + mv);
+	}
+	con.Query("SELECT COUNT(*) FROM (" + q.base_sql + ") warm_base");
+}
+
 static CostEstimate ReadCost(duckdb::Connection &con, const string &view_name) {
 	CostEstimate cost;
 	auto result = con.Query("PRAGMA refresh_cost('" + view_name + "')");
@@ -634,7 +658,7 @@ static void ConfigureMode(duckdb::Connection &con, RefreshMode mode) {
 }
 
 static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload workload, int delta_pct,
-                          FlagConfig flag_config, int scale, int rep, RefreshMode mode, bool read_cost) {
+                          FlagConfig flag_config, int scale, int rep, RefreshMode mode, bool read_cost, bool warm) {
 	ModeResult out;
 	string tag = q.id + "_" + WorkloadName(workload) + "_" + to_string(delta_pct) + "_" + FlagConfigName(flag_config) +
 	             "_" + to_string(rep) + "_" + to_string(static_cast<int>(mode));
@@ -674,6 +698,9 @@ static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload
 			}
 		}
 		out.delta_rows = ApplyDML(con, q, workload, delta_pct, scale);
+		if (warm) {
+			WarmScenario(con, q);
+		}
 		ConfigureMode(con, mode);
 		if (read_cost) {
 			out.cost = ReadCost(con, q.refresh_mvs.back());
@@ -738,7 +765,7 @@ static double RegretRatio(const string &auto_method, double incremental_ms, doub
 
 static void PrintUsage() {
 	fprintf(stderr, "cost_model_benchmark --scale N --db PATH --out CSV [--reps 3]\n"
-	                "                     [--delta-pcts 0,1,5,10,20,50] [--filter Q01,S06,...]\n");
+	                "                     [--delta-pcts 0,1,5,10,20,50] [--filter Q01,S06,...] [--no-warm]\n");
 }
 
 int main(int argc, char **argv) {
@@ -748,6 +775,7 @@ int main(int argc, char **argv) {
 	int reps = 3;
 	vector<int> delta_pcts = {0, 1, 5, 10, 20, 50};
 	set<string> query_filter;
+	bool warm = true;
 
 	for (int i = 1; i < argc; i++) {
 		string arg = argv[i];
@@ -780,6 +808,8 @@ int main(int argc, char **argv) {
 				query_filter.insert(f.substr(start, end - start));
 				start = end + 1;
 			}
+		} else if (arg == "--no-warm") {
+			warm = false;
 		} else {
 			fprintf(stderr, "unknown arg: %s\n", arg.c_str());
 			PrintUsage();
@@ -844,10 +874,12 @@ int main(int argc, char **argv) {
 						row++;
 						Log("[" + to_string(row) + "/" + to_string(total) + "] " + q.id + " wl=" + WorkloadName(wl) +
 						    " pct=" + to_string(pct) + " flags=" + FlagConfigName(config) + " rep=" + to_string(rep));
-						auto auto_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::AUTO, true);
+						auto auto_result =
+						    RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::AUTO, true, warm);
 						auto inc_result =
-						    RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::INCREMENTAL, false);
-						auto full_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::FULL, false);
+						    RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::INCREMENTAL, false, warm);
+						auto full_result =
+						    RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::FULL, false, warm);
 
 						bool correct = auto_result.correct && inc_result.correct && full_result.correct;
 						bool ok = auto_result.ok && inc_result.ok && full_result.ok;
