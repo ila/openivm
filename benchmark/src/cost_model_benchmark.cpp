@@ -906,7 +906,8 @@ static double RegretRatio(const string &auto_method, double incremental_ms, doub
 
 static void PrintUsage() {
 	fprintf(stderr, "cost_model_benchmark --scale N --db PATH --out CSV [--reps 3]\n"
-	                "                     [--delta-pcts 0,0.01,1,2,5,10,20,50] [--filter Q01,S06,...] [--no-warm]\n");
+	                "                     [--delta-pcts 0,0.01,1,2,5,10,20,50] [--filter Q01,S06,...] [--no-warm]\n"
+	                "                     [--configs all_on,all_off,skip_empty_off] [--no-validate]\n");
 }
 
 int main(int argc, char **argv) {
@@ -917,6 +918,8 @@ int main(int argc, char **argv) {
 	vector<double> delta_pcts = {0, 0.01, 1, 2, 5, 10, 20, 50};
 	set<string> query_filter;
 	bool warm = true;
+	bool validate = true; // EXCEPT ALL correctness cross-check on the AUTO path
+	vector<FlagConfig> configs = {FlagConfig::ALL_ON, FlagConfig::ALL_OFF, FlagConfig::SKIP_EMPTY_OFF};
 
 	for (int i = 1; i < argc; i++) {
 		string arg = argv[i];
@@ -951,6 +954,30 @@ int main(int argc, char **argv) {
 			}
 		} else if (arg == "--no-warm") {
 			warm = false;
+		} else if (arg == "--no-validate") {
+			validate = false;
+		} else if (arg == "--configs") {
+			string f = next("--configs");
+			configs.clear();
+			size_t start = 0;
+			while (start < f.size()) {
+				size_t end = f.find(',', start);
+				if (end == string::npos) {
+					end = f.size();
+				}
+				string name = f.substr(start, end - start);
+				if (name == "all_on") {
+					configs.push_back(FlagConfig::ALL_ON);
+				} else if (name == "all_off") {
+					configs.push_back(FlagConfig::ALL_OFF);
+				} else if (name == "skip_empty_off") {
+					configs.push_back(FlagConfig::SKIP_EMPTY_OFF);
+				} else if (!name.empty()) {
+					fprintf(stderr, "unknown config: %s (use all_on,all_off,skip_empty_off)\n", name.c_str());
+					return 2;
+				}
+				start = end + 1;
+			}
 		} else {
 			fprintf(stderr, "unknown arg: %s\n", arg.c_str());
 			PrintUsage();
@@ -970,7 +997,6 @@ int main(int argc, char **argv) {
 	}
 
 	auto queries = BuildQueries();
-	vector<FlagConfig> configs = {FlagConfig::ALL_ON, FlagConfig::ALL_OFF, FlagConfig::SKIP_EMPTY_OFF};
 
 	std::ofstream out(out_csv);
 	out << "scale,query_id,description,workload,delta_pct,flag_config,rep,view_name,"
@@ -1017,7 +1043,7 @@ int main(int argc, char **argv) {
 						Log("[" + to_string(row) + "/" + to_string(total) + "] " + q.id + " wl=" + WorkloadName(wl) +
 						    " pct=" + to_string(pct) + " flags=" + FlagConfigName(config) + " rep=" + to_string(rep));
 						auto auto_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::AUTO, true,
-						                           warm, /*do_validate=*/true);
+						                           warm, /*do_validate=*/validate);
 						auto inc_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::INCREMENTAL,
 						                          false, warm, /*do_validate=*/false);
 						auto full_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::FULL, false,
