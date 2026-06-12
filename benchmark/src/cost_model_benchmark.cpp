@@ -769,95 +769,18 @@ static void ConfigureMode(duckdb::Connection &con, RefreshMode mode) {
 	}
 }
 
-// A combo's pre-refresh state (base data + created MV + applied delta) is identical across the three
-// refresh modes, so we build it ONCE here into a standalone .db file and let each mode cheap-copy it,
-// instead of re-running CREATE MATERIALIZED VIEW (a full view recompute) three times per combo.
-struct PreparedCombo {
-	string db_path;
-	int64_t dml_statements = 0;
-	bool ok = false;
-	string error;
-
-	~PreparedCombo() {
-		if (!db_path.empty()) {
-			std::remove(db_path.c_str());
-			std::remove((db_path + ".wal").c_str());
-		}
-	}
-};
-
-static void PrepareCombo(PreparedCombo &p, const string &src_db_path, const QueryDef &q, Workload workload,
-                         double delta_pct, FlagConfig flag_config, int scale, int rep) {
-	string tag = q.id + "_" + WorkloadName(workload) + "_" + to_string(delta_pct) + "_" +
-	             FlagConfigName(flag_config) + "_" + to_string(rep) + "_prep";
-	p.db_path = "/tmp/cost_model_bench_" + to_string(getpid()) + "_" + tag + ".db";
-	std::remove(p.db_path.c_str());
-	std::remove((p.db_path + ".wal").c_str());
-	if (!CopyFile(src_db_path, p.db_path)) {
-		p.error = "prepare copy db failed: " + string(strerror(errno));
-		return;
-	}
-	try {
-		duckdb::DuckDB db(p.db_path);
-		duckdb::Connection con(db);
-		auto load = con.Query("LOAD openivm");
-		if (!load || load->HasError()) {
-			p.error = "LOAD openivm: " + (load ? load->GetError() : "null result");
-			return;
-		}
-		// Flag config can affect MV classification at CREATE time, so apply it before creating the MV.
-		ApplyFlagConfig(con, flag_config);
-		for (auto &sql : q.query_settings) {
-			auto result = con.Query(sql);
-			if (!result || result->HasError()) {
-				p.error = "query setting failed: " + (result ? result->GetError() : "null result");
-				return;
-			}
-		}
-		for (auto &sql : q.setup_sql) {
-			auto result = con.Query(sql);
-			if (!result || result->HasError()) {
-				p.error = "setup failed: " + (result ? result->GetError() : "null result");
-				return;
-			}
-		}
-		for (auto &sql : q.create_mvs) {
-			auto result = con.Query(sql);
-			if (!result || result->HasError()) {
-				p.error = "CREATE MV failed: " + (result ? result->GetError() : "null result");
-				return;
-			}
-		}
-		p.dml_statements = ApplyDML(con, q, workload, delta_pct, scale);
-		int64_t delta_rows = CountPendingDeltaRows(con, q);
-		if (workload == Workload::MIXED && delta_pct > 0 && delta_rows <= 0) {
-			p.error = "mixed workload produced no pending delta rows";
-			return;
-		}
-		// Fold the WAL into the .db file so the per-mode file copy captures the full state.
-		auto ckpt = con.Query("PRAGMA checkpoint");
-		(void)ckpt;
-	} catch (const std::exception &e) {
-		p.error = string("exception: ") + e.what();
-		return;
-	}
-	p.ok = true;
-}
-
-// When skip_build is true, db_to_copy already contains the created MV and applied delta (built once
-// by PrepareCombo), so the expensive CREATE MATERIALIZED VIEW + DML steps are skipped and only the
-// refresh is measured. do_validate gates the (also expensive) EXCEPT ALL correctness cross-check —
-// we run it for the AUTO path (the decision under test) and skip it for the INCREMENTAL/FULL
-// reference timings. Session settings (query_settings, flag config, refresh mode) are not persisted
-// in the .db file, so they are always re-applied after reopening.
-static ModeResult RunMode(const string &db_to_copy, const QueryDef &q, Workload workload, double delta_pct,
+// do_validate gates the (expensive) EXCEPT ALL correctness cross-check. We run it for the AUTO path
+// (the decision under test) and skip it for the INCREMENTAL/FULL reference-timing runs, which avoids
+// two of the three full validations per combo. Each mode still does its own independent full setup in
+// its own session, so this changes only what we verify, not how the refresh runs.
+static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload workload, double delta_pct,
                           FlagConfig flag_config, int scale, int rep, RefreshMode mode, bool read_cost, bool warm,
-                          bool skip_build, bool do_validate) {
+                          bool do_validate) {
 	ModeResult out;
 	string tag = q.id + "_" + WorkloadName(workload) + "_" + to_string(delta_pct) + "_" + FlagConfigName(flag_config) +
 	             "_" + to_string(rep) + "_" + to_string(static_cast<int>(mode));
 	TempDb temp(tag);
-	if (!CopyFile(db_to_copy, temp.path)) {
+	if (!CopyFile(src_db_path, temp.path)) {
 		out.error = "copy db failed: " + string(strerror(errno));
 		return out;
 	}
@@ -870,6 +793,13 @@ static ModeResult RunMode(const string &db_to_copy, const QueryDef &q, Workload 
 			return out;
 		}
 		ApplyFlagConfig(con, flag_config);
+		for (auto &sql : q.setup_sql) {
+			auto result = con.Query(sql);
+			if (!result || result->HasError()) {
+				out.error = "setup failed: " + (result ? result->GetError() : "null result");
+				return out;
+			}
+		}
 		for (auto &sql : q.query_settings) {
 			auto result = con.Query(sql);
 			if (!result || result->HasError()) {
@@ -877,25 +807,16 @@ static ModeResult RunMode(const string &db_to_copy, const QueryDef &q, Workload 
 				return out;
 			}
 		}
-		if (!skip_build) {
-			for (auto &sql : q.setup_sql) {
-				auto result = con.Query(sql);
-				if (!result || result->HasError()) {
-					out.error = "setup failed: " + (result ? result->GetError() : "null result");
-					return out;
-				}
+		for (auto &sql : q.create_mvs) {
+			auto result = con.Query(sql);
+			if (!result || result->HasError()) {
+				out.error = "CREATE MV failed: " + (result ? result->GetError() : "null result");
+				return out;
 			}
-			for (auto &sql : q.create_mvs) {
-				auto result = con.Query(sql);
-				if (!result || result->HasError()) {
-					out.error = "CREATE MV failed: " + (result ? result->GetError() : "null result");
-					return out;
-				}
-			}
-			out.dml_statements = ApplyDML(con, q, workload, delta_pct, scale);
 		}
+		out.dml_statements = ApplyDML(con, q, workload, delta_pct, scale);
 		out.delta_rows = CountPendingDeltaRows(con, q);
-		if (!skip_build && workload == Workload::MIXED && delta_pct > 0 && out.delta_rows <= 0) {
+		if (workload == Workload::MIXED && delta_pct > 0 && out.delta_rows <= 0) {
 			out.error = "mixed workload produced no pending delta rows";
 			return out;
 		}
@@ -950,7 +871,7 @@ static ModeResult RunMode(const string &db_to_copy, const QueryDef &q, Workload 
 				return out;
 			}
 		} else {
-			out.correct = true; // reference-timing run: correctness is checked on the AUTO path
+			out.correct = true; // reference-timing run: correctness is verified on the AUTO path
 		}
 		out.ok = true;
 		return out;
@@ -1095,24 +1016,17 @@ int main(int argc, char **argv) {
 						row++;
 						Log("[" + to_string(row) + "/" + to_string(total) + "] " + q.id + " wl=" + WorkloadName(wl) +
 						    " pct=" + to_string(pct) + " flags=" + FlagConfigName(config) + " rep=" + to_string(rep));
-						// Build the pre-refresh state once; the three modes cheap-copy it.
-						PreparedCombo prep;
-						PrepareCombo(prep, db_path, q, wl, pct, config, scale, rep);
-						ModeResult auto_result, inc_result, full_result;
-						if (!prep.ok) {
-							auto_result.error = prep.error;
-						} else {
-							auto_result = RunMode(prep.db_path, q, wl, pct, config, scale, rep, RefreshMode::AUTO, true,
-							                       warm, /*skip_build=*/true, /*do_validate=*/true);
-							inc_result = RunMode(prep.db_path, q, wl, pct, config, scale, rep, RefreshMode::INCREMENTAL,
-							                     false, warm, /*skip_build=*/true, /*do_validate=*/false);
-							full_result = RunMode(prep.db_path, q, wl, pct, config, scale, rep, RefreshMode::FULL, false,
-							                      warm, /*skip_build=*/true, /*do_validate=*/false);
-						}
-						auto_result.dml_statements = prep.dml_statements;
+						auto auto_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::AUTO, true,
+						                           warm, /*do_validate=*/true);
+						auto inc_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::INCREMENTAL,
+						                          false, warm, /*do_validate=*/false);
+						auto full_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::FULL, false,
+						                           warm, /*do_validate=*/false);
 
-						bool correct = auto_result.correct && inc_result.correct && full_result.correct;
-						bool ok = prep.ok && auto_result.ok && inc_result.ok && full_result.ok;
+						// Correctness is verified on the AUTO path (the decision under test); the forced
+						// inc/full runs are reference timings only.
+						bool correct = auto_result.correct;
+						bool ok = auto_result.ok && inc_result.ok && full_result.ok;
 						if (!ok || !correct) {
 							errors++;
 						}
