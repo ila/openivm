@@ -92,6 +92,80 @@ SELECT COUNT(*) FROM (
 0
 
 # ============================================================
+# D1b: same optimization in an attached native file catalog. The
+# pushed source must keep the source catalog qualification.
+# ============================================================
+
+statement ok
+ATTACH '__TEST_DIR__/native_left_join_pushdown.db' AS native_lj;
+
+statement ok
+CREATE TABLE native_lj.company_file(cid INT, cname VARCHAR);
+
+statement ok
+CREATE TABLE native_lj.security_file(sk INT, cid INT, sname VARCHAR);
+
+statement ok
+CREATE TABLE native_lj.market_file(sk INT, px INT);
+
+statement ok
+INSERT INTO native_lj.company_file VALUES (10, 'Acme'), (20, 'Globex');
+
+statement ok
+INSERT INTO native_lj.security_file VALUES (1, 10, 'ACM'), (2, 20, 'GLX');
+
+statement ok
+INSERT INTO native_lj.market_file VALUES (1, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW native_lj.mh_file AS
+    SELECT sec.sk, sec.sname, c.cname, m.px
+    FROM native_lj.company_file c JOIN native_lj.security_file sec ON c.cid = sec.cid
+    LEFT JOIN native_lj.market_file m ON sec.sk = m.sk;
+
+statement ok
+INSERT INTO native_lj.market_file VALUES (2, 200);
+
+statement ok
+INSERT INTO native_lj.security_file VALUES (3, 10, 'ACM2');
+
+statement ok
+PRAGMA refresh('mh_file');
+
+query I
+SELECT contains(content, 'openivm_lj_src') AND contains(content, 'openivm_affected')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mh_file.sql');
+----
+true
+
+query I
+SELECT contains(content, 'native_lj.main.security_file')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mh_file.sql');
+----
+true
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT sec.sk, sec.sname, c.cname, m.px
+  FROM native_lj.company_file c JOIN native_lj.security_file sec ON c.cid = sec.cid
+  LEFT JOIN native_lj.market_file m ON sec.sk = m.sk
+  EXCEPT ALL SELECT * FROM native_lj.mh_file
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT * FROM native_lj.mh_file
+  EXCEPT ALL
+  SELECT sec.sk, sec.sname, c.cname, m.px
+  FROM native_lj.company_file c JOIN native_lj.security_file sec ON c.cid = sec.cid
+  LEFT JOIN native_lj.market_file m ON sec.sk = m.sk
+);
+----
+0
+
+# ============================================================
 # D2: derived (non-identity) left key -> no lineage -> full-recompute
 # fallback. Results must still be correct (the optimization is skipped, not wrong).
 # ============================================================

@@ -440,6 +440,8 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		AddUnique(model.strategy_reasons, DeltaStrategyReason::ASOF_CURRENT_DIFF_RECOMPUTE);
 	} else if (analysis.found_asof_join) {
 		select_current_diff(DeltaStrategyReason::ASOF_CURRENT_DIFF_RECOMPUTE);
+	} else if (analysis.found_window && !analysis.window_partition_compatible) {
+		select_current_diff(DeltaStrategyReason::WINDOW_COMPLEX_CURRENT_DIFF_RECOMPUTE);
 	} else if (analysis.found_window) {
 		model.type = RefreshType::WINDOW_PARTITION;
 	} else if (analysis.found_grouping_sets) {
@@ -479,6 +481,8 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (analysis.found_aggregation && model.group_columns.empty() && input.facts &&
 	           TopLevelIsUngroupedAggregate(input.facts->root)) {
 		model.type = RefreshType::SIMPLE_AGGREGATE;
+	} else if (analysis.found_cte_nonlinear_construct) {
+		select_current_diff(DeltaStrategyReason::CTE_NONLINEAR_CURRENT_DIFF_RECOMPUTE);
 	} else if (analysis.found_projection && !analysis.found_aggregation) {
 		model.type = RefreshType::SIMPLE_PROJECTION;
 	} else {
@@ -554,6 +558,10 @@ const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
 		return "OUTER_JOIN_SETOP_CURRENT_DIFF_RECOMPUTE";
 	case DeltaStrategyReason::VISIBLE_OUTPUT_CURRENT_DIFF_RECOMPUTE:
 		return "VISIBLE_OUTPUT_CURRENT_DIFF_RECOMPUTE";
+	case DeltaStrategyReason::WINDOW_COMPLEX_CURRENT_DIFF_RECOMPUTE:
+		return "WINDOW_COMPLEX_CURRENT_DIFF_RECOMPUTE";
+	case DeltaStrategyReason::CTE_NONLINEAR_CURRENT_DIFF_RECOMPUTE:
+		return "CTE_NONLINEAR_CURRENT_DIFF_RECOMPUTE";
 	case DeltaStrategyReason::CTE_NONLINEAR_GROUP_RECOMPUTE:
 		return "CTE_NONLINEAR_GROUP_RECOMPUTE";
 	default:

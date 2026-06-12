@@ -91,6 +91,13 @@ ApplyGroupRecomputeSourceOccurrences(vector<GroupRecomputeDeltaSpec> &delta_spec
 	}
 }
 
+static string BuildTwoStepFullRecomputeSQL(const string &view_name, const string &data_table,
+                                           const string &view_query_sql) {
+	string temp_table = KeywordHelper::WriteOptionallyQuoted("openivm_recompute_" + view_name);
+	return "CREATE OR REPLACE TEMP TABLE " + temp_table + " AS " + view_query_sql + ";\n" + "CREATE OR REPLACE TABLE " +
+	       data_table + " AS SELECT * FROM " + temp_table + ";\n" + "DROP TABLE IF EXISTS " + temp_table + ";\n";
+}
+
 static string ResolveDeltaMetadataKey(const string &table_name, const vector<string> &delta_table_names) {
 	vector<string> candidates;
 	candidates.push_back(table_name);
@@ -411,6 +418,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	view_query_sql =
 	    QualifyViewQuerySources(metadata, con, view_name, view_query_sql, delta_table_names, view_catalog_name,
 	                            view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+	string exact_recompute_query_sql = view_query_sql;
+	auto original_view_query_sql = metadata.GetOriginalViewQuery(view_name);
+	if (!original_view_query_sql.empty()) {
+		exact_recompute_query_sql = QualifyViewQuerySources(metadata, con, view_name, original_view_query_sql,
+		                                                    delta_table_names, view_catalog_name, view_schema_name,
+		                                                    attached_db_catalog_name, attached_db_schema_name);
+	}
 	add_profile_step("generate_refresh_sql.qualify_sources", qualify_start,
 	                 "query_bytes=" + to_string(view_query_sql.size()));
 	auto recovery_start = profile_now();
@@ -552,6 +566,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	    std::find(column_names.begin(), column_names.end(), openivm::LEFT_KEY_COL) != column_names.end();
 	bool has_full_outer =
 	    std::find(column_names.begin(), column_names.end(), openivm::RIGHT_KEY_COL) != column_names.end();
+	bool has_internal_columns = std::any_of(column_names.begin(), column_names.end(), [](const string &name) {
+		return IncrementalTableNames::IsInternalColumn(name);
+	});
 	OPENIVM_DEBUG_PRINT("[UPSERT] has_left_join=%d has_full_outer=%d\n", has_left_join, has_full_outer);
 
 	auto fast_path_start = profile_now();
@@ -859,7 +876,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				OPENIVM_DEBUG_PRINT("[UPSERT] CURRENT_DIFF_RECOMPUTE has no active deltas after filtering\n");
 				break;
 			}
-			upsert_query = CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix);
+			if (has_internal_columns) {
+				upsert_query = SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql);
+			} else {
+				upsert_query = BuildTwoStepFullRecomputeSQL(view_name, data_table, exact_recompute_query_sql);
+			}
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: CURRENT_DIFF_RECOMPUTE\n");
 			break;
 		}

@@ -756,13 +756,15 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	                       " (view_name, sql_string, type, has_minmax, has_left_join, last_update, "
 	                       "refresh_interval, refresh_in_progress, group_columns, aggregate_types, "
 	                       "having_predicate, group_recompute_affected_mode, "
-	                       "group_recompute_source_occurrences_json, has_full_outer, full_outer_join_cols) values ('" +
+	                       "group_recompute_source_occurrences_json, has_full_outer, full_outer_join_cols, "
+	                       "original_sql_string) values ('" +
 	                       view_name + "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
 	                       to_string((int)refresh_type) + ", " + (has_minmax_metadata ? "true" : "false") + ", " +
 	                       (analysis.found_left_join ? "true" : "false") + ", now(), " + refresh_val + ", false, " +
 	                       group_cols_val + ", " + agg_types_val + ", " + having_val + ", " + group_recompute_mode_val +
 	                       ", " + group_recompute_source_occurrences_val + ", " +
-	                       (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
+	                       (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ", '" +
+	                       SqlUtils::EscapeSingleQuotes(original_view_query) + "')");
 
 	if (!lineage_json.empty()) {
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));

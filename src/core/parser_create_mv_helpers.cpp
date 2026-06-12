@@ -45,6 +45,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " group_recompute_source_occurrences_json varchar default null,"
 	              " has_full_outer boolean default false,"
 	              " full_outer_join_cols varchar default null,"
+	              " original_sql_string varchar default null,"
 	              " signature_hash ubigint default null,"
 	              " canonical_plan_blob blob default null,"
 	              " output_columns_json varchar default null,"
@@ -63,6 +64,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "lineage_json varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_affected_mode varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_source_occurrences_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "original_sql_string varchar default null");
 	if (!is_replace) {
 		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
 		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));

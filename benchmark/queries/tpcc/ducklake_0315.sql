@@ -1135,10 +1135,18 @@ tmp_customer_window AS (
 		tf.total_history_amount,
 		tf.payment_history_rows,
 		tf.order_line_count,
-		ROW_NUMBER() OVER (
-			PARTITION BY tf.warehouse_id, tf.district_id, tf.customer_id
-			ORDER BY tf.extended_amount DESC, tf.order_id ASC, tf.line_number ASC
-		) AS customer_line_rank,
+	ROW_NUMBER() OVER (
+		PARTITION BY tf.warehouse_id, tf.district_id, tf.customer_id
+		ORDER BY
+			tf.extended_amount DESC,
+			tf.order_id ASC,
+			tf.line_number ASC,
+			tf.item_id ASC,
+			tf.credit_code ASC,
+			tf.fulfillment_state ASC,
+			tf.account_state ASC,
+			tf.item_bucket ASC
+	) AS customer_line_rank,
 		SUM(tf.extended_amount) OVER (
 			PARTITION BY tf.warehouse_id, tf.district_id, tf.customer_id
 		) AS customer_total_amount,
@@ -1437,10 +1445,19 @@ join_window_pass_1 AS (
 		ajc.fulfillment_rows,
 		ajc.fulfillment_amount,
 		ajc.max_fulfillment_stock_window,
-		ROW_NUMBER() OVER (
-			PARTITION BY ajc.warehouse_id, ajc.district_id
-			ORDER BY ajc.extended_amount DESC, ajc.order_id ASC, ajc.line_number ASC
-		) AS chain_rank,
+	ROW_NUMBER() OVER (
+		PARTITION BY ajc.warehouse_id, ajc.district_id
+		ORDER BY
+			ajc.extended_amount DESC,
+			ajc.order_id ASC,
+			ajc.line_number ASC,
+			ajc.customer_id ASC,
+			ajc.item_id ASC,
+			ajc.credit_code ASC,
+			ajc.fulfillment_state ASC,
+			ajc.account_state ASC,
+			ajc.item_bucket ASC
+	) AS chain_rank,
 		SUM(ajc.extended_amount + ajc.credit_amount + ajc.fulfillment_amount) OVER (
 			PARTITION BY ajc.warehouse_id
 		) AS warehouse_chain_amount
@@ -1479,10 +1496,19 @@ join_window_pass_2 AS (
 		jwp1.max_fulfillment_stock_window,
 		jwp1.chain_rank,
 		jwp1.warehouse_chain_amount,
-		DENSE_RANK() OVER (
-			PARTITION BY jwp1.warehouse_id, jwp1.credit_code
-			ORDER BY jwp1.warehouse_chain_amount DESC, jwp1.district_id ASC
-		) AS credit_chain_rank,
+	DENSE_RANK() OVER (
+		PARTITION BY jwp1.warehouse_id, jwp1.credit_code
+		ORDER BY
+			jwp1.warehouse_chain_amount DESC,
+			jwp1.district_id ASC,
+			jwp1.fulfillment_state ASC,
+			jwp1.account_state ASC,
+			jwp1.item_bucket ASC,
+			jwp1.customer_id ASC,
+			jwp1.order_id ASC,
+			jwp1.line_number ASC,
+			jwp1.item_id ASC
+	) AS credit_chain_rank,
 		COUNT(*) OVER (
 			PARTITION BY jwp1.warehouse_id, jwp1.fulfillment_state, jwp1.account_state
 		) AS fulfillment_account_rows

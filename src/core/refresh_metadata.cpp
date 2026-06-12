@@ -23,7 +23,8 @@ const RefreshMetadata::ViewMetaRow &RefreshMetadata::GetViewMeta(const string &v
 	}
 	ViewMetaRow row;
 	auto result =
-	    con.Query("SELECT sql_string, type, has_minmax, has_left_join, has_full_outer, full_outer_join_cols FROM " +
+	    con.Query("SELECT sql_string, original_sql_string, type, has_minmax, has_left_join, has_full_outer, "
+	              "full_outer_join_cols FROM " +
 	              string(openivm::VIEWS_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 	if (!result->HasError() && result->RowCount() > 0) {
 		row.found = true;
@@ -31,13 +32,16 @@ const RefreshMetadata::ViewMetaRow &RefreshMetadata::GetViewMeta(const string &v
 			row.sql_string = result->GetValue(0, 0).ToString();
 		}
 		if (!result->GetValue(1, 0).IsNull()) {
-			row.type = static_cast<RefreshType>(result->GetValue(1, 0).GetValue<int8_t>());
+			row.original_sql_string = result->GetValue(1, 0).ToString();
 		}
-		row.has_minmax = !result->GetValue(2, 0).IsNull() && result->GetValue(2, 0).GetValue<bool>();
-		row.has_left_join = !result->GetValue(3, 0).IsNull() && result->GetValue(3, 0).GetValue<bool>();
-		row.has_full_outer = !result->GetValue(4, 0).IsNull() && result->GetValue(4, 0).GetValue<bool>();
-		if (!result->GetValue(5, 0).IsNull()) {
-			row.full_outer_join_cols = result->GetValue(5, 0).ToString();
+		if (!result->GetValue(2, 0).IsNull()) {
+			row.type = static_cast<RefreshType>(result->GetValue(2, 0).GetValue<int8_t>());
+		}
+		row.has_minmax = !result->GetValue(3, 0).IsNull() && result->GetValue(3, 0).GetValue<bool>();
+		row.has_left_join = !result->GetValue(4, 0).IsNull() && result->GetValue(4, 0).GetValue<bool>();
+		row.has_full_outer = !result->GetValue(5, 0).IsNull() && result->GetValue(5, 0).GetValue<bool>();
+		if (!result->GetValue(6, 0).IsNull()) {
+			row.full_outer_join_cols = result->GetValue(6, 0).ToString();
 		}
 	}
 	return view_meta_cache.emplace(view_name, std::move(row)).first->second;
@@ -45,6 +49,10 @@ const RefreshMetadata::ViewMetaRow &RefreshMetadata::GetViewMeta(const string &v
 
 string RefreshMetadata::GetViewQuery(const string &view_name) {
 	return GetViewMeta(view_name).sql_string;
+}
+
+string RefreshMetadata::GetOriginalViewQuery(const string &view_name) {
+	return GetViewMeta(view_name).original_sql_string;
 }
 
 RefreshType RefreshMetadata::GetViewType(const string &view_name) {
@@ -682,6 +690,15 @@ static bool ParseJsonIndex(const string &json, const string &key, idx_t &out) {
 	}
 }
 
+static bool ParseJsonBoolString(const string &json, const string &key, bool &out) {
+	string text;
+	if (!ExtractJsonString(json, key, text)) {
+		return false;
+	}
+	out = StringUtil::Lower(text) == "true";
+	return true;
+}
+
 static bool ReadRefreshLineageEntry(Connection &con, const string &view_name, const string &kind, string &entry) {
 	auto result = con.Query("SELECT lineage_json FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
@@ -867,6 +884,8 @@ static bool ParseProjectionKeyLineageJson(const string &json, RefreshMetadata::P
 	    !ParseJsonIndex(json, "key_occ", out.key_occurrence) || !ExtractJsonString(json, "key_col", out.key_col)) {
 		return false;
 	}
+	out.pushdown_safe = false;
+	ParseJsonBoolString(json, "pushdown_safe", out.pushdown_safe);
 	out.arms.clear();
 	auto objects = ExtractJsonObjectsFromArray(json, "arms");
 	for (auto &object : objects) {
@@ -919,7 +938,11 @@ static string ProjectionKeyLineageToJsonWithKind(const RefreshMetadata::Projecti
 	string json = "{\"k\":" + SqlUtils::JsonQuote(kind) + ",\"out\":" + SqlUtils::JsonQuote(lineage.output_col) +
 	              ",\"key_source\":" + SqlUtils::JsonQuote(lineage.key_source) +
 	              ",\"key_occ\":" + SqlUtils::JsonQuote(to_string(lineage.key_occurrence)) +
-	              ",\"key_col\":" + SqlUtils::JsonQuote(lineage.key_col) + ",\"arms\":[";
+	              ",\"key_col\":" + SqlUtils::JsonQuote(lineage.key_col);
+	if (string(kind) == "projection_key" || string(kind) == "left_join_key") {
+		json += ",\"pushdown_safe\":" + SqlUtils::JsonQuote(lineage.pushdown_safe ? "true" : "false");
+	}
+	json += ",\"arms\":[";
 	for (idx_t i = 0; i < lineage.arms.size(); i++) {
 		auto &arm = lineage.arms[i];
 		if (i > 0) {

@@ -22,6 +22,7 @@ class RefreshMetadata {
 	struct ViewMetaRow {
 		bool found = false;
 		string sql_string;
+		string original_sql_string;
 		RefreshType type {};
 		bool has_minmax = false;
 		bool has_left_join = false;
@@ -45,6 +46,7 @@ public:
 	// Get the stored SQL query for a materialized view.
 	// Returns empty string if not found.
 	string GetViewQuery(const string &view_name);
+	string GetOriginalViewQuery(const string &view_name);
 
 	// Get the IVM type for a materialized view.
 	RefreshType GetViewType(const string &view_name);
@@ -259,6 +261,7 @@ public:
 		idx_t key_occurrence = 0;
 		string key_col;
 		vector<ProjectionKeyLineageArm> arms;
+		bool pushdown_safe = false;
 	};
 
 	bool GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out);

@@ -653,6 +653,15 @@ static string OccurrenceKey(const OccurrenceColumnRef &ref) {
 	return OccurrenceKey(ref.table, ref.occurrence);
 }
 
+static bool HasSourcePushdownBarrier(const PlanAnalysis &analysis) {
+	return analysis.found_aggregation || analysis.found_having || analysis.found_distinct ||
+	       analysis.found_union_distinct || analysis.found_outer_join_under_setop || analysis.found_semi_anti_join ||
+	       analysis.found_asof_join || analysis.found_positional_join || analysis.found_sample ||
+	       analysis.found_window || analysis.found_top_k || analysis.found_count_distinct ||
+	       analysis.found_grouping_sets || analysis.found_nested_aggregate || analysis.found_cte_nonlinear_construct ||
+	       analysis.found_unsupported_order_by || analysis.found_unsupported_operator;
+}
+
 static bool GetLogicalGetColumnName(LogicalGet &get, idx_t column_index, string &column) {
 	if (get.GetTable().get()) {
 		auto &ids = get.GetColumnIds();
@@ -1221,6 +1230,8 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 		lineage.key_source = key_ref.table;
 		lineage.key_occurrence = key_ref.occurrence;
 		lineage.key_col = key_ref.column;
+		lineage.pushdown_safe = !facts.analysis.found_left_join && !facts.analysis.found_full_outer &&
+		                        !HasSourcePushdownBarrier(facts.analysis);
 		lineage.arms = std::move(arms);
 		out = std::move(lineage);
 		return true;
@@ -1248,6 +1259,31 @@ static LogicalComparisonJoin *FindFirstOuterJoin(LogicalOperator *node) {
 	return nullptr;
 }
 
+static idx_t CountLeftRightOuterJoins(LogicalOperator *node) {
+	if (!node) {
+		return 0;
+	}
+	idx_t count = 0;
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = node->Cast<LogicalComparisonJoin>();
+		if ((join.join_type == JoinType::LEFT || join.join_type == JoinType::RIGHT) && !join.conditions.empty()) {
+			count++;
+		}
+	}
+	for (auto &child : node->children) {
+		count += CountLeftRightOuterJoins(child.get());
+	}
+	return count;
+}
+
+static bool IsLeftJoinPushdownSafe(const CreateMVPlanFacts &facts) {
+	const auto &analysis = facts.analysis;
+	if (CountLeftRightOuterJoins(facts.root) != 1) {
+		return false;
+	}
+	return analysis.found_left_join && !analysis.found_full_outer && !HasSourcePushdownBarrier(analysis);
+}
+
 bool BuildLeftJoinKeyLineage(const CreateMVPlanFacts &facts, RefreshMetadata::ProjectionKeyLineage &out) {
 	auto *outer = FindFirstOuterJoin(facts.root);
 	if (!outer) {
@@ -1269,6 +1305,7 @@ bool BuildLeftJoinKeyLineage(const CreateMVPlanFacts &facts, RefreshMetadata::Pr
 	lineage.key_source = ref.table;
 	lineage.key_occurrence = ref.occurrence;
 	lineage.key_col = ref.column;
+	lineage.pushdown_safe = IsLeftJoinPushdownSafe(facts);
 	RefreshMetadata::ProjectionKeyLineageArm arm;
 	arm.source = ref.table;
 	arm.occurrence = ref.occurrence;

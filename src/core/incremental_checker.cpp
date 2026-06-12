@@ -393,6 +393,10 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 
 	case LogicalOperatorType::LOGICAL_WINDOW: {
 		result.found_window = true;
+		result.window_node_count++;
+		if (result.window_node_count > 1) {
+			result.window_partition_compatible = false;
+		}
 		auto &window = node->Cast<LogicalWindow>();
 		if (HasVolatileExpression(window.expressions)) {
 			result.incremental_compatible = false;
@@ -404,6 +408,10 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		for (auto &expr : window.expressions) {
 			if (expr->expression_class == ExpressionClass::BOUND_WINDOW) {
 				auto &win_expr = expr->Cast<BoundWindowExpression>();
+				if (win_expr.partitions.empty()) {
+					result.window_partition_compatible = false;
+				}
+				vector<string> expr_partition_columns;
 				for (auto &part : win_expr.partitions) {
 					string col_name;
 					idx_t col_index = DConstants::INVALID_INDEX;
@@ -411,10 +419,13 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 						auto &bcr = part->Cast<BoundColumnRefExpression>();
 						col_name = bcr.alias;
 						col_index = bcr.binding.column_index;
+					} else {
+						result.window_partition_compatible = false;
 					}
 					if (col_name.empty()) {
 						col_name = part->GetName();
 					}
+					expr_partition_columns.push_back(col_name);
 					// Avoid duplicates
 					bool found = false;
 					for (auto &existing : result.window_partition_columns) {
@@ -426,6 +437,18 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 					if (!found) {
 						result.window_partition_columns.push_back(col_name);
 						result.window_partition_column_indexes.push_back(col_index);
+					}
+				}
+				if (!result.window_partition_columns.empty()) {
+					if (expr_partition_columns.size() != result.window_partition_columns.size()) {
+						result.window_partition_compatible = false;
+					} else {
+						for (idx_t i = 0; i < expr_partition_columns.size(); i++) {
+							if (expr_partition_columns[i] != result.window_partition_columns[i]) {
+								result.window_partition_compatible = false;
+								break;
+							}
+						}
 					}
 				}
 			}

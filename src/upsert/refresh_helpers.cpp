@@ -13,6 +13,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 
@@ -290,6 +291,61 @@ const DuckLakeSourceSpec *FindDuckLakeSourceSpec(const vector<DuckLakeSourceSpec
 	return nullptr;
 }
 
+static string PushdownSourceSQL(const DuckLakeSourceLocation &loc, const string &source_name) {
+	if (loc.catalog_name.empty() || loc.schema_name.empty() || loc.table_name.empty()) {
+		return source_name;
+	}
+	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, loc.table_name);
+}
+
+static vector<string> PushdownSourceMatchNames(const DuckLakeSourceLocation &loc, const string &source_name) {
+	vector<string> names;
+	auto add_name = [&](const string &name) {
+		if (!name.empty() && std::find(names.begin(), names.end(), name) == names.end()) {
+			names.push_back(name);
+		}
+	};
+	add_name(source_name);
+	add_name(loc.table_name);
+	if (!loc.catalog_name.empty() && !loc.schema_name.empty() && !loc.table_name.empty()) {
+		add_name(loc.catalog_name + "." + loc.schema_name + "." + loc.table_name);
+	}
+	return names;
+}
+
+static string ReplaceSourceReferenceOccurrence(const string &view_query_sql, idx_t occurrence,
+                                               const string &replacement, const vector<string> &match_names,
+                                               string *matched_reference = nullptr) {
+	for (idx_t match_idx = 0; match_idx < match_names.size(); match_idx++) {
+		auto &match_name = match_names[match_idx];
+		bool replaced = false;
+		string marker = "__openivm_source_reference_" + to_string(match_idx) + "__";
+		string pushed =
+		    SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, match_name, occurrence, marker, replaced);
+		if (!replaced || pushed == view_query_sql) {
+			continue;
+		}
+		auto marker_pos = pushed.find(marker);
+		if (marker_pos == string::npos) {
+			continue;
+		}
+		if (matched_reference) {
+			idx_t match_len = view_query_sql.size() + marker.size() - pushed.size();
+			*matched_reference = view_query_sql.substr(marker_pos, match_len);
+		}
+		pushed.replace(marker_pos, marker.size(), replacement);
+		return pushed;
+	}
+	return "";
+}
+
+static string ReplaceSourceReferenceOccurrence(const string &view_query_sql, idx_t occurrence,
+                                               const string &replacement, const DuckLakeSourceLocation &loc,
+                                               const string &source_name, string *matched_reference = nullptr) {
+	return ReplaceSourceReferenceOccurrence(view_query_sql, occurrence, replacement,
+	                                        PushdownSourceMatchNames(loc, source_name), matched_reference);
+}
+
 bool BuildDuckLakeSourceSpecs(RefreshMetadata &metadata, Connection &con, const string &view_name,
                               const vector<string> &delta_table_names, const string &view_catalog_name,
                               const string &view_schema_name, const string &attached_db_catalog_name,
@@ -352,6 +408,9 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
 	if (!metadata.GetProjectionKeyLineage(view_name, lineage)) {
 		return false;
 	}
+	if (!lineage.pushdown_safe) {
+		return false;
+	}
 
 	vector<DuckLakeSourceSpec> specs;
 	if (!BuildDuckLakeSourceSpecs(metadata, con, view_name, delta_table_names, view_catalog_name, view_schema_name,
@@ -389,20 +448,14 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
 	string qkey = SqlUtils::QuoteIdentifier(lineage.output_col);
 	string affected_sql = "SELECT DISTINCT " + qkey + " FROM (" + union_sql + ") openivm_projection_keys";
 	string temp_affected = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name);
-	string key_table =
-	    SqlUtils::FullName(key_spec->loc.catalog_name, key_spec->loc.schema_name, key_spec->loc.table_name);
+	string key_table = PushdownSourceSQL(key_spec->loc, lineage.key_source);
 	string replacement = "(SELECT * FROM " + key_table + " openivm_key_source WHERE EXISTS (SELECT 1 FROM " +
 	                     temp_affected + " openivm_aff WHERE openivm_aff." + qkey +
 	                     " IS NOT DISTINCT FROM openivm_key_source." + SqlUtils::QuoteIdentifier(lineage.key_col) +
 	                     "))";
-	bool replaced = false;
-	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, lineage.key_source,
-	                                                                lineage.key_occurrence, replacement, replaced);
-	if (!replaced) {
-		pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_spec->loc.table_name,
-		                                                         lineage.key_occurrence, replacement, replaced);
-	}
-	if (!replaced || pushed_query == view_query_sql) {
+	string pushed_query = ReplaceSourceReferenceOccurrence(view_query_sql, lineage.key_occurrence, replacement,
+	                                                       key_spec->loc, lineage.key_source);
+	if (pushed_query.empty()) {
 		return false;
 	}
 
@@ -637,40 +690,58 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 // pushed source filter admits false positives: a left-side insert produces a new openivm_left_key in the
 // view delta, whose source row passes the pushed EXISTS, so no affected group is missed. We never push when
 // the key cannot be pinned to a single source binding.
+static string TryPushIntoLeftJoinSource(const string &source_name, const string &view_query_sql, idx_t occurrence,
+                                        const string &key_col, const string &lk) {
+	vector<string> match_names;
+	match_names.push_back(source_name);
+	auto last_identifier = SqlUtils::LastIdentifierPart(source_name);
+	if (!StringUtil::CIEquals(last_identifier, source_name)) {
+		match_names.push_back(last_identifier);
+	}
+	string matched_source;
+	string marker_replacement = "__openivm_left_join_source__";
+	string pushed_query =
+	    ReplaceSourceReferenceOccurrence(view_query_sql, occurrence, marker_replacement, match_names, &matched_source);
+	if (pushed_query.empty() || matched_source.empty()) {
+		return "";
+	}
+	string replacement = "(SELECT * FROM " + matched_source +
+	                     " openivm_lj_src WHERE EXISTS (SELECT 1 FROM openivm_affected openivm_lj_aff WHERE "
+	                     "openivm_lj_src." +
+	                     key_col + " IS NOT DISTINCT FROM openivm_lj_aff." + lk + "))";
+	auto marker_pos = pushed_query.find(marker_replacement);
+	if (marker_pos == string::npos) {
+		return "";
+	}
+	pushed_query.replace(marker_pos, marker_replacement.size(), replacement);
+	return pushed_query;
+}
+
 static string TryBuildLeftJoinAffectedPushdown(RefreshMetadata &metadata, const string &view_name,
                                                const string &data_table, const string &view_query_sql,
                                                const string &qdv, const string &delta_ts_filter, const string &lk) {
 	RefreshMetadata::ProjectionKeyLineage lineage;
-	if (!metadata.GetLeftJoinKeyLineage(view_name, lineage)) {
-		return "";
+	string lineage_view_name = view_name;
+	if (!metadata.GetLeftJoinKeyLineage(lineage_view_name, lineage)) {
+		lineage_view_name = SqlUtils::LastIdentifierPart(view_name);
+		if (lineage_view_name == view_name || !metadata.GetLeftJoinKeyLineage(lineage_view_name, lineage)) {
+			return "";
+		}
 	}
 	if (lineage.arms.size() != 1 || !lineage.arms[0].steps.empty()) {
 		return ""; // derived / multi-source key — not safe to push generically
 	}
-	// The pushdown rewrites the source by its logical name; a DuckLake source lives in an attached catalog
-	// (e.g. dl.CUSTOMER) and would lose its qualification, so fall back to full recompute for any DuckLake
-	// view (the recompute path resolves the qualified name correctly).
-	for (auto &dt : metadata.GetDeltaTables(view_name)) {
-		if (metadata.IsDuckLakeTable(view_name, dt)) {
-			return "";
-		}
+	if (!lineage.pushdown_safe) {
+		return "";
 	}
 
 	string key_col = KeywordHelper::WriteOptionallyQuoted(lineage.key_col);
-	auto push_into = [&](const string &source_name) -> string {
-		string replacement = "(SELECT * FROM " + source_name +
-		                     " openivm_lj_src WHERE EXISTS (SELECT 1 FROM openivm_affected openivm_lj_aff WHERE "
-		                     "openivm_lj_src." +
-		                     key_col + " IS NOT DISTINCT FROM openivm_lj_aff." + lk + "))";
-		bool replaced = false;
-		string pushed = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, source_name, lineage.key_occurrence,
-		                                                          replacement, replaced);
-		return (replaced && pushed != view_query_sql) ? pushed : "";
-	};
 	// The stored query references either the logical source name or, for an MV-on-MV source, its data table.
-	string pushed_query = push_into(lineage.key_source);
+	string pushed_query =
+	    TryPushIntoLeftJoinSource(lineage.key_source, view_query_sql, lineage.key_occurrence, key_col, lk);
 	if (pushed_query.empty()) {
-		pushed_query = push_into(string(openivm::DATA_TABLE_PREFIX) + lineage.key_source);
+		string data_source = string(openivm::DATA_TABLE_PREFIX) + lineage.key_source;
+		pushed_query = TryPushIntoLeftJoinSource(data_source, view_query_sql, lineage.key_occurrence, key_col, lk);
 	}
 	if (pushed_query.empty()) {
 		return "";
@@ -927,6 +998,10 @@ string QualifyViewQuerySources(RefreshMetadata &metadata, Connection &con, const
 		                                         attached_db_catalog_name, attached_db_schema_name);
 		loc.table_name = base_name;
 		if (loc.catalog_name.empty() || loc.schema_name.empty()) {
+			continue;
+		}
+		if (loc.catalog_name == "memory" && attached_db_catalog_name.empty() &&
+		    (view_catalog_name.empty() || view_catalog_name == "memory")) {
 			continue;
 		}
 		qualified_query = SqlUtils::ReplaceTableReferences(

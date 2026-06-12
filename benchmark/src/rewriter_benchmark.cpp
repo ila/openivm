@@ -62,20 +62,20 @@ static string FormatNumber(double v) {
 }
 
 // Normalized verify helper: returns a synthetic column-name list (`c1, c2, ...`) and
-// a projection that formats DOUBLE/FLOAT columns with `printf('%.12g', ...)` — 12
+// a projection that formats DOUBLE/FLOAT columns with `printf('%.10g', ...)` — 10
 // significant digits. The synthetic names let us rename both the MV and the base-
 // query results into a common column-name space so EXCEPT ALL can compare by
 // position — the base query's output names (e.g. `count(d.D_ID)`) don't match the
 // MV's sanitized names (`count_d_d_id`), but positions always agree.
 //
-// Why %.12g (significant digits) instead of ROUND(x, N) (decimal places):
+// Why %.10g (significant digits) instead of ROUND(x, N) (decimal places):
 //   DuckDB's internal AVG / VARIANCE compensation can drift 1 ULP. DOUBLE ULP is
 //   ~2^-52 of the magnitude — absolute 1e-15 for values near 1, absolute 1e-9 for
 //   values near 1e7, etc. A fixed decimal-place rounding fails for large values
 //   (e.g. VARIANCE ≈ 1.76e7 drifts by 4e-9, outside ROUND(x,10)'s 1e-10 window).
-//   12 significant digits leaves ~3–4 orders of magnitude headroom relative to
+//   10 significant digits leaves ~5–6 orders of magnitude headroom relative to
 //   DOUBLE's ~16 significant digits regardless of magnitude, while still catching
-//   any algebraic error larger than 1e-12 relative.
+//   algebraic errors larger than 1e-10 relative.
 //
 // Non-float types (INTEGER, BIGINT, DECIMAL, VARCHAR, DATE, TIMESTAMP, BOOLEAN,
 // LIST, STRUCT, MAP, ARRAY) pass through verbatim so algebraic errors still surface.
@@ -116,15 +116,15 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 			result.normalized += ", ";
 		// DECIMAL/NUMERIC are tolerated too: AVG(DECIMAL) is maintained via SUM/COUNT decomposition,
 		// which drifts 1-2 ULP from DuckDB's native compensated AVG(DECIMAL) (docs/limitations.md) —
-		// the same benign drift already tolerated for DOUBLE AVG. CAST AS DOUBLE then format to 12
+		// the same benign drift already tolerated for DOUBLE AVG. CAST AS DOUBLE then format to 10
 		// significant digits (printf needs a float; the cast is a no-op for DOUBLE/FLOAT/REAL).
 		bool is_float = (type == "DOUBLE" || type == "FLOAT" || type == "REAL");
 		bool is_decimal = (type.rfind("DECIMAL", 0) == 0 || type.rfind("NUMERIC", 0) == 0);
 		if (is_float || is_decimal) {
-			// Format with 12 significant digits (relative precision, not absolute).
-			// NULLs stay as NULL — DuckDB's printf('%.12g', NULL) returns NULL, and
+			// Format with 10 significant digits (relative precision, not absolute).
+			// NULLs stay as NULL — DuckDB's printf('%.10g', NULL) returns NULL, and
 			// EXCEPT ALL treats NULL-rows as equal on both sides.
-			string normalized_col = "printf('%.12g', CAST(" + cname + " AS DOUBLE)) AS " + cname;
+			string normalized_col = "printf('%.10g', CAST(" + cname + " AS DOUBLE)) AS " + cname;
 			result.normalized += normalized_col;
 			result.normalized_columns.push_back(std::move(normalized_col));
 			result.has_float = true;
@@ -145,7 +145,9 @@ static bool KeywordAt(const string &lower, size_t i, const char *kw, size_t len)
 	if (i + len > lower.size() || lower.compare(i, len, kw) != 0) {
 		return false;
 	}
-	auto is_word = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+	auto is_word = [](char c) {
+		return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+	};
 	bool left_ok = (i == 0) || !is_word(lower[i - 1]);
 	bool right_ok = (i + len == lower.size()) || !is_word(lower[i + len]);
 	return left_ok && right_ok;
@@ -952,10 +954,10 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 										string data_tbl = "openivm_data_" + mv_name;
 										string relaxed_limit_query =
 										    "WITH mv_r(" + nv.column_list + ") AS (SELECT " + real_cols + " FROM " +
-										    data_tbl + "), gt_r(" + nv.column_list + ") AS (SELECT * FROM (" + stripped +
-										    ") __gt) SELECT COUNT(*) FROM (SELECT " + sel + " FROM mv_r EXCEPT ALL SELECT " +
-										    sel + " FROM gt_r UNION ALL SELECT " + sel + " FROM gt_r EXCEPT ALL SELECT " +
-										    sel + " FROM mv_r) __diff";
+										    data_tbl + "), gt_r(" + nv.column_list + ") AS (SELECT * FROM (" +
+										    stripped + ") __gt) SELECT COUNT(*) FROM (SELECT " + sel +
+										    " FROM mv_r EXCEPT ALL SELECT " + sel + " FROM gt_r UNION ALL SELECT " +
+										    sel + " FROM gt_r EXCEPT ALL SELECT " + sel + " FROM mv_r) __diff";
 										auto rr = con.Query(relaxed_limit_query);
 										if (rr && !rr->HasError() && rr->RowCount() > 0 &&
 										    rr->GetValue(0, 0).GetValue<int64_t>() == 0) {

@@ -1147,14 +1147,29 @@ qualify_ranked AS (
 				qs.order_entry_date ASC,
 				qs.delivery_date ASC
 		) AS fulfillment_rank,
-		RANK() OVER (
-			PARTITION BY qs.warehouse_id, qs.credit_code
-			ORDER BY qs.customer_balance DESC, qs.customer_id ASC, qs.order_id ASC
-		) AS balance_rank,
-		DENSE_RANK() OVER (
-			PARTITION BY qs.warehouse_id, qs.district_id, qs.account_state
-			ORDER BY qs.stock_quantity ASC, qs.item_id ASC
-		) AS stock_rank,
+	RANK() OVER (
+		PARTITION BY qs.warehouse_id, qs.credit_code
+		ORDER BY
+			qs.customer_balance DESC,
+			qs.district_id ASC,
+			qs.customer_id ASC,
+			qs.order_id ASC,
+			qs.line_number ASC,
+			qs.item_id ASC,
+			qs.fulfillment_state ASC,
+			qs.account_state ASC
+	) AS balance_rank,
+	DENSE_RANK() OVER (
+		PARTITION BY qs.warehouse_id, qs.district_id, qs.account_state
+		ORDER BY
+			qs.stock_quantity ASC,
+			qs.item_id ASC,
+			qs.customer_id ASC,
+			qs.order_id ASC,
+			qs.line_number ASC,
+			qs.credit_code ASC,
+			qs.fulfillment_state ASC
+	) AS stock_rank,
 		SUM(qs.extended_amount) OVER (
 			PARTITION BY qs.warehouse_id, qs.district_id, qs.customer_id
 		) AS customer_amount_window,
@@ -1181,7 +1196,14 @@ qualify_ranked AS (
 		) <= 5
 		OR DENSE_RANK() OVER (
 			PARTITION BY qs.warehouse_id, qs.district_id, qs.account_state
-			ORDER BY qs.stock_quantity ASC, qs.item_id ASC
+			ORDER BY
+				qs.stock_quantity ASC,
+				qs.item_id ASC,
+				qs.customer_id ASC,
+				qs.order_id ASC,
+				qs.line_number ASC,
+				qs.credit_code ASC,
+				qs.fulfillment_state ASC
 		) <= 4
 
 ),
@@ -1273,10 +1295,19 @@ qualify_window_pass_3 AS (
 		qp2.amount_tile,
 		qp2.previous_customer_amount,
 		qp2.credit_fulfillment_rows,
-		DENSE_RANK() OVER (
-			PARTITION BY qp2.warehouse_id, qp2.amount_tile
-			ORDER BY qp2.customer_amount_window DESC, qp2.customer_id ASC
-		) AS tile_customer_rank,
+	DENSE_RANK() OVER (
+		PARTITION BY qp2.warehouse_id, qp2.amount_tile
+		ORDER BY
+			qp2.customer_amount_window DESC,
+			qp2.district_id ASC,
+			qp2.customer_id ASC,
+			qp2.order_id ASC,
+			qp2.line_number ASC,
+			qp2.item_id ASC,
+			qp2.credit_code ASC,
+			qp2.fulfillment_state ASC,
+			qp2.account_state ASC
+	) AS tile_customer_rank,
 		SUM(qp2.extended_amount - qp2.previous_customer_amount) OVER (
 			PARTITION BY qp2.warehouse_id, qp2.district_id
 		) AS district_delta_window
