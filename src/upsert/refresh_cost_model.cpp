@@ -120,17 +120,22 @@ static const char *StrategyLabelForRefreshType(RefreshType view_type) {
 
 // Uncalibrated, ms-grounded prior for the incremental-vs-recompute decision. Consulted only before
 // any refresh history exists; the learned regression replaces it after a few runs. We predict
-//   time_ms ≈ fixed_setup_ms + UNCAL_MS_PER_UNIT * cost_units
-// Incremental pays a larger fixed setup than recompute because every refresh re-plans the delta
-// query, runs the rewrite rules, does the LPTS round-trip and regenerates the upsert SQL — measured
-// at ~10-12 ms, independent of delta size — whereas recompute is a single query. This makes
-// recompute win at small scale (fixed cost dominates) and incremental win at large scale (the
-// throughput term dominates) — the real crossover is multiplicative in view size, which a flat
-// additive penalty in cost-units could not capture. The constants are a coarse, hardware-rough
-// prior: they only steer the decision for *small* views and only until calibration kicks in.
-static constexpr double UNCAL_MS_PER_UNIT = 0.0025;  // ~ms per cost unit (rows scanned/written)
-static constexpr double INCREMENTAL_SETUP_MS = 12.0; // fixed per-refresh compile/plan overhead
-static constexpr double RECOMPUTE_SETUP_MS = 2.0;    // recompute is a single query: small fixed cost
+//   time_ms ≈ setup_ms + ms_per_unit * cost_units
+// with separate constants for the two paths, reflecting how they actually run on DuckDB:
+//   - Full recompute is a single vectorized query: a small fixed setup and a *low* per-row cost
+//     (scanning/aggregating is cheap — ~10ms even at 100k+ rows).
+//   - Incremental pays a larger fixed setup (re-plan delta query, rewrite rules, LPTS round-trip,
+//     upsert SQL regeneration — ~12ms regardless of delta size) AND a *higher* per-row cost, because
+//     it applies changes through multiple statements (MERGE / EXISTS-driven delete+insert) rather
+//     than one bulk scan.
+// Because recompute's per-row cost is so low, full wins across a wide range of small/medium views
+// (where its vectorized scan beats incremental's per-statement overhead); incremental only wins once
+// the base query is genuinely expensive to recompute (large joins, very large scans). The constants
+// are a coarse, hardware-rough prior that only steers the decision until calibration kicks in.
+static constexpr double RECOMPUTE_SETUP_MS = 6.0;         // single vectorized query: small fixed cost
+static constexpr double RECOMPUTE_MS_PER_UNIT = 0.00004;  // vectorized scan/aggregate: cheap per row
+static constexpr double INCREMENTAL_SETUP_MS = 12.0;      // re-plan + rewrite + LPTS + upsert codegen
+static constexpr double INCREMENTAL_MS_PER_UNIT = 0.0008; // per-statement merge/upsert: pricier per row
 
 static bool IsLinearCostNode(DeltaModelNodeKind kind) {
 	return kind == DeltaModelNodeKind::SCAN || kind == DeltaModelNodeKind::FILTER ||
@@ -710,9 +715,17 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		//     decision is driven purely by the throughput term and the label is not spuriously flipped.
 		bool will_skip = !has_active_delta && skip_empty_enabled;
 		bool genuine_incremental = !will_skip && strategy_total < recompute_total;
-		double strategy_setup_ms = will_skip ? 0.0 : (genuine_incremental ? INCREMENTAL_SETUP_MS : RECOMPUTE_SETUP_MS);
-		strategy_predicted_ms = strategy_setup_ms + UNCAL_MS_PER_UNIT * strategy_total;
-		recompute_predicted_ms = RECOMPUTE_SETUP_MS + UNCAL_MS_PER_UNIT * recompute_total;
+		// Genuine incremental strategies are priced with the (pricier) incremental constants; skipped
+		// refreshes are ~free; recompute-equivalent strategies use the recompute constants so they are
+		// not spuriously flipped to full.
+		if (will_skip) {
+			strategy_predicted_ms = RECOMPUTE_MS_PER_UNIT * strategy_total;
+		} else if (genuine_incremental) {
+			strategy_predicted_ms = INCREMENTAL_SETUP_MS + INCREMENTAL_MS_PER_UNIT * strategy_total;
+		} else {
+			strategy_predicted_ms = RECOMPUTE_SETUP_MS + RECOMPUTE_MS_PER_UNIT * strategy_total;
+		}
+		recompute_predicted_ms = RECOMPUTE_SETUP_MS + RECOMPUTE_MS_PER_UNIT * recompute_total;
 
 		double decay = 0.9;
 		Value decay_val;
