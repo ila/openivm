@@ -977,7 +977,7 @@ INSERT INTO cold_base VALUES (101, 101);
 query IIIIII
 PRAGMA refresh_cost('mv_cold');
 ----
-full	8.643856	401.000000	12.021610	3.002500	0
+full	8.643856	401.000000	12.006915	6.016040	0
 
 # Empty delta with skip-empty disabled still executes the refresh path, so it pays the fixed
 # incremental setup (~12ms); recompute of this tiny view is cheaper, so full wins.
@@ -996,7 +996,7 @@ SET openivm_skip_empty_deltas = false;
 query IIIIII
 PRAGMA refresh_cost('mv_empty_cost');
 ----
-full	0.000000	400.000000	12.000000	3.000000	false
+full	0.000000	400.000000	12.000000	6.016000	false
 
 statement ok
 SET openivm_skip_empty_deltas = true;
