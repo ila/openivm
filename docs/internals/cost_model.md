@@ -33,8 +33,8 @@ PRAGMA refresh_cost('monthly_totals');
 | `decision` | Strategy selected for the next refresh. |
 | `incremental_cost` | Static cost of the selected non-full strategy. |
 | `recompute_cost` | Static cost of full recompute. |
-| `incremental_predicted_ms` | Learned prediction for the non-full strategy, or static cost before calibration. |
-| `recompute_predicted_ms` | Learned prediction for full recompute, or static cost before calibration. |
+| `incremental_predicted_ms` | Learned prediction for the non-full strategy, or the ms-grounded prior before calibration. |
+| `recompute_predicted_ms` | Learned prediction for full recompute, or the ms-grounded prior before calibration. |
 | `calibrated` | Whether enough refresh history existed to fit a learned model. |
 
 ## Static Model
@@ -143,14 +143,39 @@ Recent samples receive more weight. `openivm_cost_decay` controls the decay fact
 defaults to `0.9`. At least three history samples are required before a strategy is
 marked calibrated.
 
-During cold start, non-full strategies receive a fixed compilation/planning overhead
-when adaptive refresh is enabled and either:
+### Uncalibrated Prior (cold start)
 
-- at least one delta source is active; or
-- `openivm_skip_empty_deltas` is disabled.
+Before any refresh history exists, the `*_predicted_ms` columns are an **ms-grounded prior**
+rather than the raw cost units. Each side is predicted as a fixed setup time plus a per-row
+throughput term:
 
-This biases small-data cases toward full recompute until enough history exists. True
-empty-delta no-ops with empty-delta skipping enabled do not pay this overhead.
+```text
+predicted_ms = setup_ms + ms_per_unit * cost_units
+```
+
+The two paths use different constants, reflecting how they actually run on DuckDB:
+
+| Path | Setup | Per cost unit |
+|---|---|---|
+| Full recompute | small (`RECOMPUTE_SETUP_MS`) | low (`RECOMPUTE_MS_PER_UNIT`) — one vectorized scan/aggregate is cheap per row |
+| Incremental (genuine) | larger (`INCREMENTAL_SETUP_MS`) | higher (`INCREMENTAL_MS_PER_UNIT`) — per-statement MERGE/upsert is pricier per row |
+
+Incremental pays a larger fixed setup because every refresh re-plans the delta query, runs the
+rewrite rules, does the LPTS round-trip, and regenerates the upsert SQL — roughly constant
+regardless of delta size. Because recompute's per-row cost is low, full recompute wins across a wide
+range of small and medium views; incremental only wins once the base query is genuinely expensive to
+recompute (large joins, very large scans). The crossover is multiplicative in view size, which a
+single flat additive penalty could not capture.
+
+Two cases are priced specially:
+
+- An empty delta with empty-delta skipping enabled is a no-op, priced as ~free, so it is not biased
+  toward full recompute.
+- Recompute-equivalent strategies (current-diff recompute, full refresh, top-k) reuse the recompute
+  constants, so the prior never spuriously flips them to a separate full recompute for identical work.
+
+Once at least three history samples exist for a strategy, the learned regression replaces the prior
+for that side.
 
 ## Example
 
