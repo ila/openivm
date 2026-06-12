@@ -52,6 +52,14 @@ enum class RefreshMode {
 	FULL,
 };
 
+// VALIDATED queries are the known-good baseline (run periodically as a regression gate); TODO queries
+// exercise operators/shapes still being brought under test. Keep VALIDATED first so it is the value an
+// existing brace-initializer (which omits the trailing field) gets by default.
+enum class Batch {
+	VALIDATED,
+	TODO,
+};
+
 struct QueryDef {
 	string id;
 	string description;
@@ -62,6 +70,7 @@ struct QueryDef {
 	vector<string> touched_tables;
 	string base_sql;
 	vector<Workload> workloads;
+	Batch batch;
 };
 
 struct CostEstimate {
@@ -559,6 +568,73 @@ static vector<QueryDef> BuildQueries() {
 	              "SELECT a.val, b.label, c.tag FROM ed_a a JOIN ed_b b ON a.id = b.id JOIN ed_c c ON a.id = c.id",
 	              {Workload::INSERT_ONLY, Workload::EMPTY_DELTA}});
 
+	// ----- TODO batch: operators/shapes still being brought under test -----
+	// AVG/STDDEV use DOUBLE to avoid the documented AVG(DECIMAL) ULP drift that breaks strict EXCEPT ALL.
+	AddQuery(qs, {"T01", "AVG aggregate", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, AVG(C_BALANCE::DOUBLE) AS avg_bal FROM CUSTOMER "
+	               "GROUP BY C_W_ID"},
+	              {"mv_q"}, {"CUSTOMER"},
+	              "SELECT C_W_ID, AVG(C_BALANCE::DOUBLE) AS avg_bal FROM CUSTOMER GROUP BY C_W_ID",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	// ROUND the STDDEV: its SUM/COUNT/sum-of-squares decomposition drifts ~1e-8 from DuckDB's native
+	// STDDEV (catastrophic cancellation), which strict EXCEPT ALL would otherwise flag (docs/limitations.md).
+	AddQuery(qs, {"T02", "STDDEV aggregate", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, ROUND(STDDEV_SAMP(C_BALANCE::DOUBLE), 2) AS sd FROM "
+	               "CUSTOMER GROUP BY C_W_ID"},
+	              {"mv_q"}, {"CUSTOMER"},
+	              "SELECT C_W_ID, ROUND(STDDEV_SAMP(C_BALANCE::DOUBLE), 2) AS sd FROM CUSTOMER GROUP BY C_W_ID",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	AddQuery(qs, {"T03", "ARG_MAX aggregate", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, ARG_MAX(C_ID, C_BALANCE) AS top_c FROM CUSTOMER "
+	               "GROUP BY C_W_ID"},
+	              {"mv_q"}, {"CUSTOMER"},
+	              "SELECT C_W_ID, ARG_MAX(C_ID, C_BALANCE) AS top_c FROM CUSTOMER GROUP BY C_W_ID",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	AddQuery(qs, {"T04", "FULL OUTER JOIN projection", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, d.D_ID FROM WAREHOUSE w FULL OUTER JOIN DISTRICT d "
+	               "ON w.W_ID = d.D_W_ID"},
+	              {"mv_q"}, {"WAREHOUSE", "DISTRICT"},
+	              "SELECT w.W_ID, d.D_ID FROM WAREHOUSE w FULL OUTER JOIN DISTRICT d ON w.W_ID = d.D_W_ID",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	AddQuery(qs, {"T05", "FULL OUTER JOIN aggregate", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, COUNT(d.D_ID) AS nd FROM WAREHOUSE w FULL OUTER JOIN "
+	               "DISTRICT d ON w.W_ID = d.D_W_ID GROUP BY w.W_ID"},
+	              {"mv_q"}, {"WAREHOUSE", "DISTRICT"},
+	              "SELECT w.W_ID, COUNT(d.D_ID) AS nd FROM WAREHOUSE w FULL OUTER JOIN DISTRICT d ON w.W_ID = d.D_W_ID "
+	              "GROUP BY w.W_ID",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	AddQuery(qs, {"T06", "UNION ALL", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID AS k, C_BALANCE AS v FROM CUSTOMER UNION ALL SELECT "
+	               "D_W_ID, D_YTD FROM DISTRICT"},
+	              {"mv_q"}, {"CUSTOMER", "DISTRICT"},
+	              "SELECT C_W_ID AS k, C_BALANCE AS v FROM CUSTOMER UNION ALL SELECT D_W_ID, D_YTD FROM DISTRICT",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	AddQuery(qs, {"T07", "top-level DISTINCT", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT DISTINCT C_W_ID, C_D_ID FROM CUSTOMER"},
+	              {"mv_q"}, {"CUSTOMER"}, "SELECT DISTINCT C_W_ID, C_D_ID FROM CUSTOMER",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	AddQuery(qs, {"T08", "ORDER BY + LIMIT (top-k)", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, C_D_ID, C_ID FROM CUSTOMER ORDER BY C_W_ID, C_D_ID, "
+	               "C_ID LIMIT 100"},
+	              {"mv_q"}, {"CUSTOMER"},
+	              "SELECT C_W_ID, C_D_ID, C_ID FROM CUSTOMER ORDER BY C_W_ID, C_D_ID, C_ID LIMIT 100",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	AddQuery(qs, {"T09", "4-way INNER JOIN", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, d.D_ID, c.C_ID, o.O_ID FROM WAREHOUSE w JOIN "
+	               "DISTRICT d ON w.W_ID = d.D_W_ID JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID JOIN "
+	               "OORDER o ON o.O_W_ID = c.C_W_ID AND o.O_D_ID = c.C_D_ID AND o.O_C_ID = c.C_ID"},
+	              {"mv_q"}, {"WAREHOUSE", "DISTRICT", "CUSTOMER", "OORDER"},
+	              "SELECT w.W_ID, d.D_ID, c.C_ID, o.O_ID FROM WAREHOUSE w JOIN DISTRICT d ON w.W_ID = d.D_W_ID JOIN "
+	              "CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID JOIN OORDER o ON o.O_W_ID = c.C_W_ID AND "
+	              "o.O_D_ID = c.C_D_ID AND o.O_C_ID = c.C_ID",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	AddQuery(qs, {"T10", "FILTER aggregate", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, SUM(C_BALANCE::DOUBLE) FILTER (WHERE C_ID <= 50) AS "
+	               "s FROM CUSTOMER GROUP BY C_W_ID"},
+	              {"mv_q"}, {"CUSTOMER"},
+	              "SELECT C_W_ID, SUM(C_BALANCE::DOUBLE) FILTER (WHERE C_ID <= 50) AS s FROM CUSTOMER GROUP BY C_W_ID",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+
 	return qs;
 }
 
@@ -726,13 +802,15 @@ static string CombinePipelineMethods(const vector<string> &methods) {
 }
 
 static bool ValidateMV(duckdb::Connection &con, const string &mv_name, const string &base_sql, string &error) {
-	string left = "SELECT COUNT(*) FROM (SELECT * FROM " + mv_name + " EXCEPT ALL " + base_sql + ") x";
+	// Parenthesize both operands so a base query ending in ORDER BY/LIMIT (top-k views) is a valid
+	// set-operation operand instead of a syntax error.
+	string left = "SELECT COUNT(*) FROM ((SELECT * FROM " + mv_name + ") EXCEPT ALL (" + base_sql + ")) x";
 	auto l = con.Query(left);
 	if (!l || l->HasError()) {
 		error = l ? l->GetError() : "left validation returned null";
 		return false;
 	}
-	string right = "SELECT COUNT(*) FROM (" + base_sql + " EXCEPT ALL SELECT * FROM " + mv_name + ") x";
+	string right = "SELECT COUNT(*) FROM ((" + base_sql + ") EXCEPT ALL (SELECT * FROM " + mv_name + ")) x";
 	auto r = con.Query(right);
 	if (!r || r->HasError()) {
 		error = r ? r->GetError() : "right validation returned null";
@@ -907,7 +985,8 @@ static double RegretRatio(const string &auto_method, double incremental_ms, doub
 static void PrintUsage() {
 	fprintf(stderr, "cost_model_benchmark --scale N --db PATH --out CSV [--reps 3]\n"
 	                "                     [--delta-pcts 0,0.01,1,2,5,10,20,50] [--filter Q01,S06,...] [--no-warm]\n"
-	                "                     [--configs all_on,all_off,skip_empty_off] [--no-validate]\n");
+	                "                     [--configs all_on,all_off,skip_empty_off] [--no-validate]\n"
+	                "                     [--batch all|validated|todo]\n");
 }
 
 int main(int argc, char **argv) {
@@ -919,6 +998,7 @@ int main(int argc, char **argv) {
 	set<string> query_filter;
 	bool warm = true;
 	bool validate = true; // EXCEPT ALL correctness cross-check on the AUTO path
+	string batch_sel = "all"; // "all" | "validated" | "todo"
 	vector<FlagConfig> configs = {FlagConfig::ALL_ON, FlagConfig::ALL_OFF, FlagConfig::SKIP_EMPTY_OFF};
 
 	for (int i = 1; i < argc; i++) {
@@ -956,6 +1036,12 @@ int main(int argc, char **argv) {
 			warm = false;
 		} else if (arg == "--no-validate") {
 			validate = false;
+		} else if (arg == "--batch") {
+			batch_sel = next("--batch");
+			if (batch_sel != "all" && batch_sel != "validated" && batch_sel != "todo") {
+				fprintf(stderr, "unknown batch: %s (use all|validated|todo)\n", batch_sel.c_str());
+				return 2;
+			}
 		} else if (arg == "--configs") {
 			string f = next("--configs");
 			configs.clear();
@@ -1009,6 +1095,12 @@ int main(int argc, char **argv) {
 		if (!query_filter.empty() && !query_filter.count(q.id)) {
 			continue;
 		}
+		if (batch_sel == "validated" && q.batch != Batch::VALIDATED) {
+			continue;
+		}
+		if (batch_sel == "todo" && q.batch != Batch::TODO) {
+			continue;
+		}
 		for (auto wl : q.workloads) {
 			for (double pct : delta_pcts) {
 				if (wl == Workload::EMPTY_DELTA && pct > 0.0) {
@@ -1027,6 +1119,12 @@ int main(int argc, char **argv) {
 	int errors = 0;
 	for (auto &q : queries) {
 		if (!query_filter.empty() && !query_filter.count(q.id)) {
+			continue;
+		}
+		if (batch_sel == "validated" && q.batch != Batch::VALIDATED) {
+			continue;
+		}
+		if (batch_sel == "todo" && q.batch != Batch::TODO) {
 			continue;
 		}
 		for (auto wl : q.workloads) {
