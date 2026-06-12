@@ -432,6 +432,23 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 							throw Exception(ExceptionType::EXECUTOR, "Cannot insert in delta table! " + r->GetError());
 						}
 					}
+				} else {
+					// Any other insert-source plan shape. DuckDB places a STREAMING_LIMIT/LOGICAL_LIMIT
+					// directly above the projection for larger INSERT ... SELECT (above a row threshold),
+					// so children[0] is neither LOGICAL_PROJECTION nor LOGICAL_GET. Serialize the whole
+					// source plan generically so the delta is still captured. Without this catch-all, such
+					// inserts updated the base table but silently skipped the delta, leaving the MV stale
+					// after the next refresh.
+					auto &delta_entry_other = delta_table_catalog_entry->Cast<TableCatalogEntry>();
+					string insert_query = BuildDeltaInsertFromPlan(*con.context, delta_entry_other,
+					                                               full_delta_table_name, insert_node->children[0]);
+					OPENIVM_DEBUG_PRINT("[INSERT RULE] generic-plan delta insert_query: %s\n", insert_query.c_str());
+					DeltaLockGuard guard(SqlUtils::DeltaName(insert_table_name));
+					auto r = con.Query(insert_query);
+					if (r->HasError()) {
+						throw Exception(ExceptionType::EXECUTOR,
+						                "Cannot insert in delta table after insertion! " + r->GetError());
+					}
 				}
 			}
 		}

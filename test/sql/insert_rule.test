@@ -1106,3 +1106,54 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Regression: bulk INSERT ... SELECT with a large LIMIT.
+# DuckDB places a STREAMING_LIMIT directly above the projection for large LIMIT values,
+# so the INSERT's child is neither LOGICAL_PROJECTION nor LOGICAL_GET. The delta-capture
+# rule previously handled only those two shapes and silently skipped delta population for
+# any other shape, leaving the MV stale after refresh. The catch-all branch serializes the
+# source plan so the delta is captured for these shapes too.
+# ==========================================
+
+statement ok
+CREATE TABLE bulk_base (id INT, v INT);
+
+statement ok
+INSERT INTO bulk_base SELECT i, i * 10 FROM range(1, 11) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_bulk AS SELECT id, v FROM bulk_base;
+
+statement ok
+PRAGMA refresh('mv_bulk');
+
+statement ok
+CREATE TABLE bulk_src (id INT, v INT);
+
+statement ok
+INSERT INTO bulk_src SELECT i, i * 10 FROM range(100, 151) t(i);
+
+# Large LIMIT -> STREAMING_LIMIT-topped insert plan (the previously-dropped shape).
+statement ok
+INSERT INTO bulk_base SELECT id, v FROM bulk_src LIMIT 50000;
+
+# The 51 bulk rows must have been captured into the delta (was 0 before the fix).
+query I
+SELECT count(*) FROM openivm_delta_bulk_base;
+----
+51
+
+statement ok
+PRAGMA refresh('mv_bulk');
+
+# MV must bag-equal the base after the bulk insert.
+query I
+SELECT count(*) FROM (SELECT * FROM mv_bulk EXCEPT ALL SELECT * FROM bulk_base);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM bulk_base EXCEPT ALL SELECT * FROM mv_bulk);
+----
+0
