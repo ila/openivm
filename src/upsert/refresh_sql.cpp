@@ -894,6 +894,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	add_profile_step("generate_refresh_sql.dispatch", dispatch_start,
 	                 "refresh_type=" + string(RefreshTypeName(view_query_type)) +
 	                     "; full_recompute=" + string(refresh_plan.RequiresFullRecompute() ? "true" : "false") +
+	                     "; metadata_requires_full_refresh=" +
+	                     string(refresh_plan.metadata_requires_full_refresh ? "true" : "false") +
 	                     "; upsert_bytes=" + to_string(upsert_query.size()));
 	OPENIVM_DEBUG_PRINT("[UPSERT] Upsert query:\n%s\n", upsert_query.c_str());
 	string delta_query;
