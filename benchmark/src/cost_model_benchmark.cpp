@@ -570,11 +570,15 @@ static vector<QueryDef> BuildQueries() {
 
 	// ----- TODO batch: operators/shapes still being brought under test -----
 	// AVG/STDDEV use DOUBLE to avoid the documented AVG(DECIMAL) ULP drift that breaks strict EXCEPT ALL.
-	AddQuery(qs, {"T01", "AVG aggregate", {}, {},
-	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, AVG(C_BALANCE::DOUBLE) AS avg_bal FROM CUSTOMER "
-	               "GROUP BY C_W_ID"},
-	              {"mv_q"}, {"CUSTOMER"},
-	              "SELECT C_W_ID, AVG(C_BALANCE::DOUBLE) AS avg_bal FROM CUSTOMER GROUP BY C_W_ID",
+	// JOIN + AVG: AVG decomposition (SUM/COUNT) maintained over a 2-way join, on a varying measure
+	// (OL_AMOUNT), not a constant column.
+	AddQuery(qs, {"T01", "JOIN + AVG", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT o.O_W_ID, AVG(ol.OL_AMOUNT::DOUBLE) AS avg_amt FROM OORDER o "
+	               "JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID "
+	               "GROUP BY o.O_W_ID"},
+	              {"mv_q"}, {"OORDER", "ORDER_LINE"},
+	              "SELECT o.O_W_ID, AVG(ol.OL_AMOUNT::DOUBLE) AS avg_amt FROM OORDER o JOIN ORDER_LINE ol ON o.O_W_ID = "
+	              "ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID GROUP BY o.O_W_ID",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
 	// ROUND the STDDEV: its SUM/COUNT/sum-of-squares decomposition drifts ~1e-8 from DuckDB's native
 	// STDDEV (catastrophic cancellation), which strict EXCEPT ALL would otherwise flag (docs/limitations.md).
@@ -603,11 +607,13 @@ static vector<QueryDef> BuildQueries() {
 	              "SELECT w.W_ID, COUNT(d.D_ID) AS nd FROM WAREHOUSE w FULL OUTER JOIN DISTRICT d ON w.W_ID = d.D_W_ID "
 	              "GROUP BY w.W_ID",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
-	AddQuery(qs, {"T06", "UNION ALL", {}, {},
-	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID AS k, C_BALANCE AS v FROM CUSTOMER UNION ALL SELECT "
-	               "D_W_ID, D_YTD FROM DISTRICT"},
+	// UNION ALL of two grouped aggregates: each arm maintained incrementally, then unioned.
+	AddQuery(qs, {"T06", "UNION ALL of aggregates", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID AS k, SUM(C_BALANCE) AS v FROM CUSTOMER GROUP BY "
+	               "C_W_ID UNION ALL SELECT D_W_ID, SUM(D_YTD) FROM DISTRICT GROUP BY D_W_ID"},
 	              {"mv_q"}, {"CUSTOMER", "DISTRICT"},
-	              "SELECT C_W_ID AS k, C_BALANCE AS v FROM CUSTOMER UNION ALL SELECT D_W_ID, D_YTD FROM DISTRICT",
+	              "SELECT C_W_ID AS k, SUM(C_BALANCE) AS v FROM CUSTOMER GROUP BY C_W_ID UNION ALL SELECT D_W_ID, "
+	              "SUM(D_YTD) FROM DISTRICT GROUP BY D_W_ID",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
 	AddQuery(qs, {"T07", "top-level DISTINCT", {}, {},
 	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT DISTINCT C_W_ID, C_D_ID FROM CUSTOMER"},
@@ -619,20 +625,54 @@ static vector<QueryDef> BuildQueries() {
 	              {"mv_q"}, {"CUSTOMER"},
 	              "SELECT C_W_ID, C_D_ID, C_ID FROM CUSTOMER ORDER BY C_W_ID, C_D_ID, C_ID LIMIT 100",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
-	AddQuery(qs, {"T09", "4-way INNER JOIN", {}, {},
-	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, d.D_ID, c.C_ID, o.O_ID FROM WAREHOUSE w JOIN "
-	               "DISTRICT d ON w.W_ID = d.D_W_ID JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID JOIN "
-	               "OORDER o ON o.O_W_ID = c.C_W_ID AND o.O_D_ID = c.C_D_ID AND o.O_C_ID = c.C_ID"},
-	              {"mv_q"}, {"WAREHOUSE", "DISTRICT", "CUSTOMER", "OORDER"},
-	              "SELECT w.W_ID, d.D_ID, c.C_ID, o.O_ID FROM WAREHOUSE w JOIN DISTRICT d ON w.W_ID = d.D_W_ID JOIN "
-	              "CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID JOIN OORDER o ON o.O_W_ID = c.C_W_ID AND "
-	              "o.O_D_ID = c.C_D_ID AND o.O_C_ID = c.C_ID",
+	// 3-way join + GROUP BY + HAVING: capped at 3 tables (2^3-1 = 7 incl-excl terms; a 4-way's 15 is
+	// excessive) but layers an aggregate and a HAVING predicate on top of the join.
+	AddQuery(qs, {"T09", "3-way JOIN + GROUP BY + HAVING", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, COUNT(c.C_ID) AS nc FROM WAREHOUSE w JOIN DISTRICT d "
+	               "ON w.W_ID = d.D_W_ID JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID GROUP BY w.W_ID "
+	               "HAVING COUNT(c.C_ID) > 100"},
+	              {"mv_q"}, {"WAREHOUSE", "DISTRICT", "CUSTOMER"},
+	              "SELECT w.W_ID, COUNT(c.C_ID) AS nc FROM WAREHOUSE w JOIN DISTRICT d ON w.W_ID = d.D_W_ID JOIN "
+	              "CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID GROUP BY w.W_ID HAVING COUNT(c.C_ID) > 100",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
-	AddQuery(qs, {"T10", "FILTER aggregate", {}, {},
-	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, SUM(C_BALANCE::DOUBLE) FILTER (WHERE C_ID <= 50) AS "
-	               "s FROM CUSTOMER GROUP BY C_W_ID"},
-	              {"mv_q"}, {"CUSTOMER"},
-	              "SELECT C_W_ID, SUM(C_BALANCE::DOUBLE) FILTER (WHERE C_ID <= 50) AS s FROM CUSTOMER GROUP BY C_W_ID",
+	// JOIN + FILTER aggregate: a FILTER-clause aggregate (normalized at create time) layered over a
+	// 2-way join, on the varying OL_AMOUNT measure.
+	AddQuery(qs, {"T10", "JOIN + FILTER aggregate", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT o.O_W_ID, SUM(ol.OL_AMOUNT::DOUBLE) FILTER (WHERE "
+	               "ol.OL_AMOUNT > 30) AS hi FROM OORDER o JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = "
+	               "ol.OL_D_ID AND o.O_ID = ol.OL_O_ID GROUP BY o.O_W_ID"},
+	              {"mv_q"}, {"OORDER", "ORDER_LINE"},
+	              "SELECT o.O_W_ID, SUM(ol.OL_AMOUNT::DOUBLE) FILTER (WHERE ol.OL_AMOUNT > 30) AS hi FROM OORDER o JOIN "
+	              "ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID GROUP BY "
+	              "o.O_W_ID",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	// Window aggregate over a 2-way join result.
+	AddQuery(qs, {"T11", "window SUM over JOIN", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT o.O_W_ID, o.O_D_ID, o.O_ID, SUM(ol.OL_AMOUNT::DOUBLE) OVER "
+	               "(PARTITION BY o.O_W_ID) AS wsum FROM OORDER o JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND "
+	               "o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID"},
+	              {"mv_q"}, {"OORDER", "ORDER_LINE"},
+	              "SELECT o.O_W_ID, o.O_D_ID, o.O_ID, SUM(ol.OL_AMOUNT::DOUBLE) OVER (PARTITION BY o.O_W_ID) AS wsum "
+	              "FROM OORDER o JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = "
+	              "ol.OL_O_ID",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	// CTE that aggregates, then joins the result to another table.
+	AddQuery(qs, {"T12", "CTE aggregate + JOIN", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS WITH wagg AS (SELECT C_W_ID, SUM(C_BALANCE) AS s FROM CUSTOMER "
+	               "GROUP BY C_W_ID) SELECT a.C_W_ID, a.s, w.W_NAME FROM wagg a JOIN WAREHOUSE w ON a.C_W_ID = w.W_ID"},
+	              {"mv_q"}, {"CUSTOMER", "WAREHOUSE"},
+	              "WITH wagg AS (SELECT C_W_ID, SUM(C_BALANCE) AS s FROM CUSTOMER GROUP BY C_W_ID) SELECT a.C_W_ID, a.s, "
+	              "w.W_NAME FROM wagg a JOIN WAREHOUSE w ON a.C_W_ID = w.W_ID",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	// Multiple aggregates (SUM/COUNT/MAX) over a 2-way join with a multi-column group key.
+	AddQuery(qs, {"T13", "JOIN + multi-aggregate", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT o.O_W_ID, o.O_D_ID, SUM(ol.OL_AMOUNT::DOUBLE) AS tot, "
+	               "COUNT(*) AS cnt, MAX(ol.OL_AMOUNT) AS mx FROM OORDER o JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID "
+	               "AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID GROUP BY o.O_W_ID, o.O_D_ID"},
+	              {"mv_q"}, {"OORDER", "ORDER_LINE"},
+	              "SELECT o.O_W_ID, o.O_D_ID, SUM(ol.OL_AMOUNT::DOUBLE) AS tot, COUNT(*) AS cnt, MAX(ol.OL_AMOUNT) AS mx "
+	              "FROM OORDER o JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = "
+	              "ol.OL_O_ID GROUP BY o.O_W_ID, o.O_D_ID",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
 
 	return qs;
