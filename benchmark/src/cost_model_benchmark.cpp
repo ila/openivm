@@ -207,77 +207,141 @@ struct TempDb {
 	}
 };
 
+// Build one multi-row INSERT (a single VALUES list) instead of n per-row statements. The tuple
+// values are identical to the old per-row generation, so the captured delta is unchanged; this just
+// collapses n con.Query() calls into one, which matters a lot at scale. The VALUES/constant path in
+// the delta-capture rule handles the multi-row list.
 static vector<string> GenerateInserts(const string &table, int n, int scale, int64_t pk_offset) {
-	vector<string> out;
-	out.reserve(n);
+	vector<string> tuples;
+	tuples.reserve(n);
 	for (int i = 0; i < n; i++) {
 		int64_t pk = kPkBase + pk_offset + i;
 		int w = 1 + (i % std::max(scale, 1));
 		int d = 1 + (i % 10);
 		int c = 1 + (i % 30);
 		if (table == "CUSTOMER") {
-			out.push_back("INSERT INTO CUSTOMER VALUES (" + to_string(w) + ", " + to_string(d) + ", " + to_string(pk) +
-			              ", 0.05, 'GC', 'Last" + to_string(pk) + "', 'First" + to_string(pk) + "', 50000.00, " +
-			              to_string(100 + (i % 500)) +
-			              ".00, 0.0, 0, 0, 'S1', 'S2', 'City', 'ST', '12345', '1234567890', NOW(), 'M', 'data')");
+			tuples.push_back("(" + to_string(w) + ", " + to_string(d) + ", " + to_string(pk) +
+			                 ", 0.05, 'GC', 'Last" + to_string(pk) + "', 'First" + to_string(pk) + "', 50000.00, " +
+			                 to_string(100 + (i % 500)) +
+			                 ".00, 0.0, 0, 0, 'S1', 'S2', 'City', 'ST', '12345', '1234567890', NOW(), 'M', 'data')");
 		} else if (table == "WAREHOUSE") {
-			out.push_back("INSERT INTO WAREHOUSE VALUES (" + to_string(pk) +
-			              ", 0.00, 0.05, 'W', 'S1', 'S2', 'City', 'ST', '123456789')");
+			tuples.push_back("(" + to_string(pk) + ", 0.00, 0.05, 'W', 'S1', 'S2', 'City', 'ST', '123456789')");
 		} else if (table == "DISTRICT") {
-			out.push_back("INSERT INTO DISTRICT VALUES (" + to_string(w) + ", " + to_string(pk) +
-			              ", 0.00, 0.05, 1, 'D', 'S1', 'S2', 'City', 'ST', '123456789')");
+			tuples.push_back("(" + to_string(w) + ", " + to_string(pk) +
+			                 ", 0.00, 0.05, 1, 'D', 'S1', 'S2', 'City', 'ST', '123456789')");
 		} else if (table == "OORDER") {
-			out.push_back("INSERT INTO OORDER VALUES (" + to_string(w) + ", " + to_string(d) + ", " + to_string(pk) +
-			              ", " + to_string(c) + ", NULL, 5, 1, NOW())");
+			tuples.push_back("(" + to_string(w) + ", " + to_string(d) + ", " + to_string(pk) + ", " + to_string(c) +
+			                 ", NULL, 5, 1, NOW())");
 		} else if (table == "ORDER_LINE") {
-			out.push_back("INSERT INTO ORDER_LINE VALUES (" + to_string(w) + ", " + to_string(d) + ", " +
-			              to_string(pk) + ", 1, " + to_string(1 + (i % 100)) + ", NULL, " + to_string(10 + (i % 400)) +
-			              ".00, " + to_string(w) + ", 5.00, 'D')");
+			tuples.push_back("(" + to_string(w) + ", " + to_string(d) + ", " + to_string(pk) + ", 1, " +
+			                 to_string(1 + (i % 100)) + ", NULL, " + to_string(10 + (i % 400)) + ".00, " + to_string(w) +
+			                 ", 5.00, 'D')");
 		} else if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
-			out.push_back("INSERT INTO " + table + " VALUES (" + to_string(1 + (i % 20)) + ", 'm" + to_string(pk) +
-			              "', " + to_string(1 + (i % 64)) + ")");
+			tuples.push_back("(" + to_string(1 + (i % 20)) + ", 'm" + to_string(pk) + "', " + to_string(1 + (i % 64)) +
+			                 ")");
 		} else if (table == "cm_saj_r") {
-			out.push_back("INSERT INTO cm_saj_r VALUES (" + to_string(10 + (i % 1000)) + ")");
+			tuples.push_back("(" + to_string(10 + (i % 1000)) + ")");
 		} else if (table == "cm_win_src") {
-			out.push_back("INSERT INTO cm_win_src VALUES (" + to_string(pk) + ", " + to_string(1 + (i % 20)) + ", " +
-			              to_string(i % 1000) + ")");
+			tuples.push_back("(" + to_string(pk) + ", " + to_string(1 + (i % 20)) + ", " + to_string(i % 1000) + ")");
 		} else if (table == "cm_asof_prices") {
-			out.push_back("INSERT INTO cm_asof_prices VALUES ('A', TIMESTAMP '2024-01-02 00:00:00' + INTERVAL '" +
-			              to_string(i) + " minutes', " + to_string(100 + (i % 500)) + ")");
+			tuples.push_back("('A', TIMESTAMP '2024-01-02 00:00:00' + INTERVAL '" + to_string(i) + " minutes', " +
+			                 to_string(100 + (i % 500)) + ")");
 		} else if (table == "ed_a") {
-			out.push_back("INSERT INTO ed_a VALUES (" + to_string(pk) + ", " + to_string(pk * 10) + ")");
+			tuples.push_back("(" + to_string(pk) + ", " + to_string(pk * 10) + ")");
 		} else if (table == "ed_b") {
-			out.push_back("INSERT INTO ed_b VALUES (" + to_string(pk) + ", 'b_" + to_string(pk) + "')");
+			tuples.push_back("(" + to_string(pk) + ", 'b_" + to_string(pk) + "')");
 		} else if (table == "ed_c") {
-			out.push_back("INSERT INTO ed_c VALUES (" + to_string(pk) + ", 'c_" + to_string(pk) + "')");
+			tuples.push_back("(" + to_string(pk) + ", 'c_" + to_string(pk) + "')");
 		}
 	}
-	return out;
+	if (tuples.empty()) {
+		return {};
+	}
+	string values;
+	for (size_t i = 0; i < tuples.size(); i++) {
+		if (i > 0) {
+			values += ", ";
+		}
+		values += tuples[i];
+	}
+	return {"INSERT INTO " + table + " VALUES " + values};
 }
 
+// Batch the TPC-C updates into a single UPDATE ... FROM (VALUES ...) join. Per-row updates full-scan
+// an unindexed table each. We dedup by key keeping the last i (the same "last write wins" the per-row
+// sequence produced), so the source has at most one row per key — no ambiguous multi-match. The
+// LOGICAL_UPDATE delta-capture handler records whatever rows actually change, so the MV stays correct.
+// Small synthetic tables keep per-row updates.
 static vector<string> GenerateUpdates(const string &table, int n, int scale) {
+	// table -> (SET column, key column list, VALUES alias columns incl. trailing value alias)
+	const char *set_col = nullptr, *alias = nullptr, *join = nullptr;
+	if (table == "CUSTOMER") {
+		set_col = "C_BALANCE";
+		alias = "m(k1, k2, k3, nv)";
+		join = "CUSTOMER.C_W_ID = m.k1 AND CUSTOMER.C_D_ID = m.k2 AND CUSTOMER.C_ID = m.k3";
+	} else if (table == "WAREHOUSE") {
+		set_col = "W_YTD";
+		alias = "m(k1, nv)";
+		join = "WAREHOUSE.W_ID = m.k1";
+	} else if (table == "DISTRICT") {
+		set_col = "D_YTD";
+		alias = "m(k1, k2, nv)";
+		join = "DISTRICT.D_W_ID = m.k1 AND DISTRICT.D_ID = m.k2";
+	} else if (table == "OORDER") {
+		set_col = "O_CARRIER_ID";
+		alias = "m(k1, k2, k3, nv)";
+		join = "OORDER.O_W_ID = m.k1 AND OORDER.O_D_ID = m.k2 AND OORDER.O_ID = m.k3";
+	} else if (table == "ORDER_LINE") {
+		set_col = "OL_AMOUNT";
+		alias = "m(k1, k2, k3, k4, nv)";
+		join = "ORDER_LINE.OL_W_ID = m.k1 AND ORDER_LINE.OL_D_ID = m.k2 AND ORDER_LINE.OL_O_ID = m.k3 AND "
+		       "ORDER_LINE.OL_NUMBER = m.k4";
+	}
+	if (set_col) {
+		std::map<string, string> by_key; // key -> source tuple, last i wins
+		for (int i = 0; i < n; i++) {
+			int w = 1 + (i % std::max(scale, 1));
+			int d = 1 + (i % 10);
+			int c = 1 + (i % 30);
+			string key, tuple;
+			if (table == "CUSTOMER") {
+				key = to_string(w) + "/" + to_string(d) + "/" + to_string(c);
+				tuple = "(" + to_string(w) + ", " + to_string(d) + ", " + to_string(c) + ", " +
+				        to_string(-100 - (i % 500)) + ".00)";
+			} else if (table == "WAREHOUSE") {
+				key = to_string(w);
+				tuple = "(" + to_string(w) + ", " + to_string(300000 + i * 100) + ".00)";
+			} else if (table == "DISTRICT") {
+				key = to_string(w) + "/" + to_string(d);
+				tuple = "(" + to_string(w) + ", " + to_string(d) + ", " + to_string(30000 + i * 10) + ".00)";
+			} else if (table == "OORDER") {
+				key = to_string(w) + "/" + to_string(d) + "/" + to_string(1 + (i % 5));
+				tuple = "(" + to_string(w) + ", " + to_string(d) + ", " + to_string(1 + (i % 5)) + ", " +
+				        to_string(1 + (i % 10)) + ")";
+			} else { // ORDER_LINE
+				key = to_string(w) + "/" + to_string(d);
+				tuple = "(" + to_string(w) + ", " + to_string(d) + ", 1, 1, " + to_string(50 + (i % 400)) + ".00)";
+			}
+			by_key[key] = tuple;
+		}
+		if (by_key.empty()) {
+			return {};
+		}
+		string values;
+		for (auto &kv : by_key) {
+			if (!values.empty()) {
+				values += ", ";
+			}
+			values += kv.second;
+		}
+		return {"UPDATE " + table + " SET " + string(set_col) + " = m.nv FROM (VALUES " + values + ") AS " +
+		        string(alias) + " WHERE " + string(join)};
+	}
+
 	vector<string> out;
 	out.reserve(n);
 	for (int i = 0; i < n; i++) {
-		int w = 1 + (i % std::max(scale, 1));
-		int d = 1 + (i % 10);
-		int c = 1 + (i % 30);
-		if (table == "CUSTOMER") {
-			out.push_back("UPDATE CUSTOMER SET C_BALANCE = " + to_string(-100 - (i % 500)) + ".00 WHERE C_W_ID = " +
-			              to_string(w) + " AND C_D_ID = " + to_string(d) + " AND C_ID = " + to_string(c));
-		} else if (table == "WAREHOUSE") {
-			out.push_back("UPDATE WAREHOUSE SET W_YTD = " + to_string(300000 + i * 100) +
-			              ".00 WHERE W_ID = " + to_string(w));
-		} else if (table == "DISTRICT") {
-			out.push_back("UPDATE DISTRICT SET D_YTD = " + to_string(30000 + i * 10) +
-			              ".00 WHERE D_W_ID = " + to_string(w) + " AND D_ID = " + to_string(d));
-		} else if (table == "OORDER") {
-			out.push_back("UPDATE OORDER SET O_CARRIER_ID = " + to_string(1 + (i % 10)) + " WHERE O_W_ID = " +
-			              to_string(w) + " AND O_D_ID = " + to_string(d) + " AND O_ID = " + to_string(1 + (i % 5)));
-		} else if (table == "ORDER_LINE") {
-			out.push_back("UPDATE ORDER_LINE SET OL_AMOUNT = " + to_string(50 + (i % 400)) + ".00 WHERE OL_W_ID = " +
-			              to_string(w) + " AND OL_D_ID = " + to_string(d) + " AND OL_O_ID = 1 AND OL_NUMBER = 1");
-		} else if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
+		if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
 			out.push_back("UPDATE " + table + " SET cores = cores + 1 WHERE rowid IN (SELECT rowid FROM " + table +
 			              " LIMIT 1 OFFSET " + to_string(i % 4) + ")");
 		} else if (table == "cm_win_src") {
@@ -291,6 +355,80 @@ static vector<string> GenerateUpdates(const string &table, int n, int scale) {
 	return out;
 }
 
+static bool SupportsUpdates(const string &table) {
+	return table == "CUSTOMER" || table == "WAREHOUSE" || table == "DISTRICT" || table == "OORDER" ||
+	       table == "ORDER_LINE" || table == "cm_dist_src" || table == "cm_dist_aux_src" || table == "cm_win_src" ||
+	       table == "cm_asof_prices";
+}
+
+// Batch the TPC-C deletes (which target existing rows by composite key) into a single
+// DELETE ... WHERE (keys) IN (VALUES ...). Per-row deletes full-scan an unindexed table each, so n of
+// them is O(n * table); one IN-list delete is a single scan. Duplicate keys are harmless — IN is set
+// membership, and the row is deleted (and captured into the delta) exactly once either way. The
+// IN (VALUES ...) form is a subquery, captured via the DELETE rule's plan-serialization path. Small
+// synthetic tables keep per-row deletes (no scale concern, and they delete by non-key predicates).
+static vector<string> GenerateExistingDeletes(const string &table, int n, int scale) {
+	const char *key_cols = nullptr;
+	if (table == "CUSTOMER") {
+		key_cols = "(C_W_ID, C_D_ID, C_ID)";
+	} else if (table == "WAREHOUSE") {
+		key_cols = "(W_ID)";
+	} else if (table == "DISTRICT") {
+		key_cols = "(D_W_ID, D_ID)";
+	} else if (table == "OORDER") {
+		key_cols = "(O_W_ID, O_D_ID, O_ID)";
+	} else if (table == "ORDER_LINE") {
+		key_cols = "(OL_W_ID, OL_D_ID, OL_O_ID, OL_NUMBER)";
+	}
+	if (key_cols) {
+		string values;
+		for (int i = 0; i < n; i++) {
+			int safe_scale = std::max(scale, 1);
+			int w = 1 + ((i / 300) % safe_scale);
+			int d = 1 + ((i / 30) % 10);
+			int c = 1 + (i % 30);
+			string tuple;
+			if (table == "CUSTOMER") {
+				tuple = "(" + to_string(w) + ", " + to_string(d) + ", " + to_string(c) + ")";
+			} else if (table == "WAREHOUSE") {
+				tuple = "(" + to_string(1 + (i % safe_scale)) + ")";
+			} else if (table == "DISTRICT") {
+				tuple = "(" + to_string(1 + ((i / 10) % safe_scale)) + ", " + to_string(1 + (i % 10)) + ")";
+			} else if (table == "OORDER") {
+				tuple = "(" + to_string(1 + ((i / 50) % safe_scale)) + ", " + to_string(1 + ((i / 5) % 10)) + ", " +
+				        to_string(1 + (i % 5)) + ")";
+			} else { // ORDER_LINE
+				tuple = "(" + to_string(1 + ((i / 250) % safe_scale)) + ", " + to_string(1 + ((i / 25) % 10)) + ", " +
+				        to_string(1 + ((i / 5) % 5)) + ", " + to_string(1 + (i % 5)) + ")";
+			}
+			if (!values.empty()) {
+				values += ", ";
+			}
+			values += tuple;
+		}
+		if (values.empty()) {
+			return {};
+		}
+		return {"DELETE FROM " + table + " WHERE " + string(key_cols) + " IN (VALUES " + values + ")"};
+	}
+
+	vector<string> out;
+	out.reserve(n);
+	for (int i = 0; i < n; i++) {
+		if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
+			static const char *machines[] = {"m1", "m2", "m3"};
+			out.push_back("DELETE FROM " + table + " WHERE machine = '" + string(machines[i % 3]) + "'");
+		} else if (table == "cm_saj_r") {
+			out.push_back("DELETE FROM cm_saj_r WHERE y = " + to_string((10 * (1 + (i % 50))) + 1));
+		} else if (table == "cm_win_src") {
+			out.push_back("DELETE FROM cm_win_src WHERE id = " + to_string(1 + (i % 500)));
+		} else if (table == "cm_asof_prices") {
+			out.push_back("DELETE FROM cm_asof_prices WHERE price = " + to_string(100 + (i % 500)));
+		}
+	}
+	return out;
+}
+
 static vector<string> BuildWorkload(const string &table, int size, int scale, Workload wl, int64_t pk_offset) {
 	if (wl == Workload::EMPTY_DELTA || size <= 0) {
 		return {};
@@ -299,34 +437,39 @@ static vector<string> BuildWorkload(const string &table, int size, int scale, Wo
 		return GenerateInserts(table, size, scale, pk_offset);
 	}
 
-	int n_ins = size / 2;
-	int n_upd = (size * 30) / 100;
-	int n_del = size - n_ins - n_upd;
+	int n_ins;
+	int n_upd;
+	int n_del;
+	if (size == 1) {
+		n_ins = 0;
+		n_upd = 0;
+		n_del = 1;
+	} else if (size == 2) {
+		n_ins = 1;
+		n_upd = 0;
+		n_del = 1;
+	} else {
+		n_ins = std::max(1, size / 2);
+		n_upd = std::max(1, (size * 30) / 100);
+		n_del = size - n_ins - n_upd;
+		if (n_del <= 0) {
+			n_del = 1;
+			if (n_ins > 1) {
+				n_ins--;
+			} else {
+				n_upd--;
+			}
+		}
+	}
+	if (!SupportsUpdates(table)) {
+		n_del += n_upd;
+		n_upd = 0;
+	}
 	auto out = GenerateInserts(table, n_ins, scale, pk_offset);
 	auto updates = GenerateUpdates(table, n_upd, scale);
 	out.insert(out.end(), updates.begin(), updates.end());
-	for (int i = 0; i < n_del; i++) {
-		int64_t pk = kPkBase + pk_offset + i;
-		if (table == "CUSTOMER") {
-			out.push_back("DELETE FROM CUSTOMER WHERE C_ID = " + to_string(pk));
-		} else if (table == "WAREHOUSE") {
-			out.push_back("DELETE FROM WAREHOUSE WHERE W_ID = " + to_string(pk));
-		} else if (table == "DISTRICT") {
-			out.push_back("DELETE FROM DISTRICT WHERE D_ID = " + to_string(pk));
-		} else if (table == "OORDER") {
-			out.push_back("DELETE FROM OORDER WHERE O_ID = " + to_string(pk));
-		} else if (table == "ORDER_LINE") {
-			out.push_back("DELETE FROM ORDER_LINE WHERE OL_O_ID = " + to_string(pk));
-		} else if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
-			out.push_back("DELETE FROM " + table + " WHERE machine = 'm" + to_string(pk) + "'");
-		} else if (table == "cm_saj_r") {
-			out.push_back("DELETE FROM cm_saj_r WHERE y = " + to_string(10 + (i % 1000)));
-		} else if (table == "cm_win_src") {
-			out.push_back("DELETE FROM cm_win_src WHERE id = " + to_string(pk));
-		} else if (table == "cm_asof_prices") {
-			out.push_back("DELETE FROM cm_asof_prices WHERE price = " + to_string(100 + (i % 500)));
-		}
-	}
+	auto deletes = GenerateExistingDeletes(table, n_del, scale);
+	out.insert(out.end(), deletes.begin(), deletes.end());
 	return out;
 }
 
