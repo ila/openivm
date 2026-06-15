@@ -585,7 +585,26 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	double estimated_delta_result;
 
 	if (has_join) {
-		incremental_compute = static_cast<double>(join_terms.term_count) * total_base_scan;
+		// Each delta join term replaces the changed tables with their (small) deltas and reads the
+		// other tables in full — the delta join still scans/probes the unchanged sides. Summing the
+		// dominant single-source terms (delta of the changed table + full of the others) reflects the
+		// delta size, unlike term_count * total_base_scan, which counted the *changed* table's full
+		// scan and so priced a tiny delta on a large join as a full recompute (defeating IVM at scale).
+		if (join_terms.term_count == 0) {
+			incremental_compute = 0; // FK-pruned: this delta provably cannot affect the join
+		} else {
+			// Per join term, the changed (active) tables are scanned as their (small) deltas and the
+			// rest in full — so a tiny delta on a large join no longer pays the changed table's full
+			// scan. term_count still scales the cost, so disabling skip-empty (which keeps all leaves
+			// priced, executing the empty-delta terms too) is correctly priced higher than the
+			// active-only case. This replaces term_count * total_base_scan, which counted every table's
+			// full scan in every term and so priced a 1-row delta on a 10M join as a full recompute.
+			double per_term_scan = 0;
+			for (auto &ts : table_stats) {
+				per_term_scan += (ts.delta_card > 0) ? ts.delta_card : ts.base_card;
+			}
+			incremental_compute = static_cast<double>(join_terms.term_count) * per_term_scan;
+		}
 
 		// Estimate delta result: each delta row fans out by MV/actual_card.
 		// Use actual_card (unfiltered) instead of base_card to avoid inflated fanout
@@ -715,14 +734,18 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		//     decision is driven purely by the throughput term and the label is not spuriously flipped.
 		bool will_skip = !has_active_delta && skip_empty_enabled;
 		bool genuine_incremental = !will_skip && strategy_total < recompute_total;
-		// Genuine incremental strategies are priced with the (pricier) incremental constants; skipped
-		// refreshes are ~free; recompute-equivalent strategies use the recompute constants so they are
-		// not spuriously flipped to full.
+		// Price the compute side (scans/joins/aggregation — vectorized, cheap per row, same as recompute)
+		// at RECOMPUTE_MS_PER_UNIT, and only the upsert side (per-statement MERGE/delete+insert) at the
+		// pricier INCREMENTAL_MS_PER_UNIT. Charging the join-scan compute at the upsert rate was what made
+		// a tiny delta on a large join look expensive even after the estimate was corrected.
 		if (will_skip) {
 			strategy_predicted_ms = RECOMPUTE_MS_PER_UNIT * strategy_total;
 		} else if (genuine_incremental) {
-			strategy_predicted_ms = INCREMENTAL_SETUP_MS + INCREMENTAL_MS_PER_UNIT * strategy_total;
+			strategy_predicted_ms = INCREMENTAL_SETUP_MS + RECOMPUTE_MS_PER_UNIT * strategy_compute +
+			                        INCREMENTAL_MS_PER_UNIT * strategy_upsert;
 		} else {
+			// Recompute-equivalent strategies (current-diff/full/top-k): priced like recompute, not
+			// spuriously flipped to full.
 			strategy_predicted_ms = RECOMPUTE_SETUP_MS + RECOMPUTE_MS_PER_UNIT * strategy_total;
 		}
 		recompute_predicted_ms = RECOMPUTE_SETUP_MS + RECOMPUTE_MS_PER_UNIT * recompute_total;
