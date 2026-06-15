@@ -767,6 +767,16 @@ static vector<QueryDef> BuildQueries() {
 	              "FROM OORDER o JOIN ORDER_LINE ol ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = "
 	              "ol.OL_O_ID GROUP BY o.O_W_ID, o.O_D_ID",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	// Large-table 2-way join PROJECTION (no aggregate): directly exercises the join-cost estimate — a
+	// small delta on the big ORDER_LINE join should be priced for incremental, not a full recompute.
+	AddQuery(qs, {"T14", "large JOIN projection", {}, {},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT ol.OL_W_ID, ol.OL_O_ID, ol.OL_NUMBER, ol.OL_AMOUNT, o.O_C_ID "
+	               "FROM ORDER_LINE ol JOIN OORDER o ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = "
+	               "ol.OL_O_ID"},
+	              {"mv_q"}, {"ORDER_LINE", "OORDER"},
+	              "SELECT ol.OL_W_ID, ol.OL_O_ID, ol.OL_NUMBER, ol.OL_AMOUNT, o.O_C_ID FROM ORDER_LINE ol JOIN OORDER o "
+	              "ON o.O_W_ID = ol.OL_W_ID AND o.O_D_ID = ol.OL_D_ID AND o.O_ID = ol.OL_O_ID",
+	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
 
 	return qs;
 }
