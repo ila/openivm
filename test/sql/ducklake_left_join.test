@@ -143,6 +143,105 @@ SELECT count(*) FROM (
 ----
 0
 
+# ==========================================
+# Wrapped LEFT JOIN source: suppress child join key probes
+# ==========================================
+
+statement ok
+CREATE TABLE dl.lj_probe_company(cid INT, cname VARCHAR);
+
+statement ok
+CREATE TABLE dl.lj_probe_security(sk INT, cid INT, sname VARCHAR);
+
+statement ok
+CREATE TABLE dl.lj_probe_market(sk INT, metric INT);
+
+statement ok
+INSERT INTO dl.lj_probe_company VALUES (10, 'Acme'), (20, 'Globex');
+
+statement ok
+INSERT INTO dl.lj_probe_security VALUES (1, 10, 'ACM'), (2, 20, 'GLX');
+
+statement ok
+INSERT INTO dl.lj_probe_market VALUES (1, 7);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_lj_probe AS
+  SELECT l.sk, l.sname, l.cname, r.metric
+  FROM (
+    SELECT sec.sk, sec.sname, c.cname
+    FROM dl.lj_probe_company c
+    JOIN dl.lj_probe_security sec ON c.cid = sec.cid
+  ) l
+  LEFT JOIN (
+    SELECT m.sk, m.metric
+    FROM dl.lj_probe_market m
+  ) r ON l.sk = r.sk;
+
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+INSERT INTO dl.lj_probe_security VALUES (3, 10, 'ACM2');
+
+statement ok
+PRAGMA refresh('mv_lj_probe');
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'mv_lj_probe'
+  AND step_name = 'generate_refresh_sql.compute_delta.ducklake_join.term.key_domain_probe';
+----
+0
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'mv_lj_probe'
+  AND step_name = 'generate_refresh_sql.compute_delta.ducklake_join.total'
+  AND contains(detail, 'has_left_join=false')
+  AND contains(detail, 'key_probe_suppressed=true');
+----
+2
+
+statement ok
+SET openivm_profile_refresh = false;
+
+query I
+SELECT count(*) FROM (
+  SELECT l.sk, l.sname, l.cname, r.metric
+  FROM (
+    SELECT sec.sk, sec.sname, c.cname
+    FROM dl.lj_probe_company c
+    JOIN dl.lj_probe_security sec ON c.cid = sec.cid
+  ) l
+  LEFT JOIN (
+    SELECT m.sk, m.metric
+    FROM dl.lj_probe_market m
+  ) r ON l.sk = r.sk
+  EXCEPT ALL
+  SELECT * FROM dl.mv_lj_probe
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM dl.mv_lj_probe
+  EXCEPT ALL
+  SELECT l.sk, l.sname, l.cname, r.metric
+  FROM (
+    SELECT sec.sk, sec.sname, c.cname
+    FROM dl.lj_probe_company c
+    JOIN dl.lj_probe_security sec ON c.cid = sec.cid
+  ) l
+  LEFT JOIN (
+    SELECT m.sk, m.metric
+    FROM dl.lj_probe_market m
+  ) r ON l.sk = r.sk
+);
+----
+0
+
 # The MV delta table must be derived from the physical openivm_data_* table,
 # not from planner output columns. LEFT JOIN rewrites may carry hidden lineage
 # columns that do not survive into the stored data table.

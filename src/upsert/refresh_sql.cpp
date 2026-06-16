@@ -14,6 +14,7 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
@@ -76,6 +77,14 @@ struct RefreshPlan {
 			return "UNKNOWN";
 		}
 	}
+};
+
+class RefreshCompileProfileState : public ClientContextState {
+public:
+	explicit RefreshCompileProfileState(RefreshCompileProfile *profile_p) : profile(profile_p) {
+	}
+
+	RefreshCompileProfile *profile;
 };
 
 static void
@@ -310,6 +319,35 @@ static void EnsureSemiAntiAuxState(RefreshMetadata &metadata, Connection &con, c
 
 } // namespace
 
+RefreshCompileProfileContextSlot::RefreshCompileProfileContextSlot(ClientContext &ctx_p, RefreshCompileProfile *profile)
+    : ctx(ctx_p), installed(false) {
+	if (!profile) {
+		return;
+	}
+	auto state = make_shared_ptr<RefreshCompileProfileState>(profile);
+	ctx.registered_state->Insert(SLOT_KEY, std::move(state));
+	installed = true;
+}
+
+RefreshCompileProfileContextSlot::~RefreshCompileProfileContextSlot() {
+	if (!installed) {
+		return;
+	}
+	try {
+		ctx.registered_state->Remove(SLOT_KEY);
+	} catch (...) {
+		// Destructor must not throw.
+	}
+}
+
+RefreshCompileProfile *RefreshCompileProfileContextSlot::Get(ClientContext &ctx) {
+	auto state = ctx.registered_state->Get<RefreshCompileProfileState>(SLOT_KEY);
+	if (!state) {
+		return nullptr;
+	}
+	return state->profile;
+}
+
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta, string *out_post_meta,
@@ -347,6 +385,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// no pending deltas.
 	auto inner_facts_slot_facts = make_shared_ptr<openivm::CompileFacts>(active_facts);
 	openivm::CompileFactsContextSlot inner_facts_slot(*con.context, inner_facts_slot_facts);
+	RefreshCompileProfileContextSlot inner_profile_slot(*con.context, compile_profile);
 	con.Query("SET max_expression_depth = 10000");
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 	string default_db;
@@ -1047,23 +1086,29 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                       "');";
 		OPENIVM_DEBUG_PRINT("[UPSERT] Planning ComputeDelta query: %s\n", compute_delta.c_str());
 		auto compute_delta_plan_start = profile_now();
+		auto compute_delta_parse_start = profile_now();
 		Parser p;
 		p.ParseQuery(compute_delta);
+		add_profile_step("generate_refresh_sql.compute_delta.parse", compute_delta_parse_start);
 
 		con.BeginTransaction();
 		auto &con_ctx = *con.context;
 		OPENIVM_DEBUG_PRINT("[UPSERT] Creating planner...\n");
+		auto compute_delta_create_plan_start = profile_now();
 		Planner planner(con_ctx);
 		OPENIVM_DEBUG_PRINT("[UPSERT] CreatePlan...\n");
 		planner.CreatePlan(std::move(p.statements[0]));
 		auto plan = std::move(planner.plan);
+		add_profile_step("generate_refresh_sql.compute_delta.create_plan", compute_delta_create_plan_start);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Plan created. Running optimizer...\n");
 		// deliminator: overflow guard on the deep generated SQL. Template set: keep the serialized
 		// delta plan data-independent (the rewrite rule fires within this Optimize()).
+		auto compute_delta_optimize_start = profile_now();
 		ScopedDisabledOptimizers disabled_optimizers(con_ctx, string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "," +
 		                                                          TemplateDisabledOptimizers(con_ctx));
 		Optimizer optimizer(*planner.binder, con_ctx);
 		plan = optimizer.Optimize(std::move(plan)); // this transforms the plan into an incremental plan
+		add_profile_step("generate_refresh_sql.compute_delta.optimize", compute_delta_optimize_start);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Optimizer done.\n");
 		con.Rollback();
 		add_profile_step("generate_refresh_sql.compute_delta_plan", compute_delta_plan_start);

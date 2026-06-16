@@ -17,6 +17,28 @@
 
 namespace duckdb {
 
+namespace {
+
+static std::chrono::steady_clock::time_point ProfileNow() {
+	return std::chrono::steady_clock::now();
+}
+
+static void AddCompileProfileStep(ClientContext &context, const string &step_name,
+                                  std::chrono::steady_clock::time_point start, const string &detail = string()) {
+	auto *profile = RefreshCompileProfileContextSlot::Get(context);
+	if (profile) {
+		profile->AddStep(step_name, start, detail);
+	}
+}
+
+static string DuckLakeJoinProfileDetail(size_t index, const string &catalog, const string &schema, const string &table,
+                                        int64_t old_snapshot, int64_t current_snapshot) {
+	return "term=" + to_string(index) + "; table=" + catalog + "." + schema + "." + table +
+	       "; old_snapshot=" + to_string(old_snapshot) + "; current_snapshot=" + to_string(current_snapshot);
+}
+
+} // namespace
+
 struct DuckLakeJoinColumnRef {
 	size_t leaf_index;
 	string column_name;
@@ -93,10 +115,12 @@ static void PinToOldSnapshot(LogicalOperator &op, idx_t table_index, idx_t old_s
 vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput input, ClientContext &context,
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
                                                            bool has_left_join) {
+	auto total_start = ProfileNow();
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
 	// Collect last_snapshot_id for each leaf upfront (one query per table).
+	auto snapshot_metadata_start = ProfileNow();
 	Connection con(*context.db);
 	vector<int64_t> old_snapshots(N);
 	vector<int64_t> current_snapshots(N, -1);
@@ -124,6 +148,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			current_snapshots[i] = static_cast<int64_t>(func_info.snapshot.snapshot_id);
 		}
 	}
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.snapshot_metadata",
+	                      snapshot_metadata_start, "leaves=" + to_string(N));
 
 	// Check if empty-delta term skipping is enabled.
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
@@ -133,18 +159,31 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 	// building the term so unchanged tables do not force a full plan copy/rewrite.
 	vector<bool> empty_table_delta(N, false);
 	if (skip_empty_enabled) {
+		auto activity_total_start = ProfileNow();
 		RefreshMetadata metadata(con);
 		for (size_t i = 0; i < N; i++) {
+			auto detail = DuckLakeJoinProfileDetail(i, table_catalogs[i], table_schemas[i], table_names[i],
+			                                        old_snapshots[i], current_snapshots[i]);
 			if (current_snapshots[i] < 0) {
+				AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.activity_probe",
+				                      ProfileNow(), detail + "; skipped=no_current_snapshot");
 				continue;
 			}
 			if (old_snapshots[i] == current_snapshots[i]) {
 				empty_table_delta[i] = true;
+				AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.activity_probe",
+				                      ProfileNow(), detail + "; skipped=same_snapshot");
 				continue;
 			}
+			auto activity_probe_start = ProfileNow();
 			auto metadata_activity =
 			    ProbeDuckLakeSnapshotActivity(metadata, con, input.context.view, table_names[i], table_catalogs[i],
 			                                  table_schemas[i], old_snapshots[i], current_snapshots[i]);
+			AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.activity_probe",
+			                      activity_probe_start,
+			                      detail + "; ok=" + string(metadata_activity.ok ? "true" : "false") +
+			                          "; has_changes=" + string(metadata_activity.has_changes ? "true" : "false") +
+			                          "; has_deletes=" + string(metadata_activity.has_deletes ? "true" : "false"));
 			if (metadata_activity.ok) {
 				if (!metadata_activity.has_changes) {
 					empty_table_delta[i] = true;
@@ -163,7 +202,11 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			    SqlUtils::EscapeValue(table_catalogs[i]) + "', '" + SqlUtils::EscapeValue(table_schemas[i]) + "', '" +
 			    SqlUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
 			    to_string(current_snapshots[i]) + ") LIMIT 1)) openivm_delta_probe LIMIT 1)";
+			auto fallback_probe_start = ProfileNow();
 			auto has_changes = con.Query(has_changes_sql);
+			AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.activity_fallback_probe",
+			                      fallback_probe_start,
+			                      detail + "; error=" + string(has_changes->HasError() ? "true" : "false"));
 			if (has_changes->HasError()) {
 				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe changes for %s.%s.%s: %s\n",
 				                    table_catalogs[i].c_str(), table_schemas[i].c_str(), table_names[i].c_str(),
@@ -175,10 +218,14 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				empty_table_delta[i] = true;
 			}
 		}
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.activity_probe_total",
+		                      activity_total_start, "leaves=" + to_string(N));
 	}
 
+	bool join_key_probe_allowed = !has_left_join && !input.context.assumptions.suppress_join_key_domain_probe;
 	vector<vector<DeltaJoinKeyProbe>> key_probes(N);
-	if (skip_empty_enabled && !has_left_join) {
+	if (skip_empty_enabled && join_key_probe_allowed) {
+		auto key_probe_prepare_start = ProfileNow();
 		unordered_map<uint64_t, DuckLakeJoinColumnRef> column_refs;
 		for (size_t i = 0; i < N; i++) {
 			auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
@@ -204,20 +251,28 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			}
 		}
 		CollectDeltaJoinKeyProbes(input.plan.get(), column_refs, key_probes);
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.key_probe_prepare",
+		                      key_probe_prepare_start, "column_refs=" + to_string(column_refs.size()));
 	}
 
 	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building N-term telescoping delta terms (%zu leaves)\n", N);
 
 	for (size_t i = 0; i < N; i++) {
+		auto term_total_start = ProfileNow();
+		auto term_detail = DuckLakeJoinProfileDetail(i, table_catalogs[i], table_schemas[i], table_names[i],
+		                                             old_snapshots[i], current_snapshots[i]);
 		// Skip term if this table has no changes since last refresh.
 		if (skip_empty_enabled && empty_table_delta[i]) {
 			OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Skipping term %zu: no changes in %s.%s.%s (%ld -> %ld)\n", i,
 			                    table_catalogs[i].c_str(), table_schemas[i].c_str(), table_names[i].c_str(),
 			                    (long)old_snapshots[i], (long)current_snapshots[i]);
+			AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.total",
+			                      term_total_start, term_detail + "; emitted=false; skipped=empty_table_delta");
 			continue;
 		}
 		bool key_domain_empty = false;
-		if (skip_empty_enabled && current_snapshots[i] >= 0 && !key_probes[i].empty()) {
+		if (skip_empty_enabled && join_key_probe_allowed && current_snapshots[i] >= 0 && !key_probes[i].empty()) {
+			auto key_domain_start = ProfileNow();
 			for (auto &probe : key_probes[i]) {
 				size_t other = probe.other_leaf;
 				int64_t other_snapshot = other > i ? old_snapshots[other] : -1;
@@ -232,50 +287,78 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 					break;
 				}
 			}
+			AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.key_domain_probe",
+			                      key_domain_start,
+			                      term_detail + "; empty=" + string(key_domain_empty ? "true" : "false"));
 		}
 		if (key_domain_empty) {
+			AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.total",
+			                      term_total_start, term_detail + "; emitted=false; skipped=key_domain_empty");
 			continue;
 		}
 
+		auto copy_start = ProfileNow();
 		auto term = input.plan->Copy(context);
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.copy", copy_start,
+		                      term_detail);
+		auto renumber_start = ProfileNow();
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.renumber_rebind",
+		                      renumber_start, term_detail);
 
 		// Re-collect leaves from the copied plan (pointers change after Copy).
+		auto collect_leaves_start = ProfileNow();
 		vector<JoinLeafInfo> term_leaves;
 		CollectJoinLeaves(term.get(), {}, term_leaves);
 		D_ASSERT(term_leaves.size() == N);
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.collect_leaves",
+		                      collect_leaves_start, term_detail + "; leaves=" + to_string(term_leaves.size()));
 
 		LogicalOperator *term_root = term.get();
 
 		// For LEFT JOINs: demote to INNER when only right-side leaves have deltas.
 		if (has_left_join) {
+			auto demote_start = ProfileNow();
 			if (!leaves[i].is_right_of_left_join) {
 				// Delta is on left side — keep LEFT JOIN semantics
 			} else {
 				// Delta is only on the right side — demote to INNER
 				DemoteLeftJoins(term.get());
 			}
+			AddCompileProfileStep(
+			    context, "generate_refresh_sql.compute_delta.ducklake_join.term.demote_left", demote_start,
+			    term_detail + "; right_of_left=" + string(leaves[i].is_right_of_left_join ? "true" : "false"));
 		}
 
 		// Replace leaf[i] with its delta scan.
 		ColumnBinding mul_binding;
 		if (term_leaves[i].get) {
 			// Simple GET leaf — replace directly.
+			auto delta_leaf_start = ProfileNow();
 			DeltaGetResult delta_result = CreateDeltaGetNode(context, binder, term_leaves[i].get, input.context.view);
 			mul_binding = delta_result.mul_binding;
 			GetNodeAtPath(term, term_leaves[i].path) = std::move(delta_result.node);
+			AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.delta_leaf",
+			                      delta_leaf_start, term_detail + "; wrapped=false");
 		} else {
 			// GET wrapped in projections/filters — rewrite the entire subtree.
+			auto delta_leaf_start = ProfileNow();
 			auto &subtree_ref = GetNodeAtPath(term, term_leaves[i].path);
-			auto rewritten = input.CompileCopiedSubtree(subtree_ref, term_root);
+			auto rewritten = input.CompileCopiedSubtree(subtree_ref, term_root, has_left_join);
 			mul_binding = rewritten.mul_binding;
 			subtree_ref = std::move(rewritten.op);
+			AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.delta_leaf",
+			                      delta_leaf_start, term_detail + "; wrapped=true");
 		}
+		auto projection_map_start = ProfileNow();
 		UpdateParentProjectionMap(term, term_leaves[i].path, mul_binding, /*include_delim_parents=*/false);
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.update_projection_map",
+		                      projection_map_start, term_detail);
 
 		// Telescoping: pin leaves j > i to old snapshot (AT VERSION).
 		// Leaves j < i stay at current state (already the default).
+		auto pin_snapshots_start = ProfileNow();
 		for (size_t j = i + 1; j < N; j++) {
 			auto &leaf_node = GetNodeAtPath(term, term_leaves[j].path);
 			auto *old_get = term_leaves[j].get ? term_leaves[j].get : FindGetInSubtree(leaf_node.get());
@@ -286,10 +369,16 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				                    (unsigned long)old_get->table_index, (long)old_snapshots[j]);
 			}
 		}
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.pin_snapshots",
+		                      pin_snapshots_start, term_detail + "; pinned=" + to_string(N - i - 1));
 
+		auto resolve_types_start = ProfileNow();
 		term->ResolveOperatorTypes();
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.resolve_types",
+		                      resolve_types_start, term_detail);
 
 		// Build projection: original columns + multiplicity from the single delta leaf.
+		auto projection_start = ProfileNow();
 		auto term_bindings = term->GetColumnBindings();
 		auto term_types = term->types;
 		vector<unique_ptr<Expression>> proj_exprs;
@@ -307,14 +396,23 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		// Append multiplicity as the last column.
 		proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(input.mul_type, mul_binding));
 
+		auto output_cols = proj_exprs.size();
 		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(proj_exprs));
 		projection->children.push_back(std::move(term));
 		projection->ResolveOperatorTypes();
 		terms.push_back(std::move(projection));
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.projection",
+		                      projection_start, term_detail + "; output_cols=" + to_string(output_cols));
 
 		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Term %zu: delta on leaf %zu, %zu leaves pinned to old\n", i, i, N - i - 1);
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.term.total", term_total_start,
+		                      term_detail + "; emitted=true");
 	}
 
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_join.total", total_start,
+	                      "leaves=" + to_string(N) + "; terms=" + to_string(terms.size()) + "; has_left_join=" +
+	                          string(has_left_join ? "true" : "false") + "; key_probe_suppressed=" +
+	                          string(input.context.assumptions.suppress_join_key_domain_probe ? "true" : "false"));
 	return terms;
 }
 

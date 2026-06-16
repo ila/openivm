@@ -30,6 +30,27 @@ static bool AllSourcesAreDuckLake(const CreateMVPlanFacts &facts) {
 	return true;
 }
 
+class ScopedJoinKeyDomainProbeSuppression {
+public:
+	ScopedJoinKeyDomainProbeSuppression(DeltaCompileAssumptions &assumptions_p, bool suppress)
+	    : assumptions(assumptions_p), previous(assumptions_p.suppress_join_key_domain_probe), active(suppress) {
+		if (active) {
+			assumptions.suppress_join_key_domain_probe = true;
+		}
+	}
+
+	~ScopedJoinKeyDomainProbeSuppression() {
+		if (active) {
+			assumptions.suppress_join_key_domain_probe = previous;
+		}
+	}
+
+private:
+	DeltaCompileAssumptions &assumptions;
+	bool previous;
+	bool active;
+};
+
 } // namespace
 
 DeltaCompileContext::DeltaCompileContext(OptimizerExtensionInput &input, Connection &metadata_con, const string &view,
@@ -156,10 +177,12 @@ DeltaPlanFragment DeltaOperatorInput::CompileChild(unique_ptr<LogicalOperator> &
 }
 
 DeltaPlanFragment DeltaOperatorInput::CompileCopiedSubtree(unique_ptr<LogicalOperator> &subtree,
-                                                           LogicalOperator *&subtree_root) const {
+                                                           LogicalOperator *&subtree_root,
+                                                           bool suppress_join_key_domain_probe) const {
 	if (!compiler) {
 		throw InternalException("DeltaOperatorInput::CompileCopiedSubtree requires a DeltaCompiler");
 	}
+	ScopedJoinKeyDomainProbeSuppression suppression(context.assumptions, suppress_join_key_domain_probe);
 	return compiler->CompileCopiedSubtree(subtree, subtree_root);
 }
 

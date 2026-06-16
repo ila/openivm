@@ -44,7 +44,8 @@ struct DeltaOperatorInput {
 	}
 
 	DeltaPlanFragment CompileChild(unique_ptr<LogicalOperator> &child, LogicalOperator *&child_root) const;
-	DeltaPlanFragment CompileCopiedSubtree(unique_ptr<LogicalOperator> &subtree, LogicalOperator *&subtree_root) const;
+	DeltaPlanFragment CompileCopiedSubtree(unique_ptr<LogicalOperator> &subtree, LogicalOperator *&subtree_root,
+	                                       bool suppress_join_key_domain_probe = false) const;
 
 	DeltaCompileContext &context;
 	unique_ptr<LogicalOperator> &plan;

@@ -22,8 +22,25 @@
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "upsert/refresh_internal.hpp"
 
 namespace duckdb {
+
+namespace {
+
+static std::chrono::steady_clock::time_point ProfileNow() {
+	return std::chrono::steady_clock::now();
+}
+
+static void AddCompileProfileStep(ClientContext &context, const string &step_name,
+                                  std::chrono::steady_clock::time_point start, const string &detail = string()) {
+	auto *profile = RefreshCompileProfileContextSlot::Get(context);
+	if (profile) {
+		profile->AddStep(step_name, start, detail);
+	}
+}
+
+} // namespace
 
 static idx_t CountBits(uint64_t value) {
 	idx_t count = 0;
@@ -752,8 +769,9 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 	// shows that overhead can dominate. Keep probing for single-source changes and
 	// for tiny multi-source changes where the probe is cheap.
 	bool all_non_empty_deltas_are_tiny = non_empty_mask && ((non_empty_mask & ~delta_status.tiny_mask) == 0);
+	bool join_key_probe_allowed = !has_left_join && !input.context.assumptions.suppress_join_key_domain_probe;
 	bool key_domain_probe_enabled =
-	    skip_empty_enabled && !has_left_join && (non_empty_leaf_count == 1 || all_non_empty_deltas_are_tiny);
+	    skip_empty_enabled && join_key_probe_allowed && (non_empty_leaf_count == 1 || all_non_empty_deltas_are_tiny);
 	if (key_domain_probe_enabled) {
 		unordered_map<uint64_t, JoinColumnRef> column_refs;
 		for (size_t i = 0; i < N; i++) {
@@ -878,7 +896,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 					GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
 				} else {
 					auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
-					auto rewritten = input.CompileCopiedSubtree(subtree_ref, term_root);
+					auto rewritten = input.CompileCopiedSubtree(subtree_ref, term_root, has_left_join);
 					mul_bindings.push_back(rewritten.mul_binding);
 					subtree_ref = std::move(rewritten.op);
 				}
@@ -941,6 +959,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	ClientContext &context = input.context.input.context;
 	Binder &binder = input.context.input.optimizer.binder;
+	auto total_start = ProfileNow();
 	input.plan->ResolveOperatorTypes();
 	const vector<ColumnBinding> all_original_bindings = input.plan->GetColumnBindings();
 	unordered_set<uint64_t> existing_mul_set;
@@ -986,18 +1005,33 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	LogDeltaOperatorStrategy(input, all_ducklake ? DeltaOperatorStrategy::JOIN_DUCKLAKE_N_TERM
 	                                             : DeltaOperatorStrategy::JOIN_INCLUSION_EXCLUSION);
 
+	auto build_terms_start = ProfileNow();
 	auto terms = all_ducklake ? BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join)
 	                          : BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join);
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.join.build_terms", build_terms_start,
+	                      "all_ducklake=" + string(all_ducklake ? "true" : "false") + "; leaves=" + to_string(N) +
+	                          "; terms=" + to_string(terms.size()) + "; has_left_join=" +
+	                          string(has_left_join ? "true" : "false") + "; key_probe_suppressed=" +
+	                          string(input.context.assumptions.suppress_join_key_domain_probe ? "true" : "false"));
 
 	// 4. UNION ALL
+	auto union_start = ProfileNow();
 	auto result = AssembleJoinUnionAll(terms, types, binder);
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.join.assemble_union", union_start,
+	                      "terms=" + to_string(terms.size()) + "; output_cols=" + to_string(types.size()));
 
 	// 5. Rebind parent references
+	auto output_rebind_start = ProfileNow();
 	ColumnBinding new_mul_binding = ReplaceJoinOutputBindings(original_bindings, result, *input.root);
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.join.output_rebind", output_rebind_start,
+	                      "bindings=" + to_string(original_bindings.size()));
 
 	input.plan = std::move(result);
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Done, %zu terms unioned, mul_binding: table=%lu col=%lu\n", terms.size(),
 	                    (unsigned long)new_mul_binding.table_index, (unsigned long)new_mul_binding.column_index);
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.join.total", total_start,
+	                      "all_ducklake=" + string(all_ducklake ? "true" : "false") + "; leaves=" + to_string(N) +
+	                          "; has_left_join=" + string(has_left_join ? "true" : "false"));
 	return {std::move(input.plan), new_mul_binding};
 }
 

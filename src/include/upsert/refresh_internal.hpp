@@ -135,6 +135,22 @@ struct RefreshCompileProfile {
 	}
 };
 
+class RefreshCompileProfileContextSlot {
+public:
+	static constexpr const char *SLOT_KEY = "openivm_refresh_compile_profile";
+
+	RefreshCompileProfileContextSlot(ClientContext &ctx, RefreshCompileProfile *profile);
+	~RefreshCompileProfileContextSlot();
+	RefreshCompileProfileContextSlot(const RefreshCompileProfileContextSlot &) = delete;
+	RefreshCompileProfileContextSlot &operator=(const RefreshCompileProfileContextSlot &) = delete;
+
+	static RefreshCompileProfile *Get(ClientContext &ctx);
+
+private:
+	ClientContext &ctx;
+	bool installed;
+};
+
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col);
 bool IsEmptyDeltaPlan(LogicalOperator *op);
 string BuildEmptyDeltaInsert(const string &view_name, const vector<string> &column_names,

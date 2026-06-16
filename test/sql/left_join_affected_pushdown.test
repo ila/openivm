@@ -39,6 +39,11 @@ CREATE MATERIALIZED VIEW mh AS
     FROM company c JOIN security sec ON c.cid = sec.cid
     LEFT JOIN market m ON sec.sk = m.sk;
 
+statement ok
+UPDATE openivm_views
+SET lineage_json = replace(lineage_json, '"security"', '"openivm_data_security"')
+WHERE view_name = 'mh';
+
 query I
 SELECT COUNT(*) FROM (
   SELECT sec.sk, sec.sname, c.cname, m.px FROM company c JOIN security sec ON c.cid = sec.cid

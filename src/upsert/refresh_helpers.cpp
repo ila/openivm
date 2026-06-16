@@ -693,11 +693,34 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 static string TryPushIntoLeftJoinSource(const string &source_name, const string &view_query_sql, idx_t occurrence,
                                         const string &key_col, const string &lk) {
 	vector<string> match_names;
-	match_names.push_back(source_name);
-	auto last_identifier = SqlUtils::LastIdentifierPart(source_name);
-	if (!StringUtil::CIEquals(last_identifier, source_name)) {
-		match_names.push_back(last_identifier);
-	}
+	auto add_name = [&](const string &name) {
+		if (!name.empty() && std::find(match_names.begin(), match_names.end(), name) == match_names.end()) {
+			match_names.push_back(name);
+		}
+	};
+	auto add_data_prefix_variants = [&](const string &name) {
+		add_name(name);
+		static const string data_prefix(openivm::DATA_TABLE_PREFIX);
+		auto last_identifier = SqlUtils::LastIdentifierPart(name);
+		if (!StringUtil::CIEquals(last_identifier, name)) {
+			add_name(last_identifier);
+		}
+		if (StringUtil::StartsWith(name, data_prefix)) {
+			add_name(name.substr(data_prefix.size()));
+		}
+		if (StringUtil::StartsWith(last_identifier, data_prefix)) {
+			auto stripped_last = last_identifier.substr(data_prefix.size());
+			add_name(stripped_last);
+			if (name.size() > last_identifier.size() &&
+			    StringUtil::CIEquals(name.substr(name.size() - last_identifier.size()), last_identifier)) {
+				add_name(name.substr(0, name.size() - last_identifier.size()) + stripped_last);
+			}
+		} else {
+			add_name(string(openivm::DATA_TABLE_PREFIX) + name);
+			add_name(string(openivm::DATA_TABLE_PREFIX) + last_identifier);
+		}
+	};
+	add_data_prefix_variants(source_name);
 	string matched_source;
 	string marker_replacement = "__openivm_left_join_source__";
 	string pushed_query =
@@ -739,10 +762,6 @@ static string TryBuildLeftJoinAffectedPushdown(RefreshMetadata &metadata, const 
 	// The stored query references either the logical source name or, for an MV-on-MV source, its data table.
 	string pushed_query =
 	    TryPushIntoLeftJoinSource(lineage.key_source, view_query_sql, lineage.key_occurrence, key_col, lk);
-	if (pushed_query.empty()) {
-		string data_source = string(openivm::DATA_TABLE_PREFIX) + lineage.key_source;
-		pushed_query = TryPushIntoLeftJoinSource(data_source, view_query_sql, lineage.key_occurrence, key_col, lk);
-	}
 	if (pushed_query.empty()) {
 		return "";
 	}

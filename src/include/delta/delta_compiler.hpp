@@ -14,6 +14,7 @@ struct DeltaCompileAssumptions {
 	bool all_sources_are_ducklake = false;
 	bool keep_window_join_partitions = true;
 	bool has_unsupported_incremental_construct = false;
+	bool suppress_join_key_domain_probe = false;
 };
 
 struct DeltaCompileContext {

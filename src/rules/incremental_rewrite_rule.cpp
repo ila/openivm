@@ -13,6 +13,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "upsert/refresh_internal.hpp"
 
 namespace duckdb {
 
@@ -84,10 +85,25 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	auto view_catalog = child_get->named_parameters["view_catalog_name"].ToString();
 	auto view_schema = child_get->named_parameters["view_schema_name"].ToString();
 
+	auto *compile_profile = RefreshCompileProfileContextSlot::Get(input.context);
+	auto profile_now = []() {
+		return std::chrono::steady_clock::now();
+	};
+	auto add_profile_step = [&](const string &step_name, std::chrono::steady_clock::time_point start,
+	                            const string &detail = string()) {
+		if (compile_profile) {
+			compile_profile->AddStep(step_name, start, detail);
+		}
+	};
+	auto rewrite_start = profile_now();
+	auto connection_start = profile_now();
 	Connection con(*input.context.db);
+	add_profile_step("generate_refresh_sql.compute_delta.rewrite.connection", connection_start);
 
+	auto metadata_query_start = profile_now();
 	auto v = con.Query("select sql_string from " + string(openivm::VIEWS_TABLE) + " where view_name = '" +
 	                   SqlUtils::EscapeValue(view) + "';");
+	add_profile_step("generate_refresh_sql.compute_delta.rewrite.metadata_query", metadata_query_start);
 	if (v->HasError()) {
 		throw Exception(ExceptionType::CATALOG,
 		                "IVM: cannot read view definition for '" + view + "': " + v->GetError());
@@ -100,23 +116,29 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	Parser parser;
 	Planner planner(input.context);
 
+	auto parse_view_start = profile_now();
 	parser.ParseQuery(view_query);
+	add_profile_step("generate_refresh_sql.compute_delta.rewrite.parse_view", parse_view_start);
 	if (parser.statements.empty()) {
 		throw Exception(ExceptionType::PARSER, "IVM: empty view definition for '" + view + "'");
 	}
 	auto statement = parser.statements[0].get();
 
 	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
+	auto create_view_plan_start = profile_now();
 	planner.CreatePlan(statement->Copy());
+	add_profile_step("generate_refresh_sql.compute_delta.rewrite.create_view_plan", create_view_plan_start);
 	OPENIVM_DEBUG_PRINT("[REWRITE] CreatePlan done\n");
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Unoptimized plan: \n%s\n", planner.plan->ToString().c_str());
 #endif
 	// This optimized plan is the delta-compilation TEMPLATE — keep it data-independent (see
 	// TemplateDisabledOptimizers / TEMPLATE_DATA_DEPENDENT_OPTIMIZERS).
+	auto optimize_view_plan_start = profile_now();
 	ScopedDisabledOptimizers disabled_optimizers(input.context, TemplateDisabledOptimizers(input.context));
 	Optimizer optimizer(*planner.binder, input.context);
 	auto optimized_plan = optimizer.Optimize(std::move(planner.plan));
+	add_profile_step("generate_refresh_sql.compute_delta.rewrite.optimize_view_plan", optimize_view_plan_start);
 
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Optimized plan: \n%s\n", optimized_plan->ToString().c_str());
@@ -126,29 +148,40 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		throw NotImplementedException("Plan contains single node, this is not supported");
 	}
 
+	auto output_names_start = profile_now();
 	auto output_names = PrepareOutputNames(optimized_plan.get(), planner.names);
+	add_profile_step("generate_refresh_sql.compute_delta.rewrite.prepare_output_names", output_names_start);
 	DeltaCompileAssumptions assumptions;
+	auto build_delta_model_start = profile_now();
 	auto delta_model = BuildRefreshDeltaViewModel(input, con, view, optimized_plan.get(), output_names, &assumptions);
+	add_profile_step("generate_refresh_sql.compute_delta.rewrite.build_delta_model", build_delta_model_start);
 	LogDeltaModelSummary(delta_model);
 
 	// Advance the main binder past all table indices in the plan to prevent collisions.
 	// Join delta compilation uses input.optimizer.binder which may not have been advanced by the
 	// local optimizer. Walk the plan to find the highest table index used.
+	auto advance_binder_start = profile_now();
 	{
 		idx_t max_idx = FindMaxTableIndex(optimized_plan.get());
 		while (input.optimizer.binder.GenerateTableIndex() <= max_idx) {
 		}
 	}
+	add_profile_step("generate_refresh_sql.compute_delta.rewrite.advance_binder", advance_binder_start);
 
+	auto delta_compile_start = profile_now();
 	DeltaCompiler compiler(input, con, view, delta_model, assumptions);
 
 	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === Starting IR delta compilation ===\n");
 	auto root = optimized_plan.get();
 	DeltaPlanFragment fragment = compiler.Compile(optimized_plan, root);
+	add_profile_step("generate_refresh_sql.compute_delta.rewrite.delta_compile", delta_compile_start);
 	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === Delta compilation done, running AddInsertNode ===\n");
+	auto add_insert_start = profile_now();
 	AddInsertNode(input.context, input.optimizer.binder, fragment.op, view, view_catalog, view_schema);
+	add_profile_step("generate_refresh_sql.compute_delta.rewrite.add_insert_node", add_insert_start);
 	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === FINAL PLAN ===\n%s\n", fragment.op->ToString().c_str());
 	plan = std::move(fragment.op);
+	add_profile_step("generate_refresh_sql.compute_delta.rewrite.total", rewrite_start);
 	return;
 }
 

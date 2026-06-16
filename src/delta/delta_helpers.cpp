@@ -20,8 +20,31 @@
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "storage/ducklake_scan.hpp"
+#include "upsert/refresh_internal.hpp"
 
 namespace duckdb {
+
+namespace {
+
+static std::chrono::steady_clock::time_point ProfileNow() {
+	return std::chrono::steady_clock::now();
+}
+
+static void AddCompileProfileStep(ClientContext &context, const string &step_name,
+                                  std::chrono::steady_clock::time_point start, const string &detail = string()) {
+	auto *profile = RefreshCompileProfileContextSlot::Get(context);
+	if (profile) {
+		profile->AddStep(step_name, start, detail);
+	}
+}
+
+static string DuckLakeDeltaProfileDetail(const string &catalog, const string &schema, const string &table,
+                                         int64_t last_snapshot, int64_t current_snapshot) {
+	return "table=" + catalog + "." + schema + "." + table + "; last_snapshot=" + to_string(last_snapshot) +
+	       "; current_snapshot=" + to_string(current_snapshot);
+}
+
+} // namespace
 
 static bool CompactDeltasEnabled(ClientContext &context) {
 	Value compact_val;
@@ -116,6 +139,7 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
 /// with SCAN_INSERTIONS / SCAN_DELETIONS, avoiding SQL string round-trips.
 static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &binder, LogicalGet *old_get,
                                               const string &view_name) {
+	auto total_start = ProfileNow();
 	auto table_ref = old_get->GetTable();
 	string catalog_name = table_ref->ParentCatalog().GetName();
 	string schema_name = table_ref->schema.name;
@@ -126,6 +150,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	// Get last snapshot from IVM metadata. Uses a separate connection because
 	// the optimizer holds a lock on the main context during plan rewriting.
 	Connection con(*context.db);
+	auto metadata_start = ProfileNow();
 	auto snap_result =
 	    con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
@@ -139,11 +164,15 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	// Get current snapshot from the old_get's existing DuckLake scan info (no SQL needed).
 	auto &old_func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
 	int64_t cur_snap = static_cast<int64_t>(old_func_info.snapshot.snapshot_id);
+	auto detail = DuckLakeDeltaProfileDetail(catalog_name, schema_name, table_name, last_snap, cur_snap);
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.metadata_query", metadata_start,
+	                      detail);
 
 	int64_t start_snap = last_snap + 1;
 	OPENIVM_DEBUG_PRINT("[DuckLake] Snapshot range: %ld -> %ld\n", (long)start_snap, (long)cur_snap);
 
 	if (start_snap > cur_snap) {
+		auto empty_start = ProfileNow();
 		vector<LogicalType> empty_types = old_get->types;
 		empty_types.push_back(LogicalType::INTEGER);
 		vector<ColumnBinding> bindings;
@@ -154,17 +183,25 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 		auto mul_binding = bindings.back();
 		auto empty = make_uniq<LogicalEmptyResult>(empty_types, std::move(bindings));
 		empty->ResolveOperatorTypes();
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.empty_result", empty_start,
+		                      detail + "; start_snapshot=" + to_string(start_snap));
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.total", total_start,
+		                      detail + "; result=empty");
 		return {std::move(empty), mul_binding};
 	}
 
 	// DuckLake's table_insertions/deletions functions treat the start snapshot as
 	// inclusive, so the next refresh starts at last_snapshot_id + 1.
 	// Only snapshot_id is used by DuckLake's file selection logic.
+	auto start_snapshot_start = ProfileNow();
 	DuckLakeSnapshot start_snapshot(static_cast<idx_t>(start_snap), DConstants::INVALID_INDEX,
 	                                DConstants::INVALID_INDEX, DConstants::INVALID_INDEX);
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.start_snapshot",
+	                      start_snapshot_start, detail + "; start_snapshot=" + to_string(start_snap));
 
 	// Determine column IDs from old_get, skipping virtual columns (ROWID etc.)
 	// that don't exist in DuckLake change scans.
+	auto column_ids_start = ProfileNow();
 	vector<ColumnIndex> delta_col_ids;
 	for (auto &id : old_get->GetColumnIds()) {
 		if (!id.IsVirtualColumn()) {
@@ -174,9 +211,12 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	if (delta_col_ids.empty()) {
 		delta_col_ids.push_back(ColumnIndex(0));
 	}
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.column_ids", column_ids_start,
+	                      detail + "; columns=" + to_string(delta_col_ids.size()));
 
 	// Helper: create a LogicalGet configured as a DuckLake change scan.
 	auto make_change_scan = [&](DuckLakeScanType scan_type, idx_t table_idx) -> unique_ptr<LogicalGet> {
+		auto scan_start = ProfileNow();
 		unique_ptr<FunctionData> bind_data;
 		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table_name, QueryErrorContext());
 		auto scan_fn = table_ref->Cast<TableCatalogEntry>().GetScanFunction(context, bind_data, lookup);
@@ -204,6 +244,9 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 		                   Value::BIGINT(cur_snap)};
 
 		get->ResolveOperatorTypes();
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.change_scan", scan_start,
+		                      detail + "; scan_type=" +
+		                          string(scan_type == DuckLakeScanType::SCAN_INSERTIONS ? "insertions" : "deletions"));
 		return get;
 	};
 
@@ -214,6 +257,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	// mul_value is the signed Z-set weight: +1 for inserts, -1 for deletes.
 	auto add_mul_projection = [&](unique_ptr<LogicalOperator> scan,
 	                              int32_t mul_value) -> unique_ptr<LogicalProjection> {
+		auto projection_start = ProfileNow();
 		auto bindings = scan->GetColumnBindings();
 		auto types = scan->types;
 
@@ -226,6 +270,8 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 		auto proj = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(exprs));
 		proj->children.push_back(std::move(scan));
 		proj->ResolveOperatorTypes();
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.mul_projection",
+		                      projection_start, detail + "; mul=" + to_string(mul_value));
 		return proj;
 	};
 
@@ -233,23 +279,35 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	auto del_proj = add_mul_projection(std::move(del_get), -1);
 
 	// UNION ALL the insertions and deletions.
+	auto union_start = ProfileNow();
 	auto union_types = ins_proj->types;
 	idx_t n_output_cols = union_types.size();
 	auto union_op =
 	    make_uniq<LogicalSetOperation>(binder.GenerateTableIndex(), n_output_cols, std::move(ins_proj),
 	                                   std::move(del_proj), LogicalOperatorType::LOGICAL_UNION, true /* setop_all */);
 	union_op->types = union_types;
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.union", union_start,
+	                      detail + "; output_cols=" + to_string(n_output_cols));
 
 	ColumnBinding mul_binding(union_op->GetColumnBindings().back());
 	if (!CompactDeltasEnabled(context)) {
 		OPENIVM_DEBUG_PRINT("[DuckLake] Delta compaction disabled\n");
-		return RemapDeltaNode(context, std::move(union_op), old_get->table_index, mul_binding);
+		auto remap_start = ProfileNow();
+		auto result = RemapDeltaNode(context, std::move(union_op), old_get->table_index, mul_binding);
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.remap", remap_start, detail);
+		AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.total", total_start,
+		                      detail + "; compact=false");
+		return result;
 	}
 
+	auto compact_start = ProfileNow();
 	auto compacted = CompactDeltaNode(context, binder, std::move(union_op), old_get->table_index, mul_binding);
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.compact", compact_start, detail);
 	OPENIVM_DEBUG_PRINT("[DuckLake] Delta plan built: %zu output cols, mul_binding: table=%lu col=%lu\n",
 	                    compacted.node->types.size(), (unsigned long)compacted.mul_binding.table_index,
 	                    (unsigned long)compacted.mul_binding.column_index);
+	AddCompileProfileStep(context, "generate_refresh_sql.compute_delta.ducklake_delta.total", total_start,
+	                      detail + "; compact=true");
 	return compacted;
 }
 
