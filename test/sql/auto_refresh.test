@@ -32,7 +32,7 @@ INSERT INTO proj_base VALUES (101, 'new_name');
 query IIIIII
 PRAGMA refresh_cost('mv_proj');
 ----
-incremental	8.643856	401.000000	8.643856	401.000000	false
+incremental	8.643856	401.000000	8.643856	401.000000	0
 
 statement ok
 PRAGMA refresh('mv_proj');
@@ -118,7 +118,7 @@ INSERT INTO proj_base SELECT i, 'batch_' || i::VARCHAR FROM range(102, 402) t(i)
 query IIIIII
 PRAGMA refresh_cost('mv_proj');
 ----
-full	2597.463445	704.000000	2597.463445	704.000000	false
+full	2597.463445	704.000000	2597.463445	704.000000	0
 
 statement ok
 PRAGMA refresh('mv_proj');
@@ -206,7 +206,7 @@ DELETE FROM del_base WHERE id > 20;
 query IIIIII
 PRAGMA refresh_cost('mv_del');
 ----
-full	691.508495	400.000000	691.508495	400.000000	false
+full	691.508495	400.000000	691.508495	400.000000	0
 
 statement ok
 PRAGMA refresh('mv_del');
@@ -385,7 +385,7 @@ INSERT INTO filt VALUES (151, 'active', 151);
 query IIIIII
 PRAGMA refresh_cost('mv_filt');
 ----
-incremental	4.343928	226.000000	4.343928	226.000000	false
+incremental	4.343928	226.000000	4.343928	226.000000	0
 
 statement ok
 PRAGMA refresh('mv_filt');
@@ -402,7 +402,7 @@ INSERT INTO filt SELECT i, 'active', i FROM range(200, 500) t(i);
 query IIIIII
 PRAGMA refresh_cost('mv_filt');
 ----
-full	1303.083011	379.000000	1303.083011	379.000000	false
+full	1303.083011	379.000000	1303.083011	379.000000	0
 
 statement ok
 PRAGMA refresh('mv_filt');
@@ -597,7 +597,7 @@ INSERT INTO cost_base VALUES (101, 'x');
 query IIIIII
 PRAGMA refresh_cost('mv_cost');
 ----
-incremental	8.643856	401.000000	8.643856	401.000000	false
+incremental	8.643856	401.000000	8.643856	401.000000	0
 
 statement ok
 PRAGMA refresh('mv_cost');
@@ -609,7 +609,7 @@ INSERT INTO cost_base SELECT i, 'batch' FROM range(200, 500) t(i);
 query IIIIII
 PRAGMA refresh_cost('mv_cost');
 ----
-full	2597.463445	704.000000	2597.463445	704.000000	false
+full	2597.463445	704.000000	2597.463445	704.000000	0
 
 statement ok
 PRAGMA refresh('mv_cost');
@@ -752,7 +752,7 @@ INSERT INTO sel_base SELECT i, i FROM range(10001, 10101) t(i);
 query IIIIII
 PRAGMA refresh_cost('mv_selfilt');
 ----
-incremental	252.877124	2320.000000	252.877124	2320.000000	false
+incremental	252.877124	2320.000000	252.877124	2320.000000	0
 
 statement ok
 PRAGMA refresh('mv_selfilt');
@@ -783,7 +783,7 @@ INSERT INTO sel_base SELECT i, 0 FROM range(20001, 20201) t(i);
 query IIIIII
 PRAGMA refresh_cost('mv_selfilt');
 ----
-incremental	545.754248	2660.000000	545.754248	2660.000000	false
+incremental	545.754248	2660.000000	545.754248	2660.000000	0
 
 statement ok
 PRAGMA refresh('mv_selfilt');
@@ -972,12 +972,12 @@ statement ok
 INSERT INTO cold_base VALUES (101, 101);
 
 # No history — uncalibrated, ms-grounded prediction: incremental pays a fixed compile/plan setup
-# (~12ms) on top of a small throughput term, while recompute of this tiny view is cheaper, so the
-# model correctly prefers full recompute at this scale.
+# (~12ms) on top of a small throughput term, while a full recompute of this tiny view is flat-cheap
+# (a fixed setup + a near-free vectorized scan), so the model correctly prefers full at this scale.
 query IIIIII
 PRAGMA refresh_cost('mv_cold');
 ----
-full	8.643856	401.000000	12.006155	6.016040	0
+full	8.643856	401.000000	12.000024	10.001604	0
 
 # Empty delta with skip-empty disabled still executes the refresh path, so it pays the fixed
 # incremental setup (~12ms); recompute of this tiny view is cheaper, so full wins.
@@ -996,7 +996,7 @@ SET openivm_skip_empty_deltas = false;
 query IIIIII
 PRAGMA refresh_cost('mv_empty_cost');
 ----
-full	0.000000	400.000000	12.000000	6.016000	false
+full	0.000000	400.000000	12.000000	10.001600	false
 
 statement ok
 SET openivm_skip_empty_deltas = true;
@@ -1321,7 +1321,12 @@ SELECT count(*) FROM (SELECT * FROM mv_ed EXCEPT ALL SELECT a.val, b.label, c.ta
 ----
 0
 
-# Now insert into ONLY table A (B and C have empty deltas)
+# Now insert into ONLY table A (B and C have empty deltas).
+# With skip-empty disabled, the empty-delta join terms still execute (each scans the base tables to
+# build hash tables), so the incremental compute is priced for all 3 single-source terms (≈3×base
+# scan) rather than the 1 active term it would be with skip-empty on — i.e. disabling skip-empty
+# raises the incremental cost. At this tiny scale (51-row 3-way join) it still stays below a full
+# recompute (whose cost is inflated by the per-join output multiplier), so incremental is chosen.
 statement ok
 INSERT INTO ed_a VALUES (52, 999);
 
@@ -1331,7 +1336,7 @@ SET openivm_skip_empty_deltas = false;
 query IIIIII
 PRAGMA refresh_cost('mv_ed');
 ----
-full	727.544109	307.000000	727.544109	307.000000	false
+incremental	469.524879	769.000000	469.524879	769.000000	0
 
 statement ok
 SET openivm_skip_empty_deltas = true;

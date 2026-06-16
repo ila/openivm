@@ -87,6 +87,7 @@ struct TableStats {
 struct PlanStats {
 	vector<TableStats> table_stats;
 	idx_t join_leaf_count = 0;
+	idx_t aggregate_expr_count = 0; // total aggregate functions across all GROUP BY nodes (per-column MERGE cost)
 	bool has_join = false;
 	bool has_aggregate = false;
 	bool has_full_outer = false;
@@ -119,23 +120,43 @@ static const char *StrategyLabelForRefreshType(RefreshType view_type) {
 }
 
 // Uncalibrated, ms-grounded prior for the incremental-vs-recompute decision. Consulted only before
-// any refresh history exists; the learned regression replaces it after a few runs. We predict
-//   time_ms ≈ setup_ms + ms_per_unit * cost_units
-// with separate constants for the two paths, reflecting how they actually run on DuckDB:
-//   - Full recompute is a single vectorized query: a small fixed setup and a *low* per-row cost
-//     (scanning/aggregating is cheap — ~10ms even at 100k+ rows).
-//   - Incremental pays a larger fixed setup (re-plan delta query, rewrite rules, LPTS round-trip,
-//     upsert SQL regeneration — ~12ms regardless of delta size) AND a *higher* per-row cost, because
-//     it applies changes through multiple statements (MERGE / EXISTS-driven delete+insert) rather
-//     than one bulk scan.
-// Because recompute's per-row cost is so low, full wins across a wide range of small/medium views
-// (where its vectorized scan beats incremental's per-statement overhead); incremental only wins once
-// the base query is genuinely expensive to recompute (large joins, very large scans). The constants
-// are a coarse, hardware-rough prior that only steers the decision until calibration kicks in.
-static constexpr double RECOMPUTE_SETUP_MS = 6.0;         // single vectorized query: small fixed cost
-static constexpr double RECOMPUTE_MS_PER_UNIT = 0.00004;  // vectorized scan/aggregate: cheap per row
+// any refresh history exists; the learned regression replaces it after a few runs. This is a coarse,
+// hardware-rough prior — not perfect, but it has to *rank* incremental vs recompute correctly across
+// scale factors without any calibration (the benchmark runs each combo on a fresh DB, so it always
+// exercises this prior, never the regression).
+//
+// The model is grounded in measured TPC-C/TPC-DI refresh times across SF1–SF250:
+//
+//   FULL recompute = RECOMPUTE_SETUP_MS + RECOMPUTE_MS_PER_UNIT * base_scan * (1 + JOIN_FACTOR*joins)
+//     A full vectorized scan+aggregate is *flat-cheap* — a simple SUM+GROUP BY over 50k or 250k rows
+//     both land at ~11ms, so the per-row term is tiny. The expensive part of a full recompute is the
+//     JOIN: producing the full join output scales with the number of joins, so each join multiplies
+//     the scan cost (a 2M-row 3-way join recomputes in ~50ms, not ~10ms).
+//
+//   INCREMENTAL = INCREMENTAL_SETUP_MS + RECOMPUTE_MS_PER_UNIT * incremental_compute
+//                 + INCREMENTAL_MS_PER_UNIT * upsert + AGG_EXPR_MS * num_aggregate_exprs
+//     The delta path scans the base tables once (to build hash tables) but only produces the *delta*
+//     output, so it does NOT pay the join_factor blow-up — a delta join over a tiny delta is cheap
+//     even on a huge base. Its costs are: a fixed per-refresh floor (re-plan delta query + rewrite +
+//     LPTS round-trip + upsert codegen), the per-statement merge/upsert work (pricier per row than a
+//     bulk scan), and a per-aggregate-column MERGE penalty — multi-aggregate views (several
+//     SUM/COUNT/STDDEV columns) update each column per affected group, so their incremental floor is
+//     much higher than a single-aggregate view (a join+multi-agg refreshes in ~34ms vs ~16ms for a
+//     simple agg). The full recompute does the same aggregation in one vectorized pass, so it does
+//     *not* pay this penalty.
+//
+// Net effect: full wins for cheap-to-recompute views (simple aggregates, small/medium scans) because
+// incremental's per-statement floor beats nothing; incremental wins once recompute is genuinely
+// expensive (large joins that re-materialize a big result, or a big MV whose full replace dwarfs a
+// small delta apply).
+static constexpr double RECOMPUTE_SETUP_MS = 10.0;        // fixed query setup + MV replace overhead
+static constexpr double RECOMPUTE_MS_PER_UNIT = 0.000004; // vectorized scan: nearly free per row
+static constexpr double RECOMPUTE_JOIN_FACTOR = 1.5;      // each join multiplies full-output scan cost
 static constexpr double INCREMENTAL_SETUP_MS = 12.0;      // re-plan + rewrite + LPTS + upsert codegen
-static constexpr double INCREMENTAL_MS_PER_UNIT = 0.0008; // per-statement merge/upsert: pricier per row
+static constexpr double INCREMENTAL_MS_PER_UNIT = 0.0008; // per-group MERGE upsert (aggregates): pricier per row
+static constexpr double PROJECTION_APPLY_MS_PER_UNIT =
+    0.00002; // bulk insert/delete (projections): vectorized, far cheaper than a per-group MERGE
+static constexpr double AGG_EXPR_MS = 4.0; // per-aggregate-column MERGE penalty (incremental)
 
 static bool IsLinearCostNode(DeltaModelNodeKind kind) {
 	return kind == DeltaModelNodeKind::SCAN || kind == DeltaModelNodeKind::FILTER ||
@@ -161,7 +182,10 @@ static void AddOperatorCostClass(LogicalOperator &op, PlanStats &stats) {
 }
 
 struct JoinTermEstimate {
-	idx_t active_sources = 0;
+	idx_t active_sources = 0; // tables with a non-empty delta
+	idx_t priced_sources = 0; // tables whose single-source terms execute a base scan (= active_sources
+	                          // with skip-empty on; = all tables with skip-empty off, since empty-delta
+	                          // terms still scan the bases to build hash tables)
 	idx_t term_count = 0;
 };
 
@@ -213,6 +237,7 @@ static JoinTermEstimate EstimateJoinTerms(Connection &con, const PlanStats &stat
 		return result;
 	}
 	idx_t priced_sources = skip_empty_enabled ? result.active_sources : stats.table_stats.size();
+	result.priced_sources = priced_sources;
 	if (fk_enabled && skip_empty_enabled && !stats.all_ducklake && result.active_sources == 1 &&
 	    ActiveSourceIsInsertOnlyPK(con, stats, active_idx)) {
 		return result;
@@ -319,9 +344,14 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 		}
 		break;
 	}
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
 		stats.has_aggregate = true;
+		// Count aggregate functions (SUM, COUNT, STDDEV, …). Each becomes a column the incremental
+		// MERGE must update per affected group, so multi-aggregate views have a higher delta floor.
+		auto &agg = op.Cast<LogicalAggregate>();
+		stats.aggregate_expr_count += agg.expressions.size();
 		break;
+	}
 	case LogicalOperatorType::LOGICAL_FILTER: {
 		// Filters that weren't pushed down into the scan — estimate their selectivity
 		// from the cardinality ratio between the filter output and its child input.
@@ -585,27 +615,6 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	double estimated_delta_result;
 
 	if (has_join) {
-		// Each delta join term replaces the changed tables with their (small) deltas and reads the
-		// other tables in full — the delta join still scans/probes the unchanged sides. Summing the
-		// dominant single-source terms (delta of the changed table + full of the others) reflects the
-		// delta size, unlike term_count * total_base_scan, which counted the *changed* table's full
-		// scan and so priced a tiny delta on a large join as a full recompute (defeating IVM at scale).
-		if (join_terms.term_count == 0) {
-			incremental_compute = 0; // FK-pruned: this delta provably cannot affect the join
-		} else {
-			// Per join term, the changed (active) tables are scanned as their (small) deltas and the
-			// rest in full — so a tiny delta on a large join no longer pays the changed table's full
-			// scan. term_count still scales the cost, so disabling skip-empty (which keeps all leaves
-			// priced, executing the empty-delta terms too) is correctly priced higher than the
-			// active-only case. This replaces term_count * total_base_scan, which counted every table's
-			// full scan in every term and so priced a 1-row delta on a 10M join as a full recompute.
-			double per_term_scan = 0;
-			for (auto &ts : table_stats) {
-				per_term_scan += (ts.delta_card > 0) ? ts.delta_card : ts.base_card;
-			}
-			incremental_compute = static_cast<double>(join_terms.term_count) * per_term_scan;
-		}
-
 		// Estimate delta result: each delta row fans out by MV/actual_card.
 		// Use actual_card (unfiltered) instead of base_card to avoid inflated fanout
 		// when filters are pushed into the scan (base_card reflects post-filter estimate).
@@ -616,6 +625,25 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		}
 		// Apply selectivity from any non-pushed-down filter nodes
 		estimated_delta_result *= plan_stats.filter_selectivity;
+
+		// The delta join scans the base tables once (to build hash tables) but only *produces* the
+		// delta output — a tiny delta over a huge base is cheap because the work is bounded by the
+		// delta, not the full join. So we price it as base_scan (the unavoidable build) + delta_result
+		// (the produced rows), NOT term_count * full_base_scan. The old 2^N-1 × base formula priced a
+		// 1-row delta on a many-table join as several full recomputes, which wrongly defeated IVM at
+		// scale (e.g. a large-join projection that incrementally refreshes in ~26ms was estimated at
+		// >2000ms and lost to full). Crucially, the delta join does NOT pay the recompute join_factor
+		// blow-up below: full recompute re-materializes the entire join output, the delta join does not.
+		if (join_terms.term_count == 0) {
+			incremental_compute = 0; // FK-pruned: this delta provably cannot affect the join
+		} else {
+			// priced_sources single-source terms each scan the base tables once (build hash tables);
+			// with skip-empty off this includes the empty-delta terms (still a base scan), so disabling
+			// skip-empty is correctly priced higher. Higher-order terms (delta⋈delta) are delta-bounded
+			// and folded into delta_result. This stays bounded — it never multiplies by 2^N.
+			double scan_terms = std::max<double>(1.0, static_cast<double>(join_terms.priced_sources));
+			incremental_compute = scan_terms * total_base_scan + estimated_delta_result;
+		}
 	} else {
 		// Unary operators: scan cost is the full delta (filter doesn't reduce scan cost)
 		double total_delta = 0;
@@ -642,8 +670,11 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 			incremental_upsert *= 3.0;
 		}
 	} else {
-		// Projection/filter: targeted insert/delete
-		// EXISTS subquery cost ≈ delta_result × log(MV) for each delete
+		// Projection/filter: targeted insert/delete. The raw cost unit keeps the delta_result × log2(MV)
+		// shape so the uncalibrated raw comparison (adaptive off) still crosses over to full for a large
+		// delta. The ms prior (adaptive on) re-prices this as a cheap *bulk* vectorized apply from
+		// estimated_delta_result directly — a projection applies its delta as a bulk insert/delete, not
+		// a per-group MERGE, so pricing it at the MERGE rate inflated large-join projections ~30×.
 		incremental_upsert = estimated_delta_result * (1.0 + std::log2(std::max(mv_card, 1.0)));
 		if (plan_stats.has_full_outer) {
 			// Bidirectional key CTE queries both delta tables
@@ -653,11 +684,15 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 
 	// 4. Estimate recompute cost
 	//
-	// Recompute compute: run the full query once
-	//   - Scan all base tables + join/aggregate processing
-	// Recompute replace: delete all MV rows + insert new result
-	double recompute_compute = total_base_scan + mv_card; // scan + produce result
-	double recompute_replace = mv_card * 2.0;             // delete all + insert all
+	// Recompute compute: run the full query once. A plain scan+aggregate is flat-cheap (the per-row
+	// constant is tiny), but each join multiplies the cost of producing the full output — a large
+	// multi-way join is the expensive case for full recompute. This join_factor is what makes full
+	// the *loser* against incremental on big joins (where the delta join avoids re-materializing the
+	// whole result) while staying the winner on cheap simple-aggregate views.
+	// Recompute replace: delete all MV rows + insert new result.
+	double join_multiplier = 1.0 + RECOMPUTE_JOIN_FACTOR * static_cast<double>(plan_stats.product_nodes);
+	double recompute_compute = total_base_scan * join_multiplier + mv_card; // scan + produce full result
+	double recompute_replace = mv_card * 2.0;                               // delete all + insert all
 	double recompute_total = recompute_compute + recompute_replace;
 
 	// 5. Strategy-aware override: fixed-by-classification strategies use the same
@@ -748,8 +783,26 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		if (will_skip) {
 			strategy_predicted_ms = RECOMPUTE_MS_PER_UNIT * strategy_total;
 		} else if (genuine_incremental) {
-			strategy_predicted_ms = INCREMENTAL_SETUP_MS + RECOMPUTE_MS_PER_UNIT * strategy_compute +
-			                        INCREMENTAL_MS_PER_UNIT * strategy_upsert;
+			// Per-aggregate-column MERGE penalty: a multi-aggregate view updates each SUM/COUNT/STDDEV
+			// column per affected group, so its delta floor scales with the number of aggregate
+			// expressions. A simple SUM+GROUP BY refreshes in ~16ms; a join+multi-aggregate in ~34ms.
+			// Full recompute aggregates in one vectorized pass, so it does not pay this.
+			//
+			// The upsert is priced by HOW the delta is applied: an aggregate view runs a per-group
+			// MERGE (pricier per row, scales with affected groups), while a projection/filter applies a
+			// bulk vectorized insert/delete — far cheaper per row, and proportional to the delta rows
+			// produced (estimated_delta_result), NOT the log2(MV)-inflated raw unit. Pricing a
+			// projection's bulk apply at the per-group MERGE rate inflated large-join projections ~30×
+			// (e.g. T14: ~915ms predicted for a ~31ms refresh).
+			// Only the plain projection/filter path (SIMPLE_PROJECTION, incl. join projections like T14)
+			// applies its delta as a cheap bulk insert/delete. Aggregates and the fixed-strategy
+			// overrides (group/window/distinct/semi-anti recompute) keep the per-group MERGE rate on
+			// their own strategy_upsert estimate.
+			bool bulk_projection_apply = (view_type == RefreshType::SIMPLE_PROJECTION);
+			double upsert_ms = bulk_projection_apply ? PROJECTION_APPLY_MS_PER_UNIT * estimated_delta_result
+			                                         : INCREMENTAL_MS_PER_UNIT * strategy_upsert;
+			strategy_predicted_ms = INCREMENTAL_SETUP_MS + RECOMPUTE_MS_PER_UNIT * strategy_compute + upsert_ms +
+			                        AGG_EXPR_MS * static_cast<double>(plan_stats.aggregate_expr_count);
 		} else {
 			// Recompute-equivalent strategies (current-diff/full/top-k): priced like recompute, not
 			// spuriously flipped to full.
