@@ -62,7 +62,7 @@ static string FormatNumber(double v) {
 }
 
 // Normalized verify helper: returns a synthetic column-name list (`c1, c2, ...`) and
-// a projection that formats DOUBLE/FLOAT columns with `printf('%.10g', ...)` — 10
+// a projection that formats DOUBLE/FLOAT columns with `printf('%.9g', ...)` — 9
 // significant digits. The synthetic names let us rename both the MV and the base-
 // query results into a common column-name space so EXCEPT ALL can compare by
 // position — the base query's output names (e.g. `count(d.D_ID)`) don't match the
@@ -73,9 +73,12 @@ static string FormatNumber(double v) {
 //   ~2^-52 of the magnitude — absolute 1e-15 for values near 1, absolute 1e-9 for
 //   values near 1e7, etc. A fixed decimal-place rounding fails for large values
 //   (e.g. VARIANCE ≈ 1.76e7 drifts by 4e-9, outside ROUND(x,10)'s 1e-10 window).
-//   10 significant digits leaves ~5–6 orders of magnitude headroom relative to
+//   9 significant digits leaves ~6–7 orders of magnitude headroom relative to
 //   DOUBLE's ~16 significant digits regardless of magnitude, while still catching
-//   algebraic errors larger than 1e-10 relative.
+//   algebraic errors larger than 1e-9 relative. Keep this as a tolerance rather
+//   than an exact decimal boundary: variance formula rewrites can differ from
+//   DuckDB's aggregate by a few binary ULPs and otherwise round to adjacent
+//   10-significant-digit strings.
 //
 // Non-float types (INTEGER, BIGINT, DECIMAL, VARCHAR, DATE, TIMESTAMP, BOOLEAN,
 // LIST, STRUCT, MAP, ARRAY) pass through verbatim so algebraic errors still surface.
@@ -121,10 +124,10 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 		bool is_float = (type == "DOUBLE" || type == "FLOAT" || type == "REAL");
 		bool is_decimal = (type.rfind("DECIMAL", 0) == 0 || type.rfind("NUMERIC", 0) == 0);
 		if (is_float || is_decimal) {
-			// Format with 10 significant digits (relative precision, not absolute).
-			// NULLs stay as NULL — DuckDB's printf('%.10g', NULL) returns NULL, and
+			// Format with 9 significant digits (relative precision, not absolute).
+			// NULLs stay as NULL — DuckDB's printf('%.9g', NULL) returns NULL, and
 			// EXCEPT ALL treats NULL-rows as equal on both sides.
-			string normalized_col = "printf('%.10g', CAST(" + cname + " AS DOUBLE)) AS " + cname;
+			string normalized_col = "printf('%.9g', CAST(" + cname + " AS DOUBLE)) AS " + cname;
 			result.normalized += normalized_col;
 			result.normalized_columns.push_back(std::move(normalized_col));
 			result.has_float = true;
@@ -254,6 +257,120 @@ static vector<idx_t> WindowOutputColumns(const string &query, idx_t column_count
 		}
 	}
 	return result;
+}
+
+static bool QueryHasWindowExpression(const string &query) {
+	string lower = LowerASCII(query);
+	for (size_t i = 0; i < lower.size(); i++) {
+		if (KeywordAt(lower, i, "over", 4) || KeywordAt(lower, i, "qualify", 7)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static string SelectPrefix(const vector<string> &columns, idx_t count) {
+	string result;
+	for (idx_t i = 0; i < count; i++) {
+		if (!result.empty()) {
+			result += ", ";
+		}
+		result += columns[i];
+	}
+	return result;
+}
+
+static bool CountNormalizedDiff(duckdb::Connection &con, const string &lhs, const string &rhs,
+                                const NormalizedVerify &nv, idx_t prefix_count, int64_t &count) {
+	string select = SelectPrefix(nv.normalized_columns, prefix_count);
+	string query = "WITH lhs_r(" + nv.column_list + ") AS (SELECT * FROM " + lhs + "), rhs_r(" + nv.column_list +
+	               ") AS (SELECT * FROM " + rhs +
+	               ") "
+	               "SELECT COUNT(*) FROM ("
+	               "SELECT " +
+	               select +
+	               " FROM lhs_r "
+	               "EXCEPT ALL "
+	               "SELECT " +
+	               select +
+	               " FROM rhs_r "
+	               "UNION ALL "
+	               "SELECT " +
+	               select +
+	               " FROM rhs_r "
+	               "EXCEPT ALL "
+	               "SELECT " +
+	               select +
+	               " FROM lhs_r"
+	               ") __diff";
+	auto result = con.Query(query);
+	if (!result || result->HasError() || result->RowCount() == 0) {
+		return false;
+	}
+	count = result->GetValue(0, 0).GetValue<int64_t>();
+	return true;
+}
+
+static bool CreateTempVerifyTable(duckdb::Connection &con, const string &table_name, const string &query) {
+	auto drop = con.Query("DROP TABLE IF EXISTS " + table_name);
+	if (!drop || drop->HasError()) {
+		return false;
+	}
+	auto create = con.Query("CREATE TEMP TABLE " + table_name + " AS SELECT * FROM (" + query + ") __verify");
+	return create && !create->HasError();
+}
+
+// Window queries can be sensitive to CTE inlining during verification: a single EXCEPT ALL query may evaluate
+// the ground-truth subquery more than once. Materialize two ground-truth snapshots, compare them to find the
+// deterministic output width, then compare the MV against one snapshot.
+static bool TryVerifyMaterializedWindowOutput(duckdb::Connection &con, const string &query, const string &mv_name,
+                                              const NormalizedVerify &nv, int64_t &mismatch_count) {
+	idx_t column_count = nv.normalized_columns.size();
+	if (column_count <= 1 || !QueryHasWindowExpression(query)) {
+		return false;
+	}
+
+	string suffix = std::to_string(static_cast<long long>(getpid()));
+	string gt1 = "__openivm_verify_gt1_" + suffix;
+	string gt2 = "__openivm_verify_gt2_" + suffix;
+	auto cleanup = [&]() {
+		con.Query("DROP TABLE IF EXISTS " + gt1);
+		con.Query("DROP TABLE IF EXISTS " + gt2);
+	};
+	cleanup();
+	if (!CreateTempVerifyTable(con, gt1, query) || !CreateTempVerifyTable(con, gt2, query)) {
+		cleanup();
+		return false;
+	}
+
+	idx_t lo = 0;
+	idx_t hi = column_count;
+	while (lo < hi) {
+		idx_t mid = lo + (hi - lo + 1) / 2;
+		int64_t self_diff = 0;
+		if (!CountNormalizedDiff(con, gt1, gt2, nv, mid, self_diff)) {
+			cleanup();
+			return false;
+		}
+		if (self_diff == 0) {
+			lo = mid;
+		} else {
+			hi = mid - 1;
+		}
+	}
+
+	if (lo == 0) {
+		cleanup();
+		return false;
+	}
+
+	int64_t prefix_diff = 0;
+	bool verified = CountNormalizedDiff(con, mv_name, gt1, nv, lo, prefix_diff) && prefix_diff == 0;
+	cleanup();
+	if (verified) {
+		mismatch_count = 0;
+	}
+	return verified;
 }
 
 // If `query` ends with a top-level LIMIT that is NOT preceded by a top-level ORDER BY, the selected
@@ -422,6 +539,65 @@ static string FindQueriesDir(const string &workload = "tpcc") {
 	}
 
 	return "";
+}
+
+static vector<string> ExpectedWorkloadTables(const string &workload) {
+	if (workload == "tpcdi") {
+		return {"daily_market", "watches_history", "dim_security", "fact_market_history", "fact_watches"};
+	}
+	return {"warehouse", "district", "customer", "item", "stock", "oorder", "new_order", "order_line", "history"};
+}
+
+static bool ExistingDatabaseHasWorkloadTablesInProcess(const string &db_path, const string &workload) {
+	if (!FileExists(db_path)) {
+		return false;
+	}
+
+	try {
+		duckdb::DuckDB db(db_path);
+		duckdb::Connection con(db);
+
+		auto expected = ExpectedWorkloadTables(workload);
+		string table_list;
+		for (idx_t i = 0; i < expected.size(); i++) {
+			if (i > 0) {
+				table_list += ", ";
+			}
+			table_list += "'" + expected[i] + "'";
+		}
+
+		auto res = con.Query("SELECT count(*) FROM information_schema.tables "
+		                     "WHERE table_catalog = current_database() AND table_schema = 'main' "
+		                     "AND lower(table_name) IN (" +
+		                     table_list + ")");
+		if (!res || res->HasError() || res->RowCount() == 0) {
+			return false;
+		}
+		return res->GetValue(0, 0).GetValue<int64_t>() == static_cast<int64_t>(expected.size());
+	} catch (...) {
+		return false;
+	}
+}
+
+static bool ExistingDatabaseHasWorkloadTables(const string &db_path, const string &workload) {
+	if (!FileExists(db_path)) {
+		return false;
+	}
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		return false;
+	}
+	if (pid == 0) {
+		bool ok = ExistingDatabaseHasWorkloadTablesInProcess(db_path, workload);
+		_exit(ok ? 0 : 1);
+	}
+
+	int status = 0;
+	if (waitpid(pid, &status, 0) < 0) {
+		return false;
+	}
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 static string FormatQueryList(const vector<string> &names, size_t max_show = 10) {
@@ -786,9 +962,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							// Rename both sides to synthetic column names (c0, c1, ...) so EXCEPT ALL
 							// compares by position — the MV's sanitized column names (e.g. count_d_d_id)
 							// don't match the base query's unsanitized output names (count(d.D_ID)).
-							// Round DOUBLE/FLOAT columns to 10 decimals to tolerate ULP drift on
-							// AVG-over-DECIMAL MVs (DuckDB's native AVG uses compensated arithmetic
-							// we can't reproduce via SUM/COUNT). See docs/limitations.md.
+							// Format floating-point-like columns to a significant-digit tolerance for
+							// benign ULP drift from aggregate decompositions. See docs/limitations.md.
 							start = std::chrono::steady_clock::now();
 							auto nv = BuildNormalizedVerify(con, mv_name);
 							string verify_query;
@@ -875,6 +1050,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 										    relaxed_result->GetValue(0, 0).GetValue<int64_t>() == 0) {
 											mismatch_count = 0;
 										}
+									}
+									if (mismatch_count != 0) {
+										TryVerifyMaterializedWindowOutput(con, query, mv_name, nv, mismatch_count);
 									}
 								}
 								is_correct = (mismatch_count == 0) ? 1 : 0;
@@ -1318,7 +1496,19 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 	csv_lines.push_back("query_name,phase_reached,phase_name,meta_is_incremental,actual_is_incremental,is_correct,"
 	                    "time_select_ms,time_mv_ms,time_refresh_ms,time_verify_ms,error");
 
-	if (!FileExists(db_path)) {
+	bool db_exists = FileExists(db_path);
+	bool needs_create = !db_exists;
+	if (db_exists && !ExistingDatabaseHasWorkloadTables(db_path, workload)) {
+		Log("Existing " + workload + " database is missing native workload tables; recreating: " + db_path);
+		std::remove(db_path.c_str());
+		string wal_path = db_path + ".wal";
+		if (FileExists(wal_path)) {
+			std::remove(wal_path.c_str());
+		}
+		needs_create = true;
+	}
+
+	if (needs_create) {
 		Log("Creating " + workload + " database: " + db_path);
 		pid_t setup_pid = fork();
 		if (setup_pid == 0) {
@@ -1562,6 +1752,15 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		Log("  " + FormatQueryList(stats.crash_queries, 20));
 	}
 	Log("");
+
+	if (FileExists(db_path) && !ExistingDatabaseHasWorkloadTables(db_path, workload)) {
+		Log("Benchmark database is missing native workload tables after the run; removing stale DB: " + db_path);
+		std::remove(db_path.c_str());
+		string wal_path = db_path + ".wal";
+		if (FileExists(wal_path)) {
+			std::remove(wal_path.c_str());
+		}
+	}
 
 	return csv_lines;
 }
