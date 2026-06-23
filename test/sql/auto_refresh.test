@@ -1200,66 +1200,7 @@ SELECT count(*) FROM (
 ----
 0
 
-statement ok
-CREATE TABLE cm_asof_trades (symbol VARCHAR, ts TIMESTAMP, qty INT);
-
-statement ok
-CREATE TABLE cm_asof_prices (symbol VARCHAR, ts TIMESTAMP, price INT);
-
-statement ok
-INSERT INTO cm_asof_trades VALUES
-    ('A', TIMESTAMP '2024-01-01 10:00:00', 1),
-    ('A', TIMESTAMP '2024-01-01 10:20:00', 2);
-
-statement ok
-INSERT INTO cm_asof_prices VALUES
-    ('A', TIMESTAMP '2024-01-01 09:00:00', 100),
-    ('A', TIMESTAMP '2024-01-01 10:18:00', 180);
-
-statement ok
-CREATE MATERIALIZED VIEW mv_cm_current_diff AS
-    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
-    FROM cm_asof_trades t
-    ASOF JOIN cm_asof_prices p
-      ON t.symbol = p.symbol
-     AND t.ts >= p.ts;
-
-statement ok
-INSERT INTO cm_asof_prices VALUES ('A', TIMESTAMP '2024-01-01 10:19:00', 190);
-
-statement ok
-PRAGMA refresh('mv_cm_current_diff');
-
-query I
-SELECT CASE WHEN method IN ('full', 'current_diff_recompute') THEN 1 ELSE 0 END
-FROM openivm_refresh_history WHERE view_name = 'mv_cm_current_diff' ORDER BY refresh_timestamp DESC LIMIT 1;
-----
-1
-
-query I
-SELECT count(*) FROM (
-    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
-    FROM cm_asof_trades t
-    ASOF JOIN cm_asof_prices p
-      ON t.symbol = p.symbol
-     AND t.ts >= p.ts
-    EXCEPT ALL SELECT * FROM mv_cm_current_diff
-);
-----
-0
-
-query I
-SELECT count(*) FROM (
-    SELECT * FROM mv_cm_current_diff
-    EXCEPT ALL
-    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
-    FROM cm_asof_trades t
-    ASOF JOIN cm_asof_prices p
-      ON t.symbol = p.symbol
-     AND t.ts >= p.ts
-);
-----
-0
+# ASOF-join current-diff MV moved to test/sql/auto_refresh_asof.test.
 
 statement ok
 SET openivm_adaptive_refresh = false;
