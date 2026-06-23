@@ -1215,6 +1215,15 @@ INSERT INTO cm_asof_prices VALUES
     ('A', TIMESTAMP '2024-01-01 09:00:00', 100),
     ('A', TIMESTAMP '2024-01-01 10:18:00', 180);
 
+# TODO(asof-deadlock): DuckDB's parallel ASOF-join sort hits a thread-count-sensitive
+# deadlock in TemporaryMemoryManager that surfaces on Windows/MSVC as "resource deadlock
+# would occur" when the ASOF view's initial-load CREATE / refresh runs. It is fixed on
+# DuckDB main but not in any v1.5.x release. Force single-threaded execution around this
+# ASOF block as a temporary workaround; remove the SET/RESET threads once CI's
+# duckdb_version is bumped to a release carrying the fix.
+statement ok
+SET threads=1;
+
 statement ok
 CREATE MATERIALIZED VIEW mv_cm_current_diff AS
     SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
@@ -1258,6 +1267,10 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# TODO(asof-deadlock): restore default parallelism once the ASOF workaround above is removed.
+statement ok
+RESET threads;
 
 statement ok
 SET openivm_adaptive_refresh = false;
