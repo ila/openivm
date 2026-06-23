@@ -219,6 +219,15 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		return;
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
+	// This fresh connection executes all of the MV's initial-load / metadata DDL (including the
+	// `CREATE TABLE openivm_data_* AS <view query>` that runs the full view, e.g. an ASOF join).
+	// TODO(propagate-settings): it starts from DB defaults and only inherits a couple of options
+	// we explicitly re-apply below (preserve_insertion_order, max_expression_depth). Session-scoped
+	// settings the user set on the originating `context` are NOT propagated here. We should mirror
+	// the relevant ClientContext settings onto this connection (e.g. threads — though `threads` is
+	// global-only today — memory_limit, and other execution-affecting options) so the initial-load
+	// query runs under the same configuration as the user's session. Related: TODO(asof-deadlock)
+	// in test/sql/auto_refresh_asof.test.
 	auto conn = make_uniq<Connection>(db);
 	bool suspended_autocommit_transaction = false;
 	auto restore_outer_transaction = [&]() {

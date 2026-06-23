@@ -1,0 +1,84 @@
+# name: test/sql/auto_refresh_asof.test
+# description: ASOF-join current-diff materialized view under the adaptive cost model. Gated off Windows.
+# group: [sql]
+
+# TODO(asof-deadlock): This block was split out of auto_refresh.test and gated off Windows
+# because DuckDB's parallel ASOF-join sort deadlocks in TemporaryMemoryManager on
+# Windows/MSVC ("resource deadlock would occur") during the ASOF MV's initial-load CREATE
+# (which runs on an internal connection inside parser_ddl.cpp). The bug is fixed on DuckDB
+# main but not in any v1.5.x release, and forcing threads=1 does NOT avoid it. Re-merge this
+# back into auto_refresh.test and drop the `require notwindows` gate once CI's duckdb_version
+# is bumped to a release that carries the fix. `require notwindows` matches both the MSVC and
+# MinGW Windows builds (both define _WIN32).
+require openivm
+
+require notwindows
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_adaptive_refresh = true;
+
+statement ok
+CREATE TABLE cm_asof_trades (symbol VARCHAR, ts TIMESTAMP, qty INT);
+
+statement ok
+CREATE TABLE cm_asof_prices (symbol VARCHAR, ts TIMESTAMP, price INT);
+
+statement ok
+INSERT INTO cm_asof_trades VALUES
+    ('A', TIMESTAMP '2024-01-01 10:00:00', 1),
+    ('A', TIMESTAMP '2024-01-01 10:20:00', 2);
+
+statement ok
+INSERT INTO cm_asof_prices VALUES
+    ('A', TIMESTAMP '2024-01-01 09:00:00', 100),
+    ('A', TIMESTAMP '2024-01-01 10:18:00', 180);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cm_current_diff AS
+    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
+    FROM cm_asof_trades t
+    ASOF JOIN cm_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts;
+
+statement ok
+INSERT INTO cm_asof_prices VALUES ('A', TIMESTAMP '2024-01-01 10:19:00', 190);
+
+statement ok
+PRAGMA refresh('mv_cm_current_diff');
+
+query T
+SELECT method FROM openivm_refresh_history WHERE view_name = 'mv_cm_current_diff' ORDER BY refresh_timestamp DESC LIMIT 1;
+----
+current_diff_recompute
+
+query I
+SELECT count(*) FROM (
+    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
+    FROM cm_asof_trades t
+    ASOF JOIN cm_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+    EXCEPT ALL SELECT * FROM mv_cm_current_diff
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_cm_current_diff
+    EXCEPT ALL
+    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
+    FROM cm_asof_trades t
+    ASOF JOIN cm_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+);
+----
+0
+
+statement ok
+SET openivm_adaptive_refresh = false;

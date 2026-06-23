@@ -1199,78 +1199,9 @@ SELECT count(*) FROM (
 ----
 0
 
-statement ok
-CREATE TABLE cm_asof_trades (symbol VARCHAR, ts TIMESTAMP, qty INT);
-
-statement ok
-CREATE TABLE cm_asof_prices (symbol VARCHAR, ts TIMESTAMP, price INT);
-
-statement ok
-INSERT INTO cm_asof_trades VALUES
-    ('A', TIMESTAMP '2024-01-01 10:00:00', 1),
-    ('A', TIMESTAMP '2024-01-01 10:20:00', 2);
-
-statement ok
-INSERT INTO cm_asof_prices VALUES
-    ('A', TIMESTAMP '2024-01-01 09:00:00', 100),
-    ('A', TIMESTAMP '2024-01-01 10:18:00', 180);
-
-# TODO(asof-deadlock): DuckDB's parallel ASOF-join sort hits a thread-count-sensitive
-# deadlock in TemporaryMemoryManager that surfaces on Windows/MSVC as "resource deadlock
-# would occur" when the ASOF view's initial-load CREATE / refresh runs. It is fixed on
-# DuckDB main but not in any v1.5.x release. Force single-threaded execution around this
-# ASOF block as a temporary workaround; remove the SET/RESET threads once CI's
-# duckdb_version is bumped to a release carrying the fix.
-statement ok
-SET threads=1;
-
-statement ok
-CREATE MATERIALIZED VIEW mv_cm_current_diff AS
-    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
-    FROM cm_asof_trades t
-    ASOF JOIN cm_asof_prices p
-      ON t.symbol = p.symbol
-     AND t.ts >= p.ts;
-
-statement ok
-INSERT INTO cm_asof_prices VALUES ('A', TIMESTAMP '2024-01-01 10:19:00', 190);
-
-statement ok
-PRAGMA refresh('mv_cm_current_diff');
-
-query T
-SELECT method FROM openivm_refresh_history WHERE view_name = 'mv_cm_current_diff' ORDER BY refresh_timestamp DESC LIMIT 1;
-----
-current_diff_recompute
-
-query I
-SELECT count(*) FROM (
-    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
-    FROM cm_asof_trades t
-    ASOF JOIN cm_asof_prices p
-      ON t.symbol = p.symbol
-     AND t.ts >= p.ts
-    EXCEPT ALL SELECT * FROM mv_cm_current_diff
-);
-----
-0
-
-query I
-SELECT count(*) FROM (
-    SELECT * FROM mv_cm_current_diff
-    EXCEPT ALL
-    SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
-    FROM cm_asof_trades t
-    ASOF JOIN cm_asof_prices p
-      ON t.symbol = p.symbol
-     AND t.ts >= p.ts
-);
-----
-0
-
-# TODO(asof-deadlock): restore default parallelism once the ASOF workaround above is removed.
-statement ok
-RESET threads;
+# ASOF-join current-diff MV moved to test/sql/auto_refresh_asof.test, which is gated
+# `require notwindows` due to a DuckDB parallel-ASOF deadlock on Windows. See
+# TODO(asof-deadlock) there.
 
 statement ok
 SET openivm_adaptive_refresh = false;
