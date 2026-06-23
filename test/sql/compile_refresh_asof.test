@@ -1,0 +1,79 @@
+# name: test/sql/compile_refresh_asof.test
+# description: compile-only CURRENT_DIFF_RECOMPUTE for an ASOF view (split from compile_refresh.test). Gated off Windows.
+# group: [sql]
+
+# TODO(asof-deadlock): Split out of compile_refresh.test and gated off Windows because
+# DuckDB's parallel ASOF-join sort deadlocks in TemporaryMemoryManager on Windows/MSVC
+# ("resource deadlock would occur") during the ASOF MV's initial-load CREATE. Fixed on DuckDB
+# main but not in any v1.5.x release; threads=1 does NOT avoid it. Re-merge and drop the
+# `require notwindows` gate once CI's duckdb_version is bumped to a release with the fix.
+require openivm
+
+require notwindows
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Test 6: CURRENT_DIFF_RECOMPUTE skips local no-op refreshes, but
+# compile-only still emits the external refresh template
+# ==========================================
+
+statement ok
+CREATE TABLE compile_only_asof_trades(symbol VARCHAR, ts TIMESTAMP, qty INT);
+
+statement ok
+CREATE TABLE compile_only_asof_prices(symbol VARCHAR, ts TIMESTAMP, price INT);
+
+statement ok
+INSERT INTO compile_only_asof_trades VALUES
+    ('A', TIMESTAMP '2024-04-01 10:00:00', 1),
+    ('A', TIMESTAMP '2024-04-01 10:20:00', 2);
+
+statement ok
+INSERT INTO compile_only_asof_prices VALUES
+    ('A', TIMESTAMP '2024-04-01 09:00:00', 100),
+    ('A', TIMESTAMP '2024-04-01 10:10:00', 110);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_compile_only_current_diff AS
+    SELECT
+        t.symbol AS symbol,
+        t.ts AS trade_ts,
+        t.qty AS qty,
+        p.price AS price
+    FROM compile_only_asof_trades t
+    ASOF JOIN compile_only_asof_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_compile_only_current_diff';
+----
+10
+
+query I
+SELECT CASE WHEN coalesce(string_agg(lower(sql), ' ' ORDER BY stmt_order), '')
+                 LIKE '%delete from %openivm_data_mv_compile_only_current_diff%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_compile_only_current_diff',
+    '{"target_dialect":"duckdb"}'
+)
+WHERE stmt_kind = 'data';
+----
+0
+
+query I
+SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%delete from %openivm_data_mv_compile_only_current_diff%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%insert into %openivm_data_mv_compile_only_current_diff%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_compile_only_current_diff',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
