@@ -1,0 +1,105 @@
+# name: test/sql/compile_facts_batch.test
+# description: openivm_compile_with_facts per-batch facts drive the LEFT-JOIN Tier-1 insert-only append (openivm-spark compile-only path), plus derived-fact output enrichment.
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE sec(sym VARCHAR, ckey INT);
+
+statement ok
+CREATE TABLE daily(sym VARCHAR, px INT);
+
+statement ok
+CREATE TABLE fin(ckey INT, val INT);
+
+statement ok
+INSERT INTO sec VALUES ('A',10),('B',20);
+
+statement ok
+INSERT INTO fin VALUES (10,1),(10,2),(20,5);
+
+statement ok
+INSERT INTO daily VALUES ('A',100),('B',200);
+
+# fact_market_history shape: preserved (daily JOIN sec) LEFT JOIN fin (nullable, no output column).
+statement ok
+CREATE MATERIALIZED VIEW mh AS
+    SELECT sec.ckey, daily.sym, daily.px
+    FROM daily JOIN sec ON daily.sym=sec.sym
+    LEFT JOIN fin f ON f.ckey=sec.ckey;
+
+# Batch facts: only the preserved-side source (daily) is active + insert-only -> Tier-1 append
+# (generate_series over the view delta; no affected-key recompute).
+query I
+SELECT bool_or(contains(sql,'generate_series')) AND NOT bool_or(contains(sql,'openivm_affected'))
+FROM openivm_compile_with_facts('mh',
+  '{"schema_version":2,"target_dialect":"duckdb","compile_only":true,"batch":{"active_delta_tables":["openivm_delta_daily"],"insert_only":true}}')
+WHERE stmt_kind='data';
+----
+true
+
+# Batch facts: the nullable source (fin) is active -> a NULL->matched flip is possible ->
+# fall back to the affected-key recompute (Tier-2).
+query I
+SELECT bool_or(contains(sql,'openivm_affected'))
+FROM openivm_compile_with_facts('mh',
+  '{"schema_version":2,"target_dialect":"duckdb","compile_only":true,"batch":{"active_delta_tables":["openivm_delta_fin"],"insert_only":true}}')
+WHERE stmt_kind='data';
+----
+true
+
+# Bare base names (no openivm_delta_ prefix) are normalized too: daily-only still fires Tier-1.
+query I
+SELECT bool_or(contains(sql,'generate_series')) AND NOT bool_or(contains(sql,'openivm_affected'))
+FROM openivm_compile_with_facts('mh',
+  '{"schema_version":2,"target_dialect":"duckdb","compile_only":true,"batch":{"active_delta_tables":["daily"],"insert_only":true}}')
+WHERE stmt_kind='data';
+----
+true
+
+# An unknown source name is dropped (never widens the active set): daily + bogus still Tier-1.
+query I
+SELECT bool_or(contains(sql,'generate_series')) AND NOT bool_or(contains(sql,'openivm_affected'))
+FROM openivm_compile_with_facts('mh',
+  '{"schema_version":2,"target_dialect":"duckdb","compile_only":true,"batch":{"active_delta_tables":["openivm_delta_daily","openivm_delta_nonexistent"],"insert_only":true}}')
+WHERE stmt_kind='data';
+----
+true
+
+# insert_only=false (e.g. batch had deletes) -> not insert-only-safe -> recompute even on daily-only.
+query I
+SELECT bool_or(contains(sql,'openivm_affected'))
+FROM openivm_compile_with_facts('mh',
+  '{"schema_version":2,"target_dialect":"duckdb","compile_only":true,"batch":{"active_delta_tables":["openivm_delta_daily"],"insert_only":false}}')
+WHERE stmt_kind='data';
+----
+true
+
+# No batch facts (v1 caller) -> conservative recompute (backward compatible).
+query I
+SELECT bool_or(contains(sql,'openivm_affected'))
+FROM openivm_compile_with_facts('mh', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind='data';
+----
+true
+
+# Output enrichment: emit_derived_facts returns the LEFT-join nullable-source set.
+query I
+SELECT contains(sql,'"nullable_sources":["fin"]')
+FROM openivm_compile_with_facts('mh',
+  '{"schema_version":2,"target_dialect":"duckdb","compile_only":true,"universal":{"emit_derived_facts":true}}')
+WHERE stmt_kind='derived_fact';
+----
+true
+
+# Without emit_derived_facts: no derived_fact row.
+query I
+SELECT count(*)
+FROM openivm_compile_with_facts('mh', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind='derived_fact';
+----
+0

@@ -3,9 +3,36 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
 
+#include <unordered_map>
+
 namespace duckdb {
+
+// Canonicalize caller-supplied active-delta names (CompileFacts.active_delta_tables) to the
+// prefixed "openivm_delta_<base>" form the planner uses, by matching on base name against the
+// view's known delta_table_names (case-insensitive). Names matching no known delta table are
+// dropped (logged) — an unknown source must never silently widen the active set.
+static vector<string> NormalizeActiveDeltaNames(const vector<string> &supplied,
+                                                const vector<string> &delta_table_names) {
+	std::unordered_map<string, string> by_base;
+	for (auto &dt : delta_table_names) {
+		by_base[StringUtil::Lower(BaseTableNameFromDeltaKey(dt))] = dt;
+	}
+	vector<string> out;
+	for (auto &name : supplied) {
+		string base = StringUtil::Lower(BaseTableNameFromDeltaKey(name));
+		auto it = by_base.find(base);
+		if (it != by_base.end()) {
+			out.push_back(it->second);
+		} else {
+			OPENIVM_DEBUG_PRINT("[UPSERT] batch fact active_delta '%s' (base '%s') matches no known delta — dropped\n",
+			                    name.c_str(), base.c_str());
+		}
+	}
+	return out;
+}
 
 static bool QueryLooksLikeJoin(const string &view_query_sql, const vector<string> &delta_table_names) {
 	return delta_table_names.size() > 1 || view_query_sql.find("JOIN") != string::npos ||
@@ -272,12 +299,32 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 	(void)cross_system;
 	if (facts && facts->compile_only) {
 		DeltaFastPathFlags flags;
+		if (facts->has_batch_facts) {
+			// Caller (openivm-spark) supplied this batch's delta activity. Trust it instead of probing
+			// live delta tables (which we cannot read in compile-only mode). Absence of batch facts keeps
+			// the conservative path below; supplying them can only ENABLE a fast path, never disable a guard.
+			flags.active_delta_table_names = NormalizeActiveDeltaNames(facts->active_delta_tables, delta_table_names);
+			flags.insert_only = facts->batch_insert_only;
+			flags.skip_agg_delete = flags.insert_only;
+			flags.skip_proj_delete = flags.insert_only;
+			flags.minmax_incremental = flags.insert_only;
+			if (!SqlUtils::GetBoolSetting(context, "openivm_skip_aggregate_delete", true)) {
+				flags.skip_agg_delete = false;
+			}
+			if (!SqlUtils::GetBoolSetting(context, "openivm_skip_projection_delete", true)) {
+				flags.skip_proj_delete = false;
+			}
+			if (!SqlUtils::GetBoolSetting(context, "openivm_minmax_incremental", true)) {
+				flags.minmax_incremental = false;
+			}
+			OPENIVM_DEBUG_PRINT("[UPSERT] compile_only=true WITH batch facts: insert_only=%d active_sources=%zu\n",
+			                    flags.insert_only, flags.active_delta_table_names.size());
+			return flags;
+		}
+		// No batch facts: conservative (cannot probe live deltas in compile-only mode). The LEFT-JOIN
+		// Tier-1 insert-only append does not fire here — preserves pre-batch-facts behavior.
 		flags.active_delta_table_names = delta_table_names;
-		// NOTE: in compile-only mode (openivm-spark) we cannot probe live delta tables, so insert_only
-		// stays false and the active set is ALL sources. The LEFT-JOIN Tier-1 insert-only append
-		// therefore never fires here. To enable it on Spark, openivm-spark must pass the per-batch delta
-		// activity (which sources changed + insert-only) through CompileFacts so these can be set.
-		OPENIVM_DEBUG_PRINT("[UPSERT] compile_only=true: disabling local delta fast paths, active_sources=%zu\n",
+		OPENIVM_DEBUG_PRINT("[UPSERT] compile_only=true NO batch facts: conservative, active_sources=%zu\n",
 		                    flags.active_delta_table_names.size());
 		return flags;
 	}
