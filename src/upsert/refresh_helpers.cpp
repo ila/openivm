@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <set>
 
 namespace duckdb {
 
@@ -778,6 +779,44 @@ static string TryBuildLeftJoinAffectedPushdown(RefreshMetadata &metadata, const 
 	                                        delete_match, affected + "openivm_lj." + lk + ")", affected_cte);
 }
 
+static string NormalizeTableToken(string tok) {
+	while (!tok.empty() && (tok.front() == '"' || tok.front() == '`' || tok.front() == '\'')) {
+		tok.erase(tok.begin());
+	}
+	while (!tok.empty() && (tok.back() == '"' || tok.back() == '`' || tok.back() == '\'')) {
+		tok.pop_back();
+	}
+	tok = SqlUtils::StripTrackedTablePrefix(tok, /*strip_delta=*/true); // last dotted part + strip prefixes
+	return StringUtil::Lower(tok);
+}
+
+// Q2/D2 guard: true iff this batch's active delta touches ONLY preserved-side sources (no
+// LEFT-JOIN nullable table changed). Then no NULL->matched flip is possible, the view delta
+// is purely insert-only, and it can be appended directly (Tier 1). Otherwise we fall back to
+// the affected-key recompute (Tier 2), which stays correct for arbitrary batches.
+//
+// The nullable-source set is extracted structurally from the plan at create time
+// (BuildLeftJoinNullableSources) and read here via metadata — robust to subqueries / LATERAL /
+// aliasing / MV-on-MV, unlike a textual scan of the SQL. We require `complete` so any source
+// the plan walk could not resolve forces the conservative recompute path.
+static bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
+                                       const vector<string> &active_delta_table_names) {
+	if (active_delta_table_names.empty()) {
+		return false; // unknown active set — take the safe recompute path
+	}
+	RefreshMetadata::LeftJoinNullableSources nullable;
+	if (!metadata.GetLeftJoinNullableSources(view_name, nullable) || !nullable.complete || nullable.tables.empty()) {
+		return false; // no structured nullable-source info (or incomplete) — recompute
+	}
+	std::set<string> nullable_set(nullable.tables.begin(), nullable.tables.end());
+	for (auto &dt : active_delta_table_names) {
+		if (nullable_set.count(NormalizeTableToken(BaseTableNameFromDeltaKey(dt)))) {
+			return false; // a nullable-side source changed — flip possible
+		}
+	}
+	return true;
+}
+
 static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const string &view_name,
                                              const string &data_table, const string &view_query_sql,
                                              const string &delta_ts_filter, const string &catalog_prefix) {
@@ -799,12 +838,27 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
                                 const vector<string> &delta_table_names, const string &data_table,
                                 const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
-                                bool skip_proj_delete) {
+                                bool skip_proj_delete, bool insert_only,
+                                const vector<string> &active_delta_table_names) {
 	if (has_full_outer) {
 		return BuildFullOuterProjectionRefresh(metadata, view_name, delta_table_names, data_table, view_query_sql,
 		                                       delta_ts_filter, catalog_prefix);
 	}
 	if (has_left_join) {
+		// Tier 1 (Q2/D2 fast path): when the batch is insert-only (no base deletes) AND the
+		// active delta touches only preserved-side sources (no LEFT-JOIN nullable table
+		// changed), no NULL->matched flip is possible, so the view delta is purely positive.
+		// Append it directly instead of deleting affected keys + recomputing their full
+		// (fan-out-amplified) history. Provably exact: positive-only delta, bag table.
+		if (insert_only && LeftJoinDeltaNullableQuiet(metadata, view_name, active_delta_table_names)) {
+			OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN Tier1 insert-only append for %s (nullable side quiet)\n",
+			                    view_name.c_str());
+			return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix,
+			                                 /*insert_only=*/true);
+		}
+		// Tier 2: nullable side changed (or batch has deletes / active set unknown) — keep the
+		// affected-key delete + recompute, which stays correct for arbitrary insert/delete
+		// batches (modulo the pre-existing NULL->matched flip retraction gap shared with baseline).
 		return BuildLeftJoinProjectionRefresh(metadata, view_name, data_table, view_query_sql, delta_ts_filter,
 		                                      catalog_prefix);
 	}

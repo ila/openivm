@@ -273,6 +273,10 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 	if (facts && facts->compile_only) {
 		DeltaFastPathFlags flags;
 		flags.active_delta_table_names = delta_table_names;
+		// NOTE: in compile-only mode (openivm-spark) we cannot probe live delta tables, so insert_only
+		// stays false and the active set is ALL sources. The LEFT-JOIN Tier-1 insert-only append
+		// therefore never fires here. To enable it on Spark, openivm-spark must pass the per-batch delta
+		// activity (which sources changed + insert-only) through CompileFacts so these can be set.
 		OPENIVM_DEBUG_PRINT("[UPSERT] compile_only=true: disabling local delta fast paths, active_sources=%zu\n",
 		                    flags.active_delta_table_names.size());
 		return flags;

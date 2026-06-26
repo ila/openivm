@@ -188,7 +188,8 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
                                 const vector<string> &delta_table_names, const string &data_table,
                                 const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
-                                bool skip_proj_delete);
+                                bool skip_proj_delete, bool insert_only = false,
+                                const vector<string> &active_delta_table_names = {});
 bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,

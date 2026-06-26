@@ -272,6 +272,17 @@ public:
 	bool GetLeftJoinKeyLineage(const string &view_name, ProjectionKeyLineage &out);
 	static string LeftJoinKeyLineageToJson(const ProjectionKeyLineage &lineage);
 
+	// Base source tables on the NULL-extended side of the view's LEFT/OUTER joins, extracted from the
+	// plan at create time and persisted as a "left_join_nullable" entry. `complete` is false when any
+	// nullable source could not be resolved (e.g. an unresolved CTE ref) — callers must then treat the
+	// nullable side as potentially-active (conservative). Drives the Tier-1 insert-only append fast path.
+	struct LeftJoinNullableSources {
+		vector<string> tables; // normalized lowercase base names (openivm_data_/delta_ prefixes stripped)
+		bool complete = false;
+	};
+	bool GetLeftJoinNullableSources(const string &view_name, LeftJoinNullableSources &out);
+	static string LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src);
+
 	struct FilteredGroupCountAuxMeta {
 		string aux_table;
 		string source;

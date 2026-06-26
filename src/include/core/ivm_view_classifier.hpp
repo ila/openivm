@@ -195,6 +195,10 @@ struct DeltaViewModel {
 	// push the affected-key filter into the LEFT JOIN recompute (generic replacement for the former
 	// fact_market_history hardcode). Reuses the projection-key lineage struct with a single identity arm.
 	RefreshMetadata::ProjectionKeyLineage left_join_key_lineage;
+	// Base source tables on the NULL-extended side of the view's LEFT/OUTER joins, extracted from the
+	// plan at create time. Drives the Tier-1 insert-only append fast path: a batch whose active delta
+	// touches none of these cannot cause a NULL->matched flip, so the view delta is purely insert-only.
+	RefreshMetadata::LeftJoinNullableSources left_join_nullable_sources;
 	idx_t root_node = DConstants::INVALID_INDEX;
 	string full_outer_join_cols;
 	GroupRecomputeAffectedMode group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
@@ -206,6 +210,7 @@ struct DeltaViewModel {
 	bool union_distinct_over_agg = false;
 	bool has_projection_lineage = false;
 	bool has_left_join_key_lineage = false;
+	bool has_left_join_nullable = false;
 	bool warn_unsupported_incremental = false;
 	bool warn_unrecognized_pattern = false;
 

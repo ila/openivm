@@ -223,3 +223,146 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# Tier-1 insert-only append fast path (Q2: nullable side quiet).
+# fact_market_history shape: preserved side (daily JOIN sec) LEFT JOIN fin where the
+# LEFT JOIN contributes NO output column (pure fan-out / existence multiplier).
+# A delta on the PRESERVED side only cannot cause a NULL->matched flip, so the view
+# delta is purely insert-only and is appended directly (no affected-key recompute).
+# ============================================================
+statement ok
+CREATE TABLE t1_sec(sym VARCHAR, ckey INT);
+
+statement ok
+CREATE TABLE t1_daily(sym VARCHAR, px INT);
+
+statement ok
+CREATE TABLE t1_fin(ckey INT, val INT);
+
+statement ok
+INSERT INTO t1_sec VALUES ('A',10),('B',20),('C',30);
+
+# ckey 10 has 2 financial periods (fan-out x2), 20 has 1, 30 has none (NULL-extended)
+statement ok
+INSERT INTO t1_fin VALUES (10,1),(10,2),(20,5);
+
+statement ok
+INSERT INTO t1_daily VALUES ('A',100),('B',200),('C',300);
+
+statement ok
+CREATE MATERIALIZED VIEW t1_mh AS
+    SELECT s.ckey, d.sym, d.px
+    FROM t1_daily d JOIN t1_sec s ON d.sym=s.sym
+    LEFT JOIN t1_fin f ON f.ckey=s.ckey;
+
+# Preserved-side-only append -> Tier 1: emitted apply is a direct INSERT append
+# (generate_series over the view delta), NOT a delete-affected + recompute.
+statement ok
+INSERT INTO t1_daily VALUES ('A',101),('B',201),('C',301);
+
+statement ok
+PRAGMA refresh('t1_mh');
+
+query I
+SELECT contains(content, 'generate_series')
+   AND NOT contains(content, 'openivm_affected')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_t1_mh.sql');
+----
+true
+
+# Bag-exact vs full recompute (fan-out multiplicity preserved).
+query I
+SELECT COUNT(*) FROM (
+  SELECT s.ckey, d.sym, d.px FROM t1_daily d JOIN t1_sec s ON d.sym=s.sym LEFT JOIN t1_fin f ON f.ckey=s.ckey
+  EXCEPT ALL SELECT * FROM t1_mh);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT * FROM t1_mh
+  EXCEPT ALL SELECT s.ckey, d.sym, d.px FROM t1_daily d JOIN t1_sec s ON d.sym=s.sym LEFT JOIN t1_fin f ON f.ckey=s.ckey);
+----
+0
+
+# Nullable-side (fin) change must NOT take the fast path — a NULL->matched flip is
+# possible, so it falls back to the affected-key recompute. Correctness still holds.
+statement ok
+INSERT INTO t1_fin VALUES (20,6);
+
+statement ok
+PRAGMA refresh('t1_mh');
+
+query I
+SELECT contains(content, 'openivm_affected')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_t1_mh.sql');
+----
+true
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT s.ckey, d.sym, d.px FROM t1_daily d JOIN t1_sec s ON d.sym=s.sym LEFT JOIN t1_fin f ON f.ckey=s.ckey
+  EXCEPT ALL SELECT * FROM t1_mh);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT * FROM t1_mh
+  EXCEPT ALL SELECT s.ckey, d.sym, d.px FROM t1_daily d JOIN t1_sec s ON d.sym=s.sym LEFT JOIN t1_fin f ON f.ckey=s.ckey);
+----
+0
+
+# Structural nullable-source detection sees through a subquery RHS (a textual scan can't):
+# preserved-side delta still takes Tier 1, nullable-side delta inside the subquery recomputes.
+statement ok
+CREATE TABLE t2_sec(sym VARCHAR, ckey INT);
+
+statement ok
+CREATE TABLE t2_daily(sym VARCHAR, px INT);
+
+statement ok
+CREATE TABLE t2_fin(ckey INT, val INT);
+
+statement ok
+INSERT INTO t2_sec VALUES ('A',10),('B',20);
+
+statement ok
+INSERT INTO t2_fin VALUES (10,1),(10,2),(20,5);
+
+statement ok
+INSERT INTO t2_daily VALUES ('A',100),('B',200);
+
+statement ok
+CREATE MATERIALIZED VIEW t2_mh AS
+    SELECT s.ckey, d.sym, d.px
+    FROM t2_daily d JOIN t2_sec s ON d.sym=s.sym
+    LEFT JOIN (SELECT ckey FROM t2_fin) f ON f.ckey=s.ckey;
+
+statement ok
+INSERT INTO t2_daily VALUES ('A',101);
+
+statement ok
+PRAGMA refresh('t2_mh');
+
+# Tier 1 even though the nullable side is a subquery (plan walk resolved t2_fin).
+query I
+SELECT contains(content, 'generate_series') AND NOT contains(content, 'openivm_affected')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_t2_mh.sql');
+----
+true
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT s.ckey, d.sym, d.px FROM t2_daily d JOIN t2_sec s ON d.sym=s.sym LEFT JOIN (SELECT ckey FROM t2_fin) f ON f.ckey=s.ckey
+  EXCEPT ALL SELECT * FROM t2_mh);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT * FROM t2_mh
+  EXCEPT ALL SELECT s.ckey, d.sym, d.px FROM t2_daily d JOIN t2_sec s ON d.sym=s.sym LEFT JOIN (SELECT ckey FROM t2_fin) f ON f.ckey=s.ckey);
+----
+0
