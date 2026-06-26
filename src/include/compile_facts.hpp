@@ -18,12 +18,30 @@ namespace openivm {
 // `ParseFactsJson` deserialises the JSON object directly into these fields.
 class CompileFacts {
 public:
-	// Reserved for future schema evolution. Current valid value is 1.
-	static constexpr int CURRENT_SCHEMA_VERSION = 1;
+	// Schema evolution: v1 = scalar framing only; v2 = adds nested "universal"
+	// and "batch" objects. Both are accepted by the parser.
+	static constexpr int CURRENT_SCHEMA_VERSION = 2;
 	int schema_version = CURRENT_SCHEMA_VERSION;
 	SqlDialect target_dialect = SqlDialect::DUCKDB; // required when parsed from JSON
 	bool compile_only = false;                      // default false
 	bool force_view_delta_cascade = false;
+
+	// ---- Universal facts (stable for the view's lifetime; from the "universal" object) ----
+	// When true, the compiler emits derived universal facts back to the caller as extra
+	// "derived_fact" output rows (currently the LEFT-JOIN nullable-source set + referenced sources).
+	bool emit_derived_facts = false;
+	// Forward scaffolding — parsed but not yet consumed by emission. See compile_facts plan.
+	vector<string> source_constraints; // e.g. "table:PK(col)", "t:FK(col)->u(col)"
+	vector<string> partitioning;       // e.g. "table:partition(col,...)"
+	vector<string> target_capabilities; // e.g. "MERGE", "DELETION_VECTORS", "ROWID"
+
+	// ---- Per-batch facts (vary each refresh; from the "batch" object) ----
+	// has_batch_facts gates whether planning may trust active_delta_tables/batch_insert_only.
+	// When false (no "batch" object — v1 callers, or v2 omitting it) the compile-only path keeps
+	// the conservative all-sources / insert_only=false defaults, preserving today's behavior.
+	bool has_batch_facts = false;
+	vector<string> active_delta_tables; // prefixed form: openivm_delta_<base>
+	bool batch_insert_only = false;
 
 	// Returns a default-constructed CompileFacts wrapping the given dialect.
 	// Used by native PRAGMA-refresh callers which have no JSON facts — every

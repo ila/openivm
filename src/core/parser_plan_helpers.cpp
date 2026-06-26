@@ -5,6 +5,7 @@
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
+#include <set>
 #include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/cte_inlining.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -1313,6 +1314,77 @@ bool BuildLeftJoinKeyLineage(const CreateMVPlanFacts &facts, RefreshMetadata::Pr
 	lineage.arms.push_back(std::move(arm));
 	out = std::move(lineage);
 	return true;
+}
+
+static string NullableGetTableName(LogicalGet &get) {
+	auto table = get.GetTable();
+	if (table.get() && !table.get()->name.empty()) {
+		return table.get()->name;
+	}
+	if (get.function.name == "ducklake_scan" && get.function.function_info) {
+		return get.function.function_info->Cast<DuckLakeFunctionInfo>().table_name;
+	}
+	return "";
+}
+
+static void CollectNullableBaseTables(LogicalOperator *node, std::set<string> &out, bool &complete, int depth) {
+	if (!node || depth > 64) {
+		complete = false;
+		return;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_GET) {
+		string t = NullableGetTableName(node->Cast<LogicalGet>());
+		if (t.empty()) {
+			complete = false; // table function / unresolved scan — can't name it
+			return;
+		}
+		out.insert(StringUtil::Lower(SqlUtils::StripTrackedTablePrefix(t, /*strip_delta=*/true)));
+		return;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		complete = false; // CTE body not resolvable here — stay conservative
+		return;
+	}
+	for (auto &child : node->children) {
+		CollectNullableBaseTables(child.get(), out, complete, depth + 1);
+	}
+}
+
+bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinNullableSources &out) {
+	out.tables.clear();
+	out.complete = true;
+	std::set<string> tables;
+	bool found_any = false;
+	vector<LogicalOperator *> stack;
+	if (facts.root) {
+		stack.push_back(facts.root);
+	}
+	while (!stack.empty()) {
+		auto *node = stack.back();
+		stack.pop_back();
+		if ((node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+		     node->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) &&
+		    node->children.size() >= 2) {
+			auto &join = node->Cast<LogicalComparisonJoin>();
+			// Nullable side: right child of LEFT, left child of RIGHT, both of OUTER.
+			if (join.join_type == JoinType::LEFT) {
+				found_any = true;
+				CollectNullableBaseTables(node->children[1].get(), tables, out.complete, 0);
+			} else if (join.join_type == JoinType::RIGHT) {
+				found_any = true;
+				CollectNullableBaseTables(node->children[0].get(), tables, out.complete, 0);
+			} else if (join.join_type == JoinType::OUTER) {
+				found_any = true;
+				CollectNullableBaseTables(node->children[0].get(), tables, out.complete, 0);
+				CollectNullableBaseTables(node->children[1].get(), tables, out.complete, 0);
+			}
+		}
+		for (auto &child : node->children) {
+			stack.push_back(child.get());
+		}
+	}
+	out.tables.assign(tables.begin(), tables.end());
+	return found_any;
 }
 
 struct WindowLineageOp {

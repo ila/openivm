@@ -124,6 +124,76 @@ bool ExtractJsonInt(const string &json, const string &key, int &val) {
 	}
 }
 
+// Extract a nested object's `{...}` substring (braces included) for key. Brace-matched;
+// relies on the same closed-loop invariant as the scalar helpers (no '{'/'}' inside string
+// values on our wire). Returns false if the "key":{ needle is absent.
+bool ExtractJsonObjectBody(const string &json, const string &key, string &out_body) {
+	string needle = "\"" + key + "\":{";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return false;
+	}
+	size_t body_start = pos + needle.size() - 1; // points at '{'
+	int depth = 0;
+	for (size_t i = body_start; i < json.size(); i++) {
+		char c = json[i];
+		if (c == '{') {
+			depth++;
+		} else if (c == '}') {
+			depth--;
+			if (depth == 0) {
+				out_body = json.substr(body_start, i - body_start + 1);
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// Parse a JSON array of strings: "key":[ "a", "b" ]. Empty [] returns true with empty out.
+// Only string elements are supported (sufficient for the closed-loop wire). Escape handling
+// mirrors ExtractJsonString. Returns false if the needle is absent or the array is unterminated.
+bool ExtractJsonStringArray(const string &json, const string &key, vector<string> &out) {
+	string needle = "\"" + key + "\":[";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return false;
+	}
+	pos += needle.size();
+	out.clear();
+	while (pos < json.size()) {
+		while (pos < json.size() &&
+		       (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == ',')) {
+			pos++;
+		}
+		if (pos < json.size() && json[pos] == ']') {
+			return true;
+		}
+		if (pos >= json.size() || json[pos] != '"') {
+			return false; // only quoted string elements are supported
+		}
+		pos++; // past opening quote
+		string val;
+		while (pos < json.size()) {
+			char c = json[pos];
+			if (c == '\\' && pos + 1 < json.size()) {
+				char esc = json[pos + 1];
+				val += (esc == 'n') ? '\n' : esc;
+				pos += 2;
+				continue;
+			}
+			if (c == '"') {
+				pos++;
+				break;
+			}
+			val += c;
+			pos++;
+		}
+		out.push_back(std::move(val));
+	}
+	return false; // unterminated array
+}
+
 SqlDialect ParseDialectString(const string &s) {
 	// Reuse the lpts helper so dialect names stay in lockstep with the
 	// LPTS pipeline. LPTS throws on unrecognised values which is exactly
@@ -154,7 +224,28 @@ CompileFacts ParseFactsJson(const string &json) {
 		out.schema_version = sv;
 	}
 	ExtractJsonBool(json, "compile_only", out.compile_only);
+	// Legacy v1 top-level position (still honored); v2 canonical location is universal.*.
 	ExtractJsonBool(json, "force_view_delta_cascade", out.force_view_delta_cascade);
+
+	// v2: universal facts (stable per view). Absence = no assertion; never the negative claim,
+	// so an absent/empty field can only forgo an optimization, never disable a correctness guard.
+	string universal_body;
+	if (ExtractJsonObjectBody(json, "universal", universal_body)) {
+		ExtractJsonBool(universal_body, "force_view_delta_cascade", out.force_view_delta_cascade);
+		ExtractJsonBool(universal_body, "emit_derived_facts", out.emit_derived_facts);
+		ExtractJsonStringArray(universal_body, "source_constraints", out.source_constraints);
+		ExtractJsonStringArray(universal_body, "partitioning", out.partitioning);
+		ExtractJsonStringArray(universal_body, "target_capabilities", out.target_capabilities);
+	}
+
+	// v2: per-batch facts. Presence of the "batch" object gates the per-batch fast paths;
+	// when absent, planning keeps its conservative defaults.
+	string batch_body;
+	if (ExtractJsonObjectBody(json, "batch", batch_body)) {
+		out.has_batch_facts = true;
+		ExtractJsonStringArray(batch_body, "active_delta_tables", out.active_delta_tables);
+		ExtractJsonBool(batch_body, "insert_only", out.batch_insert_only);
+	}
 
 	return out;
 }
@@ -325,6 +416,23 @@ unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, Tab
 	PushBucket(*result, "meta_pre", out_pre_meta);
 	PushBucket(*result, "data", sql);
 	PushBucket(*result, "meta_post", out_post_meta);
+
+	// Output enrichment: when requested, return derived UNIVERSAL facts the caller can't cheaply
+	// derive itself (it runs on empty schema-only tables). Emitted as a single extra row tagged
+	// stmt_kind="derived_fact" carrying JSON in the `sql` column — additive (consumers filtering on
+	// meta_pre|data|meta_post ignore it) and NOT routed through PushBucket (no trailing ';').
+	if (facts_owned->emit_derived_facts) {
+		RefreshMetadata::LeftJoinNullableSources nullable;
+		metadata.GetLeftJoinNullableSources(view_name, nullable); // false -> empty, fine
+		vector<string> referenced;
+		for (auto &dt : metadata.GetDeltaTables(view_name)) {
+			referenced.push_back(BaseTableNameFromDeltaKey(dt));
+		}
+		string derived = "{\"nullable_sources\":" + SqlUtils::JsonArray(nullable.tables) +
+		                 ",\"referenced_sources\":" + SqlUtils::JsonArray(referenced) + "}";
+		result->stmt_kinds.push_back("derived_fact");
+		result->stmt_sqls.push_back(derived);
+	}
 
 	return_types.emplace_back(LogicalType::INTEGER);
 	names.emplace_back("refresh_type");

@@ -708,6 +708,7 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 	}
 	if (model.type == RefreshType::SIMPLE_PROJECTION && analysis.found_left_join && !analysis.found_full_outer) {
 		model.has_left_join_key_lineage = BuildLeftJoinKeyLineage(facts, model.left_join_key_lineage);
+		model.has_left_join_nullable = BuildLeftJoinNullableSources(facts, model.left_join_nullable_sources);
 	}
 	if (model.HasSemiAntiAux()) {
 		for (auto &col : model.semi_anti_aux.left_cols) {
@@ -732,6 +733,9 @@ string BuildDeltaViewModelLineageJson(const DeltaViewModel &model) {
 	}
 	if (model.has_left_join_key_lineage) {
 		entries.push_back(RefreshMetadata::LeftJoinKeyLineageToJson(model.left_join_key_lineage));
+	}
+	if (model.has_left_join_nullable) {
+		entries.push_back(RefreshMetadata::LeftJoinNullableSourcesToJson(model.left_join_nullable_sources));
 	}
 	return BuildRefreshLineageJson(entries);
 }

@@ -128,6 +128,11 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 // producing a single-arm ProjectionKeyLineage. Returns false (caller falls back to full LEFT JOIN
 // recompute) when the key is derived/multi-source or the source cannot be resolved.
 bool BuildLeftJoinKeyLineage(const CreateMVPlanFacts &facts, RefreshMetadata::ProjectionKeyLineage &out);
+// Collect base source tables on the NULL-extended side of every LEFT/RIGHT/OUTER join in the plan
+// (right child of LEFT, left child of RIGHT, both of OUTER), resolving through subqueries/LATERAL since
+// it walks the logical tree. Sets out.complete=false when a nullable source can't be resolved (e.g. an
+// unresolved CTE ref) so callers stay conservative. Returns true if the plan has any such join.
+bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinNullableSources &out);
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,
                                                  const vector<string> &output_names);
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts);

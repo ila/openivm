@@ -973,6 +973,31 @@ string RefreshMetadata::LeftJoinKeyLineageToJson(const ProjectionKeyLineage &lin
 	return ProjectionKeyLineageToJsonWithKind(lineage, "left_join_key");
 }
 
+string RefreshMetadata::LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src) {
+	string json = "{\"k\":\"left_join_nullable\",\"complete\":" + SqlUtils::JsonQuote(src.complete ? "true" : "false") +
+	              ",\"tables\":[";
+	for (idx_t i = 0; i < src.tables.size(); i++) {
+		if (i > 0) {
+			json += ",";
+		}
+		json += SqlUtils::JsonQuote(src.tables[i]);
+	}
+	json += "]}";
+	return json;
+}
+
+bool RefreshMetadata::GetLeftJoinNullableSources(const string &view_name, LeftJoinNullableSources &out) {
+	string json;
+	if (!ReadRefreshLineageEntry(con, view_name, "left_join_nullable", json)) {
+		return false;
+	}
+	out.tables.clear();
+	out.complete = false;
+	ParseJsonBoolString(json, "complete", out.complete);
+	ExtractJsonStringArray(json, "tables", out.tables);
+	return true;
+}
+
 bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {
 	auto result = con.Query("SELECT aggregate_decomposition_json FROM " + string(openivm::VIEWS_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
