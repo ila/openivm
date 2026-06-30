@@ -31,8 +31,8 @@ public:
 	// "derived_fact" output rows (currently the LEFT-JOIN nullable-source set + referenced sources).
 	bool emit_derived_facts = false;
 	// Forward scaffolding — parsed but not yet consumed by emission. See compile_facts plan.
-	vector<string> source_constraints; // e.g. "table:PK(col)", "t:FK(col)->u(col)"
-	vector<string> partitioning;       // e.g. "table:partition(col,...)"
+	vector<string> source_constraints;  // e.g. "table:PK(col)", "t:FK(col)->u(col)"
+	vector<string> partitioning;        // e.g. "table:partition(col,...)"
 	vector<string> target_capabilities; // e.g. "MERGE", "DELETION_VECTORS", "ROWID"
 
 	// ---- Per-batch facts (vary each refresh; from the "batch" object) ----

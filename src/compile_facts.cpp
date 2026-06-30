@@ -162,8 +162,7 @@ bool ExtractJsonStringArray(const string &json, const string &key, vector<string
 	pos += needle.size();
 	out.clear();
 	while (pos < json.size()) {
-		while (pos < json.size() &&
-		       (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == ',')) {
+		while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == ',')) {
 			pos++;
 		}
 		if (pos < json.size() && json[pos] == ']') {
