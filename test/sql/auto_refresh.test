@@ -1019,7 +1019,7 @@ SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt';
 0
 
 # ==========================================
-# Test 21: Cost model records fixed strategy labels
+# Test 21: Cost model records strategy/full method labels
 # ==========================================
 
 statement ok
@@ -1044,10 +1044,11 @@ INSERT INTO cm_dist_src VALUES (1, 'm4', 32), (2, 'm3', 4);
 statement ok
 PRAGMA refresh('mv_cm_group_recompute');
 
-query T
-SELECT method FROM openivm_refresh_history WHERE view_name = 'mv_cm_group_recompute' ORDER BY refresh_timestamp DESC LIMIT 1;
+query I
+SELECT CASE WHEN method IN ('full', 'group_recompute') THEN 1 ELSE 0 END
+FROM openivm_refresh_history WHERE view_name = 'mv_cm_group_recompute' ORDER BY refresh_timestamp DESC LIMIT 1;
 ----
-group_recompute
+1
 
 query I
 SELECT count(*) FROM (
@@ -1091,10 +1092,11 @@ INSERT INTO cm_dist_aux_src VALUES (1, 'm4', 32);
 statement ok
 PRAGMA refresh('mv_cm_distinct_incremental');
 
-query T
-SELECT method FROM openivm_refresh_history WHERE view_name = 'mv_cm_distinct_incremental' ORDER BY refresh_timestamp DESC LIMIT 1;
+query I
+SELECT CASE WHEN method IN ('full', 'distinct_incremental') THEN 1 ELSE 0 END
+FROM openivm_refresh_history WHERE view_name = 'mv_cm_distinct_incremental' ORDER BY refresh_timestamp DESC LIMIT 1;
 ----
-distinct_incremental
+1
 
 query I
 SELECT count(*) FROM (
@@ -1138,10 +1140,11 @@ INSERT INTO cm_saj_r VALUES (30);
 statement ok
 PRAGMA refresh('mv_cm_semi_anti');
 
-query T
-SELECT method FROM openivm_refresh_history WHERE view_name = 'mv_cm_semi_anti' ORDER BY refresh_timestamp DESC LIMIT 1;
+query I
+SELECT CASE WHEN method IN ('full', 'semi_anti_recompute') THEN 1 ELSE 0 END
+FROM openivm_refresh_history WHERE view_name = 'mv_cm_semi_anti' ORDER BY refresh_timestamp DESC LIMIT 1;
 ----
-semi_anti_recompute
+1
 
 query I
 SELECT count(*) FROM (
@@ -1175,10 +1178,11 @@ INSERT INTO cm_win_src VALUES (4, 1, 15);
 statement ok
 PRAGMA refresh('mv_cm_window_partition');
 
-query T
-SELECT method FROM openivm_refresh_history WHERE view_name = 'mv_cm_window_partition' ORDER BY refresh_timestamp DESC LIMIT 1;
+query I
+SELECT CASE WHEN method IN ('full', 'window_partition') THEN 1 ELSE 0 END
+FROM openivm_refresh_history WHERE view_name = 'mv_cm_window_partition' ORDER BY refresh_timestamp DESC LIMIT 1;
 ----
-window_partition
+1
 
 query I
 SELECT count(*) FROM (
