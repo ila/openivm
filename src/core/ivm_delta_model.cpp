@@ -85,7 +85,7 @@ static vector<string> SourceTablesFromChildren(const DeltaViewModel &model, cons
 	return tables;
 }
 
-DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
+static DeltaModelNodeKind NodeKindForOperatorInternal(LogicalOperator &op) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET:
 		return DeltaModelNodeKind::SCAN;
@@ -347,7 +347,7 @@ static idx_t BuildModelNodeForPlan(DeltaViewModel &model, LogicalOperator *op, c
 	}
 
 	DeltaModelNode node;
-	node.kind = NodeKindForOperator(*op);
+	node.kind = NodeKindForOperatorInternal(*op);
 	node.rule = RuleKindForNode(node.kind, *op, model, facts.analysis);
 	node.plan_node = op;
 	node.children = std::move(children);
@@ -521,6 +521,10 @@ AsofWindowPartitionReadsRightSideDirectly(const vector<RefreshMetadata::WindowPa
 }
 
 } // namespace
+
+DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
+	return NodeKindForOperatorInternal(op);
+}
 
 const char *DeltaMaintenanceModeName(DeltaMaintenanceMode mode) {
 	switch (mode) {
