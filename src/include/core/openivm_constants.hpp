@@ -56,10 +56,9 @@ constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";
 // Limits
 static constexpr idx_t MAX_JOIN_TABLES = 16;
 
-// Optimizer settings disabled when planning a view query into a delta-maintenance template.
-// The old-main helper name is retained for later compatibility, but this Raki-based branch keeps
-// column_lifetime disabled with statistics_propagation.
-constexpr const char *TEMPLATE_DATA_DEPENDENT_OPTIMIZERS = "column_lifetime, statistics_propagation";
+// Data-dependent optimizers disabled when planning a view query into a delta-maintenance template.
+// column_lifetime is structural/data-independent and stays enabled.
+constexpr const char *TEMPLATE_DATA_DEPENDENT_OPTIMIZERS = "statistics_propagation";
 constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 
 // Disabled wherever the deeply-nested generated refresh SQL is planned/executed. deliminator
