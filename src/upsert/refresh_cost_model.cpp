@@ -1,6 +1,7 @@
 #include "upsert/refresh_cost_model.hpp"
 #include <cmath>
 #include <unordered_set>
+#include "core/ivm_delta_model.hpp"
 #include "core/ivm_view_classifier.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/refresh_metadata.hpp"

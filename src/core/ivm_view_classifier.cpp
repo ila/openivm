@@ -6,6 +6,7 @@
 #include "rules/column_hider.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 
 #include <unordered_set>
 
@@ -323,6 +324,23 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	if (analysis.found_semi_anti_join && analysis.found_aggregation && !model.group_columns.empty()) {
 		AddUnique(model.strategy_reasons, DeltaStrategyReason::SEMI_ANTI_AGGREGATE_GROUP_FALLBACK);
 	}
+}
+
+static LogicalOperator *SkipToViewBody(LogicalOperator *op) {
+	while (op && !op->children.empty() &&
+	       (op->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
+	        op->type == LogicalOperatorType::LOGICAL_PROJECTION)) {
+		op = op->children[0].get();
+	}
+	return op;
+}
+
+static bool TopLevelIsUngroupedAggregate(LogicalOperator *root) {
+	auto *op = SkipToViewBody(root);
+	if (!op || op->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return false;
+	}
+	return op->Cast<LogicalAggregate>().groups.empty();
 }
 
 static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {

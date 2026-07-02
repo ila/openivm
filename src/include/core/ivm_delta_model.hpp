@@ -8,6 +8,7 @@ namespace duckdb {
 const char *DeltaMaintenanceModeName(DeltaMaintenanceMode mode);
 const char *DeltaMaintenanceStateKindName(DeltaMaintenanceStateKind state);
 
+DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op);
 void BuildDeltaModelNodes(DeltaViewModel &model, const CreateMVPlanFacts &facts, const vector<string> &output_names);
 void BuildDeltaModelBaseAffectedDomains(DeltaViewModel &model, const CreateMVPlanFacts &facts);
 void ValidateDeltaViewModelInvariants(const DeltaViewModel &model);

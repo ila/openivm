@@ -85,7 +85,7 @@ static vector<string> SourceTablesFromChildren(const DeltaViewModel &model, cons
 	return tables;
 }
 
-static DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
+DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET:
 		return DeltaModelNodeKind::SCAN;
