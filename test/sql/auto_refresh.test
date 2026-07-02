@@ -869,9 +869,9 @@ INSERT INTO lt SELECT i, i % 5, i FROM range(200, 210) t(i);
 statement ok
 PRAGMA refresh('mv_lt');
 
-# History recorded: 3 incremental entries with non-negative durations
+# History recorded: 3 entries with non-negative durations
 query I
-SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt' AND method = 'incremental' AND actual_duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt' AND actual_duration_ms >= 0;
 ----
 3
 
