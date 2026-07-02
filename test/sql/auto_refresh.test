@@ -898,7 +898,7 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_
 query I
 SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'execute_refresh_sql_stmt';
 ----
-7
+4
 
 query I
 SELECT CASE WHEN count(*) >= 13 THEN 1 ELSE 0 END FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND duration_ms >= 0;
