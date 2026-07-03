@@ -626,6 +626,91 @@ static string SparkPortableTimestampCasts(const string &sql) {
 	return std::regex_replace(sql, timestamp_cast_regex, "CAST($1 AS TIMESTAMP)");
 }
 
+static bool LooksLikeLastValueIgnoreNulls(const string &sql) {
+	static const std::regex last_value_regex(
+	    R"((last_value|last)\s*\([^)]*,\s*(true|1)\s*\)\s*over\s*\([^)]*partition\s+by[^)]*order\s+by[^)]*\))",
+	    std::regex_constants::icase);
+	static const std::regex ignore_nulls_regex(
+	    R"((last_value|last)\s*\([^)]*\)\s+ignore\s+nulls\s+over\s*\([^)]*partition\s+by[^)]*order\s+by[^)]*\))",
+	    std::regex_constants::icase);
+	static const std::regex arg_ignore_nulls_regex(
+	    R"((last_value|last)\s*\([^)]*ignore\s+nulls[^)]*\)\s*over\s*\([^)]*partition\s+by[^)]*order\s+by[^)]*\))",
+	    std::regex_constants::icase);
+	return std::regex_search(sql, last_value_regex) || std::regex_search(sql, ignore_nulls_regex) ||
+	       std::regex_search(sql, arg_ignore_nulls_regex);
+}
+
+static string BuildLastValueStateRefreshSQL(const string &view_name, const string &view_query_sql,
+                                            const string &delta_ts_filter, const string &catalog_prefix,
+                                            const vector<string> &partition_columns,
+                                            const vector<WindowPartitionDeltaSpec> &partition_delta_specs,
+                                            const string &affected_keys_sql, const string &affected_key_cols,
+                                            const string &affected_key_tuple, bool emit_cascade_delta) {
+	bool have_affected_keys = !affected_keys_sql.empty() && !affected_key_cols.empty() && !affected_key_tuple.empty();
+	if (!LooksLikeLastValueIgnoreNulls(view_query_sql) || (!have_affected_keys && partition_delta_specs.empty())) {
+		return "";
+	}
+	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
+	string state_table = catalog_prefix + SqlUtils::QuoteIdentifier("openivm_aux_run_state_" + view_name);
+	string affected_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
+	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
+	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
+	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + SparkPortableTimestampCasts(delta_ts_filter);
+	string affected_filter;
+	string state_delete_filter;
+	string sql;
+	if (have_affected_keys) {
+		sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS " + affected_keys_sql + ";\n\n";
+		affected_filter = affected_key_tuple + " IN (SELECT " + affected_key_cols + " FROM " + affected_table + ")";
+		state_delete_filter = "EXISTS (SELECT 1 FROM " + affected_table + " fk WHERE " +
+		                      SqlUtils::BuildNullSafeMatch(partition_columns, "st", "fk") + ")";
+	} else {
+		string key_cols;
+		string key_tuple;
+		string arms;
+		vector<string> output_keys;
+		for (idx_t i = 0; i < partition_delta_specs.size(); i++) {
+			const auto &spec = partition_delta_specs[i];
+			if (i > 0) {
+				key_cols += ", ";
+				key_tuple += ", ";
+				arms += " UNION ALL ";
+			}
+			key_cols += SqlUtils::QuoteIdentifier(spec.output_column);
+			key_tuple += SqlUtils::QuoteIdentifier(spec.output_column);
+			output_keys.push_back(spec.output_column);
+			string delta_q = spec.delta_table_sql.empty() ? SqlUtils::QuoteIdentifier(spec.delta_table) : spec.delta_table_sql;
+			arms += "SELECT " + SqlUtils::QuoteIdentifier(spec.source_column) + " AS " +
+			        SqlUtils::QuoteIdentifier(spec.output_column) + " FROM " + delta_q + delta_where;
+		}
+		sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS SELECT DISTINCT " + key_cols + " FROM (" +
+		       arms + ") openivm_last_value_changed;\n\n";
+		affected_filter = partition_columns.size() == 1 ? key_tuple + " IN (SELECT " + key_cols + " FROM " + affected_table + ")"
+		                                               : "(" + key_tuple + ") IN (SELECT " + key_cols + " FROM " + affected_table + ")";
+		state_delete_filter = "EXISTS (SELECT 1 FROM " + affected_table + " fk WHERE " +
+		                      SqlUtils::BuildNullSafeMatch(output_keys, "st", "fk") + ")";
+	}
+	sql += "CREATE TABLE IF NOT EXISTS " + state_table + " AS\nSELECT * FROM " + data_table + " WHERE 1=0;\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + " WHERE " +
+	       affected_filter + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+	       ") openivm_recompute WHERE " + affected_filter + ";\n\n";
+	sql += "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
+	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n\n";
+	if (emit_cascade_delta) {
+		sql += BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+	}
+	sql += "DELETE FROM " + state_table + " st WHERE " + state_delete_filter + ";\n";
+	sql += "INSERT INTO " + state_table + "\nSELECT * FROM " + data_table + " WHERE " + affected_filter + ";\n\n";
+	sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + affected_table + ";\n";
+	OPENIVM_DEBUG_PRINT("[CompileLastValueState] view=%s partitions=%zu cascade=%d\n", view_name.c_str(),
+	                    partition_columns.size(), emit_cascade_delta);
+	return sql;
+}
+
 static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const string &view_query_sql,
                                                  const string &delta_ts_filter, const string &catalog_prefix,
                                                  const vector<string> &partition_columns,
@@ -1342,7 +1427,7 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta,
                               const string &affected_keys_sql, const string &affected_key_cols,
                               const string &affected_key_tuple, const vector<string> &column_names,
-                              bool running_window_incremental) {
+                              bool running_window_incremental, bool last_value_state_incremental) {
 	bool have_affected_keys = !affected_keys_sql.empty() && !affected_key_cols.empty() && !affected_key_tuple.empty();
 	if (!have_affected_keys && (partition_columns.empty() || partition_delta_specs.empty())) {
 		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
@@ -1353,6 +1438,14 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		                                                     emit_cascade_delta);
 		if (!suffix_sql.empty()) {
 			return suffix_sql;
+		}
+	}
+	if (last_value_state_incremental) {
+		auto last_value_sql = BuildLastValueStateRefreshSQL(view_name, view_query_sql, delta_ts_filter, catalog_prefix,
+		                                                    partition_columns, partition_delta_specs, affected_keys_sql,
+		                                                    affected_key_cols, affected_key_tuple, emit_cascade_delta);
+		if (!last_value_sql.empty()) {
+			return last_value_sql;
 		}
 	}
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));

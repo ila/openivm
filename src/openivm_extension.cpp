@@ -201,6 +201,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_running_window_incremental",
 	                             "extend cumulative running window aggregates for append-only suffix batches",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_last_value_state_incremental",
+	                             "maintain LAST_VALUE/LAST IGNORE NULLS window partitions with aux backing state",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("openivm_having_merge",
 	                             "use MERGE for HAVING views (store all groups, VIEW filters) "
 	                             "instead of group-recompute",

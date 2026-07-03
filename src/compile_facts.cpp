@@ -299,6 +299,7 @@ CompileFacts ParseFactsJson(const string &json) {
 	ExtractJsonBool(json, "assume_insert_only", out.assume_insert_only);
 	ExtractDeltaShapeObject(json, out.delta_shape);
 	ExtractJsonBool(json, "running_window_incremental", out.running_window_incremental);
+	ExtractJsonBool(json, "last_value_state_incremental", out.last_value_state_incremental);
 	ExtractJsonBool(json, "scd2_range_join_accel", out.scd2_range_join_accel);
 	ExtractJsonBool(json, "emit_spark_hints", out.emit_spark_hints);
 
