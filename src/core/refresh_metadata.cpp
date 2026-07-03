@@ -783,8 +783,7 @@ bool RefreshMetadata::GetCountDistinctAuxMeta(const string &view_name, CountDist
 }
 
 string RefreshMetadata::CountDistinctAuxMetaToJson(const CountDistinctAuxMeta &meta) {
-	return "{\"aux_table\":" + SqlUtils::JsonQuote(meta.aux_table) +
-	       ",\"source\":" + SqlUtils::JsonQuote(meta.source) +
+	return "{\"aux_table\":" + SqlUtils::JsonQuote(meta.aux_table) + ",\"source\":" + SqlUtils::JsonQuote(meta.source) +
 	       ",\"group_cols\":" + SqlUtils::JsonArray(meta.group_cols) +
 	       ",\"group_source_exprs\":" + SqlUtils::JsonArray(meta.group_source_exprs) +
 	       ",\"distinct_col\":" + SqlUtils::JsonQuote(meta.distinct_col) +

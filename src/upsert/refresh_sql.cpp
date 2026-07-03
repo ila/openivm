@@ -421,8 +421,7 @@ static string ApplyScd2RangeJoinAccel(const string &sql) {
 				for (auto &delta_cte : ctes) {
 					for (auto &ts_alias : delta_cte.columns) {
 						auto ts = ResolveRefreshColumnAlias(ctes, ts_alias);
-						if (!ts.ok || ts.source_column != "ts" ||
-						    ts.relation.find("openivm_delta_") == string::npos) {
+						if (!ts.ok || ts.source_column != "ts" || ts.relation.find("openivm_delta_") == string::npos) {
 							continue;
 						}
 						if (!ContainsRangePredicate(sql, effective_alias, end_alias, ts_alias)) {
@@ -442,9 +441,9 @@ static string ApplyScd2RangeJoinAccel(const string &sql) {
 						                ts.relation + " WHERE " + delta_where + ")) AND (" + effective.source_column +
 						                " <= (SELECT MAX(" + ts.source_column + ") FROM " + ts.relation + " WHERE " +
 						                delta_where + "))";
-						injections.push_back({ctes[effective.cte_index].body_end,
-						                      string(ctes[effective.cte_index].has_where ? " AND " : " WHERE ") +
-						                          filter});
+						injections.push_back(
+						    {ctes[effective.cte_index].body_end,
+						     string(ctes[effective.cte_index].has_where ? " AND " : " WHERE ") + filter});
 						injected_ctes.insert(effective.cte_index);
 					}
 				}
@@ -456,9 +455,8 @@ static string ApplyScd2RangeJoinAccel(const string &sql) {
 		return sql;
 	}
 	string result = sql;
-	std::sort(injections.begin(), injections.end(), [](const Injection &a, const Injection &b) {
-		return a.pos > b.pos;
-	});
+	std::sort(injections.begin(), injections.end(),
+	          [](const Injection &a, const Injection &b) { return a.pos > b.pos; });
 	for (auto &injection : injections) {
 		result.insert(injection.pos, injection.text);
 	}
@@ -1095,7 +1093,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			    internal_catalog_prefix);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: COUNT_DISTINCT_INCREMENTAL (%zu group cols, "
 			                    "distinct=%s, out=%s)\n",
-			                    aux_meta.group_cols.size(), aux_meta.distinct_expr.c_str(), aux_meta.output_col.c_str());
+			                    aux_meta.group_cols.size(), aux_meta.distinct_expr.c_str(),
+			                    aux_meta.output_col.c_str());
 			break;
 		}
 	}

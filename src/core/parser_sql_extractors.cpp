@@ -385,7 +385,8 @@ static bool ReadSingleSourceFrom(const string &original_sql, const string &lower
 	    !StartsAnyKeywordToken(lower, after,
 	                           {"where", "group", "order", "having", "limit", "union", "join", "left", "right", "inner",
 	                            "full", "cross", "on"})) {
-		while (after < lower.size() && (std::isalnum(static_cast<unsigned char>(lower[after])) || lower[after] == '_')) {
+		while (after < lower.size() &&
+		       (std::isalnum(static_cast<unsigned char>(lower[after])) || lower[after] == '_')) {
 			after++;
 		}
 		while (after < lower.size() && std::isspace(static_cast<unsigned char>(lower[after]))) {
@@ -393,7 +394,8 @@ static bool ReadSingleSourceFrom(const string &original_sql, const string &lower
 		}
 	}
 	if (after < lower.size() &&
-	    (lower[after] == ',' || StartsAnyKeywordToken(lower, after, {"join", "left", "right", "inner", "full", "cross"}))) {
+	    (lower[after] == ',' ||
+	     StartsAnyKeywordToken(lower, after, {"join", "left", "right", "inner", "full", "cross"}))) {
 		return false;
 	}
 	out_after_source = after;

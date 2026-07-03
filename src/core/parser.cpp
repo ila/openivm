@@ -625,14 +625,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			}
 			CountDistinctExtract cd_extract;
 			if (ExtractCountDistinctAggregate(original_view_query, candidate_group_columns, output_names, cd_extract)) {
-				count_distinct_aux_candidate = {"openivm_aux_" + view_name,
-				                                SqlUtils::LastIdentifierPart(cd_extract.source),
-				                                candidate_group_columns,
-				                                cd_extract.group_exprs,
-				                                cd_extract.distinct_col,
-				                                cd_extract.distinct_expr,
-				                                cd_extract.output_col,
-				                                cd_extract.filter};
+				count_distinct_aux_candidate = {
+				    "openivm_aux_" + view_name, SqlUtils::LastIdentifierPart(cd_extract.source),
+				    candidate_group_columns,    cd_extract.group_exprs,
+				    cd_extract.distinct_col,    cd_extract.distinct_expr,
+				    cd_extract.output_col,      cd_extract.filter};
 				model_input.count_distinct_aux_candidate = &count_distinct_aux_candidate;
 			} else {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] COUNT_DISTINCT_INCREMENTAL extractor failed — demoting to "
@@ -880,7 +877,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(meta.aux_table);
 		string aux_create =
 		    BuildCountDistinctAuxStateCreateSQL(aux_target, source_table, meta.group_cols, meta.group_source_exprs,
-		                                       meta.distinct_col, meta.distinct_expr, meta.filter, /*replace=*/false);
+		                                        meta.distinct_col, meta.distinct_expr, meta.filter, /*replace=*/false);
 		ddl.push_back(aux_create);
 		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
 		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));

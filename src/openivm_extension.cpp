@@ -395,28 +395,25 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(refresh_options);
 	auto refresh = PragmaFunction::PragmaCall("refresh", UpsertDeltaQueriesLocked, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh);
-	auto declare_rely_fk =
-	    PragmaFunction::PragmaCall("openivm_declare_rely_fk",
-	                               [](ClientContext &, const FunctionParameters &parameters) -> string {
-		                               string child_table = StringValue::Get(parameters.values[0]);
-		                               auto child_columns = ParsePragmaColumnList(StringValue::Get(parameters.values[1]));
-		                               string parent_table = StringValue::Get(parameters.values[2]);
-		                               auto parent_columns = ParsePragmaColumnList(StringValue::Get(parameters.values[3]));
-		                               if (child_columns.empty() || child_columns.size() != parent_columns.size()) {
-			                               throw InvalidInputException(
-			                                   "openivm_declare_rely_fk requires matching child/parent column lists");
-		                               }
-		                               return "INSERT OR REPLACE INTO " + string(openivm::CONSTRAINTS_CACHE_TABLE) +
-		                                      " (table_name, constraint_kind, columns_json, referenced_table, "
-		                                      "referenced_columns_json, is_trusted) VALUES ('" +
-		                                      SqlUtils::EscapeValue(child_table) + "', 'RELY_FK', '" +
-		                                      SqlUtils::EscapeValue(SqlUtils::JsonArray(child_columns)) + "', '" +
-		                                      SqlUtils::EscapeValue(parent_table) + "', '" +
-		                                      SqlUtils::EscapeValue(SqlUtils::JsonArray(parent_columns)) +
-		                                      "', true);";
-	                               },
-	                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                                LogicalType::VARCHAR});
+	auto declare_rely_fk = PragmaFunction::PragmaCall(
+	    "openivm_declare_rely_fk",
+	    [](ClientContext &, const FunctionParameters &parameters) -> string {
+		    string child_table = StringValue::Get(parameters.values[0]);
+		    auto child_columns = ParsePragmaColumnList(StringValue::Get(parameters.values[1]));
+		    string parent_table = StringValue::Get(parameters.values[2]);
+		    auto parent_columns = ParsePragmaColumnList(StringValue::Get(parameters.values[3]));
+		    if (child_columns.empty() || child_columns.size() != parent_columns.size()) {
+			    throw InvalidInputException("openivm_declare_rely_fk requires matching child/parent column lists");
+		    }
+		    return "INSERT OR REPLACE INTO " + string(openivm::CONSTRAINTS_CACHE_TABLE) +
+		           " (table_name, constraint_kind, columns_json, referenced_table, "
+		           "referenced_columns_json, is_trusted) VALUES ('" +
+		           SqlUtils::EscapeValue(child_table) + "', 'RELY_FK', '" +
+		           SqlUtils::EscapeValue(SqlUtils::JsonArray(child_columns)) + "', '" +
+		           SqlUtils::EscapeValue(parent_table) + "', '" +
+		           SqlUtils::EscapeValue(SqlUtils::JsonArray(parent_columns)) + "', true);";
+	    },
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(declare_rely_fk);
 	auto refresh_cost = PragmaFunction::PragmaCall("refresh_cost", RefreshCostQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cost);

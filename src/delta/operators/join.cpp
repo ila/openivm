@@ -834,11 +834,12 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 	bool has_cache_fk = !has_compile_fk_facts && ConstraintCacheHasTrustedFk(context, leaves);
 	bool fk_pruning_worthwhile = has_compile_fk_facts || has_cache_fk || non_empty_leaf_count == 1;
 	if (fk_pruning_enabled && fk_pruning_worthwhile) {
-		auto fk_relations = has_compile_fk_facts ? DetectCompileFactsFKRelations(compile_facts, leaves, input.plan.get())
-		                                         : DetectFKRelations(context, leaves, input.plan.get());
+		auto fk_relations = has_compile_fk_facts
+		                        ? DetectCompileFactsFKRelations(compile_facts, leaves, input.plan.get())
+		                        : DetectFKRelations(context, leaves, input.plan.get());
 		if (!fk_relations.empty()) {
-			uint64_t insert_only_mask =
-			    has_compile_fk_facts ? ComputeFactsInsertOnlyMask(compile_facts, leaves) : delta_status.insert_only_mask;
+			uint64_t insert_only_mask = has_compile_fk_facts ? ComputeFactsInsertOnlyMask(compile_facts, leaves)
+			                                                 : delta_status.insert_only_mask;
 			skip_bits = ComputeSkipBits(fk_relations, insert_only_mask);
 		}
 	}

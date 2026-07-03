@@ -103,9 +103,9 @@ string CompileCountDistinctIncremental(const string &view_name, const string &au
                                        const string &count_star_col, const string &filter_sql,
                                        const string &catalog_prefix = "");
 string BuildCountDistinctAuxStateCreateSQL(const string &target_table, const string &source_relation,
-                                           const vector<string> &group_cols,
-                                           const vector<string> &group_source_exprs, const string &distinct_col,
-                                           const string &distinct_expr, const string &filter_sql, bool replace);
+                                           const vector<string> &group_cols, const vector<string> &group_source_exprs,
+                                           const string &distinct_col, const string &distinct_expr,
+                                           const string &filter_sql, bool replace);
 
 string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,

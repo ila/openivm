@@ -1,7 +1,8 @@
 # name: test/sql/insert_only_aggregate_group.test
 # description: compile-only insert-only AGGREGATE_GROUP refresh SQL preserves
-#              bag-correct affected-group deltas for SUM/COUNT and MIN/MAX.
 # group: [sql]
+
+#              bag-correct affected-group deltas for SUM/COUNT and MIN/MAX.
 
 require openivm
 

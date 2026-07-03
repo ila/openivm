@@ -964,16 +964,16 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		               " FROM " + delta_view + delta_where + ";\n";
 		cascade_sql += "DROP TABLE IF EXISTS " + old_temp + ";\n";
 		cascade_sql += "CREATE TABLE " + old_temp + " AS SELECT openivm_data.* FROM " + data_table +
-		               " openivm_data WHERE EXISTS (SELECT 1 FROM " + affected_temp +
-		               " openivm_aff WHERE " + affected_match + ");\n";
+		               " openivm_data WHERE EXISTS (SELECT 1 FROM " + affected_temp + " openivm_aff WHERE " +
+		               affected_match + ");\n";
 		cascade_sql += merge_query + "\n";
 		cascade_sql += "DELETE FROM " + delta_view + " WHERE 1=1";
 		if (!delta_ts_filter.empty()) {
 			cascade_sql += " AND " + delta_ts_filter;
 		}
 		cascade_sql += ";\n";
-		cascade_sql += "INSERT INTO " + delta_view + " (" + col_list + ") SELECT " + select_old + " FROM " +
-		               old_temp + " openivm_old;\n";
+		cascade_sql += "INSERT INTO " + delta_view + " (" + col_list + ") SELECT " + select_old + " FROM " + old_temp +
+		               " openivm_old;\n";
 		cascade_sql += "INSERT INTO " + delta_view + " (" + col_list + ") SELECT " + select_new + " FROM " +
 		               data_table + " openivm_new WHERE EXISTS (SELECT 1 FROM " + affected_temp +
 		               " openivm_aff WHERE " + new_match + ");\n";

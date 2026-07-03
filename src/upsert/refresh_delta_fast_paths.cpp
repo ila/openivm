@@ -287,8 +287,8 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 		}
 		OPENIVM_DEBUG_PRINT("[UPSERT] compile_only=true: assume_insert_only=%d insert_only=%d skip_agg_delete=%d "
 		                    "skip_proj_delete=%d minmax_incremental=%d active_sources=%zu\n",
-		                    facts->assume_insert_only, flags.insert_only, flags.skip_agg_delete,
-		                    flags.skip_proj_delete, flags.minmax_incremental, flags.active_delta_table_names.size());
+		                    facts->assume_insert_only, flags.insert_only, flags.skip_agg_delete, flags.skip_proj_delete,
+		                    flags.minmax_incremental, flags.active_delta_table_names.size());
 		return flags;
 	}
 	DeltaActivityResult summary;

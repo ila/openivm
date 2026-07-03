@@ -364,8 +364,8 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (analysis.found_filtered_list) {
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_count_distinct && !model.group_columns.empty()) {
-		model.type = input.count_distinct_aux_candidate ? RefreshType::COUNT_DISTINCT_INCREMENTAL
-		                                                : RefreshType::GROUP_RECOMPUTE;
+		model.type =
+		    input.count_distinct_aux_candidate ? RefreshType::COUNT_DISTINCT_INCREMENTAL : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && !model.distinct_at_top && analysis.found_aggregation) {
 		model.type = model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL) ? RefreshType::DISTINCT_INCREMENTAL
 		                                                                    : RefreshType::GROUP_RECOMPUTE;
