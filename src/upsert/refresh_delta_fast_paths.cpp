@@ -273,12 +273,11 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 	if (facts && facts->compile_only) {
 		DeltaFastPathFlags flags;
 		flags.active_delta_table_names = delta_table_names;
-		// v2 WorkloadFacts: when an external classifier has PROVEN this batch is
-		// append-only, re-enable the insert-only fast paths even under compile_only
-		// (they are otherwise disabled because compile_only sees empty tables and
-		// cannot detect insert-only itself). Honor the same per-setting kill switches
-		// as the normal path so an operator can still force the general signed-delta
-		// SQL. Without the flag we keep the conservative all-delta-shapes SQL.
+		// When an external classifier has PROVEN this batch is append-only,
+		// re-enable the insert-only fast paths even under compile_only (they are
+		// otherwise disabled because compile_only sees empty tables and cannot
+		// detect insert-only itself). Honor the same per-setting kill switches as
+		// the normal path. Without the flag we keep the conservative all-delta SQL.
 		if (facts->assume_insert_only) {
 			flags.insert_only = true;
 			flags.skip_agg_delete = SqlUtils::GetBoolSetting(context, "openivm_skip_aggregate_delete", true);
