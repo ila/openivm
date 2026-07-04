@@ -283,11 +283,19 @@ struct RefreshCteInfo {
 
 static vector<RefreshCteInfo> ParseRefreshCtes(const string &sql) {
 	vector<RefreshCteInfo> ctes;
-	idx_t pos = FindCaseInsensitive(sql, "WITH ");
+	// The LPTS pretty-printer emits the leading keyword as "WITH\n" (newline), not "WITH " (space), so match
+	// "WITH" followed by any SQL whitespace rather than assuming a single trailing space.
+	idx_t pos = string::npos;
+	for (idx_t i = 0; i + 4 <= sql.size(); i++) {
+		if (StringUtil::CIEquals(sql.substr(i, 4), "WITH") && (i + 4 < sql.size() && IsSqlSpace(sql[i + 4]))) {
+			pos = i;
+			break;
+		}
+	}
 	if (pos == string::npos) {
 		return ctes;
 	}
-	pos += 5;
+	pos += 4;
 	while (pos < sql.size()) {
 		while (pos < sql.size() && IsSqlSpace(sql[pos])) {
 			pos++;
@@ -322,12 +330,31 @@ static vector<RefreshCteInfo> ParseRefreshCtes(const string &sql) {
 			break;
 		}
 		string body = sql.substr(cte.body_start, cte.body_end - cte.body_start);
+		// The LPTS pretty-printer indents the CTE body (e.g. "\n    SELECT ...\n    FROM ..."), so the
+		// leading "SELECT" is not at offset 0 and clause keywords are surrounded by arbitrary whitespace.
+		// Locate the leading SELECT after any leading whitespace rather than assuming a fixed layout.
+		idx_t select_pos = FindCaseInsensitive(body, "SELECT ");
+		bool select_leads = select_pos != string::npos;
+		for (idx_t i = 0; i < select_pos && select_leads; i++) {
+			select_leads = IsSqlSpace(body[i]);
+		}
 		idx_t from_pos = FindCaseInsensitive(body, " FROM ");
-		if (from_pos != string::npos && FindCaseInsensitive(body, "SELECT ") == 0) {
-			cte.select_exprs = SplitTopLevelCommaList(body.substr(7, from_pos - 7));
+		if (select_leads && from_pos != string::npos && from_pos > select_pos) {
+			idx_t select_list_start = select_pos + 7;
+			cte.select_exprs = SplitTopLevelCommaList(body.substr(select_list_start, from_pos - select_list_start));
 			idx_t relation_start = from_pos + 6;
 			idx_t where_pos = FindCaseInsensitive(body, " WHERE ", relation_start);
+			// The relation ends at the first trailing clause. Besides WHERE, an aggregate/window CTE body
+			// continues with GROUP BY / HAVING / QUALIFY / WINDOW / ORDER BY / LIMIT — none of which are part
+			// of the source relation. Stopping only at WHERE would fold those clauses into `relation` and
+			// break chain resolution through aggregate CTEs (e.g. "t1_scan GROUP BY ..." != CTE "t1_scan").
 			idx_t relation_end = where_pos == string::npos ? body.size() : where_pos;
+			for (const char *clause : {" GROUP BY ", " HAVING ", " QUALIFY ", " WINDOW ", " ORDER BY ", " LIMIT "}) {
+				idx_t clause_pos = FindCaseInsensitive(body, clause, relation_start);
+				if (clause_pos != string::npos && clause_pos < relation_end) {
+					relation_end = clause_pos;
+				}
+			}
 			cte.relation = TrimCopy(body.substr(relation_start, relation_end - relation_start));
 			cte.has_where = where_pos != string::npos;
 		}

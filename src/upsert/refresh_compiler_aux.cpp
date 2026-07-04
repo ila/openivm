@@ -351,13 +351,51 @@ static bool TryParseRunningWindowPlan(const string &view_query_sql, const vector
 	return true;
 }
 
-static bool TryParseLptsRunningWindowPlan(const string &view_query_sql, const vector<string> &partition_columns,
+// Normalize an LPTS-emitted CTE program into the compact, single-space token stream that the
+// structural navigation in TryParseLptsRunningWindowPlan expects. The LPTS refactor (cwida lpts
+// Release 1.0.0) switched CTE bodies to a multi-line, aligned pretty-print (e.g. "AS (\n    SELECT
+// ...\n    FROM  ...\n)") and renamed CTEs from "scan_0"/"projection_1" to "t0_scan"/"t1_projection".
+// Collapsing whitespace and tightening parentheses restores "AS (SELECT ... source)" so the same
+// find()/rfind() navigation continues to work regardless of the layout. The window/order/partition
+// expressions themselves are re-parsed with whitespace-tolerant regexes, so no information is lost.
+static string NormalizeLptsRunningWindowSql(const string &sql) {
+	string collapsed;
+	collapsed.reserve(sql.size());
+	bool prev_space = false;
+	for (unsigned char c : sql) {
+		if (std::isspace(c)) {
+			if (!prev_space) {
+				collapsed += ' ';
+				prev_space = true;
+			}
+		} else {
+			collapsed += static_cast<char>(c);
+			prev_space = false;
+		}
+	}
+	auto replace_all = [](string &s, const string &from, const string &to) {
+		size_t pos = 0;
+		while ((pos = s.find(from, pos)) != string::npos) {
+			s.replace(pos, from.size(), to);
+			pos += to.size();
+		}
+	};
+	replace_all(collapsed, "( ", "(");
+	replace_all(collapsed, " )", ")");
+	return collapsed;
+}
+
+static bool TryParseLptsRunningWindowPlan(const string &raw_view_query_sql, const vector<string> &partition_columns,
                                           const vector<string> &column_names, RunningWindowPlan &plan) {
+	string view_query_sql = NormalizeLptsRunningWindowSql(raw_view_query_sql);
 	string lower = LowerCopy(view_query_sql);
-	auto scan_pos = lower.find("scan_");
+	// The first CTE in a running-window LPTS program is the base table scan. Locate it via the
+	// leading WITH rather than the CTE name, which the refactor changed from "scan_0" to "t0_scan".
+	auto scan_pos = lower.find("with");
 	if (scan_pos == string::npos) {
 		return false;
 	}
+	scan_pos += 4;
 	auto alias_start = view_query_sql.find('(', scan_pos);
 	if (alias_start == string::npos) {
 		return false;

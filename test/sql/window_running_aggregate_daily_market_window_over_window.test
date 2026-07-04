@@ -72,8 +72,8 @@ SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast_wradwow_mv%'
          AND (SELECT sql FROM fast_insert) LIKE '%MAX(d.dm_high)%'
          AND (SELECT sql FROM fast_insert) LIKE '%CASE WHEN (dm_low) = (fifty_two_week_low) THEN dm_date ELSE CAST(NULL AS DATE) END%'
          AND (SELECT sql FROM fast_insert) LIKE '%CASE WHEN (dm_high) = (fifty_two_week_high) THEN dm_date ELSE CAST(NULL AS DATE) END%'
-         AND (SELECT sql FROM fast_insert) LIKE '%MAX(f.t10_low_date_flag)%'
-         AND (SELECT sql FROM fast_insert) LIKE '%MAX(f.t10_high_date_flag)%'
+         AND (SELECT sql FROM fast_insert) LIKE '%MAX(f.low_date_flag)%'
+         AND (SELECT sql FROM fast_insert) LIKE '%MAX(f.high_date_flag)%'
     THEN 1 ELSE 0 END;
 ----
 1
