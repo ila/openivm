@@ -616,12 +616,24 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				}
 				return false;
 			};
+			auto left_col_already_maps_to_expr = [&](const string &col_name, const string &source_expr) {
+				for (auto &entry : semi_anti_left_expr_overrides) {
+					if (StringUtil::CIEquals(entry.first, col_name) &&
+					    StringUtil::CIEquals(entry.second, source_expr)) {
+						return true;
+					}
+				}
+				return false;
+			};
 			auto add_semi_anti_base_col = [&](const string &col_name) {
 				string source_expr =
 				    semi_anti_extract.left_alias + "." + KeywordHelper::WriteOptionallyQuoted(col_name);
 				if (!ContainsColumnCI(semi_anti_left_cols, col_name)) {
 					add_semi_anti_left_col(col_name);
 					add_semi_anti_expr_override(col_name, source_expr);
+					return;
+				}
+				if (left_col_already_maps_to_expr(col_name, source_expr)) {
 					return;
 				}
 				if (output_alias_is_base_col(col_name)) {

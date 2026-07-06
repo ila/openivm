@@ -1199,6 +1199,85 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Attached catalogs can duplicate information_schema.columns rows for the same
+# table name/schema. Semi/anti aux state must not treat the duplicate base
+# column as an output-alias collision and rewrite the post-filter to a hidden
+# column on the source alias.
+statement ok
+ATTACH ':memory:' AS saj_dup_other;
+
+statement ok
+CREATE TABLE saj_dup_l(o_w_id INT, o_d_id INT, o_id INT, o_carrier_id INT);
+
+statement ok
+CREATE TABLE saj_dup_other.main.saj_dup_l(o_w_id INT, o_d_id INT, o_id INT, o_carrier_id INT);
+
+statement ok
+CREATE TABLE saj_dup_r(no_w_id INT, no_d_id INT, no_o_id INT);
+
+statement ok
+INSERT INTO saj_dup_l VALUES (1, 1, 1, NULL), (1, 1, 2, 7), (1, 1, 3, NULL);
+
+statement ok
+INSERT INTO saj_dup_other.main.saj_dup_l VALUES (9, 9, 9, NULL);
+
+statement ok
+INSERT INTO saj_dup_r VALUES (1, 1, 3);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_saj_dup_exists AS
+    SELECT o.o_w_id, o.o_d_id, o.o_id
+    FROM saj_dup_l o
+    WHERE NOT EXISTS (
+        SELECT 1 FROM saj_dup_r n
+        WHERE n.no_w_id = o.o_w_id
+          AND n.no_d_id = o.o_d_id
+          AND n.no_o_id = o.o_id
+    )
+    AND o.o_carrier_id IS NULL;
+
+statement ok
+INSERT INTO saj_dup_l VALUES (1, 1, 4, NULL), (1, 1, 5, NULL);
+
+statement ok
+INSERT INTO saj_dup_r VALUES (1, 1, 5);
+
+statement ok
+PRAGMA refresh('mv_saj_dup_exists');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT o.o_w_id, o.o_d_id, o.o_id
+    FROM saj_dup_l o
+    WHERE NOT EXISTS (
+        SELECT 1 FROM saj_dup_r n
+        WHERE n.no_w_id = o.o_w_id
+          AND n.no_d_id = o.o_d_id
+          AND n.no_o_id = o.o_id
+    )
+    AND o.o_carrier_id IS NULL
+    EXCEPT ALL SELECT o_w_id, o_d_id, o_id FROM mv_saj_dup_exists
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT o_w_id, o_d_id, o_id FROM mv_saj_dup_exists
+    EXCEPT ALL
+    SELECT o.o_w_id, o.o_d_id, o.o_id
+    FROM saj_dup_l o
+    WHERE NOT EXISTS (
+        SELECT 1 FROM saj_dup_r n
+        WHERE n.no_w_id = o.o_w_id
+          AND n.no_d_id = o.o_d_id
+          AND n.no_o_id = o.o_id
+    )
+    AND o.o_carrier_id IS NULL
+);
+----
+0
+
 # ============================================================
 # Duplicate RHS matches: SEMI should not disappear until the last
 # matching right tuple is deleted; ANTI should not reappear early.
