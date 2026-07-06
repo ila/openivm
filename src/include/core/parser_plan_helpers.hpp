@@ -81,6 +81,10 @@ struct CreateMVPlanFacts {
 	bool has_unsupported_set_operation = false;
 	bool has_repeated_cte_ref_under_join = false;
 	bool has_pivot = false;
+	bool has_filter_above_aggregate = false;
+	bool has_bound_aggregate_filter = false;
+	bool has_hidden_minmax_having_column = false;
+	bool has_computed_minmax_aggregate_projection = false;
 };
 
 string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
@@ -90,10 +94,6 @@ string QualifyCreateSourceTable(const string &table_name, const string &current_
                                 const string &default_db);
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog);
-bool PlanContainsAggregateFilter(LogicalOperator *plan);
-bool PlanContainsBoundAggregateFilter(LogicalOperator *plan);
-bool PlanHasHiddenMinMaxHavingColumn(LogicalOperator *plan);
-bool PlanHasComputedMinMaxAggregateProjection(LogicalOperator *plan);
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols);
 bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t group_index);
 bool RelationExists(Connection &con, const string &qualified_name);

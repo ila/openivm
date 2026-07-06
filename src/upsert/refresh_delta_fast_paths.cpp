@@ -7,11 +7,6 @@
 
 namespace duckdb {
 
-static bool QueryLooksLikeJoin(const string &view_query_sql, const vector<string> &delta_table_names) {
-	return delta_table_names.size() > 1 || view_query_sql.find("JOIN") != string::npos ||
-	       view_query_sql.find("join") != string::npos;
-}
-
 static string DuckLakeChangeContains(const string &key, const string &table_id) {
 	return "COALESCE(list_contains(changes['" + key + "'], '" + table_id + "'), false)";
 }
@@ -239,7 +234,8 @@ DeltaActivityProvider DeltaActivityProvider::Build(RefreshMetadata &metadata, Co
                                                    const string &attached_db_schema_name) {
 	DeltaActivityProvider provider;
 	auto &summary = provider.summary;
-	summary.has_join = QueryLooksLikeJoin(view_query_sql, delta_table_names);
+	(void)view_query_sql;
+	summary.has_join = metadata.HasJoin(view_name) || delta_table_names.size() > 1;
 	for (auto &dt : delta_table_names) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
 			AccumulateDuckLakeDeltaSummary(summary, metadata, con, view_name, dt, view_catalog_name, view_schema_name,

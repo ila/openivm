@@ -380,7 +380,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// before OpenIVM's structural rewrites.
 		auto select_rewrite_start = create_profile_now();
 		InlineCtesIfPresent(context, *select_planner.binder, select_plan);
-		pre_rewrite_has_aggregate_filter = PlanContainsBoundAggregateFilter(select_plan.get());
+		auto pre_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
+		pre_rewrite_has_aggregate_filter = pre_rewrite_facts.has_bound_aggregate_filter;
 
 		// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 		PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
@@ -389,9 +390,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 		having_predicate = StripHavingFilter(select_plan, output_names);
-		stored_query_has_aggregate_filter = PlanContainsAggregateFilter(select_plan.get());
-		has_hidden_minmax_having = PlanHasHiddenMinMaxHavingColumn(select_plan.get());
-		has_computed_minmax_aggregate_projection = PlanHasComputedMinMaxAggregateProjection(select_plan.get());
+		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
+		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
+		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
+		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
 
 		// Keep data tables unlimited/unordered; apply ORDER BY/LIMIT in the user-facing view.
 		{
@@ -976,13 +978,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	}
 
 	metadata_ddl.push_back("insert or replace into " + string(openivm::VIEWS_TABLE) +
-	                       " (view_name, sql_string, type, has_minmax, has_left_join, last_update, "
+	                       " (view_name, sql_string, type, has_minmax, has_left_join, has_join, last_update, "
 	                       "refresh_interval, refresh_in_progress, group_columns, aggregate_types, "
 	                       "having_predicate, group_recompute_affected_mode, "
 	                       "group_recompute_source_occurrences_json, has_full_outer, full_outer_join_cols) values ('" +
 	                       view_name + "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
 	                       to_string((int)refresh_type) + ", " + (has_minmax_metadata ? "true" : "false") + ", " +
-	                       (analysis.found_left_join ? "true" : "false") + ", now(), " + refresh_val + ", false, " +
+	                       (analysis.found_left_join ? "true" : "false") + ", " +
+	                       (analysis.found_join ? "true" : "false") + ", now(), " + refresh_val + ", false, " +
 	                       group_cols_val + ", " + agg_types_val + ", " + having_val + ", " + group_recompute_mode_val +
 	                       ", " + group_recompute_source_occurrences_val + ", " +
 	                       (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");

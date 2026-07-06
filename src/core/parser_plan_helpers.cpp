@@ -280,6 +280,12 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		seen_agg_above = true;
 		auto &agg = op->Cast<LogicalAggregate>();
 		facts.aggregates.push_back(&agg);
+		for (auto &expr : agg.expressions) {
+			if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE &&
+			    expr->Cast<BoundAggregateExpression>().filter) {
+				facts.has_bound_aggregate_filter = true;
+			}
+		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_UNION) {
 		if (!seen_agg_above) {
 			facts.has_union_before_aggregate = true;
@@ -290,6 +296,10 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		facts.has_unsupported_set_operation = true;
 	} else if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
 		facts.has_pivot = true;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_FILTER && !op->children.empty() &&
+	    op->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		facts.has_filter_above_aggregate = true;
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN || op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
@@ -379,6 +389,67 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		facts.first_table_name[op] = first_table;
 	}
 	return first_table;
+}
+
+static bool IsHiddenHavingColumn(const string &name) {
+	return StringUtil::StartsWith(name, "openivm_having_");
+}
+
+static bool IsMinMaxAggregateColumn(const BoundColumnRefExpression &column_ref,
+                                    const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
+	auto aggregate_it = aggregates.find(column_ref.binding.table_index);
+	if (aggregate_it == aggregates.end()) {
+		return false;
+	}
+	auto &aggregate = *aggregate_it->second;
+	if (column_ref.binding.column_index >= aggregate.expressions.size()) {
+		return false;
+	}
+	auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
+	if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+		return false;
+	}
+	auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
+	return bound_aggregate.function.name == "min" || bound_aggregate.function.name == "max";
+}
+
+static bool ExpressionReferencesMinMaxAggregate(Expression &expr,
+                                                const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
+	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
+		return IsMinMaxAggregateColumn(column_ref, aggregates);
+	}
+
+	bool found = false;
+	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
+		if (!found && ExpressionReferencesMinMaxAggregate(child, aggregates)) {
+			found = true;
+		}
+	});
+	return found;
+}
+
+static void FinalizeCreateMVPlanFacts(CreateMVPlanFacts &facts) {
+	unordered_map<idx_t, LogicalAggregate *> aggregates;
+	for (auto *aggregate : facts.aggregates) {
+		aggregates[aggregate->aggregate_index] = aggregate;
+	}
+	if (aggregates.empty()) {
+		return;
+	}
+	for (auto *projection : facts.projections) {
+		for (auto &expr : projection->expressions) {
+			if (expr->expression_class == ExpressionClass::BOUND_COLUMN_REF && IsHiddenHavingColumn(expr->alias)) {
+				auto &column_ref = expr->Cast<BoundColumnRefExpression>();
+				if (IsMinMaxAggregateColumn(column_ref, aggregates)) {
+					facts.has_hidden_minmax_having_column = true;
+				}
+			} else if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF &&
+			           ExpressionReferencesMinMaxAggregate(*expr, aggregates)) {
+				facts.has_computed_minmax_aggregate_projection = true;
+			}
+		}
+	}
 }
 
 static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
@@ -756,176 +827,9 @@ CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &cu
 	facts.analysis = AnalyzePlan(plan);
 	unordered_map<string, idx_t> next_occurrence;
 	CollectCreateMVPlanFacts(plan, current_catalog, facts, next_occurrence, false, false);
+	FinalizeCreateMVPlanFacts(facts);
 	AddJoinEdgesFromFacts(facts);
 	return facts;
-}
-
-bool PlanContainsAggregateFilter(LogicalOperator *plan) {
-	if (!plan) {
-		return false;
-	}
-	if (plan->type == LogicalOperatorType::LOGICAL_FILTER && !plan->children.empty() &&
-	    plan->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		return true;
-	}
-	for (auto &child : plan->children) {
-		if (PlanContainsAggregateFilter(child.get())) {
-			return true;
-		}
-	}
-	return false;
-}
-
-bool PlanContainsBoundAggregateFilter(LogicalOperator *plan) {
-	if (!plan) {
-		return false;
-	}
-	if (plan->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		auto &aggregate = plan->Cast<LogicalAggregate>();
-		for (auto &expr : aggregate.expressions) {
-			if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE &&
-			    expr->Cast<BoundAggregateExpression>().filter) {
-				return true;
-			}
-		}
-	}
-	for (auto &child : plan->children) {
-		if (PlanContainsBoundAggregateFilter(child.get())) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static void CollectAggregatesByIndex(LogicalOperator *plan, unordered_map<idx_t, LogicalAggregate *> &aggregates) {
-	if (!plan) {
-		return;
-	}
-	if (plan->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		auto &aggregate = plan->Cast<LogicalAggregate>();
-		aggregates[aggregate.aggregate_index] = &aggregate;
-	}
-	for (auto &child : plan->children) {
-		CollectAggregatesByIndex(child.get(), aggregates);
-	}
-}
-
-static bool IsHiddenHavingColumn(const string &name) {
-	return StringUtil::StartsWith(name, "openivm_having_");
-}
-
-bool PlanHasHiddenMinMaxHavingColumn(LogicalOperator *plan) {
-	unordered_map<idx_t, LogicalAggregate *> aggregates;
-	CollectAggregatesByIndex(plan, aggregates);
-	if (aggregates.empty()) {
-		return false;
-	}
-
-	bool found = false;
-	std::function<void(LogicalOperator *)> find_hidden_minmax;
-	find_hidden_minmax = [&](LogicalOperator *node) {
-		if (!node || found) {
-			return;
-		}
-		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-			auto &projection = node->Cast<LogicalProjection>();
-			for (auto &expr : projection.expressions) {
-				if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF || !IsHiddenHavingColumn(expr->alias)) {
-					continue;
-				}
-				auto &column_ref = expr->Cast<BoundColumnRefExpression>();
-				auto aggregate_it = aggregates.find(column_ref.binding.table_index);
-				if (aggregate_it == aggregates.end()) {
-					continue;
-				}
-				auto &aggregate = *aggregate_it->second;
-				if (column_ref.binding.column_index >= aggregate.expressions.size()) {
-					continue;
-				}
-				auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
-				if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
-					continue;
-				}
-				auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
-				if (bound_aggregate.function.name == "min" || bound_aggregate.function.name == "max") {
-					found = true;
-					return;
-				}
-			}
-		}
-		for (auto &child : node->children) {
-			find_hidden_minmax(child.get());
-		}
-	};
-	find_hidden_minmax(plan);
-	return found;
-}
-
-static bool IsMinMaxAggregateColumn(const BoundColumnRefExpression &column_ref,
-                                    const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
-	auto aggregate_it = aggregates.find(column_ref.binding.table_index);
-	if (aggregate_it == aggregates.end()) {
-		return false;
-	}
-	auto &aggregate = *aggregate_it->second;
-	if (column_ref.binding.column_index >= aggregate.expressions.size()) {
-		return false;
-	}
-	auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
-	if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
-		return false;
-	}
-	auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
-	return bound_aggregate.function.name == "min" || bound_aggregate.function.name == "max";
-}
-
-static bool ExpressionReferencesMinMaxAggregate(Expression &expr,
-                                                const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
-	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
-		return IsMinMaxAggregateColumn(column_ref, aggregates);
-	}
-
-	bool found = false;
-	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
-		if (!found && ExpressionReferencesMinMaxAggregate(child, aggregates)) {
-			found = true;
-		}
-	});
-	return found;
-}
-
-bool PlanHasComputedMinMaxAggregateProjection(LogicalOperator *plan) {
-	unordered_map<idx_t, LogicalAggregate *> aggregates;
-	CollectAggregatesByIndex(plan, aggregates);
-	if (aggregates.empty()) {
-		return false;
-	}
-
-	bool found = false;
-	std::function<void(LogicalOperator *)> find_computed_minmax;
-	find_computed_minmax = [&](LogicalOperator *node) {
-		if (!node || found) {
-			return;
-		}
-		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-			auto &projection = node->Cast<LogicalProjection>();
-			for (auto &expr : projection.expressions) {
-				if (expr->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-					continue;
-				}
-				if (ExpressionReferencesMinMaxAggregate(*expr, aggregates)) {
-					found = true;
-					return;
-				}
-			}
-		}
-		for (auto &child : node->children) {
-			find_computed_minmax(child.get());
-		}
-	};
-	find_computed_minmax(plan);
-	return found;
 }
 
 static bool FindProjectionPath(const ProjectionSourceOccurrence &source, const OccurrenceColumnRef &key_ref,

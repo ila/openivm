@@ -34,6 +34,9 @@ public:
 	// Check if the view involves a LEFT/RIGHT JOIN.
 	bool HasLeftJoin(const string &view_name);
 
+	// Check if the view involves any join operator.
+	bool HasJoin(const string &view_name);
+
 	// Check if the view involves a FULL OUTER JOIN.
 	bool HasFullOuter(const string &view_name);
 

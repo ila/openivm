@@ -52,6 +52,15 @@ bool RefreshMetadata::HasLeftJoin(const string &view_name) {
 	return result->GetValue(0, 0).GetValue<bool>();
 }
 
+bool RefreshMetadata::HasJoin(const string &view_name) {
+	auto result = con.Query("SELECT has_join FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return HasLeftJoin(view_name) || HasFullOuter(view_name);
+	}
+	return result->GetValue(0, 0).GetValue<bool>();
+}
+
 bool RefreshMetadata::HasFullOuter(const string &view_name) {
 	auto result = con.Query("SELECT has_full_outer FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
