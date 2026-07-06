@@ -264,6 +264,14 @@ public:
 	bool GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out);
 	static string ProjectionKeyLineageToJson(const ProjectionKeyLineage &lineage);
 
+	struct LeftJoinNullableSources {
+		vector<string> tables;
+		bool complete = false;
+	};
+
+	bool GetLeftJoinNullableSources(const string &view_name, LeftJoinNullableSources &out);
+	static string LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src);
+
 	struct FilteredGroupCountAuxMeta {
 		string aux_table;
 		string source;

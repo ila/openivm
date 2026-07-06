@@ -22,6 +22,8 @@
 #include "storage/ducklake_scan.hpp"
 #include "storage/ducklake_table_entry.hpp"
 
+#include <set>
+
 namespace duckdb {
 
 /// Build "ORDER BY col1 ASC, col2 DESC LIMIT k [OFFSET n]".
@@ -972,6 +974,87 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 		return true;
 	}
 	return false;
+}
+
+static string NullableGetTableName(LogicalGet &get) {
+	auto table = get.GetTable();
+	if (table.get() && !table.get()->name.empty()) {
+		return table.get()->name;
+	}
+	if (get.function.name == "ducklake_scan" && get.function.function_info) {
+		return get.function.function_info->Cast<DuckLakeFunctionInfo>().table_name;
+	}
+	return "";
+}
+
+static string NormalizeNullableTableName(const string &table_name) {
+	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
+	static const string delta_prefix(openivm::DELTA_PREFIX);
+	string last = SqlUtils::LastIdentifierPart(table_name);
+	if (last.size() > data_prefix.size() && last.rfind(data_prefix, 0) == 0) {
+		last = last.substr(data_prefix.size());
+	}
+	if (last.size() > delta_prefix.size() && last.rfind(delta_prefix, 0) == 0) {
+		last = last.substr(delta_prefix.size());
+	}
+	return StringUtil::Lower(last);
+}
+
+static void CollectNullableBaseTables(LogicalOperator *node, std::set<string> &out, bool &complete, int depth) {
+	if (!node || depth > 64) {
+		complete = false;
+		return;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_GET) {
+		string table_name = NullableGetTableName(node->Cast<LogicalGet>());
+		if (table_name.empty()) {
+			complete = false;
+			return;
+		}
+		out.insert(NormalizeNullableTableName(table_name));
+		return;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		complete = false;
+		return;
+	}
+	for (auto &child : node->children) {
+		CollectNullableBaseTables(child.get(), out, complete, depth + 1);
+	}
+}
+
+bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinNullableSources &out) {
+	out.tables.clear();
+	out.complete = true;
+	std::set<string> tables;
+	bool found_any = false;
+	vector<LogicalOperator *> stack;
+	if (facts.root) {
+		stack.push_back(facts.root);
+	}
+	while (!stack.empty()) {
+		auto *node = stack.back();
+		stack.pop_back();
+		auto *join = dynamic_cast<LogicalJoin *>(node);
+		if (join && node->children.size() >= 2) {
+			if (join->join_type == JoinType::LEFT) {
+				found_any = true;
+				CollectNullableBaseTables(node->children[1].get(), tables, out.complete, 0);
+			} else if (join->join_type == JoinType::RIGHT) {
+				found_any = true;
+				CollectNullableBaseTables(node->children[0].get(), tables, out.complete, 0);
+			} else if (join->join_type == JoinType::OUTER) {
+				found_any = true;
+				CollectNullableBaseTables(node->children[0].get(), tables, out.complete, 0);
+				CollectNullableBaseTables(node->children[1].get(), tables, out.complete, 0);
+			}
+		}
+		for (auto &child : node->children) {
+			stack.push_back(child.get());
+		}
+	}
+	out.tables.assign(tables.begin(), tables.end());
+	return found_any;
 }
 
 struct WindowLineageOp {

@@ -1,0 +1,166 @@
+# name: test/sql/left_join_preserved_append.test
+# description: LEFT JOIN SIMPLE_PROJECTION preserved-side insert-only append fast path
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE ljpa_sec(sym VARCHAR, ckey INT);
+
+statement ok
+CREATE TABLE ljpa_daily(sym VARCHAR, px INT);
+
+statement ok
+CREATE TABLE ljpa_fin(ckey INT, val INT);
+
+statement ok
+INSERT INTO ljpa_sec VALUES ('A', 10), ('B', 20), ('C', 30);
+
+statement ok
+INSERT INTO ljpa_fin VALUES (10, 1), (10, 2), (20, 5);
+
+statement ok
+INSERT INTO ljpa_daily VALUES ('A', 100), ('B', 200), ('C', 300);
+
+statement ok
+CREATE MATERIALIZED VIEW ljpa_mh AS
+    SELECT s.ckey, d.sym, d.px
+    FROM ljpa_daily d
+    JOIN ljpa_sec s ON d.sym = s.sym
+    LEFT JOIN ljpa_fin f ON f.ckey = s.ckey;
+
+statement ok
+INSERT INTO ljpa_daily VALUES ('A', 101), ('B', 201), ('C', 301);
+
+statement ok
+PRAGMA refresh('ljpa_mh');
+
+query I
+SELECT contains(content, 'generate_series') AND NOT contains(content, 'openivm_affected')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_ljpa_mh.sql');
+----
+1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s.ckey, d.sym, d.px
+    FROM ljpa_daily d
+    JOIN ljpa_sec s ON d.sym = s.sym
+    LEFT JOIN ljpa_fin f ON f.ckey = s.ckey
+    EXCEPT ALL
+    SELECT * FROM ljpa_mh
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ljpa_mh
+    EXCEPT ALL
+    SELECT s.ckey, d.sym, d.px
+    FROM ljpa_daily d
+    JOIN ljpa_sec s ON d.sym = s.sym
+    LEFT JOIN ljpa_fin f ON f.ckey = s.ckey
+);
+----
+0
+
+statement ok
+INSERT INTO ljpa_fin VALUES (20, 6);
+
+statement ok
+PRAGMA refresh('ljpa_mh');
+
+query I
+SELECT contains(content, 'DELETE FROM openivm_data_ljpa_mh') AND NOT contains(content, 'generate_series')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_ljpa_mh.sql');
+----
+1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s.ckey, d.sym, d.px
+    FROM ljpa_daily d
+    JOIN ljpa_sec s ON d.sym = s.sym
+    LEFT JOIN ljpa_fin f ON f.ckey = s.ckey
+    EXCEPT ALL
+    SELECT * FROM ljpa_mh
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ljpa_mh
+    EXCEPT ALL
+    SELECT s.ckey, d.sym, d.px
+    FROM ljpa_daily d
+    JOIN ljpa_sec s ON d.sym = s.sym
+    LEFT JOIN ljpa_fin f ON f.ckey = s.ckey
+);
+----
+0
+
+statement ok
+CREATE TABLE ljpa2_sec(sym VARCHAR, ckey INT);
+
+statement ok
+CREATE TABLE ljpa2_daily(sym VARCHAR, px INT);
+
+statement ok
+CREATE TABLE ljpa2_fin(ckey INT, val INT);
+
+statement ok
+INSERT INTO ljpa2_sec VALUES ('A', 10), ('B', 20);
+
+statement ok
+INSERT INTO ljpa2_fin VALUES (10, 1), (10, 2), (20, 5);
+
+statement ok
+INSERT INTO ljpa2_daily VALUES ('A', 100), ('B', 200);
+
+statement ok
+CREATE MATERIALIZED VIEW ljpa2_mh AS
+    SELECT s.ckey, d.sym, d.px
+    FROM ljpa2_daily d
+    JOIN ljpa2_sec s ON d.sym = s.sym
+    LEFT JOIN (SELECT ckey FROM ljpa2_fin) f ON f.ckey = s.ckey;
+
+statement ok
+INSERT INTO ljpa2_daily VALUES ('A', 101);
+
+statement ok
+PRAGMA refresh('ljpa2_mh');
+
+query I
+SELECT contains(content, 'generate_series') AND NOT contains(content, 'openivm_affected')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_ljpa2_mh.sql');
+----
+1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s.ckey, d.sym, d.px
+    FROM ljpa2_daily d
+    JOIN ljpa2_sec s ON d.sym = s.sym
+    LEFT JOIN (SELECT ckey FROM ljpa2_fin) f ON f.ckey = s.ckey
+    EXCEPT ALL
+    SELECT * FROM ljpa2_mh
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ljpa2_mh
+    EXCEPT ALL
+    SELECT s.ckey, d.sym, d.px
+    FROM ljpa2_daily d
+    JOIN ljpa2_sec s ON d.sym = s.sym
+    LEFT JOIN (SELECT ckey FROM ljpa2_fin) f ON f.ckey = s.ckey
+);
+----
+0

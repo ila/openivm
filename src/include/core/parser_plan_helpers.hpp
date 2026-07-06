@@ -110,6 +110,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                RefreshMetadata::ProjectionKeyLineage &out);
+bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinNullableSources &out);
 bool QueryNeedsOriginalSqlForLpts(const string &query);
 bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op);
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,

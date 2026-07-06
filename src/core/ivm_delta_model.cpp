@@ -624,7 +624,9 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
                                    const vector<string> &output_names) {
 	model.window_lineage_ops.clear();
 	model.has_projection_lineage = false;
+	model.has_left_join_nullable = false;
 	model.projection_lineage = RefreshMetadata::ProjectionKeyLineage();
+	model.left_join_nullable_sources = RefreshMetadata::LeftJoinNullableSources();
 	model.lineage_facts.clear();
 	for (auto &node : model.nodes) {
 		node.lineage_facts.clear();
@@ -701,6 +703,9 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 			AddAffectedDomain(model, std::move(domain));
 		}
 	}
+	if (model.type == RefreshType::SIMPLE_PROJECTION && !analysis.found_full_outer) {
+		model.has_left_join_nullable = BuildLeftJoinNullableSources(facts, model.left_join_nullable_sources);
+	}
 	if (model.HasSemiAntiAux()) {
 		for (auto &col : model.semi_anti_aux.left_cols) {
 			DeltaLineageFact fact;
@@ -721,6 +726,9 @@ string BuildDeltaViewModelLineageJson(const DeltaViewModel &model) {
 	}
 	if (model.has_projection_lineage) {
 		entries.push_back(RefreshMetadata::ProjectionKeyLineageToJson(model.projection_lineage));
+	}
+	if (model.has_left_join_nullable) {
+		entries.push_back(RefreshMetadata::LeftJoinNullableSourcesToJson(model.left_join_nullable_sources));
 	}
 	return BuildRefreshLineageJson(entries);
 }

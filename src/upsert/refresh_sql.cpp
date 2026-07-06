@@ -1054,7 +1054,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		} else {
 			upsert_query = CompileProjectionRefresh(metadata, view_name, column_names, delta_table_names, data_table,
 			                                        view_query_sql, delta_ts_filter, internal_catalog_prefix,
-			                                        has_full_outer, has_left_join, skip_proj_delete);
+			                                        has_full_outer, has_left_join, skip_proj_delete, insert_only,
+			                                        fast_paths.active_delta_table_names);
 		}
 		break;
 	}

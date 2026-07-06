@@ -183,6 +183,7 @@ struct DeltaViewModel {
 	vector<DeltaLineageFact> lineage_facts;
 	vector<RefreshMetadata::WindowPartitionLineageOp> window_lineage_ops;
 	RefreshMetadata::ProjectionKeyLineage projection_lineage;
+	RefreshMetadata::LeftJoinNullableSources left_join_nullable_sources;
 	idx_t root_node = DConstants::INVALID_INDEX;
 	string full_outer_join_cols;
 	GroupRecomputeAffectedMode group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
@@ -194,6 +195,7 @@ struct DeltaViewModel {
 	bool distinct_at_top = false;
 	bool union_distinct_over_agg = false;
 	bool has_projection_lineage = false;
+	bool has_left_join_nullable = false;
 	bool warn_unsupported_incremental = false;
 	bool warn_unrecognized_pattern = false;
 

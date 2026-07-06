@@ -15,6 +15,7 @@
 
 #include <cctype>
 #include <cstring>
+#include <set>
 
 namespace duckdb {
 
@@ -751,16 +752,61 @@ static string BuildLeftJoinProjectionRefresh(const string &view_name, const stri
 	                                   affected + "openivm_lj." + lk + delta_where + ")");
 }
 
+static string NormalizeTableToken(string token) {
+	while (!token.empty() && (token.front() == '"' || token.front() == '`' || token.front() == '\'')) {
+		token.erase(token.begin());
+	}
+	while (!token.empty() && (token.back() == '"' || token.back() == '`' || token.back() == '\'')) {
+		token.pop_back();
+	}
+	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
+	static const string delta_prefix(openivm::DELTA_PREFIX);
+	token = SqlUtils::LastIdentifierPart(token);
+	if (token.size() > data_prefix.size() && token.rfind(data_prefix, 0) == 0) {
+		token = token.substr(data_prefix.size());
+	}
+	if (token.size() > delta_prefix.size() && token.rfind(delta_prefix, 0) == 0) {
+		token = token.substr(delta_prefix.size());
+	}
+	return StringUtil::Lower(token);
+}
+
+static bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
+                                       const vector<string> &active_delta_table_names) {
+	if (active_delta_table_names.empty()) {
+		return false;
+	}
+	RefreshMetadata::LeftJoinNullableSources nullable_sources;
+	if (!metadata.GetLeftJoinNullableSources(view_name, nullable_sources) || !nullable_sources.complete ||
+	    nullable_sources.tables.empty()) {
+		return false;
+	}
+	std::set<string> nullable_tables(nullable_sources.tables.begin(), nullable_sources.tables.end());
+	for (auto &delta_name : active_delta_table_names) {
+		if (nullable_tables.count(NormalizeTableToken(BaseTableNameFromDeltaKey(delta_name)))) {
+			return false;
+		}
+	}
+	return true;
+}
+
 string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
                                 const vector<string> &delta_table_names, const string &data_table,
                                 const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
-                                bool skip_proj_delete) {
+                                bool skip_proj_delete, bool insert_only,
+                                const vector<string> &active_delta_table_names) {
 	if (has_full_outer) {
 		return BuildFullOuterProjectionRefresh(metadata, view_name, delta_table_names, data_table, view_query_sql,
 		                                       delta_ts_filter, catalog_prefix);
 	}
 	if (has_left_join) {
+		if (insert_only && LeftJoinDeltaNullableQuiet(metadata, view_name, active_delta_table_names)) {
+			OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN insert-only append for %s (nullable side quiet)\n",
+			                    view_name.c_str());
+			return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix,
+			                                 /*insert_only=*/true);
+		}
 		return BuildLeftJoinProjectionRefresh(view_name, data_table, view_query_sql, delta_ts_filter, catalog_prefix);
 	}
 	return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete);
