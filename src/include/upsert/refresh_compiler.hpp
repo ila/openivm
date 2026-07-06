@@ -110,14 +110,20 @@ string BuildCountDistinctAuxStateCreateSQL(const string &target_table, const str
 string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,
                                 const string &right_alias, const string &predicate, const string &post_filter,
-                                const vector<string> &left_cols, const vector<string> &left_exprs,
-                                const vector<string> &output_cols, const string &left_delta_source,
-                                const string &right_delta_source, const string &left_last_update,
-                                const string &right_last_update, const string &catalog_prefix = "");
+                                const string &right_filter, const vector<string> &left_cols,
+                                const vector<string> &left_exprs, const vector<string> &output_cols,
+                                const string &left_delta_source, const string &right_delta_source,
+                                const string &left_last_update, const string &right_last_update,
+                                const string &catalog_prefix = "", bool null_aware = false,
+                                const string &null_aware_left_col = "", const string &null_aware_right_expr = "");
 string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &left_source, const string &left_alias,
                                       const string &right_source, const string &right_alias, const string &predicate,
-                                      const string &post_filter, const vector<string> &left_cols,
-                                      const vector<string> &left_exprs, bool replace);
+                                      const string &post_filter, const string &right_filter,
+                                      const vector<string> &left_cols, const vector<string> &left_exprs, bool replace,
+                                      bool null_aware = false, const string &null_aware_right_expr = "");
+string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_table, const string &join_type,
+                                   const vector<string> &left_cols, const vector<string> &output_cols,
+                                   bool null_aware = false, const string &null_aware_left_col = "");
 
 string CompileFilteredGroupCount(const string &view_name, const string &aux_table, const string &delta_source,
                                  const string &last_update, const string &group_col, const string &sum_col,

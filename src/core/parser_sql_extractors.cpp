@@ -1204,22 +1204,32 @@ static bool ExtractInSubquery(const string &original_sql, SemiAntiExtract &out) 
 	out.left_table = left_table_expr;
 	out.left_alias = left_alias_expr;
 	out.right_alias = "openivm_right";
+	string left_key_expr;
 	if (simple_left_table) {
-		out.predicate = StringUtil::Replace(lhs, out.left_alias + ".", out.left_alias + ".");
-		out.predicate = StringUtil::Replace(out.predicate, SqlUtils::LastIdentifierPart(out.left_table) + ".",
+		left_key_expr = StringUtil::Replace(lhs, out.left_alias + ".", out.left_alias + ".");
+		left_key_expr = StringUtil::Replace(left_key_expr, SqlUtils::LastIdentifierPart(out.left_table) + ".",
 		                                    out.left_alias + ".");
 	} else {
-		out.predicate = out.left_alias + "." + KeywordHelper::WriteOptionallyQuoted(SqlUtils::LastIdentifierPart(lhs));
+		left_key_expr = out.left_alias + "." + KeywordHelper::WriteOptionallyQuoted(SqlUtils::LastIdentifierPart(lhs));
 	}
-	out.predicate += " IS NOT DISTINCT FROM ";
-	out.predicate += StringUtil::Replace(rhs_expr, original_right_alias + ".", out.right_alias + ".");
-	out.predicate =
-	    StringUtil::Replace(out.predicate, SqlUtils::LastIdentifierPart(out.right_table) + ".", out.right_alias + ".");
+	string right_key_expr = StringUtil::Replace(rhs_expr, original_right_alias + ".", out.right_alias + ".");
+	right_key_expr =
+	    StringUtil::Replace(right_key_expr, SqlUtils::LastIdentifierPart(out.right_table) + ".", out.right_alias + ".");
+	out.left_key_col = "openivm_saj_key";
+	out.left_key_expr = left_key_expr;
+	out.right_key_expr = right_key_expr;
+	out.predicate = left_key_expr + " = " + right_key_expr;
 	if (!right_filter.empty()) {
 		string rewritten_filter = StringUtil::Replace(right_filter, original_right_alias + ".", out.right_alias + ".");
 		rewritten_filter = StringUtil::Replace(rewritten_filter, SqlUtils::LastIdentifierPart(out.right_table) + ".",
 		                                       out.right_alias + ".");
-		out.predicate += " AND (" + rewritten_filter + ")";
+		out.right_filter = rewritten_filter;
+	}
+	if (is_anti) {
+		out.null_aware = true;
+		out.null_aware_left_col = "openivm_not_in_lhs_is_null";
+		out.null_aware_left_expr = "(" + left_key_expr + " IS NULL)";
+		out.null_aware_right_expr = right_key_expr;
 	}
 	out.output_cols = std::move(output_cols);
 	out.output_exprs = std::move(output_exprs);

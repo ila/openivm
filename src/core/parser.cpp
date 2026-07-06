@@ -71,6 +71,107 @@ static bool HasDuckLakeSourceForModel(const CreateMVPlanFacts &facts, const unor
 	return false;
 }
 
+static bool ContainsColumnCI(const vector<string> &cols, const string &col_name) {
+	for (auto &col : cols) {
+		if (StringUtil::CIEquals(col, col_name)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static string UniqueInternalColumnName(const vector<string> &existing_cols, const string &base_name) {
+	string candidate = base_name;
+	for (idx_t suffix = 1; ContainsColumnCI(existing_cols, candidate); suffix++) {
+		candidate = base_name + "_" + std::to_string(suffix);
+	}
+	return candidate;
+}
+
+static bool IsSameBaseColumnExpr(string expr, const string &left_alias, const string &left_table,
+                                 const string &col_name) {
+	StringUtil::Trim(expr);
+	string table_name = SqlUtils::LastIdentifierPart(left_table);
+	vector<string> candidates = {
+	    col_name,
+	    KeywordHelper::WriteOptionallyQuoted(col_name),
+	    SqlUtils::QuoteIdentifier(col_name),
+	    left_alias + "." + KeywordHelper::WriteOptionallyQuoted(col_name),
+	    left_alias + "." + SqlUtils::QuoteIdentifier(col_name),
+	    table_name + "." + KeywordHelper::WriteOptionallyQuoted(col_name),
+	    table_name + "." + SqlUtils::QuoteIdentifier(col_name),
+	};
+	for (auto &candidate : candidates) {
+		if (StringUtil::CIEquals(expr, candidate)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool IsIdentifierTokenChar(char c) {
+	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static bool MatchesPatternCI(const string &text, idx_t pos, const string &pattern) {
+	if (pos + pattern.size() > text.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < pattern.size(); i++) {
+		if (std::tolower(static_cast<unsigned char>(text[pos + i])) !=
+		    std::tolower(static_cast<unsigned char>(pattern[i]))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool HasIdentifierBoundary(const string &text, idx_t pos, idx_t len) {
+	bool left_ok = pos == 0 || !IsIdentifierTokenChar(text[pos - 1]);
+	idx_t end = pos + len;
+	bool right_ok = end >= text.size() || !IsIdentifierTokenChar(text[end]);
+	return left_ok && right_ok;
+}
+
+static string ReplaceQualifiedColumnReference(string expr, const string &pattern, const string &replacement) {
+	if (expr.empty() || pattern.empty()) {
+		return expr;
+	}
+	string result;
+	for (idx_t pos = 0; pos < expr.size();) {
+		if (expr[pos] == '\'') {
+			idx_t start = pos++;
+			while (pos < expr.size()) {
+				if (expr[pos] == '\'' && pos + 1 < expr.size() && expr[pos + 1] == '\'') {
+					pos += 2;
+					continue;
+				}
+				if (expr[pos++] == '\'') {
+					break;
+				}
+			}
+			result += expr.substr(start, pos - start);
+			continue;
+		}
+		if (MatchesPatternCI(expr, pos, pattern) && HasIdentifierBoundary(expr, pos, pattern.size())) {
+			result += replacement;
+			pos += pattern.size();
+			continue;
+		}
+		result += expr[pos++];
+	}
+	return result;
+}
+
+static string RewriteQualifiedLeftColumnRef(string expr, const string &left_alias, const string &source_col,
+                                            const string &target_col) {
+	string target = left_alias + "." + SqlUtils::QuoteIdentifier(target_col);
+	expr = ReplaceQualifiedColumnReference(expr, left_alias + "." + KeywordHelper::WriteOptionallyQuoted(source_col),
+	                                       target);
+	expr = ReplaceQualifiedColumnReference(expr, left_alias + "." + SqlUtils::QuoteIdentifier(source_col), target);
+	return expr;
+}
+
 ParserExtensionPlanResult
 MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientContext &context,
                                               unique_ptr<ParserExtensionParseData> parse_data) {
@@ -463,6 +564,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	string distinct_sum_out;
 	SemiAntiExtract semi_anti_extract;
 	vector<string> semi_anti_left_cols;
+	vector<pair<string, string>> semi_anti_left_expr_overrides;
+	vector<pair<string, string>> semi_anti_left_col_rewrites;
 	FilteredGroupCountExtract filtered_group_count_extract;
 	FilteredGroupCountAuxRequirement filtered_group_count_aux_candidate;
 	if (analysis.found_nested_aggregate &&
@@ -487,12 +590,45 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			              SqlUtils::EscapeSingleQuotes(left_table_name) + "') AND table_schema = '" +
 			              SqlUtils::EscapeSingleQuotes(current_schema) + "' ORDER BY ordinal_position");
 			auto add_semi_anti_left_col = [&](const string &col_name) {
-				for (auto &existing : semi_anti_left_cols) {
-					if (StringUtil::CIEquals(existing, col_name)) {
+				if (!ContainsColumnCI(semi_anti_left_cols, col_name)) {
+					semi_anti_left_cols.push_back(col_name);
+				}
+			};
+			auto add_semi_anti_expr_override = [&](const string &col_name, const string &source_expr) {
+				for (auto &entry : semi_anti_left_expr_overrides) {
+					if (StringUtil::CIEquals(entry.first, col_name)) {
+						entry.second = source_expr;
 						return;
 					}
 				}
-				semi_anti_left_cols.push_back(col_name);
+				semi_anti_left_expr_overrides.emplace_back(col_name, source_expr);
+			};
+			auto output_alias_is_base_col = [&](const string &col_name) {
+				for (size_t i = 0; i < semi_anti_extract.output_cols.size(); i++) {
+					if (StringUtil::CIEquals(semi_anti_extract.output_cols[i], col_name) &&
+					    i < semi_anti_extract.output_exprs.size() &&
+					    IsSameBaseColumnExpr(semi_anti_extract.output_exprs[i], semi_anti_extract.left_alias,
+					                         semi_anti_extract.left_table, col_name)) {
+						return true;
+					}
+				}
+				return false;
+			};
+			auto add_semi_anti_base_col = [&](const string &col_name) {
+				string source_expr =
+				    semi_anti_extract.left_alias + "." + KeywordHelper::WriteOptionallyQuoted(col_name);
+				if (!ContainsColumnCI(semi_anti_left_cols, col_name)) {
+					add_semi_anti_left_col(col_name);
+					add_semi_anti_expr_override(col_name, source_expr);
+					return;
+				}
+				if (output_alias_is_base_col(col_name)) {
+					return;
+				}
+				string hidden_col = UniqueInternalColumnName(semi_anti_left_cols, "openivm_saj_" + col_name);
+				add_semi_anti_left_col(hidden_col);
+				add_semi_anti_expr_override(hidden_col, source_expr);
+				semi_anti_left_col_rewrites.emplace_back(col_name, hidden_col);
 			};
 			if (!semi_anti_extract.output_cols.empty()) {
 				for (auto &col : semi_anti_extract.output_cols) {
@@ -505,13 +641,37 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				if (semi_anti_extract.left_table.find('(') == string::npos && !col_result->HasError() &&
 				    col_result->RowCount() > 0) {
 					for (idx_t i = 0; i < col_result->RowCount(); i++) {
-						add_semi_anti_left_col(col_result->GetValue(0, i).ToString());
+						add_semi_anti_base_col(col_result->GetValue(0, i).ToString());
 					}
 				}
 			} else if (!col_result->HasError() && col_result->RowCount() > 0) {
 				for (idx_t i = 0; i < col_result->RowCount(); i++) {
-					add_semi_anti_left_col(col_result->GetValue(0, i).ToString());
+					add_semi_anti_base_col(col_result->GetValue(0, i).ToString());
 				}
+			}
+			if (!semi_anti_extract.left_key_col.empty() && !semi_anti_extract.left_key_expr.empty()) {
+				semi_anti_extract.left_key_col =
+				    UniqueInternalColumnName(semi_anti_left_cols, semi_anti_extract.left_key_col);
+				add_semi_anti_left_col(semi_anti_extract.left_key_col);
+				add_semi_anti_expr_override(semi_anti_extract.left_key_col, semi_anti_extract.left_key_expr);
+				semi_anti_extract.predicate = semi_anti_extract.left_alias + "." +
+				                              SqlUtils::QuoteIdentifier(semi_anti_extract.left_key_col) + " = " +
+				                              semi_anti_extract.right_key_expr;
+			}
+			if (semi_anti_extract.null_aware && !semi_anti_extract.null_aware_left_col.empty()) {
+				semi_anti_extract.null_aware_left_col =
+				    UniqueInternalColumnName(semi_anti_left_cols, semi_anti_extract.null_aware_left_col);
+				add_semi_anti_left_col(semi_anti_extract.null_aware_left_col);
+				add_semi_anti_expr_override(semi_anti_extract.null_aware_left_col,
+				                            semi_anti_extract.null_aware_left_expr);
+			}
+			for (auto &rewrite : semi_anti_left_col_rewrites) {
+				semi_anti_extract.predicate = RewriteQualifiedLeftColumnRef(
+				    semi_anti_extract.predicate, semi_anti_extract.left_alias, rewrite.first, rewrite.second);
+				semi_anti_extract.post_filter = RewriteQualifiedLeftColumnRef(
+				    semi_anti_extract.post_filter, semi_anti_extract.left_alias, rewrite.first, rewrite.second);
+				semi_anti_extract.right_filter = RewriteQualifiedLeftColumnRef(
+				    semi_anti_extract.right_filter, semi_anti_extract.left_alias, rewrite.first, rewrite.second);
 			}
 		}
 	}
@@ -643,27 +803,41 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		for (size_t i = 0; i < semi_anti_left_cols.size(); i++) {
 			string qcol = KeywordHelper::WriteOptionallyQuoted(semi_anti_left_cols[i]);
 			string source_expr = semi_anti_extract.left_alias + "." + qcol;
-			for (size_t j = 0; j < semi_anti_extract.output_cols.size(); j++) {
-				if (StringUtil::CIEquals(semi_anti_extract.output_cols[j], semi_anti_left_cols[i]) &&
-				    j < semi_anti_extract.output_exprs.size()) {
-					source_expr = semi_anti_extract.output_exprs[j];
+			bool has_override = false;
+			for (auto &entry : semi_anti_left_expr_overrides) {
+				if (StringUtil::CIEquals(entry.first, semi_anti_left_cols[i])) {
+					source_expr = entry.second;
+					has_override = true;
 					break;
+				}
+			}
+			if (!has_override) {
+				for (size_t j = 0; j < semi_anti_extract.output_cols.size(); j++) {
+					if (StringUtil::CIEquals(semi_anti_extract.output_cols[j], semi_anti_left_cols[i]) &&
+					    j < semi_anti_extract.output_exprs.size()) {
+						source_expr = semi_anti_extract.output_exprs[j];
+						break;
+					}
 				}
 			}
 			semi_anti_left_exprs.push_back(source_expr);
 		}
 		string aux_table = "openivm_semi_anti_state_" + view_name;
-		semi_anti_aux_candidate = {aux_table,
-		                           semi_anti_extract.join_type,
-		                           semi_anti_extract.left_table,
-		                           semi_anti_extract.left_alias,
-		                           semi_anti_extract.right_table,
-		                           semi_anti_extract.right_alias,
-		                           semi_anti_extract.predicate,
-		                           semi_anti_extract.post_filter,
-		                           semi_anti_left_cols,
-		                           semi_anti_left_exprs,
-		                           semi_anti_extract.output_cols};
+		semi_anti_aux_candidate.aux_table = aux_table;
+		semi_anti_aux_candidate.join_type = semi_anti_extract.join_type;
+		semi_anti_aux_candidate.left_table = semi_anti_extract.left_table;
+		semi_anti_aux_candidate.left_alias = semi_anti_extract.left_alias;
+		semi_anti_aux_candidate.right_table = semi_anti_extract.right_table;
+		semi_anti_aux_candidate.right_alias = semi_anti_extract.right_alias;
+		semi_anti_aux_candidate.predicate = semi_anti_extract.predicate;
+		semi_anti_aux_candidate.post_filter = semi_anti_extract.post_filter;
+		semi_anti_aux_candidate.right_filter = semi_anti_extract.right_filter;
+		semi_anti_aux_candidate.null_aware = semi_anti_extract.null_aware;
+		semi_anti_aux_candidate.null_aware_left_col = semi_anti_extract.null_aware_left_col;
+		semi_anti_aux_candidate.null_aware_right_expr = semi_anti_extract.null_aware_right_expr;
+		semi_anti_aux_candidate.left_cols = semi_anti_left_cols;
+		semi_anti_aux_candidate.left_exprs = semi_anti_left_exprs;
+		semi_anti_aux_candidate.output_cols = semi_anti_extract.output_cols;
 		model_input.semi_anti_aux_candidate = &semi_anti_aux_candidate;
 	}
 	auto view_model = BuildDeltaViewModel(model_input);
@@ -911,7 +1085,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(meta.aux_table);
 		string aux_create = BuildSemiAntiAuxStateCreateSQL(
 		    aux_target, left_source_table, meta.left_alias, right_source_table, meta.right_alias, meta.predicate,
-		    meta.post_filter, meta.left_cols, meta.left_exprs, /*replace=*/false);
+		    meta.post_filter, meta.right_filter, meta.left_cols, meta.left_exprs, /*replace=*/false, meta.null_aware,
+		    meta.null_aware_right_expr);
 		ddl.push_back(aux_create);
 		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
 		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
@@ -1038,7 +1213,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	if (!current_catalog.empty() && current_catalog != default_db) {
 		ddl.push_back("use " + current_catalog_schema);
 	}
-	ddl.push_back("create table " + qdt + " as " + view_query);
+	if (view_model.HasSemiAntiAux()) {
+		const auto &meta = view_model.semi_anti_aux;
+		string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(meta.aux_table);
+		ddl.push_back(BuildSemiAntiInitialDataSQL(qdt, aux_target, meta.join_type, meta.left_cols, meta.output_cols,
+		                                          meta.null_aware, meta.null_aware_left_col));
+	} else {
+		ddl.push_back("create table " + qdt + " as " + view_query);
+	}
 	if (!view_catalog_prefix.empty()) {
 		// Keep the same connection after a DuckLake CTAS. Reopening here can force
 		// connection teardown while DuckLake still owns the transaction used by the

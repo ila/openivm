@@ -211,6 +211,10 @@ public:
 		string right_alias;
 		string predicate;
 		string post_filter;
+		string right_filter;
+		bool null_aware = false;
+		string null_aware_left_col;
+		string null_aware_right_expr;
 		vector<string> left_cols;
 		vector<string> left_exprs;
 		vector<string> output_cols;

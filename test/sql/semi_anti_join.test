@@ -324,6 +324,11 @@ CREATE MATERIALIZED VIEW mv_not_in_cast AS
     FROM in_cast_l
     WHERE CAST(x AS BIGINT) NOT IN (SELECT CAST(y AS BIGINT) FROM in_cast_r);
 
+query I
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_not_in_cast';
+----
+1
+
 statement ok
 INSERT INTO in_cast_l VALUES (5, 50), (6, 20);
 
@@ -353,6 +358,449 @@ SELECT COUNT(*) FROM (
     SELECT CAST(x AS BIGINT) AS item_id
     FROM in_cast_l
     WHERE CAST(x AS BIGINT) NOT IN (SELECT CAST(y AS BIGINT) FROM in_cast_r)
+);
+----
+0
+
+# IN/NOT IN subqueries need SQL's null-aware MARK semantics, not null-safe
+# SEMI/ANTI equality. The aux state keeps match counts for performance and
+# stores null-aware side state for NOT IN visibility.
+statement ok
+CREATE TABLE in_null_l (x INT);
+
+statement ok
+CREATE TABLE in_null_r (y INT);
+
+statement ok
+INSERT INTO in_null_l VALUES (1), (2);
+
+statement ok
+INSERT INTO in_null_r VALUES (1), (NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_in_null AS
+    SELECT x FROM in_null_l WHERE x IN (SELECT y FROM in_null_r);
+
+query I
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_in_null';
+----
+1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM in_null_l WHERE x IN (SELECT y FROM in_null_r)
+    EXCEPT ALL SELECT x FROM mv_in_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM mv_in_null
+    EXCEPT ALL SELECT x FROM in_null_l WHERE x IN (SELECT y FROM in_null_r)
+);
+----
+0
+
+statement ok
+INSERT INTO in_null_l VALUES (NULL), (2);
+
+statement ok
+INSERT INTO in_null_r VALUES (2);
+
+statement ok
+PRAGMA refresh('mv_in_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM in_null_l WHERE x IN (SELECT y FROM in_null_r)
+    EXCEPT ALL SELECT x FROM mv_in_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM mv_in_null
+    EXCEPT ALL SELECT x FROM in_null_l WHERE x IN (SELECT y FROM in_null_r)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM mv_in_null WHERE x IS NULL;
+----
+0
+
+statement ok
+CREATE TABLE in_shadow_l (x INT);
+
+statement ok
+CREATE TABLE in_shadow_r (y INT);
+
+statement ok
+INSERT INTO in_shadow_l VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO in_shadow_r VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_in_shadow AS
+    SELECT x + 1 AS x FROM in_shadow_l WHERE x IN (SELECT y FROM in_shadow_r);
+
+query I
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_in_shadow';
+----
+1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x + 1 AS x FROM in_shadow_l WHERE x IN (SELECT y FROM in_shadow_r)
+    EXCEPT ALL SELECT x FROM mv_in_shadow
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM mv_in_shadow
+    EXCEPT ALL SELECT x + 1 AS x FROM in_shadow_l WHERE x IN (SELECT y FROM in_shadow_r)
+);
+----
+0
+
+statement ok
+INSERT INTO in_shadow_r VALUES (2);
+
+statement ok
+INSERT INTO in_shadow_l VALUES (4);
+
+statement ok
+PRAGMA refresh('mv_in_shadow');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x + 1 AS x FROM in_shadow_l WHERE x IN (SELECT y FROM in_shadow_r)
+    EXCEPT ALL SELECT x FROM mv_in_shadow
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM mv_in_shadow
+    EXCEPT ALL SELECT x + 1 AS x FROM in_shadow_l WHERE x IN (SELECT y FROM in_shadow_r)
+);
+----
+0
+
+statement ok
+CREATE TABLE in_prefix_l (x INT, x1 INT);
+
+statement ok
+CREATE TABLE in_prefix_r (y INT);
+
+statement ok
+INSERT INTO in_prefix_l VALUES (1, 10), (2, 20), (3, -1);
+
+statement ok
+INSERT INTO in_prefix_r VALUES (10);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_in_prefix AS
+    SELECT l.x + 100 AS x, l.x1
+    FROM in_prefix_l l
+    WHERE l.x1 IN (SELECT y FROM in_prefix_r) AND l.x1 > 0;
+
+query I
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_in_prefix';
+----
+1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.x + 100 AS x, l.x1
+    FROM in_prefix_l l
+    WHERE l.x1 IN (SELECT y FROM in_prefix_r) AND l.x1 > 0
+    EXCEPT ALL SELECT x, x1 FROM mv_in_prefix
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, x1 FROM mv_in_prefix
+    EXCEPT ALL
+    SELECT l.x + 100 AS x, l.x1
+    FROM in_prefix_l l
+    WHERE l.x1 IN (SELECT y FROM in_prefix_r) AND l.x1 > 0
+);
+----
+0
+
+statement ok
+INSERT INTO in_prefix_r VALUES (20);
+
+statement ok
+INSERT INTO in_prefix_l VALUES (4, 20);
+
+statement ok
+PRAGMA refresh('mv_in_prefix');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.x + 100 AS x, l.x1
+    FROM in_prefix_l l
+    WHERE l.x1 IN (SELECT y FROM in_prefix_r) AND l.x1 > 0
+    EXCEPT ALL SELECT x, x1 FROM mv_in_prefix
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, x1 FROM mv_in_prefix
+    EXCEPT ALL
+    SELECT l.x + 100 AS x, l.x1
+    FROM in_prefix_l l
+    WHERE l.x1 IN (SELECT y FROM in_prefix_r) AND l.x1 > 0
+);
+----
+0
+
+statement ok
+CREATE TABLE not_in_null_l (x INT);
+
+statement ok
+CREATE TABLE not_in_null_r (y INT, active BOOLEAN);
+
+statement ok
+INSERT INTO not_in_null_l VALUES (1), (2), (NULL);
+
+statement ok
+INSERT INTO not_in_null_r VALUES (1, true), (NULL, true), (NULL, false);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_not_in_null AS
+    SELECT x FROM not_in_null_l WHERE x NOT IN (SELECT y FROM not_in_null_r WHERE active);
+
+query I
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_not_in_null';
+----
+1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM not_in_null_l WHERE x NOT IN (SELECT y FROM not_in_null_r WHERE active)
+    EXCEPT ALL SELECT x FROM mv_not_in_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM mv_not_in_null
+    EXCEPT ALL SELECT x FROM not_in_null_l WHERE x NOT IN (SELECT y FROM not_in_null_r WHERE active)
+);
+----
+0
+
+statement ok
+INSERT INTO not_in_null_l VALUES (3);
+
+statement ok
+PRAGMA refresh('mv_not_in_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM not_in_null_l WHERE x NOT IN (SELECT y FROM not_in_null_r WHERE active)
+    EXCEPT ALL SELECT x FROM mv_not_in_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM mv_not_in_null
+    EXCEPT ALL SELECT x FROM not_in_null_l WHERE x NOT IN (SELECT y FROM not_in_null_r WHERE active)
+);
+----
+0
+
+statement ok
+DELETE FROM not_in_null_r WHERE y IS NULL AND active;
+
+statement ok
+PRAGMA refresh('mv_not_in_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM not_in_null_l WHERE x NOT IN (SELECT y FROM not_in_null_r WHERE active)
+    EXCEPT ALL SELECT x FROM mv_not_in_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM mv_not_in_null
+    EXCEPT ALL SELECT x FROM not_in_null_l WHERE x NOT IN (SELECT y FROM not_in_null_r WHERE active)
+);
+----
+0
+
+query II
+SELECT COUNT(*), COUNT(*) FILTER (WHERE x IS NULL) FROM mv_not_in_null;
+----
+2	0
+
+statement ok
+DELETE FROM not_in_null_r WHERE active;
+
+statement ok
+PRAGMA refresh('mv_not_in_null');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM not_in_null_l WHERE x NOT IN (SELECT y FROM not_in_null_r WHERE active)
+    EXCEPT ALL SELECT x FROM mv_not_in_null
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM mv_not_in_null
+    EXCEPT ALL SELECT x FROM not_in_null_l WHERE x NOT IN (SELECT y FROM not_in_null_r WHERE active)
+);
+----
+0
+
+query II
+SELECT COUNT(*), COUNT(*) FILTER (WHERE x IS NULL) FROM mv_not_in_null;
+----
+4	1
+
+statement ok
+CREATE TABLE not_in_corr_l (x INT, z INT);
+
+statement ok
+CREATE TABLE not_in_corr_r (y INT, z INT);
+
+statement ok
+INSERT INTO not_in_corr_l VALUES (1, 10), (2, 10), (3, 20), (NULL, 30);
+
+statement ok
+INSERT INTO not_in_corr_r VALUES (1, 10), (NULL, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_not_in_corr AS
+    SELECT x, z FROM not_in_corr_l l WHERE x NOT IN (SELECT y FROM not_in_corr_r r WHERE r.z = l.z);
+
+query I
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_not_in_corr';
+----
+1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, z FROM not_in_corr_l l WHERE x NOT IN (SELECT y FROM not_in_corr_r r WHERE r.z = l.z)
+    EXCEPT ALL SELECT x, z FROM mv_not_in_corr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, z FROM mv_not_in_corr
+    EXCEPT ALL SELECT x, z FROM not_in_corr_l l WHERE x NOT IN (SELECT y FROM not_in_corr_r r WHERE r.z = l.z)
+);
+----
+0
+
+statement ok
+INSERT INTO not_in_corr_r VALUES (NULL, 20);
+
+statement ok
+INSERT INTO not_in_corr_l VALUES (4, 30);
+
+statement ok
+PRAGMA refresh('mv_not_in_corr');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, z FROM not_in_corr_l l WHERE x NOT IN (SELECT y FROM not_in_corr_r r WHERE r.z = l.z)
+    EXCEPT ALL SELECT x, z FROM mv_not_in_corr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x, z FROM mv_not_in_corr
+    EXCEPT ALL SELECT x, z FROM not_in_corr_l l WHERE x NOT IN (SELECT y FROM not_in_corr_r r WHERE r.z = l.z)
+);
+----
+0
+
+statement ok
+CREATE TABLE not_in_shadow_l (x INT);
+
+statement ok
+CREATE TABLE not_in_shadow_r (y INT);
+
+statement ok
+INSERT INTO not_in_shadow_l VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO not_in_shadow_r VALUES (2);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_not_in_shadow AS
+    SELECT x + 1 AS x FROM not_in_shadow_l WHERE x NOT IN (SELECT y FROM not_in_shadow_r);
+
+query I
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_not_in_shadow';
+----
+1
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x + 1 AS x FROM not_in_shadow_l WHERE x NOT IN (SELECT y FROM not_in_shadow_r)
+    EXCEPT ALL SELECT x FROM mv_not_in_shadow
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM mv_not_in_shadow
+    EXCEPT ALL SELECT x + 1 AS x FROM not_in_shadow_l WHERE x NOT IN (SELECT y FROM not_in_shadow_r)
+);
+----
+0
+
+statement ok
+INSERT INTO not_in_shadow_r VALUES (NULL);
+
+statement ok
+INSERT INTO not_in_shadow_l VALUES (4);
+
+statement ok
+PRAGMA refresh('mv_not_in_shadow');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x + 1 AS x FROM not_in_shadow_l WHERE x NOT IN (SELECT y FROM not_in_shadow_r)
+    EXCEPT ALL SELECT x FROM mv_not_in_shadow
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT x FROM mv_not_in_shadow
+    EXCEPT ALL SELECT x + 1 AS x FROM not_in_shadow_l WHERE x NOT IN (SELECT y FROM not_in_shadow_r)
 );
 ----
 0

@@ -580,6 +580,55 @@ SELECT count(*) FROM (
 ----
 0
 
+statement ok
+CREATE TABLE se_notin_l (x INT);
+
+statement ok
+CREATE TABLE se_notin_r (rid INT, y INT, active BOOLEAN);
+
+statement ok
+INSERT INTO se_notin_l VALUES (1), (2), (3), (NULL);
+
+statement ok
+INSERT INTO se_notin_r VALUES (1, 1, true), (2, NULL, true), (3, 99, false);
+
+statement ok
+CREATE MATERIALIZED VIEW se_notin_mv AS
+    SELECT x FROM se_notin_l WHERE x NOT IN (SELECT y FROM se_notin_r WHERE active);
+
+statement ok
+ALTER TABLE se_notin_r RENAME COLUMN y TO yy;
+
+statement ok
+ALTER TABLE se_notin_r RENAME COLUMN active TO enabled;
+
+statement ok
+DELETE FROM se_notin_r WHERE yy IS NULL AND enabled;
+
+statement ok
+INSERT INTO se_notin_r VALUES (4, 2, true);
+
+statement ok
+PRAGMA refresh('se_notin_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_notin_mv
+    EXCEPT ALL
+    SELECT x FROM se_notin_l WHERE x NOT IN (SELECT yy FROM se_notin_r WHERE enabled)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT x FROM se_notin_l WHERE x NOT IN (SELECT yy FROM se_notin_r WHERE enabled)
+    EXCEPT ALL
+    SELECT * FROM se_notin_mv
+);
+----
+0
+
 # ==========================================
 # Test 10: aux repair is blocked when source deltas are pending
 # ==========================================

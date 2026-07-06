@@ -640,9 +640,10 @@ static void EnsureSemiAntiAuxState(RefreshMetadata &metadata, Connection &con, c
 		                   ResolveSourceTableSQL(metadata, view_name, right_delta, meta.right_table, view_catalog_name,
 		                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 		               string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(meta.aux_table);
-		               return BuildSemiAntiAuxStateCreateSQL(aux_q, left_source, meta.left_alias, right_source,
-		                                                     meta.right_alias, meta.predicate, meta.post_filter,
-		                                                     meta.left_cols, meta.left_exprs, /*replace=*/true);
+		               return BuildSemiAntiAuxStateCreateSQL(
+		                   aux_q, left_source, meta.left_alias, right_source, meta.right_alias, meta.predicate,
+		                   meta.post_filter, meta.right_filter, meta.left_cols, meta.left_exprs,
+		                   /*replace=*/true, meta.null_aware, meta.null_aware_right_expr);
 	               });
 }
 
@@ -1174,8 +1175,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			upsert_query = CompileSemiAntiRecompute(
 			    view_name, aux_meta.aux_table, aux_meta.join_type, left_input.table_sql, aux_meta.left_alias,
 			    right_input.table_sql, aux_meta.right_alias, aux_meta.predicate, aux_meta.post_filter,
-			    aux_meta.left_cols, aux_meta.left_exprs, aux_meta.output_cols, left_delta, right_input.delta_sql,
-			    left_ts, right_input.last_update, internal_catalog_prefix);
+			    aux_meta.right_filter, aux_meta.left_cols, aux_meta.left_exprs, aux_meta.output_cols, left_delta,
+			    right_input.delta_sql, left_ts, right_input.last_update, internal_catalog_prefix, aux_meta.null_aware,
+			    aux_meta.null_aware_left_col, aux_meta.null_aware_right_expr);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: SEMI_ANTI_RECOMPUTE (%s, %zu left cols)\n",
 			                    aux_meta.join_type.c_str(), aux_meta.left_cols.size());
 			break;

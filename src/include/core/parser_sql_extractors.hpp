@@ -13,6 +13,14 @@ struct SemiAntiExtract {
 	string right_alias;
 	string predicate;
 	string post_filter;
+	string right_filter;
+	string left_key_col;
+	string left_key_expr;
+	string right_key_expr;
+	bool null_aware = false;
+	string null_aware_left_col;
+	string null_aware_left_expr;
+	string null_aware_right_expr;
 	vector<string> output_cols;
 	vector<string> output_exprs;
 };

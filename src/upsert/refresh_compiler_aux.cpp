@@ -952,6 +952,78 @@ static void BuildAliasedSourceLists(const vector<string> &cols, const vector<str
 	}
 }
 
+static bool IsIdentifierTokenChar(char c) {
+	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static bool MatchesPatternCI(const string &text, idx_t pos, const string &pattern) {
+	if (pos + pattern.size() > text.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < pattern.size(); i++) {
+		if (std::tolower(static_cast<unsigned char>(text[pos + i])) !=
+		    std::tolower(static_cast<unsigned char>(pattern[i]))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static string RewriteQualifiedAliasPrefix(string expr, const string &source_alias, const string &target_alias) {
+	string pattern = source_alias + ".";
+	string replacement = target_alias + ".";
+	string result;
+	for (idx_t pos = 0; pos < expr.size();) {
+		if (expr[pos] == '\'') {
+			idx_t start = pos++;
+			while (pos < expr.size()) {
+				if (expr[pos] == '\'' && pos + 1 < expr.size() && expr[pos + 1] == '\'') {
+					pos += 2;
+					continue;
+				}
+				if (expr[pos++] == '\'') {
+					break;
+				}
+			}
+			result += expr.substr(start, pos - start);
+			continue;
+		}
+		bool left_boundary = pos == 0 || !IsIdentifierTokenChar(expr[pos - 1]);
+		if (left_boundary && MatchesPatternCI(expr, pos, pattern)) {
+			result += replacement;
+			pos += pattern.size();
+			continue;
+		}
+		result += expr[pos++];
+	}
+	return result;
+}
+
+static bool ReferencesQualifiedAlias(const string &expr, const string &alias) {
+	string pattern = alias + ".";
+	for (idx_t pos = 0; pos < expr.size();) {
+		if (expr[pos] == '\'') {
+			pos++;
+			while (pos < expr.size()) {
+				if (expr[pos] == '\'' && pos + 1 < expr.size() && expr[pos + 1] == '\'') {
+					pos += 2;
+					continue;
+				}
+				if (expr[pos++] == '\'') {
+					break;
+				}
+			}
+			continue;
+		}
+		bool left_boundary = pos == 0 || !IsIdentifierTokenChar(expr[pos - 1]);
+		if (left_boundary && MatchesPatternCI(expr, pos, pattern)) {
+			return true;
+		}
+		pos++;
+	}
+	return false;
+}
+
 } // namespace
 
 string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
@@ -1156,8 +1228,9 @@ string CompileCountDistinctIncremental(const string &view_name, const string &au
 
 string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &left_source, const string &left_alias,
                                       const string &right_source, const string &right_alias, const string &predicate,
-                                      const string &post_filter, const vector<string> &left_cols,
-                                      const vector<string> &left_exprs, bool replace) {
+                                      const string &post_filter, const string &right_filter,
+                                      const vector<string> &left_cols, const vector<string> &left_exprs, bool replace,
+                                      bool null_aware, const string &null_aware_right_expr) {
 	string left_cols_csv = SqlUtils::JoinQuotedColumns(left_cols);
 	string left_cols_qualified = SqlUtils::JoinQualifiedQuotedColumns(left_cols, left_alias);
 	string left_cols_lc = SqlUtils::JoinQualifiedQuotedColumns(left_cols, "lc");
@@ -1167,25 +1240,75 @@ string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &
 	string unused_group_list;
 	BuildAliasedSourceLists(left_cols, left_exprs, left_source_select, unused_group_list, left_alias);
 	string left_source_filter = post_filter.empty() ? "" : " WHERE " + post_filter;
+	string match_predicate = predicate + (right_filter.empty() ? "" : " AND (" + right_filter + ")");
+	string right_filter_sql = right_filter.empty() ? "" : " WHERE " + right_filter;
+	bool null_aware_anti = null_aware && !null_aware_right_expr.empty();
+	bool correlated_right_filter = null_aware_anti && ReferencesQualifiedAlias(right_filter, left_alias);
+	string right_stats_cte;
+	string right_stats_select;
+	string right_stats_from;
+	if (null_aware_anti) {
+		if (correlated_right_filter) {
+			string right_filter_lc = RewriteQualifiedAliasPrefix(right_filter, left_alias, "lc");
+			right_stats_select = ", (SELECT count(*)::BIGINT FROM " + right_source + " " + right_alias + " WHERE " +
+			                     right_filter_lc + ") AS _right_count, (SELECT count(*) FILTER (WHERE " +
+			                     null_aware_right_expr + " IS NULL)::BIGINT FROM " + right_source + " " + right_alias +
+			                     " WHERE " + right_filter_lc + ") AS _right_null_count";
+		} else {
+			right_stats_cte = ", right_stats AS (SELECT count(*)::BIGINT AS _right_count, count(*) FILTER (WHERE " +
+			                  null_aware_right_expr + " IS NULL)::BIGINT AS _right_null_count FROM " + right_source +
+			                  " " + right_alias + right_filter_sql + ")";
+			right_stats_select = ", rs._right_count, rs._right_null_count";
+			right_stats_from = " CROSS JOIN right_stats rs";
+		}
+	}
 	return CreateAuxTablePrefix(target_table, replace) + " AS WITH left_source AS (SELECT " + left_source_select +
 	       " FROM " + left_source + " " + left_alias + left_source_filter + "), left_counts AS (SELECT " +
 	       left_cols_csv + ", count(*)::BIGINT AS _left_count FROM left_source GROUP BY " + left_cols_csv +
 	       "), match_counts AS (SELECT " + left_cols_qualified +
 	       ", count(*)::BIGINT AS _match_count FROM (SELECT DISTINCT " + left_cols_csv + " FROM left_source) " +
-	       left_alias + " JOIN " + right_source + " " + right_alias + " ON " + predicate + " GROUP BY " +
-	       left_cols_qualified + ") SELECT " + left_cols_lc +
-	       ", lc._left_count, coalesce(mc._match_count, 0)::BIGINT AS _match_count FROM left_counts lc LEFT JOIN "
-	       "match_counts mc ON " +
-	       lc_mc_match;
+	       left_alias + " JOIN " + right_source + " " + right_alias + " ON " + match_predicate + " GROUP BY " +
+	       left_cols_qualified + ")" + right_stats_cte + " SELECT " + left_cols_lc +
+	       ", lc._left_count, coalesce(mc._match_count, 0)::BIGINT AS _match_count" + right_stats_select +
+	       " FROM left_counts lc LEFT JOIN match_counts mc ON " + lc_mc_match + right_stats_from;
+}
+
+static string SemiAntiVisibleExpr(const string &join_type, bool null_aware, const string &null_aware_left_col,
+                                  const string &alias) {
+	string prefix = alias.empty() ? "" : alias + ".";
+	bool is_anti = StringUtil::Lower(join_type) == "anti";
+	if (!is_anti) {
+		return prefix + "_match_count > 0";
+	}
+	if (null_aware && !null_aware_left_col.empty()) {
+		string left_not_null = "NOT coalesce(" + prefix + SqlUtils::QuoteIdentifier(null_aware_left_col) + ", true)";
+		return prefix + "_match_count = 0 AND (" + prefix + "_right_count = 0 OR (" + left_not_null + " AND " + prefix +
+		       "_right_null_count = 0))";
+	}
+	return prefix + "_match_count = 0";
+}
+
+string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_table, const string &join_type,
+                                   const vector<string> &left_cols, const vector<string> &output_cols, bool null_aware,
+                                   const string &null_aware_left_col) {
+	if (output_cols.empty()) {
+		throw InternalException("BuildSemiAntiInitialDataSQL called without output columns");
+	}
+	string output_cur = SqlUtils::JoinQualifiedQuotedColumns(output_cols, "_cur");
+	string visible = SemiAntiVisibleExpr(join_type, null_aware, null_aware_left_col, "_cur");
+	return "create table " + data_table + " as SELECT " + output_cur + " FROM " + aux_table +
+	       " _cur, generate_series(1, _cur._left_count::BIGINT) WHERE " + visible + " AND _cur._left_count > 0";
 }
 
 string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,
                                 const string &right_alias, const string &predicate, const string &post_filter,
-                                const vector<string> &left_cols, const vector<string> &left_exprs,
-                                const vector<string> &output_cols, const string &left_delta_source,
-                                const string &right_delta_source, const string &left_last_update,
-                                const string &right_last_update, const string &catalog_prefix) {
+                                const string &right_filter, const vector<string> &left_cols,
+                                const vector<string> &left_exprs, const vector<string> &output_cols,
+                                const string &left_delta_source, const string &right_delta_source,
+                                const string &left_last_update, const string &right_last_update,
+                                const string &catalog_prefix, bool null_aware, const string &null_aware_left_col,
+                                const string &null_aware_right_expr) {
 	if (left_cols.empty() || output_cols.empty() || aux_table.empty() || right_delta_source.empty() ||
 	    right_last_update.empty()) {
 		throw InternalException("CompileSemiAntiRecompute called with incomplete metadata for view '%s'", view_name);
@@ -1198,12 +1321,19 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	string right_delta_q = DeltaSourceRef(right_delta_source, catalog_prefix);
 	string dleft_table = "openivm_saj_dleft_" + view_name;
 	string dright_table = "openivm_saj_dright_" + view_name;
+	string dright_stats_table = "openivm_saj_dright_stats_" + view_name;
+	string right_stats_table = "openivm_saj_right_stats_" + view_name;
 	string old_table = "openivm_saj_old_" + view_name;
 	string aff_table = "openivm_saj_aff_" + view_name;
-	bool is_anti = StringUtil::Lower(join_type) == "anti";
-	string visible = is_anti ? "_match_count = 0" : "_match_count > 0";
-	string cur_visible = is_anti ? "_cur._match_count = 0" : "_cur._match_count > 0";
+	bool null_aware_anti = null_aware && StringUtil::Lower(join_type) == "anti" && !null_aware_left_col.empty() &&
+	                       !null_aware_right_expr.empty();
+	string visible = SemiAntiVisibleExpr(join_type, null_aware_anti, null_aware_left_col, "");
+	string cur_visible = SemiAntiVisibleExpr(join_type, null_aware_anti, null_aware_left_col, "_cur");
 	string left_delta_filter = post_filter.empty() ? "" : " AND (" + post_filter + ")";
+	string match_predicate = predicate + (right_filter.empty() ? "" : " AND (" + right_filter + ")");
+	string right_delta_filter = right_filter.empty() ? "" : " AND (" + right_filter + ")";
+	string right_filter_sql = right_filter.empty() ? "" : " WHERE " + right_filter;
+	bool correlated_right_filter = null_aware_anti && ReferencesQualifiedAlias(right_filter, left_alias);
 
 	string left_cols_csv = SqlUtils::JoinQuotedColumns(left_cols);
 	string output_cols_csv = SqlUtils::JoinQuotedColumns(output_cols);
@@ -1245,7 +1375,7 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 
 	sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dright_table) + " AS\n  SELECT " + left_cols_l +
 	       ", SUM(" + right_alias + "." + string(openivm::MULTIPLICITY_COL) + ")::BIGINT AS dmatch\n  FROM " + aux_q +
-	       " " + left_alias + " JOIN " + right_delta_q + " " + right_alias + " ON " + predicate + "\n  WHERE " +
+	       " " + left_alias + " JOIN " + right_delta_q + " " + right_alias + " ON " + match_predicate + "\n  WHERE " +
 	       right_ts + "\n  GROUP BY " + left_cols_l + "\n  HAVING SUM(" + right_alias + "." +
 	       string(openivm::MULTIPLICITY_COL) + ") <> 0;\n\n";
 
@@ -1253,15 +1383,67 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	       SqlUtils::BuildNullSafeMatch(left_cols, "_aux", "_d") +
 	       "\nWHEN MATCHED THEN UPDATE SET _match_count = _aux._match_count + _d.dmatch;\n\n";
 
+	if (null_aware_anti) {
+		if (correlated_right_filter) {
+			sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dright_stats_table) + " AS\n  SELECT " +
+			       left_cols_l + ", SUM(" + right_alias + "." + string(openivm::MULTIPLICITY_COL) +
+			       ")::BIGINT AS d_right_count, SUM(CASE WHEN " + null_aware_right_expr + " IS NULL THEN " +
+			       right_alias + "." + string(openivm::MULTIPLICITY_COL) +
+			       " ELSE 0 END)::BIGINT AS d_right_null_count\n  FROM " + aux_q + " " + left_alias + " JOIN " +
+			       right_delta_q + " " + right_alias + " ON " + right_filter + "\n  WHERE " + right_ts +
+			       "\n  GROUP BY " + left_cols_l + "\n  HAVING SUM(" + right_alias + "." +
+			       string(openivm::MULTIPLICITY_COL) + ") <> 0 OR SUM(CASE WHEN " + null_aware_right_expr +
+			       " IS NULL THEN " + right_alias + "." + string(openivm::MULTIPLICITY_COL) + " ELSE 0 END) <> 0;\n\n";
+			sql += "MERGE INTO " + aux_q + " _aux USING " + SqlUtils::QuoteIdentifier(dright_stats_table) + " _d ON " +
+			       SqlUtils::BuildNullSafeMatch(left_cols, "_aux", "_d") +
+			       "\nWHEN MATCHED THEN UPDATE SET _right_count = _aux._right_count + _d.d_right_count, "
+			       "_right_null_count = _aux._right_null_count + _d.d_right_null_count;\n\n";
+		} else {
+			sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dright_stats_table) +
+			       " AS\n  SELECT COALESCE(SUM(" + right_alias + "." + string(openivm::MULTIPLICITY_COL) +
+			       "), 0)::BIGINT AS d_right_count, COALESCE(SUM(CASE WHEN " + null_aware_right_expr +
+			       " IS NULL THEN " + right_alias + "." + string(openivm::MULTIPLICITY_COL) +
+			       " ELSE 0 END), 0)::BIGINT AS d_right_null_count\n  FROM " + right_delta_q + " " + right_alias +
+			       "\n  WHERE " + right_ts + right_delta_filter + ";\n\n";
+			sql += "UPDATE " + aux_q + " SET _right_count = _right_count + (SELECT d_right_count FROM " +
+			       SqlUtils::QuoteIdentifier(dright_stats_table) +
+			       "), _right_null_count = _right_null_count + (SELECT d_right_null_count FROM " +
+			       SqlUtils::QuoteIdentifier(dright_stats_table) + ") WHERE EXISTS (SELECT 1 FROM " +
+			       SqlUtils::QuoteIdentifier(dright_stats_table) +
+			       " WHERE d_right_count <> 0 OR d_right_null_count <> 0);\n\n";
+			sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(right_stats_table) +
+			       " AS\n  SELECT count(*)::BIGINT AS _right_count, count(*) FILTER (WHERE " + null_aware_right_expr +
+			       " IS NULL)::BIGINT AS _right_null_count FROM " + right_table + " " + right_alias + right_filter_sql +
+			       ";\n\n";
+		}
+	}
+
 	sql += "MERGE INTO " + aux_q + " _aux USING " + SqlUtils::QuoteIdentifier(dleft_table) + " i ON " + aux_i_match +
 	       "\nWHEN MATCHED THEN UPDATE SET _left_count = _aux._left_count + i.dmult;\n\n";
 
-	sql += "INSERT INTO " + aux_q + " (" + left_cols_csv + ", _left_count, _match_count)\nSELECT " + left_cols_i +
-	       ", i.dmult, COALESCE(mc._match_count, 0)::BIGINT\nFROM " + SqlUtils::QuoteIdentifier(dleft_table) +
-	       " i\nLEFT JOIN " + aux_q + " _aux ON " + aux_i_match + "\nLEFT JOIN (\n  SELECT " + left_cols_l +
-	       ", COUNT(*)::BIGINT AS _match_count\n  FROM " + SqlUtils::QuoteIdentifier(dleft_table) + " " + left_alias +
-	       " JOIN " + right_table + " " + right_alias + " ON " + predicate + "\n  GROUP BY " + left_cols_l +
-	       "\n) mc ON " + SqlUtils::BuildNullSafeMatch(left_cols, "mc", "i") +
+	string insert_cols = left_cols_csv + ", _left_count, _match_count";
+	string insert_stats_select;
+	string insert_stats_from;
+	if (null_aware_anti) {
+		insert_cols += ", _right_count, _right_null_count";
+		if (correlated_right_filter) {
+			string right_filter_i = RewriteQualifiedAliasPrefix(right_filter, left_alias, "i");
+			insert_stats_select = ", (SELECT count(*)::BIGINT FROM " + right_table + " " + right_alias + " WHERE " +
+			                      right_filter_i + "), (SELECT count(*) FILTER (WHERE " + null_aware_right_expr +
+			                      " IS NULL)::BIGINT FROM " + right_table + " " + right_alias + " WHERE " +
+			                      right_filter_i + ")";
+		} else {
+			insert_stats_select = ", rs._right_count, rs._right_null_count";
+			insert_stats_from = "\nCROSS JOIN " + SqlUtils::QuoteIdentifier(right_stats_table) + " rs";
+		}
+	}
+	sql += "INSERT INTO " + aux_q + " (" + insert_cols + ")\nSELECT " + left_cols_i +
+	       ", i.dmult, COALESCE(mc._match_count, 0)::BIGINT" + insert_stats_select + "\nFROM " +
+	       SqlUtils::QuoteIdentifier(dleft_table) + " i\nLEFT JOIN " + aux_q + " _aux ON " + aux_i_match +
+	       "\nLEFT JOIN (\n  SELECT " + left_cols_l + ", COUNT(*)::BIGINT AS _match_count\n  FROM " +
+	       SqlUtils::QuoteIdentifier(dleft_table) + " " + left_alias + " JOIN " + right_table + " " + right_alias +
+	       " ON " + match_predicate + "\n  GROUP BY " + left_cols_l + "\n) mc ON " +
+	       SqlUtils::BuildNullSafeMatch(left_cols, "mc", "i") + insert_stats_from +
 	       "\nWHERE _aux._left_count IS NULL AND i.dmult > 0;\n\n";
 
 	sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(aff_table) + " AS\nSELECT " + left_cols_old +
@@ -1291,8 +1473,10 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	sql += "DELETE FROM " + aux_q + " WHERE _left_count <= 0;\n";
 	sql += "DROP TABLE IF EXISTS " + SqlUtils::QuoteIdentifier(old_table) + ";\nDROP TABLE IF EXISTS " +
 	       SqlUtils::QuoteIdentifier(dleft_table) + ";\nDROP TABLE IF EXISTS " +
-	       SqlUtils::QuoteIdentifier(dright_table) + ";\nDROP TABLE IF EXISTS " + SqlUtils::QuoteIdentifier(aff_table) +
-	       ";\n";
+	       SqlUtils::QuoteIdentifier(dright_table) + ";\nDROP TABLE IF EXISTS " +
+	       SqlUtils::QuoteIdentifier(dright_stats_table) + ";\nDROP TABLE IF EXISTS " +
+	       SqlUtils::QuoteIdentifier(right_stats_table) + ";\nDROP TABLE IF EXISTS " +
+	       SqlUtils::QuoteIdentifier(aff_table) + ";\n";
 
 	OPENIVM_DEBUG_PRINT("[CompileSemiAntiRecompute] %s join, %zu left cols, aux=%s\n", join_type.c_str(),
 	                    left_cols.size(), aux_table.c_str());

@@ -398,6 +398,8 @@ static bool RewriteSemiAntiAuxMetaFields(RefreshMetadata::SemiAntiAuxMeta &meta,
 	if (AuxSourceMatches(meta.right_table, table_name)) {
 		auto qualifiers = SingleQualifier(meta.right_alias.empty() ? meta.right_table : meta.right_alias);
 		changed |= SqlUtils::RewriteColumnReferences(meta.predicate, old_name, new_name, qualifiers, true);
+		changed |= SqlUtils::RewriteColumnReferences(meta.right_filter, old_name, new_name, qualifiers, true);
+		changed |= SqlUtils::RewriteColumnReferences(meta.null_aware_right_expr, old_name, new_name, qualifiers, true);
 	}
 	return changed;
 }

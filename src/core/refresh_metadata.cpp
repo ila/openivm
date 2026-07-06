@@ -811,6 +811,13 @@ bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMet
 	ok &= ExtractJsonString(json, "right_alias", out.right_alias);
 	ok &= ExtractJsonString(json, "predicate", out.predicate);
 	ExtractJsonString(json, "post_filter", out.post_filter);
+	ExtractJsonString(json, "right_filter", out.right_filter);
+	string null_aware;
+	if (ExtractJsonString(json, "null_aware", null_aware)) {
+		out.null_aware = StringUtil::CIEquals(null_aware, "true");
+	}
+	ExtractJsonString(json, "null_aware_left_col", out.null_aware_left_col);
+	ExtractJsonString(json, "null_aware_right_expr", out.null_aware_right_expr);
 	ok &= ExtractJsonStringArray(json, "left_cols", out.left_cols);
 	ExtractJsonStringArray(json, "left_exprs", out.left_exprs);
 	ok &= ExtractJsonStringArray(json, "output_cols", out.output_cols);
@@ -826,6 +833,10 @@ string RefreshMetadata::SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta) {
 	       ",\"right_alias\":" + SqlUtils::JsonQuote(meta.right_alias) +
 	       ",\"predicate\":" + SqlUtils::JsonQuote(meta.predicate) +
 	       ",\"post_filter\":" + SqlUtils::JsonQuote(meta.post_filter) +
+	       ",\"right_filter\":" + SqlUtils::JsonQuote(meta.right_filter) +
+	       ",\"null_aware\":" + SqlUtils::JsonQuote(meta.null_aware ? "true" : "false") +
+	       ",\"null_aware_left_col\":" + SqlUtils::JsonQuote(meta.null_aware_left_col) +
+	       ",\"null_aware_right_expr\":" + SqlUtils::JsonQuote(meta.null_aware_right_expr) +
 	       ",\"left_cols\":" + SqlUtils::JsonArray(meta.left_cols) +
 	       ",\"left_exprs\":" + SqlUtils::JsonArray(meta.left_exprs) +
 	       ",\"output_cols\":" + SqlUtils::JsonArray(meta.output_cols) + "}";
@@ -1006,6 +1017,10 @@ vector<string> RefreshMetadata::ExpectedSemiAntiAuxColumns(const SemiAntiAuxMeta
 	auto expected = meta.left_cols;
 	expected.push_back("_left_count");
 	expected.push_back("_match_count");
+	if (meta.null_aware && StringUtil::Lower(meta.join_type) == "anti") {
+		expected.push_back("_right_count");
+		expected.push_back("_right_null_count");
+	}
 	return expected;
 }
 
