@@ -43,6 +43,22 @@ WHERE stmt_kind = 'data';
 ----
 true
 
+# Spark target: inline merge-temp cascade uses TEMP TABLEs that do not survive
+# Spark's statement split execution. It must stay disabled so the split-safe
+# companion emits the cascade delta instead.
+query I
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%openivm_old_snapshot_mv_io_sum_merge%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%openivm_old_affected_mv_io_sum_merge%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%MERGE INTO openivm_data_mv_io_sum%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%FROM openivm_delta_mv_io_sum d%'
+FROM openivm_compile_with_facts(
+    'mv_io_sum',
+    '{"target_dialect":"spark","compile_only":true,"assume_insert_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+true
+
 # Native runtime fast path stays bag-equal to the base query.
 statement ok
 PRAGMA refresh('mv_io_sum');

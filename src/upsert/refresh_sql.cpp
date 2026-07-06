@@ -1029,13 +1029,19 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		} else {
 			bool effective_insert_only =
 			    has_argminmax ? false : (has_minmax ? (insert_only && minmax_incremental) : skip_agg_delete);
+			// The inline merge-temp cascade snapshots affected groups into TEMP TABLEs
+			// and reads them back later in the refresh program. Spark executes the
+			// compile-only program statement-by-statement, so those temps do not
+			// survive. For Spark, let the split-safe companion below emit the view
+			// delta instead.
+			bool inline_merge_cascade =
+			    active_facts.force_view_delta_cascade && active_facts.target_dialect != SqlDialect::SPARK;
 			upsert_query = CompileAggregateGroups(
 			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
 			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types,
 			    /*use_current_diff_affected_keys=*/false, aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
 			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
-			    /*inline_cascade_delta=*/active_facts.force_view_delta_cascade,
-			    &aggregate_recompute_emits_cascade_delta);
+			    /*inline_cascade_delta=*/inline_merge_cascade, &aggregate_recompute_emits_cascade_delta);
 		}
 		break;
 	}
@@ -1322,15 +1328,30 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		string qdvn = delta_view_name.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(delta_view_name)
 		                                                        : delta_view_name;
 		const string &qdt = data_table;
-		pre_companion = "CREATE TEMP TABLE " + qt + " AS SELECT * FROM " + qdt + ";\n";
+		string user_cols;
+		for (auto &col : column_names) {
+			if (col == string(openivm::MULTIPLICITY_COL)) {
+				continue;
+			}
+			if (!user_cols.empty()) {
+				user_cols += ", ";
+			}
+			user_cols += SqlUtils::QuoteIdentifier(col);
+		}
+		pre_companion = "CREATE OR REPLACE TEMP TABLE " + qt + " AS SELECT * FROM " + qdt + ";\n";
 		post_companion = "DELETE FROM " + qdvn + " WHERE 1=1";
 		if (!delta_ts_filter.empty()) {
 			post_companion += " AND " + delta_ts_filter;
 		}
 		post_companion += ";\n";
-		post_companion += "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_old + " FROM " + qt + ";\n";
-		post_companion += "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_new + " FROM " + qdt + ";\n";
-		post_companion += "DROP TABLE " + qt + ";\n";
+		string old_minus_new =
+		    "(SELECT " + user_cols + " FROM " + qt + " EXCEPT ALL SELECT " + user_cols + " FROM " + qdt + ")";
+		string new_minus_old =
+		    "(SELECT " + user_cols + " FROM " + qdt + " EXCEPT ALL SELECT " + user_cols + " FROM " + qt + ")";
+		post_companion += "INSERT INTO " + qdvn + " (" + col_list + ") SELECT " + select_old + " FROM " +
+		                  old_minus_new + " openivm_diff UNION ALL SELECT " + select_new + " FROM " + new_minus_old +
+		                  " openivm_diff;\n";
+		post_companion += "DROP TABLE IF EXISTS " + qt + ";\n";
 		OPENIVM_DEBUG_PRINT("[UPSERT] Pre-companion: %s\n", pre_companion.c_str());
 		OPENIVM_DEBUG_PRINT("[UPSERT] Post-companion: %s\n", post_companion.c_str());
 	};
