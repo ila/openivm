@@ -36,10 +36,15 @@ Backup before recovery work: `backup/main-before-cost-model-recovery-20260706`.
 
 ## Review before applying
 
-1. Spark-safe cascade companion work
+1. Spark-safe cascade companion work - applied
    - Source branch: `saved/openivm-after-raki-pr-20260706`.
    - Commit: `68831da5 refresh: preserve Spark-safe cascade companions`.
    - Purpose: avoid Spark-unsafe inline temp-table cascade companions and use split-safe companion delta output.
+   - Applied focused patch from `68831da5`.
+   - Verified with:
+     - `cmake --build build/release --target openivm_extension unittest --parallel 4`
+     - `build/release/test/unittest "test/sql/insert_only_aggregate_group.test"`
+     - `build/release/test/unittest "test/sql/compile_spark_dialect_hardening.test"`
 
 2. Insert-only and dimension-table performance paths
    - Most base behavior is already on `main` through Raki's squashed `909a1063`.
