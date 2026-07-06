@@ -8,8 +8,8 @@
 	branch = main
 [submodule "third_party/lpts"]
 	path = third_party/lpts
-	url = https://github.com/mdrakiburrahman/lpts.git
-	branch = dev/mdrrahman/spark-dialect-compat
+	url = https://github.com/cwida/lpts.git
+	branch = main
 [submodule ".claude/skills/shared"]
 	path = .claude/skills/shared
 	url = https://github.com/ila/duckdb-claude-skills.git
