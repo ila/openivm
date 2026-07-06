@@ -1,15 +1,8 @@
 # name: test/sql/cascade_group_recompute_delta_asof.test
-# description: ASOF GROUP_RECOMPUTE cascade delta (split from cascade_group_recompute_delta.test). Gated off Windows.
+# description: ASOF GROUP_RECOMPUTE cascade delta (split from cascade_group_recompute_delta.test).
 # group: [sql]
 
-# TODO(asof-deadlock): Split out of cascade_group_recompute_delta.test and gated off Windows
-# because DuckDB's parallel ASOF-join sort deadlocks in TemporaryMemoryManager on Windows/MSVC
-# ("resource deadlock would occur") during the ASOF MV's initial-load CREATE. Fixed on DuckDB
-# main but not in any v1.5.x release; threads=1 does NOT avoid it. Re-merge and drop the
-# `require notwindows` gate once CI's duckdb_version is bumped to a release with the fix.
 require openivm
-
-require notwindows
 
 statement ok
 SET openivm_files_path='__TEST_DIR__';

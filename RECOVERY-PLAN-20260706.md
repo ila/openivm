@@ -15,7 +15,7 @@ Backup before recovery work: `backup/main-before-cost-model-recovery-20260706`.
      - `build/release/test/unittest "test/sql/auto_refresh.test"`
      - `./build/release/extension/openivm/cost_model_benchmark --scale 1 --db /tmp/openivm_cost_recovery_sf1_20260706.db --out /tmp/openivm_cost_recovery_sf1_20260706.csv --reps 1 --delta-pcts 0,1 --configs all_on --batch validated --filter Q01`
 
-2. ASOF tests
+2. ASOF tests - applied
    - Source branch: `main-on-raki-latest`.
    - Recover split ASOF-heavy SQL suites:
      - `test/sql/auto_refresh_asof.test`
@@ -23,6 +23,16 @@ Backup before recovery work: `backup/main-before-cost-model-recovery-20260706`.
      - `test/sql/compile_refresh_asof.test`
      - `test/sql/nonlocal_operator_recompute_asof.test`
    - Keep current `main` ASOF implementation; recover test coverage carefully.
+   - Applied as split SQL tests without `require notwindows` gates.
+   - Verified the four ASOF files and the four parent files:
+     - `test/sql/auto_refresh_asof.test`
+     - `test/sql/cascade_group_recompute_delta_asof.test`
+     - `test/sql/compile_refresh_asof.test`
+     - `test/sql/nonlocal_operator_recompute_asof.test`
+     - `test/sql/auto_refresh.test`
+     - `test/sql/cascade_group_recompute_delta.test`
+     - `test/sql/compile_refresh.test`
+     - `test/sql/nonlocal_operator_recompute.test`
 
 ## Review before applying
 

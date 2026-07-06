@@ -195,9 +195,7 @@ WHERE stmt_kind = 'data';
 ----
 1
 
-# Test 6 (CURRENT_DIFF_RECOMPUTE for an ASOF view) moved to compile_refresh_asof.test
-# (gated `require notwindows` — DuckDB parallel-ASOF deadlock on Windows). See
-# TODO(asof-deadlock) there.
+# Test 6 (CURRENT_DIFF_RECOMPUTE for an ASOF view) moved to compile_refresh_asof.test.
 
 # ==========================================
 # Test 7: openivm_compile_with_facts on a non-existent view fails cleanly

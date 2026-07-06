@@ -5,8 +5,7 @@
 require openivm
 
 # Top ASOF section and the materialized-CTE ASOF block moved to
-# nonlocal_operator_recompute_asof.test (gated `require notwindows` — DuckDB
-# parallel-ASOF deadlock on Windows). See TODO(asof-deadlock) there.
+# nonlocal_operator_recompute_asof.test.
 
 
 # ==========================================

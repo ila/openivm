@@ -95,9 +95,7 @@ WHERE stmt_kind = 'data';
 ----
 1
 
-# ASOF GROUP_RECOMPUTE block moved to cascade_group_recompute_delta_asof.test
-# (gated `require notwindows` — DuckDB parallel-ASOF deadlock on Windows). See
-# TODO(asof-deadlock) there.
+# ASOF GROUP_RECOMPUTE block moved to cascade_group_recompute_delta_asof.test.
 
 # ==========================================
 # Runtime correctness: PRAGMA refresh uses default CompileFacts (no cascade),
