@@ -95,7 +95,7 @@ enum class DeltaUpdateSemantics {
 	AGGREGATE_DELETE_SKIP_SAFE
 };
 
-enum class DeltaAuxStateKind { DISTINCT_COUNT, FILTERED_GROUP_COUNT, SEMI_ANTI_MATCH };
+enum class DeltaAuxStateKind { DISTINCT_COUNT, COUNT_DISTINCT, FILTERED_GROUP_COUNT, SEMI_ANTI_MATCH };
 
 enum class DeltaAffectedDomainKind { GROUP, WINDOW_PARTITION, PROJECTION_KEY, SEMI_ANTI_PREDICATE };
 
@@ -157,6 +157,7 @@ struct DeltaViewModelInput {
 	const CreateMVPlanFacts *facts = nullptr;
 	const vector<string> *output_names = nullptr;
 	const RefreshMetadata::DistinctAuxMeta *distinct_aux_candidate = nullptr;
+	const RefreshMetadata::CountDistinctAuxMeta *count_distinct_aux_candidate = nullptr;
 	const FilteredGroupCountAuxRequirement *filtered_group_count_aux_candidate = nullptr;
 	const RefreshMetadata::SemiAntiAuxMeta *semi_anti_aux_candidate = nullptr;
 	bool has_unsupported_incremental_construct = false;
@@ -186,6 +187,7 @@ struct DeltaViewModel {
 	string full_outer_join_cols;
 	GroupRecomputeAffectedMode group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
 	RefreshMetadata::DistinctAuxMeta distinct_aux;
+	RefreshMetadata::CountDistinctAuxMeta count_distinct_aux;
 	FilteredGroupCountAuxRequirement filtered_group_count_aux;
 	RefreshMetadata::SemiAntiAuxMeta semi_anti_aux;
 	bool has_minmax_metadata = false;
@@ -197,6 +199,9 @@ struct DeltaViewModel {
 
 	bool HasDistinctAux() const {
 		return !distinct_aux.aux_table.empty();
+	}
+	bool HasCountDistinctAux() const {
+		return !count_distinct_aux.aux_table.empty();
 	}
 	bool HasFilteredGroupCountAux() const {
 		return !filtered_group_count_aux.meta.aux_table.empty();

@@ -760,6 +760,38 @@ string RefreshMetadata::DistinctAuxMetaToJson(const DistinctAuxMeta &meta) {
 	       ",\"sum_out\":" + SqlUtils::JsonQuote(meta.sum_out) + "}";
 }
 
+bool RefreshMetadata::GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out) {
+	auto result = con.Query("SELECT count_distinct_aux_meta_json FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	string json = result->GetValue(0, 0).ToString();
+	if (json.empty()) {
+		return false;
+	}
+	bool ok = true;
+	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= ExtractJsonString(json, "source", out.source);
+	ok &= ExtractJsonStringArray(json, "group_cols", out.group_cols);
+	ExtractJsonStringArray(json, "group_source_exprs", out.group_source_exprs);
+	ok &= ExtractJsonString(json, "distinct_col", out.distinct_col);
+	ok &= ExtractJsonString(json, "distinct_expr", out.distinct_expr);
+	ok &= ExtractJsonString(json, "output_col", out.output_col);
+	ExtractJsonString(json, "filter", out.filter);
+	return ok;
+}
+
+string RefreshMetadata::CountDistinctAuxMetaToJson(const CountDistinctAuxMeta &meta) {
+	return "{\"aux_table\":" + SqlUtils::JsonQuote(meta.aux_table) + ",\"source\":" + SqlUtils::JsonQuote(meta.source) +
+	       ",\"group_cols\":" + SqlUtils::JsonArray(meta.group_cols) +
+	       ",\"group_source_exprs\":" + SqlUtils::JsonArray(meta.group_source_exprs) +
+	       ",\"distinct_col\":" + SqlUtils::JsonQuote(meta.distinct_col) +
+	       ",\"distinct_expr\":" + SqlUtils::JsonQuote(meta.distinct_expr) +
+	       ",\"output_col\":" + SqlUtils::JsonQuote(meta.output_col) +
+	       ",\"filter\":" + SqlUtils::JsonQuote(meta.filter) + "}";
+}
+
 bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out) {
 	auto result = con.Query("SELECT semi_anti_aux_meta_json FROM " + string(openivm::VIEWS_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
@@ -959,6 +991,13 @@ vector<string> RefreshMetadata::ExpectedDistinctAuxColumns(const DistinctAuxMeta
 	return expected;
 }
 
+vector<string> RefreshMetadata::ExpectedCountDistinctAuxColumns(const CountDistinctAuxMeta &meta) {
+	auto expected = meta.group_cols;
+	expected.push_back(meta.distinct_col);
+	expected.push_back("_count");
+	return expected;
+}
+
 vector<string> RefreshMetadata::ExpectedFilteredGroupCountAuxColumns(const FilteredGroupCountAuxMeta &meta) {
 	return vector<string> {meta.group_col, "openivm_sum"};
 }
@@ -975,6 +1014,12 @@ bool RefreshMetadata::AuxStateNeedsRepair(const string &view_name, const string 
 	DistinctAuxMeta distinct;
 	if (GetDistinctAuxMeta(view_name, distinct) &&
 	    !TableColumnsMatch(catalog_name, schema_name, distinct.aux_table, ExpectedDistinctAuxColumns(distinct))) {
+		return true;
+	}
+	CountDistinctAuxMeta count_distinct;
+	if (GetCountDistinctAuxMeta(view_name, count_distinct) &&
+	    !TableColumnsMatch(catalog_name, schema_name, count_distinct.aux_table,
+	                       ExpectedCountDistinctAuxColumns(count_distinct))) {
 		return true;
 	}
 	FilteredGroupCountAuxMeta filtered;

@@ -499,15 +499,47 @@ bool IsEmptyDeltaPlan(LogicalOperator *op) {
 	}
 }
 
+static string NullLiteralForDialect(const LogicalType &type, SqlDialect dialect) {
+	if (dialect == SqlDialect::SPARK) {
+		switch (type.id()) {
+		case LogicalTypeId::BOOLEAN:
+			return "CAST(NULL AS BOOLEAN)";
+		case LogicalTypeId::TINYINT:
+			return "CAST(NULL AS TINYINT)";
+		case LogicalTypeId::SMALLINT:
+			return "CAST(NULL AS SMALLINT)";
+		case LogicalTypeId::INTEGER:
+			return "CAST(NULL AS INTEGER)";
+		case LogicalTypeId::BIGINT:
+			return "CAST(NULL AS BIGINT)";
+		case LogicalTypeId::FLOAT:
+			return "CAST(NULL AS FLOAT)";
+		case LogicalTypeId::DOUBLE:
+			return "CAST(NULL AS DOUBLE)";
+		case LogicalTypeId::DECIMAL:
+			return "CAST(NULL AS " + type.ToString() + ")";
+		case LogicalTypeId::VARCHAR:
+			return "CAST(NULL AS VARCHAR)";
+		case LogicalTypeId::DATE:
+			return "CAST(NULL AS DATE)";
+		case LogicalTypeId::TIMESTAMP:
+			return "CAST(NULL AS TIMESTAMP)";
+		default:
+			return "CAST(NULL AS STRING)";
+		}
+	}
+	return "NULL::" + type.ToString();
+}
+
 string BuildEmptyDeltaInsert(const string &view_name, const vector<string> &column_names,
-                             const vector<LogicalType> &column_types) {
+                             const vector<LogicalType> &column_types, SqlDialect dialect) {
 	string sql = "INSERT INTO " + SqlUtils::DeltaName(view_name) + " SELECT ";
 	for (size_t i = 0; i < column_names.size(); i++) {
 		if (i > 0) {
 			sql += ", ";
 		}
 		auto type = i < column_types.size() ? column_types[i] : LogicalType::VARCHAR;
-		sql += "NULL::" + type.ToString();
+		sql += NullLiteralForDialect(type, dialect);
 	}
 	sql += " WHERE false;\n";
 	return sql;

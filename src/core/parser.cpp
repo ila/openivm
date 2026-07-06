@@ -610,6 +610,33 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		                          distinct_sum_out};
 		model_input.distinct_aux_candidate = &distinct_aux_candidate;
 	}
+	RefreshMetadata::CountDistinctAuxMeta count_distinct_aux_candidate;
+	if (analysis.found_count_distinct && table_names.size() == 1 && analysis.group_count > 0 &&
+	    analysis.group_count < output_names.size()) {
+		Value aux_val;
+		bool aux_enabled = false;
+		if (context.TryGetCurrentSetting("openivm_stateful_auxstate", aux_val) && !aux_val.IsNull()) {
+			aux_enabled = aux_val.GetValue<bool>();
+		}
+		if (aux_enabled) {
+			vector<string> candidate_group_columns;
+			for (idx_t i = 0; i < analysis.group_count && i < output_names.size(); i++) {
+				candidate_group_columns.push_back(output_names[i]);
+			}
+			CountDistinctExtract cd_extract;
+			if (ExtractCountDistinctAggregate(original_view_query, candidate_group_columns, output_names, cd_extract)) {
+				count_distinct_aux_candidate = {
+				    "openivm_aux_" + view_name, SqlUtils::LastIdentifierPart(cd_extract.source),
+				    candidate_group_columns,    cd_extract.group_exprs,
+				    cd_extract.distinct_col,    cd_extract.distinct_expr,
+				    cd_extract.output_col,      cd_extract.filter};
+				model_input.count_distinct_aux_candidate = &count_distinct_aux_candidate;
+			} else {
+				OPENIVM_DEBUG_PRINT("[CREATE MV] COUNT_DISTINCT_INCREMENTAL extractor failed — demoting to "
+				                    "GROUP_RECOMPUTE\n");
+			}
+		}
+	}
 	RefreshMetadata::SemiAntiAuxMeta semi_anti_aux_candidate;
 	if (!semi_anti_left_cols.empty()) {
 		vector<string> semi_anti_left_exprs;
@@ -841,6 +868,21 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
 		aux_metadata_ddl.push_back(
 		    BuildUpdateViewJsonSQL("distinct_aux_meta_json", RefreshMetadata::DistinctAuxMetaToJson(meta), view_name));
+	}
+
+	if (view_model.HasCountDistinctAux()) {
+		add_profile_marker("create_mv_count_distinct_aux");
+		const auto &meta = view_model.count_distinct_aux;
+		string source_table = QualifyCreateSourceTable(meta.source, current_catalog, current_schema, default_db);
+		string aux_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(meta.aux_table);
+		string aux_create =
+		    BuildCountDistinctAuxStateCreateSQL(aux_target, source_table, meta.group_cols, meta.group_source_exprs,
+		                                        meta.distinct_col, meta.distinct_expr, meta.filter, /*replace=*/false);
+		ddl.push_back(aux_create);
+		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
+		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
+		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
+		    "count_distinct_aux_meta_json", RefreshMetadata::CountDistinctAuxMetaToJson(meta), view_name));
 	}
 
 	if (view_model.HasFilteredGroupCountAux()) {

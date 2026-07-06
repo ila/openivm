@@ -6,6 +6,9 @@
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_internal.hpp"
 
+#include <map>
+#include <regex>
+
 namespace duckdb {
 
 namespace {
@@ -15,6 +18,907 @@ static string DeltaSourceRef(const string &source, const string &catalog_prefix)
 		return source;
 	}
 	return catalog_prefix + SqlUtils::QuoteIdentifier(source);
+}
+
+static string TrimCopy(const string &input) {
+	idx_t start = 0;
+	while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
+		start++;
+	}
+	idx_t end = input.size();
+	while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+		end--;
+	}
+	return input.substr(start, end - start);
+}
+
+static string LowerCopy(string input) {
+	std::transform(input.begin(), input.end(), input.begin(),
+	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return input;
+}
+
+static string StripIdentifierQuotes(string input) {
+	input = TrimCopy(input);
+	if (input.size() >= 2 && input.front() == '"' && input.back() == '"') {
+		return input.substr(1, input.size() - 2);
+	}
+	return SqlUtils::LastIdentifierPart(input);
+}
+
+static string PartitionOutputColumn(const string &input) {
+	auto pos = input.find('=');
+	return StripIdentifierQuotes(pos == string::npos ? input : input.substr(0, pos));
+}
+
+static vector<string> SplitTopLevelComma(const string &input) {
+	vector<string> parts;
+	idx_t start = 0;
+	int depth = 0;
+	for (idx_t i = 0; i < input.size(); i++) {
+		char c = input[i];
+		if (c == '(') {
+			depth++;
+		} else if (c == ')' && depth > 0) {
+			depth--;
+		} else if (c == ',' && depth == 0) {
+			parts.push_back(TrimCopy(input.substr(start, i - start)));
+			start = i + 1;
+		}
+	}
+	parts.push_back(TrimCopy(input.substr(start)));
+	return parts;
+}
+
+static idx_t FindTopLevelFrom(const string &input) {
+	string lower = LowerCopy(input);
+	int depth = 0;
+	for (idx_t i = 0; i + 6 <= lower.size(); i++) {
+		char c = lower[i];
+		if (c == '(') {
+			depth++;
+		} else if (c == ')' && depth > 0) {
+			depth--;
+		}
+
+		if (depth == 0 && lower.compare(i, 6, " from ") == 0) {
+			return i;
+		}
+	}
+	return string::npos;
+}
+
+static idx_t FindTopLevelKeyword(const string &input, const string &keyword, idx_t start = 0) {
+	string lower = LowerCopy(input);
+	string needle = " " + keyword + " ";
+	int depth = 0;
+	for (idx_t i = start; i + needle.size() <= lower.size(); i++) {
+		char c = lower[i];
+		if (c == '(') {
+			depth++;
+		} else if (c == ')' && depth > 0) {
+			depth--;
+		}
+		if (depth == 0 && lower.compare(i, needle.size(), needle) == 0) {
+			return i;
+		}
+	}
+	return string::npos;
+}
+
+struct RunningWindowExpr {
+	string function_name;
+	string argument;
+	string output_column;
+};
+
+struct RunningDerivedExpr {
+	string output_column;
+	string expression;
+};
+
+struct RunningWindowPlan {
+	string source_table;
+	string partition_column;
+	string order_column;
+	vector<string> output_columns;
+	vector<pair<string, string>> passthrough_columns;
+	vector<RunningWindowExpr> window_exprs;
+	vector<RunningDerivedExpr> derived_exprs;
+};
+
+static bool ParsePassthroughProjection(const string &item, pair<string, string> &out) {
+	static const std::regex alias_regex(R"(^\s*(.+?)\s+as\s+("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$)",
+	                                    std::regex_constants::icase);
+	std::smatch match;
+	string expr = item;
+	string output;
+	if (std::regex_match(item, match, alias_regex)) {
+		expr = TrimCopy(match[1].str());
+		output = StripIdentifierQuotes(match[2].str());
+	} else {
+		output = StripIdentifierQuotes(expr);
+	}
+	string source = StripIdentifierQuotes(expr);
+	if (source.empty() || source.find(' ') != string::npos || source.find('(') != string::npos) {
+		return false;
+	}
+	out = std::make_pair(source, output);
+	return true;
+}
+
+static bool ParseWindowSpec(const string &spec_input, string &partition_col, string &order_col) {
+	string spec = TrimCopy(spec_input);
+	string spec_lower = LowerCopy(spec);
+	auto part_pos = spec_lower.find("partition by ");
+	auto order_pos = spec_lower.find(" order by ");
+	if (part_pos == string::npos || order_pos == string::npos || order_pos <= part_pos) {
+		return false;
+	}
+	string part_expr = TrimCopy(spec.substr(part_pos + 13, order_pos - (part_pos + 13)));
+	string order_expr = TrimCopy(spec.substr(order_pos + 10));
+	string order_lower = LowerCopy(order_expr);
+	auto frame_pos = order_lower.find(" rows ");
+	if (frame_pos == string::npos) {
+		frame_pos = order_lower.find(" range ");
+	}
+	if (frame_pos != string::npos) {
+		string frame = order_lower.substr(frame_pos);
+		if (frame.find("unbounded preceding") == string::npos || frame.find("current row") == string::npos) {
+			return false;
+		}
+		order_expr = TrimCopy(order_expr.substr(0, frame_pos));
+	}
+	auto nulls_pos = LowerCopy(order_expr).find(" nulls ");
+	if (nulls_pos != string::npos) {
+		order_expr = TrimCopy(order_expr.substr(0, nulls_pos));
+	}
+	auto order_space = order_expr.find(' ');
+	if (order_space != string::npos) {
+		string suffix = LowerCopy(TrimCopy(order_expr.substr(order_space + 1)));
+		if (suffix != "asc") {
+			return false;
+		}
+		order_expr = TrimCopy(order_expr.substr(0, order_space));
+	}
+	string parsed_part = StripIdentifierQuotes(part_expr);
+	string parsed_order = StripIdentifierQuotes(order_expr);
+	if (parsed_part.empty() || parsed_order.empty() || part_expr.find(',') != string::npos ||
+	    order_expr.find(',') != string::npos) {
+		return false;
+	}
+	if (!partition_col.empty() && !StringUtil::CIEquals(partition_col, parsed_part)) {
+		return false;
+	}
+	if (!order_col.empty() && !StringUtil::CIEquals(order_col, parsed_order)) {
+		return false;
+	}
+	partition_col = parsed_part;
+	order_col = parsed_order;
+	return true;
+}
+
+static bool ParseNamedWindows(const string &tail, std::map<string, string> &named_windows) {
+	for (auto &item : SplitTopLevelComma(tail)) {
+		static const std::regex named_regex(R"(^\s*("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s+as\s*\((.*)\)\s*$)",
+		                                    std::regex_constants::icase);
+		std::smatch match;
+		if (!std::regex_match(item, match, named_regex)) {
+			return false;
+		}
+		named_windows[StringUtil::Lower(StripIdentifierQuotes(match[1].str()))] = TrimCopy(match[2].str());
+	}
+	return !named_windows.empty();
+}
+
+static bool ParseRunningWindowProjection(const string &item, const std::map<string, string> &named_windows,
+                                         RunningWindowExpr &out, string &partition_col, string &order_col) {
+	static const std::regex alias_regex(R"(^\s*(.+?)\s+as\s+("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$)",
+	                                    std::regex_constants::icase);
+	std::smatch alias_match;
+	if (!std::regex_match(item, alias_match, alias_regex)) {
+		return false;
+	}
+	string expr = TrimCopy(alias_match[1].str());
+	out.output_column = StripIdentifierQuotes(alias_match[2].str());
+	static const std::regex window_regex(R"(^\s*(sum|min|max|count|avg)\s*\(\s*([^)]+?)\s*\)\s+over\s*\((.*)\)\s*$)",
+	                                     std::regex_constants::icase);
+	static const std::regex named_window_regex(
+	    R"(^\s*(sum|min|max|count|avg)\s*\(\s*([^)]+?)\s*\)\s+over\s+("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$)",
+	    std::regex_constants::icase);
+	std::smatch window_match;
+	string spec;
+	if (!std::regex_match(expr, window_match, window_regex)) {
+		if (!std::regex_match(expr, window_match, named_window_regex)) {
+			return false;
+		}
+		auto found = named_windows.find(StringUtil::Lower(StripIdentifierQuotes(window_match[3].str())));
+		if (found == named_windows.end()) {
+			return false;
+		}
+		spec = found->second;
+	} else {
+		spec = TrimCopy(window_match[3].str());
+	}
+	if (!ParseWindowSpec(spec, partition_col, order_col)) {
+		return false;
+	}
+	out.function_name = LowerCopy(window_match[1].str());
+	out.argument = StripIdentifierQuotes(window_match[2].str());
+	return true;
+}
+
+static bool ParseRunningWindowExpression(const string &expr, RunningWindowExpr &out, string &partition_col,
+                                         string &order_col) {
+	static const std::regex window_regex(R"(^\s*(sum|min|max|count|avg)\s*\(\s*([^)]+?)\s*\)\s+over\s*\((.*)\)\s*$)",
+	                                     std::regex_constants::icase);
+	std::smatch window_match;
+	if (!std::regex_match(expr, window_match, window_regex)) {
+		return false;
+	}
+	if (!ParseWindowSpec(TrimCopy(window_match[3].str()), partition_col, order_col)) {
+		return false;
+	}
+	out.function_name = LowerCopy(window_match[1].str());
+	out.argument = StripIdentifierQuotes(window_match[2].str());
+	return true;
+}
+
+static string TranslateExpressionIdentifiers(const string &expr, const std::map<string, string> &alias_to_output) {
+	static const std::regex ident_regex(R"("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)");
+	string result;
+	idx_t pos = 0;
+	for (std::sregex_iterator it(expr.begin(), expr.end(), ident_regex), end; it != end; ++it) {
+		const auto &match = *it;
+		result += expr.substr(pos, match.position() - pos);
+		string token = match.str();
+		string key = StringUtil::Lower(StripIdentifierQuotes(token));
+		auto found = alias_to_output.find(key);
+		result += found == alias_to_output.end() ? token : SqlUtils::QuoteIdentifier(found->second);
+		pos = match.position() + match.length();
+	}
+	result += expr.substr(pos);
+	return result;
+}
+
+static bool LooksLikeLptsAlias(const string &expr) {
+	static const std::regex lpts_alias_regex(R"(\bt[0-9]+_[A-Za-z0-9_]+\b)");
+	return std::regex_search(expr, lpts_alias_regex);
+}
+
+static bool TryParseRunningWindowPlan(const string &view_query_sql, const vector<string> &partition_columns,
+                                      const vector<string> &column_names, RunningWindowPlan &plan) {
+	string query = TrimCopy(view_query_sql);
+	if (!StringUtil::StartsWith(LowerCopy(query), "select ")) {
+		return false;
+	}
+	auto from_pos = FindTopLevelFrom(query);
+	if (from_pos == string::npos) {
+		return false;
+	}
+	string select_list = query.substr(7, from_pos - 7);
+	string from_tail = TrimCopy(query.substr(from_pos + 6));
+	std::map<string, string> named_windows;
+	auto window_pos = FindTopLevelKeyword(" " + from_tail, "window");
+	if (window_pos != string::npos) {
+		string source_tail = TrimCopy(from_tail.substr(0, window_pos - 1));
+		string window_tail = TrimCopy(from_tail.substr(window_pos + 7));
+		if (!ParseNamedWindows(window_tail, named_windows)) {
+			return false;
+		}
+		from_tail = source_tail;
+	}
+	if (from_tail.empty() || from_tail.find(' ') != string::npos || from_tail.find(',') != string::npos) {
+		return false;
+	}
+	plan.source_table = StripIdentifierQuotes(from_tail);
+	auto parsed_partition = partition_columns.empty() ? "" : PartitionOutputColumn(partition_columns[0]);
+	string parsed_order;
+	for (auto &item : SplitTopLevelComma(select_list)) {
+		if (LowerCopy(item).find(" over ") != string::npos) {
+			RunningWindowExpr expr;
+			if (!ParseRunningWindowProjection(item, named_windows, expr, parsed_partition, parsed_order)) {
+				return false;
+			}
+			plan.window_exprs.push_back(expr);
+		} else {
+			pair<string, string> pass;
+			if (!ParsePassthroughProjection(item, pass)) {
+				return false;
+			}
+			plan.passthrough_columns.push_back(pass);
+		}
+	}
+	if (plan.window_exprs.empty() || parsed_partition.empty() || parsed_order.empty() ||
+	    partition_columns.size() != 1) {
+		return false;
+	}
+	plan.partition_column = parsed_partition;
+	plan.order_column = parsed_order;
+	for (auto &col : column_names) {
+		bool found = false;
+		for (auto &pass : plan.passthrough_columns) {
+			found = found || StringUtil::CIEquals(col, pass.second);
+		}
+		for (auto &expr : plan.window_exprs) {
+			found = found || StringUtil::CIEquals(col, expr.output_column);
+		}
+		if (!found) {
+			return false;
+		}
+	}
+	plan.output_columns = column_names;
+	return true;
+}
+
+// Normalize an LPTS-emitted CTE program into the compact, single-space token stream that the
+// structural navigation in TryParseLptsRunningWindowPlan expects. The LPTS refactor (cwida lpts
+// Release 1.0.0) switched CTE bodies to a multi-line, aligned pretty-print (e.g. "AS (\n    SELECT
+// ...\n    FROM  ...\n)") and renamed CTEs from "scan_0"/"projection_1" to "t0_scan"/"t1_projection".
+// Collapsing whitespace and tightening parentheses restores "AS (SELECT ... source)" so the same
+// find()/rfind() navigation continues to work regardless of the layout. The window/order/partition
+// expressions themselves are re-parsed with whitespace-tolerant regexes, so no information is lost.
+static string NormalizeLptsRunningWindowSql(const string &sql) {
+	string collapsed;
+	collapsed.reserve(sql.size());
+	bool prev_space = false;
+	for (unsigned char c : sql) {
+		if (std::isspace(c)) {
+			if (!prev_space) {
+				collapsed += ' ';
+				prev_space = true;
+			}
+		} else {
+			collapsed += static_cast<char>(c);
+			prev_space = false;
+		}
+	}
+	auto replace_all = [](string &s, const string &from, const string &to) {
+		size_t pos = 0;
+		while ((pos = s.find(from, pos)) != string::npos) {
+			s.replace(pos, from.size(), to);
+			pos += to.size();
+		}
+	};
+	replace_all(collapsed, "( ", "(");
+	replace_all(collapsed, " )", ")");
+	return collapsed;
+}
+
+static bool TryParseLptsRunningWindowPlan(const string &raw_view_query_sql, const vector<string> &partition_columns,
+                                          const vector<string> &column_names, RunningWindowPlan &plan) {
+	string view_query_sql = NormalizeLptsRunningWindowSql(raw_view_query_sql);
+	string lower = LowerCopy(view_query_sql);
+	// The first CTE in a running-window LPTS program is the base table scan. Locate it via the
+	// leading WITH rather than the CTE name, which the refactor changed from "scan_0" to "t0_scan".
+	auto scan_pos = lower.find("with");
+	if (scan_pos == string::npos) {
+		return false;
+	}
+	scan_pos += 4;
+	auto alias_start = view_query_sql.find('(', scan_pos);
+	if (alias_start == string::npos) {
+		return false;
+	}
+	auto alias_end = view_query_sql.find(')', alias_start + 1);
+	if (alias_end == string::npos) {
+		return false;
+	}
+	auto select_pos = lower.find(" as (select ", alias_end);
+	if (select_pos == string::npos) {
+		return false;
+	}
+	select_pos += 12;
+	auto from_pos = lower.find(" from ", select_pos);
+	if (from_pos == string::npos) {
+		return false;
+	}
+	auto source_end = view_query_sql.find(')', from_pos + 6);
+	if (source_end == string::npos) {
+		return false;
+	}
+	auto scan_aliases = SplitTopLevelComma(view_query_sql.substr(alias_start + 1, alias_end - alias_start - 1));
+	auto source_cols = SplitTopLevelComma(view_query_sql.substr(select_pos, from_pos - select_pos));
+	if (scan_aliases.size() != source_cols.size()) {
+		return false;
+	}
+	std::map<string, string> alias_to_source;
+	std::map<string, string> alias_to_output;
+	for (idx_t i = 0; i < scan_aliases.size(); i++) {
+		string alias = StringUtil::Lower(StripIdentifierQuotes(scan_aliases[i]));
+		string source = StripIdentifierQuotes(source_cols[i]);
+		alias_to_source[alias] = source;
+		alias_to_output[alias] = source;
+	}
+	plan.source_table = StripIdentifierQuotes(view_query_sql.substr(from_pos + 6, source_end - from_pos - 6));
+	vector<string> output_names = column_names;
+	auto final_select = lower.rfind("\nselect ");
+	if (final_select == string::npos) {
+		final_select = lower.rfind(" select ");
+	}
+	if (final_select != string::npos) {
+		auto final_from = lower.find(" from ", final_select + 8);
+		if (final_from != string::npos) {
+			vector<string> parsed_outputs;
+			for (auto &item :
+			     SplitTopLevelComma(view_query_sql.substr(final_select + 8, final_from - final_select - 8))) {
+				pair<string, string> pass;
+				if (!ParsePassthroughProjection(item, pass)) {
+					parsed_outputs.clear();
+					break;
+				}
+				parsed_outputs.push_back(pass.second);
+			}
+			if (!parsed_outputs.empty()) {
+				output_names = parsed_outputs;
+			}
+		}
+	}
+	vector<string> non_base_outputs;
+	for (auto &col : output_names) {
+		bool is_base = false;
+		for (auto &entry : alias_to_source) {
+			if (StringUtil::CIEquals(col, entry.second)) {
+				plan.passthrough_columns.push_back(std::make_pair(entry.second, col));
+				is_base = true;
+				break;
+			}
+		}
+		if (!is_base) {
+			non_base_outputs.push_back(col);
+		}
+	}
+	plan.output_columns = output_names;
+	if (non_base_outputs.empty()) {
+		return false;
+	}
+	idx_t window_idx = 0;
+	string expected_partition = partition_columns.empty() ? "" : PartitionOutputColumn(partition_columns[0]);
+	string parsed_partition;
+	string parsed_order;
+	idx_t cte_search = 0;
+	while (true) {
+		auto cte_as = lower.find(" as (select ", cte_search);
+		if (cte_as == string::npos) {
+			break;
+		}
+		auto cte_alias_start = view_query_sql.rfind('(', cte_as);
+		auto cte_alias_end = view_query_sql.rfind(')', cte_as);
+		if (cte_alias_start == string::npos || cte_alias_end == string::npos || cte_alias_end < cte_alias_start) {
+			return false;
+		}
+		auto cte_aliases =
+		    SplitTopLevelComma(view_query_sql.substr(cte_alias_start + 1, cte_alias_end - cte_alias_start - 1));
+		auto cte_select = cte_as + 12;
+		auto cte_from = lower.find(" from ", cte_select);
+		if (cte_from == string::npos) {
+			break;
+		}
+		auto cte_items = SplitTopLevelComma(view_query_sql.substr(cte_select, cte_from - cte_select));
+		if (cte_aliases.size() != cte_items.size()) {
+			return false;
+		}
+		std::map<string, string> next_alias_to_output;
+		for (idx_t item_idx = 0; item_idx < cte_items.size(); item_idx++) {
+			auto &item = cte_items[item_idx];
+			string output_alias = StripIdentifierQuotes(cte_aliases[item_idx]);
+			string output_key = StringUtil::Lower(output_alias);
+			if (LowerCopy(item).find(" over ") == string::npos) {
+				string source_key = StringUtil::Lower(StripIdentifierQuotes(item));
+				auto passthrough = alias_to_output.find(source_key);
+				if (passthrough != alias_to_output.end()) {
+					next_alias_to_output[output_key] = passthrough->second;
+					continue;
+				}
+				auto scan_passthrough = alias_to_source.find(output_key);
+				if (scan_passthrough != alias_to_source.end()) {
+					next_alias_to_output[output_key] = scan_passthrough->second;
+					continue;
+				}
+				string item_lower = LowerCopy(TrimCopy(item));
+				if (StringUtil::StartsWith(item_lower, "case ")) {
+					RunningDerivedExpr derived;
+					derived.output_column = output_alias;
+					derived.expression = TranslateExpressionIdentifiers(item, alias_to_output);
+					if (LooksLikeLptsAlias(derived.expression)) {
+						return false;
+					}
+					plan.derived_exprs.push_back(derived);
+					next_alias_to_output[output_key] = derived.output_column;
+					continue;
+				}
+				continue;
+			}
+			if (window_idx >= non_base_outputs.size()) {
+				return false;
+			}
+			RunningWindowExpr expr;
+			string expr_partition;
+			string expr_order;
+			if (!ParseRunningWindowExpression(item, expr, expr_partition, expr_order)) {
+				return false;
+			}
+			auto translate = [&](const string &alias) -> string {
+				auto found = alias_to_output.find(StringUtil::Lower(StripIdentifierQuotes(alias)));
+				return found == alias_to_output.end() ? "" : found->second;
+			};
+			if (expr.argument != "*") {
+				expr.argument = translate(expr.argument);
+			}
+			expr_partition = translate(expr_partition);
+			expr_order = translate(expr_order);
+			if (expr.argument.empty() || expr_partition.empty() || expr_order.empty()) {
+				return false;
+			}
+			if (!expected_partition.empty() && !StringUtil::CIEquals(expected_partition, expr_partition)) {
+				return false;
+			}
+			if (!parsed_partition.empty() && !StringUtil::CIEquals(parsed_partition, expr_partition)) {
+				return false;
+			}
+			if (!parsed_order.empty() && !StringUtil::CIEquals(parsed_order, expr_order)) {
+				return false;
+			}
+			parsed_partition = expr_partition;
+			parsed_order = expr_order;
+			expr.output_column = non_base_outputs[window_idx++];
+			plan.window_exprs.push_back(expr);
+			next_alias_to_output[output_key] = expr.output_column;
+		}
+		alias_to_output = next_alias_to_output;
+		cte_search = cte_from + 6;
+	}
+	plan.partition_column = parsed_partition;
+	plan.order_column = parsed_order;
+	return !plan.window_exprs.empty() && window_idx == non_base_outputs.size() && partition_columns.size() == 1;
+}
+
+static string QualifiedColumn(const string &alias, const string &column) {
+	return alias + "." + SqlUtils::QuoteIdentifier(column);
+}
+
+static string RunningLocalExpr(const RunningWindowExpr &expr, const RunningWindowPlan &plan) {
+	string arg = expr.argument == "*" ? "*" : QualifiedColumn("d", expr.argument);
+	string over = " OVER (PARTITION BY " + QualifiedColumn("d", plan.partition_column) + " ORDER BY " +
+	              QualifiedColumn("d", plan.order_column) + ")";
+	return StringUtil::Upper(expr.function_name) + "(" + arg + ")" + over;
+}
+
+static bool IsRunningDerivedArgument(const RunningWindowExpr &expr, const RunningWindowPlan &plan) {
+	for (auto &derived : plan.derived_exprs) {
+		if (StringUtil::CIEquals(expr.argument, derived.output_column)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static string RunningSeedColumn(const RunningWindowExpr &expr) {
+	return "openivm_seed_" + expr.output_column;
+}
+
+static string RunningLocalExprFromAlias(const RunningWindowExpr &expr, const RunningWindowPlan &plan,
+                                        const string &alias) {
+	string arg = expr.argument == "*" ? "*" : QualifiedColumn(alias, expr.argument);
+	string over = " OVER (PARTITION BY " + QualifiedColumn(alias, plan.partition_column) + " ORDER BY " +
+	              QualifiedColumn(alias, plan.order_column) + ")";
+	return StringUtil::Upper(expr.function_name) + "(" + arg + ")" + over;
+}
+
+static string RunningAvgPriorCountColumn(const RunningWindowExpr &expr) {
+	return "openivm_prior_count_" + expr.output_column;
+}
+
+static string RunningAdjustedExpr(const RunningWindowExpr &expr, const RunningWindowPlan &plan) {
+	string local = RunningLocalExpr(expr, plan);
+	string state_col = QualifiedColumn("s", expr.output_column);
+	if (expr.function_name == "sum") {
+		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " ELSE " + state_col + " + " + local + " END";
+	}
+	if (expr.function_name == "count") {
+		return "COALESCE(" + state_col + ", 0) + " + local;
+	}
+	if (expr.function_name == "min") {
+		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " WHEN " + local + " IS NULL THEN " + state_col +
+		       " ELSE LEAST(" + state_col + ", " + local + ") END";
+	}
+	if (expr.function_name == "max") {
+		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " WHEN " + local + " IS NULL THEN " + state_col +
+		       " ELSE GREATEST(" + state_col + ", " + local + ") END";
+	}
+	if (expr.function_name == "avg" && expr.argument != "*") {
+		string sum_local = "SUM(" + QualifiedColumn("d", expr.argument) + ") OVER (PARTITION BY " +
+		                   QualifiedColumn("d", plan.partition_column) + " ORDER BY " +
+		                   QualifiedColumn("d", plan.order_column) + ")";
+		string count_local = "COUNT(" + QualifiedColumn("d", expr.argument) + ") OVER (PARTITION BY " +
+		                     QualifiedColumn("d", plan.partition_column) + " ORDER BY " +
+		                     QualifiedColumn("d", plan.order_column) + ")";
+		string prior_count_col = QualifiedColumn("s", RunningAvgPriorCountColumn(expr));
+		string prior_count = "COALESCE(" + prior_count_col + ", 0)";
+		return "((COALESCE(" + state_col + " * " + prior_count_col + ", 0)) + COALESCE(" + sum_local +
+		       ", 0)) / NULLIF(" + prior_count + " + " + count_local + ", 0)";
+	}
+	return "";
+}
+
+static string RunningAdjustedExprWithSeed(const RunningWindowExpr &expr, const string &local, const string &state_col) {
+	if (expr.function_name == "sum") {
+		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " ELSE " + state_col + " + " + local + " END";
+	}
+	if (expr.function_name == "count") {
+		return "COALESCE(" + state_col + ", 0) + " + local;
+	}
+	if (expr.function_name == "min") {
+		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " WHEN " + local + " IS NULL THEN " + state_col +
+		       " ELSE LEAST(" + state_col + ", " + local + ") END";
+	}
+	if (expr.function_name == "max") {
+		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " WHEN " + local + " IS NULL THEN " + state_col +
+		       " ELSE GREATEST(" + state_col + ", " + local + ") END";
+	}
+	return "";
+}
+
+static string SparkPortableTimestampCasts(const string &sql) {
+	static const std::regex timestamp_cast_regex(R"(('[^']*(?:''[^']*)*')::TIMESTAMP)", std::regex_constants::icase);
+	return std::regex_replace(sql, timestamp_cast_regex, "CAST($1 AS TIMESTAMP)");
+}
+
+static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const string &view_query_sql,
+                                                 const string &delta_ts_filter, const string &catalog_prefix,
+                                                 const vector<string> &partition_columns,
+                                                 const vector<WindowPartitionDeltaSpec> &partition_delta_specs,
+                                                 const vector<string> &column_names, bool emit_cascade_delta) {
+	if (partition_delta_specs.size() != 1) {
+		return "";
+	}
+	vector<string> visible_column_names;
+	for (auto &col : column_names) {
+		if (!StringUtil::CIEquals(col, openivm::MULTIPLICITY_COL) &&
+		    !StringUtil::CIEquals(col, openivm::TIMESTAMP_COL)) {
+			visible_column_names.push_back(col);
+		}
+	}
+	RunningWindowPlan plan;
+	if (plan.window_exprs.empty() &&
+	    !TryParseRunningWindowPlan(view_query_sql, partition_columns, visible_column_names, plan)) {
+		plan = RunningWindowPlan();
+		if (!TryParseLptsRunningWindowPlan(view_query_sql, partition_columns, visible_column_names, plan)) {
+			return "";
+		}
+	}
+	const auto &spec = partition_delta_specs[0];
+	if (!StringUtil::CIEquals(spec.output_column, plan.partition_column)) {
+		return "";
+	}
+	string delta_q = spec.delta_table_sql.empty() ? SqlUtils::QuoteIdentifier(spec.delta_table) : spec.delta_table_sql;
+	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
+	string affected_table = SqlUtils::QuoteIdentifier("openivm_run_affected_" + view_name);
+	string bounds_table = SqlUtils::QuoteIdentifier("openivm_run_bounds_" + view_name);
+	string fast_table = SqlUtils::QuoteIdentifier("openivm_run_fast_" + view_name);
+	string fallback_table = SqlUtils::QuoteIdentifier("openivm_run_fallback_" + view_name);
+	string state_table = SqlUtils::QuoteIdentifier("openivm_run_state_" + view_name);
+	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
+	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
+	string portable_delta_ts_filter = SparkPortableTimestampCasts(delta_ts_filter);
+	string delta_filter = portable_delta_ts_filter.empty() ? "" : " AND " + portable_delta_ts_filter;
+	string delta_positive = QualifiedColumn("d", openivm::MULTIPLICITY_COL) + " > 0" + delta_filter;
+	string part_q = SqlUtils::QuoteIdentifier(plan.partition_column);
+	string order_q = SqlUtils::QuoteIdentifier(plan.order_column);
+	string key_match_df = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "fk");
+	string key_match_dt_fk = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "dt", "fk");
+	string key_match_b_m = "b." + part_q + " IS NOT DISTINCT FROM m." + part_q;
+	string key_match_d_fk = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "fk");
+
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS\nSELECT DISTINCT " +
+	       QualifiedColumn("d", plan.partition_column) + " AS " + part_q + "\nFROM " + delta_q + " d\nWHERE " +
+	       delta_positive + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + bounds_table + " AS\nWITH old_max AS (\n  SELECT " + part_q + ", MAX(" +
+	       order_q + ") AS openivm_old_max_order FROM " + data_table + " WHERE " + part_q + " IN (SELECT " + part_q +
+	       " FROM " + affected_table + ") GROUP BY " + part_q + "\n), delta_min AS (\n  SELECT " +
+	       QualifiedColumn("d", plan.partition_column) + " AS " + part_q + ", MIN(" +
+	       QualifiedColumn("d", plan.order_column) + ") AS openivm_delta_min_order\n  FROM " + delta_q +
+	       " d\n  WHERE " + delta_positive + "\n  GROUP BY " + QualifiedColumn("d", plan.partition_column) +
+	       "\n)\nSELECT a." + part_q + ", m.openivm_old_max_order, b.openivm_delta_min_order\nFROM " + affected_table +
+	       " a\nLEFT JOIN old_max m ON a." + part_q + " IS NOT DISTINCT FROM m." + part_q + "\nJOIN delta_min b ON a." +
+	       part_q + " IS NOT DISTINCT FROM b." + part_q + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + fast_table + " AS\nSELECT " + part_q + " FROM " + bounds_table +
+	       "\nWHERE openivm_old_max_order IS NULL OR openivm_delta_min_order > openivm_old_max_order;\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + fallback_table + " AS\nSELECT " + part_q + " FROM " + bounds_table +
+	       "\nWHERE openivm_old_max_order IS NOT NULL AND openivm_delta_min_order <= openivm_old_max_order;\n\n";
+	auto state_columns = plan.output_columns.empty() ? visible_column_names : plan.output_columns;
+	string state_outer_cols = SqlUtils::JoinQuotedColumns(state_columns);
+	state_outer_cols += ", openivm_prior_count";
+	string state_inner_cols;
+	for (idx_t i = 0; i < state_columns.size(); i++) {
+		if (i > 0) {
+			state_inner_cols += ", ";
+		}
+		state_inner_cols +=
+		    QualifiedColumn("dt", state_columns[i]) + " AS " + SqlUtils::QuoteIdentifier(state_columns[i]);
+	}
+	for (auto &expr : plan.window_exprs) {
+		if (expr.function_name == "avg" && expr.argument != "*") {
+			string prior_count_col = RunningAvgPriorCountColumn(expr);
+			state_outer_cols += ", " + SqlUtils::QuoteIdentifier(prior_count_col);
+			state_inner_cols += ", COUNT(" + QualifiedColumn("dt", expr.argument) + ") OVER (PARTITION BY " +
+			                    QualifiedColumn("dt", plan.partition_column) + ") AS " +
+			                    SqlUtils::QuoteIdentifier(prior_count_col);
+		}
+	}
+	sql += "CREATE OR REPLACE TEMP TABLE " + state_table + " AS\nSELECT " + state_outer_cols + " FROM (\n  SELECT " +
+	       state_inner_cols + ", COUNT(*) OVER (PARTITION BY " + QualifiedColumn("dt", plan.partition_column) +
+	       ") AS openivm_prior_count, ROW_NUMBER() OVER (PARTITION BY " + QualifiedColumn("dt", plan.partition_column) +
+	       " ORDER BY " + QualifiedColumn("dt", plan.order_column) + " DESC) AS openivm_rn\n  FROM " + data_table +
+	       " dt\n  JOIN " + fast_table + " fk ON " + key_match_dt_fk +
+	       "\n) openivm_state_ranked\nWHERE openivm_rn = 1;\n\n";
+	string fallback_filter = part_q + " IN (SELECT " + part_q + " FROM " + fallback_table + ")";
+	if (emit_cascade_delta) {
+		sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + "\nWHERE " +
+		       fallback_filter + ";\n\n";
+		sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+		       ") openivm_recompute\nWHERE " + fallback_filter + ";\n\n";
+		sql += "DELETE FROM " + data_table + " WHERE " + fallback_filter + ";\n";
+		sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
+		sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+	} else {
+		sql += BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", fallback_filter,
+		                                   fallback_filter);
+	}
+
+	auto emit_column_names = plan.output_columns.empty() ? visible_column_names : plan.output_columns;
+	string insert_cols = SqlUtils::JoinQuotedColumns(emit_column_names);
+	if (!plan.derived_exprs.empty()) {
+		vector<RunningWindowExpr> level1_exprs;
+		vector<RunningWindowExpr> level3_exprs;
+		for (auto &expr : plan.window_exprs) {
+			if (IsRunningDerivedArgument(expr, plan)) {
+				if (expr.function_name != "max") {
+					return "";
+				}
+				level3_exprs.push_back(expr);
+			} else {
+				level1_exprs.push_back(expr);
+			}
+		}
+		if (level1_exprs.empty() || level3_exprs.empty()) {
+			return "";
+		}
+		bool has_partition = false;
+		bool has_order = false;
+		for (auto &pass : plan.passthrough_columns) {
+			has_partition = has_partition || StringUtil::CIEquals(pass.second, plan.partition_column);
+			has_order = has_order || StringUtil::CIEquals(pass.second, plan.order_column);
+		}
+		if (!has_partition || !has_order) {
+			return "";
+		}
+		string l1_select;
+		auto append_l1 = [&](const string &expr_sql, const string &alias) {
+			if (!l1_select.empty()) {
+				l1_select += ", ";
+			}
+			l1_select += expr_sql + " AS " + SqlUtils::QuoteIdentifier(alias);
+		};
+		for (auto &pass : plan.passthrough_columns) {
+			append_l1(QualifiedColumn("d", pass.first), pass.second);
+		}
+		for (auto &expr : level1_exprs) {
+			append_l1(RunningAdjustedExpr(expr, plan), expr.output_column);
+		}
+		for (auto &expr : level3_exprs) {
+			append_l1(QualifiedColumn("s", expr.output_column), RunningSeedColumn(expr));
+		}
+		string lflags_select = "*";
+		for (auto &derived : plan.derived_exprs) {
+			lflags_select += ", " + derived.expression + " AS " + SqlUtils::QuoteIdentifier(derived.output_column);
+		}
+		string l3_select;
+		auto append_l3 = [&](const string &expr_sql, const string &alias) {
+			if (!l3_select.empty()) {
+				l3_select += ", ";
+			}
+			l3_select += expr_sql + " AS " + SqlUtils::QuoteIdentifier(alias);
+		};
+		for (auto &pass : plan.passthrough_columns) {
+			append_l3(QualifiedColumn("f", pass.second), pass.second);
+		}
+		for (auto &expr : level1_exprs) {
+			append_l3(QualifiedColumn("f", expr.output_column), expr.output_column);
+		}
+		for (auto &expr : level3_exprs) {
+			string local = RunningLocalExprFromAlias(expr, plan, "f");
+			string adjusted = RunningAdjustedExprWithSeed(expr, local, QualifiedColumn("f", RunningSeedColumn(expr)));
+			if (adjusted.empty()) {
+				return "";
+			}
+			append_l3(adjusted, expr.output_column);
+		}
+		string final_select;
+		for (idx_t i = 0; i < emit_column_names.size(); i++) {
+			if (i > 0) {
+				final_select += ", ";
+			}
+			final_select += QualifiedColumn("r", emit_column_names[i]);
+		}
+		string state_match = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "s");
+		sql += "INSERT INTO " + data_table + " (" + insert_cols + ")\nWITH openivm_l1 AS (\n  SELECT " + l1_select +
+		       "\n  FROM " + delta_q + " d\n  JOIN " + fast_table + " fk ON " + key_match_d_fk + "\n  LEFT JOIN " +
+		       state_table + " s ON " + state_match + "\n  WHERE " + delta_positive +
+		       "\n), openivm_flags AS (\n  SELECT " + lflags_select +
+		       "\n  FROM openivm_l1\n), openivm_l3 AS (\n  SELECT " + l3_select +
+		       "\n  FROM openivm_flags f\n)\nSELECT " + final_select + "\nFROM openivm_l3 r;\n\n";
+		if (emit_cascade_delta) {
+			sql += "INSERT INTO " + delta_table + "\nWITH openivm_l1 AS (\n  SELECT " + l1_select + "\n  FROM " +
+			       delta_q + " d\n  JOIN " + fast_table + " fk ON " + key_match_d_fk + "\n  LEFT JOIN " + state_table +
+			       " s ON " + state_match + "\n  WHERE " + delta_positive + "\n), openivm_flags AS (\n  SELECT " +
+			       lflags_select + "\n  FROM openivm_l1\n), openivm_l3 AS (\n  SELECT " + l3_select +
+			       "\n  FROM openivm_flags f\n)\nSELECT " + final_select +
+			       ", CAST(1 AS INTEGER), CURRENT_TIMESTAMP\nFROM openivm_l3 r;\n\n";
+			sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
+			sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
+		}
+		sql += "DROP TABLE IF EXISTS " + state_table + ";\n";
+		sql += "DROP TABLE IF EXISTS " + fallback_table + ";\n";
+		sql += "DROP TABLE IF EXISTS " + fast_table + ";\n";
+		sql += "DROP TABLE IF EXISTS " + bounds_table + ";\n";
+		sql += "DROP TABLE IF EXISTS " + affected_table + ";\n";
+		OPENIVM_DEBUG_PRINT(
+		    "[CompileWindowSuffixExtend] view=%s partition=%s order=%s window_exprs=%zu derived_exprs=%zu\n",
+		    view_name.c_str(), plan.partition_column.c_str(), plan.order_column.c_str(), plan.window_exprs.size(),
+		    plan.derived_exprs.size());
+		(void)key_match_df;
+		(void)key_match_b_m;
+		return sql;
+	}
+	string select_list;
+	for (idx_t i = 0; i < emit_column_names.size(); i++) {
+		if (i > 0) {
+			select_list += ", ";
+		}
+		string expr_sql;
+		for (auto &pass : plan.passthrough_columns) {
+			if (StringUtil::CIEquals(emit_column_names[i], pass.second)) {
+				expr_sql = QualifiedColumn("d", pass.first);
+				break;
+			}
+		}
+		for (auto &expr : plan.window_exprs) {
+			if (StringUtil::CIEquals(emit_column_names[i], expr.output_column)) {
+				expr_sql = RunningAdjustedExpr(expr, plan);
+				break;
+			}
+		}
+		if (expr_sql.empty()) {
+			return "";
+		}
+		select_list += expr_sql + " AS " + SqlUtils::QuoteIdentifier(emit_column_names[i]);
+	}
+	string state_match = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "s");
+	sql += "INSERT INTO " + data_table + " (" + insert_cols + ")\nSELECT " + select_list + "\nFROM " + delta_q +
+	       " d\nJOIN " + fast_table + " fk ON " + key_match_d_fk + "\nLEFT JOIN " + state_table + " s ON " +
+	       state_match + "\nWHERE " + delta_positive + ";\n\n";
+	if (emit_cascade_delta) {
+		sql += "INSERT INTO " + delta_table + "\nSELECT " + select_list +
+		       ", CAST(1 AS INTEGER), CURRENT_TIMESTAMP\nFROM " + delta_q + " d\nJOIN " + fast_table + " fk ON " +
+		       key_match_d_fk + "\nLEFT JOIN " + state_table + " s ON " + state_match + "\nWHERE " + delta_positive +
+		       ";\n\n";
+		sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
+		sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
+	}
+	sql += "DROP TABLE IF EXISTS " + state_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + fallback_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + fast_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + bounds_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + affected_table + ";\n";
+	OPENIVM_DEBUG_PRINT("[CompileWindowSuffixExtend] view=%s partition=%s order=%s window_exprs=%zu\n",
+	                    view_name.c_str(), plan.partition_column.c_str(), plan.order_column.c_str(),
+	                    plan.window_exprs.size());
+	(void)key_match_df;
+	(void)key_match_b_m;
+	return sql;
 }
 
 static string CreateAuxTablePrefix(const string &target_table, bool replace) {
@@ -128,6 +1032,125 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 	OPENIVM_DEBUG_PRINT("[CompileDistinctIncremental] %zu distinct cols, %zu group cols, sum %s(%s)→%s, aux=%s\n",
 	                    distinct_cols.size(), group_columns.size(), "SUM", sum_arg.c_str(), sum_out.c_str(),
 	                    aux_table.c_str());
+	return sql;
+}
+
+string BuildCountDistinctAuxStateCreateSQL(const string &target_table, const string &source_relation,
+                                           const vector<string> &group_cols, const vector<string> &group_source_exprs,
+                                           const string &distinct_col, const string &distinct_expr,
+                                           const string &filter_sql, bool replace) {
+	if (group_cols.empty() || group_cols.size() != group_source_exprs.size() || distinct_col.empty() ||
+	    distinct_expr.empty()) {
+		throw InternalException("BuildCountDistinctAuxStateCreateSQL called with incomplete metadata");
+	}
+	string select_list;
+	string group_list;
+	for (idx_t i = 0; i < group_cols.size(); i++) {
+		if (i > 0) {
+			select_list += ", ";
+			group_list += ", ";
+		}
+		select_list += group_source_exprs[i] + " AS " + SqlUtils::QuoteIdentifier(group_cols[i]);
+		group_list += group_source_exprs[i];
+	}
+	select_list += ", " + distinct_expr + " AS " + SqlUtils::QuoteIdentifier(distinct_col);
+	group_list += ", " + distinct_expr;
+	string filter = filter_sql.empty() ? "" : "(" + filter_sql + ") AND ";
+	return CreateAuxTablePrefix(target_table, replace) + " AS SELECT " + select_list +
+	       ", count(*)::BIGINT AS _count FROM " + source_relation + " WHERE " + filter + distinct_expr +
+	       " IS NOT NULL GROUP BY " + group_list;
+}
+
+string CompileCountDistinctIncremental(const string &view_name, const string &aux_table, const string &delta_source,
+                                       const string &last_update, const vector<string> &group_cols,
+                                       const vector<string> &group_source_exprs, const string &distinct_col,
+                                       const string &distinct_expr, const string &output_col,
+                                       const string &count_star_col, const string &filter_sql,
+                                       const string &catalog_prefix) {
+	if (group_cols.empty() || group_cols.size() != group_source_exprs.size() || aux_table.empty() ||
+	    delta_source.empty() || last_update.empty() || distinct_col.empty() || distinct_expr.empty() ||
+	    output_col.empty()) {
+		throw InternalException("CompileCountDistinctIncremental called with incomplete metadata for view '%s'",
+		                        view_name);
+	}
+	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
+	string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(aux_table);
+	string delta_q = DeltaSourceRef(delta_source, catalog_prefix);
+	string dinput_table = SqlUtils::QuoteIdentifier("openivm_cd_dinput_" + view_name);
+	string dgroups_table = SqlUtils::QuoteIdentifier("openivm_cd_dgroups_" + view_name);
+	string dagg_table = SqlUtils::QuoteIdentifier("openivm_cd_dagg_" + view_name);
+	string mul = string(openivm::MULTIPLICITY_COL);
+	string ts_filter = string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP";
+	string base_filter = filter_sql.empty() ? ts_filter : ts_filter + " AND (" + filter_sql + ")";
+
+	string group_select;
+	string group_by;
+	string group_csv = SqlUtils::JoinQuotedColumns(group_cols);
+	string group_csv_i = SqlUtils::JoinQualifiedQuotedColumns(group_cols, "i");
+	for (idx_t i = 0; i < group_cols.size(); i++) {
+		if (i > 0) {
+			group_select += ", ";
+			group_by += ", ";
+		}
+		group_select += group_source_exprs[i] + " AS " + SqlUtils::QuoteIdentifier(group_cols[i]);
+		group_by += group_source_exprs[i];
+	}
+
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + dinput_table + " AS\n  SELECT " + group_select + ", " + distinct_expr +
+	       " AS " + SqlUtils::QuoteIdentifier(distinct_col) + ", SUM(" + mul + ")::BIGINT AS dmult\n  FROM " + delta_q +
+	       "\n  WHERE " + base_filter + " AND " + distinct_expr + " IS NOT NULL\n  GROUP BY " + group_by + ", " +
+	       distinct_expr + "\n  HAVING SUM(" + mul + ") <> 0;\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + dgroups_table + " AS\n  SELECT " + group_select + ", SUM(" + mul +
+	       ")::BIGINT AS d_count_star\n  FROM " + delta_q + "\n  WHERE " + base_filter + "\n  GROUP BY " + group_by +
+	       "\n  HAVING SUM(" + mul + ") <> 0;\n\n";
+
+	vector<string> aux_match_cols = group_cols;
+	aux_match_cols.push_back(distinct_col);
+	string aux_match = SqlUtils::BuildNullSafeMatch(aux_match_cols, "_aux", "i");
+	sql += "CREATE OR REPLACE TEMP TABLE " + dagg_table + " AS\nWITH ddist AS (\n  SELECT " + group_csv_i +
+	       ", CASE WHEN COALESCE(_aux._count, 0) = 0 AND i.dmult > 0 THEN 1 "
+	       "WHEN COALESCE(_aux._count, 0) > 0 AND COALESCE(_aux._count, 0) + i.dmult <= 0 THEN -1 ELSE 0 END AS dd\n"
+	       "  FROM " +
+	       dinput_table + " i LEFT JOIN " + aux_q + " _aux ON " + aux_match + "\n), dcount AS (\n  SELECT " +
+	       group_csv +
+	       ", SUM(dd)::BIGINT AS d_count_distinct, 0::BIGINT AS d_count_star\n  FROM ddist WHERE dd <> 0 GROUP BY " +
+	       group_csv + "\n  UNION ALL\n  SELECT " + group_csv + ", 0::BIGINT AS d_count_distinct, d_count_star FROM " +
+	       dgroups_table + "\n)\nSELECT " + group_csv +
+	       ", SUM(d_count_distinct)::BIGINT AS d_count_distinct, SUM(d_count_star)::BIGINT AS d_count_star\nFROM "
+	       "dcount GROUP BY " +
+	       group_csv + " HAVING SUM(d_count_distinct) <> 0 OR SUM(d_count_star) <> 0;\n\n";
+
+	string output_q = SqlUtils::QuoteIdentifier(output_col);
+	string mv_match = SqlUtils::BuildNullSafeMatch(group_cols, "v", "d");
+	string insert_cols = group_csv + ", " + output_q;
+	string insert_vals = SqlUtils::JoinQualifiedQuotedColumns(group_cols, "d") + ", d.d_count_distinct";
+	string update_set = output_q + " = COALESCE(v." + output_q + ", 0) + d.d_count_distinct";
+	if (!count_star_col.empty()) {
+		string count_q = SqlUtils::QuoteIdentifier(count_star_col);
+		insert_cols += ", " + count_q;
+		insert_vals += ", d.d_count_star";
+		update_set += ", " + count_q + " = COALESCE(v." + count_q + ", 0) + d.d_count_star";
+	}
+	sql += "MERGE INTO " + data_table + " v USING " + dagg_table + " d ON " + mv_match +
+	       "\nWHEN MATCHED THEN UPDATE SET " + update_set + "\nWHEN NOT MATCHED THEN INSERT (" + insert_cols +
+	       ") VALUES (" + insert_vals + ");\n\n";
+	if (!count_star_col.empty()) {
+		sql += "DELETE FROM " + data_table + " WHERE " + SqlUtils::QuoteIdentifier(count_star_col) + " <= 0;\n\n";
+	} else {
+		sql += "DELETE FROM " + data_table + " WHERE " + output_q + " <= 0;\n\n";
+	}
+	sql += "MERGE INTO " + aux_q + " _aux USING " + dinput_table + " i ON " + aux_match +
+	       "\nWHEN MATCHED THEN UPDATE SET _count = _aux._count + i.dmult\nWHEN NOT MATCHED AND i.dmult > 0 "
+	       "THEN INSERT (" +
+	       group_csv + ", " + SqlUtils::QuoteIdentifier(distinct_col) + ", _count) VALUES (" + group_csv_i + ", i." +
+	       SqlUtils::QuoteIdentifier(distinct_col) + ", i.dmult);\n\n";
+	sql += "DELETE FROM " + aux_q + " WHERE _count <= 0;\n\n";
+	sql += "DROP TABLE IF EXISTS " + dinput_table + ";\nDROP TABLE IF EXISTS " + dgroups_table +
+	       ";\nDROP TABLE IF EXISTS " + dagg_table + ";\n";
+
+	OPENIVM_DEBUG_PRINT("[CompileCountDistinctIncremental] %zu group cols, distinct=%s, out=%s, aux=%s\n",
+	                    group_cols.size(), distinct_expr.c_str(), output_col.c_str(), aux_table.c_str());
 	return sql;
 }
 
@@ -342,10 +1365,19 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const string &catalog_prefix, const vector<string> &partition_columns,
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta,
                               const string &affected_keys_sql, const string &affected_key_cols,
-                              const string &affected_key_tuple) {
+                              const string &affected_key_tuple, const vector<string> &column_names,
+                              bool running_window_incremental) {
 	bool have_affected_keys = !affected_keys_sql.empty() && !affected_key_cols.empty() && !affected_key_tuple.empty();
 	if (!have_affected_keys && (partition_columns.empty() || partition_delta_specs.empty())) {
 		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
+	}
+	if (running_window_incremental) {
+		auto suffix_sql = BuildRunningWindowSuffixRefreshSQL(view_name, view_query_sql, delta_ts_filter, catalog_prefix,
+		                                                     partition_columns, partition_delta_specs, column_names,
+		                                                     emit_cascade_delta);
+		if (!suffix_sql.empty()) {
+			return suffix_sql;
+		}
 	}
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;

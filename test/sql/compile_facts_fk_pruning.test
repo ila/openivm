@@ -1,0 +1,113 @@
+# name: test/sql/compile_facts_fk_pruning.test
+# description: openivm_compile_with_facts prunes join delta terms using supplied FK facts.
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE cfkp_dim_product(product_id INTEGER, name VARCHAR);
+
+statement ok
+CREATE TABLE cfkp_dim_region(region_id INTEGER, region_name VARCHAR);
+
+statement ok
+CREATE TABLE cfkp_fact_sales(sale_id INTEGER, product_id INTEGER, region_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO cfkp_dim_product VALUES (1, 'Widget'), (2, 'Gadget');
+
+statement ok
+INSERT INTO cfkp_dim_region VALUES (10, 'North'), (20, 'South');
+
+statement ok
+INSERT INTO cfkp_fact_sales VALUES (1, 1, 10, 100), (2, 2, 20, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW cfkp_mv AS
+    SELECT p.name, r.region_name, SUM(f.amount) AS total, COUNT(*) AS cnt
+    FROM cfkp_fact_sales f
+    JOIN cfkp_dim_product p ON f.product_id = p.product_id
+    JOIN cfkp_dim_region r ON f.region_id = r.region_id
+    GROUP BY p.name, r.region_name;
+
+statement ok
+INSERT INTO cfkp_dim_product VALUES (3, 'Thingamajig');
+
+statement ok
+INSERT INTO cfkp_dim_region VALUES (30, 'East');
+
+statement ok
+INSERT INTO cfkp_fact_sales VALUES (3, 3, 30, 300);
+
+statement ok
+CREATE TABLE cfkp_sql_baseline AS
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts('cfkp_mv', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data';
+
+statement ok
+CREATE TABLE cfkp_sql_empty_facts AS
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts(
+    'cfkp_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{},"fk_relations":[]}'
+)
+WHERE stmt_kind = 'data';
+
+statement ok
+CREATE TABLE cfkp_sql_fk_facts AS
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts(
+    'cfkp_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{"cfkp_fact_sales":"GENERAL","cfkp_dim_product":"INSERT_ONLY","cfkp_dim_region":"INSERT_ONLY"},"fk_relations":[{"child_table":"cfkp_fact_sales","child_columns":["product_id"],"parent_table":"cfkp_dim_product","parent_columns":["product_id"],"rely":true},{"child_table":"cfkp_fact_sales","child_columns":["region_id"],"parent_table":"cfkp_dim_region","parent_columns":["region_id"],"rely":true}]}'
+)
+WHERE stmt_kind = 'data';
+
+# Empty FK facts preserve the old generated SQL byte-for-byte.
+query I
+SELECT (SELECT prog FROM cfkp_sql_baseline) = (SELECT prog FROM cfkp_sql_empty_facts);
+----
+true
+
+# With FK facts and insert-only PK-side delta_shape, the 3-way join collapses
+# from inclusion-exclusion UNION terms to the single fact-side delta term.
+query I
+SELECT
+    ((length((SELECT prog FROM cfkp_sql_fk_facts)) -
+      length(replace((SELECT prog FROM cfkp_sql_fk_facts), 'UNION ALL', ''))) / length('UNION ALL'))
+    <
+    ((length((SELECT prog FROM cfkp_sql_baseline)) -
+      length(replace((SELECT prog FROM cfkp_sql_baseline), 'UNION ALL', ''))) / length('UNION ALL'));
+----
+true
+
+statement ok
+PRAGMA refresh('cfkp_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.name, r.region_name, SUM(f.amount) AS total, COUNT(*) AS cnt
+    FROM cfkp_fact_sales f
+    JOIN cfkp_dim_product p ON f.product_id = p.product_id
+    JOIN cfkp_dim_region r ON f.region_id = r.region_id
+    GROUP BY p.name, r.region_name
+    EXCEPT ALL SELECT * FROM cfkp_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cfkp_mv
+    EXCEPT ALL
+    SELECT p.name, r.region_name, SUM(f.amount) AS total, COUNT(*) AS cnt
+    FROM cfkp_fact_sales f
+    JOIN cfkp_dim_product p ON f.product_id = p.product_id
+    JOIN cfkp_dim_region r ON f.region_id = r.region_id
+    GROUP BY p.name, r.region_name
+);
+----
+0

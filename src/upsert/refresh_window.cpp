@@ -4,6 +4,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/main/connection.hpp"
+#include "rules/column_hider.hpp"
 
 namespace duckdb {
 
@@ -523,7 +524,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &delta_ts_filter, const string &internal_catalog_prefix,
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
-                                   bool cross_system, bool emit_cascade_delta) {
+                                   bool cross_system, bool emit_cascade_delta, bool running_window_incremental) {
 	auto partition_cols = metadata.GetGroupColumns(view_name); // reuses group_columns field
 	auto partition_delta_specs =
 	    BuildWindowPartitionDeltaSpecs(metadata, con, view_name, delta_table_names, partition_cols, cross_system);
@@ -564,9 +565,21 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols, lineage keys: %s)\n",
 	                    partition_cols.size(), have_lineage_affected_keys ? "yes" : "no");
+	vector<string> running_window_column_names = column_names;
+	if (running_window_incremental) {
+		auto data_cols = con.Query("SELECT column_name FROM information_schema.columns WHERE table_name = '" +
+		                           SqlUtils::EscapeValue(IncrementalTableNames::DataTableName(view_name)) +
+		                           "' ORDER BY ordinal_position");
+		if (!data_cols->HasError() && data_cols->RowCount() > 0) {
+			running_window_column_names.clear();
+			for (idx_t i = 0; i < data_cols->RowCount(); i++) {
+				running_window_column_names.push_back(data_cols->GetValue(0, i).ToString());
+			}
+		}
+	}
 	return CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, internal_catalog_prefix, partition_cols,
 	                              partition_delta_specs, emit_cascade_delta, affected_keys_sql, affected_key_cols,
-	                              affected_key_tuple);
+	                              affected_key_tuple, running_window_column_names, running_window_incremental);
 }
 
 } // namespace duckdb

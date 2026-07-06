@@ -364,7 +364,8 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (analysis.found_filtered_list) {
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_count_distinct && !model.group_columns.empty()) {
-		model.type = RefreshType::GROUP_RECOMPUTE;
+		model.type =
+		    input.count_distinct_aux_candidate ? RefreshType::COUNT_DISTINCT_INCREMENTAL : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && !model.distinct_at_top && analysis.found_aggregation) {
 		model.type = model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL) ? RefreshType::DISTINCT_INCREMENTAL
 		                                                                    : RefreshType::GROUP_RECOMPUTE;
@@ -417,6 +418,10 @@ static void AttachAuxRequirements(DeltaViewModel &model, const DeltaViewModelInp
 	if (model.type == RefreshType::DISTINCT_INCREMENTAL) {
 		D_ASSERT(input.distinct_aux_candidate);
 		model.distinct_aux = *input.distinct_aux_candidate;
+	}
+	if (model.type == RefreshType::COUNT_DISTINCT_INCREMENTAL) {
+		D_ASSERT(input.count_distinct_aux_candidate);
+		model.count_distinct_aux = *input.count_distinct_aux_candidate;
 	}
 	if (model.type == RefreshType::SIMPLE_AGGREGATE && input.filtered_group_count_aux_candidate) {
 		model.filtered_group_count_aux = *input.filtered_group_count_aux_candidate;

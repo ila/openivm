@@ -1,0 +1,159 @@
+# name: test/sql/compile_spark_dialect_hardening.test
+# description: Spark target dialect hardening and gated hint emission.
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# Spark refresh programs must not leak DuckDB :: casts; helper SQL should use
+# Spark-compatible CAST/current_timestamp and null-safe equality.
+statement ok
+CREATE TABLE sph_empty_src(id INT, d DATE, ts TIMESTAMP, txt VARCHAR);
+
+statement ok
+INSERT INTO sph_empty_src VALUES (1, DATE '2024-01-01', TIMESTAMP '2024-01-01 01:02:03', 'one');
+
+statement ok
+CREATE MATERIALIZED VIEW sph_empty_mv AS
+    SELECT id, d, ts, txt FROM sph_empty_src;
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%::%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%current_timestamp()%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%<=>%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST(%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_empty_mv',
+    '{"target_dialect":"spark","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# Spark null-safe join conditions should use <=> rather than IS NOT DISTINCT FROM.
+statement ok
+CREATE TABLE sph_null_l(id INT, k INT);
+
+statement ok
+CREATE TABLE sph_null_r(k INT, v INT);
+
+statement ok
+INSERT INTO sph_null_l VALUES (1, NULL), (2, 2);
+
+statement ok
+INSERT INTO sph_null_r VALUES (NULL, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW sph_null_mv AS
+    SELECT l.id, r.v
+    FROM sph_null_l l JOIN sph_null_r r
+      ON l.k IS NOT DISTINCT FROM r.k;
+
+statement ok
+INSERT INTO sph_null_l VALUES (3, NULL);
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%<=>%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%IS NOT DISTINCT FROM%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_null_mv',
+    '{"target_dialect":"spark","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# Spark constants and identifiers: date/timestamp literals must be portable, and
+# reserved/special identifiers must use backticks.
+statement ok
+CREATE TABLE "sph reserved"("from" INT, d DATE, ts TIMESTAMP);
+
+statement ok
+INSERT INTO "sph reserved" VALUES (1, DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05');
+
+statement ok
+CREATE MATERIALIZED VIEW sph_reserved_mv AS
+    SELECT "from", d, ts
+    FROM "sph reserved"
+    WHERE d = DATE '2024-01-02' AND ts = TIMESTAMP '2024-01-02 03:04:05';
+
+statement ok
+INSERT INTO "sph reserved" VALUES (2, DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05');
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`from`%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%2024-01-02%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST(%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%::DATE%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%::TIMESTAMP%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_reserved_mv',
+    '{"target_dialect":"spark","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# Spark hints are default-off and byte-stable unless explicitly requested.
+statement ok
+CREATE TABLE sph_hint_l(id INT, k INT);
+
+statement ok
+CREATE TABLE sph_hint_r(k INT, v INT);
+
+statement ok
+INSERT INTO sph_hint_l VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO sph_hint_r VALUES (10, 100), (20, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW sph_hint_mv AS
+    SELECT l.id, r.v FROM sph_hint_l l JOIN sph_hint_r r ON l.k = r.k;
+
+statement ok
+INSERT INTO sph_hint_l VALUES (3, 10);
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%BROADCAST(%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_hint_mv',
+    '{"target_dialect":"spark","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+query I
+SELECT (SELECT string_agg(sql, '\n' ORDER BY stmt_order)
+        FROM openivm_compile_with_facts(
+            'sph_hint_mv',
+            '{"target_dialect":"spark","compile_only":true}'
+        )
+        WHERE stmt_kind = 'data')
+     = (SELECT string_agg(sql, '\n' ORDER BY stmt_order)
+        FROM openivm_compile_with_facts(
+            'sph_hint_mv',
+            '{"target_dialect":"spark","compile_only":true,"emit_spark_hints":false}'
+        )
+        WHERE stmt_kind = 'data');
+----
+true
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%/*+ BROADCAST(%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_sph_hint_l%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_hint_mv',
+    '{"target_dialect":"spark","compile_only":true,"emit_spark_hints":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1

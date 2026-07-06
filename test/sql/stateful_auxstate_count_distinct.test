@@ -1,0 +1,194 @@
+# name: test/sql/stateful_auxstate_count_distinct.test
+# description: COUNT(DISTINCT) aux-state incremental refresh with deletes
+# group: [sql]
+
+require openivm
+
+# Default-off guard: existing COUNT(DISTINCT) behavior remains GROUP_RECOMPUTE.
+statement ok
+CREATE TABLE cdaux_off_src(g INT, x INT);
+
+statement ok
+INSERT INTO cdaux_off_src VALUES (1, 10), (1, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW cdaux_off_mv AS
+    SELECT g, COUNT(DISTINCT x) AS dx FROM cdaux_off_src GROUP BY g;
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'cdaux_off_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data'
+ORDER BY stmt_order
+LIMIT 1;
+----
+6	GROUP_RECOMPUTE
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'openivm_aux_cdaux_off_mv';
+----
+0
+
+statement ok
+SET openivm_stateful_auxstate = true;
+
+statement ok
+CREATE TABLE cdaux_src(g INT, x INT);
+
+statement ok
+INSERT INTO cdaux_src VALUES
+    (1, 10),
+    (1, 20),
+    (1, 10),
+    (2, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW cdaux_mv AS
+    SELECT g, COUNT(DISTINCT x) AS dx FROM cdaux_src GROUP BY g;
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'cdaux_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data'
+ORDER BY stmt_order
+LIMIT 1;
+----
+11	COUNT_DISTINCT_INCREMENTAL
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'openivm_aux_cdaux_mv';
+----
+1
+
+# Insert batch: new distinct value for group 1, duplicate for group 2, new group 3.
+statement ok
+INSERT INTO cdaux_src VALUES (1, 40), (2, 30), (3, 99);
+
+statement ok
+PRAGMA refresh('cdaux_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT g, dx FROM cdaux_mv
+    EXCEPT ALL
+    SELECT g, COUNT(DISTINCT x) FROM cdaux_src GROUP BY g
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT g, COUNT(DISTINCT x) FROM cdaux_src GROUP BY g
+    EXCEPT ALL
+    SELECT g, dx FROM cdaux_mv
+);
+----
+0
+
+query I
+SELECT count(DISTINCT refresh_type_name) = 1
+   AND min(refresh_type_name) = 'COUNT_DISTINCT_INCREMENTAL'
+FROM openivm_compile_with_facts(
+    'cdaux_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+true
+
+# Delete batch: delete the last occurrence of distinct value 20.
+statement ok
+DELETE FROM cdaux_src WHERE g = 1 AND x = 20;
+
+statement ok
+PRAGMA refresh('cdaux_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT g, dx FROM cdaux_mv
+    EXCEPT ALL
+    SELECT g, COUNT(DISTINCT x) FROM cdaux_src GROUP BY g
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT g, COUNT(DISTINCT x) FROM cdaux_src GROUP BY g
+    EXCEPT ALL
+    SELECT g, dx FROM cdaux_mv
+);
+----
+0
+
+query I
+SELECT count(DISTINCT refresh_type_name) = 1
+   AND min(refresh_type_name) = 'COUNT_DISTINCT_INCREMENTAL'
+FROM openivm_compile_with_facts(
+    'cdaux_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+true
+
+# Mixed batch: remove all remaining group-2 rows, insert a duplicate and a new value.
+statement ok
+DELETE FROM cdaux_src WHERE g = 2;
+
+statement ok
+INSERT INTO cdaux_src VALUES (1, 10), (1, 50), (3, 99);
+
+statement ok
+PRAGMA refresh('cdaux_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT g, dx FROM cdaux_mv
+    EXCEPT ALL
+    SELECT g, COUNT(DISTINCT x) FROM cdaux_src GROUP BY g
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT g, COUNT(DISTINCT x) FROM cdaux_src GROUP BY g
+    EXCEPT ALL
+    SELECT g, dx FROM cdaux_mv
+);
+----
+0
+
+query I
+SELECT count(DISTINCT refresh_type_name) = 1
+   AND min(refresh_type_name) = 'COUNT_DISTINCT_INCREMENTAL'
+FROM openivm_compile_with_facts(
+    'cdaux_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+true
+
+# The emitted program is aux-state MERGE SQL, not GROUP_RECOMPUTE's affected-key DELETE+INSERT.
+query I
+SELECT contains(string_agg(lower(sql), ' ' ORDER BY stmt_order), 'openivm_aux_cdaux_mv')
+   AND contains(string_agg(lower(sql), ' ' ORDER BY stmt_order), 'merge into openivm_data_cdaux_mv')
+   AND NOT contains(string_agg(lower(sql), ' ' ORDER BY stmt_order), 'openivm_affected_cdaux_mv')
+FROM openivm_compile_with_facts(
+    'cdaux_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+true
+
+statement ok
+SET openivm_stateful_auxstate = false;

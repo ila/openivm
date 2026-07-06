@@ -273,8 +273,21 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 	if (facts && facts->compile_only) {
 		DeltaFastPathFlags flags;
 		flags.active_delta_table_names = delta_table_names;
-		OPENIVM_DEBUG_PRINT("[UPSERT] compile_only=true: disabling local delta fast paths, active_sources=%zu\n",
-		                    flags.active_delta_table_names.size());
+		// When an external classifier has PROVEN this batch is append-only,
+		// re-enable the insert-only fast paths even under compile_only (they are
+		// otherwise disabled because compile_only sees empty tables and cannot
+		// detect insert-only itself). Honor the same per-setting kill switches as
+		// the normal path. Without the flag we keep the conservative all-delta SQL.
+		if (facts->assume_insert_only) {
+			flags.insert_only = true;
+			flags.skip_agg_delete = SqlUtils::GetBoolSetting(context, "openivm_skip_aggregate_delete", true);
+			flags.skip_proj_delete = SqlUtils::GetBoolSetting(context, "openivm_skip_projection_delete", true);
+			flags.minmax_incremental = SqlUtils::GetBoolSetting(context, "openivm_minmax_incremental", true);
+		}
+		OPENIVM_DEBUG_PRINT("[UPSERT] compile_only=true: assume_insert_only=%d insert_only=%d skip_agg_delete=%d "
+		                    "skip_proj_delete=%d minmax_incremental=%d active_sources=%zu\n",
+		                    facts->assume_insert_only, flags.insert_only, flags.skip_agg_delete, flags.skip_proj_delete,
+		                    flags.minmax_incremental, flags.active_delta_table_names.size());
 		return flags;
 	}
 	DeltaActivityResult summary;

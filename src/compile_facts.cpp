@@ -75,6 +75,99 @@ bool ExtractJsonString(const string &json, const string &key, string &val) {
 	return false;
 }
 
+bool ExtractJsonStringArray(const string &json, const string &key, vector<string> &val) {
+	string needle = "\"" + key + "\":[";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return false;
+	}
+	pos += needle.size();
+	val.clear();
+	while (pos < json.size()) {
+		while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == ',')) {
+			pos++;
+		}
+		if (pos < json.size() && json[pos] == ']') {
+			return true;
+		}
+		if (pos >= json.size() || json[pos] != '"') {
+			return false;
+		}
+		pos++;
+		string item;
+		while (pos < json.size()) {
+			char c = json[pos];
+			if (c == '\\' && pos + 1 < json.size()) {
+				char esc = json[pos + 1];
+				item += (esc == 'n') ? '\n' : esc;
+				pos += 2;
+				continue;
+			}
+			if (c == '"') {
+				pos++;
+				break;
+			}
+			item += c;
+			pos++;
+		}
+		val.push_back(item);
+	}
+	return false;
+}
+
+vector<string> ExtractJsonObjectsFromArray(const string &json, const string &key) {
+	vector<string> objects;
+	string needle = "\"" + key + "\":[";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return objects;
+	}
+	pos += needle.size();
+	bool in_string = false;
+	bool escape = false;
+	int depth = 0;
+	size_t object_start = string::npos;
+	for (; pos < json.size(); pos++) {
+		char c = json[pos];
+		if (in_string) {
+			if (escape) {
+				escape = false;
+			} else if (c == '\\') {
+				escape = true;
+			} else if (c == '"') {
+				in_string = false;
+			}
+			continue;
+		}
+		if (c == '"') {
+			in_string = true;
+			continue;
+		}
+		if (c == '{') {
+			if (depth == 0) {
+				object_start = pos;
+			}
+			depth++;
+			continue;
+		}
+		if (c == '}') {
+			if (depth == 0) {
+				break;
+			}
+			depth--;
+			if (depth == 0 && object_start != string::npos) {
+				objects.push_back(json.substr(object_start, pos - object_start + 1));
+				object_start = string::npos;
+			}
+			continue;
+		}
+		if (c == ']' && depth == 0) {
+			break;
+		}
+	}
+	return objects;
+}
+
 bool ExtractJsonBool(const string &json, const string &key, bool &val) {
 	string needle = "\"" + key + "\":";
 	size_t pos = json.find(needle);
@@ -124,6 +217,54 @@ bool ExtractJsonInt(const string &json, const string &key, int &val) {
 	}
 }
 
+bool ExtractDeltaShapeObject(const string &json, unordered_map<string, string> &delta_shape) {
+	string needle = "\"delta_shape\":{";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return false;
+	}
+	pos += needle.size();
+	while (pos < json.size()) {
+		while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == ',')) {
+			pos++;
+		}
+		if (pos < json.size() && json[pos] == '}') {
+			return true;
+		}
+		if (pos >= json.size() || json[pos] != '"') {
+			return false;
+		}
+		size_t key_start = pos;
+		size_t key_end = json.find("\":\"", key_start + 1);
+		if (key_end == string::npos) {
+			return false;
+		}
+		string key_json = "{" + json.substr(key_start, key_end - key_start + 1) + "}";
+		string table;
+		if (!ExtractJsonString(key_json, "", table)) {
+			table = json.substr(key_start + 1, key_end - key_start - 1);
+		}
+		pos = key_end + 3;
+		string value;
+		while (pos < json.size()) {
+			char c = json[pos];
+			if (c == '\\' && pos + 1 < json.size()) {
+				value += json[pos + 1];
+				pos += 2;
+				continue;
+			}
+			if (c == '"') {
+				pos++;
+				break;
+			}
+			value += c;
+			pos++;
+		}
+		delta_shape[table] = value;
+	}
+	return false;
+}
+
 SqlDialect ParseDialectString(const string &s) {
 	// Reuse the lpts helper so dialect names stay in lockstep with the
 	// LPTS pipeline. LPTS throws on unrecognised values which is exactly
@@ -155,6 +296,37 @@ CompileFacts ParseFactsJson(const string &json) {
 	}
 	ExtractJsonBool(json, "compile_only", out.compile_only);
 	ExtractJsonBool(json, "force_view_delta_cascade", out.force_view_delta_cascade);
+	ExtractJsonBool(json, "assume_insert_only", out.assume_insert_only);
+	ExtractDeltaShapeObject(json, out.delta_shape);
+	ExtractJsonBool(json, "running_window_incremental", out.running_window_incremental);
+	ExtractJsonBool(json, "scd2_range_join_accel", out.scd2_range_join_accel);
+	ExtractJsonBool(json, "emit_spark_hints", out.emit_spark_hints);
+
+	for (auto &object : ExtractJsonObjectsFromArray(json, "fk_relations")) {
+		CompileFactsFkRelation fk;
+		ExtractJsonString(object, "child_table", fk.child_table);
+		ExtractJsonStringArray(object, "child_columns", fk.child_columns);
+		ExtractJsonString(object, "parent_table", fk.parent_table);
+		ExtractJsonStringArray(object, "parent_columns", fk.parent_columns);
+		// Also accept the roadmap draft spelling; Spark emits child_/parent_.
+		if (fk.child_table.empty()) {
+			ExtractJsonString(object, "fk_table", fk.child_table);
+		}
+		if (fk.child_columns.empty()) {
+			ExtractJsonStringArray(object, "fk_cols", fk.child_columns);
+		}
+		if (fk.parent_table.empty()) {
+			ExtractJsonString(object, "pk_table", fk.parent_table);
+		}
+		if (fk.parent_columns.empty()) {
+			ExtractJsonStringArray(object, "pk_cols", fk.parent_columns);
+		}
+		ExtractJsonBool(object, "rely", fk.rely);
+		if (fk.rely && !fk.child_table.empty() && !fk.parent_table.empty() && !fk.child_columns.empty() &&
+		    fk.child_columns.size() == fk.parent_columns.size()) {
+			out.fk_relations.push_back(std::move(fk));
+		}
+	}
 
 	return out;
 }

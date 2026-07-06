@@ -27,8 +27,19 @@ struct FilteredGroupCountExtract {
 	string threshold_sql;
 };
 
+struct CountDistinctExtract {
+	string source;
+	vector<string> group_exprs;
+	string distinct_expr;
+	string distinct_col;
+	string output_col;
+	string filter;
+};
+
 bool ExtractInnerDistinct(const string &original_sql, vector<string> &out_cols, string &out_input_sql,
                           string &out_source, string &out_filter_sql);
+bool ExtractCountDistinctAggregate(const string &original_sql, const vector<string> &group_columns,
+                                   const vector<string> &output_names, CountDistinctExtract &out);
 bool ExtractFilteredGroupCount(const string &original_sql, const vector<string> &output_names,
                                FilteredGroupCountExtract &out);
 bool ExtractSemiAntiQuery(const string &original_sql, SemiAntiExtract &out);

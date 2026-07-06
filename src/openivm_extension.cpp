@@ -42,6 +42,52 @@ namespace duckdb {
 // The daemon sleeps and periodically checks for scheduled views; no work if none exist.
 static shared_ptr<RefreshDaemon> global_daemon;
 
+static vector<string> ParsePragmaColumnList(string input) {
+	vector<string> columns;
+	StringUtil::Trim(input);
+	if (input.empty()) {
+		return columns;
+	}
+	if (input.front() == '[') {
+		size_t pos = 0;
+		while ((pos = input.find('"', pos)) != string::npos) {
+			pos++;
+			string value;
+			while (pos < input.size()) {
+				char c = input[pos++];
+				if (c == '\\' && pos < input.size()) {
+					char esc = input[pos++];
+					value += (esc == 'n') ? '\n' : esc;
+					continue;
+				}
+				if (c == '"') {
+					StringUtil::Trim(value);
+					if (!value.empty()) {
+						columns.push_back(value);
+					}
+					break;
+				}
+				value += c;
+			}
+		}
+		return columns;
+	}
+	size_t start = 0;
+	while (start <= input.size()) {
+		size_t end = input.find(',', start);
+		string value = input.substr(start, end == string::npos ? string::npos : end - start);
+		StringUtil::Trim(value);
+		if (!value.empty()) {
+			columns.push_back(value);
+		}
+		if (end == string::npos) {
+			break;
+		}
+		start = end + 1;
+	}
+	return columns;
+}
+
 struct ComputeDeltaData : public GlobalTableFunctionState {
 	ComputeDeltaData() : offset(0) {
 	}
@@ -137,6 +183,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_fk_pruning", "prune inclusion-exclusion join terms using FK constraints",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("openivm_scd2_range_join_accel",
+	                             "add delta timestamp-domain filters for SCD-2 range joins", LogicalType::BOOLEAN,
+	                             Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_emit_spark_hints",
+	                             "emit Spark optimizer hints in target_dialect=spark compiled refresh SQL",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("openivm_skip_aggregate_delete",
 	                             "skip zero-row DELETE for grouped aggregates when deltas are insert-only",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
@@ -146,6 +198,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_minmax_incremental",
 	                             "use GREATEST/LEAST for MIN/MAX when deltas are insert-only", LogicalType::BOOLEAN,
 	                             Value::BOOLEAN(true));
+	db_config.AddExtensionOption("openivm_running_window_incremental",
+	                             "extend cumulative running window aggregates for append-only suffix batches",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("openivm_having_merge",
 	                             "use MERGE for HAVING views (store all groups, VIEW filters) "
 	                             "instead of group-recompute",
@@ -164,6 +219,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "distinct(R)=sgn(R[t]) — emit ±1 only on count transitions across zero) "
 	                             "instead of GROUP_RECOMPUTE. Single-source views only in v0; multi-source "
 	                             "views fall back to GROUP_RECOMPUTE.",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_stateful_auxstate",
+	                             "use persisted auxiliary state for stateful operators such as "
+	                             "COUNT(DISTINCT) instead of GROUP_RECOMPUTE",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Learned cost model
@@ -268,6 +327,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS distinct_aux_meta_json VARCHAR DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS count_distinct_aux_meta_json VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS semi_anti_aux_meta_json VARCHAR DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS lineage_json VARCHAR DEFAULT NULL");
@@ -334,6 +395,26 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(refresh_options);
 	auto refresh = PragmaFunction::PragmaCall("refresh", UpsertDeltaQueriesLocked, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh);
+	auto declare_rely_fk = PragmaFunction::PragmaCall(
+	    "openivm_declare_rely_fk",
+	    [](ClientContext &, const FunctionParameters &parameters) -> string {
+		    string child_table = StringValue::Get(parameters.values[0]);
+		    auto child_columns = ParsePragmaColumnList(StringValue::Get(parameters.values[1]));
+		    string parent_table = StringValue::Get(parameters.values[2]);
+		    auto parent_columns = ParsePragmaColumnList(StringValue::Get(parameters.values[3]));
+		    if (child_columns.empty() || child_columns.size() != parent_columns.size()) {
+			    throw InvalidInputException("openivm_declare_rely_fk requires matching child/parent column lists");
+		    }
+		    return "INSERT OR REPLACE INTO " + string(openivm::CONSTRAINTS_CACHE_TABLE) +
+		           " (table_name, constraint_kind, columns_json, referenced_table, "
+		           "referenced_columns_json, is_trusted) VALUES ('" +
+		           SqlUtils::EscapeValue(child_table) + "', 'RELY_FK', '" +
+		           SqlUtils::EscapeValue(SqlUtils::JsonArray(child_columns)) + "', '" +
+		           SqlUtils::EscapeValue(parent_table) + "', '" +
+		           SqlUtils::EscapeValue(SqlUtils::JsonArray(parent_columns)) + "', true);";
+	    },
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
+	loader.RegisterFunction(declare_rely_fk);
 	auto refresh_cost = PragmaFunction::PragmaCall("refresh_cost", RefreshCostQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cost);
 	auto refresh_history =

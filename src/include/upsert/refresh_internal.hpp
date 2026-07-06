@@ -117,7 +117,7 @@ struct RefreshCompileProfile {
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col);
 bool IsEmptyDeltaPlan(LogicalOperator *op);
 string BuildEmptyDeltaInsert(const string &view_name, const vector<string> &column_names,
-                             const vector<LogicalType> &column_types);
+                             const vector<LogicalType> &column_types, SqlDialect dialect = SqlDialect::DUCKDB);
 string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_view_name,
                                 const vector<string> &column_names, const string &delta_ts_filter);
 string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_query_sql,
@@ -220,7 +220,8 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &delta_ts_filter, const string &internal_catalog_prefix,
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
-                                   bool cross_system, bool emit_cascade_delta = false);
+                                   bool cross_system, bool emit_cascade_delta = false,
+                                   bool running_window_incremental = false);
 bool TryBuildGroupMeasureUpdateRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                        const string &view_query_sql, const vector<string> &active_delta_table_names,
                                        const vector<string> &column_names, const vector<LogicalType> &column_types,

@@ -1,0 +1,136 @@
+# name: test/sql/insert_only_aggregate_group.test
+# description: compile-only insert-only AGGREGATE_GROUP refresh SQL preserves
+# group: [sql]
+
+#              bag-correct affected-group deltas for SUM/COUNT and MIN/MAX.
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# SUM/COUNT GROUP BY with a downstream consumer forces cascade-delta emission.
+statement ok
+CREATE TABLE io_sum_sales (region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO io_sum_sales VALUES ('east', 10), ('east', 5), ('west', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_io_sum AS
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
+    FROM io_sum_sales GROUP BY region;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_io_sum_downstream AS
+    SELECT region, SUM(total) AS downstream_total, COUNT(*) AS downstream_cnt
+    FROM mv_io_sum GROUP BY region;
+
+statement ok
+INSERT INTO io_sum_sales VALUES ('east', 7), ('north', 3);
+
+# Compile-only + assume_insert_only + forced inline cascade now emits a real
+# affected-group old/new delta, not NULL companion rows as the final cascade.
+query I
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_old.total%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_new.total%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%MERGE INTO openivm_data_mv_io_sum%'
+FROM openivm_compile_with_facts(
+    'mv_io_sum',
+    '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+true
+
+# Native runtime fast path stays bag-equal to the base query.
+statement ok
+PRAGMA refresh('mv_io_sum');
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT region, total, cnt FROM mv_io_sum)
+                             EXCEPT ALL
+                             (SELECT region, SUM(amount), COUNT(*) FROM io_sum_sales GROUP BY region))) = 0
+   AND (SELECT count(*) FROM ((SELECT region, SUM(amount), COUNT(*) FROM io_sum_sales GROUP BY region)
+                             EXCEPT ALL
+                             (SELECT region, total, cnt FROM mv_io_sum))) = 0;
+----
+true
+
+# MIN/MAX GROUP BY uses the same cascade discipline while keeping the
+# LEAST/GREATEST insert-only update.
+statement ok
+CREATE TABLE io_mm_sales (region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO io_mm_sales VALUES ('east', 10), ('east', 5), ('west', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_io_mm AS
+    SELECT region, MIN(amount) AS lo, MAX(amount) AS hi, COUNT(*) AS cnt
+    FROM io_mm_sales GROUP BY region;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_io_mm_downstream AS
+    SELECT region, SUM(lo) AS sum_lo, SUM(hi) AS sum_hi, COUNT(*) AS group_count
+    FROM mv_io_mm GROUP BY region;
+
+statement ok
+INSERT INTO io_mm_sales VALUES ('east', 2), ('east', 17), ('north', 3);
+
+query I
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%LEAST%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%GREATEST%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_old.lo%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_new.hi%'
+FROM openivm_compile_with_facts(
+    'mv_io_mm',
+    '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+true
+
+statement ok
+PRAGMA refresh('mv_io_mm');
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT region, lo, hi, cnt FROM mv_io_mm)
+                             EXCEPT ALL
+                             (SELECT region, MIN(amount), MAX(amount), COUNT(*) FROM io_mm_sales GROUP BY region))) = 0
+   AND (SELECT count(*) FROM ((SELECT region, MIN(amount), MAX(amount), COUNT(*) FROM io_mm_sales GROUP BY region)
+                             EXCEPT ALL
+                             (SELECT region, lo, hi, cnt FROM mv_io_mm))) = 0;
+----
+true
+
+# Mixed DML without assume_insert_only remains on the conservative general path
+# for MIN/MAX; it must not use the insert-only LEAST/GREATEST merge.
+statement ok
+CREATE TABLE io_mixed_sales (region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO io_mixed_sales VALUES ('east', 10), ('east', 5), ('west', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_io_mixed AS
+    SELECT region, MIN(amount) AS lo, MAX(amount) AS hi, COUNT(*) AS cnt
+    FROM io_mixed_sales GROUP BY region;
+
+statement ok
+INSERT INTO io_mixed_sales VALUES ('east', 2);
+
+statement ok
+DELETE FROM io_mixed_sales WHERE region = 'west';
+
+query I
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM openivm_data_mv_io_mixed%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%LEAST%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%GREATEST%'
+FROM openivm_compile_with_facts(
+    'mv_io_mixed',
+    '{"target_dialect":"duckdb","compile_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+true

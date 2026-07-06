@@ -184,6 +184,9 @@ static void AddNodeAuxRequirements(DeltaModelNode &node, const DeltaViewModel &m
 	if (model.HasDistinctAux() && node.kind == DeltaModelNodeKind::DISTINCT) {
 		AddUnique(node.required_aux_states, DeltaAuxStateKind::DISTINCT_COUNT);
 	}
+	if (model.HasCountDistinctAux() && node.kind == DeltaModelNodeKind::AGGREGATE) {
+		AddUnique(node.required_aux_states, DeltaAuxStateKind::COUNT_DISTINCT);
+	}
 	if (model.HasFilteredGroupCountAux() && node.kind == DeltaModelNodeKind::AGGREGATE) {
 		AddUnique(node.required_aux_states, DeltaAuxStateKind::FILTERED_GROUP_COUNT);
 	}
@@ -581,6 +584,7 @@ void BuildDeltaModelBaseAffectedDomains(DeltaViewModel &model, const CreateMVPla
 
 void ValidateDeltaViewModelInvariants(const DeltaViewModel &model) {
 	D_ASSERT(!model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL) || model.HasDistinctAux());
+	D_ASSERT(model.type != RefreshType::COUNT_DISTINCT_INCREMENTAL || model.HasCountDistinctAux());
 	D_ASSERT(!model.HasFeature(DeltaModelFeature::SEMI_ANTI_STATEFUL) || model.HasSemiAntiAux());
 	D_ASSERT(!model.HasFeature(DeltaModelFeature::WINDOW_AFFECTED_PARTITION) ||
 	         !model.window_partition_columns.empty());

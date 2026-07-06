@@ -445,7 +445,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               const vector<LogicalType> &column_types, bool use_current_diff_affected_keys,
                               const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs,
                               const string &cascade_lpts_table_prefix, bool emit_cascade_delta,
-                              bool *out_handled_cascade_delta) {
+                              bool inline_cascade_delta, bool *out_handled_cascade_delta) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 
@@ -919,6 +919,67 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	}
 
 	string upsert_query = merge_query + "\n";
+	if (insert_only && emit_cascade_delta && inline_cascade_delta) {
+		// The inline companion emitted by refresh_sql.cpp is a compact aggregate-delta
+		// encoding (-1 NULL marker + positive delta). That is enough for downstream SUM/COUNT,
+		// but not for arbitrary downstream consumers and MIN/MAX. Keep the fast MERGE for this
+		// MV, then replace the delta view with a true -old/+new affected-group multiset.
+		string affected_temp =
+		    SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name + "_merge");
+		string old_temp =
+		    SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + "snapshot_" + view_name + "_merge");
+		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+		string marker_predicate = string(openivm::MULTIPLICITY_COL) + " < 0";
+		for (auto &column : aggregates) {
+			marker_predicate += " AND " + column + " IS NULL";
+		}
+		string affected_match = SqlUtils::BuildNullSafeMatch(keys, "openivm_aff", "openivm_data");
+		string new_match = SqlUtils::BuildNullSafeMatch(keys, "openivm_aff", "openivm_new");
+		string col_list = SqlUtils::JoinQuotedColumns(column_names);
+		string select_old, select_new;
+		bool first_col = true;
+		for (auto &column : column_names) {
+			if (!first_col) {
+				select_old += ", ";
+				select_new += ", ";
+			}
+			first_col = false;
+			if (column == string(openivm::MULTIPLICITY_COL)) {
+				select_old += "-1";
+				select_new += "1";
+			} else {
+				select_old += "openivm_old." + SqlUtils::QuoteIdentifier(column);
+				select_new += "openivm_new." + SqlUtils::QuoteIdentifier(column);
+			}
+		}
+
+		string cascade_sql;
+		cascade_sql += "DELETE FROM " + delta_view + " WHERE " + marker_predicate;
+		if (!delta_ts_filter.empty()) {
+			cascade_sql += " AND " + delta_ts_filter;
+		}
+		cascade_sql += ";\n";
+		cascade_sql += "DROP TABLE IF EXISTS " + affected_temp + ";\n";
+		cascade_sql += "CREATE TABLE " + affected_temp + " AS SELECT DISTINCT " + SqlUtils::JoinQuotedColumns(keys) +
+		               " FROM " + delta_view + delta_where + ";\n";
+		cascade_sql += "DROP TABLE IF EXISTS " + old_temp + ";\n";
+		cascade_sql += "CREATE TABLE " + old_temp + " AS SELECT openivm_data.* FROM " + data_table +
+		               " openivm_data WHERE EXISTS (SELECT 1 FROM " + affected_temp + " openivm_aff WHERE " +
+		               affected_match + ");\n";
+		cascade_sql += merge_query + "\n";
+		cascade_sql += "DELETE FROM " + delta_view + " WHERE 1=1";
+		if (!delta_ts_filter.empty()) {
+			cascade_sql += " AND " + delta_ts_filter;
+		}
+		cascade_sql += ";\n";
+		cascade_sql += "INSERT INTO " + delta_view + " (" + col_list + ") SELECT " + select_old + " FROM " + old_temp +
+		               " openivm_old;\n";
+		cascade_sql += "INSERT INTO " + delta_view + " (" + col_list + ") SELECT " + select_new + " FROM " +
+		               data_table + " openivm_new WHERE EXISTS (SELECT 1 FROM " + affected_temp +
+		               " openivm_aff WHERE " + new_match + ");\n";
+		cascade_sql += "DROP TABLE " + old_temp + ";\nDROP TABLE " + affected_temp + ";\n";
+		upsert_query = cascade_sql;
+	}
 
 	// Delete empty groups — a group is empty iff its row count is 0. We can only detect
 	// this when the MV has a COUNT-type aggregate (either an explicit COUNT(*) / COUNT(x),
@@ -1087,11 +1148,12 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	delete_candidate_columns.erase(delete_candidate_columns.size() - 2, 2);
 
 	if (insert_only) {
-		// Insert-only fast path: all deltas are inserts (w > 0), just INSERT directly.
-		// Each row replicated |w| times for bag-correct multiplicity.
+		// Insert-only fast path: append projected delta rows directly. Do not run the signed net
+		// consolidation/delete path here; byte-identical duplicates are distinct bag entries and
+		// must be appended once per positive multiplicity.
 		string mul_filter = delta_ts_filter.empty() ? "WHERE " + mul + " > 0" : ts_where + " AND " + mul + " > 0";
 		string insert_query = "INSERT INTO " + data_table + " SELECT " + select_columns + "\nFROM " + delta_view +
-		                      ", generate_series(1, " + mul + "::BIGINT)\n" + mul_filter + ";\n";
+		                      "\nCROSS JOIN generate_series(1, " + mul + "::BIGINT)\n" + mul_filter + ";\n";
 		return insert_query;
 	}
 

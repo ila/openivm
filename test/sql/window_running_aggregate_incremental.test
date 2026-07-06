@@ -1,0 +1,139 @@
+# name: test/sql/window_running_aggregate_incremental.test
+# description: Gated cumulative running-window suffix extension is bag-equal and falls back per backdated partition.
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_running_window_incremental=true;
+
+statement ok
+CREATE TABLE wrai_sales (id INT, k VARCHAR, d INT, x INT);
+
+statement ok
+INSERT INTO wrai_sales VALUES
+    (1, 'a', 1, 10),
+    (2, 'a', 2, 5),
+    (3, 'b', 1, 7),
+    (4, 'c', 1, 3);
+
+statement ok
+CREATE MATERIALIZED VIEW wrai_sum_mv AS
+    SELECT id, k, d, x, SUM(x) OVER (PARTITION BY k ORDER BY d) AS running_sum
+    FROM wrai_sales;
+
+statement ok
+CREATE MATERIALIZED VIEW wrai_max_mv AS
+    SELECT id, k, d, x, MAX(x) OVER (PARTITION BY k ORDER BY d) AS running_max
+    FROM wrai_sales;
+
+statement ok
+INSERT INTO wrai_sales VALUES
+    (5, 'a', 3, 8),
+    (6, 'b', 2, 9),
+    (7, 'c', 2, 4);
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_run_fast_wrai_sum_mv%'
+         AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_run_fallback_wrai_sum_mv%'
+    THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'wrai_sum_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+PRAGMA refresh('wrai_sum_mv');
+
+statement ok
+PRAGMA refresh('wrai_max_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM openivm_data_wrai_sum_mv
+    EXCEPT ALL
+    SELECT id, k, d, x, SUM(x) OVER (PARTITION BY k ORDER BY d) AS running_sum FROM wrai_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, k, d, x, SUM(x) OVER (PARTITION BY k ORDER BY d) AS running_sum FROM wrai_sales
+    EXCEPT ALL
+    SELECT * FROM openivm_data_wrai_sum_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM openivm_data_wrai_max_mv
+    EXCEPT ALL
+    SELECT id, k, d, x, MAX(x) OVER (PARTITION BY k ORDER BY d) AS running_max FROM wrai_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, k, d, x, MAX(x) OVER (PARTITION BY k ORDER BY d) AS running_max FROM wrai_sales
+    EXCEPT ALL
+    SELECT * FROM openivm_data_wrai_max_mv
+);
+----
+0
+
+statement ok
+INSERT INTO wrai_sales VALUES
+    (8, 'a', 0, 11),
+    (9, 'b', 3, 2),
+    (10, 'd', 1, 6);
+
+statement ok
+PRAGMA refresh('wrai_sum_mv');
+
+statement ok
+PRAGMA refresh('wrai_max_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM openivm_data_wrai_sum_mv
+    EXCEPT ALL
+    SELECT id, k, d, x, SUM(x) OVER (PARTITION BY k ORDER BY d) AS running_sum FROM wrai_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, k, d, x, SUM(x) OVER (PARTITION BY k ORDER BY d) AS running_sum FROM wrai_sales
+    EXCEPT ALL
+    SELECT * FROM openivm_data_wrai_sum_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM openivm_data_wrai_max_mv
+    EXCEPT ALL
+    SELECT id, k, d, x, MAX(x) OVER (PARTITION BY k ORDER BY d) AS running_max FROM wrai_sales
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, k, d, x, MAX(x) OVER (PARTITION BY k ORDER BY d) AS running_max FROM wrai_sales
+    EXCEPT ALL
+    SELECT * FROM openivm_data_wrai_max_mv
+);
+----
+0

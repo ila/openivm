@@ -1,0 +1,428 @@
+# name: test/sql/window_running_aggregate_cascade_suffix_delta.test
+# description: Running-window suffix refresh emits cascade deltas for fast and fallback partitions.
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_running_window_incremental=true;
+
+statement ok
+CREATE TABLE wrcas_daily_market (
+    dm_date DATE,
+    dm_s_symb VARCHAR,
+    dm_close INT,
+    dm_high INT,
+    dm_low INT,
+    dm_vol INT
+);
+
+statement ok
+INSERT INTO wrcas_daily_market VALUES
+    (DATE '2024-01-01', 'AAA', 101, 20, 10, 1000),
+    (DATE '2024-01-02', 'AAA', 102, 22, 8, 1100),
+    (DATE '2024-01-01', 'BBB', 201, 30, 15, 2000),
+    (DATE '2024-01-02', 'BBB', 202, 29, 16, 2100);
+
+statement ok
+CREATE MATERIALIZED VIEW wrcas_daily_mv AS
+WITH cumulative AS (
+  SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+         min(dm_low)  OVER w AS fifty_two_week_low,
+         max(dm_high) OVER w AS fifty_two_week_high
+  FROM wrcas_daily_market
+  WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+), flagged AS (
+  SELECT *,
+         CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+         CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+  FROM cumulative
+)
+SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+       fifty_two_week_low, fifty_two_week_high,
+       max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+       max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+FROM flagged;
+
+statement ok
+CREATE MATERIALIZED VIEW wrcas_down_mv AS
+    SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
+    FROM wrcas_daily_mv;
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    )
+    SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+           fifty_two_week_low, fifty_two_week_high,
+           max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+           max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+    FROM flagged
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_daily_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    )
+    SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+           fifty_two_week_low, fifty_two_week_high,
+           max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+           max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+    FROM flagged
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_daily_mv);
+----
+0
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    ), daily AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             fifty_two_week_low, fifty_two_week_high,
+             max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+             max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+      FROM flagged
+    )
+    SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
+    FROM daily
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_down_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    ), daily AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             fifty_two_week_low, fifty_two_week_high,
+             max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+             max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+      FROM flagged
+    )
+    SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
+    FROM daily
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_down_mv);
+----
+0
+
+statement ok
+INSERT INTO wrcas_daily_market VALUES
+    (DATE '2024-01-03', 'AAA', 103, 24, 7, 1200),
+    (DATE '2024-01-03', 'BBB', 203, 31, 14, 2200),
+    (DATE '2024-01-01', 'CCC', 301, 40, 25, 3000);
+
+query I
+WITH compiled AS (
+    SELECT stmt_order, sql
+    FROM openivm_compile_with_facts(
+        'wrcas_daily_mv',
+        '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true,"force_view_delta_cascade":true}'
+    )
+    WHERE stmt_kind = 'data'
+), program AS (
+    SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS sql FROM compiled
+), fast_delta AS (
+    SELECT sql FROM compiled WHERE sql LIKE 'INSERT INTO openivm_delta_wrcas_daily_mv%openivm_l1 AS%'
+)
+SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast_wrcas_daily_mv%'
+         AND (SELECT sql FROM program) LIKE '%openivm_run_fallback_wrcas_daily_mv%'
+         AND (SELECT sql FROM program) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_wrcas_daily_mv AS%'
+         AND (SELECT sql FROM program) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_wrcas_daily_mv AS%'
+         AND (SELECT sql FROM program) LIKE '%INSERT INTO openivm_delta_wrcas_daily_mv%'
+         AND (SELECT sql FROM program) LIKE '%CAST(-1 AS INTEGER)%'
+         AND (SELECT sql FROM program) LIKE '%CAST(1 AS INTEGER)%'
+         AND (SELECT sql FROM fast_delta) LIKE '%CAST(1 AS INTEGER), CURRENT_TIMESTAMP%'
+    THEN 1 ELSE 0 END;
+----
+1
+
+statement ok
+PRAGMA refresh('wrcas_daily_mv');
+
+statement ok
+PRAGMA refresh('wrcas_down_mv');
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    )
+    SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+           fifty_two_week_low, fifty_two_week_high,
+           max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+           max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+    FROM flagged
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_daily_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    )
+    SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+           fifty_two_week_low, fifty_two_week_high,
+           max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+           max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+    FROM flagged
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_daily_mv);
+----
+0
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    ), daily AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             fifty_two_week_low, fifty_two_week_high,
+             max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+             max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+      FROM flagged
+    )
+    SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
+    FROM daily
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_down_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    ), daily AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             fifty_two_week_low, fifty_two_week_high,
+             max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+             max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+      FROM flagged
+    )
+    SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
+    FROM daily
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_down_mv);
+----
+0
+
+statement ok
+INSERT INTO wrcas_daily_market VALUES
+    (DATE '2024-01-01', 'AAA', 99, 25, 6, 900),
+    (DATE '2024-01-04', 'BBB', 204, 32, 13, 2300),
+    (DATE '2024-01-01', 'DDD', 401, 50, 35, 4000);
+
+query I
+WITH compiled AS (
+    SELECT stmt_order, sql
+    FROM openivm_compile_with_facts(
+        'wrcas_daily_mv',
+        '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true,"force_view_delta_cascade":true}'
+    )
+    WHERE stmt_kind = 'data'
+), program AS (
+    SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS sql FROM compiled
+)
+SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast_wrcas_daily_mv%'
+         AND (SELECT sql FROM program) LIKE '%openivm_run_fallback_wrcas_daily_mv%'
+         AND (SELECT sql FROM program) LIKE '%openivm_old_wrcas_daily_mv%'
+         AND (SELECT sql FROM program) LIKE '%openivm_new_wrcas_daily_mv%'
+         AND (SELECT sql FROM program) LIKE '%INSERT INTO openivm_delta_wrcas_daily_mv%'
+    THEN 1 ELSE 0 END;
+----
+1
+
+statement ok
+PRAGMA refresh('wrcas_daily_mv');
+
+statement ok
+PRAGMA refresh('wrcas_down_mv');
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    )
+    SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+           fifty_two_week_low, fifty_two_week_high,
+           max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+           max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+    FROM flagged
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_daily_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    )
+    SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+           fifty_two_week_low, fifty_two_week_high,
+           max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+           max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+    FROM flagged
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_daily_mv);
+----
+0
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    ), daily AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             fifty_two_week_low, fifty_two_week_high,
+             max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+             max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+      FROM flagged
+    )
+    SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
+    FROM daily
+)
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_down_mv EXCEPT ALL SELECT * FROM expected);
+----
+0
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             min(dm_low)  OVER w AS fifty_two_week_low,
+             max(dm_high) OVER w AS fifty_two_week_high
+      FROM wrcas_daily_market
+      WINDOW w AS (PARTITION BY dm_s_symb ORDER BY dm_date)
+    ), flagged AS (
+      SELECT *,
+             CASE WHEN dm_low  = fifty_two_week_low  THEN dm_date ELSE NULL END AS low_date_flag,
+             CASE WHEN dm_high = fifty_two_week_high THEN dm_date ELSE NULL END AS high_date_flag
+      FROM cumulative
+    ), daily AS (
+      SELECT dm_date, dm_s_symb, dm_close, dm_high, dm_low, dm_vol,
+             fifty_two_week_low, fifty_two_week_high,
+             max(low_date_flag)  OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_low_date,
+             max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
+      FROM flagged
+    )
+    SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
+    FROM daily
+)
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_down_mv);
+----
+0

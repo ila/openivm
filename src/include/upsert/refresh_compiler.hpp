@@ -37,7 +37,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               const vector<LogicalType> &column_types = {}, bool use_current_diff_affected_keys = false,
                               const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs = nullptr,
                               const string &cascade_lpts_table_prefix = "", bool emit_cascade_delta = false,
-                              bool *out_handled_cascade_delta = nullptr);
+                              bool inline_cascade_delta = false, bool *out_handled_cascade_delta = nullptr);
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql = "", bool has_minmax = false, bool list_mode = false,
                                const string &delta_ts_filter = "", const string &catalog_prefix = "",
@@ -49,7 +49,8 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const string &catalog_prefix = "", const vector<string> &partition_columns = {},
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {},
                               bool emit_cascade_delta = false, const string &affected_keys_sql = "",
-                              const string &affected_key_cols = "", const string &affected_key_tuple = "");
+                              const string &affected_key_cols = "", const string &affected_key_tuple = "",
+                              const vector<string> &column_names = {}, bool running_window_incremental = false);
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
 
 /// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE` (inner-DISTINCT under
@@ -95,6 +96,16 @@ string CompileDistinctIncremental(const string &view_name, const string &aux_tab
 string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
                                       const vector<string> &source_exprs, const string &source_relation,
                                       const string &filter_sql, bool replace);
+string CompileCountDistinctIncremental(const string &view_name, const string &aux_table, const string &delta_source,
+                                       const string &last_update, const vector<string> &group_cols,
+                                       const vector<string> &group_source_exprs, const string &distinct_col,
+                                       const string &distinct_expr, const string &output_col,
+                                       const string &count_star_col, const string &filter_sql,
+                                       const string &catalog_prefix = "");
+string BuildCountDistinctAuxStateCreateSQL(const string &target_table, const string &source_relation,
+                                           const vector<string> &group_cols, const vector<string> &group_source_exprs,
+                                           const string &distinct_col, const string &distinct_expr,
+                                           const string &filter_sql, bool replace);
 
 string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,

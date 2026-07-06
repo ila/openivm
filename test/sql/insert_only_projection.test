@@ -1,0 +1,244 @@
+# name: test/sql/insert_only_projection.test
+# description: assume_insert_only SIMPLE_PROJECTION compile emission preserves bag semantics.
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Test 1: compile-only insert-only projection emits the append-only direct
+# INSERT path, not the signed net-consolidation DELETE/INSERT path.
+# ==========================================
+
+statement ok
+CREATE TABLE iop_empty_src(id INT, val VARCHAR, keep BOOLEAN);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_iop_empty AS
+    SELECT id, val FROM iop_empty_src WHERE keep;
+
+statement ok
+INSERT INTO iop_empty_src VALUES
+    (1, 'dup', true),
+    (1, 'dup', true),
+    (2, 'two', true),
+    (9, 'filtered', false);
+
+query I
+SELECT CASE WHEN
+    (SELECT string_agg(lower(sql), ' ' ORDER BY stmt_order)
+     FROM openivm_compile_with_facts(
+         'mv_iop_empty',
+         '{"target_dialect":"duckdb","compile_only":true}'
+     )
+     WHERE stmt_kind = 'data') LIKE '%delete from %openivm_data_mv_iop_empty%'
+    AND
+    (SELECT string_agg(lower(sql), ' ' ORDER BY stmt_order)
+     FROM openivm_compile_with_facts(
+         'mv_iop_empty',
+         '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}'
+     )
+     WHERE stmt_kind = 'data') LIKE '%insert into openivm_data_mv_iop_empty select%'
+    AND
+    (SELECT string_agg(lower(sql), ' ' ORDER BY stmt_order)
+     FROM openivm_compile_with_facts(
+         'mv_iop_empty',
+         '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}'
+     )
+     WHERE stmt_kind = 'data') LIKE '%generate_series(1, openivm_multiplicity::bigint)%'
+    AND
+    (SELECT string_agg(lower(sql), ' ' ORDER BY stmt_order)
+     FROM openivm_compile_with_facts(
+         'mv_iop_empty',
+         '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}'
+     )
+     WHERE stmt_kind = 'data') NOT LIKE '%delete from %openivm_data_mv_iop_empty%'
+    AND
+    (SELECT string_agg(lower(sql), ' ' ORDER BY stmt_order)
+     FROM openivm_compile_with_facts(
+         'mv_iop_empty',
+         '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}'
+     )
+     WHERE stmt_kind = 'data') NOT LIKE '%sum(openivm_multiplicity)%'
+THEN 1 ELSE 0 END;
+----
+1
+
+# Execute the same runtime fast path against an initially empty MV.  Duplicate
+# source rows must survive as duplicate MV rows.
+
+statement ok
+PRAGMA refresh('mv_iop_empty');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, val FROM iop_empty_src WHERE keep
+    EXCEPT ALL
+    SELECT id, val FROM mv_iop_empty
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, val FROM mv_iop_empty
+    EXCEPT ALL
+    SELECT id, val FROM iop_empty_src WHERE keep
+);
+----
+0
+
+query I
+SELECT count(*) FROM mv_iop_empty WHERE id = 1 AND val = 'dup';
+----
+2
+
+query I
+SELECT CASE WHEN content LIKE '%generate_series(1, openivm_multiplicity::BIGINT)%'
+            AND content NOT LIKE '%DELETE FROM openivm_data_mv_iop_empty%'
+            AND content NOT LIKE '%SUM(openivm_multiplicity)%'
+       THEN 1 ELSE 0 END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_iop_empty.sql');
+----
+1
+
+# ==========================================
+# Test 2: insert-only refresh into a non-empty projection MV remains bag-equal.
+# ==========================================
+
+statement ok
+CREATE TABLE iop_nonempty_src(id INT, val VARCHAR, keep BOOLEAN);
+
+statement ok
+INSERT INTO iop_nonempty_src VALUES
+    (10, 'base', true),
+    (10, 'base', true),
+    (11, 'old', true),
+    (99, 'filtered', false);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_iop_nonempty AS
+    SELECT id, val FROM iop_nonempty_src WHERE keep;
+
+statement ok
+INSERT INTO iop_nonempty_src VALUES
+    (10, 'base', true),
+    (12, 'new', true),
+    (12, 'new', true),
+    (13, 'filtered-new', false);
+
+statement ok
+PRAGMA refresh('mv_iop_nonempty');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, val FROM iop_nonempty_src WHERE keep
+    EXCEPT ALL
+    SELECT id, val FROM mv_iop_nonempty
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, val FROM mv_iop_nonempty
+    EXCEPT ALL
+    SELECT id, val FROM iop_nonempty_src WHERE keep
+);
+----
+0
+
+query I
+SELECT count(*) FROM mv_iop_nonempty WHERE id = 10 AND val = 'base';
+----
+3
+
+query I
+SELECT count(*) FROM mv_iop_nonempty WHERE id = 12 AND val = 'new';
+----
+2
+
+# ==========================================
+# Test 3: DELETE and UPDATE are not treated as insert-only.  The local runtime
+# routes them through the signed net-consolidation path and remains bag-equal.
+# ==========================================
+
+statement ok
+CREATE TABLE iop_mut_src(id INT, val VARCHAR);
+
+statement ok
+INSERT INTO iop_mut_src VALUES
+    (1, 'a'),
+    (1, 'a'),
+    (2, 'b'),
+    (3, 'c');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_iop_mut AS
+    SELECT id, val FROM iop_mut_src;
+
+statement ok
+DELETE FROM iop_mut_src WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_iop_mut');
+
+query I
+SELECT CASE WHEN content LIKE '%DELETE FROM openivm_data_mv_iop_mut%'
+            AND content LIKE '%SUM(openivm_multiplicity)%'
+       THEN 1 ELSE 0 END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_iop_mut.sql');
+----
+1
+
+query I
+SELECT count(*) FROM (
+    SELECT id, val FROM iop_mut_src
+    EXCEPT ALL
+    SELECT id, val FROM mv_iop_mut
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, val FROM mv_iop_mut
+    EXCEPT ALL
+    SELECT id, val FROM iop_mut_src
+);
+----
+0
+
+statement ok
+UPDATE iop_mut_src SET val = 'bb' WHERE id = 2;
+
+statement ok
+PRAGMA refresh('mv_iop_mut');
+
+query I
+SELECT CASE WHEN content LIKE '%DELETE FROM openivm_data_mv_iop_mut%'
+            AND content LIKE '%SUM(openivm_multiplicity)%'
+       THEN 1 ELSE 0 END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_iop_mut.sql');
+----
+1
+
+query I
+SELECT count(*) FROM (
+    SELECT id, val FROM iop_mut_src
+    EXCEPT ALL
+    SELECT id, val FROM mv_iop_mut
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, val FROM mv_iop_mut
+    EXCEPT ALL
+    SELECT id, val FROM iop_mut_src
+);
+----
+0

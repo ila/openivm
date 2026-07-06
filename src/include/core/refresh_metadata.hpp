@@ -188,6 +188,20 @@ public:
 	bool GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out);
 	static string DistinctAuxMetaToJson(const DistinctAuxMeta &meta);
 
+	struct CountDistinctAuxMeta {
+		string aux_table;
+		string source;
+		vector<string> group_cols;
+		vector<string> group_source_exprs;
+		string distinct_col;
+		string distinct_expr;
+		string output_col;
+		string filter;
+	};
+
+	bool GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out);
+	static string CountDistinctAuxMetaToJson(const CountDistinctAuxMeta &meta);
+
 	struct SemiAntiAuxMeta {
 		string aux_table;
 		string join_type;
@@ -259,6 +273,7 @@ public:
 	static string FilteredGroupCountAuxMetaToJson(const FilteredGroupCountAuxMeta &meta);
 
 	static vector<string> ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta);
+	static vector<string> ExpectedCountDistinctAuxColumns(const CountDistinctAuxMeta &meta);
 	static vector<string> ExpectedFilteredGroupCountAuxColumns(const FilteredGroupCountAuxMeta &meta);
 	static vector<string> ExpectedSemiAntiAuxColumns(const SemiAntiAuxMeta &meta);
 	bool AuxStateNeedsRepair(const string &view_name, const string &catalog_name, const string &schema_name);

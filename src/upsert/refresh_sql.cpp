@@ -22,12 +22,27 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/planner.hpp"
 
+#include <regex>
+
 namespace duckdb {
 
 namespace {
 
 constexpr const char *DUCKLAKE_SYNTHETIC_DELTA_TS = "1970-01-02 00:00:00";
 constexpr const char *DUCKLAKE_SYNTHETIC_LAST_UPDATE = "1970-01-01 00:00:00";
+
+static string SparkPortableRefreshSQL(string sql) {
+	static const std::regex quoted_cast_regex(R"(('[^']*(?:''[^']*)*')::(TIMESTAMP|DATE))",
+	                                          std::regex_constants::icase);
+	static const std::regex bigint_cast_regex(R"(([A-Za-z_][A-Za-z0-9_\.]*)::BIGINT)", std::regex_constants::icase);
+	static const std::regex now_regex(R"(\bnow\(\))", std::regex_constants::icase);
+	static const std::regex null_safe_regex(R"(\s+IS\s+NOT\s+DISTINCT\s+FROM\s+)", std::regex_constants::icase);
+	sql = std::regex_replace(sql, quoted_cast_regex, "CAST($1 AS $2)");
+	sql = std::regex_replace(sql, bigint_cast_regex, "CAST($1 AS BIGINT)");
+	sql = std::regex_replace(sql, now_regex, "current_timestamp()");
+	sql = std::regex_replace(sql, null_safe_regex, " <=> ");
+	return sql;
+}
 
 struct SemiAntiSourceInput {
 	string table_sql;
@@ -54,6 +69,7 @@ struct RefreshPlan {
 	bool SkipsDeltaProduction() const {
 		return skip_projection_key_delta || refresh_type == RefreshType::WINDOW_PARTITION ||
 		       refresh_type == RefreshType::GROUP_RECOMPUTE || refresh_type == RefreshType::DISTINCT_INCREMENTAL ||
+		       refresh_type == RefreshType::COUNT_DISTINCT_INCREMENTAL ||
 		       refresh_type == RefreshType::SEMI_ANTI_RECOMPUTE || refresh_type == RefreshType::CURRENT_DIFF_RECOMPUTE;
 	}
 
@@ -64,6 +80,8 @@ struct RefreshPlan {
 		switch (refresh_type) {
 		case RefreshType::DISTINCT_INCREMENTAL:
 			return "DISTINCT_INCREMENTAL";
+		case RefreshType::COUNT_DISTINCT_INCREMENTAL:
+			return "COUNT_DISTINCT_INCREMENTAL";
 		case RefreshType::SEMI_ANTI_RECOMPUTE:
 			return "SEMI_ANTI_RECOMPUTE";
 		case RefreshType::GROUP_RECOMPUTE:
@@ -167,6 +185,311 @@ static SemiAntiSourceInput ResolveSemiAntiSourceInput(RefreshMetadata &metadata,
 	return input;
 }
 
+static bool IsSqlSpace(char c) {
+	return c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '\f';
+}
+
+static bool IsSqlIdentChar(char c) {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+static string TrimCopy(const string &input) {
+	idx_t begin = 0;
+	while (begin < input.size() && IsSqlSpace(input[begin])) {
+		begin++;
+	}
+	idx_t end = input.size();
+	while (end > begin && IsSqlSpace(input[end - 1])) {
+		end--;
+	}
+	return input.substr(begin, end - begin);
+}
+
+static string StripIdentifierQuotes(string input) {
+	input = TrimCopy(input);
+	if (input.size() >= 2 && input.front() == '"' && input.back() == '"') {
+		input = input.substr(1, input.size() - 2);
+	}
+	return StringUtil::Lower(input);
+}
+
+static bool IsSimpleIdentifierExpression(const string &expr) {
+	string trimmed = TrimCopy(expr);
+	if (trimmed.empty()) {
+		return false;
+	}
+	for (auto c : trimmed) {
+		if (!(IsSqlIdentChar(c) || c == '"')) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static vector<string> SplitTopLevelCommaList(const string &input) {
+	vector<string> result;
+	idx_t start = 0;
+	idx_t depth = 0;
+	bool in_quote = false;
+	for (idx_t i = 0; i < input.size(); i++) {
+		char c = input[i];
+		if (c == '"') {
+			in_quote = !in_quote;
+		} else if (!in_quote && c == '(') {
+			depth++;
+		} else if (!in_quote && c == ')' && depth > 0) {
+			depth--;
+		} else if (!in_quote && c == ',' && depth == 0) {
+			result.push_back(TrimCopy(input.substr(start, i - start)));
+			start = i + 1;
+		}
+	}
+	result.push_back(TrimCopy(input.substr(start)));
+	return result;
+}
+
+static idx_t FindMatchingParen(const string &input, idx_t open_pos) {
+	idx_t depth = 0;
+	bool in_quote = false;
+	for (idx_t i = open_pos; i < input.size(); i++) {
+		char c = input[i];
+		if (c == '"') {
+			in_quote = !in_quote;
+		} else if (!in_quote && c == '(') {
+			depth++;
+		} else if (!in_quote && c == ')') {
+			depth--;
+			if (depth == 0) {
+				return i;
+			}
+		}
+	}
+	return string::npos;
+}
+
+static idx_t FindCaseInsensitive(const string &haystack, const string &needle, idx_t start = 0) {
+	return StringUtil::Lower(haystack).find(StringUtil::Lower(needle), start);
+}
+
+struct RefreshCteInfo {
+	string name;
+	idx_t body_start;
+	idx_t body_end;
+	vector<string> columns;
+	vector<string> select_exprs;
+	string relation;
+	bool has_where;
+};
+
+static vector<RefreshCteInfo> ParseRefreshCtes(const string &sql) {
+	vector<RefreshCteInfo> ctes;
+	// The LPTS pretty-printer emits the leading keyword as "WITH\n" (newline), not "WITH " (space), so match
+	// "WITH" followed by any SQL whitespace rather than assuming a single trailing space.
+	idx_t pos = string::npos;
+	for (idx_t i = 0; i + 4 <= sql.size(); i++) {
+		if (StringUtil::CIEquals(sql.substr(i, 4), "WITH") && (i + 4 < sql.size() && IsSqlSpace(sql[i + 4]))) {
+			pos = i;
+			break;
+		}
+	}
+	if (pos == string::npos) {
+		return ctes;
+	}
+	pos += 4;
+	while (pos < sql.size()) {
+		while (pos < sql.size() && IsSqlSpace(sql[pos])) {
+			pos++;
+		}
+		idx_t name_start = pos;
+		while (pos < sql.size() && IsSqlIdentChar(sql[pos])) {
+			pos++;
+		}
+		if (pos == name_start) {
+			break;
+		}
+		RefreshCteInfo cte;
+		cte.name = sql.substr(name_start, pos - name_start);
+		while (pos < sql.size() && IsSqlSpace(sql[pos])) {
+			pos++;
+		}
+		if (pos >= sql.size() || sql[pos] != '(') {
+			break;
+		}
+		idx_t cols_end = FindMatchingParen(sql, pos);
+		if (cols_end == string::npos) {
+			break;
+		}
+		cte.columns = SplitTopLevelCommaList(sql.substr(pos + 1, cols_end - pos - 1));
+		idx_t as_pos = FindCaseInsensitive(sql, " AS (", cols_end);
+		if (as_pos == string::npos) {
+			break;
+		}
+		cte.body_start = as_pos + 5;
+		cte.body_end = FindMatchingParen(sql, cte.body_start - 1);
+		if (cte.body_end == string::npos) {
+			break;
+		}
+		string body = sql.substr(cte.body_start, cte.body_end - cte.body_start);
+		// The LPTS pretty-printer indents the CTE body (e.g. "\n    SELECT ...\n    FROM ..."), so the
+		// leading "SELECT" is not at offset 0 and clause keywords are surrounded by arbitrary whitespace.
+		// Locate the leading SELECT after any leading whitespace rather than assuming a fixed layout.
+		idx_t select_pos = FindCaseInsensitive(body, "SELECT ");
+		bool select_leads = select_pos != string::npos;
+		for (idx_t i = 0; i < select_pos && select_leads; i++) {
+			select_leads = IsSqlSpace(body[i]);
+		}
+		idx_t from_pos = FindCaseInsensitive(body, " FROM ");
+		if (select_leads && from_pos != string::npos && from_pos > select_pos) {
+			idx_t select_list_start = select_pos + 7;
+			cte.select_exprs = SplitTopLevelCommaList(body.substr(select_list_start, from_pos - select_list_start));
+			idx_t relation_start = from_pos + 6;
+			idx_t where_pos = FindCaseInsensitive(body, " WHERE ", relation_start);
+			// The relation ends at the first trailing clause. Besides WHERE, an aggregate/window CTE body
+			// continues with GROUP BY / HAVING / QUALIFY / WINDOW / ORDER BY / LIMIT — none of which are part
+			// of the source relation. Stopping only at WHERE would fold those clauses into `relation` and
+			// break chain resolution through aggregate CTEs (e.g. "t1_scan GROUP BY ..." != CTE "t1_scan").
+			idx_t relation_end = where_pos == string::npos ? body.size() : where_pos;
+			for (const char *clause : {" GROUP BY ", " HAVING ", " QUALIFY ", " WINDOW ", " ORDER BY ", " LIMIT "}) {
+				idx_t clause_pos = FindCaseInsensitive(body, clause, relation_start);
+				if (clause_pos != string::npos && clause_pos < relation_end) {
+					relation_end = clause_pos;
+				}
+			}
+			cte.relation = TrimCopy(body.substr(relation_start, relation_end - relation_start));
+			cte.has_where = where_pos != string::npos;
+		}
+		ctes.push_back(std::move(cte));
+		pos = ctes.back().body_end + 1;
+		if (pos < sql.size() && sql[pos] == ',') {
+			pos++;
+			continue;
+		}
+		break;
+	}
+	return ctes;
+}
+
+struct ResolvedRefreshColumn {
+	ResolvedRefreshColumn() : ok(false), cte_index(DConstants::INVALID_INDEX) {
+	}
+	ResolvedRefreshColumn(bool ok, idx_t cte_index, string relation, string source_column)
+	    : ok(ok), cte_index(cte_index), relation(std::move(relation)), source_column(std::move(source_column)) {
+	}
+	bool ok;
+	idx_t cte_index;
+	string relation;
+	string source_column;
+};
+
+static ResolvedRefreshColumn ResolveRefreshColumnAlias(const vector<RefreshCteInfo> &ctes, const string &alias,
+                                                       idx_t depth = 0) {
+	if (depth > ctes.size()) {
+		return {};
+	}
+	for (idx_t cte_idx = 0; cte_idx < ctes.size(); cte_idx++) {
+		auto &cte = ctes[cte_idx];
+		for (idx_t col_idx = 0; col_idx < cte.columns.size() && col_idx < cte.select_exprs.size(); col_idx++) {
+			if (!StringUtil::CIEquals(TrimCopy(cte.columns[col_idx]), alias)) {
+				continue;
+			}
+			string expr = TrimCopy(cte.select_exprs[col_idx]);
+			if (!IsSimpleIdentifierExpression(expr)) {
+				return {};
+			}
+			for (auto &candidate : ctes) {
+				if (StringUtil::CIEquals(cte.relation, candidate.name)) {
+					return ResolveRefreshColumnAlias(ctes, expr, depth + 1);
+				}
+			}
+			return {true, cte_idx, cte.relation, StripIdentifierQuotes(expr)};
+		}
+	}
+	return {};
+}
+
+static bool ContainsRangePredicate(const string &sql, const string &effective_alias, const string &end_alias,
+                                   const string &ts_alias) {
+	string lower = StringUtil::Lower(sql);
+	string effective = StringUtil::Lower(effective_alias);
+	string end = StringUtil::Lower(end_alias);
+	string ts = StringUtil::Lower(ts_alias);
+	bool lower_bound = lower.find("(" + effective + " <= " + ts + ")") != string::npos ||
+	                   lower.find("(" + ts + " >= " + effective + ")") != string::npos;
+	bool upper_bound = lower.find("(" + end + " > " + ts + ")") != string::npos ||
+	                   lower.find("(" + ts + " < " + end + ")") != string::npos;
+	return lower_bound && upper_bound;
+}
+
+static string ApplyScd2RangeJoinAccel(const string &sql) {
+	auto ctes = ParseRefreshCtes(sql);
+	if (ctes.empty()) {
+		return sql;
+	}
+
+	struct Injection {
+		idx_t pos;
+		string text;
+	};
+	vector<Injection> injections;
+	unordered_set<idx_t> injected_ctes;
+
+	for (auto &effective_cte : ctes) {
+		for (auto &effective_alias : effective_cte.columns) {
+			auto effective = ResolveRefreshColumnAlias(ctes, effective_alias);
+			if (!effective.ok || effective.source_column != "effective_timestamp" ||
+			    effective.relation.find("openivm_delta_") != string::npos) {
+				continue;
+			}
+			for (auto &end_alias : ctes[effective.cte_index].columns) {
+				auto end = ResolveRefreshColumnAlias(ctes, end_alias);
+				if (!end.ok || end.cte_index != effective.cte_index || end.source_column != "end_timestamp") {
+					continue;
+				}
+				for (auto &delta_cte : ctes) {
+					for (auto &ts_alias : delta_cte.columns) {
+						auto ts = ResolveRefreshColumnAlias(ctes, ts_alias);
+						if (!ts.ok || ts.source_column != "ts" || ts.relation.find("openivm_delta_") == string::npos) {
+							continue;
+						}
+						if (!ContainsRangePredicate(sql, effective_alias, end_alias, ts_alias)) {
+							continue;
+						}
+						if (injected_ctes.count(effective.cte_index)) {
+							continue;
+						}
+						string delta_body = sql.substr(ctes[ts.cte_index].body_start,
+						                               ctes[ts.cte_index].body_end - ctes[ts.cte_index].body_start);
+						idx_t where_pos = FindCaseInsensitive(delta_body, " WHERE ");
+						if (where_pos == string::npos) {
+							continue;
+						}
+						string delta_where = TrimCopy(delta_body.substr(where_pos + 7));
+						string filter = "(" + end.source_column + " > (SELECT MIN(" + ts.source_column + ") FROM " +
+						                ts.relation + " WHERE " + delta_where + ")) AND (" + effective.source_column +
+						                " <= (SELECT MAX(" + ts.source_column + ") FROM " + ts.relation + " WHERE " +
+						                delta_where + "))";
+						injections.push_back(
+						    {ctes[effective.cte_index].body_end,
+						     string(ctes[effective.cte_index].has_where ? " AND " : " WHERE ") + filter});
+						injected_ctes.insert(effective.cte_index);
+					}
+				}
+			}
+		}
+	}
+
+	if (injections.empty()) {
+		return sql;
+	}
+	string result = sql;
+	std::sort(injections.begin(), injections.end(),
+	          [](const Injection &a, const Injection &b) { return a.pos > b.pos; });
+	for (auto &injection : injections) {
+		result.insert(injection.pos, injection.text);
+	}
+	return result;
+}
+
 static void CopyOpenIvmSetting(ClientContext &from, ClientContext &to, const string &name) {
 	auto &db_config = DBConfig::GetConfig(to);
 	ExtensionOption option;
@@ -190,6 +513,7 @@ static void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext 
 	    "openivm_skip_empty_deltas",
 	    "openivm_fk_pruning",
 	    "openivm_ducklake_nterm",
+	    "openivm_scd2_range_join_accel",
 	};
 	for (auto setting_name : PLANNING_SETTINGS) {
 		CopyOpenIvmSetting(from, to, setting_name);
@@ -253,6 +577,26 @@ static void EnsureDistinctAuxState(RefreshMetadata &metadata, Connection &con, c
 		                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 		               return BuildDistinctAuxStateCreateSQL(aux_q, meta.cols, meta.source_exprs, source_table,
 		                                                     meta.filter, /*replace=*/true);
+	               });
+}
+
+static void EnsureCountDistinctAuxState(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                        const RefreshMetadata::CountDistinctAuxMeta &meta,
+                                        const vector<string> &delta_table_names, const string &internal_catalog_name,
+                                        const string &internal_schema_name, const string &catalog_prefix,
+                                        const string &view_catalog_name, const string &view_schema_name,
+                                        const string &attached_db_catalog_name, const string &attached_db_schema_name) {
+	string delta_source = ResolveDeltaMetadataKey(meta.source, delta_table_names);
+	EnsureAuxState(metadata, con, view_name, meta.aux_table, RefreshMetadata::ExpectedCountDistinctAuxColumns(meta),
+	               internal_catalog_name, internal_schema_name, vector<string> {delta_source}, view_catalog_name,
+	               view_schema_name, [&]() {
+		               string aux_q = catalog_prefix + SqlUtils::QuoteIdentifier(meta.aux_table);
+		               string source_table =
+		                   ResolveSourceTableSQL(metadata, view_name, delta_source, meta.source, view_catalog_name,
+		                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+		               return BuildCountDistinctAuxStateCreateSQL(aux_q, source_table, meta.group_cols,
+		                                                          meta.group_source_exprs, meta.distinct_col,
+		                                                          meta.distinct_expr, meta.filter, /*replace=*/true);
 	               });
 }
 
@@ -577,6 +921,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	bool skip_agg_delete = fast_paths.skip_agg_delete;
 	bool skip_proj_delete = fast_paths.skip_proj_delete;
 	bool minmax_incremental = fast_paths.minmax_incremental;
+	bool running_window_incremental =
+	    (active_facts.running_window_incremental && active_facts.assume_insert_only) ||
+	    (insert_only && SqlUtils::GetBoolSetting(context, "openivm_running_window_incremental", false));
 	refresh_plan.delta_flags = fast_paths;
 	auto group_cols = metadata.GetGroupColumns(view_name);
 	auto agg_types = metadata.GetAggregateTypes(view_name);
@@ -688,6 +1035,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types,
 			    /*use_current_diff_affected_keys=*/false, aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
 			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
+			    /*inline_cascade_delta=*/active_facts.force_view_delta_cascade,
 			    &aggregate_recompute_emits_cascade_delta);
 		}
 		break;
@@ -743,8 +1091,39 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		upsert_query = BuildWindowPartitionRefresh(
 		    metadata, con, view_name, view_query_sql, delta_table_names, column_names, data_table, delta_ts_filter,
 		    internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
-		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute);
+		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute, running_window_incremental);
 		break;
+	}
+	case RefreshType::COUNT_DISTINCT_INCREMENTAL: {
+		RefreshMetadata::CountDistinctAuxMeta aux_meta;
+		if (!metadata.GetCountDistinctAuxMeta(view_name, aux_meta)) {
+			throw InternalException("COUNT_DISTINCT_INCREMENTAL view '%s' has no aux metadata", view_name);
+		} else {
+			if (!active_facts.compile_only) {
+				EnsureCountDistinctAuxState(metadata, con, view_name, aux_meta, delta_table_names,
+				                            internal_catalog_name, internal_schema_name, internal_catalog_prefix,
+				                            view_catalog_name, view_schema_name, attached_db_catalog_name,
+				                            attached_db_schema_name);
+			}
+			string delta_source = ResolveDeltaMetadataKey(aux_meta.source, delta_table_names);
+			string delta_source_sql =
+			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
+			string ts = metadata.GetLastUpdate(view_name, delta_source);
+			string count_star_col;
+			if (std::find(column_names.begin(), column_names.end(), string(openivm::COUNT_STAR_COL)) !=
+			    column_names.end()) {
+				count_star_col = string(openivm::COUNT_STAR_COL);
+			}
+			upsert_query = CompileCountDistinctIncremental(
+			    view_name, aux_meta.aux_table, delta_source_sql, ts, aux_meta.group_cols, aux_meta.group_source_exprs,
+			    aux_meta.distinct_col, aux_meta.distinct_expr, aux_meta.output_col, count_star_col, aux_meta.filter,
+			    internal_catalog_prefix);
+			OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: COUNT_DISTINCT_INCREMENTAL (%zu group cols, "
+			                    "distinct=%s, out=%s)\n",
+			                    aux_meta.group_cols.size(), aux_meta.distinct_expr.c_str(),
+			                    aux_meta.output_col.c_str());
+			break;
+		}
 	}
 	case RefreshType::DISTINCT_INCREMENTAL: {
 		RefreshMetadata::DistinctAuxMeta aux_meta;
@@ -1039,7 +1418,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		add_profile_step("generate_refresh_sql.compute_delta_plan", compute_delta_plan_start);
 		string raw_refresh_sql;
 		if (IsEmptyDeltaPlan(plan.get())) {
-			raw_refresh_sql = BuildEmptyDeltaInsert(view_name, column_names, column_types);
+			raw_refresh_sql = BuildEmptyDeltaInsert(view_name, column_names, column_types, active_facts.target_dialect);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Delta plan is empty; generated no-op delta insert for '%s'\n",
 			                    view_name.c_str());
 		} else {
@@ -1047,8 +1426,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				auto lpts_start = profile_now();
 				SqlDialect dialect = active_facts.target_dialect;
 				auto ast = LogicalPlanToAst(con_ctx, plan, dialect);
-				auto cte_list = AstToCteList(*ast, dialect);
+				bool emit_spark_hints = dialect == SqlDialect::SPARK &&
+				                        (active_facts.emit_spark_hints ||
+				                         SqlUtils::GetBoolSetting(con_ctx, "openivm_emit_spark_hints", false));
+				auto cte_list = AstToCteList(*ast, dialect, emit_spark_hints);
 				raw_refresh_sql = cte_list->ToQuery(false);
+				if (active_facts.scd2_range_join_accel ||
+				    SqlUtils::GetBoolSetting(context, "openivm_scd2_range_join_accel", false)) {
+					raw_refresh_sql = ApplyScd2RangeJoinAccel(raw_refresh_sql);
+				}
 				add_profile_step("generate_refresh_sql.lpts", lpts_start,
 				                 "delta_sql_bytes=" + to_string(raw_refresh_sql.size()));
 				OPENIVM_DEBUG_PRINT("[UPSERT] ToQuery done. SQL:\n%s\n", raw_refresh_sql.c_str());
@@ -1217,6 +1603,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                  delete_from_delta_table_query;
 	const string &meta_pre_sql = set_in_progress;
 	string meta_post_sql = update_timestamp_query + snapshot_update_query + "\n" + clear_in_progress;
+	if (active_facts.target_dialect == SqlDialect::SPARK) {
+		data_sql = SparkPortableRefreshSQL(data_sql);
+		meta_post_sql = SparkPortableRefreshSQL(meta_post_sql);
+	}
 
 	string clean_query;
 	if (cross_system && out_pre_meta != nullptr && out_post_meta != nullptr) {

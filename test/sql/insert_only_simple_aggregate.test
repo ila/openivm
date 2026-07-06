@@ -1,0 +1,159 @@
+# name: test/sql/insert_only_simple_aggregate.test
+# description: SIMPLE_AGGREGATE scalar compile emission stays bag-correct for append-only facts.
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# SUM/COUNT/AVG scalar aggregate: assume_insert_only compiles to the same
+# multiplicity-weighted scalar update as the general path (there is no separate
+# scalar insert-only rewrite), and a real append-only refresh is bag-equal to recompute.
+
+statement ok
+CREATE TABLE saio_sales (id INT, amount DOUBLE);
+
+statement ok
+INSERT INTO saio_sales VALUES (1, 10.0), (2, 20.0), (3, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_saio AS
+    SELECT SUM(amount) AS total, COUNT(*) AS cnt, COUNT(amount) AS cnt_amount, AVG(amount) AS avg_amount
+    FROM saio_sales;
+
+statement ok
+INSERT INTO saio_sales VALUES (4, 5.0), (5, NULL), (6, 8.0);
+
+statement ok
+CREATE TABLE saio_sql_general AS
+SELECT string_agg(sql, '\n' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts('mv_saio', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data';
+
+statement ok
+CREATE TABLE saio_sql_insert_only AS
+SELECT string_agg(sql, '\n' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts(
+    'mv_saio', '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
+WHERE stmt_kind = 'data';
+
+query I
+SELECT (SELECT DISTINCT refresh_type_name
+        FROM openivm_compile_with_facts(
+            'mv_saio', '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')) = 'SIMPLE_AGGREGATE'
+   AND (SELECT prog FROM saio_sql_general) = (SELECT prog FROM saio_sql_insert_only)
+   AND lower((SELECT prog FROM saio_sql_insert_only)) LIKE '%update openivm_data_mv_saio%'
+   AND lower((SELECT prog FROM saio_sql_insert_only)) NOT LIKE '%delete from openivm_data_mv_saio;%'
+   AS scalar_insert_only_compile_is_incremental_and_stable;
+----
+true
+
+statement ok
+PRAGMA refresh('mv_saio');
+
+query I
+SELECT (SELECT count(*) FROM (
+            (SELECT total, cnt, cnt_amount, avg_amount FROM mv_saio)
+            EXCEPT ALL
+            (SELECT SUM(amount), COUNT(*), COUNT(amount), AVG(amount) FROM saio_sales)
+        )) = 0
+   AND (SELECT count(*) FROM (
+            (SELECT SUM(amount), COUNT(*), COUNT(amount), AVG(amount) FROM saio_sales)
+            EXCEPT ALL
+            (SELECT total, cnt, cnt_amount, avg_amount FROM mv_saio)
+        )) = 0 AS append_only_bag_equal;
+----
+true
+
+# MIN/MAX scalar aggregate: CompileSimpleAggregates deliberately keeps the safe
+# recompute shape for MIN/MAX, including when assume_insert_only is supplied.
+
+statement ok
+CREATE TABLE saio_extreme (id INT, amount INT);
+
+statement ok
+INSERT INTO saio_extreme VALUES (1, 10), (2, 20), (3, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_saio_extreme AS
+    SELECT MIN(amount) AS lo, MAX(amount) AS hi, COUNT(*) AS cnt
+    FROM saio_extreme;
+
+statement ok
+INSERT INTO saio_extreme VALUES (4, 5), (5, 99), (6, NULL);
+
+query I
+SELECT (SELECT DISTINCT refresh_type_name
+        FROM openivm_compile_with_facts(
+            'mv_saio_extreme', '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')) =
+       'SIMPLE_AGGREGATE'
+   AND lower((SELECT string_agg(sql, '\n' ORDER BY stmt_order)
+              FROM openivm_compile_with_facts(
+                  'mv_saio_extreme', '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
+              WHERE stmt_kind = 'data')) LIKE '%delete from openivm_data_mv_saio_extreme%'
+   AS minmax_insert_only_compile_uses_safe_recompute;
+----
+true
+
+statement ok
+PRAGMA refresh('mv_saio_extreme');
+
+query I
+SELECT (SELECT count(*) FROM (
+            (SELECT lo, hi, cnt FROM mv_saio_extreme)
+            EXCEPT ALL
+            (SELECT MIN(amount), MAX(amount), COUNT(*) FROM saio_extreme)
+        )) = 0
+   AND (SELECT count(*) FROM (
+            (SELECT MIN(amount), MAX(amount), COUNT(*) FROM saio_extreme)
+            EXCEPT ALL
+            (SELECT lo, hi, cnt FROM mv_saio_extreme)
+        )) = 0 AS minmax_append_only_bag_equal;
+----
+true
+
+# General (non-insert-only) scalar aggregate path remains correct after a mixed
+# DELETE/UPDATE/INSERT batch before one refresh.
+
+statement ok
+CREATE TABLE saio_mut (id INT, amount DOUBLE);
+
+statement ok
+INSERT INTO saio_mut VALUES (1, 10.0), (2, 20.0), (3, 30.0), (4, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_saio_mut AS
+    SELECT SUM(amount) AS total, COUNT(*) AS cnt, COUNT(amount) AS cnt_amount, AVG(amount) AS avg_amount
+    FROM saio_mut;
+
+statement ok
+DELETE FROM saio_mut WHERE id = 2;
+
+statement ok
+UPDATE saio_mut SET amount = amount + 7.0 WHERE id = 3;
+
+statement ok
+INSERT INTO saio_mut VALUES (5, 11.0), (6, NULL);
+
+statement ok
+SELECT count(*) FROM openivm_compile_with_facts(
+    'mv_saio_mut', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data';
+
+statement ok
+PRAGMA refresh('mv_saio_mut');
+
+query I
+SELECT (SELECT count(*) FROM (
+            (SELECT total, cnt, cnt_amount, avg_amount FROM mv_saio_mut)
+            EXCEPT ALL
+            (SELECT SUM(amount), COUNT(*), COUNT(amount), AVG(amount) FROM saio_mut)
+        )) = 0
+   AND (SELECT count(*) FROM (
+            (SELECT SUM(amount), COUNT(*), COUNT(amount), AVG(amount) FROM saio_mut)
+            EXCEPT ALL
+            (SELECT total, cnt, cnt_amount, avg_amount FROM mv_saio_mut)
+        )) = 0 AS mixed_dml_bag_equal;
+----
+true
