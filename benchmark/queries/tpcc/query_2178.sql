@@ -1,0 +1,2 @@
+-- {"operators": "SEMI_JOIN,EXISTS,ANTI_JOIN,NOT_EXISTS", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ITEM,STOCK,ORDER_LINE", "openivm_verified": true}
+SELECT i.I_ID FROM ITEM i WHERE EXISTS (SELECT 1 FROM STOCK s WHERE s.S_I_ID = i.I_ID AND s.S_QUANTITY > 0) AND NOT EXISTS (SELECT 1 FROM ORDER_LINE ol WHERE ol.OL_I_ID = i.I_ID AND ol.OL_AMOUNT < 0);

@@ -1,0 +1,2 @@
+-- {"operators": "CTE,AGGREGATE", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,ITEM", "openivm_verified": true}
+WITH item_sales AS (SELECT OL_I_ID, SUM(OL_AMOUNT) AS revenue, COUNT(*) AS line_count FROM ORDER_LINE GROUP BY OL_I_ID) SELECT i.I_ID, i.I_NAME, s.revenue, s.line_count FROM ITEM i JOIN item_sales s ON i.I_ID = s.OL_I_ID;
