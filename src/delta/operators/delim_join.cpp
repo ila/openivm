@@ -16,6 +16,8 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 namespace {
@@ -25,6 +27,8 @@ struct BaseLeafInfo {
 	LogicalGet *get;
 	LogicalOperator *node;
 };
+
+static uint64_t BindingKey(const ColumnBinding &binding);
 
 static bool IsJoinNode(LogicalOperatorType type) {
 	return type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || type == LogicalOperatorType::LOGICAL_JOIN ||
@@ -94,6 +98,40 @@ static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
 	return !join.duplicate_eliminated_columns.empty();
 }
 
+static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op,
+                                                           const unordered_set<uint64_t> &mul_set) {
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_JOIN ||
+	    op.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT || op.type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+		auto *join = dynamic_cast<LogicalComparisonJoin *>(&op);
+		if (join) {
+			for (idx_t child_idx = 0; child_idx < op.children.size() && child_idx < 2; child_idx++) {
+				auto &proj_map = child_idx == 0 ? join->left_projection_map : join->right_projection_map;
+				if (proj_map.empty()) {
+					continue;
+				}
+				auto child_bindings = op.children[child_idx]->GetColumnBindings();
+				proj_map.erase(
+				    std::remove_if(proj_map.begin(), proj_map.end(),
+				                   [&](idx_t projected_idx) { return projected_idx >= child_bindings.size(); }),
+				    proj_map.end());
+				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
+					if (!mul_set.count(BindingKey(child_bindings[binding_idx]))) {
+						continue;
+					}
+					if (std::find(proj_map.begin(), proj_map.end(), binding_idx) == proj_map.end()) {
+						proj_map.push_back(binding_idx);
+					}
+				}
+			}
+		}
+	}
+	for (auto &child : op.children) {
+		if (child) {
+			AppendMultiplicityBindingsToJoinProjectionMaps(*child, mul_set);
+		}
+	}
+}
+
 static void UpdateProjectionMapForLeaf(unique_ptr<LogicalOperator> &term, const BaseLeafInfo &leaf) {
 	if (leaf.path.empty()) {
 		return;
@@ -111,8 +149,12 @@ static void UpdateProjectionMapForLeaf(unique_ptr<LogicalOperator> &term, const 
 		return;
 	}
 	auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
-	if (!proj_map.empty()) {
-		idx_t mul_idx = leaf.node->GetColumnBindings().size();
+	if (proj_map.empty()) {
+		return;
+	}
+	auto child_bindings = (*parent)->children[child_side]->GetColumnBindings();
+	idx_t mul_idx = leaf.node->GetColumnBindings().size();
+	if (mul_idx < child_bindings.size() && std::find(proj_map.begin(), proj_map.end(), mul_idx) == proj_map.end()) {
 		proj_map.push_back(mul_idx);
 	}
 }
@@ -507,10 +549,12 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 		ReplaceDelimGets(context, term, delim_replacements);
 		output_replacements.insert(output_replacements.end(), delim_replacements.begin(), delim_replacements.end());
 
-		auto term_bindings = term->GetColumnBindings();
-		vector<unique_ptr<Expression>> exprs;
 		unordered_set<uint64_t> mul_set;
 		CollectMulBindings(mul_bindings, mul_set);
+		AppendMultiplicityBindingsToJoinProjectionMaps(*term, mul_set);
+
+		auto term_bindings = term->GetColumnBindings();
+		vector<unique_ptr<Expression>> exprs;
 		for (idx_t output_idx = 0; output_idx < original_bindings.size(); output_idx++) {
 			auto mapped_binding =
 			    MapTermBinding(original_bindings[output_idx], renumbered.idx_map, output_replacements);

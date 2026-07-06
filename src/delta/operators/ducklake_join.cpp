@@ -272,7 +272,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			mul_binding = rewritten.mul_binding;
 			subtree_ref = std::move(rewritten.op);
 		}
-		UpdateParentProjectionMap(term, term_leaves[i]);
+		UpdateParentProjectionMap(term, term_leaves[i], mul_binding);
 
 		// Telescoping: pin leaves j > i to old snapshot (AT VERSION).
 		// Leaves j < i stay at current state (already the default).

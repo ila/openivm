@@ -23,6 +23,8 @@
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 static idx_t CountBits(uint64_t value) {
@@ -391,7 +393,8 @@ static void DemoteLeftJoinsForMask(LogicalOperator *node, const vector<JoinLeafI
 	DemoteLeftJoinsForMaskRec(node, leaves, mask, path);
 }
 
-void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf) {
+void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
+                               const ColumnBinding &mul_binding) {
 	if (leaf.path.empty()) {
 		return;
 	}
@@ -405,10 +408,23 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 		if (join) {
 			auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
 			if (!proj_map.empty()) {
-				idx_t mul_idx = leaf.node->GetColumnBindings().size();
-				proj_map.push_back(mul_idx);
-				OPENIVM_DEBUG_PRINT("[DeltaJoin] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
-				                    child_side == 0 ? "left" : "right");
+				auto child_bindings = (*parent)->children[child_side]->GetColumnBindings();
+				idx_t mul_idx = DConstants::INVALID_INDEX;
+				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
+					if (DeltaJoinBindingKey(child_bindings[binding_idx]) == DeltaJoinBindingKey(mul_binding)) {
+						mul_idx = binding_idx;
+						break;
+					}
+				}
+				if (mul_idx == DConstants::INVALID_INDEX) {
+					mul_idx = leaf.node->GetColumnBindings().size();
+				}
+				if (mul_idx < child_bindings.size() &&
+				    std::find(proj_map.begin(), proj_map.end(), mul_idx) == proj_map.end()) {
+					proj_map.push_back(mul_idx);
+					OPENIVM_DEBUG_PRINT("[DeltaJoin] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
+					                    child_side == 0 ? "left" : "right");
+				}
 			}
 		}
 	}
@@ -989,13 +1005,14 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, input.context.view);
 					mul_bindings.push_back(delta_i.mul_binding);
 					GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
+					UpdateParentProjectionMap(term, leaves[i], delta_i.mul_binding);
 				} else {
 					auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
 					auto rewritten = input.CompileCopiedSubtree(subtree_ref, term_root);
 					mul_bindings.push_back(rewritten.mul_binding);
 					subtree_ref = std::move(rewritten.op);
+					UpdateParentProjectionMap(term, leaves[i], rewritten.mul_binding);
 				}
-				UpdateParentProjectionMap(term, leaves[i]);
 			}
 		}
 

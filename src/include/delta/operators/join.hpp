@@ -24,7 +24,8 @@ unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, co
 
 void DemoteLeftJoins(LogicalOperator *node);
 
-void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf);
+void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
+                               const ColumnBinding &mul_binding);
 
 unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
                                                  const vector<LogicalType> &types, Binder &binder);
