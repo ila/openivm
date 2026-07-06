@@ -110,10 +110,14 @@ static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op,
 					continue;
 				}
 				auto child_bindings = op.children[child_idx]->GetColumnBindings();
-				proj_map.erase(
-				    std::remove_if(proj_map.begin(), proj_map.end(),
-				                   [&](idx_t projected_idx) { return projected_idx >= child_bindings.size(); }),
-				    proj_map.end());
+				for (auto projected_idx : proj_map) {
+					if (projected_idx >= child_bindings.size()) {
+						throw InternalException(
+						    "DeltaDelimJoin: projection map index %llu out of bounds for child %llu with %llu bindings",
+						    (unsigned long long)projected_idx, (unsigned long long)child_idx,
+						    (unsigned long long)child_bindings.size());
+					}
+				}
 				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
 					if (!mul_set.count(BindingKey(child_bindings[binding_idx]))) {
 						continue;
@@ -132,7 +136,8 @@ static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op,
 	}
 }
 
-static void UpdateProjectionMapForLeaf(unique_ptr<LogicalOperator> &term, const BaseLeafInfo &leaf) {
+static void UpdateProjectionMapForLeaf(unique_ptr<LogicalOperator> &term, const BaseLeafInfo &leaf,
+                                       const ColumnBinding &mul_binding) {
 	if (leaf.path.empty()) {
 		return;
 	}
@@ -153,7 +158,33 @@ static void UpdateProjectionMapForLeaf(unique_ptr<LogicalOperator> &term, const 
 		return;
 	}
 	auto child_bindings = (*parent)->children[child_side]->GetColumnBindings();
+	for (auto projected_idx : proj_map) {
+		if (projected_idx >= child_bindings.size()) {
+			throw InternalException(
+			    "DeltaDelimJoin: projection map index %llu out of bounds for child %llu with %llu bindings",
+			    (unsigned long long)projected_idx, (unsigned long long)child_side,
+			    (unsigned long long)child_bindings.size());
+		}
+	}
+	// Wrapped DELIM_JOIN children can project an aggregate of the delta
+	// multiplicity under a new binding. In that shape the extra column keeps the
+	// original leaf-width ordinal, while simple children expose the raw delta
+	// multiplicity binding directly.
 	idx_t mul_idx = leaf.node->GetColumnBindings().size();
+	if (mul_idx >= child_bindings.size()) {
+		mul_idx = DConstants::INVALID_INDEX;
+		for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
+			if (child_bindings[binding_idx] == mul_binding) {
+				mul_idx = binding_idx;
+				break;
+			}
+		}
+	}
+	if (mul_idx == DConstants::INVALID_INDEX || mul_idx >= child_bindings.size()) {
+		throw InternalException(
+		    "DeltaDelimJoin: multiplicity binding not available in projected child %llu with %llu bindings",
+		    (unsigned long long)child_side, (unsigned long long)child_bindings.size());
+	}
 	if (mul_idx < child_bindings.size() && std::find(proj_map.begin(), proj_map.end(), mul_idx) == proj_map.end()) {
 		proj_map.push_back(mul_idx);
 	}
@@ -542,7 +573,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 			AddLeafBindingReplacements(leaf_bindings, delta_bindings, output_replacements, delta_i.mul_binding);
 			mul_bindings.push_back(delta_i.mul_binding);
 			leaf_ref = std::move(delta_i.node);
-			UpdateProjectionMapForLeaf(term, leaves[i]);
+			UpdateProjectionMapForLeaf(term, leaves[i], delta_i.mul_binding);
 		}
 
 		vector<ReplacementBinding> delim_replacements;

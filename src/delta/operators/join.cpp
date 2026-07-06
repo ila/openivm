@@ -409,6 +409,14 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 			auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
 			if (!proj_map.empty()) {
 				auto child_bindings = (*parent)->children[child_side]->GetColumnBindings();
+				for (auto projected_idx : proj_map) {
+					if (projected_idx >= child_bindings.size()) {
+						throw InternalException(
+						    "DeltaJoin: projection map index %llu out of bounds for child %llu with %llu bindings",
+						    (unsigned long long)projected_idx, (unsigned long long)child_side,
+						    (unsigned long long)child_bindings.size());
+					}
+				}
 				idx_t mul_idx = DConstants::INVALID_INDEX;
 				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
 					if (DeltaJoinBindingKey(child_bindings[binding_idx]) == DeltaJoinBindingKey(mul_binding)) {
@@ -418,6 +426,11 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 				}
 				if (mul_idx == DConstants::INVALID_INDEX) {
 					mul_idx = leaf.node->GetColumnBindings().size();
+				}
+				if (mul_idx >= child_bindings.size()) {
+					throw InternalException("DeltaJoin: multiplicity binding not available in projected child %llu "
+					                        "with %llu bindings",
+					                        (unsigned long long)child_side, (unsigned long long)child_bindings.size());
 				}
 				if (mul_idx < child_bindings.size() &&
 				    std::find(proj_map.begin(), proj_map.end(), mul_idx) == proj_map.end()) {
