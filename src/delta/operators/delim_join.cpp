@@ -114,8 +114,7 @@ static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op,
 					if (projected_idx >= child_bindings.size()) {
 						throw InternalException(
 						    "DeltaDelimJoin: projection map index %llu out of bounds for child %llu with %llu bindings",
-						    (unsigned long long)projected_idx, (unsigned long long)child_idx,
-						    (unsigned long long)child_bindings.size());
+						    (idx_t)projected_idx, (idx_t)child_idx, (idx_t)child_bindings.size());
 					}
 				}
 				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
@@ -270,8 +269,7 @@ static ColumnBinding FindOutputBinding(const vector<ColumnBinding> &term_binding
 		candidates += to_string(binding.table_index) + ":" + to_string(binding.column_index);
 	}
 	throw InternalException("DeltaDelimJoin: original output binding %llu:%llu not found in rewritten term [%s]",
-	                        (unsigned long long)target.table_index, (unsigned long long)target.column_index,
-	                        candidates.c_str());
+	                        (idx_t)target.table_index, (idx_t)target.column_index, candidates.c_str());
 }
 
 static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator> &node,

@@ -1275,16 +1275,16 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	// the hidden binding only to the top projection leaves LPTS with a reference to a
 	// column that no child CTE emits.
 	auto agg_bindings = agg_search->GetColumnBindings();
-	auto agg_types = agg_search->types;
+	const auto &agg_types = agg_search->types;
 	idx_t group_count = agg.groups.size();
 
 	ColumnBinding match_binding = agg_bindings[group_count + match_count_idx];
-	LogicalType match_type = agg_types[group_count + match_count_idx];
+	const LogicalType &match_type = agg_types[group_count + match_count_idx];
 	PropagateHiddenBindingThroughProjectionPath(projection_path, match_binding, match_type, openivm::MATCH_COUNT_COL);
 
 	if (is_full_outer) {
 		ColumnBinding right_match_binding = agg_bindings[group_count + right_match_count_idx];
-		LogicalType right_match_type = agg_types[group_count + right_match_count_idx];
+		const LogicalType &right_match_type = agg_types[group_count + right_match_count_idx];
 		PropagateHiddenBindingThroughProjectionPath(projection_path, right_match_binding, right_match_type,
 		                                            openivm::RIGHT_MATCH_COUNT_COL);
 	}

@@ -405,7 +405,7 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 	for (size_t depth = 0; depth < leaf_path.size(); depth++) {
 		if (leaf_path[depth] >= node->children.size()) {
 			throw InternalException("%s: leaf path child %llu out of bounds at depth %llu", context_label,
-			                        (unsigned long long)leaf_path[depth], (unsigned long long)depth);
+			                        (idx_t)leaf_path[depth], (idx_t)depth);
 		}
 		ancestors.push_back(node);
 		node = node->children[leaf_path[depth]].get();
@@ -425,8 +425,7 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 					if (projected_idx >= child_bindings.size()) {
 						throw InternalException(
 						    "%s: projection map index %llu out of bounds for child %llu with %llu bindings",
-						    context_label, (unsigned long long)projected_idx, (unsigned long long)child_side,
-						    (unsigned long long)child_bindings.size());
+						    context_label, (idx_t)projected_idx, (idx_t)child_side, (idx_t)child_bindings.size());
 					}
 				}
 				idx_t mul_idx = DConstants::INVALID_INDEX;
