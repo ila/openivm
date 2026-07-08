@@ -1107,6 +1107,7 @@ tmp_fact AS MATERIALIZED (
 		ff.fulfillment_state,
 		ff.account_state,
 		ff.item_bucket,
+		ff.line_key,
 		ff.extended_amount,
 		ff.customer_balance,
 		ff.stock_quantity,
@@ -1129,6 +1130,7 @@ tmp_customer_window AS (
 		tf.fulfillment_state,
 		tf.account_state,
 		tf.item_bucket,
+		tf.line_key,
 		tf.extended_amount,
 		tf.customer_balance,
 		tf.stock_quantity,
@@ -1137,11 +1139,11 @@ tmp_customer_window AS (
 		tf.order_line_count,
 		ROW_NUMBER() OVER (
 			PARTITION BY tf.warehouse_id, tf.district_id, tf.customer_id
-			ORDER BY tf.extended_amount DESC, tf.order_id ASC, tf.line_number ASC
+			ORDER BY tf.extended_amount DESC, tf.order_id ASC, tf.line_number ASC, tf.item_id ASC, tf.line_key ASC
 		) AS customer_line_rank,
-		SUM(tf.extended_amount) OVER (
+		CAST(SUM(CAST(ROUND(tf.extended_amount, 4) AS DECIMAL(38, 4))) OVER (
 			PARTITION BY tf.warehouse_id, tf.district_id, tf.customer_id
-		) AS customer_total_amount,
+		) AS DOUBLE) AS customer_total_amount,
 		MAX(tf.stock_quantity) OVER (
 			PARTITION BY tf.warehouse_id, tf.item_id
 		) AS warehouse_item_peak
@@ -1155,12 +1157,13 @@ tmp_order_window AS (
 		tf.order_id,
 		tf.line_number,
 		tf.item_id,
+		tf.line_key,
 		COUNT(*) OVER (
 			PARTITION BY tf.warehouse_id, tf.district_id, tf.order_id
 		) AS order_rows_window,
-		SUM(tf.extended_amount) OVER (
+		CAST(SUM(CAST(ROUND(tf.extended_amount, 4) AS DECIMAL(38, 4))) OVER (
 			PARTITION BY tf.warehouse_id, tf.district_id, tf.order_id
-		) AS order_amount_window,
+		) AS DOUBLE) AS order_amount_window,
 		MIN(tf.line_number) OVER (
 			PARTITION BY tf.warehouse_id, tf.district_id, tf.order_id
 		) AS first_line_window
@@ -1174,6 +1177,7 @@ tmp_stock_window AS (
 		tf.credit_code,
 		tf.fulfillment_state,
 		tf.account_state,
+		tf.line_key,
 		tf.stock_quantity,
 		DENSE_RANK() OVER (
 			PARTITION BY tf.warehouse_id, tf.credit_code
@@ -1197,6 +1201,8 @@ inner_join_chain AS (
 		cw.fulfillment_state,
 		cw.account_state,
 		cw.item_bucket,
+		cw.line_key,
+		sw.line_key AS stock_line_key,
 		cw.extended_amount,
 		cw.customer_balance,
 		cw.stock_quantity,
@@ -1218,6 +1224,7 @@ inner_join_chain AS (
 		AND ow.order_id = cw.order_id
 		AND ow.line_number = cw.line_number
 		AND ow.item_id = cw.item_id
+		AND ow.line_key = cw.line_key
 	INNER JOIN tmp_stock_window sw
 		ON sw.warehouse_id = cw.warehouse_id
 		AND sw.item_id = cw.item_id
@@ -1232,7 +1239,7 @@ credit_summary AS (
 		district_id,
 		credit_code,
 		COUNT(*) AS credit_rows,
-		SUM(extended_amount) AS credit_amount,
+		CAST(SUM(CAST(ROUND(extended_amount, 4) AS DECIMAL(38, 4))) AS DOUBLE) AS credit_amount,
 		MAX(customer_total_amount) AS max_customer_total_amount,
 		COUNT(*) FILTER (WHERE payment_history_rows > 0) AS paid_history_rows
 	FROM inner_join_chain
@@ -1246,7 +1253,9 @@ fulfillment_summary AS (
 		fulfillment_state,
 		account_state,
 		COUNT(*) AS fulfillment_rows,
-		SUM(extended_amount) AS fulfillment_amount,
+		CAST(SUM(CAST(ROUND(extended_amount, 4) AS DECIMAL(38, 4))) AS DOUBLE) AS fulfillment_amount,
+		MIN(line_key) AS summary_line_key,
+		MIN(line_key) AS summary_stock_line_key,
 		MAX(stock_quantity) AS max_fulfillment_stock_window
 	FROM tmp_fact
 	GROUP BY warehouse_id, district_id, fulfillment_state, account_state
@@ -1264,6 +1273,8 @@ left_join_chain AS (
 		ijc.fulfillment_state,
 		ijc.account_state,
 		ijc.item_bucket,
+		ijc.line_key,
+		ijc.stock_line_key,
 		ijc.extended_amount,
 		ijc.customer_balance,
 		ijc.stock_quantity,
@@ -1298,6 +1309,8 @@ full_outer_chain AS (
 		COALESCE(ljc.fulfillment_state, fs.fulfillment_state, 'NO_FULFILLMENT') AS fulfillment_state,
 		COALESCE(ljc.account_state, fs.account_state, 'NO_ACCOUNT') AS account_state,
 		COALESCE(ljc.item_bucket, 'NO_BUCKET') AS item_bucket,
+		COALESCE(ljc.line_key, fs.summary_line_key) AS line_key,
+		COALESCE(ljc.stock_line_key, fs.summary_stock_line_key) AS stock_line_key,
 		COALESCE(ljc.extended_amount, 0) AS extended_amount,
 		COALESCE(ljc.customer_balance, 0) AS customer_balance,
 		COALESCE(ljc.stock_quantity, 0) AS stock_quantity,
@@ -1336,6 +1349,8 @@ semi_join_chain AS (
 		foc.fulfillment_state,
 		foc.account_state,
 		foc.item_bucket,
+		foc.line_key,
+		foc.stock_line_key,
 		foc.extended_amount,
 		foc.customer_balance,
 		foc.stock_quantity,
@@ -1377,6 +1392,8 @@ anti_join_chain AS (
 		sjc.fulfillment_state,
 		sjc.account_state,
 		sjc.item_bucket,
+		sjc.line_key,
+		sjc.stock_line_key,
 		sjc.extended_amount,
 		sjc.customer_balance,
 		sjc.stock_quantity,
@@ -1419,6 +1436,8 @@ join_window_pass_1 AS (
 		ajc.fulfillment_state,
 		ajc.account_state,
 		ajc.item_bucket,
+		ajc.line_key,
+		ajc.stock_line_key,
 		ajc.extended_amount,
 		ajc.customer_balance,
 		ajc.stock_quantity,
@@ -1439,11 +1458,13 @@ join_window_pass_1 AS (
 		ajc.max_fulfillment_stock_window,
 		ROW_NUMBER() OVER (
 			PARTITION BY ajc.warehouse_id, ajc.district_id
-			ORDER BY ajc.extended_amount DESC, ajc.order_id ASC, ajc.line_number ASC
+			ORDER BY ajc.extended_amount DESC, ajc.order_id ASC, ajc.line_number ASC, ajc.item_id ASC,
+				ajc.credit_code ASC, ajc.fulfillment_state ASC, ajc.account_state ASC, ajc.line_key ASC,
+				ajc.stock_line_key ASC
 		) AS chain_rank,
-		SUM(ajc.extended_amount + ajc.credit_amount + ajc.fulfillment_amount) OVER (
+		CAST(SUM(CAST(ROUND(ajc.extended_amount + ajc.credit_amount + ajc.fulfillment_amount, 4) AS DECIMAL(38, 4))) OVER (
 			PARTITION BY ajc.warehouse_id
-		) AS warehouse_chain_amount
+		) AS DOUBLE) AS warehouse_chain_amount
 	FROM anti_join_chain ajc
 
 ),
@@ -1459,6 +1480,8 @@ join_window_pass_2 AS (
 		jwp1.fulfillment_state,
 		jwp1.account_state,
 		jwp1.item_bucket,
+		jwp1.line_key,
+		jwp1.stock_line_key,
 		jwp1.extended_amount,
 		jwp1.customer_balance,
 		jwp1.stock_quantity,
@@ -1481,7 +1504,7 @@ join_window_pass_2 AS (
 		jwp1.warehouse_chain_amount,
 		DENSE_RANK() OVER (
 			PARTITION BY jwp1.warehouse_id, jwp1.credit_code
-			ORDER BY jwp1.warehouse_chain_amount DESC, jwp1.district_id ASC
+			ORDER BY ROUND(jwp1.warehouse_chain_amount, 4) DESC, jwp1.district_id ASC
 		) AS credit_chain_rank,
 		COUNT(*) OVER (
 			PARTITION BY jwp1.warehouse_id, jwp1.fulfillment_state, jwp1.account_state
@@ -1498,10 +1521,10 @@ join_chain_rollup AS (
 		account_state,
 		item_bucket,
 		COUNT(*) AS chain_rows,
-		SUM(extended_amount) AS chain_amount,
-		SUM(credit_amount) AS chain_credit_amount,
-		SUM(fulfillment_amount) AS chain_fulfillment_amount,
-		MAX(warehouse_chain_amount) AS max_warehouse_chain_amount,
+		CAST(SUM(CAST(ROUND(extended_amount, 4) AS DECIMAL(38, 4))) AS DOUBLE) AS chain_amount,
+		CAST(SUM(CAST(ROUND(credit_amount, 4) AS DECIMAL(38, 4))) AS DOUBLE) AS chain_credit_amount,
+		CAST(SUM(CAST(ROUND(fulfillment_amount, 4) AS DECIMAL(38, 4))) AS DOUBLE) AS chain_fulfillment_amount,
+		CAST(MAX(CAST(ROUND(warehouse_chain_amount, 4) AS DECIMAL(38, 4))) AS DOUBLE) AS max_warehouse_chain_amount,
 		MAX(chain_rank) AS max_chain_rank,
 		MAX(credit_chain_rank) AS max_credit_chain_rank,
 		MAX(fulfillment_account_rows) AS max_fulfillment_account_rows,

@@ -61,6 +61,92 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Correlated aggregate with an inner join can wrap the delta leaf before the
+# join projection map sees the multiplicity binding.
+statement ok
+CREATE TABLE lat_wrap_outer (id INT, k INT);
+
+statement ok
+CREATE TABLE lat_wrap_left (k INT, x INT);
+
+statement ok
+CREATE TABLE lat_wrap_right (x INT, amount INT);
+
+statement ok
+INSERT INTO lat_wrap_outer VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+INSERT INTO lat_wrap_left VALUES (10, 100), (10, 101), (20, 200), (30, 300);
+
+statement ok
+INSERT INTO lat_wrap_right VALUES (100, 5), (101, 7), (200, 11), (300, 13);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat_wrapped_delim_join AS
+    SELECT o.id, lat.total_amount
+    FROM lat_wrap_outer o
+    JOIN LATERAL (
+        SELECT SUM(r.amount) AS total_amount
+        FROM lat_wrap_left l
+        JOIN lat_wrap_right r ON l.x = r.x
+        WHERE l.k = o.k
+    ) lat ON true;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat_wrapped_delim_join';
+----
+6
+
+statement ok
+INSERT INTO lat_wrap_outer VALUES (4, 40);
+
+statement ok
+INSERT INTO lat_wrap_left VALUES (40, 400), (10, 102);
+
+statement ok
+INSERT INTO lat_wrap_right VALUES (400, 17), (102, 19);
+
+statement ok
+UPDATE lat_wrap_right SET amount = 23 WHERE x = 200;
+
+statement ok
+DELETE FROM lat_wrap_left WHERE k = 30 AND x = 300;
+
+statement ok
+PRAGMA refresh('mv_lat_wrapped_delim_join');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_wrapped_delim_join
+    EXCEPT ALL
+    SELECT o.id, lat.total_amount
+    FROM lat_wrap_outer o
+    JOIN LATERAL (
+        SELECT SUM(r.amount) AS total_amount
+        FROM lat_wrap_left l
+        JOIN lat_wrap_right r ON l.x = r.x
+        WHERE l.k = o.k
+    ) lat ON true
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT o.id, lat.total_amount
+    FROM lat_wrap_outer o
+    JOIN LATERAL (
+        SELECT SUM(r.amount) AS total_amount
+        FROM lat_wrap_left l
+        JOIN lat_wrap_right r ON l.x = r.x
+        WHERE l.k = o.k
+    ) lat ON true
+    EXCEPT ALL
+    SELECT * FROM mv_lat_wrapped_delim_join
+);
+----
+0
+
 # Scalar subquery aggregate under grouped HAVING: a right-side update must
 # recompute affected groups even when the changed table only appears inside
 # the correlated scalar subquery.

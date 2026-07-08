@@ -60,6 +60,14 @@ static bool IsSafeForDuckLakeSnapshotDiff(const vector<string> &partition_cols, 
 	if (!any_ducklake || partition_cols.empty()) {
 		return false;
 	}
+	// The create-time metadata stores the union of window PARTITION BY columns,
+	// not each distinct partition key set. For DuckLake snapshot-diff refresh a
+	// multi-column tuple filter is only safe when every window uses that same
+	// tuple. Until the metadata can prove that, keep DuckLake partial refresh to
+	// the single-key case and use the existing full-recompute fallback otherwise.
+	if (partition_cols.size() != 1) {
+		return false;
+	}
 	for (auto &pc : partition_cols) {
 		auto parsed = SplitPartitionSpec(pc);
 		if (std::find(column_names.begin(), column_names.end(), parsed.first) == column_names.end()) {

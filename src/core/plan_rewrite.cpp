@@ -998,6 +998,27 @@ static void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
 	}
 }
 
+static ColumnBinding AppendProjectionPassthrough(LogicalProjection &proj, const ColumnBinding &binding,
+                                                 const LogicalType &type, const string &alias) {
+	auto passthrough = make_uniq<BoundColumnRefExpression>(type, binding);
+	passthrough->alias = alias;
+	proj.expressions.push_back(std::move(passthrough));
+	proj.ResolveOperatorTypes();
+	auto bindings = proj.GetColumnBindings();
+	if (bindings.empty()) {
+		throw InternalException("OpenIVM: projection produced no bindings after appending hidden passthrough");
+	}
+	return bindings.back();
+}
+
+static void PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &projection_path,
+                                                        ColumnBinding binding, LogicalType type, const string &alias) {
+	for (auto it = projection_path.rbegin(); it != projection_path.rend(); ++it) {
+		binding = AppendProjectionPassthrough(**it, binding, type, alias);
+		type = (*it)->types.back();
+	}
+}
+
 struct OuterJoinBindings {
 	bool found = false;
 	bool is_full_outer = false;
@@ -1209,9 +1230,14 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	if (plan->type != LogicalOperatorType::LOGICAL_PROJECTION) {
 		return;
 	}
+	vector<LogicalProjection *> projection_path;
+	auto &root_proj = plan->Cast<LogicalProjection>();
+	projection_path.push_back(&root_proj);
+
 	LogicalOperator *agg_search = plan->children.empty() ? nullptr : plan->children[0].get();
 	// Walk through possible intermediate projections to find the aggregate
 	while (agg_search && agg_search->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		projection_path.push_back(&agg_search->Cast<LogicalProjection>());
 		agg_search = agg_search->children.empty() ? nullptr : agg_search->children[0].get();
 	}
 	if (!agg_search || agg_search->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
@@ -1244,27 +1270,24 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 
 	agg.ResolveOperatorTypes();
 
-	// Add passthrough in the top projection
-	auto &proj = plan->Cast<LogicalProjection>();
+	// Add passthrough through every projection between the aggregate and the root.
+	// PIVOT and other planner rewrites can introduce several projection layers; adding
+	// the hidden binding only to the top projection leaves LPTS with a reference to a
+	// column that no child CTE emits.
 	auto agg_bindings = agg_search->GetColumnBindings();
 	auto agg_types = agg_search->types;
 	idx_t group_count = agg.groups.size();
 
 	ColumnBinding match_binding = agg_bindings[group_count + match_count_idx];
 	LogicalType match_type = agg_types[group_count + match_count_idx];
-	auto match_pt = make_uniq<BoundColumnRefExpression>(match_type, match_binding);
-	match_pt->alias = string(openivm::MATCH_COUNT_COL);
-	proj.expressions.push_back(std::move(match_pt));
+	PropagateHiddenBindingThroughProjectionPath(projection_path, match_binding, match_type, openivm::MATCH_COUNT_COL);
 
 	if (is_full_outer) {
 		ColumnBinding right_match_binding = agg_bindings[group_count + right_match_count_idx];
 		LogicalType right_match_type = agg_types[group_count + right_match_count_idx];
-		auto right_match_pt = make_uniq<BoundColumnRefExpression>(right_match_type, right_match_binding);
-		right_match_pt->alias = string(openivm::RIGHT_MATCH_COUNT_COL);
-		proj.expressions.push_back(std::move(right_match_pt));
+		PropagateHiddenBindingThroughProjectionPath(projection_path, right_match_binding, right_match_type,
+		                                            openivm::RIGHT_MATCH_COUNT_COL);
 	}
-
-	proj.ResolveOperatorTypes();
 
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] Added openivm_match_count%s for outer join aggregate\n",
 	                    is_full_outer ? " + openivm_right_match_count" : "");

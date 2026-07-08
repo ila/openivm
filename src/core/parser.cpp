@@ -361,6 +361,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
+	idx_t visible_output_count = DConstants::INVALID_INDEX;
 	string having_predicate;    // HAVING predicate as SQL (for VIEW WHERE clause, empty if no HAVING)
 	bool lpts_fallback = false; // set when LPTS can't serialize the plan and we fall back to SQL
 	bool stored_query_has_aggregate_filter = false;
@@ -374,6 +375,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		Planner select_planner(*con.context);
 		select_planner.CreatePlan(std::move(select_parser.statements[0]));
 		auto select_plan = std::move(select_planner.plan);
+		visible_output_count = select_planner.names.size();
 		add_create_profile_step("create_compile_select_plan", select_parse_plan_start);
 
 		// Inline CTEs without running the full optimizer, which can reshape plans
@@ -543,6 +545,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	DeltaViewModelInput model_input;
 	model_input.facts = &facts;
 	model_input.output_names = &output_names;
+	model_input.visible_output_count = visible_output_count;
 	model_input.has_unsupported_incremental_construct = has_unsupported_incremental_construct;
 	model_input.keep_window_join_partitions = keep_window_join_partitions;
 	model_input.stored_query_has_aggregate_filter =

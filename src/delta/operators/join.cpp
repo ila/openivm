@@ -393,54 +393,80 @@ static void DemoteLeftJoinsForMask(LogicalOperator *node, const vector<JoinLeafI
 	DemoteLeftJoinsForMaskRec(node, leaves, mask, path);
 }
 
-void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
-                               const ColumnBinding &mul_binding) {
-	if (leaf.path.empty()) {
+void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
+                                                const ColumnBinding &mul_binding, const char *context_label,
+                                                bool preserve_constant_sibling_child_outputs, idx_t fallback_mul_idx) {
+	if (leaf_path.empty()) {
 		return;
 	}
-	size_t child_side = leaf.path.back();
-	unique_ptr<LogicalOperator> *parent = &term;
-	for (size_t s = 0; s + 1 < leaf.path.size(); s++) {
-		parent = &((*parent)->children[leaf.path[s]]);
+	vector<LogicalOperator *> ancestors;
+	ancestors.reserve(leaf_path.size());
+	LogicalOperator *node = term.get();
+	for (size_t depth = 0; depth < leaf_path.size(); depth++) {
+		if (leaf_path[depth] >= node->children.size()) {
+			throw InternalException("%s: leaf path child %llu out of bounds at depth %llu", context_label,
+			                        (unsigned long long)leaf_path[depth], (unsigned long long)depth);
+		}
+		ancestors.push_back(node);
+		node = node->children[leaf_path[depth]].get();
 	}
-	if ((*parent)->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto *join = dynamic_cast<LogicalComparisonJoin *>((*parent).get());
-		if (join) {
+	for (size_t depth = leaf_path.size(); depth-- > 0;) {
+		size_t child_side = leaf_path[depth];
+		auto *join = dynamic_cast<LogicalJoin *>(ancestors[depth]);
+		if (join && child_side < join->children.size()) {
 			auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
 			if (!proj_map.empty()) {
-				auto child_bindings = (*parent)->children[child_side]->GetColumnBindings();
+				bool immediate_parent = depth + 1 == leaf_path.size();
+				bool preserve_full_child = preserve_constant_sibling_child_outputs && immediate_parent &&
+				                           ancestors[depth]->children.size() == 2 &&
+				                           IsConstantLeafSubtree(ancestors[depth]->children[1 - child_side].get());
+				auto child_bindings = ancestors[depth]->children[child_side]->GetColumnBindings();
 				for (auto projected_idx : proj_map) {
 					if (projected_idx >= child_bindings.size()) {
 						throw InternalException(
-						    "DeltaJoin: projection map index %llu out of bounds for child %llu with %llu bindings",
-						    (unsigned long long)projected_idx, (unsigned long long)child_side,
+						    "%s: projection map index %llu out of bounds for child %llu with %llu bindings",
+						    context_label, (unsigned long long)projected_idx, (unsigned long long)child_side,
 						    (unsigned long long)child_bindings.size());
 					}
 				}
 				idx_t mul_idx = DConstants::INVALID_INDEX;
 				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
-					if (DeltaJoinBindingKey(child_bindings[binding_idx]) == DeltaJoinBindingKey(mul_binding)) {
+					if (child_bindings[binding_idx] == mul_binding) {
 						mul_idx = binding_idx;
 						break;
 					}
 				}
+				if (mul_idx == DConstants::INVALID_INDEX && immediate_parent &&
+				    fallback_mul_idx < child_bindings.size()) {
+					mul_idx = fallback_mul_idx;
+				}
 				if (mul_idx == DConstants::INVALID_INDEX) {
-					mul_idx = leaf.node->GetColumnBindings().size();
+					continue;
 				}
-				if (mul_idx >= child_bindings.size()) {
-					throw InternalException("DeltaJoin: multiplicity binding not available in projected child %llu "
-					                        "with %llu bindings",
-					                        (unsigned long long)child_side, (unsigned long long)child_bindings.size());
-				}
-				if (mul_idx < child_bindings.size() &&
-				    std::find(proj_map.begin(), proj_map.end(), mul_idx) == proj_map.end()) {
+				if (preserve_full_child) {
+					idx_t projectable_count = MinValue<idx_t>(mul_idx + 1, child_bindings.size());
+					for (idx_t binding_idx = 0; binding_idx < projectable_count; binding_idx++) {
+						if (std::find(proj_map.begin(), proj_map.end(), binding_idx) != proj_map.end()) {
+							continue;
+						}
+						proj_map.push_back(binding_idx);
+						OPENIVM_DEBUG_PRINT("[%s] Preserved child col %lu in immediate %s proj_map\n", context_label,
+						                    (unsigned long)binding_idx, child_side == 0 ? "left" : "right");
+					}
+				} else if (std::find(proj_map.begin(), proj_map.end(), mul_idx) == proj_map.end()) {
 					proj_map.push_back(mul_idx);
-					OPENIVM_DEBUG_PRINT("[DeltaJoin] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
-					                    child_side == 0 ? "left" : "right");
+					OPENIVM_DEBUG_PRINT("[%s] Added mul col %lu to ancestor %s proj_map\n", context_label,
+					                    (unsigned long)mul_idx, child_side == 0 ? "left" : "right");
 				}
+				join->ResolveOperatorTypes();
 			}
 		}
 	}
+}
+
+void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
+                               const ColumnBinding &mul_binding) {
+	AppendMultiplicityToAncestorProjectionMaps(term, leaf.path, mul_binding, "DeltaJoin");
 }
 
 // ============================================================================

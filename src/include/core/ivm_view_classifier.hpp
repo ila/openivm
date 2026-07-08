@@ -156,6 +156,7 @@ struct FilteredGroupCountAuxRequirement {
 struct DeltaViewModelInput {
 	const CreateMVPlanFacts *facts = nullptr;
 	const vector<string> *output_names = nullptr;
+	idx_t visible_output_count = DConstants::INVALID_INDEX;
 	const RefreshMetadata::DistinctAuxMeta *distinct_aux_candidate = nullptr;
 	const RefreshMetadata::CountDistinctAuxMeta *count_distinct_aux_candidate = nullptr;
 	const FilteredGroupCountAuxRequirement *filtered_group_count_aux_candidate = nullptr;

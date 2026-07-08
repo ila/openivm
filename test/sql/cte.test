@@ -900,6 +900,175 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Join-over-aggregate projection can put aggregate outputs before visible recompute keys.
+statement ok
+CREATE TABLE cte_joa_customer (c_id INT, c_balance DOUBLE);
+
+statement ok
+CREATE TABLE cte_joa_order (o_c_id INT, o_amount DOUBLE);
+
+statement ok
+INSERT INTO cte_joa_customer VALUES (1, 10.0), (2, 20.0), (3, 30.0);
+
+statement ok
+INSERT INTO cte_joa_order VALUES
+    (1, 5.0),
+    (1, 6.0),
+    (2, 7.0),
+    (2, 8.0),
+    (3, 9.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cte_join_agg_reordered_keys AS
+WITH order_total AS (
+    SELECT o_c_id, SUM(o_amount) AS total, COUNT(*) AS n
+    FROM cte_joa_order
+    GROUP BY o_c_id
+)
+SELECT ot.total, ot.n, c.c_balance, c.c_id + 0 AS cust_key
+FROM order_total ot
+JOIN cte_joa_customer c ON c.c_id = ot.o_c_id
+WHERE ot.n > 1;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_cte_join_agg_reordered_keys';
+----
+6
+
+statement ok
+INSERT INTO cte_joa_order VALUES (3, 10.0);
+
+statement ok
+UPDATE cte_joa_customer SET c_balance = 11.0 WHERE c_id = 1;
+
+statement ok
+UPDATE cte_joa_order SET o_amount = 50.0 WHERE o_c_id = 1 AND o_amount = 5.0;
+
+statement ok
+DELETE FROM cte_joa_order WHERE o_c_id = 2 AND o_amount = 7.0;
+
+statement ok
+PRAGMA refresh('mv_cte_join_agg_reordered_keys');
+
+query I
+SELECT COUNT(*) FROM (
+    (WITH order_total AS (
+        SELECT o_c_id, SUM(o_amount) AS total, COUNT(*) AS n
+        FROM cte_joa_order
+        GROUP BY o_c_id
+    )
+    SELECT ot.total, ot.n, c.c_balance, c.c_id + 0 AS cust_key
+    FROM order_total ot
+    JOIN cte_joa_customer c ON c.c_id = ot.o_c_id
+    WHERE ot.n > 1)
+    EXCEPT ALL SELECT * FROM mv_cte_join_agg_reordered_keys
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cte_join_agg_reordered_keys
+    EXCEPT ALL
+    (WITH order_total AS (
+        SELECT o_c_id, SUM(o_amount) AS total, COUNT(*) AS n
+        FROM cte_joa_order
+        GROUP BY o_c_id
+    )
+    SELECT ot.total, ot.n, c.c_balance, c.c_id + 0 AS cust_key
+    FROM order_total ot
+    JOIN cte_joa_customer c ON c.c_id = ot.o_c_id
+    WHERE ot.n > 1)
+);
+----
+0
+
+# Aggregate CTE with scalar subquery projection must not use aggregate MERGE.
+statement ok
+CREATE TABLE cte_scalar_customer (C_W_ID INT, C_ID INT, C_LAST VARCHAR);
+
+statement ok
+CREATE TABLE cte_scalar_oorder (O_W_ID INT, O_D_ID INT, O_C_ID INT, O_OL_CNT INT);
+
+statement ok
+INSERT INTO cte_scalar_customer VALUES
+    (1, 10, 'Smith'),
+    (1, 11, 'Adams'),
+    (2, 20, 'Jones');
+
+statement ok
+INSERT INTO cte_scalar_oorder VALUES
+    (1, 1, 10, 5),
+    (1, 1, 10, 7),
+    (1, 2, 11, 3),
+    (2, 1, 20, 4),
+    (2, 1, 20, 6);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_cte_scalar_projected_agg AS
+WITH ord_agg AS (
+    SELECT O_W_ID, O_D_ID, O_C_ID, COUNT(*) AS n, SUM(O_OL_CNT) AS lines
+    FROM cte_scalar_oorder
+    GROUP BY O_W_ID, O_D_ID, O_C_ID
+)
+SELECT oa.O_W_ID, oa.O_D_ID, oa.O_C_ID, oa.n,
+       (SELECT C_LAST FROM cte_scalar_customer WHERE C_ID = oa.O_C_ID AND C_W_ID = oa.O_W_ID) AS c_last
+FROM ord_agg oa
+WHERE oa.n > 1;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_cte_scalar_projected_agg';
+----
+6
+
+statement ok
+INSERT INTO cte_scalar_oorder VALUES (1, 2, 11, 8), (1, 2, 11, 9);
+
+statement ok
+UPDATE cte_scalar_customer SET C_LAST = 'Smithson' WHERE C_W_ID = 1 AND C_ID = 10;
+
+statement ok
+UPDATE cte_scalar_oorder SET O_OL_CNT = 10 WHERE O_W_ID = 1 AND O_D_ID = 1 AND O_C_ID = 10 AND O_OL_CNT = 5;
+
+statement ok
+DELETE FROM cte_scalar_oorder WHERE O_W_ID = 2 AND O_D_ID = 1 AND O_C_ID = 20 AND O_OL_CNT = 4;
+
+statement ok
+PRAGMA refresh('mv_cte_scalar_projected_agg');
+
+query I
+SELECT COUNT(*) FROM (
+    (WITH ord_agg AS (
+        SELECT O_W_ID, O_D_ID, O_C_ID, COUNT(*) AS n, SUM(O_OL_CNT) AS lines
+        FROM cte_scalar_oorder
+        GROUP BY O_W_ID, O_D_ID, O_C_ID
+    )
+    SELECT oa.O_W_ID, oa.O_D_ID, oa.O_C_ID, oa.n,
+           (SELECT C_LAST FROM cte_scalar_customer WHERE C_ID = oa.O_C_ID AND C_W_ID = oa.O_W_ID) AS c_last
+    FROM ord_agg oa
+    WHERE oa.n > 1)
+    EXCEPT ALL SELECT * FROM mv_cte_scalar_projected_agg
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_cte_scalar_projected_agg
+    EXCEPT ALL
+    (WITH ord_agg AS (
+        SELECT O_W_ID, O_D_ID, O_C_ID, COUNT(*) AS n, SUM(O_OL_CNT) AS lines
+        FROM cte_scalar_oorder
+        GROUP BY O_W_ID, O_D_ID, O_C_ID
+    )
+    SELECT oa.O_W_ID, oa.O_D_ID, oa.O_C_ID, oa.n,
+           (SELECT C_LAST FROM cte_scalar_customer WHERE C_ID = oa.O_C_ID AND C_W_ID = oa.O_W_ID) AS c_last
+    FROM ord_agg oa
+    WHERE oa.n > 1)
+);
+----
+0
+
 # ==========================================
 # CTE nested aggregate: count filtered inner grouped SUM via aux-state transitions
 # ==========================================

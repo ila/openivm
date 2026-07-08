@@ -27,6 +27,11 @@ void DemoteLeftJoins(LogicalOperator *node);
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
                                const ColumnBinding &mul_binding);
 
+void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
+                                                const ColumnBinding &mul_binding, const char *context_label,
+                                                bool preserve_constant_sibling_child_outputs = false,
+                                                idx_t fallback_mul_idx = DConstants::INVALID_INDEX);
+
 unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
                                                  const vector<LogicalType> &types, Binder &binder);
 
