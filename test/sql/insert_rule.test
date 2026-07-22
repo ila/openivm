@@ -1112,8 +1112,8 @@ SELECT count(*) FROM (
 # DuckDB places a STREAMING_LIMIT directly above the projection for large LIMIT values,
 # so the INSERT's child is neither LOGICAL_PROJECTION nor LOGICAL_GET. The delta-capture
 # rule previously handled only those two shapes and silently skipped delta population for
-# any other shape, leaving the MV stale after refresh. The catch-all branch serializes the
-# source plan so the delta is captured for these shapes too.
+# any other shape, leaving the MV stale after refresh. Transactional capture now wraps the
+# DML input as a streaming physical operator, independent of the source-plan shape.
 # ==========================================
 
 statement ok
@@ -1155,5 +1155,204 @@ SELECT count(*) FROM (SELECT * FROM mv_bulk EXCEPT ALL SELECT * FROM bulk_base);
 
 query I
 SELECT count(*) FROM (SELECT * FROM bulk_base EXCEPT ALL SELECT * FROM mv_bulk);
+----
+0
+
+# ==========================================
+# Regression: delta capture shares the base DML transaction.
+# A rollback or failed constraint must roll back the corresponding delta rows too.
+# ==========================================
+
+statement ok
+CREATE TABLE tx_atomic_src (
+    id INTEGER PRIMARY KEY,
+    grp INTEGER,
+    v INTEGER NOT NULL DEFAULT 7
+);
+
+statement ok
+INSERT INTO tx_atomic_src VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW tx_atomic_mv AS
+SELECT grp, SUM(v) AS total, COUNT(*) AS n
+FROM tx_atomic_src
+GROUP BY grp;
+
+# Batch conflicting DML before one rollback. None of its four logical delta rows may survive.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO tx_atomic_src (id, grp) VALUES (4, 2);
+
+statement ok
+UPDATE tx_atomic_src SET v = 15 WHERE id = 1;
+
+statement ok
+DELETE FROM tx_atomic_src WHERE id = 2;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM openivm_delta_tx_atomic_src;
+----
+0
+
+statement ok
+PRAGMA refresh('tx_atomic_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM tx_atomic_mv
+    EXCEPT ALL
+    SELECT grp, SUM(v), COUNT(*) FROM tx_atomic_src GROUP BY grp
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(v), COUNT(*) FROM tx_atomic_src GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM tx_atomic_mv
+);
+----
+0
+
+# The same batch must remain incremental when committed.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO tx_atomic_src (id, grp) VALUES (4, 2);
+
+statement ok
+UPDATE tx_atomic_src SET v = 15 WHERE id = 1;
+
+statement ok
+DELETE FROM tx_atomic_src WHERE id = 2;
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM openivm_delta_tx_atomic_src;
+----
+4
+
+statement ok
+PRAGMA refresh('tx_atomic_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM tx_atomic_mv
+    EXCEPT ALL
+    SELECT grp, SUM(v), COUNT(*) FROM tx_atomic_src GROUP BY grp
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(v), COUNT(*) FROM tx_atomic_src GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM tx_atomic_mv
+);
+----
+0
+
+# Constraint failures happen after the capture operator has seen input, so these prove
+# that both writes are part of the same transaction and roll back together.
+statement error
+INSERT INTO tx_atomic_src VALUES (1, 9, 999);
+----
+Duplicate key
+
+statement error
+UPDATE tx_atomic_src SET v = NULL WHERE id = 1;
+----
+NOT NULL
+
+query I
+SELECT count(*) FROM openivm_delta_tx_atomic_src;
+----
+4
+
+statement ok
+PRAGMA refresh('tx_atomic_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM tx_atomic_mv
+    EXCEPT ALL
+    SELECT grp, SUM(v), COUNT(*) FROM tx_atomic_src GROUP BY grp
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, SUM(v), COUNT(*) FROM tx_atomic_src GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM tx_atomic_mv
+);
+----
+0
+
+# Generated columns are not physically stored in the base table, so capture must evaluate
+# them for both old and new rows. RETURNING adds a projection above the DML operator; it must
+# not hide the affected DML plan from the capture rule.
+statement ok
+CREATE TABLE tx_generated_src (
+    a INTEGER,
+    doubled INTEGER GENERATED ALWAYS AS (a * 2)
+);
+
+statement ok
+INSERT INTO tx_generated_src (a) VALUES (1), (2);
+
+statement ok
+CREATE MATERIALIZED VIEW tx_generated_mv AS SELECT a, doubled FROM tx_generated_src;
+
+query II
+INSERT INTO tx_generated_src (a) VALUES (3) RETURNING a, doubled;
+----
+3	6
+
+query II
+UPDATE tx_generated_src SET a = a + 10 WHERE a = 1 RETURNING a, doubled;
+----
+11	22
+
+query II
+DELETE FROM tx_generated_src WHERE a = 2 RETURNING a, doubled;
+----
+2	4
+
+query I
+SELECT count(*) FROM openivm_delta_tx_generated_src;
+----
+4
+
+statement ok
+PRAGMA refresh('tx_generated_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM tx_generated_mv
+    EXCEPT ALL
+    SELECT * FROM tx_generated_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM tx_generated_src
+    EXCEPT ALL
+    SELECT * FROM tx_generated_mv
+);
 ----
 0

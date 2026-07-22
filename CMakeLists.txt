@@ -57,6 +57,7 @@ set(EXTENSION_SOURCES
     src/upsert/refresh_index_regen.cpp
     src/rules/incremental_rewrite_rule.cpp
     src/rules/refresh_insert_rule.cpp
+    src/rules/transactional_delta_capture.cpp
     src/rules/schema_evolution.cpp
     src/rules/column_hider.cpp
     src/core/refresh_locks.cpp

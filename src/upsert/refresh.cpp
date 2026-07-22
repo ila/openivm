@@ -118,6 +118,8 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 	RefreshProfiler profiler(context, vn);
 	auto lock_start = std::chrono::steady_clock::now();
 	ViewLockGuard view_guard(vn);
+	auto &view_catalog = Catalog::GetCatalog(context, view_catalog_name);
+	DeltaCatalogLockGuard delta_catalog_guard(view_catalog.GetName());
 	// Acquire delta-table locks in sorted order to serialize parallel refreshes that
 	// share base tables (e.g. mv_A and mv_B both reading STOCK → both write to
 	// `delta_STOCK` inside their transactions → "Conflict on tuple deletion!" when

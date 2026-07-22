@@ -7,170 +7,64 @@
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
+#include "rules/transactional_delta_capture.hpp"
 
-#include "lpts_pipeline.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/common/column_index.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
-#include "duckdb/function/table/read_csv.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
-#include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/statement/logical_plan_statement.hpp"
-#include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
-#include "duckdb/planner/expression_iterator.hpp"
-#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
-#include "duckdb/planner/operator/logical_dummy_scan.hpp"
-#include "duckdb/planner/operator/logical_expression_get.hpp"
-#include "duckdb/planner/operator/logical_filter.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
-#include "duckdb/planner/planner.hpp"
-
-#include <iostream>
-#include <map>
 
 namespace duckdb {
 
-// PAC compatibility boundary: delta writes run through a fresh connection, so
-// disable PAC checks when that extension is loaded in the caller session.
-static void DisablePACIfLoaded(ClientContext &context, Connection &con) {
-	Value pac_val;
-	if (context.TryGetCurrentSetting("pac_check", pac_val)) {
-		con.Query("SET pac_check = false");
+static bool IsTrackedBaseTable(ClientContext &context, const string &table_name) {
+	Connection con(*context.db);
+	return RefreshMetadata(con).IsBaseTable(table_name);
+}
+
+static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert &insert) {
+	if (insert.column_index_map.empty()) {
+		return;
 	}
-}
-
-// Build the data column list from a delta table catalog entry, excluding metadata columns.
-// Returns e.g. "id, name, val" (quoted) — the base table columns only.
-static string BuildDeltaDataColumns(TableCatalogEntry &delta_entry) {
-	string cols;
-	for (auto &col : delta_entry.GetColumns().Logical()) {
-		if (col.GetName() == openivm::MULTIPLICITY_COL || col.GetName() == openivm::TIMESTAMP_COL) {
-			continue;
-		}
-		if (!cols.empty()) {
-			cols += ", ";
-		}
-		cols += KeywordHelper::WriteOptionallyQuoted(col.GetName());
-	}
-	return cols;
-}
-
-// Build "INSERT INTO delta_t (col1, col2, ..., mul, ts)" prefix for delta writes.
-static string BuildDeltaInsertPrefix(const string &full_delta_table_name, TableCatalogEntry &delta_entry) {
-	string col_list = BuildDeltaDataColumns(delta_entry);
-	return "INSERT INTO " + full_delta_table_name + " (" + col_list + ", " + string(openivm::MULTIPLICITY_COL) + ", " +
-	       string(openivm::TIMESTAMP_COL) + ")";
-}
-
-// Build "SELECT col1, col2, ..., <mul_val>, now()::timestamp FROM <source>" for delta writes.
-static string BuildDeltaSelectFrom(TableCatalogEntry &delta_entry, const string &mul_val, const string &source) {
-	string cols = BuildDeltaDataColumns(delta_entry);
-	return "SELECT " + cols + ", " + mul_val + ", now()::timestamp FROM " + source;
-}
-
-using BoundColumnNameMap = std::map<std::pair<idx_t, idx_t>, string>;
-
-static void CollectBoundColumnNames(LogicalOperator &op, BoundColumnNameMap &column_names) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op.Cast<LogicalGet>();
-		auto bindings = get.GetColumnBindings();
-		auto column_ids = get.GetColumnIds();
-		for (auto &binding : bindings) {
-			if (binding.column_index >= column_ids.size()) {
-				continue;
+	auto child_bindings = insert.children[0]->GetColumnBindings();
+	vector<unique_ptr<Expression>> expressions;
+	for (auto &column : insert.table.GetColumns().Physical()) {
+		auto mapped_index = insert.column_index_map[column.Physical()];
+		if (mapped_index == DConstants::INVALID_INDEX) {
+			expressions.push_back(insert.bound_defaults[column.StorageOid()]->Copy());
+		} else {
+			if (mapped_index >= child_bindings.size()) {
+				throw InternalException("OpenIVM insert column mapping is out of range");
 			}
-			const auto &column_name = get.GetColumnName(column_ids[binding.column_index]);
-			column_names[{binding.table_index, binding.column_index}] =
-			    KeywordHelper::WriteOptionallyQuoted(column_name);
+			expressions.push_back(make_uniq<BoundColumnRefExpression>(column.Type(), child_bindings[mapped_index]));
 		}
 	}
-	for (auto &child : op.children) {
-		CollectBoundColumnNames(*child, column_names);
-	}
+	auto projection = make_uniq<LogicalProjection>(input.optimizer.binder.GenerateTableIndex(), std::move(expressions));
+	projection->children.push_back(std::move(insert.children[0]));
+	insert.children[0] = std::move(projection);
+	insert.column_index_map = physical_index_vector_t<idx_t>();
+	insert.expected_types = insert.table.GetTypes();
 }
 
-static void QuoteBoundColumnRefs(Expression &expr, const BoundColumnNameMap &column_names) {
-	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-		auto &bcr = expr.Cast<BoundColumnRefExpression>();
-		auto entry = column_names.find({bcr.binding.table_index, bcr.binding.column_index});
-		if (entry != column_names.end()) {
-			bcr.alias = entry->second;
+static idx_t FindExpressionBindingIndex(LogicalOperator &child, const Expression &expression) {
+	if (expression.type != ExpressionType::BOUND_COLUMN_REF) {
+		throw InternalException("OpenIVM expected a bound row-id column reference");
+	}
+	auto &column_ref = expression.Cast<BoundColumnRefExpression>();
+	auto bindings = child.GetColumnBindings();
+	for (idx_t index = 0; index < bindings.size(); index++) {
+		if (bindings[index] == column_ref.binding) {
+			return index;
 		}
 	}
-	ExpressionIterator::EnumerateChildren(expr, [&](unique_ptr<Expression> &child) {
-		if (child) {
-			QuoteBoundColumnRefs(*child, column_names);
-		}
-	});
-}
-
-static string QuotedExpressionString(const unique_ptr<Expression> &expr, const BoundColumnNameMap &column_names) {
-	auto copy = expr->Copy();
-	QuoteBoundColumnRefs(*copy, column_names);
-	return copy->ToString();
-}
-
-static string BuildDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry &delta_entry,
-                                       const string &full_delta_table_name, unique_ptr<LogicalOperator> &source_plan) {
-	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
-	SqlDialect dialect = openivm::CompileFactsContextSlot::Get(context).target_dialect;
-	auto ast = LogicalPlanToAst(context, source_plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect);
-	string subquery_string = cte_list->ToQuery(false);
-	if (!subquery_string.empty() && subquery_string.back() == ';') {
-		subquery_string.pop_back();
-	}
-	return prefix + " SELECT *, 1, now()::timestamp FROM (" + subquery_string + ")";
-}
-
-static string BuildDeleteDeltaInsertFromPlan(ClientContext &context, TableCatalogEntry &delta_entry,
-                                             const string &full_delta_table_name, const string &full_table_name,
-                                             unique_ptr<LogicalOperator> &source_plan) {
-	string prefix = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry);
-	string data_cols = BuildDeltaDataColumns(delta_entry);
-	SqlDialect dialect = openivm::CompileFactsContextSlot::Get(context).target_dialect;
-	auto ast = LogicalPlanToAst(context, source_plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect);
-	string subquery_string = cte_list->ToQuery(false);
-	if (!subquery_string.empty() && subquery_string.back() == ';') {
-		subquery_string.pop_back();
-	}
-	// DuckDB DELETE children identify physical rows by rowid; read the base table
-	// columns back through that rowid set to materialize the negative delta tuple.
-	return prefix + " SELECT " + data_cols + ", -1, now()::timestamp FROM " + full_table_name +
-	       " WHERE rowid IN (SELECT rowid FROM (" + subquery_string + ") openivm_deleted_rows)";
-}
-
-static bool IsRowIdColumn(const unique_ptr<Expression> &expr) {
-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
-		return false;
-	}
-	auto &col_ref = expr->Cast<BoundColumnRefExpression>();
-	return StringUtil::CIEquals(col_ref.GetName(), "rowid") || StringUtil::CIEquals(col_ref.alias, "rowid");
-}
-
-static bool IsSemiJoinOnRowId(LogicalComparisonJoin &join) {
-	if (join.join_type != JoinType::SEMI) {
-		return false;
-	}
-	for (auto &condition : join.conditions) {
-		if (IsRowIdColumn(condition.left) || IsRowIdColumn(condition.right)) {
-			return true;
-		}
-	}
-	return false;
+	throw InternalException("OpenIVM could not resolve the DML row-id binding");
 }
 
 RefreshInsertRule::RefreshInsertRule() {
@@ -340,379 +234,93 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		return;
 	}
 
-	auto root_name = root->GetName();
-	if (root_name.rfind("INSERT", 0) != 0 && root_name.rfind("DELETE", 0) != 0 && root_name.rfind("UPDATE", 0) != 0) {
-		return;
+	auto dml = root;
+	while (dml->type != LogicalOperatorType::LOGICAL_INSERT && dml->type != LogicalOperatorType::LOGICAL_DELETE &&
+	       dml->type != LogicalOperatorType::LOGICAL_UPDATE) {
+		if (dml->children.size() != 1) {
+			return;
+		}
+		dml = dml->children[0].get();
 	}
 
-	switch (root->type) {
+	switch (dml->type) {
 	case LogicalOperatorType::LOGICAL_INSERT: {
-		auto insert_node = dynamic_cast<LogicalInsert *>(root);
-		auto insert_table_name = insert_node->table.name;
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] INSERT into '%s'\n", insert_table_name.c_str());
-
-		if (SqlUtils::IsDelta(insert_table_name) || insert_table_name.empty() ||
-		    IncrementalTableNames::IsDataTable(insert_table_name)) {
+		auto &insert = dml->Cast<LogicalInsert>();
+		const auto &table_name = insert.table.name;
+		if (SqlUtils::IsDelta(table_name) || table_name.empty() || IncrementalTableNames::IsDataTable(table_name) ||
+		    insert.table.catalog.GetCatalogType() == "ducklake") {
 			return;
 		}
-		// DuckLake tables have native change tracking — no delta writes needed
-		if (insert_node->table.catalog.GetCatalogType() == "ducklake") {
-			OPENIVM_DEBUG_PRINT("[INSERT RULE] Skipping delta for DuckLake table '%s'\n", insert_table_name.c_str());
+		auto delta_table = Catalog::GetEntry<TableCatalogEntry>(
+		    input.context, insert.table.catalog.GetName(), insert.table.schema.name, SqlUtils::DeltaName(table_name),
+		    OnEntryNotFound::RETURN_NULL);
+		if (!delta_table || !IsTrackedBaseTable(input.context, table_name)) {
 			return;
 		}
-		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    input.context, insert_node->table.catalog.GetName(), insert_node->table.schema.name,
-		    SqlUtils::DeltaName(insert_table_name), OnEntryNotFound::RETURN_NULL);
-
-		if (delta_table_catalog_entry) {
-			Connection con(*input.context.db);
-			DisablePACIfLoaded(input.context, con);
-			RefreshMetadata metadata(con);
-			if (metadata.IsBaseTable(insert_table_name)) {
-				string full_delta_table_name = SqlUtils::FullDeltaName(
-				    insert_node->table.catalog.GetName(), insert_node->table.schema.name, insert_node->table.name);
-				if (insert_node->children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-					auto &delta_entry_ins = delta_table_catalog_entry->Cast<TableCatalogEntry>();
-					string insert_query = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_ins);
-
-					auto projection = dynamic_cast<LogicalProjection *>(insert_node->children[0].get());
-					if (projection->children[0]->type == LogicalOperatorType::LOGICAL_EXPRESSION_GET) {
-						insert_query += " VALUES ";
-						auto expression_get = dynamic_cast<LogicalExpressionGet *>(projection->children[0].get());
-						bool all_values_are_constants = true;
-						for (auto &expression : expression_get->expressions) {
-							for (auto &value : expression) {
-								if (value->type != ExpressionType::VALUE_CONSTANT) {
-									all_values_are_constants = false;
-									break;
-								}
-							}
-							if (!all_values_are_constants) {
-								break;
-							}
-						}
-						if (!all_values_are_constants) {
-							// DuckDB may bind VALUES literals through casts or other scalar expressions. Serialize the
-							// planned insert source instead of rejecting an otherwise valid base-table write.
-							insert_query = BuildDeltaInsertFromPlan(*con.context, delta_entry_ins,
-							                                        full_delta_table_name, insert_node->children[0]);
-						} else {
-							for (auto &expression : expression_get->expressions) {
-								string values = "(";
-								for (auto &value : expression) {
-									auto constant = dynamic_cast<BoundConstantExpression *>(value.get());
-									values += constant->value.ToSQLString() + ",";
-								}
-								values += "1, now()::timestamp),";
-								insert_query += values;
-							}
-							insert_query.pop_back();
-						}
-					} else {
-						auto &delta_entry = delta_table_catalog_entry->Cast<TableCatalogEntry>();
-						insert_query = BuildDeltaInsertFromPlan(*con.context, delta_entry, full_delta_table_name,
-						                                        insert_node->children[0]);
-					}
-					OPENIVM_DEBUG_PRINT("[INSERT RULE] insert_query: %s\n", insert_query.c_str());
-					{
-						DeltaLockGuard guard(SqlUtils::DeltaName(insert_table_name));
-						auto r = con.Query(insert_query);
-						if (r->HasError()) {
-							throw Exception(ExceptionType::EXECUTOR,
-							                "Cannot insert in delta table after insertion! " + r->GetError());
-						}
-					}
-
-				} else if (insert_node->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
-					auto get = dynamic_cast<LogicalGet *>(insert_node->children[0].get());
-					auto *bind_data = dynamic_cast<MultiFileBindData *>(get->bind_data.get());
-					if (!bind_data) {
-						throw NotImplementedException(
-						    "Only CSV file imports (read_csv) are supported for IVM delta tracking "
-						    "via LOGICAL_GET. Other table functions are not yet supported.");
-					}
-					auto &delta_entry_csv = delta_table_catalog_entry->Cast<TableCatalogEntry>();
-					string prefix_csv = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_csv);
-					auto files = bind_data->file_list->GetAllFiles();
-					for (auto &file : files) {
-						auto query = prefix_csv + " SELECT *, 1, now()::timestamp FROM read_csv('" + file.path + "');";
-						DeltaLockGuard guard(SqlUtils::DeltaName(insert_table_name));
-						auto r = con.Query(query);
-						if (r->HasError()) {
-							throw Exception(ExceptionType::EXECUTOR, "Cannot insert in delta table! " + r->GetError());
-						}
-					}
-				} else {
-					// Any other insert-source plan shape. DuckDB places a STREAMING_LIMIT/LOGICAL_LIMIT
-					// directly above the projection for larger INSERT ... SELECT (above a row threshold),
-					// so children[0] is neither LOGICAL_PROJECTION nor LOGICAL_GET. Serialize the whole
-					// source plan generically so the delta is still captured. Without this catch-all, such
-					// inserts updated the base table but silently skipped the delta, leaving the MV stale
-					// after the next refresh.
-					auto &delta_entry_other = delta_table_catalog_entry->Cast<TableCatalogEntry>();
-					string insert_query = BuildDeltaInsertFromPlan(*con.context, delta_entry_other,
-					                                               full_delta_table_name, insert_node->children[0]);
-					OPENIVM_DEBUG_PRINT("[INSERT RULE] generic-plan delta insert_query: %s\n", insert_query.c_str());
-					DeltaLockGuard guard(SqlUtils::DeltaName(insert_table_name));
-					auto r = con.Query(insert_query);
-					if (r->HasError()) {
-						throw Exception(ExceptionType::EXECUTOR,
-						                "Cannot insert in delta table after insertion! " + r->GetError());
-					}
-				}
-			}
-		}
-	} break;
-
+		ResolveInsertDefaults(input, insert);
+		auto capture = make_uniq<LogicalTransactionalDeltaCapture>(insert.table, delta_table->Cast<TableCatalogEntry>(),
+		                                                           DeltaCaptureMode::INSERT);
+		capture->children.push_back(std::move(insert.children[0]));
+		insert.children[0] = std::move(capture);
+		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional INSERT delta capture for '%s'\n", table_name.c_str());
+		break;
+	}
 	case LogicalOperatorType::LOGICAL_DELETE: {
-		auto delete_node = dynamic_cast<LogicalDelete *>(root);
-		auto delete_table_name = delete_node->table.name;
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] DELETE from '%s'\n", delete_table_name.c_str());
-		if (SqlUtils::IsDelta(delete_table_name) || IncrementalTableNames::IsDataTable(delete_table_name)) {
+		auto &delete_op = dml->Cast<LogicalDelete>();
+		const auto &table_name = delete_op.table.name;
+		if (SqlUtils::IsDelta(table_name) || IncrementalTableNames::IsDataTable(table_name) ||
+		    delete_op.table.catalog.GetCatalogType() == "ducklake") {
 			return;
 		}
-		if (delete_node->table.catalog.GetCatalogType() == "ducklake") {
-			OPENIVM_DEBUG_PRINT("[INSERT RULE] Skipping delta for DuckLake table '%s'\n", delete_table_name.c_str());
+		auto delta_table = Catalog::GetEntry<TableCatalogEntry>(
+		    input.context, delete_op.table.catalog.GetName(), delete_op.table.schema.name,
+		    SqlUtils::DeltaName(table_name), OnEntryNotFound::RETURN_NULL);
+		if (!delta_table || !IsTrackedBaseTable(input.context, table_name)) {
 			return;
 		}
-		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    input.context, delete_node->table.catalog.GetName(), delete_node->table.schema.name,
-		    SqlUtils::DeltaName(delete_table_name), OnEntryNotFound::RETURN_NULL);
-
-		if (delta_table_catalog_entry) {
-			auto full_table_name = SqlUtils::FullName(delete_node->table.catalog.GetName(),
-			                                          delete_node->table.schema.name, delete_node->table.name);
-			auto full_delta_table_name = SqlUtils::FullDeltaName(
-			    delete_node->table.catalog.GetName(), delete_node->table.schema.name, delete_node->table.name);
-			Connection con(*input.context.db);
-			DisablePACIfLoaded(input.context, con);
-			RefreshMetadata metadata(con);
-			if (metadata.IsBaseTable(delete_table_name)) {
-				auto &delta_entry_del = delta_table_catalog_entry->Cast<TableCatalogEntry>();
-				string insert_string = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del) + " " +
-				                       BuildDeltaSelectFrom(delta_entry_del, "-1", full_table_name);
-				if (plan->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
-					auto filter = dynamic_cast<LogicalFilter *>(plan->children[0].get());
-					bool has_subquery = false;
-					for (auto &expr : filter->expressions) {
-						has_subquery = has_subquery || expr->HasSubquery();
-					}
-					if (has_subquery) {
-						insert_string = BuildDeleteDeltaInsertFromPlan(
-						    *con.context, delta_entry_del, full_delta_table_name, full_table_name, plan->children[0]);
-					} else {
-						BoundColumnNameMap column_names;
-						CollectBoundColumnNames(*filter->children[0], column_names);
-						insert_string += " where ";
-						for (idx_t i = 0; i < filter->expressions.size(); i++) {
-							if (i > 0) {
-								insert_string += " AND ";
-							}
-							insert_string += QuotedExpressionString(filter->expressions[i], column_names);
-						}
-					}
-				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
-					auto get = dynamic_cast<LogicalGet *>(plan->children[0].get());
-					if (!get->table_filters.filters.empty()) {
-						insert_string += " where ";
-						bool first_filter = true;
-						for (auto &entry : get->table_filters.filters) {
-							if (!first_filter) {
-								insert_string += " AND ";
-							}
-							first_filter = false;
-							auto col_name = get->GetColumnName(ColumnIndex(entry.first));
-							col_name = KeywordHelper::WriteOptionallyQuoted(col_name);
-							insert_string += entry.second->ToString(col_name);
-						}
-					}
-				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
-					return;
-				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-					// DELETE FROM t WHERE rowid IN (subquery) compiles to a SEMI JOIN on
-					// rowid. LPTS cannot serialise the full SEMI JOIN because `rowid` is a
-					// virtual column whose binding is lost after the join. Serialise only
-					// the right child (the subquery returning rowids) and wrap it as
-					// WHERE rowid IN (...) against the base table.
-					auto *join = dynamic_cast<LogicalComparisonJoin *>(plan->children[0].get());
-					if (join && IsSemiJoinOnRowId(*join) && !join->children.empty()) {
-						try {
-							string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
-							string data_cols = BuildDeltaDataColumns(delta_entry_del);
-							SqlDialect dialect = openivm::CompileFactsContextSlot::Get(*con.context).target_dialect;
-							auto ast = LogicalPlanToAst(*con.context, join->children[1], dialect);
-							auto cte_list = AstToCteList(*ast, dialect);
-							string rowid_sql = cte_list->ToQuery(false);
-							if (!rowid_sql.empty() && rowid_sql.back() == ';') {
-								rowid_sql.pop_back();
-							}
-							insert_string = prefix_del + " SELECT " + data_cols + ", -1, now()::timestamp FROM " +
-							                full_table_name + " WHERE rowid IN (" + rowid_sql + ")";
-						} catch (...) {
-							throw NotImplementedException(
-							    "DELETE with rowid IN (subquery) is not yet fully supported for IVM delta tracking");
-						}
-					} else {
-						try {
-							insert_string =
-							    BuildDeleteDeltaInsertFromPlan(*con.context, delta_entry_del, full_delta_table_name,
-							                                   full_table_name, plan->children[0]);
-						} catch (...) {
-							throw NotImplementedException(
-							    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");
-						}
-					}
-				} else {
-					try {
-						string prefix_del = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_del);
-						SqlDialect dialect = openivm::CompileFactsContextSlot::Get(*con.context).target_dialect;
-						auto ast = LogicalPlanToAst(*con.context, plan->children[0], dialect);
-						auto cte_list = AstToCteList(*ast, dialect);
-						string subquery_string = cte_list->ToQuery(false);
-						if (!subquery_string.empty() && subquery_string.back() == ';') {
-							subquery_string.pop_back();
-						}
-						insert_string = prefix_del + " SELECT *, -1, now()::timestamp FROM (" + subquery_string + ")";
-					} catch (...) {
-						throw NotImplementedException(
-						    "DELETE with complex subqueries is not yet fully supported for IVM delta tracking");
-					}
-				}
-
-				{
-					DeltaLockGuard guard(SqlUtils::DeltaName(delete_table_name));
-					auto r = con.Query(insert_string);
-					if (r->HasError()) {
-						throw Exception(ExceptionType::EXECUTOR,
-						                "Cannot insert in delta table after deletion! " + r->GetError());
-					}
-				}
-			}
-		}
-	} break;
-
+		D_ASSERT(delete_op.expressions.size() == 1);
+		auto row_id_index = FindExpressionBindingIndex(*delete_op.children[0], *delete_op.expressions[0]);
+		auto capture = make_uniq<LogicalTransactionalDeltaCapture>(
+		    delete_op.table, delta_table->Cast<TableCatalogEntry>(), DeltaCaptureMode::DELETE,
+		    vector<unique_ptr<Expression>> {}, vector<PhysicalIndex> {}, optional_idx(row_id_index));
+		capture->children.push_back(std::move(delete_op.children[0]));
+		delete_op.children[0] = std::move(capture);
+		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional DELETE delta capture for '%s'\n", table_name.c_str());
+		break;
+	}
 	case LogicalOperatorType::LOGICAL_UPDATE: {
-		auto update_node = dynamic_cast<LogicalUpdate *>(root);
-		auto update_table_name = update_node->table.name;
-		if (SqlUtils::IsDelta(update_table_name) || IncrementalTableNames::IsDataTable(update_table_name)) {
+		auto &update = dml->Cast<LogicalUpdate>();
+		const auto &table_name = update.table.name;
+		if (SqlUtils::IsDelta(table_name) || IncrementalTableNames::IsDataTable(table_name) ||
+		    update.table.catalog.GetCatalogType() == "ducklake") {
 			return;
 		}
-		if (update_node->table.catalog.GetCatalogType() == "ducklake") {
-			OPENIVM_DEBUG_PRINT("[INSERT RULE] Skipping delta for DuckLake table '%s'\n", update_table_name.c_str());
+		auto delta_table = Catalog::GetEntry<TableCatalogEntry>(
+		    input.context, update.table.catalog.GetName(), update.table.schema.name, SqlUtils::DeltaName(table_name),
+		    OnEntryNotFound::RETURN_NULL);
+		if (!delta_table || !IsTrackedBaseTable(input.context, table_name)) {
 			return;
 		}
-		auto delta_table_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    input.context, update_node->table.catalog.GetName(), update_node->table.schema.name,
-		    SqlUtils::DeltaName(update_table_name), OnEntryNotFound::RETURN_NULL);
-
-		if (delta_table_catalog_entry) {
-			Connection con(*input.context.db);
-			DisablePACIfLoaded(input.context, con);
-			RefreshMetadata metadata(con);
-			if (!metadata.IsBaseTable(update_table_name)) {
-				break;
-			}
-			{
-				auto full_table_name = SqlUtils::FullName(update_node->table.catalog.GetName(),
-				                                          update_node->table.schema.name, update_node->table.name);
-				auto full_delta_table_name = SqlUtils::FullDeltaName(
-				    update_node->table.catalog.GetName(), update_node->table.schema.name, update_node->table.name);
-				auto *projection = dynamic_cast<LogicalProjection *>(update_node->children[0].get());
-				if (!projection) {
-					OPENIVM_DEBUG_PRINT("[INSERT RULE] UPDATE skipped: no projection child (child type: %s)\n",
-					                    LogicalOperatorToString(update_node->children[0]->type).c_str());
-					break;
-				}
-
-				std::map<string, string> update_values;
-				string where_string;
-				BoundColumnNameMap column_names;
-				CollectBoundColumnNames(*projection->children[0], column_names);
-				for (size_t i = 0; i < update_node->columns.size(); i++) {
-					auto column = update_node->columns[i].index;
-					update_values[to_string(column)] = QuotedExpressionString(projection->expressions[i], column_names);
-				}
-
-				if (projection->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
-					auto filter = dynamic_cast<LogicalFilter *>(projection->children[0].get());
-					where_string += " where ";
-					for (idx_t i = 0; i < filter->expressions.size(); i++) {
-						if (i > 0) {
-							where_string += " AND ";
-						}
-						where_string += QuotedExpressionString(filter->expressions[i], column_names);
-					}
-				} else if (projection->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
-					auto get = dynamic_cast<LogicalGet *>(projection->children[0].get());
-					if (!get->table_filters.filters.empty()) {
-						where_string += " where ";
-						bool first_filter = true;
-						for (auto &entry : get->table_filters.filters) {
-							if (!first_filter) {
-								where_string += " AND ";
-							}
-							first_filter = false;
-							auto col_name = get->GetColumnName(ColumnIndex(entry.first));
-							col_name = KeywordHelper::WriteOptionallyQuoted(col_name);
-							where_string += entry.second->ToString(col_name);
-						}
-					}
-				} else if (projection->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
-					return;
-				} else {
-					throw NotImplementedException("Only simple UPDATE statements are supported in IVM!");
-				}
-
-				auto &delta_entry_upd = delta_table_catalog_entry->Cast<TableCatalogEntry>();
-				string prefix_upd = BuildDeltaInsertPrefix(full_delta_table_name, delta_entry_upd);
-				string select_old = BuildDeltaSelectFrom(delta_entry_upd, "-1", full_table_name) + where_string;
-				// For select_new: use the update_values map to replace modified columns
-				string select_new = "SELECT ";
-				for (auto &col : delta_entry_upd.GetColumns().Logical()) {
-					if (col.GetName() == openivm::MULTIPLICITY_COL || col.GetName() == openivm::TIMESTAMP_COL) {
-						continue;
-					}
-					// Find the column's positional index in the base table
-					auto base_columns = update_node->table.GetColumns().GetColumnNames();
-					for (size_t i = 0; i < base_columns.size(); i++) {
-						if (base_columns[i] == col.GetName()) {
-							if (update_values.find(to_string(i)) != update_values.end()) {
-								select_new += update_values[to_string(i)] + ", ";
-							} else {
-								select_new += KeywordHelper::WriteOptionallyQuoted(col.GetName()) + ", ";
-							}
-							break;
-						}
-					}
-				}
-				select_new += "1, now()::timestamp FROM " + full_table_name + where_string;
-
-				{
-					DeltaLockGuard guard(SqlUtils::DeltaName(update_table_name));
-					// ATOMIC UPDATE DELTA WRITES:
-					// The old-delete and new-insert rows MUST commit together. If they land
-					// in separate auto-commit transactions, a concurrent refresh can take a
-					// snapshot between them — seeing one but not the other. Since both rows
-					// target the same group, processing only one breaks consolidation (net
-					// count change should be 0, but ends up +1 or -1 → MV drift).
-					//
-					// Combining into a single multi-row INSERT via UNION ALL ensures both
-					// rows share one commit point and one `now()` value — either both visible
-					// in a given snapshot or neither.
-					string combined = prefix_upd + " " + "SELECT * FROM (" + select_old +
-					                  ") UNION ALL SELECT * FROM (" + select_new + ")";
-					OPENIVM_DEBUG_PRINT("[INSERT RULE] combined UPDATE delta: %s\n", combined.c_str());
-					auto r = con.Query(combined);
-					if (r->HasError()) {
-						throw Exception(ExceptionType::EXECUTOR, "Cannot insert UPDATE delta rows! " + r->GetError());
-					}
-				}
+		vector<unique_ptr<Expression>> update_expressions;
+		update_expressions.reserve(update.expressions.size());
+		for (idx_t index = 0; index < update.expressions.size(); index++) {
+			if (update.expressions[index]->type == ExpressionType::VALUE_DEFAULT) {
+				update_expressions.push_back(update.bound_defaults[update.columns[index].index]->Copy());
+			} else {
+				update_expressions.push_back(update.expressions[index]->Copy());
 			}
 		}
-	} break;
+		auto row_id_index = update.children[0]->GetColumnBindings().size() - 1;
+		auto capture = make_uniq<LogicalTransactionalDeltaCapture>(
+		    update.table, delta_table->Cast<TableCatalogEntry>(), DeltaCaptureMode::UPDATE,
+		    std::move(update_expressions), update.columns, optional_idx(row_id_index));
+		capture->children.push_back(std::move(update.children[0]));
+		update.children[0] = std::move(capture);
+		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional UPDATE delta capture for '%s'\n", table_name.c_str());
+		break;
+	}
 	default:
 		return;
 	}
 }
-
 } // namespace duckdb

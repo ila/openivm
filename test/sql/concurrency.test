@@ -302,3 +302,64 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 6: Refresh waits for an uncommitted delta-producing transaction.
+# Without the catalog-level lock, refresh can advance its timestamp cursor while
+# the delta row is invisible, then permanently skip that row after it commits.
+# ==========================================
+
+statement ok
+CREATE TABLE tx_refresh_race (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO tx_refresh_race VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_tx_refresh_race AS SELECT id, v FROM tx_refresh_race;
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=0
+statement ok
+INSERT INTO tx_refresh_race VALUES (2, 20);
+
+onlyif threadid=0
+statement ok
+SELECT sleep_ms(2000);
+
+onlyif threadid=0
+statement ok
+COMMIT;
+
+onlyif threadid=1
+statement ok
+SELECT sleep_ms(500);
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('mv_tx_refresh_race');
+
+endloop
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_tx_refresh_race
+    EXCEPT ALL
+    SELECT * FROM tx_refresh_race
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM tx_refresh_race
+    EXCEPT ALL
+    SELECT * FROM mv_tx_refresh_race
+);
+----
+0

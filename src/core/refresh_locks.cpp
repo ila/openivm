@@ -5,6 +5,7 @@ namespace duckdb {
 std::mutex RefreshLocks::map_mutex_;
 std::unordered_map<string, unique_ptr<std::mutex>> RefreshLocks::view_mutexes_;
 std::unordered_map<string, unique_ptr<std::mutex>> RefreshLocks::delta_mutexes_;
+std::unordered_map<string, unique_ptr<std::mutex>> RefreshLocks::delta_catalog_mutexes_;
 
 std::mutex &RefreshLocks::GetViewMutex(const string &view_name) {
 	std::lock_guard<std::mutex> guard(map_mutex_);
@@ -18,6 +19,15 @@ std::mutex &RefreshLocks::GetViewMutex(const string &view_name) {
 std::mutex &RefreshLocks::GetDeltaMutex(const string &delta_table_name) {
 	std::lock_guard<std::mutex> guard(map_mutex_);
 	auto &entry = delta_mutexes_[delta_table_name];
+	if (!entry) {
+		entry = duckdb::unique_ptr<std::mutex>(new std::mutex());
+	}
+	return *entry;
+}
+
+std::mutex &RefreshLocks::GetDeltaCatalogMutex(const string &catalog_name) {
+	std::lock_guard<std::mutex> guard(map_mutex_);
+	auto &entry = delta_catalog_mutexes_[catalog_name];
 	if (!entry) {
 		entry = duckdb::unique_ptr<std::mutex>(new std::mutex());
 	}
@@ -42,6 +52,14 @@ void RefreshLocks::LockDelta(const string &delta_table_name) {
 
 void RefreshLocks::UnlockDelta(const string &delta_table_name) {
 	GetDeltaMutex(delta_table_name).unlock();
+}
+
+void RefreshLocks::LockDeltaCatalog(const string &catalog_name) {
+	GetDeltaCatalogMutex(catalog_name).lock();
+}
+
+void RefreshLocks::UnlockDeltaCatalog(const string &catalog_name) {
+	GetDeltaCatalogMutex(catalog_name).unlock();
 }
 
 } // namespace duckdb

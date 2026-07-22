@@ -37,13 +37,39 @@ public:
 
 	static void UnlockDelta(const string &delta_table_name);
 
+	// Serializes refresh with transactions that write native delta tables in the same catalog.
+	// The writer holds this lock until transaction commit/rollback so a refresh cannot advance
+	// its timestamp cursor past an uncommitted delta row.
+	static void LockDeltaCatalog(const string &catalog_name);
+
+	static void UnlockDeltaCatalog(const string &catalog_name);
+
 private:
 	static std::mutex &GetViewMutex(const string &view_name);
 	static std::mutex &GetDeltaMutex(const string &delta_table_name);
+	static std::mutex &GetDeltaCatalogMutex(const string &catalog_name);
 
 	static std::mutex map_mutex_;
 	static std::unordered_map<string, unique_ptr<std::mutex>> view_mutexes_;
 	static std::unordered_map<string, unique_ptr<std::mutex>> delta_mutexes_;
+	static std::unordered_map<string, unique_ptr<std::mutex>> delta_catalog_mutexes_;
+};
+
+// RAII guard for catalog-level delta transaction locks.
+class DeltaCatalogLockGuard {
+	string name_;
+
+public:
+	explicit DeltaCatalogLockGuard(const string &catalog_name) : name_(catalog_name) {
+		RefreshLocks::LockDeltaCatalog(name_);
+	}
+	~DeltaCatalogLockGuard() {
+		RefreshLocks::UnlockDeltaCatalog(name_);
+	}
+	DeltaCatalogLockGuard(const DeltaCatalogLockGuard &) = delete;
+	DeltaCatalogLockGuard &operator=(const DeltaCatalogLockGuard &) = delete;
+	DeltaCatalogLockGuard(DeltaCatalogLockGuard &&) = delete;
+	DeltaCatalogLockGuard &operator=(DeltaCatalogLockGuard &&) = delete;
 };
 
 // RAII guard for delta-table locks. Automatically unlocks on scope exit (including exceptions).
