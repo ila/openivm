@@ -22,16 +22,18 @@ static constexpr const char *DELTA_WRITE_STATE_KEY = "openivm_transactional_delt
 
 class TransactionalDeltaWriteState : public ClientContextState {
 public:
-	void Acquire(const string &catalog_name) {
+	void Acquire(Catalog &catalog) {
 		lock_guard<mutex> guard(lock);
 		if (catalog_guard) {
-			if (catalog_name != locked_catalog) {
-				throw InternalException("OpenIVM delta transaction attempted to modify multiple catalogs");
+			if (&catalog != locked_catalog) {
+				throw TransactionException(
+				    "OpenIVM cannot capture delta rows for catalogs '%s' and '%s' in one transaction",
+				    locked_catalog->GetName(), catalog.GetName());
 			}
 			return;
 		}
-		catalog_guard = make_uniq<DeltaCatalogLockGuard>(catalog_name);
-		locked_catalog = catalog_name;
+		catalog_guard = make_uniq<DeltaCatalogWriteGuard>(catalog);
+		locked_catalog = &catalog;
 	}
 
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override {
@@ -51,17 +53,17 @@ private:
 	void Release() {
 		lock_guard<mutex> guard(lock);
 		catalog_guard.reset();
-		locked_catalog.clear();
+		locked_catalog = nullptr;
 	}
 
 	mutex lock;
-	string locked_catalog;
-	unique_ptr<DeltaCatalogLockGuard> catalog_guard;
+	Catalog *locked_catalog = nullptr;
+	unique_ptr<DeltaCatalogWriteGuard> catalog_guard;
 };
 
-static void AcquireDeltaWriteLock(ClientContext &context, const string &catalog_name) {
+static void EnterDeltaWritePhase(ClientContext &context, Catalog &catalog) {
 	auto state = context.registered_state->GetOrCreate<TransactionalDeltaWriteState>(DELTA_WRITE_STATE_KEY);
-	state->Acquire(catalog_name);
+	state->Acquire(catalog);
 }
 
 class TransactionalDeltaCaptureGlobalState : public GlobalOperatorState {
@@ -96,6 +98,7 @@ public:
 	DataChunk update_values;
 	ExpressionExecutor generated_executor;
 	DataChunk generated_values;
+	bool entered_write_phase = false;
 };
 
 class PhysicalTransactionalDeltaCapture : public PhysicalOperator {
@@ -125,9 +128,12 @@ public:
 
 	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
 	                           GlobalOperatorState &gstate_p, OperatorState &state_p) const override {
-		AcquireDeltaWriteLock(context.client, base_table.catalog.GetName());
 		auto &gstate = gstate_p.Cast<TransactionalDeltaCaptureGlobalState>();
 		auto &state = state_p.Cast<TransactionalDeltaCaptureLocalState>();
+		if (!state.entered_write_phase) {
+			EnterDeltaWritePhase(context.client, delta_table.catalog);
+			state.entered_write_phase = true;
+		}
 		lock_guard<mutex> guard(gstate.lock);
 
 		if (mode == DeltaCaptureMode::INSERT) {
@@ -300,6 +306,17 @@ LogicalTransactionalDeltaCapture::LogicalTransactionalDeltaCapture(TableCatalogE
                                                                    optional_idx row_id_index_p)
     : LogicalExtensionOperator(std::move(update_expressions)), base_table(base_table_p), delta_table(delta_table_p),
       mode(mode_p), update_columns(std::move(update_columns_p)), row_id_index(row_id_index_p) {
+	if (mode == DeltaCaptureMode::INSERT) {
+		if (!expressions.empty() || !update_columns.empty() || row_id_index.IsValid()) {
+			throw InternalException("OpenIVM INSERT delta capture received UPDATE/DELETE state");
+		}
+	} else if (!row_id_index.IsValid()) {
+		throw InternalException("OpenIVM DELETE/UPDATE delta capture is missing its row-id column");
+	} else if (mode == DeltaCaptureMode::DELETE && (!expressions.empty() || !update_columns.empty())) {
+		throw InternalException("OpenIVM DELETE delta capture received UPDATE state");
+	} else if (mode == DeltaCaptureMode::UPDATE && expressions.size() != update_columns.size()) {
+		throw InternalException("OpenIVM UPDATE delta capture expression/column counts do not match");
+	}
 }
 
 PhysicalOperator &LogicalTransactionalDeltaCapture::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {

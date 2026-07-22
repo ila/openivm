@@ -318,6 +318,9 @@ INSERT INTO tx_refresh_race VALUES (1, 10);
 statement ok
 CREATE MATERIALIZED VIEW mv_tx_refresh_race AS SELECT id, v FROM tx_refresh_race;
 
+statement ok
+CREATE TABLE tx_refresh_timing (phase VARCHAR, observed_at TIMESTAMP);
+
 concurrentloop threadid 0 2
 
 onlyif threadid=0
@@ -342,9 +345,24 @@ SELECT sleep_ms(500);
 
 onlyif threadid=1
 statement ok
+INSERT INTO tx_refresh_timing VALUES ('before', now()::TIMESTAMP);
+
+onlyif threadid=1
+statement ok
 PRAGMA refresh('mv_tx_refresh_race');
 
+onlyif threadid=1
+statement ok
+INSERT INTO tx_refresh_timing VALUES ('after', now()::TIMESTAMP);
+
 endloop
+
+# Prove refresh began during the writer transaction and waited for its commit.
+query I
+SELECT epoch_ms(max(observed_at)) - epoch_ms(min(observed_at)) >= 1000
+FROM tx_refresh_timing;
+----
+true
 
 query I
 SELECT count(*) FROM (
@@ -360,6 +378,85 @@ SELECT count(*) FROM (
     SELECT * FROM tx_refresh_race
     EXCEPT ALL
     SELECT * FROM mv_tx_refresh_race
+);
+----
+0
+
+# ==========================================
+# Test 7: A child refresh must not advance past an uncommitted parent delta.
+# The sleep keeps the parent refresh transaction open while the child attempts
+# to consume openivm_delta_chain_lock_parent. Cascading is disabled so a missed
+# delta cannot be repaired by a later automatic child refresh.
+# ==========================================
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE chain_lock_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO chain_lock_src VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW chain_lock_parent AS
+    SELECT id, v FROM chain_lock_src WHERE sleep_ms(400) IS NULL;
+
+statement ok
+CREATE MATERIALIZED VIEW chain_lock_child AS
+    SELECT SUM(v) AS total FROM chain_lock_parent;
+
+statement ok
+INSERT INTO chain_lock_src VALUES (2, 20);
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+PRAGMA refresh('chain_lock_parent');
+
+onlyif threadid=1
+statement ok
+SELECT sleep_ms(150);
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('chain_lock_child');
+
+endloop
+
+query I
+SELECT count(*) FROM (
+    SELECT id, v FROM chain_lock_parent
+    EXCEPT ALL
+    SELECT id, v FROM chain_lock_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, v FROM chain_lock_src
+    EXCEPT ALL
+    SELECT id, v FROM chain_lock_parent
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT total FROM chain_lock_child
+    EXCEPT ALL
+    SELECT SUM(v) AS total FROM chain_lock_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT SUM(v) AS total FROM chain_lock_src
+    EXCEPT ALL
+    SELECT total FROM chain_lock_child
 );
 ----
 0

@@ -55,9 +55,17 @@ public:
 		string schema_name;
 		string table_name;
 	};
+	struct DeltaSource {
+		string table_name;
+		string catalog_type;
+		string catalog_name;
+		string schema_name;
+	};
 
 	SourceLocation GetSourceLocation(const string &view_name, const string &table_name,
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
+	vector<DeltaSource> GetDeltaSources(const string &view_name, const string &fallback_catalog = "",
+	                                    const string &fallback_schema = "");
 	string ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
 
@@ -80,6 +88,7 @@ public:
 	// Get all downstream MV dependents in topological order (closest first).
 	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
 	vector<string> GetDownstreamViews(const string &view_name);
+	bool HasDownstreamViews(const string &view_name);
 
 	// Get refresh_interval in seconds for a view. Returns -1 if not set (manual only).
 	int64_t GetRefreshInterval(const string &view_name);

@@ -24,9 +24,19 @@
 
 namespace duckdb {
 
-static bool IsTrackedBaseTable(ClientContext &context, const string &table_name) {
-	Connection con(*context.db);
-	return RefreshMetadata(con).IsBaseTable(table_name);
+static optional_ptr<TableCatalogEntry> TryGetTrackedDeltaTable(ClientContext &context, TableCatalogEntry &table) {
+	const auto &table_name = table.name;
+	if (table_name.empty() || SqlUtils::IsDelta(table_name) || IncrementalTableNames::IsDataTable(table_name) ||
+	    table.catalog.GetCatalogType() == "ducklake") {
+		return nullptr;
+	}
+	auto delta_table =
+	    Catalog::GetEntry<TableCatalogEntry>(context, table.catalog.GetName(), table.schema.name,
+	                                         SqlUtils::DeltaName(table_name), OnEntryNotFound::RETURN_NULL);
+	if (!delta_table) {
+		return nullptr;
+	}
+	return &delta_table->Cast<TableCatalogEntry>();
 }
 
 static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert &insert) {
@@ -65,6 +75,59 @@ static idx_t FindExpressionBindingIndex(LogicalOperator &child, const Expression
 		}
 	}
 	throw InternalException("OpenIVM could not resolve the DML row-id binding");
+}
+
+static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate &update) {
+	bool has_default = false;
+	for (auto &expression : update.expressions) {
+		has_default = has_default || expression->type == ExpressionType::VALUE_DEFAULT;
+	}
+	if (!has_default) {
+		return;
+	}
+
+	auto child_bindings = update.children[0]->GetColumnBindings();
+	auto child_types = update.children[0]->types;
+	if (child_bindings.empty() || child_bindings.size() != child_types.size()) {
+		throw InternalException("OpenIVM cannot normalize UPDATE defaults without a row-id input");
+	}
+
+	auto projection_index = input.optimizer.binder.GenerateTableIndex();
+	vector<unique_ptr<Expression>> projection_expressions;
+	projection_expressions.reserve(child_bindings.size() + update.expressions.size());
+	for (idx_t index = 0; index + 1 < child_bindings.size(); index++) {
+		projection_expressions.push_back(
+		    make_uniq<BoundColumnRefExpression>(child_types[index], child_bindings[index]));
+	}
+
+	vector<idx_t> default_indexes(update.expressions.size(), DConstants::INVALID_INDEX);
+	for (idx_t index = 0; index < update.expressions.size(); index++) {
+		if (update.expressions[index]->type != ExpressionType::VALUE_DEFAULT) {
+			continue;
+		}
+		default_indexes[index] = projection_expressions.size();
+		projection_expressions.push_back(update.bound_defaults[update.columns[index].index]->Copy());
+	}
+
+	const auto row_id_output_index = projection_expressions.size();
+	projection_expressions.push_back(make_uniq<BoundColumnRefExpression>(child_types.back(), child_bindings.back()));
+	for (idx_t index = 0; index < update.expressions.size(); index++) {
+		auto return_type = update.expressions[index]->return_type;
+		idx_t output_index;
+		if (default_indexes[index] != DConstants::INVALID_INDEX) {
+			output_index = default_indexes[index];
+		} else {
+			output_index = FindExpressionBindingIndex(*update.children[0], *update.expressions[index]);
+			D_ASSERT(output_index + 1 < child_bindings.size());
+		}
+		update.expressions[index] =
+		    make_uniq<BoundColumnRefExpression>(return_type, ColumnBinding(projection_index, output_index));
+	}
+
+	auto projection = make_uniq<LogicalProjection>(projection_index, std::move(projection_expressions));
+	projection->children.push_back(std::move(update.children[0]));
+	update.children[0] = std::move(projection);
+	D_ASSERT(update.children[0]->GetColumnBindings().size() == row_id_output_index + 1);
 }
 
 RefreshInsertRule::RefreshInsertRule() {
@@ -247,19 +310,13 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 	case LogicalOperatorType::LOGICAL_INSERT: {
 		auto &insert = dml->Cast<LogicalInsert>();
 		const auto &table_name = insert.table.name;
-		if (SqlUtils::IsDelta(table_name) || table_name.empty() || IncrementalTableNames::IsDataTable(table_name) ||
-		    insert.table.catalog.GetCatalogType() == "ducklake") {
-			return;
-		}
-		auto delta_table = Catalog::GetEntry<TableCatalogEntry>(
-		    input.context, insert.table.catalog.GetName(), insert.table.schema.name, SqlUtils::DeltaName(table_name),
-		    OnEntryNotFound::RETURN_NULL);
-		if (!delta_table || !IsTrackedBaseTable(input.context, table_name)) {
+		auto delta_table = TryGetTrackedDeltaTable(input.context, insert.table);
+		if (!delta_table) {
 			return;
 		}
 		ResolveInsertDefaults(input, insert);
-		auto capture = make_uniq<LogicalTransactionalDeltaCapture>(insert.table, delta_table->Cast<TableCatalogEntry>(),
-		                                                           DeltaCaptureMode::INSERT);
+		auto capture =
+		    make_uniq<LogicalTransactionalDeltaCapture>(insert.table, *delta_table, DeltaCaptureMode::INSERT);
 		capture->children.push_back(std::move(insert.children[0]));
 		insert.children[0] = std::move(capture);
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional INSERT delta capture for '%s'\n", table_name.c_str());
@@ -268,21 +325,15 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 	case LogicalOperatorType::LOGICAL_DELETE: {
 		auto &delete_op = dml->Cast<LogicalDelete>();
 		const auto &table_name = delete_op.table.name;
-		if (SqlUtils::IsDelta(table_name) || IncrementalTableNames::IsDataTable(table_name) ||
-		    delete_op.table.catalog.GetCatalogType() == "ducklake") {
-			return;
-		}
-		auto delta_table = Catalog::GetEntry<TableCatalogEntry>(
-		    input.context, delete_op.table.catalog.GetName(), delete_op.table.schema.name,
-		    SqlUtils::DeltaName(table_name), OnEntryNotFound::RETURN_NULL);
-		if (!delta_table || !IsTrackedBaseTable(input.context, table_name)) {
+		auto delta_table = TryGetTrackedDeltaTable(input.context, delete_op.table);
+		if (!delta_table) {
 			return;
 		}
 		D_ASSERT(delete_op.expressions.size() == 1);
 		auto row_id_index = FindExpressionBindingIndex(*delete_op.children[0], *delete_op.expressions[0]);
 		auto capture = make_uniq<LogicalTransactionalDeltaCapture>(
-		    delete_op.table, delta_table->Cast<TableCatalogEntry>(), DeltaCaptureMode::DELETE,
-		    vector<unique_ptr<Expression>> {}, vector<PhysicalIndex> {}, optional_idx(row_id_index));
+		    delete_op.table, *delta_table, DeltaCaptureMode::DELETE, vector<unique_ptr<Expression>> {},
+		    vector<PhysicalIndex> {}, optional_idx(row_id_index));
 		capture->children.push_back(std::move(delete_op.children[0]));
 		delete_op.children[0] = std::move(capture);
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional DELETE delta capture for '%s'\n", table_name.c_str());
@@ -291,29 +342,20 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 	case LogicalOperatorType::LOGICAL_UPDATE: {
 		auto &update = dml->Cast<LogicalUpdate>();
 		const auto &table_name = update.table.name;
-		if (SqlUtils::IsDelta(table_name) || IncrementalTableNames::IsDataTable(table_name) ||
-		    update.table.catalog.GetCatalogType() == "ducklake") {
+		auto delta_table = TryGetTrackedDeltaTable(input.context, update.table);
+		if (!delta_table) {
 			return;
 		}
-		auto delta_table = Catalog::GetEntry<TableCatalogEntry>(
-		    input.context, update.table.catalog.GetName(), update.table.schema.name, SqlUtils::DeltaName(table_name),
-		    OnEntryNotFound::RETURN_NULL);
-		if (!delta_table || !IsTrackedBaseTable(input.context, table_name)) {
-			return;
-		}
+		ResolveUpdateDefaults(input, update);
 		vector<unique_ptr<Expression>> update_expressions;
 		update_expressions.reserve(update.expressions.size());
 		for (idx_t index = 0; index < update.expressions.size(); index++) {
-			if (update.expressions[index]->type == ExpressionType::VALUE_DEFAULT) {
-				update_expressions.push_back(update.bound_defaults[update.columns[index].index]->Copy());
-			} else {
-				update_expressions.push_back(update.expressions[index]->Copy());
-			}
+			update_expressions.push_back(update.expressions[index]->Copy());
 		}
 		auto row_id_index = update.children[0]->GetColumnBindings().size() - 1;
-		auto capture = make_uniq<LogicalTransactionalDeltaCapture>(
-		    update.table, delta_table->Cast<TableCatalogEntry>(), DeltaCaptureMode::UPDATE,
-		    std::move(update_expressions), update.columns, optional_idx(row_id_index));
+		auto capture = make_uniq<LogicalTransactionalDeltaCapture>(update.table, *delta_table, DeltaCaptureMode::UPDATE,
+		                                                           std::move(update_expressions), update.columns,
+		                                                           optional_idx(row_id_index));
 		capture->children.push_back(std::move(update.children[0]));
 		update.children[0] = std::move(capture);
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional UPDATE delta capture for '%s'\n", table_name.c_str());

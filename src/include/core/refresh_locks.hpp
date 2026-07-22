@@ -3,6 +3,7 @@
 
 #include "duckdb.hpp"
 
+#include <condition_variable>
 #include <mutex>
 #include <unordered_map>
 
@@ -13,9 +14,26 @@ namespace duckdb {
 // Per-view mutex: prevents two concurrent refreshes of the same MV (which would
 // cause write-write conflicts on the MV table).
 //
-// Per-delta-table mutex: serializes the refresh's "read deltas + set last_update"
-// critical section with the insert rule's delta row writes. This closes the window
-// where concurrent DML deltas could be permanently skipped.
+// Per-delta-table mutex: serializes refreshes that consume the same delta table.
+//
+// Per-catalog phase gate: allows concurrent DML writers and concurrent refreshes, but
+// prevents those two phases from overlapping. This closes the window where refresh
+// could advance a watermark past a delta row that commits afterward.
+class DeltaCatalogPhaseGate {
+public:
+	void EnterWrite();
+	void ExitWrite();
+	void EnterRefresh();
+	void ExitRefresh();
+
+private:
+	mutex lock;
+	std::condition_variable condition;
+	idx_t active_writers = 0;
+	idx_t active_refreshes = 0;
+	idx_t waiting_refreshes = 0;
+};
+
 class RefreshLocks {
 public:
 	// --- View-level locks (prevent concurrent refresh of same MV) ---
@@ -29,47 +47,61 @@ public:
 
 	static void UnlockView(const string &view_name);
 
-	// --- Delta-table-level locks (serialize delta reads/writes) ---
+	// --- Delta-table-level locks (serialize overlapping refreshes) ---
 
-	// Blocking lock — held briefly by both refresh (read + timestamp update)
-	// and insert rule (delta row write).
+	// Blocking lock held by refresh while consuming and checkpointing one delta table.
 	static void LockDelta(const string &delta_table_name);
 
 	static void UnlockDelta(const string &delta_table_name);
 
-	// Serializes refresh with transactions that write native delta tables in the same catalog.
-	// The writer holds this lock until transaction commit/rollback so a refresh cannot advance
-	// its timestamp cursor past an uncommitted delta row.
-	static void LockDeltaCatalog(const string &catalog_name);
-
-	static void UnlockDeltaCatalog(const string &catalog_name);
+	static void EnterDeltaWrite(Catalog &catalog);
+	static void ExitDeltaWrite(Catalog &catalog);
+	static void EnterDeltaRefresh(Catalog &catalog);
+	static void ExitDeltaRefresh(Catalog &catalog);
 
 private:
 	static std::mutex &GetViewMutex(const string &view_name);
 	static std::mutex &GetDeltaMutex(const string &delta_table_name);
-	static std::mutex &GetDeltaCatalogMutex(const string &catalog_name);
+	static DeltaCatalogPhaseGate &GetDeltaCatalogGate(Catalog &catalog);
 
 	static std::mutex map_mutex_;
 	static std::unordered_map<string, unique_ptr<std::mutex>> view_mutexes_;
 	static std::unordered_map<string, unique_ptr<std::mutex>> delta_mutexes_;
-	static std::unordered_map<string, unique_ptr<std::mutex>> delta_catalog_mutexes_;
+	static std::unordered_map<const Catalog *, unique_ptr<DeltaCatalogPhaseGate>> delta_catalog_gates_;
 };
 
-// RAII guard for catalog-level delta transaction locks.
-class DeltaCatalogLockGuard {
-	string name_;
+// Write guards can be retained by transaction state and released from the commit thread;
+// unlike std::mutex ownership, phase-gate membership is not tied to one OS thread.
+class DeltaCatalogWriteGuard {
+	Catalog *catalog;
 
 public:
-	explicit DeltaCatalogLockGuard(const string &catalog_name) : name_(catalog_name) {
-		RefreshLocks::LockDeltaCatalog(name_);
+	explicit DeltaCatalogWriteGuard(Catalog &catalog_p) : catalog(&catalog_p) {
+		RefreshLocks::EnterDeltaWrite(*catalog);
 	}
-	~DeltaCatalogLockGuard() {
-		RefreshLocks::UnlockDeltaCatalog(name_);
+	~DeltaCatalogWriteGuard() {
+		RefreshLocks::ExitDeltaWrite(*catalog);
 	}
-	DeltaCatalogLockGuard(const DeltaCatalogLockGuard &) = delete;
-	DeltaCatalogLockGuard &operator=(const DeltaCatalogLockGuard &) = delete;
-	DeltaCatalogLockGuard(DeltaCatalogLockGuard &&) = delete;
-	DeltaCatalogLockGuard &operator=(DeltaCatalogLockGuard &&) = delete;
+	DeltaCatalogWriteGuard(const DeltaCatalogWriteGuard &) = delete;
+	DeltaCatalogWriteGuard &operator=(const DeltaCatalogWriteGuard &) = delete;
+	DeltaCatalogWriteGuard(DeltaCatalogWriteGuard &&) = delete;
+	DeltaCatalogWriteGuard &operator=(DeltaCatalogWriteGuard &&) = delete;
+};
+
+class DeltaCatalogRefreshGuard {
+	Catalog *catalog;
+
+public:
+	explicit DeltaCatalogRefreshGuard(Catalog &catalog_p) : catalog(&catalog_p) {
+		RefreshLocks::EnterDeltaRefresh(*catalog);
+	}
+	~DeltaCatalogRefreshGuard() {
+		RefreshLocks::ExitDeltaRefresh(*catalog);
+	}
+	DeltaCatalogRefreshGuard(const DeltaCatalogRefreshGuard &) = delete;
+	DeltaCatalogRefreshGuard &operator=(const DeltaCatalogRefreshGuard &) = delete;
+	DeltaCatalogRefreshGuard(DeltaCatalogRefreshGuard &&) = delete;
+	DeltaCatalogRefreshGuard &operator=(DeltaCatalogRefreshGuard &&) = delete;
 };
 
 // RAII guard for delta-table locks. Automatically unlocks on scope exit (including exceptions).

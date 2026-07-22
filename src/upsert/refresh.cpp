@@ -118,24 +118,51 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 	RefreshProfiler profiler(context, vn);
 	auto lock_start = std::chrono::steady_clock::now();
 	ViewLockGuard view_guard(vn);
-	auto &view_catalog = Catalog::GetCatalog(context, view_catalog_name);
-	DeltaCatalogLockGuard delta_catalog_guard(view_catalog.GetName());
+	Connection probe_con(*context.db.get());
+	RefreshMetadata probe_meta(probe_con);
+	auto delta_sources = probe_meta.GetDeltaSources(vn, view_catalog_name, view_schema_name);
+	vector<string> delta_table_names;
+	delta_table_names.reserve(delta_sources.size());
+
+	// Enter the refresh phase for every native source catalog before inspecting delta activity.
+	// Writers enter the complementary phase through the actual delta table catalog, so this also
+	// covers views whose target and source catalogs differ.
+	vector<string> source_catalog_names;
+	for (auto &source : delta_sources) {
+		delta_table_names.push_back(source.table_name);
+		if (source.catalog_type != "ducklake") {
+			source_catalog_names.push_back(Catalog::GetCatalog(context, source.catalog_name).GetName());
+		}
+	}
+	std::sort(source_catalog_names.begin(), source_catalog_names.end());
+	source_catalog_names.erase(std::unique(source_catalog_names.begin(), source_catalog_names.end()),
+	                           source_catalog_names.end());
+	vector<unique_ptr<DeltaCatalogRefreshGuard>> delta_catalog_guards;
+	for (auto &catalog_name : source_catalog_names) {
+		delta_catalog_guards.push_back(make_uniq<DeltaCatalogRefreshGuard>(Catalog::GetCatalog(context, catalog_name)));
+	}
 	// Acquire delta-table locks in sorted order to serialize parallel refreshes that
 	// share base tables (e.g. mv_A and mv_B both reading STOCK → both write to
 	// `delta_STOCK` inside their transactions → "Conflict on tuple deletion!" when
 	// the second tx tries to delete rows the first already processed). Sorting
 	// guarantees the same acquisition order across all views, so no deadlock is
 	// possible between concurrent refreshes.
+	auto delta_lock_names = delta_table_names;
+	if (probe_meta.HasDownstreamViews(vn)) {
+		// A parent refresh produces this delta while a child refresh consumes it.
+		// Put both operations under the same table lock so a child cannot advance
+		// its watermark past an uncommitted parent delta.
+		delta_lock_names.push_back(SqlUtils::DeltaName(vn));
+	}
 	vector<unique_ptr<DeltaLockGuard>> delta_guards;
-	Connection probe_con(*context.db.get());
-	RefreshMetadata probe_meta(probe_con);
-	auto delta_table_names = probe_meta.GetDeltaTables(vn);
-	std::sort(delta_table_names.begin(), delta_table_names.end());
-	delta_table_names.erase(std::unique(delta_table_names.begin(), delta_table_names.end()), delta_table_names.end());
-	for (auto &dt : delta_table_names) {
+	std::sort(delta_lock_names.begin(), delta_lock_names.end());
+	delta_lock_names.erase(std::unique(delta_lock_names.begin(), delta_lock_names.end()), delta_lock_names.end());
+	for (auto &dt : delta_lock_names) {
 		delta_guards.push_back(make_uniq<DeltaLockGuard>(dt));
 	}
-	profiler.AddStep("acquire_locks", lock_start, to_string(delta_table_names.size()) + " delta locks");
+	profiler.AddStep("acquire_locks", lock_start,
+	                 to_string(source_catalog_names.size()) + " catalog gates, " + to_string(delta_lock_names.size()) +
+	                     " delta locks");
 	DeltaActivityResult delta_activity;
 	DeltaActivityResult *precomputed_delta_activity = nullptr;
 	if (skip_empty_refresh) {

@@ -122,6 +122,28 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 	return loc;
 }
 
+vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
+                                                                      const string &fallback_catalog,
+                                                                      const string &fallback_schema) {
+	auto result = con.Query("SELECT table_name, catalog_type, source_catalog, source_schema FROM " +
+	                        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
+	vector<DeltaSource> sources;
+	if (result->HasError()) {
+		return sources;
+	}
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		DeltaSource source;
+		source.table_name = result->GetValue(0, row).ToString();
+		source.catalog_type = result->GetValue(1, row).IsNull() ? "duckdb" : result->GetValue(1, row).ToString();
+		source.catalog_name =
+		    result->GetValue(2, row).IsNull() ? fallback_catalog : result->GetValue(2, row).ToString();
+		source.schema_name = result->GetValue(3, row).IsNull() ? fallback_schema : result->GetValue(3, row).ToString();
+		sources.push_back(std::move(source));
+	}
+	return sources;
+}
+
 string RefreshMetadata::ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
                                                   const string &fallback_catalog, const string &fallback_schema) {
 	auto loc = GetSourceLocation(view_name, delta_table_name, fallback_catalog, fallback_schema);
@@ -257,6 +279,12 @@ vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
 	collect(view_name);
 	std::reverse(result.begin(), result.end());
 	return result; // topological order: downstream parents before fan-in children
+}
+
+bool RefreshMetadata::HasDownstreamViews(const string &view_name) {
+	auto result = con.Query("SELECT 1 FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
+	                        SqlUtils::EscapeValue(SqlUtils::DeltaName(view_name)) + "' LIMIT 1");
+	return !result->HasError() && result->RowCount() > 0;
 }
 
 vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
