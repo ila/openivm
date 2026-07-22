@@ -15,9 +15,10 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
   appends through the caller's `ClientContext`, so base DML and delta rows share one commit or rollback. A resolved
   catalog-level lock prevents refresh from advancing its watermark past an uncommitted delta. Regression coverage includes
   rollback, constraint failure, defaults, generated columns, `RETURNING`, and an uncommitted DML/refresh race.
-- [ ] **Capture actual `ON CONFLICT` outcomes.** `INSERT ... ON CONFLICT DO UPDATE` and `INSERT OR REPLACE` do not emit the
-  required delete-old/insert-new delta pair. Derive deltas from rows actually inserted or updated, not merely the input to
-  `LogicalInsert`.
+- [x] **Capture actual `ON CONFLICT` outcomes.** Conflict clauses lower to `LogicalMergeInto`; a transparent physical action
+  decorator now captures only the INSERT, UPDATE, and DELETE rows selected by DuckDB after match and action predicates are
+  resolved. Updates emit the required delete-old/insert-new pair, volatile defaults are evaluated once, `RETURNING` is
+  preserved, and all writes remain in the base DML transaction. The same boundary also covers native `MERGE` actions.
 - [ ] **Make MV lifecycle and native refresh transactional.** CREATE, REPLACE, DROP, ALTER, and `PRAGMA refresh` currently
   execute material work through helper autocommit connections. Caller rollback cannot restore a consistent collection of
   user view, backing table, metadata, and deltas; failed replacement can destroy the old MV. Use the caller transaction for

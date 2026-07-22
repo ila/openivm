@@ -1426,3 +1426,355 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Actual outcomes for ON CONFLICT / OR REPLACE
+# ==========================================
+
+statement ok
+CREATE TABLE conflict_src (
+    id INTEGER PRIMARY KEY,
+    v INTEGER NOT NULL DEFAULT 7,
+    label VARCHAR
+);
+
+statement ok
+INSERT INTO conflict_src VALUES (1, 10, 'one'), (2, 20, 'two');
+
+statement ok
+CREATE MATERIALIZED VIEW conflict_mv AS SELECT id, v, label FROM conflict_src;
+
+# The rejected id=1 input is not an affected row and must not become a delta.
+query III
+INSERT INTO conflict_src VALUES (1, 999, 'ignored'), (3, 30, 'three')
+ON CONFLICT DO NOTHING
+RETURNING id, v, label;
+----
+3	30	three
+
+query III
+SELECT id, v, openivm_multiplicity
+FROM openivm_delta_conflict_src
+ORDER BY id, openivm_multiplicity;
+----
+3	30	1
+
+statement ok
+PRAGMA refresh('conflict_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_mv
+    EXCEPT ALL
+    SELECT * FROM conflict_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_src
+    EXCEPT ALL
+    SELECT * FROM conflict_mv
+);
+----
+0
+
+statement ok
+DELETE FROM openivm_delta_conflict_src;
+
+# Action predicates are resolved by DuckDB before capture: id=2 performs DO NOTHING,
+# id=1 updates, and id=4 inserts.
+query III
+INSERT INTO conflict_src VALUES (1, 5, 'one-updated'), (2, -1, 'ignored'), (4, 40, 'four')
+ON CONFLICT(id) DO UPDATE
+SET v = conflict_src.v + excluded.v, label = excluded.label
+WHERE excluded.v > 0
+RETURNING id, v, label;
+----
+1	15	one-updated
+4	40	four
+
+query III
+SELECT id, v, openivm_multiplicity
+FROM openivm_delta_conflict_src
+ORDER BY id, openivm_multiplicity, v;
+----
+1	10	-1
+1	15	1
+4	40	1
+
+statement ok
+PRAGMA refresh('conflict_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_mv
+    EXCEPT ALL
+    SELECT * FROM conflict_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_src
+    EXCEPT ALL
+    SELECT * FROM conflict_mv
+);
+----
+0
+
+statement ok
+DELETE FROM openivm_delta_conflict_src;
+
+# OR REPLACE is an update for the conflicting row and an insert for the fresh row.
+query III
+INSERT OR REPLACE INTO conflict_src VALUES (1, 50, 'replaced'), (5, 50, 'five')
+RETURNING id, v, label;
+----
+1	50	replaced
+5	50	five
+
+query III
+SELECT id, v, openivm_multiplicity
+FROM openivm_delta_conflict_src
+ORDER BY id, openivm_multiplicity, v;
+----
+1	15	-1
+1	50	1
+5	50	1
+
+statement ok
+PRAGMA refresh('conflict_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_mv
+    EXCEPT ALL
+    SELECT * FROM conflict_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_src
+    EXCEPT ALL
+    SELECT * FROM conflict_mv
+);
+----
+0
+
+# Capture runs before DuckDB's action sink. A failed conflict update must roll back
+# both its provisional deltas and the base-table statement.
+statement ok
+DELETE FROM openivm_delta_conflict_src;
+
+statement error
+INSERT INTO conflict_src VALUES (1, 1, 'bad')
+ON CONFLICT(id) DO UPDATE SET v = NULL;
+----
+NOT NULL
+
+query I
+SELECT count(*) FROM openivm_delta_conflict_src;
+----
+0
+
+# Batch conflict update/insert, replacement, UPDATE, and DELETE before one refresh.
+# id=6 is inserted, updated, and deleted in the same batch.
+statement ok
+INSERT INTO conflict_src VALUES (1, 1, 'again'), (6, 60, 'six')
+ON CONFLICT(id) DO UPDATE SET v = conflict_src.v + excluded.v, label = excluded.label;
+
+statement ok
+INSERT OR REPLACE INTO conflict_src VALUES (4, 44, 'four-replaced');
+
+statement ok
+UPDATE conflict_src SET v = 66 WHERE id = 6;
+
+statement ok
+DELETE FROM conflict_src WHERE id = 6;
+
+query I
+SELECT count(*) FROM openivm_delta_conflict_src;
+----
+8
+
+statement ok
+PRAGMA refresh('conflict_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_mv
+    EXCEPT ALL
+    SELECT * FROM conflict_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_src
+    EXCEPT ALL
+    SELECT * FROM conflict_mv
+);
+----
+0
+
+# A volatile UPDATE DEFAULT is evaluated once and shared by capture and the action sink.
+statement ok
+CREATE SEQUENCE conflict_default_seq START 100;
+
+statement ok
+CREATE TABLE conflict_default_src (
+    id INTEGER PRIMARY KEY,
+    v BIGINT DEFAULT nextval('conflict_default_seq')
+);
+
+statement ok
+INSERT INTO conflict_default_src VALUES (1, 0);
+
+statement ok
+CREATE MATERIALIZED VIEW conflict_default_mv AS SELECT id, v FROM conflict_default_src;
+
+query II
+INSERT INTO conflict_default_src(id) VALUES (1)
+ON CONFLICT(id) DO UPDATE SET v = DEFAULT
+RETURNING id, v;
+----
+1	101
+
+query III
+SELECT id, v, openivm_multiplicity
+FROM openivm_delta_conflict_default_src
+ORDER BY openivm_multiplicity;
+----
+1	0	-1
+1	101	1
+
+statement ok
+PRAGMA refresh('conflict_default_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_default_mv
+    EXCEPT ALL
+    SELECT * FROM conflict_default_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_default_src
+    EXCEPT ALL
+    SELECT * FROM conflict_default_mv
+);
+----
+0
+
+# Generated delta columns are evaluated from both the old and resolved new row.
+statement ok
+CREATE TABLE conflict_generated_src (
+    id INTEGER PRIMARY KEY,
+    a INTEGER,
+    doubled INTEGER GENERATED ALWAYS AS (a * 2)
+);
+
+statement ok
+INSERT INTO conflict_generated_src(id, a) VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW conflict_generated_mv AS
+SELECT id, a, doubled FROM conflict_generated_src;
+
+statement ok
+INSERT INTO conflict_generated_src(id, a) VALUES (1, 5), (2, 20)
+ON CONFLICT(id) DO UPDATE SET a = conflict_generated_src.a + excluded.a;
+
+query IIII
+SELECT id, a, doubled, openivm_multiplicity
+FROM openivm_delta_conflict_generated_src
+ORDER BY id, openivm_multiplicity;
+----
+1	10	20	-1
+1	15	30	1
+2	20	40	1
+
+statement ok
+PRAGMA refresh('conflict_generated_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_generated_mv
+    EXCEPT ALL
+    SELECT * FROM conflict_generated_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM conflict_generated_src
+    EXCEPT ALL
+    SELECT * FROM conflict_generated_mv
+);
+----
+0
+
+# Native MERGE uses the same resolved action boundary. Exercise DELETE, UPDATE,
+# and INSERT actions together, including action-specific RETURNING rows.
+statement ok
+CREATE TABLE merge_src (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO merge_src VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW merge_mv AS SELECT id, v FROM merge_src;
+
+query TII
+MERGE INTO merge_src
+USING (VALUES (1, 5), (2, -1), (3, 30)) changes(id, v)
+ON merge_src.id = changes.id
+WHEN MATCHED AND changes.v < 0 THEN DELETE
+WHEN MATCHED THEN UPDATE SET v = merge_src.v + changes.v
+WHEN NOT MATCHED THEN INSERT VALUES (changes.id, changes.v)
+RETURNING merge_action, id, v;
+----
+DELETE	2	20
+UPDATE	1	15
+INSERT	3	30
+
+query III
+SELECT id, v, openivm_multiplicity
+FROM openivm_delta_merge_src
+ORDER BY id, openivm_multiplicity;
+----
+1	10	-1
+1	15	1
+2	20	-1
+3	30	1
+
+statement ok
+PRAGMA refresh('merge_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM merge_mv
+    EXCEPT ALL
+    SELECT * FROM merge_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM merge_src
+    EXCEPT ALL
+    SELECT * FROM merge_mv
+);
+----
+0

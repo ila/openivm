@@ -18,6 +18,7 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
@@ -297,13 +298,15 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		return;
 	}
 
-	auto dml = root;
+	auto dml_owner = &plan;
+	auto dml = dml_owner->get();
 	while (dml->type != LogicalOperatorType::LOGICAL_INSERT && dml->type != LogicalOperatorType::LOGICAL_DELETE &&
-	       dml->type != LogicalOperatorType::LOGICAL_UPDATE) {
+	       dml->type != LogicalOperatorType::LOGICAL_UPDATE && dml->type != LogicalOperatorType::LOGICAL_MERGE_INTO) {
 		if (dml->children.size() != 1) {
 			return;
 		}
-		dml = dml->children[0].get();
+		dml_owner = &dml->children[0];
+		dml = dml_owner->get();
 	}
 
 	switch (dml->type) {
@@ -359,6 +362,19 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		capture->children.push_back(std::move(update.children[0]));
 		update.children[0] = std::move(capture);
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional UPDATE delta capture for '%s'\n", table_name.c_str());
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_MERGE_INTO: {
+		auto &merge = dml->Cast<LogicalMergeInto>();
+		const auto &table_name = merge.table.name;
+		auto delta_table = TryGetTrackedDeltaTable(input.context, merge.table);
+		if (!delta_table) {
+			return;
+		}
+		auto capture = make_uniq<LogicalTransactionalMergeDeltaCapture>(merge.table, *delta_table);
+		capture->children.push_back(std::move(*dml_owner));
+		*dml_owner = std::move(capture);
+		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional MERGE action delta capture for '%s'\n", table_name.c_str());
 		break;
 	}
 	default:

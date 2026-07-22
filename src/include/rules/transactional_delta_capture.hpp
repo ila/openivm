@@ -35,6 +35,27 @@ protected:
 	void ResolveTypes() override;
 };
 
+// Transparent wrapper around a LogicalMergeInto. At physical-plan creation it decorates
+// DuckDB's resolved action sinks, so only rows that actually INSERT/UPDATE/DELETE are captured.
+class LogicalTransactionalMergeDeltaCapture : public LogicalExtensionOperator {
+public:
+	LogicalTransactionalMergeDeltaCapture(TableCatalogEntry &base_table, TableCatalogEntry &delta_table);
+
+	TableCatalogEntry &base_table;
+	TableCatalogEntry &delta_table;
+
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
+	vector<ColumnBinding> GetColumnBindings() override;
+	string GetName() const override;
+	string GetExtensionName() const override;
+	bool SupportSerialization() const override {
+		return false;
+	}
+
+protected:
+	void ResolveTypes() override;
+};
+
 } // namespace duckdb
 
 #endif // TRANSACTIONAL_DELTA_CAPTURE_HPP
