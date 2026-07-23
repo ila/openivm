@@ -28,8 +28,10 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
 - [x] **Continue cascade traversal when the current node has no source deltas.** Empty-delta detection now skips only the
   current node; it cannot terminate traversal of the downstream DAG. Regression coverage exercises both a pending parent
   delta left by a cascade-off refresh and independent child-source DML, including the hook-aware empty-node path.
-- [ ] **Use NULL-safe affected-window partition matching.** `IN` does not select a NULL partition even though SQL window
-  partitioning groups NULL values. Join the affected-key relation with `IS NOT DISTINCT FROM` for every partition key.
+- [x] **Use NULL-safe affected-window partition matching.** Affected-key refresh now uses hash-semi-joinable
+  `IS NOT DISTINCT FROM` predicates for standard, cascade, running-window, and DuckLake paths. Regression coverage includes
+  batched conflicting DML on single and composite NULL partitions plus a DuckLake TPCC window whose delivery timestamp moves
+  from the NULL partition to a non-NULL partition.
 - [ ] **Preserve `SUM` NULL semantics.** Weighted SUM alone cannot distinguish numeric zero from no non-NULL inputs. Persist
   a hidden `COUNT(sum_argument)` and render NULL when that count reaches zero.
 - [ ] **Use an unconditional row count for group existence.** `COUNT(nullable_expression)=0` does not mean a group is empty.

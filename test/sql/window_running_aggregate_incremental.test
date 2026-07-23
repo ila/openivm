@@ -18,7 +18,9 @@ INSERT INTO wrai_sales VALUES
     (1, 'a', 1, 10),
     (2, 'a', 2, 5),
     (3, 'b', 1, 7),
-    (4, 'c', 1, 3);
+    (4, 'c', 1, 3),
+    (11, NULL, 1, 4),
+    (12, NULL, 2, 6);
 
 statement ok
 CREATE MATERIALIZED VIEW wrai_sum_mv AS
@@ -34,7 +36,8 @@ statement ok
 INSERT INTO wrai_sales VALUES
     (5, 'a', 3, 8),
     (6, 'b', 2, 9),
-    (7, 'c', 2, 4);
+    (7, 'c', 2, 4),
+    (13, NULL, 3, 2);
 
 query I
 SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_run_fast_wrai_sum_mv%'
@@ -94,7 +97,8 @@ statement ok
 INSERT INTO wrai_sales VALUES
     (8, 'a', 0, 11),
     (9, 'b', 3, 2),
-    (10, 'd', 1, 6);
+    (10, 'd', 1, 6),
+    (14, NULL, 0, 13);
 
 statement ok
 PRAGMA refresh('wrai_sum_mv');

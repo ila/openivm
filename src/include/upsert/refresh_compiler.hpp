@@ -53,7 +53,6 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const string &catalog_prefix = "", const vector<string> &partition_columns = {},
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {},
                               bool emit_cascade_delta = false, const string &affected_keys_sql = "",
-                              const string &affected_key_cols = "", const string &affected_key_tuple = "",
                               const vector<string> &column_names = {}, bool running_window_incremental = false);
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
 
