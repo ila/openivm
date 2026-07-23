@@ -25,9 +25,9 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
   DuckDB query-pragma preprocessing ends a transaction before its returned program completes; `refresh.cpp` records the
   native-operator follow-up. DuckLake replacement materializes data and auxiliary state under unpublished staging names
   before publishing them.
-- [ ] **Continue cascade traversal when the current node has no source deltas.** The root empty-delta fast path returns
-  before visiting downstream nodes. A child can have independent source deltas or pending parent-delta rows after an earlier
-  failed cascade. Model `node skipped` separately from `graph traversal complete` and checkpoint each node independently.
+- [x] **Continue cascade traversal when the current node has no source deltas.** Empty-delta detection now skips only the
+  current node; it cannot terminate traversal of the downstream DAG. Regression coverage exercises both a pending parent
+  delta left by a cascade-off refresh and independent child-source DML, including the hook-aware empty-node path.
 - [ ] **Use NULL-safe affected-window partition matching.** `IN` does not select a NULL partition even though SQL window
   partitioning groups NULL values. Join the affected-key relation with `IS NOT DISTINCT FROM` for every partition key.
 - [ ] **Preserve `SUM` NULL semantics.** Weighted SUM alone cannot distinguish numeric zero from no non-NULL inputs. Persist

@@ -112,7 +112,7 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
 // Generate and execute refresh SQL for a single view under its per-view lock.
 // When openivm_adaptive_refresh is on, also computes a cost estimate before execution
 // and records execution history for the learned cost model.
-static bool RefreshViewLocked(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
+static void RefreshViewLocked(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                               const string &vn, bool cross_system, const string &attached_db_catalog_name,
                               const string &attached_db_schema_name, bool skip_empty_refresh) {
 	RefreshProfiler profiler(context, vn);
@@ -171,7 +171,7 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 		                        attached_db_catalog_name, attached_db_schema_name, &delta_activity)) {
 			profiler.AddTotal();
 			profiler.Flush(*context.db.get());
-			return true;
+			return;
 		}
 		if (!delta_activity.active_delta_table_names.empty() || delta_activity.requires_full_refresh) {
 			precomputed_delta_activity = &delta_activity;
@@ -363,7 +363,7 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 		}
 		profiler.AddTotal();
 		profiler.Flush(*context.db.get());
-		return false;
+		return;
 	} catch (...) {
 		// Ensure the transaction is rolled back before we propagate the exception.
 		// This covers the case where Query() itself threw (vs returning HasError) —
@@ -544,30 +544,30 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 
 	// Hook-bearing refreshes keep the old pre-hook empty skip semantics. Hook-free refreshes
 	// compute the same delta activity under the view lock and reuse it during SQL generation.
-	if (has_refresh_hook && TrySkipEmptyRefresh(context, metadata, con, view_catalog_name, view_schema_name, view_name,
-	                                            attached_db_catalog_name, attached_db_schema_name, nullptr)) {
-		return;
-	}
-
-	if (!hook_sql.empty() && hook_mode == "before") {
-		auto hr = con.Query(hook_sql);
-		if (hr->HasError()) {
-			Printer::Print("Warning: before-hook for '" + view_name + "' failed: " + hr->GetError());
+	bool skip_current_node =
+	    has_refresh_hook && TrySkipEmptyRefresh(context, metadata, con, view_catalog_name, view_schema_name, view_name,
+	                                            attached_db_catalog_name, attached_db_schema_name, nullptr);
+	if (!skip_current_node) {
+		if (!hook_sql.empty() && hook_mode == "before") {
+			auto hr = con.Query(hook_sql);
+			if (hr->HasError()) {
+				Printer::Print("Warning: before-hook for '" + view_name + "' failed: " + hr->GetError());
+			}
 		}
-	}
 
-	if (hook_mode != "replace") {
-		if (RefreshViewLocked(context, view_catalog_name, view_schema_name, view_name, cross_system,
-		                      attached_db_catalog_name, attached_db_schema_name, !has_refresh_hook)) {
-			return;
+		if (hook_mode != "replace") {
+			RefreshViewLocked(context, view_catalog_name, view_schema_name, view_name, cross_system,
+			                  attached_db_catalog_name, attached_db_schema_name, !has_refresh_hook);
 		}
-	}
 
-	if (!hook_sql.empty() && (hook_mode == "after" || hook_mode == "replace")) {
-		auto hr = con.Query(hook_sql);
-		if (hr->HasError()) {
-			Printer::Print("Warning: " + hook_mode + "-hook for '" + view_name + "' failed: " + hr->GetError());
+		if (!hook_sql.empty() && (hook_mode == "after" || hook_mode == "replace")) {
+			auto hr = con.Query(hook_sql);
+			if (hr->HasError()) {
+				Printer::Print("Warning: " + hook_mode + "-hook for '" + view_name + "' failed: " + hr->GetError());
+			}
 		}
+	} else {
+		OPENIVM_DEBUG_PRINT("[UPSERT] Skipped refresh node '%s'; continuing cascade traversal\n", view_name.c_str());
 	}
 
 	// Downstream cascade: refresh dependents after
