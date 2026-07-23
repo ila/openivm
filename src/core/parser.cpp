@@ -6,6 +6,7 @@
 #include "core/parser_ddl.hpp"
 #include "core/parser_plan_helpers.hpp"
 #include "core/parser_sql_extractors.hpp"
+#include "core/plan_rewrite_internal.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/ivm_delta_model.hpp"
@@ -401,6 +402,12 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 		having_predicate = StripHavingFilter(select_plan, output_names);
+		// HAVING-only aggregates are exposed by StripHavingFilter. Inject SUM's
+		// non-NULL state afterward so visible, wrapped, and HAVING-only SUMs all
+		// use the same output-index mapping during incremental maintenance.
+		InjectSumNonNullCounts(context, select_plan);
+		PropagateHiddenAggregateColumns(select_plan);
+		output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
 		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
 		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
 		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;

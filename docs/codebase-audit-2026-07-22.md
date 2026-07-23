@@ -32,7 +32,7 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
   `IS NOT DISTINCT FROM` predicates for standard, cascade, running-window, and DuckLake paths. Regression coverage includes
   batched conflicting DML on single and composite NULL partitions plus a DuckLake TPCC window whose delivery timestamp moves
   from the NULL partition to a non-NULL partition.
-- [ ] **Preserve `SUM` NULL semantics.** Weighted SUM alone cannot distinguish numeric zero from no non-NULL inputs. Persist
+- [x] **Preserve `SUM` NULL semantics.** Weighted SUM alone cannot distinguish numeric zero from no non-NULL inputs. Persist
   a hidden `COUNT(sum_argument)` and render NULL when that count reaches zero.
 - [ ] **Use an unconditional row count for group existence.** `COUNT(nullable_expression)=0` does not mean a group is empty.
   Persist a hidden `COUNT(*)` solely for deciding whether the group row must be deleted.
@@ -122,6 +122,9 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
   base-leaf appearances, compilation work, and generated SQL size.
 - [ ] **Remove the fake `ConstraintCache` or make it a cache.** It repopulates a map that no read path consumes, while FK cost
   estimation separately parses textual constraint descriptions.
+- [ ] **Audit edge-case tests and mirror them in the rewriter benchmark.** Review the SQL harness for missing boundary and
+  transition cases, add deterministic bidirectional `EXCEPT ALL` coverage, and add representative cases to the rewriter
+  benchmark so real refresh compilation and execution exercise the same semantics.
 
 ## Target refresh flow
 

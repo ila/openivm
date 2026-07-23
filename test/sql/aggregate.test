@@ -2338,6 +2338,14 @@ CREATE MATERIALIZED VIEW mv_flat_sd AS
            STDDEV_POP(v) AS sdp, VAR_POP(v) AS vrp, COUNT(*) AS n
     FROM sd_flat GROUP BY grp;
 
+# Derived aggregates already carry their own hidden SUM/COUNT state. The
+# SUM NULL-state rewrite must not add redundant counts for those helper SUMs.
+query I
+SELECT count(*) FROM pragma_table_info('openivm_data_mv_flat_sd')
+WHERE name LIKE 'openivm_nonnull_sum_count_%';
+----
+0
+
 # Batch of inserts + deletes on flat data — variance is algebraically 0
 # but floating-point makes it drift negative.
 statement ok
@@ -2839,6 +2847,305 @@ SELECT count(*) FROM (
   SELECT * FROM (SELECT grp, SUM(val) AS total FROM topk_t GROUP BY grp ORDER BY total DESC LIMIT 3) _q
   EXCEPT ALL
   SELECT * FROM topk_agg
+);
+----
+0
+
+# ==========================================
+# SUM distinguishes zero from no non-NULL inputs
+# ==========================================
+
+statement ok
+CREATE TABLE sum_null_state (id INT, grp INT, amount INT);
+
+statement ok
+INSERT INTO sum_null_state VALUES (1, 1, 10), (2, 1, NULL), (3, 2, NULL), (4, 3, 5), (5, 3, -5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_state AS
+    SELECT grp, SUM(amount) AS total
+    FROM sum_null_state GROUP BY grp;
+
+# One batch exercises non-NULL→all-NULL, all-NULL→numeric zero, and net-zero SUM.
+statement ok
+UPDATE sum_null_state SET amount = NULL WHERE id = 1;
+
+statement ok
+UPDATE sum_null_state SET amount = 0 WHERE id = 3;
+
+statement ok
+INSERT INTO sum_null_state VALUES (6, 1, 99);
+
+statement ok
+DELETE FROM sum_null_state WHERE id = 6;
+
+statement ok
+PRAGMA refresh('mv_sum_null_state');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_sum_null_state
+    EXCEPT ALL
+    SELECT grp, SUM(amount) FROM sum_null_state GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(amount) FROM sum_null_state GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM mv_sum_null_state
+);
+----
+0
+
+# The scalar aggregate compiler must preserve the same NULL/zero distinction.
+statement ok
+CREATE TABLE sum_null_scalar (id INT, amount INT);
+
+statement ok
+INSERT INTO sum_null_scalar VALUES (1, 10), (2, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_scalar AS
+    SELECT SUM(amount) AS total FROM sum_null_scalar;
+
+statement ok
+DELETE FROM sum_null_scalar WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_sum_null_scalar');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT total FROM mv_sum_null_scalar
+    EXCEPT ALL
+    SELECT SUM(amount) FROM sum_null_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(amount) FROM sum_null_scalar
+    EXCEPT ALL
+    SELECT total FROM mv_sum_null_scalar
+);
+----
+0
+
+statement ok
+INSERT INTO sum_null_scalar VALUES (3, 0);
+
+statement ok
+PRAGMA refresh('mv_sum_null_scalar');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT total FROM mv_sum_null_scalar
+    EXCEPT ALL
+    SELECT SUM(amount) FROM sum_null_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(amount) FROM sum_null_scalar
+    EXCEPT ALL
+    SELECT total FROM mv_sum_null_scalar
+);
+----
+0
+
+# Reverse both NULL transitions and remove a group in one refresh.
+statement ok
+UPDATE sum_null_state SET amount = 7 WHERE id = 1;
+
+statement ok
+UPDATE sum_null_state SET amount = NULL WHERE id = 3;
+
+statement ok
+DELETE FROM sum_null_state WHERE grp = 3;
+
+statement ok
+PRAGMA refresh('mv_sum_null_state');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_sum_null_state
+    EXCEPT ALL
+    SELECT grp, SUM(amount) FROM sum_null_state GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(amount) FROM sum_null_state GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM mv_sum_null_state
+);
+----
+0
+
+# SUM state must follow top-level wrappers and pass-through casts.
+statement ok
+CREATE TABLE sum_null_wrapped (id INT, grp INT, amount INT);
+
+statement ok
+INSERT INTO sum_null_wrapped VALUES (1, 1, 10), (2, 1, NULL), (3, 2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_wrapped AS
+    WITH sums AS (
+        SELECT grp, SUM(amount) AS total
+        FROM sum_null_wrapped GROUP BY grp
+    )
+    SELECT grp, CAST(total AS BIGINT) AS total FROM sums ORDER BY grp;
+
+statement ok
+UPDATE sum_null_wrapped SET amount = NULL WHERE id IN (1, 3);
+
+statement ok
+PRAGMA refresh('mv_sum_null_wrapped');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_sum_null_wrapped
+    EXCEPT ALL
+    SELECT grp, CAST(total AS BIGINT) FROM (
+        SELECT grp, SUM(amount) AS total
+        FROM sum_null_wrapped GROUP BY grp
+    ) sums
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, CAST(total AS BIGINT) FROM (
+        SELECT grp, SUM(amount) AS total
+        FROM sum_null_wrapped GROUP BY grp
+    ) sums
+    EXCEPT ALL
+    SELECT grp, total FROM mv_sum_null_wrapped
+);
+----
+0
+
+# The scalar path must also resolve a casted SUM output.
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_scalar_cast AS
+    SELECT CAST(SUM(amount) AS BIGINT) AS total FROM sum_null_scalar;
+
+statement ok
+DELETE FROM sum_null_scalar WHERE id = 3;
+
+statement ok
+PRAGMA refresh('mv_sum_null_scalar_cast');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT total FROM mv_sum_null_scalar_cast
+    EXCEPT ALL
+    SELECT CAST(SUM(amount) AS BIGINT) FROM sum_null_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT CAST(SUM(amount) AS BIGINT) FROM sum_null_scalar
+    EXCEPT ALL
+    SELECT total FROM mv_sum_null_scalar_cast
+);
+----
+0
+
+# A SUM referenced only by HAVING needs the same hidden non-NULL count.
+statement ok
+UPDATE sum_null_wrapped SET amount = 10 WHERE id = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_having AS
+    SELECT grp, COUNT(*) AS row_count
+    FROM sum_null_wrapped GROUP BY grp
+    HAVING SUM(amount) IS NULL;
+
+statement ok
+UPDATE sum_null_wrapped SET amount = 5 WHERE id = 1;
+
+statement ok
+UPDATE sum_null_wrapped SET amount = NULL WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_sum_null_having');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, row_count FROM mv_sum_null_having
+    EXCEPT ALL
+    SELECT grp, COUNT(*) FROM sum_null_wrapped
+    GROUP BY grp HAVING SUM(amount) IS NULL
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, COUNT(*) FROM sum_null_wrapped
+    GROUP BY grp HAVING SUM(amount) IS NULL
+    EXCEPT ALL
+    SELECT grp, row_count FROM mv_sum_null_having
+);
+----
+0
+
+# A direct SUM needs NULL-state helper data, but that internal aggregate must
+# not hide a second output that folds SUM/COUNT into one derived expression.
+statement ok
+CREATE TABLE sum_null_shape (id INT, grp INT, x INT, y INT, z INT);
+
+statement ok
+INSERT INTO sum_null_shape VALUES (1, 1, 10, 10, 1), (2, 1, 20, 20, 1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_shape AS
+    SELECT grp, SUM(x) AS sx, ROUND(SUM(y) / COUNT(z), 2) AS ratio
+    FROM sum_null_shape GROUP BY grp;
+
+query I
+SELECT count(*) FROM pragma_table_info('openivm_data_mv_sum_null_shape')
+WHERE name LIKE 'openivm_nonnull_sum_count_%';
+----
+1
+
+# The correct ratio changes from 15 to 40. A delta-MERGE incorrectly adds the
+# per-delta ratio (90), producing 105, unless shape accounting selects group recompute.
+statement ok
+INSERT INTO sum_null_shape VALUES (3, 1, 30, 90, 1);
+
+statement ok
+PRAGMA refresh('mv_sum_null_shape');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, sx, ratio FROM mv_sum_null_shape
+    EXCEPT ALL
+    SELECT grp, SUM(x), ROUND(SUM(y) / COUNT(z), 2)
+    FROM sum_null_shape GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(x), ROUND(SUM(y) / COUNT(z), 2)
+    FROM sum_null_shape GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, sx, ratio FROM mv_sum_null_shape
 );
 ----
 0

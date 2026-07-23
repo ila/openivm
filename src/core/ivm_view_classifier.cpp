@@ -418,9 +418,10 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 	}
 
+	idx_t actual_visible_outputs = GetVisibleOutputCount(output_names, visible_output_count);
 	if (analysis.found_delim_join && analysis.found_aggregation && model.group_columns.empty() &&
-	    output_names.size() > analysis.aggregate_types.size()) {
-		idx_t key_count = output_names.size() - analysis.aggregate_types.size();
+	    actual_visible_outputs > analysis.aggregate_types.size()) {
+		idx_t key_count = actual_visible_outputs - analysis.aggregate_types.size();
 		for (idx_t i = 0; i < key_count; i++) {
 			if (!output_names[i].empty() && !IncrementalTableNames::IsInternalColumn(output_names[i])) {
 				model.group_columns.push_back(output_names[i]);
@@ -507,11 +508,11 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 
 	if (analysis.found_join && analysis.found_aggregation && !model.group_columns.empty()) {
 		idx_t expected_linear_outputs = model.group_columns.size() + model.aggregate_types.size();
-		if (output_names.size() > expected_linear_outputs) {
+		if (actual_visible_outputs > expected_linear_outputs) {
 			AddUnique(model.strategy_reasons, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Join-over-aggregate exposes %zu columns but only %zu are "
 			                    "group/aggregate outputs -- using GROUP_RECOMPUTE\n",
-			                    output_names.size(), expected_linear_outputs);
+			                    actual_visible_outputs, expected_linear_outputs);
 		}
 	}
 

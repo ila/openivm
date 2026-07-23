@@ -946,7 +946,8 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 /// projection's expression up through a pass-through parent projection.
 static bool IsHiddenAggregateAlias(const string &alias) {
 	return alias.find(openivm::SUM_COL_PREFIX) == 0 || alias.find(openivm::COUNT_COL_PREFIX) == 0 ||
-	       alias.find(openivm::SUM_SQ_COL_PREFIX) == 0 || alias.find(openivm::SUM_SQP_COL_PREFIX) == 0;
+	       alias.find(openivm::SUM_SQ_COL_PREFIX) == 0 || alias.find(openivm::SUM_SQP_COL_PREFIX) == 0 ||
+	       alias.find(openivm::SUM_COUNT_COL_PREFIX) == 0;
 }
 
 /// Propagate hidden aggregate columns (openivm_sum_*, openivm_count_*, …) added
@@ -962,7 +963,7 @@ static bool IsHiddenAggregateAlias(const string &alias) {
 /// data table stores only the final AVG and the MERGE computes `v.avg + d.avg`
 /// — wrong for non-summable aggregates. Propagation lets CompileAggregateGroups
 /// see the hidden SUM/COUNT columns and maintain them separately.
-static void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
+void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
 	for (auto &child : plan->children) {
 		PropagateHiddenAggregateColumns(child);
 	}

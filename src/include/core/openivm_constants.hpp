@@ -37,6 +37,10 @@ constexpr const char *VAR_SQ_COL_PREFIX = "openivm_var_sq_";   // VARIANCE: no s
 constexpr const char *SUM_SQP_COL_PREFIX = "openivm_sum_sqp_"; // STDDEV_POP: sqrt + population denominator
 constexpr const char *VAR_SQP_COL_PREFIX = "openivm_var_sqp_"; // VAR_POP: no sqrt + population denominator
 constexpr const char *COUNT_COL_PREFIX = "openivm_count_";
+// COUNT(sum_argument) companions for user-visible SUM outputs. The suffix is
+// the visible projection index, which associates the state with the exact
+// bound output without inspecting SQL text or aliases.
+constexpr const char *SUM_COUNT_COL_PREFIX = "openivm_nonnull_sum_count_";
 
 // Hidden COUNT(*) injected into AGGREGATE_GROUP MVs that don't already have a
 // count aggregate. Tracks per-group cardinality so the cleanup can delete rows

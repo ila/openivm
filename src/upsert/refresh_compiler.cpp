@@ -7,6 +7,7 @@
 #include "upsert/refresh_internal.hpp"
 
 #include <cctype>
+#include <limits>
 
 namespace duckdb {
 
@@ -329,6 +330,10 @@ static string BuildUpdatedAggregateColumn(const string &col) {
 	return "COALESCE(v." + col + " + d." + col + ", v." + col + ", d." + col + ")";
 }
 
+static string BuildNullableSum(const string &sum_expr, const string &count_expr) {
+	return "CASE WHEN " + count_expr + " = 0 THEN NULL ELSE " + sum_expr + " END";
+}
+
 static string BuildNullSafeExtremumUpdate(const string &col, const string &fn) {
 	return "CASE WHEN v." + col + " IS NULL THEN d." + col + " WHEN d." + col + " IS NULL THEN v." + col + " ELSE " +
 	       fn + "(v." + col + ", d." + col + ") END";
@@ -496,6 +501,32 @@ static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &col
 	return result;
 }
 
+static unordered_map<string, string> DetectSumNullCountColumns(const vector<string> &columns) {
+	unordered_map<string, string> result;
+	const string prefix = openivm::SUM_COUNT_COL_PREFIX;
+	for (auto &column : columns) {
+		if (column.size() <= prefix.size() || column.compare(0, prefix.size(), prefix) != 0) {
+			continue;
+		}
+		idx_t projection_index = 0;
+		for (idx_t i = prefix.size(); i < column.size(); i++) {
+			if (!std::isdigit(static_cast<unsigned char>(column[i]))) {
+				throw InternalException("Invalid SUM count state column '%s'", column);
+			}
+			idx_t digit = column[i] - '0';
+			if (projection_index > (std::numeric_limits<idx_t>::max() - digit) / 10) {
+				throw InternalException("Invalid SUM count state column '%s'", column);
+			}
+			projection_index = projection_index * 10 + digit;
+		}
+		if (projection_index >= columns.size()) {
+			throw InternalException("Invalid SUM count state column '%s'", column);
+		}
+		result[SqlUtils::QuoteIdentifier(columns[projection_index])] = SqlUtils::QuoteIdentifier(column);
+	}
+	return result;
+}
+
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
                               bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
@@ -567,6 +598,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	}
 
 	auto decomp = DetectDerivedAggColumns(aggregates);
+	auto sum_null_count_cols = DetectSumNullCountColumns(column_names);
 
 	// Detect AVG/STDDEV-derived columns that can't be maintained incrementally.
 	//
@@ -641,6 +673,11 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			}
 			if (column.find(string(openivm::COUNT_COL_PREFIX)) == 0) {
 				// Same — the COUNT half of an AVG/STDDEV decomposition.
+				continue;
+			}
+			if (column.find(string(openivm::SUM_COUNT_COL_PREFIX)) == 0) {
+				// SUM NULL-state counts are injected after AnalyzePlan captures
+				// aggregate_types, so they do not consume a metadata slot.
 				continue;
 			}
 			// openivm_match_count / openivm_right_match_count are added by
@@ -904,7 +941,13 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			}
 		} else {
 			string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
-			if (insert_only && agg_type == "min") {
+			auto sum_count = sum_null_count_cols.find(column);
+			if (sum_count != sum_null_count_cols.end()) {
+				updated_column_expressions[raw_column] =
+				    BuildNullableSum(BuildUpdatedAggregateColumn(column),
+				                     BuildUpdatedAggregateColumn(sum_count->second));
+				inserted_column_expressions[raw_column] = BuildNullableSum("d." + column, "d." + sum_count->second);
+			} else if (insert_only && agg_type == "min") {
 				updated_column_expressions[raw_column] = BuildNullSafeExtremumUpdate(column, "LEAST");
 			} else if (insert_only && agg_type == "max") {
 				updated_column_expressions[raw_column] = BuildNullSafeExtremumUpdate(column, "GREATEST");
@@ -986,7 +1029,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			// Determine if this column should be 0 (count-like) or NULL (sum-like) when unmatched.
 			// Check both the aggregate_types metadata AND the hidden column prefix
 			// (hidden openivm_count_* columns from AVG/STDDEV decomposition don't have agg_type entries).
-			bool is_count = (agg_type == "count" || col.find(string(openivm::COUNT_COL_PREFIX)) == 0);
+			bool is_count = (agg_type == "count" || col.find(string(openivm::COUNT_COL_PREFIX)) == 0 ||
+			                 col.find(string(openivm::SUM_COUNT_COL_PREFIX)) == 0);
 			string null_val = is_count ? "0" : "NULL";
 			// Three-way CASE:
 			//   mc_new > 0: group has matches (now or after delta). Normal aggregate update.
@@ -1000,9 +1044,14 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			//     data is gone; reset to null_val. This remains imperfect for folded projections
 			//     (a transitioning group whose stored COALESCE'd column was 0 resets to NULL)
 			//     — a known limitation.
-			lj_update_set += col + " = CASE WHEN " + mc_new + " > 0 THEN " + BuildUpdatedAggregateColumn(col) +
-			                 " WHEN COALESCE(v." + match_count_col + ", 0) = 0 THEN v." + col + " ELSE " + null_val +
-			                 " END";
+			string matched_update = BuildUpdatedAggregateColumn(col);
+			auto sum_count = sum_null_count_cols.find(col);
+			if (sum_count != sum_null_count_cols.end()) {
+				matched_update =
+				    BuildNullableSum(std::move(matched_update), BuildUpdatedAggregateColumn(sum_count->second));
+			}
+			lj_update_set += col + " = CASE WHEN " + mc_new + " > 0 THEN " + matched_update + " WHEN COALESCE(v." +
+			                 match_count_col + ", 0) = 0 THEN v." + col + " ELSE " + null_val + " END";
 		}
 		// INSERT values: mirror the UPDATE classification above.
 		//   count_star → d.count_star (always, no CASE)
@@ -1023,10 +1072,16 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				cond_insert_vals += "d." + aggregates[i];
 				continue;
 			}
-			bool is_count = (agg_type == "count" || aggregates[i].find(string(openivm::COUNT_COL_PREFIX)) == 0);
+			bool is_count = (agg_type == "count" || aggregates[i].find(string(openivm::COUNT_COL_PREFIX)) == 0 ||
+			                 aggregates[i].find(string(openivm::SUM_COUNT_COL_PREFIX)) == 0);
 			string null_val = is_count ? "0" : "NULL";
+			string matched_insert = "d." + aggregates[i];
+			auto sum_count = sum_null_count_cols.find(aggregates[i]);
+			if (sum_count != sum_null_count_cols.end()) {
+				matched_insert = BuildNullableSum(std::move(matched_insert), "d." + sum_count->second);
+			}
 			cond_insert_vals +=
-			    "CASE WHEN d." + match_count_col + " > 0 THEN d." + aggregates[i] + " ELSE " + null_val + " END";
+			    "CASE WHEN d." + match_count_col + " > 0 THEN " + matched_insert + " ELSE " + null_val + " END";
 		}
 		merge_query = "WITH refresh_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table +
 		              " v USING refresh_cte d\n" + "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " +
@@ -1179,6 +1234,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
 	auto decomp = DetectDerivedAggColumns(column_names);
+	auto sum_null_count_cols = DetectSumNullCountColumns(column_names);
 	auto &d_derived = decomp.derived_cols;
 	auto &d_sum = decomp.sum_cols;
 	auto &d_sum_sq = decomp.sum_sq_cols;
@@ -1212,8 +1268,18 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 		} else {
 			// Z-set bag-aware sum: weight w∈ℤ scales the column value before SUM.
 			cte += "SUM(" + mul + " * " + column + ") AS d_" + column;
-			update_set +=
-			    column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM openivm_delta), 0)";
+			auto sum_count = sum_null_count_cols.find(column);
+			if (sum_count == sum_null_count_cols.end()) {
+				update_set += column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column +
+				              " FROM openivm_delta), 0)";
+			} else {
+				string count_col = sum_count->second;
+				string updated_sum =
+				    "COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM openivm_delta), 0)";
+				string updated_count =
+				    "COALESCE(" + count_col + ", 0) + COALESCE((SELECT d_" + count_col + " FROM openivm_delta), 0)";
+				update_set += column + " = " + BuildNullableSum(std::move(updated_sum), std::move(updated_count));
+			}
 		}
 	}
 	cte += "\n  FROM " + delta_view + ts_where + "\n)\n";
