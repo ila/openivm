@@ -163,6 +163,8 @@ struct DeltaViewModelInput {
 	bool stored_query_has_top_k = false;
 	bool has_hidden_minmax_having = false;
 	bool has_computed_minmax_aggregate_projection = false;
+	bool has_computed_sum_aggregate_projection = false;
+	bool has_top_level_redundant_scalar_distinct = false;
 	bool has_ducklake_source = false;
 };
 

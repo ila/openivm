@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/parser_plan_helpers.hpp"
 #include "core/plan_rewrite_internal.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -41,18 +42,30 @@
 namespace duckdb {
 
 /// Replace LOGICAL_DISTINCT with LOGICAL_AGGREGATE + COUNT(*).
-static void RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node) {
+/// Returns whether a DISTINCT state aggregate was added at the top level.
+static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node,
+                            bool is_top_level) {
 	if (node->type != LogicalOperatorType::LOGICAL_DISTINCT) {
-		for (auto &child : node->children) {
-			RewriteDistinct(context, binder, child);
+		bool added_top_level_state = false;
+		for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
+			bool child_is_top_level =
+			    is_top_level && node->type == LogicalOperatorType::LOGICAL_PROJECTION && child_idx == 0;
+			added_top_level_state = RewriteDistinct(context, binder, node->children[child_idx], child_is_top_level) ||
+			                        added_top_level_state;
 		}
-		return;
+		return added_top_level_state;
 	}
 
 	auto &distinct = node->Cast<LogicalDistinct>();
 	if (node->children.empty()) {
 		OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT has no children — skipping\n");
-		return;
+		return false;
+	}
+	if (ProducesAtMostOneRow(*node->children[0])) {
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over scalar aggregate\n");
+		node = std::move(node->children[0]);
+		RewriteDistinct(context, binder, node, false);
+		return false;
 	}
 	auto &child = node->children[0];
 	child->ResolveOperatorTypes();
@@ -88,6 +101,7 @@ static void RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT → AGGREGATE + COUNT(*), %zu groups\n", agg_node->groups.size());
 	node = std::move(agg_node);
+	return is_top_level;
 }
 
 static bool IsSemiAntiJoinType(JoinType join_type) {
@@ -1357,9 +1371,9 @@ static void RewritePassAggregateFilters(PlanRewriteContext &rewrite_context) {
 }
 
 static void RewritePassDistinct(PlanRewriteContext &rewrite_context) {
-	bool had_distinct = HasTopLevelDistinct(rewrite_context.plan);
-	RewriteDistinct(rewrite_context.context, rewrite_context.binder, rewrite_context.plan);
-	if (had_distinct) {
+	bool added_top_level_state = RewriteDistinct(rewrite_context.context, rewrite_context.binder, rewrite_context.plan,
+	                                             HasTopLevelDistinct(rewrite_context.plan));
+	if (added_top_level_state) {
 		rewrite_context.planner_names.push_back(openivm::DISTINCT_COUNT_COL);
 	}
 }

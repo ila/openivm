@@ -372,6 +372,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	bool has_hidden_minmax_having = false;
 	bool has_computed_minmax_aggregate_projection = false;
 	DerivedAggregateOutputInfo derived_aggregate_outputs;
+	bool has_computed_sum_aggregate_projection = false;
 	{
 		auto select_parse_plan_start = create_profile_now();
 		Parser select_parser;
@@ -412,6 +413,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
 		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
 		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
+		has_computed_sum_aggregate_projection = post_rewrite_facts.has_computed_sum_aggregate_projection;
 
 		// Keep data tables unlimited/unordered; apply ORDER BY/LIMIT in the user-facing view.
 		{
@@ -575,6 +577,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	model_input.stored_query_has_top_k = stored_query_retains_top_k;
 	model_input.has_hidden_minmax_having = has_hidden_minmax_having;
 	model_input.has_computed_minmax_aggregate_projection = has_computed_minmax_aggregate_projection;
+	model_input.has_computed_sum_aggregate_projection = has_computed_sum_aggregate_projection;
+	model_input.has_top_level_redundant_scalar_distinct = facts.has_top_level_redundant_scalar_distinct;
 	model_input.has_ducklake_source = HasDuckLakeSourceForModel(facts, table_names, target_is_ducklake);
 	const bool distinct_at_top = IsDistinctAtTop(analysis, output_names);
 

@@ -353,7 +353,7 @@ static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analys
 		AddUnique(model.features, DeltaModelFeature::WINDOW_AFFECTED_PARTITION);
 	}
 	if (!model.HasFeature(DeltaModelFeature::FULL_ONLY)) {
-		if (input.distinct_aux_candidate) {
+		if (input.distinct_aux_candidate && !input.has_top_level_redundant_scalar_distinct) {
 			AddUnique(model.features, DeltaModelFeature::DISTINCT_STATEFUL);
 		}
 		if (input.semi_anti_aux_candidate) {
@@ -559,10 +559,19 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_filtered_list) {
 		model.type = RefreshType::FULL_REFRESH;
+	} else if (input.has_computed_sum_aggregate_projection) {
+		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
+	} else if (analysis.found_distinct && !analysis.found_union_distinct && model.distinct_at_top &&
+	           analysis.found_aggregation) {
+		// DISTINCT over multiple aggregate result rows is a second non-linear
+		// aggregation level. The outer DISTINCT key is an aggregate value, not
+		// a source group key that affected-group recompute can recover.
+		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_count_distinct && !model.group_columns.empty()) {
 		model.type =
 		    input.count_distinct_aux_candidate ? RefreshType::COUNT_DISTINCT_INCREMENTAL : RefreshType::GROUP_RECOMPUTE;
-	} else if (analysis.found_distinct && !model.distinct_at_top && analysis.found_aggregation) {
+	} else if (analysis.found_distinct && !input.has_top_level_redundant_scalar_distinct && !model.distinct_at_top &&
+	           analysis.found_aggregation) {
 		model.type = model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL) ? RefreshType::DISTINCT_INCREMENTAL
 		                                                                    : RefreshType::GROUP_RECOMPUTE;
 	} else if (model.union_distinct_over_agg && !model.group_columns.empty()) {
@@ -878,6 +887,9 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 
 	model.has_minmax_metadata = analysis.found_minmax || analysis.found_count_distinct || analysis.found_list;
 	model.distinct_at_top = IsDistinctAtTop(analysis, output_names);
+	if (input.has_top_level_redundant_scalar_distinct) {
+		model.distinct_at_top = false;
+	}
 	BuildGroupColumns(model, facts, output_names, input.visible_output_count);
 
 	if ((analysis.found_left_join || analysis.found_full_outer) && analysis.found_aggregation &&

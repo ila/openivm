@@ -431,6 +431,49 @@ static bool ExpressionReferencesMinMaxAggregate(Expression &expr,
 	return found;
 }
 
+static bool ExpressionReferencesUserSumAggregate(Expression &expr, const CreateMVPlanFacts &facts,
+                                                 const unordered_map<idx_t, LogicalAggregate *> &aggregates,
+                                                 idx_t depth = 0) {
+	if (depth > 16) {
+		return false;
+	}
+	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
+		auto aggregate_it = aggregates.find(column_ref.binding.table_index);
+		if (aggregate_it != aggregates.end()) {
+			auto &aggregate = *aggregate_it->second;
+			if (column_ref.binding.column_index >= aggregate.expressions.size()) {
+				return false;
+			}
+			auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
+			if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+				return false;
+			}
+			auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
+			return bound_aggregate.function.name == "sum" &&
+			       !IncrementalTableNames::IsInternalColumn(bound_aggregate.alias);
+		}
+		auto projection_it = facts.projections_by_index.find(column_ref.binding.table_index);
+		if (projection_it == facts.projections_by_index.end()) {
+			return false;
+		}
+		auto &projection = *projection_it->second;
+		if (column_ref.binding.column_index >= projection.expressions.size()) {
+			return false;
+		}
+		return ExpressionReferencesUserSumAggregate(*projection.expressions[column_ref.binding.column_index], facts,
+		                                            aggregates, depth + 1);
+	}
+
+	bool found = false;
+	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) {
+		if (!found && ExpressionReferencesUserSumAggregate(child, facts, aggregates, depth + 1)) {
+			found = true;
+		}
+	});
+	return found;
+}
+
 static void FinalizeCreateMVPlanFacts(CreateMVPlanFacts &facts) {
 	unordered_map<idx_t, LogicalAggregate *> aggregates;
 	for (auto *aggregate : facts.aggregates) {
@@ -441,6 +484,14 @@ static void FinalizeCreateMVPlanFacts(CreateMVPlanFacts &facts) {
 	}
 	for (auto *projection : facts.projections) {
 		for (auto &expr : projection->expressions) {
+			Expression *unwrapped = expr.get();
+			while (unwrapped->expression_class == ExpressionClass::BOUND_CAST) {
+				unwrapped = unwrapped->Cast<BoundCastExpression>().child.get();
+			}
+			if (unwrapped->expression_class != ExpressionClass::BOUND_COLUMN_REF &&
+			    ExpressionReferencesUserSumAggregate(*unwrapped, facts, aggregates)) {
+				facts.has_computed_sum_aggregate_projection = true;
+			}
 			if (expr->expression_class == ExpressionClass::BOUND_COLUMN_REF && IsHiddenHavingColumn(expr->alias)) {
 				auto &column_ref = expr->Cast<BoundColumnRefExpression>();
 				if (IsMinMaxAggregateColumn(column_ref, aggregates)) {
@@ -901,10 +952,34 @@ static void AddJoinEdgesFromFacts(CreateMVPlanFacts &facts) {
 	}
 }
 
+bool ProducesAtMostOneRow(LogicalOperator &node) {
+	LogicalOperator *current = &node;
+	while ((current->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	        current->type == LogicalOperatorType::LOGICAL_FILTER) &&
+	       !current->children.empty()) {
+		current = current->children[0].get();
+	}
+	if (current->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return false;
+	}
+	auto &aggregate = current->Cast<LogicalAggregate>();
+	return aggregate.groups.empty() && aggregate.grouping_sets.size() <= 1;
+}
+
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog) {
 	CreateMVPlanFacts facts;
 	facts.root = plan;
 	facts.analysis = AnalyzePlan(plan);
+	LogicalOperator *top = plan;
+	while (top && top->children.size() == 1 &&
+	       (top->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
+	        top->type == LogicalOperatorType::LOGICAL_PROJECTION || top->type == LogicalOperatorType::LOGICAL_FILTER ||
+	        top->type == LogicalOperatorType::LOGICAL_ORDER_BY || top->type == LogicalOperatorType::LOGICAL_LIMIT ||
+	        top->type == LogicalOperatorType::LOGICAL_TOP_N)) {
+		top = top->children[0].get();
+	}
+	facts.has_top_level_redundant_scalar_distinct = top && top->type == LogicalOperatorType::LOGICAL_DISTINCT &&
+	                                                !top->children.empty() && ProducesAtMostOneRow(*top->children[0]);
 	unordered_map<string, idx_t> next_occurrence;
 	CollectCreateMVPlanFacts(plan, current_catalog, facts, next_occurrence, false, false);
 	FinalizeCreateMVPlanFacts(facts);
