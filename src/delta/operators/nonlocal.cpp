@@ -17,17 +17,16 @@ static DeltaPlanFragment CompileNonLocalDeltaGuard(const DeltaOperatorInput &inp
 
 DeltaPlanFragment CompileAsofJoinDelta(const DeltaOperatorInput &input) {
 	return CompileNonLocalDeltaGuard(input, DeltaOperatorStrategy::ASOF_AFFECTED_RECOMPUTE, "ASOF_JOIN",
-	                                 "WINDOW_PARTITION, GROUP_RECOMPUTE, or CURRENT_DIFF_RECOMPUTE");
+	                                 "WINDOW_PARTITION, GROUP_RECOMPUTE, or FULL_REFRESH");
 }
 
 DeltaPlanFragment CompilePositionalJoinDelta(const DeltaOperatorInput &input) {
 	return CompileNonLocalDeltaGuard(input, DeltaOperatorStrategy::POSITIONAL_GLOBAL_RECOMPUTE, "POSITIONAL_JOIN",
-	                                 "CURRENT_DIFF_RECOMPUTE");
+	                                 "FULL_REFRESH");
 }
 
 DeltaPlanFragment CompileSampleDelta(const DeltaOperatorInput &input) {
-	return CompileNonLocalDeltaGuard(input, DeltaOperatorStrategy::SAMPLE_GLOBAL_RECOMPUTE, "SAMPLE",
-	                                 "CURRENT_DIFF_RECOMPUTE");
+	return CompileNonLocalDeltaGuard(input, DeltaOperatorStrategy::SAMPLE_GLOBAL_RECOMPUTE, "SAMPLE", "FULL_REFRESH");
 }
 
 } // namespace duckdb

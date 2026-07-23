@@ -31,7 +31,11 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 	if (result->HasError() || result->RowCount() == 0) {
 		throw ParserException("Materialized view '%s' does not exist in IVM metadata.", view_name);
 	}
-	return static_cast<RefreshType>(result->GetValue(0, 0).GetValue<int8_t>());
+	auto raw_type = result->GetValue(0, 0).GetValue<int8_t>();
+	if (raw_type == static_cast<int8_t>(openivm::LEGACY_CURRENT_DIFF_RECOMPUTE_TYPE)) {
+		return RefreshType::FULL_REFRESH;
+	}
+	return static_cast<RefreshType>(raw_type);
 }
 
 bool RefreshMetadata::HasMinMax(const string &view_name) {
@@ -946,12 +950,15 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<
 		    !ExtractJsonString(object, "source_col", op.source_col)) {
 			continue;
 		}
+		ExtractJsonString(object, "source_cast", op.source_cast);
 		if (op.kind == "lookup") {
 			if (!ExtractJsonString(object, "lookup", op.lookup) ||
 			    !ExtractJsonString(object, "lookup_col", op.lookup_col) ||
 			    !ExtractJsonString(object, "lookup_out", op.lookup_out)) {
 				continue;
 			}
+			ExtractJsonString(object, "lookup_cast", op.lookup_cast);
+			ExtractJsonString(object, "lookup_out_cast", op.lookup_out_cast);
 		} else if (op.kind != "direct") {
 			continue;
 		}
@@ -970,10 +977,19 @@ string RefreshMetadata::WindowPartitionLineageToJson(const vector<WindowPartitio
 		json += "{\"k\":" + SqlUtils::JsonQuote(op.kind) + ",\"out\":" + SqlUtils::JsonQuote(op.output_col) +
 		        ",\"source\":" + SqlUtils::JsonQuote(op.source) +
 		        ",\"source_col\":" + SqlUtils::JsonQuote(op.source_col);
+		if (!op.source_cast.empty()) {
+			json += ",\"source_cast\":" + SqlUtils::JsonQuote(op.source_cast);
+		}
 		if (op.kind == "lookup") {
 			json += ",\"lookup\":" + SqlUtils::JsonQuote(op.lookup) +
 			        ",\"lookup_col\":" + SqlUtils::JsonQuote(op.lookup_col) +
 			        ",\"lookup_out\":" + SqlUtils::JsonQuote(op.lookup_out);
+			if (!op.lookup_cast.empty()) {
+				json += ",\"lookup_cast\":" + SqlUtils::JsonQuote(op.lookup_cast);
+			}
+			if (!op.lookup_out_cast.empty()) {
+				json += ",\"lookup_out_cast\":" + SqlUtils::JsonQuote(op.lookup_out_cast);
+			}
 		}
 		json += "}";
 	}

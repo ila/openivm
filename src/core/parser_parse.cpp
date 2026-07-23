@@ -3,11 +3,53 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/pragma_statement.hpp"
 
 #include <regex>
 
 namespace duckdb {
+
+static unique_ptr<SQLStatement> BuildInternalPragma(const string &name, const string &query) {
+	auto statement = make_uniq<PragmaStatement>();
+	statement->info->name = name;
+	statement->info->parameters.push_back(make_uniq<ConstantExpression>(Value(query)));
+	return std::move(statement);
+}
+
+ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExtensionInfo *info, const string &query,
+                                                                       ParserOptions &options) {
+	try {
+		auto extension_result = ParseFunction(info, query);
+		if (extension_result.type == ParserExtensionResultType::PARSE_SUCCESSFUL) {
+			vector<unique_ptr<SQLStatement>> statements;
+			statements.push_back(BuildInternalPragma("openivm_materialized_view_lifecycle", query));
+			return ParserOverrideResult(std::move(statements));
+		}
+
+		// DuckDB parses DROP VIEW natively, so the regular parser-extension fallback
+		// never sees it. Route only that structured statement through OpenIVM so its
+		// backing objects and metadata are dropped in the same caller transaction.
+		ParserOptions native_options = options;
+		native_options.extensions = nullptr;
+		Parser parser(native_options);
+		parser.ParseQuery(query);
+		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::DROP_STATEMENT) {
+			return ParserOverrideResult();
+		}
+		auto &drop = parser.statements[0]->Cast<DropStatement>();
+		if (drop.info->type != CatalogType::VIEW_ENTRY) {
+			return ParserOverrideResult();
+		}
+		vector<unique_ptr<SQLStatement>> statements;
+		statements.push_back(BuildInternalPragma("openivm_materialized_view_drop", query));
+		return ParserOverrideResult(std::move(statements));
+	} catch (std::exception &ex) {
+		return ParserOverrideResult(ex);
+	}
+}
 
 ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(ParserExtensionInfo *info,
                                                                           const string &query) {
@@ -49,7 +91,9 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 		alter_parser.ParseQuery("SELECT 1");
 		auto parse_data =
 		    make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(std::move(alter_parser.statements[0]));
-		dynamic_cast<MaterializedViewParseData &>(*parse_data).alter_sql = update_sql;
+		auto &materialized_view_data = dynamic_cast<MaterializedViewParseData &>(*parse_data);
+		materialized_view_data.alter_sql = update_sql;
+		materialized_view_data.target_name = alter_view_name;
 		return ParserExtensionParseResult(std::move(parse_data));
 	}
 
@@ -84,7 +128,9 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 
 	auto parse_data = make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(std::move(p.statements[0]),
 	                                                                                      refresh_interval);
-	dynamic_cast<MaterializedViewParseData &>(*parse_data).is_replace = is_replace;
+	auto &materialized_view_data = dynamic_cast<MaterializedViewParseData &>(*parse_data);
+	materialized_view_data.is_replace = is_replace;
+	materialized_view_data.target_name = SqlUtils::ExtractTableName(query_lower);
 	return ParserExtensionParseResult(std::move(parse_data));
 }
 

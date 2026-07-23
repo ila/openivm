@@ -104,4 +104,43 @@ void RefreshLocks::ExitDeltaRefresh(Catalog &catalog) {
 	GetDeltaCatalogGate(catalog).ExitRefresh();
 }
 
+TransactionalMVLockState &TransactionalMVLockState::Get(ClientContext &context) {
+	return *context.registered_state->GetOrCreate<TransactionalMVLockState>("openivm_transactional_mv_locks");
+}
+
+void TransactionalMVLockState::Acquire(const vector<string> &view_names, const vector<string> &delta_table_names) {
+	auto sorted_views = view_names;
+	std::sort(sorted_views.begin(), sorted_views.end());
+	sorted_views.erase(std::unique(sorted_views.begin(), sorted_views.end()), sorted_views.end());
+	for (auto &view_name : sorted_views) {
+		if (locked_views.insert(view_name).second) {
+			view_guards.push_back(make_uniq<ViewLockGuard>(view_name));
+		}
+	}
+
+	auto sorted_deltas = delta_table_names;
+	std::sort(sorted_deltas.begin(), sorted_deltas.end());
+	sorted_deltas.erase(std::unique(sorted_deltas.begin(), sorted_deltas.end()), sorted_deltas.end());
+	for (auto &delta_table : sorted_deltas) {
+		if (locked_delta_tables.insert(delta_table).second) {
+			delta_guards.push_back(make_uniq<DeltaLockGuard>(delta_table));
+		}
+	}
+}
+
+void TransactionalMVLockState::TransactionCommit(MetaTransaction &transaction, ClientContext &context) {
+	Release();
+}
+
+void TransactionalMVLockState::TransactionRollback(MetaTransaction &transaction, ClientContext &context) {
+	Release();
+}
+
+void TransactionalMVLockState::Release() {
+	delta_guards.clear();
+	view_guards.clear();
+	locked_delta_tables.clear();
+	locked_views.clear();
+}
+
 } // namespace duckdb

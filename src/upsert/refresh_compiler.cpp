@@ -1146,7 +1146,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql, bool has_minmax, bool list_mode,
                                const string &delta_ts_filter, const string &catalog_prefix, bool /*insert_only*/,
-                               const vector<LogicalType> &column_types) {
+                               const vector<LogicalType> &column_types, bool *out_full_recompute) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// Any non-summable column (VARCHAR literal, CASE result, LIST) forces a full
@@ -1164,7 +1164,11 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 		}
 	}
 
-	if (has_minmax || has_non_summable_col) {
+	bool full_recompute = has_minmax || has_non_summable_col;
+	if (out_full_recompute) {
+		*out_full_recompute = full_recompute;
+	}
+	if (full_recompute) {
 		string delete_query = "DELETE FROM " + data_table + ";\n";
 		string insert_query = "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 		return delete_query + insert_query;

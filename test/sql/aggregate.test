@@ -2216,6 +2216,71 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# UNION-ALL-of-scalar-aggregates over separate sources, including an empty source.
+# The SIMPLE_AGGREGATE full-recompute path must not run empty-source nulling over
+# the whole UNION result.
+statement ok
+CREATE TABLE ua_multi_a (id INT, amount INT);
+
+statement ok
+CREATE TABLE ua_multi_b (id INT, amount INT);
+
+statement ok
+CREATE TABLE ua_multi_empty (id INT, amount INT);
+
+statement ok
+INSERT INTO ua_multi_a VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO ua_multi_b VALUES (1, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ua_multi_counts AS
+    SELECT 'a' AS kind, COUNT(*) AS n FROM ua_multi_a
+    UNION ALL
+    SELECT 'b', COUNT(*) FROM ua_multi_b
+    UNION ALL
+    SELECT 'empty', COUNT(*) FROM ua_multi_empty;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_ua_multi_counts';
+----
+1
+
+statement ok
+INSERT INTO ua_multi_a VALUES (3, 40);
+
+statement ok
+DELETE FROM ua_multi_b WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_ua_multi_counts');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_ua_multi_counts
+    EXCEPT ALL
+    SELECT * FROM (
+        SELECT 'a', COUNT(*) FROM ua_multi_a
+        UNION ALL SELECT 'b', COUNT(*) FROM ua_multi_b
+        UNION ALL SELECT 'empty', COUNT(*) FROM ua_multi_empty
+    ) q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        SELECT 'a', COUNT(*) FROM ua_multi_a
+        UNION ALL SELECT 'b', COUNT(*) FROM ua_multi_b
+        UNION ALL SELECT 'empty', COUNT(*) FROM ua_multi_empty
+    ) q
+    EXCEPT ALL SELECT * FROM mv_ua_multi_counts
+);
+----
+0
+
 # LIST with large batch of mixed inserts/deletes
 statement ok
 CREATE TABLE list_heavy (bucket INT, token VARCHAR);

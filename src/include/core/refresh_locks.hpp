@@ -2,10 +2,12 @@
 #define REFRESH_LOCKS_HPP
 
 #include "duckdb.hpp"
+#include "duckdb/main/client_context_state.hpp"
 
 #include <condition_variable>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -159,6 +161,27 @@ public:
 	TryViewLockGuard &operator=(const TryViewLockGuard &) = delete;
 	TryViewLockGuard(TryViewLockGuard &&) = delete;
 	TryViewLockGuard &operator=(TryViewLockGuard &&) = delete;
+};
+
+// Native lifecycle and refresh programs are returned as multiple DuckDB
+// statements. Keep their logical locks until the surrounding caller transaction
+// commits or rolls back, rather than releasing them between statements.
+class TransactionalMVLockState : public ClientContextState {
+public:
+	static TransactionalMVLockState &Get(ClientContext &context);
+
+	void Acquire(const vector<string> &view_names, const vector<string> &delta_table_names);
+
+	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
+	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override;
+
+private:
+	void Release();
+
+	unordered_set<string> locked_views;
+	unordered_set<string> locked_delta_tables;
+	vector<unique_ptr<ViewLockGuard>> view_guards;
+	vector<unique_ptr<DeltaLockGuard>> delta_guards;
 };
 
 } // namespace duckdb

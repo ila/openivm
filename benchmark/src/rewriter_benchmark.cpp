@@ -19,6 +19,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cerrno>
 #include <ctime>
 #include <iomanip>
 #include <cstdio>
@@ -44,6 +45,55 @@ using openivm_bench::Log;
 using openivm_bench::ReadAllBytes;
 using openivm_bench::Timestamp;
 using openivm_bench::WriteAllBytes;
+
+static bool ReadAllBytesUntil(int fd, void *buf, size_t n, std::chrono::steady_clock::time_point deadline,
+                              bool &timed_out) {
+	char *p = static_cast<char *>(buf);
+	while (n > 0) {
+		auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			timed_out = true;
+			return false;
+		}
+
+		int remaining_ms =
+		    static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+		struct pollfd pfd;
+		pfd.fd = fd;
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+
+		int ret = poll(&pfd, 1, std::min(remaining_ms, 500));
+		if (ret < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return false;
+		}
+		if (ret == 0) {
+			continue;
+		}
+		if (pfd.revents & POLLIN) {
+			ssize_t r = read(fd, p, n);
+			if (r < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				return false;
+			}
+			if (r == 0) {
+				return false;
+			}
+			p += r;
+			n -= static_cast<size_t>(r);
+			continue;
+		}
+		if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+			return false;
+		}
+	}
+	return true;
+}
 
 static string FormatNumber(double v) {
 	std::ostringstream oss;
@@ -1019,34 +1069,51 @@ struct ForkWorker {
 			int ret = poll(&pfd, 1, poll_ms);
 
 			if (ret > 0 && (pfd.revents & POLLIN)) {
-				if (!ReadAllBytes(from_child_fd, &result_phase, sizeof(result_phase)) ||
-				    !ReadAllBytes(from_child_fd, &result_incremental, sizeof(result_incremental)) ||
-				    !ReadAllBytes(from_child_fd, &result_correct, sizeof(result_correct)) ||
-				    !ReadAllBytes(from_child_fd, &result_time_select_ms, sizeof(result_time_select_ms)) ||
-				    !ReadAllBytes(from_child_fd, &result_time_mv_ms, sizeof(result_time_mv_ms)) ||
-				    !ReadAllBytes(from_child_fd, &result_time_refresh_ms, sizeof(result_time_refresh_ms)) ||
-				    !ReadAllBytes(from_child_fd, &result_time_verify_ms, sizeof(result_time_verify_ms))) {
+				bool timed_out = false;
+				auto read_field = [&](void *buf, size_t n) {
+					return ReadAllBytesUntil(from_child_fd, buf, n, deadline, timed_out);
+				};
+				auto finish_read_failure = [&]() {
+					if (timed_out) {
+						kill(child_pid, SIGKILL);
+						waitpid(child_pid, nullptr, 0);
+						child_pid = -1;
+						result_phase = PHASE_TIMEOUT;
+						result_error = "timeout";
+						return;
+					}
 					int status;
 					waitpid(child_pid, &status, 0);
 					child_pid = -1;
 					result_phase = PHASE_CRASH;
+					if (WIFEXITED(status)) {
+						result_error = "child exited with code " + std::to_string(WEXITSTATUS(status));
+					} else if (WIFSIGNALED(status)) {
+						result_error = "child killed by signal " + std::to_string(WTERMSIG(status));
+					} else {
+						result_error = "child died while writing result";
+					}
+				};
+
+				if (!read_field(&result_phase, sizeof(result_phase)) ||
+				    !read_field(&result_incremental, sizeof(result_incremental)) ||
+				    !read_field(&result_correct, sizeof(result_correct)) ||
+				    !read_field(&result_time_select_ms, sizeof(result_time_select_ms)) ||
+				    !read_field(&result_time_mv_ms, sizeof(result_time_mv_ms)) ||
+				    !read_field(&result_time_refresh_ms, sizeof(result_time_refresh_ms)) ||
+				    !read_field(&result_time_verify_ms, sizeof(result_time_verify_ms))) {
+					finish_read_failure();
 					return;
 				}
 				uint32_t err_len = 0;
-				if (!ReadAllBytes(from_child_fd, &err_len, sizeof(err_len))) {
-					int status;
-					waitpid(child_pid, &status, 0);
-					child_pid = -1;
-					result_phase = PHASE_CRASH;
+				if (!read_field(&err_len, sizeof(err_len))) {
+					finish_read_failure();
 					return;
 				}
 				if (err_len > 0) {
 					result_error.resize(err_len);
-					if (!ReadAllBytes(from_child_fd, &result_error[0], err_len)) {
-						int status;
-						waitpid(child_pid, &status, 0);
-						child_pid = -1;
-						result_phase = PHASE_CRASH;
+					if (!read_field(&result_error[0], err_len)) {
+						finish_read_failure();
 						return;
 					}
 				}

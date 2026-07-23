@@ -88,7 +88,7 @@ Returns a single row:
 |---|---:|---:|---:|---:|---|
 | incremental | 1200.0 | 50000.0 | 1200.0 | 50000.0 | false |
 
-- `decision`: the selected strategy. Values include `incremental`, `group_recompute`, `window_partition`, `current_diff_recompute`, `distinct_incremental`, `semi_anti_recompute`, and `full`.
+- `decision`: the selected strategy. Values include `incremental`, `group_recompute`, `window_partition`, `distinct_incremental`, `semi_anti_recompute`, and `full`.
 - `incremental_cost`: estimated cost of the selected non-full strategy. For affected-domain strategies, this is not a pure delta-only cost.
 - `recompute_cost`: estimated cost of a full DELETE + INSERT.
 - `incremental_predicted_ms`: learned prediction for the selected non-full strategy, or the static estimate before calibration.

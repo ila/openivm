@@ -581,4 +581,137 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	}
 }
 
+static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connection &metadata_con,
+                                               const string &view_catalog_name, const string &view_schema_name,
+                                               const string &view_name, const string &attached_db_catalog_name,
+                                               const string &attached_db_schema_name) {
+	RefreshMetadata metadata(metadata_con);
+	auto delta_tables = metadata.GetDeltaTables(view_name);
+	DeltaActivityResult conservative_activity;
+	conservative_activity.has_join = metadata.HasJoin(view_name) || delta_tables.size() > 1;
+	conservative_activity.tables_with_changes = delta_tables.size();
+	conservative_activity.any_has_deletes = true;
+	conservative_activity.all_ducklake = false;
+	conservative_activity.active_delta_table_names = delta_tables;
+
+	// The planning connection cannot see transaction-local delta rows. Compile all
+	// registered native sources conservatively; the returned SQL executes through
+	// the caller context and therefore sees exactly the caller's transaction.
+	return GenerateRefreshSQL(context, view_catalog_name, view_schema_name, view_name, false, attached_db_catalog_name,
+	                          attached_db_schema_name, nullptr, nullptr, nullptr, &conservative_activity, nullptr);
+}
+
+string TransactionalRefreshQuery(ClientContext &context, const FunctionParameters &parameters) {
+	string view_catalog_name;
+	string view_schema_name;
+	string attached_db_catalog_name;
+	string attached_db_schema_name;
+	string view_name;
+	bool cross_system = false;
+	Connection metadata_con(*context.db);
+
+	if (parameters.values.size() == 3) {
+		view_catalog_name = StringValue::Get(parameters.values[0]);
+		view_schema_name = StringValue::Get(parameters.values[1]);
+		view_name = StringValue::Get(parameters.values[2]);
+	} else if (parameters.values.size() == 5) {
+		view_catalog_name = StringValue::Get(parameters.values[0]);
+		view_schema_name = StringValue::Get(parameters.values[1]);
+		attached_db_catalog_name = StringValue::Get(parameters.values[2]);
+		attached_db_schema_name = StringValue::Get(parameters.values[3]);
+		view_name = StringValue::Get(parameters.values[4]);
+		cross_system = true;
+	} else if (parameters.values.size() == 1) {
+		view_name = StringValue::Get(parameters.values[0]);
+		auto resolved = ResolveViewCatalogFromContext(context, metadata_con, view_name);
+		view_catalog_name = resolved.view_catalog_name;
+		view_schema_name = resolved.view_schema_name;
+		cross_system = resolved.cross_system;
+	} else {
+		throw InvalidInputException("OpenIVM refresh received an unsupported argument list");
+	}
+	if (RefreshMetadata(metadata_con).GetViewQuery(view_name).empty()) {
+		throw CatalogException("Materialized view '%s' does not exist", view_name);
+	}
+
+	if (!view_catalog_name.empty()) {
+		auto default_result = metadata_con.Query("SELECT current_database()");
+		if (!default_result->HasError() && default_result->RowCount() > 0 && !default_result->GetValue(0, 0).IsNull() &&
+		    default_result->GetValue(0, 0).ToString() != view_catalog_name) {
+			cross_system = true;
+		}
+	}
+	if (cross_system) {
+		// DuckDB cannot commit writes to the native metadata catalog and an
+		// attached external catalog in one transaction. Keep the staged path for
+		// that boundary; native catalogs use the caller-transaction program below.
+		UpsertDeltaQueriesLocked(context, parameters);
+		return "SELECT true AS Success";
+	}
+
+	RefreshMetadata metadata(metadata_con);
+	string cascade_mode = "downstream";
+	Value cascade_value;
+	if (context.TryGetCurrentSetting("openivm_cascade_refresh", cascade_value) && !cascade_value.IsNull()) {
+		cascade_mode = StringUtil::Lower(cascade_value.ToString());
+	}
+
+	vector<string> refresh_order;
+	if (cascade_mode == "upstream" || cascade_mode == "both") {
+		auto upstream = metadata.GetUpstreamViews(view_name);
+		refresh_order.insert(refresh_order.end(), upstream.begin(), upstream.end());
+	}
+	refresh_order.push_back(view_name);
+	if (cascade_mode == "downstream" || cascade_mode == "both") {
+		auto downstream = metadata.GetDownstreamViews(view_name);
+		refresh_order.insert(refresh_order.end(), downstream.begin(), downstream.end());
+	}
+
+	string program;
+	unordered_set<string> seen;
+	vector<string> lock_views;
+	vector<string> lock_deltas;
+	for (auto &node : refresh_order) {
+		if (!seen.insert(node).second) {
+			continue;
+		}
+		auto location = ResolveViewLocation(metadata_con, node, view_catalog_name, view_schema_name);
+		if (location.cross_system) {
+			throw NotImplementedException(
+			    "Transactional native refresh cannot include cross-catalog dependent view '%s'", node);
+		}
+		lock_views.push_back(node);
+		auto node_deltas = metadata.GetDeltaTables(node);
+		lock_deltas.insert(lock_deltas.end(), node_deltas.begin(), node_deltas.end());
+		if (metadata.HasDownstreamViews(node)) {
+			lock_deltas.push_back(SqlUtils::DeltaName(node));
+		}
+
+		string hook_sql;
+		string hook_mode;
+		auto hooks = metadata_con.Query("SELECT hook_sql, mode FROM openivm_refresh_hooks"
+		                                " WHERE view_name = '" +
+		                                SqlUtils::EscapeValue(node) + "'");
+		if (!hooks->HasError() && hooks->RowCount() > 0) {
+			hook_sql = hooks->GetValue(0, 0).ToString();
+			hook_mode = StringUtil::Lower(hooks->GetValue(1, 0).ToString());
+		}
+		if (!hook_sql.empty() && hook_mode == "before") {
+			program += hook_sql + ";\n";
+		}
+		if (hook_mode != "replace") {
+			program +=
+			    BuildTransactionalRefreshViewSQL(context, metadata_con, location.catalog_name, location.schema_name,
+			                                     node, attached_db_catalog_name, attached_db_schema_name);
+			program += "\n";
+		}
+		if (!hook_sql.empty() && (hook_mode == "after" || hook_mode == "replace")) {
+			program += hook_sql + ";\n";
+		}
+	}
+	TransactionalMVLockState::Get(context).Acquire(lock_views, lock_deltas);
+	program += "SELECT true AS Success";
+	return program;
+}
+
 } // namespace duckdb

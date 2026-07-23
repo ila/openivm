@@ -530,13 +530,25 @@ static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t exp
 	return bcr.GetName();
 }
 
-static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
+static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, string *cast_type = nullptr) {
+	if (cast_type) {
+		cast_type->clear();
+	}
+	vector<string> cast_specs;
 	while (expr && expr->expression_class == ExpressionClass::BOUND_CAST) {
 		auto &cast = expr->Cast<BoundCastExpression>();
+		if (cast_type) {
+			cast_specs.push_back(SqlUtils::BuildCastSpec(expr->return_type.ToString(), cast.try_cast));
+		}
 		expr = cast.child.get();
 	}
 	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
 		return nullptr;
+	}
+	if (cast_type) {
+		for (auto it = cast_specs.rbegin(); it != cast_specs.rend(); it++) {
+			*cast_type = SqlUtils::ComposeCastSpecs(*it, *cast_type);
+		}
 	}
 	return &expr->Cast<BoundColumnRefExpression>();
 }
@@ -742,6 +754,25 @@ static bool GetLogicalGetColumnName(LogicalGet &get, idx_t column_index, string 
 	return false;
 }
 
+static bool GetLogicalGetColumnType(LogicalGet &get, idx_t column_index, LogicalType &type) {
+	if (column_index < get.returned_types.size()) {
+		type = get.returned_types[column_index];
+		return true;
+	}
+	if (get.GetTable().get()) {
+		auto &ids = get.GetColumnIds();
+		if (column_index < ids.size()) {
+			auto base_idx = ids[column_index].GetPrimaryIndex();
+			auto &cols = get.GetTable().get()->GetColumns();
+			if (base_idx < cols.LogicalColumnCount()) {
+				type = cols.GetColumn(LogicalIndex(base_idx)).Type();
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 static bool ResolveBindingToGetColumn(ColumnBinding binding, const CreateMVPlanFacts &facts, LogicalGet *&get,
                                       string &column) {
 	idx_t table_index = binding.table_index;
@@ -792,6 +823,53 @@ static bool ResolveBindingToOccurrenceRef(ColumnBinding binding, const CreateMVP
 	out.table = occurrence_it->second.table;
 	out.occurrence = occurrence_it->second.occurrence;
 	return true;
+}
+
+static bool ResolveBindingToOccurrenceRefWithCast(ColumnBinding binding, const CreateMVPlanFacts &facts,
+                                                  OccurrenceColumnRef &out, string &cast_type,
+                                                  const LogicalType &expression_type) {
+	idx_t table_index = binding.table_index;
+	idx_t column_index = binding.column_index;
+	for (int depth = 0; depth < 16; depth++) {
+		auto get_it = facts.gets_by_index.find(table_index);
+		if (get_it != facts.gets_by_index.end()) {
+			auto *get = get_it->second;
+			if (!GetLogicalGetColumnName(*get, column_index, out.column)) {
+				return false;
+			}
+			auto occurrence_it = facts.occurrence_by_index.find(get->table_index);
+			if (occurrence_it == facts.occurrence_by_index.end()) {
+				return false;
+			}
+			out.table = occurrence_it->second.table;
+			out.occurrence = occurrence_it->second.occurrence;
+			LogicalType base_type;
+			if (cast_type.empty() && GetLogicalGetColumnType(*get, column_index, base_type) &&
+			    !(base_type == expression_type)) {
+				cast_type = expression_type.ToString();
+			}
+			return true;
+		}
+		auto proj_it = facts.projections_by_index.find(table_index);
+		if (proj_it == facts.projections_by_index.end()) {
+			return false;
+		}
+		auto *proj = proj_it->second;
+		if (column_index >= proj->expressions.size()) {
+			return false;
+		}
+		string projection_cast;
+		auto *next = GetColumnRefThroughCasts(proj->expressions[column_index].get(), &projection_cast);
+		if (!next) {
+			return false;
+		}
+		if (!projection_cast.empty()) {
+			cast_type = SqlUtils::ComposeCastSpecs(cast_type, projection_cast);
+		}
+		table_index = next->binding.table_index;
+		column_index = next->binding.column_index;
+	}
+	return false;
 }
 
 static void AddJoinEdgesFromFacts(CreateMVPlanFacts &facts) {
@@ -1063,15 +1141,31 @@ struct WindowLineageOp {
 	string source_table;
 	idx_t source_occurrence = 0;
 	string source_col;
+	string source_cast;
 	string lookup_table;
 	idx_t lookup_occurrence = 0;
 	string lookup_col;
+	string lookup_cast;
 	string lookup_output_col;
+	string lookup_output_cast;
 };
 
 struct WindowLookupEdge {
 	OccurrenceColumnRef lookup_join;
+	string lookup_cast;
 	OccurrenceColumnRef changed_join;
+	string changed_cast;
+};
+
+struct WindowEquivalenceEdge {
+	OccurrenceColumnRef first;
+	string first_cast;
+	OccurrenceColumnRef second;
+	string second_cast;
+
+	bool HasCast() const {
+		return !first_cast.empty() || !second_cast.empty();
+	}
 };
 
 static void CollectLeafColumnBindings(Expression *expr, vector<ColumnBinding> &bindings) {
@@ -1133,7 +1227,7 @@ static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMV
 }
 
 static void CollectInnerJoinEdgesOccurrence(LogicalOperator *op, const CreateMVPlanFacts &facts,
-                                            vector<pair<OccurrenceColumnRef, OccurrenceColumnRef>> &edges) {
+                                            vector<WindowEquivalenceEdge> &edges) {
 	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 		auto &join = op->Cast<LogicalComparisonJoin>();
@@ -1142,15 +1236,18 @@ static void CollectInnerJoinEdgesOccurrence(LogicalOperator *op, const CreateMVP
 				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
 					continue;
 				}
-				auto *left = GetColumnRefThroughCasts(cond.left.get());
-				auto *right = GetColumnRefThroughCasts(cond.right.get());
+				string left_cast;
+				string right_cast;
+				auto *left = GetColumnRefThroughCasts(cond.left.get(), &left_cast);
+				auto *right = GetColumnRefThroughCasts(cond.right.get(), &right_cast);
 				if (!left || !right) {
 					continue;
 				}
 				OccurrenceColumnRef lref, rref;
-				if (ResolveBindingToOccurrenceRef(left->binding, facts, lref) &&
-				    ResolveBindingToOccurrenceRef(right->binding, facts, rref)) {
-					edges.emplace_back(std::move(lref), std::move(rref));
+				if (ResolveBindingToOccurrenceRefWithCast(left->binding, facts, lref, left_cast, left->return_type) &&
+				    ResolveBindingToOccurrenceRefWithCast(right->binding, facts, rref, right_cast,
+				                                          right->return_type)) {
+					edges.push_back({std::move(lref), std::move(left_cast), std::move(rref), std::move(right_cast)});
 				}
 			}
 		}
@@ -1165,35 +1262,39 @@ static void CollectWindowLookupEdges(LogicalOperator *op, const CreateMVPlanFact
 	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 		auto &join = op->Cast<LogicalComparisonJoin>();
-		auto add_lookup_edge = [&](OccurrenceColumnRef lookup_ref, OccurrenceColumnRef changed_ref) {
-			edges.push_back({std::move(lookup_ref), std::move(changed_ref)});
+		auto add_lookup_edge = [&](OccurrenceColumnRef lookup_ref, string lookup_cast, OccurrenceColumnRef changed_ref,
+		                           string changed_cast) {
+			edges.push_back(
+			    {std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
 		};
 		for (auto &cond : join.conditions) {
 			if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
 				continue;
 			}
-			auto *left = GetColumnRefThroughCasts(cond.left.get());
-			auto *right = GetColumnRefThroughCasts(cond.right.get());
+			string left_cast;
+			string right_cast;
+			auto *left = GetColumnRefThroughCasts(cond.left.get(), &left_cast);
+			auto *right = GetColumnRefThroughCasts(cond.right.get(), &right_cast);
 			if (!left || !right) {
 				continue;
 			}
 			OccurrenceColumnRef lref, rref;
-			if (!ResolveBindingToOccurrenceRef(left->binding, facts, lref) ||
-			    !ResolveBindingToOccurrenceRef(right->binding, facts, rref)) {
+			if (!ResolveBindingToOccurrenceRefWithCast(left->binding, facts, lref, left_cast, left->return_type) ||
+			    !ResolveBindingToOccurrenceRefWithCast(right->binding, facts, rref, right_cast, right->return_type)) {
 				continue;
 			}
 			switch (join.join_type) {
 			case JoinType::INNER:
-				add_lookup_edge(lref, rref);
-				add_lookup_edge(rref, lref);
+				add_lookup_edge(lref, left_cast, rref, right_cast);
+				add_lookup_edge(rref, right_cast, lref, left_cast);
 				break;
 			case JoinType::LEFT:
-				add_lookup_edge(lref, rref);
-				add_lookup_edge(rref, lref);
+				add_lookup_edge(lref, left_cast, rref, right_cast);
+				add_lookup_edge(rref, right_cast, lref, left_cast);
 				break;
 			case JoinType::RIGHT:
-				add_lookup_edge(rref, lref);
-				add_lookup_edge(lref, rref);
+				add_lookup_edge(rref, right_cast, lref, left_cast);
+				add_lookup_edge(lref, left_cast, rref, right_cast);
 				break;
 			default:
 				break;
@@ -1215,7 +1316,8 @@ static void CollectWindowPartitionRefs(LogicalOperator *op, const CreateMVPlanFa
 			}
 			auto &win_expr = expr->Cast<BoundWindowExpression>();
 			for (auto &part : win_expr.partitions) {
-				auto *bcr = GetColumnRefThroughCasts(part.get());
+				string partition_cast;
+				auto *bcr = GetColumnRefThroughCasts(part.get(), &partition_cast);
 				if (!bcr) {
 					continue;
 				}
@@ -1237,6 +1339,7 @@ static void CollectWindowPartitionRefs(LogicalOperator *op, const CreateMVPlanFa
 						op.source_table = ref.table;
 						op.source_occurrence = ref.occurrence;
 						op.source_col = ref.column;
+						op.source_cast = partition_cast;
 						direct_ops.push_back(std::move(op));
 					}
 				}
@@ -1256,9 +1359,11 @@ static bool SameRef(const OccurrenceColumnRef &a, const OccurrenceColumnRef &b) 
 static bool SameOp(const WindowLineageOp &a, const WindowLineageOp &b) {
 	return a.kind == b.kind && StringUtil::CIEquals(a.output_col, b.output_col) &&
 	       StringUtil::CIEquals(a.source_table, b.source_table) && a.source_occurrence == b.source_occurrence &&
-	       StringUtil::CIEquals(a.source_col, b.source_col) && StringUtil::CIEquals(a.lookup_table, b.lookup_table) &&
-	       a.lookup_occurrence == b.lookup_occurrence && StringUtil::CIEquals(a.lookup_col, b.lookup_col) &&
-	       StringUtil::CIEquals(a.lookup_output_col, b.lookup_output_col);
+	       StringUtil::CIEquals(a.source_col, b.source_col) && StringUtil::CIEquals(a.source_cast, b.source_cast) &&
+	       StringUtil::CIEquals(a.lookup_table, b.lookup_table) && a.lookup_occurrence == b.lookup_occurrence &&
+	       StringUtil::CIEquals(a.lookup_col, b.lookup_col) && StringUtil::CIEquals(a.lookup_cast, b.lookup_cast) &&
+	       StringUtil::CIEquals(a.lookup_output_col, b.lookup_output_col) &&
+	       StringUtil::CIEquals(a.lookup_output_cast, b.lookup_output_cast);
 }
 
 static void AddUniqueLineageOp(vector<WindowLineageOp> &ops, WindowLineageOp op) {
@@ -1288,9 +1393,12 @@ static RefreshMetadata::WindowPartitionLineageOp ToMetadataWindowLineageOp(const
 	metadata_op.output_col = op.output_col;
 	metadata_op.source = op.source_table;
 	metadata_op.source_col = op.source_col;
+	metadata_op.source_cast = op.source_cast;
 	metadata_op.lookup = op.lookup_table;
 	metadata_op.lookup_col = op.lookup_col;
+	metadata_op.lookup_cast = op.lookup_cast;
 	metadata_op.lookup_out = op.lookup_output_col;
+	metadata_op.lookup_out_cast = op.lookup_output_cast;
 	return metadata_op;
 }
 
@@ -1320,7 +1428,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		}
 	}
 
-	vector<pair<OccurrenceColumnRef, OccurrenceColumnRef>> edges;
+	vector<WindowEquivalenceEdge> edges;
 	CollectInnerJoinEdgesOccurrence(plan, facts, edges);
 	vector<WindowLookupEdge> lookup_edges;
 	CollectWindowLookupEdges(plan, facts, lookup_edges);
@@ -1335,6 +1443,9 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 		changed = false;
 		vector<WindowLineageOp> next_ops = partition_ops;
 		for (auto &edge : edges) {
+			if (edge.HasCast()) {
+				continue;
+			}
 			for (auto &direct : partition_ops) {
 				OccurrenceColumnRef direct_ref;
 				direct_ref.table = direct.source_table;
@@ -1358,6 +1469,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 				equivalent.source_table = other.table;
 				equivalent.source_occurrence = other.occurrence;
 				equivalent.source_col = other.column;
+				equivalent.source_cast = direct.source_cast;
 				AddUniqueLineageOp(next_ops, std::move(equivalent));
 				changed = true;
 			}
@@ -1387,10 +1499,13 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 			lookup.source_table = edge.changed_join.table;
 			lookup.source_occurrence = edge.changed_join.occurrence;
 			lookup.source_col = edge.changed_join.column;
+			lookup.source_cast = edge.changed_cast;
 			lookup.lookup_table = direct.source_table;
 			lookup.lookup_occurrence = direct.source_occurrence;
 			lookup.lookup_col = edge.lookup_join.column;
+			lookup.lookup_cast = edge.lookup_cast;
 			lookup.lookup_output_col = direct.source_col;
+			lookup.lookup_output_cast = direct.source_cast;
 			AddUniqueLineageOp(ops, std::move(lookup));
 		}
 	}

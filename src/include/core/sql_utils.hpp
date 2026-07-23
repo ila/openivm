@@ -50,6 +50,10 @@ public:
 	static string BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias);
 	static string BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
 	                                        const string &right_prefix);
+	/// Cast specs retain the legacy single-target-type representation while encoding nested/TRY_CAST expressions.
+	static string BuildCastSpec(const string &target_type, bool try_cast);
+	static string ComposeCastSpecs(const string &outer_cast_spec, const string &inner_cast_spec);
+	static string ApplyCastSpec(const string &column_expression, const string &cast_spec);
 	static string BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql);
 	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);
 	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,

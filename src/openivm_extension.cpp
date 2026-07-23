@@ -29,6 +29,7 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "core/parser.hpp"
+#include "core/parser_ddl.hpp"
 #include "rules/incremental_rewrite_rule.hpp"
 #include "rules/refresh_insert_rule.hpp"
 #include "core/openivm_debug.hpp"
@@ -157,6 +158,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// after the extension is loaded. Entry points also set the current ClientContext
 	// explicitly because pre-existing local settings override global defaults.
 	db_config.SetOption(PreserveInsertionOrderSetting::SettingIndex, Value::BOOLEAN(false));
+	// CREATE/ALTER MATERIALIZED VIEW and transactional DROP VIEW are expanded into
+	// ordinary DuckDB statements by OpenIVM's parser override. FALLBACK leaves every
+	// statement OpenIVM does not recognize with DuckDB's native parser.
+	db_config.SetOption(AllowParserOverrideExtensionSetting::SettingIndex, Value("fallback"));
 
 	db_config.AddExtensionOption("openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("openivm_refresh_mode", "refresh strategy: incremental, full, or auto",
@@ -356,6 +361,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	OptimizerExtension::Register(db_config, std::move(incremental_rewrite_rule));
 	OptimizerExtension::Register(db_config, std::move(refresh_insert_rule));
 
+	loader.RegisterFunction(PragmaFunction::PragmaCall("openivm_materialized_view_lifecycle",
+	                                                   MaterializedViewLifecycleQuery, {LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall("openivm_materialized_view_drop", MaterializedViewDropQuery,
+	                                                   {LogicalType::VARCHAR}));
+	loader.RegisterFunction(TableFunction(
+	    "openivm_execute_drop_view",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+	    ExecuteDropView, BindDropView, InitDropView));
+
 	TableFunction compute_delta_function("ComputeDelta",
 	                                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                                     ComputeDeltaFunction, ComputeDeltaBind, ComputeDeltaInit);
@@ -387,13 +401,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	con.Commit();
 
-	// Use the locked pragma_function_t variant: generates SQL and executes it under a
-	// per-view mutex, preventing concurrent refresh from double-applying deltas.
 	auto refresh_options =
-	    PragmaFunction::PragmaCall("refresh_options", UpsertDeltaQueriesLocked,
+	    PragmaFunction::PragmaCall("refresh_options", TransactionalRefreshQuery,
 	                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_options);
-	auto refresh = PragmaFunction::PragmaCall("refresh", UpsertDeltaQueriesLocked, {LogicalType::VARCHAR});
+	auto refresh = PragmaFunction::PragmaCall("refresh", TransactionalRefreshQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh);
 	auto declare_rely_fk = PragmaFunction::PragmaCall(
 	    "openivm_declare_rely_fk",
@@ -421,7 +433,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    PragmaFunction::PragmaCall("refresh_history", RefreshCostHistoryQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_history);
 	auto refresh_cross_system = PragmaFunction::PragmaCall(
-	    "refresh_cross_system", UpsertDeltaQueriesLocked,
+	    "refresh_cross_system", TransactionalRefreshQuery,
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cross_system);
 

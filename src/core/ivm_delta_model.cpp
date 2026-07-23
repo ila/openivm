@@ -639,10 +639,8 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 		if (analysis.found_asof_join &&
 		    (!has_lineage || AsofWindowPartitionReadsRightSideDirectly(direct_lineage_ops, model) ||
 		     !WindowLineageCoversAllSources(model.window_lineage_ops, facts))) {
-			model.type = RefreshType::CURRENT_DIFF_RECOMPUTE;
+			model.type = RefreshType::FULL_REFRESH;
 			model.window_lineage_ops.clear();
-			AddUnique(model.features, DeltaModelFeature::CURRENT_DIFF_RECOMPUTE);
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::ASOF_CURRENT_DIFF_RECOMPUTE);
 			ValidateDeltaViewModelInvariants(model);
 			return;
 		}

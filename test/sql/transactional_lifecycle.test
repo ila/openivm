@@ -1,0 +1,421 @@
+# name: test/sql/transactional_lifecycle.test
+# description: Materialized-view lifecycle operations participate in the caller transaction
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+load __TEST_DIR__/openivm_transactional_lifecycle.db
+
+# CREATE rollback removes every object created for the MV.
+statement ok
+CREATE TABLE lifecycle_create_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_create_src VALUES (1, 10);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_create_mv AS
+SELECT id, v FROM lifecycle_create_src;
+
+statement ok
+ROLLBACK;
+
+query IIII
+SELECT
+    (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_create_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_create_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_lifecycle_create_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_views');
+----
+0	0	0	0
+
+# REPLACE rollback restores the old definition, data, and refresh metadata.
+statement ok
+CREATE TABLE lifecycle_replace_src (id INTEGER, old_v INTEGER, new_v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_replace_src VALUES (1, 10, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_replace_mv REFRESH EVERY '5 minutes' AS
+SELECT id, old_v AS v FROM lifecycle_replace_src;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW lifecycle_replace_mv REFRESH EVERY '10 minutes' AS
+SELECT id, new_v AS v FROM lifecycle_replace_src;
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT id, v FROM lifecycle_replace_mv;
+----
+1	10
+
+query I
+SELECT refresh_interval FROM openivm_views WHERE view_name = 'lifecycle_replace_mv';
+----
+300
+
+# A replacement that fails during initial materialization also preserves the old MV.
+statement ok
+CREATE TABLE lifecycle_failed_replace_src (id INTEGER, txt VARCHAR);
+
+statement ok
+INSERT INTO lifecycle_failed_replace_src VALUES (1, 'not-an-integer');
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_failed_replace_mv AS
+SELECT id, txt FROM lifecycle_failed_replace_src;
+
+statement error
+CREATE OR REPLACE MATERIALIZED VIEW lifecycle_failed_replace_mv AS
+SELECT id, CAST(txt AS INTEGER) AS txt FROM lifecycle_failed_replace_src;
+----
+Could not convert
+
+query II
+SELECT id, txt FROM lifecycle_failed_replace_mv;
+----
+1	not-an-integer
+
+# ALTER rollback leaves the previous schedule unchanged.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER MATERIALIZED VIEW lifecycle_replace_mv SET REFRESH EVERY '30 minutes';
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT refresh_interval FROM openivm_views WHERE view_name = 'lifecycle_replace_mv';
+----
+300
+
+# DROP rollback restores the user view, backing state, metadata, and refreshability.
+statement ok
+CREATE TABLE lifecycle_drop_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_drop_src VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_drop_mv AS
+SELECT id, v FROM lifecycle_drop_src;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP VIEW lifecycle_drop_mv;
+
+statement ok
+ROLLBACK;
+
+query III
+SELECT
+    (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_drop_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_drop_mv'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_drop_mv');
+----
+1	1	1
+
+statement ok
+INSERT INTO lifecycle_drop_src VALUES (2, 20);
+
+statement ok
+PRAGMA refresh('lifecycle_drop_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_drop_mv
+    EXCEPT ALL
+    SELECT * FROM lifecycle_drop_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_drop_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_drop_mv
+);
+----
+0
+
+# Refresh rollback restores the MV and leaves its source delta available for retry.
+statement ok
+CREATE TABLE lifecycle_refresh_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_refresh_src VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_refresh_mv AS
+SELECT id, v FROM lifecycle_refresh_src;
+
+statement ok
+INSERT INTO lifecycle_refresh_src VALUES (2, 20);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+PRAGMA refresh('lifecycle_refresh_mv');
+
+query II
+SELECT id, v FROM lifecycle_refresh_mv ORDER BY id;
+----
+1	10
+2	20
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT id, v FROM lifecycle_refresh_mv ORDER BY id;
+----
+1	10
+
+query I
+SELECT count(*) FROM openivm_delta_lifecycle_refresh_src;
+----
+1
+
+statement ok
+PRAGMA refresh('lifecycle_refresh_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_refresh_mv
+    EXCEPT ALL
+    SELECT * FROM lifecycle_refresh_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_refresh_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_refresh_mv
+);
+----
+0
+
+# Transaction-local DML is visible to refresh and rolls back together.
+statement ok
+CREATE TABLE lifecycle_local_refresh_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_local_refresh_src VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_local_refresh_mv AS
+SELECT id, v FROM lifecycle_local_refresh_src;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO lifecycle_local_refresh_src VALUES (2, 20);
+
+statement ok
+PRAGMA refresh('lifecycle_local_refresh_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_local_refresh_mv
+    EXCEPT ALL
+    SELECT * FROM lifecycle_local_refresh_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_local_refresh_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_local_refresh_mv
+);
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_local_refresh_mv
+    EXCEPT ALL
+    SELECT * FROM lifecycle_local_refresh_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_local_refresh_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_local_refresh_mv
+);
+----
+0
+
+# A refresh keeps its OpenIVM locks until the surrounding transaction ends.
+# The second connection starts while the first transaction is sleeping after
+# refresh and must wait for rollback before it can consume the restored delta.
+statement ok
+CREATE TABLE lifecycle_lock_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_lock_src VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_lock_mv AS
+SELECT id, v FROM lifecycle_lock_src;
+
+statement ok
+INSERT INTO lifecycle_lock_src VALUES (2, 20);
+
+statement ok
+CREATE TABLE lifecycle_lock_timing (phase VARCHAR, observed_at TIMESTAMP);
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=0
+statement ok
+PRAGMA refresh('lifecycle_lock_mv');
+
+onlyif threadid=0
+statement ok
+SELECT sleep_ms(1200);
+
+onlyif threadid=0
+statement ok
+ROLLBACK;
+
+onlyif threadid=1
+statement ok
+SELECT sleep_ms(200);
+
+onlyif threadid=1
+statement ok
+INSERT INTO lifecycle_lock_timing VALUES ('before', now()::TIMESTAMP);
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('lifecycle_lock_mv');
+
+onlyif threadid=1
+statement ok
+INSERT INTO lifecycle_lock_timing VALUES ('after', now()::TIMESTAMP);
+
+endloop
+
+query I
+SELECT epoch_ms(max(observed_at)) - epoch_ms(min(observed_at)) >= 700
+FROM lifecycle_lock_timing;
+----
+true
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_lock_mv
+    EXCEPT ALL
+    SELECT * FROM lifecycle_lock_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_lock_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_lock_mv
+);
+----
+0
+
+# DuckLake cannot share the native metadata transaction. Its replacement data
+# is therefore built under an unpublished staging name and published only after
+# materialization succeeds.
+statement ok
+ATTACH '__TEST_DIR__/openivm_transactional_lifecycle.ducklake' AS lifecycle_dl (TYPE ducklake);
+
+statement ok
+CREATE TABLE lifecycle_dl.replace_src (id INTEGER, old_v INTEGER, txt VARCHAR);
+
+statement ok
+INSERT INTO lifecycle_dl.replace_src VALUES (1, 10, 'bad');
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_dl.replace_mv AS
+SELECT id, old_v AS v FROM lifecycle_dl.replace_src;
+
+statement error
+CREATE OR REPLACE MATERIALIZED VIEW lifecycle_dl.replace_mv AS
+SELECT id, CAST(txt AS INTEGER) AS v FROM lifecycle_dl.replace_src;
+----
+Could not convert
+
+query II
+SELECT id, v FROM lifecycle_dl.replace_mv;
+----
+1	10
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'lifecycle_dl'
+  AND table_name = 'openivm_stage_replace_mv';
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW lifecycle_dl.replace_mv AS
+SELECT id, length(txt) AS v FROM lifecycle_dl.replace_src;
+
+statement ok
+INSERT INTO lifecycle_dl.replace_src VALUES (2, 20, 'four');
+
+statement ok
+PRAGMA refresh('replace_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, v FROM lifecycle_dl.replace_mv
+    EXCEPT ALL
+    SELECT id, length(txt) AS v FROM lifecycle_dl.replace_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, length(txt) AS v FROM lifecycle_dl.replace_src
+    EXCEPT ALL
+    SELECT id, v FROM lifecycle_dl.replace_mv
+);
+----
+0

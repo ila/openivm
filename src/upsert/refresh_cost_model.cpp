@@ -106,8 +106,6 @@ static const char *StrategyLabelForRefreshType(RefreshType view_type) {
 		return "group_recompute";
 	case RefreshType::WINDOW_PARTITION:
 		return "window_partition";
-	case RefreshType::CURRENT_DIFF_RECOMPUTE:
-		return "current_diff_recompute";
 	case RefreshType::DISTINCT_INCREMENTAL:
 		return "distinct_incremental";
 	case RefreshType::SEMI_ANTI_RECOMPUTE:
@@ -701,17 +699,7 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	string strategy_label = StrategyLabelForRefreshType(view_type);
 	double strategy_compute = incremental_compute;
 	double strategy_upsert = incremental_upsert;
-	if (view_type == RefreshType::CURRENT_DIFF_RECOMPUTE) {
-		// Current-diff recomputes the result, diffs it against the stored MV (a scan of ~mv_card), and
-		// applies only the *changed* rows — not a full replace. So it beats full recompute when few rows
-		// change (saves the full rewrite) and loses when most of the MV changes (the diff scan is then
-		// pure overhead). Pricing the apply as recompute_replace (= full rewrite) made it a permanent tie
-		// with full, so the model never preferred full even when the delta touched most of the MV (the
-		// recurring S05 near-tie). Model the diff scan + changed-row apply instead.
-		double changed = std::min(estimated_delta_result, mv_card);
-		strategy_compute = recompute_compute + mv_card;
-		strategy_upsert = changed * 2.0;
-	} else if (view_type == RefreshType::GROUP_RECOMPUTE) {
+	if (view_type == RefreshType::GROUP_RECOMPUTE) {
 		// Estimated affected MV keys = Σᵢ delta_Tᵢ × (mv_card / actual_card_Tᵢ).
 		// Each source contributes a per-table view-query variant (substitute T_i
 		// with delta_T_i in view_query_sql), so compute scales with N_active sources.
@@ -772,8 +760,8 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		// overrides each side once it has enough history.
 		//   - will_skip: an empty delta with skip-empty on is short-circuited entirely → ~free.
 		//   - genuine incremental (strategy strictly cheaper than recompute and not skipped) pays the
-		//     incremental setup floor; recompute-equivalent strategies (CURRENT_DIFF_RECOMPUTE,
-		//     FULL_REFRESH, TOP_K) and empty-delta-with-skip-off pay only the recompute setup, so the
+		//     incremental setup floor; recompute-equivalent strategies (FULL_REFRESH, TOP_K) and
+		//     empty-delta-with-skip-off pay only the recompute setup, so the
 		//     decision is driven purely by the throughput term and the label is not spuriously flipped.
 		bool will_skip = !has_active_delta && skip_empty_enabled;
 		bool genuine_incremental = !will_skip && strategy_total < recompute_total;

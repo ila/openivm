@@ -5,7 +5,7 @@
 require openivm
 
 # ==========================================
-# ASOF projections use exact current/new diff recompute
+# ASOF projections fall back to full refresh
 # ==========================================
 
 statement ok
@@ -42,7 +42,7 @@ CREATE MATERIALIZED VIEW mv_oprec_asof_projection AS
 query I
 SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_projection';
 ----
-10
+3
 
 statement ok
 INSERT INTO oprec_asof_prices VALUES ('A', TIMESTAMP '2024-01-01 10:19:00', 190);
@@ -94,6 +94,151 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# FULL_REFRESH ASOF projections still emit signed deltas for downstream cascade.
+
+statement ok
+SET openivm_cascade_refresh = 'downstream';
+
+statement ok
+CREATE TABLE oprec_asof_cascade_trades (symbol VARCHAR, ts TIMESTAMP, qty INT);
+
+statement ok
+CREATE TABLE oprec_asof_cascade_prices (symbol VARCHAR, ts TIMESTAMP, price INT);
+
+statement ok
+INSERT INTO oprec_asof_cascade_trades VALUES
+    ('A', TIMESTAMP '2024-01-02 10:00:00', 1),
+    ('A', TIMESTAMP '2024-01-02 10:20:00', 2),
+    ('B', TIMESTAMP '2024-01-02 10:15:00', 3);
+
+statement ok
+INSERT INTO oprec_asof_cascade_prices VALUES
+    ('A', TIMESTAMP '2024-01-02 09:00:00', 100),
+    ('A', TIMESTAMP '2024-01-02 10:18:00', 180),
+    ('B', TIMESTAMP '2024-01-02 10:12:00', 120);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_asof_cascade_parent AS
+    SELECT
+        t.symbol AS symbol,
+        t.ts AS trade_ts,
+        t.qty AS qty,
+        p.ts AS price_ts,
+        p.price AS price
+    FROM oprec_asof_cascade_trades t
+    ASOF JOIN oprec_asof_cascade_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_cascade_parent';
+----
+3
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_asof_cascade_child AS
+    SELECT symbol, COUNT(*) AS cnt, SUM(qty * price) AS total_value
+    FROM mv_oprec_asof_cascade_parent
+    GROUP BY symbol;
+
+statement ok
+INSERT INTO oprec_asof_cascade_prices VALUES ('A', TIMESTAMP '2024-01-02 10:19:00', 190);
+
+statement ok
+INSERT INTO oprec_asof_cascade_trades VALUES ('A', TIMESTAMP '2024-01-02 10:21:00', 4);
+
+statement ok
+DELETE FROM oprec_asof_cascade_prices WHERE symbol = 'B' AND ts = TIMESTAMP '2024-01-02 10:12:00';
+
+statement ok
+UPDATE oprec_asof_cascade_trades SET qty = 6 WHERE symbol = 'A' AND ts = TIMESTAMP '2024-01-02 10:00:00';
+
+statement ok
+PRAGMA refresh('mv_oprec_asof_cascade_parent');
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        t.symbol AS symbol,
+        t.ts AS trade_ts,
+        t.qty AS qty,
+        p.ts AS price_ts,
+        p.price AS price
+    FROM oprec_asof_cascade_trades t
+    ASOF JOIN oprec_asof_cascade_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+    EXCEPT ALL
+    SELECT symbol, trade_ts, qty, price_ts, price FROM mv_oprec_asof_cascade_parent
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT symbol, trade_ts, qty, price_ts, price FROM mv_oprec_asof_cascade_parent
+    EXCEPT ALL
+    SELECT
+        t.symbol AS symbol,
+        t.ts AS trade_ts,
+        t.qty AS qty,
+        p.ts AS price_ts,
+        p.price AS price
+    FROM oprec_asof_cascade_trades t
+    ASOF JOIN oprec_asof_cascade_prices p
+      ON t.symbol = p.symbol
+     AND t.ts >= p.ts
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT symbol, COUNT(*) AS cnt, SUM(qty * price) AS total_value
+    FROM (
+        SELECT
+            t.symbol AS symbol,
+            t.ts AS trade_ts,
+            t.qty AS qty,
+            p.ts AS price_ts,
+            p.price AS price
+        FROM oprec_asof_cascade_trades t
+        ASOF JOIN oprec_asof_cascade_prices p
+          ON t.symbol = p.symbol
+         AND t.ts >= p.ts
+    ) q
+    GROUP BY symbol
+    EXCEPT ALL
+    SELECT symbol, cnt, total_value FROM mv_oprec_asof_cascade_child
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT symbol, cnt, total_value FROM mv_oprec_asof_cascade_child
+    EXCEPT ALL
+    SELECT symbol, COUNT(*) AS cnt, SUM(qty * price) AS total_value
+    FROM (
+        SELECT
+            t.symbol AS symbol,
+            t.ts AS trade_ts,
+            t.qty AS qty,
+            p.ts AS price_ts,
+            p.price AS price
+        FROM oprec_asof_cascade_trades t
+        ASOF JOIN oprec_asof_cascade_prices p
+          ON t.symbol = p.symbol
+         AND t.ts >= p.ts
+    ) q
+    GROUP BY symbol
+);
+----
+0
+
+statement ok
+SET openivm_cascade_refresh = 'off';
 
 # Grouped ASOF outputs use group recompute with current/new affected keys.
 
@@ -285,8 +430,9 @@ SELECT count(*) FROM (
 ----
 0
 
-# ASOF windows whose partition key comes from the RHS match must use current/new diff:
-# a newer RHS row can move existing left rows out of the old matched partition.
+# ASOF windows whose partition key comes from the RHS match fall back to full
+# refresh: a newer RHS row can move existing left rows out of the old matched
+# partition, so partition-local recompute is not safe.
 
 statement ok
 CREATE TABLE oprec_asof_rhs_win_trades (symbol VARCHAR, ts TIMESTAMP, qty INT);
@@ -329,7 +475,7 @@ CREATE MATERIALIZED VIEW mv_oprec_asof_rhs_window AS
 query I
 SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_rhs_window';
 ----
-10
+3
 
 statement ok
 INSERT INTO oprec_asof_rhs_win_prices VALUES ('A', TIMESTAMP '2024-02-02 10:15:00', 150);

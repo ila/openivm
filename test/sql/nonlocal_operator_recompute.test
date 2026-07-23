@@ -9,7 +9,7 @@ require openivm
 
 
 # ==========================================
-# SAMPLE is exact current/new diff recompute, not a local delta
+# SAMPLE falls back to full refresh; it is not a local delta
 # ==========================================
 
 statement ok
@@ -36,7 +36,7 @@ CREATE MATERIALIZED VIEW mv_oprec_sample AS
 query I
 SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_sample';
 ----
-10
+3
 
 statement ok
 INSERT INTO oprec_sample VALUES (7, 1, 70), (8, 3, 80);
@@ -95,8 +95,61 @@ SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_sample_volatile';
 ----
 3
 
+# Persisted legacy CURRENT_DIFF_RECOMPUTE metadata (type 10) maps to the
+# current full-refresh strategy during refresh.
+
+statement ok
+CREATE TABLE oprec_legacy_type10 (id INT, grp INT, v INT);
+
+statement ok
+INSERT INTO oprec_legacy_type10 VALUES
+    (1, 1, 10),
+    (2, 1, 20),
+    (3, 2, 30),
+    (4, 2, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_legacy_type10 AS
+    SELECT id, grp, v
+    FROM oprec_legacy_type10 USING SAMPLE reservoir(3 ROWS) REPEATABLE (31);
+
+statement ok
+UPDATE openivm_views SET type = 10 WHERE view_name = 'mv_oprec_legacy_type10';
+
+statement ok
+INSERT INTO oprec_legacy_type10 VALUES (5, 3, 50);
+
+statement ok
+DELETE FROM oprec_legacy_type10 WHERE id = 2;
+
+statement ok
+UPDATE oprec_legacy_type10 SET v = 15 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_oprec_legacy_type10');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, v
+    FROM oprec_legacy_type10 USING SAMPLE reservoir(3 ROWS) REPEATABLE (31)
+    EXCEPT ALL
+    SELECT id, grp, v FROM mv_oprec_legacy_type10
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, v FROM mv_oprec_legacy_type10
+    EXCEPT ALL
+    SELECT id, grp, v
+    FROM oprec_legacy_type10 USING SAMPLE reservoir(3 ROWS) REPEATABLE (31)
+);
+----
+0
+
 # ==========================================
-# POSITIONAL JOIN is exact current/new diff recompute
+# POSITIONAL JOIN falls back to full refresh
 # ==========================================
 
 statement ok
@@ -129,7 +182,7 @@ CREATE MATERIALIZED VIEW mv_oprec_positional AS
 query I
 SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_positional';
 ----
-10
+3
 
 statement ok
 INSERT INTO oprec_pos_l VALUES (4, 'd');
@@ -184,6 +237,212 @@ SELECT count(*) FROM (
 0
 
 # ==========================================
+# FULL_REFRESH non-local projections still emit cascade deltas
+# ==========================================
+
+statement ok
+SET openivm_cascade_refresh = 'downstream';
+
+statement ok
+CREATE TABLE oprec_sample_cascade (id INT, grp INT, v INT);
+
+statement ok
+INSERT INTO oprec_sample_cascade VALUES
+    (1, 1, 10),
+    (2, 1, 20),
+    (3, 1, 30),
+    (4, 2, 40),
+    (5, 2, 50),
+    (6, 3, 60);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_sample_cascade_parent AS
+    SELECT id, grp, v
+    FROM oprec_sample_cascade USING SAMPLE reservoir(4 ROWS) REPEATABLE (29);
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_sample_cascade_parent';
+----
+3
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_sample_cascade_child AS
+    SELECT grp, COUNT(*) AS cnt, SUM(v) AS total_v
+    FROM mv_oprec_sample_cascade_parent
+    GROUP BY grp;
+
+statement ok
+INSERT INTO oprec_sample_cascade VALUES (7, 2, 70), (8, 4, 80);
+
+statement ok
+DELETE FROM oprec_sample_cascade WHERE id = 2;
+
+statement ok
+UPDATE oprec_sample_cascade SET v = 15 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_oprec_sample_cascade_parent');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, v
+    FROM oprec_sample_cascade USING SAMPLE reservoir(4 ROWS) REPEATABLE (29)
+    EXCEPT ALL
+    SELECT id, grp, v FROM mv_oprec_sample_cascade_parent
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, v FROM mv_oprec_sample_cascade_parent
+    EXCEPT ALL
+    SELECT id, grp, v
+    FROM oprec_sample_cascade USING SAMPLE reservoir(4 ROWS) REPEATABLE (29)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, COUNT(*) AS cnt, SUM(v) AS total_v
+    FROM (
+        SELECT id, grp, v
+        FROM oprec_sample_cascade USING SAMPLE reservoir(4 ROWS) REPEATABLE (29)
+    ) s
+    GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, cnt, total_v FROM mv_oprec_sample_cascade_child
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT grp, cnt, total_v FROM mv_oprec_sample_cascade_child
+    EXCEPT ALL
+    SELECT grp, COUNT(*) AS cnt, SUM(v) AS total_v
+    FROM (
+        SELECT id, grp, v
+        FROM oprec_sample_cascade USING SAMPLE reservoir(4 ROWS) REPEATABLE (29)
+    ) s
+    GROUP BY grp
+);
+----
+0
+
+statement ok
+CREATE TABLE oprec_pos_cascade_l (id INT, lval INT);
+
+statement ok
+CREATE TABLE oprec_pos_cascade_r (rid INT, rval INT);
+
+statement ok
+INSERT INTO oprec_pos_cascade_l VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+INSERT INTO oprec_pos_cascade_r VALUES (10, 100), (20, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_pos_cascade_parent AS
+    SELECT
+        l.id AS id,
+        l.lval AS lval,
+        r.rid AS rid,
+        r.rval AS rval,
+        coalesce(l.id, 0) + coalesce(r.rid, 0) AS id_score,
+        coalesce(l.lval, 0) + coalesce(r.rval, 0) AS val_score
+    FROM oprec_pos_cascade_l l
+    POSITIONAL JOIN oprec_pos_cascade_r r;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_pos_cascade_parent';
+----
+3
+
+statement ok
+CREATE MATERIALIZED VIEW mv_oprec_pos_cascade_child AS
+    SELECT COUNT(*) AS cnt, SUM(id_score) AS total_ids, SUM(val_score) AS total_vals
+    FROM mv_oprec_pos_cascade_parent;
+
+statement ok
+INSERT INTO oprec_pos_cascade_l VALUES (4, 40);
+
+statement ok
+DELETE FROM oprec_pos_cascade_r WHERE rid = 20;
+
+statement ok
+UPDATE oprec_pos_cascade_l SET lval = 15 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_oprec_pos_cascade_parent');
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        l.id AS id,
+        l.lval AS lval,
+        r.rid AS rid,
+        r.rval AS rval,
+        coalesce(l.id, 0) + coalesce(r.rid, 0) AS id_score,
+        coalesce(l.lval, 0) + coalesce(r.rval, 0) AS val_score
+    FROM oprec_pos_cascade_l l
+    POSITIONAL JOIN oprec_pos_cascade_r r
+    EXCEPT ALL
+    SELECT id, lval, rid, rval, id_score, val_score FROM mv_oprec_pos_cascade_parent
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, lval, rid, rval, id_score, val_score FROM mv_oprec_pos_cascade_parent
+    EXCEPT ALL
+    SELECT
+        l.id AS id,
+        l.lval AS lval,
+        r.rid AS rid,
+        r.rval AS rval,
+        coalesce(l.id, 0) + coalesce(r.rid, 0) AS id_score,
+        coalesce(l.lval, 0) + coalesce(r.rval, 0) AS val_score
+    FROM oprec_pos_cascade_l l
+    POSITIONAL JOIN oprec_pos_cascade_r r
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT
+        COUNT(*) AS cnt,
+        SUM(coalesce(l.id, 0) + coalesce(r.rid, 0)) AS total_ids,
+        SUM(coalesce(l.lval, 0) + coalesce(r.rval, 0)) AS total_vals
+    FROM oprec_pos_cascade_l l
+    POSITIONAL JOIN oprec_pos_cascade_r r
+    EXCEPT ALL
+    SELECT cnt, total_ids, total_vals FROM mv_oprec_pos_cascade_child
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT cnt, total_ids, total_vals FROM mv_oprec_pos_cascade_child
+    EXCEPT ALL
+    SELECT
+        COUNT(*) AS cnt,
+        SUM(coalesce(l.id, 0) + coalesce(r.rid, 0)) AS total_ids,
+        SUM(coalesce(l.lval, 0) + coalesce(r.rval, 0)) AS total_vals
+    FROM oprec_pos_cascade_l l
+    POSITIONAL JOIN oprec_pos_cascade_r r
+);
+----
+0
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+# ==========================================
 # Hidden non-local operators inside materialized CTEs are still classified conservatively
 # ==========================================
 
@@ -214,7 +473,7 @@ CREATE MATERIALIZED VIEW mv_oprec_cte_sample AS
 query I
 SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_cte_sample';
 ----
-10
+3
 
 statement ok
 INSERT INTO oprec_cte_sample VALUES (7, 2, 70), (8, 4, 80);
@@ -286,7 +545,7 @@ CREATE MATERIALIZED VIEW mv_oprec_cte_positional AS
 query I
 SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_cte_positional';
 ----
-10
+3
 
 statement ok
 INSERT INTO oprec_cte_pos_l VALUES (4, 40);

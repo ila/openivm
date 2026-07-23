@@ -11,6 +11,9 @@
 
 namespace duckdb {
 
+static constexpr const char *CAST_EXPRESSION_PREFIX = "openivm_expr:";
+static constexpr const char *CAST_COLUMN_PLACEHOLDER = "{openivm_column}";
+
 static bool IsIdentifierChar(char c) {
 	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
 }
@@ -41,6 +44,40 @@ static string TrimSQLFragment(const string &input) {
 		end--;
 	}
 	return input.substr(start, end - start);
+}
+
+string SqlUtils::BuildCastSpec(const string &target_type, bool try_cast) {
+	if (!try_cast) {
+		return target_type;
+	}
+	return string(CAST_EXPRESSION_PREFIX) + "TRY_CAST(" + CAST_COLUMN_PLACEHOLDER + " AS " + target_type + ")";
+}
+
+string SqlUtils::ApplyCastSpec(const string &column_expression, const string &cast_spec) {
+	if (cast_spec.empty()) {
+		return column_expression;
+	}
+	if (!StringUtil::StartsWith(cast_spec, CAST_EXPRESSION_PREFIX)) {
+		return "CAST(" + column_expression + " AS " + cast_spec + ")";
+	}
+	string expression = cast_spec.substr(strlen(CAST_EXPRESSION_PREFIX));
+	auto placeholder = expression.find(CAST_COLUMN_PLACEHOLDER);
+	if (placeholder == string::npos) {
+		throw InternalException("OpenIVM cast expression is missing its column placeholder");
+	}
+	expression.replace(placeholder, strlen(CAST_COLUMN_PLACEHOLDER), column_expression);
+	return expression;
+}
+
+string SqlUtils::ComposeCastSpecs(const string &outer_cast_spec, const string &inner_cast_spec) {
+	if (outer_cast_spec.empty()) {
+		return inner_cast_spec;
+	}
+	if (inner_cast_spec.empty()) {
+		return outer_cast_spec;
+	}
+	string inner_expression = ApplyCastSpec(CAST_COLUMN_PLACEHOLDER, inner_cast_spec);
+	return string(CAST_EXPRESSION_PREFIX) + ApplyCastSpec(inner_expression, outer_cast_spec);
 }
 
 static bool ReadCreateTargetName(const string &sql, const string &object_keyword, string &out) {

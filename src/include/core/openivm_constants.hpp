@@ -67,6 +67,8 @@ constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 // DELIM joins to eliminate. Pure robustness guard — not flag-gated.
 constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator";
 
+constexpr uint8_t LEGACY_CURRENT_DIFF_RECOMPUTE_TYPE = 10;
+
 } // namespace openivm
 
 enum class RefreshType : uint8_t {
@@ -78,11 +80,10 @@ enum class RefreshType : uint8_t {
 	WINDOW_PARTITION, // window functions — partition-level recompute
 	GROUP_RECOMPUTE, // inner-DISTINCT-under-AGG fallback: DELETE+INSERT only the GROUP BY keys touched by source deltas
 	TOP_K,           // Legacy enum value; current top-k support strips ORDER BY/LIMIT into the user-facing view
-	DISTINCT_INCREMENTAL,   // inner-DISTINCT-under-AGG with aux state (openivm_distinct_aux_state=true): DBSP-correct
-	                        // distinct(R)=sgn(R[t]); per-tuple count table emits ±1 only on count transitions
-	SEMI_ANTI_RECOMPUTE,    // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
-	CURRENT_DIFF_RECOMPUTE, // exact recompute inside incremental refresh; emits MV deltas from old/current diff
-	COUNT_DISTINCT_INCREMENTAL // COUNT(DISTINCT x) with per-(group,x) multiplicity aux state
+	DISTINCT_INCREMENTAL, // inner-DISTINCT-under-AGG with aux state (openivm_distinct_aux_state=true): DBSP-correct
+	                      // distinct(R)=sgn(R[t]); per-tuple count table emits ±1 only on count transitions
+	SEMI_ANTI_RECOMPUTE,  // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
+	COUNT_DISTINCT_INCREMENTAL = 11 // COUNT(DISTINCT x) with per-(group,x) multiplicity aux state
 };
 
 enum class GroupRecomputeAffectedMode : uint8_t { SOURCE_DELTA, SOURCE_DELTA_RELAX_AGGREGATE_FILTER, CURRENT_DIFF };
@@ -105,8 +106,6 @@ inline const char *RefreshTypeName(RefreshType type) {
 		return "DISTINCT_INCREMENTAL";
 	case RefreshType::SEMI_ANTI_RECOMPUTE:
 		return "SEMI_ANTI_RECOMPUTE";
-	case RefreshType::CURRENT_DIFF_RECOMPUTE:
-		return "CURRENT_DIFF_RECOMPUTE";
 	case RefreshType::COUNT_DISTINCT_INCREMENTAL:
 		return "COUNT_DISTINCT_INCREMENTAL";
 	case RefreshType::TOP_K:

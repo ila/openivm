@@ -244,9 +244,13 @@ public:
 		string output_col;
 		string source;
 		string source_col;
+		// A target type for one CAST, or an encoded expression template for nested/TRY_CAST chains.
+		string source_cast;
 		string lookup;
 		string lookup_col;
+		string lookup_cast;
 		string lookup_out;
+		string lookup_out_cast;
 	};
 
 	bool GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out);
