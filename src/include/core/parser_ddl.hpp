@@ -19,7 +19,7 @@ enum class DDLExecutionMode : uint8_t { CALLER_TRANSACTION, STAGED_CROSS_CATALOG
 
 void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result,
                                 DDLExecutionMode mode = DDLExecutionMode::STAGED_CROSS_CATALOG);
-string RenderTransactionalDDL(const vector<Value> &parameters);
+string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters);
 void ExecuteStagedDDL(ClientContext &context, const vector<Value> &parameters);
 string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace);
 string BuildDropViewStatement(const DropInfo &drop_info);

@@ -461,9 +461,23 @@ void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChun
 	state.finished = true;
 }
 
-string RenderTransactionalDDL(const vector<Value> &parameters) {
+string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters) {
+	struct ProfileRow {
+		string view_name;
+		string step_name;
+		int64_t duration_ms;
+		string detail;
+	};
+	struct PendingProfileMarker {
+		string view_name;
+		string step_name;
+		string detail;
+		idx_t statement_start;
+	};
+
 	string sql;
-	auto append_statement = [&](const string &statement) {
+	idx_t logical_statement_count = 0;
+	auto append_statement = [&](const string &statement, bool logical_statement = true) {
 		if (statement.empty()) {
 			return;
 		}
@@ -472,12 +486,57 @@ string RenderTransactionalDDL(const vector<Value> &parameters) {
 			sql += ";";
 		}
 		sql += "\n";
+		if (logical_statement) {
+			logical_statement_count++;
+		}
+	};
+	Value profile_value;
+	bool profile_enabled = context.TryGetCurrentSetting("openivm_profile_refresh", profile_value) &&
+	                       !profile_value.IsNull() && BooleanValue::Get(profile_value);
+	vector<ProfileRow> profile_rows;
+	unique_ptr<PendingProfileMarker> pending_profile;
+	auto finish_profile_marker = [&]() {
+		if (!pending_profile) {
+			return;
+		}
+		auto statement_count = logical_statement_count - pending_profile->statement_start;
+		auto detail = pending_profile->detail;
+		if (!detail.empty()) {
+			detail += "; ";
+		}
+		detail +=
+		    "statements=" + to_string(statement_count) + "; transactional_program=true; duration_not_measured=true";
+		profile_rows.push_back({pending_profile->view_name, pending_profile->step_name, 0, std::move(detail)});
+		pending_profile.reset();
 	};
 	for (auto &parameter : parameters) {
 		auto statement = parameter.GetValue<string>();
-		if (statement.empty() || StringUtil::StartsWith(statement, OPENIVM_DDL_CLEANUP_PREFIX) ||
-		    StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_PREFIX) ||
-		    StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
+		if (statement.empty() || StringUtil::StartsWith(statement, OPENIVM_DDL_CLEANUP_PREFIX)) {
+			continue;
+		}
+		if (StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
+			if (profile_enabled) {
+				string view_name;
+				string step_name;
+				string detail;
+				int64_t duration_ms = 0;
+				ParseCreateMVProfileRecord(statement.substr(strlen(OPENIVM_DDL_PROFILE_RECORD_PREFIX)), view_name,
+				                           step_name, duration_ms, detail);
+				profile_rows.push_back({std::move(view_name), std::move(step_name), duration_ms, std::move(detail)});
+			}
+			continue;
+		}
+		if (StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_PREFIX)) {
+			if (profile_enabled) {
+				finish_profile_marker();
+				string view_name;
+				string step_name;
+				string detail;
+				ParseCreateMVProfileMarker(statement.substr(strlen(OPENIVM_DDL_PROFILE_PREFIX)), view_name, step_name,
+				                           detail);
+				pending_profile = make_uniq<PendingProfileMarker>(PendingProfileMarker {
+				    std::move(view_name), std::move(step_name), std::move(detail), logical_statement_count});
+			}
 			continue;
 		}
 		if (StringUtil::StartsWith(statement, OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
@@ -493,10 +552,11 @@ string RenderTransactionalDDL(const vector<Value> &parameters) {
 			                 " AS SELECT *, 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) +
 			                 ", now()::TIMESTAMP AS " + string(openivm::TIMESTAMP_COL) + " FROM " + data_table +
 			                 " LIMIT 0");
-			append_statement("ALTER TABLE " + delta_table + " ALTER " + string(openivm::MULTIPLICITY_COL) +
-			                 " SET DEFAULT 1");
+			append_statement(
+			    "ALTER TABLE " + delta_table + " ALTER " + string(openivm::MULTIPLICITY_COL) + " SET DEFAULT 1", false);
 			append_statement("ALTER TABLE " + delta_table + " ALTER " + string(openivm::TIMESTAMP_COL) +
-			                 " SET DEFAULT now()");
+			                     " SET DEFAULT now()",
+			                 false);
 			continue;
 		}
 
@@ -515,6 +575,27 @@ string RenderTransactionalDDL(const vector<Value> &parameters) {
 			// transactional program is executed.
 		}
 		append_statement(statement);
+	}
+	if (profile_enabled) {
+		finish_profile_marker();
+		if (!profile_rows.empty()) {
+			auto view_name = profile_rows.front().view_name;
+			profile_rows.push_back(
+			    {view_name, "create_mv_total", 0, "transactional_program=true; duration_not_measured=true"});
+			auto now = std::chrono::steady_clock::now().time_since_epoch();
+			auto refresh_id = view_name + "_create_tx_" +
+			                  to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+			for (idx_t step_order = 0; step_order < profile_rows.size(); step_order++) {
+				auto &row = profile_rows[step_order];
+				append_statement("INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
+				                     " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES ('" +
+				                     SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(row.view_name) +
+				                     "', " + to_string(step_order) + ", '" + SqlUtils::EscapeValue(row.step_name) +
+				                     "', " + to_string(row.duration_ms) + ", '" + SqlUtils::EscapeValue(row.detail) +
+				                     "')",
+				                 false);
+			}
+		}
 	}
 	append_statement("SELECT true AS \"MATERIALIZED VIEW CREATION\"");
 	return sql;

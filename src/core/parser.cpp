@@ -379,6 +379,12 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		select_planner.CreatePlan(std::move(select_parser.statements[0]));
 		auto select_plan = std::move(select_planner.plan);
 		visible_output_count = select_planner.names.size();
+		for (auto &name : select_planner.names) {
+			if (StringUtil::CIEquals(name, openivm::MULTIPLICITY_COL) ||
+			    StringUtil::CIEquals(name, openivm::TIMESTAMP_COL)) {
+				throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'", name);
+			}
+		}
 		add_create_profile_step("create_compile_select_plan", select_parse_plan_start);
 
 		// Inline CTEs without running the full optimizer, which can reshape plans
@@ -1536,9 +1542,11 @@ string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionPara
 	    MaterializedViewParserExtension::PlanFunction(nullptr, context, std::move(parse_result.parse_data));
 	if (plan_result.function.name == OPENIVM_TRANSACTIONAL_DDL_FUNCTION) {
 		if (!lock_view_name.empty()) {
-			TransactionalMVLockState::Get(context).Acquire({lock_view_name}, {});
+			auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
+			auto &catalog = Catalog::GetCatalog(context, default_entry.catalog);
+			TransactionalMVLockState::Get(context).Acquire({lock_view_name}, {}, {&catalog});
 		}
-		return RenderTransactionalDDL(plan_result.parameters);
+		return RenderTransactionalDDL(context, plan_result.parameters);
 	}
 	if (!lock_view_name.empty()) {
 		ViewLockGuard view_guard(lock_view_name);
@@ -1623,7 +1631,8 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	}
 	auto view_delta_table = SqlUtils::DeltaName(drop.info->name);
 	delta_tables.push_back(view_delta_table);
-	TransactionalMVLockState::Get(context).Acquire({drop.info->name}, delta_tables);
+	auto &catalog = Catalog::GetCatalog(context, catalog_name);
+	TransactionalMVLockState::Get(context).Acquire({drop.info->name}, delta_tables, {&catalog});
 	return program;
 }
 } // namespace duckdb

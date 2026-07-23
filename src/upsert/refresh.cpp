@@ -117,7 +117,6 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
                               const string &attached_db_schema_name, bool skip_empty_refresh) {
 	RefreshProfiler profiler(context, vn);
 	auto lock_start = std::chrono::steady_clock::now();
-	ViewLockGuard view_guard(vn);
 	Connection probe_con(*context.db.get());
 	RefreshMetadata probe_meta(probe_con);
 	auto delta_sources = probe_meta.GetDeltaSources(vn, view_catalog_name, view_schema_name);
@@ -139,8 +138,10 @@ static bool RefreshViewLocked(ClientContext &context, const string &view_catalog
 	                           source_catalog_names.end());
 	vector<unique_ptr<DeltaCatalogRefreshGuard>> delta_catalog_guards;
 	for (auto &catalog_name : source_catalog_names) {
-		delta_catalog_guards.push_back(make_uniq<DeltaCatalogRefreshGuard>(Catalog::GetCatalog(context, catalog_name)));
+		delta_catalog_guards.push_back(
+		    make_uniq<DeltaCatalogRefreshGuard>(context, Catalog::GetCatalog(context, catalog_name)));
 	}
+	ViewLockGuard view_guard(vn);
 	// Acquire delta-table locks in sorted order to serialize parallel refreshes that
 	// share base tables (e.g. mv_A and mv_B both reading STOCK → both write to
 	// `delta_STOCK` inside their transactions → "Conflict on tuple deletion!" when
@@ -602,6 +603,20 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 }
 
 string TransactionalRefreshQuery(ClientContext &context, const FunctionParameters &parameters) {
+	if (context.transaction.IsAutoCommit()) {
+		// TODO: Replace query-pragma expansion with a native refresh operator/table
+		// function that owns compilation, execution, and lock lifetime in one caller
+		// transaction. Query pragmas are expanded through a preprocessing transaction;
+		// its transaction-end callback can release ClientContextState locks before the
+		// returned multi-statement program has fully completed. That boundary permits a
+		// concurrent parent/child refresh to enter early and produce an MVCC update
+		// conflict. Until refresh has a native execution boundary, retain the established
+		// locked helper executor for autocommit calls. Explicit caller transactions use
+		// the program below so their DML, MV changes, metadata, and rollback remain atomic.
+		UpsertDeltaQueriesLocked(context, parameters);
+		return "SELECT true AS Success";
+	}
+
 	string view_catalog_name;
 	string view_schema_name;
 	string attached_db_catalog_name;
@@ -669,8 +684,10 @@ string TransactionalRefreshQuery(ClientContext &context, const FunctionParameter
 
 	string program;
 	unordered_set<string> seen;
+	vector<string> ordered_nodes;
 	vector<string> lock_views;
 	vector<string> lock_deltas;
+	vector<Catalog *> lock_catalogs;
 	for (auto &node : refresh_order) {
 		if (!seen.insert(node).second) {
 			continue;
@@ -680,13 +697,27 @@ string TransactionalRefreshQuery(ClientContext &context, const FunctionParameter
 			throw NotImplementedException(
 			    "Transactional native refresh cannot include cross-catalog dependent view '%s'", node);
 		}
+		ordered_nodes.push_back(node);
 		lock_views.push_back(node);
-		auto node_deltas = metadata.GetDeltaTables(node);
-		lock_deltas.insert(lock_deltas.end(), node_deltas.begin(), node_deltas.end());
+		auto node_sources = metadata.GetDeltaSources(node, location.catalog_name, location.schema_name);
+		for (auto &source : node_sources) {
+			lock_deltas.push_back(source.table_name);
+			if (source.catalog_type != "ducklake") {
+				lock_catalogs.push_back(&Catalog::GetCatalog(context, source.catalog_name));
+			}
+		}
 		if (metadata.HasDownstreamViews(node)) {
 			lock_deltas.push_back(SqlUtils::DeltaName(node));
 		}
+	}
+	// GenerateRefreshSQL consults the caller context and can establish its
+	// transaction snapshot. Serialize first so a waiter compiles against state
+	// committed by the preceding refresh rather than carrying a stale snapshot
+	// through the lock wait.
+	TransactionalMVLockState::Get(context).Acquire(lock_views, lock_deltas, lock_catalogs);
 
+	for (auto &node : ordered_nodes) {
+		auto location = ResolveViewLocation(metadata_con, node, view_catalog_name, view_schema_name);
 		string hook_sql;
 		string hook_mode;
 		auto hooks = metadata_con.Query("SELECT hook_sql, mode FROM openivm_refresh_hooks"
@@ -709,7 +740,6 @@ string TransactionalRefreshQuery(ClientContext &context, const FunctionParameter
 			program += hook_sql + ";\n";
 		}
 	}
-	TransactionalMVLockState::Get(context).Acquire(lock_views, lock_deltas);
 	program += "SELECT true AS Success";
 	return program;
 }

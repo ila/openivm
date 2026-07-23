@@ -31,7 +31,7 @@ static constexpr const char *DELTA_WRITE_STATE_KEY = "openivm_transactional_delt
 
 class TransactionalDeltaWriteState : public ClientContextState {
 public:
-	void Acquire(Catalog &catalog) {
+	void Acquire(ClientContext &context, Catalog &catalog) {
 		lock_guard<mutex> guard(lock);
 		if (catalog_guard) {
 			if (&catalog != locked_catalog) {
@@ -41,7 +41,7 @@ public:
 			}
 			return;
 		}
-		catalog_guard = make_uniq<DeltaCatalogWriteGuard>(catalog);
+		catalog_guard = make_uniq<DeltaCatalogWriteGuard>(context, catalog);
 		locked_catalog = &catalog;
 	}
 
@@ -70,9 +70,13 @@ private:
 	unique_ptr<DeltaCatalogWriteGuard> catalog_guard;
 };
 
-static void EnterDeltaWritePhase(ClientContext &context, Catalog &catalog) {
+static void EnterDeltaWritePhase(ClientContext &context, Catalog &catalog, const string &delta_table_name) {
+	auto refresh_state = TransactionalMVLockState::TryGet(context);
+	if (refresh_state && refresh_state->OwnsRefreshDelta(catalog, delta_table_name)) {
+		return;
+	}
 	auto state = context.registered_state->GetOrCreate<TransactionalDeltaWriteState>(DELTA_WRITE_STATE_KEY);
-	state->Acquire(catalog);
+	state->Acquire(context, catalog);
 }
 
 class TransactionalDeltaAppendState {
@@ -108,7 +112,7 @@ public:
 		if (state.entered_write_phase) {
 			return;
 		}
-		EnterDeltaWritePhase(context, delta_table.catalog);
+		EnterDeltaWritePhase(context, delta_table.catalog, delta_table.name);
 		state.entered_write_phase = true;
 	}
 

@@ -19,10 +19,12 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
   decorator now captures only the INSERT, UPDATE, and DELETE rows selected by DuckDB after match and action predicates are
   resolved. Updates emit the required delete-old/insert-new pair, volatile defaults are evaluated once, `RETURNING` is
   preserved, and all writes remain in the base DML transaction. The same boundary also covers native `MERGE` actions.
-- [ ] **Make MV lifecycle and native refresh transactional.** CREATE, REPLACE, DROP, ALTER, and `PRAGMA refresh` currently
-  execute material work through helper autocommit connections. Caller rollback cannot restore a consistent collection of
-  user view, backing table, metadata, and deltas; failed replacement can destroy the old MV. Use the caller transaction for
-  native-catalog work and stage cross-catalog replacement before publication.
+- [x] **Make MV lifecycle and native refresh transactional.** Native CREATE, REPLACE, DROP, ALTER, and refresh inside an
+  explicit caller transaction now mutate the user view, backing state, metadata, and deltas atomically and retain their
+  OpenIVM locks through commit or rollback. Autocommit refresh temporarily retains the established locked executor because
+  DuckDB query-pragma preprocessing ends a transaction before its returned program completes; `refresh.cpp` records the
+  native-operator follow-up. DuckLake replacement materializes data and auxiliary state under unpublished staging names
+  before publishing them.
 - [ ] **Continue cascade traversal when the current node has no source deltas.** The root empty-delta fast path returns
   before visiting downstream nodes. A child can have independent source deltas or pending parent-delta rows after an earlier
   failed cascade. Model `node skipped` separately from `graph traversal complete` and checkpoint each node independently.

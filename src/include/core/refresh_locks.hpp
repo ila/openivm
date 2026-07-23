@@ -23,16 +23,16 @@ namespace duckdb {
 // could advance a watermark past a delta row that commits afterward.
 class DeltaCatalogPhaseGate {
 public:
-	void EnterWrite();
-	void ExitWrite();
-	void EnterRefresh();
-	void ExitRefresh();
+	void EnterWrite(ClientContext &owner);
+	void ExitWrite(ClientContext &owner);
+	void EnterRefresh(ClientContext &owner);
+	void ExitRefresh(ClientContext &owner);
 
 private:
 	mutex lock;
 	std::condition_variable condition;
-	idx_t active_writers = 0;
-	idx_t active_refreshes = 0;
+	unordered_map<ClientContext *, idx_t> active_writers;
+	unordered_map<ClientContext *, idx_t> active_refreshes;
 	idx_t waiting_refreshes = 0;
 };
 
@@ -56,10 +56,10 @@ public:
 
 	static void UnlockDelta(const string &delta_table_name);
 
-	static void EnterDeltaWrite(Catalog &catalog);
-	static void ExitDeltaWrite(Catalog &catalog);
-	static void EnterDeltaRefresh(Catalog &catalog);
-	static void ExitDeltaRefresh(Catalog &catalog);
+	static void EnterDeltaWrite(ClientContext &owner, Catalog &catalog);
+	static void ExitDeltaWrite(ClientContext &owner, Catalog &catalog);
+	static void EnterDeltaRefresh(ClientContext &owner, Catalog &catalog);
+	static void ExitDeltaRefresh(ClientContext &owner, Catalog &catalog);
 
 private:
 	static std::mutex &GetViewMutex(const string &view_name);
@@ -75,14 +75,15 @@ private:
 // Write guards can be retained by transaction state and released from the commit thread;
 // unlike std::mutex ownership, phase-gate membership is not tied to one OS thread.
 class DeltaCatalogWriteGuard {
+	ClientContext *owner;
 	Catalog *catalog;
 
 public:
-	explicit DeltaCatalogWriteGuard(Catalog &catalog_p) : catalog(&catalog_p) {
-		RefreshLocks::EnterDeltaWrite(*catalog);
+	DeltaCatalogWriteGuard(ClientContext &owner_p, Catalog &catalog_p) : owner(&owner_p), catalog(&catalog_p) {
+		RefreshLocks::EnterDeltaWrite(*owner, *catalog);
 	}
 	~DeltaCatalogWriteGuard() {
-		RefreshLocks::ExitDeltaWrite(*catalog);
+		RefreshLocks::ExitDeltaWrite(*owner, *catalog);
 	}
 	DeltaCatalogWriteGuard(const DeltaCatalogWriteGuard &) = delete;
 	DeltaCatalogWriteGuard &operator=(const DeltaCatalogWriteGuard &) = delete;
@@ -91,14 +92,15 @@ public:
 };
 
 class DeltaCatalogRefreshGuard {
+	ClientContext *owner;
 	Catalog *catalog;
 
 public:
-	explicit DeltaCatalogRefreshGuard(Catalog &catalog_p) : catalog(&catalog_p) {
-		RefreshLocks::EnterDeltaRefresh(*catalog);
+	DeltaCatalogRefreshGuard(ClientContext &owner_p, Catalog &catalog_p) : owner(&owner_p), catalog(&catalog_p) {
+		RefreshLocks::EnterDeltaRefresh(*owner, *catalog);
 	}
 	~DeltaCatalogRefreshGuard() {
-		RefreshLocks::ExitDeltaRefresh(*catalog);
+		RefreshLocks::ExitDeltaRefresh(*owner, *catalog);
 	}
 	DeltaCatalogRefreshGuard(const DeltaCatalogRefreshGuard &) = delete;
 	DeltaCatalogRefreshGuard &operator=(const DeltaCatalogRefreshGuard &) = delete;
@@ -169,8 +171,11 @@ public:
 class TransactionalMVLockState : public ClientContextState {
 public:
 	static TransactionalMVLockState &Get(ClientContext &context);
+	static optional_ptr<TransactionalMVLockState> TryGet(ClientContext &context);
 
-	void Acquire(const vector<string> &view_names, const vector<string> &delta_table_names);
+	void Acquire(const vector<string> &view_names, const vector<string> &delta_table_names,
+	             const vector<Catalog *> &source_catalogs = {});
+	bool OwnsRefreshDelta(Catalog &catalog, const string &delta_table_name) const;
 
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
 	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override;
@@ -180,8 +185,11 @@ private:
 
 	unordered_set<string> locked_views;
 	unordered_set<string> locked_delta_tables;
+	unordered_set<const Catalog *> locked_catalogs;
 	vector<unique_ptr<ViewLockGuard>> view_guards;
 	vector<unique_ptr<DeltaLockGuard>> delta_guards;
+	vector<unique_ptr<DeltaCatalogRefreshGuard>> catalog_guards;
+	ClientContext *owner = nullptr;
 };
 
 } // namespace duckdb
