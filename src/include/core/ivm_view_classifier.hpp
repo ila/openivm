@@ -17,7 +17,8 @@ enum class DeltaStrategyReason {
 	NESTED_AGGREGATE_GROUP_FALLBACK,
 	REPEATED_CTE_AGGREGATE_GROUP_FALLBACK,
 	SEMI_ANTI_AGGREGATE_GROUP_FALLBACK,
-	OUTER_JOIN_AGGREGATE_RECOMPUTE
+	OUTER_JOIN_AGGREGATE_RECOMPUTE,
+	OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE
 };
 
 enum class DeltaModelFeature {
@@ -221,7 +222,7 @@ const char *DeltaRuleKindName(DeltaRuleKind kind);
 const char *DeltaUnsupportedReasonName(DeltaUnsupportedReason reason);
 const char *DeltaUpdateSemanticsName(DeltaUpdateSemantics semantics);
 const char *DeltaAffectedDomainKindName(DeltaAffectedDomainKind kind);
-bool IsDistinctAtTop(const PlanAnalysis &analysis, const vector<string> &output_names);
+bool IsDistinctAtTop(const CreateMVPlanFacts &facts, const vector<string> &output_names);
 DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input);
 
 } // namespace duckdb

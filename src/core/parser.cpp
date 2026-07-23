@@ -580,7 +580,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	model_input.has_computed_sum_aggregate_projection = has_computed_sum_aggregate_projection;
 	model_input.has_top_level_redundant_scalar_distinct = facts.has_top_level_redundant_scalar_distinct;
 	model_input.has_ducklake_source = HasDuckLakeSourceForModel(facts, table_names, target_is_ducklake);
-	const bool distinct_at_top = IsDistinctAtTop(analysis, output_names);
+	const bool distinct_at_top = IsDistinctAtTop(facts, output_names);
 
 	// Populated by ExtractInnerDistinct when classified as DISTINCT_INCREMENTAL.
 	vector<string> distinct_extracted_cols;

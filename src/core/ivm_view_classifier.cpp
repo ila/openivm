@@ -612,7 +612,8 @@ static void SelectGroupRecomputeAffectedMode(DeltaViewModel &model, const DeltaV
 	if ((input.facts && input.facts->analysis.found_asof_join) || input.stored_query_has_top_k ||
 	    aggregate_filter_join || (input.stored_query_has_aggregate_filter && input.has_ducklake_source)) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF;
-	} else if (HasStrategyReason(model, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK)) {
+	} else if (HasStrategyReason(model, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK) ||
+	           HasStrategyReason(model, DeltaStrategyReason::OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE)) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF;
 	} else if (input.stored_query_has_aggregate_filter) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER;
@@ -663,6 +664,8 @@ const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
 		return "SEMI_ANTI_AGGREGATE_GROUP_FALLBACK";
 	case DeltaStrategyReason::OUTER_JOIN_AGGREGATE_RECOMPUTE:
 		return "OUTER_JOIN_AGGREGATE_RECOMPUTE";
+	case DeltaStrategyReason::OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE:
+		return "OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE";
 	default:
 		return "UNKNOWN";
 	}
@@ -852,22 +855,31 @@ idx_t DeltaViewModel::LineageEntryCount() const {
 	return count;
 }
 
-bool IsDistinctAtTop(const PlanAnalysis &analysis, const vector<string> &output_names) {
-	if (!analysis.found_distinct || analysis.aggregate_columns.empty() || output_names.empty()) {
+bool IsDistinctAtTop(const CreateMVPlanFacts &facts, const vector<string> &output_names) {
+	if (!facts.analysis.found_distinct) {
 		return false;
 	}
 
-	unordered_set<string> output_lc;
-	for (auto &name : output_names) {
-		output_lc.insert(StringUtil::Lower(name));
+	auto *node = facts.root;
+	while (node && node->children.size() == 1 &&
+	       (node->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
+	        node->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	        node->type == LogicalOperatorType::LOGICAL_FILTER || node->type == LogicalOperatorType::LOGICAL_ORDER_BY ||
+	        node->type == LogicalOperatorType::LOGICAL_LIMIT || node->type == LogicalOperatorType::LOGICAL_TOP_N)) {
+		node = node->children[0].get();
 	}
-
-	for (auto &target : analysis.aggregate_columns) {
-		if (!output_lc.count(StringUtil::Lower(target))) {
-			return false;
+	if (node && node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+		return true;
+	}
+	if (!node || node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return false;
+	}
+	for (auto &name : output_names) {
+		if (name == openivm::DISTINCT_COUNT_COL) {
+			return true;
 		}
 	}
-	return true;
+	return false;
 }
 
 DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
@@ -886,7 +898,7 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 	}
 
 	model.has_minmax_metadata = analysis.found_minmax || analysis.found_count_distinct || analysis.found_list;
-	model.distinct_at_top = IsDistinctAtTop(analysis, output_names);
+	model.distinct_at_top = IsDistinctAtTop(facts, output_names);
 	if (input.has_top_level_redundant_scalar_distinct) {
 		model.distinct_at_top = false;
 	}
@@ -898,6 +910,12 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 		AddUnique(model.strategy_reasons, DeltaStrategyReason::OUTER_JOIN_AGGREGATE_RECOMPUTE);
 		OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT/OUTER JOIN aggregate with computed aggregate or projection wrapper -- "
 		                    "using group-recompute metadata\n");
+	}
+	if (analysis.found_aggregation && OuterJoinPreservedSideHasTableFunction(facts)) {
+		model.has_minmax_metadata = true;
+		AddUnique(model.strategy_reasons, DeltaStrategyReason::OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE);
+		OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT/RIGHT JOIN aggregate with a table function on the preserved side -- "
+		                    "using current-diff group recompute\n");
 	}
 
 	if (analysis.found_full_outer) {

@@ -230,6 +230,35 @@ bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t grou
 	return false;
 }
 
+static bool ContainsTableFunction(LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET && !op.Cast<LogicalGet>().GetTable().get()) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (ContainsTableFunction(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts) {
+	for (auto *join : facts.comparison_joins) {
+		idx_t preserved_child;
+		if (join->join_type == JoinType::LEFT) {
+			preserved_child = 0;
+		} else if (join->join_type == JoinType::RIGHT) {
+			preserved_child = 1;
+		} else {
+			continue;
+		}
+		if (join->children.size() > preserved_child && ContainsTableFunction(*join->children[preserved_child])) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMVPlanFacts &facts,
                         unordered_map<string, idx_t> &next_occurrence) {
 	facts.gets_by_index[get.table_index] = &get;

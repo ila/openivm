@@ -99,6 +99,7 @@ CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &cu
 bool ProducesAtMostOneRow(LogicalOperator &node);
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols);
 bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t group_index);
+bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts);
 bool RelationExists(Connection &con, const string &qualified_name);
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
                                       const vector<string> &output_names);
