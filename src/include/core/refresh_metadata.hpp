@@ -1,6 +1,7 @@
 #ifndef REFRESH_METADATA_HPP
 #define REFRESH_METADATA_HPP
 
+#include "core/derived_aggregate_output.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "core/openivm_constants.hpp"
@@ -105,6 +106,9 @@ public:
 
 	// Get per-column aggregate function types (min, max, sum, count_star, etc.).
 	vector<string> GetAggregateTypes(const string &view_name);
+
+	DerivedAggregateOutputInfo GetDerivedAggregateOutputs(const string &view_name);
+	static string DerivedAggregateOutputsToJson(const DerivedAggregateOutputInfo &info);
 
 	// Get the HAVING predicate extracted into the user-facing view. Empty means no
 	// predicate was extracted, which can happen when HAVING is nested inside a CTE.

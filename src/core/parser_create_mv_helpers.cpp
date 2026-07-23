@@ -41,6 +41,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " refresh_in_progress boolean default false,"
 	              " group_columns varchar default null,"
 	              " aggregate_types varchar default null,"
+	              " derived_aggregate_outputs_json varchar default null,"
 	              " having_predicate varchar default null,"
 	              " group_recompute_affected_mode varchar default null,"
 	              " group_recompute_source_occurrences_json varchar default null,"
@@ -67,13 +68,16 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "has_join boolean default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_affected_mode varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_source_occurrences_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "derived_aggregate_outputs_json varchar default null");
 	if (!is_replace) {
 		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
 		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));
 		string stale_mv_condition = "view_name = '" + escaped_view_name +
-		                            "' AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '" +
+		                            "' AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE "
+		                            "table_name = '" +
 		                            escaped_view_name +
-		                            "') AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '" +
+		                            "') AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE "
+		                            "table_name = '" +
 		                            escaped_data_table + "')";
 		// CREATE MV executes as multiple catalog statements. If a process dies or loses
 		// a DuckDB file lock after writing metadata but before creating the physical
@@ -94,7 +98,8 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 
 	ddl.push_back("create table if not exists " + string(openivm::DELTA_TABLES_TABLE) +
 	              " (view_name varchar, table_name varchar, last_update timestamp,"
-	              " catalog_type varchar default 'duckdb', last_snapshot_id bigint default null,"
+	              " catalog_type varchar default 'duckdb', last_snapshot_id bigint default "
+	              "null,"
 	              " last_refresh_ts timestamp default null,"
 	              " pending_row_estimate bigint default null,"
 	              " pending_estimate_ts timestamp default null,"
@@ -120,8 +125,10 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	// Refresh history: stores execution stats for learned cost model calibration.
 	// Stage A.5 adds `strategy` (default 'incremental') for per-strategy regression.
 	ddl.push_back("create table if not exists " + string(openivm::HISTORY_TABLE) +
-	              " (view_name varchar, refresh_timestamp timestamp default current_timestamp,"
-	              " method varchar, incremental_compute_est double, incremental_upsert_est double,"
+	              " (view_name varchar, refresh_timestamp timestamp default "
+	              "current_timestamp,"
+	              " method varchar, incremental_compute_est double, "
+	              "incremental_upsert_est double,"
 	              " recompute_compute_est double, recompute_replace_est double,"
 	              " actual_duration_ms bigint,"
 	              " strategy varchar default 'incremental',"
@@ -130,7 +137,8 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	ddl.push_back("create table if not exists " + string(openivm::PROFILE_TABLE) +
 	              " (refresh_id varchar, view_name varchar,"
 	              " profile_timestamp timestamp default current_timestamp,"
-	              " step_order integer, step_name varchar, duration_ms bigint, detail varchar,"
+	              " step_order integer, step_name varchar, duration_ms bigint, "
+	              "detail varchar,"
 	              " primary key(refresh_id, step_order))");
 }
 

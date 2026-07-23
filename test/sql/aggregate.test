@@ -2916,3 +2916,436 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Insert-only MIN/MAX with a scalar projection over the aggregate state. The
+# derived status must be evaluated from the post-MERGE MAX, not from the delta
+# batch in isolation (the watches dbt model shape).
+statement ok
+CREATE TABLE derived_watch_events (
+    customer_id INTEGER,
+    symbol VARCHAR,
+    action_type VARCHAR,
+    watch_timestamp TIMESTAMP
+);
+
+statement ok
+INSERT INTO derived_watch_events VALUES
+    (1, 'AAA', 'Activate', '2024-01-01 10:00:00'),
+    (2, 'BBB', 'Activate', '2024-01-02 10:00:00');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_derived_watch AS
+WITH staged AS (
+    SELECT customer_id, symbol,
+           CASE WHEN action_type = 'Activate' THEN watch_timestamp END AS placed_timestamp,
+           CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END AS removed_timestamp
+    FROM derived_watch_events
+), rolled AS (
+    SELECT customer_id, symbol,
+           MIN(placed_timestamp) AS placed_timestamp,
+           MAX(removed_timestamp) AS removed_timestamp
+    FROM staged
+    GROUP BY customer_id, symbol
+)
+SELECT *, CASE WHEN removed_timestamp IS NULL THEN 'Active' ELSE 'Inactive' END AS watch_status
+FROM rolled;
+
+# The derived output intentionally precedes the MIN/MAX outputs. Aggregate type
+# metadata must remain aligned with the physical aggregate columns.
+statement ok
+CREATE MATERIALIZED VIEW mv_derived_watch_reordered AS
+WITH staged AS (
+    SELECT customer_id, symbol,
+           CASE WHEN action_type = 'Activate' THEN watch_timestamp END AS placed_timestamp,
+           CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END AS removed_timestamp
+    FROM derived_watch_events
+), rolled AS (
+    SELECT customer_id, symbol,
+           MIN(placed_timestamp) AS placed_timestamp,
+           MAX(removed_timestamp) AS removed_timestamp
+    FROM staged
+    GROUP BY customer_id, symbol
+)
+SELECT customer_id, symbol,
+       CASE WHEN removed_timestamp IS NULL THEN 'Active' ELSE 'Inactive' END AS watch_status,
+       placed_timestamp, removed_timestamp
+FROM rolled;
+
+# A pass-through projection above a projection-derived numeric column must
+# preserve the expression lineage. Treating the numeric flag as additive
+# aggregate state would turn 1 into 2 when a later insert also satisfies it.
+statement ok
+CREATE TABLE derived_nested_events(grp INTEGER, value INTEGER);
+
+statement ok
+INSERT INTO derived_nested_events VALUES (1, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_derived_nested AS
+WITH grouped AS MATERIALIZED (
+    SELECT grp, MAX(value) AS max_value
+    FROM derived_nested_events
+    GROUP BY grp
+), flagged AS MATERIALIZED (
+    SELECT grp, max_value,
+           CASE WHEN max_value > 10 THEN 1 ELSE 0 END AS high_flag
+    FROM grouped
+)
+SELECT * FROM flagged;
+
+statement ok
+INSERT INTO derived_nested_events VALUES (1, 30), (2, 5);
+
+statement ok
+PRAGMA refresh('mv_derived_nested');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_derived_nested
+    EXCEPT ALL
+    SELECT grp, MAX(value), CASE WHEN MAX(value) > 10 THEN 1 ELSE 0 END
+    FROM derived_nested_events GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, MAX(value), CASE WHEN MAX(value) > 10 THEN 1 ELSE 0 END
+    FROM derived_nested_events GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_derived_nested
+);
+----
+0
+
+# One insert-only batch: group 1 changes status, group 2 keeps its old status,
+# and group 3 is inserted. This exercises both MATCHED and NOT MATCHED branches.
+statement ok
+INSERT INTO derived_watch_events VALUES
+    (1, 'AAA', 'Cancelled', '2024-02-01 11:00:00'),
+    (2, 'BBB', 'Activate', '2023-12-31 09:00:00'),
+    (3, 'CCC', 'Activate', '2024-02-03 12:00:00');
+
+statement ok
+PRAGMA refresh('mv_derived_watch');
+
+statement ok
+PRAGMA refresh('mv_derived_watch_reordered');
+
+query I
+SELECT COUNT(*) FROM (
+	SELECT * FROM mv_derived_watch
+	EXCEPT ALL
+	SELECT customer_id, symbol,
+	       MIN(CASE WHEN action_type = 'Activate' THEN watch_timestamp END),
+	       MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END),
+	       CASE WHEN MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END) IS NULL
+	            THEN 'Active' ELSE 'Inactive' END
+	FROM derived_watch_events GROUP BY customer_id, symbol
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+	SELECT customer_id, symbol,
+	       MIN(CASE WHEN action_type = 'Activate' THEN watch_timestamp END),
+	       MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END),
+	       CASE WHEN MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END) IS NULL
+	            THEN 'Active' ELSE 'Inactive' END
+	FROM derived_watch_events GROUP BY customer_id, symbol
+    EXCEPT ALL SELECT * FROM mv_derived_watch
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+	SELECT * FROM mv_derived_watch_reordered
+	EXCEPT ALL
+	SELECT customer_id, symbol,
+	       CASE WHEN MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END) IS NULL
+	            THEN 'Active' ELSE 'Inactive' END,
+	       MIN(CASE WHEN action_type = 'Activate' THEN watch_timestamp END),
+	       MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END)
+	FROM derived_watch_events GROUP BY customer_id, symbol
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+	SELECT customer_id, symbol,
+	       CASE WHEN MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END) IS NULL
+	            THEN 'Active' ELSE 'Inactive' END,
+	       MIN(CASE WHEN action_type = 'Activate' THEN watch_timestamp END),
+	       MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END)
+	FROM derived_watch_events GROUP BY customer_id, symbol
+	EXCEPT ALL
+	SELECT * FROM mv_derived_watch_reordered
+);
+----
+0
+
+# Unsupported scalar functions over MIN/MAX must record incomplete derived
+# metadata and use affected-group recompute instead of summing the expression.
+statement ok
+CREATE TABLE derived_round_events(grp INTEGER, value DOUBLE);
+
+statement ok
+INSERT INTO derived_round_events VALUES (1, 10), (2, 7);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_derived_round AS
+WITH grouped AS (
+    SELECT grp, MIN(value) AS min_value
+    FROM derived_round_events GROUP BY grp
+)
+SELECT grp, min_value, ROUND(min_value / 3.0, 2) AS rounded_value FROM grouped;
+
+statement ok
+INSERT INTO derived_round_events VALUES (1, 2), (3, 11);
+
+statement ok
+PRAGMA refresh('mv_derived_round');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_derived_round
+    EXCEPT ALL
+    SELECT grp, MIN(value), ROUND(MIN(value) / 3.0, 2)
+    FROM derived_round_events GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, MIN(value), ROUND(MIN(value) / 3.0, 2)
+    FROM derived_round_events GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_derived_round
+);
+----
+0
+
+# TRY_CAST semantics must survive expression persistence. A new group with an
+# invalid value returns NULL instead of aborting refresh as an ordinary CAST.
+statement ok
+CREATE TABLE derived_try_cast_events(grp INTEGER, value VARCHAR);
+
+statement ok
+INSERT INTO derived_try_cast_events VALUES (1, '100');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_derived_try_cast AS
+WITH grouped AS (
+    SELECT grp, MIN(value) AS min_value
+    FROM derived_try_cast_events GROUP BY grp
+)
+SELECT grp, min_value, TRY_CAST(min_value AS INTEGER) AS parsed_value FROM grouped;
+
+statement ok
+INSERT INTO derived_try_cast_events VALUES (2, 'bad');
+
+statement ok
+PRAGMA refresh('mv_derived_try_cast');
+
+query I
+SELECT COUNT(*) FROM (
+	SELECT * FROM mv_derived_try_cast
+	EXCEPT ALL
+	SELECT grp, MIN(value), TRY_CAST(MIN(value) AS INTEGER)
+	FROM derived_try_cast_events GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+	SELECT grp, MIN(value), TRY_CAST(MIN(value) AS INTEGER)
+	FROM derived_try_cast_events GROUP BY grp
+	EXCEPT ALL
+	SELECT * FROM mv_derived_try_cast
+);
+----
+0
+
+# Identifier substitution must not rewrite identifier-looking text inside a
+# SQL string literal.
+statement ok
+CREATE TABLE derived_literal_events(grp INTEGER, value INTEGER);
+
+statement ok
+INSERT INTO derived_literal_events VALUES (1, 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_derived_literal AS
+WITH grouped AS (
+    SELECT grp, MAX(value) AS max_value
+    FROM derived_literal_events GROUP BY grp
+)
+SELECT *, CASE WHEN max_value > 10 THEN '"max_value"' ELSE 'max_value' END AS label
+FROM grouped;
+
+statement ok
+INSERT INTO derived_literal_events VALUES (1, 20), (2, 1);
+
+statement ok
+PRAGMA refresh('mv_derived_literal');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_derived_literal
+    EXCEPT ALL
+    SELECT grp, MAX(value), CASE WHEN MAX(value) > 10 THEN '"max_value"' ELSE 'max_value' END
+    FROM derived_literal_events GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, MAX(value), CASE WHEN MAX(value) > 10 THEN '"max_value"' ELSE 'max_value' END
+    FROM derived_literal_events GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_derived_literal
+);
+----
+0
+
+# Batch conflicting operations on the same group before one refresh.
+statement ok
+UPDATE derived_literal_events SET value = 30 WHERE grp = 1 AND value = 20;
+
+statement ok
+DELETE FROM derived_literal_events WHERE grp = 1 AND value = 30;
+
+statement ok
+INSERT INTO derived_literal_events VALUES (1, 12);
+
+statement ok
+PRAGMA refresh('mv_derived_literal');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_derived_literal
+    EXCEPT ALL
+    SELECT grp, MAX(value), CASE WHEN MAX(value) > 10 THEN '"max_value"' ELSE 'max_value' END
+    FROM derived_literal_events GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, MAX(value), CASE WHEN MAX(value) > 10 THEN '"max_value"' ELSE 'max_value' END
+    FROM derived_literal_events GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_derived_literal
+);
+----
+0
+
+# A right-side insert into a LEFT JOIN retracts the prior NULL-padded row, so
+# base-table insert-only metadata must not select the MIN/MAX MERGE template.
+statement ok
+CREATE TABLE derived_outer_left(id INTEGER, grp INTEGER);
+
+statement ok
+CREATE TABLE derived_outer_right(left_id INTEGER, value INTEGER);
+
+statement ok
+INSERT INTO derived_outer_left VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_derived_outer AS
+SELECT l.grp, MIN(r.value) AS min_value, MAX(r.value) AS max_value
+FROM derived_outer_left l LEFT JOIN derived_outer_right r ON l.id = r.left_id
+GROUP BY l.grp;
+
+statement ok
+INSERT INTO derived_outer_right VALUES (1, 9), (1, 4), (2, 7);
+
+statement ok
+PRAGMA refresh('mv_derived_outer');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_derived_outer
+    EXCEPT ALL
+    SELECT l.grp, MIN(r.value), MAX(r.value)
+    FROM derived_outer_left l LEFT JOIN derived_outer_right r ON l.id = r.left_id
+    GROUP BY l.grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp, MIN(r.value), MAX(r.value)
+    FROM derived_outer_left l LEFT JOIN derived_outer_right r ON l.id = r.left_id
+    GROUP BY l.grp
+    EXCEPT ALL
+    SELECT * FROM mv_derived_outer
+);
+----
+0
+
+query IIT
+SELECT customer_id, symbol, watch_status FROM mv_derived_watch ORDER BY customer_id;
+----
+1	AAA	Inactive
+2	BBB	Active
+3	CCC	Active
+
+# Mixed conflicting DML before one refresh must stay on the safe recompute path.
+statement ok
+INSERT INTO derived_watch_events VALUES
+    (3, 'CCC', 'Cancelled', '2024-03-01 10:00:00'),
+    (4, 'DDD', 'Activate', '2024-03-02 10:00:00');
+
+statement ok
+UPDATE derived_watch_events
+SET watch_timestamp = '2024-01-15 08:00:00'
+WHERE customer_id = 2 AND action_type = 'Activate' AND watch_timestamp = '2024-01-02 10:00:00';
+
+statement ok
+DELETE FROM derived_watch_events
+WHERE customer_id = 1 AND action_type = 'Cancelled';
+
+statement ok
+INSERT INTO derived_watch_events VALUES
+    (1, 'AAA', 'Activate', '2023-11-01 07:00:00'),
+    (4, 'DDD', 'Cancelled', '2024-03-03 10:00:00');
+
+statement ok
+PRAGMA refresh('mv_derived_watch');
+
+query I
+SELECT COUNT(*) FROM (
+	SELECT * FROM mv_derived_watch
+	EXCEPT ALL
+	SELECT customer_id, symbol,
+	       MIN(CASE WHEN action_type = 'Activate' THEN watch_timestamp END),
+	       MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END),
+	       CASE WHEN MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END) IS NULL
+	            THEN 'Active' ELSE 'Inactive' END
+	FROM derived_watch_events GROUP BY customer_id, symbol
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+	SELECT customer_id, symbol,
+	       MIN(CASE WHEN action_type = 'Activate' THEN watch_timestamp END),
+	       MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END),
+	       CASE WHEN MAX(CASE WHEN action_type = 'Cancelled' THEN watch_timestamp END) IS NULL
+	            THEN 'Active' ELSE 'Inactive' END
+	FROM derived_watch_events GROUP BY customer_id, symbol
+    EXCEPT ALL SELECT * FROM mv_derived_watch
+);
+----
+0

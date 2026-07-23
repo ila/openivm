@@ -195,7 +195,170 @@ WHERE stmt_kind = 'data';
 ----
 1
 
-# Test 6 (CURRENT_DIFF_RECOMPUTE for an ASOF view) moved to compile_refresh_asof.test.
+# CURRENT_DIFF_RECOMPUTE coverage for ASOF views lives in compile_refresh_asof.test.
+
+# ==========================================
+# Test 6: a caller-proven insert-only batch enables the MIN/MAX MERGE
+# template, including a scalar output derived from the final aggregate state.
+# Without assume_insert_only, compile-only remains conservative (Test 5).
+# ==========================================
+
+statement ok
+CREATE TABLE compile_only_watch_events(
+    customer_id INT,
+    symbol VARCHAR,
+    action VARCHAR,
+    event_ts TIMESTAMP
+);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_compile_only_watches AS
+    WITH grouped AS (
+        SELECT customer_id,
+               symbol,
+               MIN(CASE WHEN action = 'Activate' THEN event_ts END) AS placed_at,
+               MAX(CASE WHEN action = 'Cancelled' THEN event_ts END) AS removed_at
+        FROM compile_only_watch_events
+        GROUP BY customer_id, symbol
+    )
+    SELECT *,
+           CASE WHEN removed_at IS NULL THEN 'Active' ELSE 'Inactive' END AS status
+    FROM grouped;
+
+query I
+SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%merge into %openivm_data_mv_compile_only_watches%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 NOT LIKE '%delete from %openivm_data_mv_compile_only_watches%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%status = case when%removed_at%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_compile_only_watches',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false,"assume_insert_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+query I
+SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":true%' THEN 1 ELSE 0 END
+FROM openivm_views WHERE view_name = 'mv_compile_only_watches';
+----
+1
+
+# Unsupported scalar functions are recorded as incomplete, so even a caller-
+# proven insert-only MIN/MAX batch must use exact affected-group recompute.
+statement ok
+CREATE TABLE compile_only_round_events(grp INTEGER, value DOUBLE);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_compile_only_round AS
+WITH grouped AS (
+    SELECT grp, MIN(value) AS min_value
+    FROM compile_only_round_events GROUP BY grp
+)
+SELECT grp, min_value, ROUND(min_value / 3.0, 2) AS rounded_value FROM grouped;
+
+query I
+SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":false%' THEN 1 ELSE 0 END
+FROM openivm_views WHERE view_name = 'mv_compile_only_round';
+----
+1
+
+# An escaped `"complete":true` inside an earlier derived expression must not
+# override the top-level incomplete marker and enable the MIN/MAX MERGE path.
+statement ok
+CREATE TABLE compile_only_escaped_metadata_events(grp INTEGER, value DOUBLE);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_compile_only_escaped_metadata AS
+WITH grouped AS (
+    SELECT grp, MIN(value) AS min_value
+    FROM compile_only_escaped_metadata_events GROUP BY grp
+)
+SELECT grp,
+       min_value,
+       '"complete":true' AS marker,
+       ROUND(min_value / 3.0, 2) AS rounded_value
+FROM grouped;
+
+query I
+SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":false%'
+                 AND derived_aggregate_outputs_json LIKE '%"column":"marker"%'
+            THEN 1 ELSE 0 END
+FROM openivm_views WHERE view_name = 'mv_compile_only_escaped_metadata';
+----
+1
+
+query I
+SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%delete from %openivm_data_mv_compile_only_escaped_metadata%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_compile_only_escaped_metadata',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false,"assume_insert_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# Projection lineage must reach through pass-through wrappers so numeric
+# scalar outputs are reconstructed from post-MERGE aggregate state.
+statement ok
+CREATE TABLE compile_only_nested_events(grp INTEGER, value INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_compile_only_nested AS
+WITH grouped AS MATERIALIZED (
+    SELECT grp, MAX(value) AS max_value
+    FROM compile_only_nested_events GROUP BY grp
+), flagged AS MATERIALIZED (
+    SELECT grp, max_value,
+           CASE WHEN max_value > 10 THEN 1 ELSE 0 END AS high_flag
+    FROM grouped
+)
+SELECT * FROM flagged;
+
+query I
+SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"column":"high_flag"%'
+                 AND derived_aggregate_outputs_json LIKE '%max_value%'
+            THEN 1 ELSE 0 END
+FROM openivm_views WHERE view_name = 'mv_compile_only_nested';
+----
+1
+
+query I
+SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%merge into %openivm_data_mv_compile_only_nested%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 NOT LIKE '%delete from %openivm_data_mv_compile_only_nested%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%high_flag = case when%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_compile_only_nested',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false,"assume_insert_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+query I
+SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 NOT LIKE '%merge into %openivm_data_mv_compile_only_round%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%delete from %openivm_data_mv_compile_only_round%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%insert into %openivm_data_mv_compile_only_round%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_compile_only_round',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false,"assume_insert_only":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
 
 # ==========================================
 # Test 7: openivm_compile_with_facts on a non-existent view fails cleanly

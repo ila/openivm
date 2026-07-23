@@ -3,11 +3,12 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/planner.hpp"
-#include "duckdb/execution/index/art/art.hpp"
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -37,7 +38,9 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               const vector<LogicalType> &column_types = {}, bool use_current_diff_affected_keys = false,
                               const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs = nullptr,
                               const string &cascade_lpts_table_prefix = "", bool emit_cascade_delta = false,
-                              bool inline_cascade_delta = false, bool *out_handled_cascade_delta = nullptr);
+                              bool inline_cascade_delta = false, bool *out_handled_cascade_delta = nullptr,
+                              const unordered_map<string, string> &derived_output_expressions = {},
+                              bool derived_output_expressions_complete = false);
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql = "", bool has_minmax = false, bool list_mode = false,
                                const string &delta_ts_filter = "", const string &catalog_prefix = "",
@@ -53,40 +56,48 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const vector<string> &column_names = {}, bool running_window_incremental = false);
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
 
-/// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE` (inner-DISTINCT under
-/// aggregate). For each base table T_i with a non-empty delta, builds a "view query with T_i
-/// restricted to its delta" variant by substituting `<catalog><schema>.<T_i>` in `view_query_sql`
-/// with the delta-filtered subquery. The resulting affected-keys set drives a DELETE + INSERT
-/// scoped to only the GROUP BY tuples touched by deltas — strictly cheaper than full RECOMPUTE
-/// when the affected key set is small.
+/// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE`
+/// (inner-DISTINCT under aggregate). For each base table T_i with a non-empty
+/// delta, builds a "view query with T_i restricted to its delta" variant by
+/// substituting `<catalog><schema>.<T_i>` in `view_query_sql` with the
+/// delta-filtered subquery. The resulting affected-keys set drives a DELETE +
+/// INSERT scoped to only the GROUP BY tuples touched by deltas — strictly
+/// cheaper than full RECOMPUTE when the affected key set is small.
 ///
-/// `delta_table_specs` carries one entry per source table, including whether the source is a
-/// standard DuckDB delta table or a DuckLake snapshot-diff source.
-/// `catalog_prefix` is the SQL prefix used for the MV's data table — empty for the default
-/// catalog, "<cat>.<schema>." otherwise. `lpts_table_prefix` is the *always-fully-qualified*
-/// prefix that LPTS used in `view_query_sql` to reference base tables ("<cat>.<schema>." even
-/// when the catalog is default), so we can substitute the exact `cat.schema.tbl` pattern.
+/// `delta_table_specs` carries one entry per source table, including whether
+/// the source is a standard DuckDB delta table or a DuckLake snapshot-diff
+/// source. `catalog_prefix` is the SQL prefix used for the MV's data table —
+/// empty for the default catalog, "<cat>.<schema>." otherwise.
+/// `lpts_table_prefix` is the *always-fully-qualified* prefix that LPTS used in
+/// `view_query_sql` to reference base tables ("<cat>.<schema>." even when the
+/// catalog is default), so we can substitute the exact `cat.schema.tbl`
+/// pattern.
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs,
                              const string &catalog_prefix = "", const string &lpts_table_prefix = "",
                              bool emit_cascade_delta = false,
                              GroupRecomputeAffectedMode affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF);
 
-/// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM aggregate.
-/// Generates a multi-statement SQL batch:
-///   1. Materialise Δinput per `distinct_cols` from the source delta (timestamp-filtered,
+/// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM
+/// aggregate. Generates a multi-statement SQL batch:
+///   1. Materialise Δinput per `distinct_cols` from the source delta
+///   (timestamp-filtered,
 ///      WHERE-filter applied) into a temp table.
-///   2. MERGE Δagg into the data table — Δdistinct (LEFT JOIN aux + CASE → ±1) drives a
-///      per-`group_cols` SUM(<sum_arg> * dd) update, plus matching `openivm_count_star` deltas.
+///   2. MERGE Δagg into the data table — Δdistinct (LEFT JOIN aux + CASE → ±1)
+///   drives a
+///      per-`group_cols` SUM(<sum_arg> * dd) update, plus matching
+///      `openivm_count_star` deltas.
 ///   3. DELETE rows from the data table whose `openivm_count_star` fell to ≤ 0.
-///   4. MERGE Δinput into the aux table (count = count + dmult); DELETE rows with count ≤ 0.
+///   4. MERGE Δinput into the aux table (count = count + dmult); DELETE rows
+///   with count ≤ 0.
 ///
-/// `aux_table`, `distinct_cols`, `delta_source` (the `delta_<source>` table name), and
-/// `last_update` come from `openivm_views.distinct_aux_meta_json`. `filter_sql` is the
-/// WHERE predicate of the DISTINCT body (empty if none) — applied to both Δinput (filters
-/// delta rows that wouldn't have entered the DISTINCT) and the aux MERGE source.
-/// `group_columns` is the parent aggregate's GROUP BY; `sum_arg`/`sum_out` are the single-SUM
-/// argument and output column. `count_star_col` is the auto-injected `openivm_count_star`
+/// `aux_table`, `distinct_cols`, `delta_source` (the `delta_<source>` table
+/// name), and `last_update` come from `openivm_views.distinct_aux_meta_json`.
+/// `filter_sql` is the WHERE predicate of the DISTINCT body (empty if none) —
+/// applied to both Δinput (filters delta rows that wouldn't have entered the
+/// DISTINCT) and the aux MERGE source. `group_columns` is the parent
+/// aggregate's GROUP BY; `sum_arg`/`sum_out` are the single-SUM argument and
+/// output column. `count_star_col` is the auto-injected `openivm_count_star`
 /// column name on the data table (almost always literal `openivm_count_star`).
 string CompileDistinctIncremental(const string &view_name, const string &aux_table, const vector<string> &distinct_cols,
                                   const vector<string> &source_exprs, const string &delta_source,

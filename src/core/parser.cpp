@@ -368,6 +368,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	bool pre_rewrite_has_aggregate_filter = false;
 	bool has_hidden_minmax_having = false;
 	bool has_computed_minmax_aggregate_projection = false;
+	DerivedAggregateOutputInfo derived_aggregate_outputs;
 	{
 		auto select_parse_plan_start = create_profile_now();
 		Parser select_parser;
@@ -448,6 +449,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			select_plan = std::move(select_plan->children[0]);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
 		}
+		if (select_plan) {
+			derived_aggregate_outputs = ExtractDerivedAggregateOutputs(*select_plan, output_names);
+		}
 		add_create_profile_step("create_compile_select_rewrite", select_rewrite_start,
 		                        "output_cols=" + to_string(output_names.size()));
 
@@ -471,13 +475,15 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		} catch (...) {
 			view_query = original_view_query;
 			lpts_fallback = true;
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to original query: %s\n",
+			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to "
+			                    "original query: %s\n",
 			                    view_query.c_str());
 		}
 		if (PlanNeedsOriginalSqlForLpts(select_plan.get())) {
 			view_query = original_view_query;
 			lpts_fallback = true;
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — using original SQL: %s\n",
+			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — "
+			                    "using original SQL: %s\n",
 			                    view_query.c_str());
 		}
 		add_create_profile_step("create_compile_lpts", lpts_start,
@@ -521,7 +527,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	if (analysis.found_filtered_list) {
 		view_query = original_view_query;
 		lpts_fallback = true;
-		OPENIVM_DEBUG_PRINT("[CREATE MV] LIST FILTER requires original SQL for group-recompute: %s\n",
+		OPENIVM_DEBUG_PRINT("[CREATE MV] LIST FILTER requires original SQL for "
+		                    "group-recompute: %s\n",
 		                    view_query.c_str());
 	}
 	auto classification_start = create_profile_now();
@@ -590,10 +597,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
 		if (ExtractSemiAntiQuery(original_view_query, semi_anti_extract)) {
 			string left_table_name = SqlUtils::LastIdentifierPart(semi_anti_extract.left_table);
-			auto col_result =
-			    con.Query("SELECT column_name FROM information_schema.columns WHERE lower(table_name) = lower('" +
-			              SqlUtils::EscapeSingleQuotes(left_table_name) + "') AND table_schema = '" +
-			              SqlUtils::EscapeSingleQuotes(current_schema) + "' ORDER BY ordinal_position");
+			auto col_result = con.Query("SELECT column_name FROM information_schema.columns WHERE "
+			                            "lower(table_name) = lower('" +
+			                            SqlUtils::EscapeSingleQuotes(left_table_name) + "') AND table_schema = '" +
+			                            SqlUtils::EscapeSingleQuotes(current_schema) + "' ORDER BY ordinal_position");
 			auto add_semi_anti_left_col = [&](const string &col_name) {
 				if (!ContainsColumnCI(semi_anti_left_cols, col_name)) {
 					semi_anti_left_cols.push_back(col_name);
@@ -760,7 +767,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			if (!outer_agg || unsupported_agg || sum_count != 1) {
 				distinct_sum_arg.clear();
 				distinct_sum_out.clear();
-				OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL outer-agg not single-SUM — demoting "
+				OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL outer-agg not "
+				                    "single-SUM — demoting "
 				                    "to GROUP_RECOMPUTE\n");
 			} else if (distinct_sum_out.empty()) {
 				// `SUM(c) AS s` puts the alias `s` on the SELECT-list BCR above the
@@ -889,12 +897,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	if (ducklake_window_partition && !lpts_fallback) {
 		view_query = original_view_query;
 		lpts_fallback = true;
-		OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake window MV uses original SQL for initial data table: %s\n",
+		OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake window MV uses original SQL for "
+		                    "initial data table: %s\n",
 		                    view_query.c_str());
 	}
 	add_create_profile_step("create_compile_classification", classification_start, model_profile_detail);
 
-	OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, projection=%d, group_cols=%zu)\n",
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, "
+	                    "projection=%d, group_cols=%zu)\n",
 	                    RefreshTypeName(refresh_type), (int)analysis.found_aggregation, (int)analysis.found_projection,
 	                    aggregate_columns.size());
 	for (auto reason : view_model.strategy_reasons) {
@@ -916,7 +926,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		                    domain.source_tables.size(), (int)domain.delta_local, (int)domain.needs_base_lookup);
 	}
 	for (auto &node : view_model.nodes) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta node %llu: %s rule=%s children=%zu sources=%zu keys=%zu "
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta node %llu: %s rule=%s children=%zu sources=%zu "
+		                    "keys=%zu "
 		                    "occurrence=%llu domains=%zu lineage=%zu semantics=%zu unsupported=%zu "
 		                    "maintenance=%s state=%s\n",
 		                    static_cast<unsigned long long>(node.id), DeltaModelNodeKindName(node.kind),
@@ -996,7 +1007,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	                       " (view_name, sql_string, type, has_minmax, has_left_join, has_join, last_update, "
 	                       "refresh_interval, refresh_in_progress, group_columns, aggregate_types, "
 	                       "having_predicate, group_recompute_affected_mode, "
-	                       "group_recompute_source_occurrences_json, has_full_outer, full_outer_join_cols) values ('" +
+	                       "group_recompute_source_occurrences_json, has_full_outer, "
+	                       "full_outer_join_cols) values ('" +
 	                       view_name + "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
 	                       to_string((int)refresh_type) + ", " + (has_minmax_metadata ? "true" : "false") + ", " +
 	                       (analysis.found_left_join ? "true" : "false") + ", " +
@@ -1008,6 +1020,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	if (!lineage_json.empty()) {
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));
 	}
+	aux_metadata_ddl.push_back(
+	    BuildUpdateViewJsonSQL("derived_aggregate_outputs_json",
+	                           RefreshMetadata::DerivedAggregateOutputsToJson(derived_aggregate_outputs), view_name));
 	add_profile_record("create_compile_lineage", lineage_duration_ms, "entries=" + to_string(lineage_entry_count));
 
 	Value match_flag_val;
@@ -1180,7 +1195,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	if (!source_metadata_values.empty()) {
 		source_metadata_ddl.push_back("insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
 		                              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
-		                              "last_refresh_ts, source_catalog, source_schema, source_table_id) values " +
+		                              "last_refresh_ts, source_catalog, source_schema, source_table_id) "
+		                              "values " +
 		                              StringUtil::Join(source_metadata_values, ", "));
 	}
 
@@ -1429,7 +1445,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			if (visible_ddl_idx < 3) {
 				system_tables_sql += ddl[i] + ";\n\n";
 			} else if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
-				compiled_sql += "-- OpenIVM derives the MV delta-table schema from the physical data table "
+				compiled_sql += "-- OpenIVM derives the MV delta-table schema from the "
+				                "physical data table "
 				                "at DDL execution time.\n\n";
 			} else {
 				compiled_sql += ddl[i] + ";\n\n";

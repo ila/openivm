@@ -432,7 +432,8 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	string schema_filter = schema_name.empty() ? "main" : schema_name;
 	auto current_result =
 	    con.Query("SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
-	              "ducklake_schema s ON t.schema_id = s.schema_id WHERE t.end_snapshot IS NULL AND "
+	              "ducklake_schema s ON t.schema_id = s.schema_id WHERE "
+	              "t.end_snapshot IS NULL AND "
 	              "s.end_snapshot IS NULL AND t.table_name = '" +
 	              SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" + SqlUtils::EscapeValue(schema_filter) +
 	              "' ORDER BY t.table_id DESC LIMIT 1");
@@ -597,8 +598,12 @@ static bool ExtractJsonStringArray(const string &json, const string &key, vector
 	return true;
 }
 
-static vector<string> ExtractJsonObjectsFromArray(const string &json, const string &key) {
+static vector<string> ExtractJsonObjectsFromArray(const string &json, const string &key,
+                                                  optional_ptr<bool> parsed_complete = nullptr) {
 	vector<string> objects;
+	if (parsed_complete) {
+		*parsed_complete = false;
+	}
 	string needle = "\"" + key + "\":[";
 	size_t pos = json.find(needle);
 	if (pos == string::npos) {
@@ -643,6 +648,9 @@ static vector<string> ExtractJsonObjectsFromArray(const string &json, const stri
 			continue;
 		}
 		if (c == ']' && depth == 0) {
+			if (parsed_complete) {
+				*parsed_complete = true;
+			}
 			break;
 		}
 	}
@@ -722,6 +730,51 @@ RefreshMetadata::GetGroupRecomputeSourceOccurrences(const string &view_name) {
 		occurrences.push_back(std::move(occurrence));
 	}
 	return occurrences;
+}
+
+DerivedAggregateOutputInfo RefreshMetadata::GetDerivedAggregateOutputs(const string &view_name) {
+	DerivedAggregateOutputInfo info;
+	auto result = con.Query("SELECT derived_aggregate_outputs_json FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return info;
+	}
+	const auto json = result->GetValue(0, 0).ToString();
+	const string complete_prefix = "{\"complete\":true,\"outputs\":[";
+	const string incomplete_prefix = "{\"complete\":false,\"outputs\":[";
+	const bool has_complete_prefix = json.rfind(complete_prefix, 0) == 0;
+	const bool has_incomplete_prefix = json.rfind(incomplete_prefix, 0) == 0;
+	bool parsed_outputs_complete = false;
+	auto objects = ExtractJsonObjectsFromArray(json, "outputs", parsed_outputs_complete);
+	info.complete = has_complete_prefix && parsed_outputs_complete && json.size() >= 2 &&
+	                json.compare(json.size() - 2, 2, "]}") == 0;
+	if (!has_complete_prefix && !has_incomplete_prefix) {
+		return info;
+	}
+	for (auto &object : objects) {
+		DerivedAggregateOutput output;
+		if (ExtractJsonString(object, "column", output.output_column) &&
+		    ExtractJsonString(object, "expression", output.expression_sql) && !output.output_column.empty() &&
+		    !output.expression_sql.empty()) {
+			info.outputs.push_back(std::move(output));
+		} else {
+			info.complete = false;
+		}
+	}
+	return info;
+}
+
+string RefreshMetadata::DerivedAggregateOutputsToJson(const DerivedAggregateOutputInfo &info) {
+	string json = string("{\"complete\":") + (info.complete ? "true" : "false") + ",\"outputs\":[";
+	for (idx_t i = 0; i < info.outputs.size(); i++) {
+		if (i > 0) {
+			json += ",";
+		}
+		json += "{\"column\":" + SqlUtils::JsonQuote(info.outputs[i].output_column) +
+		        ",\"expression\":" + SqlUtils::JsonQuote(info.outputs[i].expression_sql) + "}";
+	}
+	json += "]}";
+	return json;
 }
 
 string
