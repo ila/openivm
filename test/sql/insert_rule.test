@@ -1778,3 +1778,107 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Duplicate source matches can make DuckDB choose a different update row than the
+# input's first occurrence when it sorts and deduplicates target row IDs. Capture
+# the target's actual final value rather than predicting which source row wins.
+statement ok
+CREATE TABLE merge_duplicate_src (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO merge_duplicate_src SELECT i, 0 FROM range(2500) r(i);
+
+statement ok
+CREATE MATERIALIZED VIEW merge_duplicate_mv AS SELECT id, v FROM merge_duplicate_src;
+
+statement ok
+CREATE TABLE merge_duplicate_changes AS
+SELECT i AS id, x AS v
+FROM range(2500) r(i), (VALUES (1), (2)) values_table(x);
+
+statement ok
+MERGE INTO merge_duplicate_src
+USING merge_duplicate_changes
+ON merge_duplicate_src.id = merge_duplicate_changes.id
+WHEN MATCHED THEN UPDATE SET v = merge_duplicate_changes.v;
+
+statement ok
+PRAGMA refresh('merge_duplicate_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM merge_duplicate_mv
+    EXCEPT ALL
+    SELECT * FROM merge_duplicate_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM merge_duplicate_src
+    EXCEPT ALL
+    SELECT * FROM merge_duplicate_mv
+);
+----
+0
+
+# A MERGE can update a committed row while deleting a row inserted earlier in
+# the same transaction. The deleted local row ID must not be refetched as a
+# positive postimage when the MERGE actions finalize.
+statement ok
+CREATE TABLE merge_mixed_visibility_src (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO merge_mixed_visibility_src VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW merge_mixed_visibility_mv AS
+SELECT id, v FROM merge_mixed_visibility_src;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO merge_mixed_visibility_src VALUES (2, 20);
+
+statement ok
+MERGE INTO merge_mixed_visibility_src
+USING (VALUES (1, 5), (2, -1)) changes(id, v)
+ON merge_mixed_visibility_src.id = changes.id
+WHEN MATCHED AND changes.v < 0 THEN DELETE
+WHEN MATCHED THEN UPDATE SET v = merge_mixed_visibility_src.v + changes.v;
+
+statement ok
+COMMIT;
+
+query III
+SELECT id, v, openivm_multiplicity
+FROM openivm_delta_merge_mixed_visibility_src
+ORDER BY id, v, openivm_multiplicity;
+----
+1	10	-1
+1	15	1
+2	20	-1
+2	20	1
+
+statement ok
+PRAGMA refresh('merge_mixed_visibility_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM merge_mixed_visibility_mv
+    EXCEPT ALL
+    SELECT * FROM merge_mixed_visibility_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM merge_mixed_visibility_src
+    EXCEPT ALL
+    SELECT * FROM merge_mixed_visibility_mv
+);
+----
+0
