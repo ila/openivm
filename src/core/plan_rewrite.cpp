@@ -890,12 +890,27 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 /// the user-facing VIEW; `CompileAggregateGroups` already recognizes it
 /// via openivm::COUNT_STAR_COL.
 static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
-	// Only inject at the top of the plan — the AGGREGATE_GROUP compile path only
-	// runs when the MV root is PROJECTION → [FILTER] → AGGREGATE. Inner aggregates
-	// under a UNION/INTERSECT/EXCEPT or subquery are handled by different compile
-	// paths (often FULL_REFRESH) that would be broken by extra columns.
-	auto *agg_search = FindProjectionAggregateInput(plan, true);
-	if (!agg_search) {
+	// Only inject into the aggregate on the top-level output path. ORDER BY/LIMIT/TOP_N
+	// preserve the projection schema; inner aggregates under joins or set operations
+	// are handled by other refresh strategies.
+	LogicalOperator *node = plan.get();
+	while (node && node->children.size() == 1 &&
+	       (node->type == LogicalOperatorType::LOGICAL_ORDER_BY || node->type == LogicalOperatorType::LOGICAL_LIMIT ||
+	        node->type == LogicalOperatorType::LOGICAL_TOP_N)) {
+		node = node->children[0].get();
+	}
+	if (!node || node->type != LogicalOperatorType::LOGICAL_PROJECTION || node->children.empty()) {
+		return;
+	}
+	auto &projection = node->Cast<LogicalProjection>();
+	auto *agg_search = node->children[0].get();
+	if (agg_search->type == LogicalOperatorType::LOGICAL_FILTER) {
+		if (agg_search->children.empty()) {
+			return;
+		}
+		agg_search = agg_search->children[0].get();
+	}
+	if (agg_search->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		return;
 	}
 	auto &agg = agg_search->Cast<LogicalAggregate>();
@@ -948,9 +963,9 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 	ColumnBinding count_binding(agg.aggregate_index, new_agg_idx);
 	auto count_pt = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
 	count_pt->alias = openivm::COUNT_STAR_COL;
-	auto &proj = plan->Cast<LogicalProjection>();
-	proj.expressions.push_back(std::move(count_pt));
-	proj.ResolveOperatorTypes();
+	projection.expressions.push_back(std::move(count_pt));
+	projection.ResolveOperatorTypes();
+	plan->ResolveOperatorTypes();
 
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] Injected openivm_count_star for AGGREGATE_GROUP\n");
 }

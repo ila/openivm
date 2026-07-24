@@ -4011,3 +4011,52 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Group existence must use an unconditional row count even when ORDER BY wraps
+# the aggregate projection. Removing the last non-NULL x leaves the group alive
+# because another row with x=NULL remains.
+statement ok
+CREATE TABLE ordered_nullable_count_input (id INT, g INT, x INT);
+
+statement ok
+INSERT INTO ordered_nullable_count_input VALUES (1, 1, NULL), (2, 1, 5), (3, 2, 7);
+
+statement ok
+CREATE MATERIALIZED VIEW ordered_nullable_count_mv AS
+    SELECT g, COUNT(x) AS n
+    FROM ordered_nullable_count_input
+    GROUP BY g
+    ORDER BY g;
+
+statement ok
+DELETE FROM ordered_nullable_count_input WHERE id = 2;
+
+statement ok
+INSERT INTO ordered_nullable_count_input VALUES (4, 3, NULL), (5, 3, 9);
+
+statement ok
+UPDATE ordered_nullable_count_input SET x = NULL WHERE id = 5;
+
+statement ok
+DELETE FROM ordered_nullable_count_input WHERE id = 4;
+
+statement ok
+PRAGMA refresh('ordered_nullable_count_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ordered_nullable_count_mv
+    EXCEPT ALL
+    SELECT g, COUNT(x) FROM ordered_nullable_count_input GROUP BY g
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT g, COUNT(x) FROM ordered_nullable_count_input GROUP BY g
+    EXCEPT ALL
+    SELECT * FROM ordered_nullable_count_mv
+);
+----
+0

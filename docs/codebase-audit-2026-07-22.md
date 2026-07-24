@@ -34,8 +34,9 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
   from the NULL partition to a non-NULL partition.
 - [x] **Preserve `SUM` NULL semantics.** Weighted SUM alone cannot distinguish numeric zero from no non-NULL inputs. Persist
   a hidden `COUNT(sum_argument)` and render NULL when that count reaches zero.
-- [ ] **Use an unconditional row count for group existence.** `COUNT(nullable_expression)=0` does not mean a group is empty.
-  Persist a hidden `COUNT(*)` solely for deciding whether the group row must be deleted.
+- [x] **Use an unconditional row count for group existence.** `COUNT(nullable_expression)=0` does not mean a group is empty.
+  Grouped incremental aggregates persist a hidden `COUNT(*)` solely for deciding whether the group row must be deleted,
+  including aggregates below `ORDER BY`, `LIMIT`, and `TOP_N` wrappers.
 - [ ] **Delete the heuristic group-measure update fast path.** `refresh_group_measure.cpp` infers aggregate lineage from SQL
   text, output-alias substrings, LPTS formatting, and value strings. A reproduced update to input `v` changed unrelated
   aliases `revenue` and `savings`. Use the existing affected-group recompute path until bound aggregate lineage can prove a
