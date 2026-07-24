@@ -391,6 +391,26 @@ static void BuildUpdateSemantics(DeltaViewModel &model, const PlanAnalysis &anal
 	}
 }
 
+static bool IsTransparentDistinctWrapper(LogicalOperatorType type) {
+	return type == LogicalOperatorType::LOGICAL_CREATE_TABLE || type == LogicalOperatorType::LOGICAL_FILTER ||
+	       type == LogicalOperatorType::LOGICAL_ORDER_BY || type == LogicalOperatorType::LOGICAL_LIMIT ||
+	       type == LogicalOperatorType::LOGICAL_TOP_N;
+}
+
+static bool HasOuterProjectionOverDistinct(const CreateMVPlanFacts &facts) {
+	auto *node = facts.root;
+	bool found_projection = false;
+	while (node && node->children.size() == 1) {
+		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			found_projection = true;
+		} else if (!IsTransparentDistinctWrapper(node->type)) {
+			break;
+		}
+		node = node->children[0].get();
+	}
+	return found_projection && node && node->type == LogicalOperatorType::LOGICAL_DISTINCT;
+}
+
 static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &facts, const vector<string> &output_names,
                               idx_t visible_output_count) {
 	const auto &analysis = facts.analysis;
@@ -411,9 +431,14 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 			                    model.group_columns.size());
 		}
 	} else if (model.distinct_at_top) {
-		model.group_columns = analysis.aggregate_columns;
-	} else if (analysis.found_distinct && analysis.aggregate_columns.empty()) {
-		model.group_columns = analysis.aggregate_columns;
+		AddVisibleGroupNames(model.group_columns, output_names);
+	} else if (analysis.found_distinct && !analysis.found_aggregation && HasOuterProjectionOverDistinct(facts)) {
+		AddVisibleGroupNames(model.group_columns, output_names);
+		if (!model.group_columns.empty()) {
+			AddUnique(model.strategy_reasons, DeltaStrategyReason::INNER_DISTINCT_PROJECTION_RECOMPUTE);
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Inner DISTINCT below an outer projection -- using "
+			                    "GROUP_RECOMPUTE\n");
+		}
 	} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 	}
@@ -666,6 +691,8 @@ const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
 		return "OUTER_JOIN_AGGREGATE_RECOMPUTE";
 	case DeltaStrategyReason::OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE:
 		return "OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE";
+	case DeltaStrategyReason::INNER_DISTINCT_PROJECTION_RECOMPUTE:
+		return "INNER_DISTINCT_PROJECTION_RECOMPUTE";
 	default:
 		return "UNKNOWN";
 	}
@@ -861,11 +888,10 @@ bool IsDistinctAtTop(const CreateMVPlanFacts &facts, const vector<string> &outpu
 	}
 
 	auto *node = facts.root;
-	while (node && node->children.size() == 1 &&
-	       (node->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
-	        node->type == LogicalOperatorType::LOGICAL_PROJECTION ||
-	        node->type == LogicalOperatorType::LOGICAL_FILTER || node->type == LogicalOperatorType::LOGICAL_ORDER_BY ||
-	        node->type == LogicalOperatorType::LOGICAL_LIMIT || node->type == LogicalOperatorType::LOGICAL_TOP_N)) {
+	while (node && node->children.size() == 1) {
+		if (!IsTransparentDistinctWrapper(node->type)) {
+			break;
+		}
 		node = node->children[0].get();
 	}
 	if (node && node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
