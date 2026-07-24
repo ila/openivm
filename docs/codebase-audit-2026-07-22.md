@@ -73,6 +73,11 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
 - [ ] **Finish or reverse the `CURRENT_DIFF_RECOMPUTE` removal coherently.** Deterministic SAMPLE, POSITIONAL, and ASOF shapes
   are demoted to unconditional full refresh while stale nonlocal strategies, documentation, and benchmark paths remain.
   Preserve a typed affected/current-diff recompute path where correctness permits it; delete truly dead strategies.
+- [ ] **Strip computed top-k wrappers from stored aggregate state.** CREATE only moves a root `TOP_N` or
+  `LIMIT -> ORDER_BY` into the user-facing view. Plans such as
+  `PROJECTION -> TOP_N -> PROJECTION -> AGGREGATE` therefore initialize a limited backing table, while refresh strips the
+  top-k operator and applies unbounded deltas. Resolve the bound ordering expressions through the projection path, keep the
+  backing state unbounded, and apply the computed `ORDER BY`/`LIMIT` only in the user-facing view.
 
 ## P2: remove SQL-text hacks and duplicate abstractions
 
