@@ -1083,13 +1083,28 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			// delta instead.
 			bool inline_merge_cascade =
 			    active_facts.force_view_delta_cascade && active_facts.target_dialect != SqlDialect::SPARK;
+			// LEFT JOIN pipeline secondary delta (Larson & Zhou). Fetch it before compiling the MERGE so we can
+			// tell CompileAggregateGroups which preserved-side aggregate columns must NOT be gated by the
+			// (inner-side) openivm_match_count. The secondary INSERT itself is prepended to the MERGE below.
+			RefreshMetadata::LeftJoinSecondaryMeta ljsec;
+			bool have_ljsec = source_has_left_join && !source_has_full_outer &&
+			                  metadata.GetLeftJoinSecondaryMeta(view_name, ljsec) && !ljsec.sql.empty();
+			vector<string> ljsec_preserved_cols;
+			if (have_ljsec && !ljsec.preserved_cols_csv.empty()) {
+				ljsec_preserved_cols = StringUtil::Split(ljsec.preserved_cols_csv, ',');
+			}
 			upsert_query = CompileAggregateGroups(
 			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
 			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types,
 			    /*use_current_diff_affected_keys=*/false, aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
 			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
 			    /*inline_cascade_delta=*/inline_merge_cascade, &aggregate_recompute_emits_cascade_delta,
-			    derived_output_expressions, derived_output_info.complete);
+			    derived_output_expressions, derived_output_info.complete, ljsec_preserved_cols);
+			// Run the secondary-delta INSERT (NULL-padded reappearance rows for deepest-join match-count
+			// transitions) AFTER the primary-delta INSERT and BEFORE the MERGE consolidation below.
+			if (have_ljsec) {
+				upsert_query = ljsec.sql + "\n" + upsert_query;
+			}
 		}
 		break;
 	}

@@ -1969,4 +1969,243 @@ void ForwardPacSettingsIfLoaded(ClientContext &context, Connection &con) {
 	}
 }
 
+static bool SubtreeContainsComparisonJoin(LogicalOperator *op) {
+	if (!op) {
+		return false;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
+	    op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		return true;
+	}
+	for (auto &child : op->children) {
+		if (SubtreeContainsComparisonJoin(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// LEFT-JOIN pipeline secondary-delta INSERT (Larson & Zhou). Returns "" if unsupported (caller falls back
+// to current behavior — no regression). Fixes the deepest LEFT JOIN's preserved-side aggregate undercount
+// when an inner-table change flips a join key's match-count across zero. Self-contained SQL: it re-reads the
+// per-source delta timestamp via subquery, so refresh runs it verbatim (no substitution, no plan walk).
+string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
+                                      const vector<string> &output_names, const string &view_name,
+                                      vector<string> &preserved_cols) {
+	preserved_cols.clear();
+	if (facts.aggregates.size() != 1) {
+		return "";
+	}
+	auto *oj = facts.first_comparison_join;
+	if (!oj || oj->join_type != JoinType::LEFT || oj->conditions.empty() || oj->children.size() != 2) {
+		return "";
+	}
+	// Only PIPELINES need the secondary: for a single LEFT JOIN the primary delta already emits the
+	// null-padded reappearance. Require the preserved (left) side to itself contain a join.
+	if (!SubtreeContainsComparisonJoin(oj->children[0].get())) {
+		return "";
+	}
+	auto &agg = *facts.aggregates[0];
+	size_t G = agg.groups.size();
+	if (G == 0 || output_names.size() < G + agg.expressions.size()) {
+		return "";
+	}
+	// Deepest-join keys: condition.left = preserved side, condition.right = inner (null) side.
+	auto *pres_ref = GetColumnRefThroughCasts(oj->conditions[0].left.get());
+	auto *inner_ref = GetColumnRefThroughCasts(oj->conditions[0].right.get());
+	if (!pres_ref || !inner_ref) {
+		return "";
+	}
+	ColumnBinding key_pres = pres_ref->binding;
+	LogicalGet *inner_get = nullptr;
+	string inner_col;
+	if (!ResolveBindingToGetColumn(inner_ref->binding, facts, inner_get, inner_col) || !inner_get ||
+	    !inner_get->GetTable().get()) {
+		return "";
+	}
+	idx_t inner_tidx = inner_get->table_index;
+	string inner_table = inner_get->GetTable().get()->name;
+	auto sti = facts.source_table_info.find(inner_table);
+	if (sti == facts.source_table_info.end()) {
+		return "";
+	}
+	string cat = sti->second.catalog_name;
+	string sch = sti->second.schema_name;
+	string qual;
+	if (!cat.empty()) {
+		qual += KeywordHelper::WriteOptionallyQuoted(cat) + ".";
+	}
+	if (!sch.empty()) {
+		qual += KeywordHelper::WriteOptionallyQuoted(sch) + ".";
+	}
+	string inner_base = qual + KeywordHelper::WriteOptionallyQuoted(inner_table);
+	string delta_inner_bare = SqlUtils::DeltaName(inner_table);
+	string delta_inner = qual + KeywordHelper::WriteOptionallyQuoted(delta_inner_bare);
+	string qcol = KeywordHelper::WriteOptionallyQuoted(inner_col);
+
+	// The correction below assumes a dangling (null-padded) row for this key is ALREADY materialized
+	// in the view -- true only if the preserved-side row (e.g. the order) existed before this refresh
+	// batch. If the preserved-side row is itself brand new in this same batch (e.g. a freshly inserted
+	// order that immediately gets its first line), no dangling row was ever materialized, and applying
+	// this correction would spuriously subtract a row that never existed. Resolve the preserved side's
+	// own base table/column so we can gate on "did this key exist before this batch's delta."
+	LogicalGet *pres_get = nullptr;
+	string pres_col;
+	if (!ResolveBindingToGetColumn(key_pres, facts, pres_get, pres_col) || !pres_get || !pres_get->GetTable().get()) {
+		return "";
+	}
+	string pres_table = pres_get->GetTable().get()->name;
+	auto pres_sti = facts.source_table_info.find(pres_table);
+	if (pres_sti == facts.source_table_info.end()) {
+		return "";
+	}
+	string pres_qual;
+	if (!pres_sti->second.catalog_name.empty()) {
+		pres_qual += KeywordHelper::WriteOptionallyQuoted(pres_sti->second.catalog_name) + ".";
+	}
+	if (!pres_sti->second.schema_name.empty()) {
+		pres_qual += KeywordHelper::WriteOptionallyQuoted(pres_sti->second.schema_name) + ".";
+	}
+	string pres_base = pres_qual + KeywordHelper::WriteOptionallyQuoted(pres_table);
+	string delta_pres_bare = SqlUtils::DeltaName(pres_table);
+	string delta_pres = pres_qual + KeywordHelper::WriteOptionallyQuoted(delta_pres_bare);
+	string pres_qcol = KeywordHelper::WriteOptionallyQuoted(pres_col);
+
+	// Classify each aggregate output column's contribution to a null-padded row of the deepest join.
+	// output_names layout: [group cols (G)] [visible aggregates (agg.expressions, in order)] [hidden helpers].
+	// Visible: resolve the arg's base table — inner-side count/sum -> 0, preserved-side count -> 1
+	// (preserved-side sum needs the value: unsupported for now -> bail). count_star (no arg) -> 1.
+	// Hidden: openivm_count_star -> 1, openivm_match_count / openivm_nonnull_sum_count* -> 0 (all inner-derived).
+	size_t num_agg = output_names.size() - G;
+	vector<string> contribs;
+	for (size_t j = 0; j < num_agg; j++) {
+		if (j < agg.expressions.size()) {
+			auto &e = agg.expressions[j];
+			if (e->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+				return "";
+			}
+			auto &ba = e->Cast<BoundAggregateExpression>();
+			string fn = StringUtil::Lower(ba.function.name);
+			if (ba.children.empty()) {
+				contribs.push_back("1"); // count_star: null-padded row still counts
+				continue;
+			}
+			auto *cref = GetColumnRefThroughCasts(ba.children[0].get());
+			if (!cref) {
+				return "";
+			}
+			LogicalGet *g = nullptr;
+			string c;
+			bool resolved = ResolveBindingToGetColumn(cref->binding, facts, g, c);
+			bool is_inner = resolved && g && g->table_index == inner_tidx;
+			if (fn == "count") {
+				contribs.push_back(is_inner ? "0" : "1");
+				if (!is_inner) {
+					// Preserved-side COUNT: the MERGE must NOT gate it by the (inner-side) match_count.
+					preserved_cols.push_back(output_names[G + j]);
+				}
+			} else if (fn == "sum") {
+				if (is_inner) {
+					contribs.push_back("0");
+				} else {
+					return ""; // preserved-side SUM needs the value; defer to a later generalization
+				}
+			} else {
+				return "";
+			}
+		} else {
+			const string &col = output_names[G + j];
+			if (col.find("count_star") != string::npos) {
+				contribs.push_back("1");
+			} else if (col.find("match_count") != string::npos || col.find("nonnull_sum_count") != string::npos) {
+				contribs.push_back("0");
+			} else {
+				return "";
+			}
+		}
+	}
+
+	// Build the preserved-side subquery X via LPTS, naming the join key "__k" and each group col "__g<i>".
+	auto x_plan = oj->children[0]->Copy(context);
+	x_plan->ResolveOperatorTypes();
+	auto x_bindings = x_plan->GetColumnBindings();
+	vector<ColumnBinding> group_bindings;
+	for (auto &ge : agg.groups) {
+		auto *gr = GetColumnRefThroughCasts(ge.get());
+		if (!gr) {
+			return "";
+		}
+		group_bindings.push_back(gr->binding);
+	}
+	vector<string> x_names(x_bindings.size());
+	int key_pos = -1;
+	vector<int> group_pos(G, -1);
+	for (size_t i = 0; i < x_bindings.size(); i++) {
+		x_names[i] = "__x" + std::to_string(i);
+		if (x_bindings[i] == key_pres) {
+			x_names[i] = "__k";
+			key_pos = static_cast<int>(i);
+		}
+		for (size_t gi = 0; gi < G; gi++) {
+			if (x_bindings[i] == group_bindings[gi]) {
+				x_names[i] = "__g" + std::to_string(gi);
+				group_pos[gi] = static_cast<int>(i);
+			}
+		}
+	}
+	if (key_pos < 0) {
+		return "";
+	}
+	for (size_t gi = 0; gi < G; gi++) {
+		if (group_pos[gi] < 0) {
+			return "";
+		}
+	}
+	string x_sql;
+	try {
+		SqlDialect dialect = SqlDialect::DUCKDB;
+		auto ast = LogicalPlanToAst(context, x_plan, dialect);
+		auto cte_list = AstToCteList(*ast, dialect);
+		x_sql = cte_list->ToQuery(true, x_names);
+		if (!x_sql.empty() && x_sql.back() == ';') {
+			x_sql.pop_back();
+		}
+	} catch (...) {
+		return "";
+	}
+	if (x_sql.empty()) {
+		return "";
+	}
+
+	// delta_mv columns: group cols + aggregate cols + openivm_multiplicity (matches the primary INSERT).
+	string col_list;
+	string sel;
+	for (size_t gi = 0; gi < G; gi++) {
+		col_list += KeywordHelper::WriteOptionallyQuoted(output_names[gi]) + ", ";
+		sel += "X.\"__g" + std::to_string(gi) + "\", ";
+	}
+	for (size_t j = 0; j < contribs.size(); j++) {
+		col_list += KeywordHelper::WriteOptionallyQuoted(output_names[G + j]) + ", ";
+		sel += contribs[j] + ", ";
+	}
+	col_list += "openivm_multiplicity";
+	sel += "CASE WHEN (__newc - __t.dsum) > 0 AND __newc = 0 THEN 1 ELSE -1 END";
+
+	string dmv = KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
+	string sql = "INSERT INTO " + dmv + " (" + col_list + ")\nSELECT " + sel + "\nFROM (SELECT " + qcol +
+	             " AS __k, SUM(openivm_multiplicity) AS dsum FROM " + delta_inner +
+	             " WHERE openivm_timestamp >= (SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
+	             " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	             SqlUtils::EscapeValue(delta_inner_bare) + "') GROUP BY " + qcol + ") __t\nJOIN (" + x_sql +
+	             ") X ON X.\"__k\" = __t.__k,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + inner_base + " ib WHERE ib." +
+	             qcol + " = __t.__k) AS __newc) __n,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + pres_base +
+	             " pb WHERE pb." + pres_qcol + " = __t.__k) - COALESCE((SELECT SUM(openivm_multiplicity) FROM " +
+	             delta_pres + " WHERE " + pres_qcol + " = __t.__k AND openivm_timestamp >= (SELECT last_update FROM " +
+	             string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
+	             "' AND table_name = '" + SqlUtils::EscapeValue(delta_pres_bare) +
+	             "')), 0) AS __old_pres_count) __op\nWHERE (__newc > 0) <> ((__newc - __t.dsum) > 0) AND "
+	             "__old_pres_count > 0;";
+	return sql;
+}
+
 } // namespace duckdb

@@ -40,7 +40,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               const string &cascade_lpts_table_prefix = "", bool emit_cascade_delta = false,
                               bool inline_cascade_delta = false, bool *out_handled_cascade_delta = nullptr,
                               const unordered_map<string, string> &derived_output_expressions = {},
-                              bool derived_output_expressions_complete = false);
+                              bool derived_output_expressions_complete = false,
+                              const vector<string> &preserved_side_cols = {});
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql = "", bool has_minmax = false, bool list_mode = false,
                                const string &delta_ts_filter = "", const string &catalog_prefix = "",

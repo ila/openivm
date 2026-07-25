@@ -336,6 +336,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS semi_anti_aux_meta_json VARCHAR DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS leftjoin_secondary_meta_json VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS lineage_json VARCHAR DEFAULT NULL");
 
 	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +

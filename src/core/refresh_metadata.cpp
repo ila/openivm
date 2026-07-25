@@ -1130,6 +1130,29 @@ string RefreshMetadata::FilteredGroupCountAuxMetaToJson(const FilteredGroupCount
 	       ",\"threshold\":" + SqlUtils::JsonQuote(meta.threshold_sql) + "}";
 }
 
+bool RefreshMetadata::GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out) {
+	auto result = con.Query("SELECT leftjoin_secondary_meta_json FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	string json = result->GetValue(0, 0).ToString();
+	if (json.empty()) {
+		return false;
+	}
+	string kind;
+	if (!ExtractJsonString(json, "kind", kind) || kind != "leftjoin_secondary") {
+		return false;
+	}
+	ExtractJsonString(json, "preserved_cols", out.preserved_cols_csv);
+	return ExtractJsonString(json, "sql", out.sql);
+}
+
+string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta) {
+	return "{\"kind\":\"leftjoin_secondary\",\"sql\":" + SqlUtils::JsonQuote(meta.sql) +
+	       ",\"preserved_cols\":" + SqlUtils::JsonQuote(meta.preserved_cols_csv) + "}";
+}
+
 vector<string> RefreshMetadata::ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta) {
 	auto expected = meta.cols;
 	expected.push_back("_count");

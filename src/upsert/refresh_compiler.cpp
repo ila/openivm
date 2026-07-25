@@ -536,7 +536,11 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               const string &cascade_lpts_table_prefix, bool emit_cascade_delta,
                               bool inline_cascade_delta, bool *out_handled_cascade_delta,
                               const unordered_map<string, string> &derived_output_expressions,
-                              bool derived_output_expressions_complete) {
+                              bool derived_output_expressions_complete,
+                              const vector<string> &preserved_side_cols) {
+	auto is_preserved_side = [&](const string &c) {
+		return std::find(preserved_side_cols.begin(), preserved_side_cols.end(), c) != preserved_side_cols.end();
+	};
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 
@@ -1021,8 +1025,9 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				continue;
 			}
 			string agg_type = col_agg_type.count(col) ? col_agg_type.at(col) : "";
-			if (agg_type == "count_star") {
-				// Left-side-driven: always update normally.
+			if (agg_type == "count_star" || is_preserved_side(col)) {
+				// count_star and preserved/left-side COUNT columns are left-side-driven: a right-side
+				// match_count transition must NOT zero them. Always apply the normal aggregate update.
 				lj_update_set += col + " = " + BuildUpdatedAggregateColumn(col);
 				continue;
 			}
@@ -1068,7 +1073,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				continue;
 			}
 			string agg_type = col_agg_type.count(aggregates[i]) ? col_agg_type.at(aggregates[i]) : "";
-			if (agg_type == "count_star") {
+			if (agg_type == "count_star" || is_preserved_side(aggregates[i])) {
 				cond_insert_vals += "d." + aggregates[i];
 				continue;
 			}

@@ -1171,6 +1171,30 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		    BuildUpdateViewJsonSQL("semi_anti_aux_meta_json", RefreshMetadata::SemiAntiAuxMetaToJson(meta), view_name));
 	}
 
+	// LEFT JOIN pipeline secondary-delta (Larson & Zhou): generate the secondary-delta INSERT once at CREATE
+	// time and store it; refresh appends it between the primary-delta INSERT and the MERGE.
+	if (view_model.type == RefreshType::AGGREGATE_GROUP && facts.analysis.found_left_join) {
+		add_profile_marker("create_mv_leftjoin_secondary");
+		// LPTS on the preserved subtree needs an active transaction for catalog access; the main
+		// create-time LPTS ran inside a transaction that was already rolled back above.
+		con.BeginTransaction();
+		string sec_sql;
+		vector<string> preserved_cols;
+		try {
+			sec_sql = BuildLeftJoinSecondaryDeltaSQL(*con.context, facts, output_names, view_name, preserved_cols);
+		} catch (...) {
+			sec_sql.clear();
+		}
+		con.Rollback();
+		if (!sec_sql.empty()) {
+			RefreshMetadata::LeftJoinSecondaryMeta sm;
+			sm.sql = sec_sql;
+			sm.preserved_cols_csv = StringUtil::Join(preserved_cols, ",");
+			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
+			    "leftjoin_secondary_meta_json", RefreshMetadata::LeftJoinSecondaryMetaToJson(sm), view_name));
+		}
+	}
+
 	const auto &source_table_info = facts.source_table_info;
 	const auto &dl_table_info = facts.ducklake_table_info; // keyed by lowercased name
 

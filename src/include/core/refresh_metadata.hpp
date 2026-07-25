@@ -304,6 +304,18 @@ public:
 	bool GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out);
 	static string FilteredGroupCountAuxMetaToJson(const FilteredGroupCountAuxMeta &meta);
 
+	// LEFT JOIN pipeline secondary-delta maintenance (Larson & Zhou). The secondary-delta SQL is
+	// generated once at CREATE time (from the plan) and stored; refresh substitutes the per-source
+	// delta timestamps and appends it between the primary-delta INSERT and the MERGE. Zero refresh-time
+	// plan walks.
+	struct LeftJoinSecondaryMeta {
+		string sql;                // secondary-delta INSERT (self-contained; run before the MERGE)
+		string preserved_cols_csv; // comma-separated preserved-side aggregate columns the MERGE must NOT gate
+	};
+
+	bool GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out);
+	static string LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta);
+
 	static vector<string> ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta);
 	static vector<string> ExpectedCountDistinctAuxColumns(const CountDistinctAuxMeta &meta);
 	static vector<string> ExpectedFilteredGroupCountAuxColumns(const FilteredGroupCountAuxMeta &meta);
