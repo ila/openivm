@@ -1093,6 +1093,57 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			if (have_ljsec && !ljsec.preserved_cols_csv.empty()) {
 				ljsec_preserved_cols = StringUtil::Split(ljsec.preserved_cols_csv, ',');
 			}
+			// Resolve the two delta row-source placeholders. Regular tables read their delta table;
+			// DuckLake tables have none and must read ducklake_table_insertions/deletions between the
+			// last-refreshed and current snapshot -- IDs that exist only here, not at CREATE time.
+			if (have_ljsec) {
+				auto build_ljsec_delta_source = [&](const string &base_table, const string &key_col) -> string {
+					string qkey = SqlUtils::QuoteIdentifier(key_col);
+					// openivm_delta_tables keys DuckLake sources by their BARE table name but regular
+					// sources by openivm_delta_<table>; probe the bare name first to tell them apart.
+					bool is_ducklake = metadata.IsDuckLakeTable(view_name, base_table);
+					string delta_name = is_ducklake ? base_table : SqlUtils::DeltaName(base_table);
+					if (is_ducklake) {
+						auto loc = metadata.GetSourceLocation(view_name, delta_name, attached_db_catalog_name,
+						                                      attached_db_schema_name);
+						int64_t last_snap = metadata.GetLastSnapshotId(view_name, delta_name);
+						int64_t cur_snap = metadata.GetCurrentDuckLakeSnapshot(loc.catalog_name);
+						if (loc.catalog_name.empty() || last_snap < 0 || cur_snap < 0) {
+							return "";
+						}
+						// Matches CreateDeltaGetNode's convention: the stored snapshot was already
+						// consumed, so start one past it. Insertions are +1, deletions -1.
+						string ins =
+						    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name,
+						                                    loc.schema_name, loc.table_name, last_snap + 1, cur_snap);
+						string del =
+						    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name,
+						                                    loc.schema_name, loc.table_name, last_snap + 1, cur_snap);
+						return "(SELECT " + qkey + " AS __k, 1 AS __m FROM " + ins + " UNION ALL SELECT " + qkey +
+						       " AS __k, -1 AS __m FROM " + del + ")";
+					}
+					string qualified_delta = internal_catalog_prefix + SqlUtils::QuoteIdentifier(delta_name);
+					return "(SELECT " + qkey + " AS __k, " + string(openivm::MULTIPLICITY_COL) + " AS __m FROM " +
+					       qualified_delta + " WHERE " + string(openivm::TIMESTAMP_COL) +
+					       " >= (SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
+					       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
+					       SqlUtils::EscapeValue(delta_name) + "'))";
+				};
+				string inner_src = build_ljsec_delta_source(ljsec.inner_table, ljsec.inner_key);
+				string pres_src = build_ljsec_delta_source(ljsec.pres_table, ljsec.pres_key);
+				if (inner_src.empty() || pres_src.empty()) {
+					// Could not resolve a row source (e.g. missing snapshot metadata). Emitting the SQL
+					// with placeholders intact would be a syntax error, so skip the secondary rather
+					// than fail the refresh; the primary delta still applies.
+					OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN secondary skipped: unresolved delta source\n");
+					have_ljsec = false;
+				} else {
+					ljsec.sql = SqlUtils::ReplaceAllOccurrences(
+					    ljsec.sql, string(openivm::LJSEC_INNER_DELTA_PLACEHOLDER), inner_src);
+					ljsec.sql = SqlUtils::ReplaceAllOccurrences(
+					    ljsec.sql, string(openivm::LJSEC_PRES_DELTA_PLACEHOLDER), pres_src);
+				}
+			}
 			bool ljsec_used_group_recompute = false;
 			upsert_query = CompileAggregateGroups(
 			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,

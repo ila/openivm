@@ -99,9 +99,18 @@ CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &cu
 bool ProducesAtMostOneRow(LogicalOperator &node);
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols);
 bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t group_index);
+// delta_view_catalog_prefix must be the same prefix the view's delta table was created with
+// (internal_catalog_prefix). Without it the generated INSERT targets an unqualified delta table,
+// which fails for MVs whose state lives in another catalog -- e.g. DuckLake-backed views, where the
+// delta table is dl.main.openivm_delta_<view>.
+// The returned SQL carries LJSEC_INNER_DELTA_PLACEHOLDER / LJSEC_PRES_DELTA_PLACEHOLDER where each
+// side's pending changes belong; refresh substitutes them (see openivm_constants.hpp). The out_*
+// params report the two sides' identities so refresh can pick the right row source per backend.
 string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
                                       const vector<string> &output_names, const string &view_name,
-                                      vector<string> &preserved_cols);
+                                      vector<string> &preserved_cols, const string &delta_view_catalog_prefix = "",
+                                      string *out_inner_table = nullptr, string *out_inner_key = nullptr,
+                                      string *out_pres_table = nullptr, string *out_pres_key = nullptr);
 bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts);
 bool RelationExists(Connection &con, const string &qualified_name);
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,

@@ -1,0 +1,175 @@
+# name: test/sql/ducklake_left_join_pipeline_secondary.test
+# description: LEFT JOIN PIPELINE (3-table chain) secondary delta over DUCKLAKE sources. DuckLake has
+# group: [sql]
+
+#              no per-source delta tables -- it tracks changes via snapshot time travel -- so the
+#              secondary-delta row sources are placeholders resolved at refresh from
+#              ducklake_table_insertions/deletions. Before that, this shape either silently produced a
+#              wrong preserved-side COUNT (an order that lost its last line dropped out of n_ord) or,
+#              once the secondary was generated, failed the refresh outright on a missing
+#              openivm_delta_<table>. test/sql/left_join_pipeline_secondary_delta.test covers only
+#              regular tables and cannot catch either.
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/dl_lj_pipeline_secondary.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE dl.cust (cid INT, nation VARCHAR);
+
+statement ok
+CREATE TABLE dl.ord (oid INT, cid INT);
+
+statement ok
+CREATE TABLE dl.line (lid INT, oid INT, amt INT);
+
+statement ok
+INSERT INTO dl.cust VALUES (1,'A'),(2,'A'),(3,'B');
+
+statement ok
+INSERT INTO dl.ord VALUES (10,1),(11,1),(12,2);
+
+# o10 has 2 lines, o11 has 1 line, o12 has none (already NULL-padded)
+statement ok
+INSERT INTO dl.line VALUES (100,10,5),(101,10,7),(102,11,9);
+
+# n_ord counts the INTERMEDIATE preserved-side column -- the aggregate the secondary delta protects
+statement ok
+CREATE MATERIALIZED VIEW dl.dlmv AS
+    SELECT c.nation, COUNT(o.oid) AS n_ord, COUNT(l.lid) AS n_line, SUM(l.amt) AS rev
+    FROM dl.cust c LEFT JOIN dl.ord o ON o.cid = c.cid LEFT JOIN dl.line l ON l.oid = o.oid
+    GROUP BY c.nation;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), SUM(l.amt)
+    FROM dl.cust c LEFT JOIN dl.ord o ON o.cid=c.cid LEFT JOIN dl.line l ON l.oid=o.oid GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, n_line, rev FROM dl.dlmv
+);
+----
+0
+
+# Batched mixed DML before ONE refresh:
+#   DELETE line 102 -> o11 loses its LAST line  => NULL-padded row must reappear; n_ord must NOT drop
+#   INSERT line 103 -> o12 gains its FIRST line => NULL-padded row removed
+#   DELETE line 100 -> o10 still has 101        => no transition
+statement ok
+DELETE FROM dl.line WHERE lid = 102;
+
+statement ok
+INSERT INTO dl.line VALUES (103, 12, 4);
+
+statement ok
+DELETE FROM dl.line WHERE lid = 100;
+
+statement ok
+PRAGMA refresh('dlmv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), SUM(l.amt)
+    FROM dl.cust c LEFT JOIN dl.ord o ON o.cid=c.cid LEFT JOIN dl.line l ON l.oid=o.oid GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, n_line, rev FROM dl.dlmv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT nation, n_ord, n_line, rev FROM dl.dlmv
+    EXCEPT ALL
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), SUM(l.amt)
+    FROM dl.cust c LEFT JOIN dl.ord o ON o.cid=c.cid LEFT JOIN dl.line l ON l.oid=o.oid GROUP BY c.nation
+);
+----
+0
+
+# every order still counted: o10,o11,o12 for A plus a NULL-padded row for B's order-less customer
+query III
+SELECT nation, n_ord, n_line FROM dl.dlmv ORDER BY nation;
+----
+A	3	2
+B	0	0
+
+# Second batch: preserved side (orders) changes too, so BOTH sides' snapshot ranges are exercised
+statement ok
+INSERT INTO dl.ord VALUES (13,3);
+
+statement ok
+INSERT INTO dl.line VALUES (104,11,3),(105,13,8);
+
+statement ok
+DELETE FROM dl.line WHERE lid = 101;
+
+statement ok
+DELETE FROM dl.ord WHERE oid = 12;
+
+statement ok
+PRAGMA refresh('dlmv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), SUM(l.amt)
+    FROM dl.cust c LEFT JOIN dl.ord o ON o.cid=c.cid LEFT JOIN dl.line l ON l.oid=o.oid GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, n_line, rev FROM dl.dlmv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT nation, n_ord, n_line, rev FROM dl.dlmv
+    EXCEPT ALL
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), SUM(l.amt)
+    FROM dl.cust c LEFT JOIN dl.ord o ON o.cid=c.cid LEFT JOIN dl.line l ON l.oid=o.oid GROUP BY c.nation
+);
+----
+0
+
+# Third batch: an order loses its last line AND is deleted in the same batch (the downward-transition
+# case), while another order gains its first line (the upward case that must NOT be suppressed)
+statement ok
+DELETE FROM dl.line WHERE lid = 105;
+
+statement ok
+DELETE FROM dl.ord WHERE oid = 13;
+
+statement ok
+INSERT INTO dl.ord VALUES (14,2);
+
+statement ok
+INSERT INTO dl.line VALUES (106,14,6);
+
+statement ok
+PRAGMA refresh('dlmv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), SUM(l.amt)
+    FROM dl.cust c LEFT JOIN dl.ord o ON o.cid=c.cid LEFT JOIN dl.line l ON l.oid=o.oid GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, n_line, rev FROM dl.dlmv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT nation, n_ord, n_line, rev FROM dl.dlmv
+    EXCEPT ALL
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), SUM(l.amt)
+    FROM dl.cust c LEFT JOIN dl.ord o ON o.cid=c.cid LEFT JOIN dl.line l ON l.oid=o.oid GROUP BY c.nation
+);
+----
+0

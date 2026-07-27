@@ -1991,7 +1991,9 @@ static bool SubtreeContainsComparisonJoin(LogicalOperator *op) {
 // per-source delta timestamp via subquery, so refresh runs it verbatim (no substitution, no plan walk).
 string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
                                       const vector<string> &output_names, const string &view_name,
-                                      vector<string> &preserved_cols) {
+                                      vector<string> &preserved_cols, const string &delta_view_catalog_prefix,
+                                      string *out_inner_table, string *out_inner_key, string *out_pres_table,
+                                      string *out_pres_key) {
 	preserved_cols.clear();
 	if (facts.aggregates.size() != 1) {
 		return "";
@@ -2201,20 +2203,40 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 	col_list += "openivm_multiplicity";
 	sel += "CASE WHEN (__newc - __t.dsum) > 0 AND __newc = 0 THEN 1 ELSE -1 END";
 
-	string dmv = KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
-	string sql = "INSERT INTO " + dmv + " (" + col_list + ")\nSELECT " + sel + "\nFROM (SELECT " + qcol +
-	             " AS __k, SUM(openivm_multiplicity) AS dsum FROM " + delta_inner +
-	             " WHERE openivm_timestamp >= (SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	             " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
-	             SqlUtils::EscapeValue(delta_inner_bare) + "') GROUP BY " + qcol + ") __t\nJOIN (" + x_sql +
+	// Must carry the same catalog prefix the delta table was created with. Unqualified works only when
+	// the MV's state lives in the default catalog; a DuckLake-backed view's delta table is
+	// dl.main.openivm_delta_<view>, and an unqualified INSERT there fails the whole refresh.
+	if (out_inner_table) {
+		*out_inner_table = inner_table;
+	}
+	if (out_inner_key) {
+		*out_inner_key = inner_col;
+	}
+	if (out_pres_table) {
+		*out_pres_table = pres_table;
+	}
+	if (out_pres_key) {
+		*out_pres_key = pres_col;
+	}
+
+	// Must carry the same catalog prefix the delta table was created with. Unqualified works only when
+	// the MV's state lives in the default catalog; a DuckLake-backed view's delta table is
+	// dl.main.openivm_delta_<view>, and an unqualified INSERT there fails the whole refresh.
+	string dmv = delta_view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
+	// The two delta row sources are placeholders resolved at refresh: a regular table reads its
+	// openivm_delta_<table>, a DuckLake table reads ducklake_table_insertions/deletions between
+	// snapshots (whose IDs only exist at refresh time). Both substitutions yield columns (__k, __m).
+	string inner_delta_src = string(openivm::LJSEC_INNER_DELTA_PLACEHOLDER);
+	string pres_delta_src = string(openivm::LJSEC_PRES_DELTA_PLACEHOLDER);
+	// The correlated LATERAL form is deliberate: rewriting these as pre-aggregated CTEs restricted to
+	// the delta keys measured ~40% SLOWER at TPC-H SF50 (DuckDB already decorrelates them well).
+	string sql = "INSERT INTO " + dmv + " (" + col_list + ")\nSELECT " + sel +
+	             "\nFROM (SELECT __k, SUM(__m) AS dsum FROM " + inner_delta_src + " GROUP BY __k) __t\nJOIN (" + x_sql +
 	             ") X ON X.\"__k\" = __t.__k,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + inner_base + " ib WHERE ib." +
 	             qcol + " = __t.__k) AS __newc) __n,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + pres_base +
-	             " pb WHERE pb." + pres_qcol + " = __t.__k) - COALESCE((SELECT SUM(openivm_multiplicity) FROM " +
-	             delta_pres + " WHERE " + pres_qcol + " = __t.__k AND openivm_timestamp >= (SELECT last_update FROM " +
-	             string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
-	             "' AND table_name = '" + SqlUtils::EscapeValue(delta_pres_bare) +
-	             "')), 0) AS __old_pres_count) __op\nWHERE (__newc > 0) <> ((__newc - __t.dsum) > 0) AND "
-	             "__old_pres_count > 0;";
+	             " pb WHERE pb." + pres_qcol + " = __t.__k) - COALESCE((SELECT SUM(__m) FROM " + pres_delta_src +
+	             " __pd WHERE __pd.__k = __t.__k), 0) AS __old_pres_count) __op"
+	             "\nWHERE (__newc > 0) <> ((__newc - __t.dsum) > 0) AND __old_pres_count > 0;";
 	return sql;
 }
 

@@ -54,6 +54,15 @@ constexpr const char *RIGHT_MATCH_COUNT_COL = "openivm_right_match_count";
 // Index suffix for GROUP BY unique index on MV data tables
 constexpr const char *INDEX_SUFFIX = "openivm_index";
 
+// Placeholders in the stored LEFT JOIN secondary-delta SQL, substituted at refresh time with a
+// subquery yielding (__k, __m) = (join key, signed multiplicity) for that side's pending changes.
+// They exist because the row source depends on the storage backend: a regular table reads
+// openivm_delta_<table> filtered by timestamp, while a DuckLake table has no delta table at all and
+// must read ducklake_table_insertions/deletions between two snapshot IDs -- and those IDs are only
+// known at refresh, whereas this SQL is generated once at CREATE.
+constexpr const char *LJSEC_INNER_DELTA_PLACEHOLDER = "__OPENIVM_LJSEC_INNER_DELTA__";
+constexpr const char *LJSEC_PRES_DELTA_PLACEHOLDER = "__OPENIVM_LJSEC_PRES_DELTA__";
+
 // Temporary table prefix for companion row snapshots
 constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";
 

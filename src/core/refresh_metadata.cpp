@@ -1145,12 +1145,20 @@ bool RefreshMetadata::GetLeftJoinSecondaryMeta(const string &view_name, LeftJoin
 		return false;
 	}
 	ExtractJsonString(json, "preserved_cols", out.preserved_cols_csv);
+	ExtractJsonString(json, "inner_table", out.inner_table);
+	ExtractJsonString(json, "inner_key", out.inner_key);
+	ExtractJsonString(json, "pres_table", out.pres_table);
+	ExtractJsonString(json, "pres_key", out.pres_key);
 	return ExtractJsonString(json, "sql", out.sql);
 }
 
 string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta) {
 	return "{\"kind\":\"leftjoin_secondary\",\"sql\":" + SqlUtils::JsonQuote(meta.sql) +
-	       ",\"preserved_cols\":" + SqlUtils::JsonQuote(meta.preserved_cols_csv) + "}";
+	       ",\"preserved_cols\":" + SqlUtils::JsonQuote(meta.preserved_cols_csv) +
+	       ",\"inner_table\":" + SqlUtils::JsonQuote(meta.inner_table) +
+	       ",\"inner_key\":" + SqlUtils::JsonQuote(meta.inner_key) +
+	       ",\"pres_table\":" + SqlUtils::JsonQuote(meta.pres_table) +
+	       ",\"pres_key\":" + SqlUtils::JsonQuote(meta.pres_key) + "}";
 }
 
 vector<string> RefreshMetadata::ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta) {

@@ -1180,8 +1180,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		con.BeginTransaction();
 		string sec_sql;
 		vector<string> preserved_cols;
+		string sec_inner_table, sec_inner_key, sec_pres_table, sec_pres_key;
 		try {
-			sec_sql = BuildLeftJoinSecondaryDeltaSQL(*con.context, facts, output_names, view_name, preserved_cols);
+			sec_sql = BuildLeftJoinSecondaryDeltaSQL(*con.context, facts, output_names, view_name, preserved_cols,
+			                                         internal_catalog_prefix, &sec_inner_table, &sec_inner_key,
+			                                         &sec_pres_table, &sec_pres_key);
 		} catch (...) {
 			sec_sql.clear();
 		}
@@ -1190,6 +1193,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			RefreshMetadata::LeftJoinSecondaryMeta sm;
 			sm.sql = sec_sql;
 			sm.preserved_cols_csv = StringUtil::Join(preserved_cols, ",");
+			sm.inner_table = sec_inner_table;
+			sm.inner_key = sec_inner_key;
+			sm.pres_table = sec_pres_table;
+			sm.pres_key = sec_pres_key;
 			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
 			    "leftjoin_secondary_meta_json", RefreshMetadata::LeftJoinSecondaryMetaToJson(sm), view_name));
 		}
