@@ -537,7 +537,10 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               bool inline_cascade_delta, bool *out_handled_cascade_delta,
                               const unordered_map<string, string> &derived_output_expressions,
                               bool derived_output_expressions_complete,
-                              const vector<string> &preserved_side_cols) {
+                              const vector<string> &preserved_side_cols, bool *out_used_group_recompute) {
+	if (out_used_group_recompute) {
+		*out_used_group_recompute = false;
+	}
 	auto is_preserved_side = [&](const string &c) {
 		return std::find(preserved_side_cols.begin(), preserved_side_cols.end(), c) != preserved_side_cols.end();
 	};
@@ -823,6 +826,14 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	}
 
 	if (needs_group_recompute || (has_minmax && !insert_only)) {
+		// Tell the caller this call recomputes affected groups from the base tables rather than
+		// applying delta arithmetic. Callers that inject extra delta-table rows purely to correct the
+		// MERGE arithmetic (e.g. the LEFT JOIN pipeline secondary delta) should skip that injection
+		// here: group-recompute rebuilds each affected group from the base tables, so the correction
+		// is recomputed anyway and the extra rows only widen the affected-group set.
+		if (out_used_group_recompute) {
+			*out_used_group_recompute = true;
+		}
 		// Cascade-delta dispatch: when the caller (refresh_sql.cpp) requested cascade-delta
 		// emission AND we have the inputs CompileGroupRecompute needs (non-empty group_columns,
 		// non-empty delta_specs), route through the snapshot+signed-multiset path so the

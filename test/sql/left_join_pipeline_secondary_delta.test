@@ -239,3 +239,85 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ============================================================
+# Fifth batch: the same pipeline refreshed with openivm_left_join_merge=false, which routes
+# CompileAggregateGroups to group-recompute instead of the delta-arithmetic MERGE. Plain coverage
+# that a pipeline view with secondary-delta metadata still refreshes correctly on the recompute
+# path, and that switching back to the MERGE path afterwards is also correct (the secondary is a
+# per-refresh decision, not a permanent one). The existing left_join.test coverage of this flag uses
+# a single LEFT JOIN, which never generates secondary metadata, so this shape was untested.
+#
+# NOTE: this does NOT reproduce the duplicate-key refresh failure seen on the group-recompute path
+# at TPC-H scale -- that failure is PRE-EXISTING (it reproduces on commit 7697928, before any of the
+# secondary-delta work) and needs 2+ MVs over shared base tables or a prior MERGE-path refresh.
+# Tracked separately; do not treat this section as covering it.
+# ============================================================
+
+statement ok
+SET openivm_left_join_merge = false;
+
+statement ok
+INSERT INTO ord VALUES (30, 2);
+
+statement ok
+INSERT INTO line VALUES (300, 30, 12);
+
+statement ok
+DELETE FROM line WHERE lid = 104;
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid) AS n_ord, COUNT(l.lid) AS n_line, SUM(l.amt) AS rev
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, n_line, rev FROM mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT nation, n_ord, n_line, rev FROM mv
+    EXCEPT ALL
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), SUM(l.amt)
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid GROUP BY c.nation
+);
+----
+0
+
+statement ok
+SET openivm_left_join_merge = true;
+
+# Back on the MERGE path, a further batch must still be correct (the guard must not have
+# disabled the secondary permanently -- it is a per-refresh decision).
+
+statement ok
+DELETE FROM line WHERE lid = 300;
+
+statement ok
+INSERT INTO line VALUES (301, 22, 5);
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid) AS n_ord, COUNT(l.lid) AS n_line, SUM(l.amt) AS rev
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, n_line, rev FROM mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT nation, n_ord, n_line, rev FROM mv
+    EXCEPT ALL
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), SUM(l.amt)
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid GROUP BY c.nation
+);
+----
+0

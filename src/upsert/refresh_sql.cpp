@@ -1093,16 +1093,24 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			if (have_ljsec && !ljsec.preserved_cols_csv.empty()) {
 				ljsec_preserved_cols = StringUtil::Split(ljsec.preserved_cols_csv, ',');
 			}
+			bool ljsec_used_group_recompute = false;
 			upsert_query = CompileAggregateGroups(
 			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
 			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types,
 			    /*use_current_diff_affected_keys=*/false, aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
 			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
 			    /*inline_cascade_delta=*/inline_merge_cascade, &aggregate_recompute_emits_cascade_delta,
-			    derived_output_expressions, derived_output_info.complete, ljsec_preserved_cols);
+			    derived_output_expressions, derived_output_info.complete, ljsec_preserved_cols,
+			    &ljsec_used_group_recompute);
 			// Run the secondary-delta INSERT (NULL-padded reappearance rows for deepest-join match-count
 			// transitions) AFTER the primary-delta INSERT and BEFORE the MERGE consolidation below.
-			if (have_ljsec) {
+			// ONLY meaningful when CompileAggregateGroups actually emitted the delta-arithmetic MERGE: the
+			// secondary corrects THAT arithmetic. If it fell back to group-recompute (openivm_left_join_merge
+			// =false, real MIN/MAX, a non-summable column, or derived-aggregate orphans), affected groups are
+			// rebuilt from the base tables, so the corrected values are recomputed anyway and these rows only
+			// widen the affected-group set. Skipping them is the correct scoping, not a bug fix: no observed
+			// wrong-result case is attributable to emitting them here.
+			if (have_ljsec && !ljsec_used_group_recompute) {
 				upsert_query = ljsec.sql + "\n" + upsert_query;
 			}
 		}
