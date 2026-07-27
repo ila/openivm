@@ -869,8 +869,21 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		string match_insert = SqlUtils::BuildNullSafeKeyPredicate(keys, "openivm_aff.", "openivm_recompute.");
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 		string affected = "select distinct " + keys_tuple + " from " + delta_view + delta_where;
+		// index_delta_view_catalog_entry non-null means the DATA table carries the UNIQUE index that
+		// parser.cpp creates for AGGREGATE_GROUP / AGGREGATE_HAVING views. DuckDB's on-disk unique
+		// index keeps deleted keys for constraint checking within a transaction, so the plain
+		// DELETE-then-INSERT form raises a spurious duplicate-key error for every group that survives
+		// the recompute. Use the upsert form there. Without the index (DuckLake, group_column_names
+		// fallback) INSERT OR REPLACE is not usable, and plain DELETE+INSERT is already safe.
+		vector<string> upsert_keys;
+		string recompute_temp;
+		if (index_delta_view_catalog_entry) {
+			upsert_keys = keys;
+			recompute_temp = SqlUtils::QuoteIdentifier("openivm_recompute_" + view_name);
+		}
 		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, "  " + affected, "openivm_tgt",
-		                                  "openivm_recompute", "openivm_aff", match_delete, match_insert);
+		                                  "openivm_recompute", "openivm_aff", match_delete, match_insert,
+		                                  /*affected_temp_table=*/"", upsert_keys, recompute_temp);
 	}
 
 	// CTE: consolidate deltas per group

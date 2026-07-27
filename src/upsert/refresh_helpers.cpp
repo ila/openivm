@@ -252,7 +252,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &affected_subquery, const string &target_alias,
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
-                                  const string &affected_temp_table) {
+                                  const string &affected_temp_table, const vector<string> &upsert_keys,
+                                  const string &recompute_temp_table) {
 	string affected_block = "(\n" + affected_subquery + "\n)";
 	string affected_source = affected_temp_table.empty() ? affected_block : affected_temp_table;
 	string delete_where =
@@ -264,9 +265,27 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 	if (!affected_temp_table.empty()) {
 		result += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_subquery + ";\n\n";
 	}
-	result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" +
-	          "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " +
-	          insert_where + ";\n";
+	if (!upsert_keys.empty() && !recompute_temp_table.empty()) {
+		// Upsert form, for data tables carrying a UNIQUE index. Materialize the recomputed rows for
+		// the affected groups ONCE (the recompute is the expensive part), then:
+		//   1. delete only the affected groups that no longer produce a row (a group can disappear
+		//      entirely, e.g. when every preserved-side row for it is deleted), and
+		//   2. INSERT OR REPLACE the survivors.
+		// The two key sets are disjoint, so no key is deleted and re-inserted in the same
+		// transaction -- which is what trips DuckDB's on-disk unique index.
+		string keep_match = SqlUtils::BuildNullSafeKeyPredicate(upsert_keys, "openivm_keep.", target_alias + ".");
+		result += "CREATE OR REPLACE TEMP TABLE " + recompute_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+		          ") " + recompute_alias + "\nWHERE " + insert_where + ";\n\n";
+		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where +
+		          "\n  AND NOT EXISTS (\n  SELECT 1 FROM " + recompute_temp_table + " AS openivm_keep WHERE " +
+		          keep_match + "\n);\n\n";
+		result += "INSERT OR REPLACE INTO " + data_table + "\nSELECT * FROM " + recompute_temp_table + ";\n";
+		result += "\nDROP TABLE IF EXISTS " + recompute_temp_table + ";\n";
+	} else {
+		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" +
+		          "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias +
+		          "\nWHERE " + insert_where + ";\n";
+	}
 	if (!affected_temp_table.empty()) {
 		result += "\nDROP TABLE IF EXISTS " + affected_temp_table + ";\n";
 	}
