@@ -60,8 +60,12 @@ constexpr const char *INDEX_SUFFIX = "openivm_index";
 // openivm_delta_<table> filtered by timestamp, while a DuckLake table has no delta table at all and
 // must read ducklake_table_insertions/deletions between two snapshot IDs -- and those IDs are only
 // known at refresh, whereas this SQL is generated once at CREATE.
-constexpr const char *LJSEC_INNER_DELTA_PLACEHOLDER = "__OPENIVM_LJSEC_INNER_DELTA__";
-constexpr const char *LJSEC_PRES_DELTA_PLACEHOLDER = "__OPENIVM_LJSEC_PRES_DELTA__";
+// Indexed because a chain of N tables has N-1 LEFT JOIN levels and EVERY level whose preserved side
+// is itself a join needs its own secondary delta. Handling only the outermost level left deeper
+// preserved-side counts undercounted for 4+ table chains.
+constexpr const char *LJSEC_INNER_DELTA_PREFIX = "__OPENIVM_LJSEC_INNER_DELTA_";
+constexpr const char *LJSEC_PRES_DELTA_PREFIX = "__OPENIVM_LJSEC_PRES_DELTA_";
+constexpr const char *LJSEC_PLACEHOLDER_SUFFIX = "__";
 
 // Temporary table prefix for companion row snapshots
 constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";

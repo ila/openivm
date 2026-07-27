@@ -1,0 +1,176 @@
+# name: test/sql/left_join_deep_chain_secondary.test
+# description: LEFT JOIN chains DEEPER than 3 tables need a secondary delta at EVERY level whose
+# group: [sql]
+
+#              preserved side is itself a join, not just the outermost one. With cust ⟕ ord ⟕ line ⟕ supp,
+#              deleting an order's last line stranded that order in COUNT(o.oid) because only the
+#              outermost (⟕ supp) level was corrected and the ⟕ line level was not. 3-table chains were
+#              already covered by left_join_pipeline_secondary_delta.test and passed, so this shape needs
+#              its own coverage at 4 and 5 tables.
+
+require openivm
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE cust (cid INT, nation VARCHAR);
+
+statement ok
+CREATE TABLE ord (oid INT, cid INT);
+
+statement ok
+CREATE TABLE line (lid INT, oid INT, sid INT, amt INT);
+
+statement ok
+CREATE TABLE supp (sid INT, sname VARCHAR);
+
+statement ok
+CREATE TABLE part (pid INT, sid INT, pname VARCHAR);
+
+statement ok
+INSERT INTO cust VALUES (1,'A'),(2,'B');
+
+statement ok
+INSERT INTO ord VALUES (10,1),(11,2);
+
+statement ok
+INSERT INTO line VALUES (100,10,500,5),(101,11,501,7);
+
+statement ok
+INSERT INTO supp VALUES (500,'S500'),(501,'S501');
+
+statement ok
+INSERT INTO part VALUES (900,500,'P900');
+
+statement ok
+CREATE MATERIALIZED VIEW mv4 AS
+    SELECT c.nation, COUNT(o.oid) AS n_ord, COUNT(l.lid) AS n_line, COUNT(s.sid) AS n_supp
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid LEFT JOIN supp s ON s.sid=l.sid
+    GROUP BY c.nation;
+
+statement ok
+CREATE MATERIALIZED VIEW mv5 AS
+    SELECT c.nation, COUNT(o.oid) AS n_ord, COUNT(l.lid) AS n_line, COUNT(s.sid) AS n_supp, COUNT(p.pid) AS n_part
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid LEFT JOIN supp s ON s.sid=l.sid
+         LEFT JOIN part p ON p.sid=s.sid
+    GROUP BY c.nation;
+
+# order 11 loses its LAST line: its supplier and part vanish too, but the ORDER itself must still count
+statement ok
+DELETE FROM line WHERE lid = 101;
+
+statement ok
+PRAGMA refresh('mv4');
+
+statement ok
+PRAGMA refresh('mv5');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), COUNT(s.sid)
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid LEFT JOIN supp s ON s.sid=l.sid
+    GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, n_line, n_supp FROM mv4
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT nation, n_ord, n_line, n_supp FROM mv4
+    EXCEPT ALL
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), COUNT(s.sid)
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid LEFT JOIN supp s ON s.sid=l.sid
+    GROUP BY c.nation
+);
+----
+0
+
+# the specific regression: nation B's order survives in n_ord even though its line/supp/part are gone
+query III
+SELECT nation, n_ord, n_line FROM mv4 ORDER BY nation;
+----
+A	1	1
+B	1	0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), COUNT(s.sid), COUNT(p.pid)
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid LEFT JOIN supp s ON s.sid=l.sid
+         LEFT JOIN part p ON p.sid=s.sid
+    GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, n_line, n_supp, n_part FROM mv5
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT nation, n_ord, n_line, n_supp, n_part FROM mv5
+    EXCEPT ALL
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), COUNT(s.sid), COUNT(p.pid)
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid LEFT JOIN supp s ON s.sid=l.sid
+         LEFT JOIN part p ON p.sid=s.sid
+    GROUP BY c.nation
+);
+----
+0
+
+# Second batch: a middle-level match reappears (order 11 gains a line again) plus an unrelated insert,
+# exercising the upward transition at a non-outermost level.
+statement ok
+INSERT INTO line VALUES (102, 11, 501, 3);
+
+statement ok
+INSERT INTO ord VALUES (12, 1);
+
+statement ok
+PRAGMA refresh('mv4');
+
+statement ok
+PRAGMA refresh('mv5');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), COUNT(s.sid)
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid LEFT JOIN supp s ON s.sid=l.sid
+    GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, n_line, n_supp FROM mv4
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT nation, n_ord, n_line, n_supp FROM mv4
+    EXCEPT ALL
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), COUNT(s.sid)
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid LEFT JOIN supp s ON s.sid=l.sid
+    GROUP BY c.nation
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), COUNT(s.sid), COUNT(p.pid)
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid LEFT JOIN supp s ON s.sid=l.sid
+         LEFT JOIN part p ON p.sid=s.sid
+    GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, n_line, n_supp, n_part FROM mv5
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT nation, n_ord, n_line, n_supp, n_part FROM mv5
+    EXCEPT ALL
+    SELECT c.nation, COUNT(o.oid), COUNT(l.lid), COUNT(s.sid), COUNT(p.pid)
+    FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid LEFT JOIN supp s ON s.sid=l.sid
+         LEFT JOIN part p ON p.sid=s.sid
+    GROUP BY c.nation
+);
+----
+0

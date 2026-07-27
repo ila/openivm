@@ -1985,20 +1985,93 @@ static bool SubtreeContainsComparisonJoin(LogicalOperator *op) {
 	return false;
 }
 
-// LEFT-JOIN pipeline secondary-delta INSERT (Larson & Zhou). Returns "" if unsupported (caller falls back
-// to current behavior — no regression). Fixes the deepest LEFT JOIN's preserved-side aggregate undercount
-// when an inner-table change flips a join key's match-count across zero. Self-contained SQL: it re-reads the
-// per-source delta timestamp via subquery, so refresh runs it verbatim (no substitution, no plan walk).
-string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
-                                      const vector<string> &output_names, const string &view_name,
-                                      vector<string> &preserved_cols, const string &delta_view_catalog_prefix,
-                                      string *out_inner_table, string *out_inner_key, string *out_pres_table,
-                                      string *out_pres_key) {
+static void CollectSubtreeTableIndices(LogicalOperator *op, std::set<idx_t> &out) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_GET) {
+		out.insert(op->Cast<LogicalGet>().table_index);
+	}
+	for (auto &child : op->children) {
+		CollectSubtreeTableIndices(child.get(), out);
+	}
+}
+
+// Which base tables read as NULL in a null-padded row of join `oj`.
+//
+// It is not just oj's own inner side: in a chain c ⟕ o ⟕ l ⟕ s, when a line disappears the supplier
+// joined to that line's key disappears too, and anything joined to the supplier after it, and so on.
+// So start from oj's inner subtree and close transitively over any join whose condition touches an
+// already-NULL table, adding that join's inner side. Aggregates over these tables contribute 0 to the
+// null-padded row; aggregates over the preserved side still contribute.
+static std::set<idx_t> ComputeNullTablesForLevel(const CreateMVPlanFacts &facts, LogicalComparisonJoin *oj) {
+	std::set<idx_t> null_tables;
+	if (!oj || oj->children.size() != 2) {
+		return null_tables;
+	}
+	CollectSubtreeTableIndices(oj->children[1].get(), null_tables);
+	bool changed = true;
+	while (changed) {
+		changed = false;
+		for (auto *other : facts.comparison_joins) {
+			if (other == oj || other->join_type != JoinType::LEFT || other->children.size() != 2) {
+				continue;
+			}
+			std::set<idx_t> other_inner;
+			CollectSubtreeTableIndices(other->children[1].get(), other_inner);
+			bool already_null = true;
+			for (auto idx : other_inner) {
+				if (!null_tables.count(idx)) {
+					already_null = false;
+					break;
+				}
+			}
+			if (already_null || other_inner.empty()) {
+				continue;
+			}
+			bool touches_null = false;
+			for (auto &cond : other->conditions) {
+				for (auto *side : {cond.left.get(), cond.right.get()}) {
+					auto *cref = GetColumnRefThroughCasts(side);
+					if (!cref) {
+						continue;
+					}
+					LogicalGet *g = nullptr;
+					string c;
+					if (ResolveBindingToGetColumn(cref->binding, facts, g, c) && g &&
+					    null_tables.count(g->table_index)) {
+						touches_null = true;
+						break;
+					}
+				}
+				if (touches_null) {
+					break;
+				}
+			}
+			if (touches_null) {
+				for (auto idx : other_inner) {
+					null_tables.insert(idx);
+				}
+				changed = true;
+			}
+		}
+	}
+	return null_tables;
+}
+
+// Secondary delta for ONE LEFT JOIN level. `level` indexes the emitted placeholders, and
+// `null_tables` is the set of base tables that read NULL in this level's null-padded row (see
+// ComputeNullTablesForLevel) which decides each aggregate's contribution.
+static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateMVPlanFacts &facts,
+                                             const vector<string> &output_names, const string &view_name,
+                                             LogicalComparisonJoin *oj, size_t level,
+                                             const std::set<idx_t> &null_tables, vector<string> &preserved_cols,
+                                             const string &delta_view_catalog_prefix, string *out_inner_table,
+                                             string *out_inner_key, string *out_pres_table, string *out_pres_key) {
 	preserved_cols.clear();
 	if (facts.aggregates.size() != 1) {
 		return "";
 	}
-	auto *oj = facts.first_comparison_join;
 	if (!oj || oj->join_type != JoinType::LEFT || oj->conditions.empty() || oj->children.size() != 2) {
 		return "";
 	}
@@ -2106,7 +2179,7 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 			LogicalGet *g = nullptr;
 			string c;
 			bool resolved = ResolveBindingToGetColumn(cref->binding, facts, g, c);
-			bool is_inner = resolved && g && g->table_index == inner_tidx;
+			bool is_inner = resolved && g && null_tables.count(g->table_index) > 0;
 			if (fn == "count") {
 				contribs.push_back(is_inner ? "0" : "1");
 				if (!is_inner) {
@@ -2226,8 +2299,10 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 	// The two delta row sources are placeholders resolved at refresh: a regular table reads its
 	// openivm_delta_<table>, a DuckLake table reads ducklake_table_insertions/deletions between
 	// snapshots (whose IDs only exist at refresh time). Both substitutions yield columns (__k, __m).
-	string inner_delta_src = string(openivm::LJSEC_INNER_DELTA_PLACEHOLDER);
-	string pres_delta_src = string(openivm::LJSEC_PRES_DELTA_PLACEHOLDER);
+	string inner_delta_src =
+	    string(openivm::LJSEC_INNER_DELTA_PREFIX) + std::to_string(level) + string(openivm::LJSEC_PLACEHOLDER_SUFFIX);
+	string pres_delta_src =
+	    string(openivm::LJSEC_PRES_DELTA_PREFIX) + std::to_string(level) + string(openivm::LJSEC_PLACEHOLDER_SUFFIX);
 	// The correlated LATERAL form is deliberate: rewriting these as pre-aggregated CTEs restricted to
 	// the delta keys measured ~40% SLOWER at TPC-H SF50 (DuckDB already decorrelates them well).
 	string sql = "INSERT INTO " + dmv + " (" + col_list + ")\nSELECT " + sel +
@@ -2238,6 +2313,74 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 	             " __pd WHERE __pd.__k = __t.__k), 0) AS __old_pres_count) __op"
 	             "\nWHERE (__newc > 0) <> ((__newc - __t.dsum) > 0) AND __old_pres_count > 0;";
 	return sql;
+}
+
+// Emit a secondary delta for EVERY LEFT JOIN level whose preserved side is itself a join.
+//
+// A chain of N tables has N-1 LEFT JOIN levels, and a disappearing match at ANY of them can strand a
+// preserved-side count. Correcting only the outermost level (the previous behaviour) left
+// COUNT(intermediate_key) undercounted for 4+ table chains: with c ⟕ o ⟕ l ⟕ s, deleting an order's
+// last line dropped that order from COUNT(o.oid) because the `⟕ l` level had no correction.
+//
+// The per-level SQL fragments are concatenated and the two source identities per level are stored as
+// index-aligned CSV lists, so refresh can resolve each level's placeholders independently (a regular
+// table reads its delta table, a DuckLake table reads snapshot insertions/deletions).
+string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
+                                      const vector<string> &output_names, const string &view_name,
+                                      vector<string> &preserved_cols, const string &delta_view_catalog_prefix,
+                                      string *out_inner_table, string *out_inner_key, string *out_pres_table,
+                                      string *out_pres_key) {
+	preserved_cols.clear();
+	string combined_sql;
+	vector<string> inner_tables, inner_keys, pres_tables, pres_keys;
+	size_t level = 0;
+	for (auto *oj : facts.comparison_joins) {
+		if (!oj || oj->join_type != JoinType::LEFT || oj->conditions.empty() || oj->children.size() != 2) {
+			continue;
+		}
+		if (!SubtreeContainsComparisonJoin(oj->children[0].get())) {
+			continue; // innermost level: the primary delta already emits its null-padded reappearance
+		}
+		auto null_tables = ComputeNullTablesForLevel(facts, oj);
+		vector<string> level_preserved;
+		string it, ik, pt, pk;
+		string level_sql =
+		    BuildLeftJoinSecondaryForLevel(context, facts, output_names, view_name, oj, level, null_tables,
+		                                   level_preserved, delta_view_catalog_prefix, &it, &ik, &pt, &pk);
+		if (level_sql.empty()) {
+			// An unsupported level makes the whole correction incomplete, and a partial correction is
+			// worse than none (it would double-count the levels it does cover). Bail entirely.
+			preserved_cols.clear();
+			return "";
+		}
+		combined_sql += (combined_sql.empty() ? "" : "\n") + level_sql;
+		inner_tables.push_back(it);
+		inner_keys.push_back(ik);
+		pres_tables.push_back(pt);
+		pres_keys.push_back(pk);
+		for (auto &c : level_preserved) {
+			if (std::find(preserved_cols.begin(), preserved_cols.end(), c) == preserved_cols.end()) {
+				preserved_cols.push_back(c);
+			}
+		}
+		level++;
+	}
+	if (combined_sql.empty()) {
+		return "";
+	}
+	if (out_inner_table) {
+		*out_inner_table = StringUtil::Join(inner_tables, ",");
+	}
+	if (out_inner_key) {
+		*out_inner_key = StringUtil::Join(inner_keys, ",");
+	}
+	if (out_pres_table) {
+		*out_pres_table = StringUtil::Join(pres_tables, ",");
+	}
+	if (out_pres_key) {
+		*out_pres_key = StringUtil::Join(pres_keys, ",");
+	}
+	return combined_sql;
 }
 
 } // namespace duckdb

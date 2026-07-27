@@ -1129,19 +1129,38 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 					       SqlUtils::EscapeValue(delta_name) + "'))";
 				};
-				string inner_src = build_ljsec_delta_source(ljsec.inner_table, ljsec.inner_key);
-				string pres_src = build_ljsec_delta_source(ljsec.pres_table, ljsec.pres_key);
-				if (inner_src.empty() || pres_src.empty()) {
-					// Could not resolve a row source (e.g. missing snapshot metadata). Emitting the SQL
-					// with placeholders intact would be a syntax error, so skip the secondary rather
-					// than fail the refresh; the primary delta still applies.
+				// One placeholder pair PER LEFT JOIN level; identities are index-aligned CSV lists.
+				auto lj_it = StringUtil::Split(ljsec.inner_table, ',');
+				auto lj_ik = StringUtil::Split(ljsec.inner_key, ',');
+				auto lj_pt = StringUtil::Split(ljsec.pres_table, ',');
+				auto lj_pk = StringUtil::Split(ljsec.pres_key, ',');
+				bool lj_ok = !lj_it.empty() && lj_it.size() == lj_ik.size() && lj_it.size() == lj_pt.size() &&
+				             lj_it.size() == lj_pk.size();
+				for (size_t lvl = 0; lj_ok && lvl < lj_it.size(); lvl++) {
+					string inner_src = build_ljsec_delta_source(lj_it[lvl], lj_ik[lvl]);
+					string pres_src = build_ljsec_delta_source(lj_pt[lvl], lj_pk[lvl]);
+					if (inner_src.empty() || pres_src.empty()) {
+						lj_ok = false;
+						break;
+					}
+					string lvl_str = to_string(lvl);
+					ljsec.sql = SqlUtils::ReplaceAllOccurrences(ljsec.sql,
+					                                            string(openivm::LJSEC_INNER_DELTA_PREFIX) + lvl_str +
+					                                                string(openivm::LJSEC_PLACEHOLDER_SUFFIX),
+					                                            inner_src);
+					ljsec.sql = SqlUtils::ReplaceAllOccurrences(ljsec.sql,
+					                                            string(openivm::LJSEC_PRES_DELTA_PREFIX) + lvl_str +
+					                                                string(openivm::LJSEC_PLACEHOLDER_SUFFIX),
+					                                            pres_src);
+				}
+				if (!lj_ok) {
+					// Could not resolve a row source (e.g. missing snapshot metadata). Emitting the SQL with
+					// placeholders intact would be a syntax error, so skip the secondary ENTIRELY rather than
+					// fail the refresh; the primary delta still applies. All-or-nothing is deliberate: a
+					// partially substituted program is invalid SQL, and a partial correction across levels
+					// would be worse than none.
 					OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN secondary skipped: unresolved delta source\n");
 					have_ljsec = false;
-				} else {
-					ljsec.sql = SqlUtils::ReplaceAllOccurrences(
-					    ljsec.sql, string(openivm::LJSEC_INNER_DELTA_PLACEHOLDER), inner_src);
-					ljsec.sql = SqlUtils::ReplaceAllOccurrences(
-					    ljsec.sql, string(openivm::LJSEC_PRES_DELTA_PLACEHOLDER), pres_src);
 				}
 			}
 			bool ljsec_used_group_recompute = false;
