@@ -764,8 +764,23 @@ string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const 
 	return result;
 }
 
-string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql) {
-	return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
+string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
+                                       const vector<string> &unique_keys, const string &temp_table) {
+	if (unique_keys.empty() || temp_table.empty()) {
+		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
+	}
+	// Safe form for data tables carrying a UNIQUE index. `DELETE FROM t; INSERT INTO t ...` re-inserts
+	// keys deleted earlier in the same transaction, and DuckDB's on-disk unique index still reports
+	// those keys as present -- raising a spurious "Duplicate key ... violates unique constraint".
+	// Materialize the new contents once, delete only the keys that are gone, then upsert the rest, so
+	// no key is deleted and re-inserted in the same transaction.
+	string keep_match = BuildNullSafeKeyPredicate(unique_keys, "openivm_new.", "openivm_old.");
+	string sql = "CREATE OR REPLACE TEMP TABLE " + temp_table + " AS " + view_query_sql + ";\n";
+	sql += "DELETE FROM " + data_table + " AS openivm_old\nWHERE NOT EXISTS (\n  SELECT 1 FROM " + temp_table +
+	       " AS openivm_new WHERE " + keep_match + "\n);\n";
+	sql += "INSERT OR REPLACE INTO " + data_table + " SELECT * FROM " + temp_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + temp_table + ";\n";
+	return sql;
 }
 
 string SqlUtils::ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement) {

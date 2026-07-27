@@ -1,12 +1,13 @@
 # name: test/sql/group_recompute_persistent_unique_index.test
 # description: AGGREGATE_GROUP views carry a UNIQUE index on the data table. On a PERSISTENT database
+# group: [sql]
+
 #              DuckDB's on-disk unique index keeps deleted keys for constraint checking within a
 #              transaction, so the group-recompute path's DELETE-then-INSERT of a surviving group
 #              raised a spurious "Duplicate key ... violates unique constraint" and the refresh
 #              failed outright. Must use `load` + `restart`: on an in-memory database the index is
 #              built in-session and the bug does not fire, which is why the rest of the suite (all
 #              in-memory) never caught it.
-# group: [sql]
 
 load __TEST_DIR__/openivm_group_recompute_unique_index.db
 
@@ -136,6 +137,81 @@ SELECT COUNT(*) FROM (
     SELECT nation, n_ord, total FROM mv
     EXCEPT ALL
     SELECT c.nation, COUNT(o.oid), SUM(o.amt) FROM cust c LEFT JOIN ord o ON o.cid=c.cid GROUP BY c.nation
+);
+----
+0
+
+# The interrupted-refresh recovery route goes through BuildFullRecomputeSQL
+# (DELETE FROM data; INSERT INTO data <query>), which re-inserts every key deleted in the same
+# transaction and so hits the same on-disk unique-index behaviour. Distinct code path from the
+# group-recompute branch above -- it needs its own coverage.
+
+# Reopen again: the on-disk index must be freshly loaded for this to reproduce. Once earlier
+# statements in a session have modified the index, the bug stops firing.
+restart
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+statement ok
+INSERT INTO ord VALUES (16,1,6);
+
+# Simulate a crash mid-refresh: set the flag without refreshing.
+statement ok
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv';
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT refresh_in_progress FROM openivm_views WHERE view_name = 'mv';
+----
+false
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid), SUM(o.amt) FROM cust c LEFT JOIN ord o ON o.cid=c.cid GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, total FROM mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT nation, n_ord, total FROM mv
+    EXCEPT ALL
+    SELECT c.nation, COUNT(o.oid), SUM(o.amt) FROM cust c LEFT JOIN ord o ON o.cid=c.cid GROUP BY c.nation
+);
+----
+0
+
+# A group that vanishes must also be dropped by the recovery recompute.
+restart
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+DELETE FROM cust WHERE nation = 'B';
+
+statement ok
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv';
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT COUNT(*) FROM mv WHERE nation = 'B';
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.nation, COUNT(o.oid), SUM(o.amt) FROM cust c LEFT JOIN ord o ON o.cid=c.cid GROUP BY c.nation
+    EXCEPT ALL SELECT nation, n_ord, total FROM mv
 );
 ----
 0

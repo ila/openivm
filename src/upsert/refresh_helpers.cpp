@@ -623,7 +623,19 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
                            bool cross_system, const string &attached_catalog, const string &attached_schema,
                            const string &catalog_prefix, string *out_post_meta) {
 	string qdt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
-	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql) + "\n";
+	// parser.cpp gives AGGREGATE_GROUP / AGGREGATE_HAVING data tables a UNIQUE index on the group
+	// keys. A plain `DELETE FROM t; INSERT INTO t ...` re-inserts keys deleted in the same
+	// transaction, which DuckDB's on-disk unique index rejects, so those views need the upsert form.
+	auto recompute_view_type = metadata.GetViewType(view_name);
+	vector<string> unique_keys;
+	string recompute_temp;
+	if (recompute_view_type == RefreshType::AGGREGATE_GROUP || recompute_view_type == RefreshType::AGGREGATE_HAVING) {
+		unique_keys = metadata.GetGroupColumns(view_name);
+		if (!unique_keys.empty()) {
+			recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
+		}
+	}
+	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql, unique_keys, recompute_temp) + "\n";
 	string update_ts_sql = "UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
 	                       " SET last_update = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
 	auto delta_tables = metadata.GetDeltaTables(view_name);

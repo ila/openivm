@@ -895,10 +895,15 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_
 ----
 3
 
+# 6, not 4: the full-recompute path for AGGREGATE_GROUP views emits four statements
+# (CREATE TEMP TABLE / DELETE vanished keys / INSERT OR REPLACE / DROP) instead of a plain
+# DELETE + INSERT, because their data table carries a UNIQUE index and DuckDB's on-disk unique
+# index rejects re-inserting a key deleted earlier in the same transaction. See
+# test/sql/group_recompute_persistent_unique_index.test.
 query I
 SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'execute_refresh_sql_stmt';
 ----
-4
+6
 
 query I
 SELECT CASE WHEN count(*) >= 13 THEN 1 ELSE 0 END FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND duration_ms >= 0;
