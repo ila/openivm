@@ -2055,6 +2055,13 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 		return "";
 	}
 	string pres_table = pres_get->GetTable().get()->name;
+	if (pres_get->table_index == inner_tidx || StringUtil::CIEquals(pres_table, inner_table)) {
+		// Self-referencing deepest join (preserved and inner sides are the same base table): the
+		// old_pres_count/old_count arithmetic below assumes two distinct tables with independent
+		// delta tracking. Bail rather than risk generating ambiguous or incorrect SQL for this rare
+		// shape.
+		return "";
+	}
 	auto pres_sti = facts.source_table_info.find(pres_table);
 	if (pres_sti == facts.source_table_info.end()) {
 		return "";
@@ -2114,10 +2121,13 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 				return "";
 			}
 		} else {
+			// Hidden helper columns are internally generated with fixed openivm_* names (never
+			// user-chosen), so an exact/prefix match is safe and tighter than a bare substring search.
 			const string &col = output_names[G + j];
-			if (col.find("count_star") != string::npos) {
+			if (StringUtil::CIEquals(col, "openivm_count_star")) {
 				contribs.push_back("1");
-			} else if (col.find("match_count") != string::npos || col.find("nonnull_sum_count") != string::npos) {
+			} else if (StringUtil::CIEquals(col, "openivm_match_count") ||
+			           StringUtil::StartsWith(col, "openivm_nonnull_sum_count")) {
 				contribs.push_back("0");
 			} else {
 				return "";
