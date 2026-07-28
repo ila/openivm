@@ -1,0 +1,156 @@
+# name: test/sql/left_join_group_by_join_key.test
+# description: GROUP BY a column that is ALSO the deepest LEFT JOIN key. The secondary-delta generator
+# group: [sql]
+
+#              aliases the preserved-side join key "__k" and each group column "__g<i>", but a single
+#              output column can only carry one alias -- so when the key IS a group column the group
+#              alias won and the emitted SQL still referenced X."__k", failing to bind with
+#              'Values list "X" does not have a column named "__k"'. Refresh failed outright for every
+#              such view, which is a common star-schema shape (GROUP BY the dimension key you join on).
+
+require openivm
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE fact (fid INT, k INT);
+
+statement ok
+CREATE TABLE dm1 (k1 INT, v1 INT);
+
+statement ok
+CREATE TABLE dm2 (k2 INT, v2 INT);
+
+statement ok
+INSERT INTO fact VALUES (1,100),(2,100),(3,200);
+
+statement ok
+INSERT INTO dm1 VALUES (100,1),(200,1);
+
+statement ok
+INSERT INTO dm2 VALUES (100,2),(200,2);
+
+# f.k is both the GROUP BY column and the join key used by both LEFT JOINs
+statement ok
+CREATE MATERIALIZED VIEW mv_gk AS
+    SELECT f.k, COUNT(f.fid) AS n, COUNT(x1.k1) AS c1, COUNT(x2.k2) AS c2
+    FROM fact f LEFT JOIN dm1 x1 ON x1.k1 = f.k LEFT JOIN dm2 x2 ON x2.k2 = f.k
+    GROUP BY f.k;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.k, COUNT(f.fid), COUNT(x1.k1), COUNT(x2.k2)
+    FROM fact f LEFT JOIN dm1 x1 ON x1.k1=f.k LEFT JOIN dm2 x2 ON x2.k2=f.k GROUP BY f.k
+    EXCEPT ALL SELECT k, n, c1, c2 FROM mv_gk
+);
+----
+0
+
+# Batched mixed DML. Every group keeps at least one fact row, so this isolates the alias fix from the
+# separate emptied-group lifecycle behaviour.
+statement ok
+INSERT INTO fact VALUES (4,200),(5,100);
+
+statement ok
+DELETE FROM fact WHERE fid = 2;
+
+statement ok
+PRAGMA refresh('mv_gk');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.k, COUNT(f.fid), COUNT(x1.k1), COUNT(x2.k2)
+    FROM fact f LEFT JOIN dm1 x1 ON x1.k1=f.k LEFT JOIN dm2 x2 ON x2.k2=f.k GROUP BY f.k
+    EXCEPT ALL SELECT k, n, c1, c2 FROM mv_gk
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, n, c1, c2 FROM mv_gk
+    EXCEPT ALL
+    SELECT f.k, COUNT(f.fid), COUNT(x1.k1), COUNT(x2.k2)
+    FROM fact f LEFT JOIN dm1 x1 ON x1.k1=f.k LEFT JOIN dm2 x2 ON x2.k2=f.k GROUP BY f.k
+);
+----
+0
+
+query IIII
+SELECT k, n, c1, c2 FROM mv_gk ORDER BY k;
+----
+100	2	2	2
+200	2	2	2
+
+# A dimension-side change at the deepest level, which is what drives the secondary delta
+statement ok
+INSERT INTO dm2 VALUES (100,22);
+
+statement ok
+PRAGMA refresh('mv_gk');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.k, COUNT(f.fid), COUNT(x1.k1), COUNT(x2.k2)
+    FROM fact f LEFT JOIN dm1 x1 ON x1.k1=f.k LEFT JOIN dm2 x2 ON x2.k2=f.k GROUP BY f.k
+    EXCEPT ALL SELECT k, n, c1, c2 FROM mv_gk
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, n, c1, c2 FROM mv_gk
+    EXCEPT ALL
+    SELECT f.k, COUNT(f.fid), COUNT(x1.k1), COUNT(x2.k2)
+    FROM fact f LEFT JOIN dm1 x1 ON x1.k1=f.k LEFT JOIN dm2 x2 ON x2.k2=f.k GROUP BY f.k
+);
+----
+0
+
+# Deeper star (5 dimensions) grouped by the same join key
+statement ok
+CREATE TABLE dm3 (k3 INT, v3 INT);
+
+statement ok
+CREATE TABLE dm4 (k4 INT, v4 INT);
+
+statement ok
+INSERT INTO dm3 VALUES (100,3),(200,3);
+
+statement ok
+INSERT INTO dm4 VALUES (100,4),(200,4);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_gk4 AS
+    SELECT f.k, COUNT(f.fid) AS n, COUNT(x1.k1) AS c1, COUNT(x3.k3) AS c3, COUNT(x4.k4) AS c4
+    FROM fact f LEFT JOIN dm1 x1 ON x1.k1=f.k LEFT JOIN dm3 x3 ON x3.k3=f.k LEFT JOIN dm4 x4 ON x4.k4=f.k
+    GROUP BY f.k;
+
+statement ok
+INSERT INTO fact VALUES (6,100);
+
+statement ok
+PRAGMA refresh('mv_gk4');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.k, COUNT(f.fid), COUNT(x1.k1), COUNT(x3.k3), COUNT(x4.k4)
+    FROM fact f LEFT JOIN dm1 x1 ON x1.k1=f.k LEFT JOIN dm3 x3 ON x3.k3=f.k LEFT JOIN dm4 x4 ON x4.k4=f.k
+    GROUP BY f.k
+    EXCEPT ALL SELECT k, n, c1, c3, c4 FROM mv_gk4
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, n, c1, c3, c4 FROM mv_gk4
+    EXCEPT ALL
+    SELECT f.k, COUNT(f.fid), COUNT(x1.k1), COUNT(x3.k3), COUNT(x4.k4)
+    FROM fact f LEFT JOIN dm1 x1 ON x1.k1=f.k LEFT JOIN dm3 x3 ON x3.k3=f.k LEFT JOIN dm4 x4 ON x4.k4=f.k
+    GROUP BY f.k
+);
+----
+0

@@ -2225,6 +2225,11 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	vector<string> x_names(x_bindings.size());
 	int key_pos = -1;
 	vector<int> group_pos(G, -1);
+	// A column can carry only ONE alias in the emitted column list. When the join key IS also a group
+	// column (e.g. GROUP BY the same column the deepest join uses -- common in star schemas), the group
+	// alias wins and no "__k" column exists, so referencing X."__k" failed to bind. Track the alias the
+	// key actually ended up with and use that instead of assuming "__k".
+	string key_alias = "__k";
 	for (size_t i = 0; i < x_bindings.size(); i++) {
 		x_names[i] = "__x" + std::to_string(i);
 		if (x_bindings[i] == key_pres) {
@@ -2235,6 +2240,9 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 			if (x_bindings[i] == group_bindings[gi]) {
 				x_names[i] = "__g" + std::to_string(gi);
 				group_pos[gi] = static_cast<int>(i);
+				if (key_pos == static_cast<int>(i)) {
+					key_alias = x_names[i];
+				}
 			}
 		}
 	}
@@ -2307,9 +2315,10 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	// the delta keys measured ~40% SLOWER at TPC-H SF50 (DuckDB already decorrelates them well).
 	string sql = "INSERT INTO " + dmv + " (" + col_list + ")\nSELECT " + sel +
 	             "\nFROM (SELECT __k, SUM(__m) AS dsum FROM " + inner_delta_src + " GROUP BY __k) __t\nJOIN (" + x_sql +
-	             ") X ON X.\"__k\" = __t.__k,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + inner_base + " ib WHERE ib." +
-	             qcol + " = __t.__k) AS __newc) __n,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + pres_base +
-	             " pb WHERE pb." + pres_qcol + " = __t.__k) - COALESCE((SELECT SUM(__m) FROM " + pres_delta_src +
+	             ") X ON X.\"" + key_alias + "\" = __t.__k,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + inner_base +
+	             " ib WHERE ib." + qcol + " = __t.__k) AS __newc) __n,\nLATERAL (SELECT (SELECT COUNT(*) FROM " +
+	             pres_base + " pb WHERE pb." + pres_qcol + " = __t.__k) - COALESCE((SELECT SUM(__m) FROM " +
+	             pres_delta_src +
 	             " __pd WHERE __pd.__k = __t.__k), 0) AS __old_pres_count) __op"
 	             "\nWHERE (__newc > 0) <> ((__newc - __t.dsum) > 0) AND __old_pres_count > 0;";
 	return sql;
