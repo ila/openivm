@@ -51,7 +51,7 @@ static string RenderStoredViewQueryForDialect(ClientContext &context, const stri
 	parser.ParseQuery(view_query_sql);
 	if (parser.statements.size() != 1) {
 		throw ParserException("Expected one stored view query, found %llu",
-		                      static_cast<unsigned long long>(parser.statements.size()));
+		                      static_cast<idx_t>(parser.statements.size()));
 	}
 	Planner planner(context);
 	planner.CreatePlan(parser.statements[0]->Copy());

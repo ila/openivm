@@ -1623,12 +1623,14 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		catalog_name = view_entry->ParentCatalog().GetName();
 		schema_name = view_entry->ParentSchema().name;
 	}
-	if (catalog_name == INVALID_CATALOG || schema_name == INVALID_SCHEMA) {
+	// INVALID_CATALOG and INVALID_SCHEMA are both "", so these are emptiness checks; spell them that way
+	// (clang-tidy readability-container-size-empty).
+	if (catalog_name.empty() || schema_name.empty()) {
 		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-		if (catalog_name == INVALID_CATALOG) {
+		if (catalog_name.empty()) {
 			catalog_name = default_entry.catalog;
 		}
-		if (schema_name == INVALID_SCHEMA) {
+		if (schema_name.empty()) {
 			schema_name = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
 		}
 	}

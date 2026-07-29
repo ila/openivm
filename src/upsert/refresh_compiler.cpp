@@ -1080,8 +1080,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			string matched_update = BuildUpdatedAggregateColumn(col);
 			auto sum_count = sum_null_count_cols.find(col);
 			if (sum_count != sum_null_count_cols.end()) {
-				matched_update =
-				    BuildNullableSum(std::move(matched_update), BuildUpdatedAggregateColumn(sum_count->second));
+				matched_update = BuildNullableSum(matched_update, BuildUpdatedAggregateColumn(sum_count->second));
 			}
 			lj_update_set += col + " = CASE WHEN " + mc_new + " > 0 THEN " + matched_update + " WHEN COALESCE(v." +
 			                 match_count_col + ", 0) = 0 THEN v." + col + " ELSE " + null_val + " END";
@@ -1112,7 +1111,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			string matched_insert = "d." + aggregates[i];
 			auto sum_count = sum_null_count_cols.find(aggregates[i]);
 			if (sum_count != sum_null_count_cols.end()) {
-				matched_insert = BuildNullableSum(std::move(matched_insert), "d." + sum_count->second);
+				matched_insert = BuildNullableSum(matched_insert, "d." + sum_count->second);
 			}
 			cond_insert_vals +=
 			    "CASE WHEN d." + match_count_col + " > 0 THEN " + matched_insert + " ELSE " + null_val + " END";
@@ -1335,7 +1334,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 				    "COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM openivm_delta), 0)";
 				string updated_count =
 				    "COALESCE(" + count_col + ", 0) + COALESCE((SELECT d_" + count_col + " FROM openivm_delta), 0)";
-				update_set += column + " = " + BuildNullableSum(std::move(updated_sum), std::move(updated_count));
+				update_set += column + " = " + BuildNullableSum(updated_sum, updated_count);
 			}
 		}
 	}
