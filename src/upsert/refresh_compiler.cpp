@@ -1049,7 +1049,11 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				continue;
 			}
 			string agg_type = col_agg_type.count(col) ? col_agg_type.at(col) : "";
-			if (agg_type == "count_star" || is_preserved_side(col)) {
+			// Match the hidden openivm_count_star column by NAME as well: it has no col_agg_type entry,
+			// so the agg_type test alone never caught it and it fell through to the gated branch, which
+			// zeroes it on a >0 -> 0 match transition. It counts LEFT JOIN OUTPUT rows, so the
+			// NULL-padded row keeps it at 1 and it must follow the left side.
+			if (agg_type == "count_star" || col == string(openivm::COUNT_STAR_COL) || is_preserved_side(col)) {
 				// count_star and preserved/left-side COUNT columns are left-side-driven: a right-side
 				// match_count transition must NOT zero them. Always apply the normal aggregate update.
 				lj_update_set += col + " = " + BuildUpdatedAggregateColumn(col);
@@ -1097,7 +1101,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				continue;
 			}
 			string agg_type = col_agg_type.count(aggregates[i]) ? col_agg_type.at(aggregates[i]) : "";
-			if (agg_type == "count_star" || is_preserved_side(aggregates[i])) {
+			if (agg_type == "count_star" || aggregates[i] == string(openivm::COUNT_STAR_COL) ||
+			    is_preserved_side(aggregates[i])) {
 				cond_insert_vals += "d." + aggregates[i];
 				continue;
 			}
@@ -1193,9 +1198,18 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	//   SUM(CASE WHEN C_BALANCE < 0 THEN C_YTD_PAYMENT ELSE 0 END)
 	// legitimately returns 0 for every row when C_YTD_PAYMENT is always 0. Skip the
 	// cleanup in that case to avoid deleting valid rows.
-	// Also skip when insert_only (groups can't reach zero from inserts alone) and when
-	// openivm_match_count is present (LEFT JOIN preserved-side NULL aggregates are valid).
-	if (!insert_only && !has_match_count) {
+	// Also skip when insert_only (groups can't reach zero from inserts alone).
+	//
+	// LEFT JOIN views (openivm_match_count present) were previously skipped outright, because a
+	// preserved-side row with no match legitimately has inner-side COUNT = 0 and would look "empty".
+	// That left genuinely emptied groups behind forever as zeroed rows. The right discriminator is the
+	// OUTPUT-row count: a NULL-padded group still has count_star >= 1, whereas a group with no
+	// preserved-side rows left has count_star = 0. Since the predicate ANDs every count column, the
+	// NULL-padded case is preserved as long as count_star is among them -- so LEFT JOIN views are
+	// included when a count_star-type column anchors the predicate, and skipped otherwise.
+	// This relies on count_star actually counting NULL-padded output rows, which requires the
+	// secondary delta to emit the reappearance row at EVERY level including a single LEFT JOIN.
+	if (!insert_only) {
 		// Find COUNT-type columns. aggregate_types is parallel to the user-facing aggregate
 		// list; col_agg_type maps column name -> aggregate function. Also consider hidden
 		// openivm_count_<N> columns from AVG/STDDEV decomposition.
@@ -1210,6 +1224,20 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			    column == openivm::DISTINCT_COUNT_COL) {
 				count_cols.push_back(column);
 			}
+		}
+		// LEFT JOIN views may only be cleaned up when an output-row count anchors the predicate.
+		bool has_count_star_anchor = false;
+		for (auto &c : count_cols) {
+			auto it = col_agg_type.find(c);
+			if (c == string(openivm::COUNT_STAR_COL) || (it != col_agg_type.end() && it->second == "count_star")) {
+				has_count_star_anchor = true;
+				break;
+			}
+		}
+		if (has_match_count && !has_count_star_anchor) {
+			count_cols.clear();
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] LEFT JOIN view without a count_star anchor — skipping "
+			                    "empty-group cleanup so NULL-padded groups are not deleted\n");
 		}
 		if (!count_cols.empty()) {
 			string delete_query = "\ndelete from " + data_table + " where ";

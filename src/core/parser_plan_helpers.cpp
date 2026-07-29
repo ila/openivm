@@ -2075,11 +2075,13 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	if (!oj || oj->join_type != JoinType::LEFT || oj->conditions.empty() || oj->children.size() != 2) {
 		return "";
 	}
-	// Only PIPELINES need the secondary: for a single LEFT JOIN the primary delta already emits the
-	// null-padded reappearance. Require the preserved (left) side to itself contain a join.
-	if (!SubtreeContainsComparisonJoin(oj->children[0].get())) {
-		return "";
-	}
+	// Every LEFT JOIN level needs the secondary, including a SINGLE left join whose preserved side is a
+	// bare table. The old comment here claimed the primary delta already emits the null-padded
+	// reappearance for that case; it does not. The primary emits only a retraction of the previously
+	// matched row, and the MERGE's gating then synthesises the user-visible NULL/0 values. That leaves
+	// openivm_count_star at 0 for a group that still has a NULL-padded output row, which makes it
+	// impossible to tell "this group still exists, unmatched" from "this group is gone" -- and so
+	// emptied groups could never be cleaned up. Emitting the reappearance restores that distinction.
 	auto &agg = *facts.aggregates[0];
 	size_t G = agg.groups.size();
 	if (G == 0 || output_names.size() < G + agg.expressions.size()) {
@@ -2347,9 +2349,9 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 		if (!oj || oj->join_type != JoinType::LEFT || oj->conditions.empty() || oj->children.size() != 2) {
 			continue;
 		}
-		if (!SubtreeContainsComparisonJoin(oj->children[0].get())) {
-			continue; // innermost level: the primary delta already emits its null-padded reappearance
-		}
+		// Every LEFT JOIN level gets a secondary, including the innermost one whose preserved side is a
+		// bare table -- see the note in BuildLeftJoinSecondaryForLevel for why the primary delta does
+		// NOT cover that case.
 		auto null_tables = ComputeNullTablesForLevel(facts, oj);
 		vector<string> level_preserved;
 		string it, ik, pt, pk;
