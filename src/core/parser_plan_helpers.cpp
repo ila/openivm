@@ -9,6 +9,7 @@
 #include "duckdb/optimizer/cte_inlining.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -2087,7 +2088,40 @@ static bool IsUnfilteredGetSubtree(LogicalOperator *op) {
 	while (op && op->type == LogicalOperatorType::LOGICAL_PROJECTION && op->children.size() == 1) {
 		op = op->children[0].get();
 	}
-	return op && op->type == LogicalOperatorType::LOGICAL_GET;
+	return op && op->type == LogicalOperatorType::LOGICAL_GET && op->Cast<LogicalGet>().table_filters.filters.empty();
+}
+
+static bool ContainsCardinalityChangingFilter(LogicalOperator *op) {
+	if (!op) {
+		return false;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
+		return true;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_GET && !op->Cast<LogicalGet>().table_filters.filters.empty()) {
+		return true;
+	}
+	for (auto &child : op->children) {
+		if (ContainsCardinalityChangingFilter(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool ColumnIsNotNull(LogicalGet &get, const string &column_name) {
+	auto table = get.GetTable();
+	if (!table.get() || !table.get()->ColumnExists(column_name)) {
+		return false;
+	}
+	auto column_index = table.get()->GetColumn(column_name).Logical();
+	for (auto &constraint : table.get()->GetConstraints()) {
+		if (constraint->type == ConstraintType::NOT_NULL &&
+		    constraint->Cast<NotNullConstraint>().index == column_index) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateMVPlanFacts &facts,
@@ -2101,6 +2135,13 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		return "";
 	}
 	if (!oj || oj->join_type != JoinType::LEFT || oj->conditions.size() != 1 || oj->children.size() != 2) {
+		return "";
+	}
+	// Binder can flatten a filtered preserved-side subquery by lifting its
+	// LogicalFilter above the join. Inspect the complete view plan as well as
+	// the local children; secondary transition counts are valid only when no
+	// additional cardinality predicate exists anywhere in this aggregate view.
+	if (ContainsCardinalityChangingFilter(facts.root)) {
 		return "";
 	}
 	// __newc below counts rows directly in the inner base table. A filter or any other
@@ -2216,6 +2257,9 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 			bool resolved = ResolveBindingToGetColumn(cref->binding, facts, g, c);
 			bool is_inner = resolved && g && null_tables.count(g->table_index) > 0;
 			if (fn == "count") {
+				if (!is_inner && (!resolved || !g || !ColumnIsNotNull(*g, c))) {
+					return "";
+				}
 				contribs.push_back(is_inner ? "0" : "1");
 				if (!is_inner) {
 					// Preserved-side COUNT: the MERGE must NOT gate it by the (inner-side) match_count.
@@ -2290,16 +2334,12 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		}
 	}
 	string x_sql;
-	try {
-		SqlDialect dialect = SqlDialect::DUCKDB;
-		auto ast = LogicalPlanToAst(context, x_plan, dialect);
-		auto cte_list = AstToCteList(*ast, dialect);
-		x_sql = cte_list->ToQuery(true, x_names);
-		if (!x_sql.empty() && x_sql.back() == ';') {
-			x_sql.pop_back();
-		}
-	} catch (...) {
-		return "";
+	SqlDialect dialect = SqlDialect::DUCKDB;
+	auto ast = LogicalPlanToAst(context, x_plan, dialect);
+	auto cte_list = AstToCteList(*ast, dialect);
+	x_sql = cte_list->ToQuery(true, x_names);
+	if (!x_sql.empty() && x_sql.back() == ';') {
+		x_sql.pop_back();
 	}
 	if (x_sql.empty()) {
 		return "";

@@ -17,6 +17,7 @@
 #include "upsert/refresh_compiler.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/settings.hpp"
@@ -335,7 +336,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 	}
 
-	// Use con for planning — sees all committed state from previous bind-phase DDL
+	// Plan through the caller context so objects created earlier in the same
+	// transaction are visible. The helper connection remains for committed
+	// metadata probes and cross-catalog DDL preparation only.
 	con.BeginTransaction();
 	// GetTableNames binds the query internally. For MV queries that DuckDB's binder
 	// can't evaluate out-of-context (e.g. multi-column `(a, b) IN (SELECT x, y FROM t)`
@@ -354,7 +357,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	// Plan the full CREATE TABLE AS SELECT statement (for plan walking)
 	auto full_plan_start = create_profile_now();
-	Planner planner(*con.context);
+	Planner planner(context);
 	planner.CreatePlan(statement->Copy());
 	auto plan = std::move(planner.plan);
 	add_create_profile_step("create_compile_full_plan", full_plan_start);
@@ -377,7 +380,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		auto select_parse_plan_start = create_profile_now();
 		Parser select_parser;
 		select_parser.ParseQuery(original_view_query);
-		Planner select_planner(*con.context);
+		Planner select_planner(context);
 		select_planner.CreatePlan(std::move(select_parser.statements[0]));
 		auto select_plan = std::move(select_planner.plan);
 		visible_output_count = select_planner.names.size();
@@ -477,7 +480,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			// CREATE MATERIALIZED VIEW always stores the view body in DuckDB's own dialect.
 			// Refresh-time target dialects are selected per CompileFacts.
 			SqlDialect dialect = SqlDialect::DUCKDB;
-			auto ast = LogicalPlanToAst(*con.context, select_plan, dialect);
+			auto ast = LogicalPlanToAst(context, select_plan, dialect);
 			auto cte_list = AstToCteList(*ast, dialect);
 			view_query = cte_list->ToQuery(true, output_names);
 			if (!view_query.empty() && view_query.back() == ';') {
@@ -889,21 +892,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	vector<string> leftjoin_preserved_cols;
 	vector<string> leftjoin_inner_tables, leftjoin_inner_keys, leftjoin_pres_tables, leftjoin_pres_keys;
 	if (view_model.type == RefreshType::AGGREGATE_GROUP && facts.analysis.found_left_join) {
-		// LPTS on the preserved subtree needs an active transaction for catalog access; the main
-		// create-time LPTS ran inside a transaction that was already rolled back above.
-		con.BeginTransaction();
-		try {
-			leftjoin_secondary_sql = BuildLeftJoinSecondaryDeltaSQL(
-			    *con.context, facts, output_names, view_name, leftjoin_preserved_cols, internal_catalog_prefix,
-			    leftjoin_inner_tables, leftjoin_inner_keys, leftjoin_pres_tables, leftjoin_pres_keys);
-		} catch (std::exception &ex) {
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT JOIN secondary-delta generation failed: %s\n", ex.what());
-			leftjoin_secondary_sql.clear();
-		} catch (...) {
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT JOIN secondary-delta generation failed with unknown exception\n");
-			leftjoin_secondary_sql.clear();
-		}
-		con.Rollback();
+		leftjoin_secondary_sql = BuildLeftJoinSecondaryDeltaSQL(
+		    context, facts, output_names, view_name, leftjoin_preserved_cols, internal_catalog_prefix,
+		    leftjoin_inner_tables, leftjoin_inner_keys, leftjoin_pres_tables, leftjoin_pres_keys);
 		if (leftjoin_secondary_sql.empty()) {
 			// The aggregate MERGE requires the Larson & Zhou correction for null-padded row
 			// transitions. An incomplete correction is not optional: recompute only the groups
@@ -1596,9 +1587,10 @@ string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionPara
 	    MaterializedViewParserExtension::PlanFunction(nullptr, context, std::move(parse_result.parse_data));
 	if (plan_result.function.name == OPENIVM_TRANSACTIONAL_DDL_FUNCTION) {
 		if (!lock_view_name.empty()) {
-			auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-			auto &catalog = Catalog::GetCatalog(context, default_entry.catalog);
-			TransactionalMVLockState::Get(context).Acquire({lock_view_name}, {}, {&catalog});
+			TransactionalMVLockState::Get(context).Acquire({lock_view_name}, {});
+		}
+		if (!context.transaction.IsAutoCommit()) {
+			TransactionalMVMetadataState::Get(context).Register(context, plan_result.parameters);
 		}
 		return RenderTransactionalDDL(context, plan_result.parameters);
 	}
@@ -1656,19 +1648,32 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	drop.info->schema = schema_name;
 
 	string program = BuildDropViewStatement(*drop.info) + ";\n";
+	string data_table_name = IncrementalTableNames::DataTableName(drop.info->name);
+	string data_table_ref;
+	if (view_entry) {
+		auto &view = view_entry->Cast<ViewCatalogEntry>();
+		data_table_ref = SqlUtils::FindTableReference(view.sql, data_table_name);
+	}
 	Connection con(*context.db);
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		metadata_state->Apply(con);
+	}
 	auto tracked = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                         SqlUtils::EscapeValue(drop.info->name) + "'");
-	if (tracked->HasError() || tracked->RowCount() == 0) {
+	// Metadata is keyed by the bare MV name, so it cannot prove that a
+	// schema-qualified DROP targets that MV. The OpenIVM user view always reads
+	// its generated backing table; an ordinary same-named view does not.
+	if (data_table_ref.empty() || tracked->HasError() || tracked->RowCount() == 0) {
 		return program;
 	}
 
 	RefreshMetadata metadata(con);
 	auto delta_tables = metadata.GetDeltaTables(drop.info->name);
-	auto prefix = SqlUtils::QualifiedPrefix(catalog_name, schema_name);
-	program += "DROP TABLE IF EXISTS " + prefix +
-	           KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(drop.info->name)) + ";\n";
-	program += "DROP TABLE IF EXISTS " + prefix +
+	auto last_separator = data_table_ref.rfind('.');
+	string internal_prefix =
+	    last_separator == string::npos ? "" : data_table_ref.substr(0, static_cast<size_t>(last_separator + 1));
+	program += "DROP TABLE IF EXISTS " + data_table_ref + ";\n";
+	program += "DROP TABLE IF EXISTS " + internal_prefix +
 	           KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(drop.info->name)) + ";\n";
 	program += "DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	           SqlUtils::EscapeValue(drop.info->name) + "';\n";
@@ -1682,13 +1687,21 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		auto remaining = con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) +
 		                           " WHERE table_name = '" + SqlUtils::EscapeValue(delta_table) + "'");
 		if (!remaining->HasError() && remaining->RowCount() > 0 && remaining->GetValue(0, 0).GetValue<int64_t>() == 1) {
-			program += "DROP TABLE IF EXISTS " + prefix + KeywordHelper::WriteOptionallyQuoted(delta_table) + ";\n";
+			program +=
+			    "DROP TABLE IF EXISTS " + internal_prefix + KeywordHelper::WriteOptionallyQuoted(delta_table) + ";\n";
 		}
 	}
 	auto view_delta_table = SqlUtils::DeltaName(drop.info->name);
 	delta_tables.push_back(view_delta_table);
 	auto &catalog = Catalog::GetCatalog(context, catalog_name);
-	TransactionalMVLockState::Get(context).Acquire({drop.info->name}, delta_tables, {&catalog});
+	vector<DeltaGateTarget> gate_targets;
+	for (auto &delta_table : delta_tables) {
+		gate_targets.push_back({&catalog, delta_table});
+	}
+	TransactionalMVLockState::Get(context).Acquire({drop.info->name}, delta_tables, gate_targets);
+	if (!context.transaction.IsAutoCommit()) {
+		TransactionalMVMetadataState::Get(context).RegisterSQL(program);
+	}
 	return program;
 }
 } // namespace duckdb

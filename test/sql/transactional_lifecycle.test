@@ -160,6 +160,62 @@ SELECT count(*) FROM (
 ----
 0
 
+# A schema-qualified DROP of an ordinary same-named view must not clean up the
+# tracked MV in another schema. Metadata currently uses a bare view name, so
+# cleanup must first prove the exact catalog entry is OpenIVM's generated view.
+statement ok
+CREATE TABLE lifecycle_drop_collision_src (id INTEGER);
+
+statement ok
+INSERT INTO lifecycle_drop_collision_src VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_drop_collision_mv AS
+SELECT * FROM lifecycle_drop_collision_src;
+
+statement ok
+CREATE SCHEMA lifecycle_drop_collision_schema;
+
+statement ok
+CREATE VIEW lifecycle_drop_collision_schema.lifecycle_drop_collision_mv AS
+SELECT 99 AS id;
+
+statement ok
+DROP VIEW lifecycle_drop_collision_schema.lifecycle_drop_collision_mv;
+
+query III
+SELECT
+    (SELECT count(*) FROM duckdb_views() WHERE schema_name = 'main'
+        AND view_name = 'lifecycle_drop_collision_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_drop_collision_mv'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_drop_collision_mv');
+----
+1	1	1
+
+statement ok
+INSERT INTO lifecycle_drop_collision_src VALUES (2);
+
+statement ok
+PRAGMA refresh('lifecycle_drop_collision_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_drop_collision_mv
+    EXCEPT ALL
+    SELECT * FROM lifecycle_drop_collision_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_drop_collision_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_drop_collision_mv
+);
+----
+0
+
 # Refresh rollback restores the MV and leaves its source delta available for retry.
 statement ok
 CREATE TABLE lifecycle_refresh_src (id INTEGER, v INTEGER);
@@ -278,6 +334,135 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# A source table, MV metadata, backing tables, and refresh created in one
+# explicit transaction must all be visible through the caller's snapshot.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE TABLE lifecycle_same_tx_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_same_tx_src VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_same_tx_mv AS
+SELECT id, v FROM lifecycle_same_tx_src;
+
+statement ok
+INSERT INTO lifecycle_same_tx_src VALUES (3, 30), (4, 40);
+
+statement ok
+UPDATE lifecycle_same_tx_src SET v = 21 WHERE id = 2;
+
+statement ok
+DELETE FROM lifecycle_same_tx_src WHERE id = 4;
+
+statement ok
+PRAGMA refresh('lifecycle_same_tx_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_same_tx_mv
+    EXCEPT ALL
+    SELECT * FROM lifecycle_same_tx_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_same_tx_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_same_tx_mv
+);
+----
+0
+
+statement ok
+COMMIT;
+
+# A same-transaction replacement must compile refresh from the replacement
+# definition and source metadata, not the committed definition visible to a
+# helper connection.
+statement ok
+CREATE TABLE lifecycle_same_tx_replace_src (id INTEGER, old_v INTEGER, new_v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_same_tx_replace_src VALUES (1, 10, 100), (2, 20, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_same_tx_replace_mv AS
+SELECT id, old_v AS v FROM lifecycle_same_tx_replace_src;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW lifecycle_same_tx_replace_mv AS
+SELECT id, new_v AS v FROM lifecycle_same_tx_replace_src;
+
+statement ok
+INSERT INTO lifecycle_same_tx_replace_src VALUES (3, 30, 300), (4, 40, 400);
+
+statement ok
+UPDATE lifecycle_same_tx_replace_src SET new_v = 201 WHERE id = 2;
+
+statement ok
+DELETE FROM lifecycle_same_tx_replace_src WHERE id = 4;
+
+statement ok
+PRAGMA refresh('lifecycle_same_tx_replace_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_same_tx_replace_mv
+    EXCEPT ALL
+    SELECT id, new_v AS v FROM lifecycle_same_tx_replace_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, new_v AS v FROM lifecycle_same_tx_replace_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_same_tx_replace_mv
+);
+----
+0
+
+statement ok
+COMMIT;
+
+# CREATE followed by DROP in one transaction must not orphan generated state
+# or metadata that a helper connection cannot yet observe.
+statement ok
+CREATE TABLE lifecycle_same_tx_drop_src (id INTEGER);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_same_tx_drop_mv AS
+SELECT * FROM lifecycle_same_tx_drop_src;
+
+statement ok
+DROP VIEW lifecycle_same_tx_drop_mv;
+
+statement ok
+COMMIT;
+
+query IIIII
+SELECT
+    (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_same_tx_drop_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_same_tx_drop_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_lifecycle_same_tx_drop_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_lifecycle_same_tx_drop_src'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_same_tx_drop_mv');
+----
+0	0	0	0	0
 
 # A refresh keeps its OpenIVM locks until the surrounding transaction ends.
 # The second connection starts while the first transaction is sleeping after

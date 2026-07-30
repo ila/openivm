@@ -358,6 +358,135 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# A filter in the preserved subtree changes which keys contribute outer rows.
+# Raw preserved-table counts cannot model false->true and true->false transitions,
+# so this shape must use affected-group recomputation.
+statement ok
+CREATE TABLE ljfb_pres_filter_left (id INT, active BOOLEAN);
+
+statement ok
+CREATE TABLE ljfb_pres_filter_right (id INT, val INT);
+
+statement ok
+INSERT INTO ljfb_pres_filter_left VALUES (1, false), (2, true), (3, true);
+
+statement ok
+INSERT INTO ljfb_pres_filter_right VALUES (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW ljfb_pres_filter_mv AS
+    SELECT l.id, COUNT(r.val) AS matches
+    FROM (SELECT * FROM ljfb_pres_filter_left WHERE active) l
+    LEFT JOIN ljfb_pres_filter_right r ON l.id = r.id
+    GROUP BY l.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'ljfb_pres_filter_mv';
+----
+6
+
+statement ok
+UPDATE ljfb_pres_filter_left SET active = true WHERE id = 1;
+
+statement ok
+UPDATE ljfb_pres_filter_left SET active = false WHERE id = 2;
+
+statement ok
+INSERT INTO ljfb_pres_filter_right VALUES (1, 10), (3, 30);
+
+statement ok
+DELETE FROM ljfb_pres_filter_right WHERE id = 3;
+
+statement ok
+PRAGMA refresh('ljfb_pres_filter_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ljfb_pres_filter_mv
+    EXCEPT ALL
+    SELECT l.id, COUNT(r.val)
+    FROM (SELECT * FROM ljfb_pres_filter_left WHERE active) l
+    LEFT JOIN ljfb_pres_filter_right r ON l.id = r.id
+    GROUP BY l.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, COUNT(r.val)
+    FROM (SELECT * FROM ljfb_pres_filter_left WHERE active) l
+    LEFT JOIN ljfb_pres_filter_right r ON l.id = r.id
+    GROUP BY l.id
+    EXCEPT ALL
+    SELECT * FROM ljfb_pres_filter_mv
+);
+----
+0
+
+# COUNT over a nullable preserved-side column contributes zero for a
+# NULL-padded row when the preserved value itself is NULL. The scalar
+# secondary correction is safe only when the source column is proven NOT NULL.
+statement ok
+CREATE TABLE ljfb_nullable_count_left (id INT, val INT);
+
+statement ok
+CREATE TABLE ljfb_nullable_count_right (id INT, payload INT);
+
+statement ok
+INSERT INTO ljfb_nullable_count_left VALUES (1, NULL), (2, 20);
+
+statement ok
+INSERT INTO ljfb_nullable_count_right VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW ljfb_nullable_count_mv AS
+    SELECT l.id, COUNT(l.val) AS preserved_values, COUNT(r.payload) AS matches
+    FROM ljfb_nullable_count_left l
+    LEFT JOIN ljfb_nullable_count_right r ON l.id = r.id
+    GROUP BY l.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'ljfb_nullable_count_mv';
+----
+6
+
+statement ok
+DELETE FROM ljfb_nullable_count_right WHERE id = 1;
+
+statement ok
+UPDATE ljfb_nullable_count_right SET payload = 201 WHERE id = 2;
+
+statement ok
+INSERT INTO ljfb_nullable_count_right VALUES (2, 202);
+
+statement ok
+PRAGMA refresh('ljfb_nullable_count_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ljfb_nullable_count_mv
+    EXCEPT ALL
+    SELECT l.id, COUNT(l.val), COUNT(r.payload)
+    FROM ljfb_nullable_count_left l
+    LEFT JOIN ljfb_nullable_count_right r ON l.id = r.id
+    GROUP BY l.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, COUNT(l.val), COUNT(r.payload)
+    FROM ljfb_nullable_count_left l
+    LEFT JOIN ljfb_nullable_count_right r ON l.id = r.id
+    GROUP BY l.id
+    EXCEPT ALL
+    SELECT * FROM ljfb_nullable_count_mv
+);
+----
+0
+
 # Secondary source identities are structured arrays: a comma in a valid quoted
 # table identifier must not split one join level into multiple levels.
 statement ok

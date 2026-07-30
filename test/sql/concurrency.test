@@ -460,3 +460,93 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 8: A writer on one tracked table must not block refresh of an unrelated
+# tracked table in the same catalog. Phase coordination is keyed by the exact
+# delta relation, not by the whole catalog.
+# ==========================================
+
+statement ok
+CREATE TABLE scoped_gate_a (id INTEGER);
+
+statement ok
+CREATE TABLE scoped_gate_b (id INTEGER);
+
+statement ok
+INSERT INTO scoped_gate_a VALUES (1);
+
+statement ok
+INSERT INTO scoped_gate_b VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW scoped_gate_mv_a AS SELECT * FROM scoped_gate_a;
+
+statement ok
+CREATE MATERIALIZED VIEW scoped_gate_mv_b AS SELECT * FROM scoped_gate_b;
+
+statement ok
+INSERT INTO scoped_gate_b VALUES (2);
+
+statement ok
+CREATE TABLE scoped_gate_timing (phase VARCHAR, observed_at TIMESTAMP);
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=0
+statement ok
+INSERT INTO scoped_gate_a VALUES (2);
+
+onlyif threadid=0
+statement ok
+SELECT sleep_ms(2000);
+
+onlyif threadid=0
+statement ok
+COMMIT;
+
+onlyif threadid=1
+statement ok
+SELECT sleep_ms(500);
+
+onlyif threadid=1
+statement ok
+INSERT INTO scoped_gate_timing VALUES ('before', now()::TIMESTAMP);
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('scoped_gate_mv_b');
+
+onlyif threadid=1
+statement ok
+INSERT INTO scoped_gate_timing VALUES ('after', now()::TIMESTAMP);
+
+endloop
+
+query I
+SELECT epoch_ms(max(observed_at)) - epoch_ms(min(observed_at)) < 1000
+FROM scoped_gate_timing;
+----
+true
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scoped_gate_mv_b
+    EXCEPT ALL
+    SELECT * FROM scoped_gate_b
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scoped_gate_b
+    EXCEPT ALL
+    SELECT * FROM scoped_gate_mv_b
+);
+----
+0

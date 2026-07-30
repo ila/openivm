@@ -674,7 +674,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta, string *out_post_meta,
                           RefreshCompileProfile *compile_profile, const DeltaActivityResult *precomputed_delta_activity,
-                          RefreshCostEstimate *out_adaptive_estimate, const openivm::CompileFacts *facts_in) {
+                          RefreshCostEstimate *out_adaptive_estimate, const openivm::CompileFacts *facts_in,
+                          Connection *metadata_connection) {
 	// Resolve the active CompileFacts. Three sources, in priority order:
 	//   1. Explicit `facts_in` (set by direct C++ callers that own a facts
 	//      instance — e.g. the openivm_compile_with_facts table function
@@ -695,8 +696,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	};
 	auto context_start = profile_now();
 	QueryErrorContext error_context = QueryErrorContext();
-	Connection con(*context.db.get());
-	PropagateRefreshPlanningSettings(context, *con.context);
+	unique_ptr<Connection> owned_connection;
+	if (!metadata_connection) {
+		owned_connection = make_uniq<Connection>(*context.db.get());
+		metadata_connection = owned_connection.get();
+	}
+	auto &con = *metadata_connection;
+	auto &planning_context = owned_connection ? *con.context : context;
+	PropagateRefreshPlanningSettings(context, planning_context);
 	// Mirror the active CompileFacts onto the inner connection's ClientContext
 	// so the optimizer rules invoked via `Optimizer(*con.context)` below
 	// (cost estimator + main IVM rewriter) see the same facts as the outer
@@ -706,7 +713,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// `SELECT NULL ... WHERE false` placeholders for views compiled with
 	// no pending deltas.
 	auto inner_facts_slot_facts = make_shared_ptr<openivm::CompileFacts>(active_facts);
-	openivm::CompileFactsContextSlot inner_facts_slot(*con.context, inner_facts_slot_facts);
+	openivm::CompileFactsContextSlot inner_facts_slot(planning_context, inner_facts_slot_facts);
 	con.Query("SET max_expression_depth = 10000");
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 	string default_db;
@@ -750,10 +757,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db) {
 		con.BeginTransaction();
 		delta_view_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    *con.context, internal_catalog_name, internal_schema_name, SqlUtils::DeltaName(view_name),
+		    planning_context, internal_catalog_name, internal_schema_name, SqlUtils::DeltaName(view_name),
 		    OnEntryNotFound::THROW_EXCEPTION, error_context);
 		index_delta_view_catalog_entry = Catalog::GetEntry(
-		    *con.context, internal_catalog_name, internal_schema_name,
+		    planning_context, internal_catalog_name, internal_schema_name,
 		    EntryLookupInfo(CatalogType::INDEX_ENTRY, data_table_bare + openivm::INDEX_SUFFIX, error_context),
 		    OnEntryNotFound::RETURN_NULL);
 		con.Rollback();
@@ -854,12 +861,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		con.BeginTransaction();
 		Parser cost_parser;
 		cost_parser.ParseQuery(view_query_sql);
-		Planner cost_planner(*con.context);
+		Planner cost_planner(planning_context);
 		cost_planner.CreatePlan(cost_parser.statements[0]->Copy());
-		Optimizer cost_optimizer(*cost_planner.binder, *con.context);
+		Optimizer cost_optimizer(*cost_planner.binder, planning_context);
 		auto cost_plan = cost_optimizer.Optimize(std::move(cost_planner.plan));
 
-		auto cost_estimate = EstimateRefreshCost(*con.context, *cost_plan, view_name, refresh_delta_activity);
+		auto cost_estimate = EstimateRefreshCost(planning_context, *cost_plan, view_name, refresh_delta_activity);
 		con.Rollback();
 		if (out_adaptive_estimate) {
 			*out_adaptive_estimate = cost_estimate;
@@ -1103,37 +1110,67 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			// DuckLake tables have none and must read ducklake_table_insertions/deletions between the
 			// last-refreshed and current snapshot -- IDs that exist only here, not at CREATE time.
 			if (have_ljsec) {
+				auto lj_sources =
+				    metadata.GetDeltaSources(view_name, attached_db_catalog_name, attached_db_schema_name);
+				unordered_map<string, string> lj_delta_source_cache;
+				unordered_map<string, int64_t> lj_snapshot_cache;
 				auto build_ljsec_delta_source = [&](const string &base_table, const string &key_col) -> string {
+					string cache_key = StringUtil::Lower(base_table) + "\n" + StringUtil::Lower(key_col);
+					auto cached = lj_delta_source_cache.find(cache_key);
+					if (cached != lj_delta_source_cache.end()) {
+						return cached->second;
+					}
 					string qkey = SqlUtils::QuoteIdentifier(key_col);
-					// openivm_delta_tables keys DuckLake sources by their BARE table name but regular
-					// sources by openivm_delta_<table>; probe the bare name first to tell them apart.
-					bool is_ducklake = metadata.IsDuckLakeTable(view_name, base_table);
-					string delta_name = is_ducklake ? base_table : SqlUtils::DeltaName(base_table);
+					optional_ptr<RefreshMetadata::DeltaSource> source;
+					for (auto &candidate : lj_sources) {
+						if (StringUtil::CIEquals(candidate.table_name, base_table) ||
+						    StringUtil::CIEquals(candidate.table_name, SqlUtils::DeltaName(base_table))) {
+							source = &candidate;
+							break;
+						}
+					}
+					if (!source) {
+						lj_delta_source_cache[cache_key] = "";
+						return "";
+					}
+					bool is_ducklake = StringUtil::CIEquals(source->catalog_type, "ducklake");
+					string delta_name = source->table_name;
+					string result;
 					if (is_ducklake) {
-						auto loc = metadata.GetSourceLocation(view_name, delta_name, attached_db_catalog_name,
-						                                      attached_db_schema_name);
 						int64_t last_snap = metadata.GetLastSnapshotId(view_name, delta_name);
-						int64_t cur_snap = metadata.GetCurrentDuckLakeSnapshot(loc.catalog_name);
-						if (loc.catalog_name.empty() || last_snap < 0 || cur_snap < 0) {
+						auto snapshot = lj_snapshot_cache.find(source->catalog_name);
+						if (snapshot == lj_snapshot_cache.end()) {
+							snapshot = lj_snapshot_cache
+							               .emplace(source->catalog_name,
+							                        metadata.GetCurrentDuckLakeSnapshot(source->catalog_name))
+							               .first;
+						}
+						int64_t cur_snap = snapshot->second;
+						if (source->catalog_name.empty() || last_snap < 0 || cur_snap < 0) {
+							lj_delta_source_cache[cache_key] = "";
 							return "";
 						}
 						// Matches CreateDeltaGetNode's convention: the stored snapshot was already
 						// consumed, so start one past it. Insertions are +1, deletions -1.
 						string ins =
-						    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name,
-						                                    loc.schema_name, loc.table_name, last_snap + 1, cur_snap);
+						    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", source->catalog_name,
+						                                    source->schema_name, base_table, last_snap + 1, cur_snap);
 						string del =
-						    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name,
-						                                    loc.schema_name, loc.table_name, last_snap + 1, cur_snap);
-						return "(SELECT " + qkey + " AS __k, 1 AS __m FROM " + ins + " UNION ALL SELECT " + qkey +
-						       " AS __k, -1 AS __m FROM " + del + ")";
+						    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", source->catalog_name,
+						                                    source->schema_name, base_table, last_snap + 1, cur_snap);
+						result = "(SELECT " + qkey + " AS __k, 1 AS __m FROM " + ins + " UNION ALL SELECT " + qkey +
+						         " AS __k, -1 AS __m FROM " + del + ")";
+					} else {
+						string qualified_delta = metadata.ResolveDeltaQualifiedName(
+						    view_name, delta_name, view_catalog_name, view_schema_name);
+						result = "(SELECT " + qkey + " AS __k, " + string(openivm::MULTIPLICITY_COL) + " AS __m FROM " +
+						         qualified_delta + " WHERE " + string(openivm::TIMESTAMP_COL) +
+						         " >= (SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
+						         " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
+						         SqlUtils::EscapeValue(delta_name) + "'))";
 					}
-					string qualified_delta = internal_catalog_prefix + SqlUtils::QuoteIdentifier(delta_name);
-					return "(SELECT " + qkey + " AS __k, " + string(openivm::MULTIPLICITY_COL) + " AS __m FROM " +
-					       qualified_delta + " WHERE " + string(openivm::TIMESTAMP_COL) +
-					       " >= (SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
-					       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
-					       SqlUtils::EscapeValue(delta_name) + "'))";
+					lj_delta_source_cache[cache_key] = result;
+					return result;
 				};
 				// One placeholder pair PER LEFT JOIN level; identities are index-aligned arrays.
 				auto &lj_it = ljsec.inner_tables;
@@ -1404,7 +1441,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			}
 			con.BeginTransaction();
 			try {
-				full_recompute_query = RenderStoredViewQueryForDialect(*con.context, view_query_sql, output_names,
+				full_recompute_query = RenderStoredViewQueryForDialect(planning_context, view_query_sql, output_names,
 				                                                       active_facts.target_dialect);
 				con.Rollback();
 			} catch (...) {
@@ -1629,7 +1666,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		p.ParseQuery(compute_delta);
 
 		con.BeginTransaction();
-		auto &con_ctx = *con.context;
+		auto &con_ctx = planning_context;
 		OPENIVM_DEBUG_PRINT("[UPSERT] Creating planner...\n");
 		Planner planner(con_ctx);
 		OPENIVM_DEBUG_PRINT("[UPSERT] CreatePlan...\n");

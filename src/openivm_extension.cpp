@@ -113,6 +113,9 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 	input.named_parameters["view_schema_name"] = view_schema_name;
 
 	Connection con(*context.db);
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		metadata_state->Apply(con);
+	}
 	string view_query = RefreshMetadata(con).GetViewQuery(view_name);
 	if (view_query.empty()) {
 		throw Exception(ExceptionType::CATALOG,

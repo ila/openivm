@@ -62,8 +62,14 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
 - [ ] **Remove runtime type guessing from window lineage.** Bare-name `information_schema` lookup with `LIMIT 1` is ambiguous
   across schemas/catalogs, and coercing both comparison sides to VARCHAR changes bound comparison semantics. Persist exact
   bound cast chains and source identity at CREATE time.
+- [ ] **Replace window partition metadata mini-parsing with a typed contract.** Partition columns, source expressions, casts,
+  and lookup edges are reconstructed from independently encoded strings at refresh time. Persist one versioned structured
+  representation, validate it atomically, and pass the decoded object through affected-partition compilation.
 - [ ] **Make source identity fully qualified.** DML classification, metadata lookup, locking, cleanup, and dependency handling
   rely too heavily on bare table or view names. Use catalog, schema, and stable object identity.
+- [ ] **Give one abstraction ownership of source and delta resolution.** Standard tables, DuckLake snapshots, chained views,
+  legacy metadata, and attached catalogs are resolved in several compiler branches with slightly different fallback rules.
+  Load and validate each source once into an immutable qualified descriptor, including its delta relation and snapshot range.
 - [ ] **Centralize complete per-view DROP cleanup.** Hooks, refresh history/profile rows, dependency rows, and matcher state can
   survive DROP and be inherited by a newly created MV of the same name.
 - [ ] **Preserve quoted output identifiers.** Planner output names are sanitized for internal use and then reused where the
@@ -109,8 +115,9 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
   booleans, and implicit reclassification hide invariants and make call-order mistakes likely.
 - [ ] **Use tagged CREATE operations instead of magic strings.** Cleanup, profiling, schema derivation, and executable SQL are
   currently mixed in one string vector and reparsed by prefixes and tab-delimited fields.
-- [ ] **Consolidate duplicated profiling and NULL-safe predicate helpers.** CREATE and refresh profiling independently implement
-  IDs, retention, step collection, and persistence; SQL utilities contain parallel NULL-safe builders.
+- [ ] **Consolidate duplicated profiling and NULL-safe predicate helpers.** `CreateMVProfiler` and `RefreshProfiler`
+  independently implement IDs, retention, step collection, and persistence; SQL utilities contain parallel NULL-safe
+  builders. Put the shared lifecycle and storage policy in one small profiler component.
 
 ## P3: refresh performance and repeated work
 

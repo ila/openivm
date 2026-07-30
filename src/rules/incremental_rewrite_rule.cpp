@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/parser_ddl.hpp"
 #include "core/parser_plan_helpers.hpp"
 #include "core/scoped_optimizer_settings.hpp"
 #include "core/sql_utils.hpp"
@@ -85,6 +86,9 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	auto view_schema = child_get->named_parameters["view_schema_name"].ToString();
 
 	Connection con(*input.context.db);
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(input.context)) {
+		metadata_state->Apply(con);
+	}
 
 	auto v = con.Query("select sql_string from " + string(openivm::VIEWS_TABLE) + " where view_name = '" +
 	                   SqlUtils::EscapeValue(view) + "';");

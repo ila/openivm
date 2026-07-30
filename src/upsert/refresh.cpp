@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/parser_ddl.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
@@ -126,20 +127,20 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 	// Enter the refresh phase for every native source catalog before inspecting delta activity.
 	// Writers enter the complementary phase through the actual delta table catalog, so this also
 	// covers views whose target and source catalogs differ.
-	vector<string> source_catalog_names;
+	unordered_map<string, vector<string>> source_deltas_by_catalog;
 	for (auto &source : delta_sources) {
 		delta_table_names.push_back(source.table_name);
 		if (source.catalog_type != "ducklake") {
-			source_catalog_names.push_back(Catalog::GetCatalog(context, source.catalog_name).GetName());
+			source_deltas_by_catalog[source.catalog_name].push_back(source.table_name);
 		}
 	}
-	std::sort(source_catalog_names.begin(), source_catalog_names.end());
-	source_catalog_names.erase(std::unique(source_catalog_names.begin(), source_catalog_names.end()),
-	                           source_catalog_names.end());
 	vector<unique_ptr<DeltaCatalogRefreshGuard>> delta_catalog_guards;
-	for (auto &catalog_name : source_catalog_names) {
+	for (auto &entry : source_deltas_by_catalog) {
+		auto &names = entry.second;
+		std::sort(names.begin(), names.end());
+		names.erase(std::unique(names.begin(), names.end()), names.end());
 		delta_catalog_guards.push_back(
-		    make_uniq<DeltaCatalogRefreshGuard>(context, Catalog::GetCatalog(context, catalog_name)));
+		    make_uniq<DeltaCatalogRefreshGuard>(context, Catalog::GetCatalog(context, entry.first), std::move(names)));
 	}
 	ViewLockGuard view_guard(vn);
 	// Acquire delta-table locks in sorted order to serialize parallel refreshes that
@@ -162,8 +163,8 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		delta_guards.push_back(make_uniq<DeltaLockGuard>(dt));
 	}
 	profiler.AddStep("acquire_locks", lock_start,
-	                 to_string(source_catalog_names.size()) + " catalog gates, " + to_string(delta_lock_names.size()) +
-	                     " delta locks");
+	                 to_string(source_deltas_by_catalog.size()) + " catalog gates, " +
+	                     to_string(delta_lock_names.size()) + " delta locks");
 	DeltaActivityResult delta_activity;
 	DeltaActivityResult *precomputed_delta_activity = nullptr;
 	if (skip_empty_refresh) {
@@ -599,7 +600,8 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	// registered native sources conservatively; the returned SQL executes through
 	// the caller context and therefore sees exactly the caller's transaction.
 	return GenerateRefreshSQL(context, view_catalog_name, view_schema_name, view_name, false, attached_db_catalog_name,
-	                          attached_db_schema_name, nullptr, nullptr, nullptr, &conservative_activity, nullptr);
+	                          attached_db_schema_name, nullptr, nullptr, nullptr, &conservative_activity, nullptr,
+	                          nullptr, &metadata_con);
 }
 
 string TransactionalRefreshQuery(ClientContext &context, const FunctionParameters &parameters) {
@@ -624,6 +626,9 @@ string TransactionalRefreshQuery(ClientContext &context, const FunctionParameter
 	string view_name;
 	bool cross_system = false;
 	Connection metadata_con(*context.db);
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		metadata_state->Apply(metadata_con);
+	}
 
 	if (parameters.values.size() == 3) {
 		view_catalog_name = StringValue::Get(parameters.values[0]);
@@ -687,7 +692,7 @@ string TransactionalRefreshQuery(ClientContext &context, const FunctionParameter
 	vector<string> ordered_nodes;
 	vector<string> lock_views;
 	vector<string> lock_deltas;
-	vector<Catalog *> lock_catalogs;
+	vector<DeltaGateTarget> gate_targets;
 	for (auto &node : refresh_order) {
 		if (!seen.insert(node).second) {
 			continue;
@@ -703,7 +708,7 @@ string TransactionalRefreshQuery(ClientContext &context, const FunctionParameter
 		for (auto &source : node_sources) {
 			lock_deltas.push_back(source.table_name);
 			if (source.catalog_type != "ducklake") {
-				lock_catalogs.push_back(&Catalog::GetCatalog(context, source.catalog_name));
+				gate_targets.push_back({&Catalog::GetCatalog(context, source.catalog_name), source.table_name});
 			}
 		}
 		if (metadata.HasDownstreamViews(node)) {
@@ -714,7 +719,7 @@ string TransactionalRefreshQuery(ClientContext &context, const FunctionParameter
 	// transaction snapshot. Serialize first so a waiter compiles against state
 	// committed by the preceding refresh rather than carrying a stale snapshot
 	// through the lock wait.
-	TransactionalMVLockState::Get(context).Acquire(lock_views, lock_deltas, lock_catalogs);
+	TransactionalMVLockState::Get(context).Acquire(lock_views, lock_deltas, gate_targets);
 
 	for (auto &node : ordered_nodes) {
 		auto location = ResolveViewLocation(metadata_con, node, view_catalog_name, view_schema_name);

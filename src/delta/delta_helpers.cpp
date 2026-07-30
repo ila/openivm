@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/parser_ddl.hpp"
 #include "core/plan_rewrite_internal.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -126,6 +127,9 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	// Get last snapshot from IVM metadata. Uses a separate connection because
 	// the optimizer holds a lock on the main context during plan rewriting.
 	Connection con(*context.db);
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		metadata_state->Apply(con);
+	}
 	auto snap_result =
 	    con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
@@ -345,6 +349,9 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 
 	// Timestamp filter
 	Connection con(*context.db);
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		metadata_state->Apply(con);
+	}
 	con.SetAutoCommit(false);
 	auto timestamp_query = "select last_update from " + string(openivm::DELTA_TABLES_TABLE) + " where view_name = '" +
 	                       SqlUtils::EscapeValue(view_name) + "' and table_name = '" +

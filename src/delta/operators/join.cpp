@@ -571,12 +571,7 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 static unique_ptr<TransitioningKeySet> BuildTransitioningKeySet(ClientContext &context, Binder &binder,
                                                                 LogicalGet *base_get, idx_t key_pos,
                                                                 const string &view_name) {
-	try {
-		return BuildTransitioningKeySetImpl(context, binder, base_get, key_pos, view_name);
-	} catch (const std::exception &e) {
-		OPENIVM_DEBUG_PRINT("[DeltaJoin] BuildTransitioningKeySet failed: %s\n", e.what());
-		return nullptr;
-	}
+	return BuildTransitioningKeySetImpl(context, binder, base_get, key_pos, view_name);
 }
 
 // After DemoteLeftJoinsForMask, a LEFT/RIGHT join may remain un-demoted (kept as an outer join)

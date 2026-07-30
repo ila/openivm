@@ -19,6 +19,54 @@ namespace duckdb {
 
 namespace {
 
+static const vector<string> &TransactionalMetadataTables() {
+	static const vector<string> tables = {openivm::VIEWS_TABLE,   "openivm_refresh_hooks", openivm::DELTA_TABLES_TABLE,
+	                                      openivm::HISTORY_TABLE, openivm::PROFILE_TABLE,  openivm::MV_DEPS_TABLE};
+	return tables;
+}
+
+static bool ReferencesTransactionalMetadata(const string &statement) {
+	auto lower = StringUtil::Lower(statement);
+	for (auto &table : TransactionalMetadataTables()) {
+		if (lower.find(StringUtil::Lower(table)) != string::npos) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool IsReplayableMetadataStatement(const string &statement) {
+	auto trimmed = statement;
+	StringUtil::Trim(trimmed);
+	auto lower = StringUtil::Lower(trimmed);
+	return ReferencesTransactionalMetadata(lower) &&
+	       (StringUtil::StartsWith(lower, "create table") || StringUtil::StartsWith(lower, "alter table") ||
+	        StringUtil::StartsWith(lower, "insert ") || StringUtil::StartsWith(lower, "update ") ||
+	        StringUtil::StartsWith(lower, "delete "));
+}
+
+static string MakeTemporaryMetadataDDL(const string &statement) {
+	auto lower = StringUtil::Lower(statement);
+	const string prefix = "create table if not exists ";
+	if (!StringUtil::StartsWith(lower, prefix)) {
+		return statement;
+	}
+	return "create temp table if not exists " + statement.substr(prefix.size());
+}
+
+static bool IsMetadataSchemaStatement(const string &statement) {
+	auto trimmed = statement;
+	StringUtil::Trim(trimmed);
+	auto lower = StringUtil::Lower(trimmed);
+	return StringUtil::StartsWith(lower, "create table") || StringUtil::StartsWith(lower, "alter table");
+}
+
+static string StabilizeTransactionalMetadata(string statement, const string &timestamp_sql) {
+	statement = StringUtil::Replace(statement, "now()", timestamp_sql);
+	statement = StringUtil::Replace(statement, "NOW()", timestamp_sql);
+	return statement;
+}
+
 struct CreateMVProfileStep {
 	int32_t step_order;
 	string step_name;
@@ -398,6 +446,97 @@ void DDLExecutorExecuteFunction(ClientContext &context, TableFunctionInput &data
 }
 
 } // namespace
+
+TransactionalMVMetadataState &TransactionalMVMetadataState::Get(ClientContext &context) {
+	return *context.registered_state->GetOrCreate<TransactionalMVMetadataState>("openivm_transactional_mv_metadata");
+}
+
+optional_ptr<TransactionalMVMetadataState> TransactionalMVMetadataState::TryGet(ClientContext &context) {
+	return context.registered_state->Get<TransactionalMVMetadataState>("openivm_transactional_mv_metadata");
+}
+
+void TransactionalMVMetadataState::Register(ClientContext &context, const vector<Value> &parameters) {
+	auto transaction_timestamp = context.transaction.ActiveTransaction().GetCurrentTransactionStartTimestamp();
+	// Delta-table DEFAULT now() is transaction-stable. Compile from one
+	// microsecond before it so rows inserted into a newly created MV delta
+	// table during this same transaction satisfy the compiler's strict `>`
+	// watermark predicate.
+	transaction_timestamp -= 1;
+	auto timestamp_sql = Value::TIMESTAMP(transaction_timestamp).ToSQLString() + "::TIMESTAMP";
+	for (auto &parameter : parameters) {
+		auto statement = parameter.GetValue<string>();
+		if (IsReplayableMetadataStatement(statement)) {
+			statements.push_back(StabilizeTransactionalMetadata(std::move(statement), timestamp_sql));
+		}
+	}
+}
+
+void TransactionalMVMetadataState::RegisterSQL(const string &sql) {
+	for (auto &statement : StringUtil::Split(sql, ";\n")) {
+		if (IsReplayableMetadataStatement(statement)) {
+			statements.push_back(std::move(statement));
+		}
+	}
+}
+
+void TransactionalMVMetadataState::Apply(Connection &connection) const {
+	if (statements.empty()) {
+		return;
+	}
+	// Build constrained TEMP schemas first. CREATE TABLE AS would discard the
+	// primary keys required by INSERT OR REPLACE metadata operations.
+	for (auto &statement : statements) {
+		if (!IsMetadataSchemaStatement(statement)) {
+			continue;
+		}
+		auto result = connection.Query(MakeTemporaryMetadataDDL(statement));
+		if (result->HasError()) {
+			throw CatalogException("Could not reconstruct transaction-local OpenIVM metadata schema: %s",
+			                       result->GetError());
+		}
+	}
+	for (auto &table : TransactionalMetadataTables()) {
+		bool has_constrained_schema = false;
+		for (auto &statement : statements) {
+			auto lower = StringUtil::Lower(statement);
+			if (StringUtil::StartsWith(lower, "create table") && lower.find(StringUtil::Lower(table)) != string::npos) {
+				has_constrained_schema = true;
+				break;
+			}
+		}
+		if (has_constrained_schema) {
+			// Seed the constrained shadow with committed rows. A missing durable
+			// table is expected for the first MV in a database.
+			connection.Query("INSERT OR IGNORE INTO " + table + " BY NAME SELECT * FROM main." + table);
+		} else {
+			// Less central metadata (for example optional dependency state) may
+			// be initialized outside the lifecycle program. Still shadow it so
+			// replay can never mutate the durable helper-connection catalog.
+			connection.Query("CREATE TEMP TABLE IF NOT EXISTS " + table + " AS SELECT * FROM main." + table);
+		}
+	}
+	for (auto &statement : statements) {
+		if (IsMetadataSchemaStatement(statement)) {
+			continue;
+		}
+		auto result = connection.Query(MakeTemporaryMetadataDDL(statement));
+		if (result->HasError()) {
+			throw CatalogException("Could not reconstruct transaction-local OpenIVM metadata: %s", result->GetError());
+		}
+	}
+}
+
+void TransactionalMVMetadataState::TransactionCommit(MetaTransaction &transaction, ClientContext &context) {
+	Clear();
+}
+
+void TransactionalMVMetadataState::TransactionRollback(MetaTransaction &transaction, ClientContext &context) {
+	Clear();
+}
+
+void TransactionalMVMetadataState::Clear() {
+	statements.clear();
+}
 
 string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace) {
 	return string(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX) + (replace ? "replace\t" : "create\t") + delta_table +

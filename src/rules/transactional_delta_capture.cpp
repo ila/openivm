@@ -16,6 +16,8 @@
 #include "duckdb/planner/expression_binder/check_binder.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/optimistic_data_writer.hpp"
+#include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
@@ -31,18 +33,13 @@ static constexpr const char *DELTA_WRITE_STATE_KEY = "openivm_transactional_delt
 
 class TransactionalDeltaWriteState : public ClientContextState {
 public:
-	void Acquire(ClientContext &context, Catalog &catalog) {
+	void Acquire(ClientContext &context, Catalog &catalog, const string &delta_table_name) {
 		lock_guard<mutex> guard(lock);
-		if (catalog_guard) {
-			if (&catalog != locked_catalog) {
-				throw TransactionException(
-				    "OpenIVM cannot capture delta rows for catalogs '%s' and '%s' in one transaction",
-				    locked_catalog->GetName(), catalog.GetName());
-			}
+		auto &catalog_guards = guards[&catalog];
+		if (catalog_guards.find(delta_table_name) != catalog_guards.end()) {
 			return;
 		}
-		catalog_guard = make_uniq<DeltaCatalogWriteGuard>(context, catalog);
-		locked_catalog = &catalog;
+		catalog_guards[delta_table_name] = make_uniq<DeltaCatalogWriteGuard>(context, catalog, delta_table_name);
 	}
 
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override {
@@ -61,13 +58,11 @@ public:
 private:
 	void Release() {
 		lock_guard<mutex> guard(lock);
-		catalog_guard.reset();
-		locked_catalog = nullptr;
+		guards.clear();
 	}
 
 	mutex lock;
-	Catalog *locked_catalog = nullptr;
-	unique_ptr<DeltaCatalogWriteGuard> catalog_guard;
+	unordered_map<Catalog *, unordered_map<string, unique_ptr<DeltaCatalogWriteGuard>>> guards;
 };
 
 static void EnterDeltaWritePhase(ClientContext &context, Catalog &catalog, const string &delta_table_name) {
@@ -76,7 +71,7 @@ static void EnterDeltaWritePhase(ClientContext &context, Catalog &catalog, const
 		return;
 	}
 	auto state = context.registered_state->GetOrCreate<TransactionalDeltaWriteState>(DELTA_WRITE_STATE_KEY);
-	state->Acquire(context, catalog);
+	state->Acquire(context, catalog, delta_table_name);
 }
 
 class TransactionalDeltaAppendState {
@@ -96,7 +91,11 @@ public:
 	ExpressionExecutor generated_executor;
 	DataChunk generated_values;
 	DataChunk delta_rows;
+	TableAppendState local_append_state;
+	PhysicalIndex collection_index = PhysicalIndex(DConstants::INVALID_INDEX);
+	unique_ptr<OptimisticDataWriter> optimistic_writer;
 	bool entered_write_phase = false;
+	bool append_finalized = false;
 };
 
 class TransactionalDeltaAppender {
@@ -144,9 +143,50 @@ public:
 			}
 		}
 		delta_rows.SetCardinality(base_rows);
-		vector<unique_ptr<BoundConstraint>> no_constraints;
+		auto &storage = delta_table.GetStorage();
+		if (!state.collection_index.IsValid()) {
+			lock_guard<mutex> guard(append_lock);
+			state.optimistic_writer = make_uniq<OptimisticDataWriter>(context, storage);
+			auto optimistic_collection = state.optimistic_writer->CreateCollection(storage, delta_types);
+			auto &collection = *optimistic_collection->collection;
+			collection.InitializeEmpty();
+			collection.InitializeAppend(state.local_append_state);
+			state.collection_index = storage.CreateOptimisticCollection(context, std::move(optimistic_collection));
+		}
+		auto &optimistic_collection = storage.GetOptimisticCollection(context, state.collection_index);
+		auto &collection = *optimistic_collection.collection;
+		if (collection.Append(delta_rows, state.local_append_state)) {
+			state.optimistic_writer->WriteNewRowGroup(optimistic_collection);
+		}
+	}
+
+	void Finalize(ClientContext &context, TransactionalDeltaAppendState &state) const {
+		if (state.append_finalized || !state.collection_index.IsValid()) {
+			return;
+		}
+		state.append_finalized = true;
+		auto &storage = delta_table.GetStorage();
+		auto &optimistic_collection = storage.GetOptimisticCollection(context, state.collection_index);
+		auto &collection = *optimistic_collection.collection;
+		TransactionData transaction_data(0, 0);
+		collection.FinalizeAppend(transaction_data, state.local_append_state);
+
 		lock_guard<mutex> guard(append_lock);
-		delta_table.GetStorage().LocalAppend(delta_table, context, delta_rows, no_constraints);
+		if (collection.GetTotalRows() < storage.GetRowGroupSize()) {
+			vector<unique_ptr<BoundConstraint>> no_constraints;
+			LocalAppendState append_state;
+			storage.InitializeLocalAppend(append_state, delta_table, context, no_constraints);
+			auto &transaction = DuckTransaction::Get(context, delta_table.catalog);
+			for (auto &chunk : collection.Chunks(transaction)) {
+				storage.LocalAppend(append_state, context, chunk, false);
+			}
+			storage.FinalizeLocalAppend(append_state);
+			return;
+		}
+		state.optimistic_writer->WriteUnflushedRowGroups(optimistic_collection);
+		state.optimistic_writer->FinalFlush();
+		storage.LocalMerge(context, optimistic_collection);
+		storage.GetOptimisticWriter(context).Merge(*state.optimistic_writer);
 	}
 
 	const vector<unique_ptr<Expression>> &GeneratedExpressions() const {
@@ -340,11 +380,21 @@ public:
 		if (mode == DeltaCaptureMode::INSERT) {
 			appender->Append(context.client, input, 1, state.append_state);
 		} else {
-			lock_guard<mutex> guard(gstate.lock);
 			CaptureDeleteOrUpdate(context, input, gstate, state);
 		}
 		chunk.Reference(input);
 		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk, GlobalOperatorState &gstate_p,
+	                                        OperatorState &state_p) const override {
+		auto &state = state_p.Cast<TransactionalDeltaCaptureLocalState>();
+		appender->Finalize(context.client, state.append_state);
+		return OperatorFinalizeResultType::FINISHED;
+	}
+
+	bool RequiresFinalExecute() const override {
+		return true;
 	}
 
 	bool ParallelOperator() const override {
@@ -361,8 +411,14 @@ private:
 	                           TransactionalDeltaCaptureLocalState &state) const {
 		D_ASSERT(row_id_index.IsValid());
 		state.selected_input.Reset();
-		auto selected_count = SelectUnseenRows(input, row_id_index.GetIndex(), gstate.captured_row_ids, state.selection,
-		                                       state.selected_input);
+		idx_t selected_count;
+		{
+			// Only row-id deduplication is shared. Fetching preimages, evaluating
+			// UPDATE expressions, and constructing delta chunks remain parallel.
+			lock_guard<mutex> guard(gstate.lock);
+			selected_count = SelectUnseenRows(input, row_id_index.GetIndex(), gstate.captured_row_ids, state.selection,
+			                                  state.selected_input);
+		}
 		if (selected_count == 0) {
 			return;
 		}
@@ -531,6 +587,7 @@ public:
 			row_fetcher.Fetch(context, row_ids, count, rows, fetch_state);
 			appender->Append(context, rows, 1, append_state);
 		}
+		appender->Finalize(context, append_state);
 		OPENIVM_DEBUG_PRINT("[INSERT RULE] skipped %zu invisible MERGE target postimages\n", invisible_count);
 	}
 
@@ -680,7 +737,11 @@ public:
 		auto &gstate = input.global_state.Cast<MergeActionDeltaCaptureGlobalState>();
 		auto &lstate = input.local_state.Cast<MergeActionDeltaCaptureLocalState>();
 		OperatorSinkCombineInput child_input {*gstate.child_state, *lstate.child_state, input.interrupt_state};
-		return action_op.Combine(context, child_input);
+		auto result = action_op.Combine(context, child_input);
+		if (result == SinkCombineResultType::FINISHED) {
+			coordinator->Appender()->Finalize(context.client, lstate.append_state);
+		}
+		return result;
 	}
 
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,

@@ -2,6 +2,7 @@
 #define OPENIVM_PARSER_DDL_HPP
 
 #include "duckdb.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 
 namespace duckdb {
@@ -16,6 +17,29 @@ static constexpr const char *OPENIVM_TRANSACTIONAL_DDL_FUNCTION = "openivm_trans
 static constexpr const char *OPENIVM_STAGED_DDL_FUNCTION = "openivm_staged_ddl";
 
 enum class DDLExecutionMode : uint8_t { CALLER_TRANSACTION, STAGED_CROSS_CATALOG };
+
+// Native lifecycle statements are rendered into a caller-transaction SQL
+// program. Helper connections cannot observe that program's uncommitted
+// metadata, so retain the metadata operations on the caller context and replay
+// them into temporary shadow tables when a later lifecycle/refresh statement
+// in the same transaction needs to compile.
+class TransactionalMVMetadataState : public ClientContextState {
+public:
+	static TransactionalMVMetadataState &Get(ClientContext &context);
+	static optional_ptr<TransactionalMVMetadataState> TryGet(ClientContext &context);
+
+	void Register(ClientContext &context, const vector<Value> &parameters);
+	void RegisterSQL(const string &sql);
+	void Apply(Connection &connection) const;
+
+	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
+	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override;
+
+private:
+	void Clear();
+
+	vector<string> statements;
+};
 
 void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result,
                                 DDLExecutionMode mode = DDLExecutionMode::STAGED_CROSS_CATALOG);

@@ -18,22 +18,28 @@ namespace duckdb {
 //
 // Per-delta-table mutex: serializes refreshes that consume the same delta table.
 //
-// Per-catalog phase gate: allows concurrent DML writers and concurrent refreshes, but
-// prevents those two phases from overlapping. This closes the window where refresh
-// could advance a watermark past a delta row that commits afterward.
+// Per-catalog phase coordinator: allows unrelated delta tables to make progress
+// concurrently while preventing writers and refreshes of the same delta table from
+// overlapping. Refreshes reserve their full table set atomically to avoid lock-order
+// deadlocks with multi-table writer transactions.
 class DeltaCatalogPhaseGate {
 public:
-	void EnterWrite(ClientContext &owner);
-	void ExitWrite(ClientContext &owner);
-	void EnterRefresh(ClientContext &owner);
-	void ExitRefresh(ClientContext &owner);
+	void EnterWrite(ClientContext &owner, const string &delta_table_name);
+	void ExitWrite(ClientContext &owner, const string &delta_table_name);
+	void EnterRefresh(ClientContext &owner, const vector<string> &delta_table_names);
+	void ExitRefresh(ClientContext &owner, const vector<string> &delta_table_names);
 
 private:
 	mutex lock;
 	std::condition_variable condition;
-	unordered_map<ClientContext *, idx_t> active_writers;
-	unordered_map<ClientContext *, idx_t> active_refreshes;
-	idx_t waiting_refreshes = 0;
+	unordered_map<string, unordered_map<ClientContext *, idx_t>> active_writers;
+	unordered_map<string, unordered_map<ClientContext *, idx_t>> active_refreshes;
+	unordered_map<string, idx_t> waiting_refreshes;
+};
+
+struct DeltaGateTarget {
+	Catalog *catalog;
+	string delta_table_name;
 };
 
 class RefreshLocks {
@@ -56,10 +62,10 @@ public:
 
 	static void UnlockDelta(const string &delta_table_name);
 
-	static void EnterDeltaWrite(ClientContext &owner, Catalog &catalog);
-	static void ExitDeltaWrite(ClientContext &owner, Catalog &catalog);
-	static void EnterDeltaRefresh(ClientContext &owner, Catalog &catalog);
-	static void ExitDeltaRefresh(ClientContext &owner, Catalog &catalog);
+	static void EnterDeltaWrite(ClientContext &owner, Catalog &catalog, const string &delta_table_name);
+	static void ExitDeltaWrite(ClientContext &owner, Catalog &catalog, const string &delta_table_name);
+	static void EnterDeltaRefresh(ClientContext &owner, Catalog &catalog, const vector<string> &delta_table_names);
+	static void ExitDeltaRefresh(ClientContext &owner, Catalog &catalog, const vector<string> &delta_table_names);
 
 private:
 	static std::mutex &GetViewMutex(const string &view_name);
@@ -77,13 +83,15 @@ private:
 class DeltaCatalogWriteGuard {
 	ClientContext *owner;
 	Catalog *catalog;
+	string delta_table_name;
 
 public:
-	DeltaCatalogWriteGuard(ClientContext &owner_p, Catalog &catalog_p) : owner(&owner_p), catalog(&catalog_p) {
-		RefreshLocks::EnterDeltaWrite(*owner, *catalog);
+	DeltaCatalogWriteGuard(ClientContext &owner_p, Catalog &catalog_p, string delta_table_name_p)
+	    : owner(&owner_p), catalog(&catalog_p), delta_table_name(std::move(delta_table_name_p)) {
+		RefreshLocks::EnterDeltaWrite(*owner, *catalog, delta_table_name);
 	}
 	~DeltaCatalogWriteGuard() {
-		RefreshLocks::ExitDeltaWrite(*owner, *catalog);
+		RefreshLocks::ExitDeltaWrite(*owner, *catalog, delta_table_name);
 	}
 	DeltaCatalogWriteGuard(const DeltaCatalogWriteGuard &) = delete;
 	DeltaCatalogWriteGuard &operator=(const DeltaCatalogWriteGuard &) = delete;
@@ -94,13 +102,15 @@ public:
 class DeltaCatalogRefreshGuard {
 	ClientContext *owner;
 	Catalog *catalog;
+	vector<string> delta_table_names;
 
 public:
-	DeltaCatalogRefreshGuard(ClientContext &owner_p, Catalog &catalog_p) : owner(&owner_p), catalog(&catalog_p) {
-		RefreshLocks::EnterDeltaRefresh(*owner, *catalog);
+	DeltaCatalogRefreshGuard(ClientContext &owner_p, Catalog &catalog_p, vector<string> delta_table_names_p)
+	    : owner(&owner_p), catalog(&catalog_p), delta_table_names(std::move(delta_table_names_p)) {
+		RefreshLocks::EnterDeltaRefresh(*owner, *catalog, delta_table_names);
 	}
 	~DeltaCatalogRefreshGuard() {
-		RefreshLocks::ExitDeltaRefresh(*owner, *catalog);
+		RefreshLocks::ExitDeltaRefresh(*owner, *catalog, delta_table_names);
 	}
 	DeltaCatalogRefreshGuard(const DeltaCatalogRefreshGuard &) = delete;
 	DeltaCatalogRefreshGuard &operator=(const DeltaCatalogRefreshGuard &) = delete;
@@ -174,7 +184,7 @@ public:
 	static optional_ptr<TransactionalMVLockState> TryGet(ClientContext &context);
 
 	void Acquire(const vector<string> &view_names, const vector<string> &delta_table_names,
-	             const vector<Catalog *> &source_catalogs = {});
+	             const vector<DeltaGateTarget> &gate_targets = {});
 	bool OwnsRefreshDelta(Catalog &catalog, const string &delta_table_name) const;
 
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
@@ -185,7 +195,7 @@ private:
 
 	unordered_set<string> locked_views;
 	unordered_set<string> locked_delta_tables;
-	unordered_set<const Catalog *> locked_catalogs;
+	unordered_map<const Catalog *, unordered_set<string>> locked_refresh_deltas;
 	vector<unique_ptr<ViewLockGuard>> view_guards;
 	vector<unique_ptr<DeltaLockGuard>> delta_guards;
 	vector<unique_ptr<DeltaCatalogRefreshGuard>> catalog_guards;
