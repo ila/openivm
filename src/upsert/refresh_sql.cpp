@@ -1394,18 +1394,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                    group_columns.size(), delta_specs.size(), GroupRecomputeAffectedModeName(affected_mode));
 		break;
 	}
-	case RefreshType::CURRENT_DIFF_RECOMPUTE: {
-		if (skip_empty_enabled && refresh_plan.delta_flags.active_delta_table_names.empty() &&
-		    !active_facts.compile_only) {
-			upsert_query = "";
-			OPENIVM_DEBUG_PRINT("[UPSERT] CURRENT_DIFF_RECOMPUTE has no active "
-			                    "deltas after filtering\n");
-			break;
-		}
-		upsert_query = CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix);
-		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: CURRENT_DIFF_RECOMPUTE\n");
-		break;
-	}
 	case RefreshType::TOP_K:
 		[[fallthrough]];
 	case RefreshType::FULL_REFRESH: {

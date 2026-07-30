@@ -536,9 +536,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               const string &cascade_lpts_table_prefix, bool emit_cascade_delta,
                               bool inline_cascade_delta, bool *out_handled_cascade_delta,
                               const unordered_map<string, string> &derived_output_expressions,
-                              bool derived_output_expressions_complete,
-                              const vector<string> &preserved_side_cols, bool *out_used_group_recompute,
-                              bool force_group_recompute) {
+                              bool derived_output_expressions_complete, const vector<string> &preserved_side_cols,
+                              bool *out_used_group_recompute, bool force_group_recompute) {
 	if (out_used_group_recompute) {
 		*out_used_group_recompute = false;
 	}
@@ -597,7 +596,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// This is correct for VARCHAR literals, string functions of group keys, LIST
 	// aggregates, and CASE over aggregates alike. Slower than MERGE, faster than
 	// full recompute (only affected groups are re-evaluated).
-	bool needs_group_recompute = !non_summable_columns.empty() || force_group_recompute;
+	bool needs_group_recompute = force_group_recompute;
 	if (insert_only && has_minmax && !derived_output_expressions_complete) {
 		needs_group_recompute = true;
 		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] incomplete derived-output metadata for '%s' "
@@ -975,9 +974,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
 			auto sum_count = sum_null_count_cols.find(column);
 			if (sum_count != sum_null_count_cols.end()) {
-				updated_column_expressions[raw_column] =
-				    BuildNullableSum(BuildUpdatedAggregateColumn(column),
-				                     BuildUpdatedAggregateColumn(sum_count->second));
+				updated_column_expressions[raw_column] = BuildNullableSum(
+				    BuildUpdatedAggregateColumn(column), BuildUpdatedAggregateColumn(sum_count->second));
 				inserted_column_expressions[raw_column] = BuildNullableSum("d." + column, "d." + sum_count->second);
 			} else if (insert_only && agg_type == "min") {
 				updated_column_expressions[raw_column] = BuildNullSafeExtremumUpdate(column, "LEAST");
