@@ -12,14 +12,28 @@ interval.
 
 ## Delta table safety
 
-Each delta table has a per-delta-table mutex. The insert rule acquires the delta lock
-when writing DML-triggered rows into a delta table. This prevents concurrent INSERTs
-from interleaving delta rows in a way that breaks timestamp ordering.
+Native delta writers and refreshes coordinate through a phase gate per catalog. A
+writer reserves its delta relation for the lifetime of the caller transaction.
+A refresh atomically reserves its complete source set after existing writers drain,
+which prevents a multi-source refresh from deadlocking through lock-order inversion.
+Once a refresh is waiting, existing writer transactions may extend their write set
+but new writers for the reserved sources wait.
+
+Refreshes that share a delta relation additionally use a per-delta mutex while
+consuming and checkpointing it. Relation lock identities include catalog and schema,
+so unrelated same-named objects do not serialize.
+
+An explicit transaction retains its view, phase-gate, and delta locks until commit
+or rollback. A transaction that already owns a refresh is rejected with a
+serialization error if a later write would wait on another refresh and create a
+cycle; the caller can retry either transaction.
 
 ## Snapshot isolation
 
-Refresh executes SQL through a separate `Connection` from the user's session. DuckDB
-provides snapshot isolation per transaction, so:
+Autocommit refresh executes through a locked helper connection. Refresh inside an
+explicit transaction compiles metadata through a helper but executes the generated
+program in the caller transaction, so transaction-local DML and MV lifecycle changes
+remain visible and atomic. DuckDB snapshot isolation ensures:
 
 - The refresh reads a consistent snapshot of base tables and delta tables
 - Concurrent DML by other connections does not affect the in-progress refresh
@@ -51,8 +65,11 @@ Anchoring `last_update` to the maximum timestamp we *actually* processed elimina
 
 | Lock | Scope | Held during | Used by |
 |---|---|---|---|
-| View mutex | Per view name | Entire refresh cycle | `PRAGMA refresh()`, refresh daemon |
-| Delta mutex | Per delta table name | Delta row insertion | Insert rule (DML triggers) |
-| Map mutex | Global (static) | Mutex map lookup | Internal — protects the mutex maps |
+| View mutex | Per catalog/schema/view identity | Entire refresh or lifecycle operation | `PRAGMA refresh()`, lifecycle DDL, refresh daemon |
+| Catalog phase gate | Per source catalog and schema-qualified delta identity | Writer or refresh transaction | DML delta capture, refresh |
+| Delta mutex | Per catalog/schema/delta identity | Delta consumption and checkpoint | Overlapping refreshes |
+| Map mutex | Global (static) | Lock-map lookup | Internal — protects the lock maps |
 
-All locks are non-recursive mutexes. The view mutex is the outermost lock.
+View locks are acquired before source metadata is read. Refreshes then reserve their
+complete phase-gate sets before taking sorted delta mutexes. Transactional lock state
+retains those guards through commit or rollback.

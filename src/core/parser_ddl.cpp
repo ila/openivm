@@ -12,6 +12,7 @@
 #include "duckdb/planner/binder.hpp"
 
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <unordered_set>
 
@@ -25,10 +26,16 @@ static const vector<string> &TransactionalMetadataTables() {
 	return tables;
 }
 
-static bool ReferencesTransactionalMetadata(const string &statement) {
-	auto lower = StringUtil::Lower(statement);
+static bool HasMetadataTarget(const string &statement, const string &prefix) {
+	if (!StringUtil::StartsWith(statement, prefix)) {
+		return false;
+	}
+	auto target = statement.substr(prefix.size());
 	for (auto &table : TransactionalMetadataTables()) {
-		if (lower.find(StringUtil::Lower(table)) != string::npos) {
+		auto table_name = StringUtil::Lower(table);
+		if (StringUtil::StartsWith(target, table_name) &&
+		    (target.size() == table_name.size() ||
+		     std::isspace(static_cast<unsigned char>(target[table_name.size()])) || target[table_name.size()] == '(')) {
 			return true;
 		}
 	}
@@ -39,10 +46,21 @@ static bool IsReplayableMetadataStatement(const string &statement) {
 	auto trimmed = statement;
 	StringUtil::Trim(trimmed);
 	auto lower = StringUtil::Lower(trimmed);
-	return ReferencesTransactionalMetadata(lower) &&
-	       (StringUtil::StartsWith(lower, "create table") || StringUtil::StartsWith(lower, "alter table") ||
-	        StringUtil::StartsWith(lower, "insert ") || StringUtil::StartsWith(lower, "update ") ||
-	        StringUtil::StartsWith(lower, "delete "));
+	static const vector<string> prefixes = {
+	    "create table if not exists ",
+	    "alter table ",
+	    "insert or replace into ",
+	    "insert or ignore into ",
+	    "insert into ",
+	    "update ",
+	    "delete from ",
+	};
+	for (auto &prefix : prefixes) {
+		if (HasMetadataTarget(lower, prefix)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static string MakeTemporaryMetadataDDL(const string &statement) {
@@ -502,7 +520,9 @@ optional_ptr<TransactionalMVMetadataState> TransactionalMVMetadataState::TryGet(
 	return context.registered_state->Get<TransactionalMVMetadataState>("openivm_transactional_mv_metadata");
 }
 
-void TransactionalMVMetadataState::Register(ClientContext &context, const vector<Value> &parameters) {
+void TransactionalMVMetadataState::Register(ClientContext &context, const vector<Value> &parameters,
+                                            const string &view_name) {
+	view_names.insert(view_name);
 	auto transaction_timestamp = context.transaction.ActiveTransaction().GetCurrentTransactionStartTimestamp();
 	// Delta-table DEFAULT now() is transaction-stable. Compile from one
 	// microsecond before it so rows inserted into a newly created MV delta
@@ -518,7 +538,8 @@ void TransactionalMVMetadataState::Register(ClientContext &context, const vector
 	}
 }
 
-void TransactionalMVMetadataState::RegisterSQL(const string &sql) {
+void TransactionalMVMetadataState::RegisterSQL(const string &sql, const string &view_name) {
+	view_names.insert(view_name);
 	for (auto &statement : StringUtil::Split(sql, ";\n")) {
 		if (IsReplayableMetadataStatement(statement)) {
 			statements.push_back(std::move(statement));
@@ -542,7 +563,22 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 			                       result->GetError());
 		}
 	}
+	string view_filter;
+	for (auto &view_name : view_names) {
+		if (!view_filter.empty()) {
+			view_filter += ", ";
+		}
+		view_filter += "'" + SqlUtils::EscapeValue(view_name) + "'";
+	}
 	for (auto &table : TransactionalMetadataTables()) {
+		string filter;
+		if (!view_filter.empty()) {
+			if (table == openivm::MV_DEPS_TABLE) {
+				filter = " WHERE child_view IN (" + view_filter + ") OR parent_view IN (" + view_filter + ")";
+			} else {
+				filter = " WHERE view_name IN (" + view_filter + ")";
+			}
+		}
 		bool has_constrained_schema = false;
 		for (auto &statement : statements) {
 			auto lower = StringUtil::Lower(statement);
@@ -554,12 +590,12 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		if (has_constrained_schema) {
 			// Seed the constrained shadow with committed rows. A missing durable
 			// table is expected for the first MV in a database.
-			connection.Query("INSERT OR IGNORE INTO " + table + " BY NAME SELECT * FROM main." + table);
+			connection.Query("INSERT OR IGNORE INTO " + table + " BY NAME SELECT * FROM main." + table + filter);
 		} else {
 			// Less central metadata (for example optional dependency state) may
 			// be initialized outside the lifecycle program. Still shadow it so
 			// replay can never mutate the durable helper-connection catalog.
-			connection.Query("CREATE TEMP TABLE IF NOT EXISTS " + table + " AS SELECT * FROM main." + table);
+			connection.Query("CREATE TEMP TABLE IF NOT EXISTS " + table + " AS SELECT * FROM main." + table + filter);
 		}
 	}
 	for (auto &statement : statements) {
@@ -583,6 +619,7 @@ void TransactionalMVMetadataState::TransactionRollback(MetaTransaction &transact
 
 void TransactionalMVMetadataState::Clear() {
 	statements.clear();
+	view_names.clear();
 }
 
 string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace) {

@@ -24,6 +24,7 @@
 #include "duckdb/transaction/transaction_context.hpp"
 
 #include <condition_variable>
+#include <array>
 
 namespace duckdb {
 
@@ -111,7 +112,9 @@ public:
 		if (state.entered_write_phase) {
 			return;
 		}
-		EnterDeltaWritePhase(context, delta_table.catalog, delta_table.name);
+		auto identity =
+		    RefreshLocks::RelationIdentity(delta_table.catalog.GetName(), delta_table.schema.name, delta_table.name);
+		EnterDeltaWritePhase(context, delta_table.catalog, identity);
 		state.entered_write_phase = true;
 	}
 
@@ -283,15 +286,34 @@ private:
 	vector<StorageIndex> column_ids;
 };
 
-static idx_t SelectUnseenRows(DataChunk &input, idx_t row_id_index, unordered_set<row_t> &captured_row_ids,
-                              SelectionVector &selection, DataChunk &selected_input) {
+static constexpr idx_t ROW_ID_DEDUP_SHARDS = 16;
+
+struct RowIdDedupShard {
+	mutex lock;
+	unordered_set<row_t> captured_row_ids;
+};
+
+static idx_t SelectUnseenRows(DataChunk &input, idx_t row_id_index, array<RowIdDedupShard, ROW_ID_DEDUP_SHARDS> &shards,
+                              array<vector<idx_t>, ROW_ID_DEDUP_SHARDS> &candidates, SelectionVector &selection,
+                              DataChunk &selected_input) {
 	auto &row_ids = input.data[row_id_index];
 	row_ids.Flatten(input.size());
 	auto row_id_data = FlatVector::GetData<row_t>(row_ids);
-	idx_t selected_count = 0;
+	for (auto &candidate_rows : candidates) {
+		candidate_rows.clear();
+	}
 	for (idx_t row = 0; row < input.size(); row++) {
-		if (captured_row_ids.insert(row_id_data[row]).second) {
-			selection.set_index(selected_count++, row);
+		auto shard = static_cast<idx_t>(std::hash<row_t> {}(row_id_data[row])) % ROW_ID_DEDUP_SHARDS;
+		candidates[shard].push_back(row);
+	}
+	idx_t selected_count = 0;
+	for (idx_t shard_index = 0; shard_index < ROW_ID_DEDUP_SHARDS; shard_index++) {
+		auto &shard = shards[shard_index];
+		lock_guard<mutex> guard(shard.lock);
+		for (auto row : candidates[shard_index]) {
+			if (shard.captured_row_ids.insert(row_id_data[row]).second) {
+				selection.set_index(selected_count++, row);
+			}
 		}
 	}
 	if (selected_count == 0) {
@@ -307,8 +329,7 @@ static idx_t SelectUnseenRows(DataChunk &input, idx_t row_id_index, unordered_se
 
 class TransactionalDeltaCaptureGlobalState : public GlobalOperatorState {
 public:
-	mutex lock;
-	unordered_set<row_t> captured_row_ids;
+	array<RowIdDedupShard, ROW_ID_DEDUP_SHARDS> shards;
 };
 
 class TransactionalDeltaCaptureLocalState : public OperatorState {
@@ -342,6 +363,7 @@ public:
 	DataChunk new_rows;
 	SelectionVector selection;
 	ColumnFetchState fetch_state;
+	array<vector<idx_t>, ROW_ID_DEDUP_SHARDS> dedup_candidates;
 };
 
 class PhysicalTransactionalDeltaCapture : public PhysicalOperator {
@@ -412,13 +434,11 @@ private:
 		D_ASSERT(row_id_index.IsValid());
 		state.selected_input.Reset();
 		idx_t selected_count;
-		{
-			// Only row-id deduplication is shared. Fetching preimages, evaluating
-			// UPDATE expressions, and constructing delta chunks remain parallel.
-			lock_guard<mutex> guard(gstate.lock);
-			selected_count = SelectUnseenRows(input, row_id_index.GetIndex(), gstate.captured_row_ids, state.selection,
-			                                  state.selected_input);
-		}
+		// Only row-id deduplication is shared. Sharding keeps disjoint chunks from
+		// serializing behind one global mutex; preimage fetch and expression work
+		// remain parallel.
+		selected_count = SelectUnseenRows(input, row_id_index.GetIndex(), gstate.shards, state.dedup_candidates,
+		                                  state.selection, state.selected_input);
 		if (selected_count == 0) {
 			return;
 		}
@@ -621,7 +641,7 @@ public:
 
 	unique_ptr<GlobalSinkState> child_state;
 	shared_ptr<MergeDeltaCaptureExecutionState> execution_state;
-	unordered_set<row_t> captured_delete_insert_row_ids;
+	array<RowIdDedupShard, ROW_ID_DEDUP_SHARDS> delete_insert_shards;
 };
 
 class MergeActionDeltaCaptureLocalState : public LocalSinkState {
@@ -668,6 +688,7 @@ public:
 	Vector fetch_row_ids;
 	ColumnFetchState fetch_state;
 	vector<row_t> reserved_row_ids;
+	array<vector<idx_t>, ROW_ID_DEDUP_SHARDS> dedup_candidates;
 	bool prepared_for_input = false;
 };
 
@@ -830,8 +851,8 @@ private:
 	                             MergeActionDeltaCaptureGlobalState &gstate,
 	                             MergeActionDeltaCaptureLocalState &lstate) const {
 		lstate.selected_input.Reset();
-		auto selected_count = SelectUnseenRows(input, row_id_index, gstate.captured_delete_insert_row_ids,
-		                                       lstate.selection, lstate.selected_input);
+		auto selected_count = SelectUnseenRows(input, row_id_index, gstate.delete_insert_shards,
+		                                       lstate.dedup_candidates, lstate.selection, lstate.selected_input);
 		lstate.pending_new_rows.Reset();
 		if (selected_count == 0) {
 			return;

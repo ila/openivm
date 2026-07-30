@@ -118,23 +118,28 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
                               const string &attached_db_schema_name, bool skip_empty_refresh) {
 	RefreshProfiler profiler(context, vn);
 	auto lock_start = std::chrono::steady_clock::now();
+	auto view_lock_name = RefreshLocks::RelationIdentity(view_catalog_name, view_schema_name, vn);
+	ViewLockGuard view_guard(view_lock_name);
 	Connection probe_con(*context.db.get());
 	RefreshMetadata probe_meta(probe_con);
 	auto delta_sources = probe_meta.GetDeltaSources(vn, view_catalog_name, view_schema_name);
 	vector<string> delta_table_names;
 	delta_table_names.reserve(delta_sources.size());
+	vector<string> delta_lock_names;
+	delta_lock_names.reserve(delta_sources.size() + 1);
 
 	// Enter the refresh phase for every native source catalog before inspecting delta activity.
 	// Writers enter the complementary phase through the actual delta table catalog, so this also
 	// covers views whose target and source catalogs differ.
 	map<string, vector<string>> source_deltas_by_catalog;
 	for (auto &source : delta_sources) {
+		auto identity = RefreshLocks::RelationIdentity(source.catalog_name, source.schema_name, source.table_name);
 		delta_table_names.push_back(source.table_name);
+		delta_lock_names.push_back(identity);
 		if (source.catalog_type != "ducklake") {
-			source_deltas_by_catalog[source.catalog_name].push_back(source.table_name);
+			source_deltas_by_catalog[source.catalog_name].push_back(identity);
 		}
 	}
-	ViewLockGuard view_guard(vn);
 	vector<unique_ptr<DeltaCatalogRefreshGuard>> delta_catalog_guards;
 	for (auto &entry : source_deltas_by_catalog) {
 		auto &names = entry.second;
@@ -149,12 +154,12 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 	// the second tx tries to delete rows the first already processed). Sorting
 	// guarantees the same acquisition order across all views, so no deadlock is
 	// possible between concurrent refreshes.
-	auto delta_lock_names = delta_table_names;
 	if (probe_meta.HasDownstreamViews(vn)) {
 		// A parent refresh produces this delta while a child refresh consumes it.
 		// Put both operations under the same table lock so a child cannot advance
 		// its watermark past an uncommitted parent delta.
-		delta_lock_names.push_back(SqlUtils::DeltaName(vn));
+		delta_lock_names.push_back(
+		    RefreshLocks::RelationIdentity(view_catalog_name, view_schema_name, SqlUtils::DeltaName(vn)));
 	}
 	vector<unique_ptr<DeltaLockGuard>> delta_guards;
 	std::sort(delta_lock_names.begin(), delta_lock_names.end());
@@ -625,6 +630,20 @@ string TransactionalRefreshQuery(ClientContext &context, const FunctionParameter
 	string attached_db_schema_name;
 	string view_name;
 	bool cross_system = false;
+	if (parameters.values.size() != 1 && parameters.values.size() != 3 && parameters.values.size() != 5) {
+		throw InvalidInputException("OpenIVM refresh received an unsupported argument list");
+	}
+	view_name = StringValue::Get(parameters.values.back());
+	if (parameters.values.size() >= 3) {
+		view_catalog_name = StringValue::Get(parameters.values[0]);
+		view_schema_name = StringValue::Get(parameters.values[1]);
+	} else {
+		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
+		view_catalog_name = default_entry.catalog;
+		view_schema_name = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
+	}
+	auto root_lock_identity = RefreshLocks::RelationIdentity(view_catalog_name, view_schema_name, view_name);
+	TransactionalMVLockState::Get(context).Acquire({root_lock_identity}, {});
 	Connection metadata_con(*context.db);
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(metadata_con);
@@ -647,8 +666,6 @@ string TransactionalRefreshQuery(ClientContext &context, const FunctionParameter
 		view_catalog_name = resolved.view_catalog_name;
 		view_schema_name = resolved.view_schema_name;
 		cross_system = resolved.cross_system;
-	} else {
-		throw InvalidInputException("OpenIVM refresh received an unsupported argument list");
 	}
 	if (RefreshMetadata(metadata_con).GetViewQuery(view_name).empty()) {
 		throw CatalogException("Materialized view '%s' does not exist", view_name);
@@ -703,16 +720,18 @@ string TransactionalRefreshQuery(ClientContext &context, const FunctionParameter
 			    "Transactional native refresh cannot include cross-catalog dependent view '%s'", node);
 		}
 		ordered_nodes.push_back(node);
-		lock_views.push_back(node);
+		lock_views.push_back(RefreshLocks::RelationIdentity(location.catalog_name, location.schema_name, node));
 		auto node_sources = metadata.GetDeltaSources(node, location.catalog_name, location.schema_name);
 		for (auto &source : node_sources) {
-			lock_deltas.push_back(source.table_name);
+			auto identity = RefreshLocks::RelationIdentity(source.catalog_name, source.schema_name, source.table_name);
+			lock_deltas.push_back(identity);
 			if (source.catalog_type != "ducklake") {
-				gate_targets.push_back({&Catalog::GetCatalog(context, source.catalog_name), source.table_name});
+				gate_targets.push_back({&Catalog::GetCatalog(context, source.catalog_name), identity});
 			}
 		}
 		if (metadata.HasDownstreamViews(node)) {
-			lock_deltas.push_back(SqlUtils::DeltaName(node));
+			lock_deltas.push_back(
+			    RefreshLocks::RelationIdentity(location.catalog_name, location.schema_name, SqlUtils::DeltaName(node)));
 		}
 	}
 	// GenerateRefreshSQL consults the caller context and can establish its

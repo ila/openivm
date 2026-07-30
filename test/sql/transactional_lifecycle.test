@@ -160,6 +160,95 @@ SELECT count(*) FROM (
 ----
 0
 
+# Metadata replay is based on the statement target, not literals in a valid
+# backing-table query.
+statement ok
+CREATE TABLE lifecycle_metadata_literal_src (id INTEGER);
+
+statement ok
+INSERT INTO lifecycle_metadata_literal_src VALUES (1);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_metadata_literal_mv AS
+SELECT id, 'openivm_views' AS marker FROM lifecycle_metadata_literal_src;
+
+statement ok
+INSERT INTO lifecycle_metadata_literal_src VALUES (2);
+
+statement ok
+PRAGMA refresh('lifecycle_metadata_literal_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_metadata_literal_mv
+    EXCEPT ALL
+    SELECT id, 'openivm_views' AS marker FROM lifecycle_metadata_literal_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, 'openivm_views' AS marker FROM lifecycle_metadata_literal_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_metadata_literal_mv
+);
+----
+0
+
+statement ok
+COMMIT;
+
+# Native source deltas live beside the source, including non-default schemas.
+statement ok
+CREATE SCHEMA lifecycle_alt;
+
+statement ok
+CREATE TABLE lifecycle_alt.drop_src (id INTEGER);
+
+statement ok
+INSERT INTO lifecycle_alt.drop_src VALUES (1), (2);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_alt_drop_mv AS
+SELECT id FROM lifecycle_alt.drop_src;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_alt_drop_mv
+    EXCEPT ALL
+    SELECT * FROM lifecycle_alt.drop_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_alt.drop_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_alt_drop_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_schema = 'lifecycle_alt' AND table_name = 'openivm_delta_drop_src';
+----
+1
+
+statement ok
+DROP VIEW lifecycle_alt_drop_mv;
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_schema = 'lifecycle_alt' AND table_name = 'openivm_delta_drop_src';
+----
+0
+
 # A schema-qualified DROP of an ordinary same-named view must not clean up the
 # tracked MV in another schema. Metadata currently uses a bare view name, so
 # cleanup must first prove the exact catalog entry is OpenIVM's generated view.

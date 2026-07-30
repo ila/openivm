@@ -44,6 +44,8 @@ struct DeltaGateTarget {
 
 class RefreshLocks {
 public:
+	static string RelationIdentity(const string &catalog_name, const string &schema_name, const string &relation_name);
+
 	// --- View-level locks (prevent concurrent refresh of same MV) ---
 
 	// Blocking lock — used by PRAGMA refresh() (user explicitly wants to refresh, so wait).

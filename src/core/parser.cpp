@@ -1610,19 +1610,34 @@ string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionPara
 	}
 	auto view_name = dynamic_cast<MaterializedViewParseData &>(*parse_result.parse_data).target_name;
 	auto lock_view_name = SqlUtils::LastIdentifierPart(view_name);
+	auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
+	string lock_catalog = default_entry.catalog;
+	string lock_schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
+	auto raw_prefix_end = view_name.rfind('.');
+	if (raw_prefix_end != string::npos) {
+		auto raw_prefix = view_name.substr(0, raw_prefix_end);
+		auto catalog_end = raw_prefix.rfind('.');
+		if (catalog_end == string::npos) {
+			lock_catalog = raw_prefix;
+		} else {
+			lock_catalog = raw_prefix.substr(0, catalog_end);
+			lock_schema = raw_prefix.substr(catalog_end + 1);
+		}
+	}
+	auto lock_identity = RefreshLocks::RelationIdentity(lock_catalog, lock_schema, lock_view_name);
 	auto plan_result =
 	    MaterializedViewParserExtension::PlanFunction(nullptr, context, std::move(parse_result.parse_data));
 	if (plan_result.function.name == OPENIVM_TRANSACTIONAL_DDL_FUNCTION) {
 		if (!lock_view_name.empty()) {
-			TransactionalMVLockState::Get(context).Acquire({lock_view_name}, {});
+			TransactionalMVLockState::Get(context).Acquire({lock_identity}, {});
 		}
 		if (!context.transaction.IsAutoCommit()) {
-			TransactionalMVMetadataState::Get(context).Register(context, plan_result.parameters);
+			TransactionalMVMetadataState::Get(context).Register(context, plan_result.parameters, lock_view_name);
 		}
 		return RenderTransactionalDDL(context, plan_result.parameters);
 	}
 	if (!lock_view_name.empty()) {
-		ViewLockGuard view_guard(lock_view_name);
+		ViewLockGuard view_guard(lock_identity);
 		ExecuteStagedDDL(context, plan_result.parameters);
 	} else {
 		ExecuteStagedDDL(context, plan_result.parameters);
@@ -1713,7 +1728,7 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	}
 
 	RefreshMetadata metadata(con);
-	auto delta_tables = metadata.GetDeltaTables(drop.info->name);
+	auto delta_sources = metadata.GetDeltaSources(drop.info->name, catalog_name, schema_name);
 	auto last_separator = data_table_ref.rfind('.');
 	string internal_prefix =
 	    last_separator == string::npos ? "" : data_table_ref.substr(0, static_cast<size_t>(last_separator + 1));
@@ -1725,27 +1740,33 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	program += "DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	           SqlUtils::EscapeValue(drop.info->name) + "';\n";
 
-	for (auto &delta_table : delta_tables) {
-		if (metadata.IsDuckLakeTable(drop.info->name, delta_table)) {
+	vector<string> delta_lock_names;
+	vector<DeltaGateTarget> gate_targets;
+	for (auto &source : delta_sources) {
+		auto identity = RefreshLocks::RelationIdentity(source.catalog_name, source.schema_name, source.table_name);
+		delta_lock_names.push_back(identity);
+		if (source.catalog_type == "ducklake") {
 			continue;
 		}
-		auto remaining = con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) +
-		                           " WHERE table_name = '" + SqlUtils::EscapeValue(delta_table) + "'");
+		auto remaining =
+		    con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
+		              SqlUtils::EscapeValue(source.table_name) + "' AND COALESCE(source_catalog, '') = '" +
+		              SqlUtils::EscapeValue(source.catalog_name) + "' AND COALESCE(source_schema, '') = '" +
+		              SqlUtils::EscapeValue(source.schema_name) + "'");
 		if (!remaining->HasError() && remaining->RowCount() > 0 && remaining->GetValue(0, 0).GetValue<int64_t>() == 1) {
-			program +=
-			    "DROP TABLE IF EXISTS " + internal_prefix + KeywordHelper::WriteOptionallyQuoted(delta_table) + ";\n";
+			program += "DROP TABLE IF EXISTS " +
+			           SqlUtils::FullName(source.catalog_name, source.schema_name, source.table_name) + ";\n";
 		}
+		gate_targets.push_back({&Catalog::GetCatalog(context, source.catalog_name), identity});
 	}
 	auto view_delta_table = SqlUtils::DeltaName(drop.info->name);
-	delta_tables.push_back(view_delta_table);
-	auto &catalog = Catalog::GetCatalog(context, catalog_name);
-	vector<DeltaGateTarget> gate_targets;
-	for (auto &delta_table : delta_tables) {
-		gate_targets.push_back({&catalog, delta_table});
-	}
-	TransactionalMVLockState::Get(context).Acquire({drop.info->name}, delta_tables, gate_targets);
+	auto view_delta_identity = RefreshLocks::RelationIdentity(catalog_name, schema_name, view_delta_table);
+	delta_lock_names.push_back(view_delta_identity);
+	gate_targets.push_back({&Catalog::GetCatalog(context, catalog_name), view_delta_identity});
+	auto view_lock_identity = RefreshLocks::RelationIdentity(catalog_name, schema_name, drop.info->name);
+	TransactionalMVLockState::Get(context).Acquire({view_lock_identity}, delta_lock_names, gate_targets);
 	if (!context.transaction.IsAutoCommit()) {
-		TransactionalMVMetadataState::Get(context).RegisterSQL(program);
+		TransactionalMVMetadataState::Get(context).RegisterSQL(program, drop.info->name);
 	}
 	return program;
 }

@@ -283,15 +283,24 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 	}
 	auto &info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
 	string lc = StringUtil::Lower(info.table_name);
-	if (facts.ducklake_table_info.find(lc) != facts.ducklake_table_info.end()) {
-		return;
-	}
 	string cat = info.table.ParentCatalog().GetName();
 	if (cat.empty()) {
 		if (current_catalog.empty()) {
 			throw CatalogException("Could not resolve DuckLake catalog for table '" + info.table_name + "'");
 		}
 		cat = current_catalog;
+	}
+	auto existing = facts.ducklake_table_info.find(lc);
+	if (existing != facts.ducklake_table_info.end()) {
+		if (!StringUtil::CIEquals(existing->second.catalog_name, cat) ||
+		    !StringUtil::CIEquals(existing->second.schema_name, info.table.schema.name) ||
+		    existing->second.table_id != static_cast<int64_t>(info.table_id.index)) {
+			throw NotImplementedException(
+			    "DuckLake materialized views cannot reference different source tables with the same unqualified "
+			    "name '%s'; rename one source before creating the materialized view",
+			    info.table_name);
+		}
+		return;
 	}
 	DuckLakeSourceTableInfo source_info;
 	source_info.table_name = info.table_name;
@@ -592,11 +601,6 @@ static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t 
 		                              depth + 1);
 	}
 	return false;
-}
-
-bool RelationExists(Connection &con, const string &qualified_name) {
-	auto result = con.Query("SELECT * FROM " + qualified_name + " LIMIT 0");
-	return !result->HasError();
 }
 
 static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,

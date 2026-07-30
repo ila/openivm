@@ -130,7 +130,14 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
 - [ ] **Consolidate projection deletes once.** The projection path builds the same grouped/ranked net delta independently for
   DELETE and INSERT. Materialize or share the consolidated batch.
 - [ ] **Carry delta activity through the full refresh.** Activity checks, join-term selection, max timestamp lookup, and cleanup
-  repeatedly scan the same delta tables. Capture count/delete/watermark information once per transaction.
+  repeatedly scan the same delta tables. Capture count/delete/watermark information once per transaction. Explicit caller
+  transactions currently remain conservative because query-pragma preprocessing cannot observe the caller's local delta
+  rows or retain a reliable activity signal; solve this at the planned native refresh operator boundary rather than with
+  process-global transaction registries.
+- [ ] **Share repeated LEFT JOIN transition-count subplans deliberately.** Applying DuckDB's common-subplan optimizer to the
+  complete post-delta plan is not safe: it changed `left_join_emptied_group` results in the full suite. Build one explicit
+  transition relation per nullable source/key and reference it from the relevant inclusion-exclusion terms while preserving
+  each term's bindings and snapshot semantics.
 - [ ] **Price actual join work in the adaptive model.** The model counts exponential terms but underprices copied plan nodes,
   base-leaf appearances, compilation work, and generated SQL size.
 - [ ] **Remove the fake `ConstraintCache` or make it a cache.** It repopulates a map that no read path consumes, while FK cost
@@ -138,6 +145,9 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
 - [ ] **Audit edge-case tests and mirror them in the rewriter benchmark.** Review the SQL harness for missing boundary and
   transition cases, add deterministic bidirectional `EXCEPT ALL` coverage, and add representative cases to the rewriter
   benchmark so real refresh compilation and execution exercise the same semantics.
+- [ ] **Add test-only concurrency barriers.** Several SQL concurrency regressions still coordinate with bounded sleeps.
+  Introduce a deterministic handshake that can prove a writer or refresh reached a phase-gate state without exposing a
+  production pragma, then replace the timing assumptions in lifecycle and lock-cycle tests.
 
 ## Target refresh flow
 

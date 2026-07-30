@@ -5,6 +5,8 @@
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 
+#include <unordered_set>
+
 namespace duckdb {
 
 struct DropInfo;
@@ -28,8 +30,8 @@ public:
 	static TransactionalMVMetadataState &Get(ClientContext &context);
 	static optional_ptr<TransactionalMVMetadataState> TryGet(ClientContext &context);
 
-	void Register(ClientContext &context, const vector<Value> &parameters);
-	void RegisterSQL(const string &sql);
+	void Register(ClientContext &context, const vector<Value> &parameters, const string &view_name);
+	void RegisterSQL(const string &sql, const string &view_name);
 	void Apply(Connection &connection) const;
 
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
@@ -39,6 +41,7 @@ private:
 	void Clear();
 
 	vector<string> statements;
+	unordered_set<string> view_names;
 };
 
 void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result,
