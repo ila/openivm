@@ -109,8 +109,10 @@ bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t grou
 string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
                                       const vector<string> &output_names, const string &view_name,
                                       vector<string> &preserved_cols, const string &delta_view_catalog_prefix = "",
-                                      string *out_inner_table = nullptr, string *out_inner_key = nullptr,
-                                      string *out_pres_table = nullptr, string *out_pres_key = nullptr);
+                                      vector<string> *out_inner_tables = nullptr,
+                                      vector<string> *out_inner_keys = nullptr,
+                                      vector<string> *out_pres_tables = nullptr,
+                                      vector<string> *out_pres_keys = nullptr);
 bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts);
 bool RelationExists(Connection &con, const string &qualified_name);
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
@@ -126,6 +128,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                RefreshMetadata::ProjectionKeyLineage &out);
+bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out);
 bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinNullableSources &out);
 bool QueryNeedsOriginalSqlForLpts(const string &query);
 bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op);

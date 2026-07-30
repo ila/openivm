@@ -537,7 +537,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               bool inline_cascade_delta, bool *out_handled_cascade_delta,
                               const unordered_map<string, string> &derived_output_expressions,
                               bool derived_output_expressions_complete,
-                              const vector<string> &preserved_side_cols, bool *out_used_group_recompute) {
+                              const vector<string> &preserved_side_cols, bool *out_used_group_recompute,
+                              bool force_group_recompute) {
 	if (out_used_group_recompute) {
 		*out_used_group_recompute = false;
 	}
@@ -596,12 +597,15 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// This is correct for VARCHAR literals, string functions of group keys, LIST
 	// aggregates, and CASE over aggregates alike. Slower than MERGE, faster than
 	// full recompute (only affected groups are re-evaluated).
-	bool needs_group_recompute = false;
+	bool needs_group_recompute = !non_summable_columns.empty() || force_group_recompute;
 	if (insert_only && has_minmax && !derived_output_expressions_complete) {
 		needs_group_recompute = true;
 		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] incomplete derived-output metadata for '%s' "
 		                    "→ group-recompute\n",
 		                    view_name.c_str());
+	}
+	if (force_group_recompute) {
+		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] caller requires affected-group recompute\n");
 	}
 
 	auto decomp = DetectDerivedAggColumns(aggregates);

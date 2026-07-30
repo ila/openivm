@@ -1158,6 +1158,27 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 	return false;
 }
 
+bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out) {
+	for (auto *join : facts.comparison_joins) {
+		if (!join || join->join_type != JoinType::LEFT || join->conditions.empty()) {
+			continue;
+		}
+		auto *preserved_key = GetColumnRefThroughCasts(join->conditions[0].left.get());
+		if (!preserved_key) {
+			return false;
+		}
+		OccurrenceColumnRef source;
+		if (!ResolveBindingToOccurrenceRef(preserved_key->binding, facts, source)) {
+			return false;
+		}
+		out.table = source.table;
+		out.occurrence = source.occurrence;
+		out.column = source.column;
+		return true;
+	}
+	return false;
+}
+
 static string NullableGetTableName(LogicalGet &get) {
 	auto table = get.GetTable();
 	if (table.get() && !table.get()->name.empty()) {
@@ -2062,6 +2083,13 @@ static std::set<idx_t> ComputeNullTablesForLevel(const CreateMVPlanFacts &facts,
 // Secondary delta for ONE LEFT JOIN level. `level` indexes the emitted placeholders, and
 // `null_tables` is the set of base tables that read NULL in this level's null-padded row (see
 // ComputeNullTablesForLevel) which decides each aggregate's contribution.
+static bool IsUnfilteredGetSubtree(LogicalOperator *op) {
+	while (op && op->type == LogicalOperatorType::LOGICAL_PROJECTION && op->children.size() == 1) {
+		op = op->children[0].get();
+	}
+	return op && op->type == LogicalOperatorType::LOGICAL_GET;
+}
+
 static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateMVPlanFacts &facts,
                                              const vector<string> &output_names, const string &view_name,
                                              LogicalComparisonJoin *oj, size_t level,
@@ -2072,7 +2100,19 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	if (facts.aggregates.size() != 1) {
 		return "";
 	}
-	if (!oj || oj->join_type != JoinType::LEFT || oj->conditions.empty() || oj->children.size() != 2) {
+	if (!oj || oj->join_type != JoinType::LEFT || oj->conditions.size() != 1 || oj->children.size() != 2) {
+		return "";
+	}
+	// __newc below counts rows directly in the inner base table. A filter or any other
+	// cardinality-changing inner subtree (including a right-only ON predicate pushed below
+	// the join) would make that count differ from the actual join matches.
+	if (!IsUnfilteredGetSubtree(oj->children[1].get())) {
+		return "";
+	}
+	auto &condition = oj->conditions[0];
+	if (condition.comparison != ExpressionType::COMPARE_EQUAL ||
+	    condition.left->expression_class != ExpressionClass::BOUND_COLUMN_REF ||
+	    condition.right->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
 		return "";
 	}
 	// Every LEFT JOIN level needs the secondary, including a SINGLE left join whose preserved side is a
@@ -2088,8 +2128,8 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		return "";
 	}
 	// Deepest-join keys: condition.left = preserved side, condition.right = inner (null) side.
-	auto *pres_ref = GetColumnRefThroughCasts(oj->conditions[0].left.get());
-	auto *inner_ref = GetColumnRefThroughCasts(oj->conditions[0].right.get());
+	auto *pres_ref = &condition.left->Cast<BoundColumnRefExpression>();
+	auto *inner_ref = &condition.right->Cast<BoundColumnRefExpression>();
 	if (!pres_ref || !inner_ref) {
 		return "";
 	}
@@ -2334,13 +2374,13 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 // last line dropped that order from COUNT(o.oid) because the `⟕ l` level had no correction.
 //
 // The per-level SQL fragments are concatenated and the two source identities per level are stored as
-// index-aligned CSV lists, so refresh can resolve each level's placeholders independently (a regular
+// index-aligned arrays, so refresh can resolve each level's placeholders independently (a regular
 // table reads its delta table, a DuckLake table reads snapshot insertions/deletions).
 string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
                                       const vector<string> &output_names, const string &view_name,
                                       vector<string> &preserved_cols, const string &delta_view_catalog_prefix,
-                                      string *out_inner_table, string *out_inner_key, string *out_pres_table,
-                                      string *out_pres_key) {
+                                      vector<string> *out_inner_tables, vector<string> *out_inner_keys,
+                                      vector<string> *out_pres_tables, vector<string> *out_pres_keys) {
 	preserved_cols.clear();
 	string combined_sql;
 	vector<string> inner_tables, inner_keys, pres_tables, pres_keys;
@@ -2379,17 +2419,17 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 	if (combined_sql.empty()) {
 		return "";
 	}
-	if (out_inner_table) {
-		*out_inner_table = StringUtil::Join(inner_tables, ",");
+	if (out_inner_tables) {
+		*out_inner_tables = inner_tables;
 	}
-	if (out_inner_key) {
-		*out_inner_key = StringUtil::Join(inner_keys, ",");
+	if (out_inner_keys) {
+		*out_inner_keys = inner_keys;
 	}
-	if (out_pres_table) {
-		*out_pres_table = StringUtil::Join(pres_tables, ",");
+	if (out_pres_tables) {
+		*out_pres_tables = pres_tables;
 	}
-	if (out_pres_key) {
-		*out_pres_key = StringUtil::Join(pres_keys, ",");
+	if (out_pres_keys) {
+		*out_pres_keys = pres_keys;
 	}
 	return combined_sql;
 }

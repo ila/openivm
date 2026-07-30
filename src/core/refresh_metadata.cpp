@@ -1064,6 +1064,21 @@ string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &l
 	return json;
 }
 
+bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out) {
+	string json;
+	if (!ReadRefreshLineageEntry(con, view_name, "left_join_key_source", json)) {
+		return false;
+	}
+	return ExtractJsonString(json, "table", out.table) && ParseJsonIndex(json, "occ", out.occurrence) &&
+	       ExtractJsonString(json, "column", out.column);
+}
+
+string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source) {
+	return "{\"k\":\"left_join_key_source\",\"table\":" + SqlUtils::JsonQuote(source.table) +
+	       ",\"occ\":" + SqlUtils::JsonQuote(to_string(source.occurrence)) +
+	       ",\"column\":" + SqlUtils::JsonQuote(source.column) + "}";
+}
+
 string RefreshMetadata::LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src) {
 	string json = "{\"k\":\"left_join_nullable\",\"complete\":" + SqlUtils::JsonQuote(src.complete ? "true" : "false") +
 	              ",\"tables\":[";
@@ -1144,21 +1159,30 @@ bool RefreshMetadata::GetLeftJoinSecondaryMeta(const string &view_name, LeftJoin
 	if (!ExtractJsonString(json, "kind", kind) || kind != "leftjoin_secondary") {
 		return false;
 	}
-	ExtractJsonString(json, "preserved_cols", out.preserved_cols_csv);
-	ExtractJsonString(json, "inner_table", out.inner_table);
-	ExtractJsonString(json, "inner_key", out.inner_key);
-	ExtractJsonString(json, "pres_table", out.pres_table);
-	ExtractJsonString(json, "pres_key", out.pres_key);
+	auto extract_array_or_legacy_csv = [&](const string &array_key, const string &legacy_key, vector<string> &values) {
+		if (ExtractJsonStringArray(json, array_key, values)) {
+			return;
+		}
+		string legacy;
+		if (ExtractJsonString(json, legacy_key, legacy) && !legacy.empty()) {
+			values = StringUtil::Split(legacy, ',');
+		}
+	};
+	extract_array_or_legacy_csv("preserved_cols", "preserved_cols", out.preserved_cols);
+	extract_array_or_legacy_csv("inner_tables", "inner_table", out.inner_tables);
+	extract_array_or_legacy_csv("inner_keys", "inner_key", out.inner_keys);
+	extract_array_or_legacy_csv("pres_tables", "pres_table", out.pres_tables);
+	extract_array_or_legacy_csv("pres_keys", "pres_key", out.pres_keys);
 	return ExtractJsonString(json, "sql", out.sql);
 }
 
 string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta) {
 	return "{\"kind\":\"leftjoin_secondary\",\"sql\":" + SqlUtils::JsonQuote(meta.sql) +
-	       ",\"preserved_cols\":" + SqlUtils::JsonQuote(meta.preserved_cols_csv) +
-	       ",\"inner_table\":" + SqlUtils::JsonQuote(meta.inner_table) +
-	       ",\"inner_key\":" + SqlUtils::JsonQuote(meta.inner_key) +
-	       ",\"pres_table\":" + SqlUtils::JsonQuote(meta.pres_table) +
-	       ",\"pres_key\":" + SqlUtils::JsonQuote(meta.pres_key) + "}";
+	       ",\"preserved_cols\":" + SqlUtils::JsonArray(meta.preserved_cols) +
+	       ",\"inner_tables\":" + SqlUtils::JsonArray(meta.inner_tables) +
+	       ",\"inner_keys\":" + SqlUtils::JsonArray(meta.inner_keys) +
+	       ",\"pres_tables\":" + SqlUtils::JsonArray(meta.pres_tables) +
+	       ",\"pres_keys\":" + SqlUtils::JsonArray(meta.pres_keys) + "}";
 }
 
 vector<string> RefreshMetadata::ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta) {

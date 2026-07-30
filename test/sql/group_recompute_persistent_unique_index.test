@@ -43,6 +43,107 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# NULL group keys do not conflict in DuckDB UNIQUE indexes. Both the forced-full
+# and affected-group upsert forms must explicitly remove the old NULL-key row
+# before inserting its replacement.
+statement ok
+CREATE TABLE nullable_full_src (k INT, val INT);
+
+statement ok
+INSERT INTO nullable_full_src VALUES (NULL, 10), (1, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW nullable_full_mv AS
+    SELECT k, SUM(val) AS total FROM nullable_full_src GROUP BY k;
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+statement ok
+INSERT INTO nullable_full_src VALUES (NULL, 5), (1, 2);
+
+statement ok
+PRAGMA refresh('nullable_full_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM nullable_full_mv
+    EXCEPT ALL
+    SELECT k, SUM(val) FROM nullable_full_src GROUP BY k
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, SUM(val) FROM nullable_full_src GROUP BY k
+    EXCEPT ALL
+    SELECT * FROM nullable_full_mv
+);
+----
+0
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+statement ok
+CREATE TABLE nullable_gr_left (id INT, k INT);
+
+statement ok
+CREATE TABLE nullable_gr_right (id INT, val INT);
+
+statement ok
+INSERT INTO nullable_gr_left VALUES (1, NULL), (2, 1);
+
+statement ok
+INSERT INTO nullable_gr_right VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW nullable_gr_mv AS
+    SELECT l.k, COUNT(r.id) AS matches, SUM(r.val) AS total
+    FROM nullable_gr_left l LEFT JOIN nullable_gr_right r ON l.id = r.id
+    GROUP BY l.k;
+
+statement ok
+SET openivm_left_join_merge = false;
+
+statement ok
+INSERT INTO nullable_gr_right VALUES (1, 11), (2, 21);
+
+statement ok
+UPDATE nullable_gr_right SET val = 12 WHERE id = 1 AND val = 11;
+
+statement ok
+DELETE FROM nullable_gr_right WHERE id = 2 AND val = 20;
+
+statement ok
+PRAGMA refresh('nullable_gr_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM nullable_gr_mv
+    EXCEPT ALL
+    SELECT l.k, COUNT(r.id), SUM(r.val)
+    FROM nullable_gr_left l LEFT JOIN nullable_gr_right r ON l.id = r.id
+    GROUP BY l.k
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.k, COUNT(r.id), SUM(r.val)
+    FROM nullable_gr_left l LEFT JOIN nullable_gr_right r ON l.id = r.id
+    GROUP BY l.k
+    EXCEPT ALL
+    SELECT * FROM nullable_gr_mv
+);
+----
+0
+
+statement ok
+SET openivm_left_join_merge = true;
+
 # Reopen the database so the unique index is loaded from disk rather than built in this session.
 # Without this restart the bug does not reproduce.
 restart

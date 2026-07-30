@@ -885,6 +885,34 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		model_input.semi_anti_aux_candidate = &semi_anti_aux_candidate;
 	}
 	auto view_model = BuildDeltaViewModel(model_input);
+	string leftjoin_secondary_sql;
+	vector<string> leftjoin_preserved_cols;
+	vector<string> leftjoin_inner_tables, leftjoin_inner_keys, leftjoin_pres_tables, leftjoin_pres_keys;
+	if (view_model.type == RefreshType::AGGREGATE_GROUP && facts.analysis.found_left_join) {
+		// LPTS on the preserved subtree needs an active transaction for catalog access; the main
+		// create-time LPTS ran inside a transaction that was already rolled back above.
+		con.BeginTransaction();
+		try {
+			leftjoin_secondary_sql = BuildLeftJoinSecondaryDeltaSQL(
+			    *con.context, facts, output_names, view_name, leftjoin_preserved_cols, internal_catalog_prefix,
+			    &leftjoin_inner_tables, &leftjoin_inner_keys, &leftjoin_pres_tables, &leftjoin_pres_keys);
+		} catch (std::exception &ex) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT JOIN secondary-delta generation failed: %s\n", ex.what());
+			leftjoin_secondary_sql.clear();
+		} catch (...) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT JOIN secondary-delta generation failed with unknown exception\n");
+			leftjoin_secondary_sql.clear();
+		}
+		con.Rollback();
+		if (leftjoin_secondary_sql.empty()) {
+			// The aggregate MERGE requires the Larson & Zhou correction for null-padded row
+			// transitions. An incomplete correction is not optional: recompute only the groups
+			// reached from source deltas instead of silently applying incorrect arithmetic.
+			OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT JOIN secondary-delta unsupported; using GROUP_RECOMPUTE\n");
+			view_model.type = RefreshType::GROUP_RECOMPUTE;
+			view_model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
+		}
+	}
 	auto lineage_start = create_profile_now();
 	PopulateDeltaViewModelLineage(view_model, facts, output_names);
 	string lineage_json = BuildDeltaViewModelLineageJson(view_model);
@@ -1173,33 +1201,17 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	// LEFT JOIN pipeline secondary-delta (Larson & Zhou): generate the secondary-delta INSERT once at CREATE
 	// time and store it; refresh appends it between the primary-delta INSERT and the MERGE.
-	if (view_model.type == RefreshType::AGGREGATE_GROUP && facts.analysis.found_left_join) {
+	if (!leftjoin_secondary_sql.empty()) {
 		add_profile_marker("create_mv_leftjoin_secondary");
-		// LPTS on the preserved subtree needs an active transaction for catalog access; the main
-		// create-time LPTS ran inside a transaction that was already rolled back above.
-		con.BeginTransaction();
-		string sec_sql;
-		vector<string> preserved_cols;
-		string sec_inner_table, sec_inner_key, sec_pres_table, sec_pres_key;
-		try {
-			sec_sql = BuildLeftJoinSecondaryDeltaSQL(*con.context, facts, output_names, view_name, preserved_cols,
-			                                         internal_catalog_prefix, &sec_inner_table, &sec_inner_key,
-			                                         &sec_pres_table, &sec_pres_key);
-		} catch (...) {
-			sec_sql.clear();
-		}
-		con.Rollback();
-		if (!sec_sql.empty()) {
-			RefreshMetadata::LeftJoinSecondaryMeta sm;
-			sm.sql = sec_sql;
-			sm.preserved_cols_csv = StringUtil::Join(preserved_cols, ",");
-			sm.inner_table = sec_inner_table;
-			sm.inner_key = sec_inner_key;
-			sm.pres_table = sec_pres_table;
-			sm.pres_key = sec_pres_key;
-			aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
-			    "leftjoin_secondary_meta_json", RefreshMetadata::LeftJoinSecondaryMetaToJson(sm), view_name));
-		}
+		RefreshMetadata::LeftJoinSecondaryMeta sm;
+		sm.sql = leftjoin_secondary_sql;
+		sm.preserved_cols = leftjoin_preserved_cols;
+		sm.inner_tables = leftjoin_inner_tables;
+		sm.inner_keys = leftjoin_inner_keys;
+		sm.pres_tables = leftjoin_pres_tables;
+		sm.pres_keys = leftjoin_pres_keys;
+		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("leftjoin_secondary_meta_json",
+		                                                  RefreshMetadata::LeftJoinSecondaryMetaToJson(sm), view_name));
 	}
 
 	const auto &source_table_info = facts.source_table_info;

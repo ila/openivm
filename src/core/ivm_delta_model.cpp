@@ -624,8 +624,10 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
                                    const vector<string> &output_names) {
 	model.window_lineage_ops.clear();
 	model.has_projection_lineage = false;
+	model.has_left_join_key_source = false;
 	model.has_left_join_nullable = false;
 	model.projection_lineage = RefreshMetadata::ProjectionKeyLineage();
+	model.left_join_key_source = RefreshMetadata::LeftJoinKeySource();
 	model.left_join_nullable_sources = RefreshMetadata::LeftJoinNullableSources();
 	model.lineage_facts.clear();
 	for (auto &node : model.nodes) {
@@ -702,6 +704,16 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 		}
 	}
 	if (model.type == RefreshType::SIMPLE_PROJECTION && !analysis.found_full_outer) {
+		if (analysis.found_left_join && BuildLeftJoinKeySource(facts, model.left_join_key_source)) {
+			model.has_left_join_key_source = true;
+			DeltaLineageFact fact;
+			fact.kind = DeltaLineageKind::PROJECTION_KEY;
+			fact.source_table = model.left_join_key_source.table;
+			fact.source_occurrence = model.left_join_key_source.occurrence;
+			fact.source_column = model.left_join_key_source.column;
+			fact.output_column = openivm::LEFT_KEY_COL;
+			AddLineageFact(model, std::move(fact));
+		}
 		model.has_left_join_nullable = BuildLeftJoinNullableSources(facts, model.left_join_nullable_sources);
 	}
 	if (model.HasSemiAntiAux()) {
@@ -724,6 +736,9 @@ string BuildDeltaViewModelLineageJson(const DeltaViewModel &model) {
 	}
 	if (model.has_projection_lineage) {
 		entries.push_back(RefreshMetadata::ProjectionKeyLineageToJson(model.projection_lineage));
+	}
+	if (model.has_left_join_key_source) {
+		entries.push_back(RefreshMetadata::LeftJoinKeySourceToJson(model.left_join_key_source));
 	}
 	if (model.has_left_join_nullable) {
 		entries.push_back(RefreshMetadata::LeftJoinNullableSourcesToJson(model.left_join_nullable_sources));

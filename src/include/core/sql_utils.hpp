@@ -47,6 +47,7 @@ public:
 	static string JoinQuotedColumns(const vector<string> &columns);
 	static string JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias);
 	static string BuildAllNullPredicate(const vector<string> &columns);
+	static string BuildAnyNullPredicate(const vector<string> &columns, const string &prefix = "");
 	static string BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias);
 	static string BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
 	                                        const string &right_prefix);
@@ -70,6 +71,7 @@ public:
 	static bool RewriteColumnReferences(string &sql, const string &old_name, const string &new_name,
 	                                    const unordered_set<string> &qualifiers, bool allow_unqualified);
 	static string FindTableReference(const string &sql, const string &table_name);
+	static string FindTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence);
 	static idx_t CountTableReferences(const string &sql, const string &table_name);
 
 	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.

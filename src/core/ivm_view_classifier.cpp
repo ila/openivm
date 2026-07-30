@@ -879,6 +879,9 @@ idx_t DeltaViewModel::LineageEntryCount() const {
 	if (has_projection_lineage) {
 		count++;
 	}
+	if (has_left_join_key_source) {
+		count++;
+	}
 	return count;
 }
 

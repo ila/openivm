@@ -281,6 +281,15 @@ public:
 	bool GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out);
 	static string ProjectionKeyLineageToJson(const ProjectionKeyLineage &lineage);
 
+	struct LeftJoinKeySource {
+		string table;
+		idx_t occurrence = 0;
+		string column;
+	};
+
+	bool GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out);
+	static string LeftJoinKeySourceToJson(const LeftJoinKeySource &source);
+
 	struct LeftJoinNullableSources {
 		vector<string> tables;
 		bool complete = false;
@@ -309,14 +318,14 @@ public:
 	// delta timestamps and appends it between the primary-delta INSERT and the MERGE. Zero refresh-time
 	// plan walks.
 	struct LeftJoinSecondaryMeta {
-		string sql;                // secondary-delta INSERT (run before the MERGE; carries LJSEC_* placeholders)
-		string preserved_cols_csv; // comma-separated preserved-side aggregate columns the MERGE must NOT gate
+		string sql; // secondary-delta INSERT (run before the MERGE; carries LJSEC_* placeholders)
+		vector<string> preserved_cols;
 		// Identities of the two sides whose pending changes the placeholders stand for. Refresh needs
 		// them to build the right row source per storage backend (delta table vs DuckLake snapshots).
-		string inner_table; // bare base-table name of the inner (null-supplying) side
-		string inner_key;   // join key column on the inner side
-		string pres_table;  // bare base-table name of the preserved side of the deepest join
-		string pres_key;    // join key column on the preserved side
+		vector<string> inner_tables; // bare base-table names of the inner (null-supplying) sides
+		vector<string> inner_keys;   // join key columns on the inner sides
+		vector<string> pres_tables;  // bare base-table names of the preserved sides
+		vector<string> pres_keys;    // join key columns on the preserved sides
 	};
 
 	bool GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out);

@@ -1467,12 +1467,36 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	D_ASSERT(types.size() == original_bindings.size());
 	types.emplace_back(input.mul_type);
 
-	// 3. Build terms — use DuckLake N-term path when all leaves are DuckLake scans
-	// Check if all leaves are DuckLake scans AND N-term telescoping is enabled.
+	// 3. Build terms — use DuckLake N-term path when all leaves are DuckLake scans.
+	// The DuckLake collector looks through transparent wrappers so each physical
+	// source contributes one term even when a projection wraps a preserved join.
 	bool all_ducklake = true;
+	bool flattened_ducklake = false;
+	vector<JoinLeafInfo> ducklake_leaves;
+	string ducklake_fallback_reason;
 	if (!SqlUtils::GetBoolSetting(context, "openivm_ducklake_nterm", true)) {
 		all_ducklake = false; // forced to inclusion-exclusion
+		ducklake_fallback_reason = "openivm_ducklake_nterm is disabled";
 	} else {
+		if (input.context.model.type == RefreshType::SIMPLE_PROJECTION &&
+		    TryCollectDuckLakeJoinLeaves(input.plan.get(), ducklake_leaves, ducklake_fallback_reason)) {
+			bool has_wrapped_leaf = ducklake_leaves.size() != leaves.size();
+			if (!has_wrapped_leaf) {
+				for (auto &leaf : leaves) {
+					if (!leaf.get) {
+						has_wrapped_leaf = true;
+						break;
+					}
+				}
+			}
+			if (has_wrapped_leaf) {
+				flattened_ducklake = true;
+				leaves = std::move(ducklake_leaves);
+				N = leaves.size();
+			}
+		} else if (input.context.model.type != RefreshType::SIMPLE_PROJECTION) {
+			ducklake_fallback_reason = "refresh type is outside SIMPLE_PROJECTION scope";
+		}
 		for (size_t i = 0; i < N; i++) {
 			auto *get = GetLeafScan(leaves[i]);
 			if (!get || get->function.name != "ducklake_scan") {
@@ -1481,11 +1505,18 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 			}
 		}
 	}
+	if (!flattened_ducklake && !ducklake_fallback_reason.empty()) {
+		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Flattening fallback: %s\n", ducklake_fallback_reason.c_str());
+	}
+	if (N > openivm::MAX_JOIN_TABLES) {
+		throw NotImplementedException("IVM not supported for joins with more than 16 tables");
+	}
 	LogDeltaOperatorStrategy(input, all_ducklake ? DeltaOperatorStrategy::JOIN_DUCKLAKE_N_TERM
 	                                             : DeltaOperatorStrategy::JOIN_INCLUSION_EXCLUSION);
 
-	auto terms = all_ducklake ? BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join)
-	                          : BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join);
+	auto terms = all_ducklake
+	                 ? BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake)
+	                 : BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join);
 
 	// 4. UNION ALL
 	auto result = AssembleJoinUnionAll(terms, types, binder);

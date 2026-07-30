@@ -739,6 +739,17 @@ string SqlUtils::BuildAllNullPredicate(const vector<string> &columns) {
 	return result;
 }
 
+string SqlUtils::BuildAnyNullPredicate(const vector<string> &columns, const string &prefix) {
+	string result;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += " OR ";
+		}
+		result += prefix + QuoteIdentifier(columns[i]) + " IS NULL";
+	}
+	return result;
+}
+
 string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias) {
 	string result;
 	for (idx_t i = 0; i < columns.size(); i++) {
@@ -773,11 +784,13 @@ string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &v
 	// keys deleted earlier in the same transaction, and DuckDB's on-disk unique index still reports
 	// those keys as present -- raising a spurious "Duplicate key ... violates unique constraint".
 	// Materialize the new contents once, delete only the keys that are gone, then upsert the rest, so
-	// no key is deleted and re-inserted in the same transaction.
+	// no non-NULL key is deleted and re-inserted in the same transaction. NULL-containing keys do not
+	// conflict in a UNIQUE index, so remove them explicitly before INSERT OR REPLACE to avoid duplicates.
 	string keep_match = BuildNullSafeKeyPredicate(unique_keys, "openivm_new.", "openivm_old.");
+	string nullable_key = BuildAnyNullPredicate(unique_keys, "openivm_old.");
 	string sql = "CREATE OR REPLACE TEMP TABLE " + temp_table + " AS " + view_query_sql + ";\n";
-	sql += "DELETE FROM " + data_table + " AS openivm_old\nWHERE NOT EXISTS (\n  SELECT 1 FROM " + temp_table +
-	       " AS openivm_new WHERE " + keep_match + "\n);\n";
+	sql += "DELETE FROM " + data_table + " AS openivm_old\nWHERE (" + nullable_key +
+	       ")\n   OR NOT EXISTS (\n  SELECT 1 FROM " + temp_table + " AS openivm_new WHERE " + keep_match + "\n);\n";
 	sql += "INSERT OR REPLACE INTO " + data_table + " SELECT * FROM " + temp_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + temp_table + ";\n";
 	return sql;
@@ -957,6 +970,15 @@ string SqlUtils::FindTableReference(const string &sql, const string &table_name)
 		return "";
 	}
 	auto &match = matches[0];
+	return sql.substr(match.start, match.end - match.start);
+}
+
+string SqlUtils::FindTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence) {
+	auto matches = CollectTableReferenceMatches(sql, table_name, false);
+	if (occurrence >= matches.size()) {
+		return "";
+	}
+	auto &match = matches[occurrence];
 	return sql.substr(match.start, match.end - match.start);
 }
 

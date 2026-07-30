@@ -835,6 +835,17 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		    "active_sources=" + to_string(local_delta_activity.active_delta_table_names.size()) +
 		        "; requires_full_refresh=" + string(local_delta_activity.requires_full_refresh ? "true" : "false"));
 	}
+	// The DuckLake N-term compiler runs later through the optimizer extension. Reuse the source activity
+	// already established above instead of probing every leaf's snapshot manifest a second time.
+	if (refresh_delta_activity && !active_facts.compile_only) {
+		for (auto &source : refresh_delta_activity->sources) {
+			if (!source.ducklake || !source.ok || source.source_table_name.empty()) {
+				continue;
+			}
+			const char *shape = !source.has_changes ? "UNCHANGED" : (source.has_deletes ? "MIXED" : "INSERT_ONLY");
+			inner_facts_slot_facts->delta_shape[source.source_table_name] = shape;
+		}
+	}
 
 	bool adaptive_refresh = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
 	bool adaptive_recompute = false;
@@ -1089,10 +1100,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			RefreshMetadata::LeftJoinSecondaryMeta ljsec;
 			bool have_ljsec = source_has_left_join && !source_has_full_outer &&
 			                  metadata.GetLeftJoinSecondaryMeta(view_name, ljsec) && !ljsec.sql.empty();
-			vector<string> ljsec_preserved_cols;
-			if (have_ljsec && !ljsec.preserved_cols_csv.empty()) {
-				ljsec_preserved_cols = StringUtil::Split(ljsec.preserved_cols_csv, ',');
-			}
+			bool force_lj_group_recompute = source_has_left_join && !source_has_full_outer && !have_ljsec;
+			vector<string> ljsec_preserved_cols = ljsec.preserved_cols;
 			// Resolve the two delta row-source placeholders. Regular tables read their delta table;
 			// DuckLake tables have none and must read ducklake_table_insertions/deletions between the
 			// last-refreshed and current snapshot -- IDs that exist only here, not at CREATE time.
@@ -1129,11 +1138,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 					       SqlUtils::EscapeValue(delta_name) + "'))";
 				};
-				// One placeholder pair PER LEFT JOIN level; identities are index-aligned CSV lists.
-				auto lj_it = StringUtil::Split(ljsec.inner_table, ',');
-				auto lj_ik = StringUtil::Split(ljsec.inner_key, ',');
-				auto lj_pt = StringUtil::Split(ljsec.pres_table, ',');
-				auto lj_pk = StringUtil::Split(ljsec.pres_key, ',');
+				// One placeholder pair PER LEFT JOIN level; identities are index-aligned arrays.
+				auto &lj_it = ljsec.inner_tables;
+				auto &lj_ik = ljsec.inner_keys;
+				auto &lj_pt = ljsec.pres_tables;
+				auto &lj_pk = ljsec.pres_keys;
 				bool lj_ok = !lj_it.empty() && lj_it.size() == lj_ik.size() && lj_it.size() == lj_pt.size() &&
 				             lj_it.size() == lj_pk.size();
 				for (size_t lvl = 0; lj_ok && lvl < lj_it.size(); lvl++) {
@@ -1155,12 +1164,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				}
 				if (!lj_ok) {
 					// Could not resolve a row source (e.g. missing snapshot metadata). Emitting the SQL with
-					// placeholders intact would be a syntax error, so skip the secondary ENTIRELY rather than
-					// fail the refresh; the primary delta still applies. All-or-nothing is deliberate: a
-					// partially substituted program is invalid SQL, and a partial correction across levels
-					// would be worse than none.
-					OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN secondary skipped: unresolved delta source\n");
+					// placeholders intact would be a syntax error. The primary MERGE is not correct without
+					// the complete secondary, so rebuild the affected groups instead.
+					OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN secondary unresolved; forcing affected-group recompute\n");
 					have_ljsec = false;
+					force_lj_group_recompute = true;
 				}
 			}
 			bool ljsec_used_group_recompute = false;
@@ -1171,7 +1179,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
 			    /*inline_cascade_delta=*/inline_merge_cascade, &aggregate_recompute_emits_cascade_delta,
 			    derived_output_expressions, derived_output_info.complete, ljsec_preserved_cols,
-			    &ljsec_used_group_recompute);
+			    &ljsec_used_group_recompute, force_lj_group_recompute);
 			// Run the secondary-delta INSERT (NULL-padded reappearance rows for deepest-join match-count
 			// transitions) AFTER the primary-delta INSERT and BEFORE the MERGE consolidation below.
 			// ONLY meaningful when CompileAggregateGroups actually emitted the delta-arithmetic MERGE: the

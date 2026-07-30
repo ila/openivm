@@ -65,6 +65,420 @@ SELECT COUNT(*) FROM (
 0
 
 # ============================================================
+# Unsupported LEFT JOIN secondary-delta shapes must use affected-group
+# recomputation.  The arithmetic correction is valid only for one direct
+# equality predicate between distinct source tables.
+# ============================================================
+
+# SUM over the preserved side cannot be corrected by the secondary-delta
+# generator.  When the unmatched row becomes matched, the primary delta must
+# not be merged without its missing null-padded-row retraction.
+statement ok
+CREATE TABLE ljfb_left (id INT, val INT);
+
+statement ok
+CREATE TABLE ljfb_right (id INT, payload INT);
+
+statement ok
+INSERT INTO ljfb_left VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW ljfb_preserved_sum AS
+    SELECT l.id, SUM(l.val) AS total
+    FROM ljfb_left l LEFT JOIN ljfb_right r ON l.id = r.id
+    GROUP BY l.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'ljfb_preserved_sum';
+----
+6
+
+statement ok
+INSERT INTO ljfb_right VALUES (1, 100), (2, 200);
+
+statement ok
+UPDATE ljfb_right SET payload = 101 WHERE id = 1;
+
+statement ok
+DELETE FROM ljfb_right WHERE id = 2;
+
+statement ok
+PRAGMA refresh('ljfb_preserved_sum');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ljfb_preserved_sum
+    EXCEPT ALL
+    SELECT l.id, SUM(l.val)
+    FROM ljfb_left l LEFT JOIN ljfb_right r ON l.id = r.id
+    GROUP BY l.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, SUM(l.val)
+    FROM ljfb_left l LEFT JOIN ljfb_right r ON l.id = r.id
+    GROUP BY l.id
+    EXCEPT ALL
+    SELECT * FROM ljfb_preserved_sum
+);
+----
+0
+
+# A self-referencing LEFT JOIN cannot use independent preserved/inner delta
+# accounting because both occurrences share one physical delta table.
+statement ok
+CREATE TABLE ljfb_self (id INT, parent_id INT, val INT);
+
+statement ok
+INSERT INTO ljfb_self VALUES (1, NULL, 10), (2, 1, 20), (3, 99, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW ljfb_self_mv AS
+    SELECT child.id, COUNT(parent.id) AS parents, SUM(parent.val) AS parent_total
+    FROM ljfb_self child LEFT JOIN ljfb_self parent ON child.parent_id = parent.id
+    GROUP BY child.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'ljfb_self_mv';
+----
+6
+
+statement ok
+INSERT INTO ljfb_self VALUES (99, NULL, 90), (4, 1, 40);
+
+statement ok
+UPDATE ljfb_self SET parent_id = 99 WHERE id = 2;
+
+statement ok
+DELETE FROM ljfb_self WHERE id = 1;
+
+statement ok
+PRAGMA refresh('ljfb_self_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ljfb_self_mv
+    EXCEPT ALL
+    SELECT child.id, COUNT(parent.id), SUM(parent.val)
+    FROM ljfb_self child LEFT JOIN ljfb_self parent ON child.parent_id = parent.id
+    GROUP BY child.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT child.id, COUNT(parent.id), SUM(parent.val)
+    FROM ljfb_self child LEFT JOIN ljfb_self parent ON child.parent_id = parent.id
+    GROUP BY child.id
+    EXCEPT ALL
+    SELECT * FROM ljfb_self_mv
+);
+----
+0
+
+# A compound equality predicate cannot be reduced to conditions[0]: another
+# row sharing only the first key must not hide an unmatched/matched transition.
+statement ok
+CREATE TABLE ljfb_comp_left (a INT, b INT);
+
+statement ok
+CREATE TABLE ljfb_comp_right (a INT, b INT, val INT);
+
+statement ok
+INSERT INTO ljfb_comp_left VALUES (1, 1), (1, 2), (2, 1);
+
+statement ok
+INSERT INTO ljfb_comp_right VALUES (1, 2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW ljfb_comp_mv AS
+    SELECT l.a, l.b, COUNT(r.val) AS matches, SUM(r.val) AS total
+    FROM ljfb_comp_left l LEFT JOIN ljfb_comp_right r ON l.a = r.a AND l.b = r.b
+    GROUP BY l.a, l.b;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'ljfb_comp_mv';
+----
+6
+
+statement ok
+INSERT INTO ljfb_comp_right VALUES (1, 1, 10), (2, 1, 30);
+
+statement ok
+UPDATE ljfb_comp_right SET val = 11 WHERE a = 1 AND b = 1;
+
+statement ok
+DELETE FROM ljfb_comp_right WHERE a = 2 AND b = 1;
+
+statement ok
+PRAGMA refresh('ljfb_comp_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ljfb_comp_mv
+    EXCEPT ALL
+    SELECT l.a, l.b, COUNT(r.val), SUM(r.val)
+    FROM ljfb_comp_left l LEFT JOIN ljfb_comp_right r ON l.a = r.a AND l.b = r.b
+    GROUP BY l.a, l.b
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.a, l.b, COUNT(r.val), SUM(r.val)
+    FROM ljfb_comp_left l LEFT JOIN ljfb_comp_right r ON l.a = r.a AND l.b = r.b
+    GROUP BY l.a, l.b
+    EXCEPT ALL
+    SELECT * FROM ljfb_comp_mv
+);
+----
+0
+
+# Non-equality predicates need the complete predicate to find groups that lose
+# their final match, so they also use affected-group recomputation.
+statement ok
+CREATE TABLE ljfb_range_left (id INT, threshold INT);
+
+statement ok
+CREATE TABLE ljfb_range_right (id INT, val INT);
+
+statement ok
+INSERT INTO ljfb_range_left VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO ljfb_range_right VALUES (10, 5), (20, 15);
+
+statement ok
+CREATE MATERIALIZED VIEW ljfb_range_mv AS
+    SELECT l.id, COUNT(r.id) AS matches, SUM(r.val) AS total
+    FROM ljfb_range_left l LEFT JOIN ljfb_range_right r ON r.val < l.threshold
+    GROUP BY l.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'ljfb_range_mv';
+----
+6
+
+statement ok
+INSERT INTO ljfb_range_right VALUES (30, 8), (40, 25);
+
+statement ok
+UPDATE ljfb_range_right SET val = 12 WHERE id = 10;
+
+statement ok
+DELETE FROM ljfb_range_right WHERE id = 20;
+
+statement ok
+PRAGMA refresh('ljfb_range_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ljfb_range_mv
+    EXCEPT ALL
+    SELECT l.id, COUNT(r.id), SUM(r.val)
+    FROM ljfb_range_left l LEFT JOIN ljfb_range_right r ON r.val < l.threshold
+    GROUP BY l.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, COUNT(r.id), SUM(r.val)
+    FROM ljfb_range_left l LEFT JOIN ljfb_range_right r ON r.val < l.threshold
+    GROUP BY l.id
+    EXCEPT ALL
+    SELECT * FROM ljfb_range_mv
+);
+----
+0
+
+# A right-only ON predicate is represented as a filter on the inner subtree,
+# not necessarily as a second LogicalComparisonJoin condition.  Base-table
+# key counts would include inactive rows and miss the last-match transition.
+statement ok
+CREATE TABLE ljfb_filter_left (id INT);
+
+statement ok
+CREATE TABLE ljfb_filter_right (id INT, active BOOLEAN, val INT);
+
+statement ok
+INSERT INTO ljfb_filter_left VALUES (1), (2);
+
+statement ok
+INSERT INTO ljfb_filter_right VALUES (1, true, 10), (1, false, 99), (2, true, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW ljfb_filter_mv AS
+    SELECT l.id, COUNT(r.val) AS matches, SUM(r.val) AS total
+    FROM ljfb_filter_left l LEFT JOIN ljfb_filter_right r ON l.id = r.id AND r.active = true
+    GROUP BY l.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'ljfb_filter_mv';
+----
+6
+
+statement ok
+INSERT INTO ljfb_filter_right VALUES (2, false, 200), (1, true, 11);
+
+statement ok
+UPDATE ljfb_filter_right SET val = 12 WHERE id = 1 AND active;
+
+statement ok
+DELETE FROM ljfb_filter_right WHERE id = 2 AND active;
+
+statement ok
+PRAGMA refresh('ljfb_filter_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ljfb_filter_mv
+    EXCEPT ALL
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM ljfb_filter_left l LEFT JOIN ljfb_filter_right r ON l.id = r.id AND r.active = true
+    GROUP BY l.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM ljfb_filter_left l LEFT JOIN ljfb_filter_right r ON l.id = r.id AND r.active = true
+    GROUP BY l.id
+    EXCEPT ALL
+    SELECT * FROM ljfb_filter_mv
+);
+----
+0
+
+# Secondary source identities are structured arrays: a comma in a valid quoted
+# table identifier must not split one join level into multiple levels.
+statement ok
+CREATE TABLE lj_comma_left (id INT);
+
+statement ok
+CREATE TABLE "lj,r" (id INT, val INT);
+
+statement ok
+INSERT INTO lj_comma_left VALUES (1), (2);
+
+statement ok
+INSERT INTO "lj,r" VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW lj_comma_mv AS
+    SELECT l.id, COUNT(r.val) AS matches, SUM(r.val) AS total
+    FROM lj_comma_left l LEFT JOIN "lj,r" r ON l.id = r.id
+    GROUP BY l.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'lj_comma_mv';
+----
+0
+
+query I
+SELECT contains(leftjoin_secondary_meta_json, '"inner_tables":["lj,r"]')::INT
+FROM openivm_views WHERE view_name = 'lj_comma_mv';
+----
+1
+
+statement ok
+DELETE FROM "lj,r" WHERE id = 1;
+
+statement ok
+INSERT INTO "lj,r" VALUES (2, 21);
+
+statement ok
+UPDATE "lj,r" SET val = 22 WHERE id = 2 AND val = 21;
+
+statement ok
+PRAGMA refresh('lj_comma_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM lj_comma_mv
+    EXCEPT ALL
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_comma_left l LEFT JOIN "lj,r" r ON l.id = r.id
+    GROUP BY l.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_comma_left l LEFT JOIN "lj,r" r ON l.id = r.id
+    GROUP BY l.id
+    EXCEPT ALL
+    SELECT * FROM lj_comma_mv
+);
+----
+0
+
+# Existing MVs can still carry the legacy comma-delimited identity fields.
+# If such metadata is ambiguous, refresh must use affected-group recompute
+# instead of silently dropping the required secondary correction.
+statement ok
+UPDATE openivm_views
+SET leftjoin_secondary_meta_json =
+    replace(leftjoin_secondary_meta_json, '"inner_tables":["lj,r"]', '"inner_table":"lj,r"')
+WHERE view_name = 'lj_comma_mv';
+
+statement ok
+UPDATE openivm_views
+SET leftjoin_secondary_meta_json =
+    replace(leftjoin_secondary_meta_json, '"inner_keys":["id"]', '"inner_key":"id"')
+WHERE view_name = 'lj_comma_mv';
+
+statement ok
+UPDATE openivm_views
+SET leftjoin_secondary_meta_json =
+    replace(leftjoin_secondary_meta_json, '"pres_tables":["lj_comma_left"]', '"pres_table":"lj_comma_left"')
+WHERE view_name = 'lj_comma_mv';
+
+statement ok
+UPDATE openivm_views
+SET leftjoin_secondary_meta_json =
+    replace(leftjoin_secondary_meta_json, '"pres_keys":["id"]', '"pres_key":"id"')
+WHERE view_name = 'lj_comma_mv';
+
+statement ok
+DELETE FROM "lj,r" WHERE id = 2;
+
+statement ok
+PRAGMA refresh('lj_comma_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM lj_comma_mv
+    EXCEPT ALL
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_comma_left l LEFT JOIN "lj,r" r ON l.id = r.id
+    GROUP BY l.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id, COUNT(r.val), SUM(r.val)
+    FROM lj_comma_left l LEFT JOIN "lj,r" r ON l.id = r.id
+    GROUP BY l.id
+    EXCEPT ALL
+    SELECT * FROM lj_comma_mv
+);
+----
+0
+
+# ============================================================
 # Batched mixed DML before ONE refresh (exercises secondary deltas in BOTH directions):
 #   - DELETE line 102  -> o11 loses its LAST line   => NULL-padded (A,o11,NULL) reappears; COUNT(o.oid) must NOT drop
 #   - INSERT line 103  -> o12 gains its FIRST line  => NULL-padded (A,o12,NULL) removed, real row added
