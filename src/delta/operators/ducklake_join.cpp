@@ -203,27 +203,6 @@ static bool DuckLakeDeltaKeyHasMatch(Connection &con, const string &catalog, con
 	return result->GetValue(0, 0).GetValue<bool>();
 }
 
-// ============================================================================
-// PinToOldSnapshot: set a DuckLake scan to read the table at last_snapshot_id
-// ============================================================================
-
-/// Walk the subtree and pin any DuckLake scan with the given table_index to
-/// the old snapshot. LPTS detects the historical snapshot and emits AT VERSION.
-static void PinToOldSnapshot(LogicalOperator &op, idx_t table_index, idx_t old_snapshot_id) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op.Cast<LogicalGet>();
-		if (get.table_index == table_index && get.function.name == "ducklake_scan" && get.function.function_info) {
-			auto &func_info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
-			func_info.snapshot.snapshot_id = old_snapshot_id;
-			OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Pinned table_index=%lu to old snapshot %lu\n",
-			                    (unsigned long)table_index, (unsigned long)old_snapshot_id);
-		}
-	}
-	for (auto &child : op.children) {
-		PinToOldSnapshot(*child, table_index, old_snapshot_id);
-	}
-}
-
 static bool PathStartsWith(const vector<size_t> &path, const vector<size_t> &prefix) {
 	return path.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), path.begin());
 }

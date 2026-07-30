@@ -108,11 +108,9 @@ bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t grou
 // params report the two sides' identities so refresh can pick the right row source per backend.
 string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
                                       const vector<string> &output_names, const string &view_name,
-                                      vector<string> &preserved_cols, const string &delta_view_catalog_prefix = "",
-                                      vector<string> *out_inner_tables = nullptr,
-                                      vector<string> *out_inner_keys = nullptr,
-                                      vector<string> *out_pres_tables = nullptr,
-                                      vector<string> *out_pres_keys = nullptr);
+                                      vector<string> &preserved_cols, const string &delta_view_catalog_prefix,
+                                      vector<string> &out_inner_tables, vector<string> &out_inner_keys,
+                                      vector<string> &out_pres_tables, vector<string> &out_pres_keys);
 bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts);
 bool RelationExists(Connection &con, const string &qualified_name);
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,

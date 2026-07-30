@@ -2094,8 +2094,8 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
                                              const vector<string> &output_names, const string &view_name,
                                              LogicalComparisonJoin *oj, size_t level,
                                              const std::set<idx_t> &null_tables, vector<string> &preserved_cols,
-                                             const string &delta_view_catalog_prefix, string *out_inner_table,
-                                             string *out_inner_key, string *out_pres_table, string *out_pres_key) {
+                                             const string &delta_view_catalog_prefix, string &out_inner_table,
+                                             string &out_inner_key, string &out_pres_table, string &out_pres_key) {
 	preserved_cols.clear();
 	if (facts.aggregates.size() != 1) {
 		return "";
@@ -2128,15 +2128,12 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		return "";
 	}
 	// Deepest-join keys: condition.left = preserved side, condition.right = inner (null) side.
-	auto *pres_ref = &condition.left->Cast<BoundColumnRefExpression>();
-	auto *inner_ref = &condition.right->Cast<BoundColumnRefExpression>();
-	if (!pres_ref || !inner_ref) {
-		return "";
-	}
-	ColumnBinding key_pres = pres_ref->binding;
+	auto &pres_ref = condition.left->Cast<BoundColumnRefExpression>();
+	auto &inner_ref = condition.right->Cast<BoundColumnRefExpression>();
+	ColumnBinding key_pres = pres_ref.binding;
 	LogicalGet *inner_get = nullptr;
 	string inner_col;
-	if (!ResolveBindingToGetColumn(inner_ref->binding, facts, inner_get, inner_col) || !inner_get ||
+	if (!ResolveBindingToGetColumn(inner_ref.binding, facts, inner_get, inner_col) || !inner_get ||
 	    !inner_get->GetTable().get()) {
 		return "";
 	}
@@ -2156,8 +2153,6 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		qual += KeywordHelper::WriteOptionallyQuoted(sch) + ".";
 	}
 	string inner_base = qual + KeywordHelper::WriteOptionallyQuoted(inner_table);
-	string delta_inner_bare = SqlUtils::DeltaName(inner_table);
-	string delta_inner = qual + KeywordHelper::WriteOptionallyQuoted(delta_inner_bare);
 	string qcol = KeywordHelper::WriteOptionallyQuoted(inner_col);
 
 	// The correction below assumes a dangling (null-padded) row for this key is ALREADY materialized
@@ -2191,8 +2186,6 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		pres_qual += KeywordHelper::WriteOptionallyQuoted(pres_sti->second.schema_name) + ".";
 	}
 	string pres_base = pres_qual + KeywordHelper::WriteOptionallyQuoted(pres_table);
-	string delta_pres_bare = SqlUtils::DeltaName(pres_table);
-	string delta_pres = pres_qual + KeywordHelper::WriteOptionallyQuoted(delta_pres_bare);
 	string pres_qcol = KeywordHelper::WriteOptionallyQuoted(pres_col);
 
 	// Classify each aggregate output column's contribution to a null-padded row of the deepest join.
@@ -2326,21 +2319,10 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	col_list += "openivm_multiplicity";
 	sel += "CASE WHEN (__newc - __t.dsum) > 0 AND __newc = 0 THEN 1 ELSE -1 END";
 
-	// Must carry the same catalog prefix the delta table was created with. Unqualified works only when
-	// the MV's state lives in the default catalog; a DuckLake-backed view's delta table is
-	// dl.main.openivm_delta_<view>, and an unqualified INSERT there fails the whole refresh.
-	if (out_inner_table) {
-		*out_inner_table = inner_table;
-	}
-	if (out_inner_key) {
-		*out_inner_key = inner_col;
-	}
-	if (out_pres_table) {
-		*out_pres_table = pres_table;
-	}
-	if (out_pres_key) {
-		*out_pres_key = pres_col;
-	}
+	out_inner_table = inner_table;
+	out_inner_key = inner_col;
+	out_pres_table = pres_table;
+	out_pres_key = pres_col;
 
 	// Must carry the same catalog prefix the delta table was created with. Unqualified works only when
 	// the MV's state lives in the default catalog; a DuckLake-backed view's delta table is
@@ -2379,8 +2361,8 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
                                       const vector<string> &output_names, const string &view_name,
                                       vector<string> &preserved_cols, const string &delta_view_catalog_prefix,
-                                      vector<string> *out_inner_tables, vector<string> *out_inner_keys,
-                                      vector<string> *out_pres_tables, vector<string> *out_pres_keys) {
+                                      vector<string> &out_inner_tables, vector<string> &out_inner_keys,
+                                      vector<string> &out_pres_tables, vector<string> &out_pres_keys) {
 	preserved_cols.clear();
 	string combined_sql;
 	vector<string> inner_tables, inner_keys, pres_tables, pres_keys;
@@ -2397,7 +2379,7 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 		string it, ik, pt, pk;
 		string level_sql =
 		    BuildLeftJoinSecondaryForLevel(context, facts, output_names, view_name, oj, level, null_tables,
-		                                   level_preserved, delta_view_catalog_prefix, &it, &ik, &pt, &pk);
+		                                   level_preserved, delta_view_catalog_prefix, it, ik, pt, pk);
 		if (level_sql.empty()) {
 			// An unsupported level makes the whole correction incomplete, and a partial correction is
 			// worse than none (it would double-count the levels it does cover). Bail entirely.
@@ -2419,18 +2401,10 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 	if (combined_sql.empty()) {
 		return "";
 	}
-	if (out_inner_tables) {
-		*out_inner_tables = inner_tables;
-	}
-	if (out_inner_keys) {
-		*out_inner_keys = inner_keys;
-	}
-	if (out_pres_tables) {
-		*out_pres_tables = pres_tables;
-	}
-	if (out_pres_keys) {
-		*out_pres_keys = pres_keys;
-	}
+	out_inner_tables = std::move(inner_tables);
+	out_inner_keys = std::move(inner_keys);
+	out_pres_tables = std::move(pres_tables);
+	out_pres_keys = std::move(pres_keys);
 	return combined_sql;
 }
 

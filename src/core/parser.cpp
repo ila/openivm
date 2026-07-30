@@ -895,7 +895,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		try {
 			leftjoin_secondary_sql = BuildLeftJoinSecondaryDeltaSQL(
 			    *con.context, facts, output_names, view_name, leftjoin_preserved_cols, internal_catalog_prefix,
-			    &leftjoin_inner_tables, &leftjoin_inner_keys, &leftjoin_pres_tables, &leftjoin_pres_keys);
+			    leftjoin_inner_tables, leftjoin_inner_keys, leftjoin_pres_tables, leftjoin_pres_keys);
 		} catch (std::exception &ex) {
 			OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT JOIN secondary-delta generation failed: %s\n", ex.what());
 			leftjoin_secondary_sql.clear();

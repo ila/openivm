@@ -880,10 +880,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 
 	string delta_view_name_bare = SqlUtils::DeltaName(view_name);
 	string delta_view_name = internal_catalog_prefix + delta_view_name_bare;
-	auto downstream_check = con.Query("SELECT COUNT(*) FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	                                  " WHERE table_name = '" + SqlUtils::EscapeValue(delta_view_name_bare) + "'");
-	bool has_downstream = !downstream_check->HasError() && downstream_check->RowCount() > 0 &&
-	                      downstream_check->GetValue(0, 0).GetValue<int64_t>() > 0;
+	bool has_downstream = metadata.HasDownstreamViews(view_name);
 	bool full_recompute_needs_cascade_delta = has_downstream || active_facts.force_view_delta_cascade;
 	bool use_full_recompute = refresh_plan.RequiresFullRecompute();
 
