@@ -474,7 +474,29 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 	LogicalType key_type = delta_types[key_pos];
 	LogicalType mul_type = delta_types[mul_pos];
 
-	// Fresh scan of the SAME base table (current/post-delta state), grouped by key with COUNT(*).
+	// Restrict the current-state count to keys present in this delta before
+	// aggregating. Without this join, every inclusion-exclusion term hashes every
+	// key in the nullable base table even when only one key changed.
+	auto affected_delta = renumber_and_rebind_subtree(delta_renumbered.op->Copy(context), binder);
+	auto affected_bindings = affected_delta.op->GetColumnBindings();
+	if (key_pos >= affected_bindings.size()) {
+		return nullptr;
+	}
+	auto affected_group_index = binder.GenerateTableIndex();
+	auto affected_aggregate_index = binder.GenerateTableIndex();
+	auto affected_keys =
+	    make_uniq<LogicalAggregate>(affected_group_index, affected_aggregate_index, vector<unique_ptr<Expression>>());
+	affected_keys->groups.push_back(make_uniq<BoundColumnRefExpression>(key_type, affected_bindings[key_pos]));
+	affected_keys->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(key_type)));
+	GroupingSet affected_grouping_set;
+	affected_grouping_set.insert(0);
+	affected_keys->grouping_sets.push_back(std::move(affected_grouping_set));
+	affected_keys->children.push_back(std::move(affected_delta.op));
+	affected_keys->ResolveOperatorTypes();
+	ColumnBinding affected_key_binding = affected_keys->GetColumnBindings()[0];
+
+	// Fresh scan of the SAME base table (current/post-delta state), filtered to
+	// affected keys and grouped by key with COUNT(*).
 	auto base_copy_op = base_get->Copy(context);
 	auto base_renumbered = renumber_and_rebind_subtree(std::move(base_copy_op), binder);
 	auto base_scan_bindings = base_renumbered.op->GetColumnBindings();
@@ -482,6 +504,13 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 		return nullptr;
 	}
 	ColumnBinding base_key_source_binding = base_scan_bindings[key_pos];
+	auto affected_condition = make_uniq<BoundComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL, make_uniq<BoundColumnRefExpression>(key_type, base_key_source_binding),
+	    make_uniq<BoundColumnRefExpression>(key_type, affected_key_binding));
+	auto affected_base =
+	    LogicalComparisonJoin::CreateJoin(context, JoinType::INNER, JoinRefType::REGULAR, std::move(base_renumbered.op),
+	                                      std::move(affected_keys), std::move(affected_condition));
+	affected_base->ResolveOperatorTypes();
 
 	auto group_index = binder.GenerateTableIndex();
 	auto aggregate_index = binder.GenerateTableIndex();
@@ -497,7 +526,7 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 	GroupingSet base_grouping_set;
 	base_grouping_set.insert(0);
 	base_agg->grouping_sets.push_back(std::move(base_grouping_set));
-	base_agg->children.push_back(std::move(base_renumbered.op));
+	base_agg->children.push_back(std::move(affected_base));
 	base_agg->ResolveOperatorTypes();
 	auto base_agg_bindings = base_agg->GetColumnBindings();
 	ColumnBinding base_key_binding = base_agg_bindings[0];

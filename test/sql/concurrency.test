@@ -82,6 +82,73 @@ SELECT count(*) FROM (
 0
 
 # ==========================================
+# Test 1b: A write-owning transaction must not wait while upgrading to refresh
+# if another transaction owns one of the refresh sources. Waiting would retain
+# its own writer gate and permit two refresh upgrades to deadlock; return a
+# serialization error so the caller can retry after rollback.
+# ==========================================
+
+statement ok
+CREATE TABLE upgrade_gate_a (id INTEGER);
+
+statement ok
+CREATE TABLE upgrade_gate_b (id INTEGER);
+
+statement ok
+INSERT INTO upgrade_gate_a VALUES (1);
+
+statement ok
+INSERT INTO upgrade_gate_b VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW upgrade_gate_mv AS
+SELECT a.id AS a_id, b.id AS b_id
+FROM upgrade_gate_a a
+INNER JOIN upgrade_gate_b b ON true;
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=0
+statement ok
+INSERT INTO upgrade_gate_a VALUES (2);
+
+onlyif threadid=0
+statement ok
+SELECT sleep_ms(1500);
+
+onlyif threadid=0
+statement ok
+ROLLBACK;
+
+onlyif threadid=1
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=1
+statement ok
+INSERT INTO upgrade_gate_b VALUES (2);
+
+onlyif threadid=1
+statement ok
+SELECT sleep_ms(300);
+
+onlyif threadid=1
+statement error
+PRAGMA refresh('upgrade_gate_mv');
+----
+cannot upgrade this transaction to refresh
+
+onlyif threadid=1
+statement ok
+ROLLBACK;
+
+endloop
+
+# ==========================================
 # Test 2: Concurrent refresh of SAME view — per-view mutex serializes them
 # Before the mutex fix, this caused TransactionContext Error: Conflict on tuple deletion
 # Now both threads wait their turn and the MV stays correct
@@ -509,13 +576,13 @@ onlyif threadid=0
 statement ok
 COMMIT;
 
-onlyif threadid=1
+onlyif threadid=0
 statement ok
-SELECT sleep_ms(500);
+INSERT INTO scoped_gate_timing VALUES ('writer_committed', now()::TIMESTAMP);
 
 onlyif threadid=1
 statement ok
-INSERT INTO scoped_gate_timing VALUES ('before', now()::TIMESTAMP);
+SELECT sleep_ms(500);
 
 onlyif threadid=1
 statement ok
@@ -523,12 +590,14 @@ PRAGMA refresh('scoped_gate_mv_b');
 
 onlyif threadid=1
 statement ok
-INSERT INTO scoped_gate_timing VALUES ('after', now()::TIMESTAMP);
+INSERT INTO scoped_gate_timing VALUES ('refresh_finished', now()::TIMESTAMP);
 
 endloop
 
 query I
-SELECT epoch_ms(max(observed_at)) - epoch_ms(min(observed_at)) < 1000
+SELECT
+    max(observed_at) FILTER (phase = 'refresh_finished')
+    < max(observed_at) FILTER (phase = 'writer_committed')
 FROM scoped_gate_timing;
 ----
 true
@@ -547,6 +616,85 @@ SELECT count(*) FROM (
     SELECT * FROM scoped_gate_b
     EXCEPT ALL
     SELECT * FROM scoped_gate_mv_b
+);
+----
+0
+
+# ==========================================
+# Test 9: A writer that already owns one source may extend its write set while
+# a multi-source refresh waits. Blocking the second write would deadlock:
+# refresh waits for the transaction holding A, while that transaction waits for
+# refresh's pending reservation on B.
+# ==========================================
+
+statement ok
+CREATE TABLE expanding_gate_a (id INTEGER);
+
+statement ok
+CREATE TABLE expanding_gate_b (id INTEGER);
+
+statement ok
+INSERT INTO expanding_gate_a VALUES (1);
+
+statement ok
+INSERT INTO expanding_gate_b VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW expanding_gate_mv AS
+SELECT a.id AS a_id, b.id AS b_id
+FROM expanding_gate_a a
+INNER JOIN expanding_gate_b b ON true;
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=0
+statement ok
+INSERT INTO expanding_gate_a VALUES (2);
+
+onlyif threadid=0
+statement ok
+SELECT sleep_ms(1200);
+
+onlyif threadid=0
+statement ok
+INSERT INTO expanding_gate_b VALUES (2);
+
+onlyif threadid=0
+statement ok
+COMMIT;
+
+onlyif threadid=1
+statement ok
+SELECT sleep_ms(300);
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('expanding_gate_mv');
+
+endloop
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM expanding_gate_mv
+    EXCEPT ALL
+    SELECT a.id AS a_id, b.id AS b_id
+    FROM expanding_gate_a a
+    INNER JOIN expanding_gate_b b ON true
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT a.id AS a_id, b.id AS b_id
+    FROM expanding_gate_a a
+    INNER JOIN expanding_gate_b b ON true
+    EXCEPT ALL
+    SELECT * FROM expanding_gate_mv
 );
 ----
 0

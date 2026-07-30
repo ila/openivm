@@ -947,7 +947,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		if (quoted_derived_output_expressions.count(column)) {
 			continue;
 		}
-		string raw_column = aggregate_raw_names.at(column);
+		const string &raw_column = aggregate_raw_names.at(column);
 		if (derived_cols.count(column)) {
 			string sum_col = d_sum_cols.count(column) ? d_sum_cols.at(column) : "";
 			string count_col = d_count_cols.count(column) ? d_count_cols.at(column) : "";
@@ -1012,7 +1012,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				    column + " = " + SubstituteDerivedOutputColumns(expression_sql, updated_column_expressions);
 				insert_vals += SubstituteDerivedOutputColumns(expression_sql, inserted_column_expressions);
 			} else {
-				string raw_column = aggregate_raw_names.at(column);
+				const string &raw_column = aggregate_raw_names.at(column);
 				update_set += column + " = " + updated_column_expressions.at(raw_column);
 				insert_vals += inserted_column_expressions.at(raw_column);
 			}

@@ -11,16 +11,39 @@ static bool HasOtherOwner(const unordered_map<ClientContext *, idx_t> &owners, C
 	return !owners.empty() && (owners.size() > 1 || owners.find(&owner) == owners.end());
 }
 
+static bool HasOtherOwner(const unordered_map<string, unordered_map<ClientContext *, idx_t>> &owners,
+                          const string &delta_table_name, ClientContext &owner) {
+	auto entry = owners.find(delta_table_name);
+	return entry != owners.end() && HasOtherOwner(entry->second, owner);
+}
+
+static bool HasOwner(const unordered_map<string, unordered_map<ClientContext *, idx_t>> &owners,
+                     const string &delta_table_name, ClientContext &owner) {
+	auto entry = owners.find(delta_table_name);
+	return entry != owners.end() && entry->second.find(&owner) != entry->second.end();
+}
+
+static bool HasOwner(const unordered_map<string, unordered_map<ClientContext *, idx_t>> &owners, ClientContext &owner) {
+	for (auto &entry : owners) {
+		if (entry.second.find(&owner) != entry.second.end()) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void DeltaCatalogPhaseGate::EnterWrite(ClientContext &owner, const string &delta_table_name) {
 	std::unique_lock<mutex> guard(lock);
 	// Once a refresh is waiting, stop admitting new writers so the finite set of
-	// active transactions can drain. The refresh owner's own later DML remains
-	// reentrant, which lets transaction-local DML and refresh compose safely.
+	// active transactions can drain. A transaction that already owns any writer
+	// slot in this catalog may extend its write set: blocking that extension can
+	// make a refresh wait for the transaction while the transaction waits for the
+	// refresh.
 	condition.wait(guard, [&]() {
-		auto &writers = active_writers[delta_table_name];
-		auto &refreshes = active_refreshes[delta_table_name];
-		bool owner_is_active = writers.find(&owner) != writers.end() || refreshes.find(&owner) != refreshes.end();
-		return !HasOtherOwner(refreshes, owner) && (waiting_refreshes[delta_table_name] == 0 || owner_is_active);
+		bool owner_is_active = HasOwner(active_writers, owner) || HasOwner(active_refreshes, delta_table_name, owner);
+		auto waiting = waiting_refreshes.find(delta_table_name);
+		bool refresh_is_waiting = waiting != waiting_refreshes.end() && waiting->second > 0;
+		return !HasOtherOwner(active_refreshes, delta_table_name, owner) && (!refresh_is_waiting || owner_is_active);
 	});
 	active_writers[delta_table_name][&owner]++;
 }
@@ -42,12 +65,22 @@ void DeltaCatalogPhaseGate::ExitWrite(ClientContext &owner, const string &delta_
 
 void DeltaCatalogPhaseGate::EnterRefresh(ClientContext &owner, const vector<string> &delta_table_names) {
 	std::unique_lock<mutex> guard(lock);
+	if (HasOwner(active_writers, owner)) {
+		for (auto &name : delta_table_names) {
+			if (HasOtherOwner(active_writers, name, owner)) {
+				throw TransactionException(
+				    "OpenIVM cannot upgrade this transaction to refresh while another transaction is writing "
+				    "source delta table '%s'; retry the refresh after that transaction finishes",
+				    name);
+			}
+		}
+	}
 	for (auto &name : delta_table_names) {
 		waiting_refreshes[name]++;
 	}
 	condition.wait(guard, [&]() {
 		for (auto &name : delta_table_names) {
-			if (HasOtherOwner(active_writers[name], owner)) {
+			if (HasOtherOwner(active_writers, name, owner)) {
 				return false;
 			}
 		}
@@ -60,6 +93,10 @@ void DeltaCatalogPhaseGate::EnterRefresh(ClientContext &owner, const vector<stri
 			waiting_refreshes.erase(waiting);
 		}
 		active_refreshes[name][&owner]++;
+		auto writers = active_writers.find(name);
+		if (writers != active_writers.end() && writers->second.empty()) {
+			active_writers.erase(writers);
+		}
 	}
 }
 
@@ -75,6 +112,10 @@ void DeltaCatalogPhaseGate::ExitRefresh(ClientContext &owner, const vector<strin
 		}
 		if (refreshes->second.empty()) {
 			active_refreshes.erase(refreshes);
+		}
+		auto writers = active_writers.find(name);
+		if (writers != active_writers.end() && writers->second.empty()) {
+			active_writers.erase(writers);
 		}
 	}
 	condition.notify_all();
@@ -164,36 +205,49 @@ void TransactionalMVLockState::Acquire(const vector<string> &view_names, const v
 	if (!owner) {
 		throw InternalException("OpenIVM transactional lock state has no owning client context");
 	}
-	unordered_map<Catalog *, vector<string>> new_targets;
+	auto sorted_views = view_names;
+	std::sort(sorted_views.begin(), sorted_views.end());
+	sorted_views.erase(std::unique(sorted_views.begin(), sorted_views.end()), sorted_views.end());
+	for (auto &view_name : sorted_views) {
+		if (locked_views.find(view_name) != locked_views.end()) {
+			continue;
+		}
+		if (catalog_guards.empty()) {
+			view_guards.push_back(make_uniq<ViewLockGuard>(view_name));
+		} else {
+			// This transaction already holds phase gates from an earlier
+			// refresh. Never block while extending its view set: lifecycle
+			// operations acquire view locks before entering writer phases.
+			auto guard = make_uniq<TryViewLockGuard>(view_name);
+			if (!guard->OwnsLock()) {
+				throw TransactionException(
+				    "OpenIVM cannot lock materialized view '%s' after this transaction has entered refresh; "
+				    "retry after the concurrent lifecycle operation finishes",
+				    view_name);
+			}
+			late_view_guards.push_back(std::move(guard));
+		}
+		locked_views.insert(view_name);
+	}
+
+	map<string, pair<Catalog *, vector<string>>> new_targets;
 	for (auto &target : gate_targets) {
 		if (!target.catalog || target.delta_table_name.empty()) {
 			continue;
 		}
 		auto &locked = locked_refresh_deltas[target.catalog];
 		if (locked.insert(target.delta_table_name).second) {
-			new_targets[target.catalog].push_back(target.delta_table_name);
+			auto &catalog_targets = new_targets[target.catalog->GetName()];
+			catalog_targets.first = target.catalog;
+			catalog_targets.second.push_back(target.delta_table_name);
 		}
 	}
-	vector<Catalog *> sorted_catalogs;
 	for (auto &entry : new_targets) {
-		sorted_catalogs.push_back(entry.first);
-	}
-	std::sort(sorted_catalogs.begin(), sorted_catalogs.end(),
-	          [](Catalog *left, Catalog *right) { return left->GetName() < right->GetName(); });
-	for (auto catalog : sorted_catalogs) {
-		auto &names = new_targets[catalog];
+		auto catalog = entry.second.first;
+		auto &names = entry.second.second;
 		std::sort(names.begin(), names.end());
 		names.erase(std::unique(names.begin(), names.end()), names.end());
 		catalog_guards.push_back(make_uniq<DeltaCatalogRefreshGuard>(*owner, *catalog, std::move(names)));
-	}
-
-	auto sorted_views = view_names;
-	std::sort(sorted_views.begin(), sorted_views.end());
-	sorted_views.erase(std::unique(sorted_views.begin(), sorted_views.end()), sorted_views.end());
-	for (auto &view_name : sorted_views) {
-		if (locked_views.insert(view_name).second) {
-			view_guards.push_back(make_uniq<ViewLockGuard>(view_name));
-		}
 	}
 
 	auto sorted_deltas = delta_table_names;
@@ -216,8 +270,9 @@ void TransactionalMVLockState::TransactionRollback(MetaTransaction &transaction,
 
 void TransactionalMVLockState::Release() {
 	delta_guards.clear();
-	view_guards.clear();
+	late_view_guards.clear();
 	catalog_guards.clear();
+	view_guards.clear();
 	locked_delta_tables.clear();
 	locked_views.clear();
 	locked_refresh_deltas.clear();

@@ -197,6 +197,7 @@ private:
 	unordered_set<string> locked_delta_tables;
 	unordered_map<const Catalog *, unordered_set<string>> locked_refresh_deltas;
 	vector<unique_ptr<ViewLockGuard>> view_guards;
+	vector<unique_ptr<TryViewLockGuard>> late_view_guards;
 	vector<unique_ptr<DeltaLockGuard>> delta_guards;
 	vector<unique_ptr<DeltaCatalogRefreshGuard>> catalog_guards;
 	ClientContext *owner = nullptr;

@@ -464,6 +464,150 @@ SELECT
 ----
 0	0	0	0	0
 
+# DROP ownership is the exact catalog/schema identity recorded at CREATE time.
+# A same-named ordinary view that deliberately references the backing table must
+# not be able to destroy the tracked MV.
+statement ok
+CREATE TABLE lifecycle_exact_drop_src (id INTEGER);
+
+statement ok
+INSERT INTO lifecycle_exact_drop_src VALUES (1), (2);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_exact_drop_mv AS
+SELECT * FROM lifecycle_exact_drop_src;
+
+statement ok
+CREATE SCHEMA lifecycle_spoof;
+
+statement ok
+CREATE VIEW lifecycle_spoof.lifecycle_exact_drop_mv AS
+SELECT * FROM main.openivm_data_lifecycle_exact_drop_mv;
+
+statement ok
+DROP VIEW lifecycle_spoof.lifecycle_exact_drop_mv;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_exact_drop_mv
+    EXCEPT ALL
+    SELECT * FROM lifecycle_exact_drop_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_exact_drop_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_exact_drop_mv
+);
+----
+0
+
+query III
+SELECT
+    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_exact_drop_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_exact_drop_mv'),
+    (SELECT count(*) FROM duckdb_views()
+     WHERE schema_name = 'lifecycle_spoof' AND view_name = 'lifecycle_exact_drop_mv');
+----
+1	1	0
+
+# A transaction-local DROP must be visible to a subsequent CREATE of the same
+# MV name, including refresh compilation against the replacement metadata.
+statement ok
+CREATE TABLE lifecycle_drop_recreate_src (id INTEGER, old_v INTEGER, new_v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_drop_recreate_src VALUES (1, 10, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_drop_recreate_mv AS
+SELECT id, old_v AS v FROM lifecycle_drop_recreate_src;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP VIEW lifecycle_drop_recreate_mv;
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_drop_recreate_mv AS
+SELECT id, new_v AS v FROM lifecycle_drop_recreate_src;
+
+statement ok
+INSERT INTO lifecycle_drop_recreate_src VALUES (2, 20, 200);
+
+statement ok
+UPDATE lifecycle_drop_recreate_src SET new_v = 101 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('lifecycle_drop_recreate_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_drop_recreate_mv
+    EXCEPT ALL
+    SELECT id, new_v AS v FROM lifecycle_drop_recreate_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, new_v AS v FROM lifecycle_drop_recreate_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_drop_recreate_mv
+);
+----
+0
+
+statement ok
+COMMIT;
+
+# Stabilizing generated metadata timestamps must not rewrite now() text inside
+# the stored view SQL.
+statement ok
+CREATE TABLE lifecycle_now_literal_src (id INTEGER);
+
+statement ok
+INSERT INTO lifecycle_now_literal_src VALUES (1);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_now_literal_mv AS
+SELECT id, 'now()' AS marker FROM lifecycle_now_literal_src;
+
+statement ok
+INSERT INTO lifecycle_now_literal_src VALUES (2);
+
+statement ok
+PRAGMA refresh('lifecycle_now_literal_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_now_literal_mv
+    EXCEPT ALL
+    SELECT id, 'now()' AS marker FROM lifecycle_now_literal_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, 'now()' AS marker FROM lifecycle_now_literal_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_now_literal_mv
+);
+----
+0
+
+statement ok
+COMMIT;
+
 # A refresh keeps its OpenIVM locks until the surrounding transaction ends.
 # The second connection starts while the first transaction is sleeping after
 # refresh and must wait for rollback before it can consume the restored delta.

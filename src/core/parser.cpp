@@ -130,6 +130,20 @@ static bool MatchesPatternCI(const string &text, idx_t pos, const string &patter
 	return true;
 }
 
+static bool RelationExists(ClientContext &context, const string &catalog_name, const string &schema_name,
+                           const string &relation_name) {
+	QueryErrorContext error_context;
+	for (auto type : {CatalogType::TABLE_ENTRY, CatalogType::VIEW_ENTRY}) {
+		auto entry =
+		    Catalog::GetEntry(context, catalog_name, schema_name, EntryLookupInfo(type, relation_name, error_context),
+		                      OnEntryNotFound::RETURN_NULL);
+		if (entry) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool HasIdentifierBoundary(const string &text, idx_t pos, idx_t len) {
 	bool left_ok = pos == 0 || !IsIdentifierTokenChar(text[pos - 1]);
 	idx_t end = pos + len;
@@ -294,14 +308,24 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			view_catalog_prefix = SqlUtils::QualifiedPrefix(current_catalog, current_schema);
 		}
 	}
+	if (view_target_catalog.empty()) {
+		view_target_catalog = default_db;
+	}
+	if (view_target_schema.empty()) {
+		view_target_schema = default_schema;
+	}
 	RefreshMetadata metadata(con);
 	bool target_is_ducklake = metadata.IsDuckLakeCatalog(view_target_catalog);
 	string internal_catalog_prefix = view_catalog_prefix;
+	string internal_target_catalog = view_target_catalog;
+	string internal_target_schema = view_target_schema;
 	// Native MVs created from another active catalog keep OpenIVM state in the physical
 	// default DB. DuckLake-targeted MVs store their data/delta tables in DuckLake so
 	// initial materialization follows the same storage path as DuckLake CTAS.
 	if (!target_is_ducklake && !view_catalog_prefix.empty() && default_db != "memory") {
 		internal_catalog_prefix = SqlUtils::QualifiedPrefix(default_db, default_schema);
+		internal_target_catalog = default_db;
+		internal_target_schema = default_schema;
 	}
 	string data_table = IncrementalTableNames::DataTableName(view_name);
 	string qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
@@ -331,7 +355,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Fail before registering cleanup DDL. Otherwise a duplicate CREATE attempt
 		// can fail on the pre-existing backing table and then cleanup would drop the
 		// original MV's user-facing view/data table.
-		if (RelationExists(con, qvn) || RelationExists(con, qdt)) {
+		if (RelationExists(context, view_target_catalog, view_target_schema, view_name) ||
+		    RelationExists(context, internal_target_catalog, internal_target_schema, data_table)) {
 			throw CatalogException("Table with name \"" + view_name + "\" already exists!");
 		}
 	}
@@ -1064,19 +1089,21 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 	}
 
-	metadata_ddl.push_back("insert or replace into " + string(openivm::VIEWS_TABLE) +
-	                       " (view_name, sql_string, type, has_minmax, has_left_join, has_join, last_update, "
-	                       "refresh_interval, refresh_in_progress, group_columns, aggregate_types, "
-	                       "having_predicate, group_recompute_affected_mode, "
-	                       "group_recompute_source_occurrences_json, has_full_outer, "
-	                       "full_outer_join_cols) values ('" +
-	                       view_name + "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
-	                       to_string((int)refresh_type) + ", " + (has_minmax_metadata ? "true" : "false") + ", " +
-	                       (analysis.found_left_join ? "true" : "false") + ", " +
-	                       (analysis.found_join ? "true" : "false") + ", now(), " + refresh_val + ", false, " +
-	                       group_cols_val + ", " + agg_types_val + ", " + having_val + ", " + group_recompute_mode_val +
-	                       ", " + group_recompute_source_occurrences_val + ", " +
-	                       (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
+	metadata_ddl.push_back(
+	    "insert or replace into " + string(openivm::VIEWS_TABLE) +
+	    " (view_name, view_catalog, view_schema, sql_string, type, has_minmax, has_left_join, "
+	    "has_join, last_update, "
+	    "refresh_interval, refresh_in_progress, group_columns, aggregate_types, "
+	    "having_predicate, group_recompute_affected_mode, "
+	    "group_recompute_source_occurrences_json, has_full_outer, "
+	    "full_outer_join_cols) values ('" +
+	    view_name + "', '" + SqlUtils::EscapeSingleQuotes(view_target_catalog) + "', '" +
+	    SqlUtils::EscapeSingleQuotes(view_target_schema) + "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
+	    to_string((int)refresh_type) + ", " + (has_minmax_metadata ? "true" : "false") + ", " +
+	    (analysis.found_left_join ? "true" : "false") + ", " + (analysis.found_join ? "true" : "false") + ", now(), " +
+	    refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
+	    group_recompute_mode_val + ", " + group_recompute_source_occurrences_val + ", " +
+	    (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
 
 	if (!lineage_json.empty()) {
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));
@@ -1658,13 +1685,31 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(con);
 	}
-	auto tracked = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                         SqlUtils::EscapeValue(drop.info->name) + "'");
-	// Metadata is keyed by the bare MV name, so it cannot prove that a
-	// schema-qualified DROP targets that MV. The OpenIVM user view always reads
-	// its generated backing table; an ordinary same-named view does not.
+	auto tracked = con.Query("SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) +
+	                         " WHERE view_name = '" + SqlUtils::EscapeValue(drop.info->name) + "'");
+	bool legacy_identity = tracked->HasError();
+	if (legacy_identity) {
+		tracked = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+		                    SqlUtils::EscapeValue(drop.info->name) + "'");
+	}
 	if (data_table_ref.empty() || tracked->HasError() || tracked->RowCount() == 0) {
 		return program;
+	}
+	if (!legacy_identity && !tracked->GetValue(0, 0).IsNull() && !tracked->GetValue(1, 0).IsNull()) {
+		if (!StringUtil::CIEquals(tracked->GetValue(0, 0).ToString(), catalog_name) ||
+		    !StringUtil::CIEquals(tracked->GetValue(1, 0).ToString(), schema_name)) {
+			return program;
+		}
+	} else {
+		// Rows created before target identity was persisted can only be cleaned
+		// through the default search-path location. A qualified same-named view
+		// elsewhere is not sufficient proof of ownership.
+		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
+		string default_schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
+		if (!StringUtil::CIEquals(default_entry.catalog, catalog_name) ||
+		    !StringUtil::CIEquals(default_schema, schema_name)) {
+			return program;
+		}
 	}
 
 	RefreshMetadata metadata(con);

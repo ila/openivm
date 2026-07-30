@@ -127,13 +127,14 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 	// Enter the refresh phase for every native source catalog before inspecting delta activity.
 	// Writers enter the complementary phase through the actual delta table catalog, so this also
 	// covers views whose target and source catalogs differ.
-	unordered_map<string, vector<string>> source_deltas_by_catalog;
+	map<string, vector<string>> source_deltas_by_catalog;
 	for (auto &source : delta_sources) {
 		delta_table_names.push_back(source.table_name);
 		if (source.catalog_type != "ducklake") {
 			source_deltas_by_catalog[source.catalog_name].push_back(source.table_name);
 		}
 	}
+	ViewLockGuard view_guard(vn);
 	vector<unique_ptr<DeltaCatalogRefreshGuard>> delta_catalog_guards;
 	for (auto &entry : source_deltas_by_catalog) {
 		auto &names = entry.second;
@@ -142,7 +143,6 @@ static void RefreshViewLocked(ClientContext &context, const string &view_catalog
 		delta_catalog_guards.push_back(
 		    make_uniq<DeltaCatalogRefreshGuard>(context, Catalog::GetCatalog(context, entry.first), std::move(names)));
 	}
-	ViewLockGuard view_guard(vn);
 	// Acquire delta-table locks in sorted order to serialize parallel refreshes that
 	// share base tables (e.g. mv_A and mv_B both reading STOCK → both write to
 	// `delta_STOCK` inside their transactions → "Conflict on tuple deletion!" when

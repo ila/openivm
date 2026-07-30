@@ -34,7 +34,8 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	// Matcher metadata columns (signature_hash..nullified_columns_json) stay
 	// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
 	ddl.push_back("create table if not exists " + string(openivm::VIEWS_TABLE) +
-	              " (view_name varchar primary key, sql_string varchar, type tinyint,"
+	              " (view_name varchar primary key, view_catalog varchar default null,"
+	              " view_schema varchar default null, sql_string varchar, type tinyint,"
 	              " has_minmax boolean default false, has_left_join boolean default false,"
 	              " has_join boolean default false,"
 	              " last_update timestamp, refresh_interval bigint default null,"
@@ -70,6 +71,8 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_affected_mode varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_source_occurrences_json varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "derived_aggregate_outputs_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_catalog varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_schema varchar default null");
 	if (!is_replace) {
 		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
 		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));

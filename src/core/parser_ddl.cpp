@@ -61,10 +61,57 @@ static bool IsMetadataSchemaStatement(const string &statement) {
 	return StringUtil::StartsWith(lower, "create table") || StringUtil::StartsWith(lower, "alter table");
 }
 
-static string StabilizeTransactionalMetadata(string statement, const string &timestamp_sql) {
-	statement = StringUtil::Replace(statement, "now()", timestamp_sql);
-	statement = StringUtil::Replace(statement, "NOW()", timestamp_sql);
-	return statement;
+static bool MatchesNowCall(const string &statement, idx_t offset) {
+	static const string now_call = "now()";
+	if (offset + now_call.size() > statement.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < now_call.size(); i++) {
+		if (StringUtil::CharacterToLower(statement[offset + i]) != now_call[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static string StabilizeTransactionalMetadata(const string &statement, const string &timestamp_sql) {
+	string result;
+	result.reserve(statement.size() + timestamp_sql.size());
+	bool in_single_quote = false;
+	bool in_double_quote = false;
+	for (idx_t offset = 0; offset < statement.size();) {
+		char current = statement[offset];
+		if (current == '\'' && !in_double_quote) {
+			result.push_back(current);
+			if (in_single_quote && offset + 1 < statement.size() && statement[offset + 1] == '\'') {
+				result.push_back(statement[offset + 1]);
+				offset += 2;
+				continue;
+			}
+			in_single_quote = !in_single_quote;
+			offset++;
+			continue;
+		}
+		if (current == '"' && !in_single_quote) {
+			result.push_back(current);
+			if (in_double_quote && offset + 1 < statement.size() && statement[offset + 1] == '"') {
+				result.push_back(statement[offset + 1]);
+				offset += 2;
+				continue;
+			}
+			in_double_quote = !in_double_quote;
+			offset++;
+			continue;
+		}
+		if (!in_single_quote && !in_double_quote && MatchesNowCall(statement, offset)) {
+			result += timestamp_sql;
+			offset += 5;
+			continue;
+		}
+		result.push_back(current);
+		offset++;
+	}
+	return result;
 }
 
 struct CreateMVProfileStep {
@@ -466,7 +513,7 @@ void TransactionalMVMetadataState::Register(ClientContext &context, const vector
 	for (auto &parameter : parameters) {
 		auto statement = parameter.GetValue<string>();
 		if (IsReplayableMetadataStatement(statement)) {
-			statements.push_back(StabilizeTransactionalMetadata(std::move(statement), timestamp_sql));
+			statements.push_back(StabilizeTransactionalMetadata(statement, timestamp_sql));
 		}
 	}
 }
