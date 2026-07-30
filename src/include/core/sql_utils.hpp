@@ -63,6 +63,7 @@ public:
 	static bool RewriteColumnReferences(string &sql, const string &old_name, const string &new_name,
 	                                    const unordered_set<string> &qualifiers, bool allow_unqualified);
 	static string FindTableReference(const string &sql, const string &table_name);
+	static string FindTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence);
 	static idx_t CountTableReferences(const string &sql, const string &table_name);
 
 	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.

@@ -682,9 +682,44 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 	                                   affected_ctes);
 }
 
-static string TryBuildLeftJoinAffectedPushdown(const string &view_name, const string &data_table,
-                                               const string &view_query_sql, const string &qdv,
-                                               const string &delta_ts_filter, const string &lk) {
+static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const string &view_name,
+                                              const string &data_table, const string &view_query_sql, const string &qdv,
+                                              const string &delta_ts_filter, const string &lk) {
+	RefreshMetadata::LeftJoinKeySource key_source;
+	if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
+		return "";
+	}
+	string source_ref = SqlUtils::FindTableReferenceOccurrence(view_query_sql, key_source.table, key_source.occurrence);
+	if (source_ref.empty()) {
+		return "";
+	}
+
+	string affected_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	string affected_cte =
+	    "WITH openivm_affected AS (\n  SELECT DISTINCT " + lk + " FROM " + qdv + affected_where + "\n)\n";
+	string key_col = SqlUtils::QuoteIdentifier(key_source.column);
+	string replacement = "(SELECT openivm_lj_src.* FROM " + source_ref +
+	                     " openivm_lj_src INNER JOIN openivm_affected openivm_lj_aff ON openivm_lj_src." + key_col +
+	                     " IS NOT DISTINCT FROM openivm_lj_aff." + lk + ")";
+	bool replaced = false;
+	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_source.table,
+	                                                                key_source.occurrence, replacement, replaced);
+	if (!replaced || pushed_query == view_query_sql) {
+		return "";
+	}
+
+	string affected = "EXISTS (SELECT 1 FROM openivm_affected _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
+	string delete_match = "_d." + lk + " IS NOT DISTINCT FROM openivm_delete_target." + lk;
+	OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN affected-key pushdown for %s via %s[%llu].%s\n", view_name.c_str(),
+	                    key_source.table.c_str(), static_cast<unsigned long long>(key_source.occurrence),
+	                    key_source.column.c_str());
+	return BuildDeleteUsingInsertRefreshSQL(data_table, pushed_query, "openivm_lj", "openivm_affected", "_d",
+	                                        delete_match, affected + "openivm_lj." + lk + ")", affected_cte);
+}
+
+static string TryBuildFactMarketHistoryAffectedPushdown(const string &view_name, const string &data_table,
+                                                        const string &view_query_sql, const string &qdv,
+                                                        const string &delta_ts_filter, const string &lk) {
 	static const string security_table = string(openivm::DATA_TABLE_PREFIX) + "dim_security";
 	static const string security_key = "sk_company_id";
 
@@ -723,27 +758,28 @@ static string TryBuildLeftJoinAffectedPushdown(const string &view_name, const st
 
 	string affected = "EXISTS (SELECT 1 FROM openivm_affected _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
 	string delete_match = "_d." + lk + " IS NOT DISTINCT FROM openivm_delete_target." + lk;
-	// TODO(PROPER Lineage): replace this TPC-DI source-specific shortcut with lineage from
-	// openivm_left_key to the source binding that produced it, then push the affected-key
-	// predicate to that binding generically. The final EXISTS guard stays because it makes
-	// this rewrite semantics-preserving even if the source filter admits false positives.
-	// This must not be generalized by table/column names alone: left-side inserts can produce
-	// false negatives unless lineage proves the affected key comes from this source binding.
+	// Keep the legacy TPC-DI fallback for views created before LEFT JOIN key-source lineage
+	// was recorded. The final EXISTS guard makes the rewrite semantics-preserving even if
+	// the source filter admits false positives.
 	// We also benchmarked dropping the final guard at SF25/SF50; it was only marginally
 	// faster, so the guarded shape is the safer default until lineage proves exactness.
 	return BuildDeleteUsingInsertRefreshSQL(data_table, pushed_query, "openivm_lj", "openivm_affected", "_d",
 	                                        delete_match, affected + "openivm_lj." + lk + ")", affected_cte);
 }
 
-static string BuildLeftJoinProjectionRefresh(const string &view_name, const string &data_table,
-                                             const string &view_query_sql, const string &delta_ts_filter,
-                                             const string &catalog_prefix) {
+static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const string &view_name,
+                                             const string &data_table, const string &view_query_sql,
+                                             const string &delta_ts_filter, const string &catalog_prefix) {
 	string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
 	string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
 	string lk = KeywordHelper::WriteOptionallyQuoted(string(openivm::LEFT_KEY_COL));
 	string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
 	auto pushed_refresh =
-	    TryBuildLeftJoinAffectedPushdown(view_name, data_table, view_query_sql, qdv, delta_ts_filter, lk);
+	    TryBuildLeftJoinLineagePushdown(metadata, view_name, data_table, view_query_sql, qdv, delta_ts_filter, lk);
+	if (pushed_refresh.empty()) {
+		pushed_refresh =
+		    TryBuildFactMarketHistoryAffectedPushdown(view_name, data_table, view_query_sql, qdv, delta_ts_filter, lk);
+	}
 	if (!pushed_refresh.empty()) {
 		return pushed_refresh;
 	}
@@ -807,7 +843,8 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
 			return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix,
 			                                 /*insert_only=*/true);
 		}
-		return BuildLeftJoinProjectionRefresh(view_name, data_table, view_query_sql, delta_ts_filter, catalog_prefix);
+		return BuildLeftJoinProjectionRefresh(metadata, view_name, data_table, view_query_sql, delta_ts_filter,
+		                                      catalog_prefix);
 	}
 	return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete);
 }

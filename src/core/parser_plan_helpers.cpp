@@ -976,6 +976,28 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 	return false;
 }
 
+bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out) {
+	for (auto *join : facts.comparison_joins) {
+		if (!join || join->join_type != JoinType::LEFT || join->conditions.empty()) {
+			continue;
+		}
+		auto *preserved_key = join->conditions[0].left.get();
+		if (!preserved_key || preserved_key->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+			return false;
+		}
+		auto &column_ref = preserved_key->Cast<BoundColumnRefExpression>();
+		OccurrenceColumnRef source;
+		if (!ResolveBindingToOccurrenceRef(column_ref.binding, facts, source)) {
+			return false;
+		}
+		out.table = source.table;
+		out.occurrence = source.occurrence;
+		out.column = source.column;
+		return true;
+	}
+	return false;
+}
+
 static string NullableGetTableName(LogicalGet &get) {
 	auto table = get.GetTable();
 	if (table.get() && !table.get()->name.empty()) {

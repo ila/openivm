@@ -1020,6 +1020,21 @@ string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &l
 	return json;
 }
 
+bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out) {
+	string json;
+	if (!ReadRefreshLineageEntry(con, view_name, "left_join_key_source", json)) {
+		return false;
+	}
+	return ExtractJsonString(json, "table", out.table) && ParseJsonIndex(json, "occ", out.occurrence) &&
+	       ExtractJsonString(json, "column", out.column);
+}
+
+string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source) {
+	return "{\"k\":\"left_join_key_source\",\"table\":" + SqlUtils::JsonQuote(source.table) +
+	       ",\"occ\":" + SqlUtils::JsonQuote(to_string(source.occurrence)) +
+	       ",\"column\":" + SqlUtils::JsonQuote(source.column) + "}";
+}
+
 string RefreshMetadata::LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src) {
 	string json = "{\"k\":\"left_join_nullable\",\"complete\":" + SqlUtils::JsonQuote(src.complete ? "true" : "false") +
 	              ",\"tables\":[";

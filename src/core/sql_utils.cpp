@@ -908,6 +908,15 @@ string SqlUtils::FindTableReference(const string &sql, const string &table_name)
 	return sql.substr(match.start, match.end - match.start);
 }
 
+string SqlUtils::FindTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence) {
+	auto matches = CollectTableReferenceMatches(sql, table_name, false);
+	if (occurrence >= matches.size()) {
+		return "";
+	}
+	auto &match = matches[occurrence];
+	return sql.substr(match.start, match.end - match.start);
+}
+
 idx_t SqlUtils::CountTableReferences(const string &sql, const string &table_name) {
 	return CollectTableReferenceMatches(sql, table_name, false).size();
 }

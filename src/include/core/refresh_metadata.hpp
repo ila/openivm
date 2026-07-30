@@ -268,6 +268,15 @@ public:
 	bool GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out);
 	static string ProjectionKeyLineageToJson(const ProjectionKeyLineage &lineage);
 
+	struct LeftJoinKeySource {
+		string table;
+		idx_t occurrence = 0;
+		string column;
+	};
+
+	bool GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out);
+	static string LeftJoinKeySourceToJson(const LeftJoinKeySource &source);
+
 	struct LeftJoinNullableSources {
 		vector<string> tables;
 		bool complete = false;
