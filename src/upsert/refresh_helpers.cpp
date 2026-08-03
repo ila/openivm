@@ -717,10 +717,22 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 	                                   affected_ctes);
 }
 
+static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string &extra_predicate) {
+	string predicate = delta_ts_filter;
+	if (!extra_predicate.empty()) {
+		if (!predicate.empty()) {
+			predicate += " AND ";
+		}
+		predicate += extra_predicate;
+	}
+	return predicate.empty() ? "" : " WHERE " + predicate;
+}
+
 static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const string &view_name,
                                               const vector<string> &delta_table_names, const string &data_table,
                                               const string &view_query_sql, const string &qdv,
-                                              const string &delta_ts_filter, const string &lk) {
+                                              const string &delta_ts_filter, const string &lk,
+                                              const string &negative_delta_guard) {
 	bool all_ducklake = !delta_table_names.empty();
 	for (auto &delta_table : delta_table_names) {
 		if (!metadata.IsDuckLakeTable(view_name, delta_table)) {
@@ -738,7 +750,7 @@ static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const s
 		return "";
 	}
 
-	string affected_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	string affected_where = BuildGuardedDeltaWhere(delta_ts_filter, negative_delta_guard);
 	string affected_cte =
 	    "WITH openivm_affected AS (\n  SELECT DISTINCT " + lk + " FROM " + qdv + affected_where + "\n)\n";
 	string key_col = SqlUtils::QuoteIdentifier(key_source.column);
@@ -764,7 +776,8 @@ static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const s
 
 static string TryBuildFactMarketHistoryAffectedPushdown(const string &view_name, const string &data_table,
                                                         const string &view_query_sql, const string &qdv,
-                                                        const string &delta_ts_filter, const string &lk) {
+                                                        const string &delta_ts_filter, const string &lk,
+                                                        const string &negative_delta_guard) {
 	static const string security_table = string(openivm::DATA_TABLE_PREFIX) + "dim_security";
 	static const string security_key = "sk_company_id";
 
@@ -787,7 +800,7 @@ static string TryBuildFactMarketHistoryAffectedPushdown(const string &view_name,
 		return "";
 	}
 
-	string affected_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	string affected_where = BuildGuardedDeltaWhere(delta_ts_filter, negative_delta_guard);
 	string affected_cte =
 	    "WITH openivm_affected AS (\n  SELECT DISTINCT " + lk + " FROM " + qdv + affected_where + "\n)\n";
 	string key_col = KeywordHelper::WriteOptionallyQuoted(security_key);
@@ -813,25 +826,56 @@ static string TryBuildFactMarketHistoryAffectedPushdown(const string &view_name,
 }
 
 static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const string &view_name,
+                                             const vector<string> &column_names,
                                              const vector<string> &delta_table_names, const string &data_table,
                                              const string &view_query_sql, const string &delta_ts_filter,
-                                             const string &catalog_prefix) {
-	string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
+                                             const string &catalog_prefix, bool allow_runtime_insert_only) {
 	string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
 	string lk = KeywordHelper::WriteOptionallyQuoted(string(openivm::LEFT_KEY_COL));
-	string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
-	auto pushed_refresh = TryBuildLeftJoinLineagePushdown(metadata, view_name, delta_table_names, data_table,
-	                                                      view_query_sql, qdv, delta_ts_filter, lk);
-	if (pushed_refresh.empty()) {
-		pushed_refresh =
-		    TryBuildFactMarketHistoryAffectedPushdown(view_name, data_table, view_query_sql, qdv, delta_ts_filter, lk);
+	string mul = KeywordHelper::WriteOptionallyQuoted(string(openivm::MULTIPLICITY_COL));
+	string negative_delta_guard;
+	if (allow_runtime_insert_only) {
+		string negative_where = delta_ts_filter.empty() ? " WHERE " : " WHERE " + delta_ts_filter + " AND ";
+		negative_delta_guard = "EXISTS (SELECT 1 FROM " + qdv + " openivm_delta_shape" + negative_where +
+		                       "openivm_delta_shape." + mul + " < 0 LIMIT 1)";
 	}
-	if (!pushed_refresh.empty()) {
+	string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
+	if (!negative_delta_guard.empty()) {
+		delta_where += " AND " + negative_delta_guard;
+	}
+	string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
+	auto pushed_refresh =
+	    TryBuildLeftJoinLineagePushdown(metadata, view_name, delta_table_names, data_table, view_query_sql, qdv,
+	                                    delta_ts_filter, lk, negative_delta_guard);
+	if (pushed_refresh.empty()) {
+		pushed_refresh = TryBuildFactMarketHistoryAffectedPushdown(view_name, data_table, view_query_sql, qdv,
+		                                                           delta_ts_filter, lk, negative_delta_guard);
+	}
+	if (pushed_refresh.empty()) {
+		pushed_refresh = BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_lj",
+		                                             affected + data_table + "." + lk + delta_where + ")",
+		                                             affected + "openivm_lj." + lk + delta_where + ")");
+	}
+	if (!allow_runtime_insert_only) {
 		return pushed_refresh;
 	}
-	return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_lj",
-	                                   affected + data_table + "." + lk + delta_where + ")",
-	                                   affected + "openivm_lj." + lk + delta_where + ")");
+
+	string select_columns;
+	for (auto &raw_col : column_names) {
+		if (raw_col == openivm::MULTIPLICITY_COL) {
+			continue;
+		}
+		if (!select_columns.empty()) {
+			select_columns += ", ";
+		}
+		select_columns += KeywordHelper::WriteOptionallyQuoted(raw_col);
+	}
+	string append_where = delta_ts_filter.empty() ? " WHERE " : " WHERE " + delta_ts_filter + " AND ";
+	append_where += mul + " > 0 AND NOT (" + negative_delta_guard + ")";
+	string append_sql = "INSERT INTO " + data_table + " SELECT " + select_columns + "\nFROM " + qdv +
+	                    "\nCROSS JOIN generate_series(1, " + mul + "::BIGINT)\n" + append_where + ";\n";
+	OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN runtime output-delta append guard for %s\n", view_name.c_str());
+	return pushed_refresh + append_sql;
 }
 
 static string NormalizeTableToken(string token) {
@@ -876,8 +920,8 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
                                 const vector<string> &delta_table_names, const string &data_table,
                                 const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
-                                bool skip_proj_delete, bool insert_only,
-                                const vector<string> &active_delta_table_names) {
+                                bool skip_proj_delete, bool insert_only, const vector<string> &active_delta_table_names,
+                                bool allow_runtime_insert_only) {
 	if (has_full_outer) {
 		return BuildFullOuterProjectionRefresh(metadata, view_name, delta_table_names, data_table, view_query_sql,
 		                                       delta_ts_filter, catalog_prefix);
@@ -889,8 +933,9 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
 			return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix,
 			                                 /*insert_only=*/true);
 		}
-		return BuildLeftJoinProjectionRefresh(metadata, view_name, delta_table_names, data_table, view_query_sql,
-		                                      delta_ts_filter, catalog_prefix);
+		return BuildLeftJoinProjectionRefresh(metadata, view_name, column_names, delta_table_names, data_table,
+		                                      view_query_sql, delta_ts_filter, catalog_prefix,
+		                                      allow_runtime_insert_only);
 	}
 	return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete);
 }

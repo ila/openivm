@@ -67,6 +67,112 @@ SELECT count(*) FROM (
 0
 
 # ==========================================
+# Runtime output-delta append guard
+# ==========================================
+
+statement ok
+CREATE TABLE dl.runtime_left (id INTEGER, value VARCHAR);
+
+statement ok
+CREATE TABLE dl.runtime_right (id INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO dl.runtime_left VALUES (1, 'one'), (2, 'two'), (NULL, 'null-key');
+
+statement ok
+INSERT INTO dl.runtime_right VALUES (1, 'x');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_runtime_left_join AS
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id;
+
+# Touch both sides so the static preserved-side fast path cannot fire. Adding
+# matches to an already-matched key only produces positive output deltas. The
+# duplicate right rows exercise multiplicity expansion, while the NULL-keyed
+# left row remains in the materialized bag.
+statement ok
+INSERT INTO dl.runtime_left VALUES (NULL, 'second-null-key');
+
+statement ok
+INSERT INTO dl.runtime_right VALUES (1, 'y'), (1, 'y');
+
+statement ok
+PRAGMA refresh('mv_runtime_left_join');
+
+query I
+SELECT contains(content, 'openivm_delta_shape')
+       AND contains(content, 'openivm_multiplicity < 0')
+       AND contains(content, 'generate_series')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_runtime_left_join.sql');
+----
+true
+
+query I
+SELECT count(*) FROM (
+  SELECT id, value, label FROM dl.mv_runtime_left_join
+  EXCEPT ALL
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+  EXCEPT ALL
+  SELECT id, value, label FROM dl.mv_runtime_left_join
+);
+----
+0
+
+# A single conflicting batch produces negative output multiplicities: UPDATE
+# contributes -old/+new, deleting the last match restores a NULL-extended row,
+# and inserting a first match removes another NULL-extended row. The runtime
+# guard must therefore retain the affected-key recompute behavior.
+statement ok
+INSERT INTO dl.runtime_left VALUES (3, 'three');
+
+statement ok
+UPDATE dl.runtime_left SET value = 'two-updated' WHERE id = 2;
+
+statement ok
+DELETE FROM dl.runtime_right WHERE id = 1 AND label = 'x';
+
+statement ok
+INSERT INTO dl.runtime_right VALUES (2, 'z');
+
+statement ok
+PRAGMA refresh('mv_runtime_left_join');
+
+query I
+SELECT count(*) FROM (
+  SELECT id, value, label FROM dl.mv_runtime_left_join
+  EXCEPT ALL
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+  EXCEPT ALL
+  SELECT id, value, label FROM dl.mv_runtime_left_join
+);
+----
+0
+
+# ==========================================
 # Star projection: affected fact-key pushdown
 # ==========================================
 
