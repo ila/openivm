@@ -27,7 +27,7 @@ The refresh daemon is a background `std::thread` started at extension load. It:
 1. Wakes every 30 seconds
 2. Queries `openivm_views` for views with `refresh_interval IS NOT NULL`
 3. For each view where `now() - last_update >= interval`: calls `PRAGMA refresh('view_name')`
-4. Skips views that are already being refreshed (via `TryLockView`)
+4. Waits for any active OpenIVM mutation, then refreshes the due view
 
 The daemon holds a non-owning reference to the database and exits cleanly when the database is destroyed.
 
@@ -80,11 +80,11 @@ This adds two small UPDATE statements per refresh cycle (one before, one after t
 
 ## Concurrency
 
-Automatic refresh uses the same per-view locking as manual `PRAGMA refresh()`:
+Automatic refresh uses the same database-wide mutation gate as manual `PRAGMA refresh()`:
 
 - **Reads during refresh**: always safe (DuckDB MVCC — readers see a consistent snapshot)
-- **Two concurrent refreshes of the same view**: serialized by a per-view mutex. The daemon skips views that are locked (e.g., by a manual PRAGMA), and manual PRAGMAs wait for the daemon to finish.
-- **DML during refresh**: safe. A per-delta-table mutex in the insert rule prevents delta writes from racing with the refresh's timestamp logic.
+- **Concurrent refreshes**: serialized by the mutation gate. The daemon and manual refreshes wait for the active mutation to finish.
+- **Tracked DML during refresh**: serialized by the same gate, preventing delta writes from racing with refresh bookkeeping.
 
 ## Configuration
 

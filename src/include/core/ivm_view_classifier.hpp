@@ -18,9 +18,8 @@ enum class DeltaStrategyReason {
 	REPEATED_CTE_AGGREGATE_GROUP_FALLBACK,
 	SEMI_ANTI_AGGREGATE_GROUP_FALLBACK,
 	OUTER_JOIN_AGGREGATE_RECOMPUTE,
-	ASOF_CURRENT_DIFF_RECOMPUTE,
-	SAMPLE_CURRENT_DIFF_RECOMPUTE,
-	POSITIONAL_CURRENT_DIFF_RECOMPUTE
+	OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE,
+	INNER_DISTINCT_PROJECTION_RECOMPUTE
 };
 
 enum class DeltaModelFeature {
@@ -39,7 +38,6 @@ enum class DeltaModelFeature {
 	ASOF_STATEFUL,
 	SAMPLE_GLOBAL_RECOMPUTE,
 	POSITIONAL_GLOBAL_RECOMPUTE,
-	CURRENT_DIFF_RECOMPUTE,
 	FULL_ONLY
 };
 
@@ -167,6 +165,8 @@ struct DeltaViewModelInput {
 	bool stored_query_has_top_k = false;
 	bool has_hidden_minmax_having = false;
 	bool has_computed_minmax_aggregate_projection = false;
+	bool has_computed_sum_aggregate_projection = false;
+	bool has_top_level_redundant_distinct = false;
 	bool has_ducklake_source = false;
 };
 
@@ -225,7 +225,7 @@ const char *DeltaRuleKindName(DeltaRuleKind kind);
 const char *DeltaUnsupportedReasonName(DeltaUnsupportedReason reason);
 const char *DeltaUpdateSemanticsName(DeltaUpdateSemantics semantics);
 const char *DeltaAffectedDomainKindName(DeltaAffectedDomainKind kind);
-bool IsDistinctAtTop(const PlanAnalysis &analysis, const vector<string> &output_names);
+bool IsDistinctAtTop(const CreateMVPlanFacts &facts, const vector<string> &output_names);
 DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input);
 
 } // namespace duckdb

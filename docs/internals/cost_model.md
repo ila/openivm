@@ -121,7 +121,6 @@ match the refresh path that actually runs:
   affected groups.
 - `WINDOW_PARTITION` prices delta scanning plus the affected partition fraction of the
   base scan.
-- `CURRENT_DIFF_RECOMPUTE` prices the same compute and replace work as full recompute.
 - `DISTINCT_INCREMENTAL` adds aux-state maintenance over affected distinct tuples.
 - `SEMI_ANTI_RECOMPUTE` prices aux-state/domain recompute for supported semi/anti
   projection shapes.

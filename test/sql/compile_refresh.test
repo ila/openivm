@@ -159,6 +159,35 @@ WHERE stmt_kind = 'data';
 ----
 1
 
+# ==========================================
+# Test 6: forced full refresh still dispatches through the full-recompute
+# compiler when compile-for-cascade asks for view deltas.
+# ==========================================
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+query I
+SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%delete from openivm_data_mv_compile_only_proj;%insert into openivm_data_mv_compile_only_proj select%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%from %compile_only_proj_src%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 LIKE '%insert into openivm_delta_mv_compile_only_proj%'
+            AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
+                 NOT LIKE '%openivm_net%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_compile_only_proj',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
 statement ok
 CREATE TABLE compile_only_left(id INT, k INT);
 
@@ -361,7 +390,7 @@ WHERE stmt_kind = 'data';
 1
 
 # ==========================================
-# Test 7: openivm_compile_with_facts on a non-existent view fails cleanly
+# Test 9: openivm_compile_with_facts on a non-existent view fails cleanly
 # ==========================================
 
 statement error

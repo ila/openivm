@@ -51,6 +51,41 @@ static string PartitionOutputColumn(const string &input) {
 	return StripIdentifierQuotes(pos == string::npos ? input : input.substr(0, pos));
 }
 
+static vector<string> PartitionOutputColumns(const vector<string> &partition_columns) {
+	vector<string> output_columns;
+	output_columns.reserve(partition_columns.size());
+	for (auto &partition_column : partition_columns) {
+		output_columns.push_back(PartitionOutputColumn(partition_column));
+	}
+	return output_columns;
+}
+
+static string BuildAffectedTableFilter(const vector<string> &columns, const string &outer_alias,
+                                       const string &affected_table) {
+	string match = SqlUtils::BuildNullSafeMatch(columns, "openivm_aff", outer_alias);
+	return "EXISTS (SELECT 1 FROM " + affected_table + " openivm_aff WHERE " + match + ")";
+}
+
+static string BuildDeltaAffectedFilter(const vector<WindowPartitionDeltaSpec> &partition_delta_specs,
+                                       const string &delta_where, const string &outer_alias) {
+	string filter;
+	for (idx_t i = 0; i < partition_delta_specs.size(); i++) {
+		if (i > 0) {
+			filter += " OR ";
+		}
+		const auto &spec = partition_delta_specs[i];
+		string output_col = SqlUtils::QuoteIdentifier(spec.output_column);
+		string source_col = SqlUtils::QuoteIdentifier(spec.source_column);
+		string delta_table =
+		    spec.delta_table_sql.empty() ? SqlUtils::QuoteIdentifier(spec.delta_table) : spec.delta_table_sql;
+		string affected_keys =
+		    "SELECT DISTINCT " + source_col + " AS " + output_col + " FROM " + delta_table + delta_where;
+		filter += "EXISTS (SELECT 1 FROM (" + affected_keys + ") openivm_aff WHERE " + outer_alias + "." + output_col +
+		          " IS NOT DISTINCT FROM openivm_aff." + output_col + ")";
+	}
+	return filter;
+}
+
 static vector<string> SplitTopLevelComma(const string &input) {
 	vector<string> parts;
 	idx_t start = 0;
@@ -710,14 +745,16 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	string key_match_dt_fk = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "dt", "fk");
 	string key_match_b_m = "b." + part_q + " IS NOT DISTINCT FROM m." + part_q;
 	string key_match_d_fk = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "fk");
+	string affected_data_filter =
+	    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "dt", affected_table);
 
 	string sql;
 	sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS\nSELECT DISTINCT " +
 	       QualifiedColumn("d", plan.partition_column) + " AS " + part_q + "\nFROM " + delta_q + " d\nWHERE " +
 	       delta_positive + ";\n\n";
-	sql += "CREATE OR REPLACE TEMP TABLE " + bounds_table + " AS\nWITH old_max AS (\n  SELECT " + part_q + ", MAX(" +
-	       order_q + ") AS openivm_old_max_order FROM " + data_table + " WHERE " + part_q + " IN (SELECT " + part_q +
-	       " FROM " + affected_table + ") GROUP BY " + part_q + "\n), delta_min AS (\n  SELECT " +
+	sql += "CREATE OR REPLACE TEMP TABLE " + bounds_table + " AS\nWITH old_max AS (\n  SELECT dt." + part_q +
+	       ", MAX(dt." + order_q + ") AS openivm_old_max_order FROM " + data_table + " dt WHERE " +
+	       affected_data_filter + " GROUP BY dt." + part_q + "\n), delta_min AS (\n  SELECT " +
 	       QualifiedColumn("d", plan.partition_column) + " AS " + part_q + ", MIN(" +
 	       QualifiedColumn("d", plan.order_column) + ") AS openivm_delta_min_order\n  FROM " + delta_q +
 	       " d\n  WHERE " + delta_positive + "\n  GROUP BY " + QualifiedColumn("d", plan.partition_column) +
@@ -754,18 +791,29 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	       " ORDER BY " + QualifiedColumn("dt", plan.order_column) + " DESC) AS openivm_rn\n  FROM " + data_table +
 	       " dt\n  JOIN " + fast_table + " fk ON " + key_match_dt_fk +
 	       "\n) openivm_state_ranked\nWHERE openivm_rn = 1;\n\n";
-	string fallback_filter = part_q + " IN (SELECT " + part_q + " FROM " + fallback_table + ")";
+	string fallback_keys = "SELECT " + part_q + " FROM " + fallback_table;
+	string fallback_target_match =
+	    SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "openivm_aff", "openivm_target");
+	string fallback_recompute_match =
+	    SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "openivm_aff", "openivm_recompute");
 	if (emit_cascade_delta) {
-		sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + "\nWHERE " +
-		       fallback_filter + ";\n\n";
+		string fallback_old_filter =
+		    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "openivm_old", fallback_table);
+		string fallback_new_filter =
+		    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "openivm_recompute", fallback_table);
+		string fallback_delete_filter =
+		    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "openivm_target", fallback_table);
+		sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table +
+		       " openivm_old\nWHERE " + fallback_old_filter + ";\n\n";
 		sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
-		       ") openivm_recompute\nWHERE " + fallback_filter + ";\n\n";
-		sql += "DELETE FROM " + data_table + " WHERE " + fallback_filter + ";\n";
+		       ") openivm_recompute\nWHERE " + fallback_new_filter + ";\n\n";
+		sql += "DELETE FROM " + data_table + " AS openivm_target WHERE " + fallback_delete_filter + ";\n";
 		sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
 		sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
 	} else {
-		sql += BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", fallback_filter,
-		                                   fallback_filter);
+		sql +=
+		    BuildAffectedKeyRefreshSQL(data_table, view_query_sql, fallback_keys, "openivm_target", "openivm_recompute",
+		                               "openivm_aff", fallback_target_match, fallback_recompute_match);
 	}
 
 	auto emit_column_names = plan.output_columns.empty() ? visible_column_names : plan.output_columns;
@@ -1548,10 +1596,9 @@ string CompileFilteredGroupCount(const string &view_name, const string &aux_tabl
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter,
                               const string &catalog_prefix, const vector<string> &partition_columns,
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta,
-                              const string &affected_keys_sql, const string &affected_key_cols,
-                              const string &affected_key_tuple, const vector<string> &column_names,
+                              const string &affected_keys_sql, const vector<string> &column_names,
                               bool running_window_incremental) {
-	bool have_affected_keys = !affected_keys_sql.empty() && !affected_key_cols.empty() && !affected_key_tuple.empty();
+	bool have_affected_keys = !affected_keys_sql.empty();
 	if (!have_affected_keys && (partition_columns.empty() || partition_delta_specs.empty())) {
 		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
 	}
@@ -1566,25 +1613,7 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 	string affected_temp_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
-
-	string affected_filter;
-	if (have_affected_keys) {
-		affected_filter =
-		    affected_key_tuple + " IN (SELECT " + affected_key_cols + " FROM " + affected_temp_table + ")";
-	} else {
-		for (size_t i = 0; i < partition_delta_specs.size(); i++) {
-			if (i > 0) {
-				affected_filter += " OR ";
-			}
-			const auto &spec = partition_delta_specs[i];
-			string output_col = SqlUtils::QuoteIdentifier(spec.output_column);
-			string source_col = SqlUtils::QuoteIdentifier(spec.source_column);
-			string delta_table =
-			    spec.delta_table_sql.empty() ? SqlUtils::QuoteIdentifier(spec.delta_table) : spec.delta_table_sql;
-			affected_filter +=
-			    output_col + " IN (SELECT DISTINCT " + source_col + " FROM " + delta_table + delta_where + ")";
-		}
-	}
+	auto output_columns = PartitionOutputColumns(partition_columns);
 
 	OPENIVM_DEBUG_PRINT(
 	    "[CompileWindowRecompute] Partition columns: %zu, delta specs: %zu, lineage keys: %s, cascade delta: %s\n",
@@ -1592,15 +1621,17 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	    emit_cascade_delta ? "enabled" : "disabled");
 	if (!emit_cascade_delta) {
 		if (!have_affected_keys) {
-			return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter,
-			                                   affected_filter);
+			string target_filter = BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_target");
+			string recompute_filter = BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_recompute");
+			return "DELETE FROM " + data_table + " AS openivm_target WHERE " + target_filter + ";\n" + "INSERT INTO " +
+			       data_table + "\nSELECT * FROM (" + view_query_sql + ") openivm_recompute\nWHERE " +
+			       recompute_filter + ";\n";
 		}
-		string sql;
-		sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_keys_sql + ";\n\n";
-		sql += BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter,
-		                                   affected_filter);
-		sql += "DROP TABLE IF EXISTS " + affected_temp_table + ";\n";
-		return sql;
+		string target_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_target");
+		string recompute_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_recompute");
+		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_keys_sql, "openivm_target",
+		                                  "openivm_recompute", "openivm_aff", target_match, recompute_match,
+		                                  affected_temp_table);
 	}
 
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
@@ -1610,11 +1641,20 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	if (have_affected_keys) {
 		sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_keys_sql + ";\n\n";
 	}
-	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + "\nWHERE " +
-	       affected_filter + ";\n\n";
+	string old_filter = have_affected_keys
+	                        ? BuildAffectedTableFilter(output_columns, "openivm_old", affected_temp_table)
+	                        : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_old");
+	string recompute_filter = have_affected_keys
+	                              ? BuildAffectedTableFilter(output_columns, "openivm_recompute", affected_temp_table)
+	                              : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_recompute");
+	string target_filter = have_affected_keys
+	                           ? BuildAffectedTableFilter(output_columns, "openivm_target", affected_temp_table)
+	                           : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_target");
+	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table +
+	       " openivm_old\nWHERE " + old_filter + ";\n\n";
 	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
-	       ") openivm_recompute\nWHERE " + affected_filter + ";\n\n";
-	sql += "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
+	       ") openivm_recompute\nWHERE " + recompute_filter + ";\n\n";
+	sql += "DELETE FROM " + data_table + " AS openivm_target WHERE " + target_filter + ";\n";
 	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
 	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
 	if (have_affected_keys) {

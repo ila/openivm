@@ -1,0 +1,165 @@
+# OpenIVM codebase audit and remediation plan
+
+Date: 2026-07-22
+
+This audit covers the current working tree, including the in-progress nonlocal refresh changes. Findings were checked
+from correctness, reliability, performance, simplicity, and code-hygiene perspectives. Confirmed bugs were reproduced
+with real materialized views and refreshes rather than inferred only from static analysis.
+
+The remediation rule is correctness first: an incrementalizable query must retain a correct incremental or affected-domain
+maintenance path. A bug must not be hidden by weakening a test or silently changing the view to `FULL_REFRESH`.
+
+## P0: correctness and transaction safety
+
+- [x] **Capture delta rows in the base DML transaction.** Delta capture is now a streaming logical/physical operator that
+  appends through the caller's `ClientContext`, so base DML and delta rows share one commit or rollback. A resolved
+  catalog-level lock prevents refresh from advancing its watermark past an uncommitted delta. Regression coverage includes
+  rollback, constraint failure, defaults, generated columns, `RETURNING`, and an uncommitted DML/refresh race.
+- [x] **Capture actual `ON CONFLICT` outcomes.** Conflict clauses lower to `LogicalMergeInto`; a transparent physical action
+  decorator now captures only the INSERT, UPDATE, and DELETE rows selected by DuckDB after match and action predicates are
+  resolved. Updates emit the required delete-old/insert-new pair, volatile defaults are evaluated once, `RETURNING` is
+  preserved, and all writes remain in the base DML transaction. The same boundary also covers native `MERGE` actions.
+- [x] **Make MV lifecycle and native refresh transactional.** Native CREATE, REPLACE, DROP, ALTER, and refresh inside an
+  explicit caller transaction now mutate the user view, backing state, metadata, and deltas atomically and retain their
+  OpenIVM locks through commit or rollback. Autocommit refresh temporarily retains the established locked executor because
+  DuckDB query-pragma preprocessing ends a transaction before its returned program completes; `refresh.cpp` records the
+  native-operator follow-up. DuckLake replacement materializes data and auxiliary state under unpublished staging names
+  before publishing them.
+- [x] **Continue cascade traversal when the current node has no source deltas.** Empty-delta detection now skips only the
+  current node; it cannot terminate traversal of the downstream DAG. Regression coverage exercises both a pending parent
+  delta left by a cascade-off refresh and independent child-source DML, including the hook-aware empty-node path.
+- [x] **Use NULL-safe affected-window partition matching.** Affected-key refresh now uses hash-semi-joinable
+  `IS NOT DISTINCT FROM` predicates for standard, cascade, running-window, and DuckLake paths. Regression coverage includes
+  batched conflicting DML on single and composite NULL partitions plus a DuckLake TPCC window whose delivery timestamp moves
+  from the NULL partition to a non-NULL partition.
+- [x] **Preserve `SUM` NULL semantics.** Weighted SUM alone cannot distinguish numeric zero from no non-NULL inputs. Persist
+  a hidden `COUNT(sum_argument)` and render NULL when that count reaches zero.
+- [x] **Use an unconditional row count for group existence.** `COUNT(nullable_expression)=0` does not mean a group is empty.
+  Grouped incremental aggregates persist a hidden `COUNT(*)` solely for deciding whether the group row must be deleted,
+  including aggregates below `ORDER BY`, `LIMIT`, and `TOP_N` wrappers.
+- [ ] **Delete the heuristic group-measure update fast path.** `refresh_group_measure.cpp` infers aggregate lineage from SQL
+  text, output-alias substrings, LPTS formatting, and value strings. A reproduced update to input `v` changed unrelated
+  aliases `revenue` and `savings`. Use the existing affected-group recompute path until bound aggregate lineage can prove a
+  safe fast path.
+- [ ] **Validate the persisted `RefreshType` ABI.** Unknown values are raw-cast and can pass through refresh without applying
+  data changes while still advancing the watermark. Give every persisted value an explicit ordinal and decode it through a
+  single validating migration function; every dispatch must reject unknown values.
+- [ ] **Give one refresh-node API ownership of hooks.** Scheduled hooks currently run twice, empty-delta skipping can suppress
+  replace hooks, cascaded nodes bypass hooks, and hook errors are swallowed. Hooks, skip decisions, refresh, and error
+  propagation must have exactly-once semantics.
+- [ ] **Make crash recovery a durable state transition.** Some full-recompute paths bypass the in-progress journal, while
+  recovery clears the journal before recovery succeeds. Persist an attempt/checkpoint before every data mutation and clear it
+  only with successful post-refresh metadata.
+- [ ] **Do not consume DuckLake structural-change identity before refresh succeeds.** Source-identity probing currently
+  persists a new table ID immediately. Carry it as pending activity and commit it with the successful snapshot/watermark.
+
+## P1: fail-closed metadata and authoritative planning
+
+- [ ] **Distinguish metadata error, absence, and empty state.** Several getters convert query errors into `{}`, `false`, or a
+  fallback strategy. Refresh must fail closed on schema/query errors; `optional` should mean genuinely absent metadata only.
+- [ ] **Reject missing strategy contracts instead of falling through.** Missing DISTINCT or semi/anti metadata currently
+  falls into unrelated compiler cases. Validate the selected strategy and all required metadata once before compilation.
+- [ ] **Remove runtime type guessing from window lineage.** Bare-name `information_schema` lookup with `LIMIT 1` is ambiguous
+  across schemas/catalogs, and coercing both comparison sides to VARCHAR changes bound comparison semantics. Persist exact
+  bound cast chains and source identity at CREATE time.
+- [ ] **Replace window partition metadata mini-parsing with a typed contract.** Partition columns, source expressions, casts,
+  and lookup edges are reconstructed from independently encoded strings at refresh time. Persist one versioned structured
+  representation, validate it atomically, and pass the decoded object through affected-partition compilation.
+- [ ] **Make source identity fully qualified.** DML classification, metadata lookup, locking, cleanup, and dependency handling
+  rely too heavily on bare table or view names. Use catalog, schema, and stable object identity.
+- [ ] **Give one abstraction ownership of source and delta resolution.** Standard tables, DuckLake snapshots, chained views,
+  legacy metadata, and attached catalogs are resolved in several compiler branches with slightly different fallback rules.
+  Load and validate each source once into an immutable qualified descriptor, including its delta relation and snapshot range.
+- [ ] **Centralize complete per-view DROP cleanup.** Hooks, refresh history/profile rows, dependency rows, and matcher state can
+  survive DROP and be inherited by a newly created MV of the same name.
+- [ ] **Preserve quoted output identifiers.** Planner output names are sanitized for internal use and then reused where the
+  physical schema requires the original SQL identifier. Quoted names containing punctuation can fail during MV creation.
+- [ ] **Classify only after required lineage is valid.** Window lineage can demote a finalized model to `FULL_REFRESH` after
+  node maintenance and update semantics have already been derived, leaving contradictory model state.
+- [ ] **Finish or reverse the `CURRENT_DIFF_RECOMPUTE` removal coherently.** Deterministic SAMPLE, POSITIONAL, and ASOF shapes
+  are demoted to unconditional full refresh while stale nonlocal strategies, documentation, and benchmark paths remain.
+  Preserve a typed affected/current-diff recompute path where correctness permits it; delete truly dead strategies.
+- [ ] **Strip computed top-k wrappers from stored aggregate state.** CREATE only moves a root `TOP_N` or
+  `LIMIT -> ORDER_BY` into the user-facing view. Plans such as
+  `PROJECTION -> TOP_N -> PROJECTION -> AGGREGATE` therefore initialize a limited backing table, while refresh strips the
+  top-k operator and applies unbounded deltas. Resolve the bound ordering expressions through the projection path, keep the
+  backing state unbounded, and apply the computed `ORDER BY`/`LIMIT` only in the user-facing view.
+
+## P2: remove SQL-text hacks and duplicate abstractions
+
+- [ ] **Render Spark SQL by dialect instead of global regex replacement.** Whole-program replacement mutates literals,
+  comments, and quoted identifiers, while early full-refresh paths bypass conversion entirely. Render casts, timestamps, and
+  NULL-safe equality through dialect-aware builders/LPTS.
+- [ ] **Replace affected-group source substitution with plan-node substitution.** Plain occurrence replacement can modify
+  literals, comments, CTE references, and longer identifiers. Replace the exact `LogicalGet` occurrence before serialization.
+- [ ] **Delete the workload-specific TPC-DI left-join shortcut.** General refresh code hardcodes `fact_market_history`, three
+  source names, and `sk_company_id`. Retain the generic correct path unless typed lineage proves a generic optimization.
+- [ ] **Replace `parser_sql_extractors.cpp` with bound-plan extraction.** Its approximately 1,250 lines duplicate tokenization,
+  quote handling, clause parsing, alias rewriting, and parenthesis tracking for DISTINCT, filtered aggregates, and semi/anti
+  metadata already represented by bound logical operators and expressions.
+- [ ] **Delete the independent refresh SQL mini-parsers.** Aggregate-filter stripping, SCD2 predicate injection, running-window
+  parsing, and LPTS CTE parsing belong in logical-plan/AST construction, not four inconsistent scanners of emitted SQL.
+- [ ] **Make the delta IR authoritative or remove its diagnostic-only graph.** Per-node maintenance, update semantics, generic
+  affected domains, lineage facts, and auxiliary-state annotations are populated and logged but do not select compilation.
+  Keeping them beside parallel `RefreshType`/metadata dispatch creates drift.
+- [ ] **Remove the nonfunctional view-matching product surface until it has behavior.** Candidate lookup, canonicalization,
+  and predicate implication are stubs, but settings, metadata columns, logs, CMake targets, and estimator APIs remain public.
+  Keep the FK constraint functionality that is actually used.
+- [ ] **Replace handwritten JSON and pipe-delimited lineage encoding.** Important semantic metadata is manually scanned and
+  malformed fields can be skipped while keeping an incomplete lineage arm. Use typed normalized rows or a versioned structured
+  serializer and reject malformed records as a whole.
+- [ ] **Split CREATE and refresh into typed phase programs.** `PlanFunction` and `GenerateRefreshSQL` each span roughly a
+  thousand lines. Use immutable inputs and results such as `ViewDefinition`, `RefreshMetadataSnapshot`, `PendingDeltaBatch`,
+  `RefreshStrategy`, and `RefreshProgram`; do not introduce a class hierarchy.
+- [ ] **Replace boolean/argument soup with strategy input/result structs.** Compiler functions with 17 parameters, output
+  booleans, and implicit reclassification hide invariants and make call-order mistakes likely.
+- [ ] **Use tagged CREATE operations instead of magic strings.** Cleanup, profiling, schema derivation, and executable SQL are
+  currently mixed in one string vector and reparsed by prefixes and tab-delimited fields.
+- [ ] **Consolidate duplicated profiling and NULL-safe predicate helpers.** `CreateMVProfiler` and `RefreshProfiler`
+  independently implement IDs, retention, step collection, and persistence; SQL utilities contain parallel NULL-safe
+  builders. Put the shared lifecycle and storage policy in one small profiler component.
+
+## P3: refresh performance and repeated work
+
+- [ ] **Remove exact base-table counting from normal join compilation.** Standard join refresh performs `COUNT(*)` for every
+  base table on every refresh after delta activity has already been computed. Use activity/statistics or remove the heuristic.
+- [ ] **Avoid repeated parse/bind/plan/model reconstruction.** Refresh planning currently reparses and optimizes the stored
+  query multiple times. Persist a versioned create-time typed model and rebuild only for migration or invalidation.
+- [ ] **Load metadata once.** `GenerateRefreshSQL` issues many independent queries for one view and sometimes reloads the same
+  field. Load one immutable snapshot; keep writes and recovery checkpoints separate.
+- [ ] **Consolidate projection deletes once.** The projection path builds the same grouped/ranked net delta independently for
+  DELETE and INSERT. Materialize or share the consolidated batch.
+- [ ] **Carry delta activity through the full refresh.** Activity checks, join-term selection, max timestamp lookup, and cleanup
+  repeatedly scan the same delta tables. Capture count/delete/watermark information once per transaction. Explicit caller
+  transactions currently remain conservative because query-pragma preprocessing cannot observe the caller's local delta
+  rows or retain a reliable activity signal; solve this at the planned native refresh operator boundary rather than with
+  process-global transaction registries.
+- [x] **Share repeated LEFT JOIN transition-count subplans deliberately.** The join compiler now builds one explicit
+  materialized transition-key CTE per nullable source/key and gives each inclusion-exclusion term a freshly bound CTE
+  reference. This avoids the unsafe blanket common-subplan optimizer while preserving term-local bindings and delta
+  semantics.
+- [ ] **Price actual join work in the adaptive model.** The model counts exponential terms but underprices copied plan nodes,
+  base-leaf appearances, compilation work, and generated SQL size.
+- [ ] **Remove the fake `ConstraintCache` or make it a cache.** It repopulates a map that no read path consumes, while FK cost
+  estimation separately parses textual constraint descriptions.
+- [ ] **Audit edge-case tests and mirror them in the rewriter benchmark.** Review the SQL harness for missing boundary and
+  transition cases, add deterministic bidirectional `EXCEPT ALL` coverage, and add representative cases to the rewriter
+  benchmark so real refresh compilation and execution exercise the same semantics.
+- [ ] **Add test-only concurrency barriers.** Several SQL concurrency regressions still coordinate with bounded sleeps.
+  Introduce a deterministic handshake that can prove a writer or refresh owns or is waiting for the mutation gate without
+  exposing a production pragma, then replace the timing assumptions in lifecycle tests.
+
+## Target refresh flow
+
+At CREATE time, bind once and persist a versioned typed view definition, delta plan, output schema, exact source identities,
+and concrete strategy metadata.
+
+At refresh time:
+
+1. Acquire the graph/node transaction and locks.
+2. Load one immutable metadata snapshot.
+3. Capture one pending delta batch and its watermark.
+4. Choose one explicit correctness-preserving strategy; use cost only between valid strategies.
+5. Compile a structured refresh program containing data, cascade, cleanup, and checkpoint phases.
+6. Execute native work atomically; render SQL once only at a genuine external-dialect boundary.
+7. Commit data, cursor/snapshot, source identity, and recovery state together.

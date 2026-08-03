@@ -15,6 +15,26 @@ LOAD ducklake;
 statement ok
 ATTACH '__TEST_DIR__/ducklake_projection.db' AS dl (TYPE ducklake);
 
+# Snapshot metadata is keyed by an unqualified source name. Reject two
+# physically distinct DuckLake sources with the same name instead of silently
+# sharing a watermark.
+statement ok
+ATTACH '__TEST_DIR__/ducklake_projection_second.db' AS dl_second (TYPE ducklake);
+
+statement ok
+CREATE TABLE dl.same_name (id INTEGER);
+
+statement ok
+CREATE TABLE dl_second.same_name (id INTEGER);
+
+statement error
+CREATE MATERIALIZED VIEW colliding_ducklake_sources AS
+SELECT l.id AS left_id, r.id AS right_id
+FROM dl.same_name l
+JOIN dl_second.same_name r ON l.id = r.id;
+----
+cannot reference different source tables with the same unqualified name
+
 # ==========================================
 # 1. Simple SELECT projection
 # ==========================================

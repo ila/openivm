@@ -1140,5 +1140,5 @@ SELECT
 	min_balance,
 	max_balance
 FROM topk_projected
-ORDER BY total_amount DESC, warehouse_id ASC, district_id ASC, customer_id ASC
+ORDER BY ROUND(total_amount, 10) DESC, warehouse_id ASC, district_id ASC, customer_id ASC
 LIMIT 25 OFFSET 2

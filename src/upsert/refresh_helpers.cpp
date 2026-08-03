@@ -252,7 +252,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &affected_subquery, const string &target_alias,
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
-                                  const string &affected_temp_table) {
+                                  const string &affected_temp_table, const vector<string> &upsert_keys,
+                                  const string &recompute_temp_table) {
 	string affected_block = "(\n" + affected_subquery + "\n)";
 	string affected_source = affected_temp_table.empty() ? affected_block : affected_temp_table;
 	string delete_where =
@@ -264,9 +265,29 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 	if (!affected_temp_table.empty()) {
 		result += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_subquery + ";\n\n";
 	}
-	result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" +
-	          "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " +
-	          insert_where + ";\n";
+	if (!upsert_keys.empty() && !recompute_temp_table.empty()) {
+		// Upsert form, for data tables carrying a UNIQUE index. Materialize the recomputed rows for
+		// the affected groups ONCE (the recompute is the expensive part), then:
+		//   1. delete only the affected groups that no longer produce a row (a group can disappear
+		//      entirely, e.g. when every preserved-side row for it is deleted), and
+		//   2. INSERT OR REPLACE the survivors.
+		// The two key sets are disjoint for non-NULL keys, so those are not deleted and re-inserted
+		// in the same transaction. NULL-containing keys do not conflict in the UNIQUE index and must
+		// be removed explicitly before INSERT OR REPLACE to avoid duplicate groups.
+		string keep_match = SqlUtils::BuildNullSafeKeyPredicate(upsert_keys, "openivm_keep.", target_alias + ".");
+		string nullable_key = SqlUtils::BuildAnyNullPredicate(upsert_keys, target_alias + ".");
+		result += "CREATE OR REPLACE TEMP TABLE " + recompute_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+		          ") " + recompute_alias + "\nWHERE " + insert_where + ";\n\n";
+		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + "\n  AND ((" +
+		          nullable_key + ")\n    OR NOT EXISTS (\n  SELECT 1 FROM " + recompute_temp_table +
+		          " AS openivm_keep WHERE " + keep_match + "\n));\n\n";
+		result += "INSERT OR REPLACE INTO " + data_table + "\nSELECT * FROM " + recompute_temp_table + ";\n";
+		result += "\nDROP TABLE IF EXISTS " + recompute_temp_table + ";\n";
+	} else {
+		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" +
+		          "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias +
+		          "\nWHERE " + insert_where + ";\n";
+	}
 	if (!affected_temp_table.empty()) {
 		result += "\nDROP TABLE IF EXISTS " + affected_temp_table + ";\n";
 	}
@@ -602,11 +623,24 @@ string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_na
 
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
                            bool cross_system, const string &attached_catalog, const string &attached_schema,
-                           const string &catalog_prefix, string *out_post_meta) {
+                           const string &catalog_prefix, const string &metadata_prefix, string *out_post_meta) {
 	string qdt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
-	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql) + "\n";
-	string update_ts_sql = "UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
-	                       " SET last_update = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
+	// parser.cpp gives AGGREGATE_GROUP / AGGREGATE_HAVING data tables a UNIQUE index on the group
+	// keys. A plain `DELETE FROM t; INSERT INTO t ...` re-inserts keys deleted in the same
+	// transaction, which DuckDB's on-disk unique index rejects, so those views need the upsert form.
+	auto recompute_view_type = metadata.GetViewType(view_name);
+	vector<string> unique_keys;
+	string recompute_temp;
+	if (recompute_view_type == RefreshType::AGGREGATE_GROUP || recompute_view_type == RefreshType::AGGREGATE_HAVING) {
+		unique_keys = metadata.GetGroupColumns(view_name);
+		if (!unique_keys.empty()) {
+			recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
+		}
+	}
+	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql, unique_keys, recompute_temp) + "\n";
+	auto delta_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
+	string update_ts_sql = "UPDATE " + delta_metadata_table + " SET last_update = now() WHERE view_name = '" +
+	                       SqlUtils::EscapeValue(view_name) + "';\n";
 	auto delta_tables = metadata.GetDeltaTables(view_name);
 	for (auto &dt : delta_tables) {
 		if (!metadata.IsDuckLakeTable(view_name, dt)) {
@@ -619,7 +653,8 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 		string snapshot_expr =
 		    cross_system ? DuckLakeSnapshotPlaceholder(loc.catalog_name)
 		                 : "(SELECT id FROM " + SqlUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot())";
-		update_ts_sql += RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, snapshot_expr);
+		update_ts_sql +=
+		    RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, snapshot_expr, delta_metadata_table);
 	}
 	string update_ts;
 	if (!cross_system) {
@@ -634,7 +669,7 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 			continue;
 		}
 		string resolved = metadata.ResolveDeltaQualifiedName(view_name, dt, attached_catalog, attached_schema);
-		delta_cleanup += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt);
+		delta_cleanup += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt, delta_metadata_table);
 	}
 
 	return query + update_ts + "\n" + delta_cleanup;
@@ -683,8 +718,17 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 }
 
 static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const string &view_name,
-                                              const string &data_table, const string &view_query_sql, const string &qdv,
+                                              const vector<string> &delta_table_names, const string &data_table,
+                                              const string &view_query_sql, const string &qdv,
                                               const string &delta_ts_filter, const string &lk) {
+	bool all_ducklake = !delta_table_names.empty();
+	for (auto &delta_table : delta_table_names) {
+		if (!metadata.IsDuckLakeTable(view_name, delta_table)) {
+			all_ducklake = false;
+			break;
+		}
+	}
+
 	RefreshMetadata::LeftJoinKeySource key_source;
 	if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
 		return "";
@@ -714,7 +758,8 @@ static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const s
 	                    key_source.table.c_str(), static_cast<unsigned long long>(key_source.occurrence),
 	                    key_source.column.c_str());
 	return BuildDeleteUsingInsertRefreshSQL(data_table, pushed_query, "openivm_lj", "openivm_affected", "_d",
-	                                        delete_match, affected + "openivm_lj." + lk + ")", affected_cte);
+	                                        delete_match, all_ducklake ? "TRUE" : affected + "openivm_lj." + lk + ")",
+	                                        affected_cte);
 }
 
 static string TryBuildFactMarketHistoryAffectedPushdown(const string &view_name, const string &data_table,
@@ -768,14 +813,15 @@ static string TryBuildFactMarketHistoryAffectedPushdown(const string &view_name,
 }
 
 static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const string &view_name,
-                                             const string &data_table, const string &view_query_sql,
-                                             const string &delta_ts_filter, const string &catalog_prefix) {
+                                             const vector<string> &delta_table_names, const string &data_table,
+                                             const string &view_query_sql, const string &delta_ts_filter,
+                                             const string &catalog_prefix) {
 	string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
 	string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
 	string lk = KeywordHelper::WriteOptionallyQuoted(string(openivm::LEFT_KEY_COL));
 	string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
-	auto pushed_refresh =
-	    TryBuildLeftJoinLineagePushdown(metadata, view_name, data_table, view_query_sql, qdv, delta_ts_filter, lk);
+	auto pushed_refresh = TryBuildLeftJoinLineagePushdown(metadata, view_name, delta_table_names, data_table,
+	                                                      view_query_sql, qdv, delta_ts_filter, lk);
 	if (pushed_refresh.empty()) {
 		pushed_refresh =
 		    TryBuildFactMarketHistoryAffectedPushdown(view_name, data_table, view_query_sql, qdv, delta_ts_filter, lk);
@@ -843,8 +889,8 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
 			return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix,
 			                                 /*insert_only=*/true);
 		}
-		return BuildLeftJoinProjectionRefresh(metadata, view_name, data_table, view_query_sql, delta_ts_filter,
-		                                      catalog_prefix);
+		return BuildLeftJoinProjectionRefresh(metadata, view_name, delta_table_names, data_table, view_query_sql,
+		                                      delta_ts_filter, catalog_prefix);
 	}
 	return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete);
 }

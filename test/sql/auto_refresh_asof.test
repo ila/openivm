@@ -1,5 +1,5 @@
 # name: test/sql/auto_refresh_asof.test
-# description: ASOF-join current-diff materialized view under the adaptive cost model.
+# description: ASOF-join full-refresh materialized view under the adaptive cost model.
 # group: [sql]
 
 require openivm
@@ -27,7 +27,7 @@ INSERT INTO cm_asof_prices VALUES
     ('A', TIMESTAMP '2024-01-01 10:18:00', 180);
 
 statement ok
-CREATE MATERIALIZED VIEW mv_cm_current_diff AS
+CREATE MATERIALIZED VIEW mv_cm_asof_full AS
     SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
     FROM cm_asof_trades t
     ASOF JOIN cm_asof_prices p
@@ -38,11 +38,11 @@ statement ok
 INSERT INTO cm_asof_prices VALUES ('A', TIMESTAMP '2024-01-01 10:19:00', 190);
 
 statement ok
-PRAGMA refresh('mv_cm_current_diff');
+PRAGMA refresh('mv_cm_asof_full');
 
 query I
-SELECT CASE WHEN method IN ('full', 'current_diff_recompute') THEN 1 ELSE 0 END
-FROM openivm_refresh_history WHERE view_name = 'mv_cm_current_diff' ORDER BY refresh_timestamp DESC LIMIT 1;
+SELECT CASE WHEN method = 'full' THEN 1 ELSE 0 END
+FROM openivm_refresh_history WHERE view_name = 'mv_cm_asof_full' ORDER BY refresh_timestamp DESC LIMIT 1;
 ----
 1
 
@@ -53,14 +53,14 @@ SELECT count(*) FROM (
     ASOF JOIN cm_asof_prices p
       ON t.symbol = p.symbol
      AND t.ts >= p.ts
-    EXCEPT ALL SELECT * FROM mv_cm_current_diff
+    EXCEPT ALL SELECT * FROM mv_cm_asof_full
 );
 ----
 0
 
 query I
 SELECT count(*) FROM (
-    SELECT * FROM mv_cm_current_diff
+    SELECT * FROM mv_cm_asof_full
     EXCEPT ALL
     SELECT t.symbol, t.ts AS trade_ts, t.qty, p.ts AS price_ts, p.price
     FROM cm_asof_trades t

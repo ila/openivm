@@ -30,7 +30,7 @@ struct RefreshCostEstimate {
 	// meaning of `incremental_compute` / `incremental_upsert`. For "incremental"
 	// views the fields hold delta-driven IVM cost. For fixed strategy views they
 	// hold that strategy's affected-domain cost. Known labels: "incremental",
-	// "group_recompute", "window_partition", "current_diff_recompute",
+	// "group_recompute", "window_partition",
 	// "distinct_incremental", "semi_anti_recompute", and "full".
 	string strategy_label;
 

@@ -123,11 +123,18 @@ string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_vie
 string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_query_sql,
                                    const string &recompute_alias, const string &delete_where,
                                    const string &insert_where, const string &statement_prefix = "");
+// When `upsert_keys` and `recompute_temp_table` are supplied, emits an INSERT OR REPLACE form that
+// never deletes and re-inserts the same key inside one transaction. Required when the data table
+// carries a UNIQUE index: DuckDB's on-disk unique index keeps deleted keys for constraint checking
+// within the same transaction, so DELETE-then-INSERT of a surviving group raises a spurious
+// "Duplicate key ... violates unique constraint". Only valid when such an index exists (INSERT OR
+// REPLACE requires a UNIQUE/PK constraint); pass them empty to keep the plain DELETE+INSERT form.
 string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_query_sql,
                                   const string &affected_subquery, const string &target_alias,
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
-                                  const string &affected_temp_table = "");
+                                  const string &affected_temp_table = "", const vector<string> &upsert_keys = {},
+                                  const string &recompute_temp_table = "");
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
 bool IsSummableLogicalType(const LogicalType &type);
@@ -140,7 +147,8 @@ string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_na
                                   const string &attached_db_catalog_name);
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
                            bool cross_system, const string &attached_catalog = "", const string &attached_schema = "",
-                           const string &catalog_prefix = "", string *out_post_meta = nullptr);
+                           const string &catalog_prefix = "", const string &metadata_prefix = "",
+                           string *out_post_meta = nullptr);
 
 string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const string &view_name,
                                           const vector<string> &delta_table_names, const vector<string> &group_cols,
@@ -235,7 +243,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           string *out_post_meta = nullptr, RefreshCompileProfile *compile_profile = nullptr,
                           const DeltaActivityResult *precomputed_delta_activity = nullptr,
                           RefreshCostEstimate *out_adaptive_estimate = nullptr,
-                          const openivm::CompileFacts *facts = nullptr);
+                          const openivm::CompileFacts *facts = nullptr, Connection *metadata_connection = nullptr);
 
 } // namespace duckdb
 

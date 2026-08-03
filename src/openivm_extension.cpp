@@ -29,6 +29,7 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "core/parser.hpp"
+#include "core/parser_ddl.hpp"
 #include "rules/incremental_rewrite_rule.hpp"
 #include "rules/refresh_insert_rule.hpp"
 #include "core/openivm_debug.hpp"
@@ -112,6 +113,9 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 	input.named_parameters["view_schema_name"] = view_schema_name;
 
 	Connection con(*context.db);
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		metadata_state->Apply(con);
+	}
 	string view_query = RefreshMetadata(con).GetViewQuery(view_name);
 	if (view_query.empty()) {
 		throw Exception(ExceptionType::CATALOG,
@@ -157,6 +161,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// after the extension is loaded. Entry points also set the current ClientContext
 	// explicitly because pre-existing local settings override global defaults.
 	db_config.SetOption(PreserveInsertionOrderSetting::SettingIndex, Value::BOOLEAN(false));
+	// CREATE/ALTER MATERIALIZED VIEW and transactional DROP VIEW are expanded into
+	// ordinary DuckDB statements by OpenIVM's parser override. FALLBACK leaves every
+	// statement OpenIVM does not recognize with DuckDB's native parser.
+	db_config.SetOption(AllowParserOverrideExtensionSetting::SettingIndex, Value("fallback"));
 
 	db_config.AddExtensionOption("openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("openivm_refresh_mode", "refresh strategy: incremental, full, or auto",
@@ -331,6 +339,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS semi_anti_aux_meta_json VARCHAR DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS leftjoin_secondary_meta_json VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS lineage_json VARCHAR DEFAULT NULL");
 
 	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
@@ -355,6 +365,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ParserExtension::Register(db_config, std::move(materialized_view_parser));
 	OptimizerExtension::Register(db_config, std::move(incremental_rewrite_rule));
 	OptimizerExtension::Register(db_config, std::move(refresh_insert_rule));
+
+	loader.RegisterFunction(PragmaFunction::PragmaCall("openivm_materialized_view_lifecycle",
+	                                                   MaterializedViewLifecycleQuery, {LogicalType::VARCHAR}));
+	loader.RegisterFunction(PragmaFunction::PragmaCall("openivm_materialized_view_drop", MaterializedViewDropQuery,
+	                                                   {LogicalType::VARCHAR}));
+	loader.RegisterFunction(TableFunction(
+	    "openivm_execute_drop_view",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+	    ExecuteDropView, BindDropView, InitDropView));
+	loader.RegisterFunction(TableFunction(
+	    "openivm_execute_drop_table",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+	    ExecuteDropView, BindDropTable, InitDropView));
 
 	TableFunction compute_delta_function("ComputeDelta",
 	                                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -387,13 +410,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	con.Commit();
 
-	// Use the locked pragma_function_t variant: generates SQL and executes it under a
-	// per-view mutex, preventing concurrent refresh from double-applying deltas.
 	auto refresh_options =
-	    PragmaFunction::PragmaCall("refresh_options", UpsertDeltaQueriesLocked,
+	    PragmaFunction::PragmaCall("refresh_options", TransactionalRefreshQuery,
 	                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_options);
-	auto refresh = PragmaFunction::PragmaCall("refresh", UpsertDeltaQueriesLocked, {LogicalType::VARCHAR});
+	auto refresh = PragmaFunction::PragmaCall("refresh", TransactionalRefreshQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh);
 	auto declare_rely_fk = PragmaFunction::PragmaCall(
 	    "openivm_declare_rely_fk",
@@ -421,7 +442,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    PragmaFunction::PragmaCall("refresh_history", RefreshCostHistoryQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_history);
 	auto refresh_cross_system = PragmaFunction::PragmaCall(
-	    "refresh_cross_system", UpsertDeltaQueriesLocked,
+	    "refresh_cross_system", TransactionalRefreshQuery,
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cross_system);
 
@@ -489,17 +510,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(refresh_status);
 
 	// PRAGMA refresh_start_daemon — (re)start the daemon on the caller's DB instance.
-	auto refresh_start_daemon =
-	    PragmaFunction::PragmaCall("refresh_start_daemon",
-	                               [](ClientContext &context, const FunctionParameters &) -> string {
-		                               if (global_daemon) {
-			                               global_daemon->Stop();
-		                               }
-		                               global_daemon = make_shared_ptr<RefreshDaemon>();
-		                               global_daemon->Start(*context.db);
-		                               return "SELECT true AS started;";
-	                               },
-	                               {});
+	auto refresh_start_daemon = PragmaFunction::PragmaCall(
+	    "refresh_start_daemon",
+	    [](ClientContext &context, const FunctionParameters &) -> string {
+		    if (!context.transaction.IsAutoCommit()) {
+			    throw TransactionException("The OpenIVM refresh daemon cannot be restarted inside a transaction");
+		    }
+		    if (global_daemon) {
+			    global_daemon->Stop();
+		    }
+		    global_daemon = make_shared_ptr<RefreshDaemon>();
+		    global_daemon->Start(*context.db);
+		    global_daemon->Wake();
+		    return "SELECT true AS started;";
+	    },
+	    {});
 	loader.RegisterFunction(refresh_start_daemon);
 
 	// Start the refresh daemon unless disabled (e.g. shadow/compile-only DBs).

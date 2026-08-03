@@ -2216,6 +2216,71 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# UNION-ALL-of-scalar-aggregates over separate sources, including an empty source.
+# The SIMPLE_AGGREGATE full-recompute path must not run empty-source nulling over
+# the whole UNION result.
+statement ok
+CREATE TABLE ua_multi_a (id INT, amount INT);
+
+statement ok
+CREATE TABLE ua_multi_b (id INT, amount INT);
+
+statement ok
+CREATE TABLE ua_multi_empty (id INT, amount INT);
+
+statement ok
+INSERT INTO ua_multi_a VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO ua_multi_b VALUES (1, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_ua_multi_counts AS
+    SELECT 'a' AS kind, COUNT(*) AS n FROM ua_multi_a
+    UNION ALL
+    SELECT 'b', COUNT(*) FROM ua_multi_b
+    UNION ALL
+    SELECT 'empty', COUNT(*) FROM ua_multi_empty;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_ua_multi_counts';
+----
+1
+
+statement ok
+INSERT INTO ua_multi_a VALUES (3, 40);
+
+statement ok
+DELETE FROM ua_multi_b WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_ua_multi_counts');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_ua_multi_counts
+    EXCEPT ALL
+    SELECT * FROM (
+        SELECT 'a', COUNT(*) FROM ua_multi_a
+        UNION ALL SELECT 'b', COUNT(*) FROM ua_multi_b
+        UNION ALL SELECT 'empty', COUNT(*) FROM ua_multi_empty
+    ) q
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        SELECT 'a', COUNT(*) FROM ua_multi_a
+        UNION ALL SELECT 'b', COUNT(*) FROM ua_multi_b
+        UNION ALL SELECT 'empty', COUNT(*) FROM ua_multi_empty
+    ) q
+    EXCEPT ALL SELECT * FROM mv_ua_multi_counts
+);
+----
+0
+
 # LIST with large batch of mixed inserts/deletes
 statement ok
 CREATE TABLE list_heavy (bucket INT, token VARCHAR);
@@ -2272,6 +2337,14 @@ CREATE MATERIALIZED VIEW mv_flat_sd AS
     SELECT grp, STDDEV(v) AS sd, VARIANCE(v) AS vr,
            STDDEV_POP(v) AS sdp, VAR_POP(v) AS vrp, COUNT(*) AS n
     FROM sd_flat GROUP BY grp;
+
+# Derived aggregates already carry their own hidden SUM/COUNT state. The
+# SUM NULL-state rewrite must not add redundant counts for those helper SUMs.
+query I
+SELECT count(*) FROM pragma_table_info('openivm_data_mv_flat_sd')
+WHERE name LIKE 'openivm_nonnull_sum_count_%';
+----
+0
 
 # Batch of inserts + deletes on flat data — variance is algebraically 0
 # but floating-point makes it drift negative.
@@ -2774,6 +2847,738 @@ SELECT count(*) FROM (
   SELECT * FROM (SELECT grp, SUM(val) AS total FROM topk_t GROUP BY grp ORDER BY total DESC LIMIT 3) _q
   EXCEPT ALL
   SELECT * FROM topk_agg
+);
+----
+0
+
+# ==========================================
+# SUM distinguishes zero from no non-NULL inputs
+# ==========================================
+
+statement ok
+CREATE TABLE sum_null_state (id INT, grp INT, amount INT);
+
+statement ok
+INSERT INTO sum_null_state VALUES (1, 1, 10), (2, 1, NULL), (3, 2, NULL), (4, 3, 5), (5, 3, -5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_state AS
+    SELECT grp, SUM(amount) AS total
+    FROM sum_null_state GROUP BY grp;
+
+# One batch exercises non-NULL→all-NULL, all-NULL→numeric zero, and net-zero SUM.
+statement ok
+UPDATE sum_null_state SET amount = NULL WHERE id = 1;
+
+statement ok
+UPDATE sum_null_state SET amount = 0 WHERE id = 3;
+
+statement ok
+INSERT INTO sum_null_state VALUES (6, 1, 99);
+
+statement ok
+DELETE FROM sum_null_state WHERE id = 6;
+
+statement ok
+PRAGMA refresh('mv_sum_null_state');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_sum_null_state
+    EXCEPT ALL
+    SELECT grp, SUM(amount) FROM sum_null_state GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(amount) FROM sum_null_state GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM mv_sum_null_state
+);
+----
+0
+
+# The scalar aggregate compiler must preserve the same NULL/zero distinction.
+statement ok
+CREATE TABLE sum_null_scalar (id INT, amount INT);
+
+statement ok
+INSERT INTO sum_null_scalar VALUES (1, 10), (2, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_scalar AS
+    SELECT SUM(amount) AS total FROM sum_null_scalar;
+
+statement ok
+DELETE FROM sum_null_scalar WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_sum_null_scalar');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT total FROM mv_sum_null_scalar
+    EXCEPT ALL
+    SELECT SUM(amount) FROM sum_null_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(amount) FROM sum_null_scalar
+    EXCEPT ALL
+    SELECT total FROM mv_sum_null_scalar
+);
+----
+0
+
+statement ok
+INSERT INTO sum_null_scalar VALUES (3, 0);
+
+statement ok
+PRAGMA refresh('mv_sum_null_scalar');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT total FROM mv_sum_null_scalar
+    EXCEPT ALL
+    SELECT SUM(amount) FROM sum_null_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT SUM(amount) FROM sum_null_scalar
+    EXCEPT ALL
+    SELECT total FROM mv_sum_null_scalar
+);
+----
+0
+
+# Reverse both NULL transitions and remove a group in one refresh.
+statement ok
+UPDATE sum_null_state SET amount = 7 WHERE id = 1;
+
+statement ok
+UPDATE sum_null_state SET amount = NULL WHERE id = 3;
+
+statement ok
+DELETE FROM sum_null_state WHERE grp = 3;
+
+statement ok
+PRAGMA refresh('mv_sum_null_state');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_sum_null_state
+    EXCEPT ALL
+    SELECT grp, SUM(amount) FROM sum_null_state GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(amount) FROM sum_null_state GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, total FROM mv_sum_null_state
+);
+----
+0
+
+# SUM state must follow top-level wrappers and pass-through casts.
+statement ok
+CREATE TABLE sum_null_wrapped (id INT, grp INT, amount INT);
+
+statement ok
+INSERT INTO sum_null_wrapped VALUES (1, 1, 10), (2, 1, NULL), (3, 2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_wrapped AS
+    WITH sums AS (
+        SELECT grp, SUM(amount) AS total
+        FROM sum_null_wrapped GROUP BY grp
+    )
+    SELECT grp, CAST(total AS BIGINT) AS total FROM sums ORDER BY grp;
+
+statement ok
+UPDATE sum_null_wrapped SET amount = NULL WHERE id IN (1, 3);
+
+statement ok
+PRAGMA refresh('mv_sum_null_wrapped');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, total FROM mv_sum_null_wrapped
+    EXCEPT ALL
+    SELECT grp, CAST(total AS BIGINT) FROM (
+        SELECT grp, SUM(amount) AS total
+        FROM sum_null_wrapped GROUP BY grp
+    ) sums
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, CAST(total AS BIGINT) FROM (
+        SELECT grp, SUM(amount) AS total
+        FROM sum_null_wrapped GROUP BY grp
+    ) sums
+    EXCEPT ALL
+    SELECT grp, total FROM mv_sum_null_wrapped
+);
+----
+0
+
+# The scalar path must also resolve a casted SUM output.
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_scalar_cast AS
+    SELECT CAST(SUM(amount) AS BIGINT) AS total FROM sum_null_scalar;
+
+statement ok
+DELETE FROM sum_null_scalar WHERE id = 3;
+
+statement ok
+PRAGMA refresh('mv_sum_null_scalar_cast');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT total FROM mv_sum_null_scalar_cast
+    EXCEPT ALL
+    SELECT CAST(SUM(amount) AS BIGINT) FROM sum_null_scalar
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT CAST(SUM(amount) AS BIGINT) FROM sum_null_scalar
+    EXCEPT ALL
+    SELECT total FROM mv_sum_null_scalar_cast
+);
+----
+0
+
+# A SUM referenced only by HAVING needs the same hidden non-NULL count.
+statement ok
+UPDATE sum_null_wrapped SET amount = 10 WHERE id = 1;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_having AS
+    SELECT grp, COUNT(*) AS row_count
+    FROM sum_null_wrapped GROUP BY grp
+    HAVING SUM(amount) IS NULL;
+
+statement ok
+UPDATE sum_null_wrapped SET amount = 5 WHERE id = 1;
+
+statement ok
+UPDATE sum_null_wrapped SET amount = NULL WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_sum_null_having');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, row_count FROM mv_sum_null_having
+    EXCEPT ALL
+    SELECT grp, COUNT(*) FROM sum_null_wrapped
+    GROUP BY grp HAVING SUM(amount) IS NULL
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, COUNT(*) FROM sum_null_wrapped
+    GROUP BY grp HAVING SUM(amount) IS NULL
+    EXCEPT ALL
+    SELECT grp, row_count FROM mv_sum_null_having
+);
+----
+0
+
+# Computed aggregate outputs are not additive. Recompute only affected groups
+# rather than applying a delta expression to the previously computed value.
+statement ok
+CREATE TABLE sum_null_computed (id INT, grp INT, amount DOUBLE);
+
+statement ok
+INSERT INTO sum_null_computed VALUES (1, 1, 10), (2, 1, NULL), (3, 2, 1.4);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_computed AS
+    SELECT grp, SUM(amount) + 0 AS plus_zero, ROUND(SUM(amount), 0) AS rounded
+    FROM sum_null_computed GROUP BY grp;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_sum_null_computed';
+----
+6
+
+statement ok
+UPDATE sum_null_computed SET amount = NULL WHERE id = 1;
+
+statement ok
+INSERT INTO sum_null_computed VALUES (4, 2, 1.4);
+
+statement ok
+PRAGMA refresh('mv_sum_null_computed');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, plus_zero, rounded FROM mv_sum_null_computed
+    EXCEPT ALL
+    SELECT grp, SUM(amount) + 0, ROUND(SUM(amount), 0)
+    FROM sum_null_computed GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(amount) + 0, ROUND(SUM(amount), 0)
+    FROM sum_null_computed GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, plus_zero, rounded FROM mv_sum_null_computed
+);
+----
+0
+
+# A scalar computed aggregate has no affected group key, so it must recompute
+# the single result instead of using the additive scalar compiler.
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_computed_scalar AS
+    SELECT ROUND(SUM(amount), 0) AS rounded FROM sum_null_computed;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_sum_null_computed_scalar';
+----
+3
+
+statement ok
+UPDATE sum_null_computed SET amount = NULL;
+
+statement ok
+PRAGMA refresh('mv_sum_null_computed_scalar');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT rounded FROM mv_sum_null_computed_scalar
+    EXCEPT ALL
+    SELECT ROUND(SUM(amount), 0) FROM sum_null_computed
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT ROUND(SUM(amount), 0) FROM sum_null_computed
+    EXCEPT ALL
+    SELECT rounded FROM mv_sum_null_computed_scalar
+);
+----
+0
+
+# DISTINCT is redundant over a scalar aggregate. Removing it before the
+# DISTINCT state rewrite keeps the underlying SUM on the scalar IVM path.
+statement ok
+CREATE TABLE sum_null_distinct (id INT, amount INT);
+
+statement ok
+INSERT INTO sum_null_distinct VALUES (1, 10), (2, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_distinct AS
+    SELECT DISTINCT SUM(amount) AS total FROM sum_null_distinct;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_sum_null_distinct';
+----
+1
+
+statement ok
+DELETE FROM sum_null_distinct WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_sum_null_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT total FROM mv_sum_null_distinct
+    EXCEPT ALL
+    SELECT DISTINCT SUM(amount) FROM sum_null_distinct
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT SUM(amount) FROM sum_null_distinct
+    EXCEPT ALL
+    SELECT total FROM mv_sum_null_distinct
+);
+----
+0
+
+# DISTINCT over grouped aggregate results is not redundant and cannot use the
+# aggregate value as an affected source-group key.
+statement ok
+CREATE TABLE sum_null_group_distinct (id INT, grp INT, amount INT);
+
+statement ok
+INSERT INTO sum_null_group_distinct VALUES (1, 1, 10), (2, 1, NULL), (3, 2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_group_distinct AS
+    SELECT DISTINCT SUM(amount) AS total
+    FROM sum_null_group_distinct GROUP BY grp;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_sum_null_group_distinct';
+----
+3
+
+statement ok
+UPDATE sum_null_group_distinct SET amount = NULL WHERE id IN (1, 3);
+
+statement ok
+PRAGMA refresh('mv_sum_null_group_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT total FROM mv_sum_null_group_distinct
+    EXCEPT ALL
+    SELECT DISTINCT SUM(amount) FROM sum_null_group_distinct GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT SUM(amount) FROM sum_null_group_distinct GROUP BY grp
+    EXCEPT ALL
+    SELECT total FROM mv_sum_null_group_distinct
+);
+----
+0
+
+# DISTINCT over every GROUP BY key is redundant. Remove that wrapper while
+# retaining the incremental HAVING aggregate underneath it.
+statement ok
+CREATE TABLE redundant_group_item (id INT, name VARCHAR);
+
+statement ok
+INSERT INTO redundant_group_item VALUES (1, 'one'), (2, 'two'), (3, 'three');
+
+statement ok
+CREATE TABLE redundant_group_stock (item_id INT, warehouse_id INT);
+
+statement ok
+INSERT INTO redundant_group_stock VALUES (1, 1), (1, 2), (2, 1);
+
+statement ok
+CREATE TABLE redundant_group_line (item_id INT, warehouse_id INT);
+
+statement ok
+INSERT INTO redundant_group_line VALUES (1, 1), (1, 2), (2, 1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_redundant_group_distinct AS
+    SELECT DISTINCT i.id, i.name
+    FROM redundant_group_item i
+    JOIN redundant_group_stock s ON i.id = s.item_id
+    JOIN redundant_group_line l
+      ON s.item_id = l.item_id AND s.warehouse_id = l.warehouse_id
+    GROUP BY i.id, i.name
+    HAVING COUNT(*) > 0;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_redundant_group_distinct';
+----
+4
+
+# Batch insert, update, and delete transitions before one refresh.
+statement ok
+INSERT INTO redundant_group_stock VALUES (3, 1);
+
+statement ok
+INSERT INTO redundant_group_line VALUES (3, 1), (2, 2);
+
+statement ok
+UPDATE redundant_group_item SET name = 'ONE' WHERE id = 1;
+
+statement ok
+UPDATE redundant_group_line SET warehouse_id = 2
+WHERE item_id = 2 AND warehouse_id = 1;
+
+statement ok
+DELETE FROM redundant_group_line WHERE item_id = 1 AND warehouse_id = 2;
+
+statement ok
+PRAGMA refresh('mv_redundant_group_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, name FROM mv_redundant_group_distinct
+    EXCEPT ALL
+    SELECT DISTINCT i.id, i.name
+    FROM redundant_group_item i
+    JOIN redundant_group_stock s ON i.id = s.item_id
+    JOIN redundant_group_line l
+      ON s.item_id = l.item_id AND s.warehouse_id = l.warehouse_id
+    GROUP BY i.id, i.name
+    HAVING COUNT(*) > 0
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT i.id, i.name
+    FROM redundant_group_item i
+    JOIN redundant_group_stock s ON i.id = s.item_id
+    JOIN redundant_group_line l
+      ON s.item_id = l.item_id AND s.warehouse_id = l.warehouse_id
+    GROUP BY i.id, i.name
+    HAVING COUNT(*) > 0
+    EXCEPT ALL
+    SELECT id, name FROM mv_redundant_group_distinct
+);
+----
+0
+
+# Removing a redundant outer DISTINCT must preserve the affected-group
+# maintenance required by a descendant DISTINCT.
+statement ok
+CREATE TABLE redundant_outer_distinct_src (g INT, x INT);
+
+statement ok
+INSERT INTO redundant_outer_distinct_src VALUES (1, 10), (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_redundant_outer_distinct AS
+    SELECT DISTINCT g
+    FROM (SELECT DISTINCT g, x FROM redundant_outer_distinct_src) q
+    GROUP BY g;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_redundant_outer_distinct';
+----
+6
+
+# Delete one of two identical descendant tuples while batching other conflicting DML.
+statement ok
+DELETE FROM redundant_outer_distinct_src
+WHERE rowid = (SELECT MIN(rowid) FROM redundant_outer_distinct_src WHERE g = 1 AND x = 10);
+
+statement ok
+INSERT INTO redundant_outer_distinct_src VALUES (3, 30);
+
+statement ok
+UPDATE redundant_outer_distinct_src SET x = 21 WHERE g = 2 AND x = 20;
+
+statement ok
+DELETE FROM redundant_outer_distinct_src WHERE g = 3 AND x = 30;
+
+statement ok
+PRAGMA refresh('mv_redundant_outer_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT g FROM mv_redundant_outer_distinct
+    EXCEPT ALL
+    SELECT DISTINCT g
+    FROM (SELECT DISTINCT g, x FROM redundant_outer_distinct_src) q
+    GROUP BY g
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT g
+    FROM (SELECT DISTINCT g, x FROM redundant_outer_distinct_src) q
+    GROUP BY g
+    EXCEPT ALL
+    SELECT g FROM mv_redundant_outer_distinct
+);
+----
+0
+
+# Removing a redundant DISTINCT inside a nested aggregate must not hide the
+# nested-aggregate group-recompute strategy.
+statement ok
+CREATE TABLE nested_distinct_groups (grp INT);
+
+statement ok
+INSERT INTO nested_distinct_groups VALUES (1), (2);
+
+statement ok
+CREATE TABLE nested_distinct_amounts (id INT, amount INT);
+
+statement ok
+INSERT INTO nested_distinct_amounts VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_nested_redundant_distinct AS
+    SELECT g.grp, COUNT(*) AS cnt
+    FROM nested_distinct_groups g
+    CROSS JOIN (
+        SELECT DISTINCT SUM(amount) AS total
+        FROM nested_distinct_amounts
+    ) s
+    GROUP BY g.grp;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_nested_redundant_distinct';
+----
+6
+
+statement ok
+INSERT INTO nested_distinct_amounts VALUES (3, 30), (4, 40);
+
+statement ok
+UPDATE nested_distinct_amounts SET amount = amount + 1 WHERE id IN (1, 3);
+
+statement ok
+DELETE FROM nested_distinct_amounts WHERE id IN (2, 4);
+
+statement ok
+PRAGMA refresh('mv_nested_redundant_distinct');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, cnt FROM mv_nested_redundant_distinct
+    EXCEPT ALL
+    SELECT g.grp, COUNT(*)
+    FROM nested_distinct_groups g
+    CROSS JOIN (
+        SELECT DISTINCT SUM(amount) AS total
+        FROM nested_distinct_amounts
+    ) s
+    GROUP BY g.grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT g.grp, COUNT(*)
+    FROM nested_distinct_groups g
+    CROSS JOIN (
+        SELECT DISTINCT SUM(amount) AS total
+        FROM nested_distinct_amounts
+    ) s
+    GROUP BY g.grp
+    EXCEPT ALL
+    SELECT grp, cnt FROM mv_nested_redundant_distinct
+);
+----
+0
+
+# Removing a redundant top-level DISTINCT must not claim that a descendant
+# DISTINCT added state to the root output.
+statement ok
+CREATE TABLE nested_distinct_values (id INT, x INT);
+
+statement ok
+INSERT INTO nested_distinct_values VALUES (1, 10), (2, 10), (3, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_nested_distinct_state AS
+    SELECT DISTINCT COUNT(*) AS cnt
+    FROM (
+        SELECT DISTINCT x
+        FROM nested_distinct_values
+    ) d;
+
+statement ok
+INSERT INTO nested_distinct_values VALUES (4, 20), (5, 30);
+
+statement ok
+UPDATE nested_distinct_values SET x = 40 WHERE id IN (1, 5);
+
+statement ok
+DELETE FROM nested_distinct_values WHERE id IN (2, 4);
+
+statement ok
+PRAGMA refresh('mv_nested_distinct_state');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT cnt FROM mv_nested_distinct_state
+    EXCEPT ALL
+    SELECT DISTINCT COUNT(*)
+    FROM (
+        SELECT DISTINCT x
+        FROM nested_distinct_values
+    ) d
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT DISTINCT COUNT(*)
+    FROM (
+        SELECT DISTINCT x
+        FROM nested_distinct_values
+    ) d
+    EXCEPT ALL
+    SELECT cnt FROM mv_nested_distinct_state
+);
+----
+0
+
+# A direct SUM needs NULL-state helper data, but that internal aggregate must
+# not hide a second output that folds SUM/COUNT into one derived expression.
+statement ok
+CREATE TABLE sum_null_shape (id INT, grp INT, x INT, y INT, z INT);
+
+statement ok
+INSERT INTO sum_null_shape VALUES (1, 1, 10, 10, 1), (2, 1, 20, 20, 1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sum_null_shape AS
+    SELECT grp, SUM(x) AS sx, ROUND(SUM(y) / COUNT(z), 2) AS ratio
+    FROM sum_null_shape GROUP BY grp;
+
+query I
+SELECT count(*) FROM pragma_table_info('openivm_data_mv_sum_null_shape')
+WHERE name LIKE 'openivm_nonnull_sum_count_%';
+----
+1
+
+# The correct ratio changes from 15 to 40. A delta-MERGE incorrectly adds the
+# per-delta ratio (90), producing 105, unless shape accounting selects group recompute.
+statement ok
+INSERT INTO sum_null_shape VALUES (3, 1, 30, 90, 1);
+
+statement ok
+PRAGMA refresh('mv_sum_null_shape');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, sx, ratio FROM mv_sum_null_shape
+    EXCEPT ALL
+    SELECT grp, SUM(x), ROUND(SUM(y) / COUNT(z), 2)
+    FROM sum_null_shape GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, SUM(x), ROUND(SUM(y) / COUNT(z), 2)
+    FROM sum_null_shape GROUP BY grp
+    EXCEPT ALL
+    SELECT grp, sx, ratio FROM mv_sum_null_shape
 );
 ----
 0
@@ -3346,6 +4151,71 @@ SELECT COUNT(*) FROM (
 	            THEN 'Active' ELSE 'Inactive' END
 	FROM derived_watch_events GROUP BY customer_id, symbol
     EXCEPT ALL SELECT * FROM mv_derived_watch
+);
+----
+0
+
+# Group existence must use an unconditional row count when computed ORDER BY and
+# LIMIT introduce projections around the aggregate. Removing the last non-NULL x
+# leaves the group alive because another row with x=NULL remains.
+statement ok
+CREATE TABLE ordered_nullable_count_input (id INT, g INT, x INT);
+
+statement ok
+INSERT INTO ordered_nullable_count_input VALUES (1, 1, NULL), (2, 1, 5), (3, 2, 7);
+
+statement ok
+CREATE MATERIALIZED VIEW ordered_nullable_count_mv AS
+    SELECT g, COUNT(x) AS n
+    FROM ordered_nullable_count_input
+    GROUP BY g
+    ORDER BY g + 0
+    LIMIT 2;
+
+statement ok
+DELETE FROM ordered_nullable_count_input WHERE id = 2;
+
+statement ok
+INSERT INTO ordered_nullable_count_input VALUES (4, 1, 9), (5, 2, 11);
+
+statement ok
+UPDATE ordered_nullable_count_input SET x = NULL WHERE id = 5;
+
+statement ok
+UPDATE ordered_nullable_count_input SET x = NULL WHERE id = 4;
+
+statement ok
+DELETE FROM ordered_nullable_count_input WHERE id = 5;
+
+statement ok
+PRAGMA refresh('ordered_nullable_count_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM ordered_nullable_count_mv
+    EXCEPT ALL
+    SELECT * FROM (
+        SELECT g, COUNT(x)
+        FROM ordered_nullable_count_input
+        GROUP BY g
+        ORDER BY g + 0
+        LIMIT 2
+    )
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        SELECT g, COUNT(x)
+        FROM ordered_nullable_count_input
+        GROUP BY g
+        ORDER BY g + 0
+        LIMIT 2
+    )
+    EXCEPT ALL
+    SELECT * FROM ordered_nullable_count_mv
 );
 ----
 0

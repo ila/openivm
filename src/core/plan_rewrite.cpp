@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/parser_plan_helpers.hpp"
 #include "core/plan_rewrite_internal.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -41,18 +42,36 @@
 namespace duckdb {
 
 /// Replace LOGICAL_DISTINCT with LOGICAL_AGGREGATE + COUNT(*).
-static void RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node) {
+/// Returns whether a DISTINCT state aggregate was added at the top level.
+static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &node,
+                            bool is_top_level) {
 	if (node->type != LogicalOperatorType::LOGICAL_DISTINCT) {
-		for (auto &child : node->children) {
-			RewriteDistinct(context, binder, child);
+		bool added_top_level_state = false;
+		for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
+			bool child_is_top_level =
+			    is_top_level && node->type == LogicalOperatorType::LOGICAL_PROJECTION && child_idx == 0;
+			added_top_level_state = RewriteDistinct(context, binder, node->children[child_idx], child_is_top_level) ||
+			                        added_top_level_state;
 		}
-		return;
+		return added_top_level_state;
 	}
 
 	auto &distinct = node->Cast<LogicalDistinct>();
 	if (node->children.empty()) {
 		OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT has no children — skipping\n");
-		return;
+		return false;
+	}
+	if (ProducesAtMostOneRow(*node->children[0])) {
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over scalar aggregate\n");
+		node = std::move(node->children[0]);
+		RewriteDistinct(context, binder, node, false);
+		return false;
+	}
+	if (IsRedundantDistinctOverGroupKeys(*node)) {
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over aggregate group keys\n");
+		node = std::move(node->children[0]);
+		RewriteDistinct(context, binder, node, false);
+		return false;
 	}
 	auto &child = node->children[0];
 	child->ResolveOperatorTypes();
@@ -88,6 +107,7 @@ static void RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT → AGGREGATE + COUNT(*), %zu groups\n", agg_node->groups.size());
 	node = std::move(agg_node);
+	return is_top_level;
 }
 
 static bool IsSemiAntiJoinType(JoinType join_type) {
@@ -861,6 +881,27 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 	plan->ResolveOperatorTypes();
 }
 
+static ColumnBinding AppendProjectionPassthrough(LogicalProjection &proj, const ColumnBinding &binding,
+                                                 const LogicalType &type, const string &alias) {
+	auto passthrough = make_uniq<BoundColumnRefExpression>(type, binding);
+	passthrough->alias = alias;
+	proj.expressions.push_back(std::move(passthrough));
+	proj.ResolveOperatorTypes();
+	auto bindings = proj.GetColumnBindings();
+	if (bindings.empty()) {
+		throw InternalException("OpenIVM: projection produced no bindings after appending hidden passthrough");
+	}
+	return bindings.back();
+}
+
+static void PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &projection_path,
+                                                        ColumnBinding binding, LogicalType type, const string &alias) {
+	for (auto it = projection_path.rbegin(); it != projection_path.rend(); ++it) {
+		binding = AppendProjectionPassthrough(**it, binding, type, alias);
+		type = (*it)->types.back();
+	}
+}
+
 /// Inject a hidden COUNT(*) (alias `openivm_count_star`) into AGGREGATE_GROUP
 /// aggregates that don't already have a reliable total-row-count aggregate.
 ///
@@ -876,12 +917,40 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 /// the user-facing VIEW; `CompileAggregateGroups` already recognizes it
 /// via openivm::COUNT_STAR_COL.
 static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
-	// Only inject at the top of the plan — the AGGREGATE_GROUP compile path only
-	// runs when the MV root is PROJECTION → [FILTER] → AGGREGATE. Inner aggregates
-	// under a UNION/INTERSECT/EXCEPT or subquery are handled by different compile
-	// paths (often FULL_REFRESH) that would be broken by extra columns.
-	auto *agg_search = FindProjectionAggregateInput(plan, true);
-	if (!agg_search) {
+	// Only inject into the aggregate on the top-level output path. ORDER BY/LIMIT/TOP_N
+	// preserve the projection schema; inner aggregates under joins or set operations
+	// are handled by other refresh strategies.
+	vector<LogicalProjection *> projection_path;
+	LogicalOperator *node = plan.get();
+	LogicalOperator *agg_search = nullptr;
+	while (node) {
+		switch (node->type) {
+		case LogicalOperatorType::LOGICAL_ORDER_BY:
+		case LogicalOperatorType::LOGICAL_LIMIT:
+		case LogicalOperatorType::LOGICAL_TOP_N:
+			node = node->children.size() == 1 ? node->children[0].get() : nullptr;
+			continue;
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+			projection_path.push_back(&node->Cast<LogicalProjection>());
+			node = node->children.size() == 1 ? node->children[0].get() : nullptr;
+			continue;
+		case LogicalOperatorType::LOGICAL_FILTER:
+			if (node->children.size() == 1 &&
+			    node->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+				agg_search = node->children[0].get();
+			}
+			node = nullptr;
+			continue;
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+			agg_search = node;
+			node = nullptr;
+			continue;
+		default:
+			node = nullptr;
+			continue;
+		}
+	}
+	if (!agg_search || projection_path.empty()) {
 		return;
 	}
 	auto &agg = agg_search->Cast<LogicalAggregate>();
@@ -932,11 +1001,8 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 	agg.ResolveOperatorTypes();
 
 	ColumnBinding count_binding(agg.aggregate_index, new_agg_idx);
-	auto count_pt = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-	count_pt->alias = openivm::COUNT_STAR_COL;
-	auto &proj = plan->Cast<LogicalProjection>();
-	proj.expressions.push_back(std::move(count_pt));
-	proj.ResolveOperatorTypes();
+	PropagateHiddenBindingThroughProjectionPath(projection_path, count_binding, count_type, openivm::COUNT_STAR_COL);
+	plan->ResolveOperatorTypes();
 
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] Injected openivm_count_star for AGGREGATE_GROUP\n");
 }
@@ -946,7 +1012,8 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 /// projection's expression up through a pass-through parent projection.
 static bool IsHiddenAggregateAlias(const string &alias) {
 	return alias.find(openivm::SUM_COL_PREFIX) == 0 || alias.find(openivm::COUNT_COL_PREFIX) == 0 ||
-	       alias.find(openivm::SUM_SQ_COL_PREFIX) == 0 || alias.find(openivm::SUM_SQP_COL_PREFIX) == 0;
+	       alias.find(openivm::SUM_SQ_COL_PREFIX) == 0 || alias.find(openivm::SUM_SQP_COL_PREFIX) == 0 ||
+	       alias.find(openivm::SUM_COUNT_COL_PREFIX) == 0;
 }
 
 /// Propagate hidden aggregate columns (openivm_sum_*, openivm_count_*, …) added
@@ -962,7 +1029,7 @@ static bool IsHiddenAggregateAlias(const string &alias) {
 /// data table stores only the final AVG and the MERGE computes `v.avg + d.avg`
 /// — wrong for non-summable aggregates. Propagation lets CompileAggregateGroups
 /// see the hidden SUM/COUNT columns and maintain them separately.
-static void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
+void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
 	for (auto &child : plan->children) {
 		PropagateHiddenAggregateColumns(child);
 	}
@@ -1003,27 +1070,6 @@ static void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
 	}
 	if (added) {
 		proj.ResolveOperatorTypes();
-	}
-}
-
-static ColumnBinding AppendProjectionPassthrough(LogicalProjection &proj, const ColumnBinding &binding,
-                                                 const LogicalType &type, const string &alias) {
-	auto passthrough = make_uniq<BoundColumnRefExpression>(type, binding);
-	passthrough->alias = alias;
-	proj.expressions.push_back(std::move(passthrough));
-	proj.ResolveOperatorTypes();
-	auto bindings = proj.GetColumnBindings();
-	if (bindings.empty()) {
-		throw InternalException("OpenIVM: projection produced no bindings after appending hidden passthrough");
-	}
-	return bindings.back();
-}
-
-static void PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &projection_path,
-                                                        ColumnBinding binding, LogicalType type, const string &alias) {
-	for (auto it = projection_path.rbegin(); it != projection_path.rend(); ++it) {
-		binding = AppendProjectionPassthrough(**it, binding, type, alias);
-		type = (*it)->types.back();
 	}
 }
 
@@ -1356,9 +1402,9 @@ static void RewritePassAggregateFilters(PlanRewriteContext &rewrite_context) {
 }
 
 static void RewritePassDistinct(PlanRewriteContext &rewrite_context) {
-	bool had_distinct = HasTopLevelDistinct(rewrite_context.plan);
-	RewriteDistinct(rewrite_context.context, rewrite_context.binder, rewrite_context.plan);
-	if (had_distinct) {
+	bool added_top_level_state = RewriteDistinct(rewrite_context.context, rewrite_context.binder, rewrite_context.plan,
+	                                             HasTopLevelDistinct(rewrite_context.plan));
+	if (added_top_level_state) {
 		rewrite_context.planner_names.push_back(openivm::DISTINCT_COUNT_COL);
 	}
 }

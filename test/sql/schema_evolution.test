@@ -720,3 +720,278 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Test 12: same-named sources are isolated by catalog and schema
+# ==========================================
+
+statement ok
+CREATE SCHEMA se_identity_a;
+
+statement ok
+CREATE SCHEMA se_identity_b;
+
+statement ok
+CREATE TABLE se_identity_a.shared_t (id INT, v INT);
+
+statement ok
+CREATE TABLE se_identity_b.shared_t (id INT, v INT);
+
+statement ok
+INSERT INTO se_identity_a.shared_t VALUES (1, 10), (2, 20);
+
+statement ok
+INSERT INTO se_identity_b.shared_t VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW se_identity_a_mv AS
+SELECT id, v FROM se_identity_a.shared_t;
+
+statement ok
+CREATE MATERIALIZED VIEW se_identity_b_mv AS
+SELECT id, v FROM se_identity_b.shared_t;
+
+statement ok
+ALTER TABLE se_identity_a.shared_t RENAME COLUMN v TO amount;
+
+statement ok
+INSERT INTO se_identity_a.shared_t VALUES (3, 30), (4, 40);
+
+statement ok
+UPDATE se_identity_a.shared_t SET amount = 11 WHERE id = 1;
+
+statement ok
+DELETE FROM se_identity_a.shared_t WHERE id = 2;
+
+statement ok
+INSERT INTO se_identity_b.shared_t VALUES (3, 300), (4, 400);
+
+statement ok
+UPDATE se_identity_b.shared_t SET v = 101 WHERE id = 1;
+
+statement ok
+DELETE FROM se_identity_b.shared_t WHERE id = 2;
+
+statement ok
+PRAGMA refresh('se_identity_a_mv');
+
+statement ok
+PRAGMA refresh('se_identity_b_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_identity_a_mv
+    EXCEPT ALL
+    SELECT id, amount FROM se_identity_a.shared_t
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, amount FROM se_identity_a.shared_t
+    EXCEPT ALL
+    SELECT * FROM se_identity_a_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_identity_b_mv
+    EXCEPT ALL
+    SELECT id, v FROM se_identity_b.shared_t
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, v FROM se_identity_b.shared_t
+    EXCEPT ALL
+    SELECT * FROM se_identity_b_mv
+);
+----
+0
+
+# ==========================================
+# Test 13: CASCADE only removes exact-schema dependents
+# ==========================================
+
+statement ok
+CREATE TABLE se_identity_a.drop_shared (id INT);
+
+statement ok
+CREATE TABLE se_identity_b.drop_shared (id INT);
+
+statement ok
+INSERT INTO se_identity_a.drop_shared VALUES (1);
+
+statement ok
+INSERT INTO se_identity_b.drop_shared VALUES (10);
+
+statement ok
+CREATE MATERIALIZED VIEW se_identity_drop_a_mv AS
+SELECT * FROM se_identity_a.drop_shared;
+
+statement ok
+CREATE MATERIALIZED VIEW se_identity_drop_b_mv AS
+SELECT * FROM se_identity_b.drop_shared;
+
+statement ok
+DROP TABLE se_identity_a.drop_shared CASCADE;
+
+query II
+SELECT
+    (SELECT count(*) FROM openivm_views WHERE view_name = 'se_identity_drop_a_mv'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = 'se_identity_drop_b_mv');
+----
+0	1
+
+statement ok
+INSERT INTO se_identity_b.drop_shared VALUES (20), (30);
+
+statement ok
+DELETE FROM se_identity_b.drop_shared WHERE id = 10;
+
+statement ok
+PRAGMA refresh('se_identity_drop_b_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_identity_drop_b_mv
+    EXCEPT ALL
+    SELECT * FROM se_identity_b.drop_shared
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_identity_b.drop_shared
+    EXCEPT ALL
+    SELECT * FROM se_identity_drop_b_mv
+);
+----
+0
+
+# ==========================================
+# Test 14: tracked schema changes roll back atomically
+# ==========================================
+
+statement ok
+CREATE TABLE se_rollback_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO se_rollback_src VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW se_rollback_mv AS
+SELECT id, v FROM se_rollback_src;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE se_rollback_src RENAME COLUMN v TO amount;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_columns()
+WHERE table_name = 'se_rollback_src' AND column_name = 'v';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_columns()
+WHERE table_name = 'openivm_delta_se_rollback_src' AND column_name = 'v';
+----
+1
+
+statement ok
+INSERT INTO se_rollback_src VALUES (2, 20), (3, 30);
+
+statement ok
+UPDATE se_rollback_src SET v = 11 WHERE id = 1;
+
+statement ok
+DELETE FROM se_rollback_src WHERE id = 3;
+
+statement ok
+PRAGMA refresh('se_rollback_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_rollback_mv
+    EXCEPT ALL
+    SELECT * FROM se_rollback_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_rollback_src
+    EXCEPT ALL
+    SELECT * FROM se_rollback_mv
+);
+----
+0
+
+# ==========================================
+# Test 15: failed rename restores exact metadata
+# ==========================================
+
+statement ok
+CREATE TABLE se_failed_rename_src (id INTEGER, old_col INTEGER, new_col INTEGER);
+
+statement ok
+INSERT INTO se_failed_rename_src VALUES (1, 10, 100), (2, 20, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW se_failed_rename_mv AS
+SELECT id, old_col AS old_value, new_col AS new_value
+FROM se_failed_rename_src;
+
+statement error
+ALTER TABLE se_failed_rename_src RENAME COLUMN old_col TO new_col;
+----
+already exists
+
+# Batch conflicting changes before one refresh. A lossy new_col -> old_col
+# rollback rewrite makes the two projected values equal and fails bag equality.
+statement ok
+INSERT INTO se_failed_rename_src VALUES (3, 30, 300), (4, 40, 400);
+
+statement ok
+UPDATE se_failed_rename_src
+SET old_col = old_col + 1, new_col = new_col + 2
+WHERE id IN (1, 3);
+
+statement ok
+DELETE FROM se_failed_rename_src WHERE id IN (2, 4);
+
+statement ok
+PRAGMA refresh('se_failed_rename_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM se_failed_rename_mv
+    EXCEPT ALL
+    SELECT id, old_col AS old_value, new_col AS new_value
+    FROM se_failed_rename_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, old_col AS old_value, new_col AS new_value
+    FROM se_failed_rename_src
+    EXCEPT ALL
+    SELECT * FROM se_failed_rename_mv
+);
+----
+0

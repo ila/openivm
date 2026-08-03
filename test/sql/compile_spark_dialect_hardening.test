@@ -157,3 +157,41 @@ FROM openivm_compile_with_facts(
 WHERE stmt_kind = 'data';
 ----
 1
+
+# Spark full-refresh cascades must be split-safe: emit signed old/new rows
+# directly around the recompute, with no temp-backed snapshot companion.
+statement ok
+CREATE TABLE sph_full_src("from" INT, val INT);
+
+statement ok
+INSERT INTO sph_full_src VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW sph_full_mv AS
+    SELECT "from", val FROM sph_full_src;
+
+statement ok
+INSERT INTO sph_full_src VALUES (3, 30);
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%TEMP TABLE%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_sph_full_mv%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%SELECT `from`, `val`, -1 FROM openivm_data_sph_full_mv%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%SELECT `from`, `val`, 1 FROM openivm_data_sph_full_mv%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM openivm_data_sph_full_mv%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_data_sph_full_mv%`sph_full_src`%AS `from`%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%"from"%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_full_mv',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+SET openivm_refresh_mode = 'incremental';

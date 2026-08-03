@@ -37,6 +37,10 @@ constexpr const char *VAR_SQ_COL_PREFIX = "openivm_var_sq_";   // VARIANCE: no s
 constexpr const char *SUM_SQP_COL_PREFIX = "openivm_sum_sqp_"; // STDDEV_POP: sqrt + population denominator
 constexpr const char *VAR_SQP_COL_PREFIX = "openivm_var_sqp_"; // VAR_POP: no sqrt + population denominator
 constexpr const char *COUNT_COL_PREFIX = "openivm_count_";
+// COUNT(sum_argument) companions for user-visible SUM outputs. The suffix is
+// the visible projection index, which associates the state with the exact
+// bound output without inspecting SQL text or aliases.
+constexpr const char *SUM_COUNT_COL_PREFIX = "openivm_nonnull_sum_count_";
 
 // Hidden COUNT(*) injected into AGGREGATE_GROUP MVs that don't already have a
 // count aggregate. Tracks per-group cardinality so the cleanup can delete rows
@@ -49,6 +53,19 @@ constexpr const char *RIGHT_MATCH_COUNT_COL = "openivm_right_match_count";
 
 // Index suffix for GROUP BY unique index on MV data tables
 constexpr const char *INDEX_SUFFIX = "openivm_index";
+
+// Placeholders in the stored LEFT JOIN secondary-delta SQL, substituted at refresh time with a
+// subquery yielding (__k, __m) = (join key, signed multiplicity) for that side's pending changes.
+// They exist because the row source depends on the storage backend: a regular table reads
+// openivm_delta_<table> filtered by timestamp, while a DuckLake table has no delta table at all and
+// must read ducklake_table_insertions/deletions between two snapshot IDs -- and those IDs are only
+// known at refresh, whereas this SQL is generated once at CREATE.
+// Indexed because a chain of N tables has N-1 LEFT JOIN levels and EVERY level whose preserved side
+// is itself a join needs its own secondary delta. Handling only the outermost level left deeper
+// preserved-side counts undercounted for 4+ table chains.
+constexpr const char *LJSEC_INNER_DELTA_PREFIX = "__OPENIVM_LJSEC_INNER_DELTA_";
+constexpr const char *LJSEC_PRES_DELTA_PREFIX = "__OPENIVM_LJSEC_PRES_DELTA_";
+constexpr const char *LJSEC_PLACEHOLDER_SUFFIX = "__";
 
 // Temporary table prefix for companion row snapshots
 constexpr const char *TEMP_TABLE_PREFIX = "openivm_old_";
@@ -67,6 +84,8 @@ constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 // DELIM joins to eliminate. Pure robustness guard — not flag-gated.
 constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator";
 
+constexpr uint8_t LEGACY_CURRENT_DIFF_RECOMPUTE_TYPE = 10;
+
 } // namespace openivm
 
 enum class RefreshType : uint8_t {
@@ -78,11 +97,10 @@ enum class RefreshType : uint8_t {
 	WINDOW_PARTITION, // window functions — partition-level recompute
 	GROUP_RECOMPUTE, // inner-DISTINCT-under-AGG fallback: DELETE+INSERT only the GROUP BY keys touched by source deltas
 	TOP_K,           // Legacy enum value; current top-k support strips ORDER BY/LIMIT into the user-facing view
-	DISTINCT_INCREMENTAL,   // inner-DISTINCT-under-AGG with aux state (openivm_distinct_aux_state=true): DBSP-correct
-	                        // distinct(R)=sgn(R[t]); per-tuple count table emits ±1 only on count transitions
-	SEMI_ANTI_RECOMPUTE,    // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
-	CURRENT_DIFF_RECOMPUTE, // exact recompute inside incremental refresh; emits MV deltas from old/current diff
-	COUNT_DISTINCT_INCREMENTAL // COUNT(DISTINCT x) with per-(group,x) multiplicity aux state
+	DISTINCT_INCREMENTAL, // inner-DISTINCT-under-AGG with aux state (openivm_distinct_aux_state=true): DBSP-correct
+	                      // distinct(R)=sgn(R[t]); per-tuple count table emits ±1 only on count transitions
+	SEMI_ANTI_RECOMPUTE,  // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
+	COUNT_DISTINCT_INCREMENTAL = 11 // COUNT(DISTINCT x) with per-(group,x) multiplicity aux state
 };
 
 enum class GroupRecomputeAffectedMode : uint8_t { SOURCE_DELTA, SOURCE_DELTA_RELAX_AGGREGATE_FILTER, CURRENT_DIFF };
@@ -105,8 +123,6 @@ inline const char *RefreshTypeName(RefreshType type) {
 		return "DISTINCT_INCREMENTAL";
 	case RefreshType::SEMI_ANTI_RECOMPUTE:
 		return "SEMI_ANTI_RECOMPUTE";
-	case RefreshType::CURRENT_DIFF_RECOMPUTE:
-		return "CURRENT_DIFF_RECOMPUTE";
 	case RefreshType::COUNT_DISTINCT_INCREMENTAL:
 		return "COUNT_DISTINCT_INCREMENTAL";
 	case RefreshType::TOP_K:

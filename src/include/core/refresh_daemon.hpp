@@ -13,8 +13,8 @@ namespace duckdb {
 
 // Background thread that periodically refreshes materialized views with a REFRESH EVERY interval.
 // Holds a raw pointer to DatabaseInstance (valid for the lifetime of the extension).
-// The daemon wakes every 30 seconds, checks which views are due, and refreshes them.
-// Views already being refreshed (manual PRAGMA or cascade) are skipped via TryLockView.
+// The daemon wakes every 30 seconds, checks which views are due, and refreshes them
+// after acquiring the shared OpenIVM mutation gate.
 class RefreshDaemon {
 public:
 	// Start the daemon thread. Safe to call multiple times (only starts once).
@@ -22,6 +22,9 @@ public:
 
 	// Stop the daemon and join the thread. Called on destruction or explicit shutdown.
 	void Stop();
+
+	// Request an immediate scheduling cycle (used by explicit daemon restart).
+	void Wake();
 
 	~RefreshDaemon();
 
@@ -38,6 +41,7 @@ private:
 	std::thread thread_;
 	std::atomic<bool> shutdown_ {false};
 	std::atomic<bool> started_ {false};
+	std::atomic<bool> wake_requested_ {false};
 	std::mutex cv_mutex_;
 	std::condition_variable cv_;
 

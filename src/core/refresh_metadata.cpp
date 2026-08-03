@@ -29,9 +29,22 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 	auto result = con.Query("SELECT type FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError() || result->RowCount() == 0) {
+		if (result->HasError()) {
+			auto locus = con.Query("SELECT current_database(), current_schema()");
+			auto locus_text = !locus->HasError() && locus->RowCount() > 0
+			                      ? " (connection locus " + locus->GetValue(0, 0).ToString() + "." +
+			                            locus->GetValue(1, 0).ToString() + ")"
+			                      : "";
+			throw ParserException("Could not read IVM metadata for materialized view '%s'%s: %s", view_name, locus_text,
+			                      result->GetError());
+		}
 		throw ParserException("Materialized view '%s' does not exist in IVM metadata.", view_name);
 	}
-	return static_cast<RefreshType>(result->GetValue(0, 0).GetValue<int8_t>());
+	auto raw_type = result->GetValue(0, 0).GetValue<int8_t>();
+	if (raw_type == static_cast<int8_t>(openivm::LEGACY_CURRENT_DIFF_RECOMPUTE_TYPE)) {
+		return RefreshType::FULL_REFRESH;
+	}
+	return static_cast<RefreshType>(raw_type);
 }
 
 bool RefreshMetadata::HasMinMax(const string &view_name) {
@@ -120,6 +133,54 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 		}
 	}
 	return loc;
+}
+
+RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const string &view_name,
+                                                                           const string &fallback_catalog,
+                                                                           const string &fallback_schema) {
+	StoredViewLocation loc {fallback_catalog, fallback_schema};
+	auto result = con.Query("SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	if (!result->HasError() && result->RowCount() > 0) {
+		if (!result->GetValue(0, 0).IsNull()) {
+			loc.catalog_name = result->GetValue(0, 0).ToString();
+		}
+		if (!result->GetValue(1, 0).IsNull()) {
+			loc.schema_name = result->GetValue(1, 0).ToString();
+		}
+	}
+	if (loc.catalog_name.empty()) {
+		auto current = con.Query("SELECT current_database()");
+		if (!current->HasError() && current->RowCount() > 0 && !current->GetValue(0, 0).IsNull()) {
+			loc.catalog_name = current->GetValue(0, 0).ToString();
+		}
+	}
+	if (loc.schema_name.empty()) {
+		loc.schema_name = DEFAULT_SCHEMA;
+	}
+	return loc;
+}
+
+vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
+                                                                      const string &fallback_catalog,
+                                                                      const string &fallback_schema) {
+	auto result = con.Query("SELECT table_name, catalog_type, source_catalog, source_schema FROM " +
+	                        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
+	vector<DeltaSource> sources;
+	if (result->HasError()) {
+		return sources;
+	}
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		DeltaSource source;
+		source.table_name = result->GetValue(0, row).ToString();
+		source.catalog_type = result->GetValue(1, row).IsNull() ? "duckdb" : result->GetValue(1, row).ToString();
+		source.catalog_name =
+		    result->GetValue(2, row).IsNull() ? fallback_catalog : result->GetValue(2, row).ToString();
+		source.schema_name = result->GetValue(3, row).IsNull() ? fallback_schema : result->GetValue(3, row).ToString();
+		sources.push_back(std::move(source));
+	}
+	return sources;
 }
 
 string RefreshMetadata::ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
@@ -226,7 +287,7 @@ vector<string> RefreshMetadata::GetUpstreamViews(const string &view_name) {
 	return result; // topological order: ancestors first
 }
 
-vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
+static vector<string> GetDownstreamViewsInternal(Connection &con, const string &view_name, bool throw_on_error) {
 	// Find all reachable views that depend on delta_<view_name> or openivm_data_<view_name> as a source.
 	// DuckLake chained MVs use openivm_data_* (data table) instead of delta_* (delta table).
 	//
@@ -241,6 +302,10 @@ vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
 		auto dependents = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
 		                            " WHERE table_name = '" + SqlUtils::EscapeValue(delta_name) +
 		                            "' OR table_name = '" + SqlUtils::EscapeValue(data_name) + "' ORDER BY view_name");
+		if (dependents->HasError() && throw_on_error) {
+			throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view_name,
+			                       dependents->GetError());
+		}
 		if (!dependents->HasError()) {
 			for (size_t i = 0; i < dependents->RowCount(); i++) {
 				string dep = dependents->GetValue(0, i).ToString();
@@ -256,7 +321,22 @@ vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
 	};
 	collect(view_name);
 	std::reverse(result.begin(), result.end());
+	OPENIVM_DEBUG_PRINT("[CASCADE] View '%s' has %zu downstream refresh nodes\n", view_name.c_str(), result.size());
 	return result; // topological order: downstream parents before fan-in children
+}
+
+vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
+	return GetDownstreamViewsInternal(con, view_name, false);
+}
+
+vector<string> RefreshMetadata::GetDownstreamViewsStrict(const string &view_name) {
+	return GetDownstreamViewsInternal(con, view_name, true);
+}
+
+bool RefreshMetadata::HasDownstreamViews(const string &view_name) {
+	auto result = con.Query("SELECT 1 FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
+	                        SqlUtils::EscapeValue(SqlUtils::DeltaName(view_name)) + "' LIMIT 1");
+	return !result->HasError() && result->RowCount() > 0;
 }
 
 vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
@@ -332,7 +412,10 @@ int64_t RefreshMetadata::GetRefreshInterval(const string &view_name) {
 }
 
 vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
-	auto result = con.Query("SELECT v.view_name, v.refresh_interval, "
+	auto result = con.Query("SELECT v.view_name, COALESCE(v.view_catalog, current_database()), "
+	                        "COALESCE(v.view_schema, '" +
+	                        string(DEFAULT_SCHEMA) +
+	                        "'), v.refresh_interval, "
 	                        "(SELECT MIN(d.last_update) FROM " +
 	                        string(openivm::DELTA_TABLES_TABLE) +
 	                        " d WHERE d.view_name = v.view_name) AS last_update "
@@ -346,8 +429,10 @@ vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
 		for (size_t i = 0; i < result->RowCount(); i++) {
 			ScheduledView sv;
 			sv.view_name = result->GetValue(0, i).ToString();
-			sv.interval_seconds = result->GetValue(1, i).GetValue<int64_t>();
-			sv.last_update = result->GetValue(2, i).IsNull() ? "" : result->GetValue(2, i).ToString();
+			sv.catalog_name = result->GetValue(1, i).IsNull() ? "" : result->GetValue(1, i).ToString();
+			sv.schema_name = result->GetValue(2, i).IsNull() ? DEFAULT_SCHEMA : result->GetValue(2, i).ToString();
+			sv.interval_seconds = result->GetValue(3, i).GetValue<int64_t>();
+			sv.last_update = result->GetValue(4, i).IsNull() ? "" : result->GetValue(4, i).ToString();
 			views.push_back(sv);
 		}
 	}
@@ -359,11 +444,12 @@ void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_prog
 	          (in_progress ? "true" : "false") + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 }
 
-string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key) {
+string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
+                                             const string &delta_metadata_table) {
 	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
+	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 	return "DELETE FROM " + qtarget + " WHERE " + string(openivm::TIMESTAMP_COL) + " < (SELECT MIN(last_update) FROM " +
-	       string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" + SqlUtils::EscapeValue(metadata_key) +
-	       "');\n";
+	       metadata_table + " WHERE table_name = '" + SqlUtils::EscapeValue(metadata_key) + "');\n";
 }
 
 // --- DuckLake support ---
@@ -459,8 +545,10 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 }
 
 string RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
-                                                        const string &snapshot_expr) {
-	return "UPDATE " + string(openivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = " + snapshot_expr +
+                                                        const string &snapshot_expr,
+                                                        const string &delta_metadata_table) {
+	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
+	return "UPDATE " + metadata_table + " SET last_snapshot_id = " + snapshot_expr +
 	       ", last_update = now(), last_refresh_ts = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
 	       "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "';\n";
 }
@@ -918,12 +1006,15 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<
 		    !ExtractJsonString(object, "source_col", op.source_col)) {
 			continue;
 		}
+		ExtractJsonString(object, "source_cast", op.source_cast);
 		if (op.kind == "lookup") {
 			if (!ExtractJsonString(object, "lookup", op.lookup) ||
 			    !ExtractJsonString(object, "lookup_col", op.lookup_col) ||
 			    !ExtractJsonString(object, "lookup_out", op.lookup_out)) {
 				continue;
 			}
+			ExtractJsonString(object, "lookup_cast", op.lookup_cast);
+			ExtractJsonString(object, "lookup_out_cast", op.lookup_out_cast);
 		} else if (op.kind != "direct") {
 			continue;
 		}
@@ -942,10 +1033,19 @@ string RefreshMetadata::WindowPartitionLineageToJson(const vector<WindowPartitio
 		json += "{\"k\":" + SqlUtils::JsonQuote(op.kind) + ",\"out\":" + SqlUtils::JsonQuote(op.output_col) +
 		        ",\"source\":" + SqlUtils::JsonQuote(op.source) +
 		        ",\"source_col\":" + SqlUtils::JsonQuote(op.source_col);
+		if (!op.source_cast.empty()) {
+			json += ",\"source_cast\":" + SqlUtils::JsonQuote(op.source_cast);
+		}
 		if (op.kind == "lookup") {
 			json += ",\"lookup\":" + SqlUtils::JsonQuote(op.lookup) +
 			        ",\"lookup_col\":" + SqlUtils::JsonQuote(op.lookup_col) +
 			        ",\"lookup_out\":" + SqlUtils::JsonQuote(op.lookup_out);
+			if (!op.lookup_cast.empty()) {
+				json += ",\"lookup_cast\":" + SqlUtils::JsonQuote(op.lookup_cast);
+			}
+			if (!op.lookup_out_cast.empty()) {
+				json += ",\"lookup_out_cast\":" + SqlUtils::JsonQuote(op.lookup_out_cast);
+			}
 		}
 		json += "}";
 	}
@@ -1099,6 +1199,46 @@ string RefreshMetadata::FilteredGroupCountAuxMetaToJson(const FilteredGroupCount
 	       ",\"output_col\":" + SqlUtils::JsonQuote(meta.output_col) +
 	       ",\"op\":" + SqlUtils::JsonQuote(meta.comparison_op) +
 	       ",\"threshold\":" + SqlUtils::JsonQuote(meta.threshold_sql) + "}";
+}
+
+bool RefreshMetadata::GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out) {
+	auto result = con.Query("SELECT leftjoin_secondary_meta_json FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	string json = result->GetValue(0, 0).ToString();
+	if (json.empty()) {
+		return false;
+	}
+	string kind;
+	if (!ExtractJsonString(json, "kind", kind) || kind != "leftjoin_secondary") {
+		return false;
+	}
+	auto extract_array_or_legacy_csv = [&](const string &array_key, const string &legacy_key, vector<string> &values) {
+		if (ExtractJsonStringArray(json, array_key, values)) {
+			return;
+		}
+		string legacy;
+		if (ExtractJsonString(json, legacy_key, legacy) && !legacy.empty()) {
+			values = StringUtil::Split(legacy, ',');
+		}
+	};
+	extract_array_or_legacy_csv("preserved_cols", "preserved_cols", out.preserved_cols);
+	extract_array_or_legacy_csv("inner_tables", "inner_table", out.inner_tables);
+	extract_array_or_legacy_csv("inner_keys", "inner_key", out.inner_keys);
+	extract_array_or_legacy_csv("pres_tables", "pres_table", out.pres_tables);
+	extract_array_or_legacy_csv("pres_keys", "pres_key", out.pres_keys);
+	return ExtractJsonString(json, "sql", out.sql);
+}
+
+string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta) {
+	return "{\"kind\":\"leftjoin_secondary\",\"sql\":" + SqlUtils::JsonQuote(meta.sql) +
+	       ",\"preserved_cols\":" + SqlUtils::JsonArray(meta.preserved_cols) +
+	       ",\"inner_tables\":" + SqlUtils::JsonArray(meta.inner_tables) +
+	       ",\"inner_keys\":" + SqlUtils::JsonArray(meta.inner_keys) +
+	       ",\"pres_tables\":" + SqlUtils::JsonArray(meta.pres_tables) +
+	       ",\"pres_keys\":" + SqlUtils::JsonArray(meta.pres_keys) + "}";
 }
 
 vector<string> RefreshMetadata::ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta) {

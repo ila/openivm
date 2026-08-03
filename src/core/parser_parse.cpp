@@ -3,11 +3,55 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/pragma_statement.hpp"
 
 #include <regex>
 
 namespace duckdb {
+
+static unique_ptr<SQLStatement> BuildInternalPragma(const string &name, const string &query) {
+	auto statement = make_uniq<PragmaStatement>();
+	statement->info->name = name;
+	statement->info->parameters.push_back(make_uniq<ConstantExpression>(Value(query)));
+	return std::move(statement);
+}
+
+ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExtensionInfo *info, const string &query,
+                                                                       ParserOptions &options) {
+	try {
+		auto extension_result = ParseFunction(info, query);
+		if (extension_result.type == ParserExtensionResultType::PARSE_SUCCESSFUL) {
+			vector<unique_ptr<SQLStatement>> statements;
+			statements.push_back(BuildInternalPragma("openivm_materialized_view_lifecycle", query));
+			return ParserOverrideResult(std::move(statements));
+		}
+
+		// DuckDB parses these statements natively, so the regular parser-extension
+		// fallback never sees them. Route tracked-view drops and cascading source
+		// drops through OpenIVM so their cleanup uses the caller transaction.
+		ParserOptions native_options = options;
+		native_options.extensions = nullptr;
+		Parser parser(native_options);
+		parser.ParseQuery(query);
+		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::DROP_STATEMENT) {
+			return ParserOverrideResult();
+		}
+		auto &drop = parser.statements[0]->Cast<DropStatement>();
+		if (drop.info->type != CatalogType::VIEW_ENTRY &&
+		    (drop.info->type != CatalogType::TABLE_ENTRY || !drop.info->cascade)) {
+			return ParserOverrideResult();
+		}
+		vector<unique_ptr<SQLStatement>> statements;
+		statements.push_back(BuildInternalPragma("openivm_materialized_view_drop", query));
+		return ParserOverrideResult(std::move(statements));
+	} catch (std::exception &ex) {
+		return ParserOverrideResult(ex);
+	}
+}
 
 ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(ParserExtensionInfo *info,
                                                                           const string &query) {
@@ -21,35 +65,38 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 
 	// Handle ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' | SET REFRESH MANUAL
 	if (StringUtil::Contains(query_lower, "alter materialized view")) {
-		std::regex alter_re("alter\\s+materialized\\s+view\\s+(\"(?:[^\"]+)\"|[a-zA-Z0-9_.]+)\\s+set\\s+refresh\\s+("
-		                    "every\\s+'([^']+)'|manual)",
+		const string identifier = "(?:\"(?:[^\"]|\"\")*\"|[a-zA-Z_][a-zA-Z0-9_$]*)";
+		const string qualified_identifier = identifier + "(?:\\s*\\.\\s*" + identifier + "){0,2}";
+		std::regex alter_re("^alter\\s+materialized\\s+view\\s+(" + qualified_identifier +
+		                        ")\\s+set\\s+refresh\\s+(every\\s+'([^']+)'|manual)$",
 		                    std::regex::icase);
 		std::smatch match;
-		if (!std::regex_search(query_lower, match, alter_re)) {
+		if (!std::regex_match(query_lower, match, alter_re)) {
 			throw ParserException("Invalid ALTER MATERIALIZED VIEW syntax. "
 			                      "Expected: ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' "
 			                      "or ALTER MATERIALIZED VIEW <name> SET REFRESH MANUAL");
 		}
 		string alter_view_name = match[1].str();
-		if (alter_view_name.size() >= 2 && alter_view_name.front() == '"' && alter_view_name.back() == '"') {
-			alter_view_name = alter_view_name.substr(1, alter_view_name.size() - 2);
+		auto name_components = QualifiedName::ParseComponents(alter_view_name);
+		if (name_components.empty()) {
+			throw ParserException("Invalid materialized-view target '%s'", alter_view_name);
 		}
 		string refresh_type = StringUtil::Lower(match[2].str());
-		string update_sql;
+		string alter_value;
 		if (refresh_type == "manual") {
-			update_sql = "UPDATE " + string(openivm::VIEWS_TABLE) + " SET refresh_interval = NULL WHERE view_name = '" +
-			             SqlUtils::EscapeSingleQuotes(alter_view_name) + "'";
+			alter_value = "NULL";
 		} else {
 			int64_t interval = SqlUtils::ParseRefreshInterval(match[3].str());
-			update_sql = "UPDATE " + string(openivm::VIEWS_TABLE) + " SET refresh_interval = " + to_string(interval) +
-			             " WHERE view_name = '" + SqlUtils::EscapeSingleQuotes(alter_view_name) + "'";
+			alter_value = to_string(interval);
 		}
 		// Pass the UPDATE SQL through MaterializedViewParseData; PlanFunction will execute it
 		Parser alter_parser;
 		alter_parser.ParseQuery("SELECT 1");
 		auto parse_data =
 		    make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(std::move(alter_parser.statements[0]));
-		dynamic_cast<MaterializedViewParseData &>(*parse_data).alter_sql = update_sql;
+		auto &materialized_view_data = dynamic_cast<MaterializedViewParseData &>(*parse_data);
+		materialized_view_data.alter_sql = alter_value;
+		materialized_view_data.target_name = alter_view_name;
 		return ParserExtensionParseResult(std::move(parse_data));
 	}
 
@@ -84,7 +131,9 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 
 	auto parse_data = make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(std::move(p.statements[0]),
 	                                                                                      refresh_interval);
-	dynamic_cast<MaterializedViewParseData &>(*parse_data).is_replace = is_replace;
+	auto &materialized_view_data = dynamic_cast<MaterializedViewParseData &>(*parse_data);
+	materialized_view_data.is_replace = is_replace;
+	materialized_view_data.target_name = SqlUtils::ExtractTableName(query_lower);
 	return ParserExtensionParseResult(std::move(parse_data));
 }
 

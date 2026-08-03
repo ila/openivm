@@ -307,6 +307,8 @@ static void BuildUnsupportedReasons(DeltaViewModel &model, const CreateMVPlanFac
 }
 
 static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
+	const bool has_nonredundant_distinct =
+	    analysis.found_distinct && (!input.has_top_level_redundant_distinct || input.facts->has_descendant_distinct);
 	if (!model.unsupported_reasons.empty()) {
 		AddUnique(model.features, DeltaModelFeature::FULL_ONLY);
 	}
@@ -353,7 +355,7 @@ static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analys
 		AddUnique(model.features, DeltaModelFeature::WINDOW_AFFECTED_PARTITION);
 	}
 	if (!model.HasFeature(DeltaModelFeature::FULL_ONLY)) {
-		if (input.distinct_aux_candidate) {
+		if (input.distinct_aux_candidate && has_nonredundant_distinct) {
 			AddUnique(model.features, DeltaModelFeature::DISTINCT_STATEFUL);
 		}
 		if (input.semi_anti_aux_candidate) {
@@ -391,6 +393,26 @@ static void BuildUpdateSemantics(DeltaViewModel &model, const PlanAnalysis &anal
 	}
 }
 
+static bool IsTransparentDistinctWrapper(LogicalOperatorType type) {
+	return type == LogicalOperatorType::LOGICAL_CREATE_TABLE || type == LogicalOperatorType::LOGICAL_FILTER ||
+	       type == LogicalOperatorType::LOGICAL_ORDER_BY || type == LogicalOperatorType::LOGICAL_LIMIT ||
+	       type == LogicalOperatorType::LOGICAL_TOP_N;
+}
+
+static bool HasOuterProjectionOverDistinct(const CreateMVPlanFacts &facts) {
+	auto *node = facts.root;
+	bool found_projection = false;
+	while (node && node->children.size() == 1) {
+		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			found_projection = true;
+		} else if (!IsTransparentDistinctWrapper(node->type)) {
+			break;
+		}
+		node = node->children[0].get();
+	}
+	return found_projection && node && node->type == LogicalOperatorType::LOGICAL_DISTINCT;
+}
+
 static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &facts, const vector<string> &output_names,
                               idx_t visible_output_count) {
 	const auto &analysis = facts.analysis;
@@ -411,16 +433,22 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 			                    model.group_columns.size());
 		}
 	} else if (model.distinct_at_top) {
-		model.group_columns = analysis.aggregate_columns;
-	} else if (analysis.found_distinct && analysis.aggregate_columns.empty()) {
-		model.group_columns = analysis.aggregate_columns;
+		AddVisibleGroupNames(model.group_columns, output_names);
+	} else if (analysis.found_distinct && !analysis.found_aggregation && HasOuterProjectionOverDistinct(facts)) {
+		AddVisibleGroupNames(model.group_columns, output_names);
+		if (!model.group_columns.empty()) {
+			AddUnique(model.strategy_reasons, DeltaStrategyReason::INNER_DISTINCT_PROJECTION_RECOMPUTE);
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Inner DISTINCT below an outer projection -- using "
+			                    "GROUP_RECOMPUTE\n");
+		}
 	} else if (group_count > 0 && group_index != DConstants::INVALID_INDEX) {
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
 	}
 
+	idx_t actual_visible_outputs = GetVisibleOutputCount(output_names, visible_output_count);
 	if (analysis.found_delim_join && analysis.found_aggregation && model.group_columns.empty() &&
-	    output_names.size() > analysis.aggregate_types.size()) {
-		idx_t key_count = output_names.size() - analysis.aggregate_types.size();
+	    actual_visible_outputs > analysis.aggregate_types.size()) {
+		idx_t key_count = actual_visible_outputs - analysis.aggregate_types.size();
 		for (idx_t i = 0; i < key_count; i++) {
 			if (!output_names[i].empty() && !IncrementalTableNames::IsInternalColumn(output_names[i])) {
 				model.group_columns.push_back(output_names[i]);
@@ -507,11 +535,11 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 
 	if (analysis.found_join && analysis.found_aggregation && !model.group_columns.empty()) {
 		idx_t expected_linear_outputs = model.group_columns.size() + model.aggregate_types.size();
-		if (output_names.size() > expected_linear_outputs) {
+		if (actual_visible_outputs > expected_linear_outputs) {
 			AddUnique(model.strategy_reasons, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Join-over-aggregate exposes %zu columns but only %zu are "
 			                    "group/aggregate outputs -- using GROUP_RECOMPUTE\n",
-			                    output_names.size(), expected_linear_outputs);
+			                    actual_visible_outputs, expected_linear_outputs);
 		}
 	}
 
@@ -527,30 +555,26 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 }
 
 static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
+	const bool has_nonredundant_distinct =
+	    analysis.found_distinct && (!input.has_top_level_redundant_distinct || input.facts->has_descendant_distinct);
 	auto has_argminmax =
 	    std::any_of(analysis.aggregate_types.begin(), analysis.aggregate_types.end(),
 	                [](const string &agg_type) { return agg_type == "arg_min" || agg_type == "arg_max"; });
-	auto select_current_diff = [&](DeltaStrategyReason reason) {
-		model.type = RefreshType::CURRENT_DIFF_RECOMPUTE;
-		AddUnique(model.features, DeltaModelFeature::CURRENT_DIFF_RECOMPUTE);
-		AddUnique(model.strategy_reasons, reason);
-	};
 	if (input.has_unsupported_incremental_construct) {
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (!analysis.incremental_compatible) {
 		model.type = RefreshType::FULL_REFRESH;
 		model.warn_unsupported_incremental = true;
 	} else if (analysis.found_sample) {
-		select_current_diff(DeltaStrategyReason::SAMPLE_CURRENT_DIFF_RECOMPUTE);
+		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_positional_join) {
-		select_current_diff(DeltaStrategyReason::POSITIONAL_CURRENT_DIFF_RECOMPUTE);
+		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_asof_join && analysis.found_window && !model.window_partition_columns.empty()) {
 		model.type = RefreshType::WINDOW_PARTITION;
 	} else if (analysis.found_asof_join && analysis.found_aggregation && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
-		AddUnique(model.strategy_reasons, DeltaStrategyReason::ASOF_CURRENT_DIFF_RECOMPUTE);
 	} else if (analysis.found_asof_join) {
-		select_current_diff(DeltaStrategyReason::ASOF_CURRENT_DIFF_RECOMPUTE);
+		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_window) {
 		model.type = RefreshType::WINDOW_PARTITION;
 	} else if (analysis.found_grouping_sets) {
@@ -564,10 +588,18 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_filtered_list) {
 		model.type = RefreshType::FULL_REFRESH;
+	} else if (input.has_computed_sum_aggregate_projection) {
+		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
+	} else if (analysis.found_distinct && !analysis.found_union_distinct && model.distinct_at_top &&
+	           analysis.found_aggregation) {
+		// DISTINCT over multiple aggregate result rows is a second non-linear
+		// aggregation level. The outer DISTINCT key is an aggregate value, not
+		// a source group key that affected-group recompute can recover.
+		model.type = RefreshType::FULL_REFRESH;
 	} else if (analysis.found_count_distinct && !model.group_columns.empty()) {
 		model.type =
 		    input.count_distinct_aux_candidate ? RefreshType::COUNT_DISTINCT_INCREMENTAL : RefreshType::GROUP_RECOMPUTE;
-	} else if (analysis.found_distinct && !model.distinct_at_top && analysis.found_aggregation) {
+	} else if (has_nonredundant_distinct && !model.distinct_at_top && analysis.found_aggregation) {
 		model.type = model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL) ? RefreshType::DISTINCT_INCREMENTAL
 		                                                                    : RefreshType::GROUP_RECOMPUTE;
 	} else if (model.union_distinct_over_agg && !model.group_columns.empty()) {
@@ -608,7 +640,8 @@ static void SelectGroupRecomputeAffectedMode(DeltaViewModel &model, const DeltaV
 	if ((input.facts && input.facts->analysis.found_asof_join) || input.stored_query_has_top_k ||
 	    aggregate_filter_join || (input.stored_query_has_aggregate_filter && input.has_ducklake_source)) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF;
-	} else if (HasStrategyReason(model, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK)) {
+	} else if (HasStrategyReason(model, DeltaStrategyReason::JOIN_AGGREGATE_PROJECTION_FALLBACK) ||
+	           HasStrategyReason(model, DeltaStrategyReason::OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE)) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF;
 	} else if (input.stored_query_has_aggregate_filter) {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER;
@@ -659,12 +692,10 @@ const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
 		return "SEMI_ANTI_AGGREGATE_GROUP_FALLBACK";
 	case DeltaStrategyReason::OUTER_JOIN_AGGREGATE_RECOMPUTE:
 		return "OUTER_JOIN_AGGREGATE_RECOMPUTE";
-	case DeltaStrategyReason::ASOF_CURRENT_DIFF_RECOMPUTE:
-		return "ASOF_CURRENT_DIFF_RECOMPUTE";
-	case DeltaStrategyReason::SAMPLE_CURRENT_DIFF_RECOMPUTE:
-		return "SAMPLE_CURRENT_DIFF_RECOMPUTE";
-	case DeltaStrategyReason::POSITIONAL_CURRENT_DIFF_RECOMPUTE:
-		return "POSITIONAL_CURRENT_DIFF_RECOMPUTE";
+	case DeltaStrategyReason::OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE:
+		return "OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE";
+	case DeltaStrategyReason::INNER_DISTINCT_PROJECTION_RECOMPUTE:
+		return "INNER_DISTINCT_PROJECTION_RECOMPUTE";
 	default:
 		return "UNKNOWN";
 	}
@@ -702,8 +733,6 @@ const char *DeltaModelFeatureName(DeltaModelFeature feature) {
 		return "SAMPLE_GLOBAL_RECOMPUTE";
 	case DeltaModelFeature::POSITIONAL_GLOBAL_RECOMPUTE:
 		return "POSITIONAL_GLOBAL_RECOMPUTE";
-	case DeltaModelFeature::CURRENT_DIFF_RECOMPUTE:
-		return "CURRENT_DIFF_RECOMPUTE";
 	case DeltaModelFeature::FULL_ONLY:
 		return "FULL_ONLY";
 	default:
@@ -859,22 +888,30 @@ idx_t DeltaViewModel::LineageEntryCount() const {
 	return count;
 }
 
-bool IsDistinctAtTop(const PlanAnalysis &analysis, const vector<string> &output_names) {
-	if (!analysis.found_distinct || analysis.aggregate_columns.empty() || output_names.empty()) {
+bool IsDistinctAtTop(const CreateMVPlanFacts &facts, const vector<string> &output_names) {
+	if (!facts.analysis.found_distinct) {
 		return false;
 	}
 
-	unordered_set<string> output_lc;
-	for (auto &name : output_names) {
-		output_lc.insert(StringUtil::Lower(name));
+	auto *node = facts.root;
+	while (node && node->children.size() == 1) {
+		if (!IsTransparentDistinctWrapper(node->type)) {
+			break;
+		}
+		node = node->children[0].get();
 	}
-
-	for (auto &target : analysis.aggregate_columns) {
-		if (!output_lc.count(StringUtil::Lower(target))) {
-			return false;
+	if (node && node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+		return true;
+	}
+	if (!node || node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return false;
+	}
+	for (auto &name : output_names) {
+		if (name == openivm::DISTINCT_COUNT_COL) {
+			return true;
 		}
 	}
-	return true;
+	return false;
 }
 
 DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
@@ -893,7 +930,10 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 	}
 
 	model.has_minmax_metadata = analysis.found_minmax || analysis.found_count_distinct || analysis.found_list;
-	model.distinct_at_top = IsDistinctAtTop(analysis, output_names);
+	model.distinct_at_top = IsDistinctAtTop(facts, output_names);
+	if (input.has_top_level_redundant_distinct) {
+		model.distinct_at_top = false;
+	}
 	BuildGroupColumns(model, facts, output_names, input.visible_output_count);
 
 	if ((analysis.found_left_join || analysis.found_full_outer) && analysis.found_aggregation &&
@@ -902,6 +942,12 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 		AddUnique(model.strategy_reasons, DeltaStrategyReason::OUTER_JOIN_AGGREGATE_RECOMPUTE);
 		OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT/OUTER JOIN aggregate with computed aggregate or projection wrapper -- "
 		                    "using group-recompute metadata\n");
+	}
+	if (analysis.found_aggregation && OuterJoinPreservedSideHasTableFunction(facts)) {
+		model.has_minmax_metadata = true;
+		AddUnique(model.strategy_reasons, DeltaStrategyReason::OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE);
+		OPENIVM_DEBUG_PRINT("[CREATE MV] LEFT/RIGHT JOIN aggregate with a table function on the preserved side -- "
+		                    "using current-diff group recompute\n");
 	}
 
 	if (analysis.found_full_outer) {

@@ -610,6 +610,87 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# DISTINCT inside the left input of a LATERAL aggregate is not a top-level
+# DISTINCT. It remains incrementally maintainable via affected-group recompute.
+statement ok
+CREATE TABLE lat_distinct_customer (id INT, warehouse_id INT, state VARCHAR);
+
+statement ok
+INSERT INTO lat_distinct_customer VALUES
+    (1, 1, 'CA'), (2, 1, 'CA'), (3, 1, 'NY'), (4, 2, 'CA');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lat_distinct_count AS
+    SELECT c.warehouse_id, c.state, agg.customer_count
+    FROM (
+        SELECT DISTINCT warehouse_id, state
+        FROM lat_distinct_customer
+    ) c
+    JOIN LATERAL (
+        SELECT COUNT(*) AS customer_count
+        FROM lat_distinct_customer
+        WHERE warehouse_id = c.warehouse_id AND state = c.state
+    ) agg ON TRUE;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'mv_lat_distinct_count';
+----
+6
+
+statement ok
+UPDATE lat_distinct_customer SET state = 'TX' WHERE id = 2;
+
+statement ok
+DELETE FROM lat_distinct_customer WHERE id = 3;
+
+statement ok
+INSERT INTO lat_distinct_customer VALUES (5, 2, 'WA'), (6, 3, 'CA');
+
+statement ok
+UPDATE lat_distinct_customer SET warehouse_id = 3 WHERE id = 6;
+
+statement ok
+DELETE FROM lat_distinct_customer WHERE id = 5;
+
+statement ok
+PRAGMA refresh('mv_lat_distinct_count');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_distinct_count
+    EXCEPT ALL
+    SELECT c.warehouse_id, c.state, agg.customer_count
+    FROM (
+        SELECT DISTINCT warehouse_id, state
+        FROM lat_distinct_customer
+    ) c
+    JOIN LATERAL (
+        SELECT COUNT(*) AS customer_count
+        FROM lat_distinct_customer
+        WHERE warehouse_id = c.warehouse_id AND state = c.state
+    ) agg ON TRUE
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.warehouse_id, c.state, agg.customer_count
+    FROM (
+        SELECT DISTINCT warehouse_id, state
+        FROM lat_distinct_customer
+    ) c
+    JOIN LATERAL (
+        SELECT COUNT(*) AS customer_count
+        FROM lat_distinct_customer
+        WHERE warehouse_id = c.warehouse_id AND state = c.state
+    ) agg ON TRUE
+    EXCEPT ALL
+    SELECT * FROM mv_lat_distinct_count
+);
+----
+0
+
 statement ok
 INSERT INTO lat_history VALUES (1, 1, 7);
 

@@ -2,17 +2,149 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/planner/binder.hpp"
 
 #include <chrono>
+#include <cctype>
 #include <cstring>
 #include <unordered_set>
 
 namespace duckdb {
 
 namespace {
+
+static const vector<string> &TransactionalMetadataTables() {
+	static const vector<string> tables = {openivm::VIEWS_TABLE,   "openivm_refresh_hooks", openivm::DELTA_TABLES_TABLE,
+	                                      openivm::HISTORY_TABLE, openivm::PROFILE_TABLE,  openivm::MV_DEPS_TABLE};
+	return tables;
+}
+
+static const vector<string> &MetadataStatementPrefixes() {
+	static const vector<string> prefixes = {
+	    "create table if not exists ",
+	    "alter table ",
+	    "insert or replace into ",
+	    "insert or ignore into ",
+	    "insert into ",
+	    "update ",
+	    "delete from ",
+	};
+	return prefixes;
+}
+
+static bool HasMetadataTarget(const string &statement, const string &prefix, const string &table) {
+	if (!StringUtil::StartsWith(statement, prefix)) {
+		return false;
+	}
+	auto target = statement.substr(prefix.size());
+	auto table_name = StringUtil::Lower(table);
+	return StringUtil::StartsWith(target, table_name) &&
+	       (target.size() == table_name.size() || std::isspace(static_cast<unsigned char>(target[table_name.size()])) ||
+	        target[table_name.size()] == '(');
+}
+
+static bool TargetsMetadataTable(const string &statement, const string &table) {
+	auto trimmed = statement;
+	StringUtil::Trim(trimmed);
+	auto lower = StringUtil::Lower(trimmed);
+	for (auto &prefix : MetadataStatementPrefixes()) {
+		if (HasMetadataTarget(lower, prefix, table)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool IsReplayableMetadataStatement(const string &statement) {
+	auto trimmed = statement;
+	StringUtil::Trim(trimmed);
+	auto lower = StringUtil::Lower(trimmed);
+	for (auto &prefix : MetadataStatementPrefixes()) {
+		for (auto &table : TransactionalMetadataTables()) {
+			if (HasMetadataTarget(lower, prefix, table)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static string MakeTemporaryMetadataDDL(const string &statement) {
+	auto lower = StringUtil::Lower(statement);
+	const string prefix = "create table if not exists ";
+	if (!StringUtil::StartsWith(lower, prefix)) {
+		return statement;
+	}
+	return "create temp table if not exists " + statement.substr(prefix.size());
+}
+
+static bool IsMetadataSchemaStatement(const string &statement) {
+	auto trimmed = statement;
+	StringUtil::Trim(trimmed);
+	auto lower = StringUtil::Lower(trimmed);
+	return StringUtil::StartsWith(lower, "create table") || StringUtil::StartsWith(lower, "alter table");
+}
+
+static bool MatchesNowCall(const string &statement, idx_t offset) {
+	static const string now_call = "now()";
+	if (offset + now_call.size() > statement.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < now_call.size(); i++) {
+		if (StringUtil::CharacterToLower(statement[offset + i]) != now_call[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static string StabilizeTransactionalMetadata(const string &statement, const string &timestamp_sql) {
+	string result;
+	result.reserve(statement.size() + timestamp_sql.size());
+	bool in_single_quote = false;
+	bool in_double_quote = false;
+	for (idx_t offset = 0; offset < statement.size();) {
+		char current = statement[offset];
+		if (current == '\'' && !in_double_quote) {
+			result.push_back(current);
+			if (in_single_quote && offset + 1 < statement.size() && statement[offset + 1] == '\'') {
+				result.push_back(statement[offset + 1]);
+				offset += 2;
+				continue;
+			}
+			in_single_quote = !in_single_quote;
+			offset++;
+			continue;
+		}
+		if (current == '"' && !in_single_quote) {
+			result.push_back(current);
+			if (in_double_quote && offset + 1 < statement.size() && statement[offset + 1] == '"') {
+				result.push_back(statement[offset + 1]);
+				offset += 2;
+				continue;
+			}
+			in_double_quote = !in_double_quote;
+			offset++;
+			continue;
+		}
+		if (!in_single_quote && !in_double_quote && MatchesNowCall(statement, offset)) {
+			result += timestamp_sql;
+			offset += 5;
+			continue;
+		}
+		result.push_back(current);
+		offset++;
+	}
+	return result;
+}
 
 struct CreateMVProfileStep {
 	int32_t step_order;
@@ -160,16 +292,26 @@ struct DeltaSchemaDDL {
 	idx_t column_count = 0;
 };
 
-void ParseCreateDeltaFromDataPayload(const string &payload, string &delta_table, string &data_table) {
+void ParseCreateDeltaFromDataPayload(const string &payload, bool &replace, string &delta_table, string &data_table) {
 	auto first = payload.find('\t');
 	if (first == string::npos) {
 		return;
 	}
-	delta_table = payload.substr(0, first);
-	data_table = payload.substr(first + 1);
+	auto second = payload.find('\t', first + 1);
+	if (second == string::npos) {
+		return;
+	}
+	auto mode = payload.substr(0, first);
+	if (mode != "create" && mode != "replace") {
+		return;
+	}
+	replace = mode == "replace";
+	delta_table = payload.substr(first + 1, second - first - 1);
+	data_table = payload.substr(second + 1);
 }
 
-DeltaSchemaDDL BuildCreateDeltaFromDataSQL(Connection &conn, const string &delta_table, const string &data_table) {
+DeltaSchemaDDL BuildCreateDeltaFromDataSQL(Connection &conn, const string &delta_table, const string &data_table,
+                                           bool replace) {
 	auto described = conn.Query("DESCRIBE SELECT * FROM " + data_table);
 	if (described->HasError()) {
 		throw CatalogException("Could not derive IVM delta schema from data table '" + data_table +
@@ -209,7 +351,8 @@ DeltaSchemaDDL BuildCreateDeltaFromDataSQL(Connection &conn, const string &delta
 	columns.push_back(string(openivm::MULTIPLICITY_COL) + " INTEGER DEFAULT 1");
 	columns.push_back(string(openivm::TIMESTAMP_COL) + " TIMESTAMP DEFAULT now()");
 	DeltaSchemaDDL result;
-	result.sql = "create table if not exists " + delta_table + " (" + StringUtil::Join(columns, ", ") + ")";
+	result.sql = string(replace ? "create or replace table " : "create table if not exists ") + delta_table + " (" +
+	             StringUtil::Join(columns, ", ") + ")";
 	result.column_count = described->RowCount();
 	return result;
 }
@@ -220,6 +363,9 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto conn = make_uniq<Connection>(db);
+	auto &helper_lock_state = TransactionalMVLockState::Get(*conn->context);
+	helper_lock_state.SetMutationOwner(&context);
+	MutationLockGuard mutation_guard(db, &context);
 	bool suspended_autocommit_transaction = false;
 	auto restore_outer_transaction = [&]() {
 		if (suspended_autocommit_transaction && !context.transaction.HasActiveTransaction()) {
@@ -317,17 +463,18 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		}
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
 			flush_pending();
+			bool replace = false;
 			string delta_table;
 			string data_table;
-			ParseCreateDeltaFromDataPayload(q.substr(strlen(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)), delta_table,
-			                                data_table);
+			ParseCreateDeltaFromDataPayload(q.substr(strlen(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)), replace,
+			                                delta_table, data_table);
 			if (delta_table.empty() || data_table.empty()) {
 				fail_ddl("malformed delta-schema payload");
 			}
 			auto ddl_start = std::chrono::steady_clock::now();
 			DeltaSchemaDDL derived;
 			try {
-				derived = BuildCreateDeltaFromDataSQL(*conn, delta_table, data_table);
+				derived = BuildCreateDeltaFromDataSQL(*conn, delta_table, data_table, replace);
 			} catch (std::exception &ex) {
 				profiler.AddStep(current_profile_step, ddl_start,
 				                 current_profile_detail + "; delta_schema_derivation_failed=true");
@@ -382,9 +529,465 @@ void DDLExecutorExecuteFunction(ClientContext &context, TableFunctionInput &data
 
 } // namespace
 
-void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result) {
+TransactionalMVMetadataState &TransactionalMVMetadataState::Get(ClientContext &context) {
+	return *context.registered_state->GetOrCreate<TransactionalMVMetadataState>("openivm_transactional_mv_metadata");
+}
+
+optional_ptr<TransactionalMVMetadataState> TransactionalMVMetadataState::TryGet(ClientContext &context) {
+	return context.registered_state->Get<TransactionalMVMetadataState>("openivm_transactional_mv_metadata");
+}
+
+void TransactionalMVMetadataState::Register(ClientContext &context, const vector<Value> &parameters,
+                                            const string &view_name) {
+	view_names.insert(view_name);
+	auto transaction_timestamp = context.transaction.ActiveTransaction().GetCurrentTransactionStartTimestamp();
+	// Delta-table DEFAULT now() is transaction-stable. Compile from one
+	// microsecond before it so rows inserted into a newly created MV delta
+	// table during this same transaction satisfy the compiler's strict `>`
+	// watermark predicate.
+	transaction_timestamp -= 1;
+	auto timestamp_sql = Value::TIMESTAMP(transaction_timestamp).ToSQLString() + "::TIMESTAMP";
+	for (auto &parameter : parameters) {
+		auto statement = parameter.GetValue<string>();
+		if (IsReplayableMetadataStatement(statement)) {
+			statements.push_back(StabilizeTransactionalMetadata(statement, timestamp_sql));
+		}
+	}
+}
+
+void TransactionalMVMetadataState::RegisterSQL(const string &sql, const string &view_name) {
+	view_names.insert(view_name);
+	for (auto &statement : StringUtil::Split(sql, ";\n")) {
+		if (IsReplayableMetadataStatement(statement)) {
+			statements.push_back(std::move(statement));
+		}
+	}
+}
+
+void TransactionalMVMetadataState::IncludeView(const string &view_name) {
+	view_names.insert(view_name);
+}
+
+void TransactionalMVMetadataState::Apply(Connection &connection) const {
+	if (statements.empty()) {
+		return;
+	}
+	string metadata_catalog;
+	auto current_database = connection.Query("SELECT current_database()");
+	if (!current_database->HasError() && current_database->RowCount() > 0 &&
+	    !current_database->GetValue(0, 0).IsNull()) {
+		metadata_catalog = current_database->GetValue(0, 0).ToString();
+	}
+	auto durable_table = [&](const string &table) {
+		return metadata_catalog.empty() ? "main." + table : SqlUtils::FullName(metadata_catalog, DEFAULT_SCHEMA, table);
+	};
+	// Build constrained TEMP schemas first. CREATE TABLE AS would discard the
+	// primary keys required by INSERT OR REPLACE metadata operations.
+	for (auto &statement : statements) {
+		if (!IsMetadataSchemaStatement(statement)) {
+			continue;
+		}
+		auto result = connection.Query(MakeTemporaryMetadataDDL(statement));
+		if (result->HasError()) {
+			throw CatalogException("Could not reconstruct transaction-local OpenIVM metadata schema: %s",
+			                       result->GetError());
+		}
+	}
+	auto seed_table = [&](const string &table, const string &filter) {
+		bool has_constrained_schema = false;
+		for (auto &statement : statements) {
+			auto lower = StringUtil::Lower(statement);
+			if (StringUtil::StartsWith(lower, "create table") && lower.find(StringUtil::Lower(table)) != string::npos) {
+				has_constrained_schema = true;
+				break;
+			}
+		}
+		if (has_constrained_schema) {
+			// Seed the constrained shadow with committed rows. A missing durable
+			// table is expected for the first MV in a database.
+			connection.Query("INSERT OR IGNORE INTO " + table + " BY NAME SELECT * FROM " + durable_table(table) +
+			                 filter);
+		} else {
+			// Less central metadata (for example optional dependency state) may
+			// be initialized outside the lifecycle program. Still shadow it so
+			// replay can never mutate the durable helper-connection catalog.
+			connection.Query("CREATE TEMP TABLE IF NOT EXISTS " + table + " AS SELECT * FROM " + durable_table(table) +
+			                 filter);
+		}
+	};
+	auto replay_statement = [&](const string &statement) {
+		auto result = connection.Query(MakeTemporaryMetadataDDL(statement));
+		if (result->HasError()) {
+			throw CatalogException("Could not reconstruct transaction-local OpenIVM metadata: %s", result->GetError());
+		}
+	};
+
+	// Cascade dependencies are recorded both explicitly for view matching and
+	// implicitly when a view consumes another view's delta/data table. Seed and
+	// replay all three relation tables first so the closure reflects this
+	// transaction's CREATE/REPLACE/DROP statements.
+	const vector<string> dependency_tables = {
+	    openivm::VIEWS_TABLE,
+	    openivm::DELTA_TABLES_TABLE,
+	    openivm::MV_DEPS_TABLE,
+	};
+	for (auto &table : dependency_tables) {
+		seed_table(table, "");
+	}
+	for (auto &statement : statements) {
+		if (IsMetadataSchemaStatement(statement)) {
+			continue;
+		}
+		for (auto &table : dependency_tables) {
+			if (TargetsMetadataTable(statement, table)) {
+				replay_statement(statement);
+				break;
+			}
+		}
+	}
+	unordered_set<string> included_views = view_names;
+	unordered_map<string, vector<string>> dependency_graph;
+	idx_t dependency_edge_count = 0;
+	auto add_dependency = [&](const string &parent, const string &child) {
+		dependency_graph[parent].push_back(child);
+		dependency_graph[child].push_back(parent);
+		dependency_edge_count++;
+	};
+	auto dependencies = connection.Query("SELECT parent_view, child_view FROM " + string(openivm::MV_DEPS_TABLE));
+	if (!dependencies->HasError()) {
+		for (idx_t row = 0; row < dependencies->RowCount(); row++) {
+			add_dependency(dependencies->GetValue(0, row).ToString(), dependencies->GetValue(1, row).ToString());
+		}
+	}
+	unordered_set<string> registered_views;
+	auto views = connection.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE));
+	if (!views->HasError()) {
+		for (idx_t row = 0; row < views->RowCount(); row++) {
+			registered_views.insert(views->GetValue(0, row).ToString());
+		}
+	}
+	auto delta_dependencies =
+	    connection.Query("SELECT view_name, table_name FROM " + string(openivm::DELTA_TABLES_TABLE));
+	if (!delta_dependencies->HasError()) {
+		static const string delta_prefix(openivm::DELTA_PREFIX);
+		static const string data_prefix(openivm::DATA_TABLE_PREFIX);
+		for (idx_t row = 0; row < delta_dependencies->RowCount(); row++) {
+			auto child = delta_dependencies->GetValue(0, row).ToString();
+			auto table = delta_dependencies->GetValue(1, row).ToString();
+			string parent;
+			if (StringUtil::StartsWith(table, delta_prefix)) {
+				parent = table.substr(delta_prefix.size());
+			} else if (StringUtil::StartsWith(table, data_prefix)) {
+				parent = table.substr(data_prefix.size());
+			}
+			if (!parent.empty() && registered_views.count(parent)) {
+				add_dependency(parent, child);
+			}
+		}
+	}
+	vector<string> pending_views(included_views.begin(), included_views.end());
+	for (idx_t pending_index = 0; pending_index < pending_views.size(); pending_index++) {
+		auto neighbors = dependency_graph.find(pending_views[pending_index]);
+		if (neighbors == dependency_graph.end()) {
+			continue;
+		}
+		for (auto &neighbor : neighbors->second) {
+			if (included_views.insert(neighbor).second) {
+				pending_views.push_back(neighbor);
+			}
+		}
+	}
+	OPENIVM_DEBUG_PRINT("[TRANSACTIONAL METADATA] Seed views=%zu, dependency edges=%zu, closure views=%zu\n",
+	                    registered_views.size(), dependency_edge_count, included_views.size());
+	string view_filter;
+	vector<string> sorted_included_views(included_views.begin(), included_views.end());
+	std::sort(sorted_included_views.begin(), sorted_included_views.end());
+	for (auto &view_name : sorted_included_views) {
+		if (!view_filter.empty()) {
+			view_filter += ", ";
+		}
+		view_filter += "'" + SqlUtils::EscapeValue(view_name) + "'";
+	}
+	if (!view_filter.empty()) {
+		connection.Query("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name NOT IN (" + view_filter +
+		                 ")");
+		connection.Query("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name NOT IN (" +
+		                 view_filter + ")");
+		connection.Query("DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE parent_view NOT IN (" + view_filter +
+		                 ") OR child_view NOT IN (" + view_filter + ")");
+	}
+	for (auto &table : TransactionalMetadataTables()) {
+		if (std::find(dependency_tables.begin(), dependency_tables.end(), table) != dependency_tables.end()) {
+			continue;
+		}
+		string filter = view_filter.empty() ? string() : " WHERE view_name IN (" + view_filter + ")";
+		seed_table(table, filter);
+	}
+	for (auto &statement : statements) {
+		if (IsMetadataSchemaStatement(statement)) {
+			continue;
+		}
+		bool already_replayed = false;
+		for (auto &table : dependency_tables) {
+			if (TargetsMetadataTable(statement, table)) {
+				already_replayed = true;
+				break;
+			}
+		}
+		if (already_replayed) {
+			continue;
+		}
+		replay_statement(statement);
+	}
+}
+
+void TransactionalMVMetadataState::TransactionCommit(MetaTransaction &transaction, ClientContext &context) {
+	Clear();
+}
+
+void TransactionalMVMetadataState::TransactionRollback(MetaTransaction &transaction, ClientContext &context) {
+	Clear();
+}
+
+void TransactionalMVMetadataState::Clear() {
+	statements.clear();
+	view_names.clear();
+}
+
+string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace) {
+	return string(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX) + (replace ? "replace\t" : "create\t") + delta_table +
+	       "\t" + data_table;
+}
+
+string BuildDropViewStatement(const DropInfo &drop_info) {
+	return "SELECT * FROM openivm_execute_drop_view('" + SqlUtils::EscapeValue(drop_info.catalog) + "', '" +
+	       SqlUtils::EscapeValue(drop_info.schema) + "', '" + SqlUtils::EscapeValue(drop_info.name) + "', " +
+	       (drop_info.cascade ? "true" : "false") + ", " +
+	       (drop_info.if_not_found == OnEntryNotFound::RETURN_NULL ? "true" : "false") + ")";
+}
+
+string BuildDropTableStatement(const DropInfo &drop_info) {
+	return "SELECT * FROM openivm_execute_drop_table('" + SqlUtils::EscapeValue(drop_info.catalog) + "', '" +
+	       SqlUtils::EscapeValue(drop_info.schema) + "', '" + SqlUtils::EscapeValue(drop_info.name) + "', " +
+	       (drop_info.cascade ? "true" : "false") + ", " +
+	       (drop_info.if_not_found == OnEntryNotFound::RETURN_NULL ? "true" : "false") + ")";
+}
+
+struct DropViewBindData : public TableFunctionData {
+	DropInfo info;
+};
+
+struct DropViewGlobalState : public GlobalTableFunctionState {
+	bool finished = false;
+};
+
+static unique_ptr<FunctionData> BindDropEntry(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names,
+                                              CatalogType type) {
+	if (input.inputs.size() != 5) {
+		throw InternalException("OpenIVM DROP executor expected five arguments");
+	}
+	auto result = make_uniq<DropViewBindData>();
+	result->info.type = type;
+	result->info.catalog = StringValue::Get(input.inputs[0]);
+	result->info.schema = StringValue::Get(input.inputs[1]);
+	result->info.name = StringValue::Get(input.inputs[2]);
+	result->info.cascade = BooleanValue::Get(input.inputs[3]);
+	result->info.if_not_found =
+	    BooleanValue::Get(input.inputs[4]) ? OnEntryNotFound::RETURN_NULL : OnEntryNotFound::THROW_EXCEPTION;
+	if (!input.binder) {
+		throw InternalException("OpenIVM DROP executor requires a binder");
+	}
+	auto &catalog = Catalog::GetCatalog(context, result->info.catalog);
+	input.binder->GetStatementProperties().RegisterDBModify(catalog, context,
+	                                                        DatabaseModificationType::DROP_CATALOG_ENTRY);
+	return_types.push_back(LogicalType::BOOLEAN);
+	names.emplace_back("Success");
+	return std::move(result);
+}
+
+unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindInput &input,
+                                      vector<LogicalType> &return_types, vector<string> &names) {
+	return BindDropEntry(context, input, return_types, names, CatalogType::VIEW_ENTRY);
+}
+
+unique_ptr<FunctionData> BindDropTable(ClientContext &context, TableFunctionBindInput &input,
+                                       vector<LogicalType> &return_types, vector<string> &names) {
+	return BindDropEntry(context, input, return_types, names, CatalogType::TABLE_ENTRY);
+}
+
+unique_ptr<GlobalTableFunctionState> InitDropView(ClientContext &context, TableFunctionInitInput &input) {
+	return make_uniq<DropViewGlobalState>();
+}
+
+void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<DropViewGlobalState>();
+	if (state.finished) {
+		return;
+	}
+	auto &bind_data = input.bind_data->Cast<DropViewBindData>();
+	auto &catalog = Catalog::GetCatalog(context, bind_data.info.catalog);
+	DropInfo info(bind_data.info);
+	catalog.DropEntry(context, info);
+	output.SetValue(0, 0, Value::BOOLEAN(true));
+	output.SetCardinality(1);
+	state.finished = true;
+}
+
+string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters) {
+	struct ProfileRow {
+		string view_name;
+		string step_name;
+		int64_t duration_ms;
+		string detail;
+	};
+	struct PendingProfileMarker {
+		string view_name;
+		string step_name;
+		string detail;
+		idx_t statement_start;
+	};
+
+	string sql;
+	idx_t logical_statement_count = 0;
+	auto append_statement = [&](const string &statement, bool logical_statement = true) {
+		if (statement.empty()) {
+			return;
+		}
+		sql += statement;
+		if (statement.back() != ';') {
+			sql += ";";
+		}
+		sql += "\n";
+		if (logical_statement) {
+			logical_statement_count++;
+		}
+	};
+	Value profile_value;
+	bool profile_enabled = context.TryGetCurrentSetting("openivm_profile_refresh", profile_value) &&
+	                       !profile_value.IsNull() && BooleanValue::Get(profile_value);
+	vector<ProfileRow> profile_rows;
+	unique_ptr<PendingProfileMarker> pending_profile;
+	auto finish_profile_marker = [&]() {
+		if (!pending_profile) {
+			return;
+		}
+		auto statement_count = logical_statement_count - pending_profile->statement_start;
+		auto detail = pending_profile->detail;
+		if (!detail.empty()) {
+			detail += "; ";
+		}
+		detail +=
+		    "statements=" + to_string(statement_count) + "; transactional_program=true; duration_not_measured=true";
+		profile_rows.push_back({pending_profile->view_name, pending_profile->step_name, 0, std::move(detail)});
+		pending_profile.reset();
+	};
+	for (auto &parameter : parameters) {
+		auto statement = parameter.GetValue<string>();
+		if (statement.empty() || StringUtil::StartsWith(statement, OPENIVM_DDL_CLEANUP_PREFIX)) {
+			continue;
+		}
+		if (StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
+			if (profile_enabled) {
+				string view_name;
+				string step_name;
+				string detail;
+				int64_t duration_ms = 0;
+				ParseCreateMVProfileRecord(statement.substr(strlen(OPENIVM_DDL_PROFILE_RECORD_PREFIX)), view_name,
+				                           step_name, duration_ms, detail);
+				profile_rows.push_back({std::move(view_name), std::move(step_name), duration_ms, std::move(detail)});
+			}
+			continue;
+		}
+		if (StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_PREFIX)) {
+			if (profile_enabled) {
+				finish_profile_marker();
+				string view_name;
+				string step_name;
+				string detail;
+				ParseCreateMVProfileMarker(statement.substr(strlen(OPENIVM_DDL_PROFILE_PREFIX)), view_name, step_name,
+				                           detail);
+				pending_profile = make_uniq<PendingProfileMarker>(PendingProfileMarker {
+				    std::move(view_name), std::move(step_name), std::move(detail), logical_statement_count});
+			}
+			continue;
+		}
+		if (StringUtil::StartsWith(statement, OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
+			bool replace = false;
+			string delta_table;
+			string data_table;
+			ParseCreateDeltaFromDataPayload(statement.substr(strlen(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)),
+			                                replace, delta_table, data_table);
+			if (delta_table.empty() || data_table.empty()) {
+				throw InternalException("Malformed OpenIVM delta-schema operation");
+			}
+			append_statement(string(replace ? "CREATE OR REPLACE TABLE " : "CREATE TABLE ") + delta_table +
+			                 " AS SELECT *, 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) +
+			                 ", now()::TIMESTAMP AS " + string(openivm::TIMESTAMP_COL) + " FROM " + data_table +
+			                 " LIMIT 0");
+			append_statement(
+			    "ALTER TABLE " + delta_table + " ALTER " + string(openivm::MULTIPLICITY_COL) + " SET DEFAULT 1", false);
+			append_statement("ALTER TABLE " + delta_table + " ALTER " + string(openivm::TIMESTAMP_COL) +
+			                     " SET DEFAULT now()",
+			                 false);
+			continue;
+		}
+
+		try {
+			Parser parser;
+			parser.ParseQuery(statement);
+			if (parser.statements.size() == 1 && parser.statements[0]->type == StatementType::DROP_STATEMENT) {
+				auto &drop = parser.statements[0]->Cast<DropStatement>();
+				if (drop.info->type == CatalogType::VIEW_ENTRY) {
+					append_statement(BuildDropViewStatement(*drop.info));
+					continue;
+				}
+			}
+		} catch (std::exception &) {
+			// The normal DuckDB parser will produce the authoritative error when the
+			// transactional program is executed.
+		}
+		append_statement(statement);
+	}
+	if (profile_enabled) {
+		finish_profile_marker();
+		if (!profile_rows.empty()) {
+			auto view_name = profile_rows.front().view_name;
+			profile_rows.push_back(
+			    {view_name, "create_mv_total", 0, "transactional_program=true; duration_not_measured=true"});
+			auto now = std::chrono::steady_clock::now().time_since_epoch();
+			auto refresh_id = view_name + "_create_tx_" +
+			                  to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+			for (idx_t step_order = 0; step_order < profile_rows.size(); step_order++) {
+				auto &row = profile_rows[step_order];
+				append_statement("INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
+				                     " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES ('" +
+				                     SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(row.view_name) +
+				                     "', " + to_string(step_order) + ", '" + SqlUtils::EscapeValue(row.step_name) +
+				                     "', " + to_string(row.duration_ms) + ", '" + SqlUtils::EscapeValue(row.detail) +
+				                     "')",
+				                 false);
+			}
+		}
+	}
+	append_statement("SELECT true AS \"MATERIALIZED VIEW CREATION\"");
+	return sql;
+}
+
+void ExecuteStagedDDL(ClientContext &context, const vector<Value> &parameters) {
+	vector<string> ddl;
+	ddl.reserve(parameters.size());
+	for (auto &parameter : parameters) {
+		ddl.push_back(parameter.GetValue<string>());
+	}
+	ExecuteDDL(context, ddl);
+}
+
+void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result, DDLExecutionMode mode) {
 	result.function = TableFunction("openivm_ddl_executor", {}, DDLExecutorExecuteFunction, DDLExecutorBindFunction,
 	                                DDLExecutorInitFunction);
+	result.function.name =
+	    mode == DDLExecutionMode::CALLER_TRANSACTION ? OPENIVM_TRANSACTIONAL_DDL_FUNCTION : OPENIVM_STAGED_DDL_FUNCTION;
 	result.requires_valid_transaction = true;
 	result.return_type = StatementReturnType::QUERY_RESULT;
 }

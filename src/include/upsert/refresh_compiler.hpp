@@ -40,11 +40,14 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               const string &cascade_lpts_table_prefix = "", bool emit_cascade_delta = false,
                               bool inline_cascade_delta = false, bool *out_handled_cascade_delta = nullptr,
                               const unordered_map<string, string> &derived_output_expressions = {},
-                              bool derived_output_expressions_complete = false);
+                              bool derived_output_expressions_complete = false,
+                              const vector<string> &preserved_side_cols = {}, bool *out_used_group_recompute = nullptr,
+                              bool force_group_recompute = false);
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql = "", bool has_minmax = false, bool list_mode = false,
                                const string &delta_ts_filter = "", const string &catalog_prefix = "",
-                               bool insert_only = false, const vector<LogicalType> &column_types = {});
+                               bool insert_only = false, const vector<LogicalType> &column_types = {},
+                               bool *out_full_recompute = nullptr);
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
                                  const string &delta_ts_filter = "", const string &catalog_prefix = "",
                                  bool insert_only = false);
@@ -52,7 +55,6 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const string &catalog_prefix = "", const vector<string> &partition_columns = {},
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {},
                               bool emit_cascade_delta = false, const string &affected_keys_sql = "",
-                              const string &affected_key_cols = "", const string &affected_key_tuple = "",
                               const vector<string> &column_names = {}, bool running_window_incremental = false);
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
 

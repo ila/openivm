@@ -9,6 +9,11 @@ namespace duckdb {
 
 struct JoinLeafInfo;
 
+/// Collect DuckLake scans through join trees and transparent projection/filter
+/// wrappers. Returns false when the plan contains a wrapper that requires the
+/// legacy recursive compiler.
+bool TryCollectDuckLakeJoinLeaves(LogicalOperator *node, vector<JoinLeafInfo> &leaves, string &fallback_reason);
+
 /// Build N join delta terms using DuckLake time-travel (AT VERSION).
 ///
 /// Instead of inclusion-exclusion (2^N - 1 terms), produces exactly N terms
@@ -20,7 +25,7 @@ struct JoinLeafInfo;
 /// and is provably equivalent to inclusion-exclusion.
 vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput input, ClientContext &context,
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
-                                                           bool has_left_join);
+                                                           bool has_left_join, bool flattened_leaves);
 
 } // namespace duckdb
 

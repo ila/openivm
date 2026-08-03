@@ -55,9 +55,23 @@ public:
 		string schema_name;
 		string table_name;
 	};
+	struct StoredViewLocation {
+		string catalog_name;
+		string schema_name;
+	};
+	struct DeltaSource {
+		string table_name;
+		string catalog_type;
+		string catalog_name;
+		string schema_name;
+	};
 
 	SourceLocation GetSourceLocation(const string &view_name, const string &table_name,
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
+	StoredViewLocation GetStoredViewLocation(const string &view_name, const string &fallback_catalog = "",
+	                                         const string &fallback_schema = "");
+	vector<DeltaSource> GetDeltaSources(const string &view_name, const string &fallback_catalog = "",
+	                                    const string &fallback_schema = "");
 	string ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
 
@@ -80,14 +94,18 @@ public:
 	// Get all downstream MV dependents in topological order (closest first).
 	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
 	vector<string> GetDownstreamViews(const string &view_name);
+	vector<string> GetDownstreamViewsStrict(const string &view_name);
+	bool HasDownstreamViews(const string &view_name);
 
 	// Get refresh_interval in seconds for a view. Returns -1 if not set (manual only).
 	int64_t GetRefreshInterval(const string &view_name);
 
 	// Get all views with a non-null refresh_interval.
-	// Returns tuples of (view_name, interval_seconds, last_update_timestamp_string).
+	// Returns the stored relation identity plus its schedule and last refresh watermark.
 	struct ScheduledView {
 		string view_name;
+		string catalog_name;
+		string schema_name;
 		int64_t interval_seconds;
 		string last_update;
 	};
@@ -99,7 +117,8 @@ public:
 	// Build SQL to delete old delta rows that all dependent views have already consumed.
 	// target: the (possibly schema-qualified) table to delete from.
 	// metadata_key: the name used in openivm_delta_tables (unqualified delta name).
-	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key);
+	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
+	                                   const string &delta_metadata_table = "");
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);
@@ -150,7 +169,7 @@ public:
 	                                                     const string &catalog_name, const string &schema_name);
 
 	static string BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
-	                                              const string &snapshot_expr);
+	                                              const string &snapshot_expr, const string &delta_metadata_table = "");
 	void UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name, int64_t snapshot_id);
 
 	// --- Refresh history (learned cost model) ---
@@ -235,9 +254,13 @@ public:
 		string output_col;
 		string source;
 		string source_col;
+		// A target type for one CAST, or an encoded expression template for nested/TRY_CAST chains.
+		string source_cast;
 		string lookup;
 		string lookup_col;
+		string lookup_cast;
 		string lookup_out;
+		string lookup_out_cast;
 	};
 
 	bool GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out);
@@ -299,6 +322,24 @@ public:
 
 	bool GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out);
 	static string FilteredGroupCountAuxMetaToJson(const FilteredGroupCountAuxMeta &meta);
+
+	// LEFT JOIN pipeline secondary-delta maintenance (Larson & Zhou). The secondary-delta SQL is
+	// generated once at CREATE time (from the plan) and stored; refresh substitutes the per-source
+	// delta timestamps and appends it between the primary-delta INSERT and the MERGE. Zero refresh-time
+	// plan walks.
+	struct LeftJoinSecondaryMeta {
+		string sql; // secondary-delta INSERT (run before the MERGE; carries LJSEC_* placeholders)
+		vector<string> preserved_cols;
+		// Identities of the two sides whose pending changes the placeholders stand for. Refresh needs
+		// them to build the right row source per storage backend (delta table vs DuckLake snapshots).
+		vector<string> inner_tables; // bare base-table names of the inner (null-supplying) sides
+		vector<string> inner_keys;   // join key columns on the inner sides
+		vector<string> pres_tables;  // bare base-table names of the preserved sides
+		vector<string> pres_keys;    // join key columns on the preserved sides
+	};
+
+	bool GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out);
+	static string LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta);
 
 	static vector<string> ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta);
 	static vector<string> ExpectedCountDistinctAuxColumns(const CountDistinctAuxMeta &meta);
