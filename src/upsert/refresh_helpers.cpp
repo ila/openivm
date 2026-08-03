@@ -721,9 +721,11 @@ static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const s
                                               const vector<string> &delta_table_names, const string &data_table,
                                               const string &view_query_sql, const string &qdv,
                                               const string &delta_ts_filter, const string &lk) {
+	bool all_ducklake = !delta_table_names.empty();
 	for (auto &delta_table : delta_table_names) {
 		if (!metadata.IsDuckLakeTable(view_name, delta_table)) {
-			return "";
+			all_ducklake = false;
+			break;
 		}
 	}
 
@@ -750,12 +752,14 @@ static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const s
 		return "";
 	}
 
+	string affected = "EXISTS (SELECT 1 FROM openivm_affected _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
 	string delete_match = "_d." + lk + " IS NOT DISTINCT FROM openivm_delete_target." + lk;
 	OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN affected-key pushdown for %s via %s[%llu].%s\n", view_name.c_str(),
 	                    key_source.table.c_str(), static_cast<unsigned long long>(key_source.occurrence),
 	                    key_source.column.c_str());
 	return BuildDeleteUsingInsertRefreshSQL(data_table, pushed_query, "openivm_lj", "openivm_affected", "_d",
-	                                        delete_match, "TRUE", affected_cte);
+	                                        delete_match, all_ducklake ? "TRUE" : affected + "openivm_lj." + lk + ")",
+	                                        affected_cte);
 }
 
 static string TryBuildFactMarketHistoryAffectedPushdown(const string &view_name, const string &data_table,
