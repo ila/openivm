@@ -648,7 +648,7 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	unordered_set<string> included_views = view_names;
 	unordered_map<string, vector<string>> dependency_graph;
 	idx_t dependency_edge_count = 0;
-	auto add_dependency = [&](string parent, string child) {
+	auto add_dependency = [&](const string &parent, const string &child) {
 		dependency_graph[parent].push_back(child);
 		dependency_graph[child].push_back(parent);
 		dependency_edge_count++;
