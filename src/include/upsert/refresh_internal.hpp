@@ -147,7 +147,8 @@ string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_na
                                   const string &attached_db_catalog_name);
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
                            bool cross_system, const string &attached_catalog = "", const string &attached_schema = "",
-                           const string &catalog_prefix = "", string *out_post_meta = nullptr);
+                           const string &catalog_prefix = "", const string &metadata_prefix = "",
+                           string *out_post_meta = nullptr);
 
 string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const string &view_name,
                                           const vector<string> &delta_table_names, const vector<string> &group_cols,

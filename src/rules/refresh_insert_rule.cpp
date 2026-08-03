@@ -11,10 +11,14 @@
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "duckdb/common/enums/database_modification_type.hpp"
+#include "duckdb/main/client_data.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -22,8 +26,229 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 namespace duckdb {
+
+class TransactionalHelperUndoState : public ClientContextState {
+public:
+	static TransactionalHelperUndoState &Get(ClientContext &context) {
+		auto state =
+		    context.registered_state->GetOrCreate<TransactionalHelperUndoState>("openivm_transactional_helper_undo");
+		if (!state->mutation_guard) {
+			state->mutation_guard = make_uniq<MutationLockGuard>(context);
+		}
+		return *state;
+	}
+
+	void AddRestoreSQL(string sql) {
+		restore_sql.push_back(std::move(sql));
+	}
+
+	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override {
+		Clear();
+	}
+
+	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override {
+		OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] restoring %zu metadata snapshots\n", restore_sql.size());
+		try {
+			Connection con(*context.db);
+			auto schema_result = con.Query("SET schema='" + string(DEFAULT_SCHEMA) + "'");
+			if (schema_result->HasError()) {
+				OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] metadata restore setup failed: %s\n",
+				                    schema_result->GetError().c_str());
+			} else {
+				for (auto it = restore_sql.rbegin(); it != restore_sql.rend(); ++it) {
+					auto result = con.Query(*it);
+					if (result->HasError()) {
+						OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] metadata restore failed: %s\n",
+						                    result->GetError().c_str());
+					}
+				}
+			}
+		} catch (std::exception &ex) {
+			// Transaction callbacks must always release the mutation gate. A
+			// helper-restore error is diagnostic here; the caller transaction has
+			// already rolled back and cannot report a second failure safely.
+			OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] metadata rollback callback failed: %s\n", ex.what());
+		}
+		Clear();
+	}
+
+private:
+	void Clear() {
+		restore_sql.clear();
+		mutation_guard.reset();
+	}
+
+	vector<string> restore_sql;
+	unique_ptr<MutationLockGuard> mutation_guard;
+};
+
+static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &table_name) {
+	if (rows.RowCount() == 0) {
+		return "";
+	}
+	string columns;
+	for (auto &name : rows.names) {
+		if (!columns.empty()) {
+			columns += ", ";
+		}
+		columns += SqlUtils::QuoteIdentifier(name);
+	}
+	string values;
+	for (idx_t row = 0; row < rows.RowCount(); row++) {
+		if (!values.empty()) {
+			values += ", ";
+		}
+		values += "(";
+		for (idx_t col = 0; col < rows.ColumnCount(); col++) {
+			if (col > 0) {
+				values += ", ";
+			}
+			values += rows.GetValue(col, row).ToSQLString();
+		}
+		values += ")";
+	}
+	return "INSERT OR REPLACE INTO " + SqlUtils::QuoteIdentifier(table_name) + " (" + columns + ") VALUES " + values;
+}
+
+static void RegisterMetadataRestore(ClientContext &context, Connection &con, const string &table_name,
+                                    const string &predicate) {
+	auto rows = con.Query("SELECT * FROM " + SqlUtils::QuoteIdentifier(table_name) + " WHERE " + predicate);
+	if (rows->HasError()) {
+		throw CatalogException("OpenIVM could not snapshot helper metadata: %s", rows->GetError());
+	}
+	auto restore = BuildRestoreRowsSQL(*rows, table_name);
+	if (!restore.empty()) {
+		TransactionalHelperUndoState::Get(context).AddRestoreSQL(std::move(restore));
+	}
+}
+
+static void ExecuteHelperMetadataSQL(Connection &con, const string &sql) {
+	auto result = con.Query(sql);
+	if (result->HasError()) {
+		throw CatalogException("OpenIVM metadata update failed: %s", result->GetError());
+	}
+}
+
+static void DropCatalogEntry(ClientContext &context, const string &catalog_name, const string &schema_name,
+                             const string &entry_name, CatalogType type) {
+	DropInfo info;
+	info.type = type;
+	info.catalog = catalog_name;
+	info.schema = schema_name;
+	info.name = entry_name;
+	info.if_not_found = OnEntryNotFound::RETURN_NULL;
+	auto &catalog = Catalog::GetCatalog(context, catalog_name);
+	MetaTransaction::Get(context).ModifyDatabase(catalog.GetAttached(), DatabaseModificationType::DROP_CATALOG_ENTRY);
+	catalog.DropEntry(context, info);
+}
+
+static void DropQualifiedCatalogEntry(ClientContext &context, const string &qualified_name,
+                                      const string &fallback_catalog, const string &fallback_schema, CatalogType type) {
+	auto components = QualifiedName::ParseComponents(qualified_name);
+	if (components.size() == 1) {
+		DropCatalogEntry(context, fallback_catalog, fallback_schema, components[0], type);
+	} else if (components.size() == 2) {
+		DropCatalogEntry(context, fallback_catalog, components[0], components[1], type);
+	} else if (components.size() == 3) {
+		DropCatalogEntry(context, components[0], components[1], components[2], type);
+	} else {
+		throw InternalException("OpenIVM could not resolve internal relation '%s'", qualified_name);
+	}
+}
+
+static void AlterDeltaInCallerTransaction(ClientContext &context, AlterTableInfo &source_alter,
+                                          const string &catalog_name, const string &schema_name,
+                                          const string &delta_name) {
+	auto delta_alter = source_alter.Copy();
+	delta_alter->catalog = catalog_name;
+	delta_alter->schema = schema_name;
+	delta_alter->name = delta_name;
+	auto &catalog = Catalog::GetCatalog(context, catalog_name);
+	MetaTransaction::Get(context).ModifyDatabase(catalog.GetAttached(), DatabaseModificationType::ALTER_TABLE);
+	catalog.Alter(context, *delta_alter);
+}
+
+static pair<string, string> ResolveDDLLocus(ClientContext &context, const string &catalog_name,
+                                            const string &schema_name) {
+	auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
+	string default_catalog =
+	    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
+	return {
+	    catalog_name.empty() ? default_catalog : catalog_name,
+	    schema_name.empty() ? (default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema) : schema_name,
+	};
+}
+
+static bool SameRelationLocus(const string &left_catalog, const string &left_schema, const string &right_catalog,
+                              const string &right_schema) {
+	return StringUtil::CIEquals(left_catalog, right_catalog) && StringUtil::CIEquals(left_schema, right_schema);
+}
+
+static string MVInternalPrefix(ClientContext &context, const RefreshMetadata::StoredViewLocation &location,
+                               const string &view_name) {
+	QueryErrorContext error_context;
+	auto entry = Catalog::GetEntry(context, location.catalog_name, location.schema_name,
+	                               EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, error_context),
+	                               OnEntryNotFound::RETURN_NULL);
+	if (entry) {
+		auto data_table = IncrementalTableNames::DataTableName(view_name);
+		auto &view = dynamic_cast<ViewCatalogEntry &>(*entry);
+		auto data_ref = SqlUtils::FindTableReference(view.sql, data_table);
+		auto separator = data_ref.rfind('.');
+		if (separator != string::npos) {
+			return data_ref.substr(0, separator + 1);
+		}
+	}
+	return SqlUtils::QualifiedPrefix(location.catalog_name, location.schema_name);
+}
+
+static void DropTrackedMaterializedView(ClientContext &context, Connection &con, RefreshMetadata &metadata,
+                                        const string &view_name, bool drop_user_view) {
+	auto location = metadata.GetStoredViewLocation(view_name);
+	auto delta_sources = metadata.GetDeltaSources(view_name, location.catalog_name, location.schema_name);
+	auto internal_prefix = MVInternalPrefix(context, location, view_name);
+	auto escaped_view_name = SqlUtils::EscapeValue(view_name);
+	auto view_predicate = "view_name = '" + escaped_view_name + "'";
+	RegisterMetadataRestore(context, con, openivm::VIEWS_TABLE, view_predicate);
+	RegisterMetadataRestore(context, con, openivm::DELTA_TABLES_TABLE, view_predicate);
+	auto dependency_predicate = "parent_view = '" + escaped_view_name + "' OR child_view = '" + escaped_view_name + "'";
+	RegisterMetadataRestore(context, con, openivm::MV_DEPS_TABLE, dependency_predicate);
+	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                                  escaped_view_name + "'");
+	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	                                  escaped_view_name + "'");
+	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE " + dependency_predicate);
+	if (drop_user_view) {
+		DropCatalogEntry(context, location.catalog_name, location.schema_name, view_name, CatalogType::VIEW_ENTRY);
+	}
+	DropQualifiedCatalogEntry(context,
+	                          internal_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name)),
+	                          location.catalog_name, location.schema_name, CatalogType::TABLE_ENTRY);
+	DropQualifiedCatalogEntry(context,
+	                          internal_prefix +
+	                              KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name)),
+	                          location.catalog_name, location.schema_name, CatalogType::TABLE_ENTRY);
+
+	for (auto &source : delta_sources) {
+		// DuckLake entries store the base table name — never drop it.
+		if (source.catalog_type == "ducklake") {
+			continue;
+		}
+		auto remaining = con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		                           " WHERE table_name = '" + SqlUtils::EscapeValue(source.table_name) +
+		                           "' AND COALESCE(source_catalog, '" + SqlUtils::EscapeValue(source.catalog_name) +
+		                           "') = '" + SqlUtils::EscapeValue(source.catalog_name) +
+		                           "' AND COALESCE(source_schema, '" + SqlUtils::EscapeValue(source.schema_name) +
+		                           "') = '" + SqlUtils::EscapeValue(source.schema_name) + "'");
+		if (!remaining->HasError() && remaining->RowCount() > 0 && remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
+			DropCatalogEntry(context, source.catalog_name, source.schema_name, source.table_name,
+			                 CatalogType::TABLE_ENTRY);
+		}
+	}
+}
 
 static optional_ptr<TableCatalogEntry> TryGetTrackedDeltaTable(ClientContext &context, TableCatalogEntry &table) {
 	const auto &table_name = table.name;
@@ -152,69 +377,53 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		}
 
 		auto table_name = drop_info->name;
+		auto target_locus = ResolveDDLLocus(input.context, drop_info->catalog, drop_info->schema);
 		Connection con(*input.context.db);
 
 		auto view_check = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 		                            SqlUtils::EscapeValue(table_name) + "'");
 		if (!view_check->HasError() && view_check->RowCount() > 0) {
-			// Acquire view lock to prevent cleanup during an in-flight refresh
-			ViewLockGuard view_guard(table_name);
-			OPENIVM_DEBUG_PRINT("[INSERT RULE] DROP TABLE '%s' — cleaning up IVM metadata\n", table_name.c_str());
 			RefreshMetadata metadata(con);
-			auto delta_tables = metadata.GetDeltaTables(table_name);
-
-			con.Query("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-			          SqlUtils::EscapeValue(table_name) + "'");
-			con.Query("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-			          SqlUtils::EscapeValue(table_name) + "'");
-			con.Query("DROP TABLE IF EXISTS " + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(table_name)));
-			con.Query("DROP TABLE IF EXISTS " +
-			          KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(table_name)));
-
-			for (auto &dt : delta_tables) {
-				// DuckLake entries store the base table name — never drop it
-				if (metadata.IsDuckLakeTable(table_name, dt)) {
-					continue;
-				}
-				auto remaining = con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) +
-				                           " WHERE table_name = '" + SqlUtils::EscapeValue(dt) + "'");
-				if (!remaining->HasError() && remaining->RowCount() > 0 &&
-				    remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
-					con.Query("DROP TABLE IF EXISTS " + KeywordHelper::WriteOptionallyQuoted(dt));
+			auto location = metadata.GetStoredViewLocation(table_name);
+			if (SameRelationLocus(location.catalog_name, location.schema_name, target_locus.first,
+			                      target_locus.second)) {
+				TransactionalMVLockState::Get(input.context).AcquireMutationLock();
+				OPENIVM_DEBUG_PRINT("[INSERT RULE] DROP TABLE '%s' — cleaning up IVM metadata\n", table_name.c_str());
+				bool drop_user_view = drop_info->type == CatalogType::VIEW_ENTRY;
+				DropTrackedMaterializedView(input.context, con, metadata, table_name, drop_user_view);
+				if (drop_user_view) {
+					// The original logical DROP remains as an idempotent no-op.
+					drop_info->if_not_found = OnEntryNotFound::RETURN_NULL;
 				}
 			}
 		}
 
 		// Handle CASCADE: drop dependent MVs
-		auto dep_check =
-		    con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
-		              " WHERE table_name = '" + SqlUtils::EscapeValue(SqlUtils::DeltaName(table_name)) + "'");
+		auto dep_check = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		                           " WHERE table_name = '" + SqlUtils::EscapeValue(SqlUtils::DeltaName(table_name)) +
+		                           "' AND COALESCE(source_catalog, '" + SqlUtils::EscapeValue(target_locus.first) +
+		                           "') = '" + SqlUtils::EscapeValue(target_locus.first) +
+		                           "' AND COALESCE(source_schema, '" + SqlUtils::EscapeValue(target_locus.second) +
+		                           "') = '" + SqlUtils::EscapeValue(target_locus.second) + "'");
 		if (!dep_check->HasError() && dep_check->RowCount() > 0 && drop_info->cascade) {
+			TransactionalMVLockState::Get(input.context).AcquireMutationLock();
+			RefreshMetadata cascade_metadata(con);
+			vector<string> dependent_views;
+			unordered_set<string> seen_dependents;
 			for (size_t i = 0; i < dep_check->RowCount(); i++) {
-				auto dep_view = dep_check->GetValue(0, i).ToString();
-				// Lock each dependent view before dropping
-				ViewLockGuard view_guard(dep_view);
-				RefreshMetadata dep_metadata(con);
-				auto dep_delta_tables = dep_metadata.GetDeltaTables(dep_view);
-
-				con.Query("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-				          SqlUtils::EscapeValue(dep_view) + "'");
-				con.Query("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-				          SqlUtils::EscapeValue(dep_view) + "'");
-				con.Query("DROP TABLE IF EXISTS " +
-				          KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(dep_view)));
-				con.Query("DROP TABLE IF EXISTS " +
-				          KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(dep_view)));
-				con.Query("DROP VIEW IF EXISTS " + KeywordHelper::WriteOptionallyQuoted(dep_view));
-
-				for (auto &dt : dep_delta_tables) {
-					auto remaining = con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) +
-					                           " WHERE table_name = '" + SqlUtils::EscapeValue(dt) + "'");
-					if (!remaining->HasError() && remaining->RowCount() > 0 &&
-					    remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
-						con.Query("DROP TABLE IF EXISTS " + KeywordHelper::WriteOptionallyQuoted(dt));
+				auto direct_view = dep_check->GetValue(0, i).ToString();
+				auto downstream = cascade_metadata.GetDownstreamViews(direct_view);
+				for (auto it = downstream.rbegin(); it != downstream.rend(); ++it) {
+					if (seen_dependents.insert(*it).second) {
+						dependent_views.push_back(*it);
 					}
 				}
+				if (seen_dependents.insert(direct_view).second) {
+					dependent_views.push_back(std::move(direct_view));
+				}
+			}
+			for (auto &dep_view : dependent_views) {
+				DropTrackedMaterializedView(input.context, con, cascade_metadata, dep_view, true);
 			}
 		}
 
@@ -234,15 +443,18 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 
 		string table_name = alter_info->name;
 		string delta_name = SqlUtils::DeltaName(table_name);
-		string qdelta = KeywordHelper::WriteOptionallyQuoted(delta_name);
+		auto source_locus = ResolveDDLLocus(input.context, alter_info->catalog, alter_info->schema);
 
 		Connection con(*input.context.db);
 		// Check if a delta table exists for this base table (i.e., it's tracked by IVM)
-		auto delta_check = con.Query("SELECT 1 FROM information_schema.tables WHERE table_name = '" +
+		auto delta_check = con.Query("SELECT 1 FROM information_schema.tables WHERE table_catalog = '" +
+		                             SqlUtils::EscapeValue(source_locus.first) + "' AND table_schema = '" +
+		                             SqlUtils::EscapeValue(source_locus.second) + "' AND table_name = '" +
 		                             SqlUtils::EscapeValue(delta_name) + "'");
 		if (delta_check->HasError() || delta_check->RowCount() == 0) {
 			return; // not an IVM-tracked table
 		}
+		TransactionalMVLockState::Get(input.context).AcquireMutationLock();
 
 		switch (alter_info->alter_table_type) {
 		case AlterTableType::ADD_COLUMN: {
@@ -252,9 +464,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			}
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE ADD COLUMN '%s' — syncing delta table\n",
 			                    add_info->new_column.Name().c_str());
-			con.Query("ALTER TABLE " + qdelta + " ADD COLUMN IF NOT EXISTS " +
-			          KeywordHelper::WriteOptionallyQuoted(add_info->new_column.Name()) + " " +
-			          add_info->new_column.Type().ToString());
+			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, source_locus.second,
+			                              delta_name);
 			break;
 		}
 		case AlterTableType::REMOVE_COLUMN: {
@@ -263,15 +474,16 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				break;
 			}
 			string col_name = remove_info->removed_column;
-			string referencing_mv = FirstMVReferencingColumn(con, delta_name, table_name, col_name);
+			string referencing_mv = FirstMVReferencingColumn(con, delta_name, source_locus.first, source_locus.second,
+			                                                 table_name, col_name);
 			if (!referencing_mv.empty()) {
 				throw CatalogException("Cannot drop column '" + col_name +
 				                       "': it is referenced by materialized view '" + referencing_mv +
 				                       "'. Drop the view first.");
 			}
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE DROP COLUMN '%s' — syncing delta table\n", col_name.c_str());
-			con.Query("ALTER TABLE " + qdelta + " DROP COLUMN IF EXISTS " +
-			          KeywordHelper::WriteOptionallyQuoted(col_name));
+			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, source_locus.second,
+			                              delta_name);
 			break;
 		}
 		case AlterTableType::RENAME_COLUMN: {
@@ -281,11 +493,19 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			}
 			string old_name = rename_info->old_name;
 			string new_name = rename_info->new_name;
-			RewriteDependentViewMetadataForRename(con, delta_name, table_name, old_name, new_name);
+			auto dependent_view_predicate =
+			    "view_name IN (SELECT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
+			    SqlUtils::EscapeValue(delta_name) + "' AND COALESCE(source_catalog, '" +
+			    SqlUtils::EscapeValue(source_locus.first) + "') = '" + SqlUtils::EscapeValue(source_locus.first) +
+			    "' AND COALESCE(source_schema, '" + SqlUtils::EscapeValue(source_locus.second) + "') = '" +
+			    SqlUtils::EscapeValue(source_locus.second) + "')";
+			RegisterMetadataRestore(input.context, con, openivm::VIEWS_TABLE, dependent_view_predicate);
+			RewriteDependentViewMetadataForRename(con, delta_name, source_locus.first, source_locus.second, table_name,
+			                                      old_name, new_name);
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE RENAME COLUMN '%s' → '%s' — syncing delta table\n",
 			                    old_name.c_str(), new_name.c_str());
-			con.Query("ALTER TABLE " + qdelta + " RENAME COLUMN " + KeywordHelper::WriteOptionallyQuoted(old_name) +
-			          " TO " + KeywordHelper::WriteOptionallyQuoted(new_name));
+			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, source_locus.second,
+			                              delta_name);
 			break;
 		}
 		default:

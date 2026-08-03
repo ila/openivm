@@ -28,6 +28,7 @@
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
+#include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
 #include <algorithm>
@@ -452,6 +453,14 @@ struct TransitioningKeySet {
 	ColumnBinding key_binding;
 };
 
+struct TransitioningKeyCTEDefinition {
+	string name;
+	idx_t cte_index;
+	unique_ptr<LogicalOperator> node;
+	vector<LogicalType> types;
+	vector<string> names;
+};
+
 // Build the set of DISTINCT key values (from base_get's column at key_pos) whose match-count within
 // base_get's own rows ACTUALLY transitions across zero between old (pre-delta) and new (current,
 // post-delta) state -- i.e. old_count>0 && new_count==0, or old_count==0 && new_count>0. A key merely
@@ -597,10 +606,41 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 	return result;
 }
 
-static unique_ptr<TransitioningKeySet> BuildTransitioningKeySet(ClientContext &context, Binder &binder,
-                                                                LogicalGet *base_get, idx_t key_pos,
-                                                                const string &view_name) {
-	return BuildTransitioningKeySetImpl(context, binder, base_get, key_pos, view_name);
+static unique_ptr<TransitioningKeySet>
+GetTransitioningKeySetRef(ClientContext &context, Binder &binder, LogicalGet *base_get, idx_t key_pos,
+                          size_t leaf_index, const string &view_name,
+                          map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
+                          vector<TransitioningKeyCTEDefinition> &transition_ctes) {
+	auto cache_key = make_pair(leaf_index, key_pos);
+	auto existing = transition_cte_indexes.find(cache_key);
+	idx_t definition_index;
+	if (existing == transition_cte_indexes.end()) {
+		auto transitioning_keys = BuildTransitioningKeySetImpl(context, binder, base_get, key_pos, view_name);
+		if (!transitioning_keys) {
+			return nullptr;
+		}
+		D_ASSERT(transitioning_keys->node->types.size() == 1);
+		TransitioningKeyCTEDefinition definition;
+		definition.cte_index = binder.GenerateTableIndex();
+		definition.name = "openivm_transition_keys_" + to_string(definition.cte_index);
+		definition.types = transitioning_keys->node->types;
+		definition.names = {"openivm_transition_key"};
+		definition.node = std::move(transitioning_keys->node);
+		definition_index = transition_ctes.size();
+		transition_ctes.push_back(std::move(definition));
+		transition_cte_indexes[cache_key] = definition_index;
+		OPENIVM_DEBUG_PRINT("[DeltaJoin] Materialized transition-key CTE for leaf=%zu key=%zu\n", leaf_index, key_pos);
+	} else {
+		definition_index = existing->second;
+	}
+	auto &definition = transition_ctes[definition_index];
+	auto ref_table_index = binder.GenerateTableIndex();
+	auto ref = make_uniq<LogicalCTERef>(ref_table_index, definition.cte_index, definition.types, definition.names);
+	ref->ResolveOperatorTypes();
+	auto result = make_uniq<TransitioningKeySet>();
+	result->key_binding = ref->GetColumnBindings()[0];
+	result->node = std::move(ref);
+	return result;
 }
 
 // After DemoteLeftJoinsForMask, a LEFT/RIGHT join may remain un-demoted (kept as an outer join)
@@ -621,7 +661,10 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySet(ClientContext &c
 // silently otherwise, matching this file's existing unsupported-shape convention).
 static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Binder &binder, LogicalOperator *node,
                                           const vector<JoinLeafInfo> &leaves, uint64_t leaf_has_delta_mask,
-                                          const string &view_name, vector<size_t> &path) {
+                                          const string &view_name,
+                                          map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
+                                          vector<TransitioningKeyCTEDefinition> &transition_ctes,
+                                          vector<size_t> &path) {
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
 		if (j && (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT) && !j->conditions.empty()) {
@@ -674,7 +717,8 @@ static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Binder &binder
 					// term" -- matching the same match-count-transition principle as the secondary-delta
 					// fix, just applied here to avoid a double-count instead of to add a missing row.
 					auto transitioning_keys =
-					    BuildTransitioningKeySet(context, binder, current_null_side_get, key_pos, view_name);
+					    GetTransitioningKeySetRef(context, binder, current_null_side_get, key_pos, null_leaf_idx,
+					                              view_name, transition_cte_indexes, transition_ctes);
 					if (transitioning_keys) {
 						auto &other_bcr = other_key_expr->Cast<BoundColumnRefExpression>();
 						auto left_expr = make_uniq<BoundColumnRefExpression>(other_bcr.return_type, other_bcr.binding);
@@ -699,16 +743,18 @@ static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Binder &binder
 	for (size_t ci = 0; ci < node->children.size(); ci++) {
 		path.push_back(ci);
 		GuardKeptOuterJoinsForMaskRec(context, binder, node->children[ci].get(), leaves, leaf_has_delta_mask, view_name,
-		                              path);
+		                              transition_cte_indexes, transition_ctes, path);
 		path.pop_back();
 	}
 }
 
 static void GuardKeptOuterJoinsForMask(ClientContext &context, Binder &binder, LogicalOperator *node,
                                        const vector<JoinLeafInfo> &leaves, uint64_t leaf_has_delta_mask,
-                                       const string &view_name) {
+                                       const string &view_name, map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
+                                       vector<TransitioningKeyCTEDefinition> &transition_ctes) {
 	vector<size_t> path;
-	GuardKeptOuterJoinsForMaskRec(context, binder, node, leaves, leaf_has_delta_mask, view_name, path);
+	GuardKeptOuterJoinsForMaskRec(context, binder, node, leaves, leaf_has_delta_mask, view_name, transition_cte_indexes,
+	                              transition_ctes, path);
 }
 
 void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
@@ -1178,10 +1224,10 @@ static uint64_t ComputeFactsInsertOnlyMask(const openivm::CompileFacts &facts, c
 // ============================================================================
 // BuildInclusionExclusionTerms: create 2^N - 1 delta terms
 // ============================================================================
-static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOperatorInput input,
-                                                                        ClientContext &context, Binder &binder,
-                                                                        const vector<JoinLeafInfo> &leaves,
-                                                                        bool has_left_join) {
+static vector<unique_ptr<LogicalOperator>>
+BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, Binder &binder,
+                             const vector<JoinLeafInfo> &leaves, bool has_left_join,
+                             vector<TransitioningKeyCTEDefinition> &transition_ctes) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
@@ -1281,6 +1327,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 	}
 
 	uint64_t pruned_count = 0;
+	map<pair<size_t, idx_t>, idx_t> transition_cte_indexes;
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Building inclusion-exclusion terms (%lu total, skip_bits=%lu, empty_mask=%lu)\n",
 	                    (unsigned long)total_terms, (unsigned long)skip_bits, (unsigned long)empty_mask);
 	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
@@ -1379,8 +1426,8 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(DeltaOpe
 		if (has_left_join) {
 			uint64_t leaf_has_delta_mask = (~delta_status.empty_mask) & total_terms;
 			if (leaf_has_delta_mask) {
-				GuardKeptOuterJoinsForMask(context, binder, term.get(), leaves, leaf_has_delta_mask,
-				                           input.context.view);
+				GuardKeptOuterJoinsForMask(context, binder, term.get(), leaves, leaf_has_delta_mask, input.context.view,
+				                           transition_cte_indexes, transition_ctes);
 			}
 		}
 
@@ -1538,12 +1585,23 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	LogDeltaOperatorStrategy(input, all_ducklake ? DeltaOperatorStrategy::JOIN_DUCKLAKE_N_TERM
 	                                             : DeltaOperatorStrategy::JOIN_INCLUSION_EXCLUSION);
 
+	vector<TransitioningKeyCTEDefinition> transition_ctes;
 	auto terms = all_ducklake
 	                 ? BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake)
-	                 : BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join);
+	                 : BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join, transition_ctes);
 
 	// 4. UNION ALL
 	auto result = AssembleJoinUnionAll(terms, types, binder);
+	for (auto definition = transition_ctes.rbegin(); definition != transition_ctes.rend(); definition++) {
+		result = make_uniq<LogicalMaterializedCTE>(definition->name, definition->cte_index, definition->types.size(),
+		                                           std::move(definition->node), std::move(result),
+		                                           CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
+		result->ResolveOperatorTypes();
+	}
+	if (!transition_ctes.empty()) {
+		OPENIVM_DEBUG_PRINT("[DeltaJoin] Shared %zu transition-key CTEs across inclusion-exclusion terms\n",
+		                    transition_ctes.size());
+	}
 
 	// 5. Rebind parent references
 	ColumnBinding new_mul_binding = ReplaceJoinOutputBindings(original_bindings, result, *input.root);

@@ -134,10 +134,10 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
   transactions currently remain conservative because query-pragma preprocessing cannot observe the caller's local delta
   rows or retain a reliable activity signal; solve this at the planned native refresh operator boundary rather than with
   process-global transaction registries.
-- [ ] **Share repeated LEFT JOIN transition-count subplans deliberately.** Applying DuckDB's common-subplan optimizer to the
-  complete post-delta plan is not safe: it changed `left_join_emptied_group` results in the full suite. Build one explicit
-  transition relation per nullable source/key and reference it from the relevant inclusion-exclusion terms while preserving
-  each term's bindings and snapshot semantics.
+- [x] **Share repeated LEFT JOIN transition-count subplans deliberately.** The join compiler now builds one explicit
+  materialized transition-key CTE per nullable source/key and gives each inclusion-exclusion term a freshly bound CTE
+  reference. This avoids the unsafe blanket common-subplan optimizer while preserving term-local bindings and delta
+  semantics.
 - [ ] **Price actual join work in the adaptive model.** The model counts exponential terms but underprices copied plan nodes,
   base-leaf appearances, compilation work, and generated SQL size.
 - [ ] **Remove the fake `ConstraintCache` or make it a cache.** It repopulates a map that no read path consumes, while FK cost
@@ -146,8 +146,8 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
   transition cases, add deterministic bidirectional `EXCEPT ALL` coverage, and add representative cases to the rewriter
   benchmark so real refresh compilation and execution exercise the same semantics.
 - [ ] **Add test-only concurrency barriers.** Several SQL concurrency regressions still coordinate with bounded sleeps.
-  Introduce a deterministic handshake that can prove a writer or refresh reached a phase-gate state without exposing a
-  production pragma, then replace the timing assumptions in lifecycle and lock-cycle tests.
+  Introduce a deterministic handshake that can prove a writer or refresh owns or is waiting for the mutation gate without
+  exposing a production pragma, then replace the timing assumptions in lifecycle tests.
 
 ## Target refresh flow
 

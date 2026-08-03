@@ -11,6 +11,9 @@
 require openivm
 
 statement ok
+SET openivm_files_path = '__TEST_DIR__';
+
+statement ok
 SET openivm_cascade_refresh = 'off';
 
 statement ok
@@ -107,12 +110,84 @@ SELECT COUNT(*) FROM (
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT nation, n_ord, n_line, n_supp, n_part FROM mv5
+SELECT nation, n_ord, n_line, n_supp, n_part FROM mv5
     EXCEPT ALL
     SELECT c.nation, COUNT(o.oid), COUNT(l.lid), COUNT(s.sid), COUNT(p.pid)
     FROM cust c LEFT JOIN ord o ON o.cid=c.cid LEFT JOIN line l ON l.oid=o.oid LEFT JOIN supp s ON s.sid=l.sid
          LEFT JOIN part p ON p.sid=s.sid
     GROUP BY c.nation
+);
+----
+0
+
+# Repeated guards for the same leaf/key pair share one transition-count plan.
+# In this 3-leaf chain the serialized plan has three transition definitions
+# (one in the outer join compilation and two across its nested compilation),
+# with five current_count references each. Cloning per inclusion/exclusion term
+# produced more copies.
+statement ok
+CREATE TABLE transition_share_a (id INTEGER);
+
+statement ok
+CREATE TABLE transition_share_b (id INTEGER, aid INTEGER);
+
+statement ok
+CREATE TABLE transition_share_c (id INTEGER, bid INTEGER);
+
+statement ok
+INSERT INTO transition_share_a VALUES (1), (2);
+
+statement ok
+INSERT INTO transition_share_b VALUES (10, 1), (20, 2);
+
+statement ok
+INSERT INTO transition_share_c VALUES (100, 10), (200, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW transition_share_mv AS
+SELECT a.id AS aid, b.id AS bid, c.id AS cid
+FROM transition_share_a a
+LEFT JOIN transition_share_b b ON b.aid = a.id
+LEFT JOIN transition_share_c c ON c.bid = b.id;
+
+statement ok
+INSERT INTO transition_share_a VALUES (3);
+
+statement ok
+INSERT INTO transition_share_b VALUES (30, 3);
+
+statement ok
+INSERT INTO transition_share_c VALUES (300, 30);
+
+statement ok
+PRAGMA refresh('transition_share_mv');
+
+query I
+SELECT len(regexp_extract_all(content, 'current_count'))
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_transition_share_mv.sql');
+----
+15
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM transition_share_mv
+    EXCEPT ALL
+    SELECT a.id, b.id, c.id
+    FROM transition_share_a a
+    LEFT JOIN transition_share_b b ON b.aid = a.id
+    LEFT JOIN transition_share_c c ON c.bid = b.id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT a.id, b.id, c.id
+    FROM transition_share_a a
+    LEFT JOIN transition_share_b b ON b.aid = a.id
+    LEFT JOIN transition_share_c c ON c.bid = b.id
+    EXCEPT ALL
+    SELECT * FROM transition_share_mv
 );
 ----
 0

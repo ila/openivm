@@ -374,6 +374,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "openivm_execute_drop_view",
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
 	    ExecuteDropView, BindDropView, InitDropView));
+	loader.RegisterFunction(TableFunction(
+	    "openivm_execute_drop_table",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+	    ExecuteDropView, BindDropTable, InitDropView));
 
 	TableFunction compute_delta_function("ComputeDelta",
 	                                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
@@ -506,17 +510,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(refresh_status);
 
 	// PRAGMA refresh_start_daemon — (re)start the daemon on the caller's DB instance.
-	auto refresh_start_daemon =
-	    PragmaFunction::PragmaCall("refresh_start_daemon",
-	                               [](ClientContext &context, const FunctionParameters &) -> string {
-		                               if (global_daemon) {
-			                               global_daemon->Stop();
-		                               }
-		                               global_daemon = make_shared_ptr<RefreshDaemon>();
-		                               global_daemon->Start(*context.db);
-		                               return "SELECT true AS started;";
-	                               },
-	                               {});
+	auto refresh_start_daemon = PragmaFunction::PragmaCall(
+	    "refresh_start_daemon",
+	    [](ClientContext &context, const FunctionParameters &) -> string {
+		    if (!context.transaction.IsAutoCommit()) {
+			    throw TransactionException("The OpenIVM refresh daemon cannot be restarted inside a transaction");
+		    }
+		    if (global_daemon) {
+			    global_daemon->Stop();
+		    }
+		    global_daemon = make_shared_ptr<RefreshDaemon>();
+		    global_daemon->Start(*context.db);
+		    global_daemon->Wake();
+		    return "SELECT true AS started;";
+	    },
+	    {});
 	loader.RegisterFunction(refresh_start_daemon);
 
 	// Start the refresh daemon unless disabled (e.g. shadow/compile-only DBs).

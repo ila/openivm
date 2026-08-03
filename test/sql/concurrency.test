@@ -82,10 +82,9 @@ SELECT count(*) FROM (
 0
 
 # ==========================================
-# Test 1b: A write-owning transaction must not wait while upgrading to refresh
-# if another transaction owns one of the refresh sources. Waiting would retain
-# its own writer gate and permit two refresh upgrades to deadlock; return a
-# serialization error so the caller can retry after rollback.
+# Test 1b: A writer transaction and a refresh spanning both source tables are
+# serialized at the database mutation boundary. The refresh waits, then
+# succeeds without a writer/refresh lock-order cycle.
 # ==========================================
 
 statement ok
@@ -137,10 +136,8 @@ statement ok
 SELECT sleep_ms(300);
 
 onlyif threadid=1
-statement error
+statement ok
 PRAGMA refresh('upgrade_gate_mv');
-----
-cannot upgrade this transaction to refresh
 
 onlyif threadid=1
 statement ok
@@ -149,8 +146,145 @@ ROLLBACK;
 endloop
 
 # ==========================================
-# Test 2: Concurrent refresh of SAME view — per-view mutex serializes them
-# Before the mutex fix, this caused TransactionContext Error: Conflict on tuple deletion
+# Test 1c: Transactions retaining disjoint refreshes are serialized before
+# acquiring view/source locks, so extending either refresh cannot deadlock.
+# ==========================================
+
+statement ok
+CREATE TABLE refresh_cycle_a (id INTEGER);
+
+statement ok
+CREATE TABLE refresh_cycle_b (id INTEGER);
+
+statement ok
+INSERT INTO refresh_cycle_a VALUES (1);
+
+statement ok
+INSERT INTO refresh_cycle_b VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW refresh_cycle_a_mv AS SELECT * FROM refresh_cycle_a;
+
+statement ok
+CREATE MATERIALIZED VIEW refresh_cycle_a_alias_mv AS SELECT * FROM refresh_cycle_a;
+
+statement ok
+CREATE MATERIALIZED VIEW refresh_cycle_b_mv AS SELECT * FROM refresh_cycle_b;
+
+statement ok
+CREATE MATERIALIZED VIEW refresh_cycle_b_alias_mv AS SELECT * FROM refresh_cycle_b;
+
+statement ok
+CREATE SEQUENCE refresh_cycle_order;
+
+statement ok
+CREATE TABLE refresh_cycle_events (worker INTEGER, phase INTEGER, event_order BIGINT);
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=0
+statement ok
+PRAGMA refresh('refresh_cycle_a_mv');
+
+onlyif threadid=0
+statement ok
+INSERT INTO refresh_cycle_events VALUES (0, 1, nextval('refresh_cycle_order'));
+
+onlyif threadid=0
+statement ok
+PRAGMA refresh('refresh_cycle_b_alias_mv');
+
+onlyif threadid=0
+statement ok
+INSERT INTO refresh_cycle_events VALUES (0, 2, nextval('refresh_cycle_order'));
+
+onlyif threadid=0
+statement ok
+COMMIT;
+
+onlyif threadid=1
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('refresh_cycle_b_mv');
+
+onlyif threadid=1
+statement ok
+INSERT INTO refresh_cycle_events VALUES (1, 1, nextval('refresh_cycle_order'));
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('refresh_cycle_a_alias_mv');
+
+onlyif threadid=1
+statement ok
+INSERT INTO refresh_cycle_events VALUES (1, 2, nextval('refresh_cycle_order'));
+
+onlyif threadid=1
+statement ok
+COMMIT;
+
+endloop
+
+# Once one transaction passes its first refresh, it retains the mutation gate
+# through commit. Its two event sequence values must therefore be adjacent;
+# an interleaving value would prove that another context bypassed the gate.
+query II
+SELECT count(*), max(last_event)
+FROM (
+    SELECT worker, min(event_order) AS first_event, max(event_order) AS last_event
+    FROM refresh_cycle_events
+    GROUP BY worker
+    HAVING max(event_order) - min(event_order) = 1
+);
+----
+2	4
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM refresh_cycle_a_mv
+    EXCEPT ALL
+    SELECT * FROM refresh_cycle_a
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM refresh_cycle_a
+    EXCEPT ALL
+    SELECT * FROM refresh_cycle_a_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM refresh_cycle_b_mv
+    EXCEPT ALL
+    SELECT * FROM refresh_cycle_b
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM refresh_cycle_b
+    EXCEPT ALL
+    SELECT * FROM refresh_cycle_b_mv
+);
+----
+0
+
+# ==========================================
+# Test 2: Concurrent refresh of SAME view — mutation gate serializes them
+# Before serialization, this caused TransactionContext Error: Conflict on tuple deletion
 # Now both threads wait their turn and the MV stays correct
 # ==========================================
 
@@ -167,7 +301,7 @@ CREATE MATERIALIZED VIEW mv_items AS
 statement ok
 INSERT INTO items SELECT i, i * 10 FROM range(101, 201) t(i);
 
-# Both threads refresh — per-view lock ensures only one runs at a time
+# Both threads refresh — the mutation gate ensures only one runs at a time
 concurrentloop threadid 0 2
 
 statement ok
@@ -529,9 +663,9 @@ SELECT count(*) FROM (
 0
 
 # ==========================================
-# Test 8: A writer on one tracked table must not block refresh of an unrelated
-# tracked table in the same catalog. Phase coordination is keyed by the exact
-# delta relation, not by the whole catalog.
+# Test 8: The coarse mutation lock deliberately serializes a writer and an
+# unrelated refresh in the same database. This keeps one lock order for the
+# low-concurrency deployment model and avoids cross-source cycles.
 # ==========================================
 
 statement ok
@@ -600,7 +734,7 @@ SELECT
     < max(observed_at) FILTER (phase = 'writer_committed')
 FROM scoped_gate_timing;
 ----
-true
+false
 
 query I
 SELECT count(*) FROM (

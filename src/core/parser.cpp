@@ -20,8 +20,10 @@
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -35,6 +37,36 @@
 #include <chrono>
 
 namespace duckdb {
+
+struct MaterializedViewTarget {
+	string catalog_name;
+	string schema_name;
+	string view_name;
+	bool qualified;
+};
+
+static MaterializedViewTarget ResolveMaterializedViewTarget(ClientContext &context, const string &target_name) {
+	auto components = QualifiedName::ParseComponents(target_name);
+	if (components.empty() || components.size() > 3) {
+		throw ParserException("Invalid materialized-view target '%s'", target_name);
+	}
+	auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
+	string default_catalog =
+	    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
+	string default_schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
+	if (components.size() == 1) {
+		return {default_catalog, default_schema, components[0], false};
+	}
+	if (components.size() == 2) {
+		auto attached = DatabaseManager::Get(context).GetDatabase(context, components[0]);
+		if (attached) {
+			string schema_name = StringUtil::CIEquals(default_catalog, components[0]) ? default_schema : DEFAULT_SCHEMA;
+			return {components[0], schema_name, components[1], true};
+		}
+		return {default_catalog, components[0], components[1], true};
+	}
+	return {components[0], components[1], components[2], true};
+}
 
 static vector<RefreshMetadata::GroupRecomputeSourceOccurrence>
 BuildGroupRecomputeSourceOccurrences(const CreateMVPlanFacts &facts) {
@@ -261,7 +293,19 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	// Handle ALTER MATERIALIZED VIEW — just execute the metadata UPDATE
 	if (!parse_data_ref.alter_sql.empty()) {
-		result.parameters.push_back(Value(parse_data_ref.alter_sql));
+		auto target = ResolveMaterializedViewTarget(context, parse_data_ref.target_name);
+		auto metadata_table = SqlUtils::FullName(default_db, default_schema, openivm::VIEWS_TABLE);
+		auto target_filter = "view_name = '" + SqlUtils::EscapeValue(target.view_name) +
+		                     "' AND COALESCE(view_catalog, '" + SqlUtils::EscapeValue(default_db) + "') = '" +
+		                     SqlUtils::EscapeValue(target.catalog_name) + "' AND COALESCE(view_schema, '" +
+		                     string(DEFAULT_SCHEMA) + "') = '" + SqlUtils::EscapeValue(target.schema_name) + "'";
+		auto tracked = con.Query("SELECT 1 FROM " + metadata_table + " WHERE " + target_filter);
+		if (tracked->HasError() || tracked->RowCount() == 0) {
+			throw CatalogException("Materialized view '%s' does not exist in OpenIVM metadata",
+			                       parse_data_ref.target_name);
+		}
+		result.parameters.push_back(Value("UPDATE " + metadata_table + " SET refresh_interval = " +
+		                                  parse_data_ref.alter_sql + " WHERE " + target_filter));
 		ConfigureDDLExecutorResult(result, DDLExecutionMode::CALLER_TRANSACTION);
 		return result;
 	}
@@ -280,26 +324,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// for supported logical plans; this string is only the safe fallback input.
 	auto original_view_query = SqlUtils::ExtractViewQuery(statement->query);
 
-	// Split catalog-qualified name (e.g. "dl.mv_totals") into prefix and bare name.
-	string view_catalog_prefix; // e.g. "dl." or "" for default catalog
-	string view_name;           // bare name without catalog, e.g. "mv_totals"
-	string view_target_catalog = current_catalog;
-	string view_target_schema = current_schema;
-	auto dot_pos = full_view_name.rfind('.');
-	if (dot_pos != string::npos) {
-		auto raw_prefix = full_view_name.substr(0, dot_pos);
-		view_catalog_prefix = SqlUtils::QuoteQualifiedPrefix(raw_prefix + ".");
-		auto schema_dot_pos = raw_prefix.rfind('.');
-		if (schema_dot_pos != string::npos) {
-			view_target_catalog = raw_prefix.substr(0, schema_dot_pos);
-			view_target_schema = raw_prefix.substr(schema_dot_pos + 1);
-		} else {
-			view_target_catalog = raw_prefix;
-			view_target_schema = current_schema.empty() ? "main" : current_schema;
-		}
-		view_name = full_view_name.substr(dot_pos + 1);
+	auto target = ResolveMaterializedViewTarget(context, full_view_name);
+	string view_catalog_prefix;
+	string view_name = target.view_name;
+	string view_target_catalog = target.catalog_name;
+	string view_target_schema = target.schema_name;
+	if (target.qualified) {
+		view_catalog_prefix = SqlUtils::QualifiedPrefix(view_target_catalog, view_target_schema);
 	} else {
-		view_name = full_view_name;
 		// When the MV name is unqualified but the session is in a non-default catalog
 		// (e.g. USE dl.main), explicitly qualify so data/view tables land in dl rather
 		// than the physical default. Metadata tables (unqualified) stay in the physical
@@ -322,7 +354,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// Native MVs created from another active catalog keep OpenIVM state in the physical
 	// default DB. DuckLake-targeted MVs store their data/delta tables in DuckLake so
 	// initial materialization follows the same storage path as DuckLake CTAS.
-	if (!target_is_ducklake && !view_catalog_prefix.empty() && default_db != "memory") {
+	if (!target_is_ducklake && !view_catalog_prefix.empty() && default_db != "memory" &&
+	    view_target_catalog != default_db) {
 		internal_catalog_prefix = SqlUtils::QualifiedPrefix(default_db, default_schema);
 		internal_target_catalog = default_db;
 		internal_target_schema = default_schema;
@@ -1609,40 +1642,201 @@ string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionPara
 		throw ParserException("OpenIVM could not parse the materialized-view lifecycle statement");
 	}
 	auto view_name = dynamic_cast<MaterializedViewParseData &>(*parse_result.parse_data).target_name;
-	auto lock_view_name = SqlUtils::LastIdentifierPart(view_name);
-	auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-	string lock_catalog = default_entry.catalog;
-	string lock_schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
-	auto raw_prefix_end = view_name.rfind('.');
-	if (raw_prefix_end != string::npos) {
-		auto raw_prefix = view_name.substr(0, raw_prefix_end);
-		auto catalog_end = raw_prefix.rfind('.');
-		if (catalog_end == string::npos) {
-			lock_catalog = raw_prefix;
-		} else {
-			lock_catalog = raw_prefix.substr(0, catalog_end);
-			lock_schema = raw_prefix.substr(catalog_end + 1);
-		}
-	}
-	auto lock_identity = RefreshLocks::RelationIdentity(lock_catalog, lock_schema, lock_view_name);
+	auto target = ResolveMaterializedViewTarget(context, view_name);
+	auto lock_view_name = target.view_name;
 	auto plan_result =
 	    MaterializedViewParserExtension::PlanFunction(nullptr, context, std::move(parse_result.parse_data));
 	if (plan_result.function.name == OPENIVM_TRANSACTIONAL_DDL_FUNCTION) {
 		if (!lock_view_name.empty()) {
-			TransactionalMVLockState::Get(context).Acquire({lock_identity}, {});
+			TransactionalMVLockState::Get(context).AcquireMutationLock();
 		}
 		if (!context.transaction.IsAutoCommit()) {
 			TransactionalMVMetadataState::Get(context).Register(context, plan_result.parameters, lock_view_name);
 		}
 		return RenderTransactionalDDL(context, plan_result.parameters);
 	}
-	if (!lock_view_name.empty()) {
-		ViewLockGuard view_guard(lock_identity);
-		ExecuteStagedDDL(context, plan_result.parameters);
-	} else {
-		ExecuteStagedDDL(context, plan_result.parameters);
-	}
+	ExecuteStagedDDL(context, plan_result.parameters);
 	return "SELECT true AS \"MATERIALIZED VIEW CREATION\"";
+}
+
+static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata &metadata, const string &view_name,
+                                         const RefreshMetadata::StoredViewLocation &location, string &program,
+                                         vector<RefreshMetadata::DeltaSource> &sources, bool cascade,
+                                         OnEntryNotFound if_not_found) {
+	QueryErrorContext error_context;
+	auto data_name = IncrementalTableNames::DataTableName(view_name);
+	string data_ref;
+	auto view_entry = Catalog::GetEntry(context, location.catalog_name, location.schema_name,
+	                                    EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, error_context),
+	                                    OnEntryNotFound::RETURN_NULL);
+	if (view_entry) {
+		data_ref = SqlUtils::FindTableReference(view_entry->Cast<ViewCatalogEntry>().sql, data_name);
+	}
+	string internal_prefix = SqlUtils::QualifiedPrefix(location.catalog_name, location.schema_name);
+	if (!data_ref.empty()) {
+		auto separator = data_ref.rfind('.');
+		internal_prefix = separator == string::npos ? "" : data_ref.substr(0, separator + 1);
+	} else {
+		data_ref = internal_prefix + KeywordHelper::WriteOptionallyQuoted(data_name);
+	}
+
+	DropInfo view_drop;
+	view_drop.type = CatalogType::VIEW_ENTRY;
+	view_drop.catalog = location.catalog_name;
+	view_drop.schema = location.schema_name;
+	view_drop.name = view_name;
+	view_drop.cascade = cascade;
+	view_drop.if_not_found = if_not_found;
+	program += BuildDropViewStatement(view_drop) + ";\n";
+	program += "DROP TABLE IF EXISTS " + data_ref + ";\n";
+	program += "DROP TABLE IF EXISTS " + internal_prefix +
+	           KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name)) + ";\n";
+	program += "DELETE FROM openivm_refresh_hooks WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
+	program += "DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE parent_view = '" +
+	           SqlUtils::EscapeValue(view_name) + "' OR child_view = '" + SqlUtils::EscapeValue(view_name) + "';\n";
+	program += "DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	           SqlUtils::EscapeValue(view_name) + "';\n";
+	program += "DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	           SqlUtils::EscapeValue(view_name) + "';\n";
+	auto view_sources = metadata.GetDeltaSources(view_name, location.catalog_name, location.schema_name);
+	sources.insert(sources.end(), view_sources.begin(), view_sources.end());
+}
+
+static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshMetadata::DeltaSource> &sources,
+                                          const string &excluded_views, string &program) {
+	unordered_set<string> checked_sources;
+	for (auto &source : sources) {
+		if (source.catalog_type == "ducklake") {
+			continue;
+		}
+		auto identity = source.catalog_name + "\n" + source.schema_name + "\n" + source.table_name;
+		if (!checked_sources.insert(identity).second) {
+			continue;
+		}
+		auto remaining = con.Query(
+		    "SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
+		    SqlUtils::EscapeValue(source.table_name) + "' AND COALESCE(source_catalog, '" +
+		    SqlUtils::EscapeValue(source.catalog_name) + "') = '" + SqlUtils::EscapeValue(source.catalog_name) +
+		    "' AND COALESCE(source_schema, '" + SqlUtils::EscapeValue(source.schema_name) + "') = '" +
+		    SqlUtils::EscapeValue(source.schema_name) + "' AND view_name NOT IN (" + excluded_views + ")");
+		if (remaining->HasError()) {
+			throw CatalogException("OpenIVM could not verify delta-table consumers for '%s': %s", source.table_name,
+			                       remaining->GetError());
+		}
+		if (remaining->RowCount() > 0 && remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
+			program += "DROP TABLE IF EXISTS " +
+			           SqlUtils::FullName(source.catalog_name, source.schema_name, source.table_name) + ";\n";
+		}
+	}
+}
+
+static string ExecuteAutocommitDropProgram(Connection &con, const string &program) {
+	con.BeginTransaction();
+	try {
+		auto result = con.Query(program);
+		if (result->HasError()) {
+			throw CatalogException("OpenIVM DROP cleanup failed: %s", result->GetError());
+		}
+		con.Commit();
+	} catch (std::exception &) {
+		try {
+			con.Rollback();
+		} catch (std::exception &) {
+		}
+		throw;
+	}
+	return "SELECT true AS Success";
+}
+
+static string BuildCascadeDropTableProgram(ClientContext &context, DropInfo &drop_info) {
+	unique_ptr<MutationLockGuard> autocommit_guard;
+	if (context.transaction.IsAutoCommit()) {
+		autocommit_guard = make_uniq<MutationLockGuard>(context);
+	} else {
+		TransactionalMVLockState::Get(context).AcquireMutationLock();
+	}
+
+	QueryErrorContext error_context;
+	auto table_entry = Catalog::GetEntry(context, drop_info.catalog, drop_info.schema,
+	                                     EntryLookupInfo(CatalogType::TABLE_ENTRY, drop_info.name, error_context),
+	                                     OnEntryNotFound::RETURN_NULL);
+	if (table_entry) {
+		drop_info.catalog = table_entry->ParentCatalog().GetName();
+		drop_info.schema = table_entry->ParentSchema().name;
+	}
+	auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
+	if (drop_info.catalog.empty()) {
+		drop_info.catalog =
+		    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
+	}
+	if (drop_info.schema.empty()) {
+		drop_info.schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
+	}
+
+	Connection con(*context.db);
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		metadata_state->Apply(con);
+	}
+	auto dependent_rows =
+	    con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
+	              SqlUtils::EscapeValue(SqlUtils::DeltaName(drop_info.name)) + "' AND COALESCE(source_catalog, '" +
+	              SqlUtils::EscapeValue(drop_info.catalog) + "') = '" + SqlUtils::EscapeValue(drop_info.catalog) +
+	              "' AND COALESCE(source_schema, '" + SqlUtils::EscapeValue(drop_info.schema) + "') = '" +
+	              SqlUtils::EscapeValue(drop_info.schema) + "' ORDER BY view_name");
+	if (dependent_rows->HasError()) {
+		throw CatalogException("OpenIVM could not resolve materialized views depending on '%s': %s", drop_info.name,
+		                       dependent_rows->GetError());
+	}
+	if (dependent_rows->RowCount() == 0) {
+		auto program = BuildDropTableStatement(drop_info) + ";\n";
+		return context.transaction.IsAutoCommit() ? ExecuteAutocommitDropProgram(con, program) : program;
+	}
+
+	RefreshMetadata metadata(con);
+	vector<string> dependent_views;
+	unordered_set<string> seen;
+	for (idx_t row = 0; row < dependent_rows->RowCount(); row++) {
+		auto direct_view = dependent_rows->GetValue(0, row).ToString();
+		auto downstream = metadata.GetDownstreamViewsStrict(direct_view);
+		for (auto it = downstream.rbegin(); it != downstream.rend(); ++it) {
+			if (seen.insert(*it).second) {
+				dependent_views.push_back(*it);
+			}
+		}
+		if (seen.insert(direct_view).second) {
+			dependent_views.push_back(std::move(direct_view));
+		}
+	}
+
+	string excluded_views;
+	for (auto &view_name : dependent_views) {
+		if (!excluded_views.empty()) {
+			excluded_views += ", ";
+		}
+		excluded_views += "'" + SqlUtils::EscapeValue(view_name) + "'";
+	}
+
+	string program;
+	vector<RefreshMetadata::DeltaSource> sources;
+	for (auto &view_name : dependent_views) {
+		auto location = metadata.GetStoredViewLocation(view_name);
+		AppendTrackedViewDropProgram(context, metadata, view_name, location, program, sources, true,
+		                             OnEntryNotFound::RETURN_NULL);
+	}
+
+	AppendUnusedSourceDropProgram(con, sources, excluded_views, program);
+	program += BuildDropTableStatement(drop_info) + ";\n";
+
+	if (context.transaction.IsAutoCommit()) {
+		return ExecuteAutocommitDropProgram(con, program);
+	} else {
+		auto &state = TransactionalMVMetadataState::Get(context);
+		state.RegisterSQL(program, dependent_views.front());
+		for (idx_t index = 1; index < dependent_views.size(); index++) {
+			state.IncludeView(dependent_views[index]);
+		}
+	}
+	return program;
 }
 
 string MaterializedViewDropQuery(ClientContext &context, const FunctionParameters &parameters) {
@@ -1652,9 +1846,12 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	Parser parser(options);
 	parser.ParseQuery(query);
 	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::DROP_STATEMENT) {
-		throw InternalException("OpenIVM DROP rewrite expected one DROP VIEW statement");
+		throw InternalException("OpenIVM DROP rewrite expected one DROP statement");
 	}
 	auto &drop = parser.statements[0]->Cast<DropStatement>();
+	if (drop.info->type == CatalogType::TABLE_ENTRY && drop.info->cascade) {
+		return BuildCascadeDropTableProgram(context, *drop.info);
+	}
 	if (drop.info->type != CatalogType::VIEW_ENTRY) {
 		throw InternalException("OpenIVM DROP rewrite expected DROP VIEW");
 	}
@@ -1728,43 +1925,14 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	}
 
 	RefreshMetadata metadata(con);
-	auto delta_sources = metadata.GetDeltaSources(drop.info->name, catalog_name, schema_name);
-	auto last_separator = data_table_ref.rfind('.');
-	string internal_prefix =
-	    last_separator == string::npos ? "" : data_table_ref.substr(0, static_cast<size_t>(last_separator + 1));
-	program += "DROP TABLE IF EXISTS " + data_table_ref + ";\n";
-	program += "DROP TABLE IF EXISTS " + internal_prefix +
-	           KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(drop.info->name)) + ";\n";
-	program += "DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	           SqlUtils::EscapeValue(drop.info->name) + "';\n";
-	program += "DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	           SqlUtils::EscapeValue(drop.info->name) + "';\n";
-
-	vector<string> delta_lock_names;
-	vector<DeltaGateTarget> gate_targets;
-	for (auto &source : delta_sources) {
-		auto identity = RefreshLocks::RelationIdentity(source.catalog_name, source.schema_name, source.table_name);
-		delta_lock_names.push_back(identity);
-		if (source.catalog_type == "ducklake") {
-			continue;
-		}
-		auto remaining =
-		    con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
-		              SqlUtils::EscapeValue(source.table_name) + "' AND COALESCE(source_catalog, '') = '" +
-		              SqlUtils::EscapeValue(source.catalog_name) + "' AND COALESCE(source_schema, '') = '" +
-		              SqlUtils::EscapeValue(source.schema_name) + "'");
-		if (!remaining->HasError() && remaining->RowCount() > 0 && remaining->GetValue(0, 0).GetValue<int64_t>() == 1) {
-			program += "DROP TABLE IF EXISTS " +
-			           SqlUtils::FullName(source.catalog_name, source.schema_name, source.table_name) + ";\n";
-		}
-		gate_targets.push_back({&Catalog::GetCatalog(context, source.catalog_name), identity});
-	}
-	auto view_delta_table = SqlUtils::DeltaName(drop.info->name);
-	auto view_delta_identity = RefreshLocks::RelationIdentity(catalog_name, schema_name, view_delta_table);
-	delta_lock_names.push_back(view_delta_identity);
-	gate_targets.push_back({&Catalog::GetCatalog(context, catalog_name), view_delta_identity});
-	auto view_lock_identity = RefreshLocks::RelationIdentity(catalog_name, schema_name, drop.info->name);
-	TransactionalMVLockState::Get(context).Acquire({view_lock_identity}, delta_lock_names, gate_targets);
+	program.clear();
+	vector<RefreshMetadata::DeltaSource> delta_sources;
+	RefreshMetadata::StoredViewLocation location {catalog_name, schema_name};
+	AppendTrackedViewDropProgram(context, metadata, drop.info->name, location, program, delta_sources,
+	                             drop.info->cascade, drop.info->if_not_found);
+	auto excluded_view = "'" + SqlUtils::EscapeValue(drop.info->name) + "'";
+	AppendUnusedSourceDropProgram(con, delta_sources, excluded_view, program);
+	TransactionalMVLockState::Get(context).AcquireMutationLock();
 	if (!context.transaction.IsAutoCommit()) {
 		TransactionalMVMetadataState::Get(context).RegisterSQL(program, drop.info->name);
 	}

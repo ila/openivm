@@ -8,8 +8,8 @@
 
 namespace duckdb {
 
-// Generates refresh SQL for each view (including cascaded views) and executes it
-// under a per-view lock. This ensures concurrent refresh of the same view is serialized.
+// Generates refresh SQL for each view (including cascaded views) and executes it.
+// The caller must own the database-wide OpenIVM mutation gate.
 void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters);
 string TransactionalRefreshQuery(ClientContext &context, const FunctionParameters &parameters);
 

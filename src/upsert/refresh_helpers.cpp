@@ -623,7 +623,7 @@ string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_na
 
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
                            bool cross_system, const string &attached_catalog, const string &attached_schema,
-                           const string &catalog_prefix, string *out_post_meta) {
+                           const string &catalog_prefix, const string &metadata_prefix, string *out_post_meta) {
 	string qdt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
 	// parser.cpp gives AGGREGATE_GROUP / AGGREGATE_HAVING data tables a UNIQUE index on the group
 	// keys. A plain `DELETE FROM t; INSERT INTO t ...` re-inserts keys deleted in the same
@@ -638,8 +638,9 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 		}
 	}
 	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql, unique_keys, recompute_temp) + "\n";
-	string update_ts_sql = "UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
-	                       " SET last_update = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
+	auto delta_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
+	string update_ts_sql = "UPDATE " + delta_metadata_table + " SET last_update = now() WHERE view_name = '" +
+	                       SqlUtils::EscapeValue(view_name) + "';\n";
 	auto delta_tables = metadata.GetDeltaTables(view_name);
 	for (auto &dt : delta_tables) {
 		if (!metadata.IsDuckLakeTable(view_name, dt)) {
@@ -652,7 +653,8 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 		string snapshot_expr =
 		    cross_system ? DuckLakeSnapshotPlaceholder(loc.catalog_name)
 		                 : "(SELECT id FROM " + SqlUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot())";
-		update_ts_sql += RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, snapshot_expr);
+		update_ts_sql +=
+		    RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, snapshot_expr, delta_metadata_table);
 	}
 	string update_ts;
 	if (!cross_system) {
@@ -667,7 +669,7 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 			continue;
 		}
 		string resolved = metadata.ResolveDeltaQualifiedName(view_name, dt, attached_catalog, attached_schema);
-		delta_cleanup += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt);
+		delta_cleanup += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt, delta_metadata_table);
 	}
 
 	return query + update_ts + "\n" + delta_cleanup;

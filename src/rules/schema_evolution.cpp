@@ -2,7 +2,6 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/parser_plan_helpers.hpp"
-#include "core/refresh_locks.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
@@ -26,15 +25,29 @@ static bool NamesMatch(const string &left, const string &right) {
 	return StringUtil::CIEquals(SqlUtils::LastIdentifierPart(left), SqlUtils::LastIdentifierPart(right));
 }
 
-static vector<string> GetDependentViews(Connection &con, const string &delta_name) {
-	vector<string> views;
+struct DependentView {
+	string name;
+	string catalog_name;
+	string schema_name;
+};
+
+static vector<DependentView> GetDependentViews(Connection &con, const string &delta_name, const string &source_catalog,
+                                               const string &source_schema) {
+	vector<DependentView> views;
 	auto result = con.Query("SELECT DISTINCT d.view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	                        " d WHERE d.table_name = '" + SqlUtils::EscapeValue(delta_name) + "' ORDER BY 1");
+	                        " d WHERE d.table_name = '" + SqlUtils::EscapeValue(delta_name) +
+	                        "' AND COALESCE(d.source_catalog, '" + SqlUtils::EscapeValue(source_catalog) + "') = '" +
+	                        SqlUtils::EscapeValue(source_catalog) + "' AND COALESCE(d.source_schema, '" +
+	                        SqlUtils::EscapeValue(source_schema) + "') = '" + SqlUtils::EscapeValue(source_schema) +
+	                        "' ORDER BY 1");
 	if (result->HasError()) {
 		return views;
 	}
+	RefreshMetadata metadata(con);
 	for (idx_t i = 0; i < result->RowCount(); i++) {
-		views.push_back(result->GetValue(0, i).ToString());
+		auto name = result->GetValue(0, i).ToString();
+		auto location = metadata.GetStoredViewLocation(name);
+		views.push_back({std::move(name), std::move(location.catalog_name), std::move(location.schema_name)});
 	}
 	return views;
 }
@@ -549,44 +562,45 @@ static bool AuxMetadataReferencesColumn(RefreshMetadata &metadata, const string 
 	return false;
 }
 
-string FirstMVReferencingColumn(Connection &con, const string &delta_name, const string &table_name,
-                                const string &col_name) {
+string FirstMVReferencingColumn(Connection &con, const string &delta_name, const string &source_catalog,
+                                const string &source_schema, const string &table_name, const string &col_name) {
 	RefreshMetadata metadata(con);
-	for (auto &view_name : GetDependentViews(con, delta_name)) {
-		if (RewriteStoredViewQuery(con, metadata, view_name, table_name, col_name, col_name, /*persist=*/false) ||
-		    AuxMetadataReferencesColumn(metadata, view_name, table_name, col_name)) {
-			return view_name;
+	for (auto &view : GetDependentViews(con, delta_name, source_catalog, source_schema)) {
+		if (RewriteStoredViewQuery(con, metadata, view.name, table_name, col_name, col_name, /*persist=*/false) ||
+		    AuxMetadataReferencesColumn(metadata, view.name, table_name, col_name)) {
+			return view.name;
 		}
 	}
 	return "";
 }
 
-void RewriteDependentViewMetadataForRename(Connection &con, const string &delta_name, const string &table_name,
+void RewriteDependentViewMetadataForRename(Connection &con, const string &delta_name, const string &source_catalog,
+                                           const string &source_schema, const string &table_name,
                                            const string &old_name, const string &new_name) {
 	RefreshMetadata metadata(con);
-	for (auto &view_name : GetDependentViews(con, delta_name)) {
-		ViewLockGuard view_guard(view_name);
-		bool tx_open = false;
-		try {
-			con.BeginTransaction();
-			tx_open = true;
-			RewriteStoredViewQuery(con, metadata, view_name, table_name, old_name, new_name, /*persist=*/true);
-			RewriteDistinctAuxMeta(con, metadata, view_name, table_name, old_name, new_name);
-			RewriteFilteredGroupCountMeta(con, metadata, view_name, table_name, old_name, new_name);
-			RewriteSemiAntiAuxMeta(con, metadata, view_name, table_name, old_name, new_name);
-			RewriteLineageMeta(con, metadata, view_name, table_name, old_name, new_name);
-			RewriteWindowGroupColumnSources(con, metadata, view_name, old_name, new_name);
-			con.Commit();
-			tx_open = false;
-		} catch (std::exception &) {
-			if (tx_open) {
-				try {
-					con.Rollback();
-				} catch (std::exception &) {
-				}
-			}
-			throw;
+	auto views = GetDependentViews(con, delta_name, source_catalog, source_schema);
+	bool tx_open = false;
+	try {
+		con.BeginTransaction();
+		tx_open = true;
+		for (auto &view : views) {
+			RewriteStoredViewQuery(con, metadata, view.name, table_name, old_name, new_name, /*persist=*/true);
+			RewriteDistinctAuxMeta(con, metadata, view.name, table_name, old_name, new_name);
+			RewriteFilteredGroupCountMeta(con, metadata, view.name, table_name, old_name, new_name);
+			RewriteSemiAntiAuxMeta(con, metadata, view.name, table_name, old_name, new_name);
+			RewriteLineageMeta(con, metadata, view.name, table_name, old_name, new_name);
+			RewriteWindowGroupColumnSources(con, metadata, view.name, old_name, new_name);
 		}
+		con.Commit();
+		tx_open = false;
+	} catch (std::exception &) {
+		if (tx_open) {
+			try {
+				con.Rollback();
+			} catch (std::exception &) {
+			}
+		}
+		throw;
 	}
 }
 

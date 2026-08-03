@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/printer.hpp"
@@ -26,16 +27,36 @@ static const vector<string> &TransactionalMetadataTables() {
 	return tables;
 }
 
-static bool HasMetadataTarget(const string &statement, const string &prefix) {
+static const vector<string> &MetadataStatementPrefixes() {
+	static const vector<string> prefixes = {
+	    "create table if not exists ",
+	    "alter table ",
+	    "insert or replace into ",
+	    "insert or ignore into ",
+	    "insert into ",
+	    "update ",
+	    "delete from ",
+	};
+	return prefixes;
+}
+
+static bool HasMetadataTarget(const string &statement, const string &prefix, const string &table) {
 	if (!StringUtil::StartsWith(statement, prefix)) {
 		return false;
 	}
 	auto target = statement.substr(prefix.size());
-	for (auto &table : TransactionalMetadataTables()) {
-		auto table_name = StringUtil::Lower(table);
-		if (StringUtil::StartsWith(target, table_name) &&
-		    (target.size() == table_name.size() ||
-		     std::isspace(static_cast<unsigned char>(target[table_name.size()])) || target[table_name.size()] == '(')) {
+	auto table_name = StringUtil::Lower(table);
+	return StringUtil::StartsWith(target, table_name) &&
+	       (target.size() == table_name.size() || std::isspace(static_cast<unsigned char>(target[table_name.size()])) ||
+	        target[table_name.size()] == '(');
+}
+
+static bool TargetsMetadataTable(const string &statement, const string &table) {
+	auto trimmed = statement;
+	StringUtil::Trim(trimmed);
+	auto lower = StringUtil::Lower(trimmed);
+	for (auto &prefix : MetadataStatementPrefixes()) {
+		if (HasMetadataTarget(lower, prefix, table)) {
 			return true;
 		}
 	}
@@ -46,18 +67,11 @@ static bool IsReplayableMetadataStatement(const string &statement) {
 	auto trimmed = statement;
 	StringUtil::Trim(trimmed);
 	auto lower = StringUtil::Lower(trimmed);
-	static const vector<string> prefixes = {
-	    "create table if not exists ",
-	    "alter table ",
-	    "insert or replace into ",
-	    "insert or ignore into ",
-	    "insert into ",
-	    "update ",
-	    "delete from ",
-	};
-	for (auto &prefix : prefixes) {
-		if (HasMetadataTarget(lower, prefix)) {
-			return true;
+	for (auto &prefix : MetadataStatementPrefixes()) {
+		for (auto &table : TransactionalMetadataTables()) {
+			if (HasMetadataTarget(lower, prefix, table)) {
+				return true;
+			}
 		}
 	}
 	return false;
@@ -349,6 +363,9 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	}
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto conn = make_uniq<Connection>(db);
+	auto &helper_lock_state = TransactionalMVLockState::Get(*conn->context);
+	helper_lock_state.SetMutationOwner(&context);
+	MutationLockGuard mutation_guard(db, &context);
 	bool suspended_autocommit_transaction = false;
 	auto restore_outer_transaction = [&]() {
 		if (suspended_autocommit_transaction && !context.transaction.HasActiveTransaction()) {
@@ -547,10 +564,23 @@ void TransactionalMVMetadataState::RegisterSQL(const string &sql, const string &
 	}
 }
 
+void TransactionalMVMetadataState::IncludeView(const string &view_name) {
+	view_names.insert(view_name);
+}
+
 void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	if (statements.empty()) {
 		return;
 	}
+	string metadata_catalog;
+	auto current_database = connection.Query("SELECT current_database()");
+	if (!current_database->HasError() && current_database->RowCount() > 0 &&
+	    !current_database->GetValue(0, 0).IsNull()) {
+		metadata_catalog = current_database->GetValue(0, 0).ToString();
+	}
+	auto durable_table = [&](const string &table) {
+		return metadata_catalog.empty() ? "main." + table : SqlUtils::FullName(metadata_catalog, DEFAULT_SCHEMA, table);
+	};
 	// Build constrained TEMP schemas first. CREATE TABLE AS would discard the
 	// primary keys required by INSERT OR REPLACE metadata operations.
 	for (auto &statement : statements) {
@@ -563,22 +593,7 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 			                       result->GetError());
 		}
 	}
-	string view_filter;
-	for (auto &view_name : view_names) {
-		if (!view_filter.empty()) {
-			view_filter += ", ";
-		}
-		view_filter += "'" + SqlUtils::EscapeValue(view_name) + "'";
-	}
-	for (auto &table : TransactionalMetadataTables()) {
-		string filter;
-		if (!view_filter.empty()) {
-			if (table == openivm::MV_DEPS_TABLE) {
-				filter = " WHERE child_view IN (" + view_filter + ") OR parent_view IN (" + view_filter + ")";
-			} else {
-				filter = " WHERE view_name IN (" + view_filter + ")";
-			}
-		}
+	auto seed_table = [&](const string &table, const string &filter) {
 		bool has_constrained_schema = false;
 		for (auto &statement : statements) {
 			auto lower = StringUtil::Lower(statement);
@@ -590,22 +605,139 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		if (has_constrained_schema) {
 			// Seed the constrained shadow with committed rows. A missing durable
 			// table is expected for the first MV in a database.
-			connection.Query("INSERT OR IGNORE INTO " + table + " BY NAME SELECT * FROM main." + table + filter);
+			connection.Query("INSERT OR IGNORE INTO " + table + " BY NAME SELECT * FROM " + durable_table(table) +
+			                 filter);
 		} else {
 			// Less central metadata (for example optional dependency state) may
 			// be initialized outside the lifecycle program. Still shadow it so
 			// replay can never mutate the durable helper-connection catalog.
-			connection.Query("CREATE TEMP TABLE IF NOT EXISTS " + table + " AS SELECT * FROM main." + table + filter);
+			connection.Query("CREATE TEMP TABLE IF NOT EXISTS " + table + " AS SELECT * FROM " + durable_table(table) +
+			                 filter);
 		}
+	};
+	auto replay_statement = [&](const string &statement) {
+		auto result = connection.Query(MakeTemporaryMetadataDDL(statement));
+		if (result->HasError()) {
+			throw CatalogException("Could not reconstruct transaction-local OpenIVM metadata: %s", result->GetError());
+		}
+	};
+
+	// Cascade dependencies are recorded both explicitly for view matching and
+	// implicitly when a view consumes another view's delta/data table. Seed and
+	// replay all three relation tables first so the closure reflects this
+	// transaction's CREATE/REPLACE/DROP statements.
+	const vector<string> dependency_tables = {
+	    openivm::VIEWS_TABLE,
+	    openivm::DELTA_TABLES_TABLE,
+	    openivm::MV_DEPS_TABLE,
+	};
+	for (auto &table : dependency_tables) {
+		seed_table(table, "");
 	}
 	for (auto &statement : statements) {
 		if (IsMetadataSchemaStatement(statement)) {
 			continue;
 		}
-		auto result = connection.Query(MakeTemporaryMetadataDDL(statement));
-		if (result->HasError()) {
-			throw CatalogException("Could not reconstruct transaction-local OpenIVM metadata: %s", result->GetError());
+		for (auto &table : dependency_tables) {
+			if (TargetsMetadataTable(statement, table)) {
+				replay_statement(statement);
+				break;
+			}
 		}
+	}
+	unordered_set<string> included_views = view_names;
+	unordered_map<string, vector<string>> dependency_graph;
+	idx_t dependency_edge_count = 0;
+	auto add_dependency = [&](string parent, string child) {
+		dependency_graph[parent].push_back(child);
+		dependency_graph[child].push_back(parent);
+		dependency_edge_count++;
+	};
+	auto dependencies = connection.Query("SELECT parent_view, child_view FROM " + string(openivm::MV_DEPS_TABLE));
+	if (!dependencies->HasError()) {
+		for (idx_t row = 0; row < dependencies->RowCount(); row++) {
+			add_dependency(dependencies->GetValue(0, row).ToString(), dependencies->GetValue(1, row).ToString());
+		}
+	}
+	unordered_set<string> registered_views;
+	auto views = connection.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE));
+	if (!views->HasError()) {
+		for (idx_t row = 0; row < views->RowCount(); row++) {
+			registered_views.insert(views->GetValue(0, row).ToString());
+		}
+	}
+	auto delta_dependencies =
+	    connection.Query("SELECT view_name, table_name FROM " + string(openivm::DELTA_TABLES_TABLE));
+	if (!delta_dependencies->HasError()) {
+		static const string delta_prefix(openivm::DELTA_PREFIX);
+		static const string data_prefix(openivm::DATA_TABLE_PREFIX);
+		for (idx_t row = 0; row < delta_dependencies->RowCount(); row++) {
+			auto child = delta_dependencies->GetValue(0, row).ToString();
+			auto table = delta_dependencies->GetValue(1, row).ToString();
+			string parent;
+			if (StringUtil::StartsWith(table, delta_prefix)) {
+				parent = table.substr(delta_prefix.size());
+			} else if (StringUtil::StartsWith(table, data_prefix)) {
+				parent = table.substr(data_prefix.size());
+			}
+			if (!parent.empty() && registered_views.count(parent)) {
+				add_dependency(std::move(parent), std::move(child));
+			}
+		}
+	}
+	vector<string> pending_views(included_views.begin(), included_views.end());
+	for (idx_t pending_index = 0; pending_index < pending_views.size(); pending_index++) {
+		auto neighbors = dependency_graph.find(pending_views[pending_index]);
+		if (neighbors == dependency_graph.end()) {
+			continue;
+		}
+		for (auto &neighbor : neighbors->second) {
+			if (included_views.insert(neighbor).second) {
+				pending_views.push_back(neighbor);
+			}
+		}
+	}
+	OPENIVM_DEBUG_PRINT("[TRANSACTIONAL METADATA] Seed views=%zu, dependency edges=%zu, closure views=%zu\n",
+	                    registered_views.size(), dependency_edge_count, included_views.size());
+	string view_filter;
+	vector<string> sorted_included_views(included_views.begin(), included_views.end());
+	std::sort(sorted_included_views.begin(), sorted_included_views.end());
+	for (auto &view_name : sorted_included_views) {
+		if (!view_filter.empty()) {
+			view_filter += ", ";
+		}
+		view_filter += "'" + SqlUtils::EscapeValue(view_name) + "'";
+	}
+	if (!view_filter.empty()) {
+		connection.Query("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name NOT IN (" + view_filter +
+		                 ")");
+		connection.Query("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name NOT IN (" +
+		                 view_filter + ")");
+		connection.Query("DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE parent_view NOT IN (" + view_filter +
+		                 ") OR child_view NOT IN (" + view_filter + ")");
+	}
+	for (auto &table : TransactionalMetadataTables()) {
+		if (std::find(dependency_tables.begin(), dependency_tables.end(), table) != dependency_tables.end()) {
+			continue;
+		}
+		string filter = view_filter.empty() ? string() : " WHERE view_name IN (" + view_filter + ")";
+		seed_table(table, filter);
+	}
+	for (auto &statement : statements) {
+		if (IsMetadataSchemaStatement(statement)) {
+			continue;
+		}
+		bool already_replayed = false;
+		for (auto &table : dependency_tables) {
+			if (TargetsMetadataTable(statement, table)) {
+				already_replayed = true;
+				break;
+			}
+		}
+		if (already_replayed) {
+			continue;
+		}
+		replay_statement(statement);
 	}
 }
 
@@ -634,6 +766,13 @@ string BuildDropViewStatement(const DropInfo &drop_info) {
 	       (drop_info.if_not_found == OnEntryNotFound::RETURN_NULL ? "true" : "false") + ")";
 }
 
+string BuildDropTableStatement(const DropInfo &drop_info) {
+	return "SELECT * FROM openivm_execute_drop_table('" + SqlUtils::EscapeValue(drop_info.catalog) + "', '" +
+	       SqlUtils::EscapeValue(drop_info.schema) + "', '" + SqlUtils::EscapeValue(drop_info.name) + "', " +
+	       (drop_info.cascade ? "true" : "false") + ", " +
+	       (drop_info.if_not_found == OnEntryNotFound::RETURN_NULL ? "true" : "false") + ")";
+}
+
 struct DropViewBindData : public TableFunctionData {
 	DropInfo info;
 };
@@ -642,13 +781,14 @@ struct DropViewGlobalState : public GlobalTableFunctionState {
 	bool finished = false;
 };
 
-unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
+static unique_ptr<FunctionData> BindDropEntry(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names,
+                                              CatalogType type) {
 	if (input.inputs.size() != 5) {
-		throw InternalException("OpenIVM DROP VIEW executor expected five arguments");
+		throw InternalException("OpenIVM DROP executor expected five arguments");
 	}
 	auto result = make_uniq<DropViewBindData>();
-	result->info.type = CatalogType::VIEW_ENTRY;
+	result->info.type = type;
 	result->info.catalog = StringValue::Get(input.inputs[0]);
 	result->info.schema = StringValue::Get(input.inputs[1]);
 	result->info.name = StringValue::Get(input.inputs[2]);
@@ -656,7 +796,7 @@ unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindI
 	result->info.if_not_found =
 	    BooleanValue::Get(input.inputs[4]) ? OnEntryNotFound::RETURN_NULL : OnEntryNotFound::THROW_EXCEPTION;
 	if (!input.binder) {
-		throw InternalException("OpenIVM DROP VIEW executor requires a binder");
+		throw InternalException("OpenIVM DROP executor requires a binder");
 	}
 	auto &catalog = Catalog::GetCatalog(context, result->info.catalog);
 	input.binder->GetStatementProperties().RegisterDBModify(catalog, context,
@@ -664,6 +804,16 @@ unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindI
 	return_types.push_back(LogicalType::BOOLEAN);
 	names.emplace_back("Success");
 	return std::move(result);
+}
+
+unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindInput &input,
+                                      vector<LogicalType> &return_types, vector<string> &names) {
+	return BindDropEntry(context, input, return_types, names, CatalogType::VIEW_ENTRY);
+}
+
+unique_ptr<FunctionData> BindDropTable(ClientContext &context, TableFunctionBindInput &input,
+                                       vector<LogicalType> &return_types, vector<string> &names) {
+	return BindDropEntry(context, input, return_types, names, CatalogType::TABLE_ENTRY);
 }
 
 unique_ptr<GlobalTableFunctionState> InitDropView(ClientContext &context, TableFunctionInitInput &input) {

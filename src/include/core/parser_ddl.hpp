@@ -32,6 +32,7 @@ public:
 
 	void Register(ClientContext &context, const vector<Value> &parameters, const string &view_name);
 	void RegisterSQL(const string &sql, const string &view_name);
+	void IncludeView(const string &view_name);
 	void Apply(Connection &connection) const;
 
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
@@ -50,8 +51,11 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 void ExecuteStagedDDL(ClientContext &context, const vector<Value> &parameters);
 string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace);
 string BuildDropViewStatement(const DropInfo &drop_info);
+string BuildDropTableStatement(const DropInfo &drop_info);
 unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindInput &input,
                                       vector<LogicalType> &return_types, vector<string> &names);
+unique_ptr<FunctionData> BindDropTable(ClientContext &context, TableFunctionBindInput &input,
+                                       vector<LogicalType> &return_types, vector<string> &names);
 unique_ptr<GlobalTableFunctionState> InitDropView(ClientContext &context, TableFunctionInitInput &input);
 void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChunk &output);
 

@@ -160,6 +160,100 @@ SELECT count(*) FROM (
 ----
 0
 
+# A source dropped with CASCADE in the same transaction that created its MV
+# removes the caller-visible objects and uncommitted metadata atomically.
+statement ok
+CREATE TABLE lifecycle_same_tx_cascade_src (id INTEGER, v INTEGER);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_same_tx_cascade_mv AS
+SELECT id, v FROM lifecycle_same_tx_cascade_src;
+
+statement ok
+INSERT INTO openivm_refresh_hooks VALUES (
+    'lifecycle_same_tx_cascade_mv',
+    'SELECT true',
+    'after'
+);
+
+statement ok
+DROP TABLE lifecycle_same_tx_cascade_src CASCADE;
+
+statement ok
+COMMIT;
+
+query IIIIIII
+SELECT
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'lifecycle_same_tx_cascade_src'),
+    (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_same_tx_cascade_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_same_tx_cascade_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_lifecycle_same_tx_cascade_mv'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_same_tx_cascade_mv'),
+    (SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'lifecycle_same_tx_cascade_mv'),
+    (SELECT count(*) FROM openivm_refresh_hooks WHERE view_name = 'lifecycle_same_tx_cascade_mv');
+----
+0	0	0	0	0	0	0
+
+# Rolling the same sequence back restores the source and removes everything
+# created for the rolled-back MV.
+statement ok
+CREATE TABLE lifecycle_same_tx_cascade_rollback_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_same_tx_cascade_rollback_src VALUES (1, 10);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_same_tx_cascade_rollback_mv AS
+SELECT id, v FROM lifecycle_same_tx_cascade_rollback_src;
+
+statement ok
+DROP TABLE lifecycle_same_tx_cascade_rollback_src CASCADE;
+
+statement ok
+ROLLBACK;
+
+query IIII
+SELECT
+    (SELECT count(*) FROM lifecycle_same_tx_cascade_rollback_src),
+    (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_same_tx_cascade_rollback_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_same_tx_cascade_rollback_mv'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_same_tx_cascade_rollback_mv');
+----
+1	0	0	0
+
+# Autocommit cascade uses one locked helper transaction and removes hook
+# configuration together with the tracked MV.
+statement ok
+CREATE TABLE lifecycle_autocommit_cascade_src (id INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_autocommit_cascade_mv AS
+SELECT id FROM lifecycle_autocommit_cascade_src;
+
+statement ok
+INSERT INTO openivm_refresh_hooks VALUES (
+    'lifecycle_autocommit_cascade_mv',
+    'SELECT true',
+    'after'
+);
+
+statement ok
+DROP TABLE lifecycle_autocommit_cascade_src CASCADE;
+
+query III
+SELECT
+    (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_autocommit_cascade_mv'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_autocommit_cascade_mv'),
+    (SELECT count(*) FROM openivm_refresh_hooks WHERE view_name = 'lifecycle_autocommit_cascade_mv');
+----
+0	0	0
+
 # Metadata replay is based on the statement target, not literals in a valid
 # backing-table query.
 statement ok
@@ -246,6 +340,211 @@ DROP VIEW lifecycle_alt_drop_mv;
 query I
 SELECT count(*) FROM information_schema.tables
 WHERE table_schema = 'lifecycle_alt' AND table_name = 'openivm_delta_drop_src';
+----
+0
+
+# Two-part native names identify a schema, not a catalog. The generated view,
+# data table, lifecycle lock, and refresh lookup must all use that same locus.
+statement ok
+CREATE TABLE lifecycle_alt.qualified_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_alt.qualified_src VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_alt.qualified_mv AS
+SELECT id, v FROM lifecycle_alt.qualified_src;
+
+statement ok
+INSERT INTO lifecycle_alt.qualified_src VALUES (3, 30), (4, 40);
+
+statement ok
+UPDATE lifecycle_alt.qualified_src SET v = 11 WHERE id = 1;
+
+statement ok
+DELETE FROM lifecycle_alt.qualified_src WHERE id = 2;
+
+statement ok
+PRAGMA refresh_options('openivm_transactional_lifecycle', 'lifecycle_alt', 'qualified_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_alt.qualified_mv
+    EXCEPT ALL
+    SELECT * FROM lifecycle_alt.qualified_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_alt.qualified_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_alt.qualified_mv
+);
+----
+0
+
+statement ok
+ALTER MATERIALIZED VIEW "lifecycle_alt"."qualified_mv" SET REFRESH EVERY '5 minutes';
+
+query I
+SELECT count(*) FROM openivm_views
+WHERE view_name = 'qualified_mv'
+  AND view_catalog = 'openivm_transactional_lifecycle'
+  AND view_schema = 'lifecycle_alt'
+  AND refresh_interval = 300;
+----
+1
+
+# A failed refresh in an explicit transaction must not change the caller's
+# catalog search path while compiling against metadata in main.
+statement ok
+CREATE TABLE lifecycle_alt.refresh_failure_src (id INTEGER, txt VARCHAR);
+
+statement ok
+INSERT INTO lifecycle_alt.refresh_failure_src VALUES (1, '10');
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_alt.refresh_failure_mv AS
+SELECT id, CAST(txt AS INTEGER) AS v FROM lifecycle_alt.refresh_failure_src;
+
+statement ok
+USE openivm_transactional_lifecycle.lifecycle_alt;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO refresh_failure_src VALUES (2, 'not-an-integer');
+
+statement error
+PRAGMA refresh_options('openivm_transactional_lifecycle', 'lifecycle_alt', 'refresh_failure_mv');
+----
+Could not convert
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT current_schema();
+----
+lifecycle_alt
+
+statement ok
+INSERT INTO refresh_failure_src VALUES (2, '20'), (3, '30');
+
+statement ok
+DELETE FROM refresh_failure_src WHERE id = 3;
+
+statement ok
+PRAGMA refresh_options('openivm_transactional_lifecycle', 'lifecycle_alt', 'refresh_failure_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM refresh_failure_mv
+    EXCEPT ALL
+    SELECT id, CAST(txt AS INTEGER) FROM refresh_failure_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, CAST(txt AS INTEGER) FROM refresh_failure_src
+    EXCEPT ALL
+    SELECT * FROM refresh_failure_mv
+);
+----
+0
+
+statement ok
+USE openivm_transactional_lifecycle.main;
+
+# Quoted qualified targets may contain characters that are not legal in bare
+# identifiers; ALTER must preserve the component boundaries.
+statement ok
+CREATE SCHEMA "lifecycle-alt-quoted";
+
+statement ok
+CREATE TABLE "lifecycle-alt-quoted"."qualified-src" (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO "lifecycle-alt-quoted"."qualified-src" VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW "lifecycle-alt-quoted"."qualified-mv" AS
+SELECT id, v FROM "lifecycle-alt-quoted"."qualified-src";
+
+statement ok
+ALTER MATERIALIZED VIEW "lifecycle-alt-quoted"."qualified-mv" SET REFRESH EVERY '7 minutes';
+
+query I
+SELECT count(*) FROM openivm_views
+WHERE view_name = 'qualified-mv'
+  AND view_schema = 'lifecycle-alt-quoted'
+  AND refresh_interval = 420;
+----
+1
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM "lifecycle-alt-quoted"."qualified-mv"
+    EXCEPT ALL
+    SELECT * FROM "lifecycle-alt-quoted"."qualified-src"
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM "lifecycle-alt-quoted"."qualified-src"
+    EXCEPT ALL
+    SELECT * FROM "lifecycle-alt-quoted"."qualified-mv"
+);
+----
+0
+
+# Qualified ALTER must resolve the complete target instead of updating another
+# schema's same-bare metadata row.
+statement error
+ALTER MATERIALIZED VIEW "lifecycle_alt"."qualified-mv" SET REFRESH EVERY '9 minutes';
+----
+does not exist in OpenIVM metadata
+
+query I
+SELECT refresh_interval FROM openivm_views
+WHERE view_name = 'qualified-mv' AND view_schema = 'lifecycle-alt-quoted';
+----
+420
+
+statement ok
+INSERT INTO "lifecycle-alt-quoted"."qualified-src" VALUES (2, 20), (3, 30);
+
+statement ok
+UPDATE "lifecycle-alt-quoted"."qualified-src" SET v = 11 WHERE id = 1;
+
+statement ok
+DELETE FROM "lifecycle-alt-quoted"."qualified-src" WHERE id = 3;
+
+statement ok
+PRAGMA refresh_options('openivm_transactional_lifecycle', 'lifecycle-alt-quoted', 'qualified-mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM "lifecycle-alt-quoted"."qualified-mv"
+    EXCEPT ALL
+    SELECT * FROM "lifecycle-alt-quoted"."qualified-src"
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM "lifecycle-alt-quoted"."qualified-src"
+    EXCEPT ALL
+    SELECT * FROM "lifecycle-alt-quoted"."qualified-mv"
+);
 ----
 0
 
@@ -525,6 +824,97 @@ SELECT count(*) FROM (
 statement ok
 COMMIT;
 
+# Replaying one transaction-local lifecycle change must retain the complete
+# downstream dependency closure and every child's source metadata.
+statement ok
+CREATE TABLE lifecycle_cascade_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO lifecycle_cascade_src VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_cascade_parent AS
+SELECT id, v FROM lifecycle_cascade_src;
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_cascade_child AS
+SELECT id, v FROM lifecycle_cascade_parent;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW lifecycle_cascade_parent AS
+SELECT id, v FROM lifecycle_cascade_src;
+
+statement ok
+INSERT INTO lifecycle_cascade_src VALUES (2, 20), (3, 30);
+
+statement ok
+UPDATE lifecycle_cascade_src SET v = 11 WHERE id = 1;
+
+statement ok
+DELETE FROM lifecycle_cascade_src WHERE id = 3;
+
+statement ok
+PRAGMA refresh('lifecycle_cascade_parent');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_cascade_child
+    EXCEPT ALL
+    SELECT id, v FROM lifecycle_cascade_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, v FROM lifecycle_cascade_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_cascade_child
+);
+----
+0
+
+statement ok
+COMMIT;
+
+# A lifecycle change to one view must not hide an unrelated refresh target from
+# the helper metadata shadow.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER MATERIALIZED VIEW lifecycle_cascade_parent SET REFRESH MANUAL;
+
+statement ok
+INSERT INTO lifecycle_refresh_src VALUES (3, 30);
+
+statement ok
+PRAGMA refresh('lifecycle_refresh_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_refresh_mv
+    EXCEPT ALL
+    SELECT * FROM lifecycle_refresh_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_refresh_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_refresh_mv
+);
+----
+0
+
+statement ok
+COMMIT;
+
 # CREATE followed by DROP in one transaction must not orphan generated state
 # or metadata that a helper connection cannot yet observe.
 statement ok
@@ -776,11 +1166,189 @@ SELECT count(*) FROM (
 ----
 0
 
+# DROP TABLE CASCADE companion cleanup must roll back with the base-table drop
+# and must remove the complete downstream MV closure when committed.
+statement ok
+CREATE TABLE lifecycle_drop_chain_src (id INTEGER);
+
+statement ok
+INSERT INTO lifecycle_drop_chain_src VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_drop_chain_parent AS
+SELECT * FROM lifecycle_drop_chain_src;
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_drop_chain_child AS
+SELECT * FROM lifecycle_drop_chain_parent;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP TABLE lifecycle_drop_chain_src CASCADE;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM openivm_views
+WHERE view_name IN ('lifecycle_drop_chain_parent', 'lifecycle_drop_chain_child');
+----
+2
+
+statement ok
+INSERT INTO lifecycle_drop_chain_src VALUES (2), (3);
+
+statement ok
+DELETE FROM lifecycle_drop_chain_src WHERE id = 3;
+
+statement ok
+PRAGMA refresh('lifecycle_drop_chain_parent');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_drop_chain_parent
+    EXCEPT ALL
+    SELECT * FROM lifecycle_drop_chain_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_drop_chain_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_drop_chain_parent
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_drop_chain_child
+    EXCEPT ALL
+    SELECT * FROM lifecycle_drop_chain_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_drop_chain_src
+    EXCEPT ALL
+    SELECT * FROM lifecycle_drop_chain_child
+);
+----
+0
+
+statement ok
+DROP TABLE lifecycle_drop_chain_src CASCADE;
+
+query I
+SELECT count(*) FROM openivm_views
+WHERE view_name IN ('lifecycle_drop_chain_parent', 'lifecycle_drop_chain_child');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_views()
+WHERE view_name IN ('lifecycle_drop_chain_parent', 'lifecycle_drop_chain_child');
+----
+0
+
 # DuckLake cannot share the native metadata transaction. Its replacement data
 # is therefore built under an unpublished staging name and published only after
 # materialization succeeds.
 statement ok
 ATTACH '__TEST_DIR__/openivm_transactional_lifecycle.ducklake' AS lifecycle_dl (TYPE ducklake);
+
+# Cascading from a native source removes dependent MV state, but DuckLake
+# sources are external base tables and must never be treated as native delta
+# tables eligible for cleanup.
+statement ok
+CREATE TABLE lifecycle_mixed_native (id INTEGER);
+
+statement ok
+INSERT INTO lifecycle_mixed_native VALUES (1), (2);
+
+statement ok
+CREATE TABLE lifecycle_dl.lifecycle_mixed_dimension (id INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO lifecycle_dl.lifecycle_mixed_dimension VALUES (1, 'one'), (3, 'three');
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_mixed_mv AS
+SELECT n.id, d.label
+FROM lifecycle_mixed_native n
+LEFT JOIN lifecycle_dl.lifecycle_mixed_dimension d ON n.id = d.id;
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM lifecycle_mixed_mv
+    EXCEPT ALL
+    SELECT n.id, d.label
+    FROM lifecycle_mixed_native n
+    LEFT JOIN lifecycle_dl.lifecycle_mixed_dimension d ON n.id = d.id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT n.id, d.label
+    FROM lifecycle_mixed_native n
+    LEFT JOIN lifecycle_dl.lifecycle_mixed_dimension d ON n.id = d.id
+    EXCEPT ALL
+    SELECT * FROM lifecycle_mixed_mv
+);
+----
+0
+
+statement ok
+DROP TABLE lifecycle_mixed_native CASCADE;
+
+query I
+SELECT count(*) FROM lifecycle_dl.lifecycle_mixed_dimension;
+----
+2
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_mixed_mv';
+----
+0
+
+# Staged DuckLake lifecycle DDL must share the caller's logical mutation
+# ownership after tracked native DML in the same explicit transaction.
+statement ok
+CREATE TABLE lifecycle_staged_lock_src (id INTEGER);
+
+statement ok
+INSERT INTO lifecycle_staged_lock_src VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_staged_lock_native_mv AS
+SELECT * FROM lifecycle_staged_lock_src;
+
+statement ok
+CREATE TABLE lifecycle_dl.lifecycle_staged_lock_dl_src (id INTEGER);
+
+statement ok
+INSERT INTO lifecycle_dl.lifecycle_staged_lock_dl_src VALUES (10);
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO lifecycle_staged_lock_src VALUES (2);
+
+statement ok
+CREATE MATERIALIZED VIEW lifecycle_dl.lifecycle_staged_lock_dl_mv AS
+SELECT * FROM lifecycle_dl.lifecycle_staged_lock_dl_src;
+
+statement ok
+COMMIT;
 
 statement ok
 CREATE TABLE lifecycle_dl.replace_src (id INTEGER, old_v INTEGER, txt VARCHAR);
@@ -819,6 +1387,38 @@ INSERT INTO lifecycle_dl.replace_src VALUES (2, 20, 'four');
 
 statement ok
 PRAGMA refresh('replace_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, v FROM lifecycle_dl.replace_mv
+    EXCEPT ALL
+    SELECT id, length(txt) AS v FROM lifecycle_dl.replace_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, length(txt) AS v FROM lifecycle_dl.replace_src
+    EXCEPT ALL
+    SELECT id, v FROM lifecycle_dl.replace_mv
+);
+----
+0
+
+# Explicit cross-system refresh delegates before retaining the caller's
+# non-recursive view lock.
+statement ok
+INSERT INTO lifecycle_dl.replace_src VALUES (3, 30, 'three');
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+PRAGMA refresh('replace_mv');
+
+statement ok
+COMMIT;
 
 query I
 SELECT count(*) FROM (

@@ -55,6 +55,10 @@ public:
 		string schema_name;
 		string table_name;
 	};
+	struct StoredViewLocation {
+		string catalog_name;
+		string schema_name;
+	};
 	struct DeltaSource {
 		string table_name;
 		string catalog_type;
@@ -64,6 +68,8 @@ public:
 
 	SourceLocation GetSourceLocation(const string &view_name, const string &table_name,
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
+	StoredViewLocation GetStoredViewLocation(const string &view_name, const string &fallback_catalog = "",
+	                                         const string &fallback_schema = "");
 	vector<DeltaSource> GetDeltaSources(const string &view_name, const string &fallback_catalog = "",
 	                                    const string &fallback_schema = "");
 	string ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
@@ -88,15 +94,18 @@ public:
 	// Get all downstream MV dependents in topological order (closest first).
 	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
 	vector<string> GetDownstreamViews(const string &view_name);
+	vector<string> GetDownstreamViewsStrict(const string &view_name);
 	bool HasDownstreamViews(const string &view_name);
 
 	// Get refresh_interval in seconds for a view. Returns -1 if not set (manual only).
 	int64_t GetRefreshInterval(const string &view_name);
 
 	// Get all views with a non-null refresh_interval.
-	// Returns tuples of (view_name, interval_seconds, last_update_timestamp_string).
+	// Returns the stored relation identity plus its schedule and last refresh watermark.
 	struct ScheduledView {
 		string view_name;
+		string catalog_name;
+		string schema_name;
 		int64_t interval_seconds;
 		string last_update;
 	};
@@ -108,7 +117,8 @@ public:
 	// Build SQL to delete old delta rows that all dependent views have already consumed.
 	// target: the (possibly schema-qualified) table to delete from.
 	// metadata_key: the name used in openivm_delta_tables (unqualified delta name).
-	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key);
+	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
+	                                   const string &delta_metadata_table = "");
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);
@@ -159,7 +169,7 @@ public:
 	                                                     const string &catalog_name, const string &schema_name);
 
 	static string BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
-	                                              const string &snapshot_expr);
+	                                              const string &snapshot_expr, const string &delta_metadata_table = "");
 	void UpdateDuckLakeRefreshMetadata(const string &view_name, const string &table_name, int64_t snapshot_id);
 
 	// --- Refresh history (learned cost model) ---

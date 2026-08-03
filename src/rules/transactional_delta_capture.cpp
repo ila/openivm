@@ -11,7 +11,6 @@
 #include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
 #include "duckdb/execution/operator/persistent/physical_update.hpp"
 #include "duckdb/execution/physical_operator.hpp"
-#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression_binder/check_binder.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -23,56 +22,14 @@
 #include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/transaction/transaction_context.hpp"
 
-#include <condition_variable>
 #include <array>
 
 namespace duckdb {
 
 namespace {
 
-static constexpr const char *DELTA_WRITE_STATE_KEY = "openivm_transactional_delta_write";
-
-class TransactionalDeltaWriteState : public ClientContextState {
-public:
-	void Acquire(ClientContext &context, Catalog &catalog, const string &delta_table_name) {
-		lock_guard<mutex> guard(lock);
-		auto &catalog_guards = guards[&catalog];
-		if (catalog_guards.find(delta_table_name) != catalog_guards.end()) {
-			return;
-		}
-		catalog_guards[delta_table_name] = make_uniq<DeltaCatalogWriteGuard>(context, catalog, delta_table_name);
-	}
-
-	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override {
-		Release();
-	}
-
-	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override {
-		Release();
-	}
-
-	void TransactionRollback(MetaTransaction &transaction, ClientContext &context,
-	                         optional_ptr<ErrorData> error) override {
-		Release();
-	}
-
-private:
-	void Release() {
-		lock_guard<mutex> guard(lock);
-		guards.clear();
-	}
-
-	mutex lock;
-	unordered_map<Catalog *, unordered_map<string, unique_ptr<DeltaCatalogWriteGuard>>> guards;
-};
-
-static void EnterDeltaWritePhase(ClientContext &context, Catalog &catalog, const string &delta_table_name) {
-	auto refresh_state = TransactionalMVLockState::TryGet(context);
-	if (refresh_state && refresh_state->OwnsRefreshDelta(catalog, delta_table_name)) {
-		return;
-	}
-	auto state = context.registered_state->GetOrCreate<TransactionalDeltaWriteState>(DELTA_WRITE_STATE_KEY);
-	state->Acquire(context, catalog, delta_table_name);
+static void EnterDeltaWritePhase(ClientContext &context) {
+	TransactionalMVLockState::Get(context).AcquireMutationLock();
 }
 
 class TransactionalDeltaAppendState {
@@ -112,9 +69,7 @@ public:
 		if (state.entered_write_phase) {
 			return;
 		}
-		auto identity =
-		    RefreshLocks::RelationIdentity(delta_table.catalog.GetName(), delta_table.schema.name, delta_table.name);
-		EnterDeltaWritePhase(context, delta_table.catalog, identity);
+		EnterDeltaWritePhase(context);
 		state.entered_write_phase = true;
 	}
 
