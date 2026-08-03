@@ -15,6 +15,7 @@
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
@@ -1000,6 +1001,90 @@ bool ProducesAtMostOneRow(LogicalOperator &node) {
 	return aggregate.groups.empty() && aggregate.grouping_sets.size() <= 1;
 }
 
+static bool ResolveBindingToGroupKey(const ColumnBinding &binding,
+                                     const unordered_map<idx_t, LogicalProjection *> &projections,
+                                     const LogicalAggregate &aggregate, idx_t &group_index, idx_t depth = 0) {
+	if (depth > 16) {
+		return false;
+	}
+	if (binding.table_index == aggregate.group_index) {
+		if (binding.column_index >= aggregate.groups.size()) {
+			return false;
+		}
+		group_index = binding.column_index;
+		return true;
+	}
+	auto projection = projections.find(binding.table_index);
+	if (projection == projections.end() || binding.column_index >= projection->second->expressions.size()) {
+		return false;
+	}
+	auto &expression = projection->second->expressions[binding.column_index];
+	if (expression->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &column = expression->Cast<BoundColumnRefExpression>();
+	return ResolveBindingToGroupKey(column.binding, projections, aggregate, group_index, depth + 1);
+}
+
+bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node) {
+	if (node.type != LogicalOperatorType::LOGICAL_DISTINCT || node.children.empty()) {
+		return false;
+	}
+	auto &distinct = node.Cast<LogicalDistinct>();
+	if (distinct.distinct_type != DistinctType::DISTINCT || distinct.order_by) {
+		return false;
+	}
+
+	auto *output = node.children[0].get();
+	auto *current = output;
+	unordered_map<idx_t, LogicalProjection *> projections;
+	while (current && current->children.size() == 1 &&
+	       (current->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	        current->type == LogicalOperatorType::LOGICAL_FILTER)) {
+		if (current->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = current->Cast<LogicalProjection>();
+			projections[projection.table_index] = &projection;
+		}
+		current = current->children[0].get();
+	}
+	if (!current || current->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		return false;
+	}
+	auto &aggregate = current->Cast<LogicalAggregate>();
+	if (aggregate.groups.empty() || aggregate.grouping_sets.size() > 1) {
+		return false;
+	}
+	if (!aggregate.grouping_sets.empty() && aggregate.grouping_sets[0].size() != aggregate.groups.size()) {
+		return false;
+	}
+
+	auto output_bindings = output->GetColumnBindings();
+	if (output_bindings.size() != aggregate.groups.size()) {
+		return false;
+	}
+	vector<bool> seen_group(aggregate.groups.size(), false);
+	for (auto &binding : output_bindings) {
+		idx_t group_index;
+		if (!ResolveBindingToGroupKey(binding, projections, aggregate, group_index) || seen_group[group_index]) {
+			return false;
+		}
+		seen_group[group_index] = true;
+	}
+	return true;
+}
+
+static bool HasDistinctOperator(const LogicalOperator &node) {
+	if (node.type == LogicalOperatorType::LOGICAL_DISTINCT) {
+		return true;
+	}
+	for (auto &child : node.children) {
+		if (HasDistinctOperator(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog) {
 	CreateMVPlanFacts facts;
 	facts.root = plan;
@@ -1012,8 +1097,12 @@ CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &cu
 	        top->type == LogicalOperatorType::LOGICAL_TOP_N)) {
 		top = top->children[0].get();
 	}
-	facts.has_top_level_redundant_scalar_distinct = top && top->type == LogicalOperatorType::LOGICAL_DISTINCT &&
-	                                                !top->children.empty() && ProducesAtMostOneRow(*top->children[0]);
+	facts.has_top_level_redundant_distinct =
+	    top && top->type == LogicalOperatorType::LOGICAL_DISTINCT && !top->children.empty() &&
+	    (ProducesAtMostOneRow(*top->children[0]) || IsRedundantDistinctOverGroupKeys(*top));
+	if (facts.has_top_level_redundant_distinct) {
+		facts.has_descendant_distinct = HasDistinctOperator(*top->children[0]);
+	}
 	unordered_map<string, idx_t> next_occurrence;
 	CollectCreateMVPlanFacts(plan, current_catalog, facts, next_occurrence, false, false);
 	FinalizeCreateMVPlanFacts(facts);

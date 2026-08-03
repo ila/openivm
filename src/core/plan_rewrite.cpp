@@ -67,6 +67,12 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 		RewriteDistinct(context, binder, node, false);
 		return false;
 	}
+	if (IsRedundantDistinctOverGroupKeys(*node)) {
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Removed redundant DISTINCT over aggregate group keys\n");
+		node = std::move(node->children[0]);
+		RewriteDistinct(context, binder, node, false);
+		return false;
+	}
 	auto &child = node->children[0];
 	child->ResolveOperatorTypes();
 	auto child_bindings = child->GetColumnBindings();

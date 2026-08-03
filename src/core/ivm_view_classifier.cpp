@@ -307,6 +307,8 @@ static void BuildUnsupportedReasons(DeltaViewModel &model, const CreateMVPlanFac
 }
 
 static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
+	const bool has_nonredundant_distinct =
+	    analysis.found_distinct && (!input.has_top_level_redundant_distinct || input.facts->has_descendant_distinct);
 	if (!model.unsupported_reasons.empty()) {
 		AddUnique(model.features, DeltaModelFeature::FULL_ONLY);
 	}
@@ -353,7 +355,7 @@ static void BuildModelFeatures(DeltaViewModel &model, const PlanAnalysis &analys
 		AddUnique(model.features, DeltaModelFeature::WINDOW_AFFECTED_PARTITION);
 	}
 	if (!model.HasFeature(DeltaModelFeature::FULL_ONLY)) {
-		if (input.distinct_aux_candidate && !input.has_top_level_redundant_scalar_distinct) {
+		if (input.distinct_aux_candidate && has_nonredundant_distinct) {
 			AddUnique(model.features, DeltaModelFeature::DISTINCT_STATEFUL);
 		}
 		if (input.semi_anti_aux_candidate) {
@@ -553,6 +555,8 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 }
 
 static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
+	const bool has_nonredundant_distinct =
+	    analysis.found_distinct && (!input.has_top_level_redundant_distinct || input.facts->has_descendant_distinct);
 	auto has_argminmax =
 	    std::any_of(analysis.aggregate_types.begin(), analysis.aggregate_types.end(),
 	                [](const string &agg_type) { return agg_type == "arg_min" || agg_type == "arg_max"; });
@@ -595,8 +599,7 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (analysis.found_count_distinct && !model.group_columns.empty()) {
 		model.type =
 		    input.count_distinct_aux_candidate ? RefreshType::COUNT_DISTINCT_INCREMENTAL : RefreshType::GROUP_RECOMPUTE;
-	} else if (analysis.found_distinct && !input.has_top_level_redundant_scalar_distinct && !model.distinct_at_top &&
-	           analysis.found_aggregation) {
+	} else if (has_nonredundant_distinct && !model.distinct_at_top && analysis.found_aggregation) {
 		model.type = model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL) ? RefreshType::DISTINCT_INCREMENTAL
 		                                                                    : RefreshType::GROUP_RECOMPUTE;
 	} else if (model.union_distinct_over_agg && !model.group_columns.empty()) {
@@ -928,7 +931,7 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 
 	model.has_minmax_metadata = analysis.found_minmax || analysis.found_count_distinct || analysis.found_list;
 	model.distinct_at_top = IsDistinctAtTop(facts, output_names);
-	if (input.has_top_level_redundant_scalar_distinct) {
+	if (input.has_top_level_redundant_distinct) {
 		model.distinct_at_top = false;
 	}
 	BuildGroupColumns(model, facts, output_names, input.visible_output_count);

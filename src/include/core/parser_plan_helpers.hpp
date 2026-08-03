@@ -86,7 +86,8 @@ struct CreateMVPlanFacts {
 	bool has_hidden_minmax_having_column = false;
 	bool has_computed_minmax_aggregate_projection = false;
 	bool has_computed_sum_aggregate_projection = false;
-	bool has_top_level_redundant_scalar_distinct = false;
+	bool has_top_level_redundant_distinct = false;
+	bool has_descendant_distinct = false;
 };
 
 string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
@@ -97,6 +98,7 @@ string QualifyCreateSourceTable(const string &table_name, const string &current_
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog);
 bool ProducesAtMostOneRow(LogicalOperator &node);
+bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node);
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols);
 bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t group_index);
 // delta_view_catalog_prefix must be the same prefix the view's delta table was created with

@@ -5,6 +5,7 @@
 //
 
 #include "duckdb.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
 #include "core/openivm_extension.hpp"
@@ -526,6 +527,18 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		duckdb::Connection con(db);
 		con.Query("PRAGMA threads=4");
 
+		// A few corpus queries mix TIMESTAMP columns with CURRENT_TIMESTAMP.
+		// DuckDB implements the required TIMESTAMPTZ conversion in ICU, so install
+		// it up front instead of turning a missing mid-run autoload into a query
+		// validation failure.
+		auto icu_install = con.Query("INSTALL icu");
+		auto icu_load = con.Query("LOAD icu");
+		if ((icu_install && icu_install->HasError()) || (icu_load && icu_load->HasError())) {
+			fprintf(stderr, "Warning: ICU extension unavailable; timestamp validation may fail: %s%s\n",
+			        icu_install && icu_install->HasError() ? icu_install->GetError().c_str() : "",
+			        icu_load && icu_load->HasError() ? icu_load->GetError().c_str() : "");
+		}
+
 		// Figure out the default (native) catalog name so we can switch back
 		// after a ducklake query. When `db_path` is a file like
 		// `rewriter_benchmark_sf1.db`, DuckDB names the catalog
@@ -537,7 +550,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				native_catalog = cur->GetValue(0, 0).ToString();
 			}
 		}
-		string native_use = "USE " + native_catalog + ".main";
+		string quoted_native_catalog = duckdb::KeywordHelper::WriteOptionallyQuoted(native_catalog);
+		string native_use = "USE " + quoted_native_catalog + ".main";
 
 		// DuckLake support is only for the tpcc workload — tpcdi has no DuckLake variants.
 		bool ducklake_ok = false;
@@ -559,7 +573,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						CreateTPCCSchema(con);
 						for (const char *t : {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM", "STOCK", "OORDER",
 						                      "NEW_ORDER", "ORDER_LINE", "HISTORY"}) {
-							con.Query(string("INSERT INTO ") + t + " SELECT * FROM " + native_catalog + ".main." + t);
+							con.Query(string("INSERT INTO ") + t + " SELECT * FROM " + quoted_native_catalog +
+							          ".main." + t);
 						}
 						con.Query(native_use);
 					} else {
@@ -719,24 +734,35 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// Qualify with native_catalog so the lookup works both when the active catalog
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
 						// name = filename, never "memory").
-						auto check_result = con.Query("SELECT type FROM " + native_catalog +
-						                              ".openivm_views WHERE view_name = '" + mv_name + "'");
+						auto check_result = con.Query("SELECT type FROM " + quoted_native_catalog +
+						                              ".main.openivm_views WHERE view_name = '" + mv_name + "'");
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
 							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
 							is_incremental = (refresh_type != 3) ? 1 : 0;
+						} else {
+							error = "OpenIVM metadata lookup failed for " + mv_name;
+							if (check_result && check_result->HasError()) {
+								error += ": " + check_result->GetError();
+							}
+							phase_reached = PHASE_MV_CREATION_FAILED;
 						}
 
 						// Phase 3: Apply deltas
-						for (int d = 0; d < delta_batch_size && (size_t)delta_idx < deltas.size(); d++, delta_idx++) {
-							con.Query(deltas[delta_idx]); // Errors are OK (e.g. duplicate keys)
+						if (phase_reached == PHASE_DELTA_FAILED) {
+							for (int d = 0; d < delta_batch_size && (size_t)delta_idx < deltas.size();
+							     d++, delta_idx++) {
+								con.Query(deltas[delta_idx]); // Errors are OK (e.g. duplicate keys)
+							}
+							if ((size_t)delta_idx >= deltas.size())
+								delta_idx = 0;
+							phase_reached = PHASE_REFRESH_FAILED;
 						}
-						if ((size_t)delta_idx >= deltas.size())
-							delta_idx = 0;
-						phase_reached = PHASE_REFRESH_FAILED;
 
 						// Phase 4: PRAGMA refresh()
 						start = std::chrono::steady_clock::now();
-						auto refresh_result = con.Query("PRAGMA refresh('" + mv_name + "')");
+						auto refresh_result = phase_reached == PHASE_REFRESH_FAILED
+						                          ? con.Query("PRAGMA refresh('" + mv_name + "')")
+						                          : nullptr;
 						if (refresh_result && refresh_result->HasError()) {
 							error = refresh_result->GetError();
 							if (IsFatalError(error)) {
@@ -744,7 +770,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							} else {
 								phase_reached = PHASE_REFRESH_FAILED;
 							}
-						} else {
+						} else if (refresh_result) {
 							auto end_refresh = std::chrono::steady_clock::now();
 							time_refresh_ms = std::chrono::duration<double, std::milli>(end_refresh - start).count();
 							phase_reached = PHASE_VERIFY_FAILED;
