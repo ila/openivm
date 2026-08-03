@@ -681,7 +681,7 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 				parent = table.substr(data_prefix.size());
 			}
 			if (!parent.empty() && registered_views.count(parent)) {
-				add_dependency(std::move(parent), std::move(child));
+				add_dependency(parent, child);
 			}
 		}
 	}
