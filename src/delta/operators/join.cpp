@@ -661,7 +661,7 @@ GetTransitioningKeySetRef(ClientContext &context, Binder &binder, LogicalGet *ba
 // silently otherwise, matching this file's existing unsupported-shape convention).
 static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Binder &binder, LogicalOperator *node,
                                           const vector<JoinLeafInfo> &leaves, uint64_t leaf_has_delta_mask,
-                                          const string &view_name,
+                                          const string &view_name, bool portable_anti_guard,
                                           map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
                                           vector<TransitioningKeyCTEDefinition> &transition_ctes,
                                           vector<size_t> &path) {
@@ -727,11 +727,37 @@ static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Binder &binder
 						auto anti_condition = make_uniq<BoundComparisonExpression>(
 						    ExpressionType::COMPARE_EQUAL, std::move(left_expr), std::move(right_expr));
 						auto &other_subtree = j->children[other_child];
-						auto anti_join = LogicalComparisonJoin::CreateJoin(
-						    context, JoinType::ANTI, JoinRefType::REGULAR, std::move(other_subtree),
-						    std::move(transitioning_keys->node), std::move(anti_condition));
-						anti_join->ResolveOperatorTypes();
-						j->children[other_child] = std::move(anti_join);
+						if (portable_anti_guard) {
+							auto output_count = other_subtree->GetColumnBindings().size();
+							auto mark_join = LogicalComparisonJoin::CreateJoin(
+							    context, JoinType::MARK, JoinRefType::REGULAR, std::move(other_subtree),
+							    std::move(transitioning_keys->node), std::move(anti_condition));
+							auto &mark = mark_join->Cast<LogicalComparisonJoin>();
+							mark.mark_index = binder.GenerateTableIndex();
+							mark.convert_mark_to_semi = false;
+							mark_join->ResolveOperatorTypes();
+
+							auto mark_ref = make_uniq<BoundColumnRefExpression>(LogicalType::BOOLEAN,
+							                                                    ColumnBinding(mark.mark_index, 0));
+							auto keep_unmatched = make_uniq<BoundComparisonExpression>(
+							    ExpressionType::COMPARE_DISTINCT_FROM, std::move(mark_ref),
+							    make_uniq<BoundConstantExpression>(Value::BOOLEAN(true)));
+							auto filter = make_uniq<LogicalFilter>(std::move(keep_unmatched));
+							for (idx_t output_idx = 0; output_idx < output_count; output_idx++) {
+								filter->projection_map.push_back(output_idx);
+							}
+							filter->children.push_back(std::move(mark_join));
+							filter->ResolveOperatorTypes();
+							other_subtree = std::move(filter);
+							OPENIVM_DEBUG_PRINT(
+							    "[DeltaJoin] Rendered transition-key exclusion as portable MARK filter\n");
+						} else {
+							auto anti_join = LogicalComparisonJoin::CreateJoin(
+							    context, JoinType::ANTI, JoinRefType::REGULAR, std::move(other_subtree),
+							    std::move(transitioning_keys->node), std::move(anti_condition));
+							anti_join->ResolveOperatorTypes();
+							other_subtree = std::move(anti_join);
+						}
 						OPENIVM_DEBUG_PRINT("[DeltaJoin] Guarded kept outer join: excluded rows whose key "
 						                    "match-count transitions across zero via leaf %zu's delta\n",
 						                    null_leaf_idx);
@@ -743,18 +769,19 @@ static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Binder &binder
 	for (size_t ci = 0; ci < node->children.size(); ci++) {
 		path.push_back(ci);
 		GuardKeptOuterJoinsForMaskRec(context, binder, node->children[ci].get(), leaves, leaf_has_delta_mask, view_name,
-		                              transition_cte_indexes, transition_ctes, path);
+		                              portable_anti_guard, transition_cte_indexes, transition_ctes, path);
 		path.pop_back();
 	}
 }
 
 static void GuardKeptOuterJoinsForMask(ClientContext &context, Binder &binder, LogicalOperator *node,
                                        const vector<JoinLeafInfo> &leaves, uint64_t leaf_has_delta_mask,
-                                       const string &view_name, map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
+                                       const string &view_name, bool portable_anti_guard,
+                                       map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
                                        vector<TransitioningKeyCTEDefinition> &transition_ctes) {
 	vector<size_t> path;
-	GuardKeptOuterJoinsForMaskRec(context, binder, node, leaves, leaf_has_delta_mask, view_name, transition_cte_indexes,
-	                              transition_ctes, path);
+	GuardKeptOuterJoinsForMaskRec(context, binder, node, leaves, leaf_has_delta_mask, view_name, portable_anti_guard,
+	                              transition_cte_indexes, transition_ctes, path);
 }
 
 void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
@@ -1426,8 +1453,9 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 		if (has_left_join) {
 			uint64_t leaf_has_delta_mask = (~delta_status.empty_mask) & total_terms;
 			if (leaf_has_delta_mask) {
+				bool portable_anti_guard = compile_facts.target_dialect != SqlDialect::DUCKDB;
 				GuardKeptOuterJoinsForMask(context, binder, term.get(), leaves, leaf_has_delta_mask, input.context.view,
-				                           transition_cte_indexes, transition_ctes);
+				                           portable_anti_guard, transition_cte_indexes, transition_ctes);
 			}
 		}
 
