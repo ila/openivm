@@ -1537,9 +1537,10 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 }
 
 static bool HasOnlyInnerJoins(LogicalOperator *node) {
-	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto &join = node->Cast<LogicalComparisonJoin>();
-		if (join.join_type != JoinType::INNER) {
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	    node->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+		auto *join = dynamic_cast<LogicalJoin *>(node);
+		if (!join || join->join_type != JoinType::INNER) {
 			return false;
 		}
 	}
