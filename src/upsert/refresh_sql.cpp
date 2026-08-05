@@ -534,6 +534,7 @@ static void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext 
 	static const char *PLANNING_SETTINGS[] = {
 	    "openivm_adaptive_refresh", "openivm_cost_decay",     "openivm_skip_empty_deltas",
 	    "openivm_fk_pruning",       "openivm_ducklake_nterm", "openivm_scd2_range_join_accel",
+	    "openivm_regular_nterm",
 	};
 	for (auto setting_name : PLANNING_SETTINGS) {
 		CopyOpenIvmSetting(from, to, setting_name);
