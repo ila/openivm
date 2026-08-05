@@ -85,7 +85,7 @@ static vector<string> SourceTablesFromChildren(const DeltaViewModel &model, cons
 	return tables;
 }
 
-static DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
+static DeltaModelNodeKind NodeKindForOperatorInternal(LogicalOperator &op) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET:
 		return DeltaModelNodeKind::SCAN;
@@ -183,6 +183,9 @@ static DeltaRuleKind RuleKindForNode(DeltaModelNodeKind kind, LogicalOperator &o
 static void AddNodeAuxRequirements(DeltaModelNode &node, const DeltaViewModel &model) {
 	if (model.HasDistinctAux() && node.kind == DeltaModelNodeKind::DISTINCT) {
 		AddUnique(node.required_aux_states, DeltaAuxStateKind::DISTINCT_COUNT);
+	}
+	if (model.HasCountDistinctAux() && node.kind == DeltaModelNodeKind::AGGREGATE) {
+		AddUnique(node.required_aux_states, DeltaAuxStateKind::COUNT_DISTINCT);
 	}
 	if (model.HasFilteredGroupCountAux() && node.kind == DeltaModelNodeKind::AGGREGATE) {
 		AddUnique(node.required_aux_states, DeltaAuxStateKind::FILTERED_GROUP_COUNT);
@@ -344,7 +347,7 @@ static idx_t BuildModelNodeForPlan(DeltaViewModel &model, LogicalOperator *op, c
 	}
 
 	DeltaModelNode node;
-	node.kind = NodeKindForOperator(*op);
+	node.kind = NodeKindForOperatorInternal(*op);
 	node.rule = RuleKindForNode(node.kind, *op, model, facts.analysis);
 	node.plan_node = op;
 	node.children = std::move(children);
@@ -519,6 +522,10 @@ AsofWindowPartitionReadsRightSideDirectly(const vector<RefreshMetadata::WindowPa
 
 } // namespace
 
+DeltaModelNodeKind NodeKindForOperator(LogicalOperator &op) {
+	return NodeKindForOperatorInternal(op);
+}
+
 const char *DeltaMaintenanceModeName(DeltaMaintenanceMode mode) {
 	switch (mode) {
 	case DeltaMaintenanceMode::DELTA_ONLY:
@@ -581,6 +588,7 @@ void BuildDeltaModelBaseAffectedDomains(DeltaViewModel &model, const CreateMVPla
 
 void ValidateDeltaViewModelInvariants(const DeltaViewModel &model) {
 	D_ASSERT(!model.HasFeature(DeltaModelFeature::DISTINCT_STATEFUL) || model.HasDistinctAux());
+	D_ASSERT(model.type != RefreshType::COUNT_DISTINCT_INCREMENTAL || model.HasCountDistinctAux());
 	D_ASSERT(!model.HasFeature(DeltaModelFeature::SEMI_ANTI_STATEFUL) || model.HasSemiAntiAux());
 	D_ASSERT(!model.HasFeature(DeltaModelFeature::WINDOW_AFFECTED_PARTITION) ||
 	         !model.window_partition_columns.empty());
@@ -616,7 +624,11 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
                                    const vector<string> &output_names) {
 	model.window_lineage_ops.clear();
 	model.has_projection_lineage = false;
+	model.has_left_join_key_source = false;
+	model.has_left_join_nullable = false;
 	model.projection_lineage = RefreshMetadata::ProjectionKeyLineage();
+	model.left_join_key_source = RefreshMetadata::LeftJoinKeySource();
+	model.left_join_nullable_sources = RefreshMetadata::LeftJoinNullableSources();
 	model.lineage_facts.clear();
 	for (auto &node : model.nodes) {
 		node.lineage_facts.clear();
@@ -629,10 +641,8 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 		if (analysis.found_asof_join &&
 		    (!has_lineage || AsofWindowPartitionReadsRightSideDirectly(direct_lineage_ops, model) ||
 		     !WindowLineageCoversAllSources(model.window_lineage_ops, facts))) {
-			model.type = RefreshType::CURRENT_DIFF_RECOMPUTE;
+			model.type = RefreshType::FULL_REFRESH;
 			model.window_lineage_ops.clear();
-			AddUnique(model.features, DeltaModelFeature::CURRENT_DIFF_RECOMPUTE);
-			AddUnique(model.strategy_reasons, DeltaStrategyReason::ASOF_CURRENT_DIFF_RECOMPUTE);
 			ValidateDeltaViewModelInvariants(model);
 			return;
 		}
@@ -693,6 +703,19 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 			AddAffectedDomain(model, std::move(domain));
 		}
 	}
+	if (model.type == RefreshType::SIMPLE_PROJECTION && !analysis.found_full_outer) {
+		if (analysis.found_left_join && BuildLeftJoinKeySource(facts, model.left_join_key_source)) {
+			model.has_left_join_key_source = true;
+			DeltaLineageFact fact;
+			fact.kind = DeltaLineageKind::PROJECTION_KEY;
+			fact.source_table = model.left_join_key_source.table;
+			fact.source_occurrence = model.left_join_key_source.occurrence;
+			fact.source_column = model.left_join_key_source.column;
+			fact.output_column = openivm::LEFT_KEY_COL;
+			AddLineageFact(model, std::move(fact));
+		}
+		model.has_left_join_nullable = BuildLeftJoinNullableSources(facts, model.left_join_nullable_sources);
+	}
 	if (model.HasSemiAntiAux()) {
 		for (auto &col : model.semi_anti_aux.left_cols) {
 			DeltaLineageFact fact;
@@ -713,6 +736,12 @@ string BuildDeltaViewModelLineageJson(const DeltaViewModel &model) {
 	}
 	if (model.has_projection_lineage) {
 		entries.push_back(RefreshMetadata::ProjectionKeyLineageToJson(model.projection_lineage));
+	}
+	if (model.has_left_join_key_source) {
+		entries.push_back(RefreshMetadata::LeftJoinKeySourceToJson(model.left_join_key_source));
+	}
+	if (model.has_left_join_nullable) {
+		entries.push_back(RefreshMetadata::LeftJoinNullableSourcesToJson(model.left_join_nullable_sources));
 	}
 	return BuildRefreshLineageJson(entries);
 }

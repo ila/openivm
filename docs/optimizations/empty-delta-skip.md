@@ -47,6 +47,10 @@ For example, in a 3-table join where only table A changed, 6 of the 7 inclusion-
 terms contain either B's or C's empty delta and are skipped — only the 1 term with A's
 delta alone is generated.
 
+The adaptive cost model uses the same signal. Empty source deltas do not contribute
+active join terms, so `PRAGMA refresh_cost` estimates the work for the terms that can
+actually produce rows.
+
 ## What Is Avoided
 
 | Step | Skipped |
@@ -60,10 +64,10 @@ delta alone is generated.
 
 | Setting | Default | Description |
 |---|---|---|
-| `openivm_skip_empty_deltas` | `true` | Enable empty-delta skipping (early-exit + per-term DuckLake skip) |
+| `openivm_skip_empty_deltas` | `true` | Enable empty-delta skipping (early-exit + per-term join skip) |
 
 ```sql
-SET openivm_skip_empty_deltas = false;  -- disable: always run full refresh pipeline
+SET openivm_skip_empty_deltas = false;  -- disable: always run the refresh pipeline
 ```
 
 ## When It Does Not Apply
@@ -71,3 +75,6 @@ SET openivm_skip_empty_deltas = false;  -- disable: always run full refresh pipe
 - At least one delta table contains rows (standard) or snapshot IDs differ (DuckLake)
 - View type is `FULL_REFRESH` (unsupported operators always recompute)
 - `openivm_skip_empty_deltas` is set to `false`
+
+When the setting is `false`, an empty-delta refresh still executes the selected refresh
+path. The adaptive cost model includes this fixed overhead in `PRAGMA refresh_cost`.

@@ -1,0 +1,295 @@
+# name: test/sql/scd2_range_join_accel.test
+# description: SCD-2 range-join delta timestamp-domain acceleration
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE off_fact(id INT, dim_id INT, ts TIMESTAMP, amount INT);
+
+statement ok
+CREATE TABLE off_dim(dim_id INT, attr VARCHAR, effective_timestamp TIMESTAMP, end_timestamp TIMESTAMP);
+
+statement ok
+INSERT INTO off_fact VALUES (1, 10, '2024-01-15', 100), (2, 10, '2024-02-10', 200), (3, 20, '2024-01-20', 300);
+
+statement ok
+INSERT INTO off_dim VALUES (10, 'old', '2024-01-01', '2024-02-01'), (10, 'new', '2024-02-01', '9999-12-31'), (20, 'beta', '2024-01-01', '9999-12-31');
+
+statement ok
+SET openivm_scd2_range_join_accel = false;
+
+statement ok
+CREATE MATERIALIZED VIEW off_mv_scd2 AS
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM off_fact f
+    JOIN off_dim d
+      ON f.dim_id = d.dim_id
+     AND d.effective_timestamp <= f.ts
+     AND f.ts < d.end_timestamp;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM off_fact f JOIN off_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+    EXCEPT ALL
+    SELECT id, dim_id, ts, amount, attr FROM off_mv_scd2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dim_id, ts, amount, attr FROM off_mv_scd2
+    EXCEPT ALL
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM off_fact f JOIN off_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+);
+----
+0
+
+statement ok
+INSERT INTO off_fact VALUES (4, 10, '2024-03-10', 400);
+
+query I
+SELECT COALESCE(bool_or(contains(sql, 'SELECT MIN(ts)')), false)
+FROM openivm_compile_with_facts('off_mv_scd2', '{"target_dialect":"duckdb","compile_only":true}');
+----
+false
+
+statement ok
+PRAGMA refresh('off_mv_scd2');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM off_fact f JOIN off_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+    EXCEPT ALL
+    SELECT id, dim_id, ts, amount, attr FROM off_mv_scd2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dim_id, ts, amount, attr FROM off_mv_scd2
+    EXCEPT ALL
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM off_fact f JOIN off_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+);
+----
+0
+
+statement ok
+UPDATE off_dim SET end_timestamp = '2024-03-01' WHERE dim_id = 10 AND attr = 'new';
+
+statement ok
+INSERT INTO off_dim VALUES (10, 'latest', '2024-03-01', '9999-12-31');
+
+statement ok
+PRAGMA refresh('off_mv_scd2');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM off_fact f JOIN off_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+    EXCEPT ALL
+    SELECT id, dim_id, ts, amount, attr FROM off_mv_scd2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dim_id, ts, amount, attr FROM off_mv_scd2
+    EXCEPT ALL
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM off_fact f JOIN off_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+);
+----
+0
+
+statement ok
+INSERT INTO off_fact VALUES (5, 10, '2024-04-10', 500);
+
+statement ok
+UPDATE off_dim SET end_timestamp = '2024-04-01' WHERE dim_id = 10 AND attr = 'latest';
+
+statement ok
+INSERT INTO off_dim VALUES (10, 'future', '2024-04-01', '9999-12-31');
+
+statement ok
+PRAGMA refresh('off_mv_scd2');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM off_fact f JOIN off_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+    EXCEPT ALL
+    SELECT id, dim_id, ts, amount, attr FROM off_mv_scd2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dim_id, ts, amount, attr FROM off_mv_scd2
+    EXCEPT ALL
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM off_fact f JOIN off_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+);
+----
+0
+
+statement ok
+CREATE TABLE on_fact(id INT, dim_id INT, ts TIMESTAMP, amount INT);
+
+statement ok
+CREATE TABLE on_dim(dim_id INT, attr VARCHAR, effective_timestamp TIMESTAMP, end_timestamp TIMESTAMP);
+
+statement ok
+INSERT INTO on_fact VALUES (1, 10, '2024-01-15', 100), (2, 10, '2024-02-10', 200), (3, 20, '2024-01-20', 300);
+
+statement ok
+INSERT INTO on_dim VALUES (10, 'old', '2024-01-01', '2024-02-01'), (10, 'new', '2024-02-01', '9999-12-31'), (20, 'beta', '2024-01-01', '9999-12-31');
+
+statement ok
+SET openivm_scd2_range_join_accel = true;
+
+statement ok
+CREATE MATERIALIZED VIEW on_mv_scd2 AS
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM on_fact f
+    JOIN on_dim d
+      ON f.dim_id = d.dim_id
+     AND d.effective_timestamp <= f.ts
+     AND f.ts < d.end_timestamp;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM on_fact f JOIN on_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+    EXCEPT ALL
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
+    EXCEPT ALL
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM on_fact f JOIN on_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+);
+----
+0
+
+statement ok
+INSERT INTO on_fact VALUES (4, 10, '2024-03-10', 400);
+
+query I
+SELECT COALESCE(bool_or(contains(sql, 'SELECT MIN(ts)')), false)
+FROM openivm_compile_with_facts('on_mv_scd2', '{"target_dialect":"duckdb","compile_only":true}');
+----
+true
+
+statement ok
+PRAGMA refresh('on_mv_scd2');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM on_fact f JOIN on_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+    EXCEPT ALL
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
+    EXCEPT ALL
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM on_fact f JOIN on_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+);
+----
+0
+
+statement ok
+UPDATE on_dim SET end_timestamp = '2024-03-01' WHERE dim_id = 10 AND attr = 'new';
+
+statement ok
+INSERT INTO on_dim VALUES (10, 'latest', '2024-03-01', '9999-12-31');
+
+statement ok
+PRAGMA refresh('on_mv_scd2');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM on_fact f JOIN on_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+    EXCEPT ALL
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
+    EXCEPT ALL
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM on_fact f JOIN on_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+);
+----
+0
+
+statement ok
+INSERT INTO on_fact VALUES (5, 10, '2024-04-10', 500);
+
+statement ok
+UPDATE on_dim SET end_timestamp = '2024-04-01' WHERE dim_id = 10 AND attr = 'latest';
+
+statement ok
+INSERT INTO on_dim VALUES (10, 'future', '2024-04-01', '9999-12-31');
+
+statement ok
+PRAGMA refresh('on_mv_scd2');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM on_fact f JOIN on_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+    EXCEPT ALL
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
+    EXCEPT ALL
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
+    FROM on_fact f JOIN on_dim d
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
+);
+----
+0

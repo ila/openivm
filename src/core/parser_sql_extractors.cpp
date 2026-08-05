@@ -77,6 +77,9 @@ static bool StartsAnyKeywordToken(const string &text, size_t pos, std::initializ
 	return false;
 }
 
+static size_t FindTopLevelKeywordToken(const string &text, const string &keyword, size_t from);
+static size_t FindMatchingParen(const string &text, size_t open_pos);
+
 /// Extract a `(SELECT DISTINCT cols FROM source [WHERE p])` subquery from the
 /// user's CREATE-MV SQL. Single-source v0 — succeeds only for the simple shape
 /// where the DISTINCT body has exactly one base table after FROM (joins/CTEs
@@ -280,6 +283,32 @@ bool ExtractInnerDistinct(const string &original_sql, vector<string> &out_cols, 
 	return true;
 }
 
+static vector<string> SplitTopLevelCsv(const string &text) {
+	vector<string> result;
+	int depth = 0;
+	size_t last = 0;
+	for (size_t i = 0; i < text.size(); i++) {
+		if (text[i] == '(') {
+			depth++;
+		} else if (text[i] == ')' && depth > 0) {
+			depth--;
+		} else if (text[i] == ',' && depth == 0) {
+			string item = text.substr(last, i - last);
+			StringUtil::Trim(item);
+			if (!item.empty()) {
+				result.push_back(std::move(item));
+			}
+			last = i + 1;
+		}
+	}
+	string item = text.substr(last);
+	StringUtil::Trim(item);
+	if (!item.empty()) {
+		result.push_back(std::move(item));
+	}
+	return result;
+}
+
 static bool ReadIdentifierToken(const string &sql, size_t &pos, string &out) {
 	while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
 		pos++;
@@ -311,6 +340,148 @@ static bool ReadIdentifierToken(const string &sql, size_t &pos, string &out) {
 	}
 	out = sql.substr(start, pos - start);
 	return !out.empty();
+}
+
+static bool ReadSingleSourceFrom(const string &original_sql, const string &lower, size_t from_pos, string &out_source,
+                                 size_t &out_after_source) {
+	size_t pos = from_pos + strlen("from");
+	while (pos < lower.size() && std::isspace(static_cast<unsigned char>(lower[pos]))) {
+		pos++;
+	}
+	if (pos >= lower.size() || lower[pos] == '(') {
+		return false;
+	}
+	size_t src_end = pos;
+	bool in_quote = false;
+	while (src_end < lower.size()) {
+		char c = lower[src_end];
+		if (in_quote) {
+			if (c == '"') {
+				in_quote = false;
+			}
+			src_end++;
+			continue;
+		}
+		if (c == '"') {
+			in_quote = true;
+			src_end++;
+			continue;
+		}
+		if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.') {
+			src_end++;
+			continue;
+		}
+		break;
+	}
+	out_source = original_sql.substr(pos, src_end - pos);
+	if (out_source.empty()) {
+		return false;
+	}
+	size_t after = src_end;
+	while (after < lower.size() && std::isspace(static_cast<unsigned char>(lower[after]))) {
+		after++;
+	}
+	if (after < lower.size() && lower[after] != ',' && lower[after] != ')' &&
+	    !StartsAnyKeywordToken(lower, after,
+	                           {"where", "group", "order", "having", "limit", "union", "join", "left", "right", "inner",
+	                            "full", "cross", "on"})) {
+		while (after < lower.size() &&
+		       (std::isalnum(static_cast<unsigned char>(lower[after])) || lower[after] == '_')) {
+			after++;
+		}
+		while (after < lower.size() && std::isspace(static_cast<unsigned char>(lower[after]))) {
+			after++;
+		}
+	}
+	if (after < lower.size() &&
+	    (lower[after] == ',' ||
+	     StartsAnyKeywordToken(lower, after, {"join", "left", "right", "inner", "full", "cross"}))) {
+		return false;
+	}
+	out_after_source = after;
+	return true;
+}
+
+bool ExtractCountDistinctAggregate(const string &original_sql, const vector<string> &group_columns,
+                                   const vector<string> &output_names, CountDistinctExtract &out) {
+	if (group_columns.empty()) {
+		return false;
+	}
+	string lower = StringUtil::Lower(original_sql);
+	size_t count_pos = FindKeywordToken(lower, "count", 0);
+	if (count_pos == string::npos || FindKeywordToken(lower, "count", count_pos + 1) != string::npos) {
+		return false;
+	}
+	size_t open = lower.find('(', count_pos + strlen("count"));
+	if (open == string::npos) {
+		return false;
+	}
+	size_t close = FindMatchingParen(lower, open);
+	if (close == string::npos) {
+		return false;
+	}
+	string inner_lower = lower.substr(open + 1, close - open - 1);
+	StringUtil::Trim(inner_lower);
+	if (!StartsKeywordToken(inner_lower, 0, "distinct")) {
+		return false;
+	}
+	string distinct_expr = original_sql.substr(open + 1 + strlen("distinct"), close - open - 1 - strlen("distinct"));
+	StringUtil::Trim(distinct_expr);
+	if (distinct_expr.empty() || distinct_expr == "*" || SplitTopLevelCsv(distinct_expr).size() != 1) {
+		return false;
+	}
+	size_t from_pos = FindTopLevelKeywordToken(lower, "from", 0);
+	size_t group_pos = FindTopLevelKeywordToken(lower, "group", 0);
+	if (from_pos == string::npos || group_pos == string::npos || from_pos > group_pos) {
+		return false;
+	}
+	size_t after_source = string::npos;
+	if (!ReadSingleSourceFrom(original_sql, lower, from_pos, out.source, after_source)) {
+		return false;
+	}
+	size_t where_pos = FindTopLevelKeywordToken(lower, "where", after_source);
+	if (where_pos != string::npos && where_pos < group_pos) {
+		size_t filter_start = where_pos + strlen("where");
+		out.filter = original_sql.substr(filter_start, group_pos - filter_start);
+		StringUtil::Trim(out.filter);
+	} else {
+		out.filter.clear();
+	}
+	size_t by_pos = lower.find("by", group_pos + strlen("group"));
+	if (by_pos == string::npos) {
+		return false;
+	}
+	size_t group_start = by_pos + strlen("by");
+	size_t group_end = original_sql.size();
+	for (auto keyword : {"having", "order", "limit", "union"}) {
+		size_t clause = FindTopLevelKeywordToken(lower, keyword, group_start);
+		if (clause != string::npos && clause < group_end) {
+			group_end = clause;
+		}
+	}
+	out.group_exprs = SplitTopLevelCsv(original_sql.substr(group_start, group_end - group_start));
+	if (out.group_exprs.size() != group_columns.size()) {
+		return false;
+	}
+	out.distinct_expr = distinct_expr;
+	out.distinct_col = SqlUtils::LastIdentifierPart(distinct_expr);
+	if (out.distinct_col.empty() || out.distinct_col == distinct_expr && distinct_expr.find('(') != string::npos) {
+		out.distinct_col = "openivm_distinct_value";
+	}
+	size_t alias_pos = close + 1;
+	while (alias_pos < lower.size() && std::isspace(static_cast<unsigned char>(lower[alias_pos]))) {
+		alias_pos++;
+	}
+	if (StartsKeywordToken(lower, alias_pos, "as")) {
+		alias_pos += strlen("as");
+		if (ReadIdentifierToken(original_sql, alias_pos, out.output_col)) {
+			out.output_col = SqlUtils::LastIdentifierPart(out.output_col);
+		}
+	}
+	if (out.output_col.empty() && output_names.size() > group_columns.size()) {
+		out.output_col = output_names[group_columns.size()];
+	}
+	return !out.output_col.empty();
 }
 
 static size_t FindTopLevelKeywordToken(const string &text, const string &keyword, size_t from) {
@@ -1033,22 +1204,32 @@ static bool ExtractInSubquery(const string &original_sql, SemiAntiExtract &out) 
 	out.left_table = left_table_expr;
 	out.left_alias = left_alias_expr;
 	out.right_alias = "openivm_right";
+	string left_key_expr;
 	if (simple_left_table) {
-		out.predicate = StringUtil::Replace(lhs, out.left_alias + ".", out.left_alias + ".");
-		out.predicate = StringUtil::Replace(out.predicate, SqlUtils::LastIdentifierPart(out.left_table) + ".",
+		left_key_expr = StringUtil::Replace(lhs, out.left_alias + ".", out.left_alias + ".");
+		left_key_expr = StringUtil::Replace(left_key_expr, SqlUtils::LastIdentifierPart(out.left_table) + ".",
 		                                    out.left_alias + ".");
 	} else {
-		out.predicate = out.left_alias + "." + KeywordHelper::WriteOptionallyQuoted(SqlUtils::LastIdentifierPart(lhs));
+		left_key_expr = out.left_alias + "." + KeywordHelper::WriteOptionallyQuoted(SqlUtils::LastIdentifierPart(lhs));
 	}
-	out.predicate += " IS NOT DISTINCT FROM ";
-	out.predicate += StringUtil::Replace(rhs_expr, original_right_alias + ".", out.right_alias + ".");
-	out.predicate =
-	    StringUtil::Replace(out.predicate, SqlUtils::LastIdentifierPart(out.right_table) + ".", out.right_alias + ".");
+	string right_key_expr = StringUtil::Replace(rhs_expr, original_right_alias + ".", out.right_alias + ".");
+	right_key_expr =
+	    StringUtil::Replace(right_key_expr, SqlUtils::LastIdentifierPart(out.right_table) + ".", out.right_alias + ".");
+	out.left_key_col = "openivm_saj_key";
+	out.left_key_expr = left_key_expr;
+	out.right_key_expr = right_key_expr;
+	out.predicate = left_key_expr + " = " + right_key_expr;
 	if (!right_filter.empty()) {
 		string rewritten_filter = StringUtil::Replace(right_filter, original_right_alias + ".", out.right_alias + ".");
 		rewritten_filter = StringUtil::Replace(rewritten_filter, SqlUtils::LastIdentifierPart(out.right_table) + ".",
 		                                       out.right_alias + ".");
-		out.predicate += " AND (" + rewritten_filter + ")";
+		out.right_filter = rewritten_filter;
+	}
+	if (is_anti) {
+		out.null_aware = true;
+		out.null_aware_left_col = "openivm_not_in_lhs_is_null";
+		out.null_aware_left_expr = "(" + left_key_expr + " IS NULL)";
+		out.null_aware_right_expr = right_key_expr;
 	}
 	out.output_cols = std::move(output_cols);
 	out.output_exprs = std::move(output_exprs);

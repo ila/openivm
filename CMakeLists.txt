@@ -57,6 +57,7 @@ set(EXTENSION_SOURCES
     src/upsert/refresh_index_regen.cpp
     src/rules/incremental_rewrite_rule.cpp
     src/rules/refresh_insert_rule.cpp
+    src/rules/transactional_delta_capture.cpp
     src/rules/schema_evolution.cpp
     src/rules/column_hider.cpp
     src/core/refresh_locks.cpp
@@ -131,4 +132,9 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
     add_executable(flag_benchmark benchmark/src/flag_benchmark.cpp)
     target_link_libraries(flag_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
     target_include_directories(flag_benchmark PUBLIC benchmark benchmark/src)
+
+    # Cost-model accuracy benchmark
+    add_executable(cost_model_benchmark benchmark/src/cost_model_benchmark.cpp)
+    target_link_libraries(cost_model_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
+    target_include_directories(cost_model_benchmark PUBLIC benchmark benchmark/src)
 endif()

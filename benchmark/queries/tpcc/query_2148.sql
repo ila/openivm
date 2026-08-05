@@ -1,0 +1,2 @@
+-- {"operators": "FULL_OUTER_JOIN,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER", "openivm_verified": true}
+SELECT COALESCE(c.C_W_ID, o.O_W_ID) AS w_id, COALESCE(c.C_ID, o.O_C_ID) AS c_id, COUNT(o.O_ID) AS order_count, SUM(COALESCE(o.O_OL_CNT, 0)) AS line_count FROM CUSTOMER c FULL OUTER JOIN OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID GROUP BY COALESCE(c.C_W_ID, o.O_W_ID), COALESCE(c.C_ID, o.O_C_ID);

@@ -18,9 +18,8 @@ enum class DeltaStrategyReason {
 	REPEATED_CTE_AGGREGATE_GROUP_FALLBACK,
 	SEMI_ANTI_AGGREGATE_GROUP_FALLBACK,
 	OUTER_JOIN_AGGREGATE_RECOMPUTE,
-	ASOF_CURRENT_DIFF_RECOMPUTE,
-	SAMPLE_CURRENT_DIFF_RECOMPUTE,
-	POSITIONAL_CURRENT_DIFF_RECOMPUTE
+	OUTER_JOIN_PRESERVED_TABLE_FUNCTION_RECOMPUTE,
+	INNER_DISTINCT_PROJECTION_RECOMPUTE
 };
 
 enum class DeltaModelFeature {
@@ -39,7 +38,6 @@ enum class DeltaModelFeature {
 	ASOF_STATEFUL,
 	SAMPLE_GLOBAL_RECOMPUTE,
 	POSITIONAL_GLOBAL_RECOMPUTE,
-	CURRENT_DIFF_RECOMPUTE,
 	FULL_ONLY
 };
 
@@ -95,7 +93,7 @@ enum class DeltaUpdateSemantics {
 	AGGREGATE_DELETE_SKIP_SAFE
 };
 
-enum class DeltaAuxStateKind { DISTINCT_COUNT, FILTERED_GROUP_COUNT, SEMI_ANTI_MATCH };
+enum class DeltaAuxStateKind { DISTINCT_COUNT, COUNT_DISTINCT, FILTERED_GROUP_COUNT, SEMI_ANTI_MATCH };
 
 enum class DeltaAffectedDomainKind { GROUP, WINDOW_PARTITION, PROJECTION_KEY, SEMI_ANTI_PREDICATE };
 
@@ -156,7 +154,9 @@ struct FilteredGroupCountAuxRequirement {
 struct DeltaViewModelInput {
 	const CreateMVPlanFacts *facts = nullptr;
 	const vector<string> *output_names = nullptr;
+	idx_t visible_output_count = DConstants::INVALID_INDEX;
 	const RefreshMetadata::DistinctAuxMeta *distinct_aux_candidate = nullptr;
+	const RefreshMetadata::CountDistinctAuxMeta *count_distinct_aux_candidate = nullptr;
 	const FilteredGroupCountAuxRequirement *filtered_group_count_aux_candidate = nullptr;
 	const RefreshMetadata::SemiAntiAuxMeta *semi_anti_aux_candidate = nullptr;
 	bool has_unsupported_incremental_construct = false;
@@ -165,6 +165,8 @@ struct DeltaViewModelInput {
 	bool stored_query_has_top_k = false;
 	bool has_hidden_minmax_having = false;
 	bool has_computed_minmax_aggregate_projection = false;
+	bool has_computed_sum_aggregate_projection = false;
+	bool has_top_level_redundant_distinct = false;
 	bool has_ducklake_source = false;
 };
 
@@ -182,21 +184,29 @@ struct DeltaViewModel {
 	vector<DeltaLineageFact> lineage_facts;
 	vector<RefreshMetadata::WindowPartitionLineageOp> window_lineage_ops;
 	RefreshMetadata::ProjectionKeyLineage projection_lineage;
+	RefreshMetadata::LeftJoinKeySource left_join_key_source;
+	RefreshMetadata::LeftJoinNullableSources left_join_nullable_sources;
 	idx_t root_node = DConstants::INVALID_INDEX;
 	string full_outer_join_cols;
 	GroupRecomputeAffectedMode group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
 	RefreshMetadata::DistinctAuxMeta distinct_aux;
+	RefreshMetadata::CountDistinctAuxMeta count_distinct_aux;
 	FilteredGroupCountAuxRequirement filtered_group_count_aux;
 	RefreshMetadata::SemiAntiAuxMeta semi_anti_aux;
 	bool has_minmax_metadata = false;
 	bool distinct_at_top = false;
 	bool union_distinct_over_agg = false;
 	bool has_projection_lineage = false;
+	bool has_left_join_key_source = false;
+	bool has_left_join_nullable = false;
 	bool warn_unsupported_incremental = false;
 	bool warn_unrecognized_pattern = false;
 
 	bool HasDistinctAux() const {
 		return !distinct_aux.aux_table.empty();
+	}
+	bool HasCountDistinctAux() const {
+		return !count_distinct_aux.aux_table.empty();
 	}
 	bool HasFilteredGroupCountAux() const {
 		return !filtered_group_count_aux.meta.aux_table.empty();
@@ -215,7 +225,7 @@ const char *DeltaRuleKindName(DeltaRuleKind kind);
 const char *DeltaUnsupportedReasonName(DeltaUnsupportedReason reason);
 const char *DeltaUpdateSemanticsName(DeltaUpdateSemantics semantics);
 const char *DeltaAffectedDomainKindName(DeltaAffectedDomainKind kind);
-bool IsDistinctAtTop(const PlanAnalysis &analysis, const vector<string> &output_names);
+bool IsDistinctAtTop(const CreateMVPlanFacts &facts, const vector<string> &output_names);
 DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input);
 
 } // namespace duckdb

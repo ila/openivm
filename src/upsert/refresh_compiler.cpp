@@ -7,6 +7,7 @@
 #include "upsert/refresh_internal.hpp"
 
 #include <cctype>
+#include <limits>
 
 namespace duckdb {
 
@@ -329,9 +330,69 @@ static string BuildUpdatedAggregateColumn(const string &col) {
 	return "COALESCE(v." + col + " + d." + col + ", v." + col + ", d." + col + ")";
 }
 
+static string BuildNullableSum(const string &sum_expr, const string &count_expr) {
+	return "CASE WHEN " + count_expr + " = 0 THEN NULL ELSE " + sum_expr + " END";
+}
+
 static string BuildNullSafeExtremumUpdate(const string &col, const string &fn) {
 	return "CASE WHEN v." + col + " IS NULL THEN d." + col + " WHEN d." + col + " IS NULL THEN v." + col + " ELSE " +
 	       fn + "(v." + col + ", d." + col + ") END";
+}
+
+static string SubstituteDerivedOutputColumns(const string &expression_sql,
+                                             const unordered_map<string, string> &replacements) {
+	string result;
+	result.reserve(expression_sql.size());
+	for (idx_t i = 0; i < expression_sql.size();) {
+		if (expression_sql[i] == '\'') {
+			idx_t start = i++;
+			while (i < expression_sql.size()) {
+				if (expression_sql[i++] != '\'') {
+					continue;
+				}
+				if (i < expression_sql.size() && expression_sql[i] == '\'') {
+					i++;
+					continue;
+				}
+				break;
+			}
+			result.append(expression_sql, start, i - start);
+			continue;
+		}
+		if (expression_sql[i] != '"') {
+			result += expression_sql[i++];
+			continue;
+		}
+
+		idx_t start = i++;
+		string identifier;
+		bool closed = false;
+		while (i < expression_sql.size()) {
+			if (expression_sql[i] != '"') {
+				identifier += expression_sql[i++];
+				continue;
+			}
+			if (i + 1 < expression_sql.size() && expression_sql[i + 1] == '"') {
+				identifier += '"';
+				i += 2;
+				continue;
+			}
+			i++;
+			closed = true;
+			break;
+		}
+		if (!closed) {
+			result.append(expression_sql, start, expression_sql.size() - start);
+			break;
+		}
+		auto replacement = replacements.find(identifier);
+		if (replacement != replacements.end()) {
+			result += replacement->second;
+		} else {
+			result.append(expression_sql, start, i - start);
+		}
+	}
+	return result;
 }
 
 static string BuildAvgFormula(const string &sum_expr, const string &count_expr) {
@@ -356,7 +417,8 @@ static string BuildGuardedVarianceFormula(const string &sum_expr, const string &
 
 /// Detect AVG and STDDEV/VARIANCE decomposition columns from the column list.
 /// AVG(x) is stored as openivm_sum_<alias>, openivm_count_<alias>, and <alias>.
-/// STDDEV/VARIANCE(x) adds a sum-of-squares column with a prefix encoding the function type:
+/// STDDEV/VARIANCE(x) adds a sum-of-squares column with a prefix encoding the
+/// function type:
 ///   openivm_sum_sq_  = stddev_samp (apply sqrt, denominator N-1)
 ///   openivm_var_sq_  = var_samp    (no sqrt, denominator N-1)
 ///   openivm_sum_sqp_ = stddev_pop  (apply sqrt, denominator N)
@@ -371,7 +433,8 @@ struct DerivedAggDecomposition {
 	unordered_map<string, bool> is_population; // alias → true if population variant
 };
 
-/// Try to match a column against a prefix. Returns the alias suffix if matched, empty string otherwise.
+/// Try to match a column against a prefix. Returns the alias suffix if matched,
+/// empty string otherwise.
 static string MatchPrefix(const string &col, const string &prefix) {
 	if (col.size() > prefix.size() && col.substr(0, prefix.size()) == prefix) {
 		return col.substr(prefix.size());
@@ -438,6 +501,32 @@ static DerivedAggDecomposition DetectDerivedAggColumns(const vector<string> &col
 	return result;
 }
 
+static unordered_map<string, string> DetectSumNullCountColumns(const vector<string> &columns) {
+	unordered_map<string, string> result;
+	const string prefix = openivm::SUM_COUNT_COL_PREFIX;
+	for (auto &column : columns) {
+		if (column.size() <= prefix.size() || column.compare(0, prefix.size(), prefix) != 0) {
+			continue;
+		}
+		idx_t projection_index = 0;
+		for (idx_t i = prefix.size(); i < column.size(); i++) {
+			if (!std::isdigit(static_cast<unsigned char>(column[i]))) {
+				throw InternalException("Invalid SUM count state column '%s'", column);
+			}
+			idx_t digit = column[i] - '0';
+			if (projection_index > (std::numeric_limits<idx_t>::max() - digit) / 10) {
+				throw InternalException("Invalid SUM count state column '%s'", column);
+			}
+			projection_index = projection_index * 10 + digit;
+		}
+		if (projection_index >= columns.size()) {
+			throw InternalException("Invalid SUM count state column '%s'", column);
+		}
+		result[SqlUtils::QuoteIdentifier(columns[projection_index])] = SqlUtils::QuoteIdentifier(column);
+	}
+	return result;
+}
+
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
                               bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
@@ -445,7 +534,16 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
                               const vector<LogicalType> &column_types, bool use_current_diff_affected_keys,
                               const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs,
                               const string &cascade_lpts_table_prefix, bool emit_cascade_delta,
-                              bool *out_handled_cascade_delta) {
+                              bool inline_cascade_delta, bool *out_handled_cascade_delta,
+                              const unordered_map<string, string> &derived_output_expressions,
+                              bool derived_output_expressions_complete, const vector<string> &preserved_side_cols,
+                              bool *out_used_group_recompute, bool force_group_recompute) {
+	if (out_used_group_recompute) {
+		*out_used_group_recompute = false;
+	}
+	auto is_preserved_side = [&](const string &c) {
+		return std::find(preserved_side_cols.begin(), preserved_side_cols.end(), c) != preserved_side_cols.end();
+	};
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 
@@ -466,15 +564,30 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 
 	unordered_set<std::string> keys_set(keys.begin(), keys.end());
 	vector<string> aggregates;
+	unordered_map<string, string> aggregate_raw_names;
+	unordered_map<string, string> quoted_derived_output_expressions;
+	const bool use_derived_output_merge =
+	    insert_only && has_minmax && derived_output_expressions_complete && !derived_output_expressions.empty();
+	if (use_derived_output_merge) {
+		for (auto &entry : derived_output_expressions) {
+			quoted_derived_output_expressions[SqlUtils::QuoteIdentifier(entry.first)] = entry.second;
+		}
+		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] insert-only derived-output "
+		                    "MERGE for '%s' (%zu outputs)\n",
+		                    view_name.c_str(), quoted_derived_output_expressions.size());
+	}
 	// Parallel: true if the matching aggregate column has a non-summable delta type
 	// (VARCHAR CASE output, 'GC' literal, UPPER(group_col), LIST(col), etc.).
-	bool has_non_summable_col = false;
+	unordered_set<string> non_summable_columns;
 	for (size_t i = 0; i < column_names.size(); i++) {
 		const auto &column = column_names[i];
 		if (keys_set.find(column) == keys_set.end() && column != string(openivm::MULTIPLICITY_COL)) {
-			aggregates.push_back(SqlUtils::QuoteIdentifier(column));
-			if (i < column_types.size() && !IsSummableLogicalType(column_types[i])) {
-				has_non_summable_col = true;
+			string quoted_column = SqlUtils::QuoteIdentifier(column);
+			aggregates.push_back(quoted_column);
+			aggregate_raw_names[quoted_column] = column;
+			if (i < column_types.size() && !IsSummableLogicalType(column_types[i]) &&
+			    !quoted_derived_output_expressions.count(quoted_column)) {
+				non_summable_columns.insert(quoted_column);
 			}
 		}
 	}
@@ -483,9 +596,19 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// This is correct for VARCHAR literals, string functions of group keys, LIST
 	// aggregates, and CASE over aggregates alike. Slower than MERGE, faster than
 	// full recompute (only affected groups are re-evaluated).
-	bool needs_group_recompute = has_non_summable_col;
+	bool needs_group_recompute = force_group_recompute;
+	if (insert_only && has_minmax && !derived_output_expressions_complete) {
+		needs_group_recompute = true;
+		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] incomplete derived-output metadata for '%s' "
+		                    "→ group-recompute\n",
+		                    view_name.c_str());
+	}
+	if (force_group_recompute) {
+		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] caller requires affected-group recompute\n");
+	}
 
 	auto decomp = DetectDerivedAggColumns(aggregates);
+	auto sum_null_count_cols = DetectSumNullCountColumns(column_names);
 
 	// Detect AVG/STDDEV-derived columns that can't be maintained incrementally.
 	//
@@ -510,7 +633,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	for (auto &alias : decomp.derived_cols) {
 		if (!aggregate_set.count(SqlUtils::QuoteIdentifier(alias)) && !aggregate_set.count(alias)) {
 			has_orphan_derived = true;
-			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] Orphan derived alias '%s' → group-recompute\n",
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] Orphan derived alias '%s' "
+			                    "→ group-recompute\n",
 			                    alias.c_str());
 			break;
 		}
@@ -561,6 +685,11 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				// Same — the COUNT half of an AVG/STDDEV decomposition.
 				continue;
 			}
+			if (column.find(string(openivm::SUM_COUNT_COL_PREFIX)) == 0) {
+				// SUM NULL-state counts are injected after AnalyzePlan captures
+				// aggregate_types, so they do not consume a metadata slot.
+				continue;
+			}
 			// openivm_match_count / openivm_right_match_count are added by
 			// RewriteLeftJoinMatchCount *after* AnalyzePlan captures aggregate_types,
 			// so aggregate_types does NOT include them. Exclude them here for a
@@ -575,7 +704,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		}
 		if (non_decomposed_type_count > total_agg_col_count) {
 			has_computed_over_derived = true;
-			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] %llu non-decomposed aggregate types > %llu agg columns "
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] %llu non-decomposed "
+			                    "aggregate types > %llu agg columns "
 			                    "→ group-recompute\n",
 			                    (unsigned long long)non_decomposed_type_count, (unsigned long long)total_agg_col_count);
 		}
@@ -594,14 +724,34 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				}
 				if (probe_idx >= aggregate_types.size()) {
 					has_computed_over_derived = true;
-					OPENIVM_DEBUG_PRINT(
-					    "[CompileAggregateGroups] Column orphan '%s' over derived aggregates → group-recompute\n",
-					    column.c_str());
+					OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] Column orphan '%s' "
+					                    "over derived aggregates → group-recompute\n",
+					                    column.c_str());
 					break;
 				}
 				probe_idx++;
 			}
 		}
+	}
+
+	// The Larson & Zhou LEFT JOIN template below has its own column formulas.
+	// Until it reconstructs projected expressions and insert-only extrema from
+	// the same expression map, keep these shapes on the exact affected-group
+	// recompute path.
+	string match_count_col;
+	bool has_match_count = false;
+	for (auto &column : aggregates) {
+		if (column == SqlUtils::QuoteIdentifier(string(openivm::MATCH_COUNT_COL))) {
+			has_match_count = true;
+			match_count_col = column;
+			break;
+		}
+	}
+	if (has_match_count && (use_derived_output_merge || (insert_only && has_minmax))) {
+		needs_group_recompute = true;
+		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] LEFT JOIN fast-path formula is not supported for '%s' "
+		                    "→ group-recompute\n",
+		                    view_name.c_str());
 	}
 	if (has_orphan_derived || has_computed_over_derived) {
 		needs_group_recompute = true;
@@ -632,9 +782,9 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		}
 		if (has_minmax && !has_real_minmax) {
 			needs_group_recompute = true;
-			OPENIVM_DEBUG_PRINT(
-			    "[CompileAggregateGroups] has_minmax=true with no MIN/MAX in agg_types — LEFT JOIN + computed "
-			    "aggregate case → group-recompute\n");
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] has_minmax=true with no "
+			                    "MIN/MAX in agg_types — LEFT JOIN + computed "
+			                    "aggregate case → group-recompute\n");
 		}
 	}
 
@@ -649,7 +799,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	if (!aggregate_types.empty()) {
 		idx_t type_idx = 0;
 		for (auto &column : aggregates) {
-			if (decomp.derived_cols.count(column) || column.find("openivm_") != string::npos) {
+			if (quoted_derived_output_expressions.count(column) || decomp.derived_cols.count(column) ||
+			    column.find("openivm_") != string::npos) {
 				continue;
 			}
 			// Skip decomposed aggregate_types entries (avg → SUM+COUNT hidden cols)
@@ -660,11 +811,32 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				col_agg_type[column] = aggregate_types[type_idx++];
 			}
 		}
-		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] agg_type map: %zu entries from %zu types, %zu aggregates\n",
+		OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] agg_type map: %zu entries "
+		                    "from %zu types, %zu aggregates\n",
 		                    col_agg_type.size(), aggregate_types.size(), aggregates.size());
 	}
 
+	// Non-numeric aggregates normally cannot use the delta-sum MERGE. A
+	// caller-proven insert-only MIN/MAX is different: its delta is consolidated
+	// with MIN/MAX and merged with LEAST/GREATEST, which is valid for ordered
+	// types such as TIMESTAMP as well as numeric types.
+	for (auto &column : non_summable_columns) {
+		string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
+		if (!(insert_only && (agg_type == "min" || agg_type == "max"))) {
+			needs_group_recompute = true;
+			break;
+		}
+	}
+
 	if (needs_group_recompute || (has_minmax && !insert_only)) {
+		// Tell the caller this call recomputes affected groups from the base tables rather than
+		// applying delta arithmetic. Callers that inject extra delta-table rows purely to correct the
+		// MERGE arithmetic (e.g. the LEFT JOIN pipeline secondary delta) should skip that injection
+		// here: group-recompute rebuilds each affected group from the base tables, so the correction
+		// is recomputed anyway and the extra rows only widen the affected-group set.
+		if (out_used_group_recompute) {
+			*out_used_group_recompute = true;
+		}
 		// Cascade-delta dispatch: when the caller (refresh_sql.cpp) requested cascade-delta
 		// emission AND we have the inputs CompileGroupRecompute needs (non-empty group_columns,
 		// non-empty delta_specs), route through the snapshot+signed-multiset path so the
@@ -672,14 +844,15 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// LPTS sum-delta + NULL companion pair (which is wrong for MIN/MAX and breaks
 		// SIMPLE_PROJECTION-with-JOIN downstreams).
 		if (emit_cascade_delta && cascade_delta_specs && !cascade_delta_specs->empty() && !group_column_names.empty()) {
-			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] cascade-delta requested + recompute branch → dispatching "
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] cascade-delta requested + recompute branch "
+			                    "→ dispatching "
 			                    "to CompileGroupRecompute(emit_cascade_delta=true)\n");
 			if (out_handled_cascade_delta) {
 				*out_handled_cascade_delta = true;
 			}
 			return CompileGroupRecompute(view_name, view_query_sql, group_column_names, *cascade_delta_specs,
-			                             catalog_prefix, cascade_lpts_table_prefix, /*emit_cascade_delta=*/true,
-			                             GroupRecomputeAffectedMode::SOURCE_DELTA);
+			                             catalog_prefix, cascade_lpts_table_prefix,
+			                             /*emit_cascade_delta=*/true, GroupRecomputeAffectedMode::SOURCE_DELTA);
 		}
 		// Group-recompute strategy: delete affected groups, re-insert from original query.
 		// Always triggered by non-summable columns (LIST aggregates, VARCHAR literals,
@@ -689,7 +862,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		// For MIN/MAX without non-summable cols, insert_only uses GREATEST/LEAST in
 		// the MERGE path below.
 		if (use_current_diff_affected_keys && !view_query_sql.empty()) {
-			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] using current-diff affected keys for '%s'\n",
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] using current-diff "
+			                    "affected keys for '%s'\n",
 			                    view_name.c_str());
 			return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, keys);
 		}
@@ -698,14 +872,30 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		string match_insert = SqlUtils::BuildNullSafeKeyPredicate(keys, "openivm_aff.", "openivm_recompute.");
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 		string affected = "select distinct " + keys_tuple + " from " + delta_view + delta_where;
+		// index_delta_view_catalog_entry non-null means the DATA table carries the UNIQUE index that
+		// parser.cpp creates for AGGREGATE_GROUP / AGGREGATE_HAVING views. DuckDB's on-disk unique
+		// index keeps deleted keys for constraint checking within a transaction, so the plain
+		// DELETE-then-INSERT form raises a spurious duplicate-key error for every group that survives
+		// the recompute. Use the upsert form there. Without the index (DuckLake, group_column_names
+		// fallback) INSERT OR REPLACE is not usable, and plain DELETE+INSERT is already safe.
+		vector<string> upsert_keys;
+		string recompute_temp;
+		if (index_delta_view_catalog_entry) {
+			upsert_keys = keys;
+			recompute_temp = SqlUtils::QuoteIdentifier("openivm_recompute_" + view_name);
+		}
 		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, "  " + affected, "openivm_tgt",
-		                                  "openivm_recompute", "openivm_aff", match_delete, match_insert);
+		                                  "openivm_recompute", "openivm_aff", match_delete, match_insert,
+		                                  /*affected_temp_table=*/"", upsert_keys, recompute_temp);
 	}
 
 	// CTE: consolidate deltas per group
 	string cte_select_string = "select ";
 	cte_select_string += SqlUtils::JoinQuotedColumns(keys) + ", ";
 	for (auto &column : aggregates) {
+		if (quoted_derived_output_expressions.count(column)) {
+			continue;
+		}
 		string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
 		if (insert_only && agg_type == "min") {
 			// Insert-only MIN: consolidate with MIN (new min can only be <= current)
@@ -716,9 +906,11 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		} else if (list_mode) {
 			// Z-set bag-aware list sum: per-row scale every element by the row's weight,
 			// then list_reduce-add across the group.
-			cte_select_string +=
-			    "\n\tlist_reduce(list(list_transform(" + column + ", lambda x: " + string(openivm::MULTIPLICITY_COL) +
-			    " * x)), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS " + column + ", ";
+			cte_select_string += "\n\tlist_reduce(list(list_transform(" + column +
+			                     ", lambda x: " + string(openivm::MULTIPLICITY_COL) +
+			                     " * x)), lambda a, b: list_transform(list_zip(a, "
+			                     "b), lambda x: x[1] + x[2])) AS " +
+			                     column + ", ";
 		} else {
 			// Z-set bag-aware sum: weight w∈ℤ scales the column value before SUM.
 			cte_select_string = cte_select_string + "\n\tsum(" + string(openivm::MULTIPLICITY_COL) + " * " + column +
@@ -745,15 +937,57 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	auto &d_sum_sq_cols = decomp.sum_sq_cols;
 	auto &d_count_cols = decomp.count_cols;
 
-	// Detect openivm_match_count for LEFT JOIN incremental MERGE (Larson & Zhou).
-	// When present, use COALESCE(v.col, 0) for aggregate updates to handle NULL→value transitions.
-	string match_count_col;
-	bool has_match_count = false;
-	for (auto &col : aggregates) {
-		if (col == SqlUtils::QuoteIdentifier(string(openivm::MATCH_COUNT_COL))) {
-			has_match_count = true;
-			match_count_col = col;
-			break;
+	unordered_map<string, string> updated_column_expressions;
+	unordered_map<string, string> inserted_column_expressions;
+	for (auto &key : keys) {
+		updated_column_expressions[key] = "v." + SqlUtils::QuoteIdentifier(key);
+		inserted_column_expressions[key] = "d." + SqlUtils::QuoteIdentifier(key);
+	}
+	for (auto &column : aggregates) {
+		if (quoted_derived_output_expressions.count(column)) {
+			continue;
+		}
+		const string &raw_column = aggregate_raw_names.at(column);
+		if (derived_cols.count(column)) {
+			string sum_col = d_sum_cols.count(column) ? d_sum_cols.at(column) : "";
+			string count_col = d_count_cols.count(column) ? d_count_cols.at(column) : "";
+			if (sum_col.empty() || count_col.empty()) {
+				updated_column_expressions[raw_column] = BuildUpdatedAggregateColumn(column);
+				inserted_column_expressions[raw_column] = "d." + column;
+				continue;
+			}
+			if (d_sum_sq_cols.count(column)) {
+				string sum_sq_col = d_sum_sq_cols.at(column);
+				bool is_pop = decomp.is_population.count(column) && decomp.is_population.at(column);
+				bool do_sqrt = decomp.needs_sqrt.count(column) && decomp.needs_sqrt.at(column);
+				updated_column_expressions[raw_column] = BuildGuardedVarianceFormula(
+				    BuildUpdatedAggregateColumn(sum_col), BuildUpdatedAggregateColumn(sum_sq_col),
+				    BuildUpdatedAggregateColumn(count_col), is_pop, do_sqrt);
+				inserted_column_expressions[raw_column] =
+				    BuildGuardedVarianceFormula("d." + sum_col, "d." + sum_sq_col, "d." + count_col, is_pop, do_sqrt);
+			} else {
+				updated_column_expressions[raw_column] =
+				    BuildAvgFormula(BuildUpdatedAggregateColumn(sum_col), BuildUpdatedAggregateColumn(count_col));
+				inserted_column_expressions[raw_column] = BuildAvgFormula("d." + sum_col, "d." + count_col);
+			}
+		} else {
+			string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
+			auto sum_count = sum_null_count_cols.find(column);
+			if (sum_count != sum_null_count_cols.end()) {
+				updated_column_expressions[raw_column] = BuildNullableSum(
+				    BuildUpdatedAggregateColumn(column), BuildUpdatedAggregateColumn(sum_count->second));
+				inserted_column_expressions[raw_column] = BuildNullableSum("d." + column, "d." + sum_count->second);
+			} else if (insert_only && agg_type == "min") {
+				updated_column_expressions[raw_column] = BuildNullSafeExtremumUpdate(column, "LEAST");
+			} else if (insert_only && agg_type == "max") {
+				updated_column_expressions[raw_column] = BuildNullSafeExtremumUpdate(column, "GREATEST");
+			} else if (list_mode) {
+				updated_column_expressions[raw_column] =
+				    "list_transform(list_zip(v." + column + ", d." + column + "), lambda x: x[1] + x[2])";
+			} else {
+				updated_column_expressions[raw_column] = BuildUpdatedAggregateColumn(column);
+			}
+			inserted_column_expressions[raw_column] = "d." + column;
 		}
 	}
 
@@ -772,55 +1006,15 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			}
 			first_agg = false;
 
-			if (derived_cols.count(column)) {
-				// Derived column: compute from hidden columns
-				string sum_col = d_sum_cols.count(column) ? d_sum_cols.at(column) : "";
-				string count_col = d_count_cols.count(column) ? d_count_cols.at(column) : "";
-				if (sum_col.empty() || count_col.empty()) {
-					update_set += column + " = " + BuildUpdatedAggregateColumn(column);
-					insert_vals += "d." + column;
-					continue;
-				}
-				bool has_sum_sq = d_sum_sq_cols.count(column) > 0;
-				if (has_sum_sq) {
-					// STDDEV/VARIANCE. Must match the CASE-WHEN + clamp semantics that the
-					// CREATE-MV formula in RewriteDerivedAggregates already applies; the raw
-					// algebraic formula alone can (a) produce a numeric result for groups
-					// with count <= threshold (pop: 0, sample: 1) where the base query
-					// yields NULL, and (b) feed sqrt() a tiny negative value after
-					// INSERT+DELETE on flat-valued data where floating-point reassociation
-					// of (sum_sq - sum²/count) drifts below zero — crashing the refresh.
-					string sum_sq_col = d_sum_sq_cols.at(column);
-					string new_sum = BuildUpdatedAggregateColumn(sum_col);
-					string new_sq = BuildUpdatedAggregateColumn(sum_sq_col);
-					string new_n = BuildUpdatedAggregateColumn(count_col);
-					bool is_pop = decomp.is_population.count(column) && decomp.is_population.at(column);
-					bool do_sqrt = decomp.needs_sqrt.count(column) && decomp.needs_sqrt.at(column);
-					// 0::DOUBLE so GREATEST binds to DOUBLE, not INTEGER (would up-cast silently).
-					update_set += column + " = " + BuildGuardedVarianceFormula(new_sum, new_sq, new_n, is_pop, do_sqrt);
-					insert_vals += BuildGuardedVarianceFormula("d." + sum_col, "d." + sum_sq_col, "d." + count_col,
-					                                           is_pop, do_sqrt);
-				} else {
-					// AVG
-					update_set +=
-					    column + " = " +
-					    BuildAvgFormula(BuildUpdatedAggregateColumn(sum_col), BuildUpdatedAggregateColumn(count_col));
-					insert_vals += BuildAvgFormula("d." + sum_col, "d." + count_col);
-				}
+			if (quoted_derived_output_expressions.count(column)) {
+				auto &expression_sql = quoted_derived_output_expressions.at(column);
+				update_set +=
+				    column + " = " + SubstituteDerivedOutputColumns(expression_sql, updated_column_expressions);
+				insert_vals += SubstituteDerivedOutputColumns(expression_sql, inserted_column_expressions);
 			} else {
-				// Regular aggregate column
-				string agg_type = col_agg_type.count(column) ? col_agg_type[column] : "";
-				if (insert_only && agg_type == "min") {
-					update_set += column + " = " + BuildNullSafeExtremumUpdate(column, "LEAST");
-				} else if (insert_only && agg_type == "max") {
-					update_set += column + " = " + BuildNullSafeExtremumUpdate(column, "GREATEST");
-				} else if (list_mode) {
-					update_set += column + " = list_transform(list_zip(v." + column + ", d." + column +
-					              "), lambda x: x[1] + x[2])";
-				} else {
-					update_set += column + " = " + BuildUpdatedAggregateColumn(column);
-				}
-				insert_vals += "d." + column;
+				const string &raw_column = aggregate_raw_names.at(column);
+				update_set += column + " = " + updated_column_expressions.at(raw_column);
+				insert_vals += inserted_column_expressions.at(raw_column);
 			}
 		}
 		insert_cols = SqlUtils::JoinQuotedColumns(keys) + ", " + StringUtil::Join(aggregates, ", ");
@@ -857,15 +1051,21 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				continue;
 			}
 			string agg_type = col_agg_type.count(col) ? col_agg_type.at(col) : "";
-			if (agg_type == "count_star") {
-				// Left-side-driven: always update normally.
+			// Match the hidden openivm_count_star column by NAME as well: it has no col_agg_type entry,
+			// so the agg_type test alone never caught it and it fell through to the gated branch, which
+			// zeroes it on a >0 -> 0 match transition. It counts LEFT JOIN OUTPUT rows, so the
+			// NULL-padded row keeps it at 1 and it must follow the left side.
+			if (agg_type == "count_star" || col == string(openivm::COUNT_STAR_COL) || is_preserved_side(col)) {
+				// count_star and preserved/left-side COUNT columns are left-side-driven: a right-side
+				// match_count transition must NOT zero them. Always apply the normal aggregate update.
 				lj_update_set += col + " = " + BuildUpdatedAggregateColumn(col);
 				continue;
 			}
 			// Determine if this column should be 0 (count-like) or NULL (sum-like) when unmatched.
 			// Check both the aggregate_types metadata AND the hidden column prefix
 			// (hidden openivm_count_* columns from AVG/STDDEV decomposition don't have agg_type entries).
-			bool is_count = (agg_type == "count" || col.find(string(openivm::COUNT_COL_PREFIX)) == 0);
+			bool is_count = (agg_type == "count" || col.find(string(openivm::COUNT_COL_PREFIX)) == 0 ||
+			                 col.find(string(openivm::SUM_COUNT_COL_PREFIX)) == 0);
 			string null_val = is_count ? "0" : "NULL";
 			// Three-way CASE:
 			//   mc_new > 0: group has matches (now or after delta). Normal aggregate update.
@@ -879,9 +1079,13 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			//     data is gone; reset to null_val. This remains imperfect for folded projections
 			//     (a transitioning group whose stored COALESCE'd column was 0 resets to NULL)
 			//     — a known limitation.
-			lj_update_set += col + " = CASE WHEN " + mc_new + " > 0 THEN " + BuildUpdatedAggregateColumn(col) +
-			                 " WHEN COALESCE(v." + match_count_col + ", 0) = 0 THEN v." + col + " ELSE " + null_val +
-			                 " END";
+			string matched_update = BuildUpdatedAggregateColumn(col);
+			auto sum_count = sum_null_count_cols.find(col);
+			if (sum_count != sum_null_count_cols.end()) {
+				matched_update = BuildNullableSum(matched_update, BuildUpdatedAggregateColumn(sum_count->second));
+			}
+			lj_update_set += col + " = CASE WHEN " + mc_new + " > 0 THEN " + matched_update + " WHEN COALESCE(v." +
+			                 match_count_col + ", 0) = 0 THEN v." + col + " ELSE " + null_val + " END";
 		}
 		// INSERT values: mirror the UPDATE classification above.
 		//   count_star → d.count_star (always, no CASE)
@@ -898,14 +1102,21 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				continue;
 			}
 			string agg_type = col_agg_type.count(aggregates[i]) ? col_agg_type.at(aggregates[i]) : "";
-			if (agg_type == "count_star") {
+			if (agg_type == "count_star" || aggregates[i] == string(openivm::COUNT_STAR_COL) ||
+			    is_preserved_side(aggregates[i])) {
 				cond_insert_vals += "d." + aggregates[i];
 				continue;
 			}
-			bool is_count = (agg_type == "count" || aggregates[i].find(string(openivm::COUNT_COL_PREFIX)) == 0);
+			bool is_count = (agg_type == "count" || aggregates[i].find(string(openivm::COUNT_COL_PREFIX)) == 0 ||
+			                 aggregates[i].find(string(openivm::SUM_COUNT_COL_PREFIX)) == 0);
 			string null_val = is_count ? "0" : "NULL";
+			string matched_insert = "d." + aggregates[i];
+			auto sum_count = sum_null_count_cols.find(aggregates[i]);
+			if (sum_count != sum_null_count_cols.end()) {
+				matched_insert = BuildNullableSum(matched_insert, "d." + sum_count->second);
+			}
 			cond_insert_vals +=
-			    "CASE WHEN d." + match_count_col + " > 0 THEN d." + aggregates[i] + " ELSE " + null_val + " END";
+			    "CASE WHEN d." + match_count_col + " > 0 THEN " + matched_insert + " ELSE " + null_val + " END";
 		}
 		merge_query = "WITH refresh_cte AS (\n" + cte_body + ")\n" + "MERGE INTO " + data_table +
 		              " v USING refresh_cte d\n" + "ON " + on_clause + "\n" + "WHEN MATCHED THEN UPDATE SET " +
@@ -919,6 +1130,67 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	}
 
 	string upsert_query = merge_query + "\n";
+	if (insert_only && emit_cascade_delta && inline_cascade_delta) {
+		// The inline companion emitted by refresh_sql.cpp is a compact aggregate-delta
+		// encoding (-1 NULL marker + positive delta). That is enough for downstream SUM/COUNT,
+		// but not for arbitrary downstream consumers and MIN/MAX. Keep the fast MERGE for this
+		// MV, then replace the delta view with a true -old/+new affected-group multiset.
+		string affected_temp =
+		    SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name + "_merge");
+		string old_temp =
+		    SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + "snapshot_" + view_name + "_merge");
+		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+		string marker_predicate = string(openivm::MULTIPLICITY_COL) + " < 0";
+		for (auto &column : aggregates) {
+			marker_predicate += " AND " + column + " IS NULL";
+		}
+		string affected_match = SqlUtils::BuildNullSafeMatch(keys, "openivm_aff", "openivm_data");
+		string new_match = SqlUtils::BuildNullSafeMatch(keys, "openivm_aff", "openivm_new");
+		string col_list = SqlUtils::JoinQuotedColumns(column_names);
+		string select_old, select_new;
+		bool first_col = true;
+		for (auto &column : column_names) {
+			if (!first_col) {
+				select_old += ", ";
+				select_new += ", ";
+			}
+			first_col = false;
+			if (column == string(openivm::MULTIPLICITY_COL)) {
+				select_old += "-1";
+				select_new += "1";
+			} else {
+				select_old += "openivm_old." + SqlUtils::QuoteIdentifier(column);
+				select_new += "openivm_new." + SqlUtils::QuoteIdentifier(column);
+			}
+		}
+
+		string cascade_sql;
+		cascade_sql += "DELETE FROM " + delta_view + " WHERE " + marker_predicate;
+		if (!delta_ts_filter.empty()) {
+			cascade_sql += " AND " + delta_ts_filter;
+		}
+		cascade_sql += ";\n";
+		cascade_sql += "DROP TABLE IF EXISTS " + affected_temp + ";\n";
+		cascade_sql += "CREATE TABLE " + affected_temp + " AS SELECT DISTINCT " + SqlUtils::JoinQuotedColumns(keys) +
+		               " FROM " + delta_view + delta_where + ";\n";
+		cascade_sql += "DROP TABLE IF EXISTS " + old_temp + ";\n";
+		cascade_sql += "CREATE TABLE " + old_temp + " AS SELECT openivm_data.* FROM " + data_table +
+		               " openivm_data WHERE EXISTS (SELECT 1 FROM " + affected_temp + " openivm_aff WHERE " +
+		               affected_match + ");\n";
+		cascade_sql += merge_query + "\n";
+		cascade_sql += "DELETE FROM " + delta_view + " WHERE 1=1";
+		if (!delta_ts_filter.empty()) {
+			cascade_sql += " AND " + delta_ts_filter;
+		}
+		cascade_sql += ";\n";
+		cascade_sql += "INSERT INTO " + delta_view + " (" + col_list + ") SELECT " + select_old + " FROM " + old_temp +
+		               " openivm_old;\n";
+		cascade_sql += "INSERT INTO " + delta_view + " (" + col_list + ") SELECT " + select_new + " FROM " +
+		               data_table + " openivm_new WHERE EXISTS (SELECT 1 FROM " + affected_temp +
+		               " openivm_aff WHERE " + new_match + ");\n";
+		cascade_sql += "DROP TABLE " + old_temp + ";\nDROP TABLE " + affected_temp + ";\n";
+		upsert_query = cascade_sql;
+	}
 
 	// Delete empty groups — a group is empty iff its row count is 0. We can only detect
 	// this when the MV has a COUNT-type aggregate (either an explicit COUNT(*) / COUNT(x),
@@ -927,9 +1199,18 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	//   SUM(CASE WHEN C_BALANCE < 0 THEN C_YTD_PAYMENT ELSE 0 END)
 	// legitimately returns 0 for every row when C_YTD_PAYMENT is always 0. Skip the
 	// cleanup in that case to avoid deleting valid rows.
-	// Also skip when insert_only (groups can't reach zero from inserts alone) and when
-	// openivm_match_count is present (LEFT JOIN preserved-side NULL aggregates are valid).
-	if (!insert_only && !has_match_count) {
+	// Also skip when insert_only (groups can't reach zero from inserts alone).
+	//
+	// LEFT JOIN views (openivm_match_count present) were previously skipped outright, because a
+	// preserved-side row with no match legitimately has inner-side COUNT = 0 and would look "empty".
+	// That left genuinely emptied groups behind forever as zeroed rows. The right discriminator is the
+	// OUTPUT-row count: a NULL-padded group still has count_star >= 1, whereas a group with no
+	// preserved-side rows left has count_star = 0. Since the predicate ANDs every count column, the
+	// NULL-padded case is preserved as long as count_star is among them -- so LEFT JOIN views are
+	// included when a count_star-type column anchors the predicate, and skipped otherwise.
+	// This relies on count_star actually counting NULL-padded output rows, which requires the
+	// secondary delta to emit the reappearance row at EVERY level including a single LEFT JOIN.
+	if (!insert_only) {
 		// Find COUNT-type columns. aggregate_types is parallel to the user-facing aggregate
 		// list; col_agg_type maps column name -> aggregate function. Also consider hidden
 		// openivm_count_<N> columns from AVG/STDDEV decomposition.
@@ -944,6 +1225,20 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			    column == openivm::DISTINCT_COUNT_COL) {
 				count_cols.push_back(column);
 			}
+		}
+		// LEFT JOIN views may only be cleaned up when an output-row count anchors the predicate.
+		bool has_count_star_anchor = false;
+		for (auto &c : count_cols) {
+			auto it = col_agg_type.find(c);
+			if (c == string(openivm::COUNT_STAR_COL) || (it != col_agg_type.end() && it->second == "count_star")) {
+				has_count_star_anchor = true;
+				break;
+			}
+		}
+		if (has_match_count && !has_count_star_anchor) {
+			count_cols.clear();
+			OPENIVM_DEBUG_PRINT("[CompileAggregateGroups] LEFT JOIN view without a count_star anchor — skipping "
+			                    "empty-group cleanup so NULL-padded groups are not deleted\n");
 		}
 		if (!count_cols.empty()) {
 			string delete_query = "\ndelete from " + data_table + " where ";
@@ -964,7 +1259,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql, bool has_minmax, bool list_mode,
                                const string &delta_ts_filter, const string &catalog_prefix, bool /*insert_only*/,
-                               const vector<LogicalType> &column_types) {
+                               const vector<LogicalType> &column_types, bool *out_full_recompute) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// Any non-summable column (VARCHAR literal, CASE result, LIST) forces a full
@@ -982,7 +1277,11 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 		}
 	}
 
-	if (has_minmax || has_non_summable_col) {
+	bool full_recompute = has_minmax || has_non_summable_col;
+	if (out_full_recompute) {
+		*out_full_recompute = full_recompute;
+	}
+	if (full_recompute) {
 		string delete_query = "DELETE FROM " + data_table + ";\n";
 		string insert_query = "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 		return delete_query + insert_query;
@@ -993,6 +1292,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
 	auto decomp = DetectDerivedAggColumns(column_names);
+	auto sum_null_count_cols = DetectSumNullCountColumns(column_names);
 	auto &d_derived = decomp.derived_cols;
 	auto &d_sum = decomp.sum_cols;
 	auto &d_sum_sq = decomp.sum_sq_cols;
@@ -1018,15 +1318,26 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 			// list_reduce-add. NULL-list COALESCE preserves the previous semantics
 			// for empty groups.
 			cte += "COALESCE(list_reduce(list(list_transform(" + column + ", lambda x: " + mul +
-			       " * x)), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])), " +
+			       " * x)), lambda a, b: list_transform(list_zip(a, b), lambda x: "
+			       "x[1] + x[2])), " +
 			       string(ZEROS_LIST) + ") AS d_" + column;
 			update_set += column + " = list_transform(list_zip(" + column + ", (SELECT d_" + column +
 			              " FROM openivm_delta)), lambda x: x[1] + x[2])";
 		} else {
 			// Z-set bag-aware sum: weight w∈ℤ scales the column value before SUM.
 			cte += "SUM(" + mul + " * " + column + ") AS d_" + column;
-			update_set +=
-			    column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM openivm_delta), 0)";
+			auto sum_count = sum_null_count_cols.find(column);
+			if (sum_count == sum_null_count_cols.end()) {
+				update_set += column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column +
+				              " FROM openivm_delta), 0)";
+			} else {
+				string count_col = sum_count->second;
+				string updated_sum =
+				    "COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM openivm_delta), 0)";
+				string updated_count =
+				    "COALESCE(" + count_col + ", 0) + COALESCE((SELECT d_" + count_col + " FROM openivm_delta), 0)";
+				update_set += column + " = " + BuildNullableSum(updated_sum, updated_count);
+			}
 		}
 	}
 	cte += "\n  FROM " + delta_view + ts_where + "\n)\n";
@@ -1077,21 +1388,22 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 		}
 	}
 	if (select_columns.empty()) {
-		throw InvalidInputException(
-		    "Cannot compile projection refresh for materialized view '%s': delta view '%s' has no "
-		    "user-visible columns",
-		    view_name, SqlUtils::DeltaName(view_name));
+		throw InvalidInputException("Cannot compile projection refresh for materialized view '%s': delta "
+		                            "view '%s' has no "
+		                            "user-visible columns",
+		                            view_name, SqlUtils::DeltaName(view_name));
 	}
 	match_conditions.erase(match_conditions.size() - 5, 5);
 	select_columns.erase(select_columns.size() - 2, 2);
 	delete_candidate_columns.erase(delete_candidate_columns.size() - 2, 2);
 
 	if (insert_only) {
-		// Insert-only fast path: all deltas are inserts (w > 0), just INSERT directly.
-		// Each row replicated |w| times for bag-correct multiplicity.
+		// Insert-only fast path: append projected delta rows directly. Do not run the signed net
+		// consolidation/delete path here; byte-identical duplicates are distinct bag entries and
+		// must be appended once per positive multiplicity.
 		string mul_filter = delta_ts_filter.empty() ? "WHERE " + mul + " > 0" : ts_where + " AND " + mul + " > 0";
 		string insert_query = "INSERT INTO " + data_table + " SELECT " + select_columns + "\nFROM " + delta_view +
-		                      ", generate_series(1, " + mul + "::BIGINT)\n" + mul_filter + ";\n";
+		                      "\nCROSS JOIN generate_series(1, " + mul + "::BIGINT)\n" + mul_filter + ";\n";
 		return insert_query;
 	}
 
@@ -1128,12 +1440,12 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	                      ");\n\n";
 
 	// INSERT: replicate each net-insert tuple _net times using generate_series.
-	string insert_query =
-	    "WITH openivm_net AS (\n  " + cte_body +
-	    "\n)\n"
-	    "INSERT INTO " +
-	    data_table + " SELECT " + select_columns +
-	    "\nFROM openivm_net, generate_series(1, openivm_net._net::BIGINT)\nWHERE openivm_net._net > 0;\n";
+	string insert_query = "WITH openivm_net AS (\n  " + cte_body +
+	                      "\n)\n"
+	                      "INSERT INTO " +
+	                      data_table + " SELECT " + select_columns +
+	                      "\nFROM openivm_net, generate_series(1, openivm_net._net::BIGINT)\nWHERE "
+	                      "openivm_net._net > 0;\n";
 
 	return delete_query + insert_query;
 }
@@ -1157,19 +1469,22 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
 
 	if (ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
-		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys for large affected query\n");
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected "
+		                    "keys for large affected query\n");
 		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns, catalog_prefix,
 		                                         emit_cascade_delta);
 	}
 	if (affected_mode == GroupRecomputeAffectedMode::CURRENT_DIFF) {
-		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys from model metadata\n");
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected "
+		                    "keys from model metadata\n");
 		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns, catalog_prefix,
 		                                         emit_cascade_delta);
 	}
 	string affected_view_query_sql = view_query_sql;
 	if (affected_mode == GroupRecomputeAffectedMode::SOURCE_DELTA_RELAX_AGGREGATE_FILTER &&
 	    !TryBuildGroupRecomputeAffectedQuery(view_query_sql, affected_view_query_sql)) {
-		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected keys; aggregate filter relaxation "
+		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected "
+		                    "keys; aggregate filter relaxation "
 		                    "was ambiguous\n");
 		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns, catalog_prefix,
 		                                         emit_cascade_delta);
@@ -1239,7 +1554,8 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	string match_clause = SqlUtils::BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_tgt");
 	string affected_temp_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
 
-	OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] %zu group cols, %zu source deltas, cascade delta: %s\n",
+	OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] %zu group cols, %zu source "
+	                    "deltas, cascade delta: %s\n",
 	                    group_columns.size(), delta_table_specs.size(), emit_cascade_delta ? "enabled" : "disabled");
 	if (!emit_cascade_delta) {
 		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_subquery, "openivm_tgt",

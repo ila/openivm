@@ -112,6 +112,48 @@ SELECT count(*) FROM openivm_delta_tables WHERE last_update IS NOT NULL;
 2
 
 # ==========================================
+# Test 5b: legacy has_join migration marks self-joins
+# ==========================================
+
+# Simulate a pre-has_join metadata row for an existing single-source self-join
+# MV. The migration must mark it as a join even though it has only one
+# openivm_delta_tables row.
+statement ok
+CREATE TABLE legacy_self_join_src(id INT);
+
+statement ok
+INSERT INTO openivm_views
+    (view_name, sql_string, type, has_minmax, has_left_join, has_join, last_update, refresh_in_progress, has_full_outer)
+VALUES
+    ('mv_legacy_self_join',
+     'SELECT l.id AS left_id, r.id AS right_id FROM legacy_self_join_src l JOIN legacy_self_join_src r ON l.id = r.id',
+     2, false, false, NULL, now(), false, false);
+
+statement ok
+INSERT INTO openivm_delta_tables(view_name, table_name, last_update)
+VALUES ('mv_legacy_self_join', 'openivm_delta_legacy_self_join_src', now());
+
+statement ok
+CREATE MATERIALIZED VIEW mv_trigger_join_backfill AS SELECT id FROM legacy_self_join_src;
+
+query I
+SELECT has_join FROM openivm_views WHERE view_name = 'mv_legacy_self_join';
+----
+true
+
+statement ok
+DELETE FROM openivm_delta_tables WHERE view_name = 'mv_legacy_self_join';
+
+statement ok
+DELETE FROM openivm_views WHERE view_name = 'mv_legacy_self_join';
+
+statement ok
+DROP VIEW mv_trigger_join_backfill;
+
+statement ok
+DROP TABLE legacy_self_join_src;
+
+# ==========================================
 # Test 6: IVM works before any drops (sanity check)
 # ==========================================
 

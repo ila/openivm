@@ -81,6 +81,13 @@ struct CreateMVPlanFacts {
 	bool has_unsupported_set_operation = false;
 	bool has_repeated_cte_ref_under_join = false;
 	bool has_pivot = false;
+	bool has_filter_above_aggregate = false;
+	bool has_bound_aggregate_filter = false;
+	bool has_hidden_minmax_having_column = false;
+	bool has_computed_minmax_aggregate_projection = false;
+	bool has_computed_sum_aggregate_projection = false;
+	bool has_top_level_redundant_distinct = false;
+	bool has_descendant_distinct = false;
 };
 
 string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
@@ -90,13 +97,23 @@ string QualifyCreateSourceTable(const string &table_name, const string &current_
                                 const string &default_db);
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog);
-bool PlanContainsAggregateFilter(LogicalOperator *plan);
-bool PlanContainsBoundAggregateFilter(LogicalOperator *plan);
-bool PlanHasHiddenMinMaxHavingColumn(LogicalOperator *plan);
-bool PlanHasComputedMinMaxAggregateProjection(LogicalOperator *plan);
+bool ProducesAtMostOneRow(LogicalOperator &node);
+bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node);
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols);
 bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t group_index);
-bool RelationExists(Connection &con, const string &qualified_name);
+// delta_view_catalog_prefix must be the same prefix the view's delta table was created with
+// (internal_catalog_prefix). Without it the generated INSERT targets an unqualified delta table,
+// which fails for MVs whose state lives in another catalog -- e.g. DuckLake-backed views, where the
+// delta table is dl.main.openivm_delta_<view>.
+// The returned SQL carries LJSEC_INNER_DELTA_PLACEHOLDER / LJSEC_PRES_DELTA_PLACEHOLDER where each
+// side's pending changes belong; refresh substitutes them (see openivm_constants.hpp). The out_*
+// params report the two sides' identities so refresh can pick the right row source per backend.
+string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
+                                      const vector<string> &output_names, const string &view_name,
+                                      vector<string> &preserved_cols, const string &delta_view_catalog_prefix,
+                                      vector<string> &out_inner_tables, vector<string> &out_inner_keys,
+                                      vector<string> &out_pres_tables, vector<string> &out_pres_keys);
+bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts);
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
                                       const vector<string> &output_names);
 vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, const vector<string> &output_names);
@@ -110,6 +127,8 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                RefreshMetadata::ProjectionKeyLineage &out);
+bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out);
+bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinNullableSources &out);
 bool QueryNeedsOriginalSqlForLpts(const string &query);
 bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op);
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,

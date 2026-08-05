@@ -29,16 +29,16 @@ class ConstraintCache {
 public:
 	ConstraintCache() = default;
 
-	vector<CachedConstraint> GetConstraints(const string &table_name);
+	vector<CachedConstraint> GetConstraints(ClientContext &context, const string &table_name);
 
-	bool IsUniqueKey(const string &table_name, const vector<string> &columns);
+	bool IsUniqueKey(ClientContext &context, const string &table_name, const vector<string> &columns);
 
 	// Returns true iff a (RELY_)FK from child→parent matching the given
 	// columns exists in the cache.
-	bool HasFKToParent(const string &child_table, const vector<string> &child_columns, const string &parent_table,
-	                   const vector<string> &parent_columns);
+	bool HasFKToParent(ClientContext &context, const string &child_table, const vector<string> &child_columns,
+	                   const string &parent_table, const vector<string> &parent_columns);
 
-	void DeclareRelyFK(const CachedConstraint &c);
+	void DeclareRelyFK(ClientContext &context, const CachedConstraint &c);
 
 	void InvalidateTable(const string &table_name);
 

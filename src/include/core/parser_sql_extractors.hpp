@@ -13,6 +13,14 @@ struct SemiAntiExtract {
 	string right_alias;
 	string predicate;
 	string post_filter;
+	string right_filter;
+	string left_key_col;
+	string left_key_expr;
+	string right_key_expr;
+	bool null_aware = false;
+	string null_aware_left_col;
+	string null_aware_left_expr;
+	string null_aware_right_expr;
 	vector<string> output_cols;
 	vector<string> output_exprs;
 };
@@ -27,8 +35,19 @@ struct FilteredGroupCountExtract {
 	string threshold_sql;
 };
 
+struct CountDistinctExtract {
+	string source;
+	vector<string> group_exprs;
+	string distinct_expr;
+	string distinct_col;
+	string output_col;
+	string filter;
+};
+
 bool ExtractInnerDistinct(const string &original_sql, vector<string> &out_cols, string &out_input_sql,
                           string &out_source, string &out_filter_sql);
+bool ExtractCountDistinctAggregate(const string &original_sql, const vector<string> &group_columns,
+                                   const vector<string> &output_names, CountDistinctExtract &out);
 bool ExtractFilteredGroupCount(const string &original_sql, const vector<string> &output_names,
                                FilteredGroupCountExtract &out);
 bool ExtractSemiAntiQuery(const string &original_sql, SemiAntiExtract &out);

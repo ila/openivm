@@ -16,6 +16,8 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 namespace {
@@ -25,6 +27,8 @@ struct BaseLeafInfo {
 	LogicalGet *get;
 	LogicalOperator *node;
 };
+
+static uint64_t BindingKey(const ColumnBinding &binding);
 
 static bool IsJoinNode(LogicalOperatorType type) {
 	return type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || type == LogicalOperatorType::LOGICAL_JOIN ||
@@ -94,26 +98,40 @@ static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
 	return !join.duplicate_eliminated_columns.empty();
 }
 
-static void UpdateProjectionMapForLeaf(unique_ptr<LogicalOperator> &term, const BaseLeafInfo &leaf) {
-	if (leaf.path.empty()) {
-		return;
+static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op,
+                                                           const unordered_set<uint64_t> &mul_set) {
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_JOIN ||
+	    op.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT || op.type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+		auto *join = dynamic_cast<LogicalComparisonJoin *>(&op);
+		if (join) {
+			for (idx_t child_idx = 0; child_idx < op.children.size() && child_idx < 2; child_idx++) {
+				auto &proj_map = child_idx == 0 ? join->left_projection_map : join->right_projection_map;
+				if (proj_map.empty()) {
+					continue;
+				}
+				auto child_bindings = op.children[child_idx]->GetColumnBindings();
+				for (auto projected_idx : proj_map) {
+					if (projected_idx >= child_bindings.size()) {
+						throw InternalException(
+						    "DeltaDelimJoin: projection map index %llu out of bounds for child %llu with %llu bindings",
+						    (idx_t)projected_idx, (idx_t)child_idx, (idx_t)child_bindings.size());
+					}
+				}
+				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
+					if (!mul_set.count(BindingKey(child_bindings[binding_idx]))) {
+						continue;
+					}
+					if (std::find(proj_map.begin(), proj_map.end(), binding_idx) == proj_map.end()) {
+						proj_map.push_back(binding_idx);
+					}
+				}
+			}
+		}
 	}
-	size_t child_side = leaf.path.back();
-	unique_ptr<LogicalOperator> *parent = &term;
-	for (size_t s = 0; s + 1 < leaf.path.size(); s++) {
-		parent = &((*parent)->children[leaf.path[s]]);
-	}
-	if (!IsJoinNode((*parent)->type)) {
-		return;
-	}
-	auto *join = dynamic_cast<LogicalComparisonJoin *>((*parent).get());
-	if (!join) {
-		return;
-	}
-	auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
-	if (!proj_map.empty()) {
-		idx_t mul_idx = leaf.node->GetColumnBindings().size();
-		proj_map.push_back(mul_idx);
+	for (auto &child : op.children) {
+		if (child) {
+			AppendMultiplicityBindingsToJoinProjectionMaps(*child, mul_set);
+		}
 	}
 }
 
@@ -233,13 +251,25 @@ static ColumnBinding MapTermBinding(ColumnBinding binding, const unordered_map<o
 	return binding;
 }
 
-static ColumnBinding FindOutputBinding(const vector<ColumnBinding> &term_bindings, ColumnBinding target) {
+static ColumnBinding FindOutputBinding(const vector<ColumnBinding> &term_bindings, ColumnBinding target,
+                                       idx_t output_idx) {
 	for (auto &binding : term_bindings) {
 		if (binding == target) {
 			return binding;
 		}
 	}
-	throw InternalException("DeltaDelimJoin: original output binding not found in rewritten term");
+	if (output_idx < term_bindings.size() && term_bindings[output_idx].table_index == target.table_index) {
+		return term_bindings[output_idx];
+	}
+	string candidates;
+	for (auto &binding : term_bindings) {
+		if (!candidates.empty()) {
+			candidates += ", ";
+		}
+		candidates += to_string(binding.table_index) + ":" + to_string(binding.column_index);
+	}
+	throw InternalException("DeltaDelimJoin: original output binding %llu:%llu not found in rewritten term [%s]",
+	                        (idx_t)target.table_index, (idx_t)target.column_index, candidates.c_str());
 }
 
 static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator> &node,
@@ -500,24 +530,28 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 			AddLeafBindingReplacements(leaf_bindings, delta_bindings, output_replacements, delta_i.mul_binding);
 			mul_bindings.push_back(delta_i.mul_binding);
 			leaf_ref = std::move(delta_i.node);
-			UpdateProjectionMapForLeaf(term, leaves[i]);
+			auto fallback_mul_idx = leaves[i].node->GetColumnBindings().size();
+			AppendMultiplicityToAncestorProjectionMaps(term, leaves[i].path, delta_i.mul_binding, "DeltaDelimJoin",
+			                                           true, fallback_mul_idx);
 		}
 
 		vector<ReplacementBinding> delim_replacements;
 		ReplaceDelimGets(context, term, delim_replacements);
 		output_replacements.insert(output_replacements.end(), delim_replacements.begin(), delim_replacements.end());
 
-		auto term_bindings = term->GetColumnBindings();
-		vector<unique_ptr<Expression>> exprs;
 		unordered_set<uint64_t> mul_set;
 		CollectMulBindings(mul_bindings, mul_set);
+		AppendMultiplicityBindingsToJoinProjectionMaps(*term, mul_set);
+
+		auto term_bindings = term->GetColumnBindings();
+		vector<unique_ptr<Expression>> exprs;
 		for (idx_t output_idx = 0; output_idx < original_bindings.size(); output_idx++) {
 			auto mapped_binding =
 			    MapTermBinding(original_bindings[output_idx], renumbered.idx_map, output_replacements);
 			if (mul_set.count(BindingKey(mapped_binding))) {
 				throw InternalException("DeltaDelimJoin: original output remapped to multiplicity binding");
 			}
-			auto output_binding = FindOutputBinding(term_bindings, mapped_binding);
+			auto output_binding = FindOutputBinding(term_bindings, mapped_binding, output_idx);
 			exprs.push_back(make_uniq<BoundColumnRefExpression>(output_types[output_idx], output_binding));
 		}
 		exprs.push_back(BuildMultiplicityProduct(binder, input.mul_type, mul_bindings));

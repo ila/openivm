@@ -1,0 +1,91 @@
+# name: test/sql/rely_fk_constraints.test
+# description: RELY FK declarations feed the openivm constraint cache and FK pruning
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_skip_empty_deltas = false;
+
+query I
+SELECT count(*) FROM openivm_constraints_cache WHERE constraint_kind = 'RELY_FK';
+----
+0
+
+statement ok
+CREATE TABLE rely_dim(product_id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE rely_fact(sale_id INTEGER, product_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO rely_dim VALUES (1, 'widget'), (2, 'gadget');
+
+statement ok
+INSERT INTO rely_fact VALUES (10, 1, 100), (11, 2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW rely_mv AS
+    SELECT d.name, SUM(f.amount) AS total
+    FROM rely_fact f JOIN rely_dim d ON f.product_id = d.product_id
+    GROUP BY d.name;
+
+statement ok
+INSERT INTO rely_dim VALUES (3, 'thing');
+
+# With no RELY FK declared, compile-only SQL still contains the PK-side delta term.
+query I
+SELECT EXISTS (
+    SELECT 1
+    FROM openivm_compile_with_facts('rely_mv', '{"target_dialect":"duckdb","compile_only":true}')
+    WHERE stmt_kind = 'data' AND sql LIKE '%openivm_delta_rely_dim%'
+);
+----
+true
+
+statement ok
+PRAGMA openivm_declare_rely_fk('rely_fact', 'product_id', 'rely_dim', 'product_id');
+
+query TTTTTI
+SELECT table_name, constraint_kind, columns_json, referenced_table, referenced_columns_json, is_trusted
+FROM openivm_constraints_cache
+WHERE table_name = 'rely_fact';
+----
+rely_fact	RELY_FK	["product_id"]	rely_dim	["product_id"]	true
+
+# The RELY declaration is accepted by the compile-only path and preserves the
+# incremental aggregate refresh shape. The dedicated constraints_cache_fk_prune
+# test covers emitted join-term pruning on a projection where the UNION arms are
+# directly visible.
+query I
+SELECT DISTINCT refresh_type_name <> 'FULL_REFRESH'
+FROM openivm_compile_with_facts('rely_mv', '{"target_dialect":"duckdb","compile_only":true}');
+----
+true
+
+statement ok
+PRAGMA refresh('rely_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT d.name, SUM(f.amount) AS total
+    FROM rely_fact f JOIN rely_dim d ON f.product_id = d.product_id
+    GROUP BY d.name
+    EXCEPT ALL SELECT * FROM rely_mv
+);
+----
+0
+
+statement ok
+INSERT INTO rely_fact VALUES (12, 3, 300);
+
+statement ok
+PRAGMA refresh('rely_mv');
+
+query II
+SELECT name, total FROM rely_mv WHERE name = 'thing';
+----
+thing	300
+
+statement ok
+SET openivm_skip_empty_deltas = true;

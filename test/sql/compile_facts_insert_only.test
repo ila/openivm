@@ -1,0 +1,87 @@
+# name: test/sql/compile_facts_insert_only.test
+# description: openivm_compile_with_facts — WorkloadFacts v2 assume_insert_only re-enables
+# group: [sql]
+
+#              the insert-only fast paths under compile_only (openivm-spark integration).
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# ==========================================
+# Setup: a MIN/MAX + COUNT GROUP BY materialized view. MIN/MAX is the clearest
+# probe: under compile_only the minmax fast path is OFF (group-recompute), but
+# assume_insert_only re-enables it (GREATEST/LEAST), so the emitted SQL changes.
+# ==========================================
+
+statement ok
+CREATE TABLE mm_sales (region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO mm_sales VALUES ('east', 100), ('west', 200);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_mm AS
+    SELECT region, MIN(amount) AS lo, MAX(amount) AS hi, COUNT(*) AS cnt
+    FROM mm_sales GROUP BY region;
+
+# Snapshot the MV so we can prove openivm_compile_with_facts never mutates it.
+statement ok
+CREATE TABLE mv_mm_before AS SELECT * FROM mv_mm;
+
+# Append-only mutation — the scenario assume_insert_only describes.
+statement ok
+INSERT INTO mm_sales VALUES ('east', 50), ('north', 75);
+
+# ==========================================
+# Test 1: assume_insert_only must NOT change the classification — never a silent
+# downgrade to FULL_REFRESH. The classified type stays identical to the general
+# compile and is an incremental type (not FULL_REFRESH).
+# ==========================================
+
+query I
+SELECT
+  (SELECT DISTINCT refresh_type_name FROM openivm_compile_with_facts(
+      'mv_mm', '{"target_dialect":"duckdb","compile_only":true}'))
+  = (SELECT DISTINCT refresh_type_name FROM openivm_compile_with_facts(
+      'mv_mm', '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}'))
+  AND (SELECT DISTINCT refresh_type_name FROM openivm_compile_with_facts(
+      'mv_mm', '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')) <> 'FULL_REFRESH'
+  AS type_stable_and_incremental;
+----
+true
+
+# ==========================================
+# Test 2: the flag has an effect — the emitted data SQL differs between the
+# conservative (general) compile and the proven-insert-only compile.
+# ==========================================
+
+statement ok
+CREATE TABLE sql_general AS
+SELECT string_agg(sql, '\n' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts('mv_mm', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data';
+
+statement ok
+CREATE TABLE sql_insert_only AS
+SELECT string_agg(sql, '\n' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts('mv_mm',
+    '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
+WHERE stmt_kind = 'data';
+
+query I
+SELECT (SELECT prog FROM sql_general) <> (SELECT prog FROM sql_insert_only) AS differs;
+----
+true
+
+# ==========================================
+# Test 3: openivm_compile_with_facts did NOT mutate the materialized view
+# (bidirectional EXCEPT ALL bag-equality oracle).
+# ==========================================
+
+query I
+SELECT (SELECT count(*) FROM ((SELECT * FROM mv_mm) EXCEPT ALL (SELECT * FROM mv_mm_before))) = 0 AND
+       (SELECT count(*) FROM ((SELECT * FROM mv_mm_before) EXCEPT ALL (SELECT * FROM mv_mm))) = 0 AS unchanged;
+----
+true

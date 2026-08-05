@@ -2,7 +2,6 @@
 
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
-#include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/connection.hpp"
@@ -35,6 +34,11 @@ void RefreshDaemon::Stop() {
 	started_ = false;
 }
 
+void RefreshDaemon::Wake() {
+	wake_requested_ = true;
+	cv_.notify_all();
+}
+
 RefreshDaemon::~RefreshDaemon() {
 	Stop();
 }
@@ -59,11 +63,13 @@ void RefreshDaemon::Run() {
 	while (!shutdown_.load()) {
 		{
 			std::unique_lock<std::mutex> lock(cv_mutex_);
-			cv_.wait_for(lock, std::chrono::seconds(WAKE_INTERVAL_SECONDS), [this] { return shutdown_.load(); });
+			cv_.wait_for(lock, std::chrono::seconds(WAKE_INTERVAL_SECONDS),
+			             [this] { return shutdown_.load() || wake_requested_.load(); });
 		}
 		if (shutdown_.load()) {
 			break;
 		}
+		wake_requested_ = false;
 
 		try {
 			Connection con(*db_);
@@ -151,24 +157,14 @@ void RefreshDaemon::Run() {
 
 				// Check if the view is due for refresh
 				if (!sv.last_update.empty()) {
-					auto elapsed_result =
-					    con.Query("SELECT EXTRACT(EPOCH FROM (now() - '" + sv.last_update + "'::TIMESTAMP))");
+					auto elapsed_result = con.Query("SELECT EXTRACT(EPOCH FROM (now()::TIMESTAMP - '" + sv.last_update +
+					                                "'::TIMESTAMP))");
 					if (!elapsed_result->HasError() && elapsed_result->RowCount() > 0 &&
 					    !elapsed_result->GetValue(0, 0).IsNull()) {
 						auto elapsed_seconds = elapsed_result->GetValue(0, 0).GetValue<double>();
 						if (elapsed_seconds < static_cast<double>(interval)) {
 							continue; // not due yet
 						}
-					}
-				}
-
-				// Quick check if the view is already being refreshed (non-blocking).
-				{
-					TryViewLockGuard view_lock(sv.view_name);
-					if (!view_lock.OwnsLock()) {
-						OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Skipping '%s' — refresh already in progress\n",
-						                    sv.view_name.c_str());
-						continue;
 					}
 				}
 
@@ -180,42 +176,16 @@ void RefreshDaemon::Run() {
 				OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Refreshing '%s'\n", sv.view_name.c_str());
 				auto before = std::chrono::steady_clock::now();
 
+				bool refresh_succeeded = false;
 				try {
 					Connection refresh_con(*db_);
-
-					// Check for refresh hooks
-					auto hook_r =
-					    refresh_con.Query("SELECT hook_sql, mode FROM openivm_refresh_hooks WHERE view_name = '" +
-					                      SqlUtils::EscapeValue(sv.view_name) + "'");
-					string hook_sql;
-					string hook_mode;
-					if (!hook_r->HasError() && hook_r->RowCount() > 0) {
-						hook_sql = hook_r->GetValue(0, 0).ToString();
-						hook_mode = StringUtil::Lower(hook_r->GetValue(1, 0).ToString());
-					}
-
-					if (!hook_sql.empty() && hook_mode == "before") {
-						auto hr = refresh_con.Query(hook_sql);
-						if (hr->HasError()) {
-							Printer::Print("Warning: before-hook for '" + sv.view_name + "' failed: " + hr->GetError());
-						}
-					}
-
-					if (hook_mode != "replace") {
-						auto result =
-						    refresh_con.Query("PRAGMA refresh('" + SqlUtils::EscapeValue(sv.view_name) + "')");
-						if (result->HasError()) {
-							Printer::Print("Warning: auto-refresh of '" + sv.view_name +
-							               "' failed: " + result->GetError());
-						}
-					}
-
-					if (!hook_sql.empty() && (hook_mode == "after" || hook_mode == "replace")) {
-						auto hr = refresh_con.Query(hook_sql);
-						if (hr->HasError()) {
-							Printer::Print("Warning: " + hook_mode + "-hook for '" + sv.view_name +
-							               "' failed: " + hr->GetError());
-						}
+					auto result = refresh_con.Query(
+					    "PRAGMA refresh_options('" + SqlUtils::EscapeValue(sv.catalog_name) + "', '" +
+					    SqlUtils::EscapeValue(sv.schema_name) + "', '" + SqlUtils::EscapeValue(sv.view_name) + "')");
+					if (result->HasError()) {
+						Printer::Print("Warning: auto-refresh of '" + sv.view_name + "' failed: " + result->GetError());
+					} else {
+						refresh_succeeded = true;
 					}
 				} catch (std::exception &e) {
 					Printer::Print("Warning: auto-refresh of '" + sv.view_name + "' failed: " + string(e.what()));
@@ -224,6 +194,9 @@ void RefreshDaemon::Run() {
 				{
 					std::lock_guard<std::mutex> guard(refreshing_mutex_);
 					currently_refreshing_.clear();
+				}
+				if (!refresh_succeeded) {
+					continue;
 				}
 
 				// Mark this view and any cascaded views as done for this cycle

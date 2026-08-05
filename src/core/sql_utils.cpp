@@ -11,6 +11,9 @@
 
 namespace duckdb {
 
+static constexpr const char *CAST_EXPRESSION_PREFIX = "openivm_expr:";
+static constexpr const char *CAST_COLUMN_PLACEHOLDER = "{openivm_column}";
+
 static bool IsIdentifierChar(char c) {
 	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
 }
@@ -41,6 +44,40 @@ static string TrimSQLFragment(const string &input) {
 		end--;
 	}
 	return input.substr(start, end - start);
+}
+
+string SqlUtils::BuildCastSpec(const string &target_type, bool try_cast) {
+	if (!try_cast) {
+		return target_type;
+	}
+	return string(CAST_EXPRESSION_PREFIX) + "TRY_CAST(" + CAST_COLUMN_PLACEHOLDER + " AS " + target_type + ")";
+}
+
+string SqlUtils::ApplyCastSpec(const string &column_expression, const string &cast_spec) {
+	if (cast_spec.empty()) {
+		return column_expression;
+	}
+	if (!StringUtil::StartsWith(cast_spec, CAST_EXPRESSION_PREFIX)) {
+		return "CAST(" + column_expression + " AS " + cast_spec + ")";
+	}
+	string expression = cast_spec.substr(strlen(CAST_EXPRESSION_PREFIX));
+	auto placeholder = expression.find(CAST_COLUMN_PLACEHOLDER);
+	if (placeholder == string::npos) {
+		throw InternalException("OpenIVM cast expression is missing its column placeholder");
+	}
+	expression.replace(placeholder, strlen(CAST_COLUMN_PLACEHOLDER), column_expression);
+	return expression;
+}
+
+string SqlUtils::ComposeCastSpecs(const string &outer_cast_spec, const string &inner_cast_spec) {
+	if (outer_cast_spec.empty()) {
+		return inner_cast_spec;
+	}
+	if (inner_cast_spec.empty()) {
+		return outer_cast_spec;
+	}
+	string inner_expression = ApplyCastSpec(CAST_COLUMN_PLACEHOLDER, inner_cast_spec);
+	return string(CAST_EXPRESSION_PREFIX) + ApplyCastSpec(inner_expression, outer_cast_spec);
 }
 
 static bool ReadCreateTargetName(const string &sql, const string &object_keyword, string &out) {
@@ -702,6 +739,17 @@ string SqlUtils::BuildAllNullPredicate(const vector<string> &columns) {
 	return result;
 }
 
+string SqlUtils::BuildAnyNullPredicate(const vector<string> &columns, const string &prefix) {
+	string result;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (i > 0) {
+			result += " OR ";
+		}
+		result += prefix + QuoteIdentifier(columns[i]) + " IS NULL";
+	}
+	return result;
+}
+
 string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias) {
 	string result;
 	for (idx_t i = 0; i < columns.size(); i++) {
@@ -727,8 +775,25 @@ string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const 
 	return result;
 }
 
-string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql) {
-	return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
+string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
+                                       const vector<string> &unique_keys, const string &temp_table) {
+	if (unique_keys.empty() || temp_table.empty()) {
+		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
+	}
+	// Safe form for data tables carrying a UNIQUE index. `DELETE FROM t; INSERT INTO t ...` re-inserts
+	// keys deleted earlier in the same transaction, and DuckDB's on-disk unique index still reports
+	// those keys as present -- raising a spurious "Duplicate key ... violates unique constraint".
+	// Materialize the new contents once, delete only the keys that are gone, then upsert the rest, so
+	// no non-NULL key is deleted and re-inserted in the same transaction. NULL-containing keys do not
+	// conflict in a UNIQUE index, so remove them explicitly before INSERT OR REPLACE to avoid duplicates.
+	string keep_match = BuildNullSafeKeyPredicate(unique_keys, "openivm_new.", "openivm_old.");
+	string nullable_key = BuildAnyNullPredicate(unique_keys, "openivm_old.");
+	string sql = "CREATE OR REPLACE TEMP TABLE " + temp_table + " AS " + view_query_sql + ";\n";
+	sql += "DELETE FROM " + data_table + " AS openivm_old\nWHERE (" + nullable_key +
+	       ")\n   OR NOT EXISTS (\n  SELECT 1 FROM " + temp_table + " AS openivm_new WHERE " + keep_match + "\n);\n";
+	sql += "INSERT OR REPLACE INTO " + data_table + " SELECT * FROM " + temp_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + temp_table + ";\n";
+	return sql;
 }
 
 string SqlUtils::ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement) {
@@ -905,6 +970,15 @@ string SqlUtils::FindTableReference(const string &sql, const string &table_name)
 		return "";
 	}
 	auto &match = matches[0];
+	return sql.substr(match.start, match.end - match.start);
+}
+
+string SqlUtils::FindTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence) {
+	auto matches = CollectTableReferenceMatches(sql, table_name, false);
+	if (occurrence >= matches.size()) {
+		return "";
+	}
+	auto &match = matches[occurrence];
 	return sql.substr(match.start, match.end - match.start);
 }
 

@@ -1,2 +1,2 @@
--- {"operators": "ASOF_JOIN,CTE", "complexity": "high", "is_incremental": true, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,OORDER"}
+-- {"operators": "ASOF_JOIN,CTE", "complexity": "high", "is_incremental": false, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,OORDER", "non_incr_reason": "op:ASOF_JOIN"}
 WITH delivered AS (SELECT * FROM ORDER_LINE WHERE OL_DELIVERY_D IS NOT NULL) SELECT d.OL_W_ID, d.OL_O_ID, o.O_C_ID FROM delivered d ASOF JOIN OORDER o ON d.OL_W_ID = o.O_W_ID AND d.OL_D_ID = o.O_D_ID AND d.OL_DELIVERY_D >= o.O_ENTRY_D;

@@ -1,0 +1,2 @@
+-- {"operators": "SEMI_JOIN,IN,PROJECTION,FILTER", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "OORDER,ORDER_LINE", "openivm_verified": true}
+SELECT o.O_ID + 1 AS O_ID, o.O_OL_CNT, o.O_C_ID FROM OORDER o WHERE o.O_ID IN (SELECT ol.OL_O_ID FROM ORDER_LINE ol WHERE ol.OL_W_ID = o.O_W_ID AND ol.OL_D_ID = o.O_D_ID) AND o.O_OL_CNT > 0;

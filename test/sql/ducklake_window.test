@@ -228,7 +228,8 @@ statement ok
 PRAGMA refresh('mv_composite_window');
 
 query I
-SELECT contains(content, '(w_id, d_id) IN (SELECT w_id, d_id FROM openivm_old_affected_mv_composite_window)')
+SELECT content LIKE '%DELETE FROM%openivm_data_mv_composite_window;%' AND
+       content LIKE '%INSERT INTO%openivm_data_mv_composite_window%'
 FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_composite_window.sql');
 ----
 true

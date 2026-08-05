@@ -545,3 +545,110 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Regression: NULL partition keys use window equality semantics
+# ==========================================
+
+statement ok
+CREATE TABLE w_null_part (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO w_null_part VALUES
+    (1, NULL, 10),
+    (2, NULL, 20),
+    (3, 'a', 5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_null_part AS
+SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+FROM w_null_part;
+
+# Batch conflicting changes in the NULL partition before one refresh.
+statement ok
+INSERT INTO w_null_part VALUES
+    (4, NULL, 15),
+    (5, NULL, 30);
+
+statement ok
+UPDATE w_null_part SET val = 25 WHERE id = 1;
+
+statement ok
+DELETE FROM w_null_part WHERE id IN (2, 5);
+
+statement ok
+PRAGMA refresh('mv_null_part');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+    FROM w_null_part
+    EXCEPT ALL
+    SELECT * FROM mv_null_part
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_null_part
+    EXCEPT ALL
+    SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn
+    FROM w_null_part
+);
+----
+0
+
+# Composite partition keys must also match mixed-NULL tuples.
+statement ok
+CREATE TABLE w_null_comp (id INT, dept VARCHAR, team VARCHAR, val INT);
+
+statement ok
+INSERT INTO w_null_comp VALUES
+    (1, 'eng', NULL, 10),
+    (2, 'eng', NULL, 20),
+    (3, NULL, 'ops', 30),
+    (4, 'hr', 'rec', 40);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_null_comp AS
+SELECT id, dept, team, val,
+       ROW_NUMBER() OVER (PARTITION BY dept, team ORDER BY val, id) AS rn
+FROM w_null_comp;
+
+statement ok
+INSERT INTO w_null_comp VALUES
+    (5, 'eng', NULL, 15),
+    (6, NULL, 'ops', 35),
+    (7, 'eng', NULL, 50);
+
+statement ok
+UPDATE w_null_comp SET val = 25 WHERE id = 1;
+
+statement ok
+DELETE FROM w_null_comp WHERE id IN (2, 7);
+
+statement ok
+PRAGMA refresh('mv_null_comp');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, dept, team, val,
+           ROW_NUMBER() OVER (PARTITION BY dept, team ORDER BY val, id) AS rn
+    FROM w_null_comp
+    EXCEPT ALL
+    SELECT * FROM mv_null_comp
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_null_comp
+    EXCEPT ALL
+    SELECT id, dept, team, val,
+           ROW_NUMBER() OVER (PARTITION BY dept, team ORDER BY val, id) AS rn
+    FROM w_null_comp
+);
+----
+0

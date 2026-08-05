@@ -1,0 +1,2 @@
+-- {"operators": "CTE,WINDOW,AGGREGATE", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE", "openivm_verified": true}
+WITH revenue AS (SELECT OL_W_ID, OL_I_ID, SUM(OL_AMOUNT) AS item_revenue FROM ORDER_LINE GROUP BY OL_W_ID, OL_I_ID) SELECT OL_W_ID, OL_I_ID, item_revenue, ROW_NUMBER() OVER (PARTITION BY OL_W_ID ORDER BY item_revenue DESC, OL_I_ID) AS revenue_rank FROM revenue;

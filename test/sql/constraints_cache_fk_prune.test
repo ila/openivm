@@ -1,0 +1,165 @@
+# name: test/sql/constraints_cache_fk_prune.test
+# description: RELY FK constraint-cache declarations prune FK-redundant join delta terms.
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_skip_empty_deltas = false;
+
+# Baseline with an empty constraints cache: a two-sided append on child+parent
+# keeps the child-delta/full-parent arm and the higher-order both-deltas arm.
+statement ok
+CREATE TABLE nofk_dim(product_id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE nofk_fact(sale_id INTEGER, product_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO nofk_dim VALUES (1, 'widget'), (2, 'gadget');
+
+statement ok
+INSERT INTO nofk_fact VALUES (10, 1, 100), (11, 2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW nofk_mv AS
+    SELECT f.sale_id, d.name, f.amount
+    FROM nofk_fact f JOIN nofk_dim d ON f.product_id = d.product_id;
+
+statement ok
+INSERT INTO nofk_dim VALUES (3, 'thing');
+
+statement ok
+INSERT INTO nofk_fact VALUES (12, 3, 300);
+
+statement ok
+CREATE TABLE nofk_refresh_sql AS
+SELECT stmt_order, sql
+FROM openivm_compile_with_facts(
+    'nofk_mv', '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
+WHERE stmt_kind = 'data';
+
+query I
+SELECT
+    count(*) FILTER (
+        WHERE contains(sql, 'openivm_delta_nofk_fact')
+          AND contains(sql, 'openivm_delta_nofk_dim')
+    ) = 1
+    AND count(*) FILTER (
+        WHERE contains(sql, 'openivm_delta_nofk_fact')
+          AND NOT contains(sql, 'openivm_delta_nofk_dim')
+    ) >= 1
+FROM nofk_refresh_sql;
+----
+true
+
+statement ok
+PRAGMA refresh('nofk_mv');
+
+query I
+SELECT (SELECT count(*) FROM (
+    SELECT f.sale_id, d.name, f.amount
+    FROM nofk_fact f JOIN nofk_dim d ON f.product_id = d.product_id
+    EXCEPT ALL SELECT * FROM nofk_mv
+)) = 0 AND (SELECT count(*) FROM (
+    SELECT * FROM nofk_mv
+    EXCEPT ALL
+    SELECT f.sale_id, d.name, f.amount
+    FROM nofk_fact f JOIN nofk_dim d ON f.product_id = d.product_id
+)) = 0;
+----
+true
+
+# The same physical schema, but with a trusted RELY FK declared only through
+# openivm_constraints_cache. The child-delta/full-parent arm remains, while the
+# higher-order child-delta/parent-delta arm is pruned.
+statement ok
+CREATE TABLE ccfk_dim(product_id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE ccfk_fact(sale_id INTEGER, product_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO ccfk_dim VALUES (1, 'widget'), (2, 'gadget');
+
+statement ok
+INSERT INTO ccfk_fact VALUES (10, 1, 100), (11, 2, 200);
+
+statement ok
+CREATE MATERIALIZED VIEW ccfk_mv AS
+    SELECT f.sale_id, d.name, f.amount
+    FROM ccfk_fact f JOIN ccfk_dim d ON f.product_id = d.product_id;
+
+statement ok
+INSERT INTO ccfk_dim VALUES (3, 'thing');
+
+statement ok
+INSERT INTO ccfk_fact VALUES (12, 3, 300);
+
+statement ok
+PRAGMA openivm_declare_rely_fk('ccfk_fact', 'product_id', 'ccfk_dim', 'product_id');
+
+query TTTTTI
+SELECT table_name, constraint_kind, columns_json, referenced_table, referenced_columns_json, is_trusted
+FROM openivm_constraints_cache
+WHERE table_name = 'ccfk_fact';
+----
+ccfk_fact	RELY_FK	["product_id"]	ccfk_dim	["product_id"]	true
+
+statement ok
+CREATE TABLE ccfk_refresh_sql AS
+SELECT stmt_order, sql
+FROM openivm_compile_with_facts(
+    'ccfk_mv', '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
+WHERE stmt_kind = 'data';
+
+query I
+SELECT
+    count(*) FILTER (
+        WHERE contains(sql, 'openivm_delta_ccfk_fact')
+          AND contains(sql, 'openivm_delta_ccfk_dim')
+    ) = 0
+    AND count(*) FILTER (
+        WHERE contains(sql, 'openivm_delta_ccfk_fact')
+          AND NOT contains(sql, 'openivm_delta_ccfk_dim')
+    ) >= 1
+FROM ccfk_refresh_sql;
+----
+true
+
+query I
+SELECT
+    ((SELECT sum((length(sql) - length(replace(sql, 'UNION ALL', ''))) / length('UNION ALL'))
+      FROM nofk_refresh_sql)
+     >
+     (SELECT sum((length(sql) - length(replace(sql, 'UNION ALL', ''))) / length('UNION ALL'))
+      FROM ccfk_refresh_sql));
+----
+true
+
+statement ok
+PRAGMA refresh('ccfk_mv');
+
+query I
+SELECT (SELECT count(*) FROM (
+    SELECT f.sale_id, d.name, f.amount
+    FROM ccfk_fact f JOIN ccfk_dim d ON f.product_id = d.product_id
+    EXCEPT ALL SELECT * FROM ccfk_mv
+)) = 0 AND (SELECT count(*) FROM (
+    SELECT * FROM ccfk_mv
+    EXCEPT ALL
+    SELECT f.sale_id, d.name, f.amount
+    FROM ccfk_fact f JOIN ccfk_dim d ON f.product_id = d.product_id
+)) = 0;
+----
+true
+
+query III
+SELECT sale_id, name, amount FROM ccfk_mv ORDER BY sale_id;
+----
+10	widget	100
+11	gadget	200
+12	thing	300
+
+statement ok
+SET openivm_skip_empty_deltas = true;

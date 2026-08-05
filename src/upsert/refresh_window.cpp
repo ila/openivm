@@ -4,6 +4,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/main/connection.hpp"
+#include "rules/column_hider.hpp"
 
 namespace duckdb {
 
@@ -57,6 +58,14 @@ static bool AnyDuckLakeSource(RefreshMetadata &metadata, const string &view_name
 static bool IsSafeForDuckLakeSnapshotDiff(const vector<string> &partition_cols, const vector<string> &column_names,
                                           bool any_ducklake) {
 	if (!any_ducklake || partition_cols.empty()) {
+		return false;
+	}
+	// The create-time metadata stores the union of window PARTITION BY columns,
+	// not each distinct partition key set. For DuckLake snapshot-diff refresh a
+	// multi-column tuple filter is only safe when every window uses that same
+	// tuple. Until the metadata can prove that, keep DuckLake partial refresh to
+	// the single-key case and use the existing full-recompute fallback otherwise.
+	if (partition_cols.size() != 1) {
 		return false;
 	}
 	for (auto &pc : partition_cols) {
@@ -115,11 +124,37 @@ static string ResolveStandardTrackedTableSQL(RefreshMetadata &metadata, const st
 	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, resolved_name);
 }
 
+static string BuildLineageColumnExpr(const string &column_name, const string &cast_type, const string &alias = "") {
+	string column =
+	    alias.empty() ? SqlUtils::QuoteIdentifier(column_name) : alias + "." + SqlUtils::QuoteIdentifier(column_name);
+	return SqlUtils::ApplyCastSpec(column, cast_type);
+}
+
+static string DescribeColumnType(Connection &con, const string &table_sql, const string &column_name) {
+	auto result = con.Query("DESCRIBE SELECT " + SqlUtils::QuoteIdentifier(column_name) + " FROM " + table_sql);
+	if (result->HasError() || result->RowCount() == 0) {
+		return "";
+	}
+	return StringUtil::Upper(result->GetValue(1, 0).ToString());
+}
+
+static bool LookupCastMetadataIsSafe(Connection &con, const string &delta_table, const string &source_col,
+                                     const string &lookup_table, const string &lookup_col, const string &source_cast,
+                                     const string &lookup_cast) {
+	if (!source_cast.empty() || !lookup_cast.empty()) {
+		return true;
+	}
+	string source_type = DescribeColumnType(con, delta_table, source_col);
+	string lookup_type = DescribeColumnType(con, lookup_table, lookup_col);
+	return !source_type.empty() && !lookup_type.empty() && StringUtil::CIEquals(source_type, lookup_type);
+}
+
 static string BuildStandardChangedValuesSQL(RefreshMetadata &metadata, const string &view_name,
                                             const vector<string> &delta_table_names, const string &table_name,
-                                            const string &source_col, const string &output_col,
-                                            const string &delta_ts_filter, const string &view_catalog_name,
-                                            const string &view_schema_name, const string &attached_db_catalog_name,
+                                            const string &source_col, const string &source_cast,
+                                            const string &output_col, const string &delta_ts_filter,
+                                            const string &view_catalog_name, const string &view_schema_name,
+                                            const string &attached_db_catalog_name,
                                             const string &attached_db_schema_name) {
 	string delta_table = ResolveStandardTrackedTableSQL(metadata, view_name, delta_table_names, table_name,
 	                                                    /*delta_table=*/true, view_catalog_name, view_schema_name,
@@ -128,11 +163,11 @@ static string BuildStandardChangedValuesSQL(RefreshMetadata &metadata, const str
 		return "";
 	}
 	string filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-	return "SELECT DISTINCT " + SqlUtils::QuoteIdentifier(source_col) + " AS " + SqlUtils::QuoteIdentifier(output_col) +
-	       " FROM " + delta_table + filter;
+	return "SELECT DISTINCT " + BuildLineageColumnExpr(source_col, source_cast) + " AS " +
+	       SqlUtils::QuoteIdentifier(output_col) + " FROM " + delta_table + filter;
 }
 
-static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const string &view_name,
+static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const string &view_name, Connection &con,
                                                 const vector<string> &delta_table_names,
                                                 const RefreshMetadata::WindowPartitionLineageOp &op,
                                                 const string &delta_ts_filter, const string &view_catalog_name,
@@ -147,32 +182,39 @@ static string BuildStandardLookupChangedKeysSQL(RefreshMetadata &metadata, const
 	if (delta_table.empty() || lookup_table.empty()) {
 		return "";
 	}
-	string qsource_col = SqlUtils::QuoteIdentifier(op.source_col);
-	string qlookup_col = SqlUtils::QuoteIdentifier(op.lookup_col);
-	string qlookup_out = SqlUtils::QuoteIdentifier(op.lookup_out);
+	if (!LookupCastMetadataIsSafe(con, delta_table, op.source_col, lookup_table, op.lookup_col, op.source_cast,
+	                              op.lookup_cast)) {
+		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lookup cast metadata is incomplete for '%s' — "
+		                    "full recompute fallback\n",
+		                    view_name.c_str());
+		return "";
+	}
+	string source_expr = BuildLineageColumnExpr(op.source_col, op.source_cast);
+	string lookup_expr = BuildLineageColumnExpr(op.lookup_col, op.lookup_cast);
+	string lookup_out = BuildLineageColumnExpr(op.lookup_out, op.lookup_out_cast);
 	string qoutput_col = SqlUtils::QuoteIdentifier(op.output_col);
 	string filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-	return "SELECT DISTINCT " + qlookup_out + " AS " + qoutput_col + " FROM " + lookup_table + " WHERE " + qlookup_col +
-	       " IN (SELECT DISTINCT " + qsource_col + " FROM " + delta_table + filter + ")";
+	return "SELECT DISTINCT " + lookup_out + " AS " + qoutput_col + " FROM " + lookup_table + " WHERE " + lookup_expr +
+	       " IN (SELECT DISTINCT " + source_expr + " FROM " + delta_table + filter + ")";
 }
 
-static bool BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, const string &view_name,
-                                                const vector<string> &delta_table_names,
-                                                const vector<string> &partition_cols, const string &delta_ts_filter,
-                                                const string &view_catalog_name, const string &view_schema_name,
-                                                const string &attached_db_catalog_name,
-                                                const string &attached_db_schema_name, string &affected_keys_sql,
-                                                string &key_cols, string &key_tuple) {
+enum class LineageAffectedKeysResult : uint8_t { UNAVAILABLE, AVAILABLE, UNSAFE };
+
+static LineageAffectedKeysResult
+BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                    const vector<string> &delta_table_names, const vector<string> &partition_cols,
+                                    const string &delta_ts_filter, const string &view_catalog_name,
+                                    const string &view_schema_name, const string &attached_db_catalog_name,
+                                    const string &attached_db_schema_name, string &affected_keys_sql) {
 	if (partition_cols.size() != 1) {
-		return false;
+		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
 	auto parsed = SplitPartitionSpec(partition_cols[0]);
-	key_cols = SqlUtils::QuoteIdentifier(parsed.first);
-	key_tuple = key_cols;
+	string key_cols = SqlUtils::QuoteIdentifier(parsed.first);
 
 	vector<RefreshMetadata::WindowPartitionLineageOp> lineage_ops;
 	if (!metadata.GetWindowPartitionLineage(view_name, lineage_ops)) {
-		return false;
+		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
 
 	vector<string> arms;
@@ -183,16 +225,17 @@ static bool BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, const
 		}
 		string arm_sql;
 		if (op.kind == "direct") {
-			arm_sql = BuildStandardChangedValuesSQL(metadata, view_name, delta_table_names, op.source, op.source_col,
-			                                        op.output_col, delta_ts_filter, view_catalog_name, view_schema_name,
-			                                        attached_db_catalog_name, attached_db_schema_name);
+			arm_sql =
+			    BuildStandardChangedValuesSQL(metadata, view_name, delta_table_names, op.source, op.source_col,
+			                                  op.source_cast, op.output_col, delta_ts_filter, view_catalog_name,
+			                                  view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 		} else if (op.kind == "lookup") {
-			arm_sql = BuildStandardLookupChangedKeysSQL(metadata, view_name, delta_table_names, op, delta_ts_filter,
-			                                            view_catalog_name, view_schema_name, attached_db_catalog_name,
-			                                            attached_db_schema_name);
+			arm_sql = BuildStandardLookupChangedKeysSQL(metadata, view_name, con, delta_table_names, op,
+			                                            delta_ts_filter, view_catalog_name, view_schema_name,
+			                                            attached_db_catalog_name, attached_db_schema_name);
 		}
 		if (arm_sql.empty()) {
-			continue;
+			return LineageAffectedKeysResult::UNSAFE;
 		}
 		arms.push_back("(" + arm_sql + ")");
 		covered_sources.insert(StripTrackedPrefix(op.source));
@@ -200,11 +243,11 @@ static bool BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, const
 
 	for (auto &dt : delta_table_names) {
 		if (!covered_sources.count(StripTrackedPrefix(dt))) {
-			return false;
+			return LineageAffectedKeysResult::UNAVAILABLE;
 		}
 	}
 	if (arms.empty()) {
-		return false;
+		return LineageAffectedKeysResult::UNAVAILABLE;
 	}
 
 	string union_sql;
@@ -215,7 +258,7 @@ static bool BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, const
 		union_sql += arms[i];
 	}
 	affected_keys_sql = "SELECT DISTINCT " + key_cols + " FROM (" + union_sql + ") openivm_changed_partitions";
-	return true;
+	return LineageAffectedKeysResult::AVAILABLE;
 }
 
 static bool AllWindowPartitionSourcesCovered(const vector<string> &delta_table_names,
@@ -291,15 +334,15 @@ static bool BuildDuckLakeWindowSourceSpecs(RefreshMetadata &metadata, Connection
 }
 
 static string BuildDuckLakeChangedValuesSQL(const DuckLakeWindowSourceSpec &spec, const string &source_col,
-                                            const string &output_col) {
-	string qsource_col = SqlUtils::QuoteIdentifier(source_col);
+                                            const string &source_cast, const string &output_col) {
+	string source_expr = BuildLineageColumnExpr(source_col, source_cast);
 	string qoutput_col = SqlUtils::QuoteIdentifier(output_col);
 	string insertions =
-	    "SELECT " + qsource_col + " AS " + qoutput_col + " FROM " +
+	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
 	    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.loc.catalog_name, spec.loc.schema_name,
 	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
 	string deletions =
-	    "SELECT " + qsource_col + " AS " + qoutput_col + " FROM " +
+	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
 	    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.loc.catalog_name, spec.loc.schema_name,
 	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
 	return "(" + insertions + " UNION ALL " + deletions + ")";
@@ -308,38 +351,39 @@ static string BuildDuckLakeChangedValuesSQL(const DuckLakeWindowSourceSpec &spec
 static string BuildDuckLakeLookupChangedKeysSQL(const DuckLakeWindowSourceSpec &source_spec,
                                                 const DuckLakeWindowSourceSpec &lookup_spec,
                                                 const RefreshMetadata::WindowPartitionLineageOp &op) {
-	string changed = BuildDuckLakeChangedValuesSQL(source_spec, op.source_col, "openivm_join_key");
+	string changed = BuildDuckLakeChangedValuesSQL(source_spec, op.source_col, op.source_cast, "openivm_join_key");
 	string lookup_table =
 	    SqlUtils::FullName(lookup_spec.loc.catalog_name, lookup_spec.loc.schema_name, lookup_spec.loc.table_name);
-	string lookup_col = SqlUtils::QuoteIdentifier(op.lookup_col);
-	string lookup_out = SqlUtils::QuoteIdentifier(op.lookup_out);
+	string lookup_col = BuildLineageColumnExpr(op.lookup_col, op.lookup_cast, "l");
+	string lookup_out = BuildLineageColumnExpr(op.lookup_out, op.lookup_out_cast, "l");
 	string output_col = SqlUtils::QuoteIdentifier(op.output_col);
-	string current_lookup = "SELECT l." + lookup_out + " AS " + output_col + " FROM " + changed + " c JOIN " +
-	                        lookup_table + " AS l AT (VERSION => " + to_string(lookup_spec.current_snap) + ") ON l." +
+	string current_lookup = "SELECT " + lookup_out + " AS " + output_col + " FROM " + changed + " c JOIN " +
+	                        lookup_table + " AS l AT (VERSION => " + to_string(lookup_spec.current_snap) + ") ON " +
 	                        lookup_col + " = c.openivm_join_key";
-	string old_lookup = "SELECT l." + lookup_out + " AS " + output_col + " FROM " + changed + " c JOIN " +
-	                    lookup_table + " AS l AT (VERSION => " + to_string(lookup_spec.old_snap) + ") ON l." +
-	                    lookup_col + " = c.openivm_join_key";
+	string old_lookup = "SELECT " + lookup_out + " AS " + output_col + " FROM " + changed + " c JOIN " + lookup_table +
+	                    " AS l AT (VERSION => " + to_string(lookup_spec.old_snap) + ") ON " + lookup_col +
+	                    " = c.openivm_join_key";
 	return "(" + current_lookup + " UNION ALL " + old_lookup + ")";
 }
 
-static string BuildAffectedPartitionFilter(const vector<string> &partition_cols, const string &affected_table) {
-	string key_cols;
-	string key_tuple;
-	for (size_t i = 0; i < partition_cols.size(); i++) {
-		if (i > 0) {
-			key_cols += ", ";
-			key_tuple += ", ";
-		}
-		auto parsed = SplitPartitionSpec(partition_cols[i]);
-		string output_col = KeywordHelper::WriteOptionallyQuoted(parsed.first);
-		key_cols += output_col;
-		key_tuple += output_col;
+static vector<string> PartitionOutputColumns(const vector<string> &partition_cols) {
+	vector<string> output_columns;
+	output_columns.reserve(partition_cols.size());
+	for (auto &partition_col : partition_cols) {
+		output_columns.push_back(SplitPartitionSpec(partition_col).first);
 	}
-	if (partition_cols.size() == 1) {
-		return key_tuple + " IN (SELECT " + key_cols + " FROM " + affected_table + ")";
-	}
-	return "(" + key_tuple + ") IN (SELECT " + key_cols + " FROM " + affected_table + ")";
+	return output_columns;
+}
+
+static string BuildAffectedPartitionRefreshSQL(const string &data_table, const string &view_query_sql,
+                                               const string &affected_keys_sql, const string &affected_temp_table,
+                                               const vector<string> &partition_cols) {
+	auto output_columns = PartitionOutputColumns(partition_cols);
+	string target_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_target");
+	string recompute_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_recompute");
+	return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_keys_sql, "openivm_target",
+	                                  "openivm_recompute", "openivm_aff", target_match, recompute_match,
+	                                  affected_temp_table);
 }
 
 static bool BuildLineageDuckLakeAffectedKeysSQL(RefreshMetadata &metadata, Connection &con, const string &view_name,
@@ -347,13 +391,12 @@ static bool BuildLineageDuckLakeAffectedKeysSQL(RefreshMetadata &metadata, Conne
                                                 const vector<string> &partition_cols, const string &view_catalog_name,
                                                 const string &view_schema_name, const string &attached_db_catalog_name,
                                                 const string &attached_db_schema_name, string &affected_keys_sql,
-                                                string &key_cols, string &key_tuple) {
+                                                string &key_cols) {
 	if (partition_cols.size() != 1) {
 		return false;
 	}
 	auto parsed = SplitPartitionSpec(partition_cols[0]);
 	key_cols = SqlUtils::QuoteIdentifier(parsed.first);
-	key_tuple = key_cols;
 
 	vector<DuckLakeWindowSourceSpec> specs;
 	if (!BuildDuckLakeWindowSourceSpecs(metadata, con, view_name, delta_table_names, view_catalog_name,
@@ -377,7 +420,7 @@ static bool BuildLineageDuckLakeAffectedKeysSQL(RefreshMetadata &metadata, Conne
 			continue;
 		}
 		if (op.kind == "direct") {
-			arms.push_back(BuildDuckLakeChangedValuesSQL(*source_spec, op.source_col, op.output_col));
+			arms.push_back(BuildDuckLakeChangedValuesSQL(*source_spec, op.source_col, op.source_cast, op.output_col));
 			covered_sources.insert(StripDataPrefix(source_spec->metadata_key));
 			continue;
 		}
@@ -446,12 +489,10 @@ static string BuildSingleSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, 
 	string deletions = "SELECT " + affected_select + " FROM " +
 	                   SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
 	                                                   loc.table_name, old_snap, current_snap);
-	string affected_filter = BuildAffectedPartitionFilter(partition_cols, qtemp_affected);
-	string upsert_query = "CREATE TEMP TABLE " + qtemp_affected + " AS SELECT DISTINCT " + affected_cols + " FROM ((" +
-	                      insertions + ") UNION ALL (" + deletions + ")) openivm_changed_partitions;\n";
-	upsert_query +=
-	    BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter, affected_filter);
-	upsert_query += "DROP TABLE " + qtemp_affected + ";\n";
+	string affected_keys = "SELECT DISTINCT " + affected_cols + " FROM ((" + insertions + ") UNION ALL (" + deletions +
+	                       ")) openivm_changed_partitions";
+	string upsert_query =
+	    BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, affected_keys, qtemp_affected, partition_cols);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake change-feed, %zu "
 	                    "partition cols, old_snap=%ld, current_snap=%ld)\n",
 	                    partition_cols.size(), (long)old_snap, (long)current_snap);
@@ -466,24 +507,19 @@ static string BuildMultiSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, C
                                                     const string &attached_db_catalog_name,
                                                     const string &attached_db_schema_name) {
 	string key_cols;
-	string key_tuple;
 	string affected_keys;
 	if (BuildLineageDuckLakeAffectedKeysSQL(metadata, con, view_name, delta_table_names, partition_cols,
 	                                        view_catalog_name, view_schema_name, attached_db_catalog_name,
-	                                        attached_db_schema_name, affected_keys, key_cols, key_tuple)) {
+	                                        attached_db_schema_name, affected_keys, key_cols)) {
 		string temp_affected = string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name;
 		string qtemp_affected = KeywordHelper::WriteOptionallyQuoted(temp_affected);
-		string affected_filter = key_tuple + " IN (SELECT " + key_cols + " FROM " + qtemp_affected + ")";
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake lineage change-feed, %zu "
 		                    "sources)\n",
 		                    delta_table_names.size());
 		// Conservative lineage can over-include partitions, but must cover every changed source.
 		// If lineage is incomplete, the full logical view diff below preserves correctness.
-		string upsert_query = "CREATE OR REPLACE TEMP TABLE " + qtemp_affected + " AS " + affected_keys + ";\n";
-		upsert_query += BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter,
-		                                            affected_filter);
-		upsert_query += "DROP TABLE IF EXISTS " + qtemp_affected + ";\n";
-		return upsert_query;
+		return BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, affected_keys, qtemp_affected,
+		                                        partition_cols);
 	}
 
 	key_cols.clear();
@@ -504,17 +540,13 @@ static string BuildMultiSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, C
 	string temp_affected = string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name;
 	string qtemp_affected = KeywordHelper::WriteOptionallyQuoted(temp_affected);
 	string fallback_affected_keys = "SELECT DISTINCT " + key_cols + " FROM (" + changed_rows + ") openivm_changed_rows";
-	string affected_filter = BuildAffectedPartitionFilter(partition_cols, qtemp_affected);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake view-diff, %zu "
 	                    "partition cols, %zu sources)\n",
 	                    partition_cols.size(), delta_table_names.size());
 	// Materialize the affected partition keys once; otherwise DuckDB/DuckLake repeats the
 	// full view diff independently for DELETE and INSERT.
-	string upsert_query = "CREATE OR REPLACE TEMP TABLE " + qtemp_affected + " AS " + fallback_affected_keys + ";\n";
-	upsert_query +=
-	    BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter, affected_filter);
-	upsert_query += "DROP TABLE IF EXISTS " + qtemp_affected + ";\n";
-	return upsert_query;
+	return BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, fallback_affected_keys, qtemp_affected,
+	                                        partition_cols);
 }
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
@@ -523,15 +555,13 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &delta_ts_filter, const string &internal_catalog_prefix,
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
-                                   bool cross_system, bool emit_cascade_delta) {
+                                   bool cross_system, bool emit_cascade_delta, bool running_window_incremental) {
 	auto partition_cols = metadata.GetGroupColumns(view_name); // reuses group_columns field
 	auto partition_delta_specs =
 	    BuildWindowPartitionDeltaSpecs(metadata, con, view_name, delta_table_names, partition_cols, cross_system);
 	bool any_ducklake = AnyDuckLakeSource(metadata, view_name, delta_table_names);
 	bool safe_for_snapdiff = IsSafeForDuckLakeSnapshotDiff(partition_cols, column_names, any_ducklake);
 	string affected_keys_sql;
-	string affected_key_cols;
-	string affected_key_tuple;
 	bool have_lineage_affected_keys = false;
 
 	if (safe_for_snapdiff && delta_table_names.size() == 1) {
@@ -549,12 +579,15 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		    "[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake, full recompute fallback)\n");
 		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 	}
-	if (delta_table_names.size() > 1) {
-		have_lineage_affected_keys = BuildLineageStandardAffectedKeysSQL(
-		    metadata, view_name, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
-		    view_schema_name, attached_db_catalog_name, attached_db_schema_name, affected_keys_sql, affected_key_cols,
-		    affected_key_tuple);
+	auto lineage_result = BuildLineageStandardAffectedKeysSQL(
+	    metadata, con, view_name, delta_table_names, partition_cols, delta_ts_filter, view_catalog_name,
+	    view_schema_name, attached_db_catalog_name, attached_db_schema_name, affected_keys_sql);
+	if (lineage_result == LineageAffectedKeysResult::UNSAFE) {
+		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage is unsafe for '%s' — full recompute fallback\n",
+		                    view_name.c_str());
+		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix);
 	}
+	have_lineage_affected_keys = lineage_result == LineageAffectedKeysResult::AVAILABLE;
 	if (!have_lineage_affected_keys && delta_table_names.size() > 1 &&
 	    !AllWindowPartitionSourcesCovered(delta_table_names, partition_delta_specs)) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage incomplete for '%s' (%zu sources) — full recompute "
@@ -564,9 +597,21 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols, lineage keys: %s)\n",
 	                    partition_cols.size(), have_lineage_affected_keys ? "yes" : "no");
+	vector<string> running_window_column_names = column_names;
+	if (running_window_incremental) {
+		auto data_cols = con.Query("SELECT column_name FROM information_schema.columns WHERE table_name = '" +
+		                           SqlUtils::EscapeValue(IncrementalTableNames::DataTableName(view_name)) +
+		                           "' ORDER BY ordinal_position");
+		if (!data_cols->HasError() && data_cols->RowCount() > 0) {
+			running_window_column_names.clear();
+			for (idx_t i = 0; i < data_cols->RowCount(); i++) {
+				running_window_column_names.push_back(data_cols->GetValue(0, i).ToString());
+			}
+		}
+	}
 	return CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, internal_catalog_prefix, partition_cols,
-	                              partition_delta_specs, emit_cascade_delta, affected_keys_sql, affected_key_cols,
-	                              affected_key_tuple);
+	                              partition_delta_specs, emit_cascade_delta, affected_keys_sql,
+	                              running_window_column_names, running_window_incremental);
 }
 
 } // namespace duckdb

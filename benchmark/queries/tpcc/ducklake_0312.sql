@@ -1103,6 +1103,7 @@ qualify_seed AS MATERIALIZED (
 		ff.order_id,
 		ff.line_number,
 		ff.item_id,
+		ff.line_key,
 		ff.credit_code,
 		ff.fulfillment_state,
 		ff.account_state,
@@ -1124,6 +1125,7 @@ qualify_ranked AS (
 		qs.order_id,
 		qs.line_number,
 		qs.item_id,
+		qs.line_key,
 		qs.credit_code,
 		qs.fulfillment_state,
 		qs.account_state,
@@ -1145,15 +1147,18 @@ qualify_ranked AS (
 				qs.stock_quantity ASC,
 				qs.total_history_amount ASC,
 				qs.order_entry_date ASC,
-				qs.delivery_date ASC
+				qs.delivery_date ASC,
+				qs.line_key ASC
 		) AS fulfillment_rank,
 		RANK() OVER (
 			PARTITION BY qs.warehouse_id, qs.credit_code
-			ORDER BY qs.customer_balance DESC, qs.customer_id ASC, qs.order_id ASC
+			ORDER BY qs.customer_balance DESC, qs.customer_id ASC, qs.order_id ASC, qs.line_number ASC,
+				qs.item_id ASC, qs.fulfillment_state ASC, qs.account_state ASC, qs.line_key ASC
 		) AS balance_rank,
 		DENSE_RANK() OVER (
 			PARTITION BY qs.warehouse_id, qs.district_id, qs.account_state
-			ORDER BY qs.stock_quantity ASC, qs.item_id ASC
+			ORDER BY qs.stock_quantity ASC, qs.item_id ASC, qs.customer_id ASC, qs.order_id ASC,
+				qs.line_number ASC, qs.credit_code ASC, qs.fulfillment_state ASC, qs.line_key ASC
 		) AS stock_rank,
 		SUM(qs.extended_amount) OVER (
 			PARTITION BY qs.warehouse_id, qs.district_id, qs.customer_id
@@ -1177,11 +1182,13 @@ qualify_ranked AS (
 				qs.stock_quantity ASC,
 				qs.total_history_amount ASC,
 				qs.order_entry_date ASC,
-				qs.delivery_date ASC
+				qs.delivery_date ASC,
+				qs.line_key ASC
 		) <= 5
 		OR DENSE_RANK() OVER (
 			PARTITION BY qs.warehouse_id, qs.district_id, qs.account_state
-			ORDER BY qs.stock_quantity ASC, qs.item_id ASC
+			ORDER BY qs.stock_quantity ASC, qs.item_id ASC, qs.customer_id ASC, qs.order_id ASC,
+				qs.line_number ASC, qs.credit_code ASC, qs.fulfillment_state ASC, qs.line_key ASC
 		) <= 4
 
 ),
@@ -1193,6 +1200,7 @@ qualify_window_pass_2 AS (
 		qr.order_id,
 		qr.line_number,
 		qr.item_id,
+		qr.line_key,
 		qr.credit_code,
 		qr.fulfillment_state,
 		qr.account_state,
@@ -1222,8 +1230,9 @@ qualify_window_pass_2 AS (
 				qr.fulfillment_rank ASC,
 				qr.balance_rank ASC,
 				qr.stock_rank ASC,
-				qr.customer_amount_window ASC,
-				qr.customer_history_window ASC
+				ROUND(qr.customer_amount_window, 10) ASC,
+				ROUND(qr.customer_history_window, 10) ASC,
+				qr.line_key ASC
 		) AS amount_tile,
 		LAG(qr.extended_amount, 1, 0) OVER (
 			PARTITION BY qr.warehouse_id, qr.district_id, qr.customer_id
@@ -1241,8 +1250,9 @@ qualify_window_pass_2 AS (
 				qr.fulfillment_rank ASC,
 				qr.balance_rank ASC,
 				qr.stock_rank ASC,
-				qr.customer_amount_window ASC,
-				qr.customer_history_window ASC
+				ROUND(qr.customer_amount_window, 10) ASC,
+				ROUND(qr.customer_history_window, 10) ASC,
+				qr.line_key ASC
 		) AS previous_customer_amount,
 		COUNT(*) OVER (
 			PARTITION BY qr.warehouse_id, qr.credit_code, qr.fulfillment_state
@@ -1258,6 +1268,7 @@ qualify_window_pass_3 AS (
 		qp2.order_id,
 		qp2.line_number,
 		qp2.item_id,
+		qp2.line_key,
 		qp2.credit_code,
 		qp2.fulfillment_state,
 		qp2.account_state,
@@ -1275,7 +1286,9 @@ qualify_window_pass_3 AS (
 		qp2.credit_fulfillment_rows,
 		DENSE_RANK() OVER (
 			PARTITION BY qp2.warehouse_id, qp2.amount_tile
-			ORDER BY qp2.customer_amount_window DESC, qp2.customer_id ASC
+			ORDER BY ROUND(qp2.customer_amount_window, 10) DESC, qp2.customer_id ASC, qp2.order_id ASC,
+				qp2.line_number ASC, qp2.item_id ASC, qp2.credit_code ASC, qp2.fulfillment_state ASC,
+				qp2.account_state ASC, qp2.line_key ASC
 		) AS tile_customer_rank,
 		SUM(qp2.extended_amount - qp2.previous_customer_amount) OVER (
 			PARTITION BY qp2.warehouse_id, qp2.district_id
