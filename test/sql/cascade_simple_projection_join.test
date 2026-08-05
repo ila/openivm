@@ -209,6 +209,36 @@ FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_tri_mv.sql');
 ----
 1
 
+query I
+SELECT ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL'))
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_tri_mv.sql');
+----
+4
+
+statement ok
+SET openivm_regular_nterm = false;
+
+statement ok
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspj_tri_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
+
+query I
+SELECT ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL'))
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_tri_mv.sql');
+----
+6
+
+statement ok
+SET openivm_regular_nterm = true;
+
+statement ok
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspj_tri_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
+
 statement ok
 UPDATE cspj_tri_broker SET broker_name = 'NorthX' WHERE broker_id = 100;
 
@@ -334,6 +364,98 @@ SELECT COUNT(*) FROM (
     JOIN cspj_cte_security s ON h.security_id = s.security_id
     EXCEPT ALL
     SELECT * FROM cspj_cte_mv
+);
+----
+0
+
+# Projection-wrapped self join uses the regular N-term path
+statement ok
+CREATE TABLE cspj_self_event (event_id INT, account_id INT, event_ts INT, label VARCHAR);
+
+statement ok
+CREATE TABLE cspj_self_account (account_id INT, account_name VARCHAR);
+
+statement ok
+INSERT INTO cspj_self_event VALUES
+    (1, 1, 10, 'a'),
+    (2, 1, 20, 'b'),
+    (3, 2, 10, 'c');
+
+statement ok
+INSERT INTO cspj_self_account VALUES (1, 'one'), (2, 'two');
+
+statement ok
+CREATE MATERIALIZED VIEW cspj_self_mv AS
+    SELECT cur.event_id AS current_id,
+           prev.event_id AS previous_id,
+           a.account_name,
+           cur.label
+    FROM cspj_self_event cur
+    JOIN cspj_self_event prev
+      ON cur.account_id = prev.account_id
+     AND prev.event_ts < cur.event_ts
+    JOIN cspj_self_account a ON cur.account_id = a.account_id;
+
+statement ok
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspj_self_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
+
+query I
+SELECT ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL'))
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_self_mv.sql');
+----
+4
+
+statement ok
+INSERT INTO cspj_self_event VALUES (4, 1, 30, 'd'), (5, 2, 20, 'e'), (6, 2, 30, 'temporary');
+
+statement ok
+UPDATE cspj_self_event SET label = 'bx', event_ts = 25 WHERE event_id = 2;
+
+statement ok
+UPDATE cspj_self_event SET label = 'temporary_x' WHERE event_id = 6;
+
+statement ok
+DELETE FROM cspj_self_event WHERE event_id IN (1, 6);
+
+statement ok
+UPDATE cspj_self_account SET account_name = 'ONE' WHERE account_id = 1;
+
+statement ok
+PRAGMA refresh('cspj_self_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspj_self_mv
+    EXCEPT ALL
+    SELECT cur.event_id,
+           prev.event_id,
+           a.account_name,
+           cur.label
+    FROM cspj_self_event cur
+    JOIN cspj_self_event prev
+      ON cur.account_id = prev.account_id
+     AND prev.event_ts < cur.event_ts
+    JOIN cspj_self_account a ON cur.account_id = a.account_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT cur.event_id,
+           prev.event_id,
+           a.account_name,
+           cur.label
+    FROM cspj_self_event cur
+    JOIN cspj_self_event prev
+      ON cur.account_id = prev.account_id
+     AND prev.event_ts < cur.event_ts
+    JOIN cspj_self_account a ON cur.account_id = a.account_id
+    EXCEPT ALL
+    SELECT * FROM cspj_self_mv
 );
 ----
 0

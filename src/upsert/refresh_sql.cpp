@@ -190,6 +190,7 @@ static void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext 
 	    "openivm_skip_empty_deltas",
 	    "openivm_fk_pruning",
 	    "openivm_ducklake_nterm",
+	    "openivm_regular_nterm",
 	};
 	for (auto setting_name : PLANNING_SETTINGS) {
 		CopyOpenIvmSetting(from, to, setting_name);
