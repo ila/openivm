@@ -428,6 +428,14 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		// LPTS disables the top_n optimizer so ORDER BY + LIMIT appear as separate nodes.
 		// LIMIT is what makes a query top-k; ORDER BY alone does not.
 		result.found_top_k = true;
+		// Ordered top-k is maintained over an unlimited backing table and the
+		// ORDER BY/LIMIT is applied by the user-facing view. A standalone LIMIT
+		// remains in the backing-table plan; maintaining only its current rows
+		// cannot refill the boundary after a deletion, so it requires full refresh.
+		if (node->children.empty() || node->children[0]->type != LogicalOperatorType::LOGICAL_ORDER_BY) {
+			result.incremental_compatible = false;
+			result.found_unsupported_operator = true;
+		}
 		auto *limit_node = dynamic_cast<LogicalLimit *>(node);
 		if (limit_node) {
 			if (limit_node->limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
