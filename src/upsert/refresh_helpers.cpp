@@ -607,10 +607,10 @@ bool TryBuildSparkProjectionKeyRefresh(RefreshMetadata &metadata, const string &
 	                " openivm_target WHERE EXISTS (SELECT 1 FROM " + affected_temp + " openivm_aff WHERE " +
 	                target_match + ");\n\n";
 	upsert_query += "CREATE OR REPLACE TEMP TABLE " + new_temp + " AS\n" + pushed_query + ";\n\n";
-	upsert_query += BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp, new_temp);
 	upsert_query += "DELETE FROM " + data_table + " AS openivm_target WHERE EXISTS (SELECT 1 FROM " + affected_temp +
 	                " openivm_aff WHERE " + target_match + ");\n\n";
 	upsert_query += "INSERT INTO " + data_table + " SELECT * FROM " + new_temp + ";\n";
+	upsert_query += BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp, new_temp);
 	upsert_query += "DROP TABLE IF EXISTS " + old_temp + ";\nDROP TABLE IF EXISTS " + new_temp +
 	                ";\nDROP TABLE IF EXISTS " + affected_temp + ";\n";
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling Spark SIMPLE_PROJECTION affected-key refresh (%s via %s[%llu])\n",
