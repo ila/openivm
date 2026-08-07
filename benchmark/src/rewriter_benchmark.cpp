@@ -181,6 +181,16 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 	return result;
 }
 
+// Count both directional bag differences independently. Combining the two
+// EXCEPT ALL branches with UNION ALL is precedence-sensitive in DuckDB:
+// `a EXCEPT ALL b UNION ALL b EXCEPT ALL a` is evaluated left-to-right and can
+// cancel rows that exist only on one side.
+static string BuildBagMismatchCountQuery(const string &left, const string &right) {
+	return "SELECT (SELECT COUNT(*) FROM ((" + left + ") EXCEPT ALL (" + right +
+	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left +
+	       ")) __right_diff)";
+}
+
 static string LowerASCII(string s) {
 	std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
 	return s;
@@ -791,36 +801,16 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 								// identical to the historical verify so queries whose output
 								// is order-sensitive under CTE materialization (NTILE, etc.)
 								// aren't perturbed.
-								verify_query = "SELECT COUNT(*) FROM ("
-								               "SELECT * FROM " +
-								               mv_name + " EXCEPT ALL SELECT * FROM (" + query +
-								               ") __a"
-								               " UNION ALL "
-								               "SELECT * FROM (" +
-								               query + ") __b EXCEPT ALL SELECT * FROM " + mv_name + ") __diff";
+								string mv_select = "SELECT * FROM " + mv_name;
+								string gt_select = "SELECT * FROM (" + query + ") __gt";
+								verify_query = BuildBagMismatchCountQuery(mv_select, gt_select);
 							} else {
-								verify_query = "WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " + mv_name +
-								               "), "
-								               "gt_r(" +
-								               nv.column_list + ") AS (SELECT * FROM (" + query +
-								               ") __gt) "
-								               "SELECT COUNT(*) FROM ("
-								               "SELECT " +
-								               nv.normalized +
-								               " FROM mv_r "
-								               "EXCEPT ALL "
-								               "SELECT " +
-								               nv.normalized +
-								               " FROM gt_r "
-								               "UNION ALL "
-								               "SELECT " +
-								               nv.normalized +
-								               " FROM gt_r "
-								               "EXCEPT ALL "
-								               "SELECT " +
-								               nv.normalized +
-								               " FROM mv_r"
-								               ") __diff";
+								string ctes = "WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " + mv_name +
+								              "), gt_r(" + nv.column_list + ") AS (SELECT * FROM (" + query +
+								              ") __gt) ";
+								string mv_select = "SELECT " + nv.normalized + " FROM mv_r";
+								string gt_select = "SELECT " + nv.normalized + " FROM gt_r";
+								verify_query = ctes + BuildBagMismatchCountQuery(mv_select, gt_select);
 							}
 							auto verify_result = con.Query(verify_query);
 							if (verify_result && !verify_result->HasError() && verify_result->RowCount() > 0) {
@@ -839,29 +829,12 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 											}
 											non_window_select += nv.normalized_columns[i];
 										}
-										string relaxed_query = "WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " +
-										                       mv_name +
-										                       "), "
-										                       "gt_r(" +
-										                       nv.column_list + ") AS (SELECT * FROM (" + query +
-										                       ") __gt) "
-										                       "SELECT COUNT(*) FROM ("
-										                       "SELECT " +
-										                       non_window_select +
-										                       " FROM mv_r "
-										                       "EXCEPT ALL "
-										                       "SELECT " +
-										                       non_window_select +
-										                       " FROM gt_r "
-										                       "UNION ALL "
-										                       "SELECT " +
-										                       non_window_select +
-										                       " FROM gt_r "
-										                       "EXCEPT ALL "
-										                       "SELECT " +
-										                       non_window_select +
-										                       " FROM mv_r"
-										                       ") __diff";
+										string ctes = "WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " + mv_name +
+										              "), gt_r(" + nv.column_list + ") AS (SELECT * FROM (" + query +
+										              ") __gt) ";
+										string mv_select = "SELECT " + non_window_select + " FROM mv_r";
+										string gt_select = "SELECT " + non_window_select + " FROM gt_r";
+										string relaxed_query = ctes + BuildBagMismatchCountQuery(mv_select, gt_select);
 										auto relaxed_result = con.Query(relaxed_query);
 										if (relaxed_result && !relaxed_result->HasError() &&
 										    relaxed_result->RowCount() > 0 &&
