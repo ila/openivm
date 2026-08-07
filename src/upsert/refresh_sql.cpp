@@ -81,6 +81,7 @@ struct RefreshPlan {
 	bool metadata_requires_full_refresh = false;
 	bool adaptive_recompute = false;
 	bool skip_projection_key_delta = false;
+	bool projection_key_emits_cascade_delta = false;
 	DeltaFastPathFlags delta_flags;
 
 	bool RequiresFullRecompute() const {
@@ -1247,6 +1248,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                                         view_query_sql, view_catalog_name, view_schema_name,
 		                                         attached_db_catalog_name, attached_db_schema_name, upsert_query)) {
 			refresh_plan.skip_projection_key_delta = true;
+		} else if (!has_full_outer && !has_left_join && active_facts.target_dialect == SqlDialect::SPARK &&
+		           active_facts.force_view_delta_cascade &&
+		           TryBuildSparkProjectionKeyRefresh(metadata, view_name, delta_table_names, data_table,
+		                                             delta_view_name, view_query_sql, view_catalog_name,
+		                                             view_schema_name, attached_db_catalog_name,
+		                                             attached_db_schema_name, upsert_query)) {
+			refresh_plan.skip_projection_key_delta = true;
+			refresh_plan.projection_key_emits_cascade_delta = true;
 		} else {
 			upsert_query = CompileProjectionRefresh(
 			    metadata, view_name, column_names, delta_table_names, data_table, view_query_sql, delta_ts_filter,
@@ -1502,7 +1511,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		has_downstream = true;
 	}
 	bool recompute_handles_own_cascade_delta =
-	    aggregate_recompute_emits_cascade_delta ||
+	    aggregate_recompute_emits_cascade_delta || refresh_plan.projection_key_emits_cascade_delta ||
 	    (emit_cascade_delta_for_recompute && (dispatch_refresh_type == RefreshType::WINDOW_PARTITION ||
 	                                          dispatch_refresh_type == RefreshType::GROUP_RECOMPUTE));
 	bool split_safe_full_refresh_cascade =
