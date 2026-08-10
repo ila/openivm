@@ -1658,8 +1658,8 @@ static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorIn
 		for (size_t leaf = 0; leaf < term_leaves.size(); leaf++) {
 			auto &leaf_node = GetNodeAtPath(term, term_leaves[leaf].path);
 			if (leaf == delta_leaf) {
-				UpdateParentProjectionMap(term, term_leaves[leaf]);
 				auto delta = CompileRegularLeafDelta(input, context, binder, leaf_node, term_root);
+				UpdateParentProjectionMap(term, term_leaves[leaf], delta.mul_binding);
 				mul_bindings.push_back(delta.mul_binding);
 				leaf_node = std::move(delta.op);
 				continue;
@@ -1667,13 +1667,13 @@ static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorIn
 			if (leaf < delta_leaf) {
 				continue;
 			}
-			UpdateParentProjectionMap(term, term_leaves[leaf]);
 			auto delta_source = leaf_node->Copy(context);
 			auto delta_renumbered = renumber_and_rebind_subtree(std::move(delta_source), binder);
 			delta_source = std::move(delta_renumbered.op);
 			LogicalOperator *delta_root = delta_source.get();
 			auto delta = CompileRegularLeafDelta(input, context, binder, delta_source, delta_root);
 			auto old = CreateRegularOldNode(binder, std::move(leaf_node), std::move(delta), input.mul_type);
+			UpdateParentProjectionMap(term, term_leaves[leaf], old.mul_binding);
 			mul_bindings.push_back(old.mul_binding);
 			leaf_node = std::move(old.op);
 		}
