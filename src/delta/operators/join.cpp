@@ -1249,6 +1249,31 @@ static uint64_t ComputeFactsInsertOnlyMask(const openivm::CompileFacts &facts, c
 	return mask;
 }
 
+static bool RegularNtermPreservesFKPruning(ClientContext &context, const openivm::CompileFacts &facts,
+                                           const vector<JoinLeafInfo> &leaves, LogicalOperator *join_root) {
+	if (!SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true)) {
+		return true;
+	}
+	if (facts.fk_relations.empty()) {
+		bool has_cache_fk = ConstraintCacheHasTrustedFk(context, leaves);
+		if (has_cache_fk) {
+			OPENIVM_DEBUG_PRINT("[DeltaJoin] Keeping inclusion-exclusion for trusted cached FK pruning\n");
+		}
+		return !has_cache_fk;
+	}
+	auto fk_relations = DetectCompileFactsFKRelations(facts, leaves, join_root);
+	if (fk_relations.empty()) {
+		return true;
+	}
+	auto insert_only_mask = ComputeFactsInsertOnlyMask(facts, leaves);
+	auto skip_bits = ComputeSkipBits(fk_relations, insert_only_mask);
+	if (skip_bits) {
+		OPENIVM_DEBUG_PRINT("[DeltaJoin] Keeping inclusion-exclusion because FK pruning removes masks %lu\n",
+		                    (unsigned long)skip_bits);
+	}
+	return skip_bits == 0;
+}
+
 // ============================================================================
 // BuildInclusionExclusionTerms: create 2^N - 1 delta terms
 // ============================================================================
@@ -1659,9 +1684,9 @@ static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorIn
 			auto &leaf_node = GetNodeAtPath(term, term_leaves[leaf].path);
 			if (leaf == delta_leaf) {
 				auto delta = CompileRegularLeafDelta(input, context, binder, leaf_node, term_root);
-				UpdateParentProjectionMap(term, term_leaves[leaf], delta.mul_binding);
 				mul_bindings.push_back(delta.mul_binding);
 				leaf_node = std::move(delta.op);
+				UpdateParentProjectionMap(term, term_leaves[leaf], delta.mul_binding);
 				continue;
 			}
 			if (leaf < delta_leaf) {
@@ -1673,9 +1698,9 @@ static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorIn
 			LogicalOperator *delta_root = delta_source.get();
 			auto delta = CompileRegularLeafDelta(input, context, binder, delta_source, delta_root);
 			auto old = CreateRegularOldNode(binder, std::move(leaf_node), std::move(delta), input.mul_type);
-			UpdateParentProjectionMap(term, term_leaves[leaf], old.mul_binding);
 			mul_bindings.push_back(old.mul_binding);
 			leaf_node = std::move(old.op);
+			UpdateParentProjectionMap(term, term_leaves[leaf], old.mul_binding);
 		}
 
 		term->ResolveOperatorTypes();
@@ -1796,6 +1821,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	bool regular_nterm = !all_ducklake && compile_facts.compile_only && !has_left_join &&
 	                     input.context.model.type == RefreshType::SIMPLE_PROJECTION &&
 	                     HasOnlyInnerJoins(input.plan.get()) &&
+	                     RegularNtermPreservesFKPruning(context, compile_facts, leaves, input.plan.get()) &&
 	                     SqlUtils::GetBoolSetting(context, "openivm_regular_nterm", true);
 	if (regular_nterm) {
 		for (auto &leaf : leaves) {
@@ -1809,8 +1835,8 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	                                : regular_nterm ? DeltaOperatorStrategy::JOIN_REGULAR_N_TERM
 	                                                : DeltaOperatorStrategy::JOIN_INCLUSION_EXCLUSION);
 
-	vector<unique_ptr<LogicalOperator>> terms;
 	vector<TransitioningKeyCTEDefinition> transition_ctes;
+	vector<unique_ptr<LogicalOperator>> terms;
 	if (all_ducklake) {
 		terms = BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake);
 	} else if (regular_nterm) {
