@@ -162,6 +162,7 @@ struct DeltaViewModelInput {
 	bool has_unsupported_incremental_construct = false;
 	bool keep_window_join_partitions = true;
 	bool stored_query_has_aggregate_filter = false;
+	bool stored_query_retains_aggregate_filter = false;
 	bool stored_query_has_top_k = false;
 	bool has_hidden_minmax_having = false;
 	bool has_computed_minmax_aggregate_projection = false;

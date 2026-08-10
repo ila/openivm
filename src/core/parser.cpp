@@ -635,6 +635,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	model_input.keep_window_join_partitions = keep_window_join_partitions;
 	model_input.stored_query_has_aggregate_filter =
 	    stored_query_has_aggregate_filter || pre_rewrite_has_aggregate_filter || stored_query_retains_having;
+	model_input.stored_query_retains_aggregate_filter =
+	    stored_query_has_aggregate_filter || stored_query_retains_having;
 	model_input.stored_query_has_top_k = stored_query_retains_top_k;
 	model_input.has_hidden_minmax_having = has_hidden_minmax_having;
 	model_input.has_computed_minmax_aggregate_projection = has_computed_minmax_aggregate_projection;

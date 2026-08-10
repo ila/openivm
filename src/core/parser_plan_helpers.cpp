@@ -339,9 +339,15 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	} else if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
 		facts.has_pivot = true;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_FILTER && !op->children.empty() &&
-	    op->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		facts.has_filter_above_aggregate = true;
+	if (op->type == LogicalOperatorType::LOGICAL_FILTER && !op->children.empty()) {
+		auto *filter_input = op->children[0].get();
+		while (filter_input && filter_input->type == LogicalOperatorType::LOGICAL_PROJECTION &&
+		       filter_input->children.size() == 1) {
+			filter_input = filter_input->children[0].get();
+		}
+		if (filter_input && filter_input->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+			facts.has_filter_above_aggregate = true;
+		}
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN || op->type == LogicalOperatorType::LOGICAL_ANY_JOIN ||

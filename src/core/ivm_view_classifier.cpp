@@ -590,6 +590,13 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		model.type = RefreshType::FULL_REFRESH;
 	} else if (input.has_computed_sum_aggregate_projection) {
 		model.type = model.group_columns.empty() ? RefreshType::FULL_REFRESH : RefreshType::GROUP_RECOMPUTE;
+	} else if (input.stored_query_retains_aggregate_filter && analysis.found_aggregation &&
+	           !model.group_columns.empty()) {
+		// A FILTER separated from its aggregate by a projection cannot be exposed on
+		// the user-facing view by StripHavingFilter. Applying that retained predicate
+		// to SUM(delta) is incorrect: a negative delta does not imply a negative new
+		// group total. Recompute only the affected groups from current base state.
+		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && !analysis.found_union_distinct && model.distinct_at_top &&
 	           analysis.found_aggregation) {
 		// DISTINCT over multiple aggregate result rows is a second non-linear
