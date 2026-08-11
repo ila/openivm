@@ -2641,6 +2641,74 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# A decomposed STDDEV used only by HAVING contains a CASE expression. Render
+# that formula from its hidden SUM/sum-of-squares/count state rather than from
+# DuckDB's diagnostic expression name.
+statement ok
+CREATE TABLE hv_stddev_hidden(grp INT, v INT);
+
+statement ok
+INSERT INTO hv_stddev_hidden VALUES (1, 10), (1, 40), (2, 20), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hv_stddev_hidden AS
+    SELECT grp, COUNT(*) AS n, SUM(v) AS total
+    FROM hv_stddev_hidden
+    GROUP BY grp
+    HAVING STDDEV(v) > 10;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_hv_stddev_hidden
+    EXCEPT ALL
+    SELECT grp, COUNT(*), SUM(v)
+    FROM hv_stddev_hidden GROUP BY grp HAVING STDDEV(v) > 10
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, COUNT(*), SUM(v)
+    FROM hv_stddev_hidden GROUP BY grp HAVING STDDEV(v) > 10
+    EXCEPT ALL
+    SELECT * FROM mv_hv_stddev_hidden
+);
+----
+0
+
+statement ok
+UPDATE hv_stddev_hidden SET v = 25 WHERE grp = 1 AND v = 10;
+
+statement ok
+DELETE FROM hv_stddev_hidden WHERE grp = 1 AND v = 40;
+
+statement ok
+INSERT INTO hv_stddev_hidden VALUES (1, 25), (2, 50);
+
+statement ok
+PRAGMA refresh('mv_hv_stddev_hidden');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_hv_stddev_hidden
+    EXCEPT ALL
+    SELECT grp, COUNT(*), SUM(v)
+    FROM hv_stddev_hidden GROUP BY grp HAVING STDDEV(v) > 10
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, COUNT(*), SUM(v)
+    FROM hv_stddev_hidden GROUP BY grp HAVING STDDEV(v) > 10
+    EXCEPT ALL
+    SELECT * FROM mv_hv_stddev_hidden
+);
+----
+0
+
 # HAVING must read the raw aggregate when an outer projection transforms the
 # selected value. COALESCE(active_sum, 0) is non-NULL even when the SUM used by
 # HAVING is NULL.

@@ -1707,11 +1707,17 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 	case ExpressionClass::BOUND_CONSTANT: {
 		return expr.Cast<BoundConstantExpression>().value.ToString();
 	}
+	case ExpressionClass::BOUND_CASE: {
+		auto &case_expr = expr.Cast<BoundCaseExpression>();
+		string result = "CASE";
+		for (auto &check : case_expr.case_checks) {
+			result += " WHEN " + HavingExprToSQL(*check.when_expr, binding_to_alias) + " THEN " +
+			          HavingExprToSQL(*check.then_expr, binding_to_alias);
+		}
+		return result + " ELSE " + HavingExprToSQL(*case_expr.else_expr, binding_to_alias) + " END";
+	}
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &function = expr.Cast<BoundFunctionExpression>();
-		if (!expr.alias.empty()) {
-			return expr.alias;
-		}
 		vector<string> children;
 		children.reserve(function.children.size());
 		for (auto &child : function.children) {
