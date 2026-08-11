@@ -1653,8 +1653,9 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	return {std::move(old_node), ColumnBinding(output_table_index, current_bindings.size())};
 }
 
-static DeltaPlanFragment CompileRegularLeafDelta(DeltaOperatorInput input, ClientContext &context, Binder &binder,
-                                                 unique_ptr<LogicalOperator> &leaf_node, LogicalOperator *&term_root) {
+static DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, ClientContext &context,
+                                                 Binder &binder, unique_ptr<LogicalOperator> &leaf_node,
+                                                 LogicalOperator *&term_root) {
 	if (leaf_node->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = leaf_node->Cast<LogicalGet>();
 		auto delta = CreateDeltaGetNode(context, binder, &get, input.context.view);
