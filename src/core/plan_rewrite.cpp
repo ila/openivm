@@ -21,6 +21,7 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
@@ -1706,6 +1707,29 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 	case ExpressionClass::BOUND_CONSTANT: {
 		return expr.Cast<BoundConstantExpression>().value.ToString();
 	}
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		if (!expr.alias.empty()) {
+			return expr.alias;
+		}
+		vector<string> children;
+		children.reserve(function.children.size());
+		for (auto &child : function.children) {
+			children.push_back(HavingExprToSQL(*child, binding_to_alias));
+		}
+		const auto &name = function.function.name;
+		if (children.size() == 2 && (name == "+" || name == "-" || name == "*" || name == "/" || name == "%")) {
+			return "(" + children[0] + " " + name + " " + children[1] + ")";
+		}
+		string result = name + "(";
+		for (idx_t i = 0; i < children.size(); i++) {
+			if (i > 0) {
+				result += ", ";
+			}
+			result += children[i];
+		}
+		return result + ")";
+	}
 	case ExpressionClass::BOUND_CAST: {
 		return HavingExprToSQL(*expr.Cast<BoundCastExpression>().child, binding_to_alias);
 	}
@@ -1820,17 +1844,39 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 		return "";
 	}
 
-	// Build binding → alias map from the PROJECTION above the FILTER.
+	// Collect the projection path from the view output down to the projection directly
+	// above HAVING. A visible alias is safe only when every projection on this path
+	// passes the aggregate output through unchanged.
+	vector<LogicalProjection *> proj_chain;
+	for (LogicalOperator *node = plan.get(); node && node != filter_node;) {
+		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			proj_chain.push_back(&node->Cast<LogicalProjection>());
+		}
+		if (node->children.empty()) {
+			break;
+		}
+		node = (node->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && node->children.size() >= 2)
+		           ? node->children[1].get()
+		           : node->children[0].get();
+	}
+
+	// Build binding → alias map from output expressions that are pure pass-throughs.
+	// If an upper projection transforms an aggregate (for example COALESCE(sum, 0)),
+	// HAVING must use a hidden raw aggregate column instead of the transformed alias.
 	unordered_map<uint64_t, string> binding_to_alias;
 	LogicalProjection *proj_ptr = nullptr;
 	if (parent && parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		proj_ptr = &parent->Cast<LogicalProjection>();
-		for (idx_t i = 0; i < proj_ptr->expressions.size() && i < output_names.size(); i++) {
-			if (proj_ptr->expressions[i]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-				auto &col = proj_ptr->expressions[i]->Cast<BoundColumnRefExpression>();
-				uint64_t key =
-				    (uint64_t)col.binding.table_index ^ ((uint64_t)col.binding.column_index * 0x9e3779b97f4a7c15ULL);
-				binding_to_alias[key] = output_names[i];
+		if (!proj_chain.empty() && proj_chain.back() == proj_ptr) {
+			DerivedOutputProjectionMap projections;
+			CollectDerivedOutputProjections(*plan, projections);
+			auto *output_projection = proj_chain.front();
+			for (idx_t i = 0; i < output_projection->expressions.size() && i < output_names.size(); i++) {
+				auto *resolved = ResolveDerivedOutputPassThrough(*output_projection->expressions[i], projections);
+				if (resolved && resolved->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+					auto &column = resolved->Cast<BoundColumnRefExpression>();
+					binding_to_alias[DerivedOutputBindingKey(column.binding)] = output_names[i];
+				}
 			}
 		}
 	}
@@ -1884,18 +1930,6 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 			// the user view's HAVING WHERE clause reads from. Transparent operators
 			// (ORDER/LIMIT/DISTINCT/FILTER) pass column bindings through unchanged, so only
 			// projections need extending.
-			vector<LogicalProjection *> proj_chain;
-			for (LogicalOperator *n = plan.get(); n && n != filter_node;) {
-				if (n->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-					proj_chain.push_back(&n->Cast<LogicalProjection>());
-				}
-				if (n->children.empty()) {
-					break;
-				}
-				n = (n->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && n->children.size() >= 2)
-				        ? n->children[1].get()
-				        : n->children[0].get();
-			}
 			// proj_chain.back() == proj_ptr (it carries the freshly added hidden columns).
 			// Walk upward (toward the root) re-exposing each hidden column at every layer.
 			if (!proj_chain.empty() && proj_chain.back() == proj_ptr) {

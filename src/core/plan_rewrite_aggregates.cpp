@@ -445,7 +445,8 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 		uint64_t key = (uint64_t)agg.aggregate_index ^ ((uint64_t)d.old_idx * 0x9e3779b97f4a7c15ULL);
 		old_binding_to_decomp[key] = &d;
 	}
-	std::function<void(unique_ptr<Expression> &)> walk = [&](unique_ptr<Expression> &expr) {
+	std::function<void(unique_ptr<Expression> &, bool)> walk = [&](unique_ptr<Expression> &expr,
+	                                                               bool having_expression) {
 		if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
 			auto &bcr = expr->Cast<BoundColumnRefExpression>();
 			if (bcr.binding.table_index == agg.aggregate_index) {
@@ -454,7 +455,7 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 				auto dit = old_binding_to_decomp.find(key);
 				if (dit != old_binding_to_decomp.end()) {
 					auto replacement = build_replacement(*dit->second);
-					replacement->alias = bcr.alias;
+					replacement->alias = having_expression ? dit->second->user_alias : bcr.alias;
 					expr = std::move(replacement);
 					return; // do NOT descend into the replacement
 				}
@@ -464,10 +465,17 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 				}
 			}
 		}
-		ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) { walk(child); });
+		ExpressionIterator::EnumerateChildren(*expr,
+		                                      [&](unique_ptr<Expression> &child) { walk(child, having_expression); });
 	};
 	for (idx_t pi = 0; pi < original_proj_size; pi++) {
-		walk(proj.expressions[pi]);
+		walk(proj.expressions[pi], false);
+	}
+	if (!plan->children.empty() && plan->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
+		auto &having = plan->children[0]->Cast<LogicalFilter>();
+		for (auto &expression : having.expressions) {
+			walk(expression, true);
+		}
 	}
 	for (auto &d : decomps) {
 		ColumnBinding sum_binding = agg_bindings[group_count + d.sum_idx];

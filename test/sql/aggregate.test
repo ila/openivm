@@ -2572,6 +2572,170 @@ SELECT count(*) FROM (
 ----
 0
 
+# HAVING must evaluate the derived AVG, not its hidden SUM. A threshold of 15
+# distinguishes the two: SUM(10, 20) is 30 while AVG(10, 20) is exactly 15.
+statement ok
+CREATE TABLE hva_boundary(grp INT, v INT);
+
+statement ok
+INSERT INTO hva_boundary VALUES (1, 10), (1, 20), (2, 20), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hva_boundary AS
+    SELECT grp, COUNT(*) AS n, AVG(v) AS a
+    FROM hva_boundary
+    GROUP BY grp
+    HAVING AVG(v) > 15;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_hva_boundary
+    EXCEPT ALL
+    SELECT grp, COUNT(*), AVG(v)
+    FROM hva_boundary GROUP BY grp HAVING AVG(v) > 15
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, COUNT(*), AVG(v)
+    FROM hva_boundary GROUP BY grp HAVING AVG(v) > 15
+    EXCEPT ALL
+    SELECT * FROM mv_hva_boundary
+);
+----
+0
+
+# Batch conflicting updates before one refresh: group 1 crosses above the
+# threshold while group 2 lands exactly on it and must disappear.
+statement ok
+UPDATE hva_boundary SET v = 30 WHERE grp = 1 AND v = 10;
+
+statement ok
+DELETE FROM hva_boundary WHERE grp = 2 AND v = 20;
+
+statement ok
+INSERT INTO hva_boundary VALUES (2, 10);
+
+statement ok
+PRAGMA refresh('mv_hva_boundary');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_hva_boundary
+    EXCEPT ALL
+    SELECT grp, COUNT(*), AVG(v)
+    FROM hva_boundary GROUP BY grp HAVING AVG(v) > 15
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, COUNT(*), AVG(v)
+    FROM hva_boundary GROUP BY grp HAVING AVG(v) > 15
+    EXCEPT ALL
+    SELECT * FROM mv_hva_boundary
+);
+----
+0
+
+# HAVING must read the raw aggregate when an outer projection transforms the
+# selected value. COALESCE(active_sum, 0) is non-NULL even when the SUM used by
+# HAVING is NULL.
+statement ok
+CREATE TABLE hav_outer_projection(grp INT, v INT);
+
+statement ok
+INSERT INTO hav_outer_projection VALUES (1, -10), (1, -20), (2, 10), (2, -5);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hav_outer_projection AS
+    WITH rollup AS (
+        SELECT grp, SUM(v) FILTER (WHERE v > 0) AS active_sum
+        FROM hav_outer_projection
+        GROUP BY grp
+        HAVING SUM(v) FILTER (WHERE v > 0) IS NOT NULL
+    )
+    SELECT grp, COALESCE(active_sum, 0) AS active_sum FROM rollup;
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_hav_outer_projection
+    EXCEPT ALL
+    SELECT * FROM (
+        WITH rollup AS (
+            SELECT grp, SUM(v) FILTER (WHERE v > 0) AS active_sum
+            FROM hav_outer_projection GROUP BY grp
+            HAVING SUM(v) FILTER (WHERE v > 0) IS NOT NULL
+        )
+        SELECT grp, COALESCE(active_sum, 0) FROM rollup
+    )
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        WITH rollup AS (
+            SELECT grp, SUM(v) FILTER (WHERE v > 0) AS active_sum
+            FROM hav_outer_projection GROUP BY grp
+            HAVING SUM(v) FILTER (WHERE v > 0) IS NOT NULL
+        )
+        SELECT grp, COALESCE(active_sum, 0) FROM rollup
+    )
+    EXCEPT ALL
+    SELECT * FROM mv_hav_outer_projection
+);
+----
+0
+
+statement ok
+UPDATE hav_outer_projection SET v = 30 WHERE grp = 1 AND v = -10;
+
+statement ok
+DELETE FROM hav_outer_projection WHERE grp = 2 AND v = 10;
+
+statement ok
+INSERT INTO hav_outer_projection VALUES (2, -30), (3, 40);
+
+statement ok
+PRAGMA refresh('mv_hav_outer_projection');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_hav_outer_projection
+    EXCEPT ALL
+    SELECT * FROM (
+        WITH rollup AS (
+            SELECT grp, SUM(v) FILTER (WHERE v > 0) AS active_sum
+            FROM hav_outer_projection GROUP BY grp
+            HAVING SUM(v) FILTER (WHERE v > 0) IS NOT NULL
+        )
+        SELECT grp, COALESCE(active_sum, 0) FROM rollup
+    )
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (
+        WITH rollup AS (
+            SELECT grp, SUM(v) FILTER (WHERE v > 0) AS active_sum
+            FROM hav_outer_projection GROUP BY grp
+            HAVING SUM(v) FILTER (WHERE v > 0) IS NOT NULL
+        )
+        SELECT grp, COALESCE(active_sum, 0) FROM rollup
+    )
+    EXCEPT ALL
+    SELECT * FROM mv_hav_outer_projection
+);
+----
+0
+
 # ============================================================
 # HAVING that references aggregates NOT in the SELECT list.
 # The stripped predicate must reference hidden columns we add to the
