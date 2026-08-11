@@ -1705,7 +1705,7 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 		       HavingExprToSQL(*comp.right, binding_to_alias) + ")";
 	}
 	case ExpressionClass::BOUND_CONSTANT: {
-		return expr.Cast<BoundConstantExpression>().value.ToString();
+		return expr.Cast<BoundConstantExpression>().value.ToSQLString();
 	}
 	case ExpressionClass::BOUND_CASE: {
 		auto &case_expr = expr.Cast<BoundCaseExpression>();
@@ -1737,7 +1737,9 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 		return result + ")";
 	}
 	case ExpressionClass::BOUND_CAST: {
-		return HavingExprToSQL(*expr.Cast<BoundCastExpression>().child, binding_to_alias);
+		auto &cast = expr.Cast<BoundCastExpression>();
+		return string(cast.try_cast ? "TRY_CAST(" : "CAST(") + HavingExprToSQL(*cast.child, binding_to_alias) + " AS " +
+		       cast.return_type.ToString() + ")";
 	}
 	case ExpressionClass::BOUND_CONJUNCTION: {
 		auto &conj = expr.Cast<BoundConjunctionExpression>();
@@ -1766,6 +1768,18 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 		}
 		if (expr.type == ExpressionType::OPERATOR_NOT && op.children.size() == 1) {
 			return "(NOT (" + HavingExprToSQL(*op.children[0], binding_to_alias) + "))";
+		}
+		if ((expr.type == ExpressionType::COMPARE_IN || expr.type == ExpressionType::COMPARE_NOT_IN) &&
+		    op.children.size() >= 2) {
+			string result = "(" + HavingExprToSQL(*op.children[0], binding_to_alias) +
+			                (expr.type == ExpressionType::COMPARE_IN ? " IN (" : " NOT IN (");
+			for (idx_t i = 1; i < op.children.size(); i++) {
+				if (i > 1) {
+					result += ", ";
+				}
+				result += HavingExprToSQL(*op.children[i], binding_to_alias);
+			}
+			return result + "))";
 		}
 		return expr.ToString();
 	}

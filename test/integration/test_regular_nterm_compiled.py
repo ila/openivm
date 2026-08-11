@@ -141,6 +141,56 @@ FROM unchanged_a a
 JOIN unchanged_b b ON a.b_id = b.id
 JOIN unchanged_c c ON b.c_id = c.id""",
         )
+        run_scenario(
+            binary,
+            root,
+            "projection_wrapped_self_join",
+            """
+CREATE TABLE self_event(event_id INTEGER, account_id INTEGER, event_ts INTEGER, label VARCHAR);
+CREATE TABLE self_account(account_id INTEGER, account_name VARCHAR);
+INSERT INTO self_event VALUES
+    (1, 1, 10, 'a'),
+    (2, 1, 20, 'b'),
+    (3, 2, 10, 'c');
+INSERT INTO self_account VALUES (1, 'one'), (2, 'two');
+CREATE MATERIALIZED VIEW self_mv AS
+SELECT cur.event_id AS current_id,
+       prev.event_id AS previous_id,
+       account.account_name,
+       cur.label
+FROM self_event cur
+JOIN self_event prev
+  ON cur.account_id = prev.account_id
+ AND prev.event_ts < cur.event_ts
+JOIN self_account account ON cur.account_id = account.account_id;
+INSERT INTO self_event VALUES
+    (4, 1, 30, 'd'),
+    (5, 2, 20, 'e'),
+    (6, 2, 30, 'temporary');
+UPDATE self_event SET label = 'bx', event_ts = 25 WHERE event_id = 2;
+UPDATE self_event SET label = 'temporary_x' WHERE event_id = 6;
+DELETE FROM self_event WHERE event_id IN (1, 6);
+UPDATE self_account SET account_name = 'ONE' WHERE account_id = 1;
+""",
+            "self_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "delta_shape": {
+                    "self_event": "MIXED",
+                    "self_account": "MIXED",
+                },
+            },
+            """SELECT cur.event_id,
+       prev.event_id,
+       account.account_name,
+       cur.label
+FROM self_event cur
+JOIN self_event prev
+  ON cur.account_id = prev.account_id
+ AND prev.event_ts < cur.event_ts
+JOIN self_account account ON cur.account_id = account.account_id""",
+        )
 
     print("regular N-term compiled SQL integration tests passed")
 

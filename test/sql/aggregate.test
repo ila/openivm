@@ -2641,6 +2641,87 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# CAST and multi-value IN must be preserved when a derived aggregate HAVING
+# predicate is moved onto the materialized data table.
+statement ok
+CREATE TABLE hva_cast_in(grp INT, v DOUBLE);
+
+statement ok
+INSERT INTO hva_cast_in VALUES
+    (1, 15.2), (1, 15.6),
+    (2, 24.4), (2, 25.2),
+    (3, 10.0), (3, 10.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hva_cast AS
+    SELECT grp, AVG(v) AS a
+    FROM hva_cast_in
+    GROUP BY grp
+    HAVING CAST(AVG(v) AS INTEGER) = 15;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_hva_in AS
+    SELECT grp, AVG(v) AS a
+    FROM hva_cast_in
+    GROUP BY grp
+    HAVING CAST(AVG(v) AS INTEGER) IN (15, 25);
+
+# Batch conflicting INSERT, UPDATE, and DELETE operations before one refresh.
+statement ok
+UPDATE hva_cast_in SET v = 14.4 WHERE grp = 1 AND v = 15.2;
+
+statement ok
+DELETE FROM hva_cast_in WHERE grp = 2 AND v = 25.2;
+
+statement ok
+INSERT INTO hva_cast_in VALUES (1, 14.0), (2, 26.6), (3, 20.0), (4, 15.4);
+
+statement ok
+PRAGMA refresh('mv_hva_cast');
+
+statement ok
+PRAGMA refresh('mv_hva_in');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_hva_cast
+    EXCEPT ALL
+    SELECT grp, AVG(v) FROM hva_cast_in
+    GROUP BY grp HAVING CAST(AVG(v) AS INTEGER) = 15
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, AVG(v) FROM hva_cast_in
+    GROUP BY grp HAVING CAST(AVG(v) AS INTEGER) = 15
+    EXCEPT ALL
+    SELECT * FROM mv_hva_cast
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_hva_in
+    EXCEPT ALL
+    SELECT grp, AVG(v) FROM hva_cast_in
+    GROUP BY grp HAVING CAST(AVG(v) AS INTEGER) IN (15, 25)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, AVG(v) FROM hva_cast_in
+    GROUP BY grp HAVING CAST(AVG(v) AS INTEGER) IN (15, 25)
+    EXCEPT ALL
+    SELECT * FROM mv_hva_in
+);
+----
+0
+
 # A decomposed STDDEV used only by HAVING contains a CASE expression. Render
 # that formula from its hidden SUM/sum-of-squares/count state rather than from
 # DuckDB's diagnostic expression name.
