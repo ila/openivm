@@ -11,5 +11,5 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 test_release_internal: test_regular_nterm_compiled
 
-test_regular_nterm_compiled: release
+test_regular_nterm_compiled:
 	python3 test/integration/test_regular_nterm_compiled.py ./build/release/duckdb

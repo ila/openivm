@@ -65,7 +65,12 @@ SELECT COUNT(*) FROM openivm_compile_with_facts('{view_name}', '{facts_json}');
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: test_regular_nterm_compiled.py /path/to/duckdb")
-    binary = Path(sys.argv[1]).resolve()
+    binary = Path(sys.argv[1])
+    if not binary.exists() and binary.suffix.lower() != ".exe":
+        windows_binary = binary.with_name(f"{binary.name}.exe")
+        if windows_binary.exists():
+            binary = windows_binary
+    binary = binary.resolve()
     if not binary.exists():
         raise SystemExit(f"DuckDB binary not found: {binary}")
 
