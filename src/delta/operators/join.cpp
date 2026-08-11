@@ -1249,6 +1249,45 @@ static uint64_t ComputeFactsInsertOnlyMask(const openivm::CompileFacts &facts, c
 	return mask;
 }
 
+static uint64_t ComputeFactsUnchangedMask(const openivm::CompileFacts &facts, const vector<JoinLeafInfo> &leaves) {
+	uint64_t mask = 0;
+	for (size_t i = 0; i < leaves.size(); i++) {
+		vector<LogicalOperator *> pending = {leaves[i].node};
+		bool found_table = false;
+		bool all_unchanged = true;
+		while (!pending.empty() && all_unchanged) {
+			auto *node = pending.back();
+			pending.pop_back();
+			if (node->type == LogicalOperatorType::LOGICAL_GET) {
+				auto &get = node->Cast<LogicalGet>();
+				if (get.GetTable().get() == nullptr) {
+					all_unchanged = false;
+					break;
+				}
+				found_table = true;
+				bool table_unchanged = false;
+				for (auto &entry : facts.delta_shape) {
+					if (TableNameMatches(entry.first, get.GetTable().get()->name) &&
+					    StringUtil::CIEquals(entry.second, "UNCHANGED")) {
+						table_unchanged = true;
+						break;
+					}
+				}
+				if (!table_unchanged) {
+					all_unchanged = false;
+				}
+			}
+			for (auto &child : node->children) {
+				pending.push_back(child.get());
+			}
+		}
+		if (found_table && all_unchanged) {
+			mask |= (1ULL << i);
+		}
+	}
+	return mask;
+}
+
 static bool RegularNtermPreservesFKPruning(ClientContext &context, const openivm::CompileFacts &facts,
                                            const vector<JoinLeafInfo> &leaves, LogicalOperator *join_root) {
 	if (!SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true)) {
@@ -1665,13 +1704,20 @@ static DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input
 }
 
 static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context,
-                                                                 Binder &binder, const vector<JoinLeafInfo> &leaves) {
+                                                                 Binder &binder, const vector<JoinLeafInfo> &leaves,
+                                                                 uint64_t unchanged_mask) {
 	vector<unique_ptr<LogicalOperator>> terms;
 	// Base scans see post-DML state. Term i uses current state before i, delta i, and reconstructs old state after i as
 	// current - delta. These disjoint telescoping terms cover every non-empty delta combination exactly once.
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Building regular N-term telescoping delta (%zu leaves)\n", leaves.size());
+	bool all_unchanged = unchanged_mask == ((1ULL << leaves.size()) - 1);
 
 	for (size_t delta_leaf = 0; delta_leaf < leaves.size(); delta_leaf++) {
+		if ((unchanged_mask & (1ULL << delta_leaf)) && (!all_unchanged || delta_leaf != 0)) {
+			OPENIVM_DEBUG_PRINT("[DeltaJoin] Skipping regular N-term leaf %zu: compile facts mark it unchanged\n",
+			                    delta_leaf);
+			continue;
+		}
 		auto term = input.plan->Copy(context);
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);
@@ -1691,6 +1737,9 @@ static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorIn
 				continue;
 			}
 			if (leaf < delta_leaf) {
+				continue;
+			}
+			if (unchanged_mask & (1ULL << leaf)) {
 				continue;
 			}
 			auto delta_source = leaf_node->Copy(context);
@@ -1720,6 +1769,7 @@ static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorIn
 		}
 
 		FunctionBinder function_binder(binder);
+		D_ASSERT(!mul_bindings.empty());
 		unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(input.mul_type, mul_bindings[0]);
 		for (size_t i = 1; i < mul_bindings.size(); i++) {
 			vector<unique_ptr<Expression>> args;
@@ -1819,6 +1869,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 		throw NotImplementedException("IVM not supported for joins with more than 16 tables");
 	}
 	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
+	auto unchanged_mask = ComputeFactsUnchangedMask(compile_facts, leaves);
 	bool regular_nterm = !all_ducklake && compile_facts.compile_only && !has_left_join &&
 	                     input.context.model.type == RefreshType::SIMPLE_PROJECTION &&
 	                     HasOnlyInnerJoins(input.plan.get()) &&
@@ -1841,7 +1892,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	if (all_ducklake) {
 		terms = BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake);
 	} else if (regular_nterm) {
-		terms = BuildRegularJoinTerms(input, context, binder, leaves);
+		terms = BuildRegularJoinTerms(input, context, binder, leaves, unchanged_mask);
 	} else {
 		terms = BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join, transition_ctes);
 	}

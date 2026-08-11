@@ -239,6 +239,40 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
     '{"target_dialect":"duckdb","compile_only":true}'
 );
 
+# Compile facts marked UNCHANGED remove both their delta terms and their old-state reconstruction.
+query I
+SELECT CASE WHEN COUNT(*) = 1 AND
+                 bool_and(contains(sql, 'openivm_delta_cspj_tri_broker')) AND
+                 bool_and(NOT contains(sql, 'openivm_delta_cspj_tri_account')) AND
+                 bool_and(NOT contains(sql, 'openivm_delta_cspj_tri_customer')) AND
+                 bool_and(NOT contains(sql, 'UNION ALL'))
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cspj_tri_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{"cspj_tri_account":"UNCHANGED","cspj_tri_customer":"UNCHANGED","cspj_tri_broker":"MIXED"}}'
+)
+WHERE stmt_kind = 'data'
+  AND contains(sql, 'INSERT INTO openivm_delta_cspj_tri_mv');
+----
+1
+
+# An entirely unchanged join keeps one empty delta arm so the compiled program remains valid without expanding terms.
+query I
+SELECT CASE WHEN COUNT(*) = 1 AND
+                 bool_and(CAST(contains(sql, 'openivm_delta_cspj_tri_account') AS INTEGER) +
+                          CAST(contains(sql, 'openivm_delta_cspj_tri_customer') AS INTEGER) +
+                          CAST(contains(sql, 'openivm_delta_cspj_tri_broker') AS INTEGER) = 1) AND
+                 bool_and(NOT contains(sql, 'UNION ALL'))
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cspj_tri_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{"cspj_tri_account":"UNCHANGED","cspj_tri_customer":"UNCHANGED","cspj_tri_broker":"UNCHANGED"}}'
+)
+WHERE stmt_kind = 'data'
+  AND contains(sql, 'INSERT INTO openivm_delta_cspj_tri_mv');
+----
+1
+
 statement ok
 UPDATE cspj_tri_broker SET broker_name = 'NorthX' WHERE broker_id = 100;
 
