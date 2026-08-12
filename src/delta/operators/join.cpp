@@ -1253,7 +1253,6 @@ static uint64_t ComputeFactsUnchangedMask(const openivm::CompileFacts &facts, co
 	uint64_t mask = 0;
 	for (size_t i = 0; i < leaves.size(); i++) {
 		vector<LogicalOperator *> pending = {leaves[i].node};
-		bool found_table = false;
 		bool all_unchanged = true;
 		while (!pending.empty() && all_unchanged) {
 			auto *node = pending.back();
@@ -1261,10 +1260,8 @@ static uint64_t ComputeFactsUnchangedMask(const openivm::CompileFacts &facts, co
 			if (node->type == LogicalOperatorType::LOGICAL_GET) {
 				auto &get = node->Cast<LogicalGet>();
 				if (get.GetTable().get() == nullptr) {
-					all_unchanged = false;
-					break;
+					continue;
 				}
-				found_table = true;
 				bool table_unchanged = false;
 				for (auto &entry : facts.delta_shape) {
 					if (TableNameMatches(entry.first, get.GetTable().get()->name) &&
@@ -1281,7 +1278,10 @@ static uint64_t ComputeFactsUnchangedMask(const openivm::CompileFacts &facts, co
 				pending.push_back(child.get());
 			}
 		}
-		if (found_table && all_unchanged) {
+		// A supported leaf without a catalog-backed table is an inline constant
+		// relation (for example VALUES). It cannot contribute a delta term and is
+		// therefore unchanged for every compiled refresh.
+		if (all_unchanged) {
 			mask |= (1ULL << i);
 		}
 	}
@@ -1711,10 +1711,20 @@ static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorIn
 	// current - delta. These disjoint telescoping terms cover every non-empty delta combination exactly once.
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Building regular N-term telescoping delta (%zu leaves)\n", leaves.size());
 	bool all_unchanged = unchanged_mask == ((1ULL << leaves.size()) - 1);
+	size_t empty_delta_leaf = 0;
+	if (all_unchanged) {
+		for (size_t leaf = 0; leaf < leaves.size(); leaf++) {
+			auto *get = GetLeafScan(leaves[leaf]);
+			if (get && get->GetTable().get() != nullptr) {
+				empty_delta_leaf = leaf;
+				break;
+			}
+		}
+	}
 
 	for (size_t delta_leaf = 0; delta_leaf < leaves.size(); delta_leaf++) {
-		if ((unchanged_mask & (1ULL << delta_leaf)) && (!all_unchanged || delta_leaf != 0)) {
-			OPENIVM_DEBUG_PRINT("[DeltaJoin] Skipping regular N-term leaf %zu: compile facts mark it unchanged\n",
+		if ((unchanged_mask & (1ULL << delta_leaf)) && (!all_unchanged || delta_leaf != empty_delta_leaf)) {
+			OPENIVM_DEBUG_PRINT("[DeltaJoin] Skipping regular N-term leaf %zu: unchanged or source-independent\n",
 			                    delta_leaf);
 			continue;
 		}

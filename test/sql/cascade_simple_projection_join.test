@@ -82,6 +82,78 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# A source-independent VALUES leaf is unchanged and must not emit its own N-term.
+statement ok
+CREATE TABLE cspj_values_customer (customer_id INT, credit VARCHAR, last_name VARCHAR);
+
+statement ok
+INSERT INTO cspj_values_customer VALUES (1, 'GC', 'Able'), (2, 'XX', 'Cross');
+
+statement ok
+CREATE MATERIALIZED VIEW cspj_values_mv AS
+    SELECT c.customer_id, c.last_name, v.priority
+    FROM cspj_values_customer c
+    JOIN (VALUES ('GC', 1), ('BC', 2)) AS v(credit, priority)
+      ON c.credit = v.credit;
+
+query I
+SELECT CASE WHEN COUNT(*) = 1 AND
+                 bool_and(contains(sql, 'openivm_delta_cspj_values_customer')) AND
+                 bool_and(NOT contains(sql, 'UNION ALL'))
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cspj_values_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{"cspj_values_customer":"MIXED"}}'
+)
+WHERE stmt_kind = 'data'
+  AND contains(sql, 'INSERT INTO openivm_delta_cspj_values_mv');
+----
+1
+
+query I
+SELECT CASE WHEN COUNT(*) = 1 AND
+                 bool_and(contains(sql, 'openivm_delta_cspj_values_customer')) AND
+                 bool_and(NOT contains(sql, 'UNION ALL'))
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cspj_values_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{"cspj_values_customer":"UNCHANGED"}}'
+)
+WHERE stmt_kind = 'data'
+  AND contains(sql, 'INSERT INTO openivm_delta_cspj_values_mv');
+----
+1
+
+statement ok
+UPDATE cspj_values_customer SET credit = 'GC' WHERE customer_id = 2;
+
+statement ok
+PRAGMA refresh('cspj_values_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspj_values_mv
+    EXCEPT ALL
+    SELECT c.customer_id, c.last_name, v.priority
+    FROM cspj_values_customer c
+    JOIN (VALUES ('GC', 1), ('BC', 2)) AS v(credit, priority)
+      ON c.credit = v.credit
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT c.customer_id, c.last_name, v.priority
+    FROM cspj_values_customer c
+    JOIN (VALUES ('GC', 1), ('BC', 2)) AS v(credit, priority)
+      ON c.credit = v.credit
+    EXCEPT ALL
+    SELECT * FROM cspj_values_mv
+);
+----
+0
+
 # 2-source temporal range join
 statement ok
 CREATE TABLE cspj_rng_txn (txn_id INT, account_id INT, txn_ts INT, amount INT);
