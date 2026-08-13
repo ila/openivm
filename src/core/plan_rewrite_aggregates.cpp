@@ -469,6 +469,12 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 	for (idx_t pi = 0; pi < original_proj_size; pi++) {
 		walk(proj.expressions[pi]);
 	}
+	if (!plan->children.empty() && plan->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
+		auto &having = plan->children[0]->Cast<LogicalFilter>();
+		for (auto &expression : having.expressions) {
+			walk(expression);
+		}
+	}
 	for (auto &d : decomps) {
 		ColumnBinding sum_binding = agg_bindings[group_count + d.sum_idx];
 		ColumnBinding count_binding = agg_bindings[group_count + d.count_idx];

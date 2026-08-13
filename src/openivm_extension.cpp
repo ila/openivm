@@ -189,6 +189,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_ducklake_nterm",
 	                             "use N-term telescoping for DuckLake joins (vs 2^N-1 inclusion-exclusion)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("openivm_regular_nterm", "use N-term telescoping for compile-only regular inner joins",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_fk_pruning", "prune inclusion-exclusion join terms using FK constraints",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_scd2_range_join_accel",
