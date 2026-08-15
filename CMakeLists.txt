@@ -13,6 +13,7 @@ include_directories(src/include ${LPTS_DIR}/src/include ${LPTS_DIR}/third_party/
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
     src/compile_facts.cpp
+    src/functions/spark_scalar_functions.cpp
     src/core/ivm_delta_model.cpp
     src/core/ivm_view_classifier.cpp
     src/core/parser.cpp

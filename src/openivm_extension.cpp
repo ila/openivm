@@ -2,6 +2,7 @@
 
 #include "core/openivm_extension.hpp"
 #include "compile_facts.hpp"
+#include "functions/spark_scalar_functions.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_daemon.hpp"
@@ -165,6 +166,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// ordinary DuckDB statements by OpenIVM's parser override. FALLBACK leaves every
 	// statement OpenIVM does not recognize with DuckDB's native parser.
 	db_config.SetOption(AllowParserOverrideExtensionSetting::SettingIndex, Value("fallback"));
+
+	RegisterSparkScalarFunctions(loader);
 
 	db_config.AddExtensionOption("openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("openivm_refresh_mode", "refresh strategy: incremental, full, or auto",
