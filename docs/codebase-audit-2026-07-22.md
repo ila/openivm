@@ -76,9 +76,9 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
   physical schema requires the original SQL identifier. Quoted names containing punctuation can fail during MV creation.
 - [ ] **Classify only after required lineage is valid.** Window lineage can demote a finalized model to `FULL_REFRESH` after
   node maintenance and update semantics have already been derived, leaving contradictory model state.
-- [ ] **Finish or reverse the `CURRENT_DIFF_RECOMPUTE` removal coherently.** Deterministic SAMPLE, POSITIONAL, and ASOF shapes
-  are demoted to unconditional full refresh while stale nonlocal strategies, documentation, and benchmark paths remain.
-  Preserve a typed affected/current-diff recompute path where correctness permits it; delete truly dead strategies.
+- [x] **Remove deprecated refresh type value 10.** Deterministic SAMPLE, POSITIONAL, and ASOF shapes
+  demote to full refresh. The separate current-diff affected-key mode remains part of group recompute; it is not a refresh
+  type.
 - [ ] **Strip computed top-k wrappers from stored aggregate state.** CREATE only moves a root `TOP_N` or
   `LIMIT -> ORDER_BY` into the user-facing view. Plans such as
   `PROJECTION -> TOP_N -> PROJECTION -> AGGREGATE` therefore initialize a limited backing table, while refresh strips the

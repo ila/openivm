@@ -224,8 +224,6 @@ WHERE stmt_kind = 'data';
 ----
 1
 
-# CURRENT_DIFF_RECOMPUTE coverage for ASOF views lives in compile_refresh_asof.test.
-
 # ==========================================
 # Test 6: a caller-proven insert-only batch enables the MIN/MAX MERGE
 # template, including a scalar output derived from the final aggregate state.

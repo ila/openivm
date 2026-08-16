@@ -84,8 +84,6 @@ constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 // DELIM joins to eliminate. Pure robustness guard — not flag-gated.
 constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator";
 
-constexpr uint8_t LEGACY_CURRENT_DIFF_RECOMPUTE_TYPE = 10;
-
 } // namespace openivm
 
 enum class RefreshType : uint8_t {

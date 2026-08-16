@@ -41,9 +41,6 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 		throw ParserException("Materialized view '%s' does not exist in IVM metadata.", view_name);
 	}
 	auto raw_type = result->GetValue(0, 0).GetValue<int8_t>();
-	if (raw_type == static_cast<int8_t>(openivm::LEGACY_CURRENT_DIFF_RECOMPUTE_TYPE)) {
-		return RefreshType::FULL_REFRESH;
-	}
 	return static_cast<RefreshType>(raw_type);
 }
 

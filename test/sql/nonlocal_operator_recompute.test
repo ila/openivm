@@ -95,59 +95,6 @@ SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_sample_volatile';
 ----
 3
 
-# Persisted legacy CURRENT_DIFF_RECOMPUTE metadata (type 10) maps to the
-# current full-refresh strategy during refresh.
-
-statement ok
-CREATE TABLE oprec_legacy_type10 (id INT, grp INT, v INT);
-
-statement ok
-INSERT INTO oprec_legacy_type10 VALUES
-    (1, 1, 10),
-    (2, 1, 20),
-    (3, 2, 30),
-    (4, 2, 40);
-
-statement ok
-CREATE MATERIALIZED VIEW mv_oprec_legacy_type10 AS
-    SELECT id, grp, v
-    FROM oprec_legacy_type10 USING SAMPLE reservoir(3 ROWS) REPEATABLE (31);
-
-statement ok
-UPDATE openivm_views SET type = 10 WHERE view_name = 'mv_oprec_legacy_type10';
-
-statement ok
-INSERT INTO oprec_legacy_type10 VALUES (5, 3, 50);
-
-statement ok
-DELETE FROM oprec_legacy_type10 WHERE id = 2;
-
-statement ok
-UPDATE oprec_legacy_type10 SET v = 15 WHERE id = 1;
-
-statement ok
-PRAGMA refresh('mv_oprec_legacy_type10');
-
-query I
-SELECT count(*) FROM (
-    SELECT id, grp, v
-    FROM oprec_legacy_type10 USING SAMPLE reservoir(3 ROWS) REPEATABLE (31)
-    EXCEPT ALL
-    SELECT id, grp, v FROM mv_oprec_legacy_type10
-);
-----
-0
-
-query I
-SELECT count(*) FROM (
-    SELECT id, grp, v FROM mv_oprec_legacy_type10
-    EXCEPT ALL
-    SELECT id, grp, v
-    FROM oprec_legacy_type10 USING SAMPLE reservoir(3 ROWS) REPEATABLE (31)
-);
-----
-0
-
 # ==========================================
 # POSITIONAL JOIN falls back to full refresh
 # ==========================================
