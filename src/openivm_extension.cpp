@@ -2,7 +2,7 @@
 
 #include "core/openivm_extension.hpp"
 #include "compile_facts.hpp"
-#include "functions/spark_scalar_functions.hpp"
+#include "spark_scalar_functions.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_daemon.hpp"

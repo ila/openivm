@@ -1,71 +1,22 @@
 # name: test/sql/spark_add_months.test
-# description: Spark-compatible add_months scalar function (correctness + incremental MV maintenance)
+# description: add_months incremental MV maintenance through the openivm compiler
 # group: [sql]
+
+#
+# Exhaustive scalar-correctness coverage for add_months lives in lpts
+# (third_party/lpts test/sql/spark_add_months.test). openivm consumes the
+# function from lpts; this test covers openivm's concern: that add_months
+# resolves in the compiler and drives a real SIMPLE_PROJECTION delta rather
+# than a silent FULL_REFRESH demotion.
 
 require openivm
 
 statement ok
 SET openivm_files_path='__TEST_DIR__';
 
-# --- Direct scalar correctness (Spark add_months semantics) ---
-
-# Month-end input -> target month-end (with clamp)
+# add_months resolves in an openivm session (registered via lpts source)
 query I
 SELECT add_months(DATE '2015-01-31', 1) = DATE '2015-02-28';
-----
-true
-
-# Non month-end input, day clamps to target month length
-query I
-SELECT add_months(DATE '2015-01-30', 1) = DATE '2015-02-28';
-----
-true
-
-# Non month-end input, day fits
-query I
-SELECT add_months(DATE '2015-01-28', 1) = DATE '2015-02-28';
-----
-true
-
-# Leap-year target month-end
-query I
-SELECT add_months(DATE '2016-01-31', 1) = DATE '2016-02-29';
-----
-true
-
-# Feb month-end (non-leap) -> March month-end
-query I
-SELECT add_months(DATE '2015-02-28', 1) = DATE '2015-03-31';
-----
-true
-
-# Leap Feb month-end -> non-leap Feb month-end across a year
-query I
-SELECT add_months(DATE '2016-02-29', 12) = DATE '2017-02-28';
-----
-true
-
-# Negative months, month-end preserved
-query I
-SELECT add_months(DATE '2015-03-31', -1) = DATE '2015-02-28';
-----
-true
-
-# Year rollover, day preserved
-query I
-SELECT add_months(DATE '2015-01-15', 13) = DATE '2016-02-15';
-----
-true
-
-# December month-end -> January month-end (year rollover)
-query I
-SELECT add_months(DATE '2015-12-31', 1) = DATE '2016-01-31';
-----
-true
-
-# NULL propagation
-query I
-SELECT add_months(NULL::DATE, 1) IS NULL;
 ----
 true
 

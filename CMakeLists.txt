@@ -13,7 +13,6 @@ include_directories(src/include ${LPTS_DIR}/src/include ${LPTS_DIR}/third_party/
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
     src/compile_facts.cpp
-    src/functions/spark_scalar_functions.cpp
     src/core/ivm_delta_model.cpp
     src/core/ivm_view_classifier.cpp
     src/core/parser.cpp
@@ -79,7 +78,8 @@ set(EXTENSION_SOURCES
     ${LPTS_DIR}/src/lpts_ast_renderer.cpp
     ${LPTS_DIR}/src/lpts_ast_builder.cpp
     ${LPTS_DIR}/src/lpts_ast_flattener.cpp
-    ${LPTS_DIR}/src/dialect_function_map.cpp)
+    ${LPTS_DIR}/src/dialect_function_map.cpp
+    ${LPTS_DIR}/src/spark_scalar_functions.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
