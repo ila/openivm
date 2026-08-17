@@ -1,8 +1,9 @@
 # name: test/sql/left_join_regular_nterm.test
-# description: Compile-only N-term telescoping delta for LEFT-JOIN SIMPLE_PROJECTION views
-#              (openivm_regular_nterm_left). A deep LEFT-join star that would blow up under
-#              2^N inclusion-exclusion must compile to a linear delta and stay bag-correct.
+# description: Compile-only N-term telescoping delta for LEFT-JOIN SIMPLE_PROJECTION views (openivm_regular_nterm_left)
 # group: [sql]
+
+# A deep LEFT-join star that would blow up under 2^N inclusion-exclusion must
+# compile to a linear delta and stay bag-correct.
 
 require openivm
 
