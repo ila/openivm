@@ -1616,6 +1616,22 @@ static bool HasOnlyInnerJoins(LogicalOperator *node) {
 	return true;
 }
 
+static bool HasOnlyInnerOrLeftJoins(LogicalOperator *node) {
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	    node->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+		auto *join = dynamic_cast<LogicalJoin *>(node);
+		if (!join || (join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT)) {
+			return false;
+		}
+	}
+	for (auto &child : node->children) {
+		if (!HasOnlyInnerOrLeftJoins(child.get())) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool SupportsRegularNtermLeaf(const JoinLeafInfo &leaf) {
 	if (leaf.get) {
 		return leaf.get->GetTable().get() != nullptr;
@@ -1705,7 +1721,7 @@ static DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input
 
 static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context,
                                                                  Binder &binder, const vector<JoinLeafInfo> &leaves,
-                                                                 uint64_t unchanged_mask) {
+                                                                 uint64_t unchanged_mask, bool has_left_join) {
 	vector<unique_ptr<LogicalOperator>> terms;
 	// Base scans see post-DML state. Term i uses current state before i, delta i, and reconstructs old state after i as
 	// current - delta. These disjoint telescoping terms cover every non-empty delta combination exactly once.
@@ -1735,6 +1751,16 @@ static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorIn
 		LogicalOperator *term_root = term.get();
 		CollectJoinLeaves(term.get(), {}, term_leaves);
 		D_ASSERT(term_leaves.size() == leaves.size());
+
+		// LEFT-JOIN telescoping: demote only the outer join(s) whose NULL-supplying
+		// subtree contains this term's single delta leaf, mirroring the DuckLake
+		// N-term path (DemoteLeftJoinsForMask). Preserved outer joins elsewhere keep
+		// their NULL-padded rows; the upsert layer's key-based partial recompute
+		// (BuildLeftJoinProjectionRefresh) fixes NULL<->match transition rows.
+		if (has_left_join) {
+			DemoteLeftJoinsForMask(term.get(), term_leaves, (1ULL << delta_leaf));
+		}
+
 		vector<ColumnBinding> mul_bindings;
 
 		for (size_t leaf = 0; leaf < term_leaves.size(); leaf++) {
@@ -1880,11 +1906,22 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	}
 	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
 	auto unchanged_mask = ComputeFactsUnchangedMask(compile_facts, leaves);
-	bool regular_nterm = !all_ducklake && compile_facts.compile_only && !has_left_join &&
-	                     input.context.model.type == RefreshType::SIMPLE_PROJECTION &&
-	                     HasOnlyInnerJoins(input.plan.get()) &&
-	                     RegularNtermPreservesFKPruning(context, compile_facts, leaves, input.plan.get()) &&
-	                     SqlUtils::GetBoolSetting(context, "openivm_regular_nterm", true);
+	bool regular_nterm_base = !all_ducklake && compile_facts.compile_only &&
+	                          input.context.model.type == RefreshType::SIMPLE_PROJECTION &&
+	                          SqlUtils::GetBoolSetting(context, "openivm_regular_nterm", true);
+	bool regular_nterm;
+	if (has_left_join) {
+		// LEFT-JOIN telescoping: the regular N-term delta extends to LEFT joins via
+		// per-term demotion of only the outer join whose NULL-supplying side carries
+		// that term's delta (see BuildRegularJoinTerms). FULL OUTER / RIGHT shapes and
+		// the inclusion-exclusion FK-pruning path are out of scope; NULL-padded row
+		// correctness is completed by BuildLeftJoinProjectionRefresh in the upsert layer.
+		regular_nterm = regular_nterm_base && HasOnlyInnerOrLeftJoins(input.plan.get()) &&
+		                SqlUtils::GetBoolSetting(context, "openivm_regular_nterm_left", true);
+	} else {
+		regular_nterm = regular_nterm_base && HasOnlyInnerJoins(input.plan.get()) &&
+		                RegularNtermPreservesFKPruning(context, compile_facts, leaves, input.plan.get());
+	}
 	if (regular_nterm) {
 		for (auto &leaf : leaves) {
 			if (!SupportsRegularNtermLeaf(leaf)) {
@@ -1902,7 +1939,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	if (all_ducklake) {
 		terms = BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake);
 	} else if (regular_nterm) {
-		terms = BuildRegularJoinTerms(input, context, binder, leaves, unchanged_mask);
+		terms = BuildRegularJoinTerms(input, context, binder, leaves, unchanged_mask, has_left_join);
 	} else {
 		terms = BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join, transition_ctes);
 	}

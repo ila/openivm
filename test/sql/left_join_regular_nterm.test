@@ -1,0 +1,160 @@
+# name: test/sql/left_join_regular_nterm.test
+# description: Compile-only N-term telescoping delta for LEFT-JOIN SIMPLE_PROJECTION views
+#              (openivm_regular_nterm_left). A deep LEFT-join star that would blow up under
+#              2^N inclusion-exclusion must compile to a linear delta and stay bag-correct.
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_regular_nterm_left=true;
+
+# ==========================================
+# Star schema: 1 fact + 5 LEFT-joined dimensions, projection (no aggregation).
+# ==========================================
+
+statement ok
+CREATE TABLE fact(id INTEGER, amount INTEGER, k1 INTEGER, k2 INTEGER, k3 INTEGER, k4 INTEGER, k5 INTEGER);
+
+statement ok
+CREATE TABLE d1(k INTEGER, v VARCHAR);
+
+statement ok
+CREATE TABLE d2(k INTEGER, v VARCHAR);
+
+statement ok
+CREATE TABLE d3(k INTEGER, v VARCHAR);
+
+statement ok
+CREATE TABLE d4(k INTEGER, v VARCHAR);
+
+statement ok
+CREATE TABLE d5(k INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO d1 VALUES (11, 'd1a'), (21, 'd1b');
+
+statement ok
+INSERT INTO d2 VALUES (12, 'd2a'), (22, 'd2b');
+
+statement ok
+INSERT INTO d3 VALUES (13, 'd3a'), (23, 'd3b');
+
+statement ok
+INSERT INTO d4 VALUES (14, 'd4a'), (24, 'd4b');
+
+statement ok
+INSERT INTO d5 VALUES (15, 'd5a'), (25, 'd5b');
+
+# Row 2 has k1=91 which has NO matching d1 yet (NULL-padded until d1 gets 91).
+statement ok
+INSERT INTO fact VALUES
+    (1, 100, 11, 12, 13, 14, 15),
+    (2, 200, 91, 12, 13, 14, 15),
+    (3, 300, 21, 22, 23, 24, 25),
+    (4, 400, 11, 22, 13, 24, 15);
+
+statement ok
+CREATE MATERIALIZED VIEW mv AS
+    SELECT f.id, f.amount,
+           d1.v AS v1, d2.v AS v2, d3.v AS v3, d4.v AS v4, d5.v AS v5
+    FROM fact f
+    LEFT JOIN d1 ON f.k1 = d1.k
+    LEFT JOIN d2 ON f.k2 = d2.k
+    LEFT JOIN d3 ON f.k3 = d3.k
+    LEFT JOIN d4 ON f.k4 = d4.k
+    LEFT JOIN d5 ON f.k5 = d5.k;
+
+# Snapshot the MV so we can prove openivm_compile_with_facts does not mutate it.
+statement ok
+CREATE TABLE mv_before AS SELECT * FROM mv;
+
+# ==========================================
+# Mixed DML batch: NULL->match (d1 gains key 91), match->NULL (d2 loses key 22),
+# a dimension value update, and fact insert/update/delete.
+# ==========================================
+
+statement ok
+INSERT INTO d1 VALUES (91, 'd1_late');
+
+statement ok
+DELETE FROM d2 WHERE k = 22;
+
+statement ok
+UPDATE d3 SET v = 'd3_upd' WHERE k = 13;
+
+statement ok
+UPDATE fact SET amount = amount + 5 WHERE id = 1;
+
+statement ok
+INSERT INTO fact VALUES (5, 500, 91, 22, 13, 14, 15);
+
+statement ok
+DELETE FROM fact WHERE id = 3;
+
+# ==========================================
+# Test 1: compile-only path emits a SIMPLE_PROJECTION join delta into
+# openivm_delta_mv without exploding (a LEFT star that would be 2^6-1 under
+# inclusion-exclusion compiles to a linear N-term telescoping delta).
+# ==========================================
+
+query I
+SELECT COUNT(*) > 0
+FROM openivm_compile_with_facts(
+    'mv',
+    '{"target_dialect":"duckdb","compile_only":true,
+      "delta_shape":{"fact":"MIXED","d1":"INSERT_ONLY","d2":"MIXED","d3":"MIXED","d4":"UNCHANGED","d5":"UNCHANGED"}}'
+)
+WHERE stmt_kind = 'data' AND refresh_type_name = 'SIMPLE_PROJECTION'
+  AND sql LIKE '%openivm_delta_mv%';
+----
+true
+
+# Test 2: the compile call left the materialized view untouched.
+query I
+SELECT (SELECT count(*) FROM ((SELECT * FROM mv) EXCEPT ALL (SELECT * FROM mv_before))) = 0 AND
+       (SELECT count(*) FROM ((SELECT * FROM mv_before) EXCEPT ALL (SELECT * FROM mv))) = 0 AS unchanged;
+----
+true
+
+# ==========================================
+# Test 3: a real incremental refresh applies the batched deltas and the MV is
+# bag-equal to the fully recomputed base query in BOTH directions (full IVM
+# correctness cross-check, including the NULL<->match transition rows).
+# ==========================================
+
+statement ok
+PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT f.id, f.amount, d1.v AS v1, d2.v AS v2, d3.v AS v3, d4.v AS v4, d5.v AS v5
+    FROM fact f
+    LEFT JOIN d1 ON f.k1 = d1.k
+    LEFT JOIN d2 ON f.k2 = d2.k
+    LEFT JOIN d3 ON f.k3 = d3.k
+    LEFT JOIN d4 ON f.k4 = d4.k
+    LEFT JOIN d5 ON f.k5 = d5.k
+    EXCEPT ALL
+    SELECT id, amount, v1, v2, v3, v4, v5 FROM mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, amount, v1, v2, v3, v4, v5 FROM mv
+    EXCEPT ALL
+    SELECT f.id, f.amount, d1.v AS v1, d2.v AS v2, d3.v AS v3, d4.v AS v4, d5.v AS v5
+    FROM fact f
+    LEFT JOIN d1 ON f.k1 = d1.k
+    LEFT JOIN d2 ON f.k2 = d2.k
+    LEFT JOIN d3 ON f.k3 = d3.k
+    LEFT JOIN d4 ON f.k4 = d4.k
+    LEFT JOIN d5 ON f.k5 = d5.k
+);
+----
+0

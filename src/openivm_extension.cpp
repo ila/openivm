@@ -194,6 +194,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_regular_nterm", "use N-term telescoping for compile-only regular inner joins",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("openivm_regular_nterm_left",
+	                             "extend compile-only N-term telescoping to LEFT-join projection views",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_fk_pruning", "prune inclusion-exclusion join terms using FK constraints",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_scd2_range_join_accel",
