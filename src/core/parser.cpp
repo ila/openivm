@@ -23,10 +23,15 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
@@ -44,6 +49,60 @@ struct MaterializedViewTarget {
 	string view_name;
 	bool qualified;
 };
+
+static void CollectPlannerMaterializedCtes(LogicalOperator *op, unordered_set<string> &names) {
+	if (!op) {
+		return;
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		auto &cte = op->Cast<LogicalMaterializedCTE>();
+		if (cte.materialize != CTEMaterialize::CTE_MATERIALIZE_NEVER) {
+			names.insert(StringUtil::Lower(cte.ctename));
+		}
+	}
+	for (auto &child : op->children) {
+		CollectPlannerMaterializedCtes(child.get(), names);
+	}
+}
+
+static void ForcePlannerMaterializedCtes(QueryNode &node, const unordered_set<string> &names) {
+	for (auto &entry : node.cte_map.map) {
+		if (names.find(StringUtil::Lower(entry.first)) != names.end() &&
+		    entry.second->materialized == CTEMaterialize::CTE_MATERIALIZE_DEFAULT) {
+			entry.second->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+		}
+		ForcePlannerMaterializedCtes(*entry.second->query->node, names);
+	}
+
+	std::function<void(unique_ptr<ParsedExpression> &)> visit_expression;
+	visit_expression = [&](unique_ptr<ParsedExpression> &expr) {
+		if (expr->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			auto &subquery = expr->Cast<SubqueryExpression>();
+			ForcePlannerMaterializedCtes(*subquery.subquery->node, names);
+		}
+		ParsedExpressionIterator::EnumerateChildren(*expr, visit_expression);
+	};
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(node, visit_expression, [&](TableRef &ref) {
+		if (ref.type == TableReferenceType::SUBQUERY) {
+			auto &subquery = ref.Cast<SubqueryRef>();
+			ForcePlannerMaterializedCtes(*subquery.subquery->node, names);
+		}
+	});
+}
+
+static string PreservePlannerMaterializedCtes(const string &query, const unordered_set<string> &names) {
+	if (names.empty()) {
+		return query;
+	}
+	Parser parser;
+	parser.ParseQuery(query);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		return query;
+	}
+	auto &select = parser.statements[0]->Cast<SelectStatement>();
+	ForcePlannerMaterializedCtes(*select.node, names);
+	return select.ToString();
+}
 
 static MaterializedViewTarget ResolveMaterializedViewTarget(ClientContext &context, const string &target_name) {
 	auto components = QualifiedName::ParseComponents(target_name);
@@ -422,6 +481,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	// Inline CTEs so create-MV facts see the folded structure.
 	InlineCtesIfPresent(context, *planner.binder, plan);
+	unordered_set<string> planner_materialized_ctes;
+	CollectPlannerMaterializedCtes(plan.get(), planner_materialized_ctes);
 
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
@@ -993,7 +1054,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	bool ducklake_window_partition =
 	    refresh_type == RefreshType::WINDOW_PARTITION && (target_is_ducklake || !facts.ducklake_table_info.empty());
 	if (ducklake_window_partition && !lpts_fallback) {
-		view_query = original_view_query;
+		view_query = PreservePlannerMaterializedCtes(original_view_query, planner_materialized_ctes);
 		lpts_fallback = true;
 		OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake window MV uses original SQL for "
 		                    "initial data table: %s\n",
