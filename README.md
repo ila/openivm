@@ -94,6 +94,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `openivm_skip_empty_deltas` | BOOLEAN | `true` | Skip refresh work when no pending deltas exist | [Empty delta skip](docs/optimizations/empty-delta-skip.md) |
 | `openivm_compact_deltas` | BOOLEAN | `true` | Compact raw delta rows into net Z-set deltas before refresh | [Delta consolidation](docs/optimizations/delta-consolidation.md) |
 | `openivm_distinct_aux_state` | BOOLEAN | `false` | Use aux-state maintenance for supported inner-DISTINCT-under-aggregate shapes | [Distinct](docs/operators/distinct.md) |
+| `openivm_regular_nterm` | BOOLEAN | `true` | Use N-term telescoping for eligible regular-table inner joins compiled for external engines | [Inner join](docs/operators/inner-join.md#regular-table-n-term-compilation) |
 | `openivm_profile_refresh` | BOOLEAN | `false` | Record per-step refresh timings in `openivm_refresh_profile` | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files | [Internals](docs/internals/delta-tables.md) |
 

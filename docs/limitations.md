@@ -56,8 +56,11 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 
 ## Join limitations
 
-- Maximum **16 tables** in a single join (inclusion-exclusion bitmask limit — `openivm::MAX_JOIN_TABLES`).
-- `INNER JOIN`, `CROSS JOIN`, and arbitrary-predicate joins use the inclusion-exclusion delta rule. `CROSS JOIN` is treated as a join with no condition.
+- Maximum **16 tables** in a single join (`openivm::MAX_JOIN_TABLES`).
+- `INNER JOIN`, `CROSS JOIN`, and arbitrary-predicate joins use the inclusion-exclusion
+  delta rule by default. Eligible `SIMPLE_PROJECTION` refresh SQL compiled for external
+  engines uses the regular-table N-term rule instead. `CROSS JOIN` is treated as a join
+  without a condition. See [Inner join](operators/inner-join.md#regular-table-n-term-compilation).
 - Partial-recompute strategies for `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN` are documented in the partial-recompute table above.
 - `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, and `NOT EXISTS` are incrementally maintained only for the projection/filter shapes documented in [Semi and anti join](operators/semi-anti-join.md). Aggregates over semi/anti output, join-chain inputs, and `IN`/`NOT IN` membership semantics fall back to full refresh.
 
