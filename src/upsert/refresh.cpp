@@ -182,9 +182,6 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		if (!uses_stored_query) {
 			exec_con.Query("SET disabled_optimizers='" + string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "'");
 		}
-		profiler.AddMeasuredStep("configure_refresh_optimizers", 0,
-		                         "stored_query=" + string(uses_stored_query ? "true" : "false") +
-		                             "; deliminator=" + string(uses_stored_query ? "enabled" : "disabled"));
 		// Refreshes update relational MV state; physical insertion order is not part of
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.
