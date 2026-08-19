@@ -117,6 +117,18 @@ static void UseMetadataSchema(Connection &con) {
 	}
 }
 
+static bool RefreshUsesStoredQuery(RefreshType refresh_type) {
+	switch (refresh_type) {
+	case RefreshType::WINDOW_PARTITION:
+	case RefreshType::GROUP_RECOMPUTE:
+	case RefreshType::TOP_K:
+	case RefreshType::FULL_REFRESH:
+		return true;
+	default:
+		return false;
+	}
+}
+
 // Generate and execute refresh SQL for a single view while the caller owns the mutation gate.
 // When openivm_adaptive_refresh is on, also computes a cost estimate before execution
 // and records execution history for the learned cost model.
@@ -129,6 +141,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 	Connection probe_con(*context.db.get());
 	UseMetadataSchema(probe_con);
 	RefreshMetadata probe_meta(probe_con);
+	auto refresh_type = probe_meta.GetViewType(vn);
 	DeltaActivityResult delta_activity;
 	DeltaActivityResult *precomputed_delta_activity = nullptr;
 	if (skip_empty_refresh) {
@@ -174,10 +187,17 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs. Keep the
 		// established guard while rejecting unexpectedly recursive generated plans.
 		exec_con.Query("SET max_expression_depth = 10000");
-		// The generated refresh SQL already contains an explicit decorrelated plan. DuckDB's
-		// deliminator can recurse through very deep stress-query CTE/subquery expansions and
-		// overflow in the optimizer before the refresh query runs.
-		exec_con.Query("SET disabled_optimizers='" + string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "'");
+		// Delta-compiled refresh SQL is already explicitly decorrelated. Keep the deliminator
+		// recursion guard for those generated programs. Recompute strategies embed the stored
+		// query, which can still contain correlated EXISTS/NOT EXISTS subqueries and therefore
+		// must retain DuckDB's decorrelation pass.
+		bool uses_stored_query = RefreshUsesStoredQuery(refresh_type);
+		if (!uses_stored_query) {
+			exec_con.Query("SET disabled_optimizers='" + string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "'");
+		}
+		profiler.AddMeasuredStep("configure_refresh_optimizers", 0,
+		                         "refresh_type=" + string(RefreshTypeName(refresh_type)) +
+		                             "; deliminator=" + string(uses_stored_query ? "enabled" : "disabled"));
 		// Refreshes update relational MV state; physical insertion order is not part of
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.

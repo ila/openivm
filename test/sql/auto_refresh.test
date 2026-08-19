@@ -105,6 +105,15 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj'
 ----
 4
 
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'mv_profile_proj'
+  AND step_name = 'configure_refresh_optimizers'
+  AND contains(detail, 'refresh_type=SIMPLE_PROJECTION')
+  AND contains(detail, 'deliminator=disabled');
+----
+1
+
 statement ok
 SET openivm_profile_refresh = false;
 
