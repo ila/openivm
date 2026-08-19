@@ -5,6 +5,7 @@
 #include "core/parser_ddl.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_locks.hpp"
+#include "core/scoped_optimizer_settings.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "upsert/refresh_cost_model.hpp"
@@ -158,13 +159,13 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// and metadata ops (physical-default catalog) to avoid the cross-catalog write error.
 		string meta_pre_sql, meta_post_sql;
 		RefreshCompileProfile compile_profile;
-		bool uses_stored_query = false;
+		bool requires_deliminator = false;
 		auto generate_start = std::chrono::steady_clock::now();
 		string sql = GenerateRefreshSQL(
 		    context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
 		    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr, cross_system ? &meta_post_sql : nullptr,
 		    profiler.Enabled() ? &compile_profile : nullptr, precomputed_delta_activity,
-		    adaptive_refresh ? &cost_estimate : nullptr, nullptr, nullptr, &uses_stored_query);
+		    adaptive_refresh ? &cost_estimate : nullptr, nullptr, nullptr, &requires_deliminator);
 		for (const auto &step : compile_profile.steps) {
 			profiler.AddMeasuredStep(step.step_name, step.duration_ms, step.detail);
 		}
@@ -175,13 +176,6 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// IVM-generated SQL can nest deeply for multi-table joins + CTEs. Keep the
 		// established guard while rejecting unexpectedly recursive generated plans.
 		exec_con.Query("SET max_expression_depth = 10000");
-		// Delta-compiled refresh SQL is already explicitly decorrelated. Keep the deliminator
-		// recursion guard for those generated programs. Recompute strategies embed the stored
-		// query, which can still contain correlated EXISTS/NOT EXISTS subqueries and therefore
-		// must retain DuckDB's decorrelation pass.
-		if (!uses_stored_query) {
-			exec_con.Query("SET disabled_optimizers='" + string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "'");
-		}
 		// Refreshes update relational MV state; physical insertion order is not part of
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.
@@ -214,6 +208,14 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		auto start = std::chrono::steady_clock::now();
 		unique_ptr<MaterializedQueryResult> result;
 		idx_t executed_statement_count = 1;
+		// Generated delta programs can overflow Deliminator while eliminating deeply nested
+		// delimiter joins. Recompute and correlated helper programs still require that optimizer.
+		// The DuckDB setting is database-global, so scope and restore it around planning/execution.
+		unique_ptr<ScopedDisabledOptimizers> disabled_optimizers;
+		if (!requires_deliminator) {
+			disabled_optimizers = make_uniq<ScopedDisabledOptimizers>(*exec_con.context,
+			                                                         openivm::REFRESH_DISABLED_OPTIMIZERS);
+		}
 		if (profiler.Enabled()) {
 			// Diagnostic mode runs the generated batch one statement at a time so
 			// the profile table can show which refresh operation dominates runtime.
@@ -236,6 +238,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		} else {
 			result = exec_con.Query(sql);
 		}
+		disabled_optimizers.reset();
 		auto end = std::chrono::steady_clock::now();
 		profiler.AddStep("execute_refresh_sql", start,
 		                 "bytes=" + to_string(sql.size()) + ", statements=" + to_string(executed_statement_count));

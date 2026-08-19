@@ -161,7 +161,7 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
                                 bool skip_proj_delete, bool insert_only = false,
                                 const vector<string> &active_delta_table_names = {},
-                                bool allow_runtime_insert_only = false);
+                                bool allow_runtime_insert_only = false, bool *out_requires_deliminator = nullptr);
 bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,
@@ -245,7 +245,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           const DeltaActivityResult *precomputed_delta_activity = nullptr,
                           RefreshCostEstimate *out_adaptive_estimate = nullptr,
                           const openivm::CompileFacts *facts = nullptr, Connection *metadata_connection = nullptr,
-                          bool *out_uses_stored_query = nullptr);
+                          bool *out_requires_deliminator = nullptr);
 
 } // namespace duckdb
 

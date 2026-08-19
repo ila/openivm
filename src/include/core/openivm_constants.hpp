@@ -78,10 +78,9 @@ static constexpr idx_t MAX_JOIN_TABLES = 16;
 constexpr const char *TEMPLATE_DATA_DEPENDENT_OPTIMIZERS = "statistics_propagation";
 constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 
-// Disabled wherever the deeply-nested generated refresh SQL is planned/executed. deliminator
-// recurses through OpenIVM's chained CTE/subquery expansions (N-term telescoping over many tables)
-// and overflows the optimizer; the generated plan is already explicitly decorrelated so it has no
-// DELIM joins to eliminate. Pure robustness guard — not flag-gated.
+// Disabled while planning/executing deeply nested generated delta programs. Deliminator can recurse
+// through OpenIVM's chained CTE/subquery expansions and overflow. Recompute and correlated helper
+// programs retain it because they can contain delimiter joins that still need elimination.
 constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator";
 
 } // namespace openivm

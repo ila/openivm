@@ -58,13 +58,7 @@ INSERT INTO dl.history_win VALUES
     (22, 4, 2, 4, 2, '2026-01-01 00:00:00', 267.00, 'Payment');
 
 statement ok
-SET openivm_profile_refresh = true;
-
-statement ok
 PRAGMA refresh('mv_history_window');
-
-statement ok
-SET openivm_profile_refresh = false;
 
 query I
 SELECT count(*) FROM dl.mv_history_window;

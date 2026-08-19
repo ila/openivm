@@ -921,8 +921,14 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
                                 const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
                                 bool skip_proj_delete, bool insert_only, const vector<string> &active_delta_table_names,
-                                bool allow_runtime_insert_only) {
+                                bool allow_runtime_insert_only, bool *out_requires_deliminator) {
+	if (out_requires_deliminator) {
+		*out_requires_deliminator = false;
+	}
 	if (has_full_outer) {
+		if (out_requires_deliminator) {
+			*out_requires_deliminator = true;
+		}
 		return BuildFullOuterProjectionRefresh(metadata, view_name, delta_table_names, data_table, view_query_sql,
 		                                       delta_ts_filter, catalog_prefix);
 	}
@@ -932,6 +938,9 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
 			                    view_name.c_str());
 			return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix,
 			                                 /*insert_only=*/true);
+		}
+		if (out_requires_deliminator) {
+			*out_requires_deliminator = true;
 		}
 		return BuildLeftJoinProjectionRefresh(metadata, view_name, column_names, delta_table_names, data_table,
 		                                      view_query_sql, delta_ts_filter, catalog_prefix,

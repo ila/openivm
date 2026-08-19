@@ -676,9 +676,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           const string &attached_db_schema_name, string *out_pre_meta, string *out_post_meta,
                           RefreshCompileProfile *compile_profile, const DeltaActivityResult *precomputed_delta_activity,
                           RefreshCostEstimate *out_adaptive_estimate, const openivm::CompileFacts *facts_in,
-                          Connection *metadata_connection, bool *out_uses_stored_query) {
-	if (out_uses_stored_query) {
-		*out_uses_stored_query = false;
+                          Connection *metadata_connection, bool *out_requires_deliminator) {
+	if (out_requires_deliminator) {
+		*out_requires_deliminator = false;
 	}
 	// Resolve the active CompileFacts. Three sources, in priority order:
 	//   1. Explicit `facts_in` (set by direct C++ callers that own a facts
@@ -816,8 +816,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                  " SET refresh_in_progress = false WHERE view_name = '" +
 				                  SqlUtils::EscapeValue(view_name) + "';\n";
 			}
-			if (out_uses_stored_query) {
-				*out_uses_stored_query = true;
+			if (out_requires_deliminator) {
+				*out_requires_deliminator = true;
 			}
 			return recovery_query;
 		}
@@ -920,13 +920,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                     string(metadata_requires_full_refresh ? "true" : "false") +
 		                     "; adaptive_recompute=" + string(adaptive_recompute ? "true" : "false") +
 		                     "; sql_bytes=" + to_string(recompute_query.size()));
-		if (out_uses_stored_query) {
-			*out_uses_stored_query = true;
+		if (out_requires_deliminator) {
+			*out_requires_deliminator = true;
 		}
 		return recompute_query;
 	}
 	RefreshType dispatch_refresh_type = use_full_recompute ? RefreshType::FULL_REFRESH : view_query_type;
 	refresh_plan.refresh_type = dispatch_refresh_type;
+	bool requires_deliminator = false;
 	bool emit_cascade_delta_for_recompute =
 	    active_facts.force_view_delta_cascade && (dispatch_refresh_type == RefreshType::WINDOW_PARTITION ||
 	                                              dispatch_refresh_type == RefreshType::GROUP_RECOMPUTE);
@@ -1080,6 +1081,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto dispatch_start = profile_now();
 	switch (dispatch_refresh_type) {
 	case RefreshType::AGGREGATE_HAVING: {
+		bool used_group_recompute = false;
 		bool having_merge = SqlUtils::GetBoolSetting(context, "openivm_having_merge", true);
 		if (having_merge) {
 			bool effective_insert_only =
@@ -1087,21 +1089,26 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			upsert_query =
 			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
 			                           has_minmax, list_mode, delta_ts_filter, group_cols, internal_catalog_prefix,
-			                           effective_insert_only, agg_types, column_types, has_unstripped_having);
+			                           effective_insert_only, agg_types, column_types, has_unstripped_having, nullptr, "",
+			                           false, false, nullptr, {}, false, {}, &used_group_recompute);
 		} else {
 			upsert_query = CompileAggregateGroups(
 			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
 			    /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols, internal_catalog_prefix,
-			    /*insert_only=*/false, agg_types, column_types, has_unstripped_having);
+			    /*insert_only=*/false, agg_types, column_types, has_unstripped_having, nullptr, "", false, false,
+			    nullptr, {}, false, {}, &used_group_recompute);
 		}
+		requires_deliminator = used_group_recompute;
 		break;
 	}
 	case RefreshType::AGGREGATE_GROUP: {
 		if (source_has_full_outer && !full_outer_merge) {
+			requires_deliminator = true;
 			upsert_query = BuildFullOuterAffectedGroupRefresh(metadata, view_name, delta_table_names, group_cols,
 			                                                  data_table, view_query_sql, delta_ts_filter,
 			                                                  internal_catalog_prefix, "openivm_recompute");
 		} else if (source_has_full_outer && full_outer_merge) {
+			requires_deliminator = true;
 			bool effective_insert_only = has_argminmax ? false : skip_agg_delete;
 			upsert_query =
 			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
@@ -1236,6 +1243,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			    /*inline_cascade_delta=*/inline_merge_cascade, &aggregate_recompute_emits_cascade_delta,
 			    derived_output_expressions, derived_output_info.complete, ljsec_preserved_cols,
 			    &ljsec_used_group_recompute, force_lj_group_recompute);
+			requires_deliminator = ljsec_used_group_recompute;
 			// Run the secondary-delta INSERT (NULL-padded reappearance rows for deepest-join match-count
 			// transitions) AFTER the primary-delta INSERT and BEFORE the MERGE consolidation below.
 			// ONLY meaningful when CompileAggregateGroups actually emitted the delta-arithmetic MERGE: the
@@ -1256,11 +1264,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                                         view_query_sql, view_catalog_name, view_schema_name,
 		                                         attached_db_catalog_name, attached_db_schema_name, upsert_query)) {
 			refresh_plan.skip_projection_key_delta = true;
+			requires_deliminator = true;
 		} else {
 			upsert_query = CompileProjectionRefresh(
 			    metadata, view_name, column_names, delta_table_names, data_table, view_query_sql, delta_ts_filter,
 			    internal_catalog_prefix, has_full_outer, has_left_join, skip_proj_delete, insert_only,
-			    fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only);
+			    fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only,
+			    &requires_deliminator);
 		}
 		break;
 	}
@@ -1292,6 +1302,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode,
 			                                       delta_ts_filter, internal_catalog_prefix, sa_insert_only,
 			                                       column_types, &simple_aggregate_full_recompute);
+			requires_deliminator = simple_aggregate_full_recompute;
 		}
 		if (!has_minmax && aux_meta.aux_table.empty() && !simple_aggregate_full_recompute) {
 			AppendSimpleAggregateEmptySourceNulling(metadata, upsert_query, view_name, column_names, data_table,
@@ -1301,6 +1312,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		break;
 	}
 	case RefreshType::WINDOW_PARTITION: {
+		requires_deliminator = true;
 		upsert_query = BuildWindowPartitionRefresh(
 		    metadata, con, view_name, view_query_sql, delta_table_names, column_names, data_table, delta_ts_filter,
 		    internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
@@ -1365,11 +1377,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		OPENIVM_DEBUG_PRINT("[UPSERT] DISTINCT_INCREMENTAL view has no aux meta — "
 		                    "falling through to "
 		                    "GROUP_RECOMPUTE\n");
+		requires_deliminator = true;
 		[[fallthrough]];
 	}
 	case RefreshType::SEMI_ANTI_RECOMPUTE: {
 		RefreshMetadata::SemiAntiAuxMeta aux_meta;
 		if (metadata.GetSemiAntiAuxMeta(view_name, aux_meta)) {
+			requires_deliminator = true;
 			if (!active_facts.compile_only) {
 				EnsureSemiAntiAuxState(metadata, con, view_name, aux_meta, delta_table_names, internal_catalog_name,
 				                       internal_schema_name, internal_catalog_prefix, view_catalog_name,
@@ -1399,6 +1413,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		OPENIVM_DEBUG_PRINT("[UPSERT] SEMI_ANTI_RECOMPUTE view has no aux meta — "
 		                    "falling through to "
 		                    "GROUP_RECOMPUTE\n");
+		requires_deliminator = true;
 		[[fallthrough]];
 	}
 	case RefreshType::GROUP_RECOMPUTE: {
@@ -1420,6 +1435,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (TryBuildGroupMeasureUpdateRefresh(metadata, con, view_name, view_query_sql, active_delta_table_names,
 		                                      column_names, column_types, data_table, view_catalog_name,
 		                                      view_schema_name, upsert_query)) {
+			requires_deliminator = true;
 			break;
 		}
 		bool group_recompute_has_ducklake_source = false;
@@ -1444,6 +1460,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		upsert_query =
 		    CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs, internal_catalog_prefix,
 		                          lpts_table_prefix, emit_cascade_delta_for_recompute, affected_mode);
+		requires_deliminator = true;
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE "
 		                    "(%zu group cols, %zu sources, "
 		                    "affected_mode=%s)\n",
@@ -1453,6 +1470,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::TOP_K:
 		[[fallthrough]];
 	case RefreshType::FULL_REFRESH: {
+		requires_deliminator = true;
 		string full_recompute_query = view_query_sql;
 		if (active_facts.target_dialect == SqlDialect::SPARK) {
 			vector<string> output_names;
@@ -1476,11 +1494,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		break;
 	}
 	}
-	if (out_uses_stored_query) {
-		*out_uses_stored_query = dispatch_refresh_type == RefreshType::WINDOW_PARTITION ||
-		                         dispatch_refresh_type == RefreshType::GROUP_RECOMPUTE ||
-		                         dispatch_refresh_type == RefreshType::TOP_K ||
-		                         dispatch_refresh_type == RefreshType::FULL_REFRESH;
+	if (out_requires_deliminator) {
+		*out_requires_deliminator = requires_deliminator;
 	}
 	add_profile_step("generate_refresh_sql.dispatch", dispatch_start,
 	                 "refresh_type=" + string(RefreshTypeName(dispatch_refresh_type)) +
