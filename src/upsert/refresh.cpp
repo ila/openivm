@@ -117,18 +117,6 @@ static void UseMetadataSchema(Connection &con) {
 	}
 }
 
-static bool RefreshUsesStoredQuery(RefreshType refresh_type) {
-	switch (refresh_type) {
-	case RefreshType::WINDOW_PARTITION:
-	case RefreshType::GROUP_RECOMPUTE:
-	case RefreshType::TOP_K:
-	case RefreshType::FULL_REFRESH:
-		return true;
-	default:
-		return false;
-	}
-}
-
 // Generate and execute refresh SQL for a single view while the caller owns the mutation gate.
 // When openivm_adaptive_refresh is on, also computes a cost estimate before execution
 // and records execution history for the learned cost model.
@@ -141,7 +129,6 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 	Connection probe_con(*context.db.get());
 	UseMetadataSchema(probe_con);
 	RefreshMetadata probe_meta(probe_con);
-	auto refresh_type = probe_meta.GetViewType(vn);
 	DeltaActivityResult delta_activity;
 	DeltaActivityResult *precomputed_delta_activity = nullptr;
 	if (skip_empty_refresh) {
@@ -171,12 +158,13 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// and metadata ops (physical-default catalog) to avoid the cross-catalog write error.
 		string meta_pre_sql, meta_post_sql;
 		RefreshCompileProfile compile_profile;
+		bool uses_stored_query = false;
 		auto generate_start = std::chrono::steady_clock::now();
-		string sql =
-		    GenerateRefreshSQL(context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
-		                       attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr,
-		                       cross_system ? &meta_post_sql : nullptr, profiler.Enabled() ? &compile_profile : nullptr,
-		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr);
+		string sql = GenerateRefreshSQL(
+		    context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
+		    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr, cross_system ? &meta_post_sql : nullptr,
+		    profiler.Enabled() ? &compile_profile : nullptr, precomputed_delta_activity,
+		    adaptive_refresh ? &cost_estimate : nullptr, nullptr, nullptr, &uses_stored_query);
 		for (const auto &step : compile_profile.steps) {
 			profiler.AddMeasuredStep(step.step_name, step.duration_ms, step.detail);
 		}
@@ -191,12 +179,11 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// recursion guard for those generated programs. Recompute strategies embed the stored
 		// query, which can still contain correlated EXISTS/NOT EXISTS subqueries and therefore
 		// must retain DuckDB's decorrelation pass.
-		bool uses_stored_query = RefreshUsesStoredQuery(refresh_type);
 		if (!uses_stored_query) {
 			exec_con.Query("SET disabled_optimizers='" + string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "'");
 		}
 		profiler.AddMeasuredStep("configure_refresh_optimizers", 0,
-		                         "refresh_type=" + string(RefreshTypeName(refresh_type)) +
+		                         "stored_query=" + string(uses_stored_query ? "true" : "false") +
 		                             "; deliminator=" + string(uses_stored_query ? "enabled" : "disabled"));
 		// Refreshes update relational MV state; physical insertion order is not part of
 		// the contract. Let DuckDB avoid large order-preservation buffers for big

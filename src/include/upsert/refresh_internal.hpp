@@ -244,7 +244,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           string *out_post_meta = nullptr, RefreshCompileProfile *compile_profile = nullptr,
                           const DeltaActivityResult *precomputed_delta_activity = nullptr,
                           RefreshCostEstimate *out_adaptive_estimate = nullptr,
-                          const openivm::CompileFacts *facts = nullptr, Connection *metadata_connection = nullptr);
+                          const openivm::CompileFacts *facts = nullptr, Connection *metadata_connection = nullptr,
+                          bool *out_uses_stored_query = nullptr);
 
 } // namespace duckdb
 

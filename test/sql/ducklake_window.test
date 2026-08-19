@@ -67,7 +67,7 @@ query I
 SELECT count(*) FROM openivm_refresh_profile
 WHERE view_name = 'mv_history_window'
   AND step_name = 'configure_refresh_optimizers'
-  AND contains(detail, 'refresh_type=WINDOW_PARTITION')
+  AND contains(detail, 'stored_query=true')
   AND contains(detail, 'deliminator=enabled');
 ----
 1

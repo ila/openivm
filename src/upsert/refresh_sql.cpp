@@ -676,7 +676,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           const string &attached_db_schema_name, string *out_pre_meta, string *out_post_meta,
                           RefreshCompileProfile *compile_profile, const DeltaActivityResult *precomputed_delta_activity,
                           RefreshCostEstimate *out_adaptive_estimate, const openivm::CompileFacts *facts_in,
-                          Connection *metadata_connection) {
+                          Connection *metadata_connection, bool *out_uses_stored_query) {
+	if (out_uses_stored_query) {
+		*out_uses_stored_query = false;
+	}
 	// Resolve the active CompileFacts. Three sources, in priority order:
 	//   1. Explicit `facts_in` (set by direct C++ callers that own a facts
 	//      instance — e.g. the openivm_compile_with_facts table function
@@ -813,6 +816,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                  " SET refresh_in_progress = false WHERE view_name = '" +
 				                  SqlUtils::EscapeValue(view_name) + "';\n";
 			}
+			if (out_uses_stored_query) {
+				*out_uses_stored_query = true;
+			}
 			return recovery_query;
 		}
 	}
@@ -914,6 +920,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                     string(metadata_requires_full_refresh ? "true" : "false") +
 		                     "; adaptive_recompute=" + string(adaptive_recompute ? "true" : "false") +
 		                     "; sql_bytes=" + to_string(recompute_query.size()));
+		if (out_uses_stored_query) {
+			*out_uses_stored_query = true;
+		}
 		return recompute_query;
 	}
 	RefreshType dispatch_refresh_type = use_full_recompute ? RefreshType::FULL_REFRESH : view_query_type;
@@ -1466,6 +1475,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));
 		break;
 	}
+	}
+	if (out_uses_stored_query) {
+		*out_uses_stored_query = dispatch_refresh_type == RefreshType::WINDOW_PARTITION ||
+		                         dispatch_refresh_type == RefreshType::GROUP_RECOMPUTE ||
+		                         dispatch_refresh_type == RefreshType::TOP_K ||
+		                         dispatch_refresh_type == RefreshType::FULL_REFRESH;
 	}
 	add_profile_step("generate_refresh_sql.dispatch", dispatch_start,
 	                 "refresh_type=" + string(RefreshTypeName(dispatch_refresh_type)) +
