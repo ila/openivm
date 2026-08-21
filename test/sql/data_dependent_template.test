@@ -119,6 +119,40 @@ SELECT count(*) FROM ((SELECT COALESCE(a, -1), b FROM ddc) EXCEPT ALL (SELECT sa
 ----
 0
 
+# Enabling data-dependent optimization applies only after the base-view plan has been rewritten to
+# the incremental plan. The finished native plan is executed immediately, so current delta facts may
+# be folded without baking the old base-table contents into the reusable template.
+statement ok
+SET openivm_enable_data_dependent_optimizers = true;
+
+statement ok
+CREATE TABLE ddo(i INT);
+
+statement ok
+INSERT INTO ddo VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW dd_opt_count AS SELECT COUNT(*) AS c FROM ddo;
+
+statement ok
+INSERT INTO ddo VALUES (2), (3);
+
+statement ok
+PRAGMA refresh('dd_opt_count');
+
+query I
+SELECT count(*) FROM ((SELECT c FROM dd_opt_count) EXCEPT ALL (SELECT COUNT(*) FROM ddo));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT COUNT(*) FROM ddo) EXCEPT ALL (SELECT c FROM dd_opt_count));
+----
+0
+
+statement ok
+SET openivm_enable_data_dependent_optimizers = false;
+
 # Delta capture uses UTC timestamps internally. Watermarks must use the same clock even when the
 # session time zone is non-UTC, otherwise the first refresh treats fresh deltas as hours old.
 statement ok

@@ -180,12 +180,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
-	// When true, do NOT disable data-dependent optimizers (statistics_propagation) while planning the
-	// delta template. Off by default: the template is reused against future data, so data-dependent
-	// folding (count(*)->constant, predicate->EMPTY_RESULT, COALESCE simplification) corrupts the delta.
+	// Native refresh can optimize the finished incremental plan against the current deltas because the
+	// generated SQL is executed immediately. The reusable base-view template always stays data-independent.
 	db_config.AddExtensionOption("openivm_enable_data_dependent_optimizers",
-	                             "experimental: keep data-dependent optimizers on while planning the delta "
-	                             "template (unsafe — bakes current table contents into the template)",
+	                             "optimize the finished incremental plan using current delta statistics",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Per-optimization flags (default: all enabled)

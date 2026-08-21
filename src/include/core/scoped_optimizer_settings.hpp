@@ -8,10 +8,9 @@
 
 namespace duckdb {
 
-// Optimizers to disable when planning a view query into a delta-maintenance template. Returns the
-// data-dependent set (openivm::TEMPLATE_DATA_DEPENDENT_OPTIMIZERS) unless the user opts in via the
-// openivm_enable_data_dependent_optimizers setting — see that constant for why the template must
-// stay data-independent. Empty string means "disable nothing".
+// Optimizers to disable when optimizing the finished incremental plan. Native refresh executes the
+// generated SQL immediately, so callers may opt in to planning against the current delta statistics.
+// Empty string means "disable nothing". The earlier base-view template stage is always conservative.
 inline string TemplateDisabledOptimizers(ClientContext &context) {
 	Value setting;
 	if (context.TryGetCurrentSetting("openivm_enable_data_dependent_optimizers", setting) && !setting.IsNull() &&
