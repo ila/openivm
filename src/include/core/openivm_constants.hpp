@@ -84,6 +84,11 @@ constexpr const char *DISABLED_OPTIMIZERS = TEMPLATE_DATA_DEPENDENT_OPTIMIZERS;
 // DELIM joins to eliminate. Pure robustness guard — not flag-gated.
 constexpr const char *REFRESH_DISABLED_OPTIMIZERS = "deliminator";
 
+// Timestamp::GetCurrentTimestamp() (used by transactional delta capture) is UTC. Casting now()
+// from TIMESTAMPTZ to TIMESTAMP applies the session time zone, so use an epoch round-trip for all
+// watermark timestamps that are compared with captured delta timestamps.
+constexpr const char *UTC_NOW_SQL = "make_timestamp(epoch_us(now()))";
+
 } // namespace openivm
 
 enum class RefreshType : uint8_t {

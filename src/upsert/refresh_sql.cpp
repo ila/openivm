@@ -1841,8 +1841,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                          " SET last_update = COALESCE("
 		                          "(SELECT MAX(" +
 		                          string(openivm::TIMESTAMP_COL) + ") + INTERVAL '1 microsecond' FROM " + resolved +
-		                          "), now()), last_refresh_ts = now()"
-		                          " WHERE view_name = '" +
+		                          "), " + string(openivm::UTC_NOW_SQL) +
+		                          "), last_refresh_ts = " + string(openivm::UTC_NOW_SQL) + " WHERE view_name = '" +
 		                          SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 		                          SqlUtils::EscapeValue(dt) + "';\n";
 	}
