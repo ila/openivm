@@ -368,6 +368,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				           StringUtil::CIEquals(entry.second, "MIXED")) {
 					activity_known[i] = true;
 				}
+				// This counter is used only by the debug summary below.
+				// mull-ignore-next: cxx_arithmetic
 				reused_activity_count += activity_known[i] ? 1 : 0;
 				break;
 			}

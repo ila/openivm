@@ -51,7 +51,7 @@ MUTATION_WORKERS=$(nproc) MUTATION_TIMEOUT_MS=300000 \
 MUTATION_TEST_FILTER='test/sql/*join*.test' \
   tools/mutation/run_mull_poc.sh
 
-# All OpenIVM source files and the complete SQL suite. This is the overnight run.
+# All OpenIVM delta-compiler files and the complete SQL suite. This is the overnight run.
 MULL_CONFIG=tools/mutation/mull.openivm.yml \
 MUTATION_REPORT_NAME=openivm-overnight \
 MUTATION_WORKERS=$(nproc) \
@@ -78,9 +78,9 @@ MULL_PLUGIN=/opt/mull/lib/mull-ir-frontend \
 ```
 
 For a smaller overnight rotation, copy `mull.openivm.yml`, narrow
-`includePaths` to one OpenIVM directory, and set `MULL_CONFIG` to the copy. Keep
-DuckDB and `third_party/` excluded. Targeted SQL filters make subsystem runs
-substantially faster than the complete suite.
+`includePaths` to one delta-compiler operator or file, and set `MULL_CONFIG` to
+the copy. Keep DuckDB and `third_party/` excluded. Targeted SQL filters make
+subsystem runs substantially faster than the complete suite.
 
 ## Reviewing survivors
 

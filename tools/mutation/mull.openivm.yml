@@ -5,7 +5,7 @@ mutators:
   - cxx_logical
 
 includePaths:
-  - ".*/src/.*\\.cpp$"
+  - ".*/src/delta/.*\\.cpp$"
 
 excludePaths:
   - ".*/duckdb/.*"
