@@ -161,7 +161,7 @@ MIN/MAX and ARG_MIN/ARG_MAX usually force group-recompute unless insert-only fas
 | `openivm_left_join_merge` | BOOLEAN | `true` | Use incremental MERGE for LEFT JOIN aggregates instead of group-recompute |
 | `openivm_full_outer_merge` | BOOLEAN | `true` | Use incremental MERGE for FULL OUTER JOIN aggregates (Zhang & Larson) instead of group-recompute |
 | `openivm_distinct_aux_state` | BOOLEAN | `false` | Use aux-state DISTINCT maintenance for supported single-source inner DISTINCT under aggregate |
-| `openivm_enable_data_dependent_optimizers` | BOOLEAN | `false` | Optimize the finished incremental plan using current delta statistics. The reusable base-view template remains data-independent |
+| `openivm_enable_data_dependent_optimizers` | BOOLEAN | `true` | Optimize the finished native incremental plan using current delta statistics. The reusable base-view template remains data-independent; cross-system compilation always disables this optimization |
 | `openivm_enable_view_matching` | BOOLEAN | `false` | Enable query-time view matching master flag; implementation is still scaffolded |
 | `openivm_predicate_oracle` | VARCHAR | `"interval"` | Predicate oracle mode for matching: `"syntactic"`, `"interval"`, or `"sat"` stub |
 | `openivm_match_strategies` | VARCHAR | `"all"` | CSV of allowed matcher strategies |

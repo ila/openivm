@@ -184,7 +184,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// generated SQL is executed immediately. The reusable base-view template always stays data-independent.
 	db_config.AddExtensionOption("openivm_enable_data_dependent_optimizers",
 	                             "optimize the finished incremental plan using current delta statistics",
-	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Per-optimization flags (default: all enabled)
 	db_config.AddExtensionOption("openivm_skip_empty_deltas", "skip refresh or join terms when deltas are empty",

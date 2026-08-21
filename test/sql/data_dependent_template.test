@@ -9,11 +9,11 @@
 
 require openivm
 
-# Setting is off by default.
+# Finished-plan optimization is on by default for native refresh.
 query I
 SELECT current_setting('openivm_enable_data_dependent_optimizers');
 ----
-false
+true
 
 # --- Family 1: ungrouped COUNT(*) folded to a constant via TryExecuteAggregates ---
 statement ok
@@ -123,9 +123,6 @@ SELECT count(*) FROM ((SELECT COALESCE(a, -1), b FROM ddc) EXCEPT ALL (SELECT sa
 # the incremental plan. The finished native plan is executed immediately, so current delta facts may
 # be folded without baking the old base-table contents into the reusable template.
 statement ok
-SET openivm_enable_data_dependent_optimizers = true;
-
-statement ok
 CREATE TABLE ddo(i INT);
 
 statement ok
@@ -149,9 +146,6 @@ query I
 SELECT count(*) FROM ((SELECT COUNT(*) FROM ddo) EXCEPT ALL (SELECT c FROM dd_opt_count));
 ----
 0
-
-statement ok
-SET openivm_enable_data_dependent_optimizers = false;
 
 # Delta capture uses UTC timestamps internally. Watermarks must use the same clock even when the
 # session time zone is non-UTC, otherwise the first refresh treats fresh deltas as hours old.
