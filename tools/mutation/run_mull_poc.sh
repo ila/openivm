@@ -12,6 +12,15 @@ timeout_ms=${MUTATION_TIMEOUT_MS:-120000}
 config_path=${MULL_CONFIG:-"${project_dir}/tools/mutation/mull.join.yml"}
 log_path=${MUTATION_LOG_PATH:-"${report_dir}/${report_name}.log"}
 
+if [[ "${config_path}" != /* ]]; then
+	config_path="${project_dir}/${config_path}"
+fi
+if [[ ! -f "${config_path}" ]]; then
+	echo "Mull config not found: ${config_path}" >&2
+	exit 2
+fi
+config_path=$(cd "$(dirname "${config_path}")" && pwd)/$(basename "${config_path}")
+
 clang_bin=${CLANG_BIN:-clang-${llvm_version}}
 clangxx_bin=${CLANGXX_BIN:-clang++-${llvm_version}}
 mull_runner=${MULL_RUNNER:-mull-runner-${llvm_version}}
