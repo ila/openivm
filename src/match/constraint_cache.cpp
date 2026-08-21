@@ -21,8 +21,7 @@ static vector<string> ParseColumnList(const string &raw) {
 	if (input.front() == '[') {
 		size_t pos = 1;
 		while (pos < input.size()) {
-			while (pos < input.size() &&
-			       (std::isspace(static_cast<unsigned char>(input[pos])) || input[pos] == ',')) {
+			while (pos < input.size() && (std::isspace(static_cast<unsigned char>(input[pos])) || input[pos] == ',')) {
 				pos++;
 			}
 			if (pos >= input.size() || input[pos] == ']') {
@@ -136,7 +135,8 @@ bool ConstraintCache::HasFKToParent(ClientContext &context, const string &child_
 	auto cs = GetConstraints(context, child_table);
 	for (const auto &c : cs) {
 		if ((StringUtil::CIEquals(c.kind, "FK") || StringUtil::CIEquals(c.kind, "RELY_FK")) && c.is_trusted &&
-		    SameColumns(c.columns, child_columns) && SqlUtils::IdentifierMatchesTable(c.referenced_table, parent_table) &&
+		    SameColumns(c.columns, child_columns) &&
+		    SqlUtils::IdentifierMatchesTable(c.referenced_table, parent_table) &&
 		    SameColumns(c.referenced_columns, parent_columns)) {
 			return true;
 		}

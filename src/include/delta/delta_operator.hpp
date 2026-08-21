@@ -14,6 +14,7 @@ enum class DeltaOperatorStrategy {
 	PROJECTION_APPEND_MULTIPLICITY,
 	AGGREGATE_GROUP_BY_MULTIPLICITY,
 	JOIN_INCLUSION_EXCLUSION,
+	JOIN_REGULAR_N_TERM,
 	JOIN_DUCKLAKE_N_TERM,
 	DELIM_JOIN_INCLUSION_EXCLUSION,
 	UNION_ALL_LINEAR,
@@ -76,9 +77,9 @@ DeltaPlanFragment CompileCteDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileUnnestDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileConstantZeroDelta(DeltaOperatorInput input);
 DeltaPlanFragment CompileStaticConstantLeaf(DeltaOperatorInput input);
-DeltaPlanFragment CompileAsofJoinDelta(DeltaOperatorInput input);
-DeltaPlanFragment CompilePositionalJoinDelta(DeltaOperatorInput input);
-DeltaPlanFragment CompileSampleDelta(DeltaOperatorInput input);
+DeltaPlanFragment CompileAsofJoinDelta(const DeltaOperatorInput &input);
+DeltaPlanFragment CompilePositionalJoinDelta(const DeltaOperatorInput &input);
+DeltaPlanFragment CompileSampleDelta(const DeltaOperatorInput &input);
 
 } // namespace duckdb
 

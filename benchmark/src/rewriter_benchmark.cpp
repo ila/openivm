@@ -5,6 +5,7 @@
 //
 
 #include "duckdb.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
 #include "core/openivm_extension.hpp"
@@ -19,6 +20,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cerrno>
 #include <ctime>
 #include <iomanip>
 #include <cstdio>
@@ -44,6 +46,55 @@ using openivm_bench::Log;
 using openivm_bench::ReadAllBytes;
 using openivm_bench::Timestamp;
 using openivm_bench::WriteAllBytes;
+
+static bool ReadAllBytesUntil(int fd, void *buf, size_t n, std::chrono::steady_clock::time_point deadline,
+                              bool &timed_out) {
+	char *p = static_cast<char *>(buf);
+	while (n > 0) {
+		auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			timed_out = true;
+			return false;
+		}
+
+		int remaining_ms =
+		    static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+		struct pollfd pfd;
+		pfd.fd = fd;
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+
+		int ret = poll(&pfd, 1, std::min(remaining_ms, 500));
+		if (ret < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return false;
+		}
+		if (ret == 0) {
+			continue;
+		}
+		if (pfd.revents & POLLIN) {
+			ssize_t r = read(fd, p, n);
+			if (r < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				return false;
+			}
+			if (r == 0) {
+				return false;
+			}
+			p += r;
+			n -= static_cast<size_t>(r);
+			continue;
+		}
+		if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+			return false;
+		}
+	}
+	return true;
+}
 
 static string FormatNumber(double v) {
 	std::ostringstream oss;
@@ -128,6 +179,16 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 		}
 	}
 	return result;
+}
+
+// Count both directional bag differences independently. Combining the two
+// EXCEPT ALL branches with UNION ALL is precedence-sensitive in DuckDB:
+// `a EXCEPT ALL b UNION ALL b EXCEPT ALL a` is evaluated left-to-right and can
+// cancel rows that exist only on one side.
+static string BuildBagMismatchCountQuery(const string &left, const string &right) {
+	return "SELECT (SELECT COUNT(*) FROM ((" + left + ") EXCEPT ALL (" + right +
+	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left +
+	       ")) __right_diff)";
 }
 
 static string LowerASCII(string s) {
@@ -476,6 +537,18 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		duckdb::Connection con(db);
 		con.Query("PRAGMA threads=4");
 
+		// A few corpus queries mix TIMESTAMP columns with CURRENT_TIMESTAMP.
+		// DuckDB implements the required TIMESTAMPTZ conversion in ICU, so install
+		// it up front instead of turning a missing mid-run autoload into a query
+		// validation failure.
+		auto icu_install = con.Query("INSTALL icu");
+		auto icu_load = con.Query("LOAD icu");
+		if ((icu_install && icu_install->HasError()) || (icu_load && icu_load->HasError())) {
+			fprintf(stderr, "Warning: ICU extension unavailable; timestamp validation may fail: %s%s\n",
+			        icu_install && icu_install->HasError() ? icu_install->GetError().c_str() : "",
+			        icu_load && icu_load->HasError() ? icu_load->GetError().c_str() : "");
+		}
+
 		// Figure out the default (native) catalog name so we can switch back
 		// after a ducklake query. When `db_path` is a file like
 		// `rewriter_benchmark_sf1.db`, DuckDB names the catalog
@@ -487,7 +560,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				native_catalog = cur->GetValue(0, 0).ToString();
 			}
 		}
-		string native_use = "USE " + native_catalog + ".main";
+		string quoted_native_catalog = duckdb::KeywordHelper::WriteOptionallyQuoted(native_catalog);
+		string native_use = "USE " + quoted_native_catalog + ".main";
 
 		// DuckLake support is only for the tpcc workload — tpcdi has no DuckLake variants.
 		bool ducklake_ok = false;
@@ -509,7 +583,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						CreateTPCCSchema(con);
 						for (const char *t : {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM", "STOCK", "OORDER",
 						                      "NEW_ORDER", "ORDER_LINE", "HISTORY"}) {
-							con.Query(string("INSERT INTO ") + t + " SELECT * FROM " + native_catalog + ".main." + t);
+							con.Query(string("INSERT INTO ") + t + " SELECT * FROM " + quoted_native_catalog +
+							          ".main." + t);
 						}
 						con.Query(native_use);
 					} else {
@@ -669,24 +744,35 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// Qualify with native_catalog so the lookup works both when the active catalog
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
 						// name = filename, never "memory").
-						auto check_result = con.Query("SELECT type FROM " + native_catalog +
-						                              ".openivm_views WHERE view_name = '" + mv_name + "'");
+						auto check_result = con.Query("SELECT type FROM " + quoted_native_catalog +
+						                              ".main.openivm_views WHERE view_name = '" + mv_name + "'");
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
 							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
 							is_incremental = (refresh_type != 3) ? 1 : 0;
+						} else {
+							error = "OpenIVM metadata lookup failed for " + mv_name;
+							if (check_result && check_result->HasError()) {
+								error += ": " + check_result->GetError();
+							}
+							phase_reached = PHASE_MV_CREATION_FAILED;
 						}
 
 						// Phase 3: Apply deltas
-						for (int d = 0; d < delta_batch_size && (size_t)delta_idx < deltas.size(); d++, delta_idx++) {
-							con.Query(deltas[delta_idx]); // Errors are OK (e.g. duplicate keys)
+						if (phase_reached == PHASE_DELTA_FAILED) {
+							for (int d = 0; d < delta_batch_size && (size_t)delta_idx < deltas.size();
+							     d++, delta_idx++) {
+								con.Query(deltas[delta_idx]); // Errors are OK (e.g. duplicate keys)
+							}
+							if ((size_t)delta_idx >= deltas.size())
+								delta_idx = 0;
+							phase_reached = PHASE_REFRESH_FAILED;
 						}
-						if ((size_t)delta_idx >= deltas.size())
-							delta_idx = 0;
-						phase_reached = PHASE_REFRESH_FAILED;
 
 						// Phase 4: PRAGMA refresh()
 						start = std::chrono::steady_clock::now();
-						auto refresh_result = con.Query("PRAGMA refresh('" + mv_name + "')");
+						auto refresh_result = phase_reached == PHASE_REFRESH_FAILED
+						                          ? con.Query("PRAGMA refresh('" + mv_name + "')")
+						                          : nullptr;
 						if (refresh_result && refresh_result->HasError()) {
 							error = refresh_result->GetError();
 							if (IsFatalError(error)) {
@@ -694,7 +780,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							} else {
 								phase_reached = PHASE_REFRESH_FAILED;
 							}
-						} else {
+						} else if (refresh_result) {
 							auto end_refresh = std::chrono::steady_clock::now();
 							time_refresh_ms = std::chrono::duration<double, std::milli>(end_refresh - start).count();
 							phase_reached = PHASE_VERIFY_FAILED;
@@ -715,36 +801,16 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 								// identical to the historical verify so queries whose output
 								// is order-sensitive under CTE materialization (NTILE, etc.)
 								// aren't perturbed.
-								verify_query = "SELECT COUNT(*) FROM ("
-								               "SELECT * FROM " +
-								               mv_name + " EXCEPT ALL SELECT * FROM (" + query +
-								               ") __a"
-								               " UNION ALL "
-								               "SELECT * FROM (" +
-								               query + ") __b EXCEPT ALL SELECT * FROM " + mv_name + ") __diff";
+								string mv_select = "SELECT * FROM " + mv_name;
+								string gt_select = "SELECT * FROM (" + query + ") __gt";
+								verify_query = BuildBagMismatchCountQuery(mv_select, gt_select);
 							} else {
-								verify_query = "WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " + mv_name +
-								               "), "
-								               "gt_r(" +
-								               nv.column_list + ") AS (SELECT * FROM (" + query +
-								               ") __gt) "
-								               "SELECT COUNT(*) FROM ("
-								               "SELECT " +
-								               nv.normalized +
-								               " FROM mv_r "
-								               "EXCEPT ALL "
-								               "SELECT " +
-								               nv.normalized +
-								               " FROM gt_r "
-								               "UNION ALL "
-								               "SELECT " +
-								               nv.normalized +
-								               " FROM gt_r "
-								               "EXCEPT ALL "
-								               "SELECT " +
-								               nv.normalized +
-								               " FROM mv_r"
-								               ") __diff";
+								string ctes = "WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " + mv_name +
+								              "), gt_r(" + nv.column_list + ") AS (SELECT * FROM (" + query +
+								              ") __gt) ";
+								string mv_select = "SELECT " + nv.normalized + " FROM mv_r";
+								string gt_select = "SELECT " + nv.normalized + " FROM gt_r";
+								verify_query = ctes + BuildBagMismatchCountQuery(mv_select, gt_select);
 							}
 							auto verify_result = con.Query(verify_query);
 							if (verify_result && !verify_result->HasError() && verify_result->RowCount() > 0) {
@@ -763,29 +829,12 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 											}
 											non_window_select += nv.normalized_columns[i];
 										}
-										string relaxed_query = "WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " +
-										                       mv_name +
-										                       "), "
-										                       "gt_r(" +
-										                       nv.column_list + ") AS (SELECT * FROM (" + query +
-										                       ") __gt) "
-										                       "SELECT COUNT(*) FROM ("
-										                       "SELECT " +
-										                       non_window_select +
-										                       " FROM mv_r "
-										                       "EXCEPT ALL "
-										                       "SELECT " +
-										                       non_window_select +
-										                       " FROM gt_r "
-										                       "UNION ALL "
-										                       "SELECT " +
-										                       non_window_select +
-										                       " FROM gt_r "
-										                       "EXCEPT ALL "
-										                       "SELECT " +
-										                       non_window_select +
-										                       " FROM mv_r"
-										                       ") __diff";
+										string ctes = "WITH mv_r(" + nv.column_list + ") AS (SELECT * FROM " + mv_name +
+										              "), gt_r(" + nv.column_list + ") AS (SELECT * FROM (" + query +
+										              ") __gt) ";
+										string mv_select = "SELECT " + non_window_select + " FROM mv_r";
+										string gt_select = "SELECT " + non_window_select + " FROM gt_r";
+										string relaxed_query = ctes + BuildBagMismatchCountQuery(mv_select, gt_select);
 										auto relaxed_result = con.Query(relaxed_query);
 										if (relaxed_result && !relaxed_result->HasError() &&
 										    relaxed_result->RowCount() > 0 &&
@@ -1019,34 +1068,51 @@ struct ForkWorker {
 			int ret = poll(&pfd, 1, poll_ms);
 
 			if (ret > 0 && (pfd.revents & POLLIN)) {
-				if (!ReadAllBytes(from_child_fd, &result_phase, sizeof(result_phase)) ||
-				    !ReadAllBytes(from_child_fd, &result_incremental, sizeof(result_incremental)) ||
-				    !ReadAllBytes(from_child_fd, &result_correct, sizeof(result_correct)) ||
-				    !ReadAllBytes(from_child_fd, &result_time_select_ms, sizeof(result_time_select_ms)) ||
-				    !ReadAllBytes(from_child_fd, &result_time_mv_ms, sizeof(result_time_mv_ms)) ||
-				    !ReadAllBytes(from_child_fd, &result_time_refresh_ms, sizeof(result_time_refresh_ms)) ||
-				    !ReadAllBytes(from_child_fd, &result_time_verify_ms, sizeof(result_time_verify_ms))) {
+				bool timed_out = false;
+				auto read_field = [&](void *buf, size_t n) {
+					return ReadAllBytesUntil(from_child_fd, buf, n, deadline, timed_out);
+				};
+				auto finish_read_failure = [&]() {
+					if (timed_out) {
+						kill(child_pid, SIGKILL);
+						waitpid(child_pid, nullptr, 0);
+						child_pid = -1;
+						result_phase = PHASE_TIMEOUT;
+						result_error = "timeout";
+						return;
+					}
 					int status;
 					waitpid(child_pid, &status, 0);
 					child_pid = -1;
 					result_phase = PHASE_CRASH;
+					if (WIFEXITED(status)) {
+						result_error = "child exited with code " + std::to_string(WEXITSTATUS(status));
+					} else if (WIFSIGNALED(status)) {
+						result_error = "child killed by signal " + std::to_string(WTERMSIG(status));
+					} else {
+						result_error = "child died while writing result";
+					}
+				};
+
+				if (!read_field(&result_phase, sizeof(result_phase)) ||
+				    !read_field(&result_incremental, sizeof(result_incremental)) ||
+				    !read_field(&result_correct, sizeof(result_correct)) ||
+				    !read_field(&result_time_select_ms, sizeof(result_time_select_ms)) ||
+				    !read_field(&result_time_mv_ms, sizeof(result_time_mv_ms)) ||
+				    !read_field(&result_time_refresh_ms, sizeof(result_time_refresh_ms)) ||
+				    !read_field(&result_time_verify_ms, sizeof(result_time_verify_ms))) {
+					finish_read_failure();
 					return;
 				}
 				uint32_t err_len = 0;
-				if (!ReadAllBytes(from_child_fd, &err_len, sizeof(err_len))) {
-					int status;
-					waitpid(child_pid, &status, 0);
-					child_pid = -1;
-					result_phase = PHASE_CRASH;
+				if (!read_field(&err_len, sizeof(err_len))) {
+					finish_read_failure();
 					return;
 				}
 				if (err_len > 0) {
 					result_error.resize(err_len);
-					if (!ReadAllBytes(from_child_fd, &result_error[0], err_len)) {
-						int status;
-						waitpid(child_pid, &status, 0);
-						child_pid = -1;
-						result_phase = PHASE_CRASH;
+					if (!read_field(&result_error[0], err_len)) {
+						finish_read_failure();
 						return;
 					}
 				}

@@ -7,11 +7,6 @@
 
 namespace duckdb {
 
-static bool QueryLooksLikeJoin(const string &view_query_sql, const vector<string> &delta_table_names) {
-	return delta_table_names.size() > 1 || view_query_sql.find("JOIN") != string::npos ||
-	       view_query_sql.find("join") != string::npos;
-}
-
 static string DuckLakeChangeContains(const string &key, const string &table_id) {
 	return "COALESCE(list_contains(changes['" + key + "'], '" + table_id + "'), false)";
 }
@@ -239,7 +234,8 @@ DeltaActivityProvider DeltaActivityProvider::Build(RefreshMetadata &metadata, Co
                                                    const string &attached_db_schema_name) {
 	DeltaActivityProvider provider;
 	auto &summary = provider.summary;
-	summary.has_join = QueryLooksLikeJoin(view_query_sql, delta_table_names);
+	(void)view_query_sql;
+	summary.has_join = metadata.HasJoin(view_name) || delta_table_names.size() > 1;
 	for (auto &dt : delta_table_names) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
 			AccumulateDuckLakeDeltaSummary(summary, metadata, con, view_name, dt, view_catalog_name, view_schema_name,
@@ -273,12 +269,11 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 	if (facts && facts->compile_only) {
 		DeltaFastPathFlags flags;
 		flags.active_delta_table_names = delta_table_names;
-		// v2 WorkloadFacts: when an external classifier has PROVEN this batch is
-		// append-only, re-enable the insert-only fast paths even under compile_only
-		// (they are otherwise disabled because compile_only sees empty tables and
-		// cannot detect insert-only itself). Honor the same per-setting kill switches
-		// as the normal path so an operator can still force the general signed-delta
-		// SQL. Without the flag we keep the conservative all-delta-shapes SQL.
+		// When an external classifier has PROVEN this batch is append-only,
+		// re-enable the insert-only fast paths even under compile_only (they are
+		// otherwise disabled because compile_only sees empty tables and cannot
+		// detect insert-only itself). Honor the same per-setting kill switches as
+		// the normal path. Without the flag we keep the conservative all-delta SQL.
 		if (facts->assume_insert_only) {
 			flags.insert_only = true;
 			flags.skip_agg_delete = SqlUtils::GetBoolSetting(context, "openivm_skip_aggregate_delete", true);
@@ -287,8 +282,8 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 		}
 		OPENIVM_DEBUG_PRINT("[UPSERT] compile_only=true: assume_insert_only=%d insert_only=%d skip_agg_delete=%d "
 		                    "skip_proj_delete=%d minmax_incremental=%d active_sources=%zu\n",
-		                    facts->assume_insert_only, flags.insert_only, flags.skip_agg_delete,
-		                    flags.skip_proj_delete, flags.minmax_incremental, flags.active_delta_table_names.size());
+		                    facts->assume_insert_only, flags.insert_only, flags.skip_agg_delete, flags.skip_proj_delete,
+		                    flags.minmax_incremental, flags.active_delta_table_names.size());
 		return flags;
 	}
 	DeltaActivityResult summary;

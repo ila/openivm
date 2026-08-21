@@ -47,6 +47,8 @@ const char *DeltaOperatorStrategyName(DeltaOperatorStrategy strategy) {
 		return "AGGREGATE_GROUP_BY_MULTIPLICITY";
 	case DeltaOperatorStrategy::JOIN_INCLUSION_EXCLUSION:
 		return "JOIN_INCLUSION_EXCLUSION";
+	case DeltaOperatorStrategy::JOIN_REGULAR_N_TERM:
+		return "JOIN_REGULAR_N_TERM";
 	case DeltaOperatorStrategy::JOIN_DUCKLAKE_N_TERM:
 		return "JOIN_DUCKLAKE_N_TERM";
 	case DeltaOperatorStrategy::DELIM_JOIN_INCLUSION_EXCLUSION:

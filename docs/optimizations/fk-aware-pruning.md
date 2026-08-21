@@ -107,6 +107,12 @@ build + hash join probe + UNION ALL branch.
 - The referenced (PK-side) table's delta contains only inserts since last refresh
 - The join is an inner join between the FK and PK tables
 
+For eligible external-engine projection plans, OpenIVM can also use
+[regular N-term compilation](../operators/inner-join.md#regular-table-n-term-compilation).
+The compiler first checks whether FK pruning would eliminate any inclusion-exclusion
+terms. If so, it keeps the smaller FK-pruned inclusion-exclusion plan. Otherwise, it
+uses the N-term plan.
+
 ## When It Does Not Apply
 
 - No FK constraints declared between join tables

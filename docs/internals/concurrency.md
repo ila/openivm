@@ -1,29 +1,29 @@
 # Concurrency
 
-## Refresh serialization
+## Mutation serialization
 
-Each materialized view has a per-view mutex. When `PRAGMA refresh('view_name')` runs, it
-acquires the view's lock before generating or executing any SQL. This prevents two
-concurrent refresh calls from applying overlapping deltas to the same view.
+OpenIVM serializes tracked source-table writes, refreshes, and materialized-view
+lifecycle operations through one database-wide mutation gate. An explicit transaction
+retains the gate until commit or rollback. Helper connections use the same logical
+owner, making the gate re-entrant even when DuckDB executes work on another thread.
 
-The [automatic refresh daemon](../refresh/automatic-refresh.md) uses `TryLockView()` —
-if the view is already being refreshed, the daemon skips it and retries at the next
-interval.
-
-## Delta table safety
-
-Each delta table has a per-delta-table mutex. The insert rule acquires the delta lock
-when writing DML-triggered rows into a delta table. This prevents concurrent INSERTs
-from interleaving delta rows in a way that breaks timestamp ordering.
+This coarse boundary prevents refresh/write and parent/child refresh races without a
+multi-lock hierarchy. Unrelated OpenIVM mutations in the same database also serialize;
+ordinary reads remain concurrent. The [automatic refresh daemon](../refresh/automatic-refresh.md)
+waits behind an active mutation and refreshes once it acquires the gate.
 
 ## Snapshot isolation
 
-Refresh executes SQL through a separate `Connection` from the user's session. DuckDB
-provides snapshot isolation per transaction, so:
+Autocommit refresh executes through a locked helper connection. Refresh inside an
+explicit transaction compiles metadata through a helper but executes the generated
+program in the caller transaction, so transaction-local DML and MV lifecycle changes
+remain visible and atomic. The mutation gate prevents another tracked writer or
+refresh from changing OpenIVM state while the refresh is active. DuckDB snapshot
+isolation additionally ensures:
 
 - The refresh reads a consistent snapshot of base tables and delta tables
-- Concurrent DML by other connections does not affect the in-progress refresh
-- Delta rows written by concurrent DML after the refresh's snapshot are not seen
+- The refresh sees transaction-local changes made before it acquired its snapshot
+- Non-OpenIVM activity cannot change the refresh's visible snapshot
 
 For DuckLake tables, the snapshot is determined by the `DuckLakeFunctionInfo::snapshot_id`
 bound at plan time. `AT VERSION` pinning reads exactly the state at that snapshot.
@@ -45,14 +45,13 @@ Each `(view, base_table)` pair tracks two timestamps in `openivm_delta_tables`:
 4. We set `last_update = now()` (which is *less than* this row's ts).
 5. The next refresh's filter `ts >= last_update` includes this row again → double-application → MV drift.
 
-Anchoring `last_update` to the maximum timestamp we *actually* processed eliminates the gap: the next refresh's filter excludes everything we've seen and includes everything we haven't. See `src/upsert/refresh.cpp:1370–1403` for the implementation.
+Anchoring `last_update` to the maximum timestamp we *actually* processed eliminates the gap: the next refresh's filter excludes everything we've seen and includes everything we haven't. See `GenerateRefreshSQL()` in `src/upsert/refresh_sql.cpp` for the implementation.
 
-## Lock hierarchy
+## Locking
 
 | Lock | Scope | Held during | Used by |
 |---|---|---|---|
-| View mutex | Per view name | Entire refresh cycle | `PRAGMA refresh()`, refresh daemon |
-| Delta mutex | Per delta table name | Delta row insertion | Insert rule (DML triggers) |
-| Map mutex | Global (static) | Mutex map lookup | Internal — protects the mutex maps |
+| Mutation gate | Per DuckDB database instance | Entire explicit transaction or autocommit OpenIVM mutation | Delta capture, refresh, lifecycle DDL |
+| Map mutex | Global (static) | Mutation-gate lookup | Internal — protects the gate map |
 
-All locks are non-recursive mutexes. The view mutex is the outermost lock.
+Transactional lock state retains the mutation guard through commit or rollback.

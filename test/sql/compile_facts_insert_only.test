@@ -1,7 +1,8 @@
 # name: test/sql/compile_facts_insert_only.test
 # description: openivm_compile_with_facts — WorkloadFacts v2 assume_insert_only re-enables
-#              the insert-only fast paths under compile_only (openivm-spark integration).
 # group: [sql]
+
+#              the insert-only fast paths under compile_only (openivm-spark integration).
 
 require openivm
 

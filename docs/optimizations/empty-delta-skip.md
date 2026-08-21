@@ -33,10 +33,12 @@ A safety fallback ensures at least one term is always generated to avoid an empt
 
 ## Per-Term Skipping (Standard Joins)
 
-For standard (non-DuckLake) joins using inclusion-exclusion, empty-delta detection also
-skips individual terms. Each inclusion-exclusion term is a join where some tables use delta
-scans. If **any** table in a term's bitmask has zero pending delta rows, the entire join
-term produces zero rows (a join with an empty input is always empty) and is skipped.
+Standard non-DuckLake joins can use inclusion-exclusion or regular N-term compilation.
+Both strategies skip terms for unchanged inputs.
+
+For inclusion-exclusion, each term is a join where some tables use delta scans. If
+**any** table in a term's bitmask has zero pending delta rows, the term produces zero
+rows and is skipped.
 
 Detection queries each delta table's row count (filtered by timestamp since last refresh)
 in the same pass as the insert-only detection used by FK pruning. Together with FK-aware
@@ -46,6 +48,15 @@ table changed.
 For example, in a 3-table join where only table A changed, 6 of the 7 inclusion-exclusion
 terms contain either B's or C's empty delta and are skipped — only the 1 term with A's
 delta alone is generated.
+
+For [regular N-term compilation](../operators/inner-join.md#regular-table-n-term-compilation),
+compile facts mark unchanged leaves before SQL generation. OpenIVM omits their delta terms
+and avoids reconstructing their old state. A three-table join where only A changed therefore
+emits one term instead of three.
+
+The adaptive cost model uses the same signal. Empty source deltas do not contribute
+active join terms, so `PRAGMA refresh_cost` estimates the work for the terms that can
+actually produce rows.
 
 ## What Is Avoided
 
@@ -60,10 +71,10 @@ delta alone is generated.
 
 | Setting | Default | Description |
 |---|---|---|
-| `openivm_skip_empty_deltas` | `true` | Enable empty-delta skipping (early-exit + per-term DuckLake skip) |
+| `openivm_skip_empty_deltas` | `true` | Enable empty-delta skipping (early-exit + per-term join skip) |
 
 ```sql
-SET openivm_skip_empty_deltas = false;  -- disable: always run full refresh pipeline
+SET openivm_skip_empty_deltas = false;  -- disable: always run the refresh pipeline
 ```
 
 ## When It Does Not Apply
@@ -71,3 +82,6 @@ SET openivm_skip_empty_deltas = false;  -- disable: always run full refresh pipe
 - At least one delta table contains rows (standard) or snapshot IDs differ (DuckLake)
 - View type is `FULL_REFRESH` (unsupported operators always recompute)
 - `openivm_skip_empty_deltas` is set to `false`
+
+When the setting is `false`, an empty-delta refresh still executes the selected refresh
+path. The adaptive cost model includes this fixed overhead in `PRAGMA refresh_cost`.

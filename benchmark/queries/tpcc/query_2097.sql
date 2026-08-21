@@ -1,2 +1,2 @@
--- {"operators": "ASOF_JOIN,INNER_JOIN", "complexity": "high", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,OORDER,CUSTOMER"}
+-- {"operators": "ASOF_JOIN,INNER_JOIN", "complexity": "high", "is_incremental": false, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "ORDER_LINE,OORDER,CUSTOMER", "non_incr_reason": "op:ASOF_JOIN"}
 SELECT c.C_W_ID, c.C_D_ID, c.C_ID, ol.OL_AMOUNT FROM ORDER_LINE ol ASOF JOIN OORDER o ON ol.OL_W_ID = o.O_W_ID AND ol.OL_D_ID = o.O_D_ID AND ol.OL_DELIVERY_D >= o.O_ENTRY_D JOIN CUSTOMER c ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID;

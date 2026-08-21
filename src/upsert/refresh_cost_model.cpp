@@ -1,6 +1,8 @@
 #include "upsert/refresh_cost_model.hpp"
 #include <cmath>
 #include <unordered_set>
+#include "core/ivm_delta_model.hpp"
+#include "core/ivm_view_classifier.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
@@ -79,18 +81,173 @@ struct TableStats {
 	double actual_card;  // actual unfiltered table row count
 	double delta_card;   // |ΔT|
 	bool has_fk = false; // table has FK referencing another table in the join
+	bool has_deletes = false;
 };
 
 /// Aggregated plan statistics collected in a single tree walk.
 struct PlanStats {
 	vector<TableStats> table_stats;
 	idx_t join_leaf_count = 0;
+	idx_t aggregate_expr_count = 0; // total aggregate functions across all GROUP BY nodes (per-column MERGE cost)
 	bool has_join = false;
 	bool has_aggregate = false;
 	bool has_full_outer = false;
 	bool all_ducklake = true;        // true until a non-DuckLake leaf is found
 	double filter_selectivity = 1.0; // cumulative selectivity from non-pushed-down LOGICAL_FILTER nodes
+	idx_t linear_nodes = 0;
+	idx_t product_nodes = 0;
+	idx_t stateful_nodes = 0;
+	idx_t full_recompute_nodes = 0;
 };
+
+static const char *StrategyLabelForRefreshType(RefreshType view_type) {
+	switch (view_type) {
+	case RefreshType::GROUP_RECOMPUTE:
+		return "group_recompute";
+	case RefreshType::WINDOW_PARTITION:
+		return "window_partition";
+	case RefreshType::DISTINCT_INCREMENTAL:
+		return "distinct_incremental";
+	case RefreshType::SEMI_ANTI_RECOMPUTE:
+		return "semi_anti_recompute";
+	case RefreshType::FULL_REFRESH:
+	case RefreshType::TOP_K:
+		return "full";
+	default:
+		return "incremental";
+	}
+}
+
+// Uncalibrated, ms-grounded prior for the incremental-vs-recompute decision. Consulted only before
+// any refresh history exists; the learned regression replaces it after a few runs. This is a coarse,
+// hardware-rough prior — not perfect, but it has to *rank* incremental vs recompute correctly across
+// scale factors without any calibration (the benchmark runs each combo on a fresh DB, so it always
+// exercises this prior, never the regression).
+//
+// The model is grounded in measured TPC-C/TPC-DI refresh times across SF1–SF250:
+//
+//   FULL recompute = RECOMPUTE_SETUP_MS + RECOMPUTE_MS_PER_UNIT * base_scan * (1 + JOIN_FACTOR*joins)
+//     A full vectorized scan+aggregate is *flat-cheap* — a simple SUM+GROUP BY over 50k or 250k rows
+//     both land at ~11ms, so the per-row term is tiny. The expensive part of a full recompute is the
+//     JOIN: producing the full join output scales with the number of joins, so each join multiplies
+//     the scan cost (a 2M-row 3-way join recomputes in ~50ms, not ~10ms).
+//
+//   INCREMENTAL = INCREMENTAL_SETUP_MS + RECOMPUTE_MS_PER_UNIT * incremental_compute
+//                 + INCREMENTAL_MS_PER_UNIT * upsert + AGG_EXPR_MS * num_aggregate_exprs
+//     The delta path scans the base tables once (to build hash tables) but only produces the *delta*
+//     output, so it does NOT pay the join_factor blow-up — a delta join over a tiny delta is cheap
+//     even on a huge base. Its costs are: a fixed per-refresh floor (re-plan delta query + rewrite +
+//     LPTS round-trip + upsert codegen), the per-statement merge/upsert work (pricier per row than a
+//     bulk scan), and a per-aggregate-column MERGE penalty — multi-aggregate views (several
+//     SUM/COUNT/STDDEV columns) update each column per affected group, so their incremental floor is
+//     much higher than a single-aggregate view (a join+multi-agg refreshes in ~34ms vs ~16ms for a
+//     simple agg). The full recompute does the same aggregation in one vectorized pass, so it does
+//     *not* pay this penalty.
+//
+// Net effect: full wins for cheap-to-recompute views (simple aggregates, small/medium scans) because
+// incremental's per-statement floor beats nothing; incremental wins once recompute is genuinely
+// expensive (large joins that re-materialize a big result, or a big MV whose full replace dwarfs a
+// small delta apply).
+static constexpr double RECOMPUTE_SETUP_MS = 10.0;        // fixed query setup + MV replace overhead
+static constexpr double RECOMPUTE_MS_PER_UNIT = 0.000004; // vectorized scan: nearly free per row
+static constexpr double RECOMPUTE_JOIN_FACTOR = 1.5;      // each join multiplies full-output scan cost
+static constexpr double INCREMENTAL_SETUP_MS = 12.0;      // re-plan + rewrite + LPTS + upsert codegen
+static constexpr double INCREMENTAL_MS_PER_UNIT = 0.0008; // per-group MERGE upsert (aggregates): pricier per row
+static constexpr double PROJECTION_APPLY_MS_PER_UNIT =
+    0.00002; // bulk insert/delete (projections): vectorized, far cheaper than a per-group MERGE
+static constexpr double AGG_EXPR_MS = 4.0; // per-aggregate-column MERGE penalty (incremental)
+
+static bool IsLinearCostNode(DeltaModelNodeKind kind) {
+	return kind == DeltaModelNodeKind::SCAN || kind == DeltaModelNodeKind::FILTER ||
+	       kind == DeltaModelNodeKind::PROJECT || kind == DeltaModelNodeKind::UNION ||
+	       kind == DeltaModelNodeKind::CONSTANT;
+}
+
+static void AddOperatorCostClass(LogicalOperator &op, PlanStats &stats) {
+	auto kind = NodeKindForOperator(op);
+	if (IsLinearCostNode(kind)) {
+		stats.linear_nodes++;
+	} else if (kind == DeltaModelNodeKind::JOIN || kind == DeltaModelNodeKind::ASOF_JOIN ||
+	           kind == DeltaModelNodeKind::POSITIONAL_JOIN) {
+		stats.product_nodes++;
+	} else if (kind == DeltaModelNodeKind::AGGREGATE || kind == DeltaModelNodeKind::DISTINCT ||
+	           kind == DeltaModelNodeKind::WINDOW || kind == DeltaModelNodeKind::SEMI_ANTI) {
+		stats.stateful_nodes++;
+	} else if (kind == DeltaModelNodeKind::TOP_K || kind == DeltaModelNodeKind::UNNEST ||
+	           kind == DeltaModelNodeKind::SAMPLE || kind == DeltaModelNodeKind::CTE ||
+	           kind == DeltaModelNodeKind::OTHER) {
+		stats.full_recompute_nodes++;
+	}
+}
+
+struct JoinTermEstimate {
+	idx_t active_sources = 0; // tables with a non-empty delta
+	idx_t priced_sources = 0; // tables whose single-source terms execute a base scan (= active_sources
+	                          // with skip-empty on; = all tables with skip-empty off, since empty-delta
+	                          // terms still scan the bases to build hash tables)
+	idx_t term_count = 0;
+};
+
+static bool ActiveSourceIsInsertOnlyPK(Connection &con, const PlanStats &stats, idx_t active_idx) {
+	if (active_idx >= stats.table_stats.size() || stats.table_stats[active_idx].has_deletes) {
+		return false;
+	}
+	string active_table = stats.table_stats[active_idx].table_name;
+	string in_list;
+	for (idx_t i = 0; i < stats.table_stats.size(); i++) {
+		if (i == active_idx) {
+			continue;
+		}
+		if (!in_list.empty()) {
+			in_list += ", ";
+		}
+		in_list += "'" + SqlUtils::EscapeValue(stats.table_stats[i].table_name) + "'";
+	}
+	if (in_list.empty()) {
+		return false;
+	}
+	auto result = con.Query("SELECT constraint_text FROM duckdb_constraints() WHERE constraint_type = 'FOREIGN KEY' "
+	                        "AND table_name IN (" +
+	                        in_list + ")");
+	if (result->HasError()) {
+		return false;
+	}
+	string ref_pattern = "REFERENCES " + active_table;
+	for (idx_t row = 0; row < result->RowCount(); row++) {
+		if (!result->GetValue(0, row).IsNull() &&
+		    result->GetValue(0, row).ToString().find(ref_pattern) != string::npos) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static JoinTermEstimate EstimateJoinTerms(Connection &con, const PlanStats &stats, bool nterm_enabled, bool fk_enabled,
+                                          bool skip_empty_enabled) {
+	JoinTermEstimate result;
+	idx_t active_idx = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < stats.table_stats.size(); i++) {
+		if (stats.table_stats[i].delta_card > 0) {
+			result.active_sources++;
+			active_idx = i;
+		}
+	}
+	if (!stats.has_join || (result.active_sources == 0 && skip_empty_enabled)) {
+		return result;
+	}
+	idx_t priced_sources = skip_empty_enabled ? result.active_sources : stats.table_stats.size();
+	result.priced_sources = priced_sources;
+	if (fk_enabled && skip_empty_enabled && !stats.all_ducklake && result.active_sources == 1 &&
+	    ActiveSourceIsInsertOnlyPK(con, stats, active_idx)) {
+		return result;
+	}
+	if (nterm_enabled && stats.all_ducklake) {
+		result.term_count = priced_sources;
+		return result;
+	}
+	result.term_count = (static_cast<idx_t>(1) << priced_sources) - 1;
+	return result;
+}
 
 /// Get delta cardinality for a DuckLake table by counting changes between snapshots.
 static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_name, const string &schema_name,
@@ -133,6 +290,7 @@ static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_na
 static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, LogicalOperator &op,
                                       const string &view_name, const DeltaActivityResult *delta_activity,
                                       PlanStats &stats) {
+	AddOperatorCostClass(op, stats);
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET: {
 		auto &get = op.Cast<LogicalGet>();
@@ -164,6 +322,8 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 				ts.delta_table_name = SqlUtils::DeltaName(ts.table_name);
 				ts.delta_card = GetDeltaRowCount(con, ts.delta_table_name, view_name, delta_activity);
 			}
+			auto source = FindDeltaActivitySource(delta_activity, ts.delta_table_name, ts.table_name);
+			ts.has_deletes = source && source->has_deletes;
 
 			stats.table_stats.push_back(ts);
 		}
@@ -183,9 +343,14 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 		}
 		break;
 	}
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
 		stats.has_aggregate = true;
+		// Count aggregate functions (SUM, COUNT, STDDEV, …). Each becomes a column the incremental
+		// MERGE must update per affected group, so multi-aggregate views have a higher delta floor.
+		auto &agg = op.Cast<LogicalAggregate>();
+		stats.aggregate_expr_count += agg.expressions.size();
 		break;
+	}
 	case LogicalOperatorType::LOGICAL_FILTER: {
 		// Filters that weren't pushed down into the scan — estimate their selectivity
 		// from the cardinality ratio between the filter output and its child input.
@@ -397,6 +562,7 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	// Read operational flags — cost model reflects what actually happens at refresh time.
 	bool nterm_enabled = SqlUtils::GetBoolSetting(context, "openivm_ducklake_nterm", true);
 	bool fk_enabled = SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true);
+	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
 
 	// Read view type so the IVM-cost branch can reflect the strategy that will
 	// actually run at refresh time. Defaults to AGGREGATE_GROUP if the view isn't
@@ -425,9 +591,11 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	// 2. Compute basic metrics
 	double total_base_scan = 0;
 	double delta_fraction_sum = 0;
+	bool has_active_delta = false;
 	for (auto &ts : table_stats) {
 		total_base_scan += ts.base_card;
 		delta_fraction_sum += ts.delta_card / ts.base_card;
+		has_active_delta = has_active_delta || ts.delta_card > 0;
 	}
 
 	double mv_card = GetTableRowCount(con, IncrementalTableNames::DataTableName(view_name));
@@ -438,84 +606,14 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	bool has_join = plan_stats.has_join;
 	bool has_aggregate = plan_stats.has_aggregate;
 
-	// 2b. For standard joins, detect FK constraints to estimate term reduction.
-	// Count PK-side leaves whose terms can be pruned by FK-aware optimization.
-	idx_t fk_pk_leaf_count = 0;
-	if (fk_enabled && has_join && !plan_stats.all_ducklake && N > 1) {
-		// Build table name -> index map
-		unordered_map<string, size_t> table_to_idx;
-		string in_list;
-		for (size_t i = 0; i < N; i++) {
-			table_to_idx[table_stats[i].table_name] = i;
-			if (i > 0) {
-				in_list += ", ";
-			}
-			in_list += "'" + SqlUtils::EscapeValue(table_stats[i].table_name) + "'";
-		}
-		// Batch query: get all FK constraints for join tables in one call.
-		unordered_set<size_t> pruned_pk_leaves;
-		auto result = con.Query("SELECT table_name, constraint_text FROM duckdb_constraints() "
-		                        "WHERE constraint_type = 'FOREIGN KEY' AND table_name IN (" +
-		                        in_list + ")");
-		if (!result->HasError()) {
-			for (idx_t r = 0; r < result->RowCount(); r++) {
-				string fk_table = result->GetValue(0, r).ToString();
-				string fk_text = result->GetValue(1, r).ToString();
-				auto fk_it = table_to_idx.find(fk_table);
-				if (fk_it == table_to_idx.end()) {
-					continue;
-				}
-				// Check if any PK table in our join has empty delta.
-				// Match by "REFERENCES <table_name>" to avoid substring false positives.
-				for (auto &kv : table_to_idx) {
-					if (kv.second == fk_it->second) {
-						continue;
-					}
-					string ref_pattern = "REFERENCES " + kv.first;
-					if (fk_text.find(ref_pattern) != string::npos && table_stats[kv.second].delta_card == 0) {
-						pruned_pk_leaves.insert(kv.second);
-					}
-				}
-			}
-		}
-		fk_pk_leaf_count = pruned_pk_leaves.size();
-	}
-
-	// 3. Estimate IVM cost
-	//
-	// IVM compute cost:
-	//   - For DuckLake joins: N terms (N-term telescoping)
-	//   - For standard joins: 2^(N-1) terms (inclusion-exclusion), reduced by FK pruning
-	//   - For non-joins: just scan the delta (very cheap)
-	//
-	// IVM upsert cost:
-	//   - Estimated delta result size x merge overhead
-	//   - For aggregates: merge cost depends on affected groups
-	//   - For projections/filters: targeted insert/delete
-
+	// 3. Estimate IVM cost from the query's operator classes. Linear plans scan
+	// pending deltas; product plans pay for active join terms; stateful operators
+	// add an upsert/recompute component tied to the affected output domain.
+	auto join_terms = EstimateJoinTerms(con, plan_stats, nterm_enabled, fk_enabled, skip_empty_enabled);
 	double incremental_compute;
 	double estimated_delta_result;
 
 	if (has_join) {
-		idx_t join_leaves = plan_stats.join_leaf_count;
-		double scan_multiplier;
-		if (nterm_enabled && plan_stats.all_ducklake) {
-			// DuckLake N-term telescoping: exactly N terms
-			scan_multiplier = static_cast<double>(join_leaves);
-		} else if (fk_pk_leaf_count > 0) {
-			// FK pruning: surviving terms = 2^(N - pruned_pks) - 1
-			idx_t effective_leaves = join_leaves - fk_pk_leaf_count;
-			scan_multiplier = static_cast<double>((1ULL << effective_leaves) - 1);
-			if (scan_multiplier < 1) {
-				scan_multiplier = 1;
-			}
-		} else {
-			// Standard inclusion-exclusion: 2^(N-1) average scans per table
-			scan_multiplier = static_cast<double>(1ULL << (join_leaves - 1));
-		}
-
-		incremental_compute = scan_multiplier * total_base_scan;
-
 		// Estimate delta result: each delta row fans out by MV/actual_card.
 		// Use actual_card (unfiltered) instead of base_card to avoid inflated fanout
 		// when filters are pushed into the scan (base_card reflects post-filter estimate).
@@ -526,6 +624,25 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		}
 		// Apply selectivity from any non-pushed-down filter nodes
 		estimated_delta_result *= plan_stats.filter_selectivity;
+
+		// The delta join scans the base tables once (to build hash tables) but only *produces* the
+		// delta output — a tiny delta over a huge base is cheap because the work is bounded by the
+		// delta, not the full join. So we price it as base_scan (the unavoidable build) + delta_result
+		// (the produced rows), NOT term_count * full_base_scan. The old 2^N-1 × base formula priced a
+		// 1-row delta on a many-table join as several full recomputes, which wrongly defeated IVM at
+		// scale (e.g. a large-join projection that incrementally refreshes in ~26ms was estimated at
+		// >2000ms and lost to full). Crucially, the delta join does NOT pay the recompute join_factor
+		// blow-up below: full recompute re-materializes the entire join output, the delta join does not.
+		if (join_terms.term_count == 0) {
+			incremental_compute = 0; // FK-pruned: this delta provably cannot affect the join
+		} else {
+			// priced_sources single-source terms each scan the base tables once (build hash tables);
+			// with skip-empty off this includes the empty-delta terms (still a base scan), so disabling
+			// skip-empty is correctly priced higher. Higher-order terms (delta⋈delta) are delta-bounded
+			// and folded into delta_result. This stays bounded — it never multiplies by 2^N.
+			double scan_terms = std::max<double>(1.0, static_cast<double>(join_terms.priced_sources));
+			incremental_compute = scan_terms * total_base_scan + estimated_delta_result;
+		}
 	} else {
 		// Unary operators: scan cost is the full delta (filter doesn't reduce scan cost)
 		double total_delta = 0;
@@ -552,8 +669,11 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 			incremental_upsert *= 3.0;
 		}
 	} else {
-		// Projection/filter: targeted insert/delete
-		// EXISTS subquery cost ≈ delta_result × log(MV) for each delete
+		// Projection/filter: targeted insert/delete. The raw cost unit keeps the delta_result × log2(MV)
+		// shape so the uncalibrated raw comparison (adaptive off) still crosses over to full for a large
+		// delta. The ms prior (adaptive on) re-prices this as a cheap *bulk* vectorized apply from
+		// estimated_delta_result directly — a projection applies its delta as a bulk insert/delete, not
+		// a per-group MERGE, so pricing it at the MERGE rate inflated large-join projections ~30×.
 		incremental_upsert = estimated_delta_result * (1.0 + std::log2(std::max(mv_card, 1.0)));
 		if (plan_stats.has_full_outer) {
 			// Bidirectional key CTE queries both delta tables
@@ -561,104 +681,25 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		}
 	}
 
-	double incremental_total = incremental_compute + incremental_upsert;
-
 	// 4. Estimate recompute cost
 	//
-	// Recompute compute: run the full query once
-	//   - Scan all base tables + join/aggregate processing
-	// Recompute replace: delete all MV rows + insert new result
-	double recompute_compute = total_base_scan + mv_card; // scan + produce result
-	double recompute_replace = mv_card * 2.0;             // delete all + insert all
+	// Recompute compute: run the full query once. A plain scan+aggregate is flat-cheap (the per-row
+	// constant is tiny), but each join multiplies the cost of producing the full output — a large
+	// multi-way join is the expensive case for full recompute. This join_factor is what makes full
+	// the *loser* against incremental on big joins (where the delta join avoids re-materializing the
+	// whole result) while staying the winner on cheap simple-aggregate views.
+	// Recompute replace: delete all MV rows + insert new result.
+	double join_multiplier = 1.0 + RECOMPUTE_JOIN_FACTOR * static_cast<double>(plan_stats.product_nodes);
+	double recompute_compute = total_base_scan * join_multiplier + mv_card; // scan + produce full result
+	double recompute_replace = mv_card * 2.0;                               // delete all + insert all
 	double recompute_total = recompute_compute + recompute_replace;
 
-	// 5. Learned cost model: calibrate predictions using execution history
-	//    Gated by openivm_adaptive_refresh (same gate as the cost model decision).
-	double incremental_predicted_ms = incremental_total;
-	double recompute_predicted_ms = recompute_total;
-	bool calibrated = false;
-
-	bool adaptive_on = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
-
-	if (adaptive_on) {
-		// Read decay setting
-		double decay = 0.9;
-		Value decay_val;
-		if (context.TryGetCurrentSetting("openivm_cost_decay", decay_val) && !decay_val.IsNull()) {
-			decay = decay_val.GetValue<double>();
-			if (decay < 0.0 || decay > 1.0) {
-				decay = 0.9;
-			}
-		}
-
-		RefreshMetadata metadata(con);
-		constexpr double RIDGE_LAMBDA = 1e-4;
-		constexpr idx_t MIN_SAMPLES = 3;
-
-		auto incremental_history = metadata.GetRefreshHistory(view_name, "incremental");
-		auto incremental_reg = FitRegression(incremental_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
-		if (incremental_reg.calibrated) {
-			incremental_predicted_ms =
-			    std::max(0.0, incremental_reg.w_compute * incremental_compute +
-			                      incremental_reg.w_upsert * incremental_upsert + incremental_reg.w_intercept);
-			calibrated = true;
-			OPENIVM_DEBUG_PRINT("[COST MODEL] IVM regression: w_compute=%.4f, w_upsert=%.4f, intercept=%.1f\n",
-			                    incremental_reg.w_compute, incremental_reg.w_upsert, incremental_reg.w_intercept);
-		}
-
-		auto rc_history = metadata.GetRefreshHistory(view_name, "full");
-		auto rc_reg = FitRegression(rc_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
-		if (rc_reg.calibrated) {
-			recompute_predicted_ms = std::max(0.0, rc_reg.w_compute * recompute_compute +
-			                                           rc_reg.w_upsert * recompute_replace + rc_reg.w_intercept);
-			calibrated = true;
-			OPENIVM_DEBUG_PRINT("[COST MODEL] Recompute regression: w_compute=%.4f, w_replace=%.4f, intercept=%.1f\n",
-			                    rc_reg.w_compute, rc_reg.w_upsert, rc_reg.w_intercept);
-		}
-	}
-
-	OPENIVM_DEBUG_PRINT(
-	    "[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s, FullOuter: %s, DuckLake: %s, FK pruned PKs: %lu\n", N,
-	    has_join ? "yes" : "no", has_aggregate ? "yes" : "no", plan_stats.has_full_outer ? "yes" : "no",
-	    plan_stats.all_ducklake ? "yes" : "no", (unsigned long)fk_pk_leaf_count);
-	OPENIVM_DEBUG_PRINT("[COST MODEL] Base scan total: %.0f, Delta fraction sum: %.4f, Filter selectivity: %.4f\n",
-	                    total_base_scan, delta_fraction_sum, plan_stats.filter_selectivity);
-	OPENIVM_DEBUG_PRINT("[COST MODEL] MV cardinality: %.0f, Est. delta result: %.0f\n", mv_card,
-	                    estimated_delta_result);
-	OPENIVM_DEBUG_PRINT("[COST MODEL] IVM cost: %.0f (compute: %.0f, upsert: %.0f)\n", incremental_total,
-	                    incremental_compute, incremental_upsert);
-	OPENIVM_DEBUG_PRINT("[COST MODEL] Recompute cost: %.0f (compute: %.0f, replace: %.0f)\n", recompute_total,
-	                    recompute_compute, recompute_replace);
-	if (calibrated) {
-		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: IVM=%.0fms, Recompute=%.0fms\n", incremental_predicted_ms,
-		                    recompute_predicted_ms);
-	}
-	// "FULL_RECOMPUTE" is the cost-model strategy label (delete+insert the whole MV from the
-	// view query); the RefreshType enum no longer has a RECOMPUTE variant — see openivm_constants.hpp.
-	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n",
-	                    incremental_predicted_ms < recompute_predicted_ms ? "IVM" : "FULL_RECOMPUTE");
-
-	// Strategy-aware override: for views whose refresh path is fixed-by-classification
-	// (no IVM-vs-recompute decision is actually consulted), replace the `ivm_*` fields
-	// with the cost of the strategy that will actually run.
-	//
-	//   GROUP_RECOMPUTE — affected-keys recompute. Compute cost ≈ cost of running the
-	//     view query restricted to source rows in any delta (one variant per source);
-	//     upsert cost ≈ DELETE+INSERT scoped to those keys. Both bounded above by full
-	//     recompute, so the view can never lose vs RECOMPUTE — but the regression still
-	//     learns weights from observed durations to predict `group_recompute` runs.
-	//
-	//   WINDOW_PARTITION — partition-level recompute. Touched partitions ≈ delta rows
-	//     fanned through partition-key selectivity to MV rows.
-	string strategy_label;
+	// 5. Strategy-aware override: fixed-by-classification strategies use the same
+	// output columns but the "incremental" fields represent their actual refresh work.
+	string strategy_label = StrategyLabelForRefreshType(view_type);
 	double strategy_compute = incremental_compute;
 	double strategy_upsert = incremental_upsert;
-	if (view_type == RefreshType::CURRENT_DIFF_RECOMPUTE) {
-		strategy_label = "current_diff_recompute";
-		strategy_compute = recompute_compute;
-		strategy_upsert = recompute_replace;
-	} else if (view_type == RefreshType::GROUP_RECOMPUTE) {
-		strategy_label = "group_recompute";
+	if (view_type == RefreshType::GROUP_RECOMPUTE) {
 		// Estimated affected MV keys = Σᵢ delta_Tᵢ × (mv_card / actual_card_Tᵢ).
 		// Each source contributes a per-table view-query variant (substitute T_i
 		// with delta_T_i in view_query_sql), so compute scales with N_active sources.
@@ -675,8 +716,8 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 			active_sources = 1; // empty deltas → one trivial scan
 		}
 		// Each variant runs the view body restricted to that source's delta. The
-		// restricted scan dominates; approximate as delta_T × scan_multiplier per
-		// variant, summed across active sources. Upper-bounded by full base scan
+		// restricted scan dominates; approximate as one average source scan per
+		// variant. Upper-bounded by full base scan
 		// (N_active = N_total in worst case → identical to RECOMPUTE).
 		double per_variant_scan = total_base_scan / static_cast<double>(N);
 		strategy_compute = static_cast<double>(active_sources) * per_variant_scan;
@@ -684,7 +725,6 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		double affected_keys_clamped = std::min(affected_keys, mv_card);
 		strategy_upsert = affected_keys_clamped * 2.0; // delete + insert
 	} else if (view_type == RefreshType::WINDOW_PARTITION) {
-		strategy_label = "window_partition";
 		// Partition recompute: scan delta to identify affected partitions, then
 		// re-evaluate the view query for those partitions. Cost ≈ delta scan +
 		// affected-partitions fraction of full scan.
@@ -695,16 +735,127 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		double affected_fraction = std::min(1.0, total_delta / std::max(mv_card, 1.0));
 		strategy_compute = total_delta + total_base_scan * affected_fraction;
 		strategy_upsert = std::min(total_delta * (mv_card / std::max(total_base_scan, 1.0)), mv_card) * 2.0;
-	} else {
-		strategy_label = "incremental";
+	} else if (view_type == RefreshType::DISTINCT_INCREMENTAL) {
+		double affected_groups = std::min(estimated_delta_result, mv_card);
+		strategy_compute = incremental_compute + estimated_delta_result;
+		strategy_upsert = affected_groups * 2.0;
+	} else if (view_type == RefreshType::SEMI_ANTI_RECOMPUTE) {
+		strategy_compute = incremental_compute + estimated_delta_result;
+		strategy_upsert = estimated_delta_result * (1.0 + std::log2(std::max(mv_card, 1.0)));
+	} else if (view_type == RefreshType::FULL_REFRESH || view_type == RefreshType::TOP_K) {
+		strategy_compute = recompute_compute;
+		strategy_upsert = recompute_replace;
 	}
 	double strategy_total = strategy_compute + strategy_upsert;
-	double strategy_predicted_ms =
-	    incremental_predicted_ms; // calibrated regression already absorbed incremental_compute/upsert
-	if (strategy_label != "incremental") {
-		// Static fallback for non-IVM strategies until per-strategy regression history accrues.
-		strategy_predicted_ms = strategy_total;
+	double strategy_predicted_ms = strategy_total;
+	double recompute_predicted_ms = recompute_total;
+	bool calibrated = false;
+
+	// 6. Learned cost model: calibrate predictions using execution history
+	//    Gated by openivm_adaptive_refresh (same gate as the cost model decision).
+	bool adaptive_on = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
+
+	if (adaptive_on) {
+		// Uncalibrated ms-grounded prior (see constants above). The learned regression below
+		// overrides each side once it has enough history.
+		//   - will_skip: an empty delta with skip-empty on is short-circuited entirely → ~free.
+		//   - genuine incremental (strategy strictly cheaper than recompute and not skipped) pays the
+		//     incremental setup floor; recompute-equivalent strategies (FULL_REFRESH, TOP_K) and
+		//     empty-delta-with-skip-off pay only the recompute setup, so the
+		//     decision is driven purely by the throughput term and the label is not spuriously flipped.
+		bool will_skip = !has_active_delta && skip_empty_enabled;
+		bool genuine_incremental = !will_skip && strategy_total < recompute_total;
+		// Price the compute side (scans/joins/aggregation — vectorized, cheap per row, same as recompute)
+		// at RECOMPUTE_MS_PER_UNIT, and only the upsert side (per-statement MERGE/delete+insert) at the
+		// pricier INCREMENTAL_MS_PER_UNIT. Charging the join-scan compute at the upsert rate was what made
+		// a tiny delta on a large join look expensive even after the estimate was corrected.
+		if (will_skip) {
+			strategy_predicted_ms = RECOMPUTE_MS_PER_UNIT * strategy_total;
+		} else if (genuine_incremental) {
+			// Per-aggregate-column MERGE penalty: a multi-aggregate view updates each SUM/COUNT/STDDEV
+			// column per affected group, so its delta floor scales with the number of aggregate
+			// expressions. A simple SUM+GROUP BY refreshes in ~16ms; a join+multi-aggregate in ~34ms.
+			// Full recompute aggregates in one vectorized pass, so it does not pay this.
+			//
+			// The upsert is priced by HOW the delta is applied: an aggregate view runs a per-group
+			// MERGE (pricier per row, scales with affected groups), while a projection/filter applies a
+			// bulk vectorized insert/delete — far cheaper per row, and proportional to the delta rows
+			// produced (estimated_delta_result), NOT the log2(MV)-inflated raw unit. Pricing a
+			// projection's bulk apply at the per-group MERGE rate inflated large-join projections ~30×
+			// (e.g. T14: ~915ms predicted for a ~31ms refresh).
+			// Only the plain projection/filter path (SIMPLE_PROJECTION, incl. join projections like T14)
+			// applies its delta as a cheap bulk insert/delete. Aggregates and the fixed-strategy
+			// overrides (group/window/distinct/semi-anti recompute) keep the per-group MERGE rate on
+			// their own strategy_upsert estimate.
+			bool bulk_projection_apply = (view_type == RefreshType::SIMPLE_PROJECTION);
+			double upsert_ms = bulk_projection_apply ? PROJECTION_APPLY_MS_PER_UNIT * estimated_delta_result
+			                                         : INCREMENTAL_MS_PER_UNIT * strategy_upsert;
+			strategy_predicted_ms = INCREMENTAL_SETUP_MS + RECOMPUTE_MS_PER_UNIT * strategy_compute + upsert_ms +
+			                        AGG_EXPR_MS * static_cast<double>(plan_stats.aggregate_expr_count);
+		} else {
+			// Recompute-equivalent strategies (current-diff/full/top-k): priced like recompute, not
+			// spuriously flipped to full.
+			strategy_predicted_ms = RECOMPUTE_SETUP_MS + RECOMPUTE_MS_PER_UNIT * strategy_total;
+		}
+		recompute_predicted_ms = RECOMPUTE_SETUP_MS + RECOMPUTE_MS_PER_UNIT * recompute_total;
+
+		double decay = 0.9;
+		Value decay_val;
+		if (context.TryGetCurrentSetting("openivm_cost_decay", decay_val) && !decay_val.IsNull()) {
+			decay = decay_val.GetValue<double>();
+			if (decay < 0.0 || decay > 1.0) {
+				decay = 0.9;
+			}
+		}
+
+		RefreshMetadata metadata(con);
+		constexpr double RIDGE_LAMBDA = 1e-4;
+		constexpr idx_t MIN_SAMPLES = 3;
+
+		auto strategy_history = metadata.GetRefreshHistory(view_name, strategy_label);
+		auto strategy_reg = FitRegression(strategy_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
+		if (strategy_reg.calibrated) {
+			strategy_predicted_ms =
+			    std::max(0.0, strategy_reg.w_compute * strategy_compute + strategy_reg.w_upsert * strategy_upsert +
+			                      strategy_reg.w_intercept);
+			calibrated = true;
+			OPENIVM_DEBUG_PRINT("[COST MODEL] %s regression: w_compute=%.4f, w_upsert=%.4f, intercept=%.1f\n",
+			                    strategy_label, strategy_reg.w_compute, strategy_reg.w_upsert,
+			                    strategy_reg.w_intercept);
+		}
+
+		auto rc_history = metadata.GetRefreshHistory(view_name, "full");
+		auto rc_reg = FitRegression(rc_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
+		if (rc_reg.calibrated) {
+			recompute_predicted_ms = std::max(0.0, rc_reg.w_compute * recompute_compute +
+			                                           rc_reg.w_upsert * recompute_replace + rc_reg.w_intercept);
+			calibrated = true;
+			OPENIVM_DEBUG_PRINT("[COST MODEL] Recompute regression: w_compute=%.4f, w_replace=%.4f, intercept=%.1f\n",
+			                    rc_reg.w_compute, rc_reg.w_upsert, rc_reg.w_intercept);
+		}
 	}
+	OPENIVM_DEBUG_PRINT("[COST MODEL] Tables: %zu, Join: %s, Aggregate: %s, FullOuter: %s, DuckLake: %s, FK: %s\n", N,
+	                    has_join ? "yes" : "no", has_aggregate ? "yes" : "no", plan_stats.has_full_outer ? "yes" : "no",
+	                    plan_stats.all_ducklake ? "yes" : "no", fk_enabled ? "on" : "off");
+	OPENIVM_DEBUG_PRINT("[COST MODEL] Operator classes: linear=%lu, product=%lu, stateful=%lu, full=%lu\n",
+	                    (unsigned long)plan_stats.linear_nodes, (unsigned long)plan_stats.product_nodes,
+	                    (unsigned long)plan_stats.stateful_nodes, (unsigned long)plan_stats.full_recompute_nodes);
+	OPENIVM_DEBUG_PRINT("[COST MODEL] Base scan total: %.0f, Delta fraction sum: %.4f, Filter selectivity: %.4f\n",
+	                    total_base_scan, delta_fraction_sum, plan_stats.filter_selectivity);
+	OPENIVM_DEBUG_PRINT("[COST MODEL] Active sources: %lu, Join terms: %lu, MV cardinality: %.0f, Est. delta result: "
+	                    "%.0f\n",
+	                    (unsigned long)join_terms.active_sources, (unsigned long)join_terms.term_count, mv_card,
+	                    estimated_delta_result);
+	OPENIVM_DEBUG_PRINT("[COST MODEL] %s cost: %.0f (compute: %.0f, upsert: %.0f)\n", strategy_label, strategy_total,
+	                    strategy_compute, strategy_upsert);
+	OPENIVM_DEBUG_PRINT("[COST MODEL] Recompute cost: %.0f (compute: %.0f, replace: %.0f)\n", recompute_total,
+	                    recompute_compute, recompute_replace);
+	if (calibrated) {
+		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: %s=%.0fms, Recompute=%.0fms\n", strategy_label,
+		                    strategy_predicted_ms, recompute_predicted_ms);
+	}
+	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n",
+	                    recompute_predicted_ms < strategy_predicted_ms ? "FULL_RECOMPUTE" : strategy_label);
 
 	RefreshCostEstimate estimate;
 	estimate.incremental_compute = strategy_compute;
@@ -729,8 +880,9 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 	// Propagate user session settings to the cost estimation connection.
 	// The new connection has defaults, so settings like openivm_adaptive_refresh
 	// must be copied from the calling context for calibration to activate.
-	for (auto &setting_name :
-	     {"openivm_adaptive_refresh", "openivm_cost_decay", "openivm_ducklake_nterm", "openivm_fk_pruning"}) {
+	for (auto &setting_name : {"openivm_adaptive_refresh", "openivm_cost_decay", "openivm_ducklake_nterm",
+	                           "openivm_fk_pruning", "openivm_skip_empty_deltas", "openivm_having_merge",
+	                           "openivm_left_join_merge", "openivm_full_outer_merge", "openivm_distinct_aux_state"}) {
 		Value v;
 		if (context.TryGetCurrentSetting(setting_name, v) && !v.IsNull()) {
 			con.Query("SET " + string(setting_name) + " = " + v.ToString());
@@ -768,7 +920,7 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 	//   - For "incremental" views, the cost model may pick "full" when adaptive
 	//     refresh decides full recompute is cheaper.
 	string decision = estimate.strategy_label.empty() ? "incremental" : estimate.strategy_label;
-	if (decision == "incremental" && estimate.ShouldRecompute()) {
+	if (estimate.ShouldRecompute()) {
 		decision = "full";
 	}
 	return "SELECT '" + decision + "' AS decision, " + to_string(estimate.incremental_cost) + " AS incremental_cost, " +

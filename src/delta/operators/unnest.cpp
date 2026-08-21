@@ -4,9 +4,41 @@
 #include "core/openivm_debug.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
 namespace duckdb {
+
+static void PreserveMultiplicityInProjectionMaps(LogicalOperator &op, const ColumnBinding &mul_binding) {
+	for (auto &child : op.children) {
+		PreserveMultiplicityInProjectionMaps(*child, mul_binding);
+	}
+	auto *join_ptr = dynamic_cast<LogicalJoin *>(&op);
+	if (join_ptr) {
+		auto &join = *join_ptr;
+		for (idx_t child_idx = 0; child_idx < join.children.size() && child_idx < 2; child_idx++) {
+			auto &projection_map = child_idx == 0 ? join.left_projection_map : join.right_projection_map;
+			if (projection_map.empty()) {
+				continue;
+			}
+			auto child_bindings = join.children[child_idx]->GetColumnBindings();
+			idx_t mul_idx = DConstants::INVALID_INDEX;
+			for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
+				if (child_bindings[binding_idx] == mul_binding) {
+					mul_idx = binding_idx;
+					break;
+				}
+			}
+			if (mul_idx != DConstants::INVALID_INDEX &&
+			    std::find(projection_map.begin(), projection_map.end(), mul_idx) == projection_map.end()) {
+				projection_map.push_back(mul_idx);
+				OPENIVM_DEBUG_PRINT("[DeltaUnnest] Added mul col %lu to %s projection map\n", (unsigned long)mul_idx,
+				                    child_idx == 0 ? "left" : "right");
+				join.ResolveOperatorTypes();
+			}
+		}
+	}
+}
 
 DeltaPlanFragment CompileUnnestDelta(DeltaOperatorInput input) {
 	LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::UNNEST_LINEAR);
@@ -19,6 +51,7 @@ DeltaPlanFragment CompileUnnestDelta(DeltaOperatorInput input) {
 	auto child_mul = input.CompileChild(input.plan->children[0], input.root);
 	input.plan->children[0] = std::move(child_mul.op);
 	input.plan->ResolveOperatorTypes();
+	PreserveMultiplicityInProjectionMaps(*input.plan, child_mul.mul_binding);
 
 	auto output_bindings = input.plan->GetColumnBindings();
 	auto output_types = input.plan->types;

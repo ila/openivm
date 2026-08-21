@@ -134,3 +134,265 @@ query I
 SELECT COUNT(*) FROM hook_log;
 ----
 0
+
+# ============================================================
+# Regression: A hook can mutate a tracked source without deadlocking
+# ============================================================
+
+statement ok
+CREATE TABLE tracked_hook_src (id INTEGER, amount INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW tracked_hook_mv AS
+SELECT id, amount FROM tracked_hook_src;
+
+statement ok
+INSERT INTO openivm_refresh_hooks VALUES (
+    'tracked_hook_mv',
+    'INSERT INTO tracked_hook_src VALUES (4, 40)',
+    'before'
+);
+
+# Keep one batch pending so the before-hook runs, and mix conflicting mutations
+# before the single refresh to exercise consolidated delta capture.
+statement ok
+INSERT INTO tracked_hook_src VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+UPDATE tracked_hook_src SET amount = amount + 5 WHERE id IN (1, 2);
+
+statement ok
+DELETE FROM tracked_hook_src WHERE id IN (2, 3);
+
+statement ok
+PRAGMA refresh('tracked_hook_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, amount FROM tracked_hook_mv
+    EXCEPT ALL
+    SELECT id, amount FROM tracked_hook_src
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, amount FROM tracked_hook_src
+    EXCEPT ALL
+    SELECT id, amount FROM tracked_hook_mv
+);
+----
+0
+
+# ============================================================
+# Test 5: A scheduled refresh executes its hook exactly once
+# ============================================================
+
+statement ok
+BEGIN TRANSACTION;
+
+statement error
+PRAGMA refresh_start_daemon;
+----
+cannot be restarted inside a transaction
+
+statement ok
+ROLLBACK;
+
+statement ok
+CREATE TABLE daemon_hook_src (id INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW daemon_hook_mv AS
+SELECT count(*) AS cnt FROM daemon_hook_src;
+
+statement ok
+INSERT INTO openivm_refresh_hooks VALUES (
+    'daemon_hook_mv',
+    'INSERT INTO hook_log VALUES(''daemon-hook ran'')',
+    'after'
+);
+
+statement ok
+INSERT INTO daemon_hook_src VALUES (1), (2);
+
+statement ok
+UPDATE openivm_views SET refresh_interval = 60
+WHERE view_name = 'daemon_hook_mv';
+
+statement ok
+UPDATE openivm_delta_tables
+SET last_update = now()::TIMESTAMP - INTERVAL '2 minutes'
+WHERE view_name = 'daemon_hook_mv';
+
+statement ok
+PRAGMA refresh_start_daemon;
+
+statement ok
+SELECT sleep_ms(1500);
+
+query I
+SELECT count(*) FROM hook_log WHERE msg = 'daemon-hook ran';
+----
+1
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM daemon_hook_mv
+    EXCEPT ALL
+    SELECT count(*) AS cnt FROM daemon_hook_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT count(*) AS cnt FROM daemon_hook_src
+    EXCEPT ALL
+    SELECT * FROM daemon_hook_mv
+);
+----
+0
+
+statement ok
+UPDATE openivm_views SET refresh_interval = NULL WHERE view_name = 'daemon_hook_mv';
+
+statement ok
+DELETE FROM hook_log;
+
+# Dropping an MV removes its hook configuration, so a later MV with the same
+# name cannot inherit executable metadata from the dropped object.
+statement ok
+CREATE TABLE dropped_hook_src (id INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW dropped_hook_mv AS
+SELECT count(*) AS cnt FROM dropped_hook_src;
+
+statement ok
+INSERT INTO openivm_refresh_hooks VALUES (
+    'dropped_hook_mv',
+    'INSERT INTO hook_log VALUES(''stale hook ran'')',
+    'after'
+);
+
+statement ok
+DROP VIEW dropped_hook_mv;
+
+query I
+SELECT count(*) FROM openivm_refresh_hooks WHERE view_name = 'dropped_hook_mv';
+----
+0
+
+# ============================================================
+# Test 6: An empty hook-bearing node does not stop its cascade
+# ============================================================
+
+statement ok
+SET openivm_cascade_refresh = 'downstream';
+
+statement ok
+CREATE TABLE hook_cascade_root_src (id INT, amount INT);
+
+statement ok
+CREATE TABLE hook_cascade_side_src (id INT, bonus INT);
+
+statement ok
+INSERT INTO hook_cascade_root_src VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+INSERT INTO hook_cascade_side_src VALUES (1, 1), (2, 2);
+
+statement ok
+CREATE MATERIALIZED VIEW hook_cascade_parent AS
+    SELECT id, SUM(amount) AS total
+    FROM hook_cascade_root_src
+    GROUP BY id;
+
+statement ok
+CREATE MATERIALIZED VIEW hook_cascade_child AS
+    SELECT p.id, SUM(p.total + s.bonus) AS score, COUNT(*) AS cnt
+    FROM hook_cascade_parent p
+    JOIN hook_cascade_side_src s USING (id)
+    GROUP BY p.id;
+
+statement ok
+INSERT INTO openivm_refresh_hooks VALUES (
+    'hook_cascade_parent',
+    'INSERT INTO hook_log VALUES(''empty-parent hook ran'')',
+    'before'
+);
+
+# Only the child's independent source changes. The parent's pre-hook empty
+# semantics still skip its hook, but traversal must refresh the child.
+statement ok
+INSERT INTO hook_cascade_side_src VALUES (3, 3), (4, 4);
+
+statement ok
+UPDATE hook_cascade_side_src SET bonus = bonus + 10 WHERE id IN (1, 3);
+
+statement ok
+DELETE FROM hook_cascade_side_src WHERE id IN (2, 4);
+
+statement ok
+PRAGMA refresh('hook_cascade_parent');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, SUM(amount) AS total
+    FROM hook_cascade_root_src
+    GROUP BY id
+    EXCEPT ALL
+    SELECT id, total FROM hook_cascade_parent
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, total FROM hook_cascade_parent
+    EXCEPT ALL
+    SELECT id, SUM(amount) AS total
+    FROM hook_cascade_root_src
+    GROUP BY id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT p.id, SUM(p.total + s.bonus) AS score, COUNT(*) AS cnt
+    FROM (
+        SELECT id, SUM(amount) AS total
+        FROM hook_cascade_root_src
+        GROUP BY id
+    ) p
+    JOIN hook_cascade_side_src s USING (id)
+    GROUP BY p.id
+    EXCEPT ALL
+    SELECT id, score, cnt FROM hook_cascade_child
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score, cnt FROM hook_cascade_child
+    EXCEPT ALL
+    SELECT p.id, SUM(p.total + s.bonus) AS score, COUNT(*) AS cnt
+    FROM (
+        SELECT id, SUM(amount) AS total
+        FROM hook_cascade_root_src
+        GROUP BY id
+    ) p
+    JOIN hook_cascade_side_src s USING (id)
+    GROUP BY p.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM hook_log;
+----
+0

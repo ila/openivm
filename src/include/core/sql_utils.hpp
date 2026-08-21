@@ -47,10 +47,18 @@ public:
 	static string JoinQuotedColumns(const vector<string> &columns);
 	static string JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias);
 	static string BuildAllNullPredicate(const vector<string> &columns);
+	static string BuildAnyNullPredicate(const vector<string> &columns, const string &prefix = "");
 	static string BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias);
 	static string BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
 	                                        const string &right_prefix);
-	static string BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql);
+	/// Cast specs retain the legacy single-target-type representation while encoding nested/TRY_CAST expressions.
+	static string BuildCastSpec(const string &target_type, bool try_cast);
+	static string ComposeCastSpecs(const string &outer_cast_spec, const string &inner_cast_spec);
+	static string ApplyCastSpec(const string &column_expression, const string &cast_spec);
+	// Pass unique_keys + temp_table when the data table carries a UNIQUE index, to get a form that
+	// never deletes and re-inserts the same key in one transaction (see the definition for why).
+	static string BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,
+	                                    const vector<string> &unique_keys = {}, const string &temp_table = "");
 	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);
 	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
 	                                                 const string &replacement);
@@ -63,6 +71,7 @@ public:
 	static bool RewriteColumnReferences(string &sql, const string &old_name, const string &new_name,
 	                                    const unordered_set<string> &qualifiers, bool allow_unqualified);
 	static string FindTableReference(const string &sql, const string &table_name);
+	static string FindTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence);
 	static idx_t CountTableReferences(const string &sql, const string &table_name);
 
 	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.

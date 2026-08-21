@@ -63,7 +63,8 @@ SELECT count(*) FROM (
 
 # ==========================================
 # Stacked constant scalar subqueries inside CASE and an aggregate expression
-# over a GROUP BY: still folds and incrementalizes (AGGREGATE_GROUP = 0).
+# over a GROUP BY: still folds and incrementally recomputes affected groups
+# because SUM(amt) + constant is a computed aggregate output.
 # ==========================================
 
 statement ok
@@ -79,7 +80,7 @@ CREATE MATERIALIZED VIEW mv_ssf_agg AS
 query I
 SELECT type FROM openivm_views WHERE view_name = 'mv_ssf_agg';
 ----
-0
+6
 
 statement ok
 INSERT INTO ssf_t VALUES (8, 'GC', 80, 2), (9, NULL, 90, 1);

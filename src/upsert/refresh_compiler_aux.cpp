@@ -51,6 +51,41 @@ static string PartitionOutputColumn(const string &input) {
 	return StripIdentifierQuotes(pos == string::npos ? input : input.substr(0, pos));
 }
 
+static vector<string> PartitionOutputColumns(const vector<string> &partition_columns) {
+	vector<string> output_columns;
+	output_columns.reserve(partition_columns.size());
+	for (auto &partition_column : partition_columns) {
+		output_columns.push_back(PartitionOutputColumn(partition_column));
+	}
+	return output_columns;
+}
+
+static string BuildAffectedTableFilter(const vector<string> &columns, const string &outer_alias,
+                                       const string &affected_table) {
+	string match = SqlUtils::BuildNullSafeMatch(columns, "openivm_aff", outer_alias);
+	return "EXISTS (SELECT 1 FROM " + affected_table + " openivm_aff WHERE " + match + ")";
+}
+
+static string BuildDeltaAffectedFilter(const vector<WindowPartitionDeltaSpec> &partition_delta_specs,
+                                       const string &delta_where, const string &outer_alias) {
+	string filter;
+	for (idx_t i = 0; i < partition_delta_specs.size(); i++) {
+		if (i > 0) {
+			filter += " OR ";
+		}
+		const auto &spec = partition_delta_specs[i];
+		string output_col = SqlUtils::QuoteIdentifier(spec.output_column);
+		string source_col = SqlUtils::QuoteIdentifier(spec.source_column);
+		string delta_table =
+		    spec.delta_table_sql.empty() ? SqlUtils::QuoteIdentifier(spec.delta_table) : spec.delta_table_sql;
+		string affected_keys =
+		    "SELECT DISTINCT " + source_col + " AS " + output_col + " FROM " + delta_table + delta_where;
+		filter += "EXISTS (SELECT 1 FROM (" + affected_keys + ") openivm_aff WHERE " + outer_alias + "." + output_col +
+		          " IS NOT DISTINCT FROM openivm_aff." + output_col + ")";
+	}
+	return filter;
+}
+
 static vector<string> SplitTopLevelComma(const string &input) {
 	vector<string> parts;
 	idx_t start = 0;
@@ -269,7 +304,7 @@ static string TranslateExpressionIdentifiers(const string &expr, const std::map<
 	string result;
 	idx_t pos = 0;
 	for (std::sregex_iterator it(expr.begin(), expr.end(), ident_regex), end; it != end; ++it) {
-		auto match = *it;
+		const auto &match = *it;
 		result += expr.substr(pos, match.position() - pos);
 		string token = match.str();
 		string key = StringUtil::Lower(StripIdentifierQuotes(token));
@@ -351,13 +386,51 @@ static bool TryParseRunningWindowPlan(const string &view_query_sql, const vector
 	return true;
 }
 
-static bool TryParseLptsRunningWindowPlan(const string &view_query_sql, const vector<string> &partition_columns,
+// Normalize an LPTS-emitted CTE program into the compact, single-space token stream that the
+// structural navigation in TryParseLptsRunningWindowPlan expects. The LPTS refactor (cwida lpts
+// Release 1.0.0) switched CTE bodies to a multi-line, aligned pretty-print (e.g. "AS (\n    SELECT
+// ...\n    FROM  ...\n)") and renamed CTEs from "scan_0"/"projection_1" to "t0_scan"/"t1_projection".
+// Collapsing whitespace and tightening parentheses restores "AS (SELECT ... source)" so the same
+// find()/rfind() navigation continues to work regardless of the layout. The window/order/partition
+// expressions themselves are re-parsed with whitespace-tolerant regexes, so no information is lost.
+static string NormalizeLptsRunningWindowSql(const string &sql) {
+	string collapsed;
+	collapsed.reserve(sql.size());
+	bool prev_space = false;
+	for (unsigned char c : sql) {
+		if (std::isspace(c)) {
+			if (!prev_space) {
+				collapsed += ' ';
+				prev_space = true;
+			}
+		} else {
+			collapsed += static_cast<char>(c);
+			prev_space = false;
+		}
+	}
+	auto replace_all = [](string &s, const string &from, const string &to) {
+		size_t pos = 0;
+		while ((pos = s.find(from, pos)) != string::npos) {
+			s.replace(pos, from.size(), to);
+			pos += to.size();
+		}
+	};
+	replace_all(collapsed, "( ", "(");
+	replace_all(collapsed, " )", ")");
+	return collapsed;
+}
+
+static bool TryParseLptsRunningWindowPlan(const string &raw_view_query_sql, const vector<string> &partition_columns,
                                           const vector<string> &column_names, RunningWindowPlan &plan) {
+	string view_query_sql = NormalizeLptsRunningWindowSql(raw_view_query_sql);
 	string lower = LowerCopy(view_query_sql);
-	auto scan_pos = lower.find("scan_");
+	// The first CTE in a running-window LPTS program is the base table scan. Locate it via the
+	// leading WITH rather than the CTE name, which the refactor changed from "scan_0" to "t0_scan".
+	auto scan_pos = lower.find("with");
 	if (scan_pos == string::npos) {
 		return false;
 	}
+	scan_pos += 4;
 	auto alias_start = view_query_sql.find('(', scan_pos);
 	if (alias_start == string::npos) {
 		return false;
@@ -644,65 +717,51 @@ static string BuildLastValueStateRefreshSQL(const string &view_name, const strin
                                             const string &delta_ts_filter, const string &catalog_prefix,
                                             const vector<string> &partition_columns,
                                             const vector<WindowPartitionDeltaSpec> &partition_delta_specs,
-                                            const string &affected_keys_sql, const string &affected_key_cols,
-                                            const string &affected_key_tuple, bool emit_cascade_delta) {
-	bool have_affected_keys = !affected_keys_sql.empty() && !affected_key_cols.empty() && !affected_key_tuple.empty();
-	if (!LooksLikeLastValueIgnoreNulls(view_query_sql) || (!have_affected_keys && partition_delta_specs.empty())) {
+                                            const string &affected_keys_sql, bool emit_cascade_delta) {
+	auto output_columns = PartitionOutputColumns(partition_columns);
+	bool have_affected_keys = !affected_keys_sql.empty();
+	if (!LooksLikeLastValueIgnoreNulls(view_query_sql) || output_columns.empty()) {
 		return "";
 	}
+	if (!have_affected_keys && (output_columns.size() != 1 || partition_delta_specs.size() != 1)) {
+		return "";
+	}
+
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string state_table = catalog_prefix + SqlUtils::QuoteIdentifier("openivm_aux_run_state_" + view_name);
 	string affected_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
 	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
-	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
+	string new_temp_table = SqlUtils::QuoteIdentifier("openivm_new_" + view_name);
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
-	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + SparkPortableTimestampCasts(delta_ts_filter);
-	string affected_filter;
-	string state_delete_filter;
 	string sql;
 	if (have_affected_keys) {
-		sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS " + affected_keys_sql + ";\n\n";
-		affected_filter = affected_key_tuple + " IN (SELECT " + affected_key_cols + " FROM " + affected_table + ")";
-		state_delete_filter = "EXISTS (SELECT 1 FROM " + affected_table + " fk WHERE " +
-		                      SqlUtils::BuildNullSafeMatch(partition_columns, "st", "fk") + ")";
+		sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS\n" + affected_keys_sql + ";\n\n";
 	} else {
-		string key_cols;
-		string key_tuple;
-		string arms;
-		vector<string> output_keys;
-		for (idx_t i = 0; i < partition_delta_specs.size(); i++) {
-			const auto &spec = partition_delta_specs[i];
-			if (i > 0) {
-				key_cols += ", ";
-				key_tuple += ", ";
-				arms += " UNION ALL ";
-			}
-			key_cols += SqlUtils::QuoteIdentifier(spec.output_column);
-			key_tuple += SqlUtils::QuoteIdentifier(spec.output_column);
-			output_keys.push_back(spec.output_column);
-			string delta_q = spec.delta_table_sql.empty() ? SqlUtils::QuoteIdentifier(spec.delta_table) : spec.delta_table_sql;
-			arms += "SELECT " + SqlUtils::QuoteIdentifier(spec.source_column) + " AS " +
-			        SqlUtils::QuoteIdentifier(spec.output_column) + " FROM " + delta_q + delta_where;
-		}
-		sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS SELECT DISTINCT " + key_cols + " FROM (" +
-		       arms + ") openivm_last_value_changed;\n\n";
-		affected_filter = partition_columns.size() == 1 ? key_tuple + " IN (SELECT " + key_cols + " FROM " + affected_table + ")"
-		                                               : "(" + key_tuple + ") IN (SELECT " + key_cols + " FROM " + affected_table + ")";
-		state_delete_filter = "EXISTS (SELECT 1 FROM " + affected_table + " fk WHERE " +
-		                      SqlUtils::BuildNullSafeMatch(output_keys, "st", "fk") + ")";
+		const auto &spec = partition_delta_specs[0];
+		string delta_q =
+		    spec.delta_table_sql.empty() ? SqlUtils::QuoteIdentifier(spec.delta_table) : spec.delta_table_sql;
+		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + SparkPortableTimestampCasts(delta_ts_filter);
+		sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS\nSELECT DISTINCT " +
+		       SqlUtils::QuoteIdentifier(spec.source_column) + " AS " + SqlUtils::QuoteIdentifier(spec.output_column) +
+		       " FROM " + delta_q + delta_where + ";\n\n";
 	}
+	string old_filter = BuildAffectedTableFilter(output_columns, "openivm_old", affected_table);
+	string new_filter = BuildAffectedTableFilter(output_columns, "openivm_recompute", affected_table);
+	string target_filter = BuildAffectedTableFilter(output_columns, "openivm_target", affected_table);
+	string state_filter = BuildAffectedTableFilter(output_columns, "openivm_state", affected_table);
 	sql += "CREATE TABLE IF NOT EXISTS " + state_table + " AS\nSELECT * FROM " + data_table + " WHERE 1=0;\n\n";
-	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + " WHERE " +
-	       affected_filter + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table +
+	       " openivm_old WHERE " + old_filter + ";\n\n";
 	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
-	       ") openivm_recompute WHERE " + affected_filter + ";\n\n";
-	sql += "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
+	       ") openivm_recompute WHERE " + new_filter + ";\n\n";
+	sql += "DELETE FROM " + data_table + " AS openivm_target WHERE " + target_filter + ";\n";
 	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n\n";
 	if (emit_cascade_delta) {
 		sql += BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
 	}
-	sql += "DELETE FROM " + state_table + " st WHERE " + state_delete_filter + ";\n";
-	sql += "INSERT INTO " + state_table + "\nSELECT * FROM " + data_table + " WHERE " + affected_filter + ";\n\n";
+	sql += "DELETE FROM " + state_table + " AS openivm_state WHERE " + state_filter + ";\n";
+	sql += "INSERT INTO " + state_table + "\nSELECT * FROM " + data_table + " openivm_state WHERE " + state_filter +
+	       ";\n\n";
 	sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + affected_table + ";\n";
@@ -744,26 +803,39 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	string bounds_table = SqlUtils::QuoteIdentifier("openivm_run_bounds_" + view_name);
 	string fast_table = SqlUtils::QuoteIdentifier("openivm_run_fast_" + view_name);
 	string fallback_table = SqlUtils::QuoteIdentifier("openivm_run_fallback_" + view_name);
-	string state_table = catalog_prefix + SqlUtils::QuoteIdentifier("openivm_aux_run_state_" + view_name);
+	string state_table = SqlUtils::QuoteIdentifier("openivm_run_state_" + view_name);
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
 	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
 	string portable_delta_ts_filter = SparkPortableTimestampCasts(delta_ts_filter);
 	string delta_filter = portable_delta_ts_filter.empty() ? "" : " AND " + portable_delta_ts_filter;
-	string delta_any = "1=1" + delta_filter;
 	string delta_positive = QualifiedColumn("d", openivm::MULTIPLICITY_COL) + " > 0" + delta_filter;
 	string part_q = SqlUtils::QuoteIdentifier(plan.partition_column);
 	string order_q = SqlUtils::QuoteIdentifier(plan.order_column);
 	string key_match_df = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "fk");
 	string key_match_dt_fk = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "dt", "fk");
-	string key_match_st_fk = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "st", "fk");
 	string key_match_b_m = "b." + part_q + " IS NOT DISTINCT FROM m." + part_q;
 	string key_match_d_fk = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "fk");
+	string affected_data_filter =
+	    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "dt", affected_table);
 
 	string sql;
 	sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS\nSELECT DISTINCT " +
 	       QualifiedColumn("d", plan.partition_column) + " AS " + part_q + "\nFROM " + delta_q + " d\nWHERE " +
-	       delta_any + ";\n\n";
+	       delta_positive + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + bounds_table + " AS\nWITH old_max AS (\n  SELECT dt." + part_q +
+	       ", MAX(dt." + order_q + ") AS openivm_old_max_order FROM " + data_table + " dt WHERE " +
+	       affected_data_filter + " GROUP BY dt." + part_q + "\n), delta_min AS (\n  SELECT " +
+	       QualifiedColumn("d", plan.partition_column) + " AS " + part_q + ", MIN(" +
+	       QualifiedColumn("d", plan.order_column) + ") AS openivm_delta_min_order\n  FROM " + delta_q +
+	       " d\n  WHERE " + delta_positive + "\n  GROUP BY " + QualifiedColumn("d", plan.partition_column) +
+	       "\n)\nSELECT a." + part_q + ", m.openivm_old_max_order, b.openivm_delta_min_order\nFROM " + affected_table +
+	       " a\nLEFT JOIN old_max m ON a." + part_q + " IS NOT DISTINCT FROM m." + part_q + "\nJOIN delta_min b ON a." +
+	       part_q + " IS NOT DISTINCT FROM b." + part_q + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + fast_table + " AS\nSELECT " + part_q + " FROM " + bounds_table +
+	       "\nWHERE openivm_old_max_order IS NULL OR openivm_delta_min_order > openivm_old_max_order;\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + fallback_table + " AS\nSELECT " + part_q + " FROM " + bounds_table +
+	       "\nWHERE openivm_old_max_order IS NOT NULL AND openivm_delta_min_order <= openivm_old_max_order;\n\n";
 	auto state_columns = plan.output_columns.empty() ? visible_column_names : plan.output_columns;
 	string state_outer_cols = SqlUtils::JoinQuotedColumns(state_columns);
 	state_outer_cols += ", openivm_prior_count";
@@ -784,43 +856,35 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 			                    SqlUtils::QuoteIdentifier(prior_count_col);
 		}
 	}
-	string state_seed_select =
-	    "SELECT " + state_outer_cols + " FROM (\n  SELECT " + state_inner_cols + ", COUNT(*) OVER (PARTITION BY " +
-	    QualifiedColumn("dt", plan.partition_column) + ") AS openivm_prior_count, ROW_NUMBER() OVER (PARTITION BY " +
-	    QualifiedColumn("dt", plan.partition_column) + " ORDER BY " + QualifiedColumn("dt", plan.order_column) +
-	    " DESC) AS openivm_rn\n  FROM " + data_table + " dt";
-	sql += "CREATE TABLE IF NOT EXISTS " + state_table + " AS\n" + state_seed_select +
+	sql += "CREATE OR REPLACE TEMP TABLE " + state_table + " AS\nSELECT " + state_outer_cols + " FROM (\n  SELECT " +
+	       state_inner_cols + ", COUNT(*) OVER (PARTITION BY " + QualifiedColumn("dt", plan.partition_column) +
+	       ") AS openivm_prior_count, ROW_NUMBER() OVER (PARTITION BY " + QualifiedColumn("dt", plan.partition_column) +
+	       " ORDER BY " + QualifiedColumn("dt", plan.order_column) + " DESC) AS openivm_rn\n  FROM " + data_table +
+	       " dt\n  JOIN " + fast_table + " fk ON " + key_match_dt_fk +
 	       "\n) openivm_state_ranked\nWHERE openivm_rn = 1;\n\n";
-	sql += "CREATE OR REPLACE TEMP TABLE " + bounds_table + " AS\nWITH old_max AS (\n  SELECT " + part_q + ", " +
-	       order_q + " AS openivm_old_max_order FROM " + state_table + " WHERE " + part_q + " IN (SELECT " + part_q +
-	       " FROM " + affected_table + ")" + "\n), delta_min AS (\n  SELECT " +
-	       QualifiedColumn("d", plan.partition_column) + " AS " + part_q + ", MIN(" +
-	       QualifiedColumn("d", plan.order_column) + ") AS openivm_delta_min_order\n  FROM " + delta_q +
-	       " d\n  WHERE " + delta_positive + "\n  GROUP BY " + QualifiedColumn("d", plan.partition_column) +
-	       "\n), delta_neg AS (\n  SELECT DISTINCT " + QualifiedColumn("d", plan.partition_column) + " AS " + part_q +
-	       "\n  FROM " + delta_q + " d\n  WHERE " + QualifiedColumn("d", openivm::MULTIPLICITY_COL) + " < 0" +
-	       delta_filter + "\n)\nSELECT a." + part_q + ", m.openivm_old_max_order, b.openivm_delta_min_order, n." +
-	       part_q + " AS openivm_has_negative\nFROM " + affected_table + " a\nLEFT JOIN old_max m ON a." + part_q +
-	       " IS NOT DISTINCT FROM m." + part_q + "\nLEFT JOIN delta_min b ON a." + part_q + " IS NOT DISTINCT FROM b." +
-	       part_q + "\nLEFT JOIN delta_neg n ON a." + part_q + " IS NOT DISTINCT FROM n." + part_q + ";\n\n";
-	sql += "CREATE OR REPLACE TEMP TABLE " + fast_table + " AS\nSELECT " + part_q + " FROM " + bounds_table +
-	       "\nWHERE openivm_has_negative IS NULL AND openivm_delta_min_order IS NOT NULL AND "
-	       "(openivm_old_max_order IS NULL OR openivm_delta_min_order > openivm_old_max_order);\n\n";
-	sql += "CREATE OR REPLACE TEMP TABLE " + fallback_table + " AS\nSELECT " + part_q + " FROM " + bounds_table +
-	       "\nWHERE openivm_has_negative IS NOT NULL OR openivm_delta_min_order IS NULL OR "
-	       "(openivm_old_max_order IS NOT NULL AND openivm_delta_min_order <= openivm_old_max_order);\n\n";
-	string fallback_filter = part_q + " IN (SELECT " + part_q + " FROM " + fallback_table + ")";
+	string fallback_keys = "SELECT " + part_q + " FROM " + fallback_table;
+	string fallback_target_match =
+	    SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "openivm_aff", "openivm_target");
+	string fallback_recompute_match =
+	    SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "openivm_aff", "openivm_recompute");
 	if (emit_cascade_delta) {
-		sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + "\nWHERE " +
-		       fallback_filter + ";\n\n";
+		string fallback_old_filter =
+		    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "openivm_old", fallback_table);
+		string fallback_new_filter =
+		    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "openivm_recompute", fallback_table);
+		string fallback_delete_filter =
+		    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "openivm_target", fallback_table);
+		sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table +
+		       " openivm_old\nWHERE " + fallback_old_filter + ";\n\n";
 		sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
-		       ") openivm_recompute\nWHERE " + fallback_filter + ";\n\n";
-		sql += "DELETE FROM " + data_table + " WHERE " + fallback_filter + ";\n";
+		       ") openivm_recompute\nWHERE " + fallback_new_filter + ";\n\n";
+		sql += "DELETE FROM " + data_table + " AS openivm_target WHERE " + fallback_delete_filter + ";\n";
 		sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
 		sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
 	} else {
-		sql += BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", fallback_filter,
-		                                   fallback_filter);
+		sql +=
+		    BuildAffectedKeyRefreshSQL(data_table, view_query_sql, fallback_keys, "openivm_target", "openivm_recompute",
+		                               "openivm_aff", fallback_target_match, fallback_recompute_match);
 	}
 
 	auto emit_column_names = plan.output_columns.empty() ? visible_column_names : plan.output_columns;
@@ -915,10 +979,7 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 			sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
 			sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
 		}
-		sql += "DELETE FROM " + state_table + " st WHERE EXISTS (SELECT 1 FROM " + affected_table + " fk WHERE " +
-		       key_match_st_fk + ");\n";
-		sql += "INSERT INTO " + state_table + "\n" + state_seed_select + "\n  JOIN " + affected_table + " fk ON " +
-		       key_match_dt_fk + "\n) openivm_state_ranked\nWHERE openivm_rn = 1;\n\n";
+		sql += "DROP TABLE IF EXISTS " + state_table + ";\n";
 		sql += "DROP TABLE IF EXISTS " + fallback_table + ";\n";
 		sql += "DROP TABLE IF EXISTS " + fast_table + ";\n";
 		sql += "DROP TABLE IF EXISTS " + bounds_table + ";\n";
@@ -966,10 +1027,7 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 		sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
 		sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
 	}
-	sql += "DELETE FROM " + state_table + " st WHERE EXISTS (SELECT 1 FROM " + affected_table + " fk WHERE " +
-	       key_match_st_fk + ");\n";
-	sql += "INSERT INTO " + state_table + "\n" + state_seed_select + "\n  JOIN " + affected_table + " fk ON " +
-	       key_match_dt_fk + "\n) openivm_state_ranked\nWHERE openivm_rn = 1;\n\n";
+	sql += "DROP TABLE IF EXISTS " + state_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + fallback_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + fast_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + bounds_table + ";\n";
@@ -1011,6 +1069,78 @@ static void BuildAliasedSourceLists(const vector<string> &cols, const vector<str
 		select_list += expr + " AS " + SqlUtils::QuoteIdentifier(cols[i]);
 		group_list += expr;
 	}
+}
+
+static bool IsIdentifierTokenChar(char c) {
+	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+}
+
+static bool MatchesPatternCI(const string &text, idx_t pos, const string &pattern) {
+	if (pos + pattern.size() > text.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < pattern.size(); i++) {
+		if (std::tolower(static_cast<unsigned char>(text[pos + i])) !=
+		    std::tolower(static_cast<unsigned char>(pattern[i]))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static string RewriteQualifiedAliasPrefix(string expr, const string &source_alias, const string &target_alias) {
+	string pattern = source_alias + ".";
+	string replacement = target_alias + ".";
+	string result;
+	for (idx_t pos = 0; pos < expr.size();) {
+		if (expr[pos] == '\'') {
+			idx_t start = pos++;
+			while (pos < expr.size()) {
+				if (expr[pos] == '\'' && pos + 1 < expr.size() && expr[pos + 1] == '\'') {
+					pos += 2;
+					continue;
+				}
+				if (expr[pos++] == '\'') {
+					break;
+				}
+			}
+			result += expr.substr(start, pos - start);
+			continue;
+		}
+		bool left_boundary = pos == 0 || !IsIdentifierTokenChar(expr[pos - 1]);
+		if (left_boundary && MatchesPatternCI(expr, pos, pattern)) {
+			result += replacement;
+			pos += pattern.size();
+			continue;
+		}
+		result += expr[pos++];
+	}
+	return result;
+}
+
+static bool ReferencesQualifiedAlias(const string &expr, const string &alias) {
+	string pattern = alias + ".";
+	for (idx_t pos = 0; pos < expr.size();) {
+		if (expr[pos] == '\'') {
+			pos++;
+			while (pos < expr.size()) {
+				if (expr[pos] == '\'' && pos + 1 < expr.size() && expr[pos + 1] == '\'') {
+					pos += 2;
+					continue;
+				}
+				if (expr[pos++] == '\'') {
+					break;
+				}
+			}
+			continue;
+		}
+		bool left_boundary = pos == 0 || !IsIdentifierTokenChar(expr[pos - 1]);
+		if (left_boundary && MatchesPatternCI(expr, pos, pattern)) {
+			return true;
+		}
+		pos++;
+	}
+	return false;
 }
 
 } // namespace
@@ -1217,8 +1347,9 @@ string CompileCountDistinctIncremental(const string &view_name, const string &au
 
 string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &left_source, const string &left_alias,
                                       const string &right_source, const string &right_alias, const string &predicate,
-                                      const string &post_filter, const vector<string> &left_cols,
-                                      const vector<string> &left_exprs, bool replace) {
+                                      const string &post_filter, const string &right_filter,
+                                      const vector<string> &left_cols, const vector<string> &left_exprs, bool replace,
+                                      bool null_aware, const string &null_aware_right_expr) {
 	string left_cols_csv = SqlUtils::JoinQuotedColumns(left_cols);
 	string left_cols_qualified = SqlUtils::JoinQualifiedQuotedColumns(left_cols, left_alias);
 	string left_cols_lc = SqlUtils::JoinQualifiedQuotedColumns(left_cols, "lc");
@@ -1228,25 +1359,75 @@ string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &
 	string unused_group_list;
 	BuildAliasedSourceLists(left_cols, left_exprs, left_source_select, unused_group_list, left_alias);
 	string left_source_filter = post_filter.empty() ? "" : " WHERE " + post_filter;
+	string match_predicate = predicate + (right_filter.empty() ? "" : " AND (" + right_filter + ")");
+	string right_filter_sql = right_filter.empty() ? "" : " WHERE " + right_filter;
+	bool null_aware_anti = null_aware && !null_aware_right_expr.empty();
+	bool correlated_right_filter = null_aware_anti && ReferencesQualifiedAlias(right_filter, left_alias);
+	string right_stats_cte;
+	string right_stats_select;
+	string right_stats_from;
+	if (null_aware_anti) {
+		if (correlated_right_filter) {
+			string right_filter_lc = RewriteQualifiedAliasPrefix(right_filter, left_alias, "lc");
+			right_stats_select = ", (SELECT count(*)::BIGINT FROM " + right_source + " " + right_alias + " WHERE " +
+			                     right_filter_lc + ") AS _right_count, (SELECT count(*) FILTER (WHERE " +
+			                     null_aware_right_expr + " IS NULL)::BIGINT FROM " + right_source + " " + right_alias +
+			                     " WHERE " + right_filter_lc + ") AS _right_null_count";
+		} else {
+			right_stats_cte = ", right_stats AS (SELECT count(*)::BIGINT AS _right_count, count(*) FILTER (WHERE " +
+			                  null_aware_right_expr + " IS NULL)::BIGINT AS _right_null_count FROM " + right_source +
+			                  " " + right_alias + right_filter_sql + ")";
+			right_stats_select = ", rs._right_count, rs._right_null_count";
+			right_stats_from = " CROSS JOIN right_stats rs";
+		}
+	}
 	return CreateAuxTablePrefix(target_table, replace) + " AS WITH left_source AS (SELECT " + left_source_select +
 	       " FROM " + left_source + " " + left_alias + left_source_filter + "), left_counts AS (SELECT " +
 	       left_cols_csv + ", count(*)::BIGINT AS _left_count FROM left_source GROUP BY " + left_cols_csv +
 	       "), match_counts AS (SELECT " + left_cols_qualified +
 	       ", count(*)::BIGINT AS _match_count FROM (SELECT DISTINCT " + left_cols_csv + " FROM left_source) " +
-	       left_alias + " JOIN " + right_source + " " + right_alias + " ON " + predicate + " GROUP BY " +
-	       left_cols_qualified + ") SELECT " + left_cols_lc +
-	       ", lc._left_count, coalesce(mc._match_count, 0)::BIGINT AS _match_count FROM left_counts lc LEFT JOIN "
-	       "match_counts mc ON " +
-	       lc_mc_match;
+	       left_alias + " JOIN " + right_source + " " + right_alias + " ON " + match_predicate + " GROUP BY " +
+	       left_cols_qualified + ")" + right_stats_cte + " SELECT " + left_cols_lc +
+	       ", lc._left_count, coalesce(mc._match_count, 0)::BIGINT AS _match_count" + right_stats_select +
+	       " FROM left_counts lc LEFT JOIN match_counts mc ON " + lc_mc_match + right_stats_from;
+}
+
+static string SemiAntiVisibleExpr(const string &join_type, bool null_aware, const string &null_aware_left_col,
+                                  const string &alias) {
+	string prefix = alias.empty() ? "" : alias + ".";
+	bool is_anti = StringUtil::Lower(join_type) == "anti";
+	if (!is_anti) {
+		return prefix + "_match_count > 0";
+	}
+	if (null_aware && !null_aware_left_col.empty()) {
+		string left_not_null = "NOT coalesce(" + prefix + SqlUtils::QuoteIdentifier(null_aware_left_col) + ", true)";
+		return prefix + "_match_count = 0 AND (" + prefix + "_right_count = 0 OR (" + left_not_null + " AND " + prefix +
+		       "_right_null_count = 0))";
+	}
+	return prefix + "_match_count = 0";
+}
+
+string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_table, const string &join_type,
+                                   const vector<string> &left_cols, const vector<string> &output_cols, bool null_aware,
+                                   const string &null_aware_left_col) {
+	if (output_cols.empty()) {
+		throw InternalException("BuildSemiAntiInitialDataSQL called without output columns");
+	}
+	string output_cur = SqlUtils::JoinQualifiedQuotedColumns(output_cols, "_cur");
+	string visible = SemiAntiVisibleExpr(join_type, null_aware, null_aware_left_col, "_cur");
+	return "create table " + data_table + " as SELECT " + output_cur + " FROM " + aux_table +
+	       " _cur, generate_series(1, _cur._left_count::BIGINT) WHERE " + visible + " AND _cur._left_count > 0";
 }
 
 string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,
                                 const string &right_alias, const string &predicate, const string &post_filter,
-                                const vector<string> &left_cols, const vector<string> &left_exprs,
-                                const vector<string> &output_cols, const string &left_delta_source,
-                                const string &right_delta_source, const string &left_last_update,
-                                const string &right_last_update, const string &catalog_prefix) {
+                                const string &right_filter, const vector<string> &left_cols,
+                                const vector<string> &left_exprs, const vector<string> &output_cols,
+                                const string &left_delta_source, const string &right_delta_source,
+                                const string &left_last_update, const string &right_last_update,
+                                const string &catalog_prefix, bool null_aware, const string &null_aware_left_col,
+                                const string &null_aware_right_expr) {
 	if (left_cols.empty() || output_cols.empty() || aux_table.empty() || right_delta_source.empty() ||
 	    right_last_update.empty()) {
 		throw InternalException("CompileSemiAntiRecompute called with incomplete metadata for view '%s'", view_name);
@@ -1259,12 +1440,19 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	string right_delta_q = DeltaSourceRef(right_delta_source, catalog_prefix);
 	string dleft_table = "openivm_saj_dleft_" + view_name;
 	string dright_table = "openivm_saj_dright_" + view_name;
+	string dright_stats_table = "openivm_saj_dright_stats_" + view_name;
+	string right_stats_table = "openivm_saj_right_stats_" + view_name;
 	string old_table = "openivm_saj_old_" + view_name;
 	string aff_table = "openivm_saj_aff_" + view_name;
-	bool is_anti = StringUtil::Lower(join_type) == "anti";
-	string visible = is_anti ? "_match_count = 0" : "_match_count > 0";
-	string cur_visible = is_anti ? "_cur._match_count = 0" : "_cur._match_count > 0";
+	bool null_aware_anti = null_aware && StringUtil::Lower(join_type) == "anti" && !null_aware_left_col.empty() &&
+	                       !null_aware_right_expr.empty();
+	string visible = SemiAntiVisibleExpr(join_type, null_aware_anti, null_aware_left_col, "");
+	string cur_visible = SemiAntiVisibleExpr(join_type, null_aware_anti, null_aware_left_col, "_cur");
 	string left_delta_filter = post_filter.empty() ? "" : " AND (" + post_filter + ")";
+	string match_predicate = predicate + (right_filter.empty() ? "" : " AND (" + right_filter + ")");
+	string right_delta_filter = right_filter.empty() ? "" : " AND (" + right_filter + ")";
+	string right_filter_sql = right_filter.empty() ? "" : " WHERE " + right_filter;
+	bool correlated_right_filter = null_aware_anti && ReferencesQualifiedAlias(right_filter, left_alias);
 
 	string left_cols_csv = SqlUtils::JoinQuotedColumns(left_cols);
 	string output_cols_csv = SqlUtils::JoinQuotedColumns(output_cols);
@@ -1306,7 +1494,7 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 
 	sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dright_table) + " AS\n  SELECT " + left_cols_l +
 	       ", SUM(" + right_alias + "." + string(openivm::MULTIPLICITY_COL) + ")::BIGINT AS dmatch\n  FROM " + aux_q +
-	       " " + left_alias + " JOIN " + right_delta_q + " " + right_alias + " ON " + predicate + "\n  WHERE " +
+	       " " + left_alias + " JOIN " + right_delta_q + " " + right_alias + " ON " + match_predicate + "\n  WHERE " +
 	       right_ts + "\n  GROUP BY " + left_cols_l + "\n  HAVING SUM(" + right_alias + "." +
 	       string(openivm::MULTIPLICITY_COL) + ") <> 0;\n\n";
 
@@ -1314,15 +1502,67 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	       SqlUtils::BuildNullSafeMatch(left_cols, "_aux", "_d") +
 	       "\nWHEN MATCHED THEN UPDATE SET _match_count = _aux._match_count + _d.dmatch;\n\n";
 
+	if (null_aware_anti) {
+		if (correlated_right_filter) {
+			sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dright_stats_table) + " AS\n  SELECT " +
+			       left_cols_l + ", SUM(" + right_alias + "." + string(openivm::MULTIPLICITY_COL) +
+			       ")::BIGINT AS d_right_count, SUM(CASE WHEN " + null_aware_right_expr + " IS NULL THEN " +
+			       right_alias + "." + string(openivm::MULTIPLICITY_COL) +
+			       " ELSE 0 END)::BIGINT AS d_right_null_count\n  FROM " + aux_q + " " + left_alias + " JOIN " +
+			       right_delta_q + " " + right_alias + " ON " + right_filter + "\n  WHERE " + right_ts +
+			       "\n  GROUP BY " + left_cols_l + "\n  HAVING SUM(" + right_alias + "." +
+			       string(openivm::MULTIPLICITY_COL) + ") <> 0 OR SUM(CASE WHEN " + null_aware_right_expr +
+			       " IS NULL THEN " + right_alias + "." + string(openivm::MULTIPLICITY_COL) + " ELSE 0 END) <> 0;\n\n";
+			sql += "MERGE INTO " + aux_q + " _aux USING " + SqlUtils::QuoteIdentifier(dright_stats_table) + " _d ON " +
+			       SqlUtils::BuildNullSafeMatch(left_cols, "_aux", "_d") +
+			       "\nWHEN MATCHED THEN UPDATE SET _right_count = _aux._right_count + _d.d_right_count, "
+			       "_right_null_count = _aux._right_null_count + _d.d_right_null_count;\n\n";
+		} else {
+			sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(dright_stats_table) +
+			       " AS\n  SELECT COALESCE(SUM(" + right_alias + "." + string(openivm::MULTIPLICITY_COL) +
+			       "), 0)::BIGINT AS d_right_count, COALESCE(SUM(CASE WHEN " + null_aware_right_expr +
+			       " IS NULL THEN " + right_alias + "." + string(openivm::MULTIPLICITY_COL) +
+			       " ELSE 0 END), 0)::BIGINT AS d_right_null_count\n  FROM " + right_delta_q + " " + right_alias +
+			       "\n  WHERE " + right_ts + right_delta_filter + ";\n\n";
+			sql += "UPDATE " + aux_q + " SET _right_count = _right_count + (SELECT d_right_count FROM " +
+			       SqlUtils::QuoteIdentifier(dright_stats_table) +
+			       "), _right_null_count = _right_null_count + (SELECT d_right_null_count FROM " +
+			       SqlUtils::QuoteIdentifier(dright_stats_table) + ") WHERE EXISTS (SELECT 1 FROM " +
+			       SqlUtils::QuoteIdentifier(dright_stats_table) +
+			       " WHERE d_right_count <> 0 OR d_right_null_count <> 0);\n\n";
+			sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(right_stats_table) +
+			       " AS\n  SELECT count(*)::BIGINT AS _right_count, count(*) FILTER (WHERE " + null_aware_right_expr +
+			       " IS NULL)::BIGINT AS _right_null_count FROM " + right_table + " " + right_alias + right_filter_sql +
+			       ";\n\n";
+		}
+	}
+
 	sql += "MERGE INTO " + aux_q + " _aux USING " + SqlUtils::QuoteIdentifier(dleft_table) + " i ON " + aux_i_match +
 	       "\nWHEN MATCHED THEN UPDATE SET _left_count = _aux._left_count + i.dmult;\n\n";
 
-	sql += "INSERT INTO " + aux_q + " (" + left_cols_csv + ", _left_count, _match_count)\nSELECT " + left_cols_i +
-	       ", i.dmult, COALESCE(mc._match_count, 0)::BIGINT\nFROM " + SqlUtils::QuoteIdentifier(dleft_table) +
-	       " i\nLEFT JOIN " + aux_q + " _aux ON " + aux_i_match + "\nLEFT JOIN (\n  SELECT " + left_cols_l +
-	       ", COUNT(*)::BIGINT AS _match_count\n  FROM " + SqlUtils::QuoteIdentifier(dleft_table) + " " + left_alias +
-	       " JOIN " + right_table + " " + right_alias + " ON " + predicate + "\n  GROUP BY " + left_cols_l +
-	       "\n) mc ON " + SqlUtils::BuildNullSafeMatch(left_cols, "mc", "i") +
+	string insert_cols = left_cols_csv + ", _left_count, _match_count";
+	string insert_stats_select;
+	string insert_stats_from;
+	if (null_aware_anti) {
+		insert_cols += ", _right_count, _right_null_count";
+		if (correlated_right_filter) {
+			string right_filter_i = RewriteQualifiedAliasPrefix(right_filter, left_alias, "i");
+			insert_stats_select = ", (SELECT count(*)::BIGINT FROM " + right_table + " " + right_alias + " WHERE " +
+			                      right_filter_i + "), (SELECT count(*) FILTER (WHERE " + null_aware_right_expr +
+			                      " IS NULL)::BIGINT FROM " + right_table + " " + right_alias + " WHERE " +
+			                      right_filter_i + ")";
+		} else {
+			insert_stats_select = ", rs._right_count, rs._right_null_count";
+			insert_stats_from = "\nCROSS JOIN " + SqlUtils::QuoteIdentifier(right_stats_table) + " rs";
+		}
+	}
+	sql += "INSERT INTO " + aux_q + " (" + insert_cols + ")\nSELECT " + left_cols_i +
+	       ", i.dmult, COALESCE(mc._match_count, 0)::BIGINT" + insert_stats_select + "\nFROM " +
+	       SqlUtils::QuoteIdentifier(dleft_table) + " i\nLEFT JOIN " + aux_q + " _aux ON " + aux_i_match +
+	       "\nLEFT JOIN (\n  SELECT " + left_cols_l + ", COUNT(*)::BIGINT AS _match_count\n  FROM " +
+	       SqlUtils::QuoteIdentifier(dleft_table) + " " + left_alias + " JOIN " + right_table + " " + right_alias +
+	       " ON " + match_predicate + "\n  GROUP BY " + left_cols_l + "\n) mc ON " +
+	       SqlUtils::BuildNullSafeMatch(left_cols, "mc", "i") + insert_stats_from +
 	       "\nWHERE _aux._left_count IS NULL AND i.dmult > 0;\n\n";
 
 	sql += "CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(aff_table) + " AS\nSELECT " + left_cols_old +
@@ -1352,8 +1592,10 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	sql += "DELETE FROM " + aux_q + " WHERE _left_count <= 0;\n";
 	sql += "DROP TABLE IF EXISTS " + SqlUtils::QuoteIdentifier(old_table) + ";\nDROP TABLE IF EXISTS " +
 	       SqlUtils::QuoteIdentifier(dleft_table) + ";\nDROP TABLE IF EXISTS " +
-	       SqlUtils::QuoteIdentifier(dright_table) + ";\nDROP TABLE IF EXISTS " + SqlUtils::QuoteIdentifier(aff_table) +
-	       ";\n";
+	       SqlUtils::QuoteIdentifier(dright_table) + ";\nDROP TABLE IF EXISTS " +
+	       SqlUtils::QuoteIdentifier(dright_stats_table) + ";\nDROP TABLE IF EXISTS " +
+	       SqlUtils::QuoteIdentifier(right_stats_table) + ";\nDROP TABLE IF EXISTS " +
+	       SqlUtils::QuoteIdentifier(aff_table) + ";\n";
 
 	OPENIVM_DEBUG_PRINT("[CompileSemiAntiRecompute] %s join, %zu left cols, aux=%s\n", join_type.c_str(),
 	                    left_cols.size(), aux_table.c_str());
@@ -1425,10 +1667,9 @@ string CompileFilteredGroupCount(const string &view_name, const string &aux_tabl
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter,
                               const string &catalog_prefix, const vector<string> &partition_columns,
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta,
-                              const string &affected_keys_sql, const string &affected_key_cols,
-                              const string &affected_key_tuple, const vector<string> &column_names,
+                              const string &affected_keys_sql, const vector<string> &column_names,
                               bool running_window_incremental, bool last_value_state_incremental) {
-	bool have_affected_keys = !affected_keys_sql.empty() && !affected_key_cols.empty() && !affected_key_tuple.empty();
+	bool have_affected_keys = !affected_keys_sql.empty();
 	if (!have_affected_keys && (partition_columns.empty() || partition_delta_specs.empty())) {
 		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
 	}
@@ -1441,9 +1682,9 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		}
 	}
 	if (last_value_state_incremental) {
-		auto last_value_sql = BuildLastValueStateRefreshSQL(view_name, view_query_sql, delta_ts_filter, catalog_prefix,
-		                                                    partition_columns, partition_delta_specs, affected_keys_sql,
-		                                                    affected_key_cols, affected_key_tuple, emit_cascade_delta);
+		auto last_value_sql =
+		    BuildLastValueStateRefreshSQL(view_name, view_query_sql, delta_ts_filter, catalog_prefix, partition_columns,
+		                                  partition_delta_specs, affected_keys_sql, emit_cascade_delta);
 		if (!last_value_sql.empty()) {
 			return last_value_sql;
 		}
@@ -1451,25 +1692,7 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 	string affected_temp_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
-
-	string affected_filter;
-	if (have_affected_keys) {
-		affected_filter =
-		    affected_key_tuple + " IN (SELECT " + affected_key_cols + " FROM " + affected_temp_table + ")";
-	} else {
-		for (size_t i = 0; i < partition_delta_specs.size(); i++) {
-			if (i > 0) {
-				affected_filter += " OR ";
-			}
-			const auto &spec = partition_delta_specs[i];
-			string output_col = SqlUtils::QuoteIdentifier(spec.output_column);
-			string source_col = SqlUtils::QuoteIdentifier(spec.source_column);
-			string delta_table =
-			    spec.delta_table_sql.empty() ? SqlUtils::QuoteIdentifier(spec.delta_table) : spec.delta_table_sql;
-			affected_filter +=
-			    output_col + " IN (SELECT DISTINCT " + source_col + " FROM " + delta_table + delta_where + ")";
-		}
-	}
+	auto output_columns = PartitionOutputColumns(partition_columns);
 
 	OPENIVM_DEBUG_PRINT(
 	    "[CompileWindowRecompute] Partition columns: %zu, delta specs: %zu, lineage keys: %s, cascade delta: %s\n",
@@ -1477,15 +1700,17 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	    emit_cascade_delta ? "enabled" : "disabled");
 	if (!emit_cascade_delta) {
 		if (!have_affected_keys) {
-			return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter,
-			                                   affected_filter);
+			string target_filter = BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_target");
+			string recompute_filter = BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_recompute");
+			return "DELETE FROM " + data_table + " AS openivm_target WHERE " + target_filter + ";\n" + "INSERT INTO " +
+			       data_table + "\nSELECT * FROM (" + view_query_sql + ") openivm_recompute\nWHERE " +
+			       recompute_filter + ";\n";
 		}
-		string sql;
-		sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_keys_sql + ";\n\n";
-		sql += BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_recompute", affected_filter,
-		                                   affected_filter);
-		sql += "DROP TABLE IF EXISTS " + affected_temp_table + ";\n";
-		return sql;
+		string target_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_target");
+		string recompute_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_recompute");
+		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_keys_sql, "openivm_target",
+		                                  "openivm_recompute", "openivm_aff", target_match, recompute_match,
+		                                  affected_temp_table);
 	}
 
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
@@ -1495,11 +1720,20 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	if (have_affected_keys) {
 		sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_keys_sql + ";\n\n";
 	}
-	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + "\nWHERE " +
-	       affected_filter + ";\n\n";
+	string old_filter = have_affected_keys
+	                        ? BuildAffectedTableFilter(output_columns, "openivm_old", affected_temp_table)
+	                        : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_old");
+	string recompute_filter = have_affected_keys
+	                              ? BuildAffectedTableFilter(output_columns, "openivm_recompute", affected_temp_table)
+	                              : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_recompute");
+	string target_filter = have_affected_keys
+	                           ? BuildAffectedTableFilter(output_columns, "openivm_target", affected_temp_table)
+	                           : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_target");
+	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table +
+	       " openivm_old\nWHERE " + old_filter + ";\n\n";
 	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
-	       ") openivm_recompute\nWHERE " + affected_filter + ";\n\n";
-	sql += "DELETE FROM " + data_table + " WHERE " + affected_filter + ";\n";
+	       ") openivm_recompute\nWHERE " + recompute_filter + ";\n\n";
+	sql += "DELETE FROM " + data_table + " AS openivm_target WHERE " + target_filter + ";\n";
 	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
 	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
 	if (have_affected_keys) {

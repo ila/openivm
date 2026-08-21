@@ -20,37 +20,33 @@ struct CompileFactsFkRelation {
 	bool rely = true;
 };
 
-// Per-call compile context for `openivm_compile_with_facts`. The JSON wire
-// schema intentionally exposes only fields consumed by planning today: schema
-// version, target SQL dialect, compile-only mode, and the view-delta cascade
-// override. Field names are snake_case to match the JSON wire form 1:1 —
-// `ParseFactsJson` deserialises the JSON object directly into these fields.
+// Per-call compile context for `openivm_compile_with_facts`. Field names are
+// snake_case to match the JSON wire form 1:1 — `ParseFactsJson` deserialises
+// the JSON object directly into these fields, and ignores unknown fields.
 class CompileFacts {
 public:
-	// Schema evolution: 1 = original 3-field facts; 2 = WorkloadFacts (adds the
-	// classifier-derived workload shape, e.g. assume_insert_only). Unknown/extra
-	// fields are ignored by ParseFactsJson, so v1 writers keep working unchanged.
+	// Bumped when the JSON fact schema changes in a backward-compatible way;
+	// unknown/extra fields are ignored by ParseFactsJson, so older writers work.
 	static constexpr int CURRENT_SCHEMA_VERSION = 2;
 	int schema_version = CURRENT_SCHEMA_VERSION;
 	SqlDialect target_dialect = SqlDialect::DUCKDB; // required when parsed from JSON
 	bool compile_only = false;                      // default false
 	bool force_view_delta_cascade = false;
 
-	// v2 WorkloadFacts: set true ONLY when an external classifier has PROVEN, from
-	// the actual change log, that this batch is append-only (every new commit a
-	// blind append / AddFile-only, no RemoveFile dataChange). When true under
-	// compile_only it re-enables the insert-only fast paths (skip aggregate/
-	// projection delete, MIN/MAX GREATEST/LEAST) that compile_only otherwise
-	// disables. Defaults false — conservative, identical to v1 behavior.
+	// Set true ONLY when an external classifier has PROVEN, from the actual change
+	// log, that this batch is append-only (every new commit a blind append /
+	// AddFile-only, no RemoveFile dataChange). When true under compile_only it
+	// re-enables the insert-only fast paths that compile_only otherwise disables.
+	// Defaults false — conservative.
 	bool assume_insert_only = false;
 	bool running_window_incremental = false;
 	bool last_value_state_incremental = false;
 	bool scd2_range_join_accel = false;
 	bool emit_spark_hints = false;
 
-	// v2 WorkloadFacts: per-source delta shape and RELY FK declarations supplied
-	// by the caller. These are compile-time facts only; the compile path may not
-	// be able to see source catalog constraints (e.g. Spark/Delta tables).
+	// Per-source delta shape and RELY FK declarations supplied by the caller.
+	// Compile-time facts only; the compile path may not see source catalog
+	// constraints (e.g. Spark/Delta tables).
 	unordered_map<string, string> delta_shape;
 	vector<CompileFactsFkRelation> fk_relations;
 

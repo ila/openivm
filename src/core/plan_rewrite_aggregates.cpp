@@ -9,6 +9,7 @@
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -134,6 +135,137 @@ LogicalOperator *FindProjectionAggregateInput(unique_ptr<LogicalOperator> &plan,
 	}
 	return nullptr;
 }
+
+void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
+	if (!plan) {
+		return;
+	}
+
+	// Find the linear output path down to the aggregate. ORDER BY/LIMIT/TOP_N
+	// and MATERIALIZED_CTE are pass-through wrappers; projections may rename or
+	// cast aggregate outputs and therefore need to be followed explicitly.
+	vector<LogicalProjection *> projections;
+	LogicalOperator *node = plan.get();
+	LogicalOperator *agg_search = nullptr;
+	while (node) {
+		switch (node->type) {
+		case LogicalOperatorType::LOGICAL_ORDER_BY:
+		case LogicalOperatorType::LOGICAL_LIMIT:
+		case LogicalOperatorType::LOGICAL_TOP_N:
+		case LogicalOperatorType::LOGICAL_DISTINCT:
+			node = node->children.empty() ? nullptr : node->children[0].get();
+			continue;
+		case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+			node = node->children.size() < 2 ? nullptr : node->children[1].get();
+			continue;
+		case LogicalOperatorType::LOGICAL_PROJECTION:
+			projections.push_back(&node->Cast<LogicalProjection>());
+			node = node->children.empty() ? nullptr : node->children[0].get();
+			continue;
+		case LogicalOperatorType::LOGICAL_FILTER:
+			if (!node->children.empty() &&
+			    node->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+				agg_search = node->children[0].get();
+			}
+			node = nullptr;
+			continue;
+		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+			agg_search = node;
+			node = nullptr;
+			continue;
+		default:
+			node = nullptr;
+			continue;
+		}
+	}
+	if (!agg_search || projections.empty()) {
+		return;
+	}
+
+	auto &agg = agg_search->Cast<LogicalAggregate>();
+	auto &aggregate_projection = *projections.back();
+	auto &output_projection = *projections.front();
+	const idx_t original_aggregate_count = agg.expressions.size();
+
+	struct SumCountOutput {
+		idx_t projection_index;
+		idx_t aggregate_index;
+	};
+	vector<SumCountOutput> outputs;
+	for (idx_t projection_index = 0; projection_index < output_projection.expressions.size(); projection_index++) {
+		Expression *resolved = output_projection.expressions[projection_index].get();
+		while (resolved) {
+			while (resolved->expression_class == ExpressionClass::BOUND_CAST) {
+				resolved = resolved->Cast<BoundCastExpression>().child.get();
+			}
+			if (resolved->type != ExpressionType::BOUND_COLUMN_REF) {
+				break;
+			}
+			auto &ref = resolved->Cast<BoundColumnRefExpression>();
+			if (ref.binding.table_index == agg.aggregate_index) {
+				break;
+			}
+			LogicalProjection *referenced_projection = nullptr;
+			for (idx_t projection_depth = 1; projection_depth < projections.size(); projection_depth++) {
+				if (projections[projection_depth]->table_index == ref.binding.table_index) {
+					referenced_projection = projections[projection_depth];
+					break;
+				}
+			}
+			if (!referenced_projection || ref.binding.column_index >= referenced_projection->expressions.size()) {
+				resolved = nullptr;
+				break;
+			}
+			resolved = referenced_projection->expressions[ref.binding.column_index].get();
+		}
+		if (!resolved || resolved->type != ExpressionType::BOUND_COLUMN_REF) {
+			continue;
+		}
+		auto &ref = resolved->Cast<BoundColumnRefExpression>();
+		if (ref.binding.table_index != agg.aggregate_index || ref.binding.column_index >= original_aggregate_count) {
+			continue;
+		}
+		auto &aggregate_expr = agg.expressions[ref.binding.column_index];
+		if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			continue;
+		}
+		auto &sum = aggregate_expr->Cast<BoundAggregateExpression>();
+		if (sum.function.name != "sum" || sum.IsDistinct() || sum.children.size() != 1) {
+			continue;
+		}
+		if (sum.alias.find(string(openivm::SUM_COL_PREFIX)) == 0 ||
+		    sum.alias.find(string(openivm::VAR_SQ_COL_PREFIX)) == 0 ||
+		    sum.alias.find(string(openivm::VAR_SQP_COL_PREFIX)) == 0) {
+			continue;
+		}
+
+		auto count_func = BindAggregateByName(context, "count", {sum.children[0]->return_type});
+		vector<unique_ptr<Expression>> count_args;
+		count_args.push_back(sum.children[0]->Copy());
+		auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
+		                                                      nullptr, AggregateType::NON_DISTINCT);
+		count_expr->alias = string(openivm::SUM_COUNT_COL_PREFIX) + to_string(projection_index);
+		outputs.push_back({projection_index, agg.expressions.size()});
+		agg.expressions.push_back(std::move(count_expr));
+	}
+	if (outputs.empty()) {
+		return;
+	}
+
+	agg.ResolveOperatorTypes();
+	auto aggregate_bindings = agg_search->GetColumnBindings();
+	auto aggregate_types = agg_search->types;
+	for (auto &output : outputs) {
+		idx_t output_index = agg.groups.size() + output.aggregate_index;
+		auto count_ref =
+		    make_uniq<BoundColumnRefExpression>(aggregate_types[output_index], aggregate_bindings[output_index]);
+		count_ref->alias = string(openivm::SUM_COUNT_COL_PREFIX) + to_string(output.projection_index);
+		aggregate_projection.expressions.push_back(std::move(count_ref));
+	}
+	aggregate_projection.ResolveOperatorTypes();
+	OPENIVM_DEBUG_PRINT("[PlanRewrite] Injected %zu SUM non-NULL counts\n", outputs.size());
+}
+
 void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator> &plan, Optimizer &opt, bool is_top) {
 	for (auto &child : plan->children) {
 		RewriteDerivedAggregates(context, child, opt, false);
@@ -336,6 +468,12 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 	};
 	for (idx_t pi = 0; pi < original_proj_size; pi++) {
 		walk(proj.expressions[pi]);
+	}
+	if (!plan->children.empty() && plan->children[0]->type == LogicalOperatorType::LOGICAL_FILTER) {
+		auto &having = plan->children[0]->Cast<LogicalFilter>();
+		for (auto &expression : having.expressions) {
+			walk(expression);
+		}
 	}
 	for (auto &d : decomps) {
 		ColumnBinding sum_binding = agg_bindings[group_count + d.sum_idx];

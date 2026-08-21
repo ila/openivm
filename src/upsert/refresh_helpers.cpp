@@ -15,6 +15,7 @@
 
 #include <cctype>
 #include <cstring>
+#include <set>
 
 namespace duckdb {
 
@@ -251,7 +252,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &affected_subquery, const string &target_alias,
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
-                                  const string &affected_temp_table) {
+                                  const string &affected_temp_table, const vector<string> &upsert_keys,
+                                  const string &recompute_temp_table) {
 	string affected_block = "(\n" + affected_subquery + "\n)";
 	string affected_source = affected_temp_table.empty() ? affected_block : affected_temp_table;
 	string delete_where =
@@ -263,9 +265,29 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 	if (!affected_temp_table.empty()) {
 		result += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_subquery + ";\n\n";
 	}
-	result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" +
-	          "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " +
-	          insert_where + ";\n";
+	if (!upsert_keys.empty() && !recompute_temp_table.empty()) {
+		// Upsert form, for data tables carrying a UNIQUE index. Materialize the recomputed rows for
+		// the affected groups ONCE (the recompute is the expensive part), then:
+		//   1. delete only the affected groups that no longer produce a row (a group can disappear
+		//      entirely, e.g. when every preserved-side row for it is deleted), and
+		//   2. INSERT OR REPLACE the survivors.
+		// The two key sets are disjoint for non-NULL keys, so those are not deleted and re-inserted
+		// in the same transaction. NULL-containing keys do not conflict in the UNIQUE index and must
+		// be removed explicitly before INSERT OR REPLACE to avoid duplicate groups.
+		string keep_match = SqlUtils::BuildNullSafeKeyPredicate(upsert_keys, "openivm_keep.", target_alias + ".");
+		string nullable_key = SqlUtils::BuildAnyNullPredicate(upsert_keys, target_alias + ".");
+		result += "CREATE OR REPLACE TEMP TABLE " + recompute_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+		          ") " + recompute_alias + "\nWHERE " + insert_where + ";\n\n";
+		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + "\n  AND ((" +
+		          nullable_key + ")\n    OR NOT EXISTS (\n  SELECT 1 FROM " + recompute_temp_table +
+		          " AS openivm_keep WHERE " + keep_match + "\n));\n\n";
+		result += "INSERT OR REPLACE INTO " + data_table + "\nSELECT * FROM " + recompute_temp_table + ";\n";
+		result += "\nDROP TABLE IF EXISTS " + recompute_temp_table + ";\n";
+	} else {
+		result += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE " + delete_where + ";\n\n" +
+		          "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias +
+		          "\nWHERE " + insert_where + ";\n";
+	}
 	if (!affected_temp_table.empty()) {
 		result += "\nDROP TABLE IF EXISTS " + affected_temp_table + ";\n";
 	}
@@ -601,11 +623,24 @@ string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_na
 
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
                            bool cross_system, const string &attached_catalog, const string &attached_schema,
-                           const string &catalog_prefix, string *out_post_meta) {
+                           const string &catalog_prefix, const string &metadata_prefix, string *out_post_meta) {
 	string qdt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
-	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql) + "\n";
-	string update_ts_sql = "UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
-	                       " SET last_update = now() WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
+	// parser.cpp gives AGGREGATE_GROUP / AGGREGATE_HAVING data tables a UNIQUE index on the group
+	// keys. A plain `DELETE FROM t; INSERT INTO t ...` re-inserts keys deleted in the same
+	// transaction, which DuckDB's on-disk unique index rejects, so those views need the upsert form.
+	auto recompute_view_type = metadata.GetViewType(view_name);
+	vector<string> unique_keys;
+	string recompute_temp;
+	if (recompute_view_type == RefreshType::AGGREGATE_GROUP || recompute_view_type == RefreshType::AGGREGATE_HAVING) {
+		unique_keys = metadata.GetGroupColumns(view_name);
+		if (!unique_keys.empty()) {
+			recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
+		}
+	}
+	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql, unique_keys, recompute_temp) + "\n";
+	auto delta_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
+	string update_ts_sql = "UPDATE " + delta_metadata_table + " SET last_update = now() WHERE view_name = '" +
+	                       SqlUtils::EscapeValue(view_name) + "';\n";
 	auto delta_tables = metadata.GetDeltaTables(view_name);
 	for (auto &dt : delta_tables) {
 		if (!metadata.IsDuckLakeTable(view_name, dt)) {
@@ -618,7 +653,8 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 		string snapshot_expr =
 		    cross_system ? DuckLakeSnapshotPlaceholder(loc.catalog_name)
 		                 : "(SELECT id FROM " + SqlUtils::QuoteIdentifier(loc.catalog_name) + ".current_snapshot())";
-		update_ts_sql += RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, snapshot_expr);
+		update_ts_sql +=
+		    RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(view_name, dt, snapshot_expr, delta_metadata_table);
 	}
 	string update_ts;
 	if (!cross_system) {
@@ -633,7 +669,7 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 			continue;
 		}
 		string resolved = metadata.ResolveDeltaQualifiedName(view_name, dt, attached_catalog, attached_schema);
-		delta_cleanup += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt);
+		delta_cleanup += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt, delta_metadata_table);
 	}
 
 	return query + update_ts + "\n" + delta_cleanup;
@@ -681,9 +717,67 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 	                                   affected_ctes);
 }
 
-static string TryBuildLeftJoinAffectedPushdown(const string &view_name, const string &data_table,
-                                               const string &view_query_sql, const string &qdv,
-                                               const string &delta_ts_filter, const string &lk) {
+static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string &extra_predicate) {
+	string predicate = delta_ts_filter;
+	if (!extra_predicate.empty()) {
+		if (!predicate.empty()) {
+			predicate += " AND ";
+		}
+		predicate += extra_predicate;
+	}
+	return predicate.empty() ? "" : " WHERE " + predicate;
+}
+
+static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const string &view_name,
+                                              const vector<string> &delta_table_names, const string &data_table,
+                                              const string &view_query_sql, const string &qdv,
+                                              const string &delta_ts_filter, const string &lk,
+                                              const string &negative_delta_guard) {
+	bool all_ducklake = !delta_table_names.empty();
+	for (auto &delta_table : delta_table_names) {
+		if (!metadata.IsDuckLakeTable(view_name, delta_table)) {
+			all_ducklake = false;
+			break;
+		}
+	}
+
+	RefreshMetadata::LeftJoinKeySource key_source;
+	if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
+		return "";
+	}
+	string source_ref = SqlUtils::FindTableReferenceOccurrence(view_query_sql, key_source.table, key_source.occurrence);
+	if (source_ref.empty()) {
+		return "";
+	}
+
+	string affected_where = BuildGuardedDeltaWhere(delta_ts_filter, negative_delta_guard);
+	string affected_cte =
+	    "WITH openivm_affected AS (\n  SELECT DISTINCT " + lk + " FROM " + qdv + affected_where + "\n)\n";
+	string key_col = SqlUtils::QuoteIdentifier(key_source.column);
+	string replacement = "(SELECT openivm_lj_src.* FROM " + source_ref +
+	                     " openivm_lj_src INNER JOIN openivm_affected openivm_lj_aff ON openivm_lj_src." + key_col +
+	                     " IS NOT DISTINCT FROM openivm_lj_aff." + lk + ")";
+	bool replaced = false;
+	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_source.table,
+	                                                                key_source.occurrence, replacement, replaced);
+	if (!replaced || pushed_query == view_query_sql) {
+		return "";
+	}
+
+	string affected = "EXISTS (SELECT 1 FROM openivm_affected _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
+	string delete_match = "_d." + lk + " IS NOT DISTINCT FROM openivm_delete_target." + lk;
+	OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN affected-key pushdown for %s via %s[%llu].%s\n", view_name.c_str(),
+	                    key_source.table.c_str(), static_cast<unsigned long long>(key_source.occurrence),
+	                    key_source.column.c_str());
+	return BuildDeleteUsingInsertRefreshSQL(data_table, pushed_query, "openivm_lj", "openivm_affected", "_d",
+	                                        delete_match, all_ducklake ? "TRUE" : affected + "openivm_lj." + lk + ")",
+	                                        affected_cte);
+}
+
+static string TryBuildFactMarketHistoryAffectedPushdown(const string &view_name, const string &data_table,
+                                                        const string &view_query_sql, const string &qdv,
+                                                        const string &delta_ts_filter, const string &lk,
+                                                        const string &negative_delta_guard) {
 	static const string security_table = string(openivm::DATA_TABLE_PREFIX) + "dim_security";
 	static const string security_key = "sk_company_id";
 
@@ -706,7 +800,7 @@ static string TryBuildLeftJoinAffectedPushdown(const string &view_name, const st
 		return "";
 	}
 
-	string affected_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	string affected_where = BuildGuardedDeltaWhere(delta_ts_filter, negative_delta_guard);
 	string affected_cte =
 	    "WITH openivm_affected AS (\n  SELECT DISTINCT " + lk + " FROM " + qdv + affected_where + "\n)\n";
 	string key_col = KeywordHelper::WriteOptionallyQuoted(security_key);
@@ -722,46 +816,126 @@ static string TryBuildLeftJoinAffectedPushdown(const string &view_name, const st
 
 	string affected = "EXISTS (SELECT 1 FROM openivm_affected _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
 	string delete_match = "_d." + lk + " IS NOT DISTINCT FROM openivm_delete_target." + lk;
-	// TODO(PROPER Lineage): replace this TPC-DI source-specific shortcut with lineage from
-	// openivm_left_key to the source binding that produced it, then push the affected-key
-	// predicate to that binding generically. The final EXISTS guard stays because it makes
-	// this rewrite semantics-preserving even if the source filter admits false positives.
-	// This must not be generalized by table/column names alone: left-side inserts can produce
-	// false negatives unless lineage proves the affected key comes from this source binding.
+	// Keep the legacy TPC-DI fallback for views created before LEFT JOIN key-source lineage
+	// was recorded. The final EXISTS guard makes the rewrite semantics-preserving even if
+	// the source filter admits false positives.
 	// We also benchmarked dropping the final guard at SF25/SF50; it was only marginally
 	// faster, so the guarded shape is the safer default until lineage proves exactness.
 	return BuildDeleteUsingInsertRefreshSQL(data_table, pushed_query, "openivm_lj", "openivm_affected", "_d",
 	                                        delete_match, affected + "openivm_lj." + lk + ")", affected_cte);
 }
 
-static string BuildLeftJoinProjectionRefresh(const string &view_name, const string &data_table,
+static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const string &view_name,
+                                             const vector<string> &column_names,
+                                             const vector<string> &delta_table_names, const string &data_table,
                                              const string &view_query_sql, const string &delta_ts_filter,
-                                             const string &catalog_prefix) {
-	string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
+                                             const string &catalog_prefix, bool allow_runtime_insert_only) {
 	string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
 	string lk = KeywordHelper::WriteOptionallyQuoted(string(openivm::LEFT_KEY_COL));
+	string mul = KeywordHelper::WriteOptionallyQuoted(string(openivm::MULTIPLICITY_COL));
+	string negative_delta_guard;
+	if (allow_runtime_insert_only) {
+		string negative_where = delta_ts_filter.empty() ? " WHERE " : " WHERE " + delta_ts_filter + " AND ";
+		negative_delta_guard = "EXISTS (SELECT 1 FROM " + qdv + " openivm_delta_shape" + negative_where +
+		                       "openivm_delta_shape." + mul + " < 0 LIMIT 1)";
+	}
+	string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
+	if (!negative_delta_guard.empty()) {
+		delta_where += " AND " + negative_delta_guard;
+	}
 	string affected = "EXISTS (SELECT 1 FROM " + qdv + " _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
 	auto pushed_refresh =
-	    TryBuildLeftJoinAffectedPushdown(view_name, data_table, view_query_sql, qdv, delta_ts_filter, lk);
-	if (!pushed_refresh.empty()) {
+	    TryBuildLeftJoinLineagePushdown(metadata, view_name, delta_table_names, data_table, view_query_sql, qdv,
+	                                    delta_ts_filter, lk, negative_delta_guard);
+	if (pushed_refresh.empty()) {
+		pushed_refresh = TryBuildFactMarketHistoryAffectedPushdown(view_name, data_table, view_query_sql, qdv,
+		                                                           delta_ts_filter, lk, negative_delta_guard);
+	}
+	if (pushed_refresh.empty()) {
+		pushed_refresh = BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_lj",
+		                                             affected + data_table + "." + lk + delta_where + ")",
+		                                             affected + "openivm_lj." + lk + delta_where + ")");
+	}
+	if (!allow_runtime_insert_only) {
 		return pushed_refresh;
 	}
-	return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_lj",
-	                                   affected + data_table + "." + lk + delta_where + ")",
-	                                   affected + "openivm_lj." + lk + delta_where + ")");
+
+	string select_columns;
+	for (auto &raw_col : column_names) {
+		if (raw_col == openivm::MULTIPLICITY_COL) {
+			continue;
+		}
+		if (!select_columns.empty()) {
+			select_columns += ", ";
+		}
+		select_columns += KeywordHelper::WriteOptionallyQuoted(raw_col);
+	}
+	string append_where = delta_ts_filter.empty() ? " WHERE " : " WHERE " + delta_ts_filter + " AND ";
+	append_where += mul + " > 0 AND NOT (" + negative_delta_guard + ")";
+	string append_sql = "INSERT INTO " + data_table + " SELECT " + select_columns + "\nFROM " + qdv +
+	                    "\nCROSS JOIN generate_series(1, " + mul + "::BIGINT)\n" + append_where + ";\n";
+	OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN runtime output-delta append guard for %s\n", view_name.c_str());
+	return pushed_refresh + append_sql;
+}
+
+static string NormalizeTableToken(string token) {
+	while (!token.empty() && (token.front() == '"' || token.front() == '`' || token.front() == '\'')) {
+		token.erase(token.begin());
+	}
+	while (!token.empty() && (token.back() == '"' || token.back() == '`' || token.back() == '\'')) {
+		token.pop_back();
+	}
+	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
+	static const string delta_prefix(openivm::DELTA_PREFIX);
+	token = SqlUtils::LastIdentifierPart(token);
+	if (token.size() > data_prefix.size() && token.rfind(data_prefix, 0) == 0) {
+		token = token.substr(data_prefix.size());
+	}
+	if (token.size() > delta_prefix.size() && token.rfind(delta_prefix, 0) == 0) {
+		token = token.substr(delta_prefix.size());
+	}
+	return StringUtil::Lower(token);
+}
+
+static bool LeftJoinDeltaNullableQuiet(RefreshMetadata &metadata, const string &view_name,
+                                       const vector<string> &active_delta_table_names) {
+	if (active_delta_table_names.empty()) {
+		return false;
+	}
+	RefreshMetadata::LeftJoinNullableSources nullable_sources;
+	if (!metadata.GetLeftJoinNullableSources(view_name, nullable_sources) || !nullable_sources.complete ||
+	    nullable_sources.tables.empty()) {
+		return false;
+	}
+	std::set<string> nullable_tables(nullable_sources.tables.begin(), nullable_sources.tables.end());
+	for (auto &delta_name : active_delta_table_names) {
+		if (nullable_tables.count(NormalizeTableToken(BaseTableNameFromDeltaKey(delta_name)))) {
+			return false;
+		}
+	}
+	return true;
 }
 
 string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
                                 const vector<string> &delta_table_names, const string &data_table,
                                 const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
-                                bool skip_proj_delete) {
+                                bool skip_proj_delete, bool insert_only, const vector<string> &active_delta_table_names,
+                                bool allow_runtime_insert_only) {
 	if (has_full_outer) {
 		return BuildFullOuterProjectionRefresh(metadata, view_name, delta_table_names, data_table, view_query_sql,
 		                                       delta_ts_filter, catalog_prefix);
 	}
 	if (has_left_join) {
-		return BuildLeftJoinProjectionRefresh(view_name, data_table, view_query_sql, delta_ts_filter, catalog_prefix);
+		if (insert_only && LeftJoinDeltaNullableQuiet(metadata, view_name, active_delta_table_names)) {
+			OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN insert-only append for %s (nullable side quiet)\n",
+			                    view_name.c_str());
+			return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix,
+			                                 /*insert_only=*/true);
+		}
+		return BuildLeftJoinProjectionRefresh(metadata, view_name, column_names, delta_table_names, data_table,
+		                                      view_query_sql, delta_ts_filter, catalog_prefix,
+		                                      allow_runtime_insert_only);
 	}
 	return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete);
 }

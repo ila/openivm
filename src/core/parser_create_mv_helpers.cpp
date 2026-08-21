@@ -34,12 +34,15 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	// Matcher metadata columns (signature_hash..nullified_columns_json) stay
 	// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
 	ddl.push_back("create table if not exists " + string(openivm::VIEWS_TABLE) +
-	              " (view_name varchar primary key, sql_string varchar, type tinyint,"
+	              " (view_name varchar primary key, view_catalog varchar default null,"
+	              " view_schema varchar default null, sql_string varchar, type tinyint,"
 	              " has_minmax boolean default false, has_left_join boolean default false,"
+	              " has_join boolean default false,"
 	              " last_update timestamp, refresh_interval bigint default null,"
 	              " refresh_in_progress boolean default false,"
 	              " group_columns varchar default null,"
 	              " aggregate_types varchar default null,"
+	              " derived_aggregate_outputs_json varchar default null,"
 	              " having_predicate varchar default null,"
 	              " group_recompute_affected_mode varchar default null,"
 	              " group_recompute_source_occurrences_json varchar default null,"
@@ -63,15 +66,22 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "count_distinct_aux_meta_json varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "semi_anti_aux_meta_json varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "lineage_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "leftjoin_secondary_meta_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "has_join boolean default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_affected_mode varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_source_occurrences_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "derived_aggregate_outputs_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_catalog varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_schema varchar default null");
 	if (!is_replace) {
 		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
 		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));
 		string stale_mv_condition = "view_name = '" + escaped_view_name +
-		                            "' AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '" +
+		                            "' AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE "
+		                            "table_name = '" +
 		                            escaped_view_name +
-		                            "') AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '" +
+		                            "') AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE "
+		                            "table_name = '" +
 		                            escaped_data_table + "')";
 		// CREATE MV executes as multiple catalog statements. If a process dies or loses
 		// a DuckDB file lock after writing metadata but before creating the physical
@@ -92,7 +102,8 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 
 	ddl.push_back("create table if not exists " + string(openivm::DELTA_TABLES_TABLE) +
 	              " (view_name varchar, table_name varchar, last_update timestamp,"
-	              " catalog_type varchar default 'duckdb', last_snapshot_id bigint default null,"
+	              " catalog_type varchar default 'duckdb', last_snapshot_id bigint default "
+	              "null,"
 	              " last_refresh_ts timestamp default null,"
 	              " pending_row_estimate bigint default null,"
 	              " pending_estimate_ts timestamp default null,"
@@ -107,12 +118,21 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_catalog varchar default null");
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_schema varchar default null");
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_table_id bigint default null");
+	ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) +
+	              " SET has_join = true WHERE has_join IS NULL AND (COALESCE(has_left_join, false) OR "
+	              "COALESCE(has_full_outer, false) OR view_name IN (SELECT view_name FROM " +
+	              string(openivm::DELTA_TABLES_TABLE) +
+	              " GROUP BY view_name HAVING COUNT(*) > 1) OR regexp_matches(COALESCE(sql_string, ''), "
+	              "'(^|[^A-Za-z0-9_])join([^A-Za-z0-9_]|$)', 'i'))");
+	ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) + " SET has_join = false WHERE has_join IS NULL");
 
 	// Refresh history: stores execution stats for learned cost model calibration.
 	// Stage A.5 adds `strategy` (default 'incremental') for per-strategy regression.
 	ddl.push_back("create table if not exists " + string(openivm::HISTORY_TABLE) +
-	              " (view_name varchar, refresh_timestamp timestamp default current_timestamp,"
-	              " method varchar, incremental_compute_est double, incremental_upsert_est double,"
+	              " (view_name varchar, refresh_timestamp timestamp default "
+	              "current_timestamp,"
+	              " method varchar, incremental_compute_est double, "
+	              "incremental_upsert_est double,"
 	              " recompute_compute_est double, recompute_replace_est double,"
 	              " actual_duration_ms bigint,"
 	              " strategy varchar default 'incremental',"
@@ -121,7 +141,8 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	ddl.push_back("create table if not exists " + string(openivm::PROFILE_TABLE) +
 	              " (refresh_id varchar, view_name varchar,"
 	              " profile_timestamp timestamp default current_timestamp,"
-	              " step_order integer, step_name varchar, duration_ms bigint, detail varchar,"
+	              " step_order integer, step_name varchar, duration_ms bigint, "
+	              "detail varchar,"
 	              " primary key(refresh_id, step_order))");
 }
 

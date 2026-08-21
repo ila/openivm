@@ -15,6 +15,9 @@ LOAD ducklake;
 statement ok
 ATTACH '__TEST_DIR__/ducklake_left_join.db' AS dl (TYPE ducklake);
 
+statement ok
+SET openivm_files_path = '__TEST_DIR__';
+
 # ==========================================
 # Basic LEFT JOIN
 # ==========================================
@@ -59,6 +62,396 @@ SELECT count(*) FROM (
   SELECT c.name, SUM(o.amount), COUNT(o.amount) FROM dl.customers c LEFT JOIN dl.orders o ON c.id = o.cust_id GROUP BY c.name
   EXCEPT ALL
   SELECT name, total, cnt FROM dl.mv_cust_orders
+);
+----
+0
+
+# ==========================================
+# Runtime output-delta append guard
+# ==========================================
+
+statement ok
+CREATE TABLE dl.runtime_left (id INTEGER, value VARCHAR);
+
+statement ok
+CREATE TABLE dl.runtime_right (id INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO dl.runtime_left VALUES (1, 'one'), (2, 'two'), (NULL, 'null-key');
+
+statement ok
+INSERT INTO dl.runtime_right VALUES (1, 'x');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_runtime_left_join AS
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id;
+
+# Touch both sides so the static preserved-side fast path cannot fire. Adding
+# matches to an already-matched key only produces positive output deltas. The
+# duplicate right rows exercise multiplicity expansion, while the NULL-keyed
+# left row remains in the materialized bag.
+statement ok
+INSERT INTO dl.runtime_left VALUES (NULL, 'second-null-key');
+
+statement ok
+INSERT INTO dl.runtime_right VALUES (1, 'y'), (1, 'y');
+
+statement ok
+PRAGMA refresh('mv_runtime_left_join');
+
+query I
+SELECT contains(content, 'openivm_delta_shape')
+       AND contains(content, 'openivm_multiplicity < 0')
+       AND contains(content, 'generate_series')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_runtime_left_join.sql');
+----
+true
+
+query I
+SELECT count(*) FROM (
+  SELECT id, value, label FROM dl.mv_runtime_left_join
+  EXCEPT ALL
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+  EXCEPT ALL
+  SELECT id, value, label FROM dl.mv_runtime_left_join
+);
+----
+0
+
+# A single conflicting batch produces negative output multiplicities: UPDATE
+# contributes -old/+new, deleting the last match restores a NULL-extended row,
+# and inserting a first match removes another NULL-extended row. The runtime
+# guard must therefore retain the affected-key recompute behavior.
+statement ok
+INSERT INTO dl.runtime_left VALUES (3, 'three');
+
+statement ok
+UPDATE dl.runtime_left SET value = 'two-updated' WHERE id = 2;
+
+statement ok
+DELETE FROM dl.runtime_right WHERE id = 1 AND label = 'x';
+
+statement ok
+INSERT INTO dl.runtime_right VALUES (2, 'z');
+
+statement ok
+PRAGMA refresh('mv_runtime_left_join');
+
+query I
+SELECT count(*) FROM (
+  SELECT id, value, label FROM dl.mv_runtime_left_join
+  EXCEPT ALL
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+  EXCEPT ALL
+  SELECT id, value, label FROM dl.mv_runtime_left_join
+);
+----
+0
+
+# ==========================================
+# Star projection: affected fact-key pushdown
+# ==========================================
+
+statement ok
+CREATE TABLE dl.star_events (
+  event_id INTEGER,
+  account_id INTEGER,
+  infrastructure_code VARCHAR,
+  os_name VARCHAR,
+  edition_code VARCHAR,
+  meter_id INTEGER,
+  amount INTEGER
+);
+
+statement ok
+CREATE TABLE dl.star_accounts (account_id INTEGER, customer_key INTEGER);
+
+statement ok
+CREATE TABLE dl.star_infrastructure (provider VARCHAR, infrastructure_key INTEGER);
+
+statement ok
+CREATE TABLE dl.star_os (os_type VARCHAR, operating_system_key INTEGER);
+
+statement ok
+CREATE TABLE dl.star_edition (edition_name VARCHAR, edition_key INTEGER);
+
+statement ok
+CREATE TABLE dl.star_meter (meter_id INTEGER, meter_key INTEGER);
+
+statement ok
+CREATE TABLE dl.star_dim6 (event_id INTEGER, dim6_key INTEGER);
+
+statement ok
+CREATE TABLE dl.star_dim7 (event_id INTEGER, dim7_key INTEGER);
+
+statement ok
+CREATE TABLE dl.star_dim8 (event_id INTEGER, dim8_key INTEGER);
+
+statement ok
+CREATE TABLE dl.star_dim9 (event_id INTEGER, dim9_key INTEGER);
+
+statement ok
+CREATE TABLE dl.star_dim10 (event_id INTEGER, dim10_key INTEGER);
+
+statement ok
+INSERT INTO dl.star_events VALUES
+  (1, 10, 'azure', 'linux', 'std', 1, 100),
+  (2, 10, NULL, NULL, NULL, 2, 200),
+  (3, 20, 'aws', 'windows', 'ent', 3, 300),
+  (4, 30, 'gcp', 'linux', 'std', 4, 400);
+
+statement ok
+INSERT INTO dl.star_accounts VALUES (10, 1000), (20, 2000);
+
+statement ok
+INSERT INTO dl.star_infrastructure VALUES ('AZURE', 11), ('AWS', 12);
+
+statement ok
+INSERT INTO dl.star_os VALUES ('linux', 21), ('windows', 22);
+
+statement ok
+INSERT INTO dl.star_edition VALUES ('STD', 31), ('ENT', 32);
+
+statement ok
+INSERT INTO dl.star_meter VALUES (1, 41), (2, 42), (3, 43);
+
+statement ok
+INSERT INTO dl.star_dim6 VALUES (1, 61), (2, 62), (3, 63);
+
+statement ok
+INSERT INTO dl.star_dim7 VALUES (1, 71), (2, 72), (3, 73);
+
+statement ok
+INSERT INTO dl.star_dim8 VALUES (1, 81), (2, 82), (3, 83);
+
+statement ok
+INSERT INTO dl.star_dim9 VALUES (1, 91), (2, 92), (3, 93);
+
+statement ok
+INSERT INTO dl.star_dim10 VALUES (1, 101), (2, 102), (3, 103);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_star_projection AS
+  WITH base_events AS (
+    SELECT
+      event_id,
+      account_id,
+      LOWER(COALESCE(infrastructure_code, 'n/a')) AS infrastructure_provider,
+      LOWER(COALESCE(os_name, 'unknown')) AS os_type,
+      UPPER(COALESCE(edition_code, 'UNKNOWN')) AS edition_name,
+      meter_id,
+      amount
+    FROM dl.star_events
+  )
+  SELECT
+    b.event_id,
+    COALESCE(a.customer_key, 1) AS customer_key,
+    COALESCE(i.infrastructure_key, 1) AS infrastructure_key,
+    COALESCE(o.operating_system_key, 1) AS operating_system_key,
+    COALESCE(e.edition_key, 1) AS edition_key,
+    COALESCE(m.meter_key, 1) AS meter_key,
+    COALESCE(d6.dim6_key, 1) AS dim6_key,
+    COALESCE(d7.dim7_key, 1) AS dim7_key,
+    COALESCE(d8.dim8_key, 1) AS dim8_key,
+    COALESCE(d9.dim9_key, 1) AS dim9_key,
+    COALESCE(d10.dim10_key, 1) AS dim10_key,
+    b.amount
+  FROM base_events b
+  LEFT JOIN dl.star_accounts a ON b.account_id = a.account_id
+  LEFT JOIN dl.star_infrastructure i
+    ON b.infrastructure_provider = LOWER(COALESCE(i.provider, 'n/a'))
+  LEFT JOIN dl.star_os o ON b.os_type = LOWER(COALESCE(o.os_type, 'unknown'))
+  LEFT JOIN dl.star_edition e ON b.edition_name = UPPER(COALESCE(e.edition_name, 'UNKNOWN'))
+  LEFT JOIN dl.star_meter m ON b.meter_id = m.meter_id
+  LEFT JOIN dl.star_dim6 d6 ON b.event_id = d6.event_id
+  LEFT JOIN dl.star_dim7 d7 ON b.event_id = d7.event_id
+  LEFT JOIN dl.star_dim8 d8 ON b.event_id = d8.event_id
+  LEFT JOIN dl.star_dim9 d9 ON b.event_id = d9.event_id
+  LEFT JOIN dl.star_dim10 d10 ON b.event_id = d10.event_id;
+
+query I
+SELECT lineage_json LIKE '%"k":"left_join_key_source"%' FROM openivm_views
+WHERE view_name = 'mv_star_projection';
+----
+true
+
+# One refresh must consolidate conflicting fact and dimension changes, including
+# matched-to-unmatched and unmatched-to-matched LEFT JOIN transitions.
+statement ok
+INSERT INTO dl.star_events VALUES (5, 40, 'azure', 'linux', 'std', 5, 500);
+
+statement ok
+UPDATE dl.star_events
+SET account_id = 30, infrastructure_code = 'aws', meter_id = 3
+WHERE event_id = 2;
+
+statement ok
+DELETE FROM dl.star_accounts WHERE account_id = 20;
+
+statement ok
+UPDATE dl.star_infrastructure SET provider = 'azure-old' WHERE provider = 'AZURE';
+
+statement ok
+UPDATE dl.star_os SET operating_system_key = 121 WHERE os_type = 'linux';
+
+statement ok
+INSERT INTO dl.star_meter VALUES (4, 44), (5, 45);
+
+statement ok
+INSERT INTO dl.star_accounts VALUES (40, 4000);
+
+statement ok
+DELETE FROM dl.star_accounts WHERE account_id = 40;
+
+statement ok
+INSERT INTO dl.star_accounts VALUES (40, 4001);
+
+statement ok
+UPDATE dl.star_dim8 SET dim8_key = 181 WHERE event_id = 1;
+
+statement ok
+DELETE FROM dl.star_dim9 WHERE event_id = 2;
+
+statement ok
+INSERT INTO dl.star_dim10 VALUES (5, 105);
+
+statement ok
+PRAGMA refresh('mv_star_projection');
+
+query I
+SELECT contains(content, 'openivm_lj_src INNER JOIN openivm_affected')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_star_projection.sql');
+----
+true
+
+query I
+SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) <= 11
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_star_projection.sql');
+----
+true
+
+query I
+SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) <= 11
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_star_projection.sql');
+----
+true
+
+query I
+SELECT length(content) < 1000000
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_star_projection.sql');
+----
+true
+
+query I
+SELECT count(*) FROM (
+  SELECT event_id, customer_key, infrastructure_key, operating_system_key, edition_key, meter_key,
+         dim6_key, dim7_key, dim8_key, dim9_key, dim10_key, amount
+  FROM dl.mv_star_projection
+  EXCEPT ALL
+  SELECT
+    b.event_id,
+    COALESCE(a.customer_key, 1),
+    COALESCE(i.infrastructure_key, 1),
+    COALESCE(o.operating_system_key, 1),
+    COALESCE(e.edition_key, 1),
+    COALESCE(m.meter_key, 1),
+    COALESCE(d6.dim6_key, 1),
+    COALESCE(d7.dim7_key, 1),
+    COALESCE(d8.dim8_key, 1),
+    COALESCE(d9.dim9_key, 1),
+    COALESCE(d10.dim10_key, 1),
+    b.amount
+  FROM (
+    SELECT
+      event_id,
+      account_id,
+      LOWER(COALESCE(infrastructure_code, 'n/a')) AS infrastructure_provider,
+      LOWER(COALESCE(os_name, 'unknown')) AS os_type,
+      UPPER(COALESCE(edition_code, 'UNKNOWN')) AS edition_name,
+      meter_id,
+      amount
+    FROM dl.star_events
+  ) b
+  LEFT JOIN dl.star_accounts a ON b.account_id = a.account_id
+  LEFT JOIN dl.star_infrastructure i
+    ON b.infrastructure_provider = LOWER(COALESCE(i.provider, 'n/a'))
+  LEFT JOIN dl.star_os o ON b.os_type = LOWER(COALESCE(o.os_type, 'unknown'))
+  LEFT JOIN dl.star_edition e ON b.edition_name = UPPER(COALESCE(e.edition_name, 'UNKNOWN'))
+  LEFT JOIN dl.star_meter m ON b.meter_id = m.meter_id
+  LEFT JOIN dl.star_dim6 d6 ON b.event_id = d6.event_id
+  LEFT JOIN dl.star_dim7 d7 ON b.event_id = d7.event_id
+  LEFT JOIN dl.star_dim8 d8 ON b.event_id = d8.event_id
+  LEFT JOIN dl.star_dim9 d9 ON b.event_id = d9.event_id
+  LEFT JOIN dl.star_dim10 d10 ON b.event_id = d10.event_id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT
+    b.event_id,
+    COALESCE(a.customer_key, 1),
+    COALESCE(i.infrastructure_key, 1),
+    COALESCE(o.operating_system_key, 1),
+    COALESCE(e.edition_key, 1),
+    COALESCE(m.meter_key, 1),
+    COALESCE(d6.dim6_key, 1),
+    COALESCE(d7.dim7_key, 1),
+    COALESCE(d8.dim8_key, 1),
+    COALESCE(d9.dim9_key, 1),
+    COALESCE(d10.dim10_key, 1),
+    b.amount
+  FROM (
+    SELECT
+      event_id,
+      account_id,
+      LOWER(COALESCE(infrastructure_code, 'n/a')) AS infrastructure_provider,
+      LOWER(COALESCE(os_name, 'unknown')) AS os_type,
+      UPPER(COALESCE(edition_code, 'UNKNOWN')) AS edition_name,
+      meter_id,
+      amount
+    FROM dl.star_events
+  ) b
+  LEFT JOIN dl.star_accounts a ON b.account_id = a.account_id
+  LEFT JOIN dl.star_infrastructure i
+    ON b.infrastructure_provider = LOWER(COALESCE(i.provider, 'n/a'))
+  LEFT JOIN dl.star_os o ON b.os_type = LOWER(COALESCE(o.os_type, 'unknown'))
+  LEFT JOIN dl.star_edition e ON b.edition_name = UPPER(COALESCE(e.edition_name, 'UNKNOWN'))
+  LEFT JOIN dl.star_meter m ON b.meter_id = m.meter_id
+  LEFT JOIN dl.star_dim6 d6 ON b.event_id = d6.event_id
+  LEFT JOIN dl.star_dim7 d7 ON b.event_id = d7.event_id
+  LEFT JOIN dl.star_dim8 d8 ON b.event_id = d8.event_id
+  LEFT JOIN dl.star_dim9 d9 ON b.event_id = d9.event_id
+  LEFT JOIN dl.star_dim10 d10 ON b.event_id = d10.event_id
+  EXCEPT ALL
+  SELECT event_id, customer_key, infrastructure_key, operating_system_key, edition_key, meter_key,
+         dim6_key, dim7_key, dim8_key, dim9_key, dim10_key, amount
+  FROM dl.mv_star_projection
 );
 ----
 0

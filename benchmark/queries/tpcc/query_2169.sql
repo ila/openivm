@@ -1,0 +1,2 @@
+-- {"operators": "FILTER,SCALAR_SUBQUERY", "complexity": "medium", "is_incremental": true, "has_nulls": false, "has_cast": false, "has_case": false, "tables": "STOCK", "openivm_verified": true}
+SELECT s.S_W_ID, s.S_I_ID, s.S_QUANTITY FROM STOCK s WHERE s.S_QUANTITY > (SELECT AVG(s2.S_QUANTITY) FROM STOCK s2 WHERE s2.S_W_ID = s.S_W_ID);

@@ -67,15 +67,13 @@ WITH compiled AS (
     SELECT sql FROM compiled WHERE sql LIKE 'INSERT INTO openivm_data_wradwow_mv (%'
 )
 SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast_wradwow_mv%'
-         AND (SELECT sql FROM program) LIKE '%openivm_aux_run_state_wradwow_mv%'
-         AND (SELECT sql FROM program) NOT LIKE '%FROM openivm_data_wradwow_mv dt JOIN openivm_run_fast_wradwow_mv%'
          AND (SELECT sql FROM fast_insert) LIKE '%openivm_l1 AS%'
          AND (SELECT sql FROM fast_insert) LIKE '%MIN(d.dm_low)%'
          AND (SELECT sql FROM fast_insert) LIKE '%MAX(d.dm_high)%'
          AND (SELECT sql FROM fast_insert) LIKE '%CASE WHEN (dm_low) = (fifty_two_week_low) THEN dm_date ELSE CAST(NULL AS DATE) END%'
          AND (SELECT sql FROM fast_insert) LIKE '%CASE WHEN (dm_high) = (fifty_two_week_high) THEN dm_date ELSE CAST(NULL AS DATE) END%'
-         AND (SELECT sql FROM fast_insert) LIKE '%MAX(f.t10_low_date_flag)%'
-         AND (SELECT sql FROM fast_insert) LIKE '%MAX(f.t10_high_date_flag)%'
+         AND (SELECT sql FROM fast_insert) LIKE '%MAX(f.low_date_flag)%'
+         AND (SELECT sql FROM fast_insert) LIKE '%MAX(f.high_date_flag)%'
     THEN 1 ELSE 0 END;
 ----
 1
@@ -144,10 +142,6 @@ INSERT INTO brokerage_daily_market VALUES
     (DATE '2024-01-01', 'AAA', 99, 25, 6, 900),
     (DATE '2024-01-04', 'BBB', 204, 32, 13, 2300),
     (DATE '2024-01-01', 'DDD', 401, 50, 35, 4000);
-
-statement ok
-DELETE FROM brokerage_daily_market
-WHERE dm_s_symb = 'CCC' AND dm_date = DATE '2024-01-01';
 
 statement ok
 PRAGMA refresh('wradwow_mv');

@@ -1,0 +1,2 @@
+-- {"operators": "ANTI_JOIN,NOT_EXISTS,LEFT_JOIN", "complexity": "high", "is_incremental": false, "has_nulls": true, "has_cast": false, "has_case": false, "tables": "CUSTOMER,OORDER,HISTORY", "openivm_verified": true}
+SELECT c.C_W_ID, c.C_D_ID, c.C_ID, o.O_ID FROM CUSTOMER c LEFT JOIN OORDER o ON c.C_W_ID = o.O_W_ID AND c.C_D_ID = o.O_D_ID AND c.C_ID = o.O_C_ID WHERE NOT EXISTS (SELECT 1 FROM HISTORY h WHERE h.H_C_W_ID = c.C_W_ID AND h.H_C_D_ID = c.C_D_ID AND h.H_C_ID = c.C_ID);

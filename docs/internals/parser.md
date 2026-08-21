@@ -64,7 +64,13 @@ The IVM compatibility checker validates the entire plan tree, flagging unsupport
 
 ## Generated DDL
 
-The parser produces a sequence of DDL statements executed during the bind phase:
+The parser produces a sequence of DDL statements, but does not mutate the catalog
+during bind. Native-catalog lifecycle statements are rendered as a SQL program and
+execute in the caller transaction. A later lifecycle or refresh statement in that
+same transaction replays only the affected view's uncommitted metadata into
+constrained temporary shadow tables for compilation. DuckLake and other
+cross-catalog lifecycles use staged execution because DuckDB cannot commit writes to
+two attached catalogs in one transaction.
 
 1. **System tables**: `CREATE TABLE IF NOT EXISTS openivm_views (...)` and `openivm_delta_tables (...)`.
 2. **Metadata inserts**: Registers the view name, query string, type, and source table mappings.
@@ -82,6 +88,8 @@ Stores one row per materialized view.
 | Column | Type | Description |
 |---|---|---|
 | `view_name` | `VARCHAR` (PK) | Name of the materialized view. |
+| `view_catalog` | `VARCHAR` | Catalog containing the user-facing view. |
+| `view_schema` | `VARCHAR` | Schema containing the user-facing view. |
 | `sql_string` | `VARCHAR` | The original SELECT query defining the view. |
 | `type` | `TINYINT` | View classification (see IVM compatibility classification above). |
 | `has_minmax` | `BOOLEAN` | Whether the view uses MIN/MAX or another aggregate shape that may need group-recompute. |
@@ -99,6 +107,7 @@ Stores one row per materialized view.
 | `distinct_aux_meta_json` | `VARCHAR` | JSON metadata for DISTINCT aux-state maintenance. |
 | `semi_anti_aux_meta_json` | `VARCHAR` | JSON metadata for SEMI/ANTI aux-state maintenance. |
 | `lineage_json` | `VARCHAR` | JSON lineage metadata for window and projection-key refresh paths. |
+| `leftjoin_secondary_meta_json` | `VARCHAR` | Structured source/key identities for supported LEFT JOIN aggregate correction deltas. |
 | `signature_hash`, `canonical_plan_blob`, `output_columns_json`, `predicate_summary_json`, `fd_summary_json`, `nullified_columns_json` | Mixed | View-matching metadata. These stay NULL unless view matching is enabled. |
 
 Example content:

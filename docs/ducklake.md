@@ -59,9 +59,13 @@ current one.
 
 ### N-term telescoping join rule
 
-For joins over DuckLake tables, OpenIVM uses an N-term telescoping formula instead of the standard 2^N - 1 inclusion-exclusion terms.
+For joins over DuckLake tables, OpenIVM uses an N-term telescoping formula instead of
+the default 2^N - 1 inclusion-exclusion terms.
 
-**Standard inclusion-exclusion** (non-DuckLake): For N tables, generates all non-empty subsets — 2^N - 1 terms, each replacing a subset of base table scans with delta scans.
+**Standard inclusion-exclusion:** For N tables, generates all non-empty subsets —
+2^N - 1 terms, each replacing a subset of base table scans with delta scans. Eligible
+regular-table projection SQL compiled for external engines has a separate
+[N-term path](operators/inner-join.md#regular-table-n-term-compilation).
 
 **N-term telescoping** (DuckLake): For N tables, generates exactly N terms:
 

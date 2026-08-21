@@ -37,15 +37,18 @@ clean.
 ### BILINEAR
 
 Linear in each input separately. The delta rule expands to multiple terms, each weighted
-by the **Z-set bilinear product** of leaf multiplicities times a **Möbius
-inclusion-exclusion sign**. For an N-table inner join, this is `2^N − 1` terms; for a
-DuckLake N-term telescoping join, it's exactly N.
+by the **Z-set bilinear product** of leaf multiplicities. The default current-state
+formulation uses a **Möbius inclusion-exclusion sign** and produces `2^N − 1` terms.
+N-term telescoping produces at most N terms by mixing current and reconstructed old states.
+OpenIVM uses telescoping for DuckLake joins and eligible regular-table refresh SQL compiled
+for external engines.
 
 | Operator | Delta rule |
 |---|---|
 | INNER JOIN, CROSS JOIN, arbitrary-predicate joins | `CompileJoinDelta` |
 | LEFT JOIN, RIGHT JOIN, FULL OUTER JOIN | `CompileJoinDelta` plus outer-join upsert paths |
 | DuckLake telescoping join | `BuildDuckLakeJoinTerms` |
+| Regular-table compile-only telescoping join | `BuildRegularJoinTerms` |
 
 See [`operators/inner-join.md`](../operators/inner-join.md) for the algebraic derivation
 of the combined-multiplicity formula.
@@ -76,10 +79,9 @@ every row in the partition.
 
 The rule kind is a **document-time invariant**: it tells you what cost to expect
 and what state OpenIVM has to maintain to keep the MV correct. It also gates the
-`append-only` optimisation (see [`optimizations/append-only.md`](../optimizations/append-only.md)) —
-LINEAR operators preserve insert-only semantics through the delta pipeline; BILINEAR
-joins do not (cross-terms produce negative weights via the Möbius sign), which is why
-the optimisation only fires for single-delta-table joins.
+`append-only` optimisation (see [`optimizations/append-only.md`](../optimizations/append-only.md)).
+LINEAR operators preserve insert-only semantics directly. For BILINEAR joins, safety
+depends on the selected join rule and whether its emitted delta contains negative weights.
 
 Adding a new operator should start with: pick the linearity class, then derive the
 delta rule that the class permits.

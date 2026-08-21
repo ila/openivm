@@ -82,8 +82,209 @@ SELECT count(*) FROM (
 0
 
 # ==========================================
-# Test 2: Concurrent refresh of SAME view — per-view mutex serializes them
-# Before the mutex fix, this caused TransactionContext Error: Conflict on tuple deletion
+# Test 1b: A writer transaction and a refresh spanning both source tables are
+# serialized at the database mutation boundary. The refresh waits, then
+# succeeds without a writer/refresh lock-order cycle.
+# ==========================================
+
+statement ok
+CREATE TABLE upgrade_gate_a (id INTEGER);
+
+statement ok
+CREATE TABLE upgrade_gate_b (id INTEGER);
+
+statement ok
+INSERT INTO upgrade_gate_a VALUES (1);
+
+statement ok
+INSERT INTO upgrade_gate_b VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW upgrade_gate_mv AS
+SELECT a.id AS a_id, b.id AS b_id
+FROM upgrade_gate_a a
+INNER JOIN upgrade_gate_b b ON true;
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=0
+statement ok
+INSERT INTO upgrade_gate_a VALUES (2);
+
+onlyif threadid=0
+statement ok
+SELECT sleep_ms(1500);
+
+onlyif threadid=0
+statement ok
+ROLLBACK;
+
+onlyif threadid=1
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=1
+statement ok
+INSERT INTO upgrade_gate_b VALUES (2);
+
+onlyif threadid=1
+statement ok
+SELECT sleep_ms(300);
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('upgrade_gate_mv');
+
+onlyif threadid=1
+statement ok
+ROLLBACK;
+
+endloop
+
+# ==========================================
+# Test 1c: Transactions retaining disjoint refreshes are serialized before
+# acquiring view/source locks, so extending either refresh cannot deadlock.
+# ==========================================
+
+statement ok
+CREATE TABLE refresh_cycle_a (id INTEGER);
+
+statement ok
+CREATE TABLE refresh_cycle_b (id INTEGER);
+
+statement ok
+INSERT INTO refresh_cycle_a VALUES (1);
+
+statement ok
+INSERT INTO refresh_cycle_b VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW refresh_cycle_a_mv AS SELECT * FROM refresh_cycle_a;
+
+statement ok
+CREATE MATERIALIZED VIEW refresh_cycle_a_alias_mv AS SELECT * FROM refresh_cycle_a;
+
+statement ok
+CREATE MATERIALIZED VIEW refresh_cycle_b_mv AS SELECT * FROM refresh_cycle_b;
+
+statement ok
+CREATE MATERIALIZED VIEW refresh_cycle_b_alias_mv AS SELECT * FROM refresh_cycle_b;
+
+statement ok
+CREATE SEQUENCE refresh_cycle_order;
+
+statement ok
+CREATE TABLE refresh_cycle_events (worker INTEGER, phase INTEGER, event_order BIGINT);
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=0
+statement ok
+PRAGMA refresh('refresh_cycle_a_mv');
+
+onlyif threadid=0
+statement ok
+INSERT INTO refresh_cycle_events VALUES (0, 1, nextval('refresh_cycle_order'));
+
+onlyif threadid=0
+statement ok
+PRAGMA refresh('refresh_cycle_b_alias_mv');
+
+onlyif threadid=0
+statement ok
+INSERT INTO refresh_cycle_events VALUES (0, 2, nextval('refresh_cycle_order'));
+
+onlyif threadid=0
+statement ok
+COMMIT;
+
+onlyif threadid=1
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('refresh_cycle_b_mv');
+
+onlyif threadid=1
+statement ok
+INSERT INTO refresh_cycle_events VALUES (1, 1, nextval('refresh_cycle_order'));
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('refresh_cycle_a_alias_mv');
+
+onlyif threadid=1
+statement ok
+INSERT INTO refresh_cycle_events VALUES (1, 2, nextval('refresh_cycle_order'));
+
+onlyif threadid=1
+statement ok
+COMMIT;
+
+endloop
+
+# Once one transaction passes its first refresh, it retains the mutation gate
+# through commit. Its two event sequence values must therefore be adjacent;
+# an interleaving value would prove that another context bypassed the gate.
+query II
+SELECT count(*), max(last_event)
+FROM (
+    SELECT worker, min(event_order) AS first_event, max(event_order) AS last_event
+    FROM refresh_cycle_events
+    GROUP BY worker
+    HAVING max(event_order) - min(event_order) = 1
+);
+----
+2	4
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM refresh_cycle_a_mv
+    EXCEPT ALL
+    SELECT * FROM refresh_cycle_a
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM refresh_cycle_a
+    EXCEPT ALL
+    SELECT * FROM refresh_cycle_a_mv
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM refresh_cycle_b_mv
+    EXCEPT ALL
+    SELECT * FROM refresh_cycle_b
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM refresh_cycle_b
+    EXCEPT ALL
+    SELECT * FROM refresh_cycle_b_mv
+);
+----
+0
+
+# ==========================================
+# Test 2: Concurrent refresh of SAME view — mutation gate serializes them
+# Before serialization, this caused TransactionContext Error: Conflict on tuple deletion
 # Now both threads wait their turn and the MV stays correct
 # ==========================================
 
@@ -100,7 +301,7 @@ CREATE MATERIALIZED VIEW mv_items AS
 statement ok
 INSERT INTO items SELECT i, i * 10 FROM range(101, 201) t(i);
 
-# Both threads refresh — per-view lock ensures only one runs at a time
+# Both threads refresh — the mutation gate ensures only one runs at a time
 concurrentloop threadid 0 2
 
 statement ok
@@ -299,6 +500,335 @@ SELECT count(*) FROM (
     SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM stress GROUP BY grp
     EXCEPT ALL
     SELECT grp, total, cnt FROM mv_stress
+);
+----
+0
+
+# ==========================================
+# Test 6: Refresh waits for an uncommitted delta-producing transaction.
+# Without the catalog-level lock, refresh can advance its timestamp cursor while
+# the delta row is invisible, then permanently skip that row after it commits.
+# ==========================================
+
+statement ok
+CREATE TABLE tx_refresh_race (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO tx_refresh_race VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_tx_refresh_race AS SELECT id, v FROM tx_refresh_race;
+
+statement ok
+CREATE TABLE tx_refresh_timing (phase VARCHAR, observed_at TIMESTAMP);
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=0
+statement ok
+INSERT INTO tx_refresh_race VALUES (2, 20);
+
+onlyif threadid=0
+statement ok
+SELECT sleep_ms(2000);
+
+onlyif threadid=0
+statement ok
+COMMIT;
+
+onlyif threadid=1
+statement ok
+SELECT sleep_ms(500);
+
+onlyif threadid=1
+statement ok
+INSERT INTO tx_refresh_timing VALUES ('before', now()::TIMESTAMP);
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('mv_tx_refresh_race');
+
+onlyif threadid=1
+statement ok
+INSERT INTO tx_refresh_timing VALUES ('after', now()::TIMESTAMP);
+
+endloop
+
+# Prove refresh began during the writer transaction and waited for its commit.
+query I
+SELECT epoch_ms(max(observed_at)) - epoch_ms(min(observed_at)) >= 1000
+FROM tx_refresh_timing;
+----
+true
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_tx_refresh_race
+    EXCEPT ALL
+    SELECT * FROM tx_refresh_race
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM tx_refresh_race
+    EXCEPT ALL
+    SELECT * FROM mv_tx_refresh_race
+);
+----
+0
+
+# ==========================================
+# Test 7: A child refresh must not advance past an uncommitted parent delta.
+# The sleep keeps the parent refresh transaction open while the child attempts
+# to consume openivm_delta_chain_lock_parent. Cascading is disabled so a missed
+# delta cannot be repaired by a later automatic child refresh.
+# ==========================================
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE chain_lock_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO chain_lock_src VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW chain_lock_parent AS
+    SELECT id, v FROM chain_lock_src WHERE sleep_ms(400) IS NULL;
+
+statement ok
+CREATE MATERIALIZED VIEW chain_lock_child AS
+    SELECT SUM(v) AS total FROM chain_lock_parent;
+
+statement ok
+INSERT INTO chain_lock_src VALUES (2, 20);
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+PRAGMA refresh('chain_lock_parent');
+
+onlyif threadid=1
+statement ok
+SELECT sleep_ms(150);
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('chain_lock_child');
+
+endloop
+
+query I
+SELECT count(*) FROM (
+    SELECT id, v FROM chain_lock_parent
+    EXCEPT ALL
+    SELECT id, v FROM chain_lock_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, v FROM chain_lock_src
+    EXCEPT ALL
+    SELECT id, v FROM chain_lock_parent
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT total FROM chain_lock_child
+    EXCEPT ALL
+    SELECT SUM(v) AS total FROM chain_lock_src
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT SUM(v) AS total FROM chain_lock_src
+    EXCEPT ALL
+    SELECT total FROM chain_lock_child
+);
+----
+0
+
+# ==========================================
+# Test 8: The coarse mutation lock deliberately serializes a writer and an
+# unrelated refresh in the same database. This keeps one lock order for the
+# low-concurrency deployment model and avoids cross-source cycles.
+# ==========================================
+
+statement ok
+CREATE TABLE scoped_gate_a (id INTEGER);
+
+statement ok
+CREATE TABLE scoped_gate_b (id INTEGER);
+
+statement ok
+INSERT INTO scoped_gate_a VALUES (1);
+
+statement ok
+INSERT INTO scoped_gate_b VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW scoped_gate_mv_a AS SELECT * FROM scoped_gate_a;
+
+statement ok
+CREATE MATERIALIZED VIEW scoped_gate_mv_b AS SELECT * FROM scoped_gate_b;
+
+statement ok
+INSERT INTO scoped_gate_b VALUES (2);
+
+statement ok
+CREATE TABLE scoped_gate_timing (phase VARCHAR, observed_at TIMESTAMP);
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=0
+statement ok
+INSERT INTO scoped_gate_a VALUES (2);
+
+onlyif threadid=0
+statement ok
+SELECT sleep_ms(2000);
+
+onlyif threadid=0
+statement ok
+COMMIT;
+
+onlyif threadid=0
+statement ok
+INSERT INTO scoped_gate_timing VALUES ('writer_committed', now()::TIMESTAMP);
+
+onlyif threadid=1
+statement ok
+SELECT sleep_ms(500);
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('scoped_gate_mv_b');
+
+onlyif threadid=1
+statement ok
+INSERT INTO scoped_gate_timing VALUES ('refresh_finished', now()::TIMESTAMP);
+
+endloop
+
+query I
+SELECT
+    max(observed_at) FILTER (phase = 'refresh_finished')
+    < max(observed_at) FILTER (phase = 'writer_committed')
+FROM scoped_gate_timing;
+----
+false
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scoped_gate_mv_b
+    EXCEPT ALL
+    SELECT * FROM scoped_gate_b
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM scoped_gate_b
+    EXCEPT ALL
+    SELECT * FROM scoped_gate_mv_b
+);
+----
+0
+
+# ==========================================
+# Test 9: A writer that already owns one source may extend its write set while
+# a multi-source refresh waits. Blocking the second write would deadlock:
+# refresh waits for the transaction holding A, while that transaction waits for
+# refresh's pending reservation on B.
+# ==========================================
+
+statement ok
+CREATE TABLE expanding_gate_a (id INTEGER);
+
+statement ok
+CREATE TABLE expanding_gate_b (id INTEGER);
+
+statement ok
+INSERT INTO expanding_gate_a VALUES (1);
+
+statement ok
+INSERT INTO expanding_gate_b VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW expanding_gate_mv AS
+SELECT a.id AS a_id, b.id AS b_id
+FROM expanding_gate_a a
+INNER JOIN expanding_gate_b b ON true;
+
+concurrentloop threadid 0 2
+
+onlyif threadid=0
+statement ok
+BEGIN TRANSACTION;
+
+onlyif threadid=0
+statement ok
+INSERT INTO expanding_gate_a VALUES (2);
+
+onlyif threadid=0
+statement ok
+SELECT sleep_ms(1200);
+
+onlyif threadid=0
+statement ok
+INSERT INTO expanding_gate_b VALUES (2);
+
+onlyif threadid=0
+statement ok
+COMMIT;
+
+onlyif threadid=1
+statement ok
+SELECT sleep_ms(300);
+
+onlyif threadid=1
+statement ok
+PRAGMA refresh('expanding_gate_mv');
+
+endloop
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM expanding_gate_mv
+    EXCEPT ALL
+    SELECT a.id AS a_id, b.id AS b_id
+    FROM expanding_gate_a a
+    INNER JOIN expanding_gate_b b ON true
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT a.id AS a_id, b.id AS b_id
+    FROM expanding_gate_a a
+    INNER JOIN expanding_gate_b b ON true
+    EXCEPT ALL
+    SELECT * FROM expanding_gate_mv
 );
 ----
 0

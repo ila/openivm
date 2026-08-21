@@ -104,6 +104,54 @@ FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_iop_empty.sql');
 ----
 1
 
+# A single-source view whose SQL text contains "join" must still use the
+# insert-only projection fast path; join presence comes from plan metadata, not
+# SQL string matching.
+statement ok
+CREATE TABLE iop_join_word_src(id INT);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_iop_join_word AS
+    SELECT id, 'join literal' AS label
+    FROM iop_join_word_src;
+
+query I
+SELECT has_join FROM openivm_views WHERE view_name = 'mv_iop_join_word';
+----
+false
+
+statement ok
+INSERT INTO iop_join_word_src VALUES (1), (2);
+
+statement ok
+PRAGMA refresh('mv_iop_join_word');
+
+query I
+SELECT CASE WHEN content LIKE '%generate_series(1, openivm_multiplicity::BIGINT)%'
+            AND content NOT LIKE '%DELETE FROM openivm_data_mv_iop_join_word%'
+       THEN 1 ELSE 0 END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_iop_join_word.sql');
+----
+1
+
+query I
+SELECT count(*) FROM (
+    SELECT id, 'join literal' AS label FROM iop_join_word_src
+    EXCEPT ALL
+    SELECT id, label FROM mv_iop_join_word
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, label FROM mv_iop_join_word
+    EXCEPT ALL
+    SELECT id, 'join literal' AS label FROM iop_join_word_src
+);
+----
+0
+
 # ==========================================
 # Test 2: insert-only refresh into a non-empty projection MV remains bag-equal.
 # ==========================================

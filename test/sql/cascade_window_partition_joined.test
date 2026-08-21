@@ -158,3 +158,660 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# ==========================================
+# Casted lookup keys: joined WINDOW_PARTITION affected-key lineage must
+# preserve casts from the join predicate. TPC-DI securities has this shape:
+# partition by a left-table key, and refresh after a right-table update through
+# CAST(left_key AS VARCHAR) = CAST(right_key AS VARCHAR).
+# ==========================================
+
+statement ok
+CREATE TABLE cwj_cast_security (
+    symbol VARCHAR,
+    cik BIGINT,
+    pts INT
+);
+
+statement ok
+CREATE TABLE cwj_cast_company (
+    company_id VARCHAR,
+    name VARCHAR,
+    rank_score INT
+);
+
+statement ok
+INSERT INTO cwj_cast_security VALUES
+    ('SYM_A', 100, 10),
+    ('SYM_A', 101, 20),
+    ('SYM_B', 200, 5);
+
+statement ok
+INSERT INTO cwj_cast_company VALUES
+    ('100', 'Acme', 1),
+    ('101', 'Beta', 5),
+    ('200', 'Solo', 3);
+
+statement ok
+CREATE MATERIALIZED VIEW cwj_cast_mv AS
+    SELECT s.symbol,
+           s.cik,
+           c.name AS company_name,
+           c.rank_score,
+           ROW_NUMBER() OVER (
+               PARTITION BY s.symbol
+               ORDER BY c.rank_score DESC NULLS LAST, s.pts DESC, s.cik
+           ) AS rn
+    FROM cwj_cast_security s
+    LEFT JOIN cwj_cast_company c
+      ON CAST(s.cik AS VARCHAR) = CAST(c.company_id AS VARCHAR);
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE
+       '%CAST%cik%AS VARCHAR%IN (SELECT DISTINCT %company_id%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cwj_cast_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+UPDATE cwj_cast_company
+SET rank_score = 9, name = 'Acme Updated'
+WHERE company_id = '100';
+
+statement ok
+PRAGMA refresh('cwj_cast_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT symbol, cik, company_name, rank_score, rn
+    FROM openivm_data_cwj_cast_mv
+    EXCEPT ALL
+    SELECT s.symbol,
+           s.cik,
+           c.name AS company_name,
+           c.rank_score,
+           ROW_NUMBER() OVER (
+               PARTITION BY s.symbol
+               ORDER BY c.rank_score DESC NULLS LAST, s.pts DESC, s.cik
+           ) AS rn
+    FROM cwj_cast_security s
+    LEFT JOIN cwj_cast_company c
+      ON CAST(s.cik AS VARCHAR) = CAST(c.company_id AS VARCHAR)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s.symbol,
+           s.cik,
+           c.name AS company_name,
+           c.rank_score,
+           ROW_NUMBER() OVER (
+               PARTITION BY s.symbol
+               ORDER BY c.rank_score DESC NULLS LAST, s.pts DESC, s.cik
+           ) AS rn
+    FROM cwj_cast_security s
+    LEFT JOIN cwj_cast_company c
+      ON CAST(s.cik AS VARCHAR) = CAST(c.company_id AS VARCHAR)
+    EXCEPT ALL
+    SELECT symbol, cik, company_name, rank_score, rn
+    FROM openivm_data_cwj_cast_mv
+);
+----
+0
+
+# Explicit non-VARCHAR casts must be preserved in lookup lineage.
+
+statement ok
+CREATE TABLE cwj_cast_int_security (
+    symbol VARCHAR,
+    key_txt VARCHAR,
+    pts INT
+);
+
+statement ok
+CREATE TABLE cwj_cast_int_company (
+    key_int INTEGER,
+    name VARCHAR,
+    rank_score INT
+);
+
+statement ok
+INSERT INTO cwj_cast_int_security VALUES
+    ('SYM_C', '0300', 10),
+    ('SYM_C', '301', 20),
+    ('SYM_D', '400', 5);
+
+statement ok
+INSERT INTO cwj_cast_int_company VALUES
+    (300, 'Cedar', 2),
+    (301, 'Delta', 6),
+    (400, 'Echo', 4);
+
+statement ok
+CREATE MATERIALIZED VIEW cwj_cast_int_mv AS
+    SELECT s.symbol,
+           s.key_txt,
+           c.name AS company_name,
+           c.rank_score,
+           ROW_NUMBER() OVER (
+               PARTITION BY s.symbol
+               ORDER BY c.rank_score DESC NULLS LAST, s.pts DESC, s.key_txt
+           ) AS rn
+    FROM cwj_cast_int_security s
+    LEFT JOIN cwj_cast_int_company c
+      ON CAST(s.key_txt AS INTEGER) = c.key_int;
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE
+       '%CAST%key_txt%AS INTEGER%IN (SELECT DISTINCT %key_int%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE
+       '%CAST%key_int%AS VARCHAR%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cwj_cast_int_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+UPDATE cwj_cast_int_company
+SET rank_score = 12, name = 'Cedar Updated'
+WHERE key_int = 300;
+
+statement ok
+PRAGMA refresh('cwj_cast_int_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT symbol, key_txt, company_name, rank_score, rn
+    FROM openivm_data_cwj_cast_int_mv
+    EXCEPT ALL
+    SELECT s.symbol,
+           s.key_txt,
+           c.name AS company_name,
+           c.rank_score,
+           ROW_NUMBER() OVER (
+               PARTITION BY s.symbol
+               ORDER BY c.rank_score DESC NULLS LAST, s.pts DESC, s.key_txt
+           ) AS rn
+    FROM cwj_cast_int_security s
+    LEFT JOIN cwj_cast_int_company c
+      ON CAST(s.key_txt AS INTEGER) = c.key_int
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s.symbol,
+           s.key_txt,
+           c.name AS company_name,
+           c.rank_score,
+           ROW_NUMBER() OVER (
+               PARTITION BY s.symbol
+               ORDER BY c.rank_score DESC NULLS LAST, s.pts DESC, s.key_txt
+           ) AS rn
+    FROM cwj_cast_int_security s
+    LEFT JOIN cwj_cast_int_company c
+      ON CAST(s.key_txt AS INTEGER) = c.key_int
+    EXCEPT ALL
+    SELECT symbol, key_txt, company_name, rank_score, rn
+    FROM openivm_data_cwj_cast_int_mv
+);
+----
+0
+
+# Simulate metadata written before lookup_cast was persisted. Because the raw
+# key types differ, refresh must fail closed to a full recompute rather than
+# inventing a VARCHAR comparison ('0300' must continue to match integer 300).
+statement ok
+UPDATE openivm_views
+SET lineage_json = regexp_replace(lineage_json, ',"lookup_cast":"INTEGER"', '', 'g')
+WHERE view_name = 'cwj_cast_int_mv';
+
+query I
+SELECT CASE WHEN
+       string_agg(lower(sql), ' ' ORDER BY stmt_order) LIKE
+       '%delete from %openivm_data_cwj_cast_int_mv%;%'
+   AND string_agg(lower(sql), ' ' ORDER BY stmt_order) LIKE
+       '%insert into %openivm_data_cwj_cast_int_mv%'
+   AND string_agg(lower(sql), ' ' ORDER BY stmt_order) NOT LIKE
+       '%cast%key_int%as varchar%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cwj_cast_int_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+UPDATE cwj_cast_int_company
+SET rank_score = 14, name = 'Cedar Legacy Updated'
+WHERE key_int = 300;
+
+statement ok
+PRAGMA refresh('cwj_cast_int_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT symbol, key_txt, company_name, rank_score, rn
+    FROM openivm_data_cwj_cast_int_mv
+    EXCEPT ALL
+    SELECT s.symbol,
+           s.key_txt,
+           c.name AS company_name,
+           c.rank_score,
+           ROW_NUMBER() OVER (
+               PARTITION BY s.symbol
+               ORDER BY c.rank_score DESC NULLS LAST, s.pts DESC, s.key_txt
+           ) AS rn
+    FROM cwj_cast_int_security s
+    LEFT JOIN cwj_cast_int_company c
+      ON CAST(s.key_txt AS INTEGER) = c.key_int
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s.symbol,
+           s.key_txt,
+           c.name AS company_name,
+           c.rank_score,
+           ROW_NUMBER() OVER (
+               PARTITION BY s.symbol
+               ORDER BY c.rank_score DESC NULLS LAST, s.pts DESC, s.key_txt
+           ) AS rn
+    FROM cwj_cast_int_security s
+    LEFT JOIN cwj_cast_int_company c
+      ON CAST(s.key_txt AS INTEGER) = c.key_int
+    EXCEPT ALL
+    SELECT symbol, key_txt, company_name, rank_score, rn
+    FROM openivm_data_cwj_cast_int_mv
+);
+----
+0
+
+# Inner-join equivalence through a casted join key must not add a raw direct
+# arm for the other side. Right-side changes should look up the partition key
+# from the partition-side table so the affected key keeps the MV partition type.
+
+statement ok
+CREATE TABLE cwj_inner_cast_l (
+    k BIGINT,
+    payload VARCHAR,
+    pts INT
+);
+
+statement ok
+CREATE TABLE cwj_inner_cast_r (
+    kstr VARCHAR,
+    score INT
+);
+
+statement ok
+INSERT INTO cwj_inner_cast_l VALUES
+    (10, 'left-a', 1),
+    (20, 'left-b', 2),
+    (30, 'left-c', 3);
+
+statement ok
+INSERT INTO cwj_inner_cast_r VALUES
+    ('10', 100),
+    ('20', 200),
+    ('30', 300);
+
+statement ok
+CREATE MATERIALIZED VIEW cwj_inner_cast_mv AS
+    SELECT l.k,
+           l.payload,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.k
+               ORDER BY r.score DESC, l.pts
+           ) AS rn
+    FROM cwj_inner_cast_l l
+    JOIN cwj_inner_cast_r r
+      ON CAST(l.k AS VARCHAR) = r.kstr;
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE
+       '%CAST%k%AS VARCHAR%IN (SELECT DISTINCT %kstr%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE
+       '%SELECT DISTINCT kstr AS k FROM %openivm_delta_cwj_inner_cast_r%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cwj_inner_cast_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+UPDATE cwj_inner_cast_r
+SET score = 125
+WHERE kstr = '10';
+
+statement ok
+PRAGMA refresh('cwj_inner_cast_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT k, payload, score, rn
+    FROM openivm_data_cwj_inner_cast_mv
+    EXCEPT ALL
+    SELECT l.k,
+           l.payload,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.k
+               ORDER BY r.score DESC, l.pts
+           ) AS rn
+    FROM cwj_inner_cast_l l
+    JOIN cwj_inner_cast_r r
+      ON CAST(l.k AS VARCHAR) = r.kstr
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.k,
+           l.payload,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.k
+               ORDER BY r.score DESC, l.pts
+           ) AS rn
+    FROM cwj_inner_cast_l l
+    JOIN cwj_inner_cast_r r
+      ON CAST(l.k AS VARCHAR) = r.kstr
+    EXCEPT ALL
+    SELECT k, payload, score, rn
+    FROM openivm_data_cwj_inner_cast_mv
+);
+----
+0
+
+# Nested CAST chains in a join key must be reproduced exactly in affected-key
+# lookup SQL. Collapsing this chain to its outer VARCHAR cast makes '0300' stop
+# matching '300' and leaves the window partition stale after a lookup update.
+statement ok
+CREATE TABLE cwj_nested_cast_left (
+    grp VARCHAR,
+    key_txt VARCHAR,
+    pts INTEGER
+);
+
+statement ok
+CREATE TABLE cwj_nested_cast_right (
+    key_txt VARCHAR,
+    score INTEGER
+);
+
+statement ok
+INSERT INTO cwj_nested_cast_left VALUES
+    ('nested', '0300', 1),
+    ('nested', '301', 2);
+
+statement ok
+INSERT INTO cwj_nested_cast_right VALUES
+    ('300', 3),
+    ('301', 8);
+
+statement ok
+CREATE MATERIALIZED VIEW cwj_nested_cast_mv AS
+    SELECT l.grp,
+           l.key_txt,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.grp
+               ORDER BY r.score DESC NULLS LAST, l.pts, l.key_txt
+           ) AS rn
+    FROM cwj_nested_cast_left l
+    LEFT JOIN cwj_nested_cast_right r
+      ON CAST(CAST(l.key_txt AS INTEGER) AS VARCHAR) = r.key_txt;
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE
+       '%CAST(CAST%key_txt%AS INTEGER) AS VARCHAR%IN (SELECT DISTINCT %key_txt%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cwj_nested_cast_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+UPDATE cwj_nested_cast_right
+SET score = 12
+WHERE key_txt = '300';
+
+statement ok
+PRAGMA refresh('cwj_nested_cast_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, key_txt, score, rn
+    FROM openivm_data_cwj_nested_cast_mv
+    EXCEPT ALL
+    SELECT l.grp,
+           l.key_txt,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.grp
+               ORDER BY r.score DESC NULLS LAST, l.pts, l.key_txt
+           ) AS rn
+    FROM cwj_nested_cast_left l
+    LEFT JOIN cwj_nested_cast_right r
+      ON CAST(CAST(l.key_txt AS INTEGER) AS VARCHAR) = r.key_txt
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp,
+           l.key_txt,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.grp
+               ORDER BY r.score DESC NULLS LAST, l.pts, l.key_txt
+           ) AS rn
+    FROM cwj_nested_cast_left l
+    LEFT JOIN cwj_nested_cast_right r
+      ON CAST(CAST(l.key_txt AS INTEGER) AS VARCHAR) = r.key_txt
+    EXCEPT ALL
+    SELECT grp, key_txt, score, rn
+    FROM openivm_data_cwj_nested_cast_mv
+);
+----
+0
+
+# Legacy self-join lineage can have a valid direct arm and an unsafe lookup arm
+# for the same physical source. The unsafe arm must invalidate the whole
+# affected-key program instead of being hidden by source-level coverage.
+statement ok
+CREATE TABLE cwj_legacy_self (
+    id INTEGER,
+    grp VARCHAR,
+    key_txt VARCHAR,
+    key_int INTEGER,
+    score INTEGER,
+    pts INTEGER
+);
+
+statement ok
+INSERT INTO cwj_legacy_self VALUES
+    (1, 'target', '0300', NULL, 0, 1),
+    (2, 'lookup', NULL, 300, 3, 2),
+    (3, 'target', '301', NULL, 0, 3),
+    (4, 'lookup', NULL, 301, 8, 4);
+
+statement ok
+CREATE MATERIALIZED VIEW cwj_legacy_self_mv AS
+    SELECT l.id,
+           l.grp,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.grp
+               ORDER BY r.score DESC NULLS LAST, l.pts, l.id
+           ) AS rn
+    FROM cwj_legacy_self l
+    LEFT JOIN cwj_legacy_self r
+      ON CAST(l.key_txt AS INTEGER) = r.key_int;
+
+statement ok
+UPDATE openivm_views
+SET lineage_json = regexp_replace(lineage_json, ',"lookup_cast":"INTEGER"', '', 'g')
+WHERE view_name = 'cwj_legacy_self_mv';
+
+query I
+SELECT COUNT(*)
+FROM openivm_compile_with_facts(
+    'cwj_legacy_self_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+WHERE stmt_kind = 'data'
+  AND lower(trim(sql)) = 'delete from openivm_data_cwj_legacy_self_mv;';
+----
+1
+
+statement ok
+UPDATE cwj_legacy_self SET score = 12 WHERE id = 2;
+
+statement ok
+PRAGMA refresh('cwj_legacy_self_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, grp, score, rn
+    FROM openivm_data_cwj_legacy_self_mv
+    EXCEPT ALL
+    SELECT l.id,
+           l.grp,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.grp
+               ORDER BY r.score DESC NULLS LAST, l.pts, l.id
+           ) AS rn
+    FROM cwj_legacy_self l
+    LEFT JOIN cwj_legacy_self r
+      ON CAST(l.key_txt AS INTEGER) = r.key_int
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.id,
+           l.grp,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.grp
+               ORDER BY r.score DESC NULLS LAST, l.pts, l.id
+           ) AS rn
+    FROM cwj_legacy_self l
+    LEFT JOIN cwj_legacy_self r
+      ON CAST(l.key_txt AS INTEGER) = r.key_int
+    EXCEPT ALL
+    SELECT id, grp, score, rn
+    FROM openivm_data_cwj_legacy_self_mv
+);
+----
+0
+
+# TRY_CAST is semantically distinct from CAST on malformed keys and must remain
+# present when the affected-key lookup expression is reconstructed.
+statement ok
+INSERT INTO cwj_nested_cast_left VALUES ('try', 'not-an-integer', 1);
+
+statement ok
+CREATE MATERIALIZED VIEW cwj_try_cast_mv AS
+    SELECT l.grp,
+           l.key_txt,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.grp
+               ORDER BY r.score DESC NULLS LAST, l.pts, l.key_txt
+           ) AS rn
+    FROM cwj_nested_cast_left l
+    LEFT JOIN cwj_nested_cast_right r
+      ON CAST(TRY_CAST(l.key_txt AS INTEGER) AS VARCHAR) = r.key_txt;
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE
+       '%CAST(TRY_CAST%key_txt%AS INTEGER) AS VARCHAR%IN (SELECT DISTINCT %key_txt%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'cwj_try_cast_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+UPDATE cwj_nested_cast_right
+SET score = 14
+WHERE key_txt = '300';
+
+statement ok
+PRAGMA refresh('cwj_try_cast_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, key_txt, score, rn
+    FROM openivm_data_cwj_try_cast_mv
+    EXCEPT ALL
+    SELECT l.grp,
+           l.key_txt,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.grp
+               ORDER BY r.score DESC NULLS LAST, l.pts, l.key_txt
+           ) AS rn
+    FROM cwj_nested_cast_left l
+    LEFT JOIN cwj_nested_cast_right r
+      ON CAST(TRY_CAST(l.key_txt AS INTEGER) AS VARCHAR) = r.key_txt
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT l.grp,
+           l.key_txt,
+           r.score,
+           ROW_NUMBER() OVER (
+               PARTITION BY l.grp
+               ORDER BY r.score DESC NULLS LAST, l.pts, l.key_txt
+           ) AS rn
+    FROM cwj_nested_cast_left l
+    LEFT JOIN cwj_nested_cast_right r
+      ON CAST(TRY_CAST(l.key_txt AS INTEGER) AS VARCHAR) = r.key_txt
+    EXCEPT ALL
+    SELECT grp, key_txt, score, rn
+    FROM openivm_data_cwj_try_cast_mv
+);
+----
+0
