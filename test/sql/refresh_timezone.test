@@ -1,0 +1,54 @@
+# name: test/sql/refresh_timezone.test
+# description: refresh watermarks use UTC independently of the session time zone
+# group: [sql]
+
+require openivm
+require icu
+
+# Delta capture uses UTC timestamps internally. Watermarks must use the same clock even when the
+# session time zone is non-UTC, otherwise the first refresh treats fresh deltas as hours old.
+statement ok
+SET TimeZone = 'Europe/Amsterdam';
+
+statement ok
+CREATE TABLE ddtz_parent(id INTEGER PRIMARY KEY, label VARCHAR);
+
+statement ok
+CREATE TABLE ddtz_child(id INTEGER PRIMARY KEY, parent_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO ddtz_parent VALUES (1, 'one');
+
+statement ok
+INSERT INTO ddtz_child VALUES (10, 1, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW ddtz_mv AS
+SELECT p.id, p.label, c.id AS child_id, c.amount
+FROM ddtz_parent p JOIN ddtz_child c ON p.id = c.parent_id;
+
+statement ok
+UPDATE ddtz_child SET amount = 30 WHERE id = 10;
+
+statement ok
+PRAGMA refresh('ddtz_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, label, child_id, amount FROM ddtz_mv
+    EXCEPT ALL
+    SELECT p.id, p.label, c.id, c.amount
+    FROM ddtz_parent p JOIN ddtz_child c ON p.id = c.parent_id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT p.id, p.label, c.id, c.amount
+    FROM ddtz_parent p JOIN ddtz_child c ON p.id = c.parent_id
+    EXCEPT ALL
+    SELECT id, label, child_id, amount FROM ddtz_mv
+);
+----
+0
