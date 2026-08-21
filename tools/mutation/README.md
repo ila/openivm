@@ -81,3 +81,12 @@ For a smaller overnight rotation, copy `mull.openivm.yml`, narrow
 `includePaths` to one OpenIVM directory, and set `MULL_CONFIG` to the copy. Keep
 DuckDB and `third_party/` excluded. Targeted SQL filters make subsystem runs
 substantially faster than the complete suite.
+
+## Reviewing survivors
+
+Use `mull-ignore` only after proving that a mutation cannot affect correctness.
+Put the reason beside the annotation and name the narrowest applicable mutator.
+Broad `mull-off` blocks are not used. Optimization thresholds and debug-only
+branches are reasonable suppressions; multiplicity arithmetic, masks, bounds,
+join classification, and other correctness logic must remain visible until a
+test kills the mutant or equivalence is demonstrated.

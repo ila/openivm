@@ -949,7 +949,11 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
 			status.insert_only_mask |= (1ULL << i); // empty is trivially insert-only
 			OPENIVM_DEBUG_PRINT("[DeltaJoin] Leaf %zu (%s) has empty delta\n", i, table_ref.get()->name.c_str());
 		} else {
+			// This threshold only decides whether to attempt a semantics-preserving key-domain probe.
+			// mull-ignore-next
 			int64_t tiny_limit = std::max<int64_t>(8, (base_count + 19) / 20);
+			// The inclusive boundary is a performance choice, not a correctness boundary.
+			// mull-ignore-next: cxx_boundary
 			if (total_count <= tiny_limit) {
 				status.tiny_mask |= (1ULL << i);
 			}
@@ -1342,7 +1346,9 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 	// declared (compile facts, or a trusted RELY_FK in the constraints cache).
 	bool has_compile_fk_facts = compile_only && !compile_facts.fk_relations.empty();
 	bool has_cache_fk = !has_compile_fk_facts && ConstraintCacheHasTrustedFk(context, leaves);
-	bool fk_pruning_worthwhile = has_compile_fk_facts || has_cache_fk || non_empty_leaf_count == 1;
+	// The one-leaf cutoff avoids catalog work; FK pruning remains semantically valid on either side of it.
+	bool fk_pruning_worthwhile =
+	    has_compile_fk_facts || has_cache_fk || non_empty_leaf_count == 1; // mull-ignore: cxx_eq_to_ne
 	if (fk_pruning_enabled && fk_pruning_worthwhile) {
 		auto fk_relations = has_compile_fk_facts
 		                        ? DetectCompileFactsFKRelations(compile_facts, leaves, input.plan.get())
@@ -1374,7 +1380,8 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 	// for tiny multi-source changes where the probe is cheap.
 	bool all_non_empty_deltas_are_tiny = non_empty_mask && ((non_empty_mask & ~delta_status.tiny_mask) == 0);
 	bool key_domain_probe_enabled =
-	    skip_empty_enabled && !has_left_join && (non_empty_leaf_count == 1 || all_non_empty_deltas_are_tiny);
+	    skip_empty_enabled && !has_left_join &&
+	    (non_empty_leaf_count == 1 || all_non_empty_deltas_are_tiny); // mull-ignore: cxx_eq_to_ne
 	if (key_domain_probe_enabled) {
 		unordered_map<uint64_t, JoinColumnRef> column_refs;
 		for (size_t i = 0; i < N; i++) {
@@ -1593,6 +1600,8 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 		projection->ResolveOperatorTypes();
 		terms.push_back(std::move(projection));
 	}
+	// This condition only suppresses an empty debug message; it cannot affect generated terms.
+	// mull-ignore-next
 	if (pruned_count > 0) {
 		OPENIVM_DEBUG_PRINT("[DeltaJoin] FK pruning: %lu/%lu terms pruned, %lu remaining\n",
 		                    (unsigned long)pruned_count, (unsigned long)total_terms, (unsigned long)terms.size());
