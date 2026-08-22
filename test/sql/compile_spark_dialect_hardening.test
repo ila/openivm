@@ -195,3 +195,140 @@ WHERE stmt_kind = 'data';
 
 statement ok
 SET openivm_refresh_mode = 'incremental';
+
+# ==========================================
+# Spark hardening for the reduced "arc_machine_status_transaction" shape: a
+# CTE (INNER JOIN + LEFT JOIN) feeding an outer query with two further
+# chained LEFT JOINs must still compile to a real incremental cascade delta
+# under target_dialect=spark, with a spark-portable (no `::`) cast and
+# backtick-quoted identifiers, and without dropping the `cust_key` column
+# from the final signed insert — the regression this shape covers is in
+# src/delta/operators/join.cpp's AppendMultiplicityToAncestorProjectionMaps,
+# not dialect-specific, but the original failure was first observed against
+# a spark-targeted compile.
+# ==========================================
+statement ok
+CREATE TABLE sph_arcm_msf(id INT, coll_key INT);
+
+statement ok
+CREATE TABLE sph_arcm_acd(coll_key INT, sub_id INT, arm_id VARCHAR);
+
+statement ok
+CREATE TABLE sph_arcm_hw(arm_id VARCHAR, provider VARCHAR);
+
+statement ok
+CREATE TABLE sph_arcm_tpid(sub_id INT, tp_id INT);
+
+statement ok
+CREATE TABLE sph_arcm_cust(tp_id INT, cust_key INT);
+
+statement ok
+INSERT INTO sph_arcm_msf VALUES (1, 100);
+
+statement ok
+INSERT INTO sph_arcm_acd VALUES (100, 10, 'arm-1');
+
+statement ok
+INSERT INTO sph_arcm_hw VALUES ('arm-1', 'azure');
+
+statement ok
+INSERT INTO sph_arcm_tpid VALUES (10, 200);
+
+statement ok
+INSERT INTO sph_arcm_cust VALUES (200, 21);
+
+statement ok
+CREATE MATERIALIZED VIEW sph_arcm_mv AS
+    WITH bff AS (
+        SELECT msf.id, acd.sub_id,
+               coalesce(hw.provider, 'N/A') AS provider
+        FROM sph_arcm_msf msf
+        INNER JOIN sph_arcm_acd acd ON msf.coll_key = acd.coll_key
+        LEFT JOIN sph_arcm_hw hw ON acd.arm_id = hw.arm_id
+    )
+    SELECT bff.id,
+           coalesce(cust.cust_key, 1) AS cust_key
+    FROM bff
+    LEFT JOIN sph_arcm_tpid tpid ON bff.sub_id = tpid.sub_id
+    LEFT JOIN sph_arcm_cust cust ON coalesce(tpid.tp_id, -1) = cust.tp_id;
+
+statement ok
+INSERT INTO sph_arcm_msf VALUES (2, 100);
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'sph_arcm_mv',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+2	SIMPLE_PROJECTION
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%::%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order)
+                  LIKE '%INSERT INTO openivm_delta_sph_arcm_mv (id, cust_key, openivm_multiplicity)%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_arcm_mv',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================
+# Spark hardening for the reduced "int_instance_status_transaction" shape: a
+# UNION ALL of two LEFT JOIN branches partitioned by an IS NOT NULL / IS NULL
+# predicate on the joined side must still compile cleanly under
+# target_dialect=spark without a stale child-alias reference leaking into the
+# emitted SQL (the failure this shape covers, fixed upstream in
+# `third_party/lpts` at commit 77ed5e5, surfaced as a Binder Error referencing
+# a column that no longer existed in the rewritten plan).
+# ==========================================
+statement ok
+CREATE TABLE sph_inti_isf(id INT, k INT);
+
+statement ok
+CREATE TABLE sph_inti_ml(k INT, res VARCHAR);
+
+statement ok
+INSERT INTO sph_inti_isf VALUES (1, 100), (2, 200);
+
+statement ok
+INSERT INTO sph_inti_ml VALUES (100, 'machine-1');
+
+statement ok
+CREATE MATERIALIZED VIEW sph_inti_mv AS
+    SELECT isf.id, isf.k FROM sph_inti_isf isf LEFT JOIN sph_inti_ml ml ON isf.k = ml.k WHERE ml.res IS NOT NULL
+    UNION ALL
+    SELECT isf.id, isf.k FROM sph_inti_isf isf LEFT JOIN sph_inti_ml ml ON isf.k = ml.k WHERE ml.res IS NULL;
+
+statement ok
+INSERT INTO sph_inti_isf VALUES (3, 300);
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'sph_inti_mv',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+2	SIMPLE_PROJECTION
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%::%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order)
+                  LIKE '%INSERT INTO openivm_delta_sph_inti_mv (id, k, openivm_left_key, openivm_multiplicity)%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_inti_mv',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
