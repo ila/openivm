@@ -834,20 +834,61 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 				if (mul_idx == DConstants::INVALID_INDEX) {
 					continue;
 				}
+				// Appending to this join's own left_projection_map grows its LEFT
+				// contribution width, which shifts the absolute position where its RIGHT
+				// contribution starts within its own combined GetColumnBindings(). A
+				// grandparent ancestor may already have a projection map entry referencing
+				// (by that now-stale absolute position) a column from this join's right
+				// side; left as-is, that entry would silently start pointing at the
+				// newly-inserted column instead, dropping the real column it used to
+				// select. Appending to right_projection_map never has this effect: right
+				// contributions are always placed last, so a new entry there only ever
+				// extends the combined output with a brand-new highest index.
+				idx_t old_width = proj_map.size();
+				auto shift_stale_parent_indexes = [&](idx_t added) {
+					if (child_side != 0 || added == 0 || depth == 0) {
+						return;
+					}
+					size_t parent_side = leaf_path[depth - 1];
+					auto *parent_join = dynamic_cast<LogicalJoin *>(ancestors[depth - 1]);
+					if (!parent_join || parent_side >= parent_join->children.size()) {
+						return;
+					}
+					auto &parent_map =
+					    (parent_side == 0) ? parent_join->left_projection_map : parent_join->right_projection_map;
+					for (auto &parent_idx : parent_map) {
+						if (parent_idx >= old_width) {
+							parent_idx += added;
+						}
+					}
+				};
 				if (preserve_full_child) {
 					idx_t projectable_count = MinValue<idx_t>(mul_idx + 1, child_bindings.size());
+					idx_t added = 0;
 					for (idx_t binding_idx = 0; binding_idx < projectable_count; binding_idx++) {
 						if (std::find(proj_map.begin(), proj_map.end(), binding_idx) != proj_map.end()) {
 							continue;
 						}
 						proj_map.push_back(binding_idx);
+						added++;
 						OPENIVM_DEBUG_PRINT("[%s] Preserved child col %lu in immediate %s proj_map\n", context_label,
 						                    (unsigned long)binding_idx, child_side == 0 ? "left" : "right");
 					}
-				} else if (std::find(proj_map.begin(), proj_map.end(), mul_idx) == proj_map.end()) {
-					proj_map.push_back(mul_idx);
-					OPENIVM_DEBUG_PRINT("[%s] Added mul col %lu to ancestor %s proj_map\n", context_label,
-					                    (unsigned long)mul_idx, child_side == 0 ? "left" : "right");
+					shift_stale_parent_indexes(added);
+				} else {
+					// proj_map entries are positions into the child's *current* combined
+					// GetColumnBindings(). Testing raw index membership of mul_idx against
+					// proj_map can alias onto an unrelated pre-existing entry that now shares
+					// the same numeric position after a deeper level's own map grew. Compare
+					// by column identity against what this ancestor currently exposes instead
+					// of trusting the raw index.
+					auto exposed = join->GetColumnBindings();
+					if (std::find(exposed.begin(), exposed.end(), mul_binding) == exposed.end()) {
+						proj_map.push_back(mul_idx);
+						shift_stale_parent_indexes(1);
+						OPENIVM_DEBUG_PRINT("[%s] Added mul col %lu to ancestor %s proj_map\n", context_label,
+						                    (unsigned long)mul_idx, child_side == 0 ? "left" : "right");
+					}
 				}
 				join->ResolveOperatorTypes();
 			}
@@ -1497,9 +1538,20 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 		for (size_t i = 0; i < N; i++) {
 			if (mask & (1ULL << i)) {
 				if (leaves[i].get) {
-					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, input.context.view);
+					// leaves[] was collected once on the ORIGINAL input.plan, before this
+					// mask's own renumber_and_rebind_subtree pass, so leaves[i].get is a
+					// stale pointer carrying the pre-renumbering table_index. The rest of
+					// `term` (join conditions, transitioning-key guards, etc.) was rebound
+					// to the FRESH per-term index, so the replacement delta node -- which
+					// reuses old_get->table_index verbatim -- must be built from term's own,
+					// already-renumbered GET at this leaf's (renumbering-invariant) path,
+					// not from leaves[i].get, or every reference elsewhere in `term` to this
+					// leaf's fresh index is left dangling.
+					auto &leaf_node_ref = GetNodeAtPath(term, leaves[i].path);
+					auto &term_local_get = leaf_node_ref->Cast<LogicalGet>();
+					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, &term_local_get, input.context.view);
 					mul_bindings.push_back(delta_i.mul_binding);
-					GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
+					leaf_node_ref = std::move(delta_i.node);
 					UpdateParentProjectionMap(term, leaves[i], delta_i.mul_binding);
 				} else {
 					auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
