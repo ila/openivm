@@ -20,7 +20,7 @@ PRAGMA refresh('user_orders');
 
 ## How IVM handles it
 
-**Algebraic rule (Möbius inclusion-exclusion over Z-sets):**
+**Default algebraic rule (Möbius inclusion-exclusion over Z-sets):**
 
 For a two-table join R ⨝ S, with current bases pointing at `R_now = R_old + ΔR` and `S_now = S_old + ΔS` (deltas already merged into the source by the insert rule):
 
@@ -40,7 +40,9 @@ combined_w = (-1)^(k-1) × ∏ wᵢ      over leaves i in the mask
 
 This is *not* the textbook DBSP all-positive delta-join formula, which would apply if non-delta legs read `R_old` instead of `R_now`. OpenIVM chose to read `R_now` because the insert rule has already committed the delta rows to the source — see `src/delta/operators/join.cpp` for the inclusion-exclusion implementation and term-pruning logic.
 
-The same rule is used for `INNER JOIN`, `CROSS JOIN`, and DuckDB's arbitrary-predicate join plan (`LOGICAL_ANY_JOIN`). A cross product is just the same join with no predicate. Non-equality predicates are kept in the generated join terms.
+This is the default rule for `INNER JOIN`, `CROSS JOIN`, and DuckDB's
+arbitrary-predicate join plan (`LOGICAL_ANY_JOIN`). A cross product is the same join
+without a predicate. Non-equality predicates are preserved in the generated terms.
 
 The maximum supported join width is 16 tables.
 
@@ -77,6 +79,48 @@ SELECT name, amount, mul FROM union_13;
 ```
 
 The join result is a projection, so the upsert uses [counting-based consolidation](projection-filter.md).
+
+## Regular-table N-term compilation
+
+When OpenIVM compiles refresh SQL for an external engine, eligible regular-table joins
+use an N-term telescoping rule. For a join over N leaves, the compiler emits at most N
+terms instead of 2^N − 1:
+
+```
+Term 0: delta(T0)   join T1_old      join T2_old      join ... join T(N-1)_old
+Term 1: T0_current  join delta(T1)   join T2_old      join ... join T(N-1)_old
+Term 2: T0_current  join T1_current  join delta(T2)   join ... join T(N-1)_old
+...
+Term N-1: T0_current join T1_current join T2_current  join ... join delta(T(N-1))
+```
+
+Regular tables do not provide snapshot time travel to the OpenIVM compiler. It therefore
+represents each old-state input as a Z-set difference:
+
+```
+T_old = T_current + (-delta(T))
+```
+
+An external engine adapter can replace this canonical expression with a native old-state
+scan or another equivalent implementation. Leaves marked `UNCHANGED` in compile facts do
+not receive a delta term and do not require old-state reconstruction.
+
+The regular N-term path applies only when all of these conditions hold:
+
+- OpenIVM is compiling SQL for an external engine (`compile_only`).
+- The materialized view is a `SIMPLE_PROJECTION`.
+- The join tree contains only inner joins, cross joins, or arbitrary inner predicates.
+- Every leaf is a supported table scan or transparent single-input projection.
+- FK-aware pruning would not remove inclusion-exclusion terms.
+
+OpenIVM keeps inclusion-exclusion for outer joins, aggregates, unsupported leaf shapes,
+normal in-process refreshes, and cases where FK pruning produces a smaller plan.
+
+Disable regular-table N-term compilation with:
+
+```sql
+SET openivm_regular_nterm = false;
+```
 
 ## DuckLake tables
 

@@ -45,9 +45,10 @@ Condition 2 depends on the join rule used:
 |---|---|---|
 | No join (projection, filter, single-table aggregate) | Always | Multiplicity passes through directly from base delta |
 | DuckLake join (any number of tables) | Always | [N-term telescoping](../ducklake.md#n-term-telescoping-join-rule) uses one delta per term with no inclusion-exclusion cross-terms |
-| Standard join, one table changed | Yes | Other deltas are empty, so no cross-terms fire |
-| Standard join, self-join (one delta table) | No | Both join leaves reference the same delta, so cross-terms always fire |
-| Standard join, 2+ tables changed | No | Inclusion-exclusion cross-terms produce negative-weight rows for `k=2, 4, …` mask sizes |
+| Standard inclusion-exclusion join, one table changed | Yes | Other deltas are empty, so no cross-terms fire |
+| Standard inclusion-exclusion self-join (one delta table) | No | Both join leaves reference the same delta, so cross-terms always fire |
+| Standard inclusion-exclusion join, 2+ tables changed | No | Cross-terms produce negative-weight rows for `k=2, 4, …` mask sizes |
+| Regular-table N-term compilation | Adapter-dependent | The canonical `current - delta` old-state expression contains negative helper weights. The external adapter must replace it with an equivalent old-state scan or otherwise prove that the output delta is insert-only. |
 
 ### Why standard joins with multiple changes are unsafe
 
@@ -59,6 +60,11 @@ the |mask|=1 terms introduce — but it would be lost if the DELETE phase is ski
 
 DuckLake's N-term telescoping avoids this by reading the **old** state (via `AT VERSION`)
 for non-delta sides, so there is no double-counting and no Möbius sign needed.
+
+[Regular-table N-term compilation](../operators/inner-join.md#regular-table-n-term-compilation)
+also removes exponential cross-terms. Its portable SQL reconstructs old state as
+`current - delta`, so an external adapter decides whether the resulting refresh qualifies
+for the append-only fast path.
 
 ## Detection
 
