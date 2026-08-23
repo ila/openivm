@@ -332,3 +332,123 @@ FROM openivm_compile_with_facts(
 WHERE stmt_kind = 'data';
 ----
 1
+
+# ==========================================
+# Spark hardening for the "bounded HUGEINT" canary: a plain (non-aggregate)
+# projection that widens a BIGINT to HUGEINT via COALESCE(CAST(...), 0) must
+# still compile to a real incremental cascade delta under
+# target_dialect=spark. Before `third_party/lpts` was advanced to commit
+# 754c797 ("Fix bounded Spark HUGEINT and UNION aliases"), rendering ANY cast
+# to HUGEINT unconditionally raised LPTS_UNSUPPORTED_TYPE for Spark, even
+# when the source type (BIGINT here) provably fits within Spark's
+# DECIMAL(38,0); the fix maps a provably-bounded HUGEINT cast/literal to
+# DECIMAL(38,0) instead of failing the compile. Note a literal
+# COALESCE(SUM(...), 0) is classified GROUP_RECOMPUTE by OpenIVM (bypassing
+# LPTS entirely, echoing native SQL), so this canary uses an equivalent
+# non-aggregate COALESCE(CAST(... AS HUGEINT), 0) shape that is classified
+# SIMPLE_PROJECTION and does go through LPTS.
+# ==========================================
+statement ok
+CREATE TABLE sph_hugeint_src(id INT, amount BIGINT);
+
+statement ok
+INSERT INTO sph_hugeint_src VALUES (1, 5000000000), (2, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW sph_hugeint_mv AS
+    SELECT id, COALESCE(CAST(amount AS HUGEINT), 0) AS wide_amount
+    FROM sph_hugeint_src;
+
+statement ok
+INSERT INTO sph_hugeint_src VALUES (3, 2000000000);
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'sph_hugeint_mv',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+2	SIMPLE_PROJECTION
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DECIMAL(38,0)%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '% HUGEINT%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_hugeint_mv',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================
+# Spark hardening for the "machine-status left-deep UNION" canary: a literal
+# three-way (left-deep) UNION ALL of LEFT JOIN branches, each partitioned by a
+# mutually exclusive predicate on the joined side, must still compile to a
+# real incremental cascade delta under target_dialect=spark, correctly
+# binding every column -- including the trailing duplicated
+# `openivm_left_key`/`openivm_multiplicity` output columns -- at every level
+# of the left-deep chain (internally: a nested union node whose own union is
+# itself one arm of a further union, e.g. `(A UNION ALL B) UNION ALL C`).
+# This is upstream `third_party/lpts` commit 754c797's second fix ("retain
+# trailing rewritten UNION bindings as aliases of their physical multiplicity
+# output"); unlike the two-way `sph_inti_mv` shape above, this exercises an
+# actual left-deep union chain, matching the shape of LPTS's own
+# `test/sql/union.test` regression (a left-deep "machine status" UNION ALL
+# carrying duplicated key/multiplicity output columns).
+# ==========================================
+statement ok
+CREATE TABLE sph_ms_terms(event_time INT, machine_arm_id VARCHAR, customer_key INT);
+
+statement ok
+CREATE TABLE sph_ms_status(machine_arm_id VARCHAR, status_label VARCHAR);
+
+statement ok
+INSERT INTO sph_ms_terms VALUES (10, 'arm-1', 1), (20, 'arm-2', 6);
+
+statement ok
+INSERT INTO sph_ms_status VALUES ('arm-1', 'active');
+
+statement ok
+CREATE MATERIALIZED VIEW sph_ms_mv AS
+    SELECT t.event_time, t.machine_arm_id, t.customer_key
+    FROM sph_ms_terms t LEFT JOIN sph_ms_status s ON t.machine_arm_id = s.machine_arm_id
+    WHERE s.status_label = 'active'
+    UNION ALL
+    SELECT t.event_time, t.machine_arm_id, t.customer_key
+    FROM sph_ms_terms t LEFT JOIN sph_ms_status s ON t.machine_arm_id = s.machine_arm_id
+    WHERE s.status_label = 'inactive'
+    UNION ALL
+    SELECT t.event_time, t.machine_arm_id, t.customer_key
+    FROM sph_ms_terms t LEFT JOIN sph_ms_status s ON t.machine_arm_id = s.machine_arm_id
+    WHERE s.status_label IS NULL;
+
+statement ok
+INSERT INTO sph_ms_terms VALUES (30, 'arm-3', 11);
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'sph_ms_mv',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+2	SIMPLE_PROJECTION
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%::%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order)
+                  LIKE '%INSERT INTO openivm_delta_sph_ms_mv (event_time, machine_arm_id, customer_key, openivm_left_key, openivm_multiplicity)%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%UNION ALL%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'sph_ms_mv',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
