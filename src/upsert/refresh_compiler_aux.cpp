@@ -1600,7 +1600,11 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               bool running_window_incremental) {
 	bool have_affected_keys = !affected_keys_sql.empty();
 	if (!have_affected_keys && (partition_columns.empty() || partition_delta_specs.empty())) {
-		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
+		// No PARTITION BY (global surrogate-key window) or no partition key resolvable in any
+		// source delta table → nothing to scope the recompute to. Keep the cascade delta the
+		// caller asked for so downstream MVs stay incremental.
+		return emit_cascade_delta ? CompileFullRecomputeWithCascadeDelta(view_name, view_query_sql, catalog_prefix)
+		                          : CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
 	}
 	if (running_window_incremental) {
 		auto suffix_sql = BuildRunningWindowSuffixRefreshSQL(view_name, view_query_sql, delta_ts_filter, catalog_prefix,

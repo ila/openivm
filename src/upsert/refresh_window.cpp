@@ -577,6 +577,9 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	if (any_ducklake) {
 		OPENIVM_DEBUG_PRINT(
 		    "[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake, full recompute fallback)\n");
+		if (emit_cascade_delta) {
+			return CompileFullRecomputeWithCascadeDelta(view_name, view_query_sql, internal_catalog_prefix);
+		}
 		return "DELETE FROM " + data_table + ";\n" + "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 	}
 	auto lineage_result = BuildLineageStandardAffectedKeysSQL(
@@ -585,7 +588,9 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	if (lineage_result == LineageAffectedKeysResult::UNSAFE) {
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage is unsafe for '%s' — full recompute fallback\n",
 		                    view_name.c_str());
-		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix);
+		return emit_cascade_delta
+		           ? CompileFullRecomputeWithCascadeDelta(view_name, view_query_sql, internal_catalog_prefix)
+		           : CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix);
 	}
 	have_lineage_affected_keys = lineage_result == LineageAffectedKeysResult::AVAILABLE;
 	if (!have_lineage_affected_keys && delta_table_names.size() > 1 &&
@@ -593,7 +598,9 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION lineage incomplete for '%s' (%zu sources) — full recompute "
 		                    "fallback\n",
 		                    view_name.c_str(), delta_table_names.size());
-		return CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix);
+		return emit_cascade_delta
+		           ? CompileFullRecomputeWithCascadeDelta(view_name, view_query_sql, internal_catalog_prefix)
+		           : CompileFullRecompute(view_name, view_query_sql, internal_catalog_prefix);
 	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (%zu partition cols, lineage keys: %s)\n",
 	                    partition_cols.size(), have_lineage_affected_keys ? "yes" : "no");
