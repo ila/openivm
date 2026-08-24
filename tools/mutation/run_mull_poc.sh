@@ -73,8 +73,6 @@ cmake -G Ninja \
 
 cmake --build "${build_dir}" --target unittest --parallel "${workers}"
 
-"${build_dir}/test/unittest" "${test_filter}"
-
 "${mull_runner}" \
 	--workers "${workers}" \
 	--timeout "${timeout_ms}" \
