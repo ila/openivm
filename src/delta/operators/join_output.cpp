@@ -42,11 +42,12 @@ unique_ptr<LogicalOperator> AssembleJoinUnionAll(vector<unique_ptr<LogicalOperat
 ColumnBinding ReplaceJoinOutputBindings(const vector<ColumnBinding> &original_bindings,
                                         unique_ptr<LogicalOperator> &result, LogicalOperator &root) {
 	auto union_bindings = result->GetColumnBindings();
-	if (union_bindings.size() < 2) {
-		throw InternalException("Join rewrite produced too few bindings (%zu)", union_bindings.size());
+	if (union_bindings.size() != original_bindings.size() + 1) {
+		throw InternalException("Join rewrite produced %zu bindings for %zu original columns and multiplicity",
+		                        union_bindings.size(), original_bindings.size());
 	}
 	ColumnBindingReplacer replacer;
-	idx_t map_count = std::min(original_bindings.size(), union_bindings.size() - 1);
+	const idx_t map_count = original_bindings.size();
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Binding replacement: %zu mappings (original=%zu, union=%zu)\n", map_count,
 	                    original_bindings.size(), union_bindings.size());
 	for (idx_t col_idx = 0; col_idx < map_count; ++col_idx) {
