@@ -1,0 +1,16 @@
+mutators:
+  - cxx_arithmetic
+  - cxx_comparison
+  - cxx_boundary
+  - cxx_logical
+
+includePaths:
+  - ".*/src/delta/delta_compiler\\.cpp$"
+
+excludePaths:
+  - ".*/duckdb/.*"
+  - ".*/third_party/.*"
+
+parallelization:
+  workers: 4
+  executionWorkers: 4
