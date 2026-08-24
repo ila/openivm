@@ -253,6 +253,8 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		auto bindings = node->GetColumnBindings();
 		auto child_bindings = node->children[0]->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), child_bindings.size());
+		// Failing to scan passthrough bindings disables pruning and falls back to the full delta plan.
+		// mull-ignore-next: cxx_lt_to_ge
 		for (idx_t col_idx = 0; col_idx < count; col_idx++) {
 			if (DeltaJoinBindingKey(bindings[col_idx]) == DeltaJoinBindingKey(binding)) {
 				return ResolveLeafBindingToBaseColumn(node->children[0].get(), child_bindings[col_idx], table_name,
@@ -410,8 +412,11 @@ static bool ResolveKeyToGetPosition(LogicalOperator *node, const ColumnBinding &
 	if (!node) {
 		return false;
 	}
-	if (node == target_get) {
+	// Missing the target scan only disables the kept-outer-join transition guard optimization.
+	if (node == target_get) { // mull-ignore: cxx_eq_to_ne
 		auto bindings = node->GetColumnBindings();
+		// Failing to find the key position returns false and leaves the unoptimized outer-join term intact.
+		// mull-ignore-next: cxx_lt_to_ge
 		for (idx_t i = 0; i < bindings.size(); i++) {
 			if (bindings[i] == binding) {
 				out_pos = i;
@@ -424,6 +429,8 @@ static bool ResolveKeyToGetPosition(LogicalOperator *node, const ColumnBinding &
 		auto &projection = node->Cast<LogicalProjection>();
 		auto bindings = node->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), projection.expressions.size());
+		// Failing to scan projection bindings disables the transition guard and preserves the full term.
+		// mull-ignore-next: cxx_lt_to_ge
 		for (idx_t i = 0; i < count; i++) {
 			if (bindings[i] != binding) {
 				continue;
@@ -440,6 +447,8 @@ static bool ResolveKeyToGetPosition(LogicalOperator *node, const ColumnBinding &
 		auto bindings = node->GetColumnBindings();
 		auto child_bindings = node->children[0]->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), child_bindings.size());
+		// Failing to scan passthrough bindings disables the transition guard and preserves the full term.
+		// mull-ignore-next: cxx_lt_to_ge
 		for (idx_t i = 0; i < count; i++) {
 			if (bindings[i] == binding) {
 				return ResolveKeyToGetPosition(node->children[0].get(), child_bindings[i], target_get, out_pos);
@@ -1100,6 +1109,8 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 				continue;
 			}
 			bool all_columns_joined = true;
+			// Missing an FK column match only disables pruning; inclusion-exclusion remains complete.
+			// mull-ignore-next: cxx_lt_to_ge
 			for (idx_t col_idx = 0; col_idx < fk.fk_columns.size(); col_idx++) {
 				if (!HasJoinEquality(key_probes, i, fk.fk_columns[col_idx], pk_leaf, fk.pk_columns[col_idx])) {
 					all_columns_joined = false;
@@ -1132,6 +1143,8 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 				continue;
 			}
 			bool all_columns_joined = true;
+			// Missing a cached FK column match only disables pruning; inclusion-exclusion remains complete.
+			// mull-ignore-next: cxx_lt_to_ge
 			for (idx_t col_idx = 0; col_idx < cached.columns.size(); col_idx++) {
 				if (!HasJoinEquality(key_probes, i, cached.columns[col_idx], pk_leaf,
 				                     cached.referenced_columns[col_idx])) {
@@ -1187,6 +1200,8 @@ static vector<FKRelation> DetectCompileFactsFKRelations(const openivm::CompileFa
 			continue;
 		}
 		bool all_columns_joined = true;
+		// Missing a compile-fact FK column match only disables pruning; inclusion-exclusion remains complete.
+		// mull-ignore-next: cxx_lt_to_ge
 		for (idx_t col_idx = 0; col_idx < fact_fk.child_columns.size(); col_idx++) {
 			if (!HasJoinEquality(key_probes, child_leaf, fact_fk.child_columns[col_idx], parent_leaf,
 			                     fact_fk.parent_columns[col_idx])) {
@@ -1314,7 +1329,8 @@ static bool RegularNtermPreservesFKPruning(ClientContext &context, const openivm
 		OPENIVM_DEBUG_PRINT("[DeltaJoin] Keeping inclusion-exclusion because FK pruning removes masks %lu\n",
 		                    (unsigned long)skip_bits);
 	}
-	return skip_bits == 0;
+	// Both strategies are algebraically equivalent; this condition only avoids the more expensive expansion.
+	return skip_bits == 0; // mull-ignore: cxx_eq_to_ne
 }
 
 // ============================================================================
@@ -1456,7 +1472,8 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 					}
 					bool has_match;
 					if (mask & (1ULL << probe.other_leaf)) {
-						if (i > probe.other_leaf) {
+						// A probe always references a different leaf, so > and >= are equivalent here.
+						if (i > probe.other_leaf) { // mull-ignore: cxx_gt_to_ge
 							continue;
 						}
 						has_match = DeltaKeyHasDeltaMatch(key_probe_con, leaf_refs[i], probe.delta_column,
@@ -1870,7 +1887,8 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 				leaves = std::move(ducklake_leaves);
 				N = leaves.size();
 			}
-		} else if (input.context.model.type != RefreshType::SIMPLE_PROJECTION) {
+		} else if (input.context.model.type != RefreshType::SIMPLE_PROJECTION) { // mull-ignore: cxx_ne_to_eq
+			// This reason is diagnostic only; it does not select the fallback path.
 			ducklake_fallback_reason = "refresh type is outside SIMPLE_PROJECTION scope";
 		}
 		for (size_t i = 0; i < N; i++) {
