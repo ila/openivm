@@ -97,6 +97,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `openivm_regular_nterm` | BOOLEAN | `true` | Use N-term telescoping for eligible regular-table inner joins compiled for external engines | [Inner join](docs/operators/inner-join.md#regular-table-n-term-compilation) |
 | `openivm_profile_refresh` | BOOLEAN | `false` | Record per-step refresh timings in `openivm_refresh_profile` | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files | [Internals](docs/internals/delta-tables.md) |
+| `openivm_input_dialect` | VARCHAR | `duckdb` | Dialect of incoming `CREATE MATERIALIZED VIEW` bodies (e.g. `spark` for `VERSION AS OF`) | [Parser](docs/internals/parser.md#input-dialect) |
 
 
 ## Pragmas

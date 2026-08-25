@@ -8,6 +8,7 @@
 #include "core/refresh_daemon.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
+#include "core/time_travel_pins.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh.hpp"
@@ -127,6 +128,7 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 	Parser parser;
 	parser.ParseQuery(view_query);
 	auto statement = parser.statements[0].get();
+	duckdb::openivm::TimeTravelPins::PeelForLocalBinding(context, *statement);
 	Planner planner(context);
 	planner.CreatePlan(statement->Copy());
 	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] Plan:\n%s\n", planner.plan->ToString().c_str());
@@ -205,6 +207,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_emit_spark_hints",
 	                             "emit Spark optimizer hints in target_dialect=spark compiled refresh SQL",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption(duckdb::OPENIVM_INPUT_DIALECT_SETTING,
+	                             "SQL dialect materialized-view bodies are written in: duckdb (default) or spark",
+	                             LogicalType::VARCHAR, Value("duckdb"), duckdb::SetOpenIvmInputDialect);
 	db_config.AddExtensionOption("openivm_skip_aggregate_delete",
 	                             "skip zero-row DELETE for grouped aggregates when deltas are insert-only",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
