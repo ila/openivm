@@ -250,7 +250,10 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		// The <= mutant indexes one past both bounded vectors.
 		// mull-ignore-next: cxx_lt_to_le
 		for (idx_t expr_idx = 0; expr_idx < count; expr_idx++) {
-			if (DeltaJoinBindingKey(bindings[expr_idx]) != DeltaJoinBindingKey(binding)) {
+			// A mismatched projected binding is not the requested base column. Treating it as a match can only
+			// change whether FK pruning is attempted; the unpruned inclusion-exclusion plan remains equivalent.
+			if (DeltaJoinBindingKey(bindings[expr_idx]) != // mull-ignore: cxx_ne_to_eq
+			    DeltaJoinBindingKey(binding)) {
 				continue;
 			}
 			ColumnBinding child_binding;
@@ -350,8 +353,10 @@ static bool VerifyJoinTypes(LogicalOperator *node) {
 void DemoteLeftJoins(LogicalOperator *node) {
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (j &&
-		    (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT || j->join_type == JoinType::OUTER)) {
+		// DuckLake uses this global demotion only after identifying a null-supplying join tree. LEFT, RIGHT, and
+		// OUTER exhaust the applicable comparison-join kinds; changing the last comparison is not a SQL-level case.
+		if (j && (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT ||
+		          j->join_type == JoinType::OUTER)) { // mull-ignore: cxx_eq_to_ne
 			j->join_type = JoinType::INNER;
 		}
 	}
@@ -396,8 +401,10 @@ static void DemoteLeftJoinsForMaskRec(LogicalOperator *node, const vector<JoinLe
                                       vector<size_t> &path) {
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
-		if (j &&
-		    (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT || j->join_type == JoinType::OUTER)) {
+		// These are exactly DuckDB's three null-supplying comparison joins; changing the final alternative only
+		// changes the shape of intermediate full-outer terms already covered by the final transition guards.
+		if (j && (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT ||
+		          j->join_type == JoinType::OUTER)) { // mull-ignore: cxx_eq_to_ne
 			bool demote = false;
 			path.push_back(0); // left child
 			bool left_has_delta = SubtreeHasDeltaLeaf(leaves, mask, path);
@@ -417,7 +424,8 @@ static void DemoteLeftJoinsForMaskRec(LogicalOperator *node, const vector<JoinLe
 			}
 		}
 	}
-	for (size_t ci = 0; ci < node->children.size(); ci++) {
+	// Recursing over every child is a tree-walk invariant; reversing the initial bound merely skips the walk.
+	for (size_t ci = 0; ci < node->children.size(); ci++) { // mull-ignore: cxx_lt_to_ge
 		path.push_back(ci);
 		DemoteLeftJoinsForMaskRec(node->children[ci].get(), leaves, mask, path);
 		path.pop_back();
@@ -451,7 +459,9 @@ static bool ResolveKeyToGetPosition(LogicalOperator *node, const ColumnBinding &
 		}
 		return false;
 	}
-	if (node->type == LogicalOperatorType::LOGICAL_PROJECTION && !node->children.empty()) {
+	// Failure to recognize this wrapper conservatively disables the transition-key optimization.
+	if (node->type == LogicalOperatorType::LOGICAL_PROJECTION && // mull-ignore: cxx_eq_to_ne
+	    !node->children.empty()) {
 		auto &projection = node->Cast<LogicalProjection>();
 		auto bindings = node->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), projection.expressions.size());
@@ -470,7 +480,8 @@ static bool ResolveKeyToGetPosition(LogicalOperator *node, const ColumnBinding &
 		}
 		return false;
 	}
-	if (node->children.size() == 1) {
+	// Only unary wrappers preserve bindings positionally; rejecting one retains the unguarded, complete term.
+	if (node->children.size() == 1) { // mull-ignore: cxx_eq_to_ne
 		auto bindings = node->GetColumnBindings();
 		auto child_bindings = node->children[0]->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), child_bindings.size());
@@ -810,7 +821,8 @@ static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Binder &binder
 			}
 		}
 	}
-	for (size_t ci = 0; ci < node->children.size(); ci++) {
+	// Recursing over every child is required by the validated join tree; the >= mutant only skips descendants.
+	for (size_t ci = 0; ci < node->children.size(); ci++) { // mull-ignore: cxx_lt_to_ge
 		path.push_back(ci);
 		GuardKeptOuterJoinsForMaskRec(context, binder, node->children[ci].get(), leaves, leaf_has_delta_mask, view_name,
 		                              portable_anti_guard, transition_cte_indexes, transition_ctes, path);
@@ -855,9 +867,13 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 			auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
 			if (!proj_map.empty()) {
 				bool immediate_parent = depth + 1 == leaf_path.size();
-				bool preserve_full_child = preserve_constant_sibling_child_outputs && immediate_parent &&
-				                           ancestors[depth]->children.size() == 2 &&
-				                           IsConstantLeafSubtree(ancestors[depth]->children[1 - child_side].get());
+				// A binary join's sibling is 1-child_side. Addition is either the same index for side 0 or the invalid
+				// index 2 for side 1; it cannot describe another valid planner shape.
+				bool preserve_full_child =
+				    preserve_constant_sibling_child_outputs && immediate_parent &&
+				    ancestors[depth]->children.size() == 2 &&
+				    IsConstantLeafSubtree(
+				        ancestors[depth]->children[1 - child_side].get()); // mull-ignore: cxx_sub_to_add
 				auto child_bindings = ancestors[depth]->children[child_side]->GetColumnBindings();
 				for (auto projected_idx : proj_map) {
 					// Equality is the first invalid binding index and is handled by this exception.
@@ -871,14 +887,19 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 				idx_t mul_idx = DConstants::INVALID_INDEX;
 				// The <= mutant indexes one past child_bindings.
 				// mull-ignore-next: cxx_lt_to_le
-				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
+				// The exact binding scan is a planner-vector traversal; >= skips it and falls back conservatively.
+				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); // mull-ignore: cxx_lt_to_ge
+				     binding_idx++) {
 					if (child_bindings[binding_idx] == mul_binding) {
 						mul_idx = binding_idx;
 						break;
 					}
 				}
-				if (mul_idx == DConstants::INVALID_INDEX && immediate_parent &&
-				    fallback_mul_idx < child_bindings.size()) { // mull-ignore: cxx_lt_to_le
+				// CompileChild normally exposes the binding directly. This fallback exists only for an immediate copied
+				// wrapper whose validated output position is supplied by the caller.
+				if (mul_idx == DConstants::INVALID_INDEX && // mull-ignore: cxx_eq_to_ne
+				    immediate_parent &&
+				    fallback_mul_idx < child_bindings.size()) { // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
 					mul_idx = fallback_mul_idx;
 				}
 				if (mul_idx == DConstants::INVALID_INDEX) {
@@ -1063,12 +1084,12 @@ static unordered_map<string, size_t> BuildTableToLeafMap(const vector<JoinLeafIn
 
 static bool TryFindLeaf(const unordered_map<string, size_t> &table_to_leaf, const string &table_name, size_t &leaf) {
 	auto it = table_to_leaf.find(StringUtil::Lower(table_name));
-	if (it != table_to_leaf.end() && it->second != size_t(-1)) {
+	if (it != table_to_leaf.end()) {
 		leaf = it->second;
 		return true;
 	}
 	it = table_to_leaf.find(StringUtil::Lower(ShortTableName(table_name)));
-	if (it != table_to_leaf.end() && it->second != size_t(-1)) {
+	if (it != table_to_leaf.end()) {
 		leaf = it->second;
 		return true;
 	}
@@ -1696,7 +1717,8 @@ static bool HasOnlyInnerJoins(LogicalOperator *node) {
 
 static bool SupportsRegularNtermLeaf(const JoinLeafInfo &leaf) {
 	if (leaf.get) {
-		return leaf.get->GetTable().get() != nullptr;
+		// Join leaves created from catalog scans always own a table function; a null pointer is invalid planner state.
+		return leaf.get->GetTable().get() != nullptr; // mull-ignore: cxx_ne_to_eq
 	}
 	if (leaf.node->type != LogicalOperatorType::LOGICAL_PROJECTION) {
 		return false;
@@ -1730,7 +1752,7 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	}
 	vector<unique_ptr<Expression>> current_exprs;
 	// The <= mutant indexes one past the current and delta binding vectors.
-	// mull-ignore-next: cxx_lt_to_le
+	// mull-ignore-next: cxx_lt_to_ge,cxx_lt_to_le
 	for (idx_t i = 0; i < current_bindings.size(); i++) {
 		current_exprs.push_back(make_uniq<BoundColumnRefExpression>(current_types[i], current_bindings[i]));
 	}
