@@ -812,10 +812,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// their refresh program as SQL text instead, which the pins never reach — those would ship to
 	// the target engine reading the latest snapshot rather than the pinned one. Every exit is
 	// therefore finalized here: scans that already carry their qualifier are left untouched, and a
-	// dialect with no time-travel syntax still refuses through LPTS.
+	// dialect with no time-travel syntax still refuses through LPTS. DuckDB output runs against this
+	// catalog, which holds no snapshots, so there the pin is stripped instead of translated.
 	auto finalize_refresh_sql = [&](string refresh_sql) {
-		if (view_time_travel_pins.Empty() || active_facts.target_dialect == SqlDialect::DUCKDB) {
+		if (view_time_travel_pins.Empty()) {
 			return refresh_sql;
+		}
+		if (active_facts.target_dialect == SqlDialect::DUCKDB) {
+			return view_time_travel_pins.StripFrom(refresh_sql);
 		}
 		return view_time_travel_pins.RestoreIntoSql(refresh_sql, active_facts.target_dialect);
 	};

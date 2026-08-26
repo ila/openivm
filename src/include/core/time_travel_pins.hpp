@@ -58,9 +58,11 @@ public:
 	// in already-rendered `sql`. Refresh programs for several view shapes (min/max aggregates,
 	// group recompute, interrupted-refresh recovery, ...) are assembled as SQL text rather than
 	// through the AST, so `RestoreInto` never sees them; without this they would ship to the target
-	// engine reading the latest snapshot instead of the pinned one. Scans that already carry the
-	// qualifier are left alone, so it is safe to run over AST-rendered SQL as well. Throws through
-	// LPTS for dialects with no verified time-travel syntax rather than emitting an unpinned scan.
+	// engine reading the latest snapshot instead of the pinned one. A raw DuckDB `AT (...)` left on
+	// such a scan is replaced rather than duplicated, and scans that already carry the qualifier in
+	// the target spelling are left alone, so it is safe to run over AST-rendered SQL as well. Throws
+	// through LPTS for dialects with no verified time-travel syntax rather than emitting an unpinned
+	// scan.
 	string RestoreIntoSql(const string &sql, SqlDialect dialect) const;
 
 private:

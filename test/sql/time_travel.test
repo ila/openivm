@@ -482,6 +482,188 @@ statement ok
 UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'tt_join';
 
 # ==========================================
+# Text-carried pins: the qualifier is translated in place, never duplicated
+# ==========================================
+#
+# A body LPTS cannot serialize keeps its pin in the normalized text, where DuckDB spells it *after*
+# the alias (`t p AT (VERSION => 366)`). Every other dialect wants the pin directly behind the
+# relation, so the raw clause has to be replaced rather than left standing next to a translated one:
+# `t VERSION AS OF 366 p AT (VERSION => 366)` is not valid anywhere.
+
+# An unpinned relation of its own, so the set operation that forces the fallback never scans a
+# pinned relation unpinned (which would be refused as ambiguous instead).
+statement ok
+CREATE TABLE tt_regions(region VARCHAR);
+
+statement ok
+INSERT INTO tt_regions VALUES ('us'), ('eu');
+
+statement ok
+CREATE MATERIALIZED VIEW tt_text_join AS
+    SELECT c.region AS region, SUM(o.amount) AS total
+    FROM tt_orders VERSION AS OF 366 o
+    JOIN tt_customers VERSION AS OF 12 c ON o.c_id = c.c_id
+    WHERE c.region IN (SELECT region FROM tt_regions EXCEPT SELECT region FROM tt_regions WHERE region = 'zz')
+    GROUP BY c.region;
+
+query II
+SELECT region, total FROM tt_text_join ORDER BY region;
+----
+eu	20
+us	18
+
+# The stored SQL is the text shape: alias between the relation and its qualifier, one per relation.
+query I
+SELECT CASE WHEN sql_string LIKE '%tt_orders o AT (VERSION => 366)%'
+             AND sql_string LIKE '%tt_customers c AT (VERSION => 12)%'
+            THEN 1 ELSE 0 END
+FROM openivm_views WHERE view_name = 'tt_text_join';
+----
+1
+
+statement ok
+CREATE MATERIALIZED VIEW tt_text_comma AS
+    SELECT c.region AS region, MIN(o.amount) AS lo, MAX(o.amount) AS hi
+    FROM tt_orders VERSION AS OF 366 o, tt_customers VERSION AS OF 12 c
+    WHERE o.c_id = c.c_id
+      AND c.region IN (SELECT region FROM tt_regions EXCEPT SELECT region FROM tt_regions WHERE region = 'zz')
+    GROUP BY c.region;
+
+query III
+SELECT region, lo, hi FROM tt_text_comma ORDER BY region;
+----
+eu	20	20
+us	3	10
+
+statement ok
+INSERT INTO tt_orders VALUES (6, 2, 4);
+
+# Ordinary incremental/group-recompute output for Spark: both relations pinned in Spark spelling,
+# aliases intact, and no DuckDB qualifier left behind on either.
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders% VERSION AS OF 366%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers% VERSION AS OF 12%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('tt_text_comma', '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind = 'data';
+----
+1
+
+# Compiling the same view twice must produce the same SQL: translating a pin is idempotent.
+query I
+SELECT CASE WHEN (SELECT string_agg(sql, ' ' ORDER BY stmt_order)
+                  FROM openivm_compile_with_facts('tt_text_comma', '{"target_dialect":"spark","compile_only":true}')
+                  WHERE stmt_kind = 'data') =
+                 (SELECT string_agg(sql, ' ' ORDER BY stmt_order)
+                  FROM openivm_compile_with_facts('tt_text_comma', '{"target_dialect":"spark","compile_only":true}')
+                  WHERE stmt_kind = 'data')
+            THEN 1 ELSE 0 END;
+----
+1
+
+statement ok
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_join';
+
+statement ok
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_comma';
+
+# Interrupted-refresh recovery recomputes from the stored text, so this is where a raw qualifier
+# would survive: an explicit JOIN keeps one pin per side...
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 o%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 c%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('tt_text_join', '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind = 'data';
+----
+1
+
+# ... and so does a comma FROM list, where every implicit cross join is a scan of its own.
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 o, %'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 c %'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('tt_text_comma', '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind = 'data';
+----
+1
+
+# A dialect with no verified time-travel syntax still refuses rather than dropping the qualifier.
+statement error
+SELECT sql FROM openivm_compile_with_facts('tt_text_comma', '{"target_dialect":"postgres","compile_only":true}');
+----
+LPTS_UNSUPPORTED_TIME_TRAVEL
+
+# DuckDB output executes against this catalog, which holds no snapshots, so recovery drops the
+# qualifier entirely instead of handing the binder syntax it cannot resolve.
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%VERSION AS OF%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('tt_text_join', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+PRAGMA refresh('tt_text_join');
+
+statement ok
+PRAGMA refresh('tt_text_comma');
+
+query II
+SELECT region, total FROM tt_text_join ORDER BY region;
+----
+eu	24
+us	18
+
+query III
+SELECT region, lo, hi FROM tt_text_comma ORDER BY region;
+----
+eu	4	20
+us	3	10
+
+# A body whose CTE shadows the pinned relation still ends up with a pin on every scan of that
+# relation and no raw qualifier anywhere: source qualification resolves the shadowed name against
+# the catalog, and a name the query binds itself is never handed a qualifier it cannot carry.
+statement ok
+CREATE TABLE tt_spare(c_id INT, amount INT);
+
+statement ok
+CREATE MATERIALIZED VIEW tt_text_shadow AS
+    WITH tt_orders AS (
+        SELECT c_id, amount FROM tt_orders VERSION AS OF 366
+        EXCEPT ALL
+        SELECT c_id, amount FROM tt_spare
+    )
+    SELECT c_id, SUM(amount) AS total FROM tt_orders GROUP BY c_id;
+
+statement ok
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_shadow';
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%VERSION AS OF 366 VERSION AS OF%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('tt_text_shadow', '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+PRAGMA refresh('tt_text_shadow');
+
+query II
+SELECT c_id, total FROM tt_text_shadow ORDER BY c_id;
+----
+1	18
+2	24
+
+# ==========================================
 # Unpinned views are untouched by the Spark input dialect
 # ==========================================
 

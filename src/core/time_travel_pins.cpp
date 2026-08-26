@@ -470,10 +470,22 @@ string TimeTravelPins::StripFrom(const string &sql) const {
 	return result;
 }
 
+// Words that may legally follow a table reference; none of them can be a bare alias.
+static bool CanBeBareAlias(const string &token) {
+	// DuckDB's `alias_clause` takes a `ColId`: plain identifiers plus the unreserved and column-name
+	// keywords, but not the reserved or type/function ones. So `WHERE`, `JOIN` and `NATURAL` end the
+	// relation instead of naming it.
+	auto category = Parser::IsKeyword(StringUtil::Lower(token));
+	return category != KeywordCategory::KEYWORD_RESERVED && category != KeywordCategory::KEYWORD_TYPE_FUNC;
+}
+
 // Copy the `[catalog.][schema.]relation` chain starting at `sql[start]` into `result`, honouring
-// quoted components, and report the unquoted final component — the relation name pins are keyed by.
-static idx_t CopyQualifiedIdentifierChain(const string &sql, idx_t start, string &result, string &final_component) {
+// quoted components. Reports the unquoted final component — the relation name pins are keyed by —
+// and whether the chain carried a catalog/schema prefix, which a CTE reference never does.
+static idx_t CopyQualifiedIdentifierChain(const string &sql, idx_t start, string &result, string &final_component,
+                                          bool &qualified) {
 	idx_t i = start;
+	qualified = false;
 	while (true) {
 		if (i < sql.size() && (sql[i] == '"' || sql[i] == '`')) {
 			idx_t quoted_start = result.size();
@@ -493,6 +505,7 @@ static idx_t CopyQualifiedIdentifierChain(const string &sql, idx_t start, string
 		if (i < sql.size() && sql[i] == '.') {
 			result += '.';
 			i++;
+			qualified = true;
 			continue;
 		}
 		break;
@@ -541,15 +554,151 @@ static string DialectPinSuffix(const string &at_suffix, SqlDialect dialect) {
 	return dialect_suffix;
 }
 
+// Advance past whitespace and comments so a qualifier written behind either is still found.
+static idx_t SkipIgnorableSpan(const string &sql, idx_t pos) {
+	while (pos < sql.size()) {
+		if (std::isspace(static_cast<unsigned char>(sql[pos]))) {
+			pos++;
+			continue;
+		}
+		if (sql[pos] == '-' && pos + 1 < sql.size() && sql[pos + 1] == '-') {
+			auto newline = sql.find('\n', pos);
+			pos = newline == string::npos ? sql.size() : newline + 1;
+			continue;
+		}
+		if (sql[pos] == '/' && pos + 1 < sql.size() && sql[pos + 1] == '*') {
+			auto close = sql.find("*/", pos + 2);
+			pos = close == string::npos ? sql.size() : close + 2;
+			continue;
+		}
+		break;
+	}
+	return pos;
+}
+
+// Read a raw DuckDB `AT (...)` qualifier belonging to the relation that ends at `pos`. Bodies that
+// never reach the AST keep their pin in normalized text, where DuckDB spells it *after* the alias
+// (`t AS p AT (VERSION => 366)`); every other dialect wants it directly behind the relation. The
+// alias text in between is handed back verbatim so it can be re-emitted after the translated pin,
+// and `end` reports where the raw clause stops so the caller drops it instead of keeping both.
+static bool TryReadRawPinAfterRelation(const string &sql, idx_t pos, string &alias_text, idx_t &end) {
+	string buffer;
+	idx_t cursor = pos;
+	// `[AS] alias` is at most two tokens, so the qualifier has to appear within three.
+	for (idx_t token_index = 0; token_index < 3; token_index++) {
+		idx_t token_start = SkipIgnorableSpan(sql, cursor);
+		idx_t token_end;
+		string token;
+		if (token_start < sql.size() && (sql[token_start] == '"' || sql[token_start] == '`')) {
+			token_end = CopyQuotedRun(sql, token_start, token);
+		} else if (!TryReadIdentifierToken(sql, token_start, token_end, token)) {
+			return false;
+		}
+		if (StringUtil::CIEquals(token, "at")) {
+			idx_t paren = SkipIgnorableSpan(sql, token_end);
+			if (paren >= sql.size() || sql[paren] != '(') {
+				return false;
+			}
+			auto close = MatchingParen(sql, paren);
+			if (close == DConstants::INVALID_INDEX) {
+				return false;
+			}
+			alias_text = buffer;
+			end = close;
+			return true;
+		}
+		if (!StringUtil::CIEquals(token, "as") && !CanBeBareAlias(token)) {
+			return false;
+		}
+		buffer.append(sql, cursor, token_end - cursor);
+		cursor = token_end;
+	}
+	return false;
+}
+
+// Words that close a FROM list, so a comma past them separates something other than relations.
+static bool EndsFromList(const string &token) {
+	static const char *const TERMINATORS[] = {"where",  "group",     "having", "qualify", "window",    "order",
+	                                          "limit",  "offset",    "union",  "except",  "intersect", "select",
+	                                          "values", "returning", "set",    "insert",  "update",    "delete"};
+	for (auto terminator : TERMINATORS) {
+		if (StringUtil::CIEquals(token, terminator)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Names a `WITH` clause binds in `sql`. A CTE reference is a name, not a scan, so it must never be
+// handed a snapshot qualifier even when it shadows a pinned relation.
+static case_insensitive_set_t CollectCteNames(const string &sql) {
+	case_insensitive_set_t names;
+	string candidate;
+	idx_t i = 0;
+	while (i < sql.size()) {
+		char c = sql[i];
+		if (c == '\'') {
+			string ignored;
+			i = CopyQuotedRun(sql, i, ignored);
+			candidate.clear();
+			continue;
+		}
+		if (c == '"' || c == '`') {
+			string quoted;
+			i = CopyQuotedRun(sql, i, quoted);
+			candidate = quoted.size() >= 2 ? quoted.substr(1, quoted.size() - 2) : quoted;
+			continue;
+		}
+		if (IsIdentifierStart(c)) {
+			idx_t end = i;
+			while (end < sql.size() && IsIdentifierPart(sql[end])) {
+				end++;
+			}
+			auto token = sql.substr(i, end - i);
+			i = end;
+			if (!StringUtil::CIEquals(token, "as")) {
+				candidate = token;
+				continue;
+			}
+			// `name AS (`, `name (columns) AS (` and `name AS [NOT] MATERIALIZED (` all define a CTE;
+			// nothing else puts a parenthesis directly behind `AS`.
+			idx_t cursor = SkipIgnorableSpan(sql, i);
+			for (idx_t modifiers = 0; modifiers < 2; modifiers++) {
+				idx_t keyword_end;
+				string keyword;
+				if (!TryReadIdentifierToken(sql, cursor, keyword_end, keyword) ||
+				    (!StringUtil::CIEquals(keyword, "not") && !StringUtil::CIEquals(keyword, "materialized"))) {
+					break;
+				}
+				cursor = SkipIgnorableSpan(sql, keyword_end);
+			}
+			if (cursor < sql.size() && sql[cursor] == '(' && !candidate.empty()) {
+				names.insert(candidate);
+			}
+			continue;
+		}
+		// A column-alias list sits between the CTE name and its `AS`, so parentheses keep the name.
+		if (c != '(' && c != ')' && !std::isspace(static_cast<unsigned char>(c))) {
+			candidate.clear();
+		}
+		i++;
+	}
+	return names;
+}
+
 string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) const {
 	if (pins.empty()) {
 		return sql;
 	}
 	string result;
 	result.reserve(sql.size());
-	// Only a relation directly behind FROM or JOIN is a scan; anything else naming the relation is a
-	// column reference, a delta/metadata table or a literal, none of which take a pin.
+	// Only a relation directly behind FROM, JOIN or a FROM-list comma is a scan; anything else naming
+	// the relation is a column reference, a delta/metadata table or a literal, none of which take a
+	// pin. Each parenthesis nests its own FROM list so a subquery never leaks the enclosing one.
 	bool expect_relation = false;
+	vector<bool> from_list_open;
+	from_list_open.push_back(false);
+	auto cte_names = CollectCteNames(sql);
 	idx_t i = 0;
 	while (i < sql.size()) {
 		char c = sql[i];
@@ -573,30 +722,64 @@ string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) con
 		}
 		if (IsIdentifierStart(c) || c == '"' || c == '`') {
 			string final_component;
-			i = CopyQualifiedIdentifierChain(sql, i, result, final_component);
+			bool qualified;
+			i = CopyQualifiedIdentifierChain(sql, i, result, final_component, qualified);
 			if (expect_relation) {
-				auto entry = pins.find(final_component);
-				if (entry != pins.end()) {
-					auto dialect_suffix = DialectPinSuffix(entry->second.suffix, dialect);
-					if (!CarriesQualifierAt(sql, i, dialect_suffix)) {
-						result += dialect_suffix;
-						OPENIVM_DEBUG_PRINT("[TIME TRAVEL] Restored pin '%s' onto rendered scan of '%s'\n",
-						                    dialect_suffix.c_str(), final_component.c_str());
-					}
-				}
 				expect_relation = false;
+				auto entry = pins.find(final_component);
+				if (entry == pins.end()) {
+					continue;
+				}
+				auto dialect_suffix = DialectPinSuffix(entry->second.suffix, dialect);
+				if (CarriesQualifierAt(sql, i, dialect_suffix)) {
+					continue;
+				}
+				string alias_text;
+				idx_t raw_pin_end;
+				bool carries_raw_pin = TryReadRawPinAfterRelation(sql, i, alias_text, raw_pin_end);
+				if (!carries_raw_pin && !qualified && cte_names.find(final_component) != cte_names.end()) {
+					// A bare name this query itself binds: the scan it stands for was pinned where the
+					// CTE was defined, and only a real relation can carry a qualifier.
+					continue;
+				}
+				if (carries_raw_pin) {
+					i = raw_pin_end;
+				}
+				result += dialect_suffix;
+				result += alias_text;
+				OPENIVM_DEBUG_PRINT("[TIME TRAVEL] Restored pin '%s' onto rendered scan of '%s'\n",
+				                    dialect_suffix.c_str(), final_component.c_str());
 				continue;
 			}
-			expect_relation =
-			    StringUtil::CIEquals(final_component, "from") || StringUtil::CIEquals(final_component, "join");
+			if (StringUtil::CIEquals(final_component, "from")) {
+				expect_relation = true;
+				from_list_open.back() = true;
+			} else if (StringUtil::CIEquals(final_component, "join")) {
+				expect_relation = true;
+			} else if (EndsFromList(final_component)) {
+				from_list_open.back() = false;
+			}
 			continue;
 		}
 		result += c;
-		// A comma continues a FROM list; anything else that is not whitespace ends the table position.
-		if (c != ',' && !std::isspace(static_cast<unsigned char>(c))) {
+		i++;
+		if (c == '(') {
+			from_list_open.push_back(false);
+			expect_relation = false;
+		} else if (c == ')') {
+			if (from_list_open.size() > 1) {
+				from_list_open.pop_back();
+			}
+			expect_relation = false;
+		} else if (c == ',') {
+			// An implicit cross join: the next relation is a scan of its own and needs its own pin.
+			expect_relation = from_list_open.back();
+		} else if (c == ';') {
+			from_list_open.assign(1, false);
+			expect_relation = false;
+		} else if (!std::isspace(static_cast<unsigned char>(c))) {
 			expect_relation = false;
 		}
-		i++;
 	}
 	return result;
 }
@@ -618,15 +801,6 @@ static string NormalizeQualifierText(const string &qualifier) {
 		normalized += c;
 	}
 	return normalized;
-}
-
-// Words that may legally follow a table reference; none of them can be a bare alias.
-static bool CanBeBareAlias(const string &token) {
-	// DuckDB's `alias_clause` takes a `ColId`: plain identifiers plus the unreserved and column-name
-	// keywords, but not the reserved or type/function ones. So `WHERE`, `JOIN` and `NATURAL` end the
-	// relation instead of naming it.
-	auto category = Parser::IsKeyword(StringUtil::Lower(token));
-	return category != KeywordCategory::KEYWORD_RESERVED && category != KeywordCategory::KEYWORD_TYPE_FUNC;
 }
 
 // Map a Spark/Delta temporal keyword at `pos` to the DuckDB `AT (...)` parameter carrying the same
