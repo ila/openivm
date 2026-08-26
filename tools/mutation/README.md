@@ -31,6 +31,9 @@ tools/mutation/run_mull_poc.sh
 The initial DuckDB build is the expensive part. Subsequent campaigns reuse the
 same `build/mutation` tree.
 
+Campaigns fail when mutants survive. Set `MUTATION_ALLOW_SURVIVING=1` only for
+an exploratory classification run where a nonzero mutation score is expected.
+
 OpenIVM is compiled at `-O1`: its normal optimized build folds two C++11
 `static constexpr` daemon values that become ODR-used at `-O0`. This retains a
 useful LLVM mutation pipeline without adding production definitions solely for

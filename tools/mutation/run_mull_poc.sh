@@ -9,6 +9,7 @@ report_name=${MUTATION_REPORT_NAME:-openivm-join-poc}
 test_filter=${MUTATION_TEST_FILTER:-test/sql/inner_join.test}
 workers=${MUTATION_WORKERS:-4}
 timeout_ms=${MUTATION_TIMEOUT_MS:-120000}
+allow_surviving=${MUTATION_ALLOW_SURVIVING:-0}
 config_path=${MULL_CONFIG:-"${project_dir}/tools/mutation/mull.join.yml"}
 log_path=${MUTATION_LOG_PATH:-"${report_dir}/${report_name}.log"}
 
@@ -73,16 +74,19 @@ cmake -G Ninja \
 
 cmake --build "${build_dir}" --target unittest --parallel "${workers}"
 
-"${mull_runner}" \
-	--workers "${workers}" \
-	--timeout "${timeout_ms}" \
-	--allow-surviving \
-	--reporters IDE \
-	--reporters SQLite \
-	--report-dir "${report_dir}" \
-	--report-name "${report_name}" \
-	"${build_dir}/test/unittest" \
-	"${test_filter}"
+mull_args=(
+	--workers "${workers}"
+	--timeout "${timeout_ms}"
+	--reporters IDE
+	--reporters SQLite
+	--report-dir "${report_dir}"
+	--report-name "${report_name}"
+)
+if [[ "${allow_surviving}" == "1" ]]; then
+	mull_args+=(--allow-surviving)
+fi
+
+"${mull_runner}" "${mull_args[@]}" "${build_dir}/test/unittest" "${test_filter}"
 
 echo "Mutation report: ${report_dir}/${report_name}.sqlite"
 echo "Progress log: ${log_path}"

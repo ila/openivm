@@ -250,10 +250,7 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		// The <= mutant indexes one past both bounded vectors.
 		// mull-ignore-next: cxx_lt_to_le
 		for (idx_t expr_idx = 0; expr_idx < count; expr_idx++) {
-			// A mismatched projected binding is not the requested base column. Treating it as a match can only
-			// change whether FK pruning is attempted; the unpruned inclusion-exclusion plan remains equivalent.
-			if (DeltaJoinBindingKey(bindings[expr_idx]) != // mull-ignore: cxx_ne_to_eq
-			    DeltaJoinBindingKey(binding)) {
+			if (DeltaJoinBindingKey(bindings[expr_idx]) != DeltaJoinBindingKey(binding)) {
 				continue;
 			}
 			ColumnBinding child_binding;
@@ -445,8 +442,7 @@ static bool ResolveKeyToGetPosition(LogicalOperator *node, const ColumnBinding &
 	if (!node) {
 		return false;
 	}
-	// Missing the target scan only disables the kept-outer-join transition guard optimization.
-	if (node == target_get) { // mull-ignore: cxx_eq_to_ne
+	if (node == target_get) {
 		auto bindings = node->GetColumnBindings();
 		// Failing to find the key position returns false and leaves the unoptimized outer-join term intact.
 		// The <= mutant indexes one past bindings.
@@ -1084,12 +1080,12 @@ static unordered_map<string, size_t> BuildTableToLeafMap(const vector<JoinLeafIn
 
 static bool TryFindLeaf(const unordered_map<string, size_t> &table_to_leaf, const string &table_name, size_t &leaf) {
 	auto it = table_to_leaf.find(StringUtil::Lower(table_name));
-	if (it != table_to_leaf.end()) {
+	if (it != table_to_leaf.end() && it->second != size_t(-1)) {
 		leaf = it->second;
 		return true;
 	}
 	it = table_to_leaf.find(StringUtil::Lower(ShortTableName(table_name)));
-	if (it != table_to_leaf.end()) {
+	if (it != table_to_leaf.end() && it->second != size_t(-1)) {
 		leaf = it->second;
 		return true;
 	}
@@ -1751,9 +1747,9 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 		}
 	}
 	vector<unique_ptr<Expression>> current_exprs;
-	// The <= mutant indexes one past the current and delta binding vectors.
-	// mull-ignore-next: cxx_lt_to_ge,cxx_lt_to_le
-	for (idx_t i = 0; i < current_bindings.size(); i++) {
+	// Logical operators expose one type per binding; <= indexes one past both vectors and >= skips all outputs.
+	for (idx_t i = 0; i < current_bindings.size(); // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
+	     i++) {
 		current_exprs.push_back(make_uniq<BoundColumnRefExpression>(current_types[i], current_bindings[i]));
 	}
 	current_exprs.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
