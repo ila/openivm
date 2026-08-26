@@ -19,6 +19,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "lpts_helpers.hpp"
 #include "lpts_sql_scanner.hpp"
 
 #include <cstring>
@@ -238,11 +239,15 @@ TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statem
 	TimeTravelPins result;
 	case_insensitive_set_t unpinned;
 	BaseTableRefCallback callback = [&](BaseTableRef &ref) {
-		if (CatalogHonoursPin(context, ref)) {
+		if (!ref.at_clause) {
+			// Every unpinned scan is recorded, including one in a catalog that honours pins
+			// natively: re-attachment is keyed by relation name and an unqualified pin matches any
+			// catalog, so a pin peeled off one relation would otherwise land on a same-named
+			// relation that was deliberately read unpinned.
+			unpinned.insert(ref.table_name);
 			return;
 		}
-		if (!ref.at_clause) {
-			unpinned.insert(ref.table_name);
+		if (CatalogHonoursPin(context, ref)) {
 			return;
 		}
 		Pin pin;
@@ -367,25 +372,55 @@ static idx_t MatchingParen(const string &sql, idx_t open) {
 	return DConstants::INVALID_INDEX;
 }
 
+// The identifier a trailing qualifier belongs to. DuckDB spells a pin *after* the alias
+// (`FROM t AS v AT (VERSION => 366)`, the shape LPTS normalises Spark's `FROM t VERSION AS OF 366 v`
+// into), so the pinned relation is one alias-step behind the most recent identifier. Tracking only
+// the most recent one credits the qualifier to the alias and leaves the pin in place, which sends a
+// scan the local catalog cannot bind into SQL OpenIVM executes itself.
+struct RelationCursor {
+	string last;     // most recent identifier: the alias when the relation carries one
+	string previous; // the identifier before it: the relation itself when `last` is its alias
+
+	void Push(const string &identifier) {
+		// `AS` introduces the alias of the relation already in `last`, so it must not shift it out.
+		if (StringUtil::CIEquals(identifier, "as")) {
+			return;
+		}
+		previous = last;
+		last = identifier;
+	}
+
+	void Reset() {
+		last.clear();
+		previous.clear();
+	}
+};
+
 string TimeTravelPins::StripFrom(const string &sql) const {
 	if (pins.empty()) {
 		return sql;
 	}
 	string result;
 	result.reserve(sql.size());
-	string last_identifier;
+	RelationCursor cursor;
+	auto pinned_relation = [&]() {
+		if (pins.find(cursor.last) != pins.end()) {
+			return true;
+		}
+		return pins.find(cursor.previous) != pins.end();
+	};
 	idx_t i = 0;
 	while (i < sql.size()) {
 		char c = sql[i];
 		if (c == '\'') {
 			i = CopyQuotedRun(sql, i, result);
-			last_identifier.clear();
+			cursor.Reset();
 			continue;
 		}
 		if (c == '"' || c == '`') {
 			idx_t start = result.size();
 			i = CopyQuotedRun(sql, i, result);
-			last_identifier = result.substr(start + 1, result.size() - start - 2);
+			cursor.Push(result.substr(start + 1, result.size() - start - 2));
 			continue;
 		}
 		if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
@@ -411,8 +446,7 @@ string TimeTravelPins::StripFrom(const string &sql) const {
 			while (after < sql.size() && std::isspace(static_cast<unsigned char>(sql[after]))) {
 				after++;
 			}
-			if (StringUtil::CIEquals(token, "at") && after < sql.size() && sql[after] == '(' &&
-			    pins.find(last_identifier) != pins.end()) {
+			if (StringUtil::CIEquals(token, "at") && after < sql.size() && sql[after] == '(' && pinned_relation()) {
 				auto close = MatchingParen(sql, after);
 				if (close != DConstants::INVALID_INDEX) {
 					while (!result.empty() && std::isspace(static_cast<unsigned char>(result.back()))) {
@@ -423,13 +457,144 @@ string TimeTravelPins::StripFrom(const string &sql) const {
 				}
 			}
 			result += token;
-			last_identifier = token;
+			cursor.Push(token);
 			i = end;
 			continue;
 		}
 		result += c;
 		if (c != '.' && !std::isspace(static_cast<unsigned char>(c))) {
-			last_identifier.clear();
+			cursor.Reset();
+		}
+		i++;
+	}
+	return result;
+}
+
+// Copy the `[catalog.][schema.]relation` chain starting at `sql[start]` into `result`, honouring
+// quoted components, and report the unquoted final component — the relation name pins are keyed by.
+static idx_t CopyQualifiedIdentifierChain(const string &sql, idx_t start, string &result, string &final_component) {
+	idx_t i = start;
+	while (true) {
+		if (i < sql.size() && (sql[i] == '"' || sql[i] == '`')) {
+			idx_t quoted_start = result.size();
+			i = CopyQuotedRun(sql, i, result);
+			final_component = result.substr(quoted_start + 1, result.size() - quoted_start - 2);
+		} else if (i < sql.size() && IsIdentifierStart(sql[i])) {
+			idx_t end = i;
+			while (end < sql.size() && IsIdentifierPart(sql[end])) {
+				end++;
+			}
+			final_component = sql.substr(i, end - i);
+			result.append(sql, i, end - i);
+			i = end;
+		} else {
+			break;
+		}
+		if (i < sql.size() && sql[i] == '.') {
+			result += '.';
+			i++;
+			continue;
+		}
+		break;
+	}
+	return i;
+}
+
+// Whether `sql` already carries `qualifier` at `pos` (ignoring how its whitespace is spelled), so an
+// AST-rendered scan is never given a second copy of its own pin.
+static bool CarriesQualifierAt(const string &sql, idx_t pos, const string &qualifier) {
+	idx_t sql_pos = pos;
+	idx_t qualifier_pos = 0;
+	while (qualifier_pos < qualifier.size()) {
+		if (std::isspace(static_cast<unsigned char>(qualifier[qualifier_pos]))) {
+			bool sql_has_space = sql_pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[sql_pos]));
+			while (qualifier_pos < qualifier.size() &&
+			       std::isspace(static_cast<unsigned char>(qualifier[qualifier_pos]))) {
+				qualifier_pos++;
+			}
+			while (sql_pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[sql_pos]))) {
+				sql_pos++;
+			}
+			if (!sql_has_space) {
+				return false;
+			}
+			continue;
+		}
+		if (sql_pos >= sql.size() || std::tolower(static_cast<unsigned char>(sql[sql_pos])) !=
+		                                 std::tolower(static_cast<unsigned char>(qualifier[qualifier_pos]))) {
+			return false;
+		}
+		sql_pos++;
+		qualifier_pos++;
+	}
+	return true;
+}
+
+// Render `at_suffix` (` AT (VERSION => 366)`) in `dialect`'s own spelling. LPTS owns both the
+// spelling and the refusal for dialects with no verified time-travel syntax, so this never guesses.
+static string DialectPinSuffix(const string &at_suffix, SqlDialect dialect) {
+	string base_name;
+	string dialect_suffix;
+	if (!TrySplitDialectSnapshotSuffix("openivm_pinned_relation" + at_suffix, dialect, base_name, dialect_suffix)) {
+		throw InternalException("OpenIVM could not render the time-travel pin '%s'", at_suffix);
+	}
+	return dialect_suffix;
+}
+
+string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) const {
+	if (pins.empty()) {
+		return sql;
+	}
+	string result;
+	result.reserve(sql.size());
+	// Only a relation directly behind FROM or JOIN is a scan; anything else naming the relation is a
+	// column reference, a delta/metadata table or a literal, none of which take a pin.
+	bool expect_relation = false;
+	idx_t i = 0;
+	while (i < sql.size()) {
+		char c = sql[i];
+		if (c == '\'') {
+			i = CopyQuotedRun(sql, i, result);
+			expect_relation = false;
+			continue;
+		}
+		if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
+			while (i < sql.size() && sql[i] != '\n') {
+				result += sql[i++];
+			}
+			continue;
+		}
+		if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
+			auto close = sql.find("*/", i + 2);
+			auto end = close == string::npos ? sql.size() : close + 2;
+			result.append(sql, i, end - i);
+			i = end;
+			continue;
+		}
+		if (IsIdentifierStart(c) || c == '"' || c == '`') {
+			string final_component;
+			i = CopyQualifiedIdentifierChain(sql, i, result, final_component);
+			if (expect_relation) {
+				auto entry = pins.find(final_component);
+				if (entry != pins.end()) {
+					auto dialect_suffix = DialectPinSuffix(entry->second.suffix, dialect);
+					if (!CarriesQualifierAt(sql, i, dialect_suffix)) {
+						result += dialect_suffix;
+						OPENIVM_DEBUG_PRINT("[TIME TRAVEL] Restored pin '%s' onto rendered scan of '%s'\n",
+						                    dialect_suffix.c_str(), final_component.c_str());
+					}
+				}
+				expect_relation = false;
+				continue;
+			}
+			expect_relation =
+			    StringUtil::CIEquals(final_component, "from") || StringUtil::CIEquals(final_component, "join");
+			continue;
+		}
+		result += c;
+		// A comma continues a FROM list; anything else that is not whitespace ends the table position.
+		if (c != ',' && !std::isspace(static_cast<unsigned char>(c))) {
+			expect_relation = false;
 		}
 		i++;
 	}

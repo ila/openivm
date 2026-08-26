@@ -54,6 +54,15 @@ public:
 	// kept in the stored view SQL and re-attached when rendering for a foreign dialect.
 	string StripFrom(const string &sql) const;
 
+	// Re-attach every recorded qualifier, in `dialect`'s own spelling, to the scans of that relation
+	// in already-rendered `sql`. Refresh programs for several view shapes (min/max aggregates,
+	// group recompute, interrupted-refresh recovery, ...) are assembled as SQL text rather than
+	// through the AST, so `RestoreInto` never sees them; without this they would ship to the target
+	// engine reading the latest snapshot instead of the pinned one. Scans that already carry the
+	// qualifier are left alone, so it is safe to run over AST-rendered SQL as well. Throws through
+	// LPTS for dialects with no verified time-travel syntax rather than emitting an unpinned scan.
+	string RestoreIntoSql(const string &sql, SqlDialect dialect) const;
+
 private:
 	struct Pin {
 		string catalog;

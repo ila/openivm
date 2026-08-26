@@ -397,6 +397,91 @@ SELECT COUNT(*) FROM (
 0
 
 # ==========================================
+# Pins survive the paths that do not go through the AST
+# ==========================================
+#
+# Bodies that never reach the AST keep their pin in the normalized *text*, where the alias sits
+# between the relation and its `AT (...)` qualifier. Stripping the pin for local execution has to
+# find it there too, or the view is executed against this catalog with a qualifier it cannot bind.
+statement ok
+CREATE MATERIALIZED VIEW tt_fallback_alias AS
+    SELECT p.c_id AS c_id, SUM(p.amount) AS total
+    FROM tt_orders VERSION AS OF 366 p
+    WHERE p.c_id IN (SELECT c_id FROM tt_customers EXCEPT SELECT c_id FROM tt_customers WHERE region = 'zz')
+    GROUP BY p.c_id;
+
+query II
+SELECT c_id, total FROM tt_fallback_alias ORDER BY c_id;
+----
+1	15
+2	20
+
+query I
+SELECT CASE WHEN sql_string LIKE '%tt_orders p AT (VERSION => 366)%' THEN 1 ELSE 0 END
+FROM openivm_views WHERE view_name = 'tt_fallback_alias';
+----
+1
+
+# Refresh programs that are assembled as SQL text rather than rendered from the AST (min/max
+# aggregates, group recompute, recovery) must still pin every scan they emit: reading the latest
+# snapshot instead of the pinned one has to be impossible, not merely unlikely.
+statement ok
+CREATE MATERIALIZED VIEW tt_minmax AS
+    SELECT c_id, MIN(amount) AS lo, MAX(amount) AS hi
+    FROM tt_orders VERSION AS OF 366
+    GROUP BY c_id;
+
+query III
+SELECT c_id, lo, hi FROM tt_minmax ORDER BY c_id;
+----
+1	5	10
+2	20	20
+
+statement ok
+INSERT INTO tt_orders VALUES (5, 1, 3);
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%VERSION AS OF 366%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('tt_minmax', '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind = 'data';
+----
+1
+
+# An interrupted refresh recovers by recomputing from source, and that recovery program is built as
+# text as well, so both pins have to survive it.
+statement ok
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_join';
+
+query I
+SELECT CASE WHEN (string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366%'
+                  OR string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders` VERSION AS OF 366%')
+             AND (string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12%'
+                  OR string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers` VERSION AS OF 12%')
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%tt_orders VERSION AS OF 12%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%tt_customers VERSION AS OF 366%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('tt_join', '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind = 'data';
+----
+1
+
+# The same recovery program for DuckDB drops the pins instead, since this catalog holds no snapshots.
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%VERSION AS OF%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
+            THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts('tt_join', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'tt_join';
+
+# ==========================================
 # Unpinned views are untouched by the Spark input dialect
 # ==========================================
 

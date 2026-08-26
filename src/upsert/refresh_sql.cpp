@@ -807,6 +807,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			throw;
 		}
 	}
+	// Only the AST-rendered refresh paths run the pins back through `RestoreInto`. Several view
+	// shapes (min/max aggregates, group recompute, interrupted-refresh recovery, ...) assemble
+	// their refresh program as SQL text instead, which the pins never reach — those would ship to
+	// the target engine reading the latest snapshot rather than the pinned one. Every exit is
+	// therefore finalized here: scans that already carry their qualifier are left untouched, and a
+	// dialect with no time-travel syntax still refuses through LPTS.
+	auto finalize_refresh_sql = [&](string refresh_sql) {
+		if (view_time_travel_pins.Empty() || active_facts.target_dialect == SqlDialect::DUCKDB) {
+			return refresh_sql;
+		}
+		return view_time_travel_pins.RestoreIntoSql(refresh_sql, active_facts.target_dialect);
+	};
 	RefreshType view_query_type = metadata.GetViewType(view_name);
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
@@ -838,7 +850,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                  " SET refresh_in_progress = false WHERE view_name = '" +
 				                  SqlUtils::EscapeValue(view_name) + "';\n";
 			}
-			return recovery_query;
+			return finalize_refresh_sql(recovery_query);
 		}
 	}
 	add_profile_step("generate_refresh_sql.recovery_check", recovery_start);
@@ -953,7 +965,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                     string(metadata_requires_full_refresh ? "true" : "false") +
 		                     "; adaptive_recompute=" + string(adaptive_recompute ? "true" : "false") +
 		                     "; sql_bytes=" + to_string(recompute_query.size()));
-		return recompute_query;
+		return finalize_refresh_sql(recompute_query);
 	}
 	RefreshType dispatch_refresh_type = use_full_recompute ? RefreshType::FULL_REFRESH : view_query_type;
 	refresh_plan.refresh_type = dispatch_refresh_type;
@@ -1938,6 +1950,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	} else {
 		clean_query = meta_pre_sql + data_sql + meta_post_sql;
 	}
+	clean_query = finalize_refresh_sql(std::move(clean_query));
 	Value files_path_val;
 	if (context.TryGetCurrentSetting("openivm_files_path", files_path_val) && !files_path_val.IsNull()) {
 		string refresh_file_path = files_path_val.ToString() + "/openivm_upsert_queries_" + view_name + ".sql";
