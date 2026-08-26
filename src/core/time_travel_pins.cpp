@@ -629,6 +629,25 @@ static bool EndsFromList(const string &token) {
 	return false;
 }
 
+// Whether the parenthesis that ends at `pos` opens a derived table rather than a parenthesized join
+// list. `(SELECT ...)`, `(WITH ...)`, `(VALUES ...)`, `(TABLE t)` and DuckDB's `(FROM t ...)` all
+// start a query of their own; anything else in table position is a relation, and a nested
+// parenthesis just defers the question one level.
+static bool OpensDerivedTable(const string &sql, idx_t pos) {
+	idx_t cursor = SkipIgnorableSpan(sql, pos);
+	while (cursor < sql.size() && sql[cursor] == '(') {
+		cursor = SkipIgnorableSpan(sql, cursor + 1);
+	}
+	idx_t token_end;
+	string token;
+	if (!TryReadIdentifierToken(sql, cursor, token_end, token)) {
+		return false;
+	}
+	return StringUtil::CIEquals(token, "select") || StringUtil::CIEquals(token, "with") ||
+	       StringUtil::CIEquals(token, "values") || StringUtil::CIEquals(token, "table") ||
+	       StringUtil::CIEquals(token, "from");
+}
+
 // Names a `WITH` clause binds in `sql`. A CTE reference is a name, not a scan, so it must never be
 // handed a snapshot qualifier even when it shadows a pinned relation.
 static case_insensitive_set_t CollectCteNames(const string &sql) {
@@ -764,8 +783,13 @@ string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) con
 		result += c;
 		i++;
 		if (c == '(') {
-			from_list_open.push_back(false);
-			expect_relation = false;
+			// In table position a parenthesis opens either a derived table, which starts its own
+			// query, or a parenthesized join list, whose first element is still a scan that needs its
+			// pin. Only the query keywords tell the two apart; a table function's argument list never
+			// reaches here because its own name already consumed the table position.
+			bool table_list = expect_relation && !OpensDerivedTable(sql, i);
+			from_list_open.push_back(table_list);
+			expect_relation = table_list;
 		} else if (c == ')') {
 			if (from_list_open.size() > 1) {
 				from_list_open.pop_back();
