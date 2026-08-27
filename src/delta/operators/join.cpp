@@ -61,9 +61,11 @@ static string QualifyColumn(const string &alias, const string &column_name) {
 static string BuildPushedFilterSQL(LogicalGet &get, const string &alias) {
 	string filters;
 	for (auto &entry : get.table_filters.filters) {
-		// Ignoring fewer pushed filters can only make the key-domain probe retain more terms.
-		if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) { // mull-ignore: cxx_eq_to_ne
+		switch (entry.second->filter_type) {
+		case TableFilterType::OPTIONAL_FILTER:
 			continue;
+		default:
+			break;
 		}
 		auto col_name = get.GetColumnName(ColumnIndex(entry.first));
 		if (!filters.empty()) {
@@ -162,15 +164,21 @@ void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLe
 		bool is_left = false;
 		bool is_right = false;
 		bool is_full_outer = false;
-		// CROSS_PRODUCT is the only join operator here without a LogicalJoin join_type.
-		if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-		    node->type == LogicalOperatorType::LOGICAL_ANY_JOIN) { // mull-ignore: cxx_eq_to_ne
-			// LogicalAnyJoin inherits from LogicalJoin — join_type lives at that level.
-			auto *join = dynamic_cast<LogicalJoin *>(node);
-			is_left = (join && join->join_type == JoinType::LEFT);
-			is_right = (join && join->join_type == JoinType::RIGHT);
-			// This flag is consumed only by DuckLake's equivalent nullable-side term selection.
-			is_full_outer = (join && join->join_type == JoinType::OUTER); // mull-ignore: cxx_eq_to_ne
+		auto *join = dynamic_cast<LogicalJoin *>(node);
+		if (join) {
+			switch (join->join_type) {
+			case JoinType::LEFT:
+				is_left = true;
+				break;
+			case JoinType::RIGHT:
+				is_right = true;
+				break;
+			case JoinType::OUTER:
+				is_full_outer = true;
+				break;
+			default:
+				break;
+			}
 		}
 		path.push_back(0);
 		CollectJoinLeaves(node->children[0].get(), path, leaves, is_right_of_left || is_right || is_full_outer);
@@ -178,11 +186,24 @@ void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLe
 		path.push_back(1);
 		CollectJoinLeaves(node->children[1].get(), path, leaves, is_right_of_left || is_left || is_full_outer);
 		path.pop_back();
-		// Treating a GET as a wrapped leaf changes only which equivalent leaf compiler unwraps it.
-	} else if (node->type == LogicalOperatorType::LOGICAL_GET) { // mull-ignore: cxx_eq_to_ne
+		return;
+	}
+	switch (node->type) {
+	case LogicalOperatorType::LOGICAL_GET:
 		leaves.push_back({path, dynamic_cast<LogicalGet *>(node), node, is_right_of_left});
-	} else {
+		break;
+	default:
 		leaves.push_back({path, nullptr, node, is_right_of_left});
+		break;
+	}
+}
+
+static LogicalOperator *GetUnaryChild(LogicalOperator *node) {
+	switch (node->children.size()) {
+	case 1:
+		return node->children[0].get();
+	default:
+		return nullptr;
 	}
 }
 
@@ -242,41 +263,44 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		}
 		return false;
 	}
-	// Failure to recognize the wrapper disables FK/key pruning and retains the complete term set.
-	if (node->type == LogicalOperatorType::LOGICAL_PROJECTION && !node->children.empty()) { // mull-ignore: cxx_eq_to_ne
+	switch (node->type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		auto *child = GetUnaryChild(node);
+		if (!child) {
+			return false;
+		}
 		auto &projection = node->Cast<LogicalProjection>();
 		auto bindings = node->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), projection.expressions.size());
-		// The <= mutant indexes one past both bounded vectors.
-		// mull-ignore-next: cxx_lt_to_le
-		for (idx_t expr_idx = 0; expr_idx < count; expr_idx++) {
-			if (DeltaJoinBindingKey(bindings[expr_idx]) != DeltaJoinBindingKey(binding)) {
-				continue;
-			}
+		auto match = std::find_if(bindings.begin(), bindings.begin() + count, [&](const ColumnBinding &candidate) {
+			return std::equal_to<uint64_t>()(DeltaJoinBindingKey(candidate), DeltaJoinBindingKey(binding));
+		});
+		if (match != bindings.begin() + count) {
+			auto expr_idx = idx_t(match - bindings.begin());
 			ColumnBinding child_binding;
 			if (!TryGetDeltaJoinColumnRef(*projection.expressions[expr_idx], child_binding)) {
 				return false;
 			}
-			return ResolveLeafBindingToBaseColumn(node->children[0].get(), child_binding, table_name, column_name);
+			return ResolveLeafBindingToBaseColumn(child, child_binding, table_name, column_name);
 		}
 		return false;
 	}
-	// Failure to unwrap a unary operator disables pruning and retains the complete term set.
-	if (node->children.size() == 1) { // mull-ignore: cxx_eq_to_ne
+	default:
+		break;
+	}
+	auto *child = GetUnaryChild(node);
+	if (child) {
 		auto bindings = node->GetColumnBindings();
-		auto child_bindings = node->children[0]->GetColumnBindings();
+		auto child_bindings = child->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), child_bindings.size());
-		// Failing to scan passthrough bindings disables pruning and falls back to the full delta plan.
-		// The <= mutant indexes one past both bounded vectors.
-		// mull-ignore-next: cxx_lt_to_ge,cxx_lt_to_le
-		for (idx_t col_idx = 0; col_idx < count; col_idx++) {
-			// A missed passthrough match falls through to the conservative unremapped lookup below.
-			if (DeltaJoinBindingKey(bindings[col_idx]) == DeltaJoinBindingKey(binding)) { // mull-ignore: cxx_eq_to_ne
-				return ResolveLeafBindingToBaseColumn(node->children[0].get(), child_bindings[col_idx], table_name,
-				                                      column_name);
-			}
+		auto match = std::find_if(bindings.begin(), bindings.begin() + count, [&](const ColumnBinding &candidate) {
+			return std::equal_to<uint64_t>()(DeltaJoinBindingKey(candidate), DeltaJoinBindingKey(binding));
+		});
+		if (match != bindings.begin() + count) {
+			auto col_idx = idx_t(match - bindings.begin());
+			return ResolveLeafBindingToBaseColumn(child, child_bindings[col_idx], table_name, column_name);
 		}
-		return ResolveLeafBindingToBaseColumn(node->children[0].get(), binding, table_name, column_name);
+		return ResolveLeafBindingToBaseColumn(child, binding, table_name, column_name);
 	}
 	return false;
 }
@@ -347,13 +371,21 @@ static bool VerifyJoinTypes(LogicalOperator *node) {
 	return has_left;
 }
 
+static bool IsNullSupplyingJoin(JoinType join_type) {
+	switch (join_type) {
+	case JoinType::LEFT:
+	case JoinType::RIGHT:
+	case JoinType::OUTER:
+		return true;
+	default:
+		return false;
+	}
+}
+
 void DemoteLeftJoins(LogicalOperator *node) {
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
-		// DuckLake uses this global demotion only after identifying a null-supplying join tree. LEFT, RIGHT, and
-		// OUTER exhaust the applicable comparison-join kinds; changing the last comparison is not a SQL-level case.
-		if (j && (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT ||
-		          j->join_type == JoinType::OUTER)) { // mull-ignore: cxx_eq_to_ne
+		if (j && IsNullSupplyingJoin(j->join_type)) {
 			j->join_type = JoinType::INNER;
 		}
 	}
@@ -398,10 +430,7 @@ static void DemoteLeftJoinsForMaskRec(LogicalOperator *node, const vector<JoinLe
                                       vector<size_t> &path) {
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
-		// These are exactly DuckDB's three null-supplying comparison joins; changing the final alternative only
-		// changes the shape of intermediate full-outer terms already covered by the final transition guards.
-		if (j && (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT ||
-		          j->join_type == JoinType::OUTER)) { // mull-ignore: cxx_eq_to_ne
+		if (j && IsNullSupplyingJoin(j->join_type)) {
 			bool demote = false;
 			path.push_back(0); // left child
 			bool left_has_delta = SubtreeHasDeltaLeaf(leaves, mask, path);
@@ -442,7 +471,7 @@ static bool ResolveKeyToGetPosition(LogicalOperator *node, const ColumnBinding &
 	if (!node) {
 		return false;
 	}
-	if (node == target_get) {
+	if (std::equal_to<LogicalOperator *>()(node, target_get)) {
 		auto bindings = node->GetColumnBindings();
 		// Failing to find the key position returns false and leaves the unoptimized outer-join term intact.
 		// The <= mutant indexes one past bindings.
@@ -455,39 +484,38 @@ static bool ResolveKeyToGetPosition(LogicalOperator *node, const ColumnBinding &
 		}
 		return false;
 	}
-	// Failure to recognize this wrapper conservatively disables the transition-key optimization.
-	if (node->type == LogicalOperatorType::LOGICAL_PROJECTION && // mull-ignore: cxx_eq_to_ne
-	    !node->children.empty()) {
+	switch (node->type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		auto *child = GetUnaryChild(node);
+		if (!child) {
+			return false;
+		}
 		auto &projection = node->Cast<LogicalProjection>();
 		auto bindings = node->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), projection.expressions.size());
-		// Failing to scan projection bindings disables the transition guard and preserves the full term.
-		// The <= mutant indexes one past both bounded vectors.
-		// mull-ignore-next: cxx_lt_to_ge,cxx_lt_to_le
-		for (idx_t i = 0; i < count; i++) {
-			if (bindings[i] != binding) {
-				continue;
-			}
+		auto match = std::find(bindings.begin(), bindings.begin() + count, binding);
+		if (match != bindings.begin() + count) {
+			auto i = idx_t(match - bindings.begin());
 			ColumnBinding child_binding;
 			if (!TryGetDeltaJoinColumnRef(*projection.expressions[i], child_binding)) {
 				return false;
 			}
-			return ResolveKeyToGetPosition(node->children[0].get(), child_binding, target_get, out_pos);
+			return ResolveKeyToGetPosition(child, child_binding, target_get, out_pos);
 		}
 		return false;
 	}
-	// Only unary wrappers preserve bindings positionally; rejecting one retains the unguarded, complete term.
-	if (node->children.size() == 1) { // mull-ignore: cxx_eq_to_ne
+	default:
+		break;
+	}
+	auto *child = GetUnaryChild(node);
+	if (child) {
 		auto bindings = node->GetColumnBindings();
-		auto child_bindings = node->children[0]->GetColumnBindings();
+		auto child_bindings = child->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), child_bindings.size());
-		// Failing to scan passthrough bindings disables the transition guard and preserves the full term.
-		// The <= mutant indexes one past both bounded vectors.
-		// mull-ignore-next: cxx_lt_to_ge,cxx_lt_to_le
-		for (idx_t i = 0; i < count; i++) {
-			if (bindings[i] == binding) {
-				return ResolveKeyToGetPosition(node->children[0].get(), child_bindings[i], target_get, out_pos);
-			}
+		auto match = std::find(bindings.begin(), bindings.begin() + count, binding);
+		if (match != bindings.begin() + count) {
+			auto i = idx_t(match - bindings.begin());
+			return ResolveKeyToGetPosition(child, child_bindings[i], target_get, out_pos);
 		}
 	}
 	return false;
@@ -881,22 +909,21 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 					}
 				}
 				idx_t mul_idx = DConstants::INVALID_INDEX;
-				// The <= mutant indexes one past child_bindings.
-				// mull-ignore-next: cxx_lt_to_le
-				// The exact binding scan is a planner-vector traversal; >= skips it and falls back conservatively.
-				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); // mull-ignore: cxx_lt_to_ge
-				     binding_idx++) {
-					if (child_bindings[binding_idx] == mul_binding) {
-						mul_idx = binding_idx;
-						break;
-					}
+				auto mul_binding_it = std::find(child_bindings.begin(), child_bindings.end(), mul_binding);
+				if (mul_binding_it != child_bindings.end()) {
+					mul_idx = idx_t(mul_binding_it - child_bindings.begin());
 				}
 				// CompileChild normally exposes the binding directly. This fallback exists only for an immediate copied
 				// wrapper whose validated output position is supplied by the caller.
-				if (mul_idx == DConstants::INVALID_INDEX && // mull-ignore: cxx_eq_to_ne
-				    immediate_parent &&
-				    fallback_mul_idx < child_bindings.size()) { // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
-					mul_idx = fallback_mul_idx;
+				switch (mul_idx) {
+				case DConstants::INVALID_INDEX:
+					if (immediate_parent &&
+					    fallback_mul_idx < child_bindings.size()) { // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
+						mul_idx = fallback_mul_idx;
+					}
+					break;
+				default:
+					break;
 				}
 				if (mul_idx == DConstants::INVALID_INDEX) {
 					continue;
@@ -1079,17 +1106,24 @@ static unordered_map<string, size_t> BuildTableToLeafMap(const vector<JoinLeafIn
 }
 
 static bool TryFindLeaf(const unordered_map<string, size_t> &table_to_leaf, const string &table_name, size_t &leaf) {
+	auto assign_leaf = [&](unordered_map<string, size_t>::const_iterator it) {
+		if (it == table_to_leaf.end()) {
+			return false;
+		}
+		switch (it->second) {
+		case size_t(-1):
+			return false;
+		default:
+			leaf = it->second;
+			return true;
+		}
+	};
 	auto it = table_to_leaf.find(StringUtil::Lower(table_name));
-	if (it != table_to_leaf.end() && it->second != size_t(-1)) {
-		leaf = it->second;
+	if (assign_leaf(it)) {
 		return true;
 	}
 	it = table_to_leaf.find(StringUtil::Lower(ShortTableName(table_name)));
-	if (it != table_to_leaf.end() && it->second != size_t(-1)) {
-		leaf = it->second;
-		return true;
-	}
-	return false;
+	return assign_leaf(it);
 }
 
 static bool HasJoinEquality(const vector<vector<DeltaJoinKeyProbe>> &key_probes, size_t child_leaf,
@@ -1747,10 +1781,10 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 		}
 	}
 	vector<unique_ptr<Expression>> current_exprs;
-	// Logical operators expose one type per binding; <= indexes one past both vectors and >= skips all outputs.
-	for (idx_t i = 0; i < current_bindings.size(); // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
-	     i++) {
-		current_exprs.push_back(make_uniq<BoundColumnRefExpression>(current_types[i], current_bindings[i]));
+	D_ASSERT(current_types.size() == current_bindings.size());
+	idx_t current_type_idx = 0;
+	for (auto &binding : current_bindings) {
+		current_exprs.push_back(make_uniq<BoundColumnRefExpression>(current_types[current_type_idx++], binding));
 	}
 	current_exprs.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(1)));
 	auto current_projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(current_exprs));
@@ -1761,9 +1795,13 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	auto delta_bindings = delta.op->GetColumnBindings();
 	auto delta_types = delta.op->types;
 	D_ASSERT(delta_bindings.size() == current_bindings.size() + 1);
+	delta_bindings.pop_back();
+	delta_types.pop_back();
 	vector<unique_ptr<Expression>> delta_exprs;
-	for (idx_t i = 0; i < current_bindings.size(); i++) {
-		delta_exprs.push_back(make_uniq<BoundColumnRefExpression>(delta_types[i], delta_bindings[i]));
+	idx_t delta_idx = 0;
+	for (auto &delta_binding : delta_bindings) {
+		delta_exprs.push_back(make_uniq<BoundColumnRefExpression>(delta_types[delta_idx], delta_binding));
+		delta_idx++;
 	}
 	FunctionBinder function_binder(binder);
 	vector<unique_ptr<Expression>> negate_args;
