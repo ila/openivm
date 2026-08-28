@@ -3,6 +3,7 @@
 # group: [sql]
 
 require openivm
+
 require icu
 
 # Delta capture uses UTC timestamps internally. Watermarks must use the same clock even when the
