@@ -281,6 +281,10 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 			}
 			continue;
 		}
+		if (parent->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+			// LogicalCrossProduct exposes both children's bindings unchanged.
+			continue;
+		}
 		if (auto *join = dynamic_cast<LogicalJoin *>(parent)) {
 			auto &projection_map = child_side == 0 ? join->left_projection_map : join->right_projection_map;
 			if (!projection_map.empty() &&
