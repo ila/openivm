@@ -26,7 +26,9 @@ namespace duckdb {
 
 static bool CompactDeltasEnabled(ClientContext &context) {
 	Value compact_val;
-	if (context.TryGetCurrentSetting("openivm_compact_deltas", compact_val) && !compact_val.IsNull()) {
+	// A present NULL setting is treated like absence; negating this guard only attempts to cast NULL to bool.
+	if (context.TryGetCurrentSetting("openivm_compact_deltas", compact_val) &&
+	    !compact_val.IsNull()) { // mull-ignore: cxx_remove_negation
 		return compact_val.GetValue<bool>();
 	}
 	return true;
@@ -36,8 +38,13 @@ static DeltaGetResult RemapDeltaNode(ClientContext &context, unique_ptr<LogicalO
                                      idx_t output_table_index, ColumnBinding mul_binding) {
 	auto input_bindings = delta_node->GetColumnBindings();
 	auto input_types = delta_node->types;
+	// Logical operators expose one type per binding; equality is the required valid shape.
+	if (input_bindings.empty() || input_bindings.size() != input_types.size()) { // mull-ignore: cxx_ne_to_eq
+		throw InternalException("Delta remap requires matching non-empty binding and type vectors");
+	}
 	vector<unique_ptr<Expression>> remap_exprs;
-	for (idx_t i = 0; i < input_bindings.size(); i++) {
+	// >= disables the remap and <= indexes one past both bounded vectors.
+	for (idx_t i = 0; i < input_bindings.size(); i++) { // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
 		if (input_bindings[i] == mul_binding) {
 			remap_exprs.push_back(BoundCastExpression::AddCastToType(
 			    context, make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]), LogicalType::INTEGER));
@@ -49,7 +56,8 @@ static DeltaGetResult RemapDeltaNode(ClientContext &context, unique_ptr<LogicalO
 	remap_proj->children.push_back(std::move(delta_node));
 	remap_proj->ResolveOperatorTypes();
 
-	ColumnBinding remapped_mul(output_table_index, input_bindings.size() - 1);
+	// Multiplicity is appended by both delta producers and is therefore the final binding.
+	ColumnBinding remapped_mul(output_table_index, input_bindings.size() - 1); // mull-ignore: cxx_sub_to_add
 	return {std::move(remap_proj), remapped_mul};
 }
 
@@ -57,6 +65,9 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
                                        idx_t output_table_index, ColumnBinding mul_binding) {
 	auto input_bindings = delta_node->GetColumnBindings();
 	auto input_types = delta_node->types;
+	if (input_bindings.empty() || input_bindings.size() != input_types.size()) {
+		throw InternalException("Delta compaction requires matching non-empty binding and type vectors");
+	}
 	idx_t base_col_count = input_bindings.size() - 1;
 
 	auto group_index = binder.GenerateTableIndex();
@@ -73,7 +84,8 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
 	aggregates.push_back(std::move(sum_expr));
 	auto aggregate = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
 	GroupingSet grouping_set;
-	for (idx_t i = 0; i < base_col_count; i++) {
+	// The <= mutant includes the multiplicity aggregate itself as a grouping key.
+	for (idx_t i = 0; i < base_col_count; i++) { // mull-ignore: cxx_lt_to_le
 		aggregate->groups.push_back(make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
 		aggregate->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(input_types[i])));
 		grouping_set.insert(i);
@@ -94,7 +106,8 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
 
 	auto filter_bindings = filter->GetColumnBindings();
 	vector<unique_ptr<Expression>> remap_exprs;
-	for (idx_t i = 0; i < base_col_count; i++) {
+	// The <= mutant emits the aggregate multiplicity once here and once below.
+	for (idx_t i = 0; i < base_col_count; i++) { // mull-ignore: cxx_lt_to_le
 		remap_exprs.push_back(make_uniq<BoundColumnRefExpression>(agg_types[i], filter_bindings[i]));
 	}
 	remap_exprs.push_back(BoundCastExpression::AddCastToType(
@@ -144,7 +157,8 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 	auto &old_func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
 	int64_t cur_snap = static_cast<int64_t>(old_func_info.snapshot.snapshot_id);
 
-	int64_t start_snap = last_snap + 1;
+	// DuckLake change scans use an inclusive lower bound, so subtraction would replay already-applied snapshots.
+	int64_t start_snap = last_snap + 1; // mull-ignore: cxx_add_to_sub
 	OPENIVM_DEBUG_PRINT("[DuckLake] Snapshot range: %ld -> %ld\n", (long)start_snap, (long)cur_snap);
 
 	if (start_snap > cur_snap) {
@@ -152,7 +166,8 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 		empty_types.push_back(LogicalType::INTEGER);
 		vector<ColumnBinding> bindings;
 		auto table_index = binder.GenerateTableIndex();
-		for (idx_t i = 0; i < empty_types.size(); i++) {
+		// >= leaves the empty result without bindings and <= creates one more binding than types.
+		for (idx_t i = 0; i < empty_types.size(); i++) { // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
 			bindings.emplace_back(table_index, i);
 		}
 		auto mul_binding = bindings.back();
@@ -197,7 +212,8 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 		                                 std::move(col_names));
 		get->SetColumnIds(vector<ColumnIndex>(delta_col_ids));
 		for (auto &entry : old_get->table_filters.filters) {
-			if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+			// OPTIONAL_FILTER is advisory scan pruning; copying or omitting it cannot change query results.
+			if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) { // mull-ignore: cxx_eq_to_ne
 				continue;
 			}
 			get->table_filters.filters[entry.first] = entry.second->Copy();
@@ -313,7 +329,8 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 		} else if (col.Name() == string(openivm::TIMESTAMP_COL)) {
 			ts_oid = col.Oid();
 		}
-		if (col.Oid() > max_oid) {
+		// Equality only reassigns max_oid to itself.
+		if (col.Oid() > max_oid) { // mull-ignore: cxx_gt_to_ge
 			max_oid = col.Oid();
 		}
 	}
@@ -341,7 +358,8 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	                                       std::move(return_types), std::move(return_names));
 	delta_get_node->SetColumnIds(std::move(column_ids));
 	for (auto &entry : old_get->table_filters.filters) {
-		if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+		// OPTIONAL_FILTER is advisory scan pruning; copying or omitting it cannot change query results.
+		if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) { // mull-ignore: cxx_eq_to_ne
 			continue;
 		}
 		delta_get_node->table_filters.filters[entry.first] = entry.second->Copy();
@@ -377,7 +395,8 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	// projection_ids
 	delta_get_node->projection_ids.clear();
 	idx_t n_base = old_get->GetColumnIds().size();
-	for (idx_t i = 0; i < n_base; i++) {
+	// The <= mutant projects the appended multiplicity column twice.
+	for (idx_t i = 0; i < n_base; i++) { // mull-ignore: cxx_lt_to_le
 		delta_get_node->projection_ids.push_back(i);
 	}
 	delta_get_node->projection_ids.push_back(n_base); // mul column

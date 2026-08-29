@@ -12,7 +12,7 @@ struct JoinLeafInfo {
 	vector<size_t> path;
 	LogicalGet *get;            // non-null for simple table scans
 	LogicalOperator *node;      // always set; for non-GET leaves, rewrite the subtree
-	bool is_right_of_left_join; // true if this leaf is on the RIGHT side of a LEFT JOIN
+	bool is_right_of_left_join; // true if this leaf is on the nullable side of an outer join
 };
 
 void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves,

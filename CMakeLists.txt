@@ -83,6 +83,34 @@ set(EXTENSION_SOURCES
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# Mutation testing is intentionally applied only to the static extension linked
+# into the SQL unittest executable. Mull's path filters restrict candidates to
+# OpenIVM-owned src/ files; DuckDB and the loadable extension remain ordinary
+# optimized code.
+set(OPENIVM_MULL_PLUGIN "" CACHE FILEPATH "Path to the Mull LLVM IR frontend plugin")
+set(OPENIVM_MULL_CONFIG "" CACHE FILEPATH "Path to the Mull mutation configuration")
+if(OPENIVM_MULL_PLUGIN)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "OPENIVM_MULL_PLUGIN requires a Clang C++ compiler")
+    endif()
+    if(NOT EXISTS "${OPENIVM_MULL_PLUGIN}")
+        message(FATAL_ERROR "Mull LLVM IR frontend not found: ${OPENIVM_MULL_PLUGIN}")
+    endif()
+    if(NOT EXISTS "${OPENIVM_MULL_CONFIG}")
+        message(FATAL_ERROR "Mull configuration not found: ${OPENIVM_MULL_CONFIG}")
+    endif()
+    file(SHA256 "${OPENIVM_MULL_CONFIG}" OPENIVM_MULL_CONFIG_FINGERPRINT)
+    target_compile_options(${EXTENSION_NAME} PRIVATE
+        -O1
+        -g
+        -grecord-command-line
+        "-fpass-plugin=${OPENIVM_MULL_PLUGIN}")
+    # Make a config change visible to Ninja's command-line dependency tracking.
+    # This re-instruments the extension without rebuilding DuckDB.
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE
+        "OPENIVM_MULL_CONFIG_FINGERPRINT=${OPENIVM_MULL_CONFIG_FINGERPRINT}")
+endif()
+
 install(
   TARGETS ${EXTENSION_NAME}
   EXPORT "${DUCKDB_EXPORT_SET}"

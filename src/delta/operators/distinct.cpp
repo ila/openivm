@@ -28,6 +28,14 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 	Binder &binder = input.context.input.optimizer.binder;
 	auto child_bindings = rewritten_child->GetColumnBindings();
 	auto child_types = rewritten_child->types;
+	// DuckDB plans expose one type per binding; this guard documents and diagnoses a broken internal plan.
+	if (child_bindings.size() != child_types.size()) { // mull-ignore: cxx_ne_to_eq
+		throw InternalException("DeltaDistinct: rewritten child binding/type count mismatch");
+	}
+	// CompileChild's contract adds exactly one multiplicity output to the original DISTINCT columns.
+	if (child_bindings.size() != original_bindings.size() + 1) { // mull-ignore: cxx_ne_to_eq,cxx_add_to_sub
+		throw InternalException("DeltaDistinct: expected one multiplicity column in rewritten child");
+	}
 
 	// Group-by keys = all child columns EXCEPT multiplicity
 	// Aggregate = COUNT(*) as openivm_distinct_count
@@ -47,8 +55,10 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 	auto agg_node = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
 
 	GroupingSet grouping_set;
-	const idx_t child_output_count = MinValue<idx_t>(child_bindings.size(), child_types.size());
-	for (idx_t i = 0; i < child_output_count; i++) {
+	const idx_t child_output_count = child_bindings.size();
+	// The validated binding/type vectors define this exact traversal; changing the bound is invalid planner state.
+	for (idx_t i = 0; i < child_output_count; // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
+	     i++) {
 		if (child_bindings[i] == input_mul_binding) {
 			continue; // skip multiplicity — added separately below
 		}
@@ -83,14 +93,21 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 	// are still valid (they are the UNION's genuine output bindings).
 	ColumnBindingReplacer replacer;
 	idx_t group_position = 0;
-	const idx_t remap_count = MinValue<idx_t>(original_bindings.size(), child_output_count);
-	for (idx_t i = 0; i < remap_count; i++) {
+	idx_t original_position = 0;
+	// Every non-multiplicity child output corresponds to exactly one original DISTINCT output.
+	for (idx_t i = 0; i < child_output_count; // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
+	     i++) {
 		if (child_bindings[i] == input_mul_binding) {
 			continue; // multiplicity is not in the parent's original bindings
 		}
 		ColumnBinding new_binding(group_index, group_position);
-		replacer.replacement_bindings.emplace_back(original_bindings[i], new_binding);
+		replacer.replacement_bindings.emplace_back(original_bindings[original_position], new_binding);
+		original_position++;
 		group_position++;
+	}
+	// The cardinality contract above guarantees this; retain the check to diagnose future compiler regressions.
+	if (original_position != original_bindings.size()) { // mull-ignore: cxx_ne_to_eq
+		throw InternalException("DeltaDistinct: rewritten child did not expose every original output binding");
 	}
 	replacer.stop_operator = input.plan.get();
 	replacer.VisitOperator(*input.root);

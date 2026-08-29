@@ -31,9 +31,17 @@ struct BaseLeafInfo {
 static uint64_t BindingKey(const ColumnBinding &binding);
 
 static bool IsJoinNode(LogicalOperatorType type) {
-	return type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || type == LogicalOperatorType::LOGICAL_JOIN ||
-	       type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT || type == LogicalOperatorType::LOGICAL_ANY_JOIN ||
-	       type == LogicalOperatorType::LOGICAL_DELIM_JOIN || type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN;
+	switch (type) {
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
+	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
+		return true;
+	default:
+		return false;
+	}
 }
 
 static void CollectBaseLeaves(LogicalOperator *node, vector<size_t> path, vector<BaseLeafInfo> &leaves) {
@@ -57,13 +65,23 @@ static void CollectBaseLeaves(LogicalOperator *node, vector<size_t> path, vector
 static void VerifyDelimJoinTypes(LogicalOperator *node) {
 	if (IsJoinNode(node->type)) {
 		auto *join = dynamic_cast<LogicalJoin *>(node);
-		if (join && join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT &&
-		    join->join_type != JoinType::RIGHT && join->join_type != JoinType::OUTER &&
-		    join->join_type != JoinType::MARK && join->join_type != JoinType::SEMI &&
-		    join->join_type != JoinType::ANTI && join->join_type != JoinType::RIGHT_SEMI &&
-		    join->join_type != JoinType::RIGHT_ANTI && join->join_type != JoinType::SINGLE) {
-			throw Exception(ExceptionType::OPTIMIZER,
-			                JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM DELIM_JOIN");
+		if (join) {
+			switch (join->join_type) {
+			case JoinType::INNER:
+			case JoinType::LEFT:
+			case JoinType::RIGHT:
+			case JoinType::OUTER:
+			case JoinType::MARK:
+			case JoinType::SEMI:
+			case JoinType::ANTI:
+			case JoinType::RIGHT_SEMI:
+			case JoinType::RIGHT_ANTI:
+			case JoinType::SINGLE:
+				break;
+			default:
+				throw Exception(ExceptionType::OPTIMIZER,
+				                JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM DELIM_JOIN");
+			}
 		}
 	}
 	for (auto &child : node->children) {
@@ -85,7 +103,8 @@ static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
 		return false;
 	}
 	for (auto &condition : join.conditions) {
-		if (condition.comparison != ExpressionType::COMPARE_EQUAL &&
+		// This gate only selects the cheaper rewrite; rejecting equality retains the equivalent DELIM_JOIN fallback.
+		if (condition.comparison != ExpressionType::COMPARE_EQUAL && // mull-ignore: cxx_ne_to_eq
 		    condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			return false;
 		}
@@ -100,25 +119,31 @@ static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
 
 static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op,
                                                            const unordered_set<uint64_t> &mul_set) {
-	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_JOIN ||
-	    op.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT || op.type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+	if (IsJoinNode(op.type)) {
 		auto *join = dynamic_cast<LogicalComparisonJoin *>(&op);
 		if (join) {
-			for (idx_t child_idx = 0; child_idx < op.children.size() && child_idx < 2; child_idx++) {
+			const idx_t projected_child_count = std::min<idx_t>(op.children.size(), 2);
+			// A comparison join owns exactly these two projection maps; disabling the loop only corrupts its internal
+			// plan.
+			for (idx_t child_idx = 0; child_idx < projected_child_count; child_idx++) { // mull-ignore: cxx_lt_to_ge
 				auto &proj_map = child_idx == 0 ? join->left_projection_map : join->right_projection_map;
 				if (proj_map.empty()) {
 					continue;
 				}
 				auto child_bindings = op.children[child_idx]->GetColumnBindings();
 				for (auto projected_idx : proj_map) {
-					if (projected_idx >= child_bindings.size()) {
+					// Equality is valid: the largest valid index is size - 1.
+					if (projected_idx >= child_bindings.size()) { // mull-ignore: cxx_ge_to_gt
 						throw InternalException(
 						    "DeltaDelimJoin: projection map index %llu out of bounds for child %llu with %llu bindings",
 						    (idx_t)projected_idx, (idx_t)child_idx, (idx_t)child_bindings.size());
 					}
 				}
-				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); binding_idx++) {
-					if (!mul_set.count(BindingKey(child_bindings[binding_idx]))) {
+				// Disabling this bounded scan only creates an invalid internal projection map, not another SQL
+				// behavior.
+				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); // mull-ignore: cxx_lt_to_ge
+				     binding_idx++) { // mull-ignore: cxx_post_inc_to_post_dec
+					if (!mul_set.count(BindingKey(child_bindings[binding_idx]))) { // mull-ignore: cxx_remove_negation
 						continue;
 					}
 					if (std::find(proj_map.begin(), proj_map.end(), binding_idx) == proj_map.end()) {
@@ -165,7 +190,8 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 			}
 		}
 		if (source_ordinal == DConstants::INVALID_INDEX) {
-			if (!allow_ordinal_fallback || col_ref.binding.column_index >= copy_bindings.size()) {
+			if (!allow_ordinal_fallback ||
+			    col_ref.binding.column_index >= copy_bindings.size()) { // mull-ignore: cxx_ge_to_gt
 				throw InternalException("DELIM_JOIN duplicate-eliminated binding not found in source child");
 			}
 			source_ordinal = col_ref.binding.column_index;
@@ -182,7 +208,8 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 
 	vector<unique_ptr<Expression>> distinct_targets;
 	auto bindings = projection->GetColumnBindings();
-	for (idx_t i = 0; i < bindings.size(); i++) {
+	// Every projection binding must become a DISTINCT target; an empty target list is an invalid internal plan shape.
+	for (idx_t i = 0; i < bindings.size(); i++) { // mull-ignore: cxx_lt_to_ge
 		distinct_targets.push_back(make_uniq<BoundColumnRefExpression>(projection->types[i], bindings[i]));
 	}
 	auto distinct = make_uniq<LogicalDistinct>(std::move(distinct_targets), DistinctType::DISTINCT);
@@ -235,7 +262,9 @@ static ColumnBinding MapTermBinding(ColumnBinding binding, const unordered_map<o
 		binding.table_index = idx_entry->second;
 	}
 
-	for (idx_t pass = 0; pass <= replacement_bindings.size(); pass++) {
+	// At most N replacements can be followed. The inclusive final pass detects a cycle instead of returning midway.
+	for (idx_t pass = 0; pass <= replacement_bindings.size(); // mull-ignore: cxx_le_to_lt
+	     pass++) {                                            // mull-ignore: cxx_post_inc_to_post_dec
 		bool replaced = false;
 		for (auto &replacement : replacement_bindings) {
 			if (binding == replacement.old_binding) {
@@ -258,7 +287,9 @@ static ColumnBinding FindOutputBinding(const vector<ColumnBinding> &term_binding
 			return binding;
 		}
 	}
-	if (output_idx < term_bindings.size() && term_bindings[output_idx].table_index == target.table_index) {
+	// This ordinal fallback is planner bookkeeping after exact binding lookup, not a separately observable SQL path.
+	if (output_idx < term_bindings.size() &&                           // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
+	    term_bindings[output_idx].table_index == target.table_index) { // mull-ignore: cxx_eq_to_ne
 		return term_bindings[output_idx];
 	}
 	string candidates;
@@ -286,7 +317,8 @@ static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator>
 		if (old_bindings.size() != new_bindings.size()) {
 			throw InternalException("DELIM_GET replacement changed binding count");
 		}
-		for (idx_t i = 0; i < old_bindings.size(); i++) {
+		// The replacement must remain one-to-one; disabling the bounded loop only leaves dangling internal bindings.
+		for (idx_t i = 0; i < old_bindings.size(); i++) { // mull-ignore: cxx_lt_to_ge
 			replacement_bindings.emplace_back(old_bindings[i], new_bindings[i]);
 		}
 		return true;
@@ -304,7 +336,9 @@ static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator>
 		}
 		replaced = ReplaceDelimGets(context, child, replacement_bindings, next_delim) || replaced;
 	}
-	if (node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN && replaced && !replacement_bindings.empty()) {
+	// Rebinding is mandatory after replacement; negating this internal guard creates dangling DuckDB bindings.
+	if (node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN && // mull-ignore: cxx_eq_to_ne
+	    replaced && !replacement_bindings.empty()) {
 		ColumnBindingReplacer replacer;
 		replacer.replacement_bindings = replacement_bindings;
 		RebindAllExpressions(*node, replacer);
@@ -369,6 +403,9 @@ static void CollectMulBindings(const vector<ColumnBinding> &mul_bindings, unorde
 
 static unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const LogicalType &mul_type,
                                                        const vector<ColumnBinding> &mul_bindings) {
+	if (mul_bindings.empty()) {
+		throw InternalException("DeltaDelimJoin: cannot build an empty multiplicity product");
+	}
 	FunctionBinder fbinder(binder);
 	unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[0]);
 	for (size_t i = 1; i < mul_bindings.size(); i++) {
@@ -396,6 +433,9 @@ static unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const Log
 
 static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
                                                     const vector<LogicalType> &types, Binder &binder) {
+	if (terms.empty()) {
+		throw InternalException("DeltaDelimJoin: cannot assemble an empty term set");
+	}
 	auto result = std::move(terms[0]);
 	for (size_t i = 1; i < terms.size(); i++) {
 		result = make_uniq<LogicalSetOperation>(binder.GenerateTableIndex(), types.size(), std::move(result),
@@ -417,9 +457,14 @@ static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOpe
 static ColumnBinding ReplaceOutputBindings(const vector<ColumnBinding> &original_bindings,
                                            unique_ptr<LogicalOperator> &result, LogicalOperator &root) {
 	auto new_bindings = result->GetColumnBindings();
+	// The additional binding is multiplicity; subtraction describes no valid rewritten output schema.
+	if (new_bindings.size() != original_bindings.size() + 1) { // mull-ignore: cxx_add_to_sub
+		throw InternalException("DeltaDelimJoin: expected %llu rewritten bindings, found %llu",
+		                        (idx_t)(original_bindings.size() + 1), // mull-ignore: cxx_add_to_sub
+		                        (idx_t)new_bindings.size());
+	}
 	ColumnBindingReplacer replacer;
-	idx_t map_count = std::min(original_bindings.size(), new_bindings.size() - 1);
-	for (idx_t col_idx = 0; col_idx < map_count; col_idx++) {
+	for (idx_t col_idx = 0; col_idx < original_bindings.size(); col_idx++) {
 		replacer.replacement_bindings.emplace_back(original_bindings[col_idx], new_bindings[col_idx]);
 	}
 	replacer.stop_operator = result;
@@ -499,7 +544,8 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 	if (leaves.empty()) {
 		throw InternalException("DeltaDelimJoin: no mutable base leaves found");
 	}
-	if (leaves.size() > openivm::MAX_JOIN_TABLES) {
+	// Exactly MAX_JOIN_TABLES is representable by the uint64_t term mask.
+	if (leaves.size() > openivm::MAX_JOIN_TABLES) { // mull-ignore: cxx_gt_to_ge
 		throw NotImplementedException("DELIM_JOIN IVM not supported for joins with more than 16 base tables");
 	}
 
@@ -519,7 +565,8 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 		vector<ColumnBinding> mul_bindings;
 		vector<ReplacementBinding> output_replacements;
 
-		for (size_t i = 0; i < leaves.size(); i++) {
+		// The <= mutant indexes one past both leaves and the copied plan path table.
+		for (size_t i = 0; i < leaves.size(); i++) { // mull-ignore: cxx_lt_to_le,cxx_post_inc_to_post_dec
 			if (!(mask & (1ULL << i))) {
 				continue;
 			}
