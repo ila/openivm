@@ -116,7 +116,10 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Unoptimized plan: \n%s\n", planner.plan->ToString().c_str());
 #endif
-	ScopedDisabledOptimizers disabled_optimizers(input.context, openivm::DISABLED_OPTIMIZERS);
+	// This is still the stored base-view plan. Its scans have not been replaced with delta scans yet,
+	// so current base-table facts must never be folded into it. The user setting only controls the
+	// subsequent optimization of the finished incremental plan in GenerateRefreshSQL().
+	ScopedDisabledOptimizers disabled_optimizers(input.context, openivm::TEMPLATE_DATA_DEPENDENT_OPTIMIZERS);
 	Optimizer optimizer(*planner.binder, input.context);
 	auto optimized_plan = optimizer.Optimize(std::move(planner.plan));
 

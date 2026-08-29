@@ -639,8 +639,8 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 	}
 	string query = SqlUtils::BuildFullRecomputeSQL(qdt, view_query_sql, unique_keys, recompute_temp) + "\n";
 	auto delta_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
-	string update_ts_sql = "UPDATE " + delta_metadata_table + " SET last_update = now() WHERE view_name = '" +
-	                       SqlUtils::EscapeValue(view_name) + "';\n";
+	string update_ts_sql = "UPDATE " + delta_metadata_table + " SET last_update = " + string(openivm::UTC_NOW_SQL) +
+	                       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
 	auto delta_tables = metadata.GetDeltaTables(view_name);
 	for (auto &dt : delta_tables) {
 		if (!metadata.IsDuckLakeTable(view_name, dt)) {
