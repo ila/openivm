@@ -9,6 +9,7 @@
 #include "upsert/refresh_index_regen.hpp"
 #include "match/constraint_cache.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/constraint.hpp"
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
@@ -272,10 +273,11 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		auto &projection = node->Cast<LogicalProjection>();
 		auto bindings = node->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), projection.expressions.size());
-		auto match = std::find_if(bindings.begin(), bindings.begin() + count, [&](const ColumnBinding &candidate) {
+		auto search_end = bindings.begin() + NumericCast<int64_t>(count);
+		auto match = std::find_if(bindings.begin(), search_end, [&](const ColumnBinding &candidate) {
 			return std::equal_to<uint64_t>()(DeltaJoinBindingKey(candidate), DeltaJoinBindingKey(binding));
 		});
-		if (match != bindings.begin() + count) {
+		if (match != search_end) {
 			auto expr_idx = idx_t(match - bindings.begin());
 			ColumnBinding child_binding;
 			if (!TryGetDeltaJoinColumnRef(*projection.expressions[expr_idx], child_binding)) {
@@ -293,10 +295,11 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		auto bindings = node->GetColumnBindings();
 		auto child_bindings = child->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), child_bindings.size());
-		auto match = std::find_if(bindings.begin(), bindings.begin() + count, [&](const ColumnBinding &candidate) {
+		auto search_end = bindings.begin() + NumericCast<int64_t>(count);
+		auto match = std::find_if(bindings.begin(), search_end, [&](const ColumnBinding &candidate) {
 			return std::equal_to<uint64_t>()(DeltaJoinBindingKey(candidate), DeltaJoinBindingKey(binding));
 		});
-		if (match != bindings.begin() + count) {
+		if (match != search_end) {
 			auto col_idx = idx_t(match - bindings.begin());
 			return ResolveLeafBindingToBaseColumn(child, child_bindings[col_idx], table_name, column_name);
 		}
@@ -493,8 +496,9 @@ static bool ResolveKeyToGetPosition(LogicalOperator *node, const ColumnBinding &
 		auto &projection = node->Cast<LogicalProjection>();
 		auto bindings = node->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), projection.expressions.size());
-		auto match = std::find(bindings.begin(), bindings.begin() + count, binding);
-		if (match != bindings.begin() + count) {
+		auto search_end = bindings.begin() + NumericCast<int64_t>(count);
+		auto match = std::find(bindings.begin(), search_end, binding);
+		if (match != search_end) {
 			auto i = idx_t(match - bindings.begin());
 			ColumnBinding child_binding;
 			if (!TryGetDeltaJoinColumnRef(*projection.expressions[i], child_binding)) {
@@ -512,8 +516,9 @@ static bool ResolveKeyToGetPosition(LogicalOperator *node, const ColumnBinding &
 		auto bindings = node->GetColumnBindings();
 		auto child_bindings = child->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), child_bindings.size());
-		auto match = std::find(bindings.begin(), bindings.begin() + count, binding);
-		if (match != bindings.begin() + count) {
+		auto search_end = bindings.begin() + NumericCast<int64_t>(count);
+		auto match = std::find(bindings.begin(), search_end, binding);
+		if (match != search_end) {
 			auto i = idx_t(match - bindings.begin());
 			return ResolveKeyToGetPosition(child, child_bindings[i], target_get, out_pos);
 		}
