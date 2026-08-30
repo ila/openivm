@@ -895,15 +895,18 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_
 ----
 3
 
-# 6, not 4: the full-recompute path for AGGREGATE_GROUP views emits four statements
-# (CREATE TEMP TABLE / DELETE vanished keys / INSERT OR REPLACE / DROP) instead of a plain
-# DELETE + INSERT, because their data table carries a UNIQUE index and DuckDB's on-disk unique
-# index rejects re-inserting a key deleted earlier in the same transaction. See
-# test/sql/group_recompute_persistent_unique_index.test.
+# 7 profiled statements per refresh for an AGGREGATE_GROUP MERGE view:
+#   1. SET refresh_in_progress = true
+#   2. INSERT INTO openivm_delta_<view> (delta computation)
+#   3. MERGE INTO openivm_data_<view> (applies delta via CTE from the delta view)
+#   4. DELETE FROM openivm_delta_<view> (view delta cleanup)
+#   5. DELETE FROM openivm_delta_<source> (source delta cleanup)
+#   6. UPDATE openivm_delta_tables SET last_update (metadata timestamp)
+#   7. SET refresh_in_progress = false
 query I
 SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'execute_refresh_sql_stmt';
 ----
-6
+7
 
 query I
 SELECT CASE WHEN count(*) >= 13 THEN 1 ELSE 0 END FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND duration_ms >= 0;
