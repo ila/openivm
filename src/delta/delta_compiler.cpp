@@ -55,10 +55,11 @@ const DeltaModelNode *DeltaCompiler::FindNode(LogicalOperator *op) const {
 		return nullptr;
 	}
 	auto entry = node_by_plan.find(op);
-	if (entry == node_by_plan.end() || entry->second >= context.model.nodes.size()) {
+	if (entry == node_by_plan.end()) {
 		return nullptr;
 	}
-	return &context.model.nodes[entry->second];
+	// Model node ids are vector indexes. Use checked access so malformed internal model metadata fails immediately.
+	return &context.model.nodes.at(entry->second);
 }
 
 DeltaPlanFragment DeltaCompiler::CompileInternal(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root,

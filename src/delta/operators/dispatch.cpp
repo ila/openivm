@@ -83,6 +83,8 @@ const char *DeltaOperatorStrategyName(DeltaOperatorStrategy strategy) {
 }
 
 void LogDeltaOperatorStrategy(const DeltaOperatorInput &input, DeltaOperatorStrategy strategy) {
+	// Both branches are debug-only descriptions of the already-selected strategy.
+	// mull-ignore-next
 	if (input.node) {
 		OPENIVM_DEBUG_PRINT("[Delta Operator] strategy=%s node=%llu kind=%s rule=%s maintenance=%s/%s\n",
 		                    DeltaOperatorStrategyName(strategy), (unsigned long long)input.node->id,

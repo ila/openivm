@@ -1145,9 +1145,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	    view_name + "', '" + SqlUtils::EscapeSingleQuotes(view_target_catalog) + "', '" +
 	    SqlUtils::EscapeSingleQuotes(view_target_schema) + "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
 	    to_string((int)refresh_type) + ", " + (has_minmax_metadata ? "true" : "false") + ", " +
-	    (analysis.found_left_join ? "true" : "false") + ", " + (analysis.found_join ? "true" : "false") + ", now(), " +
-	    refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
-	    group_recompute_mode_val + ", " + group_recompute_source_occurrences_val + ", " +
+	    (analysis.found_left_join ? "true" : "false") + ", " + (analysis.found_join ? "true" : "false") + ", " +
+	    string(openivm::UTC_NOW_SQL) + ", " + refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ", " +
+	    having_val + ", " + group_recompute_mode_val + ", " + group_recompute_source_occurrences_val + ", " +
 	    (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
 
 	if (!lineage_json.empty()) {
@@ -1337,7 +1337,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 		source_metadata_values.push_back(
 		    "('" + SqlUtils::EscapeSingleQuotes(view_name) + "', '" + SqlUtils::EscapeSingleQuotes(meta_table_name) +
-		    "', now(), '" + SqlUtils::EscapeSingleQuotes(catalog_type) + "', " + snapshot_val + ", now(), '" +
+		    "', " + string(openivm::UTC_NOW_SQL) + ", '" + SqlUtils::EscapeSingleQuotes(catalog_type) + "', " +
+		    snapshot_val + ", " + string(openivm::UTC_NOW_SQL) + ", '" +
 		    SqlUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
 		    SqlUtils::EscapeSingleQuotes(source_schema_val) + "', " + source_table_id_val + ")");
 	}
@@ -1516,9 +1517,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 		ddl.push_back("create table if not exists " + catalog_schema +
 		              KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(table_name)) +
-		              " as select *, 1::INTEGER as " + string(openivm::MULTIPLICITY_COL) + ", now()::timestamp as " +
-		              string(openivm::TIMESTAMP_COL) + " from " + catalog_schema +
-		              KeywordHelper::WriteOptionallyQuoted(table_name) + " limit 0");
+		              " as select *, 1::INTEGER as " + string(openivm::MULTIPLICITY_COL) + ", " +
+		              string(openivm::UTC_NOW_SQL) + " as " + string(openivm::TIMESTAMP_COL) + " from " +
+		              catalog_schema + KeywordHelper::WriteOptionallyQuoted(table_name) + " limit 0");
 	}
 
 	// Delta table for the MV — based on the DATA table (has all columns)

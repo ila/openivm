@@ -1741,7 +1741,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		planner.CreatePlan(std::move(p.statements[0]));
 		auto plan = std::move(planner.plan);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Plan created. Running optimizer...\n");
-		ScopedDisabledOptimizers disabled_optimizers(con_ctx, string(openivm::DISABLED_OPTIMIZERS) + ", deliminator");
+		// deliminator: overflow guard on the deep generated SQL. Template set: keep the serialized
+		// delta plan data-independent (the rewrite rule fires within this Optimize()).
+		ScopedDisabledOptimizers disabled_optimizers(con_ctx, string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "," +
+		                                                          FinalPlanDisabledOptimizers(con_ctx, cross_system));
 		Optimizer optimizer(*planner.binder, con_ctx);
 		plan = optimizer.Optimize(std::move(plan)); // this transforms the plan into an incremental plan
 		OPENIVM_DEBUG_PRINT("[UPSERT] Optimizer done.\n");
@@ -1899,8 +1902,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                          " SET last_update = COALESCE("
 		                          "(SELECT MAX(" +
 		                          string(openivm::TIMESTAMP_COL) + ") + INTERVAL '1 microsecond' FROM " + resolved +
-		                          "), now()), last_refresh_ts = now()"
-		                          " WHERE view_name = '" +
+		                          "), " + string(openivm::UTC_NOW_SQL) +
+		                          "), last_refresh_ts = " + string(openivm::UTC_NOW_SQL) + " WHERE view_name = '" +
 		                          SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 		                          SqlUtils::EscapeValue(dt) + "';\n";
 	}

@@ -148,6 +148,81 @@ SELECT COUNT(*) FROM (
 0
 
 # ==========================================
+# Regression: CTE projection above CROSS JOIN
+# ==========================================
+
+statement ok
+CREATE TABLE dl.cross_warehouses (warehouse_id INT, ytd INT);
+
+statement ok
+CREATE TABLE dl.cross_items (item_id INT, price INT);
+
+statement ok
+INSERT INTO dl.cross_warehouses VALUES (1, 100), (2, 200);
+
+statement ok
+INSERT INTO dl.cross_items VALUES (1, 10), (2, 20), (5, 50);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.cross_products AS
+    WITH totals AS (
+        SELECT warehouse_id, ytd FROM dl.cross_warehouses
+    )
+    SELECT totals.warehouse_id, items.item_id, totals.ytd * items.price AS product
+    FROM totals CROSS JOIN dl.cross_items items
+    WHERE items.item_id < 5;
+
+# Batch conflicting INSERT, UPDATE, and DELETE operations before one refresh.
+statement ok
+INSERT INTO dl.cross_warehouses VALUES (3, 300), (4, 400);
+
+statement ok
+UPDATE dl.cross_warehouses SET ytd = ytd + 10 WHERE warehouse_id IN (1, 4);
+
+statement ok
+DELETE FROM dl.cross_warehouses WHERE warehouse_id IN (2, 4);
+
+statement ok
+INSERT INTO dl.cross_items VALUES (3, 30), (4, 40);
+
+statement ok
+UPDATE dl.cross_items SET price = price + 2 WHERE item_id IN (1, 4);
+
+statement ok
+DELETE FROM dl.cross_items WHERE item_id IN (2, 4);
+
+statement ok
+PRAGMA refresh('cross_products');
+
+query I
+WITH totals AS (
+    SELECT warehouse_id, ytd FROM dl.cross_warehouses
+)
+SELECT COUNT(*) FROM (
+    SELECT totals.warehouse_id, items.item_id, totals.ytd * items.price AS product
+    FROM totals CROSS JOIN dl.cross_items items
+    WHERE items.item_id < 5
+    EXCEPT ALL
+    SELECT warehouse_id, item_id, product FROM dl.cross_products
+);
+----
+0
+
+query I
+WITH totals AS (
+    SELECT warehouse_id, ytd FROM dl.cross_warehouses
+)
+SELECT COUNT(*) FROM (
+    SELECT warehouse_id, item_id, product FROM dl.cross_products
+    EXCEPT ALL
+    SELECT totals.warehouse_id, items.item_id, totals.ytd * items.price AS product
+    FROM totals CROSS JOIN dl.cross_items items
+    WHERE items.item_id < 5
+);
+----
+0
+
+# ==========================================
 # Test 7: Projection-key refresh over a self-join
 # ==========================================
 

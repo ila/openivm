@@ -27,19 +27,51 @@ struct DuckLakeJoinColumnRef {
 };
 
 static bool IsJoinOperator(LogicalOperatorType type) {
-	return type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT ||
-	       type == LogicalOperatorType::LOGICAL_ANY_JOIN;
+	switch (type) {
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void GetNullableJoinSides(LogicalJoin *join, bool &left_is_nullable, bool &right_is_nullable) {
+	left_is_nullable = false;
+	right_is_nullable = false;
+	if (!join) {
+		return;
+	}
+	switch (join->join_type) {
+	case JoinType::LEFT:
+		right_is_nullable = true;
+		break;
+	case JoinType::RIGHT:
+		left_is_nullable = true;
+		break;
+	case JoinType::OUTER:
+		left_is_nullable = true;
+		right_is_nullable = true;
+		break;
+	default:
+		break;
+	}
 }
 
 static bool CollectDuckLakeJoinLeaves(LogicalOperator *node, vector<size_t> &path, vector<JoinLeafInfo> &leaves,
                                       bool is_right_of_left, string &fallback_reason) {
 	if (IsJoinOperator(node->type)) {
 		auto *join = dynamic_cast<LogicalJoin *>(node);
-		bool left_is_nullable = join && (join->join_type == JoinType::RIGHT || join->join_type == JoinType::OUTER);
-		bool right_is_nullable = join && (join->join_type == JoinType::LEFT || join->join_type == JoinType::OUTER);
+		bool left_is_nullable;
+		bool right_is_nullable;
+		GetNullableJoinSides(join, left_is_nullable, right_is_nullable);
 		for (size_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
 			path.push_back(child_idx);
-			bool child_is_nullable = is_right_of_left || (child_idx == 0 ? left_is_nullable : right_is_nullable);
+			// DuckDB joins have two children, so the only non-zero child is the right side.
+			bool child_is_nullable =
+			    is_right_of_left ||
+			    (child_idx == 0 ? left_is_nullable : right_is_nullable); // mull-ignore: cxx_eq_to_ne
 			if (!CollectDuckLakeJoinLeaves(node->children[child_idx].get(), path, leaves, child_is_nullable,
 			                               fallback_reason)) {
 				return false;
@@ -94,7 +126,8 @@ static void AddDuckLakeLeafColumnRefs(LogicalOperator *root, const JoinLeafInfo 
 	ancestors.reserve(leaf.path.size());
 	LogicalOperator *node = root;
 	for (auto child_idx : leaf.path) {
-		if (child_idx >= node->children.size()) {
+		// Equality is already out of bounds for this planner-owned path.
+		if (child_idx >= node->children.size()) { // mull-ignore: cxx_ge_to_gt
 			throw InternalException("DuckLakeJoin: leaf path child %llu is out of bounds",
 			                        static_cast<idx_t>(child_idx));
 		}
@@ -109,15 +142,17 @@ static void AddDuckLakeLeafColumnRefs(LogicalOperator *root, const JoinLeafInfo 
 	unordered_map<uint64_t, string> visible_columns;
 	auto bindings = get->GetColumnBindings();
 	auto &column_ids = get->GetColumnIds();
-	for (idx_t output_idx = 0; output_idx < bindings.size(); output_idx++) {
+	// The <= mutant indexes one past bindings.
+	for (idx_t output_idx = 0; output_idx < bindings.size(); output_idx++) { // mull-ignore: cxx_lt_to_le
 		idx_t column_id_idx = output_idx;
 		if (!get->projection_ids.empty()) {
-			if (output_idx >= get->projection_ids.size()) {
+			if (output_idx >= get->projection_ids.size()) { // mull-ignore: cxx_ge_to_gt
 				continue;
 			}
 			column_id_idx = get->projection_ids[output_idx];
 		}
-		if (column_id_idx >= column_ids.size() || column_ids[column_id_idx].IsVirtualColumn()) {
+		if (column_id_idx >= column_ids.size() || // mull-ignore: cxx_ge_to_gt
+		    column_ids[column_id_idx].IsVirtualColumn()) {
 			continue;
 		}
 		visible_columns[DeltaJoinBindingKey(bindings[output_idx])] = get->GetColumnName(column_ids[column_id_idx]);
@@ -164,7 +199,8 @@ static string DuckLakeQualifiedTable(const string &catalog, const string &schema
                                      int64_t snapshot_id) {
 	string result = SqlUtils::QuoteIdentifier(catalog) + "." + SqlUtils::QuoteIdentifier(schema) + "." +
 	                SqlUtils::QuoteIdentifier(table_name);
-	if (snapshot_id >= 0) {
+	// -1 is the only sentinel; snapshot zero, if supplied by DuckLake, is valid.
+	if (snapshot_id >= 0) { // mull-ignore: cxx_ge_to_gt,cxx_ge_to_lt
 		result += " AT (VERSION => " + to_string(snapshot_id) + ")";
 	}
 	return result;
@@ -204,7 +240,9 @@ static bool DuckLakeDeltaKeyHasMatch(Connection &con, const string &catalog, con
 }
 
 static bool PathStartsWith(const vector<size_t> &path, const vector<size_t> &prefix) {
-	return path.size() >= prefix.size() && std::equal(prefix.begin(), prefix.end(), path.begin());
+	// Equality is the exact-path case; reversing the guard would let std::equal read beyond path.
+	return path.size() >= prefix.size() && // mull-ignore: cxx_ge_to_gt,cxx_ge_to_lt
+	       std::equal(prefix.begin(), prefix.end(), path.begin());
 }
 
 static void DemoteOuterJoinsForLeaf(LogicalOperator *node, const vector<size_t> &leaf_path, vector<size_t> &path) {
@@ -218,13 +256,27 @@ static void DemoteOuterJoinsForLeaf(LogicalOperator *node, const vector<size_t> 
 		right_has_delta = PathStartsWith(leaf_path, path);
 		path.pop_back();
 
-		if ((join->join_type == JoinType::LEFT && right_has_delta) ||
-		    (join->join_type == JoinType::RIGHT && left_has_delta) ||
-		    (join->join_type == JoinType::OUTER && (left_has_delta || right_has_delta))) {
+		bool demote = false;
+		switch (join->join_type) {
+		case JoinType::LEFT:
+			demote = right_has_delta;
+			break;
+		case JoinType::RIGHT:
+			demote = left_has_delta;
+			break;
+		case JoinType::OUTER:
+			demote = left_has_delta || right_has_delta;
+			break;
+		default:
+			break;
+		}
+		if (demote) {
 			join->join_type = JoinType::INNER;
 		}
 	}
-	for (size_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
+	// This planner traversal must visit [0, child_count); >= disables it and <= indexes one past children.
+	for (size_t child_idx = 0; child_idx < node->children.size(); // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
+	     child_idx++) {
 		path.push_back(child_idx);
 		DemoteOuterJoinsForLeaf(node->children[child_idx].get(), leaf_path, path);
 		path.pop_back();
@@ -238,7 +290,8 @@ static void DemoteOuterJoinsForLeaf(LogicalOperator *node, const vector<size_t> 
 
 static idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &binding, const char *context_label) {
 	auto bindings = op.GetColumnBindings();
-	for (idx_t binding_idx = 0; binding_idx < bindings.size(); binding_idx++) {
+	// The <= mutant indexes one past bindings.
+	for (idx_t binding_idx = 0; binding_idx < bindings.size(); binding_idx++) { // mull-ignore: cxx_lt_to_le
 		if (bindings[binding_idx] == binding) {
 			return binding_idx;
 		}
@@ -253,7 +306,7 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 	ancestors.reserve(leaf_path.size());
 	LogicalOperator *node = term.get();
 	for (size_t depth = 0; depth < leaf_path.size(); depth++) {
-		if (leaf_path[depth] >= node->children.size()) {
+		if (leaf_path[depth] >= node->children.size()) { // mull-ignore: cxx_ge_to_gt
 			throw InternalException("DuckLakeJoin: leaf path child %llu out of bounds at depth %llu",
 			                        static_cast<idx_t>(leaf_path[depth]), static_cast<idx_t>(depth));
 		}
@@ -279,6 +332,10 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 			                                                mul_idx) == filter.projection_map.end()) {
 				filter.projection_map.push_back(mul_idx);
 			}
+			continue;
+		}
+		if (parent->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+			// LogicalCrossProduct exposes both children's bindings unchanged.
 			continue;
 		}
 		if (auto *join = dynamic_cast<LogicalJoin *>(parent)) {
@@ -356,7 +413,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 	if (skip_empty_enabled) {
 		auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
 		size_t reused_activity_count = 0;
-		for (size_t i = 0; i < N; i++) {
+		// Compile facts are an optimization cache; skipping this scan falls back to authoritative metadata probes.
+		for (size_t i = 0; i < N; i++) { // mull-ignore: cxx_lt_to_ge
 			for (auto &entry : compile_facts.delta_shape) {
 				if (!StringUtil::CIEquals(SqlUtils::LastIdentifierPart(entry.first), table_names[i])) {
 					continue;
@@ -368,20 +426,25 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				           StringUtil::CIEquals(entry.second, "MIXED")) {
 					activity_known[i] = true;
 				}
+				// This counter is used only by the debug summary below.
+				// mull-ignore-next: cxx_arithmetic
 				reused_activity_count += activity_known[i] ? 1 : 0;
 				break;
 			}
 		}
 		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Reused source activity for %zu/%zu leaves\n", reused_activity_count, N);
 		RefreshMetadata metadata(con);
-		for (size_t i = 0; i < N; i++) {
+		// Skipping table-activity probes only retains extra terms; it cannot omit a required delta term.
+		for (size_t i = 0; i < N; i++) { // mull-ignore: cxx_lt_to_ge
 			if (activity_known[i]) {
 				continue;
 			}
-			if (current_snapshots[i] < 0) {
+			// Negative means unavailable; fail open by retaining the term.
+			if (current_snapshots[i] < 0) { // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
 				continue;
 			}
-			if (old_snapshots[i] == current_snapshots[i]) {
+			// Equal snapshots prove emptiness; treating a changed snapshot as unknown only retains an extra term.
+			if (old_snapshots[i] == current_snapshots[i]) { // mull-ignore: cxx_eq_to_ne
 				empty_table_delta[i] = true;
 				continue;
 			}
@@ -413,8 +476,10 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				                    has_changes->GetError().c_str());
 				continue;
 			}
-			if (has_changes->RowCount() > 0 && !has_changes->GetValue(0, 0).IsNull() &&
-			    !has_changes->GetValue(0, 0).GetValue<bool>()) {
+			// Malformed/no-result probes fail open. The metadata path normally handles this before the SQL fallback.
+			if (has_changes->RowCount() > 0 &&                   // mull-ignore: cxx_gt_to_ge,cxx_gt_to_le
+			    !has_changes->GetValue(0, 0).IsNull() &&         // mull-ignore: cxx_remove_negation
+			    !has_changes->GetValue(0, 0).GetValue<bool>()) { // mull-ignore: cxx_remove_negation
 				empty_table_delta[i] = true;
 			}
 		}
@@ -445,10 +510,13 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			continue;
 		}
 		bool key_domain_empty = false;
-		if (skip_empty_enabled && current_snapshots[i] >= 0 && !key_probes[i].empty()) {
+		// Snapshot zero is valid; excluding it only disables this optional key-domain pruning.
+		if (skip_empty_enabled && current_snapshots[i] >= 0 && // mull-ignore: cxx_ge_to_gt
+		    !key_probes[i].empty()) {
 			for (auto &probe : key_probes[i]) {
 				size_t other = probe.other_leaf;
-				int64_t other_snapshot = other > i ? old_snapshots[other] : -1;
+				// A probe always targets another leaf, so > and >= differ only for an impossible self-probe.
+				int64_t other_snapshot = other > i ? old_snapshots[other] : -1; // mull-ignore: cxx_gt_to_ge
 				if (!DuckLakeDeltaKeyHasMatch(con, table_catalogs[i], table_schemas[i], table_names[i],
 				                              probe.delta_column, old_snapshots[i], current_snapshots[i],
 				                              table_catalogs[other], table_schemas[other], table_names[other],

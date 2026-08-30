@@ -111,3 +111,83 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Schema-qualified compile facts must resolve to the corresponding join leaves before FK pruning.
+statement ok
+CREATE SCHEMA cfkp_schema;
+
+statement ok
+CREATE TABLE cfkp_schema.dim(id INTEGER PRIMARY KEY, label VARCHAR);
+
+statement ok
+CREATE TABLE cfkp_schema.fact(id INTEGER, dim_id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO cfkp_schema.dim VALUES (1, 'one');
+
+statement ok
+INSERT INTO cfkp_schema.fact VALUES (10, 1, 100);
+
+statement ok
+CREATE MATERIALIZED VIEW cfkp_schema_mv AS
+    SELECT f.id, d.label, f.amount
+    FROM cfkp_schema.fact f
+    JOIN cfkp_schema.dim d ON f.dim_id = d.id;
+
+statement ok
+INSERT INTO cfkp_schema.dim VALUES (2, 'two');
+
+statement ok
+INSERT INTO cfkp_schema.fact VALUES (20, 2, 200);
+
+statement ok
+CREATE TABLE cfkp_schema_baseline AS
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts(
+    'cfkp_schema_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{"cfkp_schema.fact":"GENERAL","cfkp_schema.dim":"INSERT_ONLY"},"fk_relations":[]}'
+)
+WHERE stmt_kind = 'data';
+
+statement ok
+CREATE TABLE cfkp_schema_pruned AS
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS prog
+FROM openivm_compile_with_facts(
+    'cfkp_schema_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{"cfkp_schema.fact":"GENERAL","cfkp_schema.dim":"INSERT_ONLY"},"fk_relations":[{"child_table":"cfkp_schema.fact","child_columns":["dim_id"],"parent_table":"cfkp_schema.dim","parent_columns":["id"],"rely":true}]}'
+)
+WHERE stmt_kind = 'data';
+
+query I
+SELECT ((length((SELECT prog FROM cfkp_schema_pruned)) -
+         length(replace((SELECT prog FROM cfkp_schema_pruned), 'UNION ALL', ''))) / length('UNION ALL'))
+       <
+       ((length((SELECT prog FROM cfkp_schema_baseline)) -
+         length(replace((SELECT prog FROM cfkp_schema_baseline), 'UNION ALL', ''))) / length('UNION ALL'));
+----
+true
+
+statement ok
+PRAGMA refresh('cfkp_schema_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cfkp_schema_mv
+    EXCEPT ALL
+    SELECT f.id, d.label, f.amount
+    FROM cfkp_schema.fact f
+    JOIN cfkp_schema.dim d ON f.dim_id = d.id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT f.id, d.label, f.amount
+    FROM cfkp_schema.fact f
+    JOIN cfkp_schema.dim d ON f.dim_id = d.id
+    EXCEPT ALL
+    SELECT * FROM cfkp_schema_mv
+);
+----
+0

@@ -185,6 +185,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
+	// Native refresh can optimize the finished incremental plan against the current deltas because the
+	// generated SQL is executed immediately. The reusable base-view template always stays data-independent.
+	db_config.AddExtensionOption("openivm_enable_data_dependent_optimizers",
+	                             "optimize the finished incremental plan using current delta statistics",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	// Per-optimization flags (default: all enabled)
 	db_config.AddExtensionOption("openivm_skip_empty_deltas", "skip refresh or join terms when deltas are empty",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));

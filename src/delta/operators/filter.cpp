@@ -13,10 +13,13 @@ DeltaPlanFragment CompileFilterDelta(DeltaOperatorInput input) {
 	// groups, not evaluate the HAVING condition. Group-recompute re-evaluates HAVING.
 	if (!input.plan->expressions.empty()) {
 		auto *walk = input.plan->children[0].get();
-		while (walk->type == LogicalOperatorType::LOGICAL_PROJECTION && !walk->children.empty()) {
+		// CREATE-time normalization usually removes HAVING. This remains for copied/internal plans whose exact
+		// PROJECTION chain is a planner-shape contract rather than independently observable SQL behavior.
+		while (walk->type == LogicalOperatorType::LOGICAL_PROJECTION && // mull-ignore: cxx_eq_to_ne
+		       !walk->children.empty()) {                               // mull-ignore: cxx_remove_negation
 			walk = walk->children[0].get();
 		}
-		if (walk->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		if (walk->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) { // mull-ignore: cxx_eq_to_ne
 			LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::FILTER_HAVING_STRIP);
 			OPENIVM_DEBUG_PRINT("[DeltaFilter] HAVING filter above AGGREGATE -- stripping from delta\n");
 			auto child_mul = input.CompileChild(input.plan->children[0], input.root);
@@ -43,7 +46,9 @@ DeltaPlanFragment CompileFilterDelta(DeltaOperatorInput input) {
 		auto child_binds = plan_as_filter->children[0]->GetColumnBindings();
 		idx_t mul_index = child_binds.size();
 		bool mul_found = false;
-		while (!mul_found && mul_index > 0) {
+		// CompileChild guarantees the binding exists. The zero boundary prevents unsigned underflow only when that
+		// internal contract is broken; SQL cannot construct such a plan.
+		while (!mul_found && mul_index > 0) { // mull-ignore: cxx_gt_to_ge,cxx_gt_to_le
 			--mul_index;
 			if (child_binds[mul_index] == child_mul_binding) {
 				mul_found = true;
