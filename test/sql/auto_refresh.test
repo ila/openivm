@@ -881,6 +881,14 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt';
 ----
 0
 
+# Force deterministic incremental path for the profiling assertions below.
+# The adaptive cost model (still enabled from Test 18 setup) can nondeterministically
+# choose full recompute vs incremental depending on prior refresh durations, which
+# changes the statement count (6 vs 7). The profiling feature is path-independent;
+# the adaptive cost model is already validated by the history assertions above.
+statement ok
+SET openivm_adaptive_refresh = false;
+
 statement ok
 SET openivm_profile_refresh = true;
 
@@ -907,6 +915,10 @@ query I
 SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'execute_refresh_sql_stmt';
 ----
 7
+
+# Re-enable adaptive refresh so subsequent refreshes record history for Test 20.
+statement ok
+SET openivm_adaptive_refresh = true;
 
 query I
 SELECT CASE WHEN count(*) >= 13 THEN 1 ELSE 0 END FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND duration_ms >= 0;
@@ -1013,10 +1025,13 @@ SET openivm_skip_empty_deltas = true;
 # Test 20: Learned cost model — history cleanup on REPLACE
 # ==========================================
 
+# 5 history rows: 3 from Test 18 setup + 2 from profiling retention tests.
+# The profiled refresh itself ran with openivm_adaptive_refresh = false (for deterministic
+# statement count), so it did not record a history entry.
 query I
 SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt';
 ----
-6
+5
 
 statement ok
 CREATE OR REPLACE MATERIALIZED VIEW mv_lt AS SELECT grp, sum(val) as total FROM lt GROUP BY grp;
