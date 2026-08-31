@@ -1122,6 +1122,11 @@ bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeyS
 	if (!ReadRefreshLineageEntry(con, view_name, "left_join_key_source", json)) {
 		return false;
 	}
+	out.cardinality_transition_check_safe = false;
+	string cardinality_transition_check_safe;
+	if (ExtractJsonString(json, "cardinality_transition_check_safe", cardinality_transition_check_safe)) {
+		out.cardinality_transition_check_safe = StringUtil::CIEquals(cardinality_transition_check_safe, "true");
+	}
 	return ExtractJsonString(json, "table", out.table) && ParseJsonIndex(json, "occ", out.occurrence) &&
 	       ExtractJsonString(json, "column", out.column);
 }
@@ -1129,7 +1134,8 @@ bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeyS
 string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source) {
 	return "{\"k\":\"left_join_key_source\",\"table\":" + SqlUtils::JsonQuote(source.table) +
 	       ",\"occ\":" + SqlUtils::JsonQuote(to_string(source.occurrence)) +
-	       ",\"column\":" + SqlUtils::JsonQuote(source.column) + "}";
+	       ",\"column\":" + SqlUtils::JsonQuote(source.column) + ",\"cardinality_transition_check_safe\":" +
+	       SqlUtils::JsonQuote(source.cardinality_transition_check_safe ? "true" : "false") + "}";
 }
 
 string RefreshMetadata::LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src) {

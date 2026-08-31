@@ -158,12 +158,26 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// and metadata ops (physical-default catalog) to avoid the cross-catalog write error.
 		string meta_pre_sql, meta_post_sql;
 		RefreshCompileProfile compile_profile;
+		ProjectionDeleteRetryPlan delete_retry_plan;
 		auto generate_start = std::chrono::steady_clock::now();
 		string sql =
 		    GenerateRefreshSQL(context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
 		                       attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr,
 		                       cross_system ? &meta_post_sql : nullptr, profiler.Enabled() ? &compile_profile : nullptr,
-		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr);
+		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr,
+		                       /*facts=*/nullptr, /*metadata_connection=*/nullptr, &delete_retry_plan);
+		string fallback_sql;
+		if (delete_retry_plan.IsActive()) {
+			// Compile the ranked rowid program before setting refresh_in_progress. It is only
+			// executed when DuckLake reports that the exhaustive tuple delete removed more
+			// rows than the negative delta requested.
+			fallback_sql = GenerateRefreshSQL(
+			    context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
+			    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr,
+			    cross_system ? &meta_post_sql : nullptr, /*compile_profile=*/nullptr, precomputed_delta_activity,
+			    /*out_adaptive_estimate=*/nullptr, /*facts=*/nullptr, /*metadata_connection=*/nullptr,
+			    /*delete_retry_plan=*/nullptr, /*write_query_file=*/false);
+		}
 		for (const auto &step : compile_profile.steps) {
 			profiler.AddMeasuredStep(step.step_name, step.duration_ms, step.detail);
 		}
@@ -187,17 +201,9 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		OPENIVM_DEBUG_PRINT("[UPSERT] Executing refresh SQL:\n%s\n", sql.c_str());
 		OPENIVM_DEBUG_PRINT("[UPSERT] Generated refresh SQL size: %zu bytes\n", sql.size());
 
-		// Wrap the entire refresh in a transaction so that a failed refresh leaves the MV
-		// and delta tables in a clean state (atomically rolled back). The refresh_in_progress
-		// flag is inside the same transaction, so it also rolls back on failure — WAL recovery
-		// handles the crash case automatically.
-		// DuckLake (cross_system) skips this: DuckDB forbids writing to two attached databases
-		// (metadata catalog + dl) within a single transaction. Instead, we run metadata ops on
-		// a separate meta_con (physical-default catalog) and data ops on exec_con (dl catalog).
-		if (!cross_system) {
-			exec_con.BeginTransaction();
-			tx_open = true;
-		} else if (!meta_pre_sql.empty()) {
+		// DuckLake metadata is written through a separate connection because DuckDB forbids
+		// writing the physical metadata catalog and DuckLake in one transaction.
+		if (cross_system && !meta_pre_sql.empty()) {
 			auto meta_pre_start = std::chrono::steady_clock::now();
 			Connection meta_con(*context.db.get());
 			auto meta_result = meta_con.Query(meta_pre_sql);
@@ -207,30 +213,78 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			}
 			profiler.AddStep("metadata_pre_sql", meta_pre_start, "bytes=" + to_string(meta_pre_sql.size()));
 		}
+		// Native refreshes are always transactional. DuckLake only needs a data transaction
+		// for the exhaustive-delete attempt: a multiplicity mismatch rolls the attempt back
+		// before the ranked rowid program runs.
+		if (!cross_system || delete_retry_plan.IsActive()) {
+			exec_con.BeginTransaction();
+			tx_open = true;
+		}
 		auto start = std::chrono::steady_clock::now();
 		unique_ptr<MaterializedQueryResult> result;
-		idx_t executed_statement_count = 1;
-		if (profiler.Enabled()) {
-			// Diagnostic mode runs the generated batch one statement at a time so
-			// the profile table can show which refresh operation dominates runtime.
-			auto statements = SqlUtils::SplitSQLStatements(sql);
-			executed_statement_count = statements.size();
-			if (statements.empty()) {
-				result = exec_con.Query(sql);
+		idx_t executed_statement_count = 0;
+		bool retry_required = false;
+		int64_t expected_delete_count = -1;
+		int64_t actual_delete_count = -1;
+		auto execute_program = [&](const string &program, const ProjectionDeleteRetryPlan *retry_plan) {
+			bool split_program = profiler.Enabled() || (retry_plan && retry_plan->IsActive());
+			if (!split_program) {
+				executed_statement_count++;
+				return exec_con.Query(program);
 			}
+
+			auto statements = SqlUtils::SplitSQLStatements(program);
+			executed_statement_count += statements.size();
+			unique_ptr<MaterializedQueryResult> program_result;
 			for (idx_t stmt_idx = 0; stmt_idx < statements.size(); stmt_idx++) {
 				auto stmt_start = std::chrono::steady_clock::now();
-				result = exec_con.Query(statements[stmt_idx]);
+				program_result = exec_con.Query(statements[stmt_idx]);
 				profiler.AddStep("execute_refresh_sql_stmt", stmt_start,
 				                 "statement=" + to_string(stmt_idx + 1) + "/" + to_string(statements.size()) +
 				                     ", bytes=" + to_string(statements[stmt_idx].size()) +
 				                     ", sql=" + SqlUtils::SQLStatementPreview(statements[stmt_idx]));
-				if (result->HasError()) {
+				if (program_result->HasError()) {
 					break;
 				}
+				if (!retry_plan || !retry_plan->IsActive()) {
+					continue;
+				}
+				if (statements[stmt_idx] == retry_plan->expected_count_statement) {
+					if (program_result->RowCount() != 1 || program_result->ColumnCount() != 1 ||
+					    program_result->GetValue(0, 0).IsNull()) {
+						throw InternalException("IVM exhaustive-delete count query returned an invalid result");
+					}
+					expected_delete_count = program_result->GetValue(0, 0).GetValue<int64_t>();
+				} else if (statements[stmt_idx] == retry_plan->delete_statement) {
+					if (expected_delete_count < 0 || program_result->RowCount() != 1 ||
+					    program_result->ColumnCount() != 1 || program_result->GetValue(0, 0).IsNull()) {
+						throw InternalException("IVM exhaustive-delete statement returned an invalid result");
+					}
+					actual_delete_count = program_result->GetValue(0, 0).GetValue<int64_t>();
+					if (actual_delete_count != expected_delete_count) {
+						retry_required = true;
+						break;
+					}
+				}
 			}
-		} else {
-			result = exec_con.Query(sql);
+			return program_result;
+		};
+
+		result = execute_program(sql, delete_retry_plan.IsActive() ? &delete_retry_plan : nullptr);
+		if (retry_required) {
+			D_ASSERT(tx_open);
+			exec_con.Rollback();
+			tx_open = false;
+			profiler.AddMeasuredStep("projection_delete_retry", 0,
+			                         "expected_rows=" + to_string(expected_delete_count) +
+			                             ", deleted_rows=" + to_string(actual_delete_count));
+			OPENIVM_DEBUG_PRINT("[UPSERT] Exhaustive tuple delete for %s removed %lld rows; expected %lld. "
+			                    "Retrying with ranked bag deletion.\n",
+			                    vn.c_str(), static_cast<long long>(actual_delete_count),
+			                    static_cast<long long>(expected_delete_count));
+			exec_con.BeginTransaction();
+			tx_open = true;
+			result = execute_program(fallback_sql, nullptr);
 		}
 		auto end = std::chrono::steady_clock::now();
 		profiler.AddStep("execute_refresh_sql", start,
@@ -251,7 +305,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		if (tx_open) {
 			exec_con.Commit();
 			tx_open = false;
-		} else if (cross_system && !meta_post_sql.empty()) {
+		}
+		if (cross_system && !meta_post_sql.empty()) {
 			auto meta_post_start = std::chrono::steady_clock::now();
 			if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
 				// DuckLake can keep read snapshot state on the connection that compiled

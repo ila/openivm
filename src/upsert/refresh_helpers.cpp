@@ -728,6 +728,31 @@ static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string
 	return predicate.empty() ? "" : " WHERE " + predicate;
 }
 
+static string TryBuildLeftJoinLineagePushedQuery(RefreshMetadata &metadata, const string &view_name,
+                                                 const string &view_query_sql, const string &affected_source,
+                                                 const string &affected_alias, const string &lk,
+                                                 RefreshMetadata::LeftJoinKeySource &key_source) {
+	if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
+		return "";
+	}
+	string source_ref = SqlUtils::FindTableReferenceOccurrence(view_query_sql, key_source.table, key_source.occurrence);
+	if (source_ref.empty()) {
+		return "";
+	}
+
+	string key_col = SqlUtils::QuoteIdentifier(key_source.column);
+	string replacement = "(SELECT openivm_lj_src.* FROM " + source_ref + " openivm_lj_src INNER JOIN " +
+	                     affected_source + " " + affected_alias + " ON openivm_lj_src." + key_col +
+	                     " IS NOT DISTINCT FROM " + affected_alias + "." + lk + ")";
+	bool replaced = false;
+	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_source.table,
+	                                                                key_source.occurrence, replacement, replaced);
+	if (!replaced || pushed_query == view_query_sql) {
+		return "";
+	}
+	return pushed_query;
+}
+
 static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const string &view_name,
                                               const vector<string> &delta_table_names, const string &data_table,
                                               const string &view_query_sql, const string &qdv,
@@ -741,26 +766,13 @@ static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const s
 		}
 	}
 
-	RefreshMetadata::LeftJoinKeySource key_source;
-	if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
-		return "";
-	}
-	string source_ref = SqlUtils::FindTableReferenceOccurrence(view_query_sql, key_source.table, key_source.occurrence);
-	if (source_ref.empty()) {
-		return "";
-	}
-
 	string affected_where = BuildGuardedDeltaWhere(delta_ts_filter, negative_delta_guard);
 	string affected_cte =
 	    "WITH openivm_affected AS (\n  SELECT DISTINCT " + lk + " FROM " + qdv + affected_where + "\n)\n";
-	string key_col = SqlUtils::QuoteIdentifier(key_source.column);
-	string replacement = "(SELECT openivm_lj_src.* FROM " + source_ref +
-	                     " openivm_lj_src INNER JOIN openivm_affected openivm_lj_aff ON openivm_lj_src." + key_col +
-	                     " IS NOT DISTINCT FROM openivm_lj_aff." + lk + ")";
-	bool replaced = false;
-	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_source.table,
-	                                                                key_source.occurrence, replacement, replaced);
-	if (!replaced || pushed_query == view_query_sql) {
+	RefreshMetadata::LeftJoinKeySource key_source;
+	string pushed_query = TryBuildLeftJoinLineagePushedQuery(metadata, view_name, view_query_sql, "openivm_affected",
+	                                                         "openivm_lj_aff", lk, key_source);
+	if (pushed_query.empty()) {
 		return "";
 	}
 
@@ -772,6 +784,189 @@ static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const s
 	return BuildDeleteUsingInsertRefreshSQL(data_table, pushed_query, "openivm_lj", "openivm_affected", "_d",
 	                                        delete_match, all_ducklake ? "TRUE" : affected + "openivm_lj." + lk + ")",
 	                                        affected_cte);
+}
+
+static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, const string &view_name,
+                                                   const vector<string> &column_names,
+                                                   const vector<string> &delta_table_names, const string &data_table,
+                                                   const string &view_query_sql, const string &qdv,
+                                                   const string &delta_ts_filter, const string &lk, bool insert_only,
+                                                   bool can_use_runtime_delta_shape, bool nullable_side_quiet,
+                                                   ProjectionDeleteRetryPlan *delete_retry_plan) {
+	// The primary LEFT JOIN delta omits NULL-padding transition corrections. For a single outer join,
+	// those corrections change the output cardinality of their preserved-side key, so compare the
+	// primary cardinality prediction with the current query. Exact tuple deltas are safe for matching
+	// keys; only transition keys need the existing delete/recompute path. Multiple outer joins are not
+	// eligible because cardinality corrections at different levels or join predicates can cancel.
+	if (insert_only || !can_use_runtime_delta_shape || delta_table_names.empty()) {
+		return "";
+	}
+	for (auto &delta_table : delta_table_names) {
+		if (!metadata.IsDuckLakeTable(view_name, delta_table)) {
+			return "";
+		}
+	}
+	RefreshMetadata::LeftJoinKeySource key_source;
+	string affected_table = SqlUtils::QuoteIdentifier("openivm_lj_affected_" + view_name);
+	string stats_table = SqlUtils::QuoteIdentifier("openivm_lj_key_stats_" + view_name);
+	string net_table = SqlUtils::QuoteIdentifier("openivm_lj_safe_net_" + view_name);
+	string partial_delete_table = SqlUtils::QuoteIdentifier("openivm_lj_partial_deletes_" + view_name);
+	string delete_matches_table = SqlUtils::QuoteIdentifier("openivm_lj_delete_matches_" + view_name);
+	string pushed_query;
+	if (!nullable_side_quiet) {
+		pushed_query = TryBuildLeftJoinLineagePushedQuery(metadata, view_name, view_query_sql, affected_table,
+		                                                  "openivm_lj_aff", lk, key_source);
+		if (pushed_query.empty() || !key_source.cardinality_transition_check_safe) {
+			return "";
+		}
+	}
+
+	string mul = KeywordHelper::WriteOptionallyQuoted(string(openivm::MULTIPLICITY_COL));
+	string delta_source = "(SELECT * FROM " + qdv;
+	if (!delta_ts_filter.empty()) {
+		delta_source += " WHERE " + delta_ts_filter;
+	}
+	delta_source += ")";
+
+	string select_columns;
+	string delta_columns;
+	string delete_candidate_columns;
+	string match_conditions;
+	for (auto &raw_col : column_names) {
+		if (raw_col == openivm::MULTIPLICITY_COL) {
+			continue;
+		}
+		string col = KeywordHelper::WriteOptionallyQuoted(raw_col);
+		if (!select_columns.empty()) {
+			select_columns += ", ";
+			delta_columns += ", ";
+			delete_candidate_columns += ", ";
+			match_conditions += " AND ";
+		}
+		select_columns += col;
+		delta_columns += "openivm_delta." + col;
+		delete_candidate_columns += "openivm_target." + col + " AS " + col;
+		match_conditions += "openivm_target." + col + " IS NOT DISTINCT FROM openivm_net." + col;
+	}
+	if (select_columns.empty()) {
+		return "";
+	}
+
+	string transition_query;
+	if (!nullable_side_quiet) {
+		string transition_source = "(SELECT " + lk + " FROM " + stats_table + " WHERE NOT openivm_safe)";
+		RefreshMetadata::LeftJoinKeySource transition_key_source;
+		transition_query = TryBuildLeftJoinLineagePushedQuery(metadata, view_name, view_query_sql, transition_source,
+		                                                      "openivm_lj_transition", lk, transition_key_source);
+		if (transition_query.empty()) {
+			return "";
+		}
+	}
+
+	string sql;
+	if (!nullable_side_quiet) {
+		sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS\nSELECT DISTINCT " + lk + " FROM " +
+		       delta_source + ";\n\n";
+		sql += "CREATE OR REPLACE TEMP TABLE " + stats_table +
+		       " AS\nWITH openivm_old_counts AS (\n  SELECT openivm_old." + lk +
+		       ", COUNT(*)::BIGINT AS openivm_old_count\n  FROM " + data_table + " openivm_old\n  JOIN " +
+		       affected_table + " openivm_affected ON openivm_old." + lk + " IS NOT DISTINCT FROM openivm_affected." +
+		       lk + "\n  GROUP BY openivm_old." + lk + "\n), openivm_delta_counts AS (\n  SELECT openivm_delta." + lk +
+		       ", SUM(openivm_delta." + mul + ")::BIGINT AS openivm_delta_count FROM " + delta_source +
+		       " openivm_delta\n  GROUP BY openivm_delta." + lk +
+		       "\n), openivm_expected_counts AS (\n  SELECT openivm_current." + lk +
+		       ", COUNT(*)::BIGINT AS openivm_expected_count FROM (" + pushed_query +
+		       ") openivm_current\n  GROUP BY openivm_current." + lk + "\n)\nSELECT openivm_affected." + lk +
+		       ", COALESCE(openivm_old_count, 0) + COALESCE(openivm_delta_count, 0) = "
+		       "COALESCE(openivm_expected_count, 0) AS openivm_safe\nFROM " +
+		       affected_table + " openivm_affected\nLEFT JOIN openivm_old_counts ON openivm_old_counts." + lk +
+		       " IS NOT DISTINCT FROM openivm_affected." + lk +
+		       "\nLEFT JOIN openivm_delta_counts ON openivm_delta_counts." + lk +
+		       " IS NOT DISTINCT FROM openivm_affected." + lk +
+		       "\nLEFT JOIN openivm_expected_counts ON openivm_expected_counts." + lk +
+		       " IS NOT DISTINCT FROM openivm_affected." + lk + ";\n\n";
+	}
+	string safe_join;
+	string safe_where;
+	if (!nullable_side_quiet) {
+		safe_join = "\nJOIN " + stats_table + " openivm_stats ON openivm_stats." + lk +
+		            " IS NOT DISTINCT FROM openivm_delta." + lk;
+		safe_where = "\nWHERE openivm_stats.openivm_safe";
+	}
+	bool try_exhaustive_delete = nullable_side_quiet && delete_retry_plan;
+	string net_projection = nullable_side_quiet && !try_exhaustive_delete
+	                            ? "openivm_grouped.*, ROW_NUMBER() OVER () AS openivm_net_id"
+	                            : "openivm_grouped.*";
+	sql += "CREATE OR REPLACE TEMP TABLE " + net_table + " AS\nSELECT " + net_projection + " FROM (\nSELECT " +
+	       delta_columns + ", SUM(openivm_delta." + mul + ")::BIGINT AS openivm_net\nFROM " + delta_source +
+	       " openivm_delta" + safe_join + safe_where + "\nGROUP BY " + delta_columns + "\nHAVING SUM(openivm_delta." +
+	       mul + ") <> 0\n) openivm_grouped;\n\n";
+	if (nullable_side_quiet) {
+		if (try_exhaustive_delete) {
+			delete_retry_plan->expected_count_statement =
+			    "SELECT COALESCE(SUM(-openivm_net), 0)::BIGINT AS openivm_expected_delete_rows FROM " + net_table +
+			    " WHERE openivm_net < 0";
+			delete_retry_plan->delete_statement = "DELETE FROM " + data_table + " openivm_target USING " + net_table +
+			                                      " openivm_net\nWHERE openivm_net.openivm_net < 0 AND " +
+			                                      match_conditions;
+			sql += delete_retry_plan->expected_count_statement + ";\n\n";
+			sql += delete_retry_plan->delete_statement + ";\n\n";
+			OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN attempting exhaustive tuple delete for %s\n", view_name.c_str());
+		} else {
+			sql += "CREATE OR REPLACE TEMP TABLE " + delete_matches_table +
+			       " AS\nSELECT openivm_target.rowid, openivm_net.openivm_net_id, openivm_net.openivm_net\nFROM " +
+			       data_table + " openivm_target JOIN " + net_table + " openivm_net ON " + match_conditions +
+			       "\nWHERE openivm_net.openivm_net < 0;\n\n";
+			sql += "CREATE OR REPLACE TEMP TABLE " + partial_delete_table +
+			       " AS\nSELECT openivm_net_id, openivm_net\nFROM " + delete_matches_table +
+			       "\nGROUP BY openivm_net_id, openivm_net\nHAVING COUNT(*) <> -openivm_net;\n\n";
+			sql += "DELETE FROM " + data_table + " WHERE rowid IN (\n  SELECT openivm_match.rowid\n  FROM " +
+			       delete_matches_table + " openivm_match\n  WHERE NOT EXISTS (SELECT 1 FROM " + partial_delete_table +
+			       " openivm_partial WHERE openivm_partial.openivm_net_id = openivm_match.openivm_net_id)\n);\n\n";
+			sql +=
+			    "WITH openivm_ranked_deletes AS (\n  SELECT openivm_match.rowid, openivm_match.openivm_net, "
+			    "ROW_NUMBER() OVER (PARTITION BY openivm_match.openivm_net_id ORDER BY openivm_match.rowid) AS "
+			    "openivm_rn\n  FROM " +
+			    delete_matches_table + " openivm_match JOIN " + partial_delete_table +
+			    " openivm_partial ON openivm_partial.openivm_net_id = openivm_match.openivm_net_id\n)\nDELETE FROM " +
+			    data_table +
+			    " WHERE rowid IN (SELECT rowid FROM openivm_ranked_deletes WHERE openivm_rn <= -openivm_net);\n\n";
+		}
+	} else {
+		sql += "WITH openivm_delete_net AS (\n  SELECT * FROM " + net_table +
+		       " WHERE openivm_net < 0\n), openivm_delete_candidates AS (\n  SELECT openivm_target.rowid, " +
+		       delete_candidate_columns + ", openivm_net.openivm_net\n  FROM " + data_table +
+		       " openivm_target JOIN openivm_delete_net openivm_net ON " + match_conditions +
+		       "\n), openivm_ranked_deletes AS (\n  SELECT rowid, openivm_net, ROW_NUMBER() OVER (PARTITION BY " +
+		       select_columns + " ORDER BY rowid) AS openivm_rn\n  FROM openivm_delete_candidates\n)\nDELETE FROM " +
+		       data_table +
+		       " WHERE rowid IN (SELECT rowid FROM openivm_ranked_deletes WHERE openivm_rn <= -openivm_net);\n\n";
+	}
+	sql += "INSERT INTO " + data_table + " SELECT " + select_columns + " FROM " + net_table +
+	       ", generate_series(1, openivm_net::BIGINT) WHERE openivm_net > 0;\n\n";
+	if (!nullable_side_quiet) {
+		string target_stats_match = "openivm_stats." + lk + " IS NOT DISTINCT FROM openivm_target." + lk;
+		sql += "DELETE FROM " + data_table + " openivm_target USING " + stats_table +
+		       " openivm_stats\nWHERE NOT openivm_stats.openivm_safe AND " + target_stats_match + ";\n\n";
+		sql += "INSERT INTO " + data_table + " SELECT * FROM (" + transition_query + ") openivm_transition;\n\n";
+	}
+	if (nullable_side_quiet && !try_exhaustive_delete) {
+		sql += "DROP TABLE IF EXISTS " + partial_delete_table + ";\n";
+		sql += "DROP TABLE IF EXISTS " + delete_matches_table + ";\n";
+	}
+	sql += "DROP TABLE IF EXISTS " + net_table + ";\n";
+	if (!nullable_side_quiet) {
+		sql += "DROP TABLE IF EXISTS " + stats_table + ";\nDROP TABLE IF EXISTS " + affected_table + ";\n";
+	}
+
+	if (nullable_side_quiet) {
+		OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN exact mixed hybrid for %s (nullable side quiet)\n", view_name.c_str());
+	} else {
+		OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN mixed hybrid for %s via %s[%llu].%s\n", view_name.c_str(),
+		                    key_source.table.c_str(), static_cast<unsigned long long>(key_source.occurrence),
+		                    key_source.column.c_str());
+	}
+	return sql;
 }
 
 static string TryBuildFactMarketHistoryAffectedPushdown(const string &view_name, const string &data_table,
@@ -829,15 +1024,23 @@ static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const st
                                              const vector<string> &column_names,
                                              const vector<string> &delta_table_names, const string &data_table,
                                              const string &view_query_sql, const string &delta_ts_filter,
-                                             const string &catalog_prefix, bool allow_runtime_insert_only) {
+                                             const string &catalog_prefix, bool insert_only,
+                                             bool can_use_runtime_delta_shape, bool nullable_side_quiet,
+                                             ProjectionDeleteRetryPlan *delete_retry_plan) {
 	string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
 	string lk = KeywordHelper::WriteOptionallyQuoted(string(openivm::LEFT_KEY_COL));
 	string mul = KeywordHelper::WriteOptionallyQuoted(string(openivm::MULTIPLICITY_COL));
 	string negative_delta_guard;
-	if (allow_runtime_insert_only) {
+	if (can_use_runtime_delta_shape) {
 		string negative_where = delta_ts_filter.empty() ? " WHERE " : " WHERE " + delta_ts_filter + " AND ";
 		negative_delta_guard = "EXISTS (SELECT 1 FROM " + qdv + " openivm_delta_shape" + negative_where +
 		                       "openivm_delta_shape." + mul + " < 0 LIMIT 1)";
+	}
+	string hybrid_refresh = BuildLeftJoinHybridProjectionRefresh(
+	    metadata, view_name, column_names, delta_table_names, data_table, view_query_sql, qdv, delta_ts_filter, lk,
+	    insert_only, can_use_runtime_delta_shape, nullable_side_quiet, delete_retry_plan);
+	if (!hybrid_refresh.empty()) {
+		return hybrid_refresh;
 	}
 	string delta_where = delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter;
 	if (!negative_delta_guard.empty()) {
@@ -856,7 +1059,7 @@ static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const st
 		                                             affected + data_table + "." + lk + delta_where + ")",
 		                                             affected + "openivm_lj." + lk + delta_where + ")");
 	}
-	if (!allow_runtime_insert_only) {
+	if (!can_use_runtime_delta_shape) {
 		return pushed_refresh;
 	}
 
@@ -921,21 +1124,22 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
                                 const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
                                 bool skip_proj_delete, bool insert_only, const vector<string> &active_delta_table_names,
-                                bool allow_runtime_insert_only) {
+                                bool can_use_runtime_delta_shape, ProjectionDeleteRetryPlan *delete_retry_plan) {
 	if (has_full_outer) {
 		return BuildFullOuterProjectionRefresh(metadata, view_name, delta_table_names, data_table, view_query_sql,
 		                                       delta_ts_filter, catalog_prefix);
 	}
 	if (has_left_join) {
-		if (insert_only && LeftJoinDeltaNullableQuiet(metadata, view_name, active_delta_table_names)) {
+		bool nullable_side_quiet = LeftJoinDeltaNullableQuiet(metadata, view_name, active_delta_table_names);
+		if (insert_only && nullable_side_quiet) {
 			OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN insert-only append for %s (nullable side quiet)\n",
 			                    view_name.c_str());
 			return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix,
 			                                 /*insert_only=*/true);
 		}
 		return BuildLeftJoinProjectionRefresh(metadata, view_name, column_names, delta_table_names, data_table,
-		                                      view_query_sql, delta_ts_filter, catalog_prefix,
-		                                      allow_runtime_insert_only);
+		                                      view_query_sql, delta_ts_filter, catalog_prefix, insert_only,
+		                                      can_use_runtime_delta_shape, nullable_side_quiet, delete_retry_plan);
 	}
 	return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete);
 }
@@ -1140,16 +1344,32 @@ string QualifyViewQuerySources(RefreshMetadata &metadata, Connection &con, const
                                const string &view_catalog_name, const string &view_schema_name,
                                const string &attached_db_catalog_name, const string &attached_db_schema_name) {
 	string qualified_query = view_query_sql;
+	auto sources = metadata.GetDeltaSources(view_name);
+	unordered_map<string, RefreshMetadata::DeltaSource> sources_by_name;
+	for (auto &source : sources) {
+		sources_by_name[StringUtil::Lower(source.table_name)] = std::move(source);
+	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] Qualifying %zu sources for %s from one metadata snapshot\n", sources_by_name.size(),
+	                    view_name.c_str());
 	for (auto &dt : delta_table_names) {
 		string base_name = BaseTableNameFromDeltaKey(dt);
-		auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
-		                                         attached_db_catalog_name, attached_db_schema_name);
-		loc.table_name = base_name;
-		if (loc.catalog_name.empty() || loc.schema_name.empty()) {
+		string catalog_name;
+		string schema_name;
+		auto source = sources_by_name.find(StringUtil::Lower(dt));
+		if (source != sources_by_name.end()) {
+			catalog_name = source->second.catalog_name;
+			schema_name = source->second.schema_name;
+		} else {
+			auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
+			                                         attached_db_catalog_name, attached_db_schema_name);
+			catalog_name = loc.catalog_name;
+			schema_name = loc.schema_name;
+		}
+		if (catalog_name.empty() || schema_name.empty()) {
 			continue;
 		}
-		qualified_query = SqlUtils::ReplaceTableReferences(
-		    qualified_query, base_name, SqlUtils::FullName(loc.catalog_name, loc.schema_name, base_name));
+		qualified_query = SqlUtils::ReplaceTableReferences(qualified_query, base_name,
+		                                                   SqlUtils::FullName(catalog_name, schema_name, base_name));
 	}
 	return qualified_query;
 }

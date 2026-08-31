@@ -77,10 +77,11 @@ statement ok
 CREATE TABLE dl.runtime_right (id INTEGER, label VARCHAR);
 
 statement ok
-INSERT INTO dl.runtime_left VALUES (1, 'one'), (2, 'two'), (NULL, 'null-key');
+INSERT INTO dl.runtime_left VALUES
+  (1, 'one'), (2, 'two'), (4, 'four'), (6, 'six'), (6, 'six'), (NULL, 'null-key');
 
 statement ok
-INSERT INTO dl.runtime_right VALUES (1, 'x');
+INSERT INTO dl.runtime_right VALUES (1, 'x'), (4, 'stable'), (4, 'duplicate');
 
 statement ok
 CREATE MATERIALIZED VIEW dl.mv_runtime_left_join AS
@@ -105,6 +106,7 @@ query I
 SELECT contains(content, 'openivm_delta_shape')
        AND contains(content, 'openivm_multiplicity < 0')
        AND contains(content, 'generate_series')
+       AND NOT contains(content, 'openivm_lj_key_stats_')
 FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_runtime_left_join.sql');
 ----
 true
@@ -131,24 +133,36 @@ SELECT count(*) FROM (
 ----
 0
 
-# A single conflicting batch produces negative output multiplicities: UPDATE
-# contributes -old/+new, deleting the last match restores a NULL-extended row,
-# and inserting a first match removes another NULL-extended row. The runtime
-# guard must therefore retain the affected-key recompute behavior.
+# One refresh sees INSERT + DELETE + UPDATE together. Key 1 transitions from
+# matched to unmatched, key 2 from unmatched to matched, and key 4 remains
+# matched while both sides change. The duplicate rows exercise bag deletion;
+# only the two match-transition keys should need affected-key recompute.
 statement ok
 INSERT INTO dl.runtime_left VALUES (3, 'three');
 
 statement ok
-UPDATE dl.runtime_left SET value = 'two-updated' WHERE id = 2;
+UPDATE dl.runtime_left SET value = value || '-updated' WHERE id IN (2, 4);
 
 statement ok
-DELETE FROM dl.runtime_right WHERE id = 1 AND label = 'x';
+DELETE FROM dl.runtime_right WHERE id = 1;
 
 statement ok
-INSERT INTO dl.runtime_right VALUES (2, 'z');
+DELETE FROM dl.runtime_right WHERE id = 4 AND label = 'duplicate';
+
+statement ok
+INSERT INTO dl.runtime_right VALUES (2, 'z'), (4, 'replacement');
 
 statement ok
 PRAGMA refresh('mv_runtime_left_join');
+
+query IIII
+SELECT contains(content, 'openivm_lj_safe_net_'),
+       contains(content, 'openivm_lj_key_stats_'),
+       contains(content, 'WHERE NOT openivm_stats.openivm_safe'),
+       contains(content, 'openivm_refresh_delta_mv_runtime_left_join')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_runtime_left_join.sql');
+----
+true	true	true	true
 
 query I
 SELECT count(*) FROM (
@@ -168,6 +182,177 @@ SELECT count(*) FROM (
   LEFT JOIN dl.runtime_right r ON l.id = r.id
   EXCEPT ALL
   SELECT id, value, label FROM dl.mv_runtime_left_join
+);
+----
+0
+
+# With the nullable side quiet, mixed changes on the preserved side already
+# produce exact tuple deltas. The refresh skips cardinality-transition checks
+# and the exhaustive tuple delete succeeds without a ranked-delete retry.
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+INSERT INTO dl.runtime_left VALUES (5, 'five');
+
+statement ok
+UPDATE dl.runtime_left SET value = 'three-updated' WHERE id = 3;
+
+statement ok
+DELETE FROM dl.runtime_left WHERE id = 2;
+
+statement ok
+PRAGMA refresh('mv_runtime_left_join');
+
+query IIIIII
+SELECT contains(content, 'openivm_lj_safe_net_'),
+       contains(content, 'openivm_expected_delete_rows'),
+       contains(content, 'DELETE FROM dl.main.openivm_data_mv_runtime_left_join openivm_target USING'),
+       NOT contains(content, 'openivm_lj_key_stats_'),
+       contains(content, 'openivm_inline_delta'),
+       NOT contains(content, 'openivm_refresh_delta_mv_runtime_left_join')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_runtime_left_join.sql');
+----
+true	true	true	true	true	true
+
+query I
+SELECT count(*)
+FROM openivm_refresh_profile
+WHERE view_name = 'mv_runtime_left_join' AND step_name = 'projection_delete_retry';
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT id, value, label FROM dl.mv_runtime_left_join
+  EXCEPT ALL
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+  EXCEPT ALL
+SELECT id, value, label FROM dl.mv_runtime_left_join
+);
+----
+0
+
+# Identical target rows make a one-copy retraction partial. Batch conflicting
+# INSERT, DELETE, and UPDATE operations before one refresh. The exhaustive
+# delete over-removes, is rolled back, and the ranked bag-safe program retries.
+statement ok
+INSERT INTO dl.runtime_left VALUES (7, 'seven');
+
+statement ok
+UPDATE dl.runtime_left SET value = 'five-updated' WHERE id = 5;
+
+statement ok
+DELETE FROM dl.runtime_left
+WHERE rowid = (SELECT min(rowid) FROM dl.runtime_left WHERE id = 6 AND value = 'six');
+
+statement ok
+PRAGMA refresh('mv_runtime_left_join');
+
+query I
+SELECT count(*)
+FROM openivm_refresh_profile
+WHERE view_name = 'mv_runtime_left_join' AND step_name = 'projection_delete_retry';
+----
+1
+
+query I
+SELECT count(*) FROM (
+  SELECT id, value, label FROM dl.mv_runtime_left_join
+  EXCEPT ALL
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT l.id, l.value, r.label
+  FROM dl.runtime_left l
+  LEFT JOIN dl.runtime_right r ON l.id = r.id
+  EXCEPT ALL
+  SELECT id, value, label FROM dl.mv_runtime_left_join
+);
+----
+0
+
+statement ok
+SET openivm_profile_refresh = false;
+
+# A composite LEFT JOIN cannot use cardinality alone to prove that transition
+# corrections are absent: opposite transitions can share the first key and
+# cancel. It must retain affected-key recompute.
+statement ok
+CREATE TABLE dl.composite_left (id INTEGER, kind VARCHAR, payload VARCHAR);
+
+statement ok
+CREATE TABLE dl.composite_right (id INTEGER, kind VARCHAR, label VARCHAR);
+
+statement ok
+INSERT INTO dl.composite_left VALUES (1, 'a', 'one-a'), (1, 'b', 'one-b'), (2, 'a', 'two-a');
+
+statement ok
+INSERT INTO dl.composite_right VALUES (1, 'a', 'old-a'), (1, 'b', 'old-b');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_composite_left_join AS
+  SELECT l.id, l.kind, l.payload, r.label
+  FROM dl.composite_left l
+  LEFT JOIN dl.composite_right r ON l.id = r.id AND l.kind = r.kind;
+
+statement ok
+INSERT INTO dl.composite_left VALUES (3, 'a', 'three-a');
+
+statement ok
+UPDATE dl.composite_left SET payload = 'one-a-updated' WHERE id = 1 AND kind = 'a';
+
+statement ok
+DELETE FROM dl.composite_right WHERE id = 1 AND kind = 'a';
+
+statement ok
+INSERT INTO dl.composite_right VALUES (2, 'a', 'new-two-a'), (3, 'a', 'new-three-a');
+
+statement ok
+PRAGMA refresh('mv_composite_left_join');
+
+query I
+SELECT contains(content, 'openivm_lj_src INNER JOIN openivm_affected')
+       AND NOT contains(content, 'openivm_lj_key_stats_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_composite_left_join.sql');
+----
+true
+
+query I
+SELECT count(*) FROM (
+  SELECT id, kind, payload, label FROM dl.mv_composite_left_join
+  EXCEPT ALL
+  SELECT l.id, l.kind, l.payload, r.label
+  FROM dl.composite_left l
+  LEFT JOIN dl.composite_right r ON l.id = r.id AND l.kind = r.kind
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT l.id, l.kind, l.payload, r.label
+  FROM dl.composite_left l
+  LEFT JOIN dl.composite_right r ON l.id = r.id AND l.kind = r.kind
+  EXCEPT ALL
+  SELECT id, kind, payload, label FROM dl.mv_composite_left_join
 );
 ----
 0
@@ -344,6 +529,7 @@ PRAGMA refresh('mv_star_projection');
 
 query I
 SELECT contains(content, 'openivm_lj_src INNER JOIN openivm_affected')
+       AND NOT contains(content, 'openivm_lj_key_stats_')
 FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_star_projection.sql');
 ----
 true

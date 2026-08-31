@@ -1259,6 +1259,13 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 }
 
 bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out) {
+	idx_t outer_join_count = 0;
+	for (auto *join : facts.comparison_joins) {
+		if (join && (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT ||
+		             join->join_type == JoinType::OUTER)) {
+			outer_join_count++;
+		}
+	}
 	for (auto *join : facts.comparison_joins) {
 		if (!join || join->join_type != JoinType::LEFT || join->conditions.empty()) {
 			continue;
@@ -1274,6 +1281,8 @@ bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::Lef
 		out.table = source.table;
 		out.occurrence = source.occurrence;
 		out.column = source.column;
+		out.cardinality_transition_check_safe = outer_join_count == 1 && join->conditions.size() == 1 &&
+		                                        join->conditions[0].comparison == ExpressionType::COMPARE_EQUAL;
 		return true;
 	}
 	return false;
