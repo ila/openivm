@@ -180,6 +180,229 @@ SELECT count(*) FROM (
 ----
 0
 
+# A single-source ordered DuckLake window can pair old and new row occurrences
+# by PARTITION BY + ORDER BY, then write only the compact bag difference. The
+# duplicate (symbol, event_day) keys below ensure this does not assume a unique
+# window key.
+statement ok
+CREATE TABLE dl.window_compact_src (
+    event_day INT,
+    symbol VARCHAR,
+    low_value INT,
+    high_value INT,
+    payload INT
+);
+
+statement ok
+INSERT INTO dl.window_compact_src VALUES
+    (1, 'A', 10, 20, 100),
+    (1, 'A', 9, 21, 101),
+    (2, 'A', 8, 19, 102),
+    (3, 'A', 11, 23, 103),
+    (1, 'B', 30, 40, 200),
+    (2, 'B', 29, 39, 201);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_window_compact AS
+WITH cumulative AS (
+    SELECT
+        event_day,
+        symbol,
+        low_value,
+        high_value,
+        payload,
+        min(low_value) OVER w AS running_low,
+        max(high_value) OVER w AS running_high
+    FROM dl.window_compact_src
+    WINDOW w AS (PARTITION BY symbol ORDER BY event_day)
+), flagged AS (
+    SELECT
+        *,
+        CASE WHEN low_value = running_low THEN event_day END AS low_day_flag,
+        CASE WHEN high_value = running_high THEN event_day END AS high_day_flag
+    FROM cumulative
+)
+SELECT
+    event_day,
+    symbol,
+    low_value,
+    high_value,
+    payload,
+    running_low,
+    running_high,
+    max(low_day_flag) OVER (PARTITION BY symbol ORDER BY event_day) AS running_low_day,
+    max(high_day_flag) OVER (PARTITION BY symbol ORDER BY event_day) AS running_high_day
+FROM flagged;
+
+query T
+SELECT window_order_columns FROM openivm_views WHERE view_name = 'mv_window_compact';
+----
+event_day=event_day
+
+# Batch conflicting INSERT, UPDATE, and DELETE operations—including multiple
+# operations on the same logical key—before one refresh.
+statement ok
+INSERT INTO dl.window_compact_src VALUES (4, 'A', 7, 24, 104);
+
+statement ok
+UPDATE dl.window_compact_src SET high_value = 25, payload = 105
+WHERE symbol = 'A' AND event_day = 4;
+
+statement ok
+DELETE FROM dl.window_compact_src WHERE symbol = 'A' AND event_day = 4;
+
+statement ok
+INSERT INTO dl.window_compact_src VALUES
+    (4, 'A', 6, 26, 106),
+    (2, 'B', 28, 41, 202);
+
+statement ok
+UPDATE dl.window_compact_src SET low_value = 7, payload = 112
+WHERE symbol = 'A' AND event_day = 2 AND payload = 102;
+
+statement ok
+DELETE FROM dl.window_compact_src
+WHERE symbol = 'A' AND event_day = 1 AND payload = 100;
+
+statement ok
+PRAGMA refresh('mv_window_compact');
+
+query I
+SELECT contains(content, 'openivm_window_changed_mv_window_compact')::INT
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_window_compact.sql');
+----
+1
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+        SELECT event_day, symbol, low_value, high_value, payload,
+               min(low_value) OVER w AS running_low,
+               max(high_value) OVER w AS running_high
+        FROM dl.window_compact_src
+        WINDOW w AS (PARTITION BY symbol ORDER BY event_day)
+    ), flagged AS (
+        SELECT *,
+               CASE WHEN low_value = running_low THEN event_day END AS low_day_flag,
+               CASE WHEN high_value = running_high THEN event_day END AS high_day_flag
+        FROM cumulative
+    )
+    SELECT event_day, symbol, low_value, high_value, payload,
+           running_low, running_high,
+           max(low_day_flag) OVER (PARTITION BY symbol ORDER BY event_day) AS running_low_day,
+           max(high_day_flag) OVER (PARTITION BY symbol ORDER BY event_day) AS running_high_day
+    FROM flagged
+)
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_window_compact
+    EXCEPT ALL
+    SELECT * FROM expected
+);
+----
+0
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+        SELECT event_day, symbol, low_value, high_value, payload,
+               min(low_value) OVER w AS running_low,
+               max(high_value) OVER w AS running_high
+        FROM dl.window_compact_src
+        WINDOW w AS (PARTITION BY symbol ORDER BY event_day)
+    ), flagged AS (
+        SELECT *,
+               CASE WHEN low_value = running_low THEN event_day END AS low_day_flag,
+               CASE WHEN high_value = running_high THEN event_day END AS high_day_flag
+        FROM cumulative
+    )
+    SELECT event_day, symbol, low_value, high_value, payload,
+           running_low, running_high,
+           max(low_day_flag) OVER (PARTITION BY symbol ORDER BY event_day) AS running_low_day,
+           max(high_day_flag) OVER (PARTITION BY symbol ORDER BY event_day) AS running_high_day
+    FROM flagged
+)
+SELECT count(*) FROM (
+    SELECT * FROM expected
+    EXCEPT ALL
+    SELECT * FROM dl.mv_window_compact
+);
+----
+0
+
+# A second mixed batch verifies that the compact physical layout remains valid
+# for the next refresh rather than deferring work into the following batch.
+statement ok
+UPDATE dl.window_compact_src SET low_value = low_value - 2, payload = payload + 1000
+WHERE symbol = 'A' AND event_day = 1;
+
+statement ok
+DELETE FROM dl.window_compact_src
+WHERE symbol = 'B' AND event_day = 2 AND payload = 201;
+
+statement ok
+INSERT INTO dl.window_compact_src VALUES
+    (2, 'B', 27, 42, 203),
+    (3, 'B', 26, 43, 204);
+
+statement ok
+PRAGMA refresh('mv_window_compact');
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+        SELECT event_day, symbol, low_value, high_value, payload,
+               min(low_value) OVER w AS running_low,
+               max(high_value) OVER w AS running_high
+        FROM dl.window_compact_src
+        WINDOW w AS (PARTITION BY symbol ORDER BY event_day)
+    ), flagged AS (
+        SELECT *,
+               CASE WHEN low_value = running_low THEN event_day END AS low_day_flag,
+               CASE WHEN high_value = running_high THEN event_day END AS high_day_flag
+        FROM cumulative
+    )
+    SELECT event_day, symbol, low_value, high_value, payload,
+           running_low, running_high,
+           max(low_day_flag) OVER (PARTITION BY symbol ORDER BY event_day) AS running_low_day,
+           max(high_day_flag) OVER (PARTITION BY symbol ORDER BY event_day) AS running_high_day
+    FROM flagged
+)
+SELECT count(*) FROM (
+    SELECT * FROM dl.mv_window_compact
+    EXCEPT ALL
+    SELECT * FROM expected
+);
+----
+0
+
+query I
+WITH expected AS (
+    WITH cumulative AS (
+        SELECT event_day, symbol, low_value, high_value, payload,
+               min(low_value) OVER w AS running_low,
+               max(high_value) OVER w AS running_high
+        FROM dl.window_compact_src
+        WINDOW w AS (PARTITION BY symbol ORDER BY event_day)
+    ), flagged AS (
+        SELECT *,
+               CASE WHEN low_value = running_low THEN event_day END AS low_day_flag,
+               CASE WHEN high_value = running_high THEN event_day END AS high_day_flag
+        FROM cumulative
+    )
+    SELECT event_day, symbol, low_value, high_value, payload,
+           running_low, running_high,
+           max(low_day_flag) OVER (PARTITION BY symbol ORDER BY event_day) AS running_low_day,
+           max(high_day_flag) OVER (PARTITION BY symbol ORDER BY event_day) AS running_high_day
+    FROM flagged
+)
+SELECT count(*) FROM (
+    SELECT * FROM expected
+    EXCEPT ALL
+    SELECT * FROM dl.mv_window_compact
+);
+----
+0
+
 statement ok
 CREATE TABLE dl.window_composite_src (
     w_id INT,
