@@ -295,6 +295,7 @@ public:
 		string table;
 		idx_t occurrence = 0;
 		string column;
+		bool cardinality_transition_check_safe = false;
 	};
 
 	bool GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out);

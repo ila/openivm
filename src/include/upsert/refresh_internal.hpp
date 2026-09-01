@@ -114,6 +114,18 @@ struct RefreshCompileProfile {
 	}
 };
 
+// Native DuckLake refreshes can try an exhaustive tuple delete first and retry
+// with ranked rowid deletion when the changed-row count proves that the target
+// contained more copies than the delta removes.
+struct ProjectionDeleteRetryPlan {
+	string expected_count_statement;
+	string delete_statement;
+
+	bool IsActive() const {
+		return !expected_count_statement.empty() && !delete_statement.empty();
+	}
+};
+
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col);
 bool IsEmptyDeltaPlan(LogicalOperator *op);
 string BuildEmptyDeltaInsert(const string &view_name, const vector<string> &column_names,
@@ -161,7 +173,8 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
                                 bool skip_proj_delete, bool insert_only = false,
                                 const vector<string> &active_delta_table_names = {},
-                                bool allow_runtime_insert_only = false);
+                                bool can_use_runtime_delta_shape = false,
+                                ProjectionDeleteRetryPlan *delete_retry_plan = nullptr);
 bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,
@@ -202,7 +215,7 @@ string BuildDuckLakeSnapshotQuery(RefreshMetadata &metadata, Connection &con, co
                                   const string &view_catalog_name, const string &view_schema_name,
                                   const string &attached_db_catalog_name, const string &attached_db_schema_name);
 string QualifyViewQuerySources(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                               const string &view_query_sql, const vector<string> &delta_table_names,
+                               const string &view_query_sql, const vector<RefreshMetadata::DeltaSource> &delta_sources,
                                const string &view_catalog_name, const string &view_schema_name,
                                const string &attached_db_catalog_name, const string &attached_db_schema_name);
 string DuckLakeSnapshotPlaceholder(const string &catalog_name);
@@ -244,7 +257,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           string *out_post_meta = nullptr, RefreshCompileProfile *compile_profile = nullptr,
                           const DeltaActivityResult *precomputed_delta_activity = nullptr,
                           RefreshCostEstimate *out_adaptive_estimate = nullptr,
-                          const openivm::CompileFacts *facts = nullptr, Connection *metadata_connection = nullptr);
+                          const openivm::CompileFacts *facts = nullptr, Connection *metadata_connection = nullptr,
+                          ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, bool write_query_file = true);
 
 } // namespace duckdb
 
