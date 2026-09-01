@@ -355,6 +355,23 @@ vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
 	return cols;
 }
 
+vector<string> RefreshMetadata::GetWindowOrderColumns(const string &view_name) {
+	auto result = con.Query("SELECT window_order_columns FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	vector<string> cols;
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return cols;
+	}
+	std::istringstream ss(result->GetValue(0, 0).ToString());
+	string token;
+	while (std::getline(ss, token, ',')) {
+		if (!token.empty()) {
+			cols.push_back(token);
+		}
+	}
+	return cols;
+}
+
 vector<string> RefreshMetadata::GetAggregateTypes(const string &view_name) {
 	auto result = con.Query("SELECT aggregate_types FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");

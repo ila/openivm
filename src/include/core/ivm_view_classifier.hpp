@@ -176,6 +176,7 @@ struct DeltaViewModel {
 	vector<DeltaStrategyReason> strategy_reasons;
 	vector<string> group_columns;
 	vector<string> window_partition_columns;
+	vector<string> window_order_columns;
 	vector<string> aggregate_types;
 	vector<DeltaModelFeature> features;
 	vector<DeltaUnsupportedReason> unsupported_reasons;
