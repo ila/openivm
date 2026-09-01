@@ -728,13 +728,9 @@ static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string
 	return predicate.empty() ? "" : " WHERE " + predicate;
 }
 
-static string TryBuildLeftJoinLineagePushedQuery(RefreshMetadata &metadata, const string &view_name,
-                                                 const string &view_query_sql, const string &affected_source,
-                                                 const string &affected_alias, const string &lk,
-                                                 RefreshMetadata::LeftJoinKeySource &key_source) {
-	if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
-		return "";
-	}
+static string BuildLeftJoinLineagePushedQuery(const string &view_query_sql, const string &affected_source,
+                                              const string &affected_alias, const string &lk,
+                                              const RefreshMetadata::LeftJoinKeySource &key_source) {
 	string source_ref = SqlUtils::FindTableReferenceOccurrence(view_query_sql, key_source.table, key_source.occurrence);
 	if (source_ref.empty()) {
 		return "";
@@ -770,8 +766,11 @@ static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const s
 	string affected_cte =
 	    "WITH openivm_affected AS (\n  SELECT DISTINCT " + lk + " FROM " + qdv + affected_where + "\n)\n";
 	RefreshMetadata::LeftJoinKeySource key_source;
-	string pushed_query = TryBuildLeftJoinLineagePushedQuery(metadata, view_name, view_query_sql, "openivm_affected",
-	                                                         "openivm_lj_aff", lk, key_source);
+	if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
+		return "";
+	}
+	string pushed_query =
+	    BuildLeftJoinLineagePushedQuery(view_query_sql, "openivm_affected", "openivm_lj_aff", lk, key_source);
 	if (pushed_query.empty()) {
 		return "";
 	}
@@ -814,8 +813,11 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 	string delete_matches_table = SqlUtils::QuoteIdentifier("openivm_lj_delete_matches_" + view_name);
 	string pushed_query;
 	if (!nullable_side_quiet) {
-		pushed_query = TryBuildLeftJoinLineagePushedQuery(metadata, view_name, view_query_sql, affected_table,
-		                                                  "openivm_lj_aff", lk, key_source);
+		if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
+			return "";
+		}
+		pushed_query =
+		    BuildLeftJoinLineagePushedQuery(view_query_sql, affected_table, "openivm_lj_aff", lk, key_source);
 		if (pushed_query.empty() || !key_source.cardinality_transition_check_safe) {
 			return "";
 		}
@@ -855,9 +857,8 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 	string transition_query;
 	if (!nullable_side_quiet) {
 		string transition_source = "(SELECT " + lk + " FROM " + stats_table + " WHERE NOT openivm_safe)";
-		RefreshMetadata::LeftJoinKeySource transition_key_source;
-		transition_query = TryBuildLeftJoinLineagePushedQuery(metadata, view_name, view_query_sql, transition_source,
-		                                                      "openivm_lj_transition", lk, transition_key_source);
+		transition_query =
+		    BuildLeftJoinLineagePushedQuery(view_query_sql, transition_source, "openivm_lj_transition", lk, key_source);
 		if (transition_query.empty()) {
 			return "";
 		}
@@ -1340,34 +1341,26 @@ string BuildDuckLakeSnapshotQuery(RefreshMetadata &metadata, Connection &con, co
 }
 
 string QualifyViewQuerySources(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                               const string &view_query_sql, const vector<string> &delta_table_names,
+                               const string &view_query_sql, const vector<RefreshMetadata::DeltaSource> &delta_sources,
                                const string &view_catalog_name, const string &view_schema_name,
                                const string &attached_db_catalog_name, const string &attached_db_schema_name) {
 	string qualified_query = view_query_sql;
-	auto sources = metadata.GetDeltaSources(view_name);
-	unordered_map<string, RefreshMetadata::DeltaSource> sources_by_name;
-	for (auto &source : sources) {
-		sources_by_name[StringUtil::Lower(source.table_name)] = std::move(source);
-	}
-	OPENIVM_DEBUG_PRINT("[UPSERT] Qualifying %zu sources for %s from one metadata snapshot\n", sources_by_name.size(),
+	OPENIVM_DEBUG_PRINT("[UPSERT] Qualifying %zu sources for %s from one metadata snapshot\n", delta_sources.size(),
 	                    view_name.c_str());
-	for (auto &dt : delta_table_names) {
-		string base_name = BaseTableNameFromDeltaKey(dt);
-		string catalog_name;
-		string schema_name;
-		auto source = sources_by_name.find(StringUtil::Lower(dt));
-		if (source != sources_by_name.end()) {
-			catalog_name = source->second.catalog_name;
-			schema_name = source->second.schema_name;
-		} else {
-			auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
-			                                         attached_db_catalog_name, attached_db_schema_name);
+	for (auto &source : delta_sources) {
+		string catalog_name = source.catalog_name;
+		string schema_name = source.schema_name;
+		if (catalog_name.empty() || schema_name.empty()) {
+			auto loc =
+			    ResolveDuckLakeSourceLocation(con, view_name, source.table_name, view_catalog_name, view_schema_name,
+			                                  attached_db_catalog_name, attached_db_schema_name);
 			catalog_name = loc.catalog_name;
 			schema_name = loc.schema_name;
 		}
 		if (catalog_name.empty() || schema_name.empty()) {
 			continue;
 		}
+		string base_name = BaseTableNameFromDeltaKey(source.table_name);
 		qualified_query = SqlUtils::ReplaceTableReferences(qualified_query, base_name,
 		                                                   SqlUtils::FullName(catalog_name, schema_name, base_name));
 	}
