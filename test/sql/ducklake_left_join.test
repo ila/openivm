@@ -357,6 +357,80 @@ SELECT count(*) FROM (
 ----
 0
 
+# LogicalAnyJoin is not recorded in comparison_joins. It must still count as
+# an outer join when deciding whether the single-join cardinality transition
+# check is safe. The two nullable-side transitions below cancel in row count,
+# so incorrectly treating this as one outer join leaves stale tuples behind.
+statement ok
+CREATE TABLE dl.any_left (id INTEGER, payload VARCHAR);
+
+statement ok
+CREATE TABLE dl.any_right1 (id INTEGER, label1 VARCHAR);
+
+statement ok
+CREATE TABLE dl.any_right2 (id INTEGER, label2 VARCHAR);
+
+statement ok
+INSERT INTO dl.any_left VALUES (1, 'one'), (2, 'two');
+
+statement ok
+INSERT INTO dl.any_right1 VALUES (1, 'old-one');
+
+statement ok
+INSERT INTO dl.any_right2 VALUES (2, 'old-two');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_any_left_join AS
+  SELECT l.id, l.payload, r1.label1, r2.label2
+  FROM dl.any_left l
+  LEFT JOIN dl.any_right1 r1 ON l.id = r1.id
+  LEFT JOIN dl.any_right2 r2 ON l.id = r2.id OR (l.id = 42 AND r2.id = 43);
+
+# Batch INSERT + DELETE + UPDATE before one refresh. For key 1, the first join
+# becomes unmatched while the second becomes matched, preserving cardinality
+# but replacing the complete output tuple.
+statement ok
+UPDATE dl.any_left SET payload = 'one-updated' WHERE id = 1;
+
+statement ok
+DELETE FROM dl.any_right1 WHERE id = 1;
+
+statement ok
+INSERT INTO dl.any_right2 VALUES (1, 'new-one');
+
+statement ok
+PRAGMA refresh('mv_any_left_join');
+
+query I
+SELECT NOT contains(content, 'openivm_lj_key_stats_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_any_left_join.sql');
+----
+true
+
+query I
+SELECT count(*) FROM (
+  SELECT id, payload, label1, label2 FROM dl.mv_any_left_join
+  EXCEPT ALL
+  SELECT l.id, l.payload, r1.label1, r2.label2
+  FROM dl.any_left l
+  LEFT JOIN dl.any_right1 r1 ON l.id = r1.id
+  LEFT JOIN dl.any_right2 r2 ON l.id = r2.id OR (l.id = 42 AND r2.id = 43)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT l.id, l.payload, r1.label1, r2.label2
+  FROM dl.any_left l
+  LEFT JOIN dl.any_right1 r1 ON l.id = r1.id
+  LEFT JOIN dl.any_right2 r2 ON l.id = r2.id OR (l.id = 42 AND r2.id = 43)
+  EXCEPT ALL
+  SELECT id, payload, label1, label2 FROM dl.mv_any_left_join
+);
+----
+0
+
 # ==========================================
 # Star projection: affected fact-key pushdown
 # ==========================================
