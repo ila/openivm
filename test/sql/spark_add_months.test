@@ -1,0 +1,86 @@
+# name: test/sql/spark_add_months.test
+# description: add_months incremental MV maintenance through the openivm compiler
+# group: [sql]
+
+#
+# Exhaustive scalar-correctness coverage for add_months lives in lpts
+# (third_party/lpts test/sql/spark_add_months.test). openivm consumes the
+# function from lpts; this test covers openivm's concern: that add_months
+# resolves in the compiler and drives a real SIMPLE_PROJECTION delta rather
+# than a silent FULL_REFRESH demotion.
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# add_months resolves in an openivm session (registered via lpts source)
+query I
+SELECT add_months(DATE '2015-01-31', 1) = DATE '2015-02-28';
+----
+true
+
+# --- Incremental materialized-view maintenance using add_months ---
+
+statement ok
+CREATE TABLE am_item (id INT, d DATE, n INT);
+
+statement ok
+INSERT INTO am_item VALUES
+    (1, DATE '2015-01-31', 1),
+    (2, DATE '2016-02-29', 12),
+    (3, DATE '2015-01-15', 13);
+
+statement ok
+CREATE MATERIALIZED VIEW am_mv AS
+    SELECT id, d, n, add_months(d, n) AS shifted
+    FROM am_item;
+
+statement ok
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'am_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
+
+# Real SIMPLE_PROJECTION delta emitted (no full-refresh demotion)
+query I
+SELECT CASE
+           WHEN contains(content, 'INSERT INTO openivm_delta_am_mv') AND
+                contains(content, 'openivm_delta_am_item') AND
+                NOT contains(content, 'SELECT NULL::')
+           THEN 1 ELSE 0
+       END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_am_mv.sql');
+----
+1
+
+statement ok
+UPDATE am_item SET d = DATE '2015-12-31', n = 1 WHERE id = 1;
+
+statement ok
+INSERT INTO am_item VALUES (4, DATE '2015-06-30', 3);
+
+statement ok
+DELETE FROM am_item WHERE id = 3;
+
+statement ok
+PRAGMA refresh('am_mv');
+
+# Incrementally maintained MV matches full recomputation, both directions
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM am_mv
+    EXCEPT ALL
+    SELECT id, d, n, add_months(d, n) AS shifted FROM am_item
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, d, n, add_months(d, n) AS shifted FROM am_item
+    EXCEPT ALL
+    SELECT * FROM am_mv
+);
+----
+0

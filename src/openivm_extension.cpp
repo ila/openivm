@@ -2,11 +2,13 @@
 
 #include "core/openivm_extension.hpp"
 #include "compile_facts.hpp"
+#include "spark_scalar_functions.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_daemon.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
+#include "core/time_travel_pins.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh.hpp"
@@ -126,6 +128,7 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 	Parser parser;
 	parser.ParseQuery(view_query);
 	auto statement = parser.statements[0].get();
+	duckdb::openivm::TimeTravelPins::PeelForLocalBinding(context, *statement);
 	Planner planner(context);
 	planner.CreatePlan(statement->Copy());
 	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] Plan:\n%s\n", planner.plan->ToString().c_str());
@@ -166,6 +169,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// statement OpenIVM does not recognize with DuckDB's native parser.
 	db_config.SetOption(AllowParserOverrideExtensionSetting::SettingIndex, Value("fallback"));
 
+	RegisterSparkScalarFunctions(loader);
+
 	db_config.AddExtensionOption("openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("openivm_refresh_mode", "refresh strategy: incremental, full, or auto",
 	                             LogicalType::VARCHAR, Value("incremental"));
@@ -197,6 +202,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_regular_nterm", "use N-term telescoping for compile-only regular inner joins",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("openivm_regular_nterm_left",
+	                             "extend compile-only N-term telescoping to LEFT-join projection views",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_fk_pruning", "prune inclusion-exclusion join terms using FK constraints",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_scd2_range_join_accel",
@@ -205,6 +213,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_emit_spark_hints",
 	                             "emit Spark optimizer hints in target_dialect=spark compiled refresh SQL",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption(duckdb::OPENIVM_INPUT_DIALECT_SETTING,
+	                             "SQL dialect materialized-view bodies are written in: duckdb (default) or spark",
+	                             LogicalType::VARCHAR, Value("duckdb"), duckdb::SetOpenIvmInputDialect);
 	db_config.AddExtensionOption("openivm_skip_aggregate_delete",
 	                             "skip zero-row DELETE for grouped aggregates when deltas are insert-only",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));

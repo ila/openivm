@@ -1,0 +1,529 @@
+# name: test/sql/cascade_window_unscopable_delta.test
+# description: WINDOW_PARTITION plans whose partition keys cannot be scoped to a source delta still emit signed cascade deltas when facts.force_view_delta_cascade=true
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+# ==========================================================================
+# Case 1 - global surrogate key: ROW_NUMBER() OVER (ORDER BY ...) with no
+# PARTITION BY. The classifier still selects WINDOW_PARTITION, but there are
+# no partition columns to scope an affected-key set with, so the compiler
+# falls back to a full recompute of the view body. That fallback must still
+# honour an explicitly requested cascade view delta - otherwise every
+# downstream materialized view observes "no delta" and gets demoted to a
+# full refresh.
+# ==========================================================================
+
+statement ok
+CREATE TABLE uwd_src (id INT, grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO uwd_src VALUES
+    (1, 'a', 10),
+    (2, 'a', 20),
+    (3, 'b', 5),
+    (4, 'b', 15);
+
+statement ok
+CREATE MATERIALIZED VIEW uwd_dim AS
+    SELECT CAST(ROW_NUMBER() OVER (ORDER BY grp, id) AS INT) AS dim_key, id, grp, val
+    FROM uwd_src;
+
+# The refresh type is unchanged by the cascade request: no relabeling, no
+# demotion to FULL_REFRESH.
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'uwd_dim',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+LIMIT 1;
+----
+5	WINDOW_PARTITION
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'uwd_dim',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+5	WINDOW_PARTITION
+
+# Without a cascade request the program is the plain in-place recompute and
+# must not write into the view's own delta table.
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data_uwd_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_uwd_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO openivm_delta_uwd_dim%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'uwd_dim',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# With a cascade request the same recompute must be bracketed by old/new
+# snapshots and publish the signed whole-view delta.
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_uwd_dim AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_uwd_dim AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data_uwd_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_uwd_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_uwd_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old_uwd_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new_uwd_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old_uwd_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new_uwd_dim%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'uwd_dim',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================================================
+# Case 2 - computed partition key: PARTITION BY lower(a) || '_' || lower(b)
+# is not a column of any source delta table, so no partition delta spec can
+# be built. Same requirement.
+# ==========================================================================
+
+statement ok
+CREATE TABLE uwd_os_src (os_name VARCHAR, os_sku VARCHAR);
+
+statement ok
+INSERT INTO uwd_os_src VALUES ('linux', 'a'), ('windows', 'b'), ('linux', 'c');
+
+statement ok
+CREATE MATERIALIZED VIEW uwd_os_dim AS
+    SELECT CAST(ROW_NUMBER() OVER (ORDER BY os_full) AS INT) AS os_key, os_full, os_name, os_sku
+    FROM (
+        SELECT lower(os_name) || '_' || lower(os_sku) AS os_full, os_name, os_sku,
+               ROW_NUMBER() OVER (PARTITION BY lower(os_name) || '_' || lower(os_sku) ORDER BY os_name) AS rn
+        FROM uwd_os_src
+    ) t
+    WHERE rn = 1;
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'uwd_os_dim',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+5	WINDOW_PARTITION
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO openivm_delta_uwd_os_dim%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'uwd_os_dim',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_uwd_os_dim AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_uwd_os_dim AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_uwd_os_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old_uwd_os_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new_uwd_os_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new_uwd_os_dim%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'uwd_os_dim',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================================================
+# Case 3 - multi-source join whose partition key is a computed expression:
+# the window partition lineage cannot cover every source delta table.
+# ==========================================================================
+
+statement ok
+CREATE TABLE uwd_inst (instance_id INT, sub_id INT, region VARCHAR);
+
+statement ok
+CREATE TABLE uwd_sub (sub_id INT, sub_name VARCHAR);
+
+statement ok
+INSERT INTO uwd_inst VALUES (1, 10, 'eus'), (2, 10, 'wus'), (3, 11, 'eus');
+
+statement ok
+INSERT INTO uwd_sub VALUES (10, 's10'), (11, 's11');
+
+statement ok
+CREATE MATERIALIZED VIEW uwd_target AS
+    SELECT CAST(ROW_NUMBER() OVER (PARTITION BY upper(i.region) ORDER BY i.instance_id) AS INT) AS rn,
+           i.instance_id, i.region, s.sub_name
+    FROM uwd_inst i JOIN uwd_sub s ON i.sub_id = s.sub_id;
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'uwd_target',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+5	WINDOW_PARTITION
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_uwd_target AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_uwd_target AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_uwd_target%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old_uwd_target%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new_uwd_target%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'uwd_target',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================================================
+# End-to-end: run the emitted cascade program for uwd_dim after a batch of
+# conflicting DML (insert + update + delete applied before a single refresh)
+# and prove (a) the signed delta reconstructs the new view content from the
+# old content under bag semantics, and (b) a downstream materialized view
+# refreshes incrementally off that delta and stays bidirectionally equal to
+# its base query. PRAGMA refresh() uses the default CompileFacts (cascade
+# off), so the cascade program is executed explicitly here exactly as the
+# engine driver executes it.
+# ==========================================================================
+
+statement ok
+CREATE MATERIALIZED VIEW uwd_down AS
+    SELECT dim_key, grp, val FROM uwd_dim WHERE val > 6;
+
+statement ok
+INSERT INTO uwd_src VALUES (5, 'a', 15), (6, 'c', 1);
+
+statement ok
+DELETE FROM uwd_src WHERE id = 1;
+
+statement ok
+UPDATE uwd_src SET val = 12 WHERE id = 3;
+
+statement ok
+CREATE TABLE uwd_old_snapshot AS SELECT * FROM openivm_data_uwd_dim;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE openivm_old_uwd_dim AS
+SELECT * FROM openivm_data_uwd_dim openivm_old;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE openivm_new_uwd_dim AS
+SELECT * FROM (
+    SELECT CAST(ROW_NUMBER() OVER (ORDER BY grp, id) AS INT) AS dim_key, id, grp, val
+    FROM uwd_src
+) openivm_recompute;
+
+statement ok
+DELETE FROM openivm_data_uwd_dim;
+
+statement ok
+INSERT INTO openivm_data_uwd_dim
+SELECT * FROM openivm_new_uwd_dim;
+
+statement ok
+INSERT INTO openivm_delta_uwd_dim
+SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_uwd_dim
+UNION ALL
+SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_uwd_dim;
+
+statement ok
+DROP TABLE IF EXISTS openivm_old_uwd_dim;
+
+statement ok
+DROP TABLE IF EXISTS openivm_new_uwd_dim;
+
+# The retraction leg is exactly the pre-refresh content (bag equality).
+query I
+SELECT COUNT(*) FROM (
+    SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = -1
+    EXCEPT ALL
+    SELECT dim_key, id, grp, val FROM uwd_old_snapshot
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT dim_key, id, grp, val FROM uwd_old_snapshot
+    EXCEPT ALL
+    SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = -1
+);
+----
+0
+
+# Applying the signed delta to the old content reproduces the new content
+# exactly, in both directions.
+query I
+WITH applied AS (
+    (
+        SELECT dim_key, id, grp, val FROM uwd_old_snapshot
+        UNION ALL
+        SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = 1
+    )
+    EXCEPT ALL
+    SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = -1
+)
+SELECT COUNT(*) FROM (
+    SELECT dim_key, id, grp, val FROM applied
+    EXCEPT ALL
+    SELECT dim_key, id, grp, val FROM openivm_data_uwd_dim
+);
+----
+0
+
+query I
+WITH applied AS (
+    (
+        SELECT dim_key, id, grp, val FROM uwd_old_snapshot
+        UNION ALL
+        SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = 1
+    )
+    EXCEPT ALL
+    SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = -1
+)
+SELECT COUNT(*) FROM (
+    SELECT dim_key, id, grp, val FROM openivm_data_uwd_dim
+    EXCEPT ALL
+    SELECT dim_key, id, grp, val FROM applied
+);
+----
+0
+
+# The refreshed view itself matches its base query.
+query I
+SELECT COUNT(*) FROM (
+    SELECT dim_key, id, grp, val FROM openivm_data_uwd_dim
+    EXCEPT ALL
+    SELECT CAST(ROW_NUMBER() OVER (ORDER BY grp, id) AS INT) AS dim_key, id, grp, val FROM uwd_src
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT CAST(ROW_NUMBER() OVER (ORDER BY grp, id) AS INT) AS dim_key, id, grp, val FROM uwd_src
+    EXCEPT ALL
+    SELECT dim_key, id, grp, val FROM openivm_data_uwd_dim
+);
+----
+0
+
+# The downstream view consumes the cascade delta incrementally and is
+# bidirectionally equal to its base query.
+statement ok
+PRAGMA refresh('uwd_down');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT dim_key, grp, val FROM openivm_data_uwd_down
+    EXCEPT ALL
+    SELECT dim_key, grp, val FROM (
+        SELECT CAST(ROW_NUMBER() OVER (ORDER BY grp, id) AS INT) AS dim_key, id, grp, val FROM uwd_src
+    ) d
+    WHERE val > 6
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT dim_key, grp, val FROM (
+        SELECT CAST(ROW_NUMBER() OVER (ORDER BY grp, id) AS INT) AS dim_key, id, grp, val FROM uwd_src
+    ) d
+    WHERE val > 6
+    EXCEPT ALL
+    SELECT dim_key, grp, val FROM openivm_data_uwd_down
+);
+----
+0
+
+# ==========================================================================
+# Duplicate-heavy view: the signed delta must carry exact multiplicities,
+# not a de-duplicated set.
+# ==========================================================================
+
+statement ok
+CREATE TABLE uwd_bag_src (grp VARCHAR, val INT);
+
+statement ok
+INSERT INTO uwd_bag_src VALUES ('a', 1), ('a', 1), ('a', 1), ('b', 2), ('b', 2);
+
+statement ok
+CREATE MATERIALIZED VIEW uwd_bag_mv AS
+    SELECT grp, val, CAST(SUM(val) OVER () AS INT) AS total FROM uwd_bag_src;
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'uwd_bag_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+5	WINDOW_PARTITION
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_uwd_bag_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old_uwd_bag_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new_uwd_bag_mv%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'uwd_bag_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+statement ok
+INSERT INTO uwd_bag_src VALUES ('a', 1), ('c', 3);
+
+statement ok
+CREATE TABLE uwd_bag_old AS SELECT * FROM openivm_data_uwd_bag_mv;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE openivm_old_uwd_bag_mv AS
+SELECT * FROM openivm_data_uwd_bag_mv openivm_old;
+
+statement ok
+CREATE OR REPLACE TEMP TABLE openivm_new_uwd_bag_mv AS
+SELECT * FROM (
+    SELECT grp, val, CAST(SUM(val) OVER () AS INT) AS total FROM uwd_bag_src
+) openivm_recompute;
+
+statement ok
+DELETE FROM openivm_data_uwd_bag_mv;
+
+statement ok
+INSERT INTO openivm_data_uwd_bag_mv
+SELECT * FROM openivm_new_uwd_bag_mv;
+
+statement ok
+INSERT INTO openivm_delta_uwd_bag_mv
+SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_uwd_bag_mv
+UNION ALL
+SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_uwd_bag_mv;
+
+statement ok
+DROP TABLE IF EXISTS openivm_old_uwd_bag_mv;
+
+statement ok
+DROP TABLE IF EXISTS openivm_new_uwd_bag_mv;
+
+# Three identical ('a', 1, 5) rows must be retracted three times, and four
+# identical ('a', 1, 9) rows must be inserted four times.
+query III
+SELECT grp, val, COUNT(*) FROM openivm_delta_uwd_bag_mv
+WHERE openivm_multiplicity = -1 AND grp = 'a'
+GROUP BY grp, val;
+----
+a	1	3
+
+query III
+SELECT grp, val, COUNT(*) FROM openivm_delta_uwd_bag_mv
+WHERE openivm_multiplicity = 1 AND grp = 'a'
+GROUP BY grp, val;
+----
+a	1	4
+
+query I
+WITH applied AS (
+    (
+        SELECT grp, val, total FROM uwd_bag_old
+        UNION ALL
+        SELECT grp, val, total FROM openivm_delta_uwd_bag_mv WHERE openivm_multiplicity = 1
+    )
+    EXCEPT ALL
+    SELECT grp, val, total FROM openivm_delta_uwd_bag_mv WHERE openivm_multiplicity = -1
+)
+SELECT COUNT(*) FROM (
+    SELECT grp, val, total FROM applied
+    EXCEPT ALL
+    SELECT grp, val, total FROM openivm_data_uwd_bag_mv
+);
+----
+0
+
+query I
+WITH applied AS (
+    (
+        SELECT grp, val, total FROM uwd_bag_old
+        UNION ALL
+        SELECT grp, val, total FROM openivm_delta_uwd_bag_mv WHERE openivm_multiplicity = 1
+    )
+    EXCEPT ALL
+    SELECT grp, val, total FROM openivm_delta_uwd_bag_mv WHERE openivm_multiplicity = -1
+)
+SELECT COUNT(*) FROM (
+    SELECT grp, val, total FROM openivm_data_uwd_bag_mv
+    EXCEPT ALL
+    SELECT grp, val, total FROM applied
+);
+----
+0
+
+# ==========================================================================
+# Requesting a cascade delta must not relabel or rescue an unsupported plan.
+# A window view whose predicate is non-deterministic (the same guard that
+# demotes production predicates built on current_date()) stays FULL_REFRESH,
+# and an unknown view still fails explicitly.
+# ==========================================================================
+
+statement ok
+CREATE TABLE uwd_vol_src (id INT, event_date DATE, val INT);
+
+statement ok
+INSERT INTO uwd_vol_src VALUES (1, DATE '2024-01-01', 10);
+
+statement ok
+CREATE MATERIALIZED VIEW uwd_vol_mv AS
+    SELECT CAST(ROW_NUMBER() OVER (ORDER BY id) AS INT) AS k, id, event_date, val
+    FROM uwd_vol_src
+    WHERE val > random();
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'uwd_vol_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+3	FULL_REFRESH
+
+statement error
+SELECT * FROM openivm_compile_with_facts(
+    'uwd_does_not_exist',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+);
+----
+materialized view 'uwd_does_not_exist' not found

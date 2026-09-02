@@ -58,6 +58,28 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const vector<string> &column_names = {}, bool running_window_incremental = false);
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
 
+/// Full recompute of `openivm_data_<view>` that ALSO emits the exact signed
+/// multiset view-delta into `openivm_delta_<view>`.
+///
+/// The partial-recompute paths (`WINDOW_PARTITION`, `GROUP_RECOMPUTE`) degrade to
+/// a full recompute whenever the affected partition/group key set cannot be
+/// scoped from the source deltas — an unpartitioned surrogate-key
+/// `ROW_NUMBER() OVER (ORDER BY ...)`, a partition key that is a computed
+/// expression absent from every source delta table, or incomplete multi-source
+/// lineage. The view keeps its `WINDOW_PARTITION` / `GROUP_RECOMPUTE`
+/// classification, so a caller that asked for a cascade delta
+/// (`CompileFacts::force_view_delta_cascade`) would otherwise receive a program
+/// that writes no `openivm_delta_<view>` rows at all, and every downstream MV
+/// would have to be demoted to a full refresh.
+///
+/// Retracting the whole pre-refresh content at multiplicity -1 and adding the
+/// whole post-refresh content at +1 is the exact Z-set delta of the view
+/// (`new_bag - old_bag`): unchanged rows contribute cancelling -1/+1 pairs, so
+/// bag semantics are preserved exactly. Statement shapes mirror the
+/// `CompileWindowRecompute` / `CompileGroupRecompute` cascade branches.
+string CompileFullRecomputeWithCascadeDelta(const string &view_name, const string &view_query_sql,
+                                            const string &catalog_prefix = "");
+
 /// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE`
 /// (inner-DISTINCT under aggregate). For each base table T_i with a non-empty
 /// delta, builds a "view query with T_i restricted to its delta" variant by

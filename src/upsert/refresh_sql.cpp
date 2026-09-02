@@ -5,6 +5,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/scoped_optimizer_settings.hpp"
 #include "core/sql_utils.hpp"
+#include "core/time_travel_pins.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_compiler.hpp"
 #include "upsert/refresh_cost_model.hpp"
@@ -46,7 +47,8 @@ static string SparkPortableRefreshSQL(string sql) {
 }
 
 static string RenderStoredViewQueryForDialect(ClientContext &context, const string &view_query_sql,
-                                              const vector<string> &output_names, SqlDialect dialect) {
+                                              const vector<string> &output_names, SqlDialect dialect,
+                                              const openivm::TimeTravelPins &time_travel_pins) {
 	Parser parser(context.GetParserOptions());
 	parser.ParseQuery(view_query_sql);
 	if (parser.statements.size() != 1) {
@@ -54,9 +56,17 @@ static string RenderStoredViewQueryForDialect(ClientContext &context, const stri
 		                      static_cast<idx_t>(parser.statements.size()));
 	}
 	Planner planner(context);
+	// Source qualification already peeled any time-travel pin the local catalog cannot bind, so the
+	// plan builds here. Re-attach the pins only when rendering for a foreign engine: DuckDB-dialect
+	// output runs against this same pin-less catalog, while Spark (and any other dialect LPTS can
+	// render) must read exactly the snapshot the view was defined against.
+	openivm::TimeTravelPins::PeelForLocalBinding(context, *parser.statements[0]);
 	planner.CreatePlan(parser.statements[0]->Copy());
 	auto plan = std::move(planner.plan);
 	auto ast = LogicalPlanToAst(context, plan, dialect);
+	if (dialect != SqlDialect::DUCKDB) {
+		time_travel_pins.RestoreInto(*ast);
+	}
 	auto cte_list = AstToCteList(*ast, dialect);
 	auto rendered = cte_list->ToQuery(true, output_names);
 	if (!rendered.empty() && rendered.back() == ';') {
@@ -532,9 +542,9 @@ static void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext 
 	// session-scoped planning settings still need to be mirrored onto the fresh
 	// planning connection.
 	static const char *PLANNING_SETTINGS[] = {
-	    "openivm_adaptive_refresh", "openivm_cost_decay",     "openivm_skip_empty_deltas",
-	    "openivm_fk_pruning",       "openivm_ducklake_nterm", "openivm_scd2_range_join_accel",
-	    "openivm_regular_nterm",
+	    "openivm_adaptive_refresh", "openivm_cost_decay",         "openivm_skip_empty_deltas",
+	    "openivm_fk_pruning",       "openivm_ducklake_nterm",     "openivm_scd2_range_join_accel",
+	    "openivm_regular_nterm",    "openivm_regular_nterm_left",
 	};
 	for (auto setting_name : PLANNING_SETTINGS) {
 		CopyOpenIvmSetting(from, to, setting_name);
@@ -786,6 +796,37 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	if (view_query_sql.empty()) {
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
+	// The stored view SQL is the only place the per-relation time-travel pins survive: source
+	// qualification below rewrites every base reference to its delta-qualified name and drops the
+	// trailing `AT (...)` qualifier so the refresh binds against the local stand-in tables. Capture
+	// the pins first so foreign-dialect output can re-attach them to the very same relations.
+	openivm::TimeTravelPins view_time_travel_pins;
+	{
+		con.BeginTransaction();
+		try {
+			view_time_travel_pins = openivm::TimeTravelPins::FromViewSql(planning_context, view_query_sql);
+			con.Rollback();
+		} catch (...) {
+			con.Rollback();
+			throw;
+		}
+	}
+	// Only the AST-rendered refresh paths run the pins back through `RestoreInto`. Several view
+	// shapes (min/max aggregates, group recompute, interrupted-refresh recovery, ...) assemble
+	// their refresh program as SQL text instead, which the pins never reach — those would ship to
+	// the target engine reading the latest snapshot rather than the pinned one. Every exit is
+	// therefore finalized here: scans that already carry their qualifier are left untouched, and a
+	// dialect with no time-travel syntax still refuses through LPTS. DuckDB output runs against this
+	// catalog, which holds no snapshots, so there the pin is stripped instead of translated.
+	auto finalize_refresh_sql = [&](string refresh_sql) {
+		if (view_time_travel_pins.Empty()) {
+			return refresh_sql;
+		}
+		if (active_facts.target_dialect == SqlDialect::DUCKDB) {
+			return view_time_travel_pins.StripFrom(refresh_sql);
+		}
+		return view_time_travel_pins.RestoreIntoSql(refresh_sql, active_facts.target_dialect);
+	};
 	RefreshType view_query_type = metadata.GetViewType(view_name);
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
@@ -821,7 +862,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                  " SET refresh_in_progress = false WHERE view_name = '" +
 				                  SqlUtils::EscapeValue(view_name) + "';\n";
 			}
-			return recovery_query;
+			return finalize_refresh_sql(recovery_query);
 		}
 	}
 	add_profile_step("generate_refresh_sql.recovery_check", recovery_start);
@@ -883,6 +924,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		Parser cost_parser;
 		cost_parser.ParseQuery(view_query_sql);
 		Planner cost_planner(planning_context);
+		openivm::TimeTravelPins::PeelForLocalBinding(planning_context, *cost_parser.statements[0]);
 		cost_planner.CreatePlan(cost_parser.statements[0]->Copy());
 		Optimizer cost_optimizer(*cost_planner.binder, planning_context);
 		auto cost_plan = cost_optimizer.Optimize(std::move(cost_planner.plan));
@@ -914,15 +956,28 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 
 	if (use_full_recompute && !full_recompute_needs_cascade_delta) {
 		auto full_refresh_start = profile_now();
+		string recompute_source_sql = view_query_sql;
+		if (!view_time_travel_pins.Empty() && active_facts.target_dialect != SqlDialect::DUCKDB) {
+			con.BeginTransaction();
+			try {
+				recompute_source_sql =
+				    RenderStoredViewQueryForDialect(planning_context, view_query_sql, vector<string>(),
+				                                    active_facts.target_dialect, view_time_travel_pins);
+				con.Rollback();
+			} catch (...) {
+				con.Rollback();
+				throw;
+			}
+		}
 		auto recompute_query =
-		    BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+		    BuildRecomputeQuery(metadata, view_name, recompute_source_sql, cross_system, attached_db_catalog_name,
 		                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta);
 		add_profile_step("generate_refresh_sql.dispatch", full_refresh_start,
 		                 "full_recompute=true; metadata_requires_full_refresh=" +
 		                     string(metadata_requires_full_refresh ? "true" : "false") +
 		                     "; adaptive_recompute=" + string(adaptive_recompute ? "true" : "false") +
 		                     "; sql_bytes=" + to_string(recompute_query.size()));
-		return recompute_query;
+		return finalize_refresh_sql(recompute_query);
 	}
 	RefreshType dispatch_refresh_type = use_full_recompute ? RefreshType::FULL_REFRESH : view_query_type;
 	refresh_plan.refresh_type = dispatch_refresh_type;
@@ -1465,8 +1520,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			}
 			con.BeginTransaction();
 			try {
-				full_recompute_query = RenderStoredViewQueryForDialect(planning_context, view_query_sql, output_names,
-				                                                       active_facts.target_dialect);
+				full_recompute_query = RenderStoredViewQueryForDialect(
+				    planning_context, view_query_sql, output_names, active_facts.target_dialect, view_time_travel_pins);
 				con.Rollback();
 			} catch (...) {
 				con.Rollback();
@@ -1717,6 +1772,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				auto lpts_start = profile_now();
 				SqlDialect dialect = active_facts.target_dialect;
 				auto ast = LogicalPlanToAst(con_ctx, plan, dialect);
+				if (dialect != SqlDialect::DUCKDB) {
+					// The delta plan still scans the pinned base relations alongside the delta
+					// tables; re-attach each pin so the target engine reads the snapshot the view
+					// was defined against.
+					view_time_travel_pins.RestoreInto(*ast);
+				}
 				bool emit_spark_hints = dialect == SqlDialect::SPARK &&
 				                        (active_facts.emit_spark_hints ||
 				                         SqlUtils::GetBoolSetting(con_ctx, "openivm_emit_spark_hints", false));
@@ -1957,6 +2018,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	} else {
 		clean_query = meta_pre_sql + data_sql + meta_post_sql;
 	}
+	clean_query = finalize_refresh_sql(std::move(clean_query));
 	Value files_path_val;
 	if (write_query_file && context.TryGetCurrentSetting("openivm_files_path", files_path_val) &&
 	    !files_path_val.IsNull()) {

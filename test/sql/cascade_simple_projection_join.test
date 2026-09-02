@@ -565,3 +565,345 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Reduced "arc_machine_status_transaction" shape: a CTE (INNER JOIN + LEFT
+# JOIN) feeding an outer query with two further chained LEFT JOINs. Before
+# src/delta/operators/join.cpp's AppendMultiplicityToAncestorProjectionMaps
+# fix, a deeper join's own left_projection_map growing (to append a new
+# per-leaf multiplicity column) silently shifted where its right-side
+# contribution begins in its own combined column numbering. A grandparent
+# join's pre-existing projection-map entry, fixed before that growth
+# happened, could then alias onto the just-added multiplicity column
+# instead of the real business column (`cust_key`) it used to select,
+# permanently dropping it and surfacing as an internal arity mismatch.
+statement ok
+CREATE TABLE cspj_arcm_msf(id INT, coll_key INT);
+
+statement ok
+CREATE TABLE cspj_arcm_acd(coll_key INT, sub_id INT, arm_id VARCHAR);
+
+statement ok
+CREATE TABLE cspj_arcm_hw(arm_id VARCHAR, provider VARCHAR);
+
+statement ok
+CREATE TABLE cspj_arcm_tpid(sub_id INT, tp_id INT);
+
+statement ok
+CREATE TABLE cspj_arcm_cust(tp_id INT, cust_key INT);
+
+statement ok
+INSERT INTO cspj_arcm_msf VALUES (1, 100), (2, 100);
+
+statement ok
+INSERT INTO cspj_arcm_acd VALUES (100, 10, 'arm-1');
+
+statement ok
+INSERT INTO cspj_arcm_hw VALUES ('arm-1', 'azure');
+
+statement ok
+INSERT INTO cspj_arcm_tpid VALUES (10, 200);
+
+statement ok
+INSERT INTO cspj_arcm_cust VALUES (200, 21);
+
+statement ok
+CREATE MATERIALIZED VIEW cspj_arcm_mv AS
+    WITH bff AS (
+        SELECT msf.id, acd.sub_id,
+               coalesce(hw.provider, 'N/A') AS provider
+        FROM cspj_arcm_msf msf
+        INNER JOIN cspj_arcm_acd acd ON msf.coll_key = acd.coll_key
+        LEFT JOIN cspj_arcm_hw hw ON acd.arm_id = hw.arm_id
+    )
+    SELECT bff.id,
+           coalesce(cust.cust_key, 1) AS cust_key
+    FROM bff
+    LEFT JOIN cspj_arcm_tpid tpid ON bff.sub_id = tpid.sub_id
+    LEFT JOIN cspj_arcm_cust cust ON coalesce(tpid.tp_id, -1) = cust.tp_id;
+
+statement ok
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspj_arcm_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
+
+query I
+SELECT CASE
+           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_arcm_mv') AND
+                contains(content, 'openivm_delta_cspj_arcm_msf') AND
+                contains(content, 'openivm_delta_cspj_arcm_acd') AND
+                contains(content, 'openivm_delta_cspj_arcm_hw') AND
+                contains(content, 'openivm_delta_cspj_arcm_tpid') AND
+                contains(content, 'openivm_delta_cspj_arcm_cust') AND
+                NOT contains(content, 'SELECT NULL::')
+           THEN 1 ELSE 0
+       END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_arcm_mv.sql');
+----
+1
+
+statement ok
+INSERT INTO cspj_arcm_msf VALUES (3, 300);
+
+statement ok
+INSERT INTO cspj_arcm_acd VALUES (300, 30, 'arm-2');
+
+statement ok
+INSERT INTO cspj_arcm_hw VALUES ('arm-2', 'gcp');
+
+statement ok
+INSERT INTO cspj_arcm_tpid VALUES (30, 400);
+
+statement ok
+DELETE FROM cspj_arcm_msf WHERE id = 2;
+
+statement ok
+UPDATE cspj_arcm_cust SET cust_key = 99 WHERE tp_id = 200;
+
+statement ok
+PRAGMA refresh('cspj_arcm_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspj_arcm_mv
+    EXCEPT ALL
+    SELECT bff.id, coalesce(cust.cust_key, 1) AS cust_key
+    FROM (
+        SELECT msf.id, acd.sub_id, coalesce(hw.provider, 'N/A') AS provider
+        FROM cspj_arcm_msf msf
+        INNER JOIN cspj_arcm_acd acd ON msf.coll_key = acd.coll_key
+        LEFT JOIN cspj_arcm_hw hw ON acd.arm_id = hw.arm_id
+    ) bff
+    LEFT JOIN cspj_arcm_tpid tpid ON bff.sub_id = tpid.sub_id
+    LEFT JOIN cspj_arcm_cust cust ON coalesce(tpid.tp_id, -1) = cust.tp_id
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT bff.id, coalesce(cust.cust_key, 1) AS cust_key
+    FROM (
+        SELECT msf.id, acd.sub_id, coalesce(hw.provider, 'N/A') AS provider
+        FROM cspj_arcm_msf msf
+        INNER JOIN cspj_arcm_acd acd ON msf.coll_key = acd.coll_key
+        LEFT JOIN cspj_arcm_hw hw ON acd.arm_id = hw.arm_id
+    ) bff
+    LEFT JOIN cspj_arcm_tpid tpid ON bff.sub_id = tpid.sub_id
+    LEFT JOIN cspj_arcm_cust cust ON coalesce(tpid.tp_id, -1) = cust.tp_id
+    EXCEPT ALL
+    SELECT * FROM cspj_arcm_mv
+);
+----
+0
+
+# Reduced "int_instance_status_transaction" shape: a UNION ALL of two LEFT
+# JOIN branches partitioned by an IS NOT NULL / IS NULL predicate on the
+# joined side. Before the `third_party/lpts` pin was advanced to commit
+# 77ed5e5 (fork PR #18, "Fix set-op column binding remaps"), remapping
+# duplicated UNION ALL key-projection output aliases could leave a stale
+# reference to a child alias that no longer existed in the rewritten plan,
+# surfacing as a runtime Binder Error ("Referenced column ... not found in
+# FROM clause").
+statement ok
+CREATE TABLE cspj_inti_isf(id INT, k INT);
+
+statement ok
+CREATE TABLE cspj_inti_ml(k INT, res VARCHAR);
+
+statement ok
+INSERT INTO cspj_inti_isf VALUES (1, 100), (2, 200);
+
+statement ok
+INSERT INTO cspj_inti_ml VALUES (100, 'machine-1');
+
+statement ok
+CREATE MATERIALIZED VIEW cspj_inti_mv AS
+    SELECT isf.id, isf.k FROM cspj_inti_isf isf LEFT JOIN cspj_inti_ml ml ON isf.k = ml.k WHERE ml.res IS NOT NULL
+    UNION ALL
+    SELECT isf.id, isf.k FROM cspj_inti_isf isf LEFT JOIN cspj_inti_ml ml ON isf.k = ml.k WHERE ml.res IS NULL;
+
+statement ok
+SELECT COUNT(*) FROM openivm_compile_with_facts(
+    'cspj_inti_mv',
+    '{"target_dialect":"duckdb","compile_only":true}'
+);
+
+query I
+SELECT CASE
+           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_inti_mv') AND
+                contains(content, 'openivm_delta_cspj_inti_isf') AND
+                contains(content, 'openivm_delta_cspj_inti_ml') AND
+                contains(content, 'UNION ALL') AND
+                NOT contains(content, 'SELECT NULL::')
+           THEN 1 ELSE 0
+       END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_inti_mv.sql');
+----
+1
+
+statement ok
+INSERT INTO cspj_inti_isf VALUES (3, 300), (4, 400);
+
+statement ok
+INSERT INTO cspj_inti_ml VALUES (300, 'machine-2'), (400, NULL);
+
+statement ok
+DELETE FROM cspj_inti_isf WHERE id = 2;
+
+statement ok
+UPDATE cspj_inti_ml SET res = NULL WHERE k = 100;
+
+statement ok
+PRAGMA refresh('cspj_inti_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspj_inti_mv
+    EXCEPT ALL
+    (
+        SELECT isf.id, isf.k FROM cspj_inti_isf isf LEFT JOIN cspj_inti_ml ml ON isf.k = ml.k WHERE ml.res IS NOT NULL
+        UNION ALL
+        SELECT isf.id, isf.k FROM cspj_inti_isf isf LEFT JOIN cspj_inti_ml ml ON isf.k = ml.k WHERE ml.res IS NULL
+    )
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (
+        SELECT isf.id, isf.k FROM cspj_inti_isf isf LEFT JOIN cspj_inti_ml ml ON isf.k = ml.k WHERE ml.res IS NOT NULL
+        UNION ALL
+        SELECT isf.id, isf.k FROM cspj_inti_isf isf LEFT JOIN cspj_inti_ml ml ON isf.k = ml.k WHERE ml.res IS NULL
+    )
+    EXCEPT ALL
+    SELECT * FROM cspj_inti_mv
+);
+----
+0
+
+# Reduced "machine-status left-deep UNION" shape: a literal three-way
+# (left-deep) UNION ALL of LEFT JOIN branches, each partitioned by a mutually
+# exclusive predicate on the joined side (active / inactive / unmatched).
+# Internally this compiles to a nested union whose own union is itself one
+# arm of a further union (`(A UNION ALL B) UNION ALL C`), carrying duplicated
+# `openivm_left_key`/`openivm_multiplicity` output columns at every level of
+# the chain. This matches the shape of upstream `third_party/lpts` commit
+# 754c797's own `test/sql/union.test` regression ("OpenIVM join-delta UNION
+# terms carry ... a duplicated hidden left key and multiplicity. A left-deep
+# UNION must preserve and bind all ... positions"); the fix retains a
+# trailing rewritten UNION binding as an alias of its physical multiplicity
+# output rather than losing it. Compiled with force_view_delta_cascade under
+# target_dialect=spark, this must classify SIMPLE_PROJECTION -- never
+# COMPILE_FAILED/FULL_REFRESH -- and a real batched multi-table
+# CREATE + INSERT/DELETE/UPDATE + PRAGMA refresh must stay in bidirectional
+# bag-equality with the view definition.
+statement ok
+CREATE TABLE cspj_ms_terms(event_time INT, machine_arm_id VARCHAR, customer_key INT);
+
+statement ok
+CREATE TABLE cspj_ms_status(machine_arm_id VARCHAR, status_label VARCHAR);
+
+statement ok
+INSERT INTO cspj_ms_terms VALUES (10, 'arm-1', 1), (20, 'arm-2', 6);
+
+statement ok
+INSERT INTO cspj_ms_status VALUES ('arm-1', 'active');
+
+statement ok
+CREATE MATERIALIZED VIEW cspj_ms_mv AS
+    SELECT t.event_time, t.machine_arm_id, t.customer_key
+    FROM cspj_ms_terms t LEFT JOIN cspj_ms_status s ON t.machine_arm_id = s.machine_arm_id
+    WHERE s.status_label = 'active'
+    UNION ALL
+    SELECT t.event_time, t.machine_arm_id, t.customer_key
+    FROM cspj_ms_terms t LEFT JOIN cspj_ms_status s ON t.machine_arm_id = s.machine_arm_id
+    WHERE s.status_label = 'inactive'
+    UNION ALL
+    SELECT t.event_time, t.machine_arm_id, t.customer_key
+    FROM cspj_ms_terms t LEFT JOIN cspj_ms_status s ON t.machine_arm_id = s.machine_arm_id
+    WHERE s.status_label IS NULL;
+
+statement ok
+INSERT INTO cspj_ms_terms VALUES (30, 'arm-3', 11);
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'cspj_ms_mv',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+2	SIMPLE_PROJECTION
+
+query I
+SELECT CASE
+           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_ms_mv') AND
+                contains(content, 'openivm_delta_cspj_ms_terms') AND
+                contains(content, 'openivm_delta_cspj_ms_status') AND
+                contains(content, 'UNION ALL') AND
+                NOT contains(content, 'SELECT NULL::')
+           THEN 1 ELSE 0
+       END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_ms_mv.sql');
+----
+1
+
+statement ok
+INSERT INTO cspj_ms_terms VALUES (40, 'arm-4', 16);
+
+statement ok
+INSERT INTO cspj_ms_status VALUES ('arm-3', 'active'), ('arm-4', NULL);
+
+statement ok
+DELETE FROM cspj_ms_terms WHERE event_time = 20;
+
+statement ok
+UPDATE cspj_ms_status SET status_label = 'inactive' WHERE machine_arm_id = 'arm-1';
+
+statement ok
+PRAGMA refresh('cspj_ms_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM cspj_ms_mv
+    EXCEPT ALL
+    (
+        SELECT t.event_time, t.machine_arm_id, t.customer_key
+        FROM cspj_ms_terms t LEFT JOIN cspj_ms_status s ON t.machine_arm_id = s.machine_arm_id
+        WHERE s.status_label = 'active'
+        UNION ALL
+        SELECT t.event_time, t.machine_arm_id, t.customer_key
+        FROM cspj_ms_terms t LEFT JOIN cspj_ms_status s ON t.machine_arm_id = s.machine_arm_id
+        WHERE s.status_label = 'inactive'
+        UNION ALL
+        SELECT t.event_time, t.machine_arm_id, t.customer_key
+        FROM cspj_ms_terms t LEFT JOIN cspj_ms_status s ON t.machine_arm_id = s.machine_arm_id
+        WHERE s.status_label IS NULL
+    )
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    (
+        SELECT t.event_time, t.machine_arm_id, t.customer_key
+        FROM cspj_ms_terms t LEFT JOIN cspj_ms_status s ON t.machine_arm_id = s.machine_arm_id
+        WHERE s.status_label = 'active'
+        UNION ALL
+        SELECT t.event_time, t.machine_arm_id, t.customer_key
+        FROM cspj_ms_terms t LEFT JOIN cspj_ms_status s ON t.machine_arm_id = s.machine_arm_id
+        WHERE s.status_label = 'inactive'
+        UNION ALL
+        SELECT t.event_time, t.machine_arm_id, t.customer_key
+        FROM cspj_ms_terms t LEFT JOIN cspj_ms_status s ON t.machine_arm_id = s.machine_arm_id
+        WHERE s.status_label IS NULL
+    )
+    EXCEPT ALL
+    SELECT * FROM cspj_ms_mv
+);
+----
+0
