@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/parser_create_mv_helpers.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -91,6 +92,21 @@ static bool IsMetadataSchemaStatement(const string &statement) {
 	StringUtil::Trim(trimmed);
 	auto lower = StringUtil::Lower(trimmed);
 	return StringUtil::StartsWith(lower, "create table") || StringUtil::StartsWith(lower, "alter table");
+}
+
+static void EnsureTransactionalMetadataSchemas(vector<string> &statements) {
+	for (auto &statement : statements) {
+		if (IsMetadataSchemaStatement(statement)) {
+			return;
+		}
+	}
+	vector<string> schema;
+	AppendCreateMVSystemTablesDDL(schema);
+	for (auto &statement : schema) {
+		if (IsMetadataSchemaStatement(statement)) {
+			statements.push_back(std::move(statement));
+		}
+	}
 }
 
 static bool MatchesNowCall(const string &statement, idx_t offset) {
@@ -553,6 +569,7 @@ void TransactionalMVMetadataState::Register(ClientContext &context, const vector
 			statements.push_back(StabilizeTransactionalMetadata(statement, timestamp_sql));
 		}
 	}
+	EnsureTransactionalMetadataSchemas(statements);
 }
 
 void TransactionalMVMetadataState::RegisterSQL(const string &sql, const string &view_name) {
@@ -562,6 +579,7 @@ void TransactionalMVMetadataState::RegisterSQL(const string &sql, const string &
 			statements.push_back(std::move(statement));
 		}
 	}
+	EnsureTransactionalMetadataSchemas(statements);
 }
 
 void TransactionalMVMetadataState::IncludeView(const string &view_name) {

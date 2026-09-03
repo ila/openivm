@@ -1082,9 +1082,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		add_profile_record(step.step_name, step.duration_ms, step.detail);
 	}
 
-	add_profile_marker("create_mv_system_tables", "refresh_type=" + string(RefreshTypeName(refresh_type)) +
-	                                                  "; lpts_fallback=" + string(lpts_fallback ? "true" : "false"));
-	AppendCreateMVSystemTablesDDL(ddl, view_name, parse_data_ref.is_replace);
+	if (MVSystemTablesNeedMigration(con)) {
+		add_profile_marker("create_mv_system_tables",
+		                   "refresh_type=" + string(RefreshTypeName(refresh_type)) +
+		                       "; lpts_fallback=" + string(lpts_fallback ? "true" : "false"));
+		AppendCreateMVSystemTablesDDL(ddl);
+	}
+	AppendCreateMVPreflightDDL(ddl, view_name, parse_data_ref.is_replace);
 
 	if (parse_data_ref.is_replace && !staged_cross_catalog_replace) {
 		add_profile_marker("create_mv_replace_cleanup");

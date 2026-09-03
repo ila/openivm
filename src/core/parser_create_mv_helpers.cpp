@@ -30,7 +30,25 @@ string BuildUpdateViewJsonSQL(const string &column_name, const string &json, con
 	       SqlUtils::EscapeSingleQuotes(json) + "' WHERE view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'";
 }
 
-void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name, bool is_replace) {
+bool MVSystemTablesNeedMigration(Connection &con) {
+	// Binding this zero-row query checks the complete current schema without
+	// rerunning DuckLake DDL for every materialized view.
+	auto schema = con.Query("SELECT v.view_catalog, v.view_schema, v.distinct_aux_meta_json, "
+	                        "v.count_distinct_aux_meta_json, v.semi_anti_aux_meta_json, v.lineage_json, "
+	                        "v.leftjoin_secondary_meta_json, v.has_join, v.group_recompute_affected_mode, "
+	                        "v.group_recompute_source_occurrences_json, v.derived_aggregate_outputs_json, "
+	                        "d.last_refresh_ts, d.pending_row_estimate, d.pending_estimate_ts, "
+	                        "d.source_catalog, d.source_schema, d.source_table_id, h.mode, r.strategy, "
+	                        "p.detail FROM openivm_views v, openivm_delta_tables d, openivm_refresh_hooks h, "
+	                        "openivm_refresh_history r, openivm_refresh_profile p LIMIT 0");
+	if (schema->HasError()) {
+		return true;
+	}
+	auto legacy_rows = con.Query("SELECT 1 FROM openivm_views WHERE has_join IS NULL LIMIT 1");
+	return legacy_rows->HasError() || legacy_rows->RowCount() != 0;
+}
+
+void AppendCreateMVSystemTablesDDL(vector<string> &ddl) {
 	// Matcher metadata columns (signature_hash..nullified_columns_json) stay
 	// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
 	ddl.push_back("create table if not exists " + string(openivm::VIEWS_TABLE) +
@@ -73,26 +91,6 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "derived_aggregate_outputs_json varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_catalog varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_schema varchar default null");
-	if (!is_replace) {
-		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
-		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));
-		string stale_mv_condition = "view_name = '" + escaped_view_name +
-		                            "' AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE "
-		                            "table_name = '" +
-		                            escaped_view_name +
-		                            "') AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE "
-		                            "table_name = '" +
-		                            escaped_data_table + "')";
-		// CREATE MV executes as multiple catalog statements. If a process dies or loses
-		// a DuckDB file lock after writing metadata but before creating the physical
-		// DuckLake/default-catalog objects, a retry should clean that stale row rather
-		// than report a misleading duplicate MV.
-		ddl.push_back("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);
-		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(openivm::VIEWS_TABLE) +
-		              " WHERE view_name = '" + escaped_view_name +
-		              "') THEN error('Duplicate key: materialized view \"" + escaped_view_name +
-		              "\" already exists') ELSE NULL END");
-	}
 
 	// Refresh hooks: extensions can register custom SQL to run on MV refresh
 	// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
@@ -144,6 +142,29 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " step_order integer, step_name varchar, duration_ms bigint, "
 	              "detail varchar,"
 	              " primary key(refresh_id, step_order))");
+}
+
+void AppendCreateMVPreflightDDL(vector<string> &ddl, const string &view_name, bool is_replace) {
+	if (!is_replace) {
+		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
+		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));
+		string stale_mv_condition = "view_name = '" + escaped_view_name +
+		                            "' AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE "
+		                            "table_name = '" +
+		                            escaped_view_name +
+		                            "') AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE "
+		                            "table_name = '" +
+		                            escaped_data_table + "')";
+		// CREATE MV executes as multiple catalog statements. If a process dies or loses
+		// a DuckDB file lock after writing metadata but before creating the physical
+		// DuckLake/default-catalog objects, a retry should clean that stale row rather
+		// than report a misleading duplicate MV.
+		ddl.push_back("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);
+		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(openivm::VIEWS_TABLE) +
+		              " WHERE view_name = '" + escaped_view_name +
+		              "') THEN error('Duplicate key: materialized view \"" + escaped_view_name +
+		              "\" already exists') ELSE NULL END");
+	}
 }
 
 } // namespace duckdb

@@ -134,12 +134,33 @@ INSERT INTO openivm_delta_tables(view_name, table_name, last_update)
 VALUES ('mv_legacy_self_join', 'openivm_delta_legacy_self_join_src', now());
 
 statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
 CREATE MATERIALIZED VIEW mv_trigger_join_backfill AS SELECT id FROM legacy_self_join_src;
 
 query I
 SELECT has_join FROM openivm_views WHERE view_name = 'mv_legacy_self_join';
 ----
 true
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'mv_trigger_join_backfill' AND step_name = 'create_mv_system_tables';
+----
+1
+
+statement ok
+CREATE MATERIALIZED VIEW mv_after_join_backfill AS SELECT id FROM legacy_self_join_src;
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'mv_after_join_backfill' AND step_name = 'create_mv_system_tables';
+----
+0
+
+statement ok
+SET openivm_profile_refresh = false;
 
 statement ok
 DELETE FROM openivm_delta_tables WHERE view_name = 'mv_legacy_self_join';
@@ -149,6 +170,9 @@ DELETE FROM openivm_views WHERE view_name = 'mv_legacy_self_join';
 
 statement ok
 DROP VIEW mv_trigger_join_backfill;
+
+statement ok
+DROP VIEW mv_after_join_backfill;
 
 statement ok
 DROP TABLE legacy_self_join_src;
