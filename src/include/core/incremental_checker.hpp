@@ -49,6 +49,8 @@ struct PlanAnalysis {
 	vector<string> aggregate_types;          // per-column: "min", "max", "sum", "count_star", "count", "avg", "list"
 	vector<string> window_partition_columns; // PARTITION BY source columns from window functions
 	vector<idx_t> window_partition_column_indexes; // Output-position hint for each PARTITION BY column
+	vector<string> window_order_columns;           // Common simple ORDER BY columns for all window expressions
+	bool window_row_key_compatible = true;         // False when window expressions use different/non-column keys
 	size_t group_count = 0;                        // number of GROUP BY expressions
 	idx_t group_index = DConstants::INVALID_INDEX; // aggregate's group_index for binding lookup
 };

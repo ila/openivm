@@ -46,6 +46,28 @@ static string OrderByColumnName(const Expression &expr) {
 	return string();
 }
 
+static bool WindowColumn(const Expression &expr, string &name, idx_t &column_index) {
+	if (expr.type != ExpressionType::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &column = expr.Cast<BoundColumnRefExpression>();
+	name = column.alias.empty() ? column.GetName() : column.alias;
+	column_index = column.binding.column_index;
+	return !name.empty();
+}
+
+static bool SameWindowColumns(const vector<string> &left, const vector<string> &right) {
+	if (left.size() != right.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < left.size(); i++) {
+		if (!StringUtil::CIEquals(left[i], right[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /// Populate top_k_order_columns / top_k_order_desc from a vector<BoundOrderByNode>.
 /// Returns false if any entry is non-column-ref (caller should mark incremental_compatible=false).
 static bool ExtractOrderBy(const vector<BoundOrderByNode> &orders, PlanAnalysis &result) {
@@ -357,23 +379,24 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 			result.incremental_compatible = false;
 			result.found_volatile_expression = true;
 		}
-		// Extract PARTITION BY column names from ALL window expressions.
-		// Different window functions may use different PARTITION BY clauses —
-		// collect the union of all partition columns so any change triggers recompute.
+		// Extract PARTITION BY column names from ALL window expressions. Also retain
+		// a common simple PARTITION BY + ORDER BY key when every window agrees. The
+		// latter lets DuckLake pair old/new row occurrences without assuming that the
+		// key is unique; differing or computed window keys keep the existing
+		// partition-recompute path.
 		for (auto &expr : window.expressions) {
 			if (expr->expression_class == ExpressionClass::BOUND_WINDOW) {
 				auto &win_expr = expr->Cast<BoundWindowExpression>();
+				vector<string> current_partitions;
+				vector<string> current_orders;
 				for (auto &part : win_expr.partitions) {
 					string col_name;
 					idx_t col_index = DConstants::INVALID_INDEX;
-					if (part->type == ExpressionType::BOUND_COLUMN_REF) {
-						auto &bcr = part->Cast<BoundColumnRefExpression>();
-						col_name = bcr.alias;
-						col_index = bcr.binding.column_index;
-					}
-					if (col_name.empty()) {
+					if (!WindowColumn(*part, col_name, col_index)) {
+						result.window_row_key_compatible = false;
 						col_name = part->GetName();
 					}
+					current_partitions.push_back(col_name);
 					// Avoid duplicates
 					bool found = false;
 					for (auto &existing : result.window_partition_columns) {
@@ -386,6 +409,30 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 						result.window_partition_columns.push_back(col_name);
 						result.window_partition_column_indexes.push_back(col_index);
 					}
+				}
+				for (auto &order : win_expr.orders) {
+					string col_name;
+					idx_t col_index = DConstants::INVALID_INDEX;
+					if (!WindowColumn(*order.expression, col_name, col_index)) {
+						result.window_row_key_compatible = false;
+						break;
+					}
+					current_orders.push_back(col_name);
+				}
+				if (current_partitions.empty() || current_orders.empty()) {
+					result.window_row_key_compatible = false;
+				}
+				if (result.window_row_key_compatible) {
+					if (result.window_order_columns.empty()) {
+						result.window_order_columns = current_orders;
+					} else if (!SameWindowColumns(result.window_order_columns, current_orders) ||
+					           !SameWindowColumns(result.window_partition_columns, current_partitions)) {
+						result.window_row_key_compatible = false;
+						result.window_order_columns.clear();
+					}
+				}
+				if (!result.window_row_key_compatible) {
+					result.window_order_columns.clear();
 				}
 			}
 		}

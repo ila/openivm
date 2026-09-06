@@ -975,6 +975,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	auto aggregate_columns = std::move(view_model.group_columns);
 	auto aggregate_types = std::move(view_model.aggregate_types);
 	auto window_partition_columns = std::move(view_model.window_partition_columns);
+	auto window_order_columns = std::move(view_model.window_order_columns);
 	bool has_minmax_metadata = view_model.has_minmax_metadata;
 	auto group_recompute_affected_mode = view_model.group_recompute_affected_mode;
 	auto group_recompute_source_occurrences = BuildGroupRecomputeSourceOccurrences(facts);
@@ -1105,6 +1106,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
 	auto &cols_to_store = analysis.found_window ? window_partition_columns : aggregate_columns;
 	string group_cols_val = SqlCsvLiteralOrNull(cols_to_store);
+	string window_order_cols_val = SqlCsvLiteralOrNull(window_order_columns);
 	string agg_types_val = SqlCsvLiteralOrNull(aggregate_types);
 	string having_val = (having_predicate.empty() || stored_query_retains_having)
 	                        ? "null"
@@ -1128,7 +1130,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	    "insert or replace into " + string(openivm::VIEWS_TABLE) +
 	    " (view_name, view_catalog, view_schema, sql_string, type, has_minmax, has_left_join, "
 	    "has_join, last_update, "
-	    "refresh_interval, refresh_in_progress, group_columns, aggregate_types, "
+	    "refresh_interval, refresh_in_progress, group_columns, window_order_columns, aggregate_types, "
 	    "having_predicate, group_recompute_affected_mode, "
 	    "group_recompute_source_occurrences_json, has_full_outer, "
 	    "full_outer_join_cols) values ('" +
@@ -1136,9 +1138,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	    SqlUtils::EscapeSingleQuotes(view_target_schema) + "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
 	    to_string((int)refresh_type) + ", " + (has_minmax_metadata ? "true" : "false") + ", " +
 	    (analysis.found_left_join ? "true" : "false") + ", " + (analysis.found_join ? "true" : "false") + ", " +
-	    string(openivm::UTC_NOW_SQL) + ", " + refresh_val + ", false, " + group_cols_val + ", " + agg_types_val + ", " +
-	    having_val + ", " + group_recompute_mode_val + ", " + group_recompute_source_occurrences_val + ", " +
-	    (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
+	    string(openivm::UTC_NOW_SQL) + ", " + refresh_val + ", false, " + group_cols_val + ", " +
+	    window_order_cols_val + ", " + agg_types_val + ", " + having_val + ", " + group_recompute_mode_val + ", " +
+	    group_recompute_source_occurrences_val + ", " + (analysis.found_full_outer ? "true" : "false") + ", " +
+	    full_outer_join_cols_val + ")");
 
 	if (!lineage_json.empty()) {
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));

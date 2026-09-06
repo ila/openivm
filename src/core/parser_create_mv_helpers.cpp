@@ -41,6 +41,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " last_update timestamp, refresh_interval bigint default null,"
 	              " refresh_in_progress boolean default false,"
 	              " group_columns varchar default null,"
+	              " window_order_columns varchar default null,"
 	              " aggregate_types varchar default null,"
 	              " derived_aggregate_outputs_json varchar default null,"
 	              " having_predicate varchar default null,"
@@ -73,6 +74,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "derived_aggregate_outputs_json varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_catalog varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_schema varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "window_order_columns varchar default null");
 	if (!is_replace) {
 		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
 		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));

@@ -123,6 +123,10 @@ public:
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);
 
+	// Get common window ORDER BY output/source mappings. Empty means the view
+	// predates this metadata or its window specifications do not share a simple key.
+	vector<string> GetWindowOrderColumns(const string &view_name);
+
 	// Get per-column aggregate function types (min, max, sum, count_star, etc.).
 	vector<string> GetAggregateTypes(const string &view_name);
 

@@ -932,8 +932,13 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 	model.aggregate_types = analysis.aggregate_types;
 	model.window_partition_columns = analysis.window_partition_columns;
 	ResolveWindowPartitionOutputNames(facts, model.window_partition_columns, output_names);
+	if (analysis.window_row_key_compatible) {
+		model.window_order_columns = analysis.window_order_columns;
+		ResolveWindowPartitionOutputNames(facts, model.window_order_columns, output_names);
+	}
 	if (!input.keep_window_join_partitions) {
 		model.window_partition_columns.clear();
+		model.window_order_columns.clear();
 	}
 
 	model.has_minmax_metadata = analysis.found_minmax || analysis.found_count_distinct || analysis.found_list;
