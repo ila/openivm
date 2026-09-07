@@ -557,7 +557,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			                    "original query: %s\n",
 			                    view_query.c_str());
 		}
-		if (PlanNeedsOriginalSqlForLpts(select_plan.get())) {
+		if (PlanNeedsOriginalSqlForLpts(post_rewrite_facts)) {
 			view_query = original_view_query;
 			lpts_fallback = true;
 			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS can't round-trip this construct — "
@@ -813,12 +813,12 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				distinct_extracted_filter = std::move(d_filter);
 			}
 		}
-		// Walk the rewritten plan for the outer aggregate's expressions. v0 supports
+		// Inspect the outer aggregate collected by the existing plan-facts walk. v0 supports
 		// exactly one SUM(<arg>) — `openivm_count_star` (auto-injected by PlanRewrite)
 		// is allowed alongside it. Anything else (AVG, COUNT, MIN/MAX, multiple SUMs)
 		// demotes back to GROUP_RECOMPUTE.
 		if (!distinct_extracted_cols.empty()) {
-			LogicalAggregate *outer_agg = FindOuterAggregate(plan.get());
+			LogicalAggregate *outer_agg = facts.aggregates.empty() ? nullptr : facts.aggregates.front();
 			int sum_count = 0;
 			bool unsupported_agg = false;
 			if (outer_agg) {

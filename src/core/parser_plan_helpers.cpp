@@ -68,41 +68,28 @@ string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, 
 	return sql;
 }
 
-static bool PlanContainsCte(LogicalOperator *op) {
+static bool PrepareCtesForInlining(LogicalOperator *op) {
 	if (!op) {
 		return false;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_CTE_REF || op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
-		return true;
-	}
-	for (auto &child : op->children) {
-		if (PlanContainsCte(child.get())) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static void RelaxMaterializedCtes(LogicalOperator *op) {
-	if (!op) {
-		return;
-	}
+	bool found_cte = op->type == LogicalOperatorType::LOGICAL_CTE_REF;
 	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		found_cte = true;
 		auto &cte = op->Cast<LogicalMaterializedCTE>();
 		if (cte.materialize == CTEMaterialize::CTE_MATERIALIZE_ALWAYS) {
 			cte.materialize = CTEMaterialize::CTE_MATERIALIZE_DEFAULT;
 		}
 	}
 	for (auto &child : op->children) {
-		RelaxMaterializedCtes(child.get());
+		found_cte = PrepareCtesForInlining(child.get()) || found_cte;
 	}
+	return found_cte;
 }
 
 void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
-	if (!PlanContainsCte(plan.get())) {
+	if (!PrepareCtesForInlining(plan.get())) {
 		return;
 	}
-	RelaxMaterializedCtes(plan.get());
 	Optimizer cte_opt(binder, context);
 	CTEInlining cte_inlining(cte_opt);
 	plan = cte_inlining.Optimize(std::move(plan));
@@ -2041,54 +2028,22 @@ static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
 	       fn_name == "arg_min" || fn_name == "arg_max";
 }
 
-bool QueryNeedsOriginalSqlForLpts(const string &query) {
-	string lower = StringUtil::Lower(query);
-	return lower.find("pivot ") != string::npos || lower.find("(pivot ") != string::npos;
-}
-
-bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op) {
-	if (!op) {
-		return false;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
+bool PlanNeedsOriginalSqlForLpts(const CreateMVPlanFacts &facts) {
+	if (facts.has_pivot) {
 		return true;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		auto *agg = dynamic_cast<LogicalAggregate *>(op);
-		if (agg) {
-			for (auto &expr : agg->expressions) {
-				if (expr->type != ExpressionType::BOUND_AGGREGATE) {
-					continue;
-				}
-				auto &bound_agg = expr->Cast<BoundAggregateExpression>();
-				if (IsAggregateFunctionUnsupportedByLpts(bound_agg.function.name)) {
-					return true;
-				}
+	for (auto *aggregate : facts.aggregates) {
+		for (auto &expr : aggregate->expressions) {
+			if (expr->type != ExpressionType::BOUND_AGGREGATE) {
+				continue;
+			}
+			auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+			if (IsAggregateFunctionUnsupportedByLpts(bound_agg.function.name)) {
+				return true;
 			}
 		}
 	}
-	for (auto &child : op->children) {
-		if (PlanNeedsOriginalSqlForLpts(child.get())) {
-			return true;
-		}
-	}
 	return false;
-}
-
-LogicalAggregate *FindOuterAggregate(LogicalOperator *op) {
-	if (!op) {
-		return nullptr;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		return &op->Cast<LogicalAggregate>();
-	}
-	for (auto &child : op->children) {
-		auto *aggregate = FindOuterAggregate(child.get());
-		if (aggregate) {
-			return aggregate;
-		}
-	}
-	return nullptr;
 }
 
 bool IsPacLoaded(ClientContext &context) {

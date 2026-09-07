@@ -516,8 +516,4 @@ PlanAnalysis AnalyzePlan(LogicalOperator *plan) {
 	return result;
 }
 
-bool ValidateIncrementalPlan(LogicalOperator *plan) {
-	return AnalyzePlan(plan).incremental_compatible;
-}
-
 } // namespace duckdb

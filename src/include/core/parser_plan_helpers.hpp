@@ -129,13 +129,11 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
                                RefreshMetadata::ProjectionKeyLineage &out);
 bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out);
 bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinNullableSources &out);
-bool QueryNeedsOriginalSqlForLpts(const string &query);
-bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op);
+bool PlanNeedsOriginalSqlForLpts(const CreateMVPlanFacts &facts);
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,
                                                  const vector<string> &output_names);
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts);
 vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<string> &planner_names);
-LogicalAggregate *FindOuterAggregate(LogicalOperator *op);
 bool IsPacLoaded(ClientContext &context);
 void ForwardPacSettingsIfLoaded(ClientContext &context, Connection &con);
 
