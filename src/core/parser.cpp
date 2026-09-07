@@ -421,7 +421,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	add_create_profile_step("create_compile_full_plan", full_plan_start);
 
 	// Inline CTEs so create-MV facts see the folded structure.
-	InlineCtesIfPresent(context, *planner.binder, plan);
+	(void)InlineCtesIfPresent(context, *planner.binder, plan);
 
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
@@ -453,9 +453,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Inline CTEs without running the full optimizer, which can reshape plans
 		// before OpenIVM's structural rewrites.
 		auto select_rewrite_start = create_profile_now();
-		InlineCtesIfPresent(context, *select_planner.binder, select_plan);
-		auto pre_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
-		pre_rewrite_has_aggregate_filter = pre_rewrite_facts.has_bound_aggregate_filter;
+		pre_rewrite_has_aggregate_filter =
+		    InlineCtesIfPresent(context, *select_planner.binder, select_plan);
 
 		// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 		PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);

@@ -68,11 +68,25 @@ string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, 
 	return sql;
 }
 
-static bool PrepareCtesForInlining(LogicalOperator *op) {
+static bool HasBoundAggregateFilter(LogicalAggregate &aggregate) {
+	for (auto &expression : aggregate.expressions) {
+		if (expression->expression_class == ExpressionClass::BOUND_AGGREGATE &&
+		    expression->Cast<BoundAggregateExpression>().filter) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool PrepareCtesForInlining(LogicalOperator *op, bool &has_bound_aggregate_filter) {
 	if (!op) {
 		return false;
 	}
 	bool found_cte = op->type == LogicalOperatorType::LOGICAL_CTE_REF;
+	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+	    HasBoundAggregateFilter(op->Cast<LogicalAggregate>())) {
+		has_bound_aggregate_filter = true;
+	}
 	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
 		found_cte = true;
 		auto &cte = op->Cast<LogicalMaterializedCTE>();
@@ -81,18 +95,19 @@ static bool PrepareCtesForInlining(LogicalOperator *op) {
 		}
 	}
 	for (auto &child : op->children) {
-		found_cte = PrepareCtesForInlining(child.get()) || found_cte;
+		found_cte = PrepareCtesForInlining(child.get(), has_bound_aggregate_filter) || found_cte;
 	}
 	return found_cte;
 }
 
-void InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
-	if (!PrepareCtesForInlining(plan.get())) {
-		return;
+bool InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
+	bool has_bound_aggregate_filter = false;
+	if (PrepareCtesForInlining(plan.get(), has_bound_aggregate_filter)) {
+		Optimizer cte_opt(binder, context);
+		CTEInlining cte_inlining(cte_opt);
+		plan = cte_inlining.Optimize(std::move(plan));
 	}
-	Optimizer cte_opt(binder, context);
-	CTEInlining cte_inlining(cte_opt);
-	plan = cte_inlining.Optimize(std::move(plan));
+	return has_bound_aggregate_filter;
 }
 
 string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
@@ -314,12 +329,7 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		seen_agg_above = true;
 		auto &agg = op->Cast<LogicalAggregate>();
 		facts.aggregates.push_back(&agg);
-		for (auto &expr : agg.expressions) {
-			if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE &&
-			    expr->Cast<BoundAggregateExpression>().filter) {
-				facts.has_bound_aggregate_filter = true;
-			}
-		}
+		facts.has_bound_aggregate_filter = facts.has_bound_aggregate_filter || HasBoundAggregateFilter(agg);
 	} else if (op->type == LogicalOperatorType::LOGICAL_UNION) {
 		if (!seen_agg_above) {
 			facts.has_union_before_aggregate = true;
@@ -1465,128 +1475,91 @@ static bool ResolveBindingToOccurrenceRefs(ColumnBinding binding, const CreateMV
 	return ResolveBindingToOccurrenceRefsInternal(binding, facts, out, 0);
 }
 
-static void CollectInnerJoinEdgesOccurrence(LogicalOperator *op, const CreateMVPlanFacts &facts,
-                                            vector<WindowEquivalenceEdge> &edges) {
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
-		auto &join = op->Cast<LogicalComparisonJoin>();
+static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPlanFacts &facts,
+                                   vector<WindowEquivalenceEdge> &equivalence_edges,
+                                   vector<WindowLookupEdge> &lookup_edges) {
+	if (join.type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+	    join.type != LogicalOperatorType::LOGICAL_ASOF_JOIN) {
+		return;
+	}
+	auto add_lookup_edge = [&](OccurrenceColumnRef lookup_ref, string lookup_cast, OccurrenceColumnRef changed_ref,
+	                           string changed_cast) {
+		lookup_edges.push_back(
+		    {std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
+	};
+	for (auto &condition : join.conditions) {
+		if (condition.comparison != ExpressionType::COMPARE_EQUAL) {
+			continue;
+		}
+		string left_cast;
+		string right_cast;
+		auto *left = GetColumnRefThroughCasts(condition.left.get(), &left_cast);
+		auto *right = GetColumnRefThroughCasts(condition.right.get(), &right_cast);
+		if (!left || !right) {
+			continue;
+		}
+		OccurrenceColumnRef left_ref, right_ref;
+		if (!ResolveBindingToOccurrenceRefWithCast(left->binding, facts, left_ref, left_cast, left->return_type) ||
+		    !ResolveBindingToOccurrenceRefWithCast(right->binding, facts, right_ref, right_cast,
+		                                           right->return_type)) {
+			continue;
+		}
+		switch (join.join_type) {
+		case JoinType::INNER:
+		case JoinType::LEFT:
+			add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
+			add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
+			break;
+		case JoinType::RIGHT:
+			add_lookup_edge(right_ref, right_cast, left_ref, left_cast);
+			add_lookup_edge(left_ref, left_cast, right_ref, right_cast);
+			break;
+		default:
+			break;
+		}
 		if (join.join_type == JoinType::INNER) {
-			for (auto &cond : join.conditions) {
-				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
-					continue;
-				}
-				string left_cast;
-				string right_cast;
-				auto *left = GetColumnRefThroughCasts(cond.left.get(), &left_cast);
-				auto *right = GetColumnRefThroughCasts(cond.right.get(), &right_cast);
-				if (!left || !right) {
-					continue;
-				}
-				OccurrenceColumnRef lref, rref;
-				if (ResolveBindingToOccurrenceRefWithCast(left->binding, facts, lref, left_cast, left->return_type) &&
-				    ResolveBindingToOccurrenceRefWithCast(right->binding, facts, rref, right_cast,
-				                                          right->return_type)) {
-					edges.push_back({std::move(lref), std::move(left_cast), std::move(rref), std::move(right_cast)});
-				}
-			}
+			equivalence_edges.push_back(
+			    {std::move(left_ref), std::move(left_cast), std::move(right_ref), std::move(right_cast)});
 		}
-	}
-	for (auto &child : op->children) {
-		CollectInnerJoinEdgesOccurrence(child.get(), facts, edges);
 	}
 }
 
-static void CollectWindowLookupEdges(LogicalOperator *op, const CreateMVPlanFacts &facts,
-                                     vector<WindowLookupEdge> &edges) {
-	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-	    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
-		auto &join = op->Cast<LogicalComparisonJoin>();
-		auto add_lookup_edge = [&](OccurrenceColumnRef lookup_ref, string lookup_cast, OccurrenceColumnRef changed_ref,
-		                           string changed_cast) {
-			edges.push_back(
-			    {std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
-		};
-		for (auto &cond : join.conditions) {
-			if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
-				continue;
-			}
-			string left_cast;
-			string right_cast;
-			auto *left = GetColumnRefThroughCasts(cond.left.get(), &left_cast);
-			auto *right = GetColumnRefThroughCasts(cond.right.get(), &right_cast);
-			if (!left || !right) {
-				continue;
-			}
-			OccurrenceColumnRef lref, rref;
-			if (!ResolveBindingToOccurrenceRefWithCast(left->binding, facts, lref, left_cast, left->return_type) ||
-			    !ResolveBindingToOccurrenceRefWithCast(right->binding, facts, rref, right_cast, right->return_type)) {
-				continue;
-			}
-			switch (join.join_type) {
-			case JoinType::INNER:
-				add_lookup_edge(lref, left_cast, rref, right_cast);
-				add_lookup_edge(rref, right_cast, lref, left_cast);
-				break;
-			case JoinType::LEFT:
-				add_lookup_edge(lref, left_cast, rref, right_cast);
-				add_lookup_edge(rref, right_cast, lref, left_cast);
-				break;
-			case JoinType::RIGHT:
-				add_lookup_edge(rref, right_cast, lref, left_cast);
-				add_lookup_edge(lref, left_cast, rref, right_cast);
-				break;
-			default:
-				break;
-			}
-		}
-	}
-	for (auto &child : op->children) {
-		CollectWindowLookupEdges(child.get(), facts, edges);
-	}
-}
-
-static void CollectWindowPartitionRefs(LogicalOperator *op, const CreateMVPlanFacts &facts,
+static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlanFacts &facts,
                                        const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops) {
-	if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
-		auto &window = op->Cast<LogicalWindow>();
-		for (auto &expr : window.expressions) {
-			if (expr->expression_class != ExpressionClass::BOUND_WINDOW) {
+	for (auto &expression : window.expressions) {
+		if (expression->expression_class != ExpressionClass::BOUND_WINDOW) {
+			continue;
+		}
+		auto &window_expression = expression->Cast<BoundWindowExpression>();
+		for (auto &partition : window_expression.partitions) {
+			string partition_cast;
+			auto *column_ref = GetColumnRefThroughCasts(partition.get(), &partition_cast);
+			if (!column_ref) {
 				continue;
 			}
-			auto &win_expr = expr->Cast<BoundWindowExpression>();
-			for (auto &part : win_expr.partitions) {
-				string partition_cast;
-				auto *bcr = GetColumnRefThroughCasts(part.get(), &partition_cast);
-				if (!bcr) {
-					continue;
-				}
-				vector<OccurrenceColumnRef> refs;
-				if (!ResolveBindingToOccurrenceRefs(bcr->binding, facts, refs)) {
-					continue;
-				}
-				for (auto &ref : refs) {
-					for (auto &stored : partition_columns) {
-						auto pos = stored.find('=');
-						string output_col = pos == string::npos ? stored : stored.substr(0, pos);
-						string source_col = pos == string::npos ? stored : stored.substr(pos + 1);
-						if (!StringUtil::CIEquals(source_col, ref.column)) {
-							continue;
-						}
-						WindowLineageOp op;
-						op.kind = "direct";
-						op.output_col = output_col;
-						op.source_table = ref.table;
-						op.source_occurrence = ref.occurrence;
-						op.source_col = ref.column;
-						op.source_cast = partition_cast;
-						direct_ops.push_back(std::move(op));
+			vector<OccurrenceColumnRef> refs;
+			if (!ResolveBindingToOccurrenceRefs(column_ref->binding, facts, refs)) {
+				continue;
+			}
+			for (auto &ref : refs) {
+				for (auto &stored : partition_columns) {
+					auto pos = stored.find('=');
+					string output_col = pos == string::npos ? stored : stored.substr(0, pos);
+					string source_col = pos == string::npos ? stored : stored.substr(pos + 1);
+					if (!StringUtil::CIEquals(source_col, ref.column)) {
+						continue;
 					}
+					WindowLineageOp op;
+					op.kind = "direct";
+					op.output_col = output_col;
+					op.source_table = ref.table;
+					op.source_occurrence = ref.occurrence;
+					op.source_col = ref.column;
+					op.source_cast = partition_cast;
+					direct_ops.push_back(std::move(op));
 				}
 			}
 		}
-	}
-	for (auto &child : op->children) {
-		CollectWindowPartitionRefs(child.get(), facts, partition_columns, direct_ops);
 	}
 }
 
@@ -1651,13 +1624,14 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	if (!facts.root || partition_columns.empty()) {
 		return false;
 	}
-	auto *plan = facts.root;
 	if (facts.source_occurrences.empty()) {
 		return false;
 	}
 
 	vector<WindowLineageOp> direct_ops;
-	CollectWindowPartitionRefs(plan, facts, partition_columns, direct_ops);
+	for (auto *window : facts.windows) {
+		CollectWindowPartitionRefs(*window, facts, partition_columns, direct_ops);
+	}
 	if (direct_ops.empty()) {
 		return false;
 	}
@@ -1668,9 +1642,10 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 	}
 
 	vector<WindowEquivalenceEdge> edges;
-	CollectInnerJoinEdgesOccurrence(plan, facts, edges);
 	vector<WindowLookupEdge> lookup_edges;
-	CollectWindowLookupEdges(plan, facts, lookup_edges);
+	for (auto *join : facts.comparison_joins) {
+		CollectWindowJoinEdges(*join, facts, edges, lookup_edges);
+	}
 
 	vector<WindowLineageOp> partition_ops;
 	for (auto &op : direct_ops) {
