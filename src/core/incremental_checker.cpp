@@ -140,8 +140,8 @@ static void MergeCompatibilityAndNonLocalFacts(PlanAnalysis &result, const PlanA
 	result.found_sample = result.found_sample || body.found_sample;
 }
 
-/// Single-pass recursive plan analysis: validates IVM compatibility AND extracts metadata.
-static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
+void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
+	auto *node = &op;
 	switch (node->type) {
 	// Infrastructure nodes — always compatible, no metadata
 	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
@@ -162,23 +162,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		break;
 
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-		// After the parser runs CTEInlining (with CTE_MATERIALIZE_ALWAYS → DEFAULT), most
-		// query-bound CTEs get inlined into the outer plan. Any MATERIALIZED_CTE remaining
-		// here couldn't be inlined (recursive, multi-ref with aggregate, etc.). Analyze
-		// the outer first; inherit the CTE body's aggregate only when the outer is a pure
-		// pass-through, otherwise classify from the outer alone.
-		if (node->children.size() >= 2) {
-			AnalyzeNode(node->children[1].get(), result);
-			const bool outer_passthrough = !result.found_aggregation && !result.found_distinct && !result.found_join;
-			if (outer_passthrough) {
-				AnalyzeNode(node->children[0].get(), result);
-			} else {
-				PlanAnalysis body_analysis;
-				AnalyzeNode(node->children[0].get(), body_analysis);
-				MergeCompatibilityAndNonLocalFacts(result, body_analysis);
-			}
-		}
-		return;
+		break;
 
 	case LogicalOperatorType::LOGICAL_FILTER:
 		// Check for volatile functions
@@ -449,10 +433,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 			result.incremental_compatible = false; // non-column ORDER BY: fall through to FULL_REFRESH
 			result.found_unsupported_order_by = true;
 		}
-		if (!node->children.empty()) {
-			AnalyzeNode(node->children[0].get(), result);
-		}
-		return;
+		break;
 	}
 
 	case LogicalOperatorType::LOGICAL_ORDER_BY: {
@@ -465,10 +446,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		if (result.top_k_order_columns.empty()) {
 			(void)ExtractOrderBy(order.orders, result);
 		}
-		if (!node->children.empty()) {
-			AnalyzeNode(node->children[0].get(), result);
-		}
-		return;
+		break;
 	}
 
 	case LogicalOperatorType::LOGICAL_LIMIT: {
@@ -492,10 +470,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 				result.top_k_offset = limit_node->offset_val.GetConstantValue();
 			}
 		}
-		if (!node->children.empty()) {
-			AnalyzeNode(node->children[0].get(), result);
-		}
-		return;
+		break;
 	}
 
 	default:
@@ -504,16 +479,78 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
 		result.found_unsupported_operator = true;
 		break;
 	}
+}
 
-	for (auto &child : node->children) {
-		AnalyzeNode(child.get(), result);
+static void MergeWindowAnalysis(PlanAnalysis &result, PlanAnalysis &body) {
+	if (!body.found_window) {
+		return;
+	}
+	if (!result.found_window) {
+		result.window_partition_columns = std::move(body.window_partition_columns);
+		result.window_partition_column_indexes = std::move(body.window_partition_column_indexes);
+		result.window_order_columns = std::move(body.window_order_columns);
+		result.window_row_key_compatible = body.window_row_key_compatible;
+		return;
+	}
+	bool compatible = result.window_row_key_compatible && body.window_row_key_compatible &&
+	                  SameWindowColumns(result.window_partition_columns, body.window_partition_columns) &&
+	                  SameWindowColumns(result.window_order_columns, body.window_order_columns);
+	for (idx_t i = 0; i < body.window_partition_columns.size(); i++) {
+		auto &column = body.window_partition_columns[i];
+		if (std::find(result.window_partition_columns.begin(), result.window_partition_columns.end(), column) ==
+		    result.window_partition_columns.end()) {
+			result.window_partition_columns.push_back(std::move(column));
+			result.window_partition_column_indexes.push_back(body.window_partition_column_indexes[i]);
+		}
+	}
+	result.window_row_key_compatible = compatible;
+	if (!compatible) {
+		result.window_order_columns.clear();
 	}
 }
 
-PlanAnalysis AnalyzePlan(LogicalOperator *plan) {
-	PlanAnalysis result;
-	AnalyzeNode(plan, result);
-	return result;
+void MergeMaterializedCteBodyAnalysis(PlanAnalysis &result, PlanAnalysis body) {
+	const bool outer_passthrough = !result.found_aggregation && !result.found_distinct && !result.found_join;
+	if (!outer_passthrough) {
+		MergeCompatibilityAndNonLocalFacts(result, body);
+		return;
+	}
+
+	MergeCompatibilityAndNonLocalFacts(result, body);
+	MergeWindowAnalysis(result, body);
+	result.found_aggregation = result.found_aggregation || body.found_aggregation;
+	result.found_projection = result.found_projection || body.found_projection;
+	result.found_having = result.found_having || body.found_having;
+	result.found_distinct = result.found_distinct || body.found_distinct;
+	result.found_union_distinct = result.found_union_distinct || body.found_union_distinct;
+	result.found_minmax = result.found_minmax || body.found_minmax;
+	result.found_list = result.found_list || body.found_list;
+	result.found_filtered_list = result.found_filtered_list || body.found_filtered_list;
+	result.found_left_join = result.found_left_join || body.found_left_join;
+	result.found_full_outer = result.found_full_outer || body.found_full_outer;
+	result.found_semi_anti_join = result.found_semi_anti_join || body.found_semi_anti_join;
+	result.found_join = result.found_join || body.found_join;
+	result.found_delim_join = result.found_delim_join || body.found_delim_join;
+	result.found_single_join = result.found_single_join || body.found_single_join;
+	result.found_window = result.found_window || body.found_window;
+	result.found_top_k = result.found_top_k || body.found_top_k;
+	result.found_count_distinct = result.found_count_distinct || body.found_count_distinct;
+	result.found_grouping_sets = result.found_grouping_sets || body.found_grouping_sets;
+	result.found_nested_aggregate = result.found_nested_aggregate || body.found_nested_aggregate;
+	if (body.found_top_k) {
+		result.top_k_limit = body.top_k_limit;
+		result.top_k_offset = body.top_k_offset;
+		result.top_k_order_columns = std::move(body.top_k_order_columns);
+		result.top_k_order_desc = std::move(body.top_k_order_desc);
+	} else if (result.top_k_order_columns.empty()) {
+		result.top_k_order_columns = std::move(body.top_k_order_columns);
+		result.top_k_order_desc = std::move(body.top_k_order_desc);
+	}
+	D_ASSERT(result.aggregate_columns.empty());
+	result.aggregate_columns = std::move(body.aggregate_columns);
+	result.aggregate_types = std::move(body.aggregate_types);
+	result.group_count = body.group_count;
+	result.group_index = body.group_index;
 }
 
 } // namespace duckdb

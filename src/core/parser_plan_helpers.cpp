@@ -300,9 +300,14 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 
 static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &current_catalog, CreateMVPlanFacts &facts,
                                        unordered_map<string, idx_t> &next_occurrence, bool seen_agg_above,
-                                       bool under_join) {
+                                       bool under_join, const LogicalOperator *redundant_distinct,
+                                       PlanAnalysis &analysis) {
 	if (!op) {
 		return "";
+	}
+	AnalyzePlanOperator(*op, analysis);
+	if (redundant_distinct && op != redundant_distinct && op->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+		facts.has_descendant_distinct = true;
 	}
 	string first_table;
 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
@@ -413,11 +418,29 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		facts.first_table_name[op] = first_table;
 		return first_table;
 	}
-	for (auto &child : op->children) {
-		string child_first =
-		    CollectCreateMVPlanFacts(child.get(), current_catalog, facts, next_occurrence, seen_agg_above, under_join);
+	auto collect_child = [&](LogicalOperator *child, PlanAnalysis &child_analysis) {
+		string child_first = CollectCreateMVPlanFacts(child, current_catalog, facts, next_occurrence, seen_agg_above,
+		                                             under_join, redundant_distinct, child_analysis);
 		if (first_table.empty()) {
 			first_table = std::move(child_first);
+		}
+	};
+	if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE) {
+		PlanAnalysis body_analysis;
+		if (!op->children.empty()) {
+			collect_child(op->children[0].get(), body_analysis);
+		}
+		if (op->children.size() >= 2) {
+			collect_child(op->children[1].get(), analysis);
+			MergeMaterializedCteBodyAnalysis(analysis, std::move(body_analysis));
+		}
+		for (idx_t i = 2; i < op->children.size(); i++) {
+			PlanAnalysis ignored_analysis;
+			collect_child(op->children[i].get(), ignored_analysis);
+		}
+	} else {
+		for (auto &child : op->children) {
+			collect_child(child.get(), analysis);
 		}
 	}
 	if (!first_table.empty()) {
@@ -1066,22 +1089,9 @@ bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node) {
 	return true;
 }
 
-static bool HasDistinctOperator(const LogicalOperator &node) {
-	if (node.type == LogicalOperatorType::LOGICAL_DISTINCT) {
-		return true;
-	}
-	for (auto &child : node.children) {
-		if (HasDistinctOperator(*child)) {
-			return true;
-		}
-	}
-	return false;
-}
-
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog) {
 	CreateMVPlanFacts facts;
 	facts.root = plan;
-	facts.analysis = AnalyzePlan(plan);
 	LogicalOperator *top = plan;
 	while (top && top->children.size() == 1 &&
 	       (top->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ||
@@ -1093,11 +1103,9 @@ CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &cu
 	facts.has_top_level_redundant_distinct =
 	    top && top->type == LogicalOperatorType::LOGICAL_DISTINCT && !top->children.empty() &&
 	    (ProducesAtMostOneRow(*top->children[0]) || IsRedundantDistinctOverGroupKeys(*top));
-	if (facts.has_top_level_redundant_distinct) {
-		facts.has_descendant_distinct = HasDistinctOperator(*top->children[0]);
-	}
 	unordered_map<string, idx_t> next_occurrence;
-	CollectCreateMVPlanFacts(plan, current_catalog, facts, next_occurrence, false, false);
+	CollectCreateMVPlanFacts(plan, current_catalog, facts, next_occurrence, false, false,
+	                         facts.has_top_level_redundant_distinct ? top : nullptr, facts.analysis);
 	FinalizeCreateMVPlanFacts(facts);
 	AddJoinEdgesFromFacts(facts);
 	return facts;

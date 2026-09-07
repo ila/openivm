@@ -55,10 +55,13 @@ struct PlanAnalysis {
 	idx_t group_index = DConstants::INVALID_INDEX; // aggregate's group_index for binding lookup
 };
 
-/// Walk the logical plan tree once, validating IVM compatibility AND extracting
-/// metadata (aggregation type, join type, group-by columns, etc.).
-/// Replaces separate compatibility and metadata walks.
-PlanAnalysis AnalyzePlan(LogicalOperator *plan);
+/// Add one operator's compatibility and classification metadata to the plan analysis.
+/// Tree traversal is owned by BuildCreateMVPlanFacts so analysis and lineage are collected together.
+void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &analysis);
+
+/// Merge an already-analyzed materialized CTE body after its outer consumer has been analyzed.
+/// The body supplies the query shape only for a pass-through consumer; otherwise only safety facts propagate.
+void MergeMaterializedCteBodyAnalysis(PlanAnalysis &analysis, PlanAnalysis body_analysis);
 
 } // namespace duckdb
 
