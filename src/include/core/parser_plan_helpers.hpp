@@ -58,7 +58,6 @@ struct CreateMVPlanFacts {
 	unordered_map<string, SourceTableInfo> source_table_info;
 	unordered_map<string, DuckLakeSourceTableInfo> ducklake_table_info;
 	LogicalProjection *first_projection = nullptr;
-	LogicalComparisonJoin *first_comparison_join = nullptr;
 	vector<LogicalProjection *> projections;
 	vector<LogicalAggregate *> aggregates;
 	vector<LogicalComparisonJoin *> comparison_joins;
@@ -82,7 +81,8 @@ struct CreateMVPlanFacts {
 	bool has_repeated_cte_ref_under_join = false;
 	bool has_pivot = false;
 	bool has_filter_above_aggregate = false;
-	bool has_bound_aggregate_filter = false;
+	bool has_cardinality_changing_filter = false;
+	idx_t outer_join_count = 0;
 	bool has_hidden_minmax_having_column = false;
 	bool has_computed_minmax_aggregate_projection = false;
 	bool has_computed_sum_aggregate_projection = false;

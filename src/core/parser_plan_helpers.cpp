@@ -321,6 +321,11 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		return "";
 	}
 	AnalyzePlanOperator(*op, analysis);
+	auto *logical_join = dynamic_cast<LogicalJoin *>(op);
+	if (logical_join && (logical_join->join_type == JoinType::LEFT || logical_join->join_type == JoinType::RIGHT ||
+	                     logical_join->join_type == JoinType::OUTER)) {
+		facts.outer_join_count++;
+	}
 	if (redundant_distinct && op != redundant_distinct && op->type == LogicalOperatorType::LOGICAL_DISTINCT) {
 		facts.has_descendant_distinct = true;
 	}
@@ -329,7 +334,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		seen_agg_above = true;
 		auto &agg = op->Cast<LogicalAggregate>();
 		facts.aggregates.push_back(&agg);
-		facts.has_bound_aggregate_filter = facts.has_bound_aggregate_filter || HasBoundAggregateFilter(agg);
 	} else if (op->type == LogicalOperatorType::LOGICAL_UNION) {
 		if (!seen_agg_above) {
 			facts.has_union_before_aggregate = true;
@@ -341,14 +345,17 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	} else if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
 		facts.has_pivot = true;
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_FILTER && !op->children.empty()) {
-		auto *filter_input = op->children[0].get();
-		while (filter_input && filter_input->type == LogicalOperatorType::LOGICAL_PROJECTION &&
-		       filter_input->children.size() == 1) {
-			filter_input = filter_input->children[0].get();
-		}
-		if (filter_input && filter_input->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-			facts.has_filter_above_aggregate = true;
+	if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
+		facts.has_cardinality_changing_filter = true;
+		if (!op->children.empty()) {
+			auto *filter_input = op->children[0].get();
+			while (filter_input && filter_input->type == LogicalOperatorType::LOGICAL_PROJECTION &&
+			       filter_input->children.size() == 1) {
+				filter_input = filter_input->children[0].get();
+			}
+			if (filter_input && filter_input->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+				facts.has_filter_above_aggregate = true;
+			}
 		}
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
@@ -367,11 +374,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	           op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN ||
 	           op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
 		auto &join = op->Cast<LogicalComparisonJoin>();
-		if ((op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-		     op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) &&
-		    !facts.first_comparison_join) {
-			facts.first_comparison_join = &join;
-		}
 		if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 		    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 			facts.comparison_joins.push_back(&join);
@@ -405,6 +407,8 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op->Cast<LogicalGet>();
+		facts.has_cardinality_changing_filter =
+		    facts.has_cardinality_changing_filter || !get.table_filters.filters.empty();
 		AddGetFacts(get, current_catalog, facts, next_occurrence);
 		auto table_ref = get.GetTable();
 		if (table_ref.get()) {
@@ -1263,24 +1267,7 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 	return false;
 }
 
-static idx_t CountOuterJoins(const LogicalOperator *node) {
-	if (!node) {
-		return 0;
-	}
-	idx_t count = 0;
-	auto *join = dynamic_cast<const LogicalJoin *>(node);
-	if (join && (join->join_type == JoinType::LEFT || join->join_type == JoinType::RIGHT ||
-	             join->join_type == JoinType::OUTER)) {
-		count++;
-	}
-	for (auto &child : node->children) {
-		count += CountOuterJoins(child.get());
-	}
-	return count;
-}
-
 bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out) {
-	auto outer_join_count = CountOuterJoins(facts.root);
 	for (auto *join : facts.comparison_joins) {
 		if (!join || join->join_type != JoinType::LEFT || join->conditions.empty()) {
 			continue;
@@ -1296,7 +1283,7 @@ bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::Lef
 		out.table = source.table;
 		out.occurrence = source.occurrence;
 		out.column = source.column;
-		out.cardinality_transition_check_safe = outer_join_count == 1 && join->conditions.size() == 1 &&
+		out.cardinality_transition_check_safe = facts.outer_join_count == 1 && join->conditions.size() == 1 &&
 		                                        join->conditions[0].comparison == ExpressionType::COMPARE_EQUAL;
 		return true;
 	}
@@ -2147,24 +2134,6 @@ static bool IsUnfilteredGetSubtree(LogicalOperator *op) {
 	return op && op->type == LogicalOperatorType::LOGICAL_GET && op->Cast<LogicalGet>().table_filters.filters.empty();
 }
 
-static bool ContainsCardinalityChangingFilter(LogicalOperator *op) {
-	if (!op) {
-		return false;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
-		return true;
-	}
-	if (op->type == LogicalOperatorType::LOGICAL_GET && !op->Cast<LogicalGet>().table_filters.filters.empty()) {
-		return true;
-	}
-	for (auto &child : op->children) {
-		if (ContainsCardinalityChangingFilter(child.get())) {
-			return true;
-		}
-	}
-	return false;
-}
-
 static bool ColumnIsNotNull(LogicalGet &get, const string &column_name) {
 	auto table = get.GetTable();
 	if (!table.get() || !table.get()->ColumnExists(column_name)) {
@@ -2197,7 +2166,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	// LogicalFilter above the join. Inspect the complete view plan as well as
 	// the local children; secondary transition counts are valid only when no
 	// additional cardinality predicate exists anywhere in this aggregate view.
-	if (ContainsCardinalityChangingFilter(facts.root)) {
+	if (facts.has_cardinality_changing_filter) {
 		return "";
 	}
 	// __newc below counts rows directly in the inner base table. A filter or any other

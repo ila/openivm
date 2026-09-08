@@ -15,8 +15,6 @@
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
-#include "duckdb/planner/operator/logical_limit.hpp"
-#include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 
@@ -31,28 +29,12 @@ static const unordered_set<string> &GetSupportedAggregates() {
 	return kSet;
 }
 
-/// Extract a column name from an ORDER BY expression. Returns empty if the expression
-/// isn't a column reference (rejecting non-column ORDER BY in Phase 1 keeps the new-top-k
-/// SQL emission simple — function/CASE/cast expressions over base columns would need a
-/// projection alias).
-static string OrderByColumnName(const Expression &expr) {
-	if (expr.type == ExpressionType::BOUND_COLUMN_REF) {
-		auto &bcr = expr.Cast<BoundColumnRefExpression>();
-		if (!bcr.alias.empty()) {
-			return bcr.alias;
-		}
-		return bcr.GetName();
-	}
-	return string();
-}
-
-static bool WindowColumn(const Expression &expr, string &name, idx_t &column_index) {
+static bool WindowColumn(const Expression &expr, string &name) {
 	if (expr.type != ExpressionType::BOUND_COLUMN_REF) {
 		return false;
 	}
 	auto &column = expr.Cast<BoundColumnRefExpression>();
 	name = column.alias.empty() ? column.GetName() : column.alias;
-	column_index = column.binding.column_index;
 	return !name.empty();
 }
 
@@ -68,18 +50,15 @@ static bool SameWindowColumns(const vector<string> &left, const vector<string> &
 	return true;
 }
 
-/// Populate top_k_order_columns / top_k_order_desc from a vector<BoundOrderByNode>.
-/// Returns false if any entry is non-column-ref (caller should mark incremental_compatible=false).
-static bool ExtractOrderBy(const vector<BoundOrderByNode> &orders, PlanAnalysis &result) {
-	result.top_k_order_columns.clear();
-	result.top_k_order_desc.clear();
-	for (auto &o : orders) {
-		string name = OrderByColumnName(*o.expression);
-		if (name.empty()) {
+static bool HasSimpleOrderBy(const vector<BoundOrderByNode> &orders) {
+	for (auto &order : orders) {
+		if (order.expression->type != ExpressionType::BOUND_COLUMN_REF) {
 			return false;
 		}
-		result.top_k_order_columns.push_back(name);
-		result.top_k_order_desc.push_back(o.type == OrderType::DESCENDING);
+		auto &column = order.expression->Cast<BoundColumnRefExpression>();
+		if (column.alias.empty() && column.GetName().empty()) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -152,6 +131,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 	case LogicalOperatorType::LOGICAL_DELIM_GET:
 	case LogicalOperatorType::LOGICAL_CTE_REF:
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
 		break;
 
 	case LogicalOperatorType::LOGICAL_UNNEST:
@@ -375,8 +355,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 				vector<string> current_orders;
 				for (auto &part : win_expr.partitions) {
 					string col_name;
-					idx_t col_index = DConstants::INVALID_INDEX;
-					if (!WindowColumn(*part, col_name, col_index)) {
+					if (!WindowColumn(*part, col_name)) {
 						result.window_row_key_compatible = false;
 						col_name = part->GetName();
 					}
@@ -391,13 +370,11 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 					}
 					if (!found) {
 						result.window_partition_columns.push_back(col_name);
-						result.window_partition_column_indexes.push_back(col_index);
 					}
 				}
 				for (auto &order : win_expr.orders) {
 					string col_name;
-					idx_t col_index = DConstants::INVALID_INDEX;
-					if (!WindowColumn(*order.expression, col_name, col_index)) {
+					if (!WindowColumn(*order.expression, col_name)) {
 						result.window_row_key_compatible = false;
 						break;
 					}
@@ -424,35 +401,17 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	}
 
 	case LogicalOperatorType::LOGICAL_TOP_N: {
-		// TOP_N fuses ORDER BY + LIMIT. Capture both for top-k suffix handling.
+		// Function/CASE/cast order expressions need a projection alias before they can
+		// be emitted in the user-facing top-k view.
 		auto &top_n = node->Cast<LogicalTopN>();
-		result.found_top_k = true;
-		result.top_k_limit = top_n.limit;
-		result.top_k_offset = top_n.offset;
-		if (!ExtractOrderBy(top_n.orders, result)) {
+		if (!HasSimpleOrderBy(top_n.orders)) {
 			result.incremental_compatible = false; // non-column ORDER BY: fall through to FULL_REFRESH
 			result.found_unsupported_order_by = true;
 		}
 		break;
 	}
 
-	case LogicalOperatorType::LOGICAL_ORDER_BY: {
-		// ORDER BY alone (without LIMIT) is meaningless on an MV (a table has no inherent
-		// order). Top-k delta compilation drops the node from the delta plan; we still capture
-		// the order columns so a sibling LIMIT below this node — see plan shapes where
-		// LPTS keeps them as separate ORDER_BY → LIMIT nodes — has them available for
-		// top-k suffix handling.
-		auto &order = node->Cast<LogicalOrder>();
-		if (result.top_k_order_columns.empty()) {
-			(void)ExtractOrderBy(order.orders, result);
-		}
-		break;
-	}
-
 	case LogicalOperatorType::LOGICAL_LIMIT: {
-		// LPTS disables the top_n optimizer so ORDER BY + LIMIT appear as separate nodes.
-		// LIMIT is what makes a query top-k; ORDER BY alone does not.
-		result.found_top_k = true;
 		// Ordered top-k is maintained over an unlimited backing table and the
 		// ORDER BY/LIMIT is applied by the user-facing view. A standalone LIMIT
 		// remains in the backing-table plan; maintaining only its current rows
@@ -460,15 +419,6 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		if (node->children.empty() || node->children[0]->type != LogicalOperatorType::LOGICAL_ORDER_BY) {
 			result.incremental_compatible = false;
 			result.found_unsupported_operator = true;
-		}
-		auto *limit_node = dynamic_cast<LogicalLimit *>(node);
-		if (limit_node) {
-			if (limit_node->limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
-				result.top_k_limit = limit_node->limit_val.GetConstantValue();
-			}
-			if (limit_node->offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
-				result.top_k_offset = limit_node->offset_val.GetConstantValue();
-			}
 		}
 		break;
 	}
@@ -487,7 +437,6 @@ static void MergeWindowAnalysis(PlanAnalysis &result, PlanAnalysis &body) {
 	}
 	if (!result.found_window) {
 		result.window_partition_columns = std::move(body.window_partition_columns);
-		result.window_partition_column_indexes = std::move(body.window_partition_column_indexes);
 		result.window_order_columns = std::move(body.window_order_columns);
 		result.window_row_key_compatible = body.window_row_key_compatible;
 		return;
@@ -495,12 +444,10 @@ static void MergeWindowAnalysis(PlanAnalysis &result, PlanAnalysis &body) {
 	bool compatible = result.window_row_key_compatible && body.window_row_key_compatible &&
 	                  SameWindowColumns(result.window_partition_columns, body.window_partition_columns) &&
 	                  SameWindowColumns(result.window_order_columns, body.window_order_columns);
-	for (idx_t i = 0; i < body.window_partition_columns.size(); i++) {
-		auto &column = body.window_partition_columns[i];
+	for (auto &column : body.window_partition_columns) {
 		if (std::find(result.window_partition_columns.begin(), result.window_partition_columns.end(), column) ==
 		    result.window_partition_columns.end()) {
 			result.window_partition_columns.push_back(std::move(column));
-			result.window_partition_column_indexes.push_back(body.window_partition_column_indexes[i]);
 		}
 	}
 	result.window_row_key_compatible = compatible;
@@ -533,19 +480,9 @@ void MergeMaterializedCteBodyAnalysis(PlanAnalysis &result, PlanAnalysis body) {
 	result.found_delim_join = result.found_delim_join || body.found_delim_join;
 	result.found_single_join = result.found_single_join || body.found_single_join;
 	result.found_window = result.found_window || body.found_window;
-	result.found_top_k = result.found_top_k || body.found_top_k;
 	result.found_count_distinct = result.found_count_distinct || body.found_count_distinct;
 	result.found_grouping_sets = result.found_grouping_sets || body.found_grouping_sets;
 	result.found_nested_aggregate = result.found_nested_aggregate || body.found_nested_aggregate;
-	if (body.found_top_k) {
-		result.top_k_limit = body.top_k_limit;
-		result.top_k_offset = body.top_k_offset;
-		result.top_k_order_columns = std::move(body.top_k_order_columns);
-		result.top_k_order_desc = std::move(body.top_k_order_desc);
-	} else if (result.top_k_order_columns.empty()) {
-		result.top_k_order_columns = std::move(body.top_k_order_columns);
-		result.top_k_order_desc = std::move(body.top_k_order_desc);
-	}
 	D_ASSERT(result.aggregate_columns.empty());
 	result.aggregate_columns = std::move(body.aggregate_columns);
 	result.aggregate_types = std::move(body.aggregate_types);
