@@ -453,8 +453,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Inline CTEs without running the full optimizer, which can reshape plans
 		// before OpenIVM's structural rewrites.
 		auto select_rewrite_start = create_profile_now();
-		pre_rewrite_has_aggregate_filter =
-		    InlineCtesIfPresent(context, *select_planner.binder, select_plan);
+		pre_rewrite_has_aggregate_filter = InlineCtesIfPresent(context, *select_planner.binder, select_plan);
 
 		// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
 		PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);

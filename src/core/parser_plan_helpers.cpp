@@ -434,7 +434,7 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	}
 	auto collect_child = [&](LogicalOperator *child, PlanAnalysis &child_analysis) {
 		string child_first = CollectCreateMVPlanFacts(child, current_catalog, facts, next_occurrence, seen_agg_above,
-		                                             under_join, redundant_distinct, child_analysis);
+		                                              under_join, redundant_distinct, child_analysis);
 		if (first_table.empty()) {
 			first_table = std::move(child_first);
 		}
@@ -1487,8 +1487,7 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 		}
 		OccurrenceColumnRef left_ref, right_ref;
 		if (!ResolveBindingToOccurrenceRefWithCast(left->binding, facts, left_ref, left_cast, left->return_type) ||
-		    !ResolveBindingToOccurrenceRefWithCast(right->binding, facts, right_ref, right_cast,
-		                                           right->return_type)) {
+		    !ResolveBindingToOccurrenceRefWithCast(right->binding, facts, right_ref, right_cast, right->return_type)) {
 			continue;
 		}
 		switch (join.join_type) {
