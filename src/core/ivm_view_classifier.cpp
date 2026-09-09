@@ -209,7 +209,7 @@ static bool GroupColumnsAreVisibleOutputs(const vector<string> &group_columns, c
 static void AddJoinKeyGroupColumns(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                    vector<string> &aggregate_columns, vector<DeltaStrategyReason> &strategy_reasons) {
 	auto *top_proj_ptr = facts.first_projection;
-	auto *cjoin = facts.first_comparison_join;
+	auto *cjoin = facts.comparison_joins.empty() ? nullptr : facts.comparison_joins.front();
 	if (!top_proj_ptr || !cjoin) {
 		return;
 	}

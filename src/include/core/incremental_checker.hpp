@@ -27,7 +27,6 @@ struct PlanAnalysis {
 	bool found_positional_join = false;
 	bool found_sample = false;
 	bool found_window = false;
-	bool found_top_k = false;
 	bool found_count_distinct = false;   // COUNT(DISTINCT x) — handled via group-recompute
 	bool found_grouping_sets = false;    // ROLLUP/CUBE/GROUPING SETS — handled via RECOMPUTE
 	bool found_nested_aggregate = false; // outer aggregate over inner aggregate (CTE re-agg); COUNT(*) in outer is
@@ -39,29 +38,22 @@ struct PlanAnalysis {
 	bool found_unsupported_join_type = false;
 	bool found_unsupported_order_by = false;
 	bool found_unsupported_operator = false;
-	idx_t top_k_limit = 0;                  // constant LIMIT value from LOGICAL_TOP_N
-	idx_t top_k_offset = 0;                 // OFFSET value (0 if none)
-	vector<string> top_k_order_columns;     // ORDER BY column names (in order) for the top-k
-	vector<bool> top_k_order_desc;          // parallel to top_k_order_columns; true = DESC
-	vector<string> top_k_partition_columns; // PARTITION BY cols for per-partition top-k via ROW_NUMBER ≤ k pattern;
-	                                        // empty for global top-k
 	vector<string> aggregate_columns;
 	vector<string> aggregate_types;          // per-column: "min", "max", "sum", "count_star", "count", "avg", "list"
 	vector<string> window_partition_columns; // PARTITION BY source columns from window functions
-	vector<idx_t> window_partition_column_indexes; // Output-position hint for each PARTITION BY column
-	vector<string> window_order_columns;           // Common simple ORDER BY columns for all window expressions
-	bool window_row_key_compatible = true;         // False when window expressions use different/non-column keys
-	size_t group_count = 0;                        // number of GROUP BY expressions
+	vector<string> window_order_columns;     // Common simple ORDER BY columns for all window expressions
+	bool window_row_key_compatible = true;   // False when window expressions use different/non-column keys
+	size_t group_count = 0;                  // number of GROUP BY expressions
 	idx_t group_index = DConstants::INVALID_INDEX; // aggregate's group_index for binding lookup
 };
 
-/// Walk the logical plan tree once, validating IVM compatibility AND extracting
-/// metadata (aggregation type, join type, group-by columns, etc.).
-/// Replaces the separate ValidateIncrementalPlan + parser stack walk.
-PlanAnalysis AnalyzePlan(LogicalOperator *plan);
+/// Add one operator's compatibility and classification metadata to the plan analysis.
+/// Tree traversal is owned by BuildCreateMVPlanFacts so analysis and lineage are collected together.
+void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &analysis);
 
-/// Thin wrapper for backward compatibility. Returns true if the plan is fully IVM-compatible.
-bool ValidateIncrementalPlan(LogicalOperator *plan);
+/// Merge an already-analyzed materialized CTE body after its outer consumer has been analyzed.
+/// The body supplies the query shape only for a pass-through consumer; otherwise only safety facts propagate.
+void MergeMaterializedCteBodyAnalysis(PlanAnalysis &analysis, PlanAnalysis body_analysis);
 
 } // namespace duckdb
 
