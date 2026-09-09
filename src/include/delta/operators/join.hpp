@@ -15,9 +15,6 @@ struct JoinLeafInfo {
 	bool is_right_of_left_join; // true if this leaf is on the nullable side of an outer join
 };
 
-void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves,
-                       bool is_right_of_left = false);
-
 LogicalGet *FindGetInSubtree(LogicalOperator *node);
 
 unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, const vector<size_t> &path);

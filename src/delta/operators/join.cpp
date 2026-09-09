@@ -126,24 +126,6 @@ static bool DeltaKeyHasDeltaMatch(Connection &con, const JoinColumnRef &left_ref
 	return result->GetValue(0, 0).GetValue<bool>();
 }
 
-static void CollectExistingMultiplicityBindings(LogicalOperator *node, unordered_set<uint64_t> &mul_set) {
-	if (!node) {
-		return;
-	}
-	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
-		auto &ref = node->Cast<LogicalCTERef>();
-		if (!ref.bound_columns.empty() && ref.bound_columns.back() == openivm::MULTIPLICITY_COL) {
-			auto bindings = node->GetColumnBindings();
-			if (!bindings.empty()) {
-				mul_set.insert(DeltaJoinBindingKey(bindings.back()));
-			}
-		}
-	}
-	for (auto &child : node->children) {
-		CollectExistingMultiplicityBindings(child.get(), mul_set);
-	}
-}
-
 static void FilterInternalMultiplicityColumns(const vector<ColumnBinding> &bindings, const vector<LogicalType> &types,
                                               const unordered_set<uint64_t> &mul_set,
                                               vector<ColumnBinding> &filtered_bindings,
@@ -157,45 +139,15 @@ static void FilterInternalMultiplicityColumns(const vector<ColumnBinding> &bindi
 	}
 }
 
-void CollectJoinLeaves(LogicalOperator *node, vector<size_t> path, vector<JoinLeafInfo> &leaves,
-                       bool is_right_of_left) {
-	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-	    node->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT ||
-	    node->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
-		bool is_left = false;
-		bool is_right = false;
-		bool is_full_outer = false;
-		auto *join = dynamic_cast<LogicalJoin *>(node);
-		if (join) {
-			switch (join->join_type) {
-			case JoinType::LEFT:
-				is_left = true;
-				break;
-			case JoinType::RIGHT:
-				is_right = true;
-				break;
-			case JoinType::OUTER:
-				is_full_outer = true;
-				break;
-			default:
-				break;
-			}
+static void AddRenumberedMultiplicityBindings(const vector<ColumnBinding> &bindings,
+                                              const unordered_map<old_idx, new_idx> &idx_map,
+                                              unordered_set<uint64_t> &mul_set) {
+	for (auto binding : bindings) {
+		auto remapped = idx_map.find(binding.table_index);
+		if (remapped != idx_map.end()) {
+			binding.table_index = remapped->second;
 		}
-		path.push_back(0);
-		CollectJoinLeaves(node->children[0].get(), path, leaves, is_right_of_left || is_right || is_full_outer);
-		path.pop_back();
-		path.push_back(1);
-		CollectJoinLeaves(node->children[1].get(), path, leaves, is_right_of_left || is_left || is_full_outer);
-		path.pop_back();
-		return;
-	}
-	switch (node->type) {
-	case LogicalOperatorType::LOGICAL_GET:
-		leaves.push_back({path, dynamic_cast<LogicalGet *>(node), node, is_right_of_left});
-		break;
-	default:
-		leaves.push_back({path, nullptr, node, is_right_of_left});
-		break;
+		mul_set.insert(DeltaJoinBindingKey(binding));
 	}
 }
 
@@ -343,7 +295,10 @@ unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, co
 
 struct JoinPlanFacts {
 	vector<JoinLeafInfo> leaves;
-	unordered_set<uint64_t> existing_multiplicity_bindings;
+	vector<JoinLeafInfo> ducklake_leaves;
+	vector<ColumnBinding> existing_multiplicity_bindings;
+	unordered_set<uint64_t> existing_multiplicity_binding_keys;
+	string ducklake_fallback_reason;
 	bool has_outer_join = false;
 	bool only_inner_joins = true;
 };
@@ -351,13 +306,14 @@ struct JoinPlanFacts {
 // Collect join leaves and the properties needed to select a compilation strategy. Non-join wrappers remain leaves,
 // but their descendants are still inspected for validation and existing multiplicity bindings.
 static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bool is_right_of_left, bool collect_leaf,
-                                 JoinPlanFacts &facts) {
+                                 bool collect_ducklake_leaf, JoinPlanFacts &facts) {
 	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &ref = node->Cast<LogicalCTERef>();
 		if (!ref.bound_columns.empty() && ref.bound_columns.back() == openivm::MULTIPLICITY_COL) {
 			auto bindings = node->GetColumnBindings();
-			if (!bindings.empty()) {
-				facts.existing_multiplicity_bindings.insert(DeltaJoinBindingKey(bindings.back()));
+			if (!bindings.empty() &&
+			    facts.existing_multiplicity_binding_keys.insert(DeltaJoinBindingKey(bindings.back())).second) {
+				facts.existing_multiplicity_bindings.push_back(bindings.back());
 			}
 		}
 	}
@@ -391,7 +347,7 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 			facts.only_inner_joins = false;
 		}
 	}
-	if (collect_leaf && is_join_tree_node) {
+	if ((collect_leaf || collect_ducklake_leaf) && is_join_tree_node) {
 		bool left_is_nullable = is_right_of_left;
 		bool right_is_nullable = is_right_of_left;
 		auto *join = dynamic_cast<LogicalJoin *>(node);
@@ -403,10 +359,12 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		}
 		D_ASSERT(node->children.size() == 2);
 		path.push_back(0);
-		CollectJoinPlanFacts(node->children[0].get(), path, left_is_nullable, true, facts);
+		CollectJoinPlanFacts(node->children[0].get(), path, left_is_nullable, collect_leaf, collect_ducklake_leaf,
+		                     facts);
 		path.pop_back();
 		path.push_back(1);
-		CollectJoinPlanFacts(node->children[1].get(), path, right_is_nullable, true, facts);
+		CollectJoinPlanFacts(node->children[1].get(), path, right_is_nullable, collect_leaf, collect_ducklake_leaf,
+		                     facts);
 		path.pop_back();
 		return;
 	}
@@ -414,8 +372,35 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		auto *get = node->type == LogicalOperatorType::LOGICAL_GET ? dynamic_cast<LogicalGet *>(node) : nullptr;
 		facts.leaves.push_back({path, get, node, is_right_of_left});
 	}
-	for (auto &child : node->children) {
-		CollectJoinPlanFacts(child.get(), path, is_right_of_left, false, facts);
+	if (collect_ducklake_leaf) {
+		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+		    node->type == LogicalOperatorType::LOGICAL_FILTER) {
+			if (node->children.size() == 1) {
+				path.push_back(0);
+				CollectJoinPlanFacts(node->children[0].get(), path, is_right_of_left, false, true, facts);
+				path.pop_back();
+				return;
+			}
+			if (facts.ducklake_fallback_reason.empty()) {
+				facts.ducklake_fallback_reason = node->GetName() + " does not have exactly one child";
+			}
+		} else if (node->type == LogicalOperatorType::LOGICAL_GET) {
+			auto *get = dynamic_cast<LogicalGet *>(node);
+			if (get && get->function.name == "ducklake_scan" && get->function.function_info) {
+				facts.ducklake_leaves.push_back({path, get, node, is_right_of_left});
+				return;
+			}
+			if (facts.ducklake_fallback_reason.empty()) {
+				facts.ducklake_fallback_reason = "non-DuckLake scan " + node->GetName();
+			}
+		} else if (facts.ducklake_fallback_reason.empty()) {
+			facts.ducklake_fallback_reason = "unsupported wrapper " + node->GetName();
+		}
+	}
+	for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
+		path.push_back(child_idx);
+		CollectJoinPlanFacts(node->children[child_idx].get(), path, is_right_of_left, false, false, facts);
+		path.pop_back();
 	}
 }
 
@@ -1485,6 +1470,7 @@ static bool RegularNtermPreservesFKPruning(ClientContext &context, const openivm
 static vector<unique_ptr<LogicalOperator>>
 BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, Binder &binder,
                              const vector<JoinLeafInfo> &leaves, bool has_left_join,
+                             const vector<ColumnBinding> &existing_multiplicity_bindings,
                              vector<TransitioningKeyCTEDefinition> &transition_ctes) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
@@ -1710,7 +1696,7 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 
 		// Filter out multiplicity columns (O(1) lookup via hash set)
 		unordered_set<uint64_t> mul_set;
-		CollectExistingMultiplicityBindings(term.get(), mul_set);
+		AddRenumberedMultiplicityBindings(existing_multiplicity_bindings, renumbered.idx_map, mul_set);
 		for (auto &mb : mul_bindings) {
 			mul_set.insert(DeltaJoinBindingKey(mb));
 		}
@@ -1873,9 +1859,10 @@ static DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input
 	return input.CompileCopiedSubtree(leaf_node, term_root);
 }
 
-static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context,
-                                                                 Binder &binder, const vector<JoinLeafInfo> &leaves,
-                                                                 uint64_t unchanged_mask) {
+static vector<unique_ptr<LogicalOperator>>
+BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &binder,
+                      const vector<JoinLeafInfo> &leaves, uint64_t unchanged_mask,
+                      const vector<ColumnBinding> &existing_multiplicity_bindings) {
 	vector<unique_ptr<LogicalOperator>> terms;
 	// Base scans see post-DML state. Term i uses current state before i, delta i, and reconstructs old state after i as
 	// current - delta. These disjoint telescoping terms cover every non-empty delta combination exactly once.
@@ -1904,19 +1891,16 @@ static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorIn
 		auto term = input.plan->Copy(context);
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);
-		vector<JoinLeafInfo> term_leaves;
 		LogicalOperator *term_root = term.get();
-		CollectJoinLeaves(term.get(), {}, term_leaves);
-		D_ASSERT(term_leaves.size() == leaves.size());
 		vector<ColumnBinding> mul_bindings;
 
-		for (size_t leaf = 0; leaf < term_leaves.size(); leaf++) {
-			auto &leaf_node = GetNodeAtPath(term, term_leaves[leaf].path);
+		for (size_t leaf = 0; leaf < leaves.size(); leaf++) {
+			auto &leaf_node = GetNodeAtPath(term, leaves[leaf].path);
 			if (leaf == delta_leaf) {
 				auto delta = CompileRegularLeafDelta(input, context, binder, leaf_node, term_root);
 				mul_bindings.push_back(delta.mul_binding);
 				leaf_node = std::move(delta.op);
-				UpdateParentProjectionMap(term, term_leaves[leaf], delta.mul_binding);
+				UpdateParentProjectionMap(term, leaves[leaf], delta.mul_binding);
 				continue;
 			}
 			// leaf == delta_leaf continued above, so < and <= are identical here.
@@ -1934,14 +1918,14 @@ static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorIn
 			auto old = CreateRegularOldNode(binder, std::move(leaf_node), std::move(delta), input.mul_type);
 			mul_bindings.push_back(old.mul_binding);
 			leaf_node = std::move(old.op);
-			UpdateParentProjectionMap(term, term_leaves[leaf], old.mul_binding);
+			UpdateParentProjectionMap(term, leaves[leaf], old.mul_binding);
 		}
 
 		term->ResolveOperatorTypes();
 		auto term_bindings = term->GetColumnBindings();
 		auto term_types = term->types;
 		unordered_set<uint64_t> mul_set;
-		CollectExistingMultiplicityBindings(term.get(), mul_set);
+		AddRenumberedMultiplicityBindings(existing_multiplicity_bindings, renumbered.idx_map, mul_set);
 		for (auto &binding : mul_bindings) {
 			mul_set.insert(DeltaJoinBindingKey(binding));
 		}
@@ -1982,13 +1966,15 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	Binder &binder = input.context.input.optimizer.binder;
 	input.plan->ResolveOperatorTypes();
 	const vector<ColumnBinding> all_original_bindings = input.plan->GetColumnBindings();
+	bool ducklake_nterm_enabled = SqlUtils::GetBoolSetting(context, "openivm_ducklake_nterm", true);
+	bool collect_ducklake_leaves = ducklake_nterm_enabled && input.context.model.type == RefreshType::SIMPLE_PROJECTION;
 	JoinPlanFacts join_facts;
 	vector<size_t> join_path;
-	CollectJoinPlanFacts(input.plan.get(), join_path, false, true, join_facts);
+	CollectJoinPlanFacts(input.plan.get(), join_path, false, true, collect_ducklake_leaves, join_facts);
 	vector<ColumnBinding> original_bindings;
 	vector<LogicalType> output_types;
 	FilterInternalMultiplicityColumns(all_original_bindings, input.plan->types,
-	                                  join_facts.existing_multiplicity_bindings, original_bindings, output_types);
+	                                  join_facts.existing_multiplicity_binding_keys, original_bindings, output_types);
 
 	// 1. Verify + collect
 	bool has_left_join = join_facts.has_outer_join;
@@ -2014,16 +2000,15 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	// source contributes one term even when a projection wraps a preserved join.
 	bool all_ducklake = true;
 	bool flattened_ducklake = false;
-	vector<JoinLeafInfo> ducklake_leaves;
 	string ducklake_fallback_reason;
-	if (!SqlUtils::GetBoolSetting(context, "openivm_ducklake_nterm", true)) {
+	if (!ducklake_nterm_enabled) {
 		all_ducklake = false; // forced to inclusion-exclusion
 		ducklake_fallback_reason = "openivm_ducklake_nterm is disabled";
 	} else {
-		if (input.context.model.type == RefreshType::SIMPLE_PROJECTION &&
-		    TryCollectDuckLakeJoinLeaves(input.plan.get(), ducklake_leaves, ducklake_fallback_reason)) {
+		if (collect_ducklake_leaves && join_facts.ducklake_fallback_reason.empty() &&
+		    !join_facts.ducklake_leaves.empty()) {
 			// A false positive only replaces the leaf list with an equivalent flattened list.
-			bool has_wrapped_leaf = ducklake_leaves.size() != leaves.size(); // mull-ignore: cxx_ne_to_eq
+			bool has_wrapped_leaf = join_facts.ducklake_leaves.size() != leaves.size(); // mull-ignore: cxx_ne_to_eq
 			if (!has_wrapped_leaf) {
 				for (auto &leaf : leaves) {
 					if (!leaf.get) {
@@ -2034,12 +2019,14 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 			}
 			if (has_wrapped_leaf) {
 				flattened_ducklake = true;
-				leaves = std::move(ducklake_leaves);
+				leaves = std::move(join_facts.ducklake_leaves);
 				N = leaves.size();
 			}
-		} else if (input.context.model.type != RefreshType::SIMPLE_PROJECTION) { // mull-ignore: cxx_ne_to_eq
+		} else if (!collect_ducklake_leaves) {
 			// This reason is diagnostic only; it does not select the fallback path.
 			ducklake_fallback_reason = "refresh type is outside SIMPLE_PROJECTION scope";
+		} else {
+			ducklake_fallback_reason = join_facts.ducklake_fallback_reason;
 		}
 		// The <= mutant indexes one past leaves.
 		// mull-ignore-next: cxx_lt_to_le
@@ -2081,9 +2068,11 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	if (all_ducklake) {
 		terms = BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake);
 	} else if (regular_nterm) {
-		terms = BuildRegularJoinTerms(input, context, binder, leaves, unchanged_mask);
+		terms = BuildRegularJoinTerms(input, context, binder, leaves, unchanged_mask,
+		                              join_facts.existing_multiplicity_bindings);
 	} else {
-		terms = BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join, transition_ctes);
+		terms = BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join,
+		                                     join_facts.existing_multiplicity_bindings, transition_ctes);
 	}
 
 	// 4. UNION ALL
