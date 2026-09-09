@@ -6,6 +6,7 @@
 #include "core/parser_plan_helpers.hpp"
 #include "core/scoped_optimizer_settings.hpp"
 #include "core/sql_utils.hpp"
+#include "core/time_travel_pins.hpp"
 #include "delta/delta_compiler.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -109,6 +110,7 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		throw Exception(ExceptionType::PARSER, "IVM: empty view definition for '" + view + "'");
 	}
 	auto statement = parser.statements[0].get();
+	openivm::TimeTravelPins::PeelForLocalBinding(input.context, *statement);
 
 	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
 	planner.CreatePlan(statement->Copy());

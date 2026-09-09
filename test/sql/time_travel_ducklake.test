@@ -1,0 +1,49 @@
+# name: test/sql/time_travel_ducklake.test
+# description: A pin may never leak onto a same-named relation in a catalog that honours pins.
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+ATTACH '__TEST_DIR__/time_travel_ducklake.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE TABLE dl.main.tt_orders(o_id INT, c_id INT, amount INT);
+
+statement ok
+INSERT INTO dl.main.tt_orders VALUES (1, 1, 10), (2, 2, 20);
+
+statement ok
+CREATE TABLE tt_orders(o_id INT, c_id INT, amount INT);
+
+statement ok
+INSERT INTO tt_orders VALUES (1, 1, 10), (2, 2, 20);
+
+statement ok
+SET openivm_input_dialect='spark';
+
+# `memory.tt_orders` is pinned, `dl.main.tt_orders` is not. Pins are keyed by relation name, so a
+# catalog that honours time travel is exactly where a stray pin would bind and silently read the
+# wrong snapshot of a different table. The ambiguity has to be refused instead.
+statement error
+CREATE MATERIALIZED VIEW tt_mixed AS
+    SELECT a.c_id AS c_id, SUM(a.amount + b.amount) AS total
+    FROM tt_orders VERSION AS OF 366 a
+    JOIN dl.main.tt_orders b ON a.c_id = b.c_id
+    GROUP BY a.c_id;
+----
+scanned both pinned and unpinned
+
+statement ok
+SET openivm_input_dialect='duckdb';

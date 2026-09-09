@@ -2,11 +2,32 @@
 #define OPENIVM_PARSER_HPP
 
 #include "duckdb.hpp"
+#include "duckdb/main/setting_info.hpp"
 #include "duckdb/parser/parser_extension.hpp"
+#include "sql_dialect.hpp"
 
+#include <atomic>
 #include <utility>
 
 namespace duckdb {
+
+//! Name of the setting that declares which SQL dialect the caller writes materialized-view bodies in.
+constexpr const char *OPENIVM_INPUT_DIALECT_SETTING = "openivm_input_dialect";
+
+//! Parser-extension state. `parse_function` and `parser_override` run before any ClientContext
+//! exists, so the input dialect is mirrored here from the `openivm_input_dialect` setting: it
+//! decides whether a materialized-view body must be normalized out of its source dialect before
+//! DuckDB's parser ever sees it.
+struct MaterializedViewParserExtensionInfo : ParserExtensionInfo {
+	std::atomic<uint8_t> input_dialect {static_cast<uint8_t>(SqlDialect::DUCKDB)};
+
+	SqlDialect InputDialect() const {
+		return static_cast<SqlDialect>(input_dialect.load());
+	}
+	void SetInputDialect(SqlDialect dialect) {
+		input_dialect.store(static_cast<uint8_t>(dialect));
+	}
+};
 
 class MaterializedViewParserExtension : public ParserExtension {
 public:
@@ -14,6 +35,7 @@ public:
 		parse_function = ParseFunction;
 		plan_function = PlanFunction;
 		parser_override = OverrideFunction;
+		parser_info = make_shared_ptr<MaterializedViewParserExtensionInfo>();
 	}
 
 	static ParserExtensionParseResult ParseFunction(ParserExtensionInfo *info, const string &query);
@@ -22,6 +44,15 @@ public:
 	static ParserExtensionPlanResult PlanFunction(ParserExtensionInfo *info, ClientContext &context,
 	                                              unique_ptr<ParserExtensionParseData> parse_data);
 };
+
+//! Parse a materialized-view lifecycle statement written in `input_dialect`.
+ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, SqlDialect input_dialect);
+
+//! The dialect materialized-view bodies arrive in for this session (`openivm_input_dialect`).
+SqlDialect OpenIvmInputDialect(ClientContext &context);
+
+//! `openivm_input_dialect` set callback: validates the value and mirrors it onto the parser extension.
+void SetOpenIvmInputDialect(ClientContext &context, SetScope scope, Value &parameter);
 
 string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionParameters &parameters);
 string MaterializedViewDropQuery(ClientContext &context, const FunctionParameters &parameters);

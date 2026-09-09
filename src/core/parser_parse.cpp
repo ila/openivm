@@ -3,11 +3,15 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
+#include "core/time_travel_pins.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/parser/statement/pragma_statement.hpp"
+#include "lpts_parser.hpp"
 
 #include <regex>
 
@@ -20,10 +24,37 @@ static unique_ptr<SQLStatement> BuildInternalPragma(const string &name, const st
 	return std::move(statement);
 }
 
+SqlDialect OpenIvmInputDialect(ClientContext &context) {
+	Value setting_value;
+	if (!context.TryGetCurrentSetting(OPENIVM_INPUT_DIALECT_SETTING, setting_value) || setting_value.IsNull()) {
+		return SqlDialect::DUCKDB;
+	}
+	return ParseSqlDialectSetting(setting_value.ToString(), OPENIVM_INPUT_DIALECT_SETTING);
+}
+
+void SetOpenIvmInputDialect(ClientContext &context, SetScope scope, Value &parameter) {
+	auto dialect = parameter.IsNull() ? SqlDialect::DUCKDB
+	                                  : ParseSqlDialectSetting(parameter.ToString(), OPENIVM_INPUT_DIALECT_SETTING);
+	// `parser_override` and `parse_function` are handed the extension info, not a ClientContext, so
+	// mirror the resolved dialect there. The info is owned by the DBConfig, so the mirror stays
+	// scoped to this database.
+	for (auto &extension : ExtensionCallbackManager::Get(context).ParserExtensions()) {
+		auto info = dynamic_cast<MaterializedViewParserExtensionInfo *>(extension.parser_info.get());
+		if (info) {
+			info->SetInputDialect(dialect);
+		}
+	}
+}
+
+static SqlDialect InputDialectFromInfo(ParserExtensionInfo *info) {
+	auto materialized_view_info = dynamic_cast<MaterializedViewParserExtensionInfo *>(info);
+	return materialized_view_info ? materialized_view_info->InputDialect() : SqlDialect::DUCKDB;
+}
+
 ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExtensionInfo *info, const string &query,
                                                                        ParserOptions &options) {
 	try {
-		auto extension_result = ParseFunction(info, query);
+		auto extension_result = ParseMaterializedViewStatement(query, InputDialectFromInfo(info));
 		if (extension_result.type == ParserExtensionResultType::PARSE_SUCCESSFUL) {
 			vector<unique_ptr<SQLStatement>> statements;
 			statements.push_back(BuildInternalPragma("openivm_materialized_view_lifecycle", query));
@@ -55,6 +86,10 @@ ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExt
 
 ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(ParserExtensionInfo *info,
                                                                           const string &query) {
+	return ParseMaterializedViewStatement(query, InputDialectFromInfo(info));
+}
+
+ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, SqlDialect input_dialect) {
 	auto query_lower = SqlUtils::SQLToLowercase(StringUtil::Replace(query, ";", ""));
 	StringUtil::Trim(query_lower);
 	// Strip SQL line comments (-- to end of line) before whitespace normalization.
@@ -126,8 +161,25 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 	// at the plan level in PlanFunction via PlanRewrite + LPTS.
 	OPENIVM_DEBUG_PRINT("[CREATE MV] After structural rewrite: %s\n", query_lower.c_str());
 
+	vector<openivm::SnapshotBinding> pin_bindings;
+	if (input_dialect != SqlDialect::DUCKDB) {
+		// The body is written in another dialect, so DuckDB's parser cannot read it as-is — a
+		// Spark/Delta temporal clause (`FROM t VERSION AS OF 366`) dies on `AS`. LPTS rewrites the
+		// source spelling into the semantically equivalent DuckDB one, keeping the pin
+		// (`AT (VERSION => 366)`) rather than dropping it, which would silently promote the scan to
+		// "read latest". Record what each pin is written against first, so the rewrite can be held
+		// to it below.
+		pin_bindings = openivm::CollectSourceSnapshotBindings(query_lower, input_dialect);
+		query_lower = NormalizeInputSqlToDuckDB(query_lower, input_dialect);
+		OPENIVM_DEBUG_PRINT("[CREATE MV] After %s input normalization: %s\n", SqlDialectToString(input_dialect).c_str(),
+		                    query_lower.c_str());
+	}
+
 	Parser p;
 	p.ParseQuery(query_lower);
+	// Rewriting the temporal clause moves it across the relation's alias, so re-check against the
+	// parse tree that every pin still names the relation and alias it was written against.
+	openivm::VerifySnapshotBindings(*p.statements[0], pin_bindings);
 
 	auto parse_data = make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(std::move(p.statements[0]),
 	                                                                                      refresh_interval);

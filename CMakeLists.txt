@@ -22,6 +22,7 @@ set(EXTENSION_SOURCES
     src/core/parser_plan_helpers.cpp
     src/core/parser_sql_extractors.cpp
     src/core/sql_utils.cpp
+    src/core/time_travel_pins.cpp
     src/core/refresh_metadata.cpp
     src/core/incremental_checker.cpp
     src/core/plan_rewrite.cpp
@@ -78,7 +79,8 @@ set(EXTENSION_SOURCES
     ${LPTS_DIR}/src/lpts_ast_renderer.cpp
     ${LPTS_DIR}/src/lpts_ast_builder.cpp
     ${LPTS_DIR}/src/lpts_ast_flattener.cpp
-    ${LPTS_DIR}/src/dialect_function_map.cpp)
+    ${LPTS_DIR}/src/dialect_function_map.cpp
+    ${LPTS_DIR}/src/spark_scalar_functions.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

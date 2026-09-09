@@ -933,20 +933,61 @@ void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &ter
 				if (mul_idx == DConstants::INVALID_INDEX) {
 					continue;
 				}
+				// Appending to this join's own left_projection_map grows its LEFT
+				// contribution width, which shifts the absolute position where its RIGHT
+				// contribution starts within its own combined GetColumnBindings(). A
+				// grandparent ancestor may already have a projection map entry referencing
+				// (by that now-stale absolute position) a column from this join's right
+				// side; left as-is, that entry would silently start pointing at the
+				// newly-inserted column instead, dropping the real column it used to
+				// select. Appending to right_projection_map never has this effect: right
+				// contributions are always placed last, so a new entry there only ever
+				// extends the combined output with a brand-new highest index.
+				idx_t old_width = proj_map.size();
+				auto shift_stale_parent_indexes = [&](idx_t added) {
+					if (child_side != 0 || added == 0 || depth == 0) {
+						return;
+					}
+					size_t parent_side = leaf_path[depth - 1];
+					auto *parent_join = dynamic_cast<LogicalJoin *>(ancestors[depth - 1]);
+					if (!parent_join || parent_side >= parent_join->children.size()) {
+						return;
+					}
+					auto &parent_map =
+					    (parent_side == 0) ? parent_join->left_projection_map : parent_join->right_projection_map;
+					for (auto &parent_idx : parent_map) {
+						if (parent_idx >= old_width) {
+							parent_idx += added;
+						}
+					}
+				};
 				if (preserve_full_child) {
 					idx_t projectable_count = MinValue<idx_t>(mul_idx + 1, child_bindings.size());
+					idx_t added = 0;
 					for (idx_t binding_idx = 0; binding_idx < projectable_count; binding_idx++) {
 						if (std::find(proj_map.begin(), proj_map.end(), binding_idx) != proj_map.end()) {
 							continue;
 						}
 						proj_map.push_back(binding_idx);
+						added++;
 						OPENIVM_DEBUG_PRINT("[%s] Preserved child col %lu in immediate %s proj_map\n", context_label,
 						                    (unsigned long)binding_idx, child_side == 0 ? "left" : "right");
 					}
-				} else if (std::find(proj_map.begin(), proj_map.end(), mul_idx) == proj_map.end()) {
-					proj_map.push_back(mul_idx);
-					OPENIVM_DEBUG_PRINT("[%s] Added mul col %lu to ancestor %s proj_map\n", context_label,
-					                    (unsigned long)mul_idx, child_side == 0 ? "left" : "right");
+					shift_stale_parent_indexes(added);
+				} else {
+					// proj_map entries are positions into the child's *current* combined
+					// GetColumnBindings(). Testing raw index membership of mul_idx against
+					// proj_map can alias onto an unrelated pre-existing entry that now shares
+					// the same numeric position after a deeper level's own map grew. Compare
+					// by column identity against what this ancestor currently exposes instead
+					// of trusting the raw index.
+					auto exposed = join->GetColumnBindings();
+					if (std::find(exposed.begin(), exposed.end(), mul_binding) == exposed.end()) {
+						proj_map.push_back(mul_idx);
+						shift_stale_parent_indexes(1);
+						OPENIVM_DEBUG_PRINT("[%s] Added mul col %lu to ancestor %s proj_map\n", context_label,
+						                    (unsigned long)mul_idx, child_side == 0 ? "left" : "right");
+					}
 				}
 				join->ResolveOperatorTypes();
 			}
@@ -1629,9 +1670,20 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 		for (size_t i = 0; i < N; i++) {
 			if (mask & (1ULL << i)) {
 				if (leaves[i].get) {
-					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, input.context.view);
+					// leaves[] was collected once on the ORIGINAL input.plan, before this
+					// mask's own renumber_and_rebind_subtree pass, so leaves[i].get is a
+					// stale pointer carrying the pre-renumbering table_index. The rest of
+					// `term` (join conditions, transitioning-key guards, etc.) was rebound
+					// to the FRESH per-term index, so the replacement delta node -- which
+					// reuses old_get->table_index verbatim -- must be built from term's own,
+					// already-renumbered GET at this leaf's (renumbering-invariant) path,
+					// not from leaves[i].get, or every reference elsewhere in `term` to this
+					// leaf's fresh index is left dangling.
+					auto &leaf_node_ref = GetNodeAtPath(term, leaves[i].path);
+					auto &term_local_get = leaf_node_ref->Cast<LogicalGet>();
+					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, &term_local_get, input.context.view);
 					mul_bindings.push_back(delta_i.mul_binding);
-					GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
+					leaf_node_ref = std::move(delta_i.node);
 					UpdateParentProjectionMap(term, leaves[i], delta_i.mul_binding);
 				} else {
 					auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
@@ -1750,6 +1802,22 @@ static bool HasOnlyInnerJoins(LogicalOperator *node) {
 	return true;
 }
 
+static bool HasOnlyInnerOrLeftJoins(LogicalOperator *node) {
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	    node->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+		auto *join = dynamic_cast<LogicalJoin *>(node);
+		if (!join || (join->join_type != JoinType::INNER && join->join_type != JoinType::LEFT)) {
+			return false;
+		}
+	}
+	for (auto &child : node->children) {
+		if (!HasOnlyInnerOrLeftJoins(child.get())) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool SupportsRegularNtermLeaf(const JoinLeafInfo &leaf) {
 	if (leaf.get) {
 		// Join leaves created from catalog scans always own a table function; a null pointer is invalid planner state.
@@ -1846,7 +1914,7 @@ static DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input
 
 static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context,
                                                                  Binder &binder, const vector<JoinLeafInfo> &leaves,
-                                                                 uint64_t unchanged_mask) {
+                                                                 uint64_t unchanged_mask, bool has_left_join) {
 	vector<unique_ptr<LogicalOperator>> terms;
 	// Base scans see post-DML state. Term i uses current state before i, delta i, and reconstructs old state after i as
 	// current - delta. These disjoint telescoping terms cover every non-empty delta combination exactly once.
@@ -1879,6 +1947,16 @@ static vector<unique_ptr<LogicalOperator>> BuildRegularJoinTerms(DeltaOperatorIn
 		LogicalOperator *term_root = term.get();
 		CollectJoinLeaves(term.get(), {}, term_leaves);
 		D_ASSERT(term_leaves.size() == leaves.size());
+
+		// LEFT-JOIN telescoping: demote only the outer join(s) whose NULL-supplying
+		// subtree contains this term's single delta leaf, mirroring the DuckLake
+		// N-term path (DemoteLeftJoinsForMask). Preserved outer joins elsewhere keep
+		// their NULL-padded rows; the upsert layer's key-based partial recompute
+		// (BuildLeftJoinProjectionRefresh) fixes NULL<->match transition rows.
+		if (has_left_join) {
+			DemoteLeftJoinsForMask(term.get(), term_leaves, (1ULL << delta_leaf));
+		}
+
 		vector<ColumnBinding> mul_bindings;
 
 		for (size_t leaf = 0; leaf < term_leaves.size(); leaf++) {
@@ -2031,11 +2109,22 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	}
 	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
 	auto unchanged_mask = ComputeFactsUnchangedMask(compile_facts, leaves);
-	bool regular_nterm = !all_ducklake && compile_facts.compile_only && !has_left_join &&
-	                     input.context.model.type == RefreshType::SIMPLE_PROJECTION &&
-	                     HasOnlyInnerJoins(input.plan.get()) &&
-	                     RegularNtermPreservesFKPruning(context, compile_facts, leaves, input.plan.get()) &&
-	                     SqlUtils::GetBoolSetting(context, "openivm_regular_nterm", true);
+	bool regular_nterm_base = !all_ducklake && compile_facts.compile_only &&
+	                          input.context.model.type == RefreshType::SIMPLE_PROJECTION &&
+	                          SqlUtils::GetBoolSetting(context, "openivm_regular_nterm", true);
+	bool regular_nterm;
+	if (has_left_join) {
+		// LEFT-JOIN telescoping: the regular N-term delta extends to LEFT joins via
+		// per-term demotion of only the outer join whose NULL-supplying side carries
+		// that term's delta (see BuildRegularJoinTerms). FULL OUTER / RIGHT shapes and
+		// the inclusion-exclusion FK-pruning path are out of scope; NULL-padded row
+		// correctness is completed by BuildLeftJoinProjectionRefresh in the upsert layer.
+		regular_nterm = regular_nterm_base && HasOnlyInnerOrLeftJoins(input.plan.get()) &&
+		                SqlUtils::GetBoolSetting(context, "openivm_regular_nterm_left", true);
+	} else {
+		regular_nterm = regular_nterm_base && HasOnlyInnerJoins(input.plan.get()) &&
+		                RegularNtermPreservesFKPruning(context, compile_facts, leaves, input.plan.get());
+	}
 	if (regular_nterm) {
 		for (auto &leaf : leaves) {
 			if (!SupportsRegularNtermLeaf(leaf)) {
@@ -2053,7 +2142,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	if (all_ducklake) {
 		terms = BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake);
 	} else if (regular_nterm) {
-		terms = BuildRegularJoinTerms(input, context, binder, leaves, unchanged_mask);
+		terms = BuildRegularJoinTerms(input, context, binder, leaves, unchanged_mask, has_left_join);
 	} else {
 		terms = BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join, transition_ctes);
 	}

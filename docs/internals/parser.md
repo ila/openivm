@@ -43,6 +43,38 @@ CREATE MATERIALIZED VIEW mv REFRESH EVERY '5 minutes' AS
 
 The parsed interval (300 seconds) is stored in the `refresh_interval` column of `openivm_views`. When omitted, `refresh_interval` is `NULL` (manual refresh only). See [Automatic Refresh](../refresh/automatic-refresh.md) for how the daemon uses this.
 
+## Input dialect
+
+`openivm_input_dialect` (default `duckdb`) declares the dialect the *incoming* `CREATE MATERIALIZED VIEW` body is written in. When it is not `duckdb`, the body is run through LPTS' `NormalizeInputSqlToDuckDB` before `Parser::ParseQuery`, so backtick identifiers, dialect casts, interval literals and time-travel clauses are translated into DuckDB syntax first. The setting is mirrored onto the parser extension's `ParserExtensionInfo` because `parser_override` is not given a `ClientContext`.
+
+```sql
+SET openivm_input_dialect='spark';
+CREATE MATERIALIZED VIEW mv AS
+    SELECT region, SUM(amount) FROM sales VERSION AS OF 366 GROUP BY region;
+```
+
+## Time-travel pins
+
+A Spark/Delta pin (`VERSION AS OF n`, `TIMESTAMP AS OF '...'`) normalizes to DuckDB's `AT (VERSION => n)` / `AT (TIMESTAMP => '...')` qualifier. OpenIVM registers the sources of a compiled view as plain in-memory stand-in tables whose catalog reports `SupportsTimeTravel() == false`, so a pinned scan cannot be bound directly.
+
+`src/core/time_travel_pins.cpp` handles this by *peeling* the qualifier off each `BaseTableRef` whose catalog cannot honour it, planning against the pin-less stand-in, and *restoring* the qualifier onto the matching `AstGetNode::table_name` after `LogicalPlanToAst`. Pins are keyed by relation, so aliases, repeated scans, CTEs and joins all keep their own pin, and two relations pinned to different snapshots stay distinct. A catalog that does support time travel (DuckLake) is never peeled and binds natively.
+
+Because pin restoration is keyed by relation, a view that pins the same relation ambiguously is refused with `NotImplementedException` rather than compiled with a guessed snapshot:
+
+- the same relation pinned to two different snapshots,
+- the same pin naming two differently qualified relations,
+- the same relation scanned both pinned and unpinned.
+
+The first is a real limitation rather than a policy choice. DuckDB resolves the `AT (...)` qualifier during *catalog lookup* — it selects which snapshot of the catalog entry to bind — so neither `LogicalGet` nor `AstGetNode` carries a per-scan pin. Two scans of one relation at two versions are indistinguishable in the bound plan except by `table_index`, and pairing those back to parse-tree references would rest on the binder's index-allocation order, whose failure mode is silently reading the wrong snapshot. Repeated scans that share a pin, including across CTEs, are supported normally.
+
+The pin is stored in the view SQL in `openivm_views.sql_string` so it survives a restart. Every site that binds or locally executes that SQL peels it first, and refresh source qualification drops it, since the local stand-in catalog holds no snapshots. Foreign-dialect output re-attaches it: Spark renders `VERSION AS OF n`, DuckDB keeps `AT (...)`, and any dialect LPTS has no verified time-travel syntax for raises `LPTS_UNSUPPORTED_TIME_TRAVEL` instead of silently reading the latest snapshot.
+
+### Alias association
+
+Spark writes the pin *between* a relation and its alias (`FROM t VERSION AS OF n p`) where DuckDB wants it after both (`FROM t AS p AT (VERSION => n)`), so normalization has to carry the alias across the rewrite. That is the one step where a pin could land on a neighbouring relation, attach to the wrong alias, or be dropped outright — each of which reads a different snapshot while still compiling cleanly.
+
+The association is therefore checked rather than trusted. `CollectSourceSnapshotBindings` reads every `{relation, alias, qualifier}` triple straight off the *source* text before normalization, and `VerifySnapshotBindings` re-checks them against the parse tree DuckDB produced, raising `NotImplementedException` on any pin that did not come through on the same relation and alias.
+
 ## IVM compatibility classification
 
 After rewriting, the parser plans the query and walks the logical plan to classify the view into a refresh type:
