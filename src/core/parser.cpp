@@ -466,13 +466,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// non-NULL state afterward so visible, wrapped, and HAVING-only SUMs all
 		// use the same output-index mapping during incremental maintenance.
 		InjectSumNonNullCounts(context, select_plan);
-		PropagateHiddenAggregateColumns(select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
-		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
-		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
-		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
-		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
-		has_computed_sum_aggregate_projection = post_rewrite_facts.has_computed_sum_aggregate_projection;
 
 		// Keep data tables unlimited/unordered; apply ORDER BY/LIMIT in the user-facing view.
 		{
@@ -525,8 +519,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			select_plan = std::move(select_plan->children[0]);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
 		}
+		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
+		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
+		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
+		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
+		has_computed_sum_aggregate_projection = post_rewrite_facts.has_computed_sum_aggregate_projection;
 		if (select_plan) {
-			derived_aggregate_outputs = ExtractDerivedAggregateOutputs(*select_plan, output_names);
+			derived_aggregate_outputs = ExtractDerivedAggregateOutputs(*select_plan, post_rewrite_facts, output_names);
 		}
 		add_create_profile_step("create_compile_select_rewrite", select_rewrite_start,
 		                        "output_cols=" + to_string(output_names.size()));

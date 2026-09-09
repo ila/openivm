@@ -183,7 +183,6 @@ void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> 
 	}
 
 	auto &agg = agg_search->Cast<LogicalAggregate>();
-	auto &aggregate_projection = *projections.back();
 	auto &output_projection = *projections.front();
 	const idx_t original_aggregate_count = agg.expressions.size();
 
@@ -257,12 +256,10 @@ void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> 
 	auto aggregate_types = agg_search->types;
 	for (auto &output : outputs) {
 		idx_t output_index = agg.groups.size() + output.aggregate_index;
-		auto count_ref =
-		    make_uniq<BoundColumnRefExpression>(aggregate_types[output_index], aggregate_bindings[output_index]);
-		count_ref->alias = string(openivm::SUM_COUNT_COL_PREFIX) + to_string(output.projection_index);
-		aggregate_projection.expressions.push_back(std::move(count_ref));
+		auto alias = string(openivm::SUM_COUNT_COL_PREFIX) + to_string(output.projection_index);
+		PropagateHiddenBindingThroughProjectionPath(projections, aggregate_bindings[output_index],
+		                                            aggregate_types[output_index], alias);
 	}
-	aggregate_projection.ResolveOperatorTypes();
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] Injected %zu SUM non-NULL counts\n", outputs.size());
 }
 

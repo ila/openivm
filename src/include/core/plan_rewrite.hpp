@@ -7,6 +7,8 @@
 
 namespace duckdb {
 
+struct CreateMVPlanFacts;
+
 /// Strip AGG(...) FILTER (WHERE p) by converting to AGG(CASE WHEN p THEN arg
 /// END). Must be called on both the SELECT plan (for LPTS serialization) and
 /// the full CREATE plan (for AnalyzePlan / find_group_cols) so the checker sees
@@ -48,7 +50,7 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 /// aggregate outputs that are also projected by name. `complete` is false when
 /// any user-visible expression cannot be rendered solely in terms of stored
 /// output columns, so refresh compilation can fail closed.
-DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator &plan,
+DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator &plan, const CreateMVPlanFacts &facts,
                                                           const vector<string> &output_names);
 
 } // namespace duckdb

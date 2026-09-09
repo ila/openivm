@@ -52,8 +52,15 @@ struct ProjectionLineageEdge {
 	OccurrenceColumnRef to;
 };
 
+struct CreateMVPlanNodeFacts {
+	LogicalOperator *plan_node = nullptr;
+	vector<idx_t> child_ids;
+};
+
 struct CreateMVPlanFacts {
 	LogicalOperator *root = nullptr;
+	vector<CreateMVPlanNodeFacts> plan_nodes_post_order;
+	idx_t max_table_index = 0;
 	PlanAnalysis analysis;
 	unordered_map<string, SourceTableInfo> source_table_info;
 	unordered_map<string, DuckLakeSourceTableInfo> ducklake_table_info;

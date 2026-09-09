@@ -895,8 +895,8 @@ static ColumnBinding AppendProjectionPassthrough(LogicalProjection &proj, const 
 	return bindings.back();
 }
 
-static void PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &projection_path,
-                                                        ColumnBinding binding, LogicalType type, const string &alias) {
+void PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &projection_path, ColumnBinding binding,
+                                                 LogicalType type, const string &alias) {
 	for (auto it = projection_path.rbegin(); it != projection_path.rend(); ++it) {
 		binding = AppendProjectionPassthrough(**it, binding, type, alias);
 		type = (*it)->types.back();
@@ -1636,17 +1636,20 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 	}
 }
 
-DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator &plan,
+DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator &plan, const CreateMVPlanFacts &facts,
                                                           const vector<string> &output_names) {
 	DerivedAggregateOutputInfo info;
-	if (plan.type != LogicalOperatorType::LOGICAL_PROJECTION || plan.children.empty() ||
-	    !PlanContainsOperator(plan.children[0].get(), LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY)) {
+	if (plan.type != LogicalOperatorType::LOGICAL_PROJECTION || plan.children.empty() || facts.aggregates.empty()) {
 		info.complete = true;
 		return info;
 	}
 	auto &projection = plan.Cast<LogicalProjection>();
 	DerivedOutputProjectionMap projections;
-	CollectDerivedOutputProjections(*plan.children[0], projections);
+	for (auto *candidate : facts.projections) {
+		if (candidate != &projection) {
+			projections[candidate->table_index] = candidate;
+		}
+	}
 	unordered_map<uint64_t, string> binding_to_column;
 	vector<const Expression *> resolved_expressions;
 	resolved_expressions.reserve(projection.expressions.size());

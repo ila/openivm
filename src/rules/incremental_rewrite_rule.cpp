@@ -17,18 +17,6 @@
 
 namespace duckdb {
 
-/// Walk a plan tree and return the highest table_index found in any column binding.
-static idx_t FindMaxTableIndex(LogicalOperator *node) {
-	idx_t max_idx = 0;
-	for (auto &b : node->GetColumnBindings()) {
-		max_idx = std::max(max_idx, b.table_index);
-	}
-	for (auto &child : node->children) {
-		max_idx = std::max(max_idx, FindMaxTableIndex(child.get()));
-	}
-	return max_idx;
-}
-
 void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                                            const string &view_name, const string &view_catalog_name,
                                            const string &view_schema_name) {
@@ -136,13 +124,8 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	auto delta_model = BuildRefreshDeltaViewModel(input, con, view, optimized_plan.get(), output_names, &assumptions);
 	LogDeltaModelSummary(delta_model);
 
-	// Advance the main binder past all table indices in the plan to prevent collisions.
-	// Join delta compilation uses input.optimizer.binder which may not have been advanced by the
-	// local optimizer. Walk the plan to find the highest table index used.
-	{
-		idx_t max_idx = FindMaxTableIndex(optimized_plan.get());
-		while (input.optimizer.binder.GenerateTableIndex() <= max_idx) {
-		}
+	// Join delta compilation uses input.optimizer.binder, which may not have been advanced by the local optimizer.
+	while (input.optimizer.binder.GenerateTableIndex() <= delta_model.max_table_index) {
 	}
 
 	DeltaCompiler compiler(input, con, view, delta_model, assumptions);

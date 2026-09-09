@@ -320,6 +320,9 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	if (!op) {
 		return "";
 	}
+	for (auto &binding : op->GetColumnBindings()) {
+		facts.max_table_index = std::max(facts.max_table_index, binding.table_index);
+	}
 	AnalyzePlanOperator(*op, analysis);
 	auto *logical_join = dynamic_cast<LogicalJoin *>(op);
 	if (logical_join && (logical_join->join_type == JoinType::LEFT || logical_join->join_type == JoinType::RIGHT ||
@@ -428,13 +431,13 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	} else if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
 		facts.windows.push_back(&op->Cast<LogicalWindow>());
 	}
-	if (op->type == LogicalOperatorType::LOGICAL_GET) {
-		facts.first_table_name[op] = first_table;
-		return first_table;
-	}
+	vector<idx_t> child_ids;
+	child_ids.reserve(op->children.size());
 	auto collect_child = [&](LogicalOperator *child, PlanAnalysis &child_analysis) {
 		string child_first = CollectCreateMVPlanFacts(child, current_catalog, facts, next_occurrence, seen_agg_above,
 		                                              under_join, redundant_distinct, child_analysis);
+		D_ASSERT(!facts.plan_nodes_post_order.empty());
+		child_ids.push_back(facts.plan_nodes_post_order.size() - 1);
 		if (first_table.empty()) {
 			first_table = std::move(child_first);
 		}
@@ -460,6 +463,10 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	if (!first_table.empty()) {
 		facts.first_table_name[op] = first_table;
 	}
+	CreateMVPlanNodeFacts node_facts;
+	node_facts.plan_node = op;
+	node_facts.child_ids = std::move(child_ids);
+	facts.plan_nodes_post_order.push_back(std::move(node_facts));
 	return first_table;
 }
 
