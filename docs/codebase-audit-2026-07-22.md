@@ -92,7 +92,7 @@ maintenance path. A bug must not be hidden by weakening a test or silently chang
   NULL-safe equality through dialect-aware builders/LPTS.
 - [ ] **Replace affected-group source substitution with plan-node substitution.** Plain occurrence replacement can modify
   literals, comments, CTE references, and longer identifiers. Replace the exact `LogicalGet` occurrence before serialization.
-- [ ] **Delete the workload-specific TPC-DI left-join shortcut.** General refresh code hardcodes `fact_market_history`, three
+- [x] **Delete the workload-specific TPC-DI left-join shortcut.** General refresh code hardcoded `fact_market_history`, three
   source names, and `sk_company_id`. Retain the generic correct path unless typed lineage proves a generic optimization.
 - [ ] **Replace `parser_sql_extractors.cpp` with bound-plan extraction.** Its approximately 1,250 lines duplicate tokenization,
   quote handling, clause parsing, alias rewriting, and parenthesis tracking for DISTINCT, filtered aggregates, and semi/anti
