@@ -156,21 +156,11 @@ static uint64_t HashBinding(const ColumnBinding &b) {
 	return std::hash<idx_t>()(b.table_index) ^ (std::hash<idx_t>()(b.column_index) * 0x9e3779b97f4a7c15ULL);
 }
 
-static bool ContainsDelimOperator(LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN || op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
-	    op.type == LogicalOperatorType::LOGICAL_DELIM_GET) {
-		return true;
-	}
-	for (auto &child : op.children) {
-		if (ContainsDelimOperator(*child)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t> &seen,
-                               std::vector<ColumnBinding> &out) {
+static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t> &seen, std::vector<ColumnBinding> &out,
+                               bool &contains_delim_operator) {
+	contains_delim_operator = contains_delim_operator || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+	                          op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+	                          op.type == LogicalOperatorType::LOGICAL_DELIM_GET;
 	std::function<void(Expression &)> CollectExpr = [&](Expression &e) {
 		if (e.type == ExpressionType::BOUND_COLUMN_REF) {
 			auto &bcr = e.Cast<BoundColumnRefExpression>();
@@ -249,7 +239,7 @@ static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t>
 		if (!child) {
 			continue;
 		}
-		CollectAllBindings(*child, seen, out);
+		CollectAllBindings(*child, seen, out, contains_delim_operator);
 	}
 }
 
@@ -361,8 +351,8 @@ RenumberWrapper renumber_and_rebind_subtree(unique_ptr<LogicalOperator> plan, Bi
 	// Collect ALL bindings BEFORE renumbering (we need the old table indices)
 	std::unordered_set<uint64_t> seen;
 	std::vector<ColumnBinding> all_bindings;
-	const bool contains_delim_operator = ContainsDelimOperator(*plan);
-	CollectAllBindings(*plan, seen, all_bindings);
+	bool contains_delim_operator = false;
+	CollectAllBindings(*plan, seen, all_bindings, contains_delim_operator);
 
 	RenumberWrapper res = renumber_table_indices(std::move(plan), binder);
 

@@ -793,22 +793,22 @@ static bool TryEvalConstantSubtree(ClientContext &context, LogicalOperator &node
 	}
 }
 
-// Replaces a single column binding with a constant everywhere in a plan.
+// Replaces a set of column bindings with constants everywhere in a plan.
 class ConstantBindingReplacer : public LogicalOperatorVisitor {
 public:
-	ConstantBindingReplacer(ColumnBinding target, Value value) : target(target), value(std::move(value)) {
+	explicit ConstantBindingReplacer(const column_binding_map_t<Value> &values) : values(values) {
 	}
 	using LogicalOperatorVisitor::VisitReplace;
 	unique_ptr<Expression> VisitReplace(BoundColumnRefExpression &expr, unique_ptr<Expression> *expr_ptr) override {
-		if (expr.binding == target) {
-			return make_uniq<BoundConstantExpression>(value.DefaultCastAs(expr.return_type));
+		auto entry = values.find(expr.binding);
+		if (entry != values.end()) {
+			return make_uniq<BoundConstantExpression>(entry->second.DefaultCastAs(expr.return_type));
 		}
 		return nullptr;
 	}
 
 private:
-	ColumnBinding target;
-	Value value;
+	const column_binding_map_t<Value> &values;
 };
 
 // Find the first CROSS_PRODUCT (bottom-up) with a provably-constant single-row
@@ -845,13 +845,15 @@ static bool FoldConstantScalarSubqueriesOnce(ClientContext &context, unique_ptr<
 		if (!all_constant) {
 			continue;
 		}
+		ConstantBindingReplacer replacer(values);
+		replacer.VisitOperator(*root);
 		for (auto &b : bindings) {
-			ConstantBindingReplacer replacer(b, values[b]);
-			replacer.VisitOperator(*root);
+			auto value = values.find(b);
+			D_ASSERT(value != values.end());
 			OPENIVM_DEBUG_PRINT("[PlanRewrite] Folded constant scalar subquery "
 			                    "binding (%lu.%lu) = %s\n",
 			                    (unsigned long)b.table_index, (unsigned long)b.column_index,
-			                    values[b].ToString().c_str());
+			                    value->second.ToString().c_str());
 		}
 		node = std::move(node->children[1 - side]); // keep the real input, drop the cross product
 		return true;
@@ -1132,18 +1134,6 @@ static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan) {
 	return bindings;
 }
 
-static bool PlanContainsOperator(LogicalOperator *plan, LogicalOperatorType type) {
-	if (plan->type == type) {
-		return true;
-	}
-	for (auto &child : plan->children) {
-		if (PlanContainsOperator(child.get(), type)) {
-			return true;
-		}
-	}
-	return false;
-}
-
 static void PropagateBindingThroughOperatorPath(unique_ptr<LogicalOperator> &plan, ColumnBinding &binding,
                                                 LogicalType &type) {
 	plan->ResolveOperatorTypes();
@@ -1350,13 +1340,14 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	                    is_full_outer ? " + openivm_right_match_count" : "");
 }
 
-static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan) {
+static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
+                                    bool has_aggregate) {
 	auto outer_join = FindFirstOuterJoinBindings(plan.get());
 	if (!outer_join.found) {
 		return;
 	}
 
-	if (PlanContainsOperator(plan.get(), LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY)) {
+	if (has_aggregate) {
 		RewriteLeftJoinMatchCount(context, binder, plan, outer_join);
 		return;
 	}
@@ -1369,6 +1360,7 @@ struct PlanRewriteContext {
 	Binder &binder;
 	unique_ptr<LogicalOperator> &plan;
 	vector<string> &planner_names;
+	const PlanRewriteNeeds &needs;
 };
 
 using PlanRewritePass = void (*)(PlanRewriteContext &);
@@ -1376,6 +1368,7 @@ using PlanRewritePass = void (*)(PlanRewriteContext &);
 struct PlanRewritePassEntry {
 	const char *name;
 	PlanRewritePass rewrite;
+	bool PlanRewriteNeeds::*required;
 };
 
 static bool HasTopLevelDistinct(const unique_ptr<LogicalOperator> &plan) {
@@ -1424,7 +1417,8 @@ static void RewritePassHiddenAggregatePropagation(PlanRewriteContext &rewrite_co
 }
 
 static void RewritePassOuterJoinSupport(PlanRewriteContext &rewrite_context) {
-	RewriteOuterJoinSupport(rewrite_context.context, rewrite_context.binder, rewrite_context.plan);
+	RewriteOuterJoinSupport(rewrite_context.context, rewrite_context.binder, rewrite_context.plan,
+	                        rewrite_context.needs.has_aggregate);
 }
 
 static void RewritePassSemiAntiSubqueries(PlanRewriteContext &rewrite_context) {
@@ -1438,26 +1432,31 @@ static void RewritePassSemiAntiSubqueries(PlanRewriteContext &rewrite_context) {
 
 static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	const PlanRewritePassEntry passes[] = {
-	    {"inline_cte_refs", RewritePassInlineCteRefs},
-	    {"fold_constant_scalar_subqueries", RewritePassFoldConstantScalarSubqueries},
-	    {"aggregate_filters", RewritePassAggregateFilters},
-	    {"distinct", RewritePassDistinct},
-	    {"derived_aggregates", RewritePassDerivedAggregates},
-	    {"group_count_star", RewritePassGroupCountStar},
-	    {"hidden_aggregate_propagation", RewritePassHiddenAggregatePropagation},
-	    {"outer_join_support", RewritePassOuterJoinSupport},
-	    {"semi_anti_subqueries", RewritePassSemiAntiSubqueries},
+	    {"inline_cte_refs", RewritePassInlineCteRefs, &PlanRewriteNeeds::inline_cte_refs},
+	    {"fold_constant_scalar_subqueries", RewritePassFoldConstantScalarSubqueries,
+	     &PlanRewriteNeeds::fold_constant_scalar_subqueries},
+	    {"aggregate_filters", RewritePassAggregateFilters, &PlanRewriteNeeds::aggregate_filters},
+	    {"distinct", RewritePassDistinct, &PlanRewriteNeeds::distinct},
+	    {"derived_aggregates", RewritePassDerivedAggregates, &PlanRewriteNeeds::derived_aggregates},
+	    {"group_count_star", RewritePassGroupCountStar, &PlanRewriteNeeds::has_aggregate},
+	    {"hidden_aggregate_propagation", RewritePassHiddenAggregatePropagation, &PlanRewriteNeeds::derived_aggregates},
+	    {"outer_join_support", RewritePassOuterJoinSupport, &PlanRewriteNeeds::outer_join_support},
+	    {"semi_anti_subqueries", RewritePassSemiAntiSubqueries, &PlanRewriteNeeds::semi_anti_subqueries},
 	};
 
 	for (const auto &pass : passes) {
+		if (!(rewrite_context.needs.*pass.required)) {
+			OPENIVM_DEBUG_PRINT("[PlanRewrite] Pass skipped: %s\n", pass.name);
+			continue;
+		}
 		RunRewritePass(pass, rewrite_context);
 	}
 }
 
 void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
-                 vector<string> &planner_names) {
+                 vector<string> &planner_names, const PlanRewriteNeeds &needs) {
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] Starting\n");
-	PlanRewriteContext rewrite_context {context, binder, plan, planner_names};
+	PlanRewriteContext rewrite_context {context, binder, plan, planner_names, needs};
 	RunRewritePipeline(rewrite_context);
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] Done\n");
 }
@@ -1467,16 +1466,6 @@ static uint64_t DerivedOutputBindingKey(const ColumnBinding &binding) {
 }
 
 using DerivedOutputProjectionMap = unordered_map<idx_t, const LogicalProjection *>;
-
-static void CollectDerivedOutputProjections(const LogicalOperator &plan, DerivedOutputProjectionMap &projections) {
-	if (plan.type == LogicalOperatorType::LOGICAL_PROJECTION) {
-		auto &projection = plan.Cast<LogicalProjection>();
-		projections[projection.table_index] = &projection;
-	}
-	for (auto &child : plan.children) {
-		CollectDerivedOutputProjections(*child, projections);
-	}
-}
 
 static const Expression *ResolveDerivedOutputPassThrough(const Expression &expr,
                                                          const DerivedOutputProjectionMap &projections,
@@ -1892,7 +1881,9 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 		proj_ptr = &parent->Cast<LogicalProjection>();
 		if (!proj_chain.empty() && proj_chain.back() == proj_ptr) {
 			DerivedOutputProjectionMap projections;
-			CollectDerivedOutputProjections(*plan, projections);
+			for (auto *projection : proj_chain) {
+				projections[projection->table_index] = projection;
+			}
 			auto *output_projection = proj_chain.front();
 			for (idx_t i = 0; i < output_projection->expressions.size() && i < output_names.size(); i++) {
 				auto *resolved = ResolveDerivedOutputPassThrough(*output_projection->expressions[i], projections);

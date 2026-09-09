@@ -341,18 +341,36 @@ unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, co
 	return *current;
 }
 
-/// Verify all joins in the subtree are supported. Returns true if any LEFT/RIGHT/OUTER found.
-/// MARK/SEMI/ANTI joins (from IN-list, EXISTS, etc.) are allowed: LPTS converts MARK→LEFT JOIN,
-/// and their constant right-side (VALUES list) has no delta so inclusion-exclusion reduces trivially.
-static bool VerifyJoinTypes(LogicalOperator *node) {
-	bool has_left = false;
+struct JoinPlanFacts {
+	vector<JoinLeafInfo> leaves;
+	unordered_set<uint64_t> existing_multiplicity_bindings;
+	bool has_outer_join = false;
+	bool only_inner_joins = true;
+};
+
+// Collect join leaves and the properties needed to select a compilation strategy. Non-join wrappers remain leaves,
+// but their descendants are still inspected for validation and existing multiplicity bindings.
+static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bool is_right_of_left, bool collect_leaf,
+                                 JoinPlanFacts &facts) {
+	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		auto &ref = node->Cast<LogicalCTERef>();
+		if (!ref.bound_columns.empty() && ref.bound_columns.back() == openivm::MULTIPLICITY_COL) {
+			auto bindings = node->GetColumnBindings();
+			if (!bindings.empty()) {
+				facts.existing_multiplicity_bindings.insert(DeltaJoinBindingKey(bindings.back()));
+			}
+		}
+	}
+	bool is_join_tree_node = node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	                         node->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT ||
+	                         node->type == LogicalOperatorType::LOGICAL_ANY_JOIN;
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
-		switch (join->join_type) {
+		auto &join = node->Cast<LogicalComparisonJoin>();
+		switch (join.join_type) {
 		case JoinType::LEFT:
 		case JoinType::RIGHT:
 		case JoinType::OUTER:
-			has_left = true;
+			facts.has_outer_join = true;
 			break;
 		case JoinType::INNER:
 		case JoinType::MARK:
@@ -363,15 +381,42 @@ static bool VerifyJoinTypes(LogicalOperator *node) {
 			break;
 		default:
 			throw Exception(ExceptionType::OPTIMIZER,
-			                JoinTypeToString(join->join_type) + " type not yet supported in OpenIVM");
+			                JoinTypeToString(join.join_type) + " type not yet supported in OpenIVM");
 		}
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+	    node->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+		auto *join = dynamic_cast<LogicalJoin *>(node);
+		if (!join || join->join_type != JoinType::INNER) {
+			facts.only_inner_joins = false;
+		}
+	}
+	if (collect_leaf && is_join_tree_node) {
+		bool left_is_nullable = is_right_of_left;
+		bool right_is_nullable = is_right_of_left;
+		auto *join = dynamic_cast<LogicalJoin *>(node);
+		if (join) {
+			left_is_nullable =
+			    left_is_nullable || join->join_type == JoinType::RIGHT || join->join_type == JoinType::OUTER;
+			right_is_nullable =
+			    right_is_nullable || join->join_type == JoinType::LEFT || join->join_type == JoinType::OUTER;
+		}
+		D_ASSERT(node->children.size() == 2);
+		path.push_back(0);
+		CollectJoinPlanFacts(node->children[0].get(), path, left_is_nullable, true, facts);
+		path.pop_back();
+		path.push_back(1);
+		CollectJoinPlanFacts(node->children[1].get(), path, right_is_nullable, true, facts);
+		path.pop_back();
+		return;
+	}
+	if (collect_leaf) {
+		auto *get = node->type == LogicalOperatorType::LOGICAL_GET ? dynamic_cast<LogicalGet *>(node) : nullptr;
+		facts.leaves.push_back({path, get, node, is_right_of_left});
 	}
 	for (auto &child : node->children) {
-		if (VerifyJoinTypes(child.get())) {
-			has_left = true;
-		}
+		CollectJoinPlanFacts(child.get(), path, is_right_of_left, false, facts);
 	}
-	return has_left;
 }
 
 static bool IsNullSupplyingJoin(JoinType join_type) {
@@ -1734,22 +1779,6 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 	return terms;
 }
 
-static bool HasOnlyInnerJoins(LogicalOperator *node) {
-	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-	    node->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
-		auto *join = dynamic_cast<LogicalJoin *>(node);
-		if (!join || join->join_type != JoinType::INNER) {
-			return false;
-		}
-	}
-	for (auto &child : node->children) {
-		if (!HasOnlyInnerJoins(child.get())) {
-			return false;
-		}
-	}
-	return true;
-}
-
 static bool SupportsRegularNtermLeaf(const JoinLeafInfo &leaf) {
 	if (leaf.get) {
 		// Join leaves created from catalog scans always own a table function; a null pointer is invalid planner state.
@@ -1953,17 +1982,17 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	Binder &binder = input.context.input.optimizer.binder;
 	input.plan->ResolveOperatorTypes();
 	const vector<ColumnBinding> all_original_bindings = input.plan->GetColumnBindings();
-	unordered_set<uint64_t> existing_mul_set;
-	CollectExistingMultiplicityBindings(input.plan.get(), existing_mul_set);
+	JoinPlanFacts join_facts;
+	vector<size_t> join_path;
+	CollectJoinPlanFacts(input.plan.get(), join_path, false, true, join_facts);
 	vector<ColumnBinding> original_bindings;
 	vector<LogicalType> output_types;
-	FilterInternalMultiplicityColumns(all_original_bindings, input.plan->types, existing_mul_set, original_bindings,
-	                                  output_types);
+	FilterInternalMultiplicityColumns(all_original_bindings, input.plan->types,
+	                                  join_facts.existing_multiplicity_bindings, original_bindings, output_types);
 
 	// 1. Verify + collect
-	bool has_left_join = VerifyJoinTypes(input.plan.get());
-	vector<JoinLeafInfo> leaves;
-	CollectJoinLeaves(input.plan.get(), {}, leaves);
+	bool has_left_join = join_facts.has_outer_join;
+	vector<JoinLeafInfo> leaves = std::move(join_facts.leaves);
 	size_t N = leaves.size();
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Rewriting JOIN node, %zu leaves found\n", N);
 
@@ -2032,8 +2061,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
 	auto unchanged_mask = ComputeFactsUnchangedMask(compile_facts, leaves);
 	bool regular_nterm = !all_ducklake && compile_facts.compile_only && !has_left_join &&
-	                     input.context.model.type == RefreshType::SIMPLE_PROJECTION &&
-	                     HasOnlyInnerJoins(input.plan.get()) &&
+	                     input.context.model.type == RefreshType::SIMPLE_PROJECTION && join_facts.only_inner_joins &&
 	                     RegularNtermPreservesFKPruning(context, compile_facts, leaves, input.plan.get()) &&
 	                     SqlUtils::GetBoolSetting(context, "openivm_regular_nterm", true);
 	if (regular_nterm) {

@@ -9,6 +9,17 @@ namespace duckdb {
 
 struct CreateMVPlanFacts;
 
+struct PlanRewriteNeeds {
+	bool inline_cte_refs = false;
+	bool fold_constant_scalar_subqueries = false;
+	bool aggregate_filters = false;
+	bool distinct = false;
+	bool derived_aggregates = false;
+	bool has_aggregate = false;
+	bool outer_join_support = false;
+	bool semi_anti_subqueries = false;
+};
+
 /// Strip AGG(...) FILTER (WHERE p) by converting to AGG(CASE WHEN p THEN arg
 /// END). Must be called on both the SELECT plan (for LPTS serialization) and
 /// the full CREATE plan (for AnalyzePlan / find_group_cols) so the checker sees
@@ -32,9 +43,10 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 /// - LEFT/RIGHT JOIN → add projection with openivm_left_key column
 /// planner_names: column names from Planner.names (user aliases). These are set
 /// on aggregate expressions so LPTS can pick them up. Unaliased aggregates get
-/// auto-generated names.
+/// auto-generated names. needs is collected by InlineCtesIfPresent so passes
+/// that cannot match the plan are skipped without another preflight traversal.
 void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
-                 vector<string> &planner_names);
+                 vector<string> &planner_names, const PlanRewriteNeeds &needs);
 
 /// Strip the HAVING filter (FILTER above AGGREGATE) from the plan.
 /// Returns the HAVING predicate as SQL using output column aliases, or empty if
