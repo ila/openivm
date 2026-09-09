@@ -1419,11 +1419,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			// openivm itself executes the refresh) is bypassed here.
 			active_delta_table_names = delta_table_names;
 		}
-		if (TryBuildGroupMeasureUpdateRefresh(metadata, con, view_name, view_query_sql, active_delta_table_names,
-		                                      column_names, column_types, data_table, view_catalog_name,
-		                                      view_schema_name, upsert_query)) {
-			break;
-		}
 		bool group_recompute_has_ducklake_source = false;
 		for (auto &dt : active_delta_table_names) {
 			if (metadata.IsDuckLakeTable(view_name, dt)) {

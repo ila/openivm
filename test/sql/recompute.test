@@ -985,23 +985,26 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# GROUP_RECOMPUTE measure-only updates can update the stored SUM directly when
-# the changed source column is not part of keys, filters, joins, or nonlinear aggregates.
+# GROUP_RECOMPUTE measure-only updates use affected-group recompute. Aggregate
+# output lineage must not be inferred from output alias text: a source column
+# named v must not match unrelated revenue and savings output aliases.
 statement ok
-CREATE TABLE gr_measure_t(id INTEGER, k INTEGER, measure_amount DOUBLE, label VARCHAR);
+CREATE TABLE gr_measure_t(id INTEGER, k INTEGER, v DOUBLE, sales DOUBLE, costs DOUBLE, label VARCHAR);
 
 statement ok
 INSERT INTO gr_measure_t VALUES
-    (1, 10, 2.5, 'a'),
-    (2, 10, 4.0, 'b'),
-    (3, 20, 7.0, 'c');
+	(1, 10, 2.5, 100.0, 40.0, 'a'),
+	(2, 10, 4.0, 200.0, 70.0, 'b'),
+	(3, 20, 7.0, 300.0, 90.0, 'c');
 
 statement ok
 CREATE MATERIALIZED VIEW gr_measure_mv AS
 SELECT md5(CAST(k AS VARCHAR)) AS primary_key,
        k,
        COUNT(DISTINCT id) AS cd,
-       SUM(measure_amount) AS measure_amount_sum
+       SUM(v) AS value_total,
+       SUM(sales) AS revenue,
+       SUM(costs) AS savings
 FROM gr_measure_t
 GROUP BY k;
 
@@ -1011,7 +1014,7 @@ SELECT type FROM openivm_views WHERE view_name = 'gr_measure_mv';
 6
 
 statement ok
-UPDATE gr_measure_t SET measure_amount = 9.0 WHERE id = 2;
+UPDATE gr_measure_t SET v = 9.0 WHERE id = 2;
 
 statement ok
 PRAGMA refresh('gr_measure_mv');
@@ -1020,7 +1023,7 @@ query I
 SELECT contains(content, 'openivm_measure_delta')
 FROM read_text('__TEST_DIR__/openivm_upsert_queries_gr_measure_mv.sql');
 ----
-true
+false
 
 query I
 SELECT COUNT(*) FROM (
@@ -1029,7 +1032,9 @@ SELECT COUNT(*) FROM (
     SELECT md5(CAST(k AS VARCHAR)) AS primary_key,
            k,
            COUNT(DISTINCT id) AS cd,
-           SUM(measure_amount) AS measure_amount_sum
+           SUM(v) AS value_total,
+           SUM(sales) AS revenue,
+           SUM(costs) AS savings
     FROM gr_measure_t
     GROUP BY k
 );
@@ -1041,7 +1046,9 @@ SELECT COUNT(*) FROM (
     SELECT md5(CAST(k AS VARCHAR)) AS primary_key,
            k,
            COUNT(DISTINCT id) AS cd,
-           SUM(measure_amount) AS measure_amount_sum
+           SUM(v) AS value_total,
+           SUM(sales) AS revenue,
+           SUM(costs) AS savings
     FROM gr_measure_t
     GROUP BY k
     EXCEPT ALL
@@ -1050,8 +1057,7 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# The direct measure update is only valid for simple SUM(column). Expressions
-# must keep the generic affected-key recompute path.
+# Expressions also use the generic affected-key recompute path.
 statement ok
 CREATE TABLE gr_measure_expr_t(id INTEGER, k INTEGER, measure_amount DOUBLE);
 
