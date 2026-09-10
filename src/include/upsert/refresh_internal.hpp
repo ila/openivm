@@ -179,8 +179,7 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,
                                           const string &view_schema_name, const string &attached_db_catalog_name,
-                                          const string &attached_db_schema_name, bool scd2_range_join_accel,
-                                          string &upsert_query);
+                                          const string &attached_db_schema_name, string &upsert_query);
 void AppendSimpleAggregateEmptySourceNulling(RefreshMetadata &metadata, string &upsert_query, const string &view_name,
                                              const vector<string> &column_names, const string &data_table,
                                              const string &view_catalog_name, const string &view_schema_name,

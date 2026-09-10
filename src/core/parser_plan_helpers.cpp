@@ -16,7 +16,6 @@
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
-#include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
@@ -338,15 +337,6 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 static string NullableGetTableName(LogicalGet &get);
 static string NormalizeNullableTableName(const string &table_name);
 
-static void CollectExpressionComparisons(Expression &expression, CreateMVPlanFacts &facts) {
-	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
-		auto &comparison = expression.Cast<BoundComparisonExpression>();
-		facts.plan_comparisons.push_back({comparison.left.get(), comparison.right.get(), comparison.type});
-	}
-	ExpressionIterator::EnumerateChildren(expression,
-	                                      [&](Expression &child) { CollectExpressionComparisons(child, facts); });
-}
-
 template <class T>
 static void AppendUniqueValues(vector<T> &target, const vector<T> &source) {
 	for (auto &value : source) {
@@ -394,9 +384,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
 		facts.has_cardinality_changing_filter = true;
-		for (auto &expression : op->expressions) {
-			CollectExpressionComparisons(*expression, facts);
-		}
 		if (!op->children.empty()) {
 			auto *filter_input = op->children[0].get();
 			while (filter_input && filter_input->type == LogicalOperatorType::LOGICAL_PROJECTION &&
@@ -428,7 +415,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 			facts.comparison_joins.push_back(&join);
 			for (auto &cond : join.conditions) {
-				facts.plan_comparisons.push_back({cond.left.get(), cond.right.get(), cond.comparison});
 				auto *left = cond.left.get();
 				auto *right = cond.right.get();
 				if (left->type != ExpressionType::BOUND_COLUMN_REF || right->type != ExpressionType::BOUND_COLUMN_REF) {
@@ -455,11 +441,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 					facts.single_delim_key_bindings.insert(BindingKey(cond.right->Cast<BoundColumnRefExpression>()));
 				}
 			}
-		}
-	} else if (op->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
-		auto &join = op->Cast<LogicalAnyJoin>();
-		if (join.condition) {
-			CollectExpressionComparisons(*join.condition, facts);
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op->Cast<LogicalGet>();
@@ -1032,93 +1013,6 @@ static bool ResolveBindingToOccurrenceRef(ColumnBinding binding, const CreateMVP
 	return true;
 }
 
-static bool ResolveComparisonColumn(Expression *expression, const CreateMVPlanFacts &facts, OccurrenceColumnRef &out) {
-	auto *column_ref = GetColumnRefThroughCasts(expression);
-	return column_ref && ResolveBindingToOccurrenceRef(column_ref->binding, facts, out);
-}
-
-static bool SameOccurrenceColumn(const OccurrenceColumnRef &left, const OccurrenceColumnRef &right) {
-	return left.occurrence == right.occurrence && StringUtil::CIEquals(left.table, right.table) &&
-	       StringUtil::CIEquals(left.column, right.column);
-}
-
-static void AddProjectionScd2Ranges(const CreateMVPlanFacts &facts, RefreshMetadata::ProjectionKeyLineage &lineage) {
-	struct LowerBound {
-		OccurrenceColumnRef dimension;
-		OccurrenceColumnRef probe;
-	};
-	struct UpperBound {
-		OccurrenceColumnRef dimension;
-		OccurrenceColumnRef probe;
-		bool inclusive;
-	};
-	vector<LowerBound> lower_bounds;
-	vector<UpperBound> upper_bounds;
-	for (auto &condition : facts.plan_comparisons) {
-		OccurrenceColumnRef left;
-		OccurrenceColumnRef right;
-		if (!ResolveComparisonColumn(condition.left, facts, left) ||
-		    !ResolveComparisonColumn(condition.right, facts, right)) {
-			continue;
-		}
-		if (StringUtil::CIEquals(left.column, "effective_timestamp") &&
-		    condition.comparison == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
-			lower_bounds.push_back({left, right});
-		} else if (StringUtil::CIEquals(right.column, "effective_timestamp") &&
-		           condition.comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
-			lower_bounds.push_back({right, left});
-		} else if (StringUtil::CIEquals(left.column, "end_timestamp") &&
-		           (condition.comparison == ExpressionType::COMPARE_GREATERTHAN ||
-		            condition.comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO)) {
-			upper_bounds.push_back({left, right, condition.comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO});
-		} else if (StringUtil::CIEquals(right.column, "end_timestamp") &&
-		           (condition.comparison == ExpressionType::COMPARE_LESSTHAN ||
-		            condition.comparison == ExpressionType::COMPARE_LESSTHANOREQUALTO)) {
-			upper_bounds.push_back({right, left, condition.comparison == ExpressionType::COMPARE_LESSTHANOREQUALTO});
-		}
-	}
-	for (auto &lower : lower_bounds) {
-		for (auto &upper : upper_bounds) {
-			if (lower.dimension.occurrence != upper.dimension.occurrence ||
-			    !StringUtil::CIEquals(lower.dimension.table, upper.dimension.table) ||
-			    !SameOccurrenceColumn(lower.probe, upper.probe) ||
-			    (lower.dimension.occurrence == lower.probe.occurrence &&
-			     StringUtil::CIEquals(lower.dimension.table, lower.probe.table))) {
-				continue;
-			}
-			RefreshMetadata::ProjectionScd2Range range;
-			range.probe_source = lower.probe.table;
-			range.probe_occurrence = lower.probe.occurrence;
-			range.probe_col = lower.probe.column;
-			range.dimension_source = lower.dimension.table;
-			range.dimension_occurrence = lower.dimension.occurrence;
-			range.effective_col = lower.dimension.column;
-			range.end_col = upper.dimension.column;
-			range.end_inclusive = upper.inclusive;
-			auto duplicate =
-			    std::find_if(lineage.scd2_ranges.begin(), lineage.scd2_ranges.end(),
-			                 [&](const RefreshMetadata::ProjectionScd2Range &existing) {
-				                 return existing.probe_occurrence == range.probe_occurrence &&
-				                        existing.dimension_occurrence == range.dimension_occurrence &&
-				                        StringUtil::CIEquals(existing.probe_source, range.probe_source) &&
-				                        StringUtil::CIEquals(existing.probe_col, range.probe_col) &&
-				                        StringUtil::CIEquals(existing.dimension_source, range.dimension_source) &&
-				                        StringUtil::CIEquals(existing.effective_col, range.effective_col) &&
-				                        StringUtil::CIEquals(existing.end_col, range.end_col) &&
-				                        existing.end_inclusive == range.end_inclusive;
-			                 });
-			if (duplicate == lineage.scd2_ranges.end()) {
-				OPENIVM_DEBUG_PRINT("[CREATE MV] SCD2 projection lineage: dimension=%s[%llu] probe=%s[%llu].%s\n",
-				                    range.dimension_source.c_str(),
-				                    static_cast<unsigned long long>(range.dimension_occurrence),
-				                    range.probe_source.c_str(), static_cast<unsigned long long>(range.probe_occurrence),
-				                    range.probe_col.c_str());
-				lineage.scd2_ranges.push_back(std::move(range));
-			}
-		}
-	}
-}
-
 static bool ResolveBindingToOccurrenceRefWithCast(ColumnBinding binding, const CreateMVPlanFacts &facts,
                                                   OccurrenceColumnRef &out, string &cast_type,
                                                   const LogicalType &expression_type) {
@@ -1439,7 +1333,6 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 		lineage.key_occurrence = key_ref.occurrence;
 		lineage.key_col = key_ref.column;
 		lineage.arms = std::move(arms);
-		AddProjectionScd2Ranges(facts, lineage);
 		out = std::move(lineage);
 		return true;
 	}

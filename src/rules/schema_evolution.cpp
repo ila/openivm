@@ -477,23 +477,6 @@ static bool RewriteProjectionLineageFields(RefreshMetadata::ProjectionKeyLineage
 			}
 		}
 	}
-	for (auto &range : lineage.scd2_ranges) {
-		if (AuxSourceMatches(range.probe_source, table_name) && StringUtil::CIEquals(range.probe_col, old_name)) {
-			range.probe_col = new_name;
-			changed = true;
-		}
-		if (!AuxSourceMatches(range.dimension_source, table_name)) {
-			continue;
-		}
-		if (StringUtil::CIEquals(range.effective_col, old_name)) {
-			range.effective_col = new_name;
-			changed = true;
-		}
-		if (StringUtil::CIEquals(range.end_col, old_name)) {
-			range.end_col = new_name;
-			changed = true;
-		}
-	}
 	return changed;
 }
 

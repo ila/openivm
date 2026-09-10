@@ -1077,7 +1077,6 @@ bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, Projectio
 		return false;
 	}
 	out.arms.clear();
-	out.scd2_ranges.clear();
 	auto objects = ExtractJsonObjectsFromArray(json, "arms");
 	for (auto &object : objects) {
 		ProjectionKeyLineageArm arm;
@@ -1105,23 +1104,6 @@ bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, Projectio
 		}
 		out.arms.push_back(std::move(arm));
 	}
-	auto ranges = ExtractJsonObjectsFromArray(json, "scd2_ranges");
-	for (auto &range_json : ranges) {
-		ProjectionScd2Range range;
-		string inclusive;
-		if (!ExtractJsonString(range_json, "probe_source", range.probe_source) ||
-		    !ParseJsonIndex(range_json, "probe_occ", range.probe_occurrence) ||
-		    !ExtractJsonString(range_json, "probe_col", range.probe_col) ||
-		    !ExtractJsonString(range_json, "dimension_source", range.dimension_source) ||
-		    !ParseJsonIndex(range_json, "dimension_occ", range.dimension_occurrence) ||
-		    !ExtractJsonString(range_json, "effective_col", range.effective_col) ||
-		    !ExtractJsonString(range_json, "end_col", range.end_col) ||
-		    !ExtractJsonString(range_json, "end_inclusive", inclusive)) {
-			continue;
-		}
-		range.end_inclusive = inclusive == "1";
-		out.scd2_ranges.push_back(std::move(range));
-	}
 	return !out.arms.empty();
 }
 
@@ -1147,21 +1129,6 @@ string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &l
 			                            step.lookup_out);
 		}
 		json += "]}";
-	}
-	json += "],\"scd2_ranges\":[";
-	for (idx_t i = 0; i < lineage.scd2_ranges.size(); i++) {
-		auto &range = lineage.scd2_ranges[i];
-		if (i > 0) {
-			json += ",";
-		}
-		json += "{\"probe_source\":" + SqlUtils::JsonQuote(range.probe_source) +
-		        ",\"probe_occ\":" + SqlUtils::JsonQuote(to_string(range.probe_occurrence)) +
-		        ",\"probe_col\":" + SqlUtils::JsonQuote(range.probe_col) +
-		        ",\"dimension_source\":" + SqlUtils::JsonQuote(range.dimension_source) +
-		        ",\"dimension_occ\":" + SqlUtils::JsonQuote(to_string(range.dimension_occurrence)) +
-		        ",\"effective_col\":" + SqlUtils::JsonQuote(range.effective_col) +
-		        ",\"end_col\":" + SqlUtils::JsonQuote(range.end_col) +
-		        ",\"end_inclusive\":" + SqlUtils::JsonQuote(range.end_inclusive ? "1" : "0") + "}";
 	}
 	json += "]}";
 	return json;
