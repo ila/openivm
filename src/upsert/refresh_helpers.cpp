@@ -315,6 +315,11 @@ static bool ProjectionSourceNameMatches(const ProjectionKeySourceSpec &spec, con
 	       StringUtil::CIEquals(StripOpenIVMDataPrefix(spec.loc.table_name), StripOpenIVMDataPrefix(table_name));
 }
 
+static bool SameSourceOccurrence(const string &left_source, idx_t left_occurrence, const string &right_source,
+                                 idx_t right_occurrence) {
+	return left_occurrence == right_occurrence && StringUtil::CIEquals(left_source, right_source);
+}
+
 static const ProjectionKeySourceSpec *FindProjectionSourceSpec(const vector<ProjectionKeySourceSpec> &specs,
                                                                const string &table_name) {
 	for (auto &spec : specs) {
@@ -387,11 +392,56 @@ static string BuildProjectionLineageArmSQL(const RefreshMetadata::ProjectionKeyL
 	return "SELECT openivm_lineage_key AS " + SqlUtils::QuoteIdentifier(output_col) + " FROM (" + sql + ") openivm_k";
 }
 
+static const RefreshMetadata::ProjectionKeyLineageArm *
+FindProjectionLineageArm(const RefreshMetadata::ProjectionKeyLineage &lineage, const string &source, idx_t occurrence) {
+	for (auto &arm : lineage.arms) {
+		if (arm.occurrence == occurrence && StringUtil::CIEquals(arm.source, source)) {
+			return &arm;
+		}
+	}
+	return nullptr;
+}
+
+static string BuildProjectionProbeSQL(const RefreshMetadata::ProjectionKeyLineageArm &arm,
+                                      const vector<ProjectionKeySourceSpec> &specs, const string &output_col,
+                                      const string &temp_affected) {
+	auto *source_spec = FindProjectionSourceSpec(specs, arm.source);
+	if (!source_spec) {
+		return "";
+	}
+	string source_alias = "openivm_probe_source";
+	string sql =
+	    "SELECT " + source_alias + ".* FROM " +
+	    SqlUtils::FullName(source_spec->loc.catalog_name, source_spec->loc.schema_name, source_spec->loc.table_name) +
+	    " " + source_alias;
+	string lineage_key = source_alias + "." + SqlUtils::QuoteIdentifier(arm.source_col);
+	// Equality lineage can conservatively select extra probe rows across SCD2 versions. That only widens
+	// MIN/MAX scan bounds; the original temporal join still decides which rows enter the materialized view.
+	for (idx_t i = 0; i < arm.steps.size(); i++) {
+		auto &step = arm.steps[i];
+		auto *lookup_spec = FindProjectionSourceSpec(specs, step.table);
+		if (!lookup_spec) {
+			return "";
+		}
+		string lookup_alias = "openivm_probe_lookup_" + to_string(i);
+		sql += "\nJOIN " +
+		       SqlUtils::FullName(lookup_spec->loc.catalog_name, lookup_spec->loc.schema_name,
+		                          lookup_spec->loc.table_name) +
+		       " " + lookup_alias + " ON " + lookup_alias + "." + SqlUtils::QuoteIdentifier(step.lookup_col) +
+		       " IS NOT DISTINCT FROM " + lineage_key;
+		lineage_key = lookup_alias + "." + SqlUtils::QuoteIdentifier(step.lookup_out);
+	}
+	string qoutput = SqlUtils::QuoteIdentifier(output_col);
+	return sql + "\nWHERE EXISTS (SELECT 1 FROM " + temp_affected + " openivm_aff WHERE openivm_aff." + qoutput +
+	       " IS NOT DISTINCT FROM " + lineage_key + ")";
+}
+
 bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,
                                           const string &view_schema_name, const string &attached_db_catalog_name,
-                                          const string &attached_db_schema_name, string &upsert_query) {
+                                          const string &attached_db_schema_name, bool scd2_range_join_accel,
+                                          string &upsert_query) {
 	RefreshMetadata::ProjectionKeyLineage lineage;
 	if (!metadata.GetProjectionKeyLineage(view_name, lineage)) {
 		return false;
@@ -435,31 +485,106 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
 	string temp_affected = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name);
 	string key_table =
 	    SqlUtils::FullName(key_spec->loc.catalog_name, key_spec->loc.schema_name, key_spec->loc.table_name);
-	string replacement = "(SELECT * FROM " + key_table + " openivm_key_source WHERE EXISTS (SELECT 1 FROM " +
-	                     temp_affected + " openivm_aff WHERE openivm_aff." + qkey +
-	                     " IS NOT DISTINCT FROM openivm_key_source." + SqlUtils::QuoteIdentifier(lineage.key_col) +
-	                     "))";
-	bool replaced = false;
-	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, lineage.key_source,
-	                                                                lineage.key_occurrence, replacement, replaced);
-	if (!replaced) {
-		pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_spec->loc.table_name,
-		                                                         lineage.key_occurrence, replacement, replaced);
+	string key_filter = "SELECT * FROM " + key_table + " openivm_key_source WHERE EXISTS (SELECT 1 FROM " +
+	                    temp_affected + " openivm_aff WHERE openivm_aff." + qkey +
+	                    " IS NOT DISTINCT FROM openivm_key_source." + SqlUtils::QuoteIdentifier(lineage.key_col) + ")";
+	bool apply_scd2_ranges = scd2_range_join_accel && !lineage.scd2_ranges.empty();
+	string temp_probe = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + "scd2_probe_" + view_name);
+	string probe_sql;
+	if (apply_scd2_ranges) {
+		auto &first_range = lineage.scd2_ranges[0];
+		for (auto &range : lineage.scd2_ranges) {
+			if (!SameSourceOccurrence(range.probe_source, range.probe_occurrence, first_range.probe_source,
+			                          first_range.probe_occurrence) ||
+			    !StringUtil::CIEquals(range.probe_col, first_range.probe_col)) {
+				return false;
+			}
+		}
+		auto *probe_arm = FindProjectionLineageArm(lineage, first_range.probe_source, first_range.probe_occurrence);
+		if (!probe_arm) {
+			return false;
+		}
+		probe_sql = BuildProjectionProbeSQL(*probe_arm, specs, lineage.output_col, temp_affected);
+		if (probe_sql.empty()) {
+			return false;
+		}
 	}
-	if (!replaced || pushed_query == view_query_sql) {
-		return false;
+
+	string pushed_query = view_query_sql;
+	bool key_replaced = false;
+	if (apply_scd2_ranges) {
+		for (auto &range : lineage.scd2_ranges) {
+			auto *dimension_spec = FindProjectionSourceSpec(specs, range.dimension_source);
+			if (!dimension_spec) {
+				return false;
+			}
+			string dimension_table = SqlUtils::FullName(
+			    dimension_spec->loc.catalog_name, dimension_spec->loc.schema_name, dimension_spec->loc.table_name);
+			string dimension_alias = "openivm_scd2_dimension";
+			string range_filter =
+			    "(SELECT * FROM " + dimension_table + " " + dimension_alias + " WHERE " + dimension_alias + "." +
+			    SqlUtils::QuoteIdentifier(range.end_col) + (range.end_inclusive ? " >= " : " > ") + "(SELECT MIN(" +
+			    SqlUtils::QuoteIdentifier(range.probe_col) + ") AS openivm_scd2_probe_min FROM " + temp_probe +
+			    ") AND " + dimension_alias + "." + SqlUtils::QuoteIdentifier(range.effective_col) + " <= (SELECT MAX(" +
+			    SqlUtils::QuoteIdentifier(range.probe_col) + ") AS openivm_scd2_probe_max FROM " + temp_probe + ")";
+			bool dimension_is_key = SameSourceOccurrence(range.dimension_source, range.dimension_occurrence,
+			                                             lineage.key_source, lineage.key_occurrence);
+			if (dimension_is_key) {
+				range_filter += " AND EXISTS (SELECT 1 FROM " + temp_affected + " openivm_aff WHERE openivm_aff." +
+				                qkey + " IS NOT DISTINCT FROM " + dimension_alias + "." +
+				                SqlUtils::QuoteIdentifier(lineage.key_col) + ")";
+				key_replaced = true;
+			}
+			range_filter += ")";
+			bool dimension_replaced = false;
+			auto bounded_query = SqlUtils::ReplaceTableReferenceOccurrence(
+			    pushed_query, range.dimension_source, range.dimension_occurrence, range_filter, dimension_replaced);
+			if (!dimension_replaced) {
+				bounded_query = SqlUtils::ReplaceTableReferenceOccurrence(pushed_query, dimension_spec->loc.table_name,
+				                                                          range.dimension_occurrence, range_filter,
+				                                                          dimension_replaced);
+			}
+			if (!dimension_replaced || bounded_query == pushed_query) {
+				return false;
+			}
+			pushed_query = std::move(bounded_query);
+		}
+	}
+	if (!key_replaced) {
+		bool replaced = false;
+		bool probe_is_key = apply_scd2_ranges && SameSourceOccurrence(lineage.scd2_ranges[0].probe_source,
+		                                                              lineage.scd2_ranges[0].probe_occurrence,
+		                                                              lineage.key_source, lineage.key_occurrence);
+		string replacement = probe_is_key ? "(SELECT * FROM " + temp_probe + ")" : "(" + key_filter + ")";
+		auto filtered_query = SqlUtils::ReplaceTableReferenceOccurrence(pushed_query, lineage.key_source,
+		                                                                lineage.key_occurrence, replacement, replaced);
+		if (!replaced) {
+			filtered_query = SqlUtils::ReplaceTableReferenceOccurrence(pushed_query, key_spec->loc.table_name,
+			                                                           lineage.key_occurrence, replacement, replaced);
+		}
+		if (!replaced || filtered_query == pushed_query) {
+			return false;
+		}
+		pushed_query = std::move(filtered_query);
 	}
 
 	string target_alias = "openivm_delete_target";
 	string target_match = "openivm_aff." + qkey + " IS NOT DISTINCT FROM " + target_alias + "." + qkey;
 	upsert_query = "CREATE OR REPLACE TEMP TABLE " + temp_affected + " AS\n" + affected_sql + ";\n\n";
+	if (apply_scd2_ranges) {
+		upsert_query += "CREATE OR REPLACE TEMP TABLE " + temp_probe + " AS\n" + probe_sql + ";\n\n";
+	}
 	upsert_query += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE EXISTS (SELECT 1 FROM " +
 	                temp_affected + " openivm_aff WHERE " + target_match + ");\n\n";
 	upsert_query += "INSERT INTO " + data_table + "\n" + pushed_query + ";\n\n";
+	if (apply_scd2_ranges) {
+		upsert_query += "DROP TABLE IF EXISTS " + temp_probe + ";\n";
+	}
 	upsert_query += "DROP TABLE IF EXISTS " + temp_affected + ";\n";
-	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling SIMPLE_PROJECTION DuckLake affected-key refresh (%s via %s[%llu])\n",
-	                    lineage.output_col.c_str(), lineage.key_source.c_str(),
-	                    static_cast<unsigned long long>(lineage.key_occurrence));
+	OPENIVM_DEBUG_PRINT(
+	    "[UPSERT] Compiling SIMPLE_PROJECTION DuckLake affected-key refresh (%s via %s[%llu], SCD2 ranges=%zu)\n",
+	    lineage.output_col.c_str(), lineage.key_source.c_str(), static_cast<unsigned long long>(lineage.key_occurrence),
+	    apply_scd2_ranges ? lineage.scd2_ranges.size() : 0);
 	return true;
 }
 

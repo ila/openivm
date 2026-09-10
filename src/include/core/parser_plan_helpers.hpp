@@ -54,6 +54,16 @@ struct ProjectionLineageEdge {
 	OccurrenceColumnRef to;
 };
 
+struct PlanComparison {
+	PlanComparison(Expression *left_p, Expression *right_p, ExpressionType comparison_p)
+	    : left(left_p), right(right_p), comparison(comparison_p) {
+	}
+
+	Expression *left;
+	Expression *right;
+	ExpressionType comparison;
+};
+
 struct CreateMVPlanNodeFacts {
 	LogicalOperator *plan_node = nullptr;
 	vector<idx_t> child_ids;
@@ -90,6 +100,7 @@ struct CreateMVPlanFacts {
 	unordered_map<idx_t, ProjectionSourceOccurrence> occurrence_by_index;
 	vector<ProjectionSourceOccurrence> source_occurrences;
 	vector<ProjectionLineageEdge> projection_lineage_edges;
+	vector<PlanComparison> plan_comparisons;
 	unordered_map<const LogicalOperator *, string> first_table_name;
 	unordered_map<idx_t, int> cte_refs_under_join_count;
 	bool has_union_before_aggregate = false;

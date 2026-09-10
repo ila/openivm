@@ -241,6 +241,129 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# A leading equality join leaves the SCD2 predicate inside a composed DuckLake join leaf.
+statement ok
+CREATE TABLE dl.scd2_chain_facts(id INT, lookup_id INT, dim_id INT, dm_date DATE, amount INT);
+
+statement ok
+CREATE TABLE dl.scd2_chain_lookup(
+    lookup_id INT,
+    lookup_label VARCHAR,
+    effective_timestamp DATE,
+    end_timestamp DATE
+);
+
+statement ok
+CREATE TABLE dl.scd2_chain_dims(
+    sk_dim_id INT,
+    dim_id INT,
+    label VARCHAR,
+    effective_timestamp DATE,
+    end_timestamp DATE
+);
+
+statement ok
+INSERT INTO dl.scd2_chain_facts VALUES
+    (1, 100, 10, DATE '2024-01-15', 100),
+    (2, 200, 10, DATE '2024-02-15', 200);
+
+statement ok
+INSERT INTO dl.scd2_chain_lookup VALUES
+    (100, 'one', DATE '2024-01-01', DATE '9999-12-31'),
+    (200, 'two', DATE '2024-01-01', DATE '9999-12-31');
+
+statement ok
+INSERT INTO dl.scd2_chain_dims VALUES
+    (1000, 10, 'old', DATE '2024-01-01', DATE '2024-01-31'),
+    (1001, 10, 'current', DATE '2024-02-01', DATE '9999-12-31');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.scd2_chain_ducklake AS
+    SELECT d.sk_dim_id, f.id, l.lookup_label, d.label, f.dm_date, f.amount
+    FROM dl.scd2_chain_facts f
+    JOIN dl.scd2_chain_lookup l
+      ON f.lookup_id = l.lookup_id
+     AND f.dm_date BETWEEN l.effective_timestamp AND l.end_timestamp
+    JOIN dl.scd2_chain_dims d
+      ON f.dim_id = d.dim_id
+     AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp;
+
+# Batch conflicting fact and dimension mutations before one refresh.
+statement ok
+INSERT INTO dl.scd2_chain_facts VALUES
+    (3, 100, 10, DATE '2024-03-15', 300),
+    (4, 200, 10, DATE '2024-03-20', 400);
+
+statement ok
+UPDATE dl.scd2_chain_facts SET amount = 350 WHERE id = 3;
+
+statement ok
+DELETE FROM dl.scd2_chain_facts WHERE id = 4;
+
+statement ok
+UPDATE dl.scd2_chain_dims
+SET end_timestamp = DATE '2024-02-29'
+WHERE dim_id = 10 AND label = 'current';
+
+statement ok
+INSERT INTO dl.scd2_chain_dims VALUES (1002, 10, 'latest', DATE '2024-03-01', DATE '9999-12-31');
+
+query I
+SELECT COALESCE(bool_or(contains(sql, 'openivm_scd2_probe_min')), false)
+FROM openivm_compile_with_facts(
+    'scd2_chain_ducklake',
+    '{"target_dialect":"duckdb","compile_only":true,"scd2_range_join_accel":true}'
+);
+----
+true
+
+query I
+SELECT COALESCE(MAX(CAST(
+    (length(sql) - length(replace(sql, 'openivm_scd2_probe_min', ''))) /
+    length('openivm_scd2_probe_min') AS INTEGER
+)), 0)
+FROM openivm_compile_with_facts(
+    'scd2_chain_ducklake',
+    '{"target_dialect":"duckdb","compile_only":true,"scd2_range_join_accel":true}'
+);
+----
+2
+
+statement ok
+PRAGMA refresh('scd2_chain_ducklake');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT d.sk_dim_id, f.id, l.lookup_label, d.label, f.dm_date, f.amount
+    FROM dl.scd2_chain_facts f
+    JOIN dl.scd2_chain_lookup l
+      ON f.lookup_id = l.lookup_id
+     AND f.dm_date BETWEEN l.effective_timestamp AND l.end_timestamp
+    JOIN dl.scd2_chain_dims d
+      ON f.dim_id = d.dim_id
+     AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp
+    EXCEPT ALL
+    SELECT sk_dim_id, id, lookup_label, label, dm_date, amount FROM dl.scd2_chain_ducklake
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT sk_dim_id, id, lookup_label, label, dm_date, amount FROM dl.scd2_chain_ducklake
+    EXCEPT ALL
+    SELECT d.sk_dim_id, f.id, l.lookup_label, d.label, f.dm_date, f.amount
+    FROM dl.scd2_chain_facts f
+    JOIN dl.scd2_chain_lookup l
+      ON f.lookup_id = l.lookup_id
+     AND f.dm_date BETWEEN l.effective_timestamp AND l.end_timestamp
+    JOIN dl.scd2_chain_dims d
+      ON f.dim_id = d.dim_id
+     AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp
+);
+----
+0
+
 # ==========================================
 # Regression: CTE projection above CROSS JOIN
 # ==========================================

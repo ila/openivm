@@ -284,12 +284,24 @@ public:
 		vector<ProjectionKeyLineageStep> steps;
 	};
 
+	struct ProjectionScd2Range {
+		string probe_source;
+		idx_t probe_occurrence = 0;
+		string probe_col;
+		string dimension_source;
+		idx_t dimension_occurrence = 0;
+		string effective_col;
+		string end_col;
+		bool end_inclusive = false;
+	};
+
 	struct ProjectionKeyLineage {
 		string output_col;
 		string key_source;
 		idx_t key_occurrence = 0;
 		string key_col;
 		vector<ProjectionKeyLineageArm> arms;
+		vector<ProjectionScd2Range> scd2_ranges;
 	};
 
 	bool GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out);

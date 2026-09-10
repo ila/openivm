@@ -949,9 +949,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	}
 	case RefreshType::SIMPLE_PROJECTION: {
 		if (!has_full_outer && !has_left_join &&
-		    TryBuildDuckLakeProjectionKeyRefresh(metadata, con, view_name, delta_table_names, data_table,
-		                                         view_query_sql, view_catalog_name, view_schema_name,
-		                                         attached_db_catalog_name, attached_db_schema_name, upsert_query)) {
+		    TryBuildDuckLakeProjectionKeyRefresh(
+		        metadata, con, view_name, delta_table_names, data_table, view_query_sql, view_catalog_name,
+		        view_schema_name, attached_db_catalog_name, attached_db_schema_name,
+		        active_facts.scd2_range_join_accel ||
+		            SqlUtils::GetBoolSetting(context, "openivm_scd2_range_join_accel", false),
+		        upsert_query)) {
 			refresh_plan.skip_projection_key_delta = true;
 		} else {
 			upsert_query = CompileProjectionRefresh(
