@@ -8,7 +8,6 @@
 namespace duckdb {
 
 struct JoinLeafInfo;
-struct Scd2RangeJoinInfo;
 
 /// Build N join delta terms using DuckLake time-travel (AT VERSION).
 ///
@@ -21,8 +20,7 @@ struct Scd2RangeJoinInfo;
 /// and is provably equivalent to inclusion-exclusion.
 vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput input, ClientContext &context,
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
-                                                           bool has_left_join, bool flattened_leaves,
-                                                           const vector<Scd2RangeJoinInfo> &scd2_range_joins);
+                                                           bool has_left_join, bool flattened_leaves);
 
 } // namespace duckdb
 

@@ -207,6 +207,311 @@ static SemiAntiSourceInput ResolveSemiAntiSourceInput(RefreshMetadata &metadata,
 	return input;
 }
 
+static bool IsSqlSpace(char c) {
+	return c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '\f';
+}
+
+static bool IsSqlIdentChar(char c) {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+static string TrimCopy(const string &input) {
+	idx_t begin = 0;
+	while (begin < input.size() && IsSqlSpace(input[begin])) {
+		begin++;
+	}
+	idx_t end = input.size();
+	while (end > begin && IsSqlSpace(input[end - 1])) {
+		end--;
+	}
+	return input.substr(begin, end - begin);
+}
+
+static string StripIdentifierQuotes(string input) {
+	input = TrimCopy(input);
+	if (input.size() >= 2 && input.front() == '"' && input.back() == '"') {
+		input = input.substr(1, input.size() - 2);
+	}
+	return StringUtil::Lower(input);
+}
+
+static bool IsSimpleIdentifierExpression(const string &expr) {
+	string trimmed = TrimCopy(expr);
+	if (trimmed.empty()) {
+		return false;
+	}
+	for (auto c : trimmed) {
+		if (!(IsSqlIdentChar(c) || c == '"')) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static vector<string> SplitTopLevelCommaList(const string &input) {
+	vector<string> result;
+	idx_t start = 0;
+	idx_t depth = 0;
+	bool in_quote = false;
+	for (idx_t i = 0; i < input.size(); i++) {
+		char c = input[i];
+		if (c == '"') {
+			in_quote = !in_quote;
+		} else if (!in_quote && c == '(') {
+			depth++;
+		} else if (!in_quote && c == ')' && depth > 0) {
+			depth--;
+		} else if (!in_quote && c == ',' && depth == 0) {
+			result.push_back(TrimCopy(input.substr(start, i - start)));
+			start = i + 1;
+		}
+	}
+	result.push_back(TrimCopy(input.substr(start)));
+	return result;
+}
+
+static idx_t FindMatchingParen(const string &input, idx_t open_pos) {
+	idx_t depth = 0;
+	bool in_quote = false;
+	for (idx_t i = open_pos; i < input.size(); i++) {
+		char c = input[i];
+		if (c == '"') {
+			in_quote = !in_quote;
+		} else if (!in_quote && c == '(') {
+			depth++;
+		} else if (!in_quote && c == ')') {
+			depth--;
+			if (depth == 0) {
+				return i;
+			}
+		}
+	}
+	return string::npos;
+}
+
+static idx_t FindCaseInsensitive(const string &haystack, const string &needle, idx_t start = 0) {
+	return StringUtil::Lower(haystack).find(StringUtil::Lower(needle), start);
+}
+
+struct RefreshCteInfo {
+	string name;
+	idx_t body_start;
+	idx_t body_end;
+	vector<string> columns;
+	vector<string> select_exprs;
+	string relation;
+	bool has_where;
+};
+
+static vector<RefreshCteInfo> ParseRefreshCtes(const string &sql) {
+	vector<RefreshCteInfo> ctes;
+	// The LPTS pretty-printer emits the leading keyword as "WITH\n" (newline), not "WITH " (space), so match
+	// "WITH" followed by any SQL whitespace rather than assuming a single trailing space.
+	idx_t pos = string::npos;
+	for (idx_t i = 0; i + 4 <= sql.size(); i++) {
+		if (StringUtil::CIEquals(sql.substr(i, 4), "WITH") && (i + 4 < sql.size() && IsSqlSpace(sql[i + 4]))) {
+			pos = i;
+			break;
+		}
+	}
+	if (pos == string::npos) {
+		return ctes;
+	}
+	pos += 4;
+	while (pos < sql.size()) {
+		while (pos < sql.size() && IsSqlSpace(sql[pos])) {
+			pos++;
+		}
+		idx_t name_start = pos;
+		while (pos < sql.size() && IsSqlIdentChar(sql[pos])) {
+			pos++;
+		}
+		if (pos == name_start) {
+			break;
+		}
+		RefreshCteInfo cte;
+		cte.name = sql.substr(name_start, pos - name_start);
+		while (pos < sql.size() && IsSqlSpace(sql[pos])) {
+			pos++;
+		}
+		if (pos >= sql.size() || sql[pos] != '(') {
+			break;
+		}
+		idx_t cols_end = FindMatchingParen(sql, pos);
+		if (cols_end == string::npos) {
+			break;
+		}
+		cte.columns = SplitTopLevelCommaList(sql.substr(pos + 1, cols_end - pos - 1));
+		idx_t as_pos = FindCaseInsensitive(sql, " AS (", cols_end);
+		if (as_pos == string::npos) {
+			break;
+		}
+		cte.body_start = as_pos + 5;
+		cte.body_end = FindMatchingParen(sql, cte.body_start - 1);
+		if (cte.body_end == string::npos) {
+			break;
+		}
+		string body = sql.substr(cte.body_start, cte.body_end - cte.body_start);
+		// The LPTS pretty-printer indents the CTE body (e.g. "\n    SELECT ...\n    FROM ..."), so the
+		// leading "SELECT" is not at offset 0 and clause keywords are surrounded by arbitrary whitespace.
+		// Locate the leading SELECT after any leading whitespace rather than assuming a fixed layout.
+		idx_t select_pos = FindCaseInsensitive(body, "SELECT ");
+		bool select_leads = select_pos != string::npos;
+		for (idx_t i = 0; i < select_pos && select_leads; i++) {
+			select_leads = IsSqlSpace(body[i]);
+		}
+		idx_t from_pos = FindCaseInsensitive(body, " FROM ");
+		if (select_leads && from_pos != string::npos && from_pos > select_pos) {
+			idx_t select_list_start = select_pos + 7;
+			cte.select_exprs = SplitTopLevelCommaList(body.substr(select_list_start, from_pos - select_list_start));
+			idx_t relation_start = from_pos + 6;
+			idx_t where_pos = FindCaseInsensitive(body, " WHERE ", relation_start);
+			// The relation ends at the first trailing clause. Besides WHERE, an aggregate/window CTE body
+			// continues with GROUP BY / HAVING / QUALIFY / WINDOW / ORDER BY / LIMIT — none of which are part
+			// of the source relation. Stopping only at WHERE would fold those clauses into `relation` and
+			// break chain resolution through aggregate CTEs (e.g. "t1_scan GROUP BY ..." != CTE "t1_scan").
+			idx_t relation_end = where_pos == string::npos ? body.size() : where_pos;
+			for (const char *clause : {" GROUP BY ", " HAVING ", " QUALIFY ", " WINDOW ", " ORDER BY ", " LIMIT "}) {
+				idx_t clause_pos = FindCaseInsensitive(body, clause, relation_start);
+				if (clause_pos != string::npos && clause_pos < relation_end) {
+					relation_end = clause_pos;
+				}
+			}
+			cte.relation = TrimCopy(body.substr(relation_start, relation_end - relation_start));
+			cte.has_where = where_pos != string::npos;
+		}
+		ctes.push_back(std::move(cte));
+		pos = ctes.back().body_end + 1;
+		if (pos < sql.size() && sql[pos] == ',') {
+			pos++;
+			continue;
+		}
+		break;
+	}
+	return ctes;
+}
+
+struct ResolvedRefreshColumn {
+	ResolvedRefreshColumn() : ok(false), cte_index(DConstants::INVALID_INDEX) {
+	}
+	ResolvedRefreshColumn(bool ok, idx_t cte_index, string relation, string source_column)
+	    : ok(ok), cte_index(cte_index), relation(std::move(relation)), source_column(std::move(source_column)) {
+	}
+	bool ok;
+	idx_t cte_index;
+	string relation;
+	string source_column;
+};
+
+static ResolvedRefreshColumn ResolveRefreshColumnAlias(const vector<RefreshCteInfo> &ctes, const string &alias,
+                                                       idx_t depth = 0) {
+	if (depth > ctes.size()) {
+		return {};
+	}
+	for (idx_t cte_idx = 0; cte_idx < ctes.size(); cte_idx++) {
+		auto &cte = ctes[cte_idx];
+		for (idx_t col_idx = 0; col_idx < cte.columns.size() && col_idx < cte.select_exprs.size(); col_idx++) {
+			if (!StringUtil::CIEquals(TrimCopy(cte.columns[col_idx]), alias)) {
+				continue;
+			}
+			string expr = TrimCopy(cte.select_exprs[col_idx]);
+			if (!IsSimpleIdentifierExpression(expr)) {
+				return {};
+			}
+			for (auto &candidate : ctes) {
+				if (StringUtil::CIEquals(cte.relation, candidate.name)) {
+					return ResolveRefreshColumnAlias(ctes, expr, depth + 1);
+				}
+			}
+			return {true, cte_idx, cte.relation, StripIdentifierQuotes(expr)};
+		}
+	}
+	return {};
+}
+
+static bool ContainsRangePredicate(const string &sql, const string &effective_alias, const string &end_alias,
+                                   const string &ts_alias) {
+	string lower = StringUtil::Lower(sql);
+	string effective = StringUtil::Lower(effective_alias);
+	string end = StringUtil::Lower(end_alias);
+	string ts = StringUtil::Lower(ts_alias);
+	bool lower_bound = lower.find("(" + effective + " <= " + ts + ")") != string::npos ||
+	                   lower.find("(" + ts + " >= " + effective + ")") != string::npos;
+	bool upper_bound = lower.find("(" + end + " > " + ts + ")") != string::npos ||
+	                   lower.find("(" + ts + " < " + end + ")") != string::npos;
+	return lower_bound && upper_bound;
+}
+
+static string ApplyScd2RangeJoinAccel(const string &sql) {
+	auto ctes = ParseRefreshCtes(sql);
+	if (ctes.empty()) {
+		return sql;
+	}
+
+	struct Injection {
+		idx_t pos;
+		string text;
+	};
+	vector<Injection> injections;
+	unordered_set<idx_t> injected_ctes;
+
+	for (auto &effective_cte : ctes) {
+		for (auto &effective_alias : effective_cte.columns) {
+			auto effective = ResolveRefreshColumnAlias(ctes, effective_alias);
+			if (!effective.ok || effective.source_column != "effective_timestamp" ||
+			    effective.relation.find("openivm_delta_") != string::npos) {
+				continue;
+			}
+			for (auto &end_alias : ctes[effective.cte_index].columns) {
+				auto end = ResolveRefreshColumnAlias(ctes, end_alias);
+				if (!end.ok || end.cte_index != effective.cte_index || end.source_column != "end_timestamp") {
+					continue;
+				}
+				for (auto &delta_cte : ctes) {
+					for (auto &ts_alias : delta_cte.columns) {
+						auto ts = ResolveRefreshColumnAlias(ctes, ts_alias);
+						if (!ts.ok || ts.source_column != "ts" || ts.relation.find("openivm_delta_") == string::npos) {
+							continue;
+						}
+						if (!ContainsRangePredicate(sql, effective_alias, end_alias, ts_alias)) {
+							continue;
+						}
+						if (injected_ctes.count(effective.cte_index)) {
+							continue;
+						}
+						string delta_body = sql.substr(ctes[ts.cte_index].body_start,
+						                               ctes[ts.cte_index].body_end - ctes[ts.cte_index].body_start);
+						idx_t where_pos = FindCaseInsensitive(delta_body, " WHERE ");
+						if (where_pos == string::npos) {
+							continue;
+						}
+						string delta_where = TrimCopy(delta_body.substr(where_pos + 7));
+						string filter = "(" + end.source_column + " > (SELECT MIN(" + ts.source_column + ") FROM " +
+						                ts.relation + " WHERE " + delta_where + ")) AND (" + effective.source_column +
+						                " <= (SELECT MAX(" + ts.source_column + ") FROM " + ts.relation + " WHERE " +
+						                delta_where + "))";
+						injections.push_back(
+						    {ctes[effective.cte_index].body_end,
+						     string(ctes[effective.cte_index].has_where ? " AND " : " WHERE ") + filter});
+						injected_ctes.insert(effective.cte_index);
+					}
+				}
+			}
+		}
+	}
+
+	if (injections.empty()) {
+		return sql;
+	}
+	string result = sql;
+	std::sort(injections.begin(), injections.end(),
+	          [](const Injection &a, const Injection &b) { return a.pos > b.pos; });
+	for (auto &injection : injections) {
+		result.insert(injection.pos, injection.text);
+	}
+	return result;
+}
+
 static void CopyOpenIvmSetting(ClientContext &from, ClientContext &to, const string &name) {
 	auto &db_config = DBConfig::GetConfig(to);
 	ExtensionOption option;
@@ -1418,6 +1723,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					if (!inline_delta_select_query.empty() && inline_delta_select_query.back() == ';') {
 						inline_delta_select_query.pop_back();
 					}
+				}
+				if (active_facts.scd2_range_join_accel ||
+				    SqlUtils::GetBoolSetting(context, "openivm_scd2_range_join_accel", false)) {
+					raw_refresh_sql = ApplyScd2RangeJoinAccel(raw_refresh_sql);
 				}
 				add_profile_step("generate_refresh_sql.lpts", lpts_start,
 				                 "delta_sql_bytes=" + to_string(raw_refresh_sql.size()));

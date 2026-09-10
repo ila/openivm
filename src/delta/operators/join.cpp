@@ -26,7 +26,6 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
@@ -180,7 +179,7 @@ static LogicalGet *GetLeafScan(const JoinLeafInfo &leaf) {
 }
 
 static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBinding &binding, string &table_name,
-                                           string &column_name, ColumnBinding *base_binding = nullptr) {
+                                           string &column_name) {
 	if (!node) {
 		return false;
 	}
@@ -213,9 +212,6 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 			}
 			table_name = get->GetTable().get()->name;
 			column_name = get->GetColumnName(column_ids[column_id_idx]);
-			if (base_binding) {
-				*base_binding = bindings[col_idx];
-			}
 			return true;
 		}
 		return false;
@@ -239,7 +235,7 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 			if (!TryGetDeltaJoinColumnRef(*projection.expressions[expr_idx], child_binding)) {
 				return false;
 			}
-			return ResolveLeafBindingToBaseColumn(child, child_binding, table_name, column_name, base_binding);
+			return ResolveLeafBindingToBaseColumn(child, child_binding, table_name, column_name);
 		}
 		return false;
 	}
@@ -257,10 +253,9 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		});
 		if (match != search_end) {
 			auto col_idx = idx_t(match - bindings.begin());
-			return ResolveLeafBindingToBaseColumn(child, child_bindings[col_idx], table_name, column_name,
-			                                      base_binding);
+			return ResolveLeafBindingToBaseColumn(child, child_bindings[col_idx], table_name, column_name);
 		}
-		return ResolveLeafBindingToBaseColumn(child, binding, table_name, column_name, base_binding);
+		return ResolveLeafBindingToBaseColumn(child, binding, table_name, column_name);
 	}
 	return false;
 }
@@ -299,20 +294,11 @@ unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, co
 }
 
 struct JoinPlanFacts {
-	struct RangeCondition {
-		ColumnBinding left;
-		ColumnBinding right;
-		ExpressionType comparison;
-	};
-
 	vector<JoinLeafInfo> leaves;
 	vector<JoinLeafInfo> ducklake_leaves;
 	vector<ColumnBinding> existing_multiplicity_bindings;
-	vector<RangeCondition> range_conditions;
-	vector<Scd2RangeJoinInfo> scd2_range_joins;
 	unordered_set<uint64_t> existing_multiplicity_binding_keys;
 	string ducklake_fallback_reason;
-	bool collect_scd2_ranges = false;
 	bool has_outer_join = false;
 	bool only_inner_joins = true;
 };
@@ -336,16 +322,6 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 	                         node->type == LogicalOperatorType::LOGICAL_ANY_JOIN;
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &join = node->Cast<LogicalComparisonJoin>();
-		if (facts.collect_scd2_ranges) {
-			for (auto &condition : join.conditions) {
-				if (condition.left->type == ExpressionType::BOUND_COLUMN_REF &&
-				    condition.right->type == ExpressionType::BOUND_COLUMN_REF) {
-					facts.range_conditions.push_back({condition.left->Cast<BoundColumnRefExpression>().binding,
-					                                  condition.right->Cast<BoundColumnRefExpression>().binding,
-					                                  condition.comparison});
-				}
-			}
-		}
 		switch (join.join_type) {
 		case JoinType::LEFT:
 		case JoinType::RIGHT:
@@ -425,221 +401,6 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		path.push_back(child_idx);
 		CollectJoinPlanFacts(node->children[child_idx].get(), path, is_right_of_left, false, false, facts);
 		path.pop_back();
-	}
-}
-
-struct ResolvedRangeColumn {
-	size_t leaf_index;
-	ColumnBinding binding;
-	ColumnBinding source_binding;
-	string column_name;
-};
-
-static bool ResolveRangeColumn(const JoinPlanFacts &facts, const ColumnBinding &binding,
-                               ResolvedRangeColumn &resolved) {
-	for (size_t leaf_index = 0; leaf_index < facts.leaves.size(); leaf_index++) {
-		string table_name;
-		string column_name;
-		ColumnBinding source_binding;
-		if (ResolveLeafBindingToBaseColumn(facts.leaves[leaf_index].node, binding, table_name, column_name,
-		                                   &source_binding)) {
-			resolved = {leaf_index, binding, source_binding, StringUtil::Lower(column_name)};
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool IsInclusiveLowerBound(const JoinPlanFacts::RangeCondition &condition, const ResolvedRangeColumn &left,
-                                  const ResolvedRangeColumn &right, ResolvedRangeColumn &effective,
-                                  ResolvedRangeColumn &probe) {
-	if (left.column_name == "effective_timestamp" &&
-	    condition.comparison == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
-		effective = left;
-		probe = right;
-		return true;
-	}
-	if (right.column_name == "effective_timestamp" &&
-	    condition.comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
-		effective = right;
-		probe = left;
-		return true;
-	}
-	return false;
-}
-
-static bool IsUpperBound(const JoinPlanFacts::RangeCondition &condition, const ResolvedRangeColumn &left,
-                         const ResolvedRangeColumn &right, ResolvedRangeColumn &end, ResolvedRangeColumn &probe,
-                         bool &inclusive) {
-	if (left.column_name == "end_timestamp" && (condition.comparison == ExpressionType::COMPARE_GREATERTHAN ||
-	                                            condition.comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO)) {
-		end = left;
-		probe = right;
-		inclusive = condition.comparison == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
-		return true;
-	}
-	if (right.column_name == "end_timestamp" && (condition.comparison == ExpressionType::COMPARE_LESSTHAN ||
-	                                             condition.comparison == ExpressionType::COMPARE_LESSTHANOREQUALTO)) {
-		end = right;
-		probe = left;
-		inclusive = condition.comparison == ExpressionType::COMPARE_LESSTHANOREQUALTO;
-		return true;
-	}
-	return false;
-}
-
-static void ResolveScd2RangeJoins(JoinPlanFacts &facts) {
-	struct LowerBound {
-		ResolvedRangeColumn effective;
-		ResolvedRangeColumn probe;
-	};
-	struct UpperBound {
-		ResolvedRangeColumn end;
-		ResolvedRangeColumn probe;
-		bool inclusive;
-	};
-	vector<LowerBound> lower_bounds;
-	vector<UpperBound> upper_bounds;
-	for (auto &condition : facts.range_conditions) {
-		ResolvedRangeColumn left;
-		ResolvedRangeColumn right;
-		if (!ResolveRangeColumn(facts, condition.left, left) || !ResolveRangeColumn(facts, condition.right, right) ||
-		    left.leaf_index == right.leaf_index) {
-			continue;
-		}
-		ResolvedRangeColumn endpoint;
-		ResolvedRangeColumn probe;
-		bool inclusive;
-		if (IsInclusiveLowerBound(condition, left, right, endpoint, probe)) {
-			lower_bounds.push_back({endpoint, probe});
-		} else if (IsUpperBound(condition, left, right, endpoint, probe, inclusive)) {
-			upper_bounds.push_back({endpoint, probe, inclusive});
-		}
-	}
-	for (auto &lower : lower_bounds) {
-		for (auto &upper : upper_bounds) {
-			if (lower.effective.leaf_index != upper.end.leaf_index ||
-			    lower.probe.leaf_index != upper.probe.leaf_index ||
-			    lower.probe.source_binding != upper.probe.source_binding ||
-			    !GetLeafScan(facts.leaves[lower.probe.leaf_index])) {
-				continue;
-			}
-			facts.scd2_range_joins.push_back({lower.effective.leaf_index, lower.probe.leaf_index,
-			                                  lower.effective.binding, upper.end.binding, lower.probe.source_binding,
-			                                  upper.inclusive});
-			OPENIVM_DEBUG_PRINT("[DeltaJoin] SCD2 range: dimension_leaf=%zu probe_leaf=%zu probe=%s upper=%s\n",
-			                    lower.effective.leaf_index, lower.probe.leaf_index, lower.probe.column_name.c_str(),
-			                    upper.inclusive ? "inclusive" : "exclusive");
-		}
-	}
-}
-
-static ColumnBinding RemapJoinBinding(const ColumnBinding &binding,
-                                      const unordered_map<old_idx, new_idx> &table_mapping) {
-	auto mapped = binding;
-	auto entry = table_mapping.find(binding.table_index);
-	if (entry != table_mapping.end()) {
-		mapped.table_index = entry->second;
-	}
-	return mapped;
-}
-
-static unique_ptr<LogicalOperator> BuildScd2ProbeBounds(DeltaOperatorInput input, ClientContext &context,
-                                                        Binder &binder, const JoinLeafInfo &probe_leaf,
-                                                        const ColumnBinding &probe_binding, ColumnBinding &min_binding,
-                                                        ColumnBinding &max_binding) {
-	auto *probe_get = GetLeafScan(probe_leaf);
-	D_ASSERT(probe_get);
-	auto source_bindings = probe_get->GetColumnBindings();
-	auto probe_entry = std::find(source_bindings.begin(), source_bindings.end(), probe_binding);
-	if (probe_entry == source_bindings.end()) {
-		throw InternalException("DeltaJoin: SCD2 probe binding is not exposed by its source scan");
-	}
-	idx_t probe_index = idx_t(probe_entry - source_bindings.begin());
-	auto probe_scan = probe_get->Copy(context);
-	auto &copied_get = probe_scan->Cast<LogicalGet>();
-	copied_get.table_index = binder.GenerateTableIndex();
-	auto delta = CreateDeltaGetNode(context, binder, &copied_get, input.context.view);
-	delta.node->ResolveOperatorTypes();
-	auto delta_bindings = delta.node->GetColumnBindings();
-	if (probe_index >= delta_bindings.size() || probe_index >= delta.node->types.size()) {
-		throw InternalException("DeltaJoin: SCD2 probe column is missing from its delta scan");
-	}
-	auto probe_type = delta.node->types[probe_index];
-	auto delta_probe_binding = delta_bindings[probe_index];
-
-	vector<unique_ptr<Expression>> min_args;
-	min_args.push_back(make_uniq<BoundColumnRefExpression>(probe_type, delta_probe_binding));
-	auto min_function = BindAggregateByName(context, "min", {probe_type});
-	auto min_expression = make_uniq<BoundAggregateExpression>(std::move(min_function), std::move(min_args), nullptr,
-	                                                          nullptr, AggregateType::NON_DISTINCT);
-	min_expression->alias = "openivm_scd2_probe_min";
-
-	vector<unique_ptr<Expression>> max_args;
-	max_args.push_back(make_uniq<BoundColumnRefExpression>(probe_type, delta_probe_binding));
-	auto max_function = BindAggregateByName(context, "max", {probe_type});
-	auto max_expression = make_uniq<BoundAggregateExpression>(std::move(max_function), std::move(max_args), nullptr,
-	                                                          nullptr, AggregateType::NON_DISTINCT);
-	max_expression->alias = "openivm_scd2_probe_max";
-
-	vector<unique_ptr<Expression>> aggregates;
-	aggregates.push_back(std::move(min_expression));
-	aggregates.push_back(std::move(max_expression));
-	auto aggregate_index = binder.GenerateTableIndex();
-	auto aggregate = make_uniq<LogicalAggregate>(binder.GenerateTableIndex(), aggregate_index, std::move(aggregates));
-	aggregate->children.push_back(std::move(delta.node));
-	aggregate->ResolveOperatorTypes();
-	min_binding = ColumnBinding(aggregate_index, 0);
-	max_binding = ColumnBinding(aggregate_index, 1);
-	return aggregate;
-}
-
-void ApplyScd2RangeFilters(DeltaOperatorInput input, ClientContext &context, Binder &binder,
-                           unique_ptr<LogicalOperator> &term, const vector<JoinLeafInfo> &leaves,
-                           const vector<Scd2RangeJoinInfo> &ranges, uint64_t delta_mask,
-                           const unordered_map<idx_t, idx_t> &table_mapping) {
-	for (auto &range : ranges) {
-		if (!(delta_mask & (1ULL << range.probe_leaf)) || (delta_mask & (1ULL << range.dimension_leaf))) {
-			continue;
-		}
-		auto &dimension = GetNodeAtPath(term, leaves[range.dimension_leaf].path);
-		dimension->ResolveOperatorTypes();
-		auto dimension_bindings = dimension->GetColumnBindings();
-		auto effective_binding = RemapJoinBinding(range.effective_binding, table_mapping);
-		auto end_binding = RemapJoinBinding(range.end_binding, table_mapping);
-		auto effective_entry = std::find(dimension_bindings.begin(), dimension_bindings.end(), effective_binding);
-		auto end_entry = std::find(dimension_bindings.begin(), dimension_bindings.end(), end_binding);
-		if (effective_entry == dimension_bindings.end() || end_entry == dimension_bindings.end()) {
-			throw InternalException("DeltaJoin: SCD2 dimension endpoints are missing from the dimension state");
-		}
-		idx_t effective_index = idx_t(effective_entry - dimension_bindings.begin());
-		idx_t end_index = idx_t(end_entry - dimension_bindings.begin());
-		auto dimension_types = dimension->types;
-
-		ColumnBinding min_binding;
-		ColumnBinding max_binding;
-		auto bounds = BuildScd2ProbeBounds(input, context, binder, leaves[range.probe_leaf], range.probe_source_binding,
-		                                   min_binding, max_binding);
-		auto bound_types = bounds->types;
-		auto cross_product = LogicalCrossProduct::Create(std::move(dimension), std::move(bounds));
-
-		auto filter = make_uniq<LogicalFilter>();
-		filter->expressions.push_back(make_uniq<BoundComparisonExpression>(
-		    range.upper_inclusive ? ExpressionType::COMPARE_GREATERTHANOREQUALTO : ExpressionType::COMPARE_GREATERTHAN,
-		    make_uniq<BoundColumnRefExpression>(dimension_types[end_index], end_binding),
-		    make_uniq<BoundColumnRefExpression>(bound_types[0], min_binding)));
-		filter->expressions.push_back(make_uniq<BoundComparisonExpression>(
-		    ExpressionType::COMPARE_LESSTHANOREQUALTO,
-		    make_uniq<BoundColumnRefExpression>(dimension_types[effective_index], effective_binding),
-		    make_uniq<BoundColumnRefExpression>(bound_types[1], max_binding)));
-		for (idx_t output_index = 0; output_index < dimension_bindings.size(); output_index++) {
-			filter->projection_map.push_back(output_index);
-		}
-		filter->children.push_back(std::move(cross_product));
-		filter->ResolveOperatorTypes();
-		dimension = std::move(filter);
-		OPENIVM_DEBUG_PRINT("[DeltaJoin] Applied SCD2 delta-domain filter: dimension_leaf=%zu probe_leaf=%zu\n",
-		                    range.dimension_leaf, range.probe_leaf);
 	}
 }
 
@@ -1706,10 +1467,11 @@ static bool RegularNtermPreservesFKPruning(ClientContext &context, const openivm
 // ============================================================================
 // BuildInclusionExclusionTerms: create 2^N - 1 delta terms
 // ============================================================================
-static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
-    DeltaOperatorInput input, ClientContext &context, Binder &binder, const vector<JoinLeafInfo> &leaves,
-    bool has_left_join, const vector<ColumnBinding> &existing_multiplicity_bindings,
-    const vector<Scd2RangeJoinInfo> &scd2_range_joins, vector<TransitioningKeyCTEDefinition> &transition_ctes) {
+static vector<unique_ptr<LogicalOperator>>
+BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, Binder &binder,
+                             const vector<JoinLeafInfo> &leaves, bool has_left_join,
+                             const vector<ColumnBinding> &existing_multiplicity_bindings,
+                             vector<TransitioningKeyCTEDefinition> &transition_ctes) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
@@ -1911,7 +1673,6 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 				}
 			}
 		}
-		ApplyScd2RangeFilters(input, context, binder, term, leaves, scd2_range_joins, mask, renumbered.idx_map);
 
 		// Guard kept (un-demoted) outer joins AFTER delta leaves are replaced: the mask-driven side
 		// (e.g. Δ(P1) via CompileCopiedSubtree) must already be its final compiled form before we wrap
@@ -2101,8 +1862,7 @@ static DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input
 static vector<unique_ptr<LogicalOperator>>
 BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &binder,
                       const vector<JoinLeafInfo> &leaves, uint64_t unchanged_mask,
-                      const vector<ColumnBinding> &existing_multiplicity_bindings,
-                      const vector<Scd2RangeJoinInfo> &scd2_range_joins) {
+                      const vector<ColumnBinding> &existing_multiplicity_bindings) {
 	vector<unique_ptr<LogicalOperator>> terms;
 	// Base scans see post-DML state. Term i uses current state before i, delta i, and reconstructs old state after i as
 	// current - delta. These disjoint telescoping terms cover every non-empty delta combination exactly once.
@@ -2160,8 +1920,6 @@ BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &
 			leaf_node = std::move(old.op);
 			UpdateParentProjectionMap(term, leaves[leaf], old.mul_binding);
 		}
-		ApplyScd2RangeFilters(input, context, binder, term, leaves, scd2_range_joins, 1ULL << delta_leaf,
-		                      renumbered.idx_map);
 
 		term->ResolveOperatorTypes();
 		auto term_bindings = term->GetColumnBindings();
@@ -2208,18 +1966,11 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	Binder &binder = input.context.input.optimizer.binder;
 	input.plan->ResolveOperatorTypes();
 	const vector<ColumnBinding> all_original_bindings = input.plan->GetColumnBindings();
-	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
-	bool scd2_range_join_accel = compile_facts.scd2_range_join_accel ||
-	                             SqlUtils::GetBoolSetting(context, "openivm_scd2_range_join_accel", false);
 	bool ducklake_nterm_enabled = SqlUtils::GetBoolSetting(context, "openivm_ducklake_nterm", true);
 	bool collect_ducklake_leaves = ducklake_nterm_enabled && input.context.model.type == RefreshType::SIMPLE_PROJECTION;
 	JoinPlanFacts join_facts;
-	join_facts.collect_scd2_ranges = scd2_range_join_accel;
 	vector<size_t> join_path;
 	CollectJoinPlanFacts(input.plan.get(), join_path, false, true, collect_ducklake_leaves, join_facts);
-	if (scd2_range_join_accel) {
-		ResolveScd2RangeJoins(join_facts);
-	}
 	vector<ColumnBinding> original_bindings;
 	vector<LogicalType> output_types;
 	FilterInternalMultiplicityColumns(all_original_bindings, input.plan->types,
@@ -2266,9 +2017,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 					}
 				}
 			}
-			// SCD2 endpoint bindings belong to the wrapper outputs collected above. Keep those
-			// leaf paths so the range filter can preserve the join's existing bindings.
-			if (has_wrapped_leaf && join_facts.scd2_range_joins.empty()) {
+			if (has_wrapped_leaf) {
 				flattened_ducklake = true;
 				leaves = std::move(join_facts.ducklake_leaves);
 				N = leaves.size();
@@ -2296,6 +2045,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	if (N > openivm::MAX_JOIN_TABLES) { // mull-ignore: cxx_gt_to_ge
 		throw NotImplementedException("IVM not supported for joins with more than 16 tables");
 	}
+	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
 	auto unchanged_mask = ComputeFactsUnchangedMask(compile_facts, leaves);
 	bool regular_nterm = !all_ducklake && compile_facts.compile_only && !has_left_join &&
 	                     input.context.model.type == RefreshType::SIMPLE_PROJECTION && join_facts.only_inner_joins &&
@@ -2316,15 +2066,13 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	vector<TransitioningKeyCTEDefinition> transition_ctes;
 	vector<unique_ptr<LogicalOperator>> terms;
 	if (all_ducklake) {
-		terms = BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake,
-		                               join_facts.scd2_range_joins);
+		terms = BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake);
 	} else if (regular_nterm) {
 		terms = BuildRegularJoinTerms(input, context, binder, leaves, unchanged_mask,
-		                              join_facts.existing_multiplicity_bindings, join_facts.scd2_range_joins);
+		                              join_facts.existing_multiplicity_bindings);
 	} else {
 		terms = BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join,
-		                                     join_facts.existing_multiplicity_bindings, join_facts.scd2_range_joins,
-		                                     transition_ctes);
+		                                     join_facts.existing_multiplicity_bindings, transition_ctes);
 	}
 
 	// 4. UNION ALL

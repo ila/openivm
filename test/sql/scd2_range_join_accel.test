@@ -54,7 +54,7 @@ statement ok
 INSERT INTO off_fact VALUES (4, 10, '2024-03-10', 400);
 
 query I
-SELECT COALESCE(bool_or(contains(sql, 'openivm_scd2_probe_min')), false)
+SELECT COALESCE(bool_or(contains(sql, 'SELECT MIN(ts)')), false)
 FROM openivm_compile_with_facts('off_mv_scd2', '{"target_dialect":"duckdb","compile_only":true}');
 ----
 false
@@ -150,10 +150,10 @@ SELECT COUNT(*) FROM (
 0
 
 statement ok
-CREATE TABLE on_fact(id INT, dim_id INT, dm_date DATE, amount INT);
+CREATE TABLE on_fact(id INT, dim_id INT, ts TIMESTAMP, amount INT);
 
 statement ok
-CREATE TABLE on_dim(dim_id INT, attr VARCHAR, effective_timestamp DATE, end_timestamp DATE);
+CREATE TABLE on_dim(dim_id INT, attr VARCHAR, effective_timestamp TIMESTAMP, end_timestamp TIMESTAMP);
 
 statement ok
 INSERT INTO on_fact VALUES (1, 10, '2024-01-15', 100), (2, 10, '2024-02-10', 200), (3, 20, '2024-01-20', 300);
@@ -166,30 +166,31 @@ SET openivm_scd2_range_join_accel = true;
 
 statement ok
 CREATE MATERIALIZED VIEW on_mv_scd2 AS
-    SELECT f.id, f.dim_id, f.dm_date, f.amount, d.attr
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
     FROM on_fact f
     JOIN on_dim d
       ON f.dim_id = d.dim_id
-     AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp;
+     AND d.effective_timestamp <= f.ts
+     AND f.ts < d.end_timestamp;
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT f.id, f.dim_id, f.dm_date, f.amount, d.attr
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
     FROM on_fact f JOIN on_dim d
-      ON f.dim_id = d.dim_id AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
     EXCEPT ALL
-    SELECT id, dim_id, dm_date, amount, attr FROM on_mv_scd2
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT id, dim_id, dm_date, amount, attr FROM on_mv_scd2
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
     EXCEPT ALL
-    SELECT f.id, f.dim_id, f.dm_date, f.amount, d.attr
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
     FROM on_fact f JOIN on_dim d
-      ON f.dim_id = d.dim_id AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
 );
 ----
 0
@@ -198,7 +199,7 @@ statement ok
 INSERT INTO on_fact VALUES (4, 10, '2024-03-10', 400);
 
 query I
-SELECT COALESCE(bool_or(contains(sql, 'openivm_scd2_probe_min')), false)
+SELECT COALESCE(bool_or(contains(sql, 'SELECT MIN(ts)')), false)
 FROM openivm_compile_with_facts('on_mv_scd2', '{"target_dialect":"duckdb","compile_only":true}');
 ----
 true
@@ -208,22 +209,22 @@ PRAGMA refresh('on_mv_scd2');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT f.id, f.dim_id, f.dm_date, f.amount, d.attr
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
     FROM on_fact f JOIN on_dim d
-      ON f.dim_id = d.dim_id AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
     EXCEPT ALL
-    SELECT id, dim_id, dm_date, amount, attr FROM on_mv_scd2
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT id, dim_id, dm_date, amount, attr FROM on_mv_scd2
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
     EXCEPT ALL
-    SELECT f.id, f.dim_id, f.dm_date, f.amount, d.attr
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
     FROM on_fact f JOIN on_dim d
-      ON f.dim_id = d.dim_id AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
 );
 ----
 0
@@ -239,22 +240,22 @@ PRAGMA refresh('on_mv_scd2');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT f.id, f.dim_id, f.dm_date, f.amount, d.attr
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
     FROM on_fact f JOIN on_dim d
-      ON f.dim_id = d.dim_id AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
     EXCEPT ALL
-    SELECT id, dim_id, dm_date, amount, attr FROM on_mv_scd2
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT id, dim_id, dm_date, amount, attr FROM on_mv_scd2
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
     EXCEPT ALL
-    SELECT f.id, f.dim_id, f.dm_date, f.amount, d.attr
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
     FROM on_fact f JOIN on_dim d
-      ON f.dim_id = d.dim_id AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
 );
 ----
 0
@@ -273,22 +274,22 @@ PRAGMA refresh('on_mv_scd2');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT f.id, f.dim_id, f.dm_date, f.amount, d.attr
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
     FROM on_fact f JOIN on_dim d
-      ON f.dim_id = d.dim_id AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
     EXCEPT ALL
-    SELECT id, dim_id, dm_date, amount, attr FROM on_mv_scd2
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT id, dim_id, dm_date, amount, attr FROM on_mv_scd2
+    SELECT id, dim_id, ts, amount, attr FROM on_mv_scd2
     EXCEPT ALL
-    SELECT f.id, f.dim_id, f.dm_date, f.amount, d.attr
+    SELECT f.id, f.dim_id, f.ts, f.amount, d.attr
     FROM on_fact f JOIN on_dim d
-      ON f.dim_id = d.dim_id AND f.dm_date BETWEEN d.effective_timestamp AND d.end_timestamp
+      ON f.dim_id = d.dim_id AND d.effective_timestamp <= f.ts AND f.ts < d.end_timestamp
 );
 ----
 0

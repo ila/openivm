@@ -263,8 +263,7 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 
 vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput input, ClientContext &context,
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
-                                                           bool has_left_join, bool flattened_leaves,
-                                                           const vector<Scd2RangeJoinInfo> &scd2_range_joins) {
+                                                           bool has_left_join, bool flattened_leaves) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
@@ -497,7 +496,6 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				                    (unsigned long)old_get->table_index, (long)old_snapshots[j]);
 			}
 		}
-		ApplyScd2RangeFilters(input, context, binder, term, leaves, scd2_range_joins, 1ULL << i, renumbered.idx_map);
 
 		term->ResolveOperatorTypes();
 
