@@ -497,7 +497,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				                    (unsigned long)old_get->table_index, (long)old_snapshots[j]);
 			}
 		}
-		ApplyScd2RangeFilters(context, binder, term, leaves, scd2_range_joins, 1ULL << i, renumbered.idx_map);
+		ApplyScd2RangeFilters(input, context, binder, term, leaves, scd2_range_joins, 1ULL << i, renumbered.idx_map);
 
 		term->ResolveOperatorTypes();
 
