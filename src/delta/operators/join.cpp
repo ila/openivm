@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -317,6 +318,23 @@ struct JoinPlanFacts {
 	bool only_inner_joins = true;
 };
 
+static void AddRangeCondition(Expression &left, Expression &right, ExpressionType comparison, JoinPlanFacts &facts) {
+	ColumnBinding left_binding;
+	ColumnBinding right_binding;
+	if (!TryGetDeltaJoinColumnRef(left, left_binding) || !TryGetDeltaJoinColumnRef(right, right_binding)) {
+		return;
+	}
+	facts.range_conditions.push_back({left_binding, right_binding, comparison});
+}
+
+static void CollectRangeConditions(Expression &expression, JoinPlanFacts &facts) {
+	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
+		auto &comparison = expression.Cast<BoundComparisonExpression>();
+		AddRangeCondition(*comparison.left, *comparison.right, comparison.type, facts);
+	}
+	ExpressionIterator::EnumerateChildren(expression, [&](Expression &child) { CollectRangeConditions(child, facts); });
+}
+
 // Collect join leaves and the properties needed to select a compilation strategy. Non-join wrappers remain leaves,
 // but their descendants are still inspected for validation and existing multiplicity bindings.
 static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bool is_right_of_left, bool collect_leaf,
@@ -338,12 +356,7 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		auto &join = node->Cast<LogicalComparisonJoin>();
 		if (facts.collect_scd2_ranges) {
 			for (auto &condition : join.conditions) {
-				if (condition.left->type == ExpressionType::BOUND_COLUMN_REF &&
-				    condition.right->type == ExpressionType::BOUND_COLUMN_REF) {
-					facts.range_conditions.push_back({condition.left->Cast<BoundColumnRefExpression>().binding,
-					                                  condition.right->Cast<BoundColumnRefExpression>().binding,
-					                                  condition.comparison});
-				}
+				AddRangeCondition(*condition.left, *condition.right, condition.comparison, facts);
 			}
 		}
 		switch (join.join_type) {
@@ -362,6 +375,17 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		default:
 			throw Exception(ExceptionType::OPTIMIZER,
 			                JoinTypeToString(join.join_type) + " type not yet supported in OpenIVM");
+		}
+	}
+	if (facts.collect_scd2_ranges && node->type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+		auto &join = node->Cast<LogicalAnyJoin>();
+		if (join.condition) {
+			CollectRangeConditions(*join.condition, facts);
+		}
+	}
+	if (facts.collect_scd2_ranges && node->type == LogicalOperatorType::LOGICAL_FILTER) {
+		for (auto &expression : node->expressions) {
+			CollectRangeConditions(*expression, facts);
 		}
 	}
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
@@ -431,21 +455,26 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 struct ResolvedRangeColumn {
 	size_t leaf_index;
 	ColumnBinding binding;
-	ColumnBinding source_binding;
 	string column_name;
 };
 
 static bool ResolveRangeColumn(const JoinPlanFacts &facts, const ColumnBinding &binding,
                                ResolvedRangeColumn &resolved) {
 	for (size_t leaf_index = 0; leaf_index < facts.leaves.size(); leaf_index++) {
+		auto bindings = facts.leaves[leaf_index].node->GetColumnBindings();
+		if (std::find(bindings.begin(), bindings.end(), binding) == bindings.end()) {
+			continue;
+		}
 		string table_name;
 		string column_name;
-		ColumnBinding source_binding;
-		if (ResolveLeafBindingToBaseColumn(facts.leaves[leaf_index].node, binding, table_name, column_name,
-		                                   &source_binding)) {
-			resolved = {leaf_index, binding, source_binding, StringUtil::Lower(column_name)};
-			return true;
+		if (ResolveLeafBindingToBaseColumn(facts.leaves[leaf_index].node, binding, table_name, column_name)) {
+			resolved = {leaf_index, binding, StringUtil::Lower(column_name)};
+		} else {
+			// A composed join leaf still exposes the probe binding even when it has no single
+			// physical-column lineage. Endpoint recognition continues to require a physical name.
+			resolved = {leaf_index, binding, string()};
 		}
+		return true;
 	}
 	return false;
 }
@@ -519,13 +548,11 @@ static void ResolveScd2RangeJoins(JoinPlanFacts &facts) {
 	for (auto &lower : lower_bounds) {
 		for (auto &upper : upper_bounds) {
 			if (lower.effective.leaf_index != upper.end.leaf_index ||
-			    lower.probe.leaf_index != upper.probe.leaf_index ||
-			    lower.probe.source_binding != upper.probe.source_binding ||
-			    !GetLeafScan(facts.leaves[lower.probe.leaf_index])) {
+			    lower.probe.leaf_index != upper.probe.leaf_index || lower.probe.binding != upper.probe.binding) {
 				continue;
 			}
 			facts.scd2_range_joins.push_back({lower.effective.leaf_index, lower.probe.leaf_index,
-			                                  lower.effective.binding, upper.end.binding, lower.probe.source_binding,
+			                                  lower.effective.binding, upper.end.binding, lower.probe.binding,
 			                                  upper.inclusive});
 			OPENIVM_DEBUG_PRINT("[DeltaJoin] SCD2 range: dimension_leaf=%zu probe_leaf=%zu probe=%s upper=%s\n",
 			                    lower.effective.leaf_index, lower.probe.leaf_index, lower.probe.column_name.c_str(),
@@ -544,39 +571,88 @@ static ColumnBinding RemapJoinBinding(const ColumnBinding &binding,
 	return mapped;
 }
 
-static unique_ptr<LogicalOperator> BuildScd2ProbeBounds(DeltaOperatorInput input, ClientContext &context,
-                                                        Binder &binder, const JoinLeafInfo &probe_leaf,
-                                                        const ColumnBinding &probe_binding, ColumnBinding &min_binding,
-                                                        ColumnBinding &max_binding) {
-	auto *probe_get = GetLeafScan(probe_leaf);
-	D_ASSERT(probe_get);
-	auto source_bindings = probe_get->GetColumnBindings();
-	auto probe_entry = std::find(source_bindings.begin(), source_bindings.end(), probe_binding);
-	if (probe_entry == source_bindings.end()) {
-		throw InternalException("DeltaJoin: SCD2 probe binding is not exposed by its source scan");
+struct Scd2ProbeCTEDefinition {
+	idx_t cte_index;
+	string name;
+	vector<LogicalType> types;
+	vector<string> names;
+	vector<ColumnBinding> bindings;
+	unique_ptr<LogicalOperator> node;
+};
+
+static unique_ptr<LogicalCTERef> CreateScd2ProbeRef(Binder &binder, const Scd2ProbeCTEDefinition &definition,
+                                                    idx_t table_index = DConstants::INVALID_INDEX) {
+	if (table_index == DConstants::INVALID_INDEX) {
+		table_index = binder.GenerateTableIndex();
 	}
-	idx_t probe_index = idx_t(probe_entry - source_bindings.begin());
-	auto probe_scan = probe_get->Copy(context);
-	auto &copied_get = probe_scan->Cast<LogicalGet>();
-	copied_get.table_index = binder.GenerateTableIndex();
-	auto delta = CreateDeltaGetNode(context, binder, &copied_get, input.context.view);
-	delta.node->ResolveOperatorTypes();
-	auto delta_bindings = delta.node->GetColumnBindings();
-	if (probe_index >= delta_bindings.size() || probe_index >= delta.node->types.size()) {
-		throw InternalException("DeltaJoin: SCD2 probe column is missing from its delta scan");
+	auto ref = make_uniq<LogicalCTERef>(table_index, definition.cte_index, definition.types, definition.names);
+	ref->ResolveOperatorTypes();
+	return ref;
+}
+
+static Scd2ProbeCTEDefinition *GetScd2ProbeDefinition(Binder &binder, unique_ptr<LogicalOperator> &term,
+                                                      const vector<JoinLeafInfo> &leaves, size_t probe_leaf,
+                                                      const ColumnBinding &probe_binding,
+                                                      map<size_t, size_t> &definitions_by_leaf,
+                                                      vector<Scd2ProbeCTEDefinition> &definitions, idx_t &probe_index) {
+	auto existing = definitions_by_leaf.find(probe_leaf);
+	if (existing != definitions_by_leaf.end()) {
+		auto &definition = definitions[existing->second];
+		auto entry = std::find(definition.bindings.begin(), definition.bindings.end(), probe_binding);
+		if (entry == definition.bindings.end()) {
+			return nullptr;
+		}
+		probe_index = idx_t(entry - definition.bindings.begin());
+		return &definition;
 	}
-	auto probe_type = delta.node->types[probe_index];
-	auto delta_probe_binding = delta_bindings[probe_index];
+
+	auto &probe = GetNodeAtPath(term, leaves[probe_leaf].path);
+	probe->ResolveOperatorTypes();
+	auto bindings = probe->GetColumnBindings();
+	auto entry = std::find(bindings.begin(), bindings.end(), probe_binding);
+	if (entry == bindings.end() || bindings.empty()) {
+		return nullptr;
+	}
+	auto found_probe_index = idx_t(entry - bindings.begin());
+	idx_t table_index = bindings[0].table_index;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		if (bindings[i] != ColumnBinding(table_index, i)) {
+			return nullptr;
+		}
+	}
+
+	Scd2ProbeCTEDefinition definition;
+	definition.cte_index = binder.GenerateTableIndex();
+	definition.name = "openivm_scd2_probe_" + to_string(definition.cte_index);
+	definition.types = probe->types;
+	definition.bindings = std::move(bindings);
+	for (idx_t i = 0; i < definition.types.size(); i++) {
+		definition.names.push_back("openivm_scd2_col_" + to_string(i));
+	}
+	definition.node = std::move(probe);
+	probe = CreateScd2ProbeRef(binder, definition, table_index);
+	probe_index = found_probe_index;
+	definitions_by_leaf[probe_leaf] = definitions.size();
+	definitions.push_back(std::move(definition));
+	return &definitions.back();
+}
+
+static unique_ptr<LogicalOperator> BuildScd2ProbeBounds(ClientContext &context, Binder &binder,
+                                                        const Scd2ProbeCTEDefinition &definition, idx_t probe_index,
+                                                        ColumnBinding &min_binding, ColumnBinding &max_binding) {
+	auto ref = CreateScd2ProbeRef(binder, definition);
+	auto probe_binding = ref->GetColumnBindings()[probe_index];
+	auto probe_type = definition.types[probe_index];
 
 	vector<unique_ptr<Expression>> min_args;
-	min_args.push_back(make_uniq<BoundColumnRefExpression>(probe_type, delta_probe_binding));
+	min_args.push_back(make_uniq<BoundColumnRefExpression>(probe_type, probe_binding));
 	auto min_function = BindAggregateByName(context, "min", {probe_type});
 	auto min_expression = make_uniq<BoundAggregateExpression>(std::move(min_function), std::move(min_args), nullptr,
 	                                                          nullptr, AggregateType::NON_DISTINCT);
 	min_expression->alias = "openivm_scd2_probe_min";
 
 	vector<unique_ptr<Expression>> max_args;
-	max_args.push_back(make_uniq<BoundColumnRefExpression>(probe_type, delta_probe_binding));
+	max_args.push_back(make_uniq<BoundColumnRefExpression>(probe_type, probe_binding));
 	auto max_function = BindAggregateByName(context, "max", {probe_type});
 	auto max_expression = make_uniq<BoundAggregateExpression>(std::move(max_function), std::move(max_args), nullptr,
 	                                                          nullptr, AggregateType::NON_DISTINCT);
@@ -587,21 +663,34 @@ static unique_ptr<LogicalOperator> BuildScd2ProbeBounds(DeltaOperatorInput input
 	aggregates.push_back(std::move(max_expression));
 	auto aggregate_index = binder.GenerateTableIndex();
 	auto aggregate = make_uniq<LogicalAggregate>(binder.GenerateTableIndex(), aggregate_index, std::move(aggregates));
-	aggregate->children.push_back(std::move(delta.node));
+	aggregate->children.push_back(std::move(ref));
 	aggregate->ResolveOperatorTypes();
 	min_binding = ColumnBinding(aggregate_index, 0);
 	max_binding = ColumnBinding(aggregate_index, 1);
 	return aggregate;
 }
 
-void ApplyScd2RangeFilters(DeltaOperatorInput input, ClientContext &context, Binder &binder,
-                           unique_ptr<LogicalOperator> &term, const vector<JoinLeafInfo> &leaves,
-                           const vector<Scd2RangeJoinInfo> &ranges, uint64_t delta_mask,
-                           const unordered_map<idx_t, idx_t> &table_mapping) {
+void ApplyScd2RangeFilters(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &term,
+                           const vector<JoinLeafInfo> &leaves, const vector<Scd2RangeJoinInfo> &ranges,
+                           uint64_t delta_mask, const unordered_map<idx_t, idx_t> &table_mapping) {
+	map<size_t, size_t> definitions_by_leaf;
+	vector<Scd2ProbeCTEDefinition> definitions;
 	for (auto &range : ranges) {
 		if (!(delta_mask & (1ULL << range.probe_leaf)) || (delta_mask & (1ULL << range.dimension_leaf))) {
 			continue;
 		}
+		auto probe_binding = RemapJoinBinding(range.probe_binding, table_mapping);
+		idx_t probe_index;
+		auto *definition = GetScd2ProbeDefinition(binder, term, leaves, range.probe_leaf, probe_binding,
+		                                          definitions_by_leaf, definitions, probe_index);
+		if (!definition) {
+			OPENIVM_DEBUG_PRINT("[DeltaJoin] Skipping SCD2 range: probe leaf has non-canonical bindings\n");
+			continue;
+		}
+		ColumnBinding min_binding;
+		ColumnBinding max_binding;
+		auto bounds = BuildScd2ProbeBounds(context, binder, *definition, probe_index, min_binding, max_binding);
+
 		auto &dimension = GetNodeAtPath(term, leaves[range.dimension_leaf].path);
 		dimension->ResolveOperatorTypes();
 		auto dimension_bindings = dimension->GetColumnBindings();
@@ -616,10 +705,6 @@ void ApplyScd2RangeFilters(DeltaOperatorInput input, ClientContext &context, Bin
 		idx_t end_index = idx_t(end_entry - dimension_bindings.begin());
 		auto dimension_types = dimension->types;
 
-		ColumnBinding min_binding;
-		ColumnBinding max_binding;
-		auto bounds = BuildScd2ProbeBounds(input, context, binder, leaves[range.probe_leaf], range.probe_source_binding,
-		                                   min_binding, max_binding);
 		auto bound_types = bounds->types;
 		auto cross_product = LogicalCrossProduct::Create(std::move(dimension), std::move(bounds));
 
@@ -640,6 +725,12 @@ void ApplyScd2RangeFilters(DeltaOperatorInput input, ClientContext &context, Bin
 		dimension = std::move(filter);
 		OPENIVM_DEBUG_PRINT("[DeltaJoin] Applied SCD2 delta-domain filter: dimension_leaf=%zu probe_leaf=%zu\n",
 		                    range.dimension_leaf, range.probe_leaf);
+	}
+	for (auto definition = definitions.rbegin(); definition != definitions.rend(); definition++) {
+		term = make_uniq<LogicalMaterializedCTE>(definition->name, definition->cte_index, definition->types.size(),
+		                                         std::move(definition->node), std::move(term),
+		                                         CTEMaterialize::CTE_MATERIALIZE_ALWAYS);
+		term->ResolveOperatorTypes();
 	}
 }
 
@@ -1911,7 +2002,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 				}
 			}
 		}
-		ApplyScd2RangeFilters(input, context, binder, term, leaves, scd2_range_joins, mask, renumbered.idx_map);
+		ApplyScd2RangeFilters(context, binder, term, leaves, scd2_range_joins, mask, renumbered.idx_map);
 
 		// Guard kept (un-demoted) outer joins AFTER delta leaves are replaced: the mask-driven side
 		// (e.g. Δ(P1) via CompileCopiedSubtree) must already be its final compiled form before we wrap
@@ -2160,8 +2251,7 @@ BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &
 			leaf_node = std::move(old.op);
 			UpdateParentProjectionMap(term, leaves[leaf], old.mul_binding);
 		}
-		ApplyScd2RangeFilters(input, context, binder, term, leaves, scd2_range_joins, 1ULL << delta_leaf,
-		                      renumbered.idx_map);
+		ApplyScd2RangeFilters(context, binder, term, leaves, scd2_range_joins, 1ULL << delta_leaf, renumbered.idx_map);
 
 		term->ResolveOperatorTypes();
 		auto term_bindings = term->GetColumnBindings();

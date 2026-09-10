@@ -20,7 +20,7 @@ struct Scd2RangeJoinInfo {
 	size_t probe_leaf;
 	ColumnBinding effective_binding;
 	ColumnBinding end_binding;
-	ColumnBinding probe_source_binding;
+	ColumnBinding probe_binding;
 	bool upper_inclusive;
 };
 
@@ -33,10 +33,9 @@ void DemoteLeftJoins(LogicalOperator *node);
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
                                const ColumnBinding &mul_binding);
 
-void ApplyScd2RangeFilters(DeltaOperatorInput input, ClientContext &context, Binder &binder,
-                           unique_ptr<LogicalOperator> &term, const vector<JoinLeafInfo> &leaves,
-                           const vector<Scd2RangeJoinInfo> &ranges, uint64_t delta_mask,
-                           const unordered_map<idx_t, idx_t> &table_mapping);
+void ApplyScd2RangeFilters(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &term,
+                           const vector<JoinLeafInfo> &leaves, const vector<Scd2RangeJoinInfo> &ranges,
+                           uint64_t delta_mask, const unordered_map<idx_t, idx_t> &table_mapping);
 
 void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
                                                 const ColumnBinding &mul_binding, const char *context_label,
