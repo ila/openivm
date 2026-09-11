@@ -26,100 +26,6 @@ struct DuckLakeJoinColumnRef {
 	string column_name;
 };
 
-static bool IsJoinOperator(LogicalOperatorType type) {
-	switch (type) {
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-	case LogicalOperatorType::LOGICAL_ANY_JOIN:
-		return true;
-	default:
-		return false;
-	}
-}
-
-static void GetNullableJoinSides(LogicalJoin *join, bool &left_is_nullable, bool &right_is_nullable) {
-	left_is_nullable = false;
-	right_is_nullable = false;
-	if (!join) {
-		return;
-	}
-	switch (join->join_type) {
-	case JoinType::LEFT:
-		right_is_nullable = true;
-		break;
-	case JoinType::RIGHT:
-		left_is_nullable = true;
-		break;
-	case JoinType::OUTER:
-		left_is_nullable = true;
-		right_is_nullable = true;
-		break;
-	default:
-		break;
-	}
-}
-
-static bool CollectDuckLakeJoinLeaves(LogicalOperator *node, vector<size_t> &path, vector<JoinLeafInfo> &leaves,
-                                      bool is_right_of_left, string &fallback_reason) {
-	if (IsJoinOperator(node->type)) {
-		auto *join = dynamic_cast<LogicalJoin *>(node);
-		bool left_is_nullable;
-		bool right_is_nullable;
-		GetNullableJoinSides(join, left_is_nullable, right_is_nullable);
-		for (size_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
-			path.push_back(child_idx);
-			// DuckDB joins have two children, so the only non-zero child is the right side.
-			bool child_is_nullable =
-			    is_right_of_left ||
-			    (child_idx == 0 ? left_is_nullable : right_is_nullable); // mull-ignore: cxx_eq_to_ne
-			if (!CollectDuckLakeJoinLeaves(node->children[child_idx].get(), path, leaves, child_is_nullable,
-			                               fallback_reason)) {
-				return false;
-			}
-			path.pop_back();
-		}
-		return true;
-	}
-	if (node->type == LogicalOperatorType::LOGICAL_PROJECTION || node->type == LogicalOperatorType::LOGICAL_FILTER) {
-		if (node->children.size() != 1) {
-			fallback_reason = node->GetName() + " does not have exactly one child";
-			return false;
-		}
-		path.push_back(0);
-		bool result =
-		    CollectDuckLakeJoinLeaves(node->children[0].get(), path, leaves, is_right_of_left, fallback_reason);
-		path.pop_back();
-		return result;
-	}
-	if (node->type != LogicalOperatorType::LOGICAL_GET) {
-		fallback_reason = "unsupported wrapper " + node->GetName();
-		return false;
-	}
-	auto *get = dynamic_cast<LogicalGet *>(node);
-	if (!get || get->function.name != "ducklake_scan" || !get->function.function_info) {
-		fallback_reason = "non-DuckLake scan " + node->GetName();
-		return false;
-	}
-	leaves.push_back({path, get, node, is_right_of_left});
-	return true;
-}
-
-bool TryCollectDuckLakeJoinLeaves(LogicalOperator *node, vector<JoinLeafInfo> &leaves, string &fallback_reason) {
-	leaves.clear();
-	fallback_reason.clear();
-	vector<size_t> path;
-	if (!CollectDuckLakeJoinLeaves(node, path, leaves, false, fallback_reason)) {
-		leaves.clear();
-		return false;
-	}
-	if (leaves.empty()) {
-		fallback_reason = "no DuckLake scans found";
-		return false;
-	}
-	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Flattened leaf count: %zu\n", leaves.size());
-	return true;
-}
-
 static void AddDuckLakeLeafColumnRefs(LogicalOperator *root, const JoinLeafInfo &leaf, size_t leaf_index,
                                       unordered_map<uint64_t, DuckLakeJoinColumnRef> &column_refs) {
 	vector<LogicalOperator *> ancestors;
@@ -537,19 +443,6 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
 		term = std::move(renumbered.op);
 
-		// Re-collect leaves from the copied plan (pointers change after Copy).
-		vector<JoinLeafInfo> term_leaves;
-		if (flattened_leaves) {
-			string fallback_reason;
-			if (!TryCollectDuckLakeJoinLeaves(term.get(), term_leaves, fallback_reason)) {
-				throw InternalException("DuckLakeJoin: copied plan no longer supports flattening: %s",
-				                        fallback_reason.c_str());
-			}
-		} else {
-			CollectJoinLeaves(term.get(), {}, term_leaves);
-		}
-		D_ASSERT(term_leaves.size() == N);
-
 		LogicalOperator *term_root = term.get();
 
 		// Demote only the outer joins whose NULL-supplying subtree contains this
@@ -557,7 +450,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		// outer joins so unmatched rows continue to flow to later dimensions.
 		if (has_left_join) {
 			if (flattened_leaves) {
-				DemoteOuterJoinsForLeaf(term.get(), term_leaves[i].path);
+				DemoteOuterJoinsForLeaf(term.get(), leaves[i].path);
 			} else if (leaves[i].is_right_of_left_join) {
 				DemoteLeftJoins(term.get());
 			}
@@ -565,30 +458,37 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 
 		// Replace leaf[i] with its delta scan.
 		ColumnBinding mul_binding;
-		if (flattened_leaves || term_leaves[i].get) {
+		auto &delta_leaf_node = GetNodeAtPath(term, leaves[i].path);
+		auto *delta_get = delta_leaf_node->type == LogicalOperatorType::LOGICAL_GET
+		                      ? dynamic_cast<LogicalGet *>(delta_leaf_node.get())
+		                      : nullptr;
+		if (flattened_leaves || delta_get) {
 			// Simple GET leaf — replace directly.
-			DeltaGetResult delta_result = CreateDeltaGetNode(context, binder, term_leaves[i].get, input.context.view);
+			D_ASSERT(delta_get);
+			DeltaGetResult delta_result = CreateDeltaGetNode(context, binder, delta_get, input.context.view);
 			mul_binding = delta_result.mul_binding;
-			GetNodeAtPath(term, term_leaves[i].path) = std::move(delta_result.node);
+			delta_leaf_node = std::move(delta_result.node);
 			if (flattened_leaves) {
-				mul_binding = PropagateMultiplicityThroughPath(term, term_leaves[i].path, mul_binding);
+				mul_binding = PropagateMultiplicityThroughPath(term, leaves[i].path, mul_binding);
 			}
 		} else {
 			// GET wrapped in projections/filters — rewrite the entire subtree.
-			auto &subtree_ref = GetNodeAtPath(term, term_leaves[i].path);
+			auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
 			auto rewritten = input.CompileCopiedSubtree(subtree_ref, term_root);
 			mul_binding = rewritten.mul_binding;
 			subtree_ref = std::move(rewritten.op);
 		}
 		if (!flattened_leaves) {
-			UpdateParentProjectionMap(term, term_leaves[i], mul_binding);
+			UpdateParentProjectionMap(term, leaves[i], mul_binding);
 		}
 
 		// Telescoping: pin leaves j > i to old snapshot (AT VERSION).
 		// Leaves j < i stay at current state (already the default).
 		for (size_t j = i + 1; j < N; j++) {
-			auto &leaf_node = GetNodeAtPath(term, term_leaves[j].path);
-			auto *old_get = term_leaves[j].get ? term_leaves[j].get : FindGetInSubtree(leaf_node.get());
+			auto &leaf_node = GetNodeAtPath(term, leaves[j].path);
+			auto *old_get = leaf_node->type == LogicalOperatorType::LOGICAL_GET
+			                    ? dynamic_cast<LogicalGet *>(leaf_node.get())
+			                    : FindGetInSubtree(leaf_node.get());
 			if (old_get && old_get->function.name == "ducklake_scan" && old_get->function.function_info) {
 				auto &func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
 				func_info.snapshot.snapshot_id = static_cast<idx_t>(old_snapshots[j]);

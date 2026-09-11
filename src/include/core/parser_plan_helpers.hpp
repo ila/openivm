@@ -17,6 +17,8 @@
 
 namespace duckdb {
 
+struct PlanRewriteNeeds;
+
 struct DuckLakeSourceTableInfo {
 	string table_name;
 	string catalog_name;
@@ -52,8 +54,20 @@ struct ProjectionLineageEdge {
 	OccurrenceColumnRef to;
 };
 
+struct CreateMVPlanNodeFacts {
+	LogicalOperator *plan_node = nullptr;
+	vector<idx_t> child_ids;
+	vector<idx_t> group_column_search_ids;
+	vector<idx_t> subtree_table_indices;
+	vector<string> subtree_base_tables;
+	bool subtree_base_tables_complete = true;
+	bool contains_table_function = false;
+};
+
 struct CreateMVPlanFacts {
 	LogicalOperator *root = nullptr;
+	vector<CreateMVPlanNodeFacts> plan_nodes_post_order;
+	idx_t max_table_index = 0;
 	PlanAnalysis analysis;
 	unordered_map<string, SourceTableInfo> source_table_info;
 	unordered_map<string, DuckLakeSourceTableInfo> ducklake_table_info;
@@ -61,7 +75,9 @@ struct CreateMVPlanFacts {
 	vector<LogicalProjection *> projections;
 	vector<LogicalAggregate *> aggregates;
 	vector<LogicalComparisonJoin *> comparison_joins;
+	vector<LogicalJoin *> outer_joins;
 	vector<LogicalWindow *> windows;
+	unordered_map<const LogicalOperator *, idx_t> plan_node_ids;
 	unordered_map<idx_t, LogicalProjection *> projections_by_index;
 	unordered_map<idx_t, LogicalGet *> gets_by_index;
 	unordered_map<idx_t, LogicalSetOperation *> setops_by_index;
@@ -92,8 +108,8 @@ struct CreateMVPlanFacts {
 
 string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
                        const vector<string> &output_col_names, bool include_limit = true);
-/// Inline eligible CTEs and return whether the input plan contained a bound aggregate FILTER.
-bool InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
+/// Collect rewrite requirements while preparing CTEs, then inline eligible CTEs.
+PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
                                 const string &default_db);
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);

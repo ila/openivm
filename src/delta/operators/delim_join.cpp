@@ -44,25 +44,7 @@ static bool IsJoinNode(LogicalOperatorType type) {
 	}
 }
 
-static void CollectBaseLeaves(LogicalOperator *node, vector<size_t> path, vector<BaseLeafInfo> &leaves) {
-	if (node->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
-		return;
-	}
-	if (node->type == LogicalOperatorType::LOGICAL_GET) {
-		auto *get = dynamic_cast<LogicalGet *>(node);
-		if (get && get->GetTable().get() != nullptr) {
-			leaves.push_back({std::move(path), get, node});
-		}
-		return;
-	}
-	for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
-		path.push_back(child_idx);
-		CollectBaseLeaves(node->children[child_idx].get(), path, leaves);
-		path.pop_back();
-	}
-}
-
-static void VerifyDelimJoinTypes(LogicalOperator *node) {
+static void CollectBaseLeavesAndVerify(LogicalOperator *node, vector<size_t> path, vector<BaseLeafInfo> &leaves) {
 	if (IsJoinNode(node->type)) {
 		auto *join = dynamic_cast<LogicalJoin *>(node);
 		if (join) {
@@ -84,8 +66,20 @@ static void VerifyDelimJoinTypes(LogicalOperator *node) {
 			}
 		}
 	}
-	for (auto &child : node->children) {
-		VerifyDelimJoinTypes(child.get());
+	if (node->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
+		return;
+	}
+	if (node->type == LogicalOperatorType::LOGICAL_GET) {
+		auto *get = dynamic_cast<LogicalGet *>(node);
+		if (get && get->GetTable().get() != nullptr) {
+			leaves.push_back({std::move(path), get, node});
+		}
+		return;
+	}
+	for (idx_t child_idx = 0; child_idx < node->children.size(); child_idx++) {
+		path.push_back(child_idx);
+		CollectBaseLeavesAndVerify(node->children[child_idx].get(), path, leaves);
+		path.pop_back();
 	}
 }
 
@@ -538,9 +532,8 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 	const vector<ColumnBinding> original_bindings = input.plan->GetColumnBindings();
 
 	LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::DELIM_JOIN_INCLUSION_EXCLUSION);
-	VerifyDelimJoinTypes(input.plan.get());
 	vector<BaseLeafInfo> leaves;
-	CollectBaseLeaves(input.plan.get(), {}, leaves);
+	CollectBaseLeavesAndVerify(input.plan.get(), {}, leaves);
 	if (leaves.empty()) {
 		throw InternalException("DeltaDelimJoin: no mutable base leaves found");
 	}

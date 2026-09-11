@@ -9,6 +9,8 @@ namespace duckdb {
 
 AggregateFunction BindAggregateByName(ClientContext &context, const string &name, const vector<LogicalType> &arg_types);
 LogicalOperator *FindProjectionAggregateInput(unique_ptr<LogicalOperator> &plan, bool allow_having_filter);
+void PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &projection_path, ColumnBinding binding,
+                                                 LogicalType type, const string &alias);
 void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator> &plan, Optimizer &opt,
                               bool is_top = true);
 void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> &plan);

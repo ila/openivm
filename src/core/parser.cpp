@@ -421,7 +421,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	add_create_profile_step("create_compile_full_plan", full_plan_start);
 
 	// Inline CTEs so create-MV facts see the folded structure.
-	(void)InlineCtesIfPresent(context, *planner.binder, plan);
+	auto full_plan_rewrite_needs = InlineCtesIfPresent(context, *planner.binder, plan);
 
 	// Plan the raw SELECT query separately for IVM plan rewrite + LPTS conversion
 	vector<string> output_names;
@@ -453,10 +453,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Inline CTEs without running the full optimizer, which can reshape plans
 		// before OpenIVM's structural rewrites.
 		auto select_rewrite_start = create_profile_now();
-		pre_rewrite_has_aggregate_filter = InlineCtesIfPresent(context, *select_planner.binder, select_plan);
+		auto select_rewrite_needs = InlineCtesIfPresent(context, *select_planner.binder, select_plan);
+		pre_rewrite_has_aggregate_filter = select_rewrite_needs.aggregate_filters;
 
 		// Apply IVM plan rewrites (DISTINCT → GROUP BY + COUNT, AVG → SUM + COUNT, LEFT JOIN key)
-		PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names);
+		PlanRewrite(context, *select_planner.binder, select_plan, select_planner.names, select_rewrite_needs);
 
 		output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
 		// Strip HAVING filter from plan — data table stores all groups.
@@ -466,13 +467,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// non-NULL state afterward so visible, wrapped, and HAVING-only SUMs all
 		// use the same output-index mapping during incremental maintenance.
 		InjectSumNonNullCounts(context, select_plan);
-		PropagateHiddenAggregateColumns(select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
-		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
-		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
-		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
-		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
-		has_computed_sum_aggregate_projection = post_rewrite_facts.has_computed_sum_aggregate_projection;
 
 		// Keep data tables unlimited/unordered; apply ORDER BY/LIMIT in the user-facing view.
 		{
@@ -525,8 +520,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			select_plan = std::move(select_plan->children[0]);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
 		}
+		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
+		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
+		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
+		has_computed_minmax_aggregate_projection = post_rewrite_facts.has_computed_minmax_aggregate_projection;
+		has_computed_sum_aggregate_projection = post_rewrite_facts.has_computed_sum_aggregate_projection;
 		if (select_plan) {
-			derived_aggregate_outputs = ExtractDerivedAggregateOutputs(*select_plan, output_names);
+			derived_aggregate_outputs = ExtractDerivedAggregateOutputs(*select_plan, post_rewrite_facts, output_names);
 		}
 		add_create_profile_step("create_compile_select_rewrite", select_rewrite_start,
 		                        "output_cols=" + to_string(output_names.size()));
@@ -576,10 +576,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// sees CASE expressions instead of raw FILTER and doesn't set incremental_compatible=false.
 	// (PlanRewrite already rewrote select_plan for the LPTS view_query above.)
 	auto analysis_start = create_profile_now();
-	RewriteAggregateFilters(context, plan);
+	if (full_plan_rewrite_needs.aggregate_filters) {
+		RewriteAggregateFilters(context, plan);
+	}
 	// Fold uncorrelated constant scalar subqueries so the checker sees literals instead of the
 	// scalar-subquery guard's ungrouped first() aggregate. (PlanRewrite already did this for select_plan.)
-	FoldConstantScalarSubqueries(context, plan);
+	if (full_plan_rewrite_needs.fold_constant_scalar_subqueries) {
+		FoldConstantScalarSubqueries(context, plan);
+	}
 
 	auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
 	if (!facts.source_table_info.empty()) {

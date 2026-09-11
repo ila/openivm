@@ -970,57 +970,6 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 	return sql;
 }
 
-static string TryBuildFactMarketHistoryAffectedPushdown(const string &view_name, const string &data_table,
-                                                        const string &view_query_sql, const string &qdv,
-                                                        const string &delta_ts_filter, const string &lk,
-                                                        const string &negative_delta_guard) {
-	static const string security_table = string(openivm::DATA_TABLE_PREFIX) + "dim_security";
-	static const string security_key = "sk_company_id";
-
-	if (!StringUtil::CIEquals(view_name, "fact_market_history")) {
-		return "";
-	}
-
-	auto lower_query = StringUtil::Lower(view_query_sql);
-	if (view_query_sql.find(openivm::LEFT_KEY_COL) == string::npos || lower_query.find(security_key) == string::npos) {
-		return "";
-	}
-	if (lower_query.find("openivm_data_daily_market") == string::npos ||
-	    lower_query.find("openivm_data_financial") == string::npos ||
-	    lower_query.find("openivm_data_dim_company") == string::npos) {
-		return "";
-	}
-
-	auto source_ref = SqlUtils::FindTableReference(view_query_sql, security_table);
-	if (source_ref.empty()) {
-		return "";
-	}
-
-	string affected_where = BuildGuardedDeltaWhere(delta_ts_filter, negative_delta_guard);
-	string affected_cte =
-	    "WITH openivm_affected AS (\n  SELECT DISTINCT " + lk + " FROM " + qdv + affected_where + "\n)\n";
-	string key_col = KeywordHelper::WriteOptionallyQuoted(security_key);
-	string replacement = "(SELECT * FROM " + source_ref +
-	                     " openivm_lj_src WHERE EXISTS (SELECT 1 FROM openivm_affected openivm_lj_aff WHERE "
-	                     "openivm_lj_src." +
-	                     key_col + " IS NOT DISTINCT FROM openivm_lj_aff." + lk + "))";
-
-	auto pushed_query = SqlUtils::ReplaceTableReferences(view_query_sql, security_table, replacement);
-	if (pushed_query == view_query_sql) {
-		return "";
-	}
-
-	string affected = "EXISTS (SELECT 1 FROM openivm_affected _d WHERE _d." + lk + " IS NOT DISTINCT FROM ";
-	string delete_match = "_d." + lk + " IS NOT DISTINCT FROM openivm_delete_target." + lk;
-	// Keep the legacy TPC-DI fallback for views created before LEFT JOIN key-source lineage
-	// was recorded. The final EXISTS guard makes the rewrite semantics-preserving even if
-	// the source filter admits false positives.
-	// We also benchmarked dropping the final guard at SF25/SF50; it was only marginally
-	// faster, so the guarded shape is the safer default until lineage proves exactness.
-	return BuildDeleteUsingInsertRefreshSQL(data_table, pushed_query, "openivm_lj", "openivm_affected", "_d",
-	                                        delete_match, affected + "openivm_lj." + lk + ")", affected_cte);
-}
-
 static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const string &view_name,
                                              const vector<string> &column_names,
                                              const vector<string> &delta_table_names, const string &data_table,
@@ -1051,10 +1000,6 @@ static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const st
 	auto pushed_refresh =
 	    TryBuildLeftJoinLineagePushdown(metadata, view_name, delta_table_names, data_table, view_query_sql, qdv,
 	                                    delta_ts_filter, lk, negative_delta_guard);
-	if (pushed_refresh.empty()) {
-		pushed_refresh = TryBuildFactMarketHistoryAffectedPushdown(view_name, data_table, view_query_sql, qdv,
-		                                                           delta_ts_filter, lk, negative_delta_guard);
-	}
 	if (pushed_refresh.empty()) {
 		pushed_refresh = BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_lj",
 		                                             affected + data_table + "." + lk + delta_where + ")",

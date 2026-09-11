@@ -333,24 +333,14 @@ static idx_t AddModelNode(DeltaViewModel &model, DeltaModelNode node) {
 	return model.nodes.back().id;
 }
 
-static idx_t BuildModelNodeForPlan(DeltaViewModel &model, LogicalOperator *op, const CreateMVPlanFacts &facts,
-                                   const vector<string> &output_names) {
-	if (!op) {
-		return DConstants::INVALID_INDEX;
-	}
-	vector<idx_t> children;
-	for (auto &child : op->children) {
-		auto child_id = BuildModelNodeForPlan(model, child.get(), facts, output_names);
-		if (child_id != DConstants::INVALID_INDEX) {
-			children.push_back(child_id);
-		}
-	}
-
+static idx_t BuildModelNodeForPlan(DeltaViewModel &model, const CreateMVPlanNodeFacts &plan_facts,
+                                   const CreateMVPlanFacts &facts, const vector<string> &output_names) {
+	auto *op = plan_facts.plan_node;
 	DeltaModelNode node;
 	node.kind = NodeKindForOperatorInternal(*op);
 	node.rule = RuleKindForNode(node.kind, *op, model, facts.analysis);
 	node.plan_node = op;
-	node.children = std::move(children);
+	node.children = plan_facts.child_ids;
 	node.source_tables = SourceTablesFromChildren(model, node.children);
 	AddNodeAuxRequirements(node, model);
 	AddNodeUnsupportedReasons(node, model);
@@ -558,7 +548,12 @@ const char *DeltaMaintenanceStateKindName(DeltaMaintenanceStateKind state) {
 
 void BuildDeltaModelNodes(DeltaViewModel &model, const CreateMVPlanFacts &facts, const vector<string> &output_names) {
 	model.nodes.clear();
-	model.root_node = BuildModelNodeForPlan(model, facts.root, facts, output_names);
+	model.max_table_index = facts.max_table_index;
+	for (auto &plan_node : facts.plan_nodes_post_order) {
+		BuildModelNodeForPlan(model, plan_node, facts, output_names);
+	}
+	D_ASSERT(facts.plan_nodes_post_order.empty() || facts.plan_nodes_post_order.back().plan_node == facts.root);
+	model.root_node = model.nodes.empty() ? DConstants::INVALID_INDEX : model.nodes.size() - 1;
 	RefreshDeltaNodeMaintenance(model);
 }
 
@@ -598,6 +593,9 @@ void ValidateDeltaViewModelInvariants(const DeltaViewModel &model) {
 	for (auto &node : model.nodes) {
 		D_ASSERT(node.id < model.nodes.size());
 		D_ASSERT(node.plan_node);
+		for (auto child_id : node.children) {
+			D_ASSERT(child_id < node.id);
+		}
 		if (node.kind == DeltaModelNodeKind::SCAN && !node.source_table.empty()) {
 			D_ASSERT(node.source_occurrence != DConstants::INVALID_INDEX);
 			D_ASSERT(node.source_table_index != DConstants::INVALID_INDEX);

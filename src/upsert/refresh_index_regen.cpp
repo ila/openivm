@@ -17,15 +17,53 @@
 
 namespace duckdb {
 
+static uint64_t HashBinding(const ColumnBinding &binding) {
+	return std::hash<idx_t>()(binding.table_index) ^ (std::hash<idx_t>()(binding.column_index) * 0x9e3779b97f4a7c15ULL);
+}
+
+static void CollectExpressionBindings(Expression &expression, std::vector<ColumnBinding> &bindings) {
+	if (expression.type == ExpressionType::BOUND_COLUMN_REF) {
+		bindings.push_back(expression.Cast<BoundColumnRefExpression>().binding);
+	}
+	ExpressionIterator::EnumerateChildren(expression, [&](unique_ptr<Expression> &child) {
+		if (child) {
+			CollectExpressionBindings(*child, bindings);
+		}
+	});
+}
+
+static void CollectOperatorExpressionBindings(LogicalOperator &op, std::vector<ColumnBinding> &bindings) {
+	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expression) {
+		if (expression && *expression) {
+			CollectExpressionBindings(**expression, bindings);
+		}
+	});
+	if (op.type != LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+		return;
+	}
+	auto &join = op.Cast<LogicalDependentJoin>();
+	if (join.join_condition) {
+		CollectExpressionBindings(*join.join_condition, bindings);
+	}
+	for (auto &column : join.correlated_columns) {
+		bindings.push_back(column.binding);
+	}
+}
+
 RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder &binder) {
 	std::unordered_map<old_idx, new_idx> table_reassign;
 	std::vector<ColumnBinding> current_bindings = plan->GetColumnBindings();
+	CollectOperatorExpressionBindings(*plan, current_bindings);
+	bool contains_delim_operator = plan->type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+	                               plan->type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
+	                               plan->type == LogicalOperatorType::LOGICAL_DELIM_GET;
 	std::vector<unique_ptr<LogicalOperator>> rec_children;
 	for (auto &child : plan->children) {
 		RenumberWrapper child_wrap = renumber_table_indices(std::move(child), binder);
 		table_reassign.insert(child_wrap.idx_map.cbegin(), child_wrap.idx_map.cend());
 		current_bindings.insert(current_bindings.end(), child_wrap.column_bindings.cbegin(),
 		                        child_wrap.column_bindings.cend());
+		contains_delim_operator = contains_delim_operator || child_wrap.contains_delim_operator;
 		rec_children.emplace_back(std::move(child_wrap.op));
 	}
 
@@ -53,7 +91,7 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 			}
 		}
 		agg_ptr->children = std::move(rec_children);
-		return {std::move(agg_ptr), table_reassign, current_bindings};
+		return {std::move(agg_ptr), table_reassign, current_bindings, contains_delim_operator};
 	}
 	case LogicalOperatorType::LOGICAL_GET: {
 		unique_ptr<LogicalGet> get_ptr = unique_ptr_cast<LogicalOperator, LogicalGet>(std::move(plan));
@@ -65,7 +103,7 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_GET: Change %zu -> %zu\n", current_idx, new_idx);
 #endif
 		get_ptr->children = std::move(rec_children);
-		return {std::move(get_ptr), table_reassign, current_bindings};
+		return {std::move(get_ptr), table_reassign, current_bindings, contains_delim_operator};
 	}
 	case LogicalOperatorType::LOGICAL_DELIM_GET: {
 		unique_ptr<LogicalDelimGet> delim_get_ptr = unique_ptr_cast<LogicalOperator, LogicalDelimGet>(std::move(plan));
@@ -76,7 +114,7 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 #if OPENIVM_DEBUG
 		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_DELIM_GET: Change %zu -> %zu\n", current_idx, new_idx);
 #endif
-		return {std::move(delim_get_ptr), table_reassign, current_bindings};
+		return {std::move(delim_get_ptr), table_reassign, current_bindings, contains_delim_operator};
 	}
 	case LogicalOperatorType::LOGICAL_PROJECTION: {
 		unique_ptr<LogicalProjection> proj_ptr = unique_ptr_cast<LogicalOperator, LogicalProjection>(std::move(plan));
@@ -88,7 +126,7 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 		proj_ptr->table_index = new_idx;
 		table_reassign[current_idx] = new_idx;
 		proj_ptr->children = std::move(rec_children);
-		return {std::move(proj_ptr), table_reassign, current_bindings};
+		return {std::move(proj_ptr), table_reassign, current_bindings, contains_delim_operator};
 	}
 	case LogicalOperatorType::LOGICAL_UNNEST: {
 		auto &unnest = plan->Cast<LogicalUnnest>();
@@ -100,7 +138,7 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_UNNEST: Change %zu -> %zu\n", current_idx, new_idx);
 #endif
 		plan->children = std::move(rec_children);
-		return {std::move(plan), table_reassign, current_bindings};
+		return {std::move(plan), table_reassign, current_bindings, contains_delim_operator};
 	}
 	case LogicalOperatorType::LOGICAL_UNION:
 	case LogicalOperatorType::LOGICAL_EXCEPT:
@@ -111,7 +149,7 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 		setop.table_index = new_idx;
 		table_reassign[current_idx] = new_idx;
 		plan->children = std::move(rec_children);
-		return {std::move(plan), table_reassign, current_bindings};
+		return {std::move(plan), table_reassign, current_bindings, contains_delim_operator};
 	}
 	case LogicalOperatorType::LOGICAL_EMPTY_RESULT: {
 		// LogicalEmptyResult stores a `bindings` vector directly (no single
@@ -137,7 +175,7 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 			cb.table_index = new_t;
 		}
 		plan->children = std::move(rec_children);
-		return {std::move(plan), table_reassign, current_bindings};
+		return {std::move(plan), table_reassign, current_bindings, contains_delim_operator};
 	}
 	default: {
 #if OPENIVM_DEBUG
@@ -147,195 +185,32 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 	}
 	}
 	plan->children = std::move(rec_children);
-	return {std::move(plan), table_reassign, current_bindings};
+	return {std::move(plan), table_reassign, current_bindings, contains_delim_operator};
 }
 
-// Walk every expression in the operator tree and collect all referenced ColumnBindings.
-static uint64_t HashBinding(const ColumnBinding &b) {
-	// Mix both indices to avoid collisions for large table indices
-	return std::hash<idx_t>()(b.table_index) ^ (std::hash<idx_t>()(b.column_index) * 0x9e3779b97f4a7c15ULL);
-}
-
-static bool ContainsDelimOperator(LogicalOperator &op) {
-	if (op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN || op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN ||
-	    op.type == LogicalOperatorType::LOGICAL_DELIM_GET) {
-		return true;
-	}
-	for (auto &child : op.children) {
-		if (ContainsDelimOperator(*child)) {
-			return true;
+static void RebindExpressionsNullSafe(LogicalOperator &op, ColumnBindingReplacer &replacer,
+                                      const std::unordered_map<old_idx, new_idx> &table_mapping) {
+	LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expression) {
+		if (expression && *expression) {
+			replacer.VisitExpression(expression);
 		}
-	}
-	return false;
-}
-
-static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t> &seen,
-                               std::vector<ColumnBinding> &out) {
-	std::function<void(Expression &)> CollectExpr = [&](Expression &e) {
-		if (e.type == ExpressionType::BOUND_COLUMN_REF) {
-			auto &bcr = e.Cast<BoundColumnRefExpression>();
-			uint64_t key = HashBinding(bcr.binding);
-			if (seen.insert(key).second) {
-				out.push_back(bcr.binding);
-			}
-		}
-		ExpressionIterator::EnumerateChildren(e, [&](unique_ptr<Expression> &child) {
-			if (child) {
-				CollectExpr(*child);
-			}
-		});
-	};
-	// GetColumnBindings
-	for (auto &cb : op.GetColumnBindings()) {
-		uint64_t key = HashBinding(cb);
-		if (seen.insert(key).second) {
-			out.push_back(cb);
-		}
-	}
-	// Standard expressions
-	for (auto &expr : op.expressions) {
-		if (!expr) {
-			continue;
-		}
-		CollectExpr(*expr);
-	}
-	// Comparison/delim/dependent join conditions (stored separately from expressions)
-	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
-	    op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
-		auto &join = op.Cast<LogicalComparisonJoin>();
-		for (auto &cond : join.conditions) {
-			if (cond.left) {
-				CollectExpr(*cond.left);
-			}
-			if (cond.right) {
-				CollectExpr(*cond.right);
-			}
-		}
-		for (auto &expr : join.duplicate_eliminated_columns) {
-			if (!expr) {
-				continue;
-			}
-			CollectExpr(*expr);
-		}
-		if (join.predicate) {
-			CollectExpr(*join.predicate);
-		}
-	}
+	});
 	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
 		auto &join = op.Cast<LogicalDependentJoin>();
 		if (join.join_condition) {
-			CollectExpr(*join.join_condition);
+			replacer.VisitExpression(&join.join_condition);
 		}
-		for (auto &expr : join.arbitrary_expressions) {
-			if (!expr) {
-				continue;
-			}
-			CollectExpr(*expr);
-		}
-		for (auto &expr : join.expression_children) {
-			if (!expr) {
-				continue;
-			}
-			CollectExpr(*expr);
-		}
-		for (auto &col : join.correlated_columns) {
-			uint64_t key = HashBinding(col.binding);
-			if (seen.insert(key).second) {
-				out.push_back(col.binding);
+		for (auto &column : join.correlated_columns) {
+			auto entry = table_mapping.find(column.binding.table_index);
+			if (entry != table_mapping.end()) {
+				column.binding.table_index = entry->second;
 			}
 		}
 	}
 	for (auto &child : op.children) {
-		if (!child) {
-			continue;
+		if (child) {
+			RebindExpressionsNullSafe(*child, replacer, table_mapping);
 		}
-		CollectAllBindings(*child, seen, out);
-	}
-}
-
-// Replace bindings in expressions that ColumnBindingReplacer skips:
-//   - COMPARISON/DELIM/DEPENDENT_JOIN conditions (stored outside op.expressions)
-//   - LogicalAggregate::groups (GROUP BY expressions, also outside op.expressions)
-static void RebindSkippedExpressions(LogicalOperator &op, const std::unordered_map<old_idx, new_idx> &table_mapping) {
-	std::function<void(Expression &)> RebindExpr = [&](Expression &e) {
-		if (e.type == ExpressionType::BOUND_COLUMN_REF) {
-			auto &bcr = e.Cast<BoundColumnRefExpression>();
-			auto it = table_mapping.find(bcr.binding.table_index);
-			if (it != table_mapping.end()) {
-				bcr.binding.table_index = it->second;
-			}
-		}
-		ExpressionIterator::EnumerateChildren(e, [&](unique_ptr<Expression> &child) {
-			if (child) {
-				RebindExpr(*child);
-			}
-		});
-	};
-	for (auto &expr : op.expressions) {
-		if (!expr) {
-			continue;
-		}
-		RebindExpr(*expr);
-	}
-	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
-	    op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
-		auto &join = op.Cast<LogicalComparisonJoin>();
-		for (auto &cond : join.conditions) {
-			if (cond.left) {
-				RebindExpr(*cond.left);
-			}
-			if (cond.right) {
-				RebindExpr(*cond.right);
-			}
-		}
-		for (auto &expr : join.duplicate_eliminated_columns) {
-			if (!expr) {
-				continue;
-			}
-			RebindExpr(*expr);
-		}
-		if (join.predicate) {
-			RebindExpr(*join.predicate);
-		}
-	}
-	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
-		auto &join = op.Cast<LogicalDependentJoin>();
-		if (join.join_condition) {
-			RebindExpr(*join.join_condition);
-		}
-		for (auto &expr : join.arbitrary_expressions) {
-			if (!expr) {
-				continue;
-			}
-			RebindExpr(*expr);
-		}
-		for (auto &expr : join.expression_children) {
-			if (!expr) {
-				continue;
-			}
-			RebindExpr(*expr);
-		}
-		for (auto &col : join.correlated_columns) {
-			auto it = table_mapping.find(col.binding.table_index);
-			if (it != table_mapping.end()) {
-				col.binding.table_index = it->second;
-			}
-		}
-	}
-	if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		auto &agg = op.Cast<LogicalAggregate>();
-		for (auto &group : agg.groups) {
-			if (!group) {
-				continue;
-			}
-			RebindExpr(*group);
-		}
-	}
-	for (auto &child : op.children) {
-		if (!child) {
-			continue;
-		}
-		RebindSkippedExpressions(*child, table_mapping);
 	}
 }
 
@@ -358,31 +233,15 @@ ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &bindings
 }
 
 RenumberWrapper renumber_and_rebind_subtree(unique_ptr<LogicalOperator> plan, Binder &binder) {
-	// Collect ALL bindings BEFORE renumbering (we need the old table indices)
-	std::unordered_set<uint64_t> seen;
-	std::vector<ColumnBinding> all_bindings;
-	const bool contains_delim_operator = ContainsDelimOperator(*plan);
-	CollectAllBindings(*plan, seen, all_bindings);
-
 	RenumberWrapper res = renumber_table_indices(std::move(plan), binder);
-
-	// Merge in any bindings from the renumber pass
-	for (auto &cb : res.column_bindings) {
-		uint64_t key = HashBinding(cb);
-		if (seen.insert(key).second) {
-			all_bindings.push_back(cb);
-		}
-	}
-
-	ColumnBindingReplacer replacer = vec_to_replacer(all_bindings, res.idx_map);
-	if (!contains_delim_operator) {
+	ColumnBindingReplacer replacer = vec_to_replacer(res.column_bindings, res.idx_map);
+	if (!res.contains_delim_operator) {
 		replacer.VisitOperator(*res.op);
+	} else {
+		// Some DELIM/DEPENDENT join expression slots are nullable until delimiter
+		// rewriting. DuckDB's generic visitor dereferences them unconditionally.
+		RebindExpressionsNullSafe(*res.op, replacer, res.idx_map);
 	}
-
-	// DELIM/DEPENDENT joins store nullable expression slots that the generic
-	// visitor can dereference before the delimiter rewrite has normalized them.
-	// Rebind the explicit expression fields below instead.
-	RebindSkippedExpressions(*res.op, res.idx_map);
 	return res;
 }
 

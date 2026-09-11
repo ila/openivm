@@ -245,12 +245,6 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
                                    bool cross_system, bool emit_cascade_delta = false,
                                    bool running_window_incremental = false);
-bool TryBuildGroupMeasureUpdateRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                       const string &view_query_sql, const vector<string> &active_delta_table_names,
-                                       const vector<string> &column_names, const vector<LogicalType> &column_types,
-                                       const string &data_table, const string &view_catalog_name,
-                                       const string &view_schema_name, string &upsert_query);
-
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta = nullptr,

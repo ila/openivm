@@ -47,7 +47,6 @@ set(EXTENSION_SOURCES
     src/delta/operators/window.cpp
     src/upsert/refresh.cpp
     src/upsert/refresh_delta_fast_paths.cpp
-    src/upsert/refresh_group_measure.cpp
     src/upsert/refresh_helpers.cpp
     src/upsert/refresh_sql.cpp
     src/upsert/refresh_window.cpp
