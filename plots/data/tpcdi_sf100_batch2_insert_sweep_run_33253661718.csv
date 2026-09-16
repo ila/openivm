@@ -1,0 +1,81 @@
+insertion_pct,engine,seconds,repetitions,status
+5,databricks-enzyme,520.907606,2,two-run mean
+5,duckdb,188.744884,2,two-run mean
+5,duckdb-openivm,117.669087,2,two-run mean
+5,fabric-jvm-35,707.425893,2,two-run mean
+5,fabric-openivm-jvm-35,827.481470,2,two-run mean
+5,feldera,7.993000,2,two-run mean
+5,spark,578.184444,2,two-run mean
+5,spark-openivm,399.383554,2,two-run mean
+10,databricks-enzyme,417.907727,2,two-run mean
+10,duckdb,186.642779,2,two-run mean
+10,duckdb-openivm,124.691148,2,two-run mean
+10,fabric-jvm-35,823.478883,2,two-run mean
+10,fabric-openivm-jvm-35,886.614236,2,two-run mean
+10,feldera,10.356000,2,two-run mean
+10,spark,536.138557,2,two-run mean
+10,spark-openivm,416.118064,2,two-run mean
+15,databricks-enzyme,431.700576,2,two-run mean
+15,duckdb,182.859568,2,two-run mean
+15,duckdb-openivm,123.764473,2,two-run mean
+15,fabric-jvm-35,836.476105,2,two-run mean
+15,fabric-openivm-jvm-35,786.621324,2,two-run mean
+15,feldera,11.326000,2,two-run mean
+15,spark,543.891013,2,two-run mean
+15,spark-openivm,445.048482,2,two-run mean
+20,databricks-enzyme,401.565390,2,two-run mean
+20,duckdb,187.153191,2,two-run mean
+20,duckdb-openivm,121.777594,2,two-run mean
+20,fabric-jvm-35,819.629827,2,two-run mean
+20,fabric-openivm-jvm-35,879.556709,2,two-run mean
+20,feldera,12.202500,2,two-run mean
+20,spark,562.168782,2,two-run mean
+20,spark-openivm,432.587892,2,two-run mean
+25,databricks-enzyme,,1,incomplete
+25,duckdb,,1,incomplete
+25,duckdb-openivm,,1,incomplete
+25,fabric-jvm-35,,1,incomplete
+25,fabric-openivm-jvm-35,,1,incomplete
+25,feldera,,1,incomplete
+25,spark,,1,incomplete
+25,spark-openivm,,1,incomplete
+30,databricks-enzyme,419.907452,2,two-run mean
+30,duckdb,182.191757,2,two-run mean
+30,duckdb-openivm,131.860614,2,two-run mean
+30,fabric-jvm-35,824.560495,2,two-run mean
+30,fabric-openivm-jvm-35,816.475204,2,two-run mean
+30,feldera,13.228500,2,two-run mean
+30,spark,596.763824,2,two-run mean
+30,spark-openivm,463.819604,2,two-run mean
+35,databricks-enzyme,,1,incomplete
+35,duckdb,,1,incomplete
+35,duckdb-openivm,,1,incomplete
+35,fabric-jvm-35,,1,incomplete
+35,fabric-openivm-jvm-35,,1,incomplete
+35,feldera,,1,incomplete
+35,spark,,1,incomplete
+35,spark-openivm,,1,incomplete
+40,databricks-enzyme,,1,incomplete
+40,duckdb,,1,incomplete
+40,duckdb-openivm,,1,incomplete
+40,fabric-jvm-35,,1,incomplete
+40,fabric-openivm-jvm-35,,1,incomplete
+40,feldera,,1,incomplete
+40,spark,,1,incomplete
+40,spark-openivm,,1,incomplete
+45,databricks-enzyme,,1,incomplete
+45,duckdb,,1,incomplete
+45,duckdb-openivm,,1,incomplete
+45,fabric-jvm-35,,1,incomplete
+45,fabric-openivm-jvm-35,,1,incomplete
+45,feldera,,1,incomplete
+45,spark,,1,incomplete
+45,spark-openivm,,1,incomplete
+50,databricks-enzyme,,1,incomplete
+50,duckdb,,1,incomplete
+50,duckdb-openivm,,1,incomplete
+50,fabric-jvm-35,,1,incomplete
+50,fabric-openivm-jvm-35,,1,incomplete
+50,feldera,,1,incomplete
+50,spark,,1,incomplete
+50,spark-openivm,,1,incomplete

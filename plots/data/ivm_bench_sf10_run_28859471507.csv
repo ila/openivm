@@ -1,0 +1,9 @@
+engine,display_name,batch_1_seconds,batch_2_seconds,batch_3_seconds
+spark,Spark,180,154,154
+spark_openivm,Spark–OpenIVM,792,274,299
+duckdb,DuckDB,27,34,35
+duckdb_openivm,DuckDB–OpenIVM,57,36,42
+feldera,Feldera,361,23,25
+databricks_enzyme,Databricks Enzyme,432,179,206
+fabric_jvm_35,Fabric Spark,939,588,534
+fabric_openivm_jvm_35,Fabric–OpenIVM,985,392,426

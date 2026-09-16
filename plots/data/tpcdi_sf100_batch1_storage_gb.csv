@@ -1,0 +1,21 @@
+"engine","display_name","state_observability","label","gigabytes","component","bytes","component_gigabytes"
+"databricks-enzyme","Databricks Enzyme","inseparable","15.5 GB",15.533814777,"Base tables",2748815995,2.748815995
+"databricks-enzyme","Databricks Enzyme","inseparable","15.5 GB",15.533814777,"MVs",12774344571,12.774344571
+"databricks-enzyme","Databricks Enzyme","inseparable","15.5 GB",15.533814777,"IVM state",0,0
+"databricks-enzyme","Databricks Enzyme","inseparable","15.5 GB",15.533814777,"Metadata",10654211,0.010654211
+"spark-openivm","Spark-OpenIVM","observable","32.6 GB",32.640416958,"Base tables",4635150608,4.635150608
+"spark-openivm","Spark-OpenIVM","observable","32.6 GB",32.640416958,"MVs",27996017286,27.996017286
+"spark-openivm","Spark-OpenIVM","observable","32.6 GB",32.640416958,"IVM state",7873670,0.00787367
+"spark-openivm","Spark-OpenIVM","observable","32.6 GB",32.640416958,"Metadata",1375394,0.001375394
+"duckdb-openivm","DuckDB-OpenIVM","observable","27.4 GB",27.387913061,"Base tables",4625882553,4.625882553
+"duckdb-openivm","DuckDB-OpenIVM","observable","27.4 GB",27.387913061,"MVs",22757442988,22.757442988
+"duckdb-openivm","DuckDB-OpenIVM","observable","27.4 GB",27.387913061,"IVM state",0,0
+"duckdb-openivm","DuckDB-OpenIVM","observable","27.4 GB",27.387913061,"Metadata",4587520,0.00458752
+"feldera","Feldera","observable","115.1 GB",115.133346332,"Base tables",8108254919,8.108254919
+"feldera","Feldera","observable","115.1 GB",115.133346332,"MVs",6843135002,6.843135002
+"feldera","Feldera","observable","115.1 GB",115.133346332,"IVM state",100181862519,100.181862519
+"feldera","Feldera","observable","115.1 GB",115.133346332,"Metadata",93892,9.3892e-05
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","26.0 GB",25.965173465,"Base tables",4218544078,4.218544078
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","26.0 GB",25.965173465,"MVs",21710619063,21.710619063
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","26.0 GB",25.965173465,"IVM state",6355362,0.006355362
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","26.0 GB",25.965173465,"Metadata",29654962,0.029654962

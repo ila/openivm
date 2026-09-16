@@ -1,0 +1,25 @@
+engine,display_name,batch,visible_output_bytes,helper_data_bytes,metadata_bytes,source_bytes,total_bytes,source_mode,shared_source_bytes,state_observability
+databricks-enzyme,Databricks Enzyme,1,1125439213,0,2177189,246762402,1374378804,managed,0,unobservable
+databricks-enzyme,Databricks Enzyme,2,1125439215,0,4324239,246762402,1376525856,managed,0,unobservable
+databricks-enzyme,Databricks Enzyme,3,1125439215,0,6461933,246762402,1378663550,managed,0,unobservable
+duckdb,DuckDB,1,1894545275,0,294912,408620423,2303460610,managed,0,not_applicable
+duckdb,DuckDB,2,3830616665,0,471040,408690824,4239778529,managed,0,not_applicable
+duckdb,DuckDB,3,5757537332,0,626688,408808621,6166972641,managed,0,not_applicable
+duckdb-openivm,DuckDB-OpenIVM,1,1898532906,0,4567040,408530970,2311630916,managed,0,observable
+duckdb-openivm,DuckDB-OpenIVM,2,1987861581,107661,3567616,408601371,2400138229,managed,0,observable
+duckdb-openivm,DuckDB-OpenIVM,3,2136708714,284257,4395008,408719168,2550107147,managed,0,observable
+fabric-jvm-35,Fabric,1,1858823831,0,13331394,400742107,2272897332,managed,0,not_applicable
+fabric-jvm-35,Fabric,2,3729145719,0,25107708,400858898,4155112325,managed,0,not_applicable
+fabric-jvm-35,Fabric,3,5604362015,0,36970985,401025733,6042358733,managed,0,not_applicable
+fabric-openivm-jvm-35,Fabric-OpenIVM,1,1858843757,5654263,13352714,400742107,2278592841,managed,0,observable
+fabric-openivm-jvm-35,Fabric-OpenIVM,2,3422294853,7118153,25054661,400858898,3855326565,managed,0,observable
+fabric-openivm-jvm-35,Fabric-OpenIVM,3,4986044295,8394918,36845018,401025733,5432309964,managed,0,observable
+feldera,Feldera,1,503070750,6546653815,93870,0,7049818435,shared_raw,741812840,observable
+feldera,Feldera,2,503712282,6129012855,113071,0,6632838208,shared_raw,741897052,observable
+feldera,Feldera,3,504687166,6225110135,132653,0,6729929954,shared_raw,742026202,observable
+spark,Spark,1,1619775264,0,542972,0,1620318236,shared_raw,741812840,not_applicable
+spark,Spark,2,3239707571,0,1172271,0,3240879842,shared_raw,741897052,not_applicable
+spark,Spark,3,4859840471,0,1809929,0,4861650400,shared_raw,742026202,not_applicable
+spark-openivm,Spark-OpenIVM,1,2504567927,8669941,879525,421877099,2935994492,managed,0,observable
+spark-openivm,Spark-OpenIVM,2,2821321734,13809339,1711050,421962059,3258804182,managed,0,observable
+spark-openivm,Spark-OpenIVM,3,2976741276,21911886,2747885,422092288,3423493335,managed,0,observable

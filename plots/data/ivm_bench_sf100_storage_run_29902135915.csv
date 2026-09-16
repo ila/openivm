@@ -1,0 +1,16 @@
+engine,display_name,batch,visible_output_bytes,helper_data_bytes,metadata_bytes,source_bytes,total_bytes,source_mode,shared_source_bytes,state_observability
+duckdb,DuckDB,1,22751949894,0,524288,4625665737,27378139919,managed,0,not_applicable
+duckdb,DuckDB,2,46053113723,0,921600,4626117366,50680152689,managed,0,not_applicable
+duckdb,DuckDB,3,69357474152,0,1368064,4626139575,73984981791,managed,0,not_applicable
+duckdb-openivm,DuckDB-OpenIVM,1,22798390224,0,4587520,4625320403,27428298147,managed,0,observable
+duckdb-openivm,DuckDB-OpenIVM,2,25079838687,713772,3592192,4625772032,29709916683,managed,0,observable
+duckdb-openivm,DuckDB-OpenIVM,3,25158637476,750889,3903488,4625794241,29789086094,managed,0,observable
+feldera,Feldera,1,6843135002,102967399031,93892,0,109810627925,shared_raw,8108254919,observable
+feldera,Feldera,2,6851197729,95169284215,115511,0,102020597455,shared_raw,8108706150,observable
+feldera,Feldera,3,6852448118,95193551991,130368,0,102046130477,shared_raw,8108743078,observable
+spark,Spark,1,19298494686,0,812593,0,19299307279,shared_raw,8108254919,not_applicable
+spark,Spark,2,38597905462,0,1745526,0,38599650988,shared_raw,8108706150,not_applicable
+spark,Spark,3,57902457000,0,2688089,0,57905145089,shared_raw,8108743078,not_applicable
+spark-openivm,Spark-OpenIVM,1,27974672928,7928270,1358149,4635150608,32619109955,managed,0,observable
+spark-openivm,Spark-OpenIVM,2,32151877858,67972241,2594728,4635605458,36858050285,managed,0,observable
+spark-openivm,Spark-OpenIVM,3,33611010820,71124960,3606090,4635642776,38321384646,managed,0,observable

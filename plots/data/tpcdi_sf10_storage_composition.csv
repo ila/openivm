@@ -1,0 +1,21 @@
+"engine","display_name","state_observability","component","bytes","input_equivalents"
+"databricks-enzyme","Databricks Enzyme","unobservable","Source",246762402,0.33255214079354
+"databricks-enzyme","Databricks Enzyme","unobservable","Materialized output",1125439215,1.51671088159229
+"databricks-enzyme","Databricks Enzyme","unobservable","Observable IVM state",0,0
+"databricks-enzyme","Databricks Enzyme","unobservable","Metadata",6461933,0.00870849706194068
+"duckdb-openivm","DuckDB-OpenIVM","observable","Source",408719168,0.550815007473281
+"duckdb-openivm","DuckDB-OpenIVM","observable","Materialized output",2136708714,2.87955965468723
+"duckdb-openivm","DuckDB-OpenIVM","observable","Observable IVM state",284257,0.000383082159678237
+"duckdb-openivm","DuckDB-OpenIVM","observable","Metadata",4395008,0.00592298221835568
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","Source",401025733,0.540446862818464
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","Materialized output",4986044295,6.7194989631916
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","Observable IVM state",8394918,0.0113135061502855
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","Metadata",36845018,0.0496546050539601
+"feldera","Feldera","observable","Source",742026202,1
+"feldera","Feldera","observable","Materialized output",504687166,0.680147364930922
+"feldera","Feldera","observable","Observable IVM state",6225110135,8.38934005055525
+"feldera","Feldera","observable","Metadata",132653,0.000178771315140163
+"spark-openivm","Spark-OpenIVM","observable","Source",422092288,0.568837443829241
+"spark-openivm","Spark-OpenIVM","observable","Materialized output",2976741276,4.0116390337386
+"spark-openivm","Spark-OpenIVM","observable","Observable IVM state",21911886,0.0295298008896996
+"spark-openivm","Spark-OpenIVM","observable","Metadata",2747885,0.00370321828608419

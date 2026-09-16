@@ -1,0 +1,21 @@
+"engine","display_name","state_observability","label","gigabytes","component","bytes","component_gigabytes"
+"databricks-enzyme","Databricks Enzyme","inseparable","1.4 GB",1.382622391,"Base tables",246762984,0.246762984
+"databricks-enzyme","Databricks Enzyme","inseparable","1.4 GB",1.382622391,"MVs",1126033268,1.126033268
+"databricks-enzyme","Databricks Enzyme","inseparable","1.4 GB",1.382622391,"IVM state",0,0
+"databricks-enzyme","Databricks Enzyme","inseparable","1.4 GB",1.382622391,"Metadata",9826139,0.009826139
+"spark-openivm","Spark-OpenIVM","observable","2.9 GB",2.935999085,"Base tables",421877099,0.421877099
+"spark-openivm","Spark-OpenIVM","observable","2.9 GB",2.935999085,"MVs",2504568035,2.504568035
+"spark-openivm","Spark-OpenIVM","observable","2.9 GB",2.935999085,"IVM state",8674422,0.008674422
+"spark-openivm","Spark-OpenIVM","observable","2.9 GB",2.935999085,"Metadata",879529,0.000879529
+"duckdb-openivm","DuckDB-OpenIVM","observable","2.3 GB",2.313781434,"Base tables",408438358,0.408438358
+"duckdb-openivm","DuckDB-OpenIVM","observable","2.3 GB",2.313781434,"MVs",1900776036,1.900776036
+"duckdb-openivm","DuckDB-OpenIVM","observable","2.3 GB",2.313781434,"IVM state",0,0
+"duckdb-openivm","DuckDB-OpenIVM","observable","2.3 GB",2.313781434,"Metadata",4567040,0.00456704
+"feldera","Feldera","observable","7.8 GB",7.791735211,"Base tables",741812840,0.74181284
+"feldera","Feldera","observable","7.8 GB",7.791735211,"MVs",503070750,0.50307075
+"feldera","Feldera","observable","7.8 GB",7.791735211,"IVM state",6546757751,6.546757751
+"feldera","Feldera","observable","7.8 GB",7.791735211,"Metadata",93870,9.387e-05
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","2.3 GB",2.278891421,"Base tables",400742107,0.400742107
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","2.3 GB",2.278891421,"MVs",1858843759,1.858843759
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","2.3 GB",2.278891421,"IVM state",5952841,0.005952841
+"fabric-openivm-jvm-35","Fabric-OpenIVM","observable","2.3 GB",2.278891421,"Metadata",13352714,0.013352714

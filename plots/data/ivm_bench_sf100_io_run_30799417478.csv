@@ -1,0 +1,25 @@
+engine,display_name,batch,input_gb,shuffle_read_gb,shuffle_write_gb,telemetry_status
+databricks-enzyme,Databricks Enzyme,1,,,,not_exposed
+databricks-enzyme,Databricks Enzyme,2,,,,not_exposed
+databricks-enzyme,Databricks Enzyme,3,,,,not_exposed
+spark,Spark,1,26.179,22.275,21.057,measured
+spark,Spark,2,26.186,22.275,21.057,measured
+spark,Spark,3,26.193,22.276,21.058,measured
+spark-openivm,Spark-OpenIVM,1,59.725,44.974,43.788,measured
+spark-openivm,Spark-OpenIVM,2,42.446,56.241,56.534,measured
+spark-openivm,Spark-OpenIVM,3,44.116,56.319,56.601,measured
+duckdb,DuckDB,1,,,,not_exposed
+duckdb,DuckDB,2,,,,not_exposed
+duckdb,DuckDB,3,,,,not_exposed
+duckdb-openivm,DuckDB-OpenIVM,1,,,,not_exposed
+duckdb-openivm,DuckDB-OpenIVM,2,,,,not_exposed
+duckdb-openivm,DuckDB-OpenIVM,3,,,,not_exposed
+feldera,Feldera,1,,,,not_comparable
+feldera,Feldera,2,,,,not_comparable
+feldera,Feldera,3,,,,not_comparable
+fabric-jvm-35,Fabric,1,,,,not_exposed
+fabric-jvm-35,Fabric,2,,,,not_exposed
+fabric-jvm-35,Fabric,3,,,,not_exposed
+fabric-openivm-jvm-35,Fabric-OpenIVM,1,,,,not_exposed
+fabric-openivm-jvm-35,Fabric-OpenIVM,2,,,,not_exposed
+fabric-openivm-jvm-35,Fabric-OpenIVM,3,,,,not_exposed
