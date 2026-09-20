@@ -286,6 +286,22 @@ static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_na
 	return count;
 }
 
+/// Estimated number of rows the incremental delta plan will produce, read from DuckDB's own
+/// cardinality estimator on the plan the refresh is about to run. The root is normally an INSERT
+/// into the view's delta table, whose cardinality is not the number we want, so descend through
+/// wrapper nodes to the first operator that actually produces rows. Returns -1 when no usable node
+/// is found, which tells the caller to keep its own estimate.
+static double EstimateIncrementalDeltaRows(ClientContext &context, LogicalOperator &plan) {
+	LogicalOperator *node = &plan;
+	while (node->type == LogicalOperatorType::LOGICAL_INSERT || node->type == LogicalOperatorType::LOGICAL_EXPLAIN) {
+		if (node->children.empty()) {
+			return -1;
+		}
+		node = node->children[0].get();
+	}
+	return static_cast<double>(node->EstimateCardinality(context));
+}
+
 /// Walk the plan tree once, collecting table stats, join info, and aggregate presence.
 static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, LogicalOperator &op,
                                       const string &view_name, const DeltaActivityResult *delta_activity,
@@ -555,7 +571,7 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 // ============================================================================
 
 RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name,
-                                        const DeltaActivityResult *delta_activity) {
+                                        const DeltaActivityResult *delta_activity, LogicalOperator *incremental_plan) {
 	// Single connection for all cardinality queries
 	Connection con(*context.db);
 
@@ -656,6 +672,20 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		incremental_compute = total_delta;
 		// Apply both pushed-down selectivity and non-pushed-down filter selectivity
 		estimated_delta_result = filtered_delta * plan_stats.filter_selectivity;
+	}
+
+	// Prefer DuckDB's estimate of the plan that will actually run. Everything above is a proxy:
+	// delta rows scaled by mv_card/actual_card for joins, or by a filter selectivity ratio for
+	// unary plans. The rewritten delta plan has already been through the optimizer with the real
+	// delta tables in place, so its estimated output is both better informed and, unlike the proxy,
+	// derived from the same estimator that produced the recompute side's numbers.
+	if (incremental_plan) {
+		double plan_delta_rows = EstimateIncrementalDeltaRows(context, *incremental_plan);
+		if (plan_delta_rows >= 0) {
+			OPENIVM_DEBUG_PRINT("[COST MODEL] Delta result: proxy=%.0f, plan estimate=%.0f (using plan estimate)\n",
+			                    estimated_delta_result, plan_delta_rows);
+			estimated_delta_result = plan_delta_rows;
+		}
 	}
 
 	double incremental_upsert;
