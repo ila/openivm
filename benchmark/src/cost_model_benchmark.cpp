@@ -1102,6 +1102,16 @@ static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload
 	}
 }
 
+// Ratio error between a predicted and a measured duration, the standard accuracy measure for cost
+// estimates: 1.0 is exact, 2.0 is off by a factor of two in either direction. Returns 0 when either
+// side is non-positive, which marks the sample as undefined rather than perfect.
+static double QError(double predicted_ms, double actual_ms) {
+	if (predicted_ms <= 0 || actual_ms <= 0) {
+		return 0;
+	}
+	return std::max(predicted_ms, actual_ms) / std::min(predicted_ms, actual_ms);
+}
+
 static string BestMethod(double incremental_ms, double full_ms) {
 	return incremental_ms <= full_ms ? "incremental" : "full";
 }
@@ -1214,14 +1224,14 @@ int main(int argc, char **argv) {
 		}
 	}
 	if (db_path.empty()) {
-		db_path = "/tmp/cost_model_bench_sf" + to_string(scale) + ".db";
+		db_path = "/tmp/cost_model_bench_tpcc_sf" + to_string(scale) + ".db";
 	}
 	if (!FileExists(db_path)) {
 		Log("Creating TPC-C DB at scale " + to_string(scale) + ": " + db_path);
 		duckdb::DuckDB db(db_path);
 		duckdb::Connection con(db);
 		CreateTPCCSchema(con);
-		InsertTPCCData(con, scale);
+		InsertTPCCData(con, scale, openivm_bench::TPCCScaleProfile::SPEC);
 		con.Query("PRAGMA checkpoint");
 	}
 
@@ -1230,7 +1240,8 @@ int main(int argc, char **argv) {
 	std::ofstream out(out_csv);
 	out << "scale,query_id,description,workload,delta_pct,flag_config,rep,view_name,"
 	       "cost_decision,incremental_cost,recompute_cost,incremental_predicted_ms,recompute_predicted_ms,calibrated,"
-	       "auto_method,auto_ms,incremental_ms,full_ms,best_method,regret_ratio,correct,base_rows,mv_rows,"
+	       "auto_method,auto_ms,incremental_ms,full_ms,best_method,regret_ratio,inc_qerror,full_qerror,"
+	       "correct,base_rows,mv_rows,"
 	       "dml_statements,delta_rows,error\n";
 
 	int total = 0;
@@ -1339,7 +1350,10 @@ int main(int argc, char **argv) {
 						    << (auto_result.cost.calibrated ? "true" : "false") << "," << CsvQuote(auto_result.method)
 						    << "," << std::setprecision(3) << auto_result.refresh_ms << "," << inc_result.refresh_ms
 						    << "," << full_result.refresh_ms << "," << CsvQuote(best) << "," << std::setprecision(6)
-						    << regret << "," << (correct ? "true" : "false") << "," << auto_result.base_rows << ","
+						    << regret << ","
+						    << QError(auto_result.cost.incremental_predicted_ms, inc_result.refresh_ms) << ","
+						    << QError(auto_result.cost.recompute_predicted_ms, full_result.refresh_ms) << ","
+						    << (correct ? "true" : "false") << "," << auto_result.base_rows << ","
 						    << auto_result.mv_rows << "," << auto_result.dml_statements << ","
 						    << auto_result.delta_rows << "," << CsvQuote(error) << "\n";
 						out.flush();

@@ -83,17 +83,31 @@ void CreateTPCCSchema(duckdb::Connection &con) {
 	          "TIMESTAMP, H_AMOUNT DECIMAL(6, 2), H_DATA VARCHAR(24))");
 }
 
-void InsertTPCCData(duckdb::Connection &con, int scale_factor) {
-	// Per-warehouse cardinality. These are far larger than a row-per-INSERT loop could
-	// populate cheaply, so generation is set-based (INSERT ... SELECT over range() cross
-	// products) — fast even at high scale. scale_factor == number of warehouses, so total
-	// data grows linearly with it. At SF1 ORDER_LINE ~10k rows; at SF100 ~1M rows.
+void InsertTPCCData(duckdb::Connection &con, int scale_factor, TPCCScaleProfile profile) {
+	// Rows are far more numerous than a row-per-INSERT loop could populate cheaply, so generation
+	// is set-based (INSERT ... SELECT over range() cross products) — fast even at high scale.
+	// scale_factor == number of warehouses, so all per-warehouse tables grow linearly with it.
+	//
+	// SPEC uses the TPC-C specification cardinality: per warehouse 10 districts, 30k customers,
+	// 30k orders, ~300k order lines, 100k stock rows, plus a fixed 100k ITEM rows. COMPACT keeps
+	// the historical 30x-smaller counts. Resulting totals:
+	//
+	//   SF   ORDER_LINE (SPEC)   all tables (SPEC)   ORDER_LINE (COMPACT)
+	//    1             300,000            ~430,000               10,000
+	//   25           7,500,000         ~10,800,000              250,000
+	//  100          30,000,000         ~43,100,000            1,000,000
+	//
+	// COMPACT is 30x below spec, which makes even SF100 a ~1M-row database. Any measurement that
+	// compares incremental refresh against full recompute needs SPEC: under COMPACT the entire
+	// base query is cheaper than the incremental path's fixed planning floor, so full recompute
+	// wins at every delta size and the crossover cannot be observed.
+	const bool spec = profile == TPCCScaleProfile::SPEC;
 	const int num_warehouses = scale_factor;
 	const int districts_per_wh = 10;
-	const int customers_per_district = 100;
-	const int orders_per_district = 100; // ~one order per customer
+	const int customers_per_district = spec ? 3000 : 100;
+	const int orders_per_district = spec ? 3000 : 100; // ~one order per customer
 	const int order_lines_per_order = 10;
-	const int num_items = 1000;
+	const int num_items = spec ? 100000 : 1000;
 	auto N = std::to_string(num_warehouses + 1);
 	auto D = std::to_string(districts_per_wh + 1);
 	auto C = std::to_string(customers_per_district + 1);
