@@ -148,6 +148,20 @@ static const char *StrategyLabelForRefreshType(RefreshType view_type) {
 // incremental's per-statement floor beats nothing; incremental wins once recompute is genuinely
 // expensive (large joins that re-materialize a big result, or a big MV whose full replace dwarfs a
 // small delta apply).
+// TODO: replace these seven constants with weights learned per operator class. Each candidate plan
+// would contribute a feature vector of estimated rows bucketed by operator (scan, join build, join
+// probe, aggregate input, aggregate output, window, sort, write), read from the same DuckDB
+// estimator that already prices both sides, and predicted time would be that vector against weights
+// fit over recorded refreshes. A `DOUBLE[]` column on `openivm_refresh_history` alongside a small
+// integer naming the feature layout stores it without a JSON parser and without schema churn when
+// the layout changes; DuckDB's per-operator profiler output (operator_type, operator_cardinality,
+// operator_timing) supplies the per-operator actuals that say which class is mispriced.
+//
+// The motivating measurement, from the cost-model benchmark at TPC-C spec scale with calibration
+// active: the incremental side predicts within about 30% while full recompute is under-predicted by
+// a factor of two to three (4.0ms predicted against 12.0ms measured for a simple grouped aggregate,
+// 10.8ms against 21.3ms for a join). Both sides being wrong in the same direction is why decisions
+// still came out right there, and is exactly what stops holding near the crossover.
 static constexpr double RECOMPUTE_SETUP_MS = 10.0;        // fixed query setup + MV replace overhead
 static constexpr double RECOMPUTE_MS_PER_UNIT = 0.000004; // vectorized scan: nearly free per row
 static constexpr double RECOMPUTE_JOIN_FACTOR = 1.5;      // each join multiplies full-output scan cost
@@ -750,6 +764,20 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	// therefore too high by the accumulated consumed rows, and the error grows over a view's
 	// lifetime rather than staying put. Our pending counts come from the delta-activity metadata and
 	// are exact.
+	//
+	// TODO: measure the delta instead of estimating it, where the delta is small enough that a probe
+	// costs less than the error. The exact answers are one query each over a table that is normally
+	// tiny: the rows satisfying the view's predicates, the distinct group keys, and the keys that
+	// already exist in the materialized data table.
+	//
+	// This is the remaining source of error here, and it is DuckDB's statistics rather than its
+	// estimator that is missing. On an ordinary table the optimizer prunes `val > 9900` over a
+	// column of zeros to an empty result from the zone map; delta rows written by the statement under
+	// test carry no usable statistics yet, so the same predicate is estimated at full pass-through.
+	// Two cases in test/sql/auto_refresh.test record the consequence: 200 inserted rows that satisfy
+	// none of the view's filter are estimated at 200 against a true 0, and an inserted join key that
+	// matches nothing is estimated at 3.7 rows against a true 0. Both are over-estimates, so they
+	// bias toward full recompute rather than toward an incorrect result.
 	//
 	// So: fanout comes from the plan, input size comes from metadata.
 	if (incremental_plan) {
