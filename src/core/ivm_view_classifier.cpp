@@ -655,6 +655,15 @@ static void SelectGroupRecomputeAffectedMode(DeltaViewModel &model, const DeltaV
 	} else {
 		model.group_recompute_affected_mode = GroupRecomputeAffectedMode::SOURCE_DELTA;
 	}
+	if (model.group_recompute_affected_mode == GroupRecomputeAffectedMode::CURRENT_DIFF &&
+	    !input.stored_query_has_top_k) {
+		auto key = DeriveDirectSourceGroupKey(*input.facts, *input.output_names);
+		if (!key.empty()) {
+			model.group_columns = {key};
+			model.group_recompute_affected_mode = GroupRecomputeAffectedMode::DIRECT_SOURCE_KEYS;
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Proven source-key-local GROUP_RECOMPUTE on '%s'\n", key.c_str());
+		}
+	}
 }
 
 static void AttachAuxRequirements(DeltaViewModel &model, const DeltaViewModelInput &input) {

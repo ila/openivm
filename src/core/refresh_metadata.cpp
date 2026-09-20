@@ -406,6 +406,9 @@ GroupRecomputeAffectedMode RefreshMetadata::GetGroupRecomputeAffectedMode(const 
 		return GroupRecomputeAffectedMode::CURRENT_DIFF;
 	}
 	string mode = result->GetValue(0, 0).ToString();
+	if (StringUtil::CIEquals(mode, GroupRecomputeAffectedModeName(GroupRecomputeAffectedMode::DIRECT_SOURCE_KEYS))) {
+		return GroupRecomputeAffectedMode::DIRECT_SOURCE_KEYS;
+	}
 	if (StringUtil::CIEquals(mode, GroupRecomputeAffectedModeName(GroupRecomputeAffectedMode::SOURCE_DELTA))) {
 		return GroupRecomputeAffectedMode::SOURCE_DELTA;
 	}

@@ -1468,7 +1468,10 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
 
-	if (ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
+	string affected_temp_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
+	string recompute_query = view_query_sql;
+	if (affected_mode != GroupRecomputeAffectedMode::DIRECT_SOURCE_KEYS &&
+	    ShouldUseCurrentDiffGroupRecompute(view_query_sql, delta_table_specs)) {
 		OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] using current-diff affected "
 		                    "keys for large affected query\n");
 		return BuildCurrentDiffGroupRecomputeSQL(view_name, data_table, view_query_sql, group_columns, catalog_prefix,
@@ -1510,9 +1513,30 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 			                                    base, spec.last_snapshot_id, spec.current_snapshot_id) +
 			    ")";
 		} else {
-			string delta_basename = string(openivm::DELTA_PREFIX) + base;
-			delta_subselect =
-			    BuildStandardDeltaRowsSQL(catalog_prefix + SqlUtils::QuoteIdentifier(delta_basename), spec.last_update);
+			delta_subselect = BuildStandardDeltaRowsSQL(spec.delta_table_sql, spec.last_update);
+		}
+
+		if (affected_mode == GroupRecomputeAffectedMode::DIRECT_SOURCE_KEYS) {
+			// Both signs/images participate: deleting a maximum or moving a key
+			// must repair the old group as well as any new group. Do not run the
+			// view predicate against delta rows to discover affected keys.
+			if (!affected_subquery.empty()) {
+				affected_subquery += "\n  UNION\n  ";
+			}
+			affected_subquery += "SELECT DISTINCT " + group_csv + " FROM " + delta_subselect + " openivm_source_keys";
+			// The key-locality proof allows restriction of every source occurrence,
+			// including below aggregates; do not rely on backend semi-join pushdown.
+			string source_full = (lpts_table_prefix.empty() ? catalog_prefix : lpts_table_prefix) + base;
+			string source_ref = SqlUtils::FindTableReference(view_query_sql, source_full);
+			if (source_ref.empty()) {
+				source_ref = SqlUtils::FindTableReference(view_query_sql, base);
+			}
+			D_ASSERT(!source_ref.empty());
+			string restricted_source = "(SELECT * FROM " + source_ref + " AS openivm_src WHERE EXISTS (SELECT 1 FROM " +
+			                           affected_temp_table + " AS openivm_aff WHERE " +
+			                           SqlUtils::BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_src") + "))";
+			recompute_query = SqlUtils::ReplaceTableReferences(recompute_query, source_ref, restricted_source);
+			continue;
 		}
 
 		// LPTS form ALWAYS references base tables as fully-qualified `cat.schema.tbl`, even when
@@ -1552,13 +1576,12 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	// DELETE and INSERT, so materialize it once per refresh instead of recomputing the same delta-
 	// scoped view query twice.
 	string match_clause = SqlUtils::BuildNullSafeMatch(group_columns, "openivm_aff", "openivm_tgt");
-	string affected_temp_table = SqlUtils::QuoteIdentifier("openivm_affected_" + view_name);
 
 	OPENIVM_DEBUG_PRINT("[CompileGroupRecompute] %zu group cols, %zu source "
 	                    "deltas, cascade delta: %s\n",
 	                    group_columns.size(), delta_table_specs.size(), emit_cascade_delta ? "enabled" : "disabled");
 	if (!emit_cascade_delta) {
-		return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_subquery, "openivm_tgt",
+		return BuildAffectedKeyRefreshSQL(data_table, recompute_query, affected_subquery, "openivm_tgt",
 		                                  "AS openivm_tgt", "openivm_aff", match_clause, match_clause,
 		                                  affected_temp_table);
 	}
@@ -1574,7 +1597,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_subquery + ";\n\n";
 	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table +
 	       " AS openivm_tgt\nWHERE " + delete_where + ";\n\n";
-	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + recompute_query +
 	       ") AS openivm_tgt\nWHERE " + insert_where + ";\n\n";
 	sql += "DELETE FROM " + data_table + " AS openivm_tgt\nWHERE " + delete_where + ";\n\n";
 	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
