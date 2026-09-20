@@ -244,10 +244,15 @@ odd	625	25
 statement ok
 DELETE FROM agg_del WHERE grp = 'even';
 
+# 27 = 25 delta rows of compute + 2 of upsert. The upsert term is the affected group count doubled,
+# for one read and one write per group, and deleting every 'even' row affects exactly one of the two
+# groups. This read 29 while the model estimated affected groups as min(delta_rows, view_rows) = 2,
+# which could not see that the whole delta lands in a single group. The cost model now takes that
+# count from the delta plan, whose filter on grp makes the group count 1.
 query IIIIII
 PRAGMA refresh_cost('mv_agg_del');
 ----
-incremental	29.000000	56.000000	29.000000	56.000000	false
+incremental	27.000000	56.000000	27.000000	56.000000	false
 
 statement ok
 PRAGMA refresh('mv_agg_del');
@@ -382,10 +387,14 @@ SELECT count(*) FROM mv_filt;
 statement ok
 INSERT INTO filt VALUES (151, 'active', 151);
 
+# The inserted row is 'active', so exactly one row reaches the view and the delta result is 1.
+# This read 4.343928, from a delta result of about 0.5: the model multiplied the single delta row by
+# a table-wide selectivity ratio for status = 'active'. Half a row is not a quantity the refresh can
+# produce. The cost model now reads the count from the delta plan's own filter node.
 query IIIIII
 PRAGMA refresh_cost('mv_filt');
 ----
-incremental	4.343928	226.000000	4.343928	226.000000	0
+incremental	7.643856	226.000000	7.643856	226.000000	0
 
 statement ok
 PRAGMA refresh('mv_filt');
@@ -399,10 +408,13 @@ SELECT count(*) FROM mv_filt;
 statement ok
 INSERT INTO filt SELECT i, 'active', i FROM range(200, 500) t(i);
 
+# Every inserted row is 'active', so all 300 reach the view. This read 1303.083011, from a delta
+# result of about 150: the same table-wide selectivity ratio as the single-row case above, applied
+# to a batch that happens to pass the filter in full. The decision is 'full' either way.
 query IIIIII
 PRAGMA refresh_cost('mv_filt');
 ----
-full	1303.083011	379.000000	1303.083011	379.000000	0
+full	2301.727603	379.000000	2301.727603	379.000000	0
 
 statement ok
 PRAGMA refresh('mv_filt');
@@ -520,10 +532,15 @@ D	8200	20
 statement ok
 DELETE FROM xcheck WHERE cat = 'D';
 
+# Deleting every 'D' row touches one of the four groups. This read 28, pricing the merge against all
+# four, because affected groups were estimated as min(delta_rows, view_rows). Reading the count from
+# the delta plan gives three, which is closer but still not one: the plan groups the delta table
+# without knowing that every pending row carries the same category. An exact count needs
+# COUNT(DISTINCT) over the pending delta, which the delta-exact statistics work adds later.
 query IIIIII
 PRAGMA refresh_cost('mv_xcheck');
 ----
-incremental	28.000000	93.000000	28.000000	93.000000	false
+incremental	26.000000	93.000000	26.000000	93.000000	false
 
 statement ok
 PRAGMA refresh('mv_xcheck');
@@ -748,11 +765,16 @@ SELECT count(*) FROM mv_selfilt;
 statement ok
 INSERT INTO sel_base SELECT i, i FROM range(10001, 10101) t(i);
 
-# IVM cost should be reduced by filter selectivity (~1% selectivity)
+# Every inserted row has val > 9900, so all 100 reach the view and the delta result is 100.
+# This read 252.877124, from a delta result of 20: the model scaled the delta by the filter's
+# table-wide selectivity. That ratio describes the base table, where the predicate keeps 1% of rows,
+# and says nothing about a delta appended at the top of the value range. A delta is not a uniform
+# sample of the table it belongs to. The cost model now reads the count from the delta plan's own
+# filter node, which sees the delta's actual values.
 query IIIIII
 PRAGMA refresh_cost('mv_selfilt');
 ----
-incremental	252.877124	2320.000000	252.877124	2320.000000	0
+incremental	864.385619	2320.000000	864.385619	2320.000000	0
 
 statement ok
 PRAGMA refresh('mv_selfilt');
@@ -779,11 +801,20 @@ SELECT id, val FROM sel_base WHERE val > 9900 EXCEPT ALL SELECT * FROM mv_selfil
 statement ok
 INSERT INTO sel_base SELECT i, 0 FROM range(20001, 20201) t(i);
 
-# Despite 200 delta rows, filter selectivity keeps IVM cost manageable
+# The mirror of the case above, and the one the plan estimate gets worse rather than better. None of
+# the 200 inserted rows passes val > 9900, so the true delta result is 0. This read 545.754248, from
+# a delta result of 40; it now reads a delta result of 200, the full delta unreduced.
+#
+# The cause is not the model but its input: DuckDB prunes this predicate correctly on an ordinary
+# table, where the column's zone map proves no row can match, but the delta table's rows were
+# written by the statement under test and carry no usable statistics yet, so the filter is estimated
+# at full pass-through. Counting the delta rows that satisfy the view's predicate directly, rather
+# than estimating them, is what the delta-exact statistics work adds; it resolves this case and the
+# selective-insert case above to their exact values. The decision is 'incremental' either way.
 query IIIIII
 PRAGMA refresh_cost('mv_selfilt');
 ----
-incremental	545.754248	2660.000000	545.754248	2660.000000	0
+incremental	1928.771238	2660.000000	1928.771238	2660.000000	0
 
 statement ok
 PRAGMA refresh('mv_selfilt');
@@ -1281,10 +1312,14 @@ INSERT INTO ed_a VALUES (52, 999);
 statement ok
 SET openivm_skip_empty_deltas = false;
 
+# The inserted key has no match in B or C, so the join emits nothing. Neither estimate knows that:
+# this read 469.524879 from a delta result near 1.4 and now reads 487.764063 from one near 3.7,
+# against a true result of 0. Both are small next to the ~459 units of base scan that dominate this
+# term count, and the decision is unchanged.
 query IIIIII
 PRAGMA refresh_cost('mv_ed');
 ----
-incremental	469.524879	769.000000	469.524879	769.000000	0
+incremental	487.764063	769.000000	487.764063	769.000000	0
 
 statement ok
 SET openivm_skip_empty_deltas = true;

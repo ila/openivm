@@ -7,6 +7,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/planner/planner.hpp"
 #include "upsert/refresh_compiler.hpp"
 
 #include <chrono>
@@ -125,6 +126,23 @@ struct ProjectionDeleteRetryPlan {
 		return !expected_count_statement.empty() && !delete_statement.empty();
 	}
 };
+
+// The optimized incremental delta plan. Planning `ComputeDelta(...)` runs the IVM rewrite rules
+// inside Optimize(), which is what turns the view plan into one that reads delta tables. The
+// Planner is retained alongside the plan because the plan's column bindings reference its binder,
+// which LPTS serialization dereferences later.
+struct IncrementalDeltaPlan {
+	unique_ptr<Planner> planner;
+	unique_ptr<LogicalOperator> plan;
+};
+
+// Plans and optimizes the delta query for `view_name`. Runs inside a transaction on `con`, which it
+// rolls back before returning; the plan does not outlive the catalog state it was bound against any
+// more than the caller's own planning does.
+IncrementalDeltaPlan BuildIncrementalDeltaPlan(ClientContext &con_ctx, Connection &con,
+                                               const string &internal_catalog_name,
+                                               const string &internal_schema_name, const string &view_name,
+                                               bool cross_system);
 
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col);
 bool IsEmptyDeltaPlan(LogicalOperator *op);

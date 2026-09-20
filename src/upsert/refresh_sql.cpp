@@ -363,19 +363,12 @@ static void EnsureSemiAntiAuxState(RefreshMetadata &metadata, Connection &con, c
 	               });
 }
 
-// The optimized incremental delta plan. Planning `ComputeDelta(...)` runs the IVM rewrite rules
-// inside Optimize(), which is what turns the view plan into one that reads delta tables. The
-// Planner is retained alongside the plan because the plan's column bindings reference its binder,
-// which LPTS serialization dereferences later.
-struct IncrementalDeltaPlan {
-	unique_ptr<Planner> planner;
-	unique_ptr<LogicalOperator> plan;
-};
+} // namespace
 
-static IncrementalDeltaPlan BuildIncrementalDeltaPlan(ClientContext &con_ctx, Connection &con,
-                                                      const string &internal_catalog_name,
-                                                      const string &internal_schema_name, const string &view_name,
-                                                      bool cross_system) {
+IncrementalDeltaPlan BuildIncrementalDeltaPlan(ClientContext &con_ctx, Connection &con,
+                                               const string &internal_catalog_name,
+                                               const string &internal_schema_name, const string &view_name,
+                                               bool cross_system) {
 	string compute_delta = "select * from ComputeDelta('" + SqlUtils::EscapeValue(internal_catalog_name) + "','" +
 	                       SqlUtils::EscapeValue(internal_schema_name) + "','" + SqlUtils::EscapeValue(view_name) +
 	                       "');";
@@ -397,8 +390,6 @@ static IncrementalDeltaPlan BuildIncrementalDeltaPlan(ClientContext &con_ctx, Co
 	con.Rollback();
 	return result;
 }
-
-} // namespace
 
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
