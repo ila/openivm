@@ -366,9 +366,8 @@ static void EnsureSemiAntiAuxState(RefreshMetadata &metadata, Connection &con, c
 } // namespace
 
 IncrementalDeltaPlan BuildIncrementalDeltaPlan(ClientContext &con_ctx, Connection &con,
-                                               const string &internal_catalog_name,
-                                               const string &internal_schema_name, const string &view_name,
-                                               bool cross_system) {
+                                               const string &internal_catalog_name, const string &internal_schema_name,
+                                               const string &view_name, bool cross_system) {
 	string compute_delta = "select * from ComputeDelta('" + SqlUtils::EscapeValue(internal_catalog_name) + "','" +
 	                       SqlUtils::EscapeValue(internal_schema_name) + "','" + SqlUtils::EscapeValue(view_name) +
 	                       "');";
@@ -1417,8 +1416,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		IncrementalDeltaPlan delta_plan = std::move(prebuilt_delta);
 		bool reused_cost_model_plan = delta_plan.plan != nullptr;
 		if (!reused_cost_model_plan) {
-			delta_plan = BuildIncrementalDeltaPlan(con_ctx, con, internal_catalog_name, internal_schema_name,
-			                                       view_name, cross_system);
+			delta_plan = BuildIncrementalDeltaPlan(con_ctx, con, internal_catalog_name, internal_schema_name, view_name,
+			                                       cross_system);
 		}
 		auto &plan = delta_plan.plan;
 		OPENIVM_DEBUG_PRINT("[UPSERT] Optimizer done.\n");

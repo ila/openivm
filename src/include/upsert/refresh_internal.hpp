@@ -140,9 +140,8 @@ struct IncrementalDeltaPlan {
 // rolls back before returning; the plan does not outlive the catalog state it was bound against any
 // more than the caller's own planning does.
 IncrementalDeltaPlan BuildIncrementalDeltaPlan(ClientContext &con_ctx, Connection &con,
-                                               const string &internal_catalog_name,
-                                               const string &internal_schema_name, const string &view_name,
-                                               bool cross_system);
+                                               const string &internal_catalog_name, const string &internal_schema_name,
+                                               const string &view_name, bool cross_system);
 
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col);
 bool IsEmptyDeltaPlan(LogicalOperator *op);
