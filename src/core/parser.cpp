@@ -412,7 +412,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// SQL OpenIVM binds or executes itself runs against the very catalog that cannot honour the pin,
 	// so those copies drop it. The stored view SQL keeps it, and refresh re-attaches it when
 	// rendering for a foreign dialect.
-	auto local_view_query = time_travel_pins.StripFrom(original_view_query);
+	auto local_view_query = time_travel_pins.StripFrom(context, original_view_query);
 	try {
 		table_names = con.GetTableNames(statement->query);
 	} catch (const std::exception &e) {
@@ -1367,7 +1367,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		if (!current_catalog.empty() && current_catalog != default_db) {
 			con.Query("USE " + current_catalog_schema);
 		}
-		string local_initial_load_query = time_travel_pins.StripFrom(view_query);
+		string local_initial_load_query = time_travel_pins.StripFrom(context, view_query);
 		string initial_load_statement = "CREATE TABLE " + initial_load_target + " AS " + local_initial_load_query;
 		string diagnostic;
 		diagnostic += "\n[OpenIVM initial-load diagnostic]\n";
@@ -1412,7 +1412,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		ddl.push_back(BuildSemiAntiInitialDataSQL(initial_load_target, aux_target, meta.join_type, meta.left_cols,
 		                                          meta.output_cols, meta.null_aware, meta.null_aware_left_col));
 	} else {
-		ddl.push_back("create table " + initial_load_target + " as " + time_travel_pins.StripFrom(view_query));
+		ddl.push_back("create table " + initial_load_target + " as " + time_travel_pins.StripFrom(context, view_query));
 	}
 	if (staged_cross_catalog_replace) {
 		// DuckDB cannot make the DuckLake objects and native metadata atomic

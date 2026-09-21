@@ -36,7 +36,7 @@ public:
 	SnapshotResolver Resolver() const;
 
 	// Strip pins from a SELECT for local stand-in execution; stored metadata keeps the pinned query.
-	string StripFrom(const string &sql) const;
+	string StripFrom(ClientContext &context, const string &sql) const;
 
 	// Re-attach foreign qualifiers, in `dialect`'s own spelling, to the scans of that relation
 	// in already-rendered `sql`. Refresh programs for several view shapes (min/max aggregates,

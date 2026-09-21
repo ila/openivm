@@ -123,3 +123,25 @@ SELECT (SELECT COUNT(*) FROM (SELECT * FROM tt_native_short EXCEPT ALL SELECT * 
        (SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM tt_native_short));
 ----
 0	0
+
+# Interrupted-refresh recovery must render native pins in the requested output dialect too.
+statement ok
+UPDATE openivm_views SET refresh_in_progress=true WHERE view_name='tt_native_snapshot';
+
+query I
+SELECT COUNT(*) > 0 AND COUNT(*) FILTER (WHERE sql LIKE '%`tt_orders` VERSION AS OF 2%') > 0
+       AND COUNT(*) FILTER (WHERE sql LIKE '%AT (VERSION%') = 0
+FROM openivm_compile_with_facts('tt_native_snapshot', '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind='data';
+----
+true
+
+statement ok
+PRAGMA refresh('tt_native_snapshot');
+
+query II
+WITH expected AS (SELECT c_id, SUM(amount) AS total FROM dl.tt_orders AT (VERSION => 2) GROUP BY c_id)
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM tt_native_snapshot EXCEPT ALL SELECT * FROM expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM tt_native_snapshot));
+----
+0	0

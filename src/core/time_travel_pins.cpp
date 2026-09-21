@@ -239,21 +239,17 @@ TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statem
 			qualify_source(ref);
 		}
 		if (!ref.at_clause) {
-			// Every unpinned scan is recorded, including one in a catalog that honours pins
-			// natively: re-attachment is keyed by relation name and an unqualified pin matches any
-			// catalog, so a pin peeled off one relation would otherwise land on a same-named
-			// relation that was deliberately read unpinned.
+			// Track native scans too: the pin map is keyed by relation name, so mixed pinned and
+			// unpinned uses of that name cannot be represented safely.
 			unpinned.insert(ref.table_name);
 			return;
 		}
 		Pin pin;
-		// INVALID_CATALOG / INVALID_SCHEMA are the empty string, so an unqualified reference already
-		// stores the "" this map treats as "matches any qualifier".
 		pin.catalog = ref.catalog_name;
 		pin.schema = ref.schema_name;
 		auto relation = LookupPinRelation(context, ref);
 		pin.binds_natively = !relation || relation->ParentCatalog().SupportsTimeTravel();
-		if (relation && pin.binds_natively) {
+		if (relation) {
 			pin.catalog = relation->ParentCatalog().GetName();
 			pin.schema = relation->ParentSchema().name;
 		}
@@ -325,11 +321,11 @@ static idx_t CopyQuotedRun(const string &sql, idx_t start, string &result) {
 	return i;
 }
 
-string TimeTravelPins::StripFrom(const string &sql) const {
+string TimeTravelPins::StripFrom(ClientContext &context, const string &sql) const {
 	if (pins.empty()) {
 		return sql;
 	}
-	Parser parser;
+	Parser parser(context.GetParserOptions());
 	parser.ParseQuery(sql);
 	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 		throw InternalException("Expected one view query while stripping time-travel pins");
@@ -340,8 +336,9 @@ string TimeTravelPins::StripFrom(const string &sql) const {
 			return;
 		}
 		auto &pin = entry->second;
-		if ((pin.catalog.empty() || StringUtil::CIEquals(pin.catalog, ref.catalog_name)) &&
-		    (pin.schema.empty() || StringUtil::CIEquals(pin.schema, ref.schema_name))) {
+		auto relation = LookupPinRelation(context, ref);
+		if (relation && StringUtil::CIEquals(pin.catalog, relation->ParentCatalog().GetName()) &&
+		    StringUtil::CIEquals(pin.schema, relation->ParentSchema().name)) {
 			ref.at_clause.reset();
 		}
 	};
@@ -467,63 +464,6 @@ static bool OpensDerivedTable(const string &sql, idx_t pos) {
 	       StringUtil::CIEquals(token, "from");
 }
 
-// Names a `WITH` clause binds in `sql`. A CTE reference is a name, not a scan, so it must never be
-// handed a snapshot qualifier even when it shadows a pinned relation.
-static case_insensitive_set_t CollectCteNames(const string &sql) {
-	case_insensitive_set_t names;
-	string candidate;
-	idx_t i = 0;
-	while (i < sql.size()) {
-		char c = sql[i];
-		if (c == '\'') {
-			string ignored;
-			i = CopyQuotedRun(sql, i, ignored);
-			candidate.clear();
-			continue;
-		}
-		if (c == '"' || c == '`') {
-			string quoted;
-			i = CopyQuotedRun(sql, i, quoted);
-			candidate = quoted.size() >= 2 ? quoted.substr(1, quoted.size() - 2) : quoted;
-			continue;
-		}
-		if (IsIdentStart(c)) {
-			idx_t end = i;
-			while (end < sql.size() && (IsIdentPart(sql[end]) || sql[end] == '$')) {
-				end++;
-			}
-			auto token = sql.substr(i, end - i);
-			i = end;
-			if (!StringUtil::CIEquals(token, "as")) {
-				candidate = token;
-				continue;
-			}
-			// `name AS (`, `name (columns) AS (` and `name AS [NOT] MATERIALIZED (` all define a CTE;
-			// nothing else puts a parenthesis directly behind `AS`.
-			idx_t cursor = SkipIgnorableSpan(sql, i);
-			for (idx_t modifiers = 0; modifiers < 2; modifiers++) {
-				idx_t keyword_end;
-				string keyword;
-				if (!TryReadIdentifierToken(sql, cursor, keyword_end, keyword) ||
-				    (!StringUtil::CIEquals(keyword, "not") && !StringUtil::CIEquals(keyword, "materialized"))) {
-					break;
-				}
-				cursor = SkipIgnorableSpan(sql, keyword_end);
-			}
-			if (cursor < sql.size() && sql[cursor] == '(' && !candidate.empty()) {
-				names.insert(candidate);
-			}
-			continue;
-		}
-		// A column-alias list sits between the CTE name and its `AS`, so parentheses keep the name.
-		if (c != '(' && c != ')' && !std::isspace(static_cast<unsigned char>(c))) {
-			candidate.clear();
-		}
-		i++;
-	}
-	return names;
-}
-
 string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) const {
 	if (pins.empty()) {
 		return sql;
@@ -536,7 +476,6 @@ string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) con
 	bool expect_relation = false;
 	vector<bool> from_list_open;
 	from_list_open.push_back(false);
-	auto cte_names = CollectCteNames(sql);
 	idx_t i = 0;
 	while (i < sql.size()) {
 		char c = sql[i];
@@ -565,16 +504,13 @@ string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) con
 			if (expect_relation) {
 				expect_relation = false;
 				auto entry = pins.find(final_component);
-				if (entry == pins.end() || entry->second.binds_natively) {
+				// PrepareViewQuerySources qualifies base scans in the parsed tree, not CTE references.
+				// Plan-rendered scans already carry their pins, even with output qualification overrides.
+				if (!qualified || entry == pins.end() || entry->second.binds_natively) {
 					continue;
 				}
 				auto dialect_suffix = RenderSnapshotSuffix(entry->second.snapshot.get(), dialect);
 				if (CarriesQualifierAt(sql, i, dialect_suffix)) {
-					continue;
-				}
-				if (!qualified && cte_names.find(final_component) != cte_names.end()) {
-					// A bare name this query itself binds: the scan it stands for was pinned where the
-					// CTE was defined, and only a real relation can carry a qualifier.
 					continue;
 				}
 				result += dialect_suffix;

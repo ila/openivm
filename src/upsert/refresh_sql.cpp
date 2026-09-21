@@ -46,23 +46,27 @@ static string SparkPortableRefreshSQL(string sql) {
 	return sql;
 }
 
-static string RenderStoredViewQueryForDialect(ClientContext &context, const string &view_query_sql,
+static string RenderStoredViewQueryForDialect(Connection &con, const string &view_query_sql,
                                               const vector<string> &output_names, SqlDialect dialect,
                                               const openivm::TimeTravelPins &time_travel_pins) {
-	Parser parser(context.GetParserOptions());
-	parser.ParseQuery(view_query_sql);
-	if (parser.statements.size() != 1) {
-		throw ParserException("Expected one stored view query, found %llu",
-		                      static_cast<idx_t>(parser.statements.size()));
-	}
-	Planner planner(context);
-	// Source qualification already stripped foreign pins; native catalog snapshots remain bindable.
-	planner.CreatePlan(std::move(parser.statements[0]));
-	auto plan = std::move(planner.plan);
-	auto ast = LogicalPlanToAst(context, plan, dialect,
-	                            dialect == SqlDialect::DUCKDB ? SnapshotResolver() : time_travel_pins.Resolver());
-	auto cte_list = AstToCteList(*ast, dialect);
-	auto rendered = cte_list->ToQuery(true, output_names);
+	string rendered;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &context = *con.context;
+		Parser parser(context.GetParserOptions());
+		parser.ParseQuery(view_query_sql);
+		if (parser.statements.size() != 1) {
+			throw ParserException("Expected one stored view query, found %llu",
+			                      static_cast<idx_t>(parser.statements.size()));
+		}
+		Planner planner(context);
+		// Source qualification already stripped foreign pins; native catalog snapshots remain bindable.
+		planner.CreatePlan(std::move(parser.statements[0]));
+		auto plan = std::move(planner.plan);
+		auto ast = LogicalPlanToAst(context, plan, dialect,
+		                            dialect == SqlDialect::DUCKDB ? SnapshotResolver() : time_travel_pins.Resolver());
+		auto cte_list = AstToCteList(*ast, dialect);
+		rendered = cte_list->ToQuery(true, output_names);
+	});
 	if (!rendered.empty() && rendered.back() == ';') {
 		rendered.pop_back();
 	}
@@ -518,8 +522,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (!flag_result->HasError() && flag_result->RowCount() > 0 && !flag_result->GetValue(0, 0).IsNull() &&
 		    flag_result->GetValue(0, 0).GetValue<bool>()) {
 			Printer::Print("Warning: recovering '" + view_name + "' from interrupted refresh via full recompute.");
+			auto recovery_source_sql = view_query_sql;
+			if (!view_time_travel_pins.Empty() && active_facts.target_dialect != SqlDialect::DUCKDB) {
+				recovery_source_sql = RenderStoredViewQueryForDialect(
+				    con, view_query_sql, vector<string>(), active_facts.target_dialect, view_time_travel_pins);
+			}
 			auto recovery_query =
-			    BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+			    BuildRecomputeQuery(metadata, view_name, recovery_source_sql, cross_system, attached_db_catalog_name,
 			                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta);
 			if (cross_system) {
 				metadata.SetRefreshInProgress(view_name, false);
@@ -623,16 +632,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		auto full_refresh_start = profile_now();
 		string recompute_source_sql = view_query_sql;
 		if (!view_time_travel_pins.Empty() && active_facts.target_dialect != SqlDialect::DUCKDB) {
-			con.BeginTransaction();
-			try {
-				recompute_source_sql =
-				    RenderStoredViewQueryForDialect(planning_context, view_query_sql, vector<string>(),
-				                                    active_facts.target_dialect, view_time_travel_pins);
-				con.Rollback();
-			} catch (...) {
-				con.Rollback();
-				throw;
-			}
+			recompute_source_sql = RenderStoredViewQueryForDialect(con, view_query_sql, vector<string>(),
+			                                                       active_facts.target_dialect, view_time_travel_pins);
 		}
 		auto recompute_query =
 		    BuildRecomputeQuery(metadata, view_name, recompute_source_sql, cross_system, attached_db_catalog_name,
@@ -1178,15 +1179,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					output_names.push_back(column_name);
 				}
 			}
-			con.BeginTransaction();
-			try {
-				full_recompute_query = RenderStoredViewQueryForDialect(
-				    planning_context, view_query_sql, output_names, active_facts.target_dialect, view_time_travel_pins);
-				con.Rollback();
-			} catch (...) {
-				con.Rollback();
-				throw;
-			}
+			full_recompute_query = RenderStoredViewQueryForDialect(con, view_query_sql, output_names,
+			                                                       active_facts.target_dialect, view_time_travel_pins);
 		}
 		upsert_query = CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));

@@ -568,11 +568,11 @@ UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_j
 statement ok
 UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_comma';
 
-# Interrupted-refresh recovery recomputes from the stored text, so this is where a raw qualifier
-# would survive: an explicit JOIN keeps one pin per side...
+# Recovery renders through LPTS: original aliases become CTE bindings, and each qualified
+# source scan must retain its own pin in the target dialect.
 query I
-SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 AS o%'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 AS c%'
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`memory`.`main`.`tt_orders` VERSION AS OF 366%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`memory`.`main`.`tt_customers` VERSION AS OF 12%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts('tt_text_join', '{"target_dialect":"spark","compile_only":true}')
@@ -582,8 +582,8 @@ WHERE stmt_kind = 'data';
 
 # ... and so does a comma FROM list, where every implicit cross join is a scan of its own.
 query I
-SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 AS o , %'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 AS c %'
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`memory`.`main`.`tt_orders` VERSION AS OF 366%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`memory`.`main`.`tt_customers` VERSION AS OF 12%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts('tt_text_comma', '{"target_dialect":"spark","compile_only":true}')
@@ -636,7 +636,7 @@ INSERT INTO tt_spare VALUES (1, 3), (1, 3), (2, 20);
 
 statement ok
 CREATE MATERIALIZED VIEW tt_text_shadow AS
-    WITH tt_orders AS (
+    WITH tt_orders(c_id, amount) AS (
         SELECT c_id, amount FROM tt_orders VERSION AS OF 366
         EXCEPT ALL
         SELECT c_id, amount FROM tt_spare
@@ -647,9 +647,10 @@ statement ok
 UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_shadow';
 
 query I
-SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366%'
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`memory`.`main`.`tt_orders` VERSION AS OF 366%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%VERSION AS OF 366 VERSION AS OF%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%FROM tt_orders VERSION AS OF%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts('tt_text_shadow', '{"target_dialect":"spark","compile_only":true}')
 WHERE stmt_kind = 'data';
@@ -761,10 +762,10 @@ UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_p
 statement ok
 UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_derived';
 
-# Parsed serialization removes redundant parentheses and makes aliases and INNER JOIN explicit.
+# LPTS renders the parenthesized join through CTEs; pins stay on the correct qualified scans.
 query I
-SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 AS o INNER JOIN%'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 AS c %'
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`memory`.`main`.`tt_orders` VERSION AS OF 366%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`memory`.`main`.`tt_customers` VERSION AS OF 12%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts('tt_text_paren', '{"target_dialect":"spark","compile_only":true}')
@@ -774,8 +775,8 @@ WHERE stmt_kind = 'data';
 
 # Nested parentheses defer the question one level, so the innermost element is still a scan.
 query I
-SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 AS o %'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 AS c%'
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`memory`.`main`.`tt_orders` VERSION AS OF 366%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`memory`.`main`.`tt_customers` VERSION AS OF 12%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts('tt_text_paren_nested', '{"target_dialect":"spark","compile_only":true}')
@@ -785,7 +786,7 @@ WHERE stmt_kind = 'data';
 
 # The derived table keeps exactly one pin - on the scan inside it, never on the subquery itself.
 query I
-SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366%'
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`memory`.`main`.`tt_orders` VERSION AS OF 366%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%) VERSION AS OF%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
             THEN 1 ELSE 0 END
@@ -852,6 +853,60 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+statement ok
+SET openivm_input_dialect='duckdb';
+
+# Foreign pins use resolved catalog identity too: memory.table is not schema.table.
+statement ok
+CREATE TABLE tt_identity(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO tt_identity VALUES (1, 10), (1, 10), (2, 20);
+
+statement ok
+SET openivm_input_dialect='spark';
+
+statement ok
+CREATE MATERIALIZED VIEW tt_identity_mv AS
+SELECT a.k, SUM(a.v + b.v) AS total
+FROM memory.tt_identity VERSION AS OF 7 a
+JOIN memory.main.tt_identity VERSION AS OF 7 b ON a.k = b.k GROUP BY a.k;
+
+query I
+SELECT sql_string LIKE '%AT (VERSION => 7)%' FROM openivm_views WHERE view_name='tt_identity_mv';
+----
+true
+
+query I
+SELECT COUNT(*) > 0 AND COUNT(*) FILTER (WHERE sql LIKE '%`tt_identity` VERSION AS OF 7%') > 0
+       AND COUNT(*) FILTER (WHERE sql LIKE '%AT (VERSION%') = 0
+FROM openivm_compile_with_facts('tt_identity_mv', '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind='data';
+----
+true
+
+statement ok
+INSERT INTO tt_identity VALUES (1, 5), (2, 30);
+
+statement ok
+UPDATE tt_identity SET v = v + 1 WHERE k = 1;
+
+statement ok
+DELETE FROM tt_identity WHERE k = 2;
+
+statement ok
+INSERT INTO tt_identity VALUES (2, 7), (2, 7);
+
+statement ok
+PRAGMA refresh('tt_identity_mv');
+
+query II
+WITH expected AS (SELECT a.k, SUM(a.v + b.v) AS total FROM tt_identity a JOIN tt_identity b ON a.k=b.k GROUP BY a.k)
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM tt_identity_mv EXCEPT ALL SELECT * FROM expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM tt_identity_mv));
+----
+0	0
 
 statement ok
 SET openivm_input_dialect='duckdb';
