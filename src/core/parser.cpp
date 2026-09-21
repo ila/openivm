@@ -25,7 +25,10 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
@@ -412,7 +415,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// SQL OpenIVM binds or executes itself runs against the very catalog that cannot honour the pin,
 	// so those copies drop it. The stored view SQL keeps it, and refresh re-attaches it when
 	// rendering for a foreign dialect.
-	auto local_view_query = time_travel_pins.StripFrom(context, original_view_query);
+	auto &select_statement = *statement->Cast<CreateStatement>().info->Cast<CreateTableInfo>().query;
+	auto local_view_query = time_travel_pins.Empty() ? original_view_query : select_statement.ToString();
 	try {
 		table_names = con.GetTableNames(statement->query);
 	} catch (const std::exception &e) {
@@ -444,10 +448,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	bool has_computed_sum_aggregate_projection = false;
 	{
 		auto select_parse_plan_start = create_profile_now();
-		Parser select_parser;
-		select_parser.ParseQuery(local_view_query);
 		Planner select_planner(context);
-		select_planner.CreatePlan(std::move(select_parser.statements[0]));
+		select_planner.CreatePlan(select_statement.Copy());
 		auto select_plan = std::move(select_planner.plan);
 		visible_output_count = select_planner.names.size();
 		for (auto &name : select_planner.names) {

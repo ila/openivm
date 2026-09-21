@@ -413,21 +413,12 @@ static bool CarriesQualifierAt(const string &sql, idx_t pos, const string &quali
 // Advance past whitespace and comments so a qualifier written behind either is still found.
 static idx_t SkipIgnorableSpan(const string &sql, idx_t pos) {
 	while (pos < sql.size()) {
-		if (std::isspace(static_cast<unsigned char>(sql[pos]))) {
-			pos++;
-			continue;
+		pos = SkipWhitespace(sql, pos);
+		idx_t end;
+		if (pos == sql.size() || (sql[pos] != '-' && sql[pos] != '/') || !TryReadSkippableSqlSpan(sql, pos, end)) {
+			break;
 		}
-		if (sql[pos] == '-' && pos + 1 < sql.size() && sql[pos + 1] == '-') {
-			auto newline = sql.find('\n', pos);
-			pos = newline == string::npos ? sql.size() : newline + 1;
-			continue;
-		}
-		if (sql[pos] == '/' && pos + 1 < sql.size() && sql[pos + 1] == '*') {
-			auto close = sql.find("*/", pos + 2);
-			pos = close == string::npos ? sql.size() : close + 2;
-			continue;
-		}
-		break;
+		pos = end;
 	}
 	return pos;
 }
@@ -479,22 +470,14 @@ string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) con
 	idx_t i = 0;
 	while (i < sql.size()) {
 		char c = sql[i];
-		if (c == '\'') {
-			i = CopyQuotedRun(sql, i, result);
-			expect_relation = false;
-			continue;
-		}
-		if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-			while (i < sql.size() && sql[i] != '\n') {
-				result += sql[i++];
-			}
-			continue;
-		}
-		if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-			auto close = sql.find("*/", i + 2);
-			auto end = close == string::npos ? sql.size() : close + 2;
+		idx_t end;
+		// Quoted identifiers must reach relation matching below; only literals/comments are skipped.
+		if (c != '"' && TryReadSkippableSqlSpan(sql, i, end)) {
 			result.append(sql, i, end - i);
 			i = end;
+			if (c == '\'') {
+				expect_relation = false;
+			}
 			continue;
 		}
 		if (IsIdentStart(c) || c == '"' || c == '`') {

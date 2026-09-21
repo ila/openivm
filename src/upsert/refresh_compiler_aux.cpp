@@ -20,26 +20,8 @@ static string DeltaSourceRef(const string &source, const string &catalog_prefix)
 	return catalog_prefix + SqlUtils::QuoteIdentifier(source);
 }
 
-static string TrimCopy(const string &input) {
-	idx_t start = 0;
-	while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
-		start++;
-	}
-	idx_t end = input.size();
-	while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
-		end--;
-	}
-	return input.substr(start, end - start);
-}
-
-static string LowerCopy(string input) {
-	std::transform(input.begin(), input.end(), input.begin(),
-	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-	return input;
-}
-
 static string StripIdentifierQuotes(string input) {
-	input = TrimCopy(input);
+	input = SqlUtils::TrimSQLFragment(input);
 	if (input.size() >= 2 && input.front() == '"' && input.back() == '"') {
 		return input.substr(1, input.size() - 2);
 	}
@@ -97,16 +79,16 @@ static vector<string> SplitTopLevelComma(const string &input) {
 		} else if (c == ')' && depth > 0) {
 			depth--;
 		} else if (c == ',' && depth == 0) {
-			parts.push_back(TrimCopy(input.substr(start, i - start)));
+			parts.push_back(SqlUtils::TrimSQLFragment(input.substr(start, i - start)));
 			start = i + 1;
 		}
 	}
-	parts.push_back(TrimCopy(input.substr(start)));
+	parts.push_back(SqlUtils::TrimSQLFragment(input.substr(start)));
 	return parts;
 }
 
 static idx_t FindTopLevelFrom(const string &input) {
-	string lower = LowerCopy(input);
+	string lower = StringUtil::Lower(input);
 	int depth = 0;
 	for (idx_t i = 0; i + 6 <= lower.size(); i++) {
 		char c = lower[i];
@@ -124,7 +106,7 @@ static idx_t FindTopLevelFrom(const string &input) {
 }
 
 static idx_t FindTopLevelKeyword(const string &input, const string &keyword, idx_t start = 0) {
-	string lower = LowerCopy(input);
+	string lower = StringUtil::Lower(input);
 	string needle = " " + keyword + " ";
 	int depth = 0;
 	for (idx_t i = start; i + needle.size() <= lower.size(); i++) {
@@ -169,7 +151,7 @@ static bool ParsePassthroughProjection(const string &item, pair<string, string> 
 	string expr = item;
 	string output;
 	if (std::regex_match(item, match, alias_regex)) {
-		expr = TrimCopy(match[1].str());
+		expr = SqlUtils::TrimSQLFragment(match[1].str());
 		output = StripIdentifierQuotes(match[2].str());
 	} else {
 		output = StripIdentifierQuotes(expr);
@@ -183,16 +165,16 @@ static bool ParsePassthroughProjection(const string &item, pair<string, string> 
 }
 
 static bool ParseWindowSpec(const string &spec_input, string &partition_col, string &order_col) {
-	string spec = TrimCopy(spec_input);
-	string spec_lower = LowerCopy(spec);
+	string spec = SqlUtils::TrimSQLFragment(spec_input);
+	string spec_lower = StringUtil::Lower(spec);
 	auto part_pos = spec_lower.find("partition by ");
 	auto order_pos = spec_lower.find(" order by ");
 	if (part_pos == string::npos || order_pos == string::npos || order_pos <= part_pos) {
 		return false;
 	}
-	string part_expr = TrimCopy(spec.substr(part_pos + 13, order_pos - (part_pos + 13)));
-	string order_expr = TrimCopy(spec.substr(order_pos + 10));
-	string order_lower = LowerCopy(order_expr);
+	string part_expr = SqlUtils::TrimSQLFragment(spec.substr(part_pos + 13, order_pos - (part_pos + 13)));
+	string order_expr = SqlUtils::TrimSQLFragment(spec.substr(order_pos + 10));
+	string order_lower = StringUtil::Lower(order_expr);
 	auto frame_pos = order_lower.find(" rows ");
 	if (frame_pos == string::npos) {
 		frame_pos = order_lower.find(" range ");
@@ -202,19 +184,19 @@ static bool ParseWindowSpec(const string &spec_input, string &partition_col, str
 		if (frame.find("unbounded preceding") == string::npos || frame.find("current row") == string::npos) {
 			return false;
 		}
-		order_expr = TrimCopy(order_expr.substr(0, frame_pos));
+		order_expr = SqlUtils::TrimSQLFragment(order_expr.substr(0, frame_pos));
 	}
-	auto nulls_pos = LowerCopy(order_expr).find(" nulls ");
+	auto nulls_pos = StringUtil::Lower(order_expr).find(" nulls ");
 	if (nulls_pos != string::npos) {
-		order_expr = TrimCopy(order_expr.substr(0, nulls_pos));
+		order_expr = SqlUtils::TrimSQLFragment(order_expr.substr(0, nulls_pos));
 	}
 	auto order_space = order_expr.find(' ');
 	if (order_space != string::npos) {
-		string suffix = LowerCopy(TrimCopy(order_expr.substr(order_space + 1)));
+		string suffix = StringUtil::Lower(SqlUtils::TrimSQLFragment(order_expr.substr(order_space + 1)));
 		if (suffix != "asc") {
 			return false;
 		}
-		order_expr = TrimCopy(order_expr.substr(0, order_space));
+		order_expr = SqlUtils::TrimSQLFragment(order_expr.substr(0, order_space));
 	}
 	string parsed_part = StripIdentifierQuotes(part_expr);
 	string parsed_order = StripIdentifierQuotes(order_expr);
@@ -241,7 +223,8 @@ static bool ParseNamedWindows(const string &tail, std::map<string, string> &name
 		if (!std::regex_match(item, match, named_regex)) {
 			return false;
 		}
-		named_windows[StringUtil::Lower(StripIdentifierQuotes(match[1].str()))] = TrimCopy(match[2].str());
+		named_windows[StringUtil::Lower(StripIdentifierQuotes(match[1].str()))] =
+		    SqlUtils::TrimSQLFragment(match[2].str());
 	}
 	return !named_windows.empty();
 }
@@ -254,7 +237,7 @@ static bool ParseRunningWindowProjection(const string &item, const std::map<stri
 	if (!std::regex_match(item, alias_match, alias_regex)) {
 		return false;
 	}
-	string expr = TrimCopy(alias_match[1].str());
+	string expr = SqlUtils::TrimSQLFragment(alias_match[1].str());
 	out.output_column = StripIdentifierQuotes(alias_match[2].str());
 	static const std::regex window_regex(R"(^\s*(sum|min|max|count|avg)\s*\(\s*([^)]+?)\s*\)\s+over\s*\((.*)\)\s*$)",
 	                                     std::regex_constants::icase);
@@ -273,12 +256,12 @@ static bool ParseRunningWindowProjection(const string &item, const std::map<stri
 		}
 		spec = found->second;
 	} else {
-		spec = TrimCopy(window_match[3].str());
+		spec = SqlUtils::TrimSQLFragment(window_match[3].str());
 	}
 	if (!ParseWindowSpec(spec, partition_col, order_col)) {
 		return false;
 	}
-	out.function_name = LowerCopy(window_match[1].str());
+	out.function_name = StringUtil::Lower(window_match[1].str());
 	out.argument = StripIdentifierQuotes(window_match[2].str());
 	return true;
 }
@@ -291,10 +274,10 @@ static bool ParseRunningWindowExpression(const string &expr, RunningWindowExpr &
 	if (!std::regex_match(expr, window_match, window_regex)) {
 		return false;
 	}
-	if (!ParseWindowSpec(TrimCopy(window_match[3].str()), partition_col, order_col)) {
+	if (!ParseWindowSpec(SqlUtils::TrimSQLFragment(window_match[3].str()), partition_col, order_col)) {
 		return false;
 	}
-	out.function_name = LowerCopy(window_match[1].str());
+	out.function_name = StringUtil::Lower(window_match[1].str());
 	out.argument = StripIdentifierQuotes(window_match[2].str());
 	return true;
 }
@@ -323,8 +306,8 @@ static bool LooksLikeLptsAlias(const string &expr) {
 
 static bool TryParseRunningWindowPlan(const string &view_query_sql, const vector<string> &partition_columns,
                                       const vector<string> &column_names, RunningWindowPlan &plan) {
-	string query = TrimCopy(view_query_sql);
-	if (!StringUtil::StartsWith(LowerCopy(query), "select ")) {
+	string query = SqlUtils::TrimSQLFragment(view_query_sql);
+	if (!StringUtil::StartsWith(StringUtil::Lower(query), "select ")) {
 		return false;
 	}
 	auto from_pos = FindTopLevelFrom(query);
@@ -332,12 +315,12 @@ static bool TryParseRunningWindowPlan(const string &view_query_sql, const vector
 		return false;
 	}
 	string select_list = query.substr(7, from_pos - 7);
-	string from_tail = TrimCopy(query.substr(from_pos + 6));
+	string from_tail = SqlUtils::TrimSQLFragment(query.substr(from_pos + 6));
 	std::map<string, string> named_windows;
 	auto window_pos = FindTopLevelKeyword(" " + from_tail, "window");
 	if (window_pos != string::npos) {
-		string source_tail = TrimCopy(from_tail.substr(0, window_pos - 1));
-		string window_tail = TrimCopy(from_tail.substr(window_pos + 7));
+		string source_tail = SqlUtils::TrimSQLFragment(from_tail.substr(0, window_pos - 1));
+		string window_tail = SqlUtils::TrimSQLFragment(from_tail.substr(window_pos + 7));
 		if (!ParseNamedWindows(window_tail, named_windows)) {
 			return false;
 		}
@@ -350,7 +333,7 @@ static bool TryParseRunningWindowPlan(const string &view_query_sql, const vector
 	auto parsed_partition = partition_columns.empty() ? "" : PartitionOutputColumn(partition_columns[0]);
 	string parsed_order;
 	for (auto &item : SplitTopLevelComma(select_list)) {
-		if (LowerCopy(item).find(" over ") != string::npos) {
+		if (StringUtil::Lower(item).find(" over ") != string::npos) {
 			RunningWindowExpr expr;
 			if (!ParseRunningWindowProjection(item, named_windows, expr, parsed_partition, parsed_order)) {
 				return false;
@@ -423,7 +406,7 @@ static string NormalizeLptsRunningWindowSql(const string &sql) {
 static bool TryParseLptsRunningWindowPlan(const string &raw_view_query_sql, const vector<string> &partition_columns,
                                           const vector<string> &column_names, RunningWindowPlan &plan) {
 	string view_query_sql = NormalizeLptsRunningWindowSql(raw_view_query_sql);
-	string lower = LowerCopy(view_query_sql);
+	string lower = StringUtil::Lower(view_query_sql);
 	// The first CTE in a running-window LPTS program is the base table scan. Locate it via the
 	// leading WITH rather than the CTE name, which the refactor changed from "scan_0" to "t0_scan".
 	auto scan_pos = lower.find("with");
@@ -538,7 +521,7 @@ static bool TryParseLptsRunningWindowPlan(const string &raw_view_query_sql, cons
 			auto &item = cte_items[item_idx];
 			string output_alias = StripIdentifierQuotes(cte_aliases[item_idx]);
 			string output_key = StringUtil::Lower(output_alias);
-			if (LowerCopy(item).find(" over ") == string::npos) {
+			if (StringUtil::Lower(item).find(" over ") == string::npos) {
 				string source_key = StringUtil::Lower(StripIdentifierQuotes(item));
 				auto passthrough = alias_to_output.find(source_key);
 				if (passthrough != alias_to_output.end()) {
@@ -550,7 +533,7 @@ static bool TryParseLptsRunningWindowPlan(const string &raw_view_query_sql, cons
 					next_alias_to_output[output_key] = scan_passthrough->second;
 					continue;
 				}
-				string item_lower = LowerCopy(TrimCopy(item));
+				string item_lower = StringUtil::Lower(SqlUtils::TrimSQLFragment(item));
 				if (StringUtil::StartsWith(item_lower, "case ")) {
 					RunningDerivedExpr derived;
 					derived.output_column = output_alias;
@@ -1603,8 +1586,7 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		// No PARTITION BY (global surrogate-key window) or no partition key resolvable in any
 		// source delta table → nothing to scope the recompute to. Keep the cascade delta the
 		// caller asked for so downstream MVs stay incremental.
-		return emit_cascade_delta ? CompileFullRecomputeWithCascadeDelta(view_name, view_query_sql, catalog_prefix)
-		                          : CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
+		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix, emit_cascade_delta);
 	}
 	if (running_window_incremental) {
 		auto suffix_sql = BuildRunningWindowSuffixRefreshSQL(view_name, view_query_sql, delta_ts_filter, catalog_prefix,

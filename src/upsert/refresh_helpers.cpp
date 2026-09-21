@@ -1314,9 +1314,9 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
 	Parser parser(con.context->GetParserOptions());
 	parser.ParseQuery(view_query_sql);
 	bool qualified = false;
-	con.BeginTransaction();
-	try {
-		auto pins = openivm::TimeTravelPins::Peel(*con.context, *parser.statements.at(0), [&](BaseTableRef &ref) {
+	openivm::TimeTravelPins pins;
+	con.context->RunFunctionInTransaction([&]() {
+		pins = openivm::TimeTravelPins::Peel(*con.context, *parser.statements.at(0), [&](BaseTableRef &ref) {
 			auto location = locations.find(ref.table_name);
 			if (location != locations.end() && (ref.catalog_name != location->second.catalog_name ||
 			                                    ref.schema_name != location->second.schema_name)) {
@@ -1328,12 +1328,8 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
 		if (qualified || !pins.Empty()) {
 			view_query_sql = parser.statements[0]->ToString();
 		}
-		con.Rollback();
-		return pins;
-	} catch (const std::exception &) {
-		con.Rollback();
-		throw;
-	}
+	});
+	return pins;
 }
 
 static string HexEncodeToken(const string &input) {
