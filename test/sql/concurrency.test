@@ -832,3 +832,52 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Parallel workers must share one transaction guard. A lost guard leaves a stale
+# owner after COMMIT and deadlocks the next connection's refresh.
+statement ok
+SET threads=8;
+
+statement ok
+PRAGMA verify_parallelism;
+
+statement ok
+CREATE TABLE parallel_gate_src (id INTEGER, v INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW parallel_gate_mv AS
+SELECT id % 16 AS grp, SUM(v) AS total, COUNT(*) AS cnt
+FROM parallel_gate_src GROUP BY id % 16;
+
+loop batch 0 20
+
+statement ok
+INSERT INTO parallel_gate_src SELECT i, i FROM range(131072) t(i);
+
+statement ok
+UPDATE parallel_gate_src SET v = v + 1;
+
+statement ok
+DELETE FROM parallel_gate_src WHERE id % 2 = 0;
+
+statement ok gate_refresher
+PRAGMA refresh('parallel_gate_mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM parallel_gate_mv EXCEPT ALL
+     SELECT id % 16, SUM(v), COUNT(*) FROM parallel_gate_src GROUP BY id % 16)
+    UNION ALL
+    (SELECT id % 16, SUM(v), COUNT(*) FROM parallel_gate_src GROUP BY id % 16
+     EXCEPT ALL SELECT * FROM parallel_gate_mv)
+);
+----
+0
+
+endloop
+
+statement ok
+PRAGMA disable_verify_parallelism;
+
+statement ok
+RESET threads;

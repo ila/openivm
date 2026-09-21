@@ -3,17 +3,27 @@
 
 #include "duckdb.hpp"
 #include "duckdb/main/client_context_state.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 #include <condition_variable>
 #include <mutex>
-#include <unordered_map>
 
 namespace duckdb {
 
 // Serializes OpenIVM mutations for one database. The gate is re-entrant for one
 // logical owner because helper connections can execute on different worker threads.
-class MutationGate {
+class MutationGate : public ObjectCacheEntry {
 public:
+	static string ObjectType() {
+		return "openivm_mutation_gate";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // The database's mutation gate must never be evicted.
+	}
+
 	void Lock(const void *owner);
 	void Unlock(const void *owner);
 
@@ -26,29 +36,11 @@ private:
 
 class RefreshLocks {
 public:
-	// The gate for `db`, created on first use. Callers hold the returned reference for as long as
-	// they hold the lock, and that reference is what keeps the gate alive.
-	//
-	// The registry deliberately holds only weak references. It is keyed by DatabaseInstance address,
-	// and addresses are recycled: a process that opens and closes many databases, as the benchmarks
-	// do, will eventually allocate a new instance at the address of a destroyed one. Holding the
-	// gates by value or by owning pointer meant the new database inherited the dead one's gate,
-	// including its active owner and recursion depth, so a fresh database could start out already
-	// locked by a context that no longer existed and every acquirer would block forever. Weak
-	// references make a gate die with the last guard that holds it, which happens when the database
-	// and its client contexts go away, so a recycled address gets a new gate. It also stops the
-	// registry growing without bound.
+	// The database owns the gate; guards retain the exact gate they acquired.
 	static shared_ptr<MutationGate> AcquireGate(DatabaseInstance &db);
-
-private:
-	static std::mutex map_mutex_;
-	static std::unordered_map<const DatabaseInstance *, weak_ptr<MutationGate>> mutation_gates_;
 };
 
 class MutationLockGuard {
-	// Held rather than looked up again on release. The destructor previously re-resolved the gate
-	// from the database address, which is a second chance to find a different object than the one
-	// that was locked.
 	shared_ptr<MutationGate> gate;
 	const void *owner;
 
@@ -74,6 +66,7 @@ public:
 // statements. Retain the mutation gate until the caller transaction ends.
 class TransactionalMVLockState : public ClientContextState {
 public:
+	explicit TransactionalMVLockState(ClientContext &context);
 	static TransactionalMVLockState &Get(ClientContext &context);
 
 	void AcquireMutationLock();
@@ -85,9 +78,10 @@ public:
 private:
 	void Release();
 
+	mutex state_lock;
 	unique_ptr<MutationLockGuard> mutation_guard;
-	ClientContext *owner = nullptr;
-	const void *mutation_owner = nullptr;
+	ClientContext &owner;
+	const void *mutation_owner;
 };
 
 } // namespace duckdb
