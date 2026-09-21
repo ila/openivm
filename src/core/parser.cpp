@@ -1532,10 +1532,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	add_cleanup("DROP TABLE IF EXISTS " + qdv);
 
 	// --- Index DDL (for aggregate group queries) ---
-	// DuckLake source scans and DuckLake-backed MV state do not support this optional
-	// native index.
+	// The index belongs to the MV state, not its sources. DuckLake-backed state cannot have it.
 	if ((refresh_type == RefreshType::AGGREGATE_GROUP || refresh_type == RefreshType::AGGREGATE_HAVING) &&
-	    !aggregate_columns.empty() && ducklake_tables.empty() && view_catalog_prefix.empty()) {
+	    !aggregate_columns.empty() && !target_is_ducklake && view_catalog_prefix.empty()) {
 		add_profile_marker("create_view_index", "columns=" + to_string(aggregate_columns.size()));
 		string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + openivm::INDEX_SUFFIX);
 		ddl.push_back("create unique index " + index_name + " on " + qdt + "(" +

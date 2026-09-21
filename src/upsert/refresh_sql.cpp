@@ -484,26 +484,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	if (view_query_sql.empty()) {
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
-	// Capture pins before stripping them for local stand-in binding and source qualification.
-	openivm::TimeTravelPins view_time_travel_pins;
-	{
-		con.BeginTransaction();
-		try {
-			view_time_travel_pins = openivm::TimeTravelPins::PeelFromSql(planning_context, view_query_sql);
-			con.Rollback();
-		} catch (...) {
-			con.Rollback();
-			throw;
-		}
-	}
-	// Text-only refresh paths still need restoration. Plan-based paths already carry typed snapshots;
-	// DuckDB output uses the unpinned local source query and must not acquire foreign pins.
-	auto finalize_refresh_sql = [&](string refresh_sql) {
-		if (view_time_travel_pins.Empty() || active_facts.target_dialect == SqlDialect::DUCKDB) {
-			return refresh_sql;
-		}
-		return view_time_travel_pins.RestoreIntoSql(refresh_sql, active_facts.target_dialect);
-	};
 	RefreshType view_query_type = metadata.GetViewType(view_name);
 	OPENIVM_DEBUG_PRINT("[UPSERT] View: %s, Type: %d, Query: %s\n", view_name.c_str(), (int)view_query_type,
 	                    view_query_sql.c_str());
@@ -518,8 +498,17 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                     "; delta_tables=" + to_string(delta_table_names.size()) +
 	                     "; target_ducklake=" + string(target_is_ducklake ? "true" : "false"));
 	auto qualify_start = profile_now();
-	view_query_sql = QualifyViewQuerySources(metadata, con, view_name, view_query_sql, delta_sources, view_catalog_name,
-	                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+	auto view_time_travel_pins =
+	    PrepareViewQuerySources(con, view_name, view_query_sql, delta_sources, view_catalog_name, view_schema_name,
+	                            attached_db_catalog_name, attached_db_schema_name);
+	// Text-only refresh paths still need restoration. Plan-based paths already carry typed snapshots;
+	// DuckDB output uses the unpinned local source query and must not acquire foreign pins.
+	auto finalize_refresh_sql = [&](string refresh_sql) {
+		if (view_time_travel_pins.Empty() || active_facts.target_dialect == SqlDialect::DUCKDB) {
+			return refresh_sql;
+		}
+		return view_time_travel_pins.RestoreIntoSql(refresh_sql, active_facts.target_dialect);
+	};
 	add_profile_step("generate_refresh_sql.qualify_sources", qualify_start,
 	                 "query_bytes=" + to_string(view_query_sql.size()));
 	auto recovery_start = profile_now();

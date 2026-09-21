@@ -47,3 +47,79 @@ scanned both pinned and unpinned
 
 statement ok
 SET openivm_input_dialect='duckdb';
+
+# Native snapshots must survive source qualification; foreign pin stripping does not own them.
+# Snapshot 2 contains the first INSERT above; later writes must not affect this full-refresh view.
+statement ok
+CREATE MATERIALIZED VIEW tt_native_snapshot AS
+SELECT c_id, SUM(amount) AS total FROM dl.main.tt_orders AT (VERSION => 2) GROUP BY c_id;
+
+# Two-part catalog.table spelling must resolve to the same native catalog identity.
+statement ok
+CREATE MATERIALIZED VIEW tt_native_short AS
+SELECT c_id, SUM(amount) AS total FROM dl.tt_orders AT (VERSION => 2) GROUP BY c_id;
+
+query I
+SELECT COUNT(*) FROM openivm_views
+WHERE view_name IN ('tt_native_snapshot', 'tt_native_short') AND sql_string LIKE '%AT (VERSION => 2)%';
+----
+2
+
+# The per-relation resolver cannot distinguish a current pinned scan from an unpinned scan.
+statement error
+CREATE MATERIALIZED VIEW tt_native_ambiguous AS
+SELECT a.o_id FROM dl.tt_orders a AT (VERSION => 2) JOIN dl.tt_orders b ON a.o_id = b.o_id;
+----
+scanned both pinned and unpinned
+
+query I
+SELECT COUNT(*) FROM duckdb_indexes()
+WHERE table_name IN ('openivm_data_tt_native_snapshot', 'openivm_data_tt_native_short') AND is_unique;
+----
+2
+
+statement ok
+INSERT INTO dl.main.tt_orders VALUES (1, 1, 5), (3, 2, 30);
+
+statement ok
+UPDATE dl.main.tt_orders SET amount = amount + 1 WHERE c_id = 1;
+
+statement ok
+DELETE FROM dl.main.tt_orders WHERE c_id = 2;
+
+statement ok
+INSERT INTO dl.main.tt_orders VALUES (4, 2, 7), (4, 2, 7);
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+query I
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%AT (VERSION => 2)%'
+FROM openivm_compile_with_facts('tt_native_snapshot', '{"target_dialect":"duckdb","compile_only":true}')
+WHERE stmt_kind = 'data';
+----
+true
+
+statement ok
+PRAGMA refresh('tt_native_snapshot');
+
+query II
+WITH expected AS (SELECT c_id, SUM(amount) AS total FROM dl.main.tt_orders AT (VERSION => 2) GROUP BY c_id)
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM tt_native_snapshot EXCEPT ALL SELECT * FROM expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM tt_native_snapshot));
+----
+0	0
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+# The pinned source has an empty delta even after conflicting changes to its latest snapshot.
+statement ok
+PRAGMA refresh('tt_native_short');
+
+query II
+WITH expected AS (SELECT c_id, SUM(amount) AS total FROM dl.tt_orders AT (VERSION => 2) GROUP BY c_id)
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM tt_native_short EXCEPT ALL SELECT * FROM expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM tt_native_short));
+----
+0	0

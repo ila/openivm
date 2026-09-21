@@ -3,6 +3,7 @@
 
 #include "compile_facts.hpp"
 #include "core/refresh_metadata.hpp"
+#include "core/time_travel_pins.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -214,10 +215,11 @@ string BuildDuckLakeSnapshotQuery(RefreshMetadata &metadata, Connection &con, co
                                   const string &view_query_sql, const vector<string> &delta_table_names,
                                   const string &view_catalog_name, const string &view_schema_name,
                                   const string &attached_db_catalog_name, const string &attached_db_schema_name);
-string QualifyViewQuerySources(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                               const string &view_query_sql, const vector<RefreshMetadata::DeltaSource> &delta_sources,
-                               const string &view_catalog_name, const string &view_schema_name,
-                               const string &attached_db_catalog_name, const string &attached_db_schema_name);
+openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &view_name, string &view_query_sql,
+                                                const vector<RefreshMetadata::DeltaSource> &delta_sources,
+                                                const string &view_catalog_name, const string &view_schema_name,
+                                                const string &attached_db_catalog_name,
+                                                const string &attached_db_schema_name);
 string DuckLakeSnapshotPlaceholder(const string &catalog_name);
 
 DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMetadata &metadata, Connection &con,

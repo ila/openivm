@@ -20,6 +20,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "lpts_helpers.hpp"
 #include "lpts_sql_scanner.hpp"
 
@@ -205,21 +206,18 @@ static void VisitStatement(SQLStatement &statement, const RefVisitor &visitor) {
 	}
 }
 
-// Whether the catalog backing `ref` implements time travel, so its pin binds natively and must be
-// left in place. An unresolvable relation is left alone as well: DuckDB owns that error message.
-static bool CatalogHonoursPin(ClientContext &context, BaseTableRef &ref) {
+// Resolve without the AT clause; DuckDB owns lookup errors for unresolved relations.
+static optional_ptr<CatalogEntry> LookupPinRelation(ClientContext &context, BaseTableRef &ref) {
 	QueryErrorContext error_context;
 	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, ref.table_name, error_context);
-	optional_ptr<CatalogEntry> entry;
 	try {
-		entry = Catalog::GetEntry(context, ref.catalog_name, ref.schema_name, lookup, OnEntryNotFound::RETURN_NULL);
+		auto catalog = ref.catalog_name;
+		auto schema = ref.schema_name;
+		Binder::BindSchemaOrCatalog(context, catalog, schema);
+		return Catalog::GetEntry(context, catalog, schema, lookup, OnEntryNotFound::RETURN_NULL);
 	} catch (const std::exception &) {
-		return true;
+		return nullptr;
 	}
-	if (!entry) {
-		return true;
-	}
-	return entry->ParentCatalog().SupportsTimeTravel();
 }
 
 [[noreturn]] static void ThrowAmbiguousPin(const string &table_name, const string &reason) {
@@ -232,10 +230,14 @@ static bool CatalogHonoursPin(ClientContext &context, BaseTableRef &ref) {
 	    table_name, reason);
 }
 
-TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statement) {
+TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statement,
+                                    const BaseTableRefCallback &qualify_source) {
 	TimeTravelPins result;
 	case_insensitive_set_t unpinned;
 	BaseTableRefCallback callback = [&](BaseTableRef &ref) {
+		if (qualify_source) {
+			qualify_source(ref);
+		}
 		if (!ref.at_clause) {
 			// Every unpinned scan is recorded, including one in a catalog that honours pins
 			// natively: re-attachment is keyed by relation name and an unqualified pin matches any
@@ -244,15 +246,20 @@ TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statem
 			unpinned.insert(ref.table_name);
 			return;
 		}
-		if (CatalogHonoursPin(context, ref)) {
-			return;
-		}
 		Pin pin;
 		// INVALID_CATALOG / INVALID_SCHEMA are the empty string, so an unqualified reference already
 		// stores the "" this map treats as "matches any qualifier".
 		pin.catalog = ref.catalog_name;
 		pin.schema = ref.schema_name;
-		pin.snapshot = std::move(ref.at_clause);
+		auto relation = LookupPinRelation(context, ref);
+		pin.binds_natively = !relation || relation->ParentCatalog().SupportsTimeTravel();
+		if (relation && pin.binds_natively) {
+			pin.catalog = relation->ParentCatalog().GetName();
+			pin.schema = relation->ParentSchema().name;
+		}
+		// Binding loses the explicit AT clause even when it names the current native snapshot.
+		// Preserve it for LPTS, but only remove foreign pins from the locally executable query.
+		pin.snapshot = pin.binds_natively ? ref.at_clause->Copy() : std::move(ref.at_clause);
 		auto existing = result.pins.find(ref.table_name);
 		if (existing != result.pins.end()) {
 			if (!AtClause::Equals(existing->second.snapshot, pin.snapshot)) {
@@ -263,8 +270,8 @@ TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statem
 				ThrowAmbiguousPin(ref.table_name, "the same pin names two differently qualified relations");
 			}
 		}
-		OPENIVM_DEBUG_PRINT("[TIME TRAVEL] Peeled pin '%s' off relation '%s'\n", pin.snapshot->ToString().c_str(),
-		                    ref.table_name.c_str());
+		OPENIVM_DEBUG_PRINT("[TIME TRAVEL] Recorded pin '%s' on relation '%s' (native=%d)\n",
+		                    pin.snapshot->ToString().c_str(), ref.table_name.c_str(), pin.binds_natively);
 		result.pins[ref.table_name] = std::move(pin);
 	};
 	RefVisitor visitor {callback, case_insensitive_set_t()};
@@ -273,19 +280,6 @@ TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statem
 		if (unpinned.find(entry.first) != unpinned.end()) {
 			ThrowAmbiguousPin(entry.first, "it is scanned both pinned and unpinned");
 		}
-	}
-	return result;
-}
-
-TimeTravelPins TimeTravelPins::PeelFromSql(ClientContext &context, string &view_query_sql) {
-	Parser parser(context.GetParserOptions());
-	parser.ParseQuery(view_query_sql);
-	if (parser.statements.empty()) {
-		return TimeTravelPins();
-	}
-	auto result = Peel(context, *parser.statements[0]);
-	if (!result.Empty()) {
-		view_query_sql = parser.statements[0]->ToString();
 	}
 	return result;
 }
@@ -342,7 +336,7 @@ string TimeTravelPins::StripFrom(const string &sql) const {
 	}
 	BaseTableRefCallback callback = [&](BaseTableRef &ref) {
 		auto entry = pins.find(ref.table_name);
-		if (entry == pins.end()) {
+		if (entry == pins.end() || entry->second.binds_natively) {
 			return;
 		}
 		auto &pin = entry->second;
@@ -571,7 +565,7 @@ string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) con
 			if (expect_relation) {
 				expect_relation = false;
 				auto entry = pins.find(final_component);
-				if (entry == pins.end()) {
+				if (entry == pins.end() || entry->second.binds_natively) {
 					continue;
 				}
 				auto dialect_suffix = RenderSnapshotSuffix(entry->second.snapshot.get(), dialect);

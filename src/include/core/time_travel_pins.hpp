@@ -11,21 +11,22 @@
 namespace duckdb {
 
 class SQLStatement;
+class BaseTableRef;
 
 namespace openivm {
 
 // Foreign snapshots cannot bind against the Spark bridge's local schema-only tables. Keep their
 // parsed AT clauses while binding those stand-ins, then resolve them during LPTS's scan walk.
-// Native time-travel catalogs (DuckLake) retain their clauses and use LPTS's existing scan metadata.
+// Native time-travel catalogs retain their clauses. Record these too: a pin to the current native
+// snapshot is indistinguishable from an unpinned scan in the bound plan.
 class TimeTravelPins {
 public:
-	// Peel every unbindable pin out of `statement`, recording relation -> qualifier. Throws when a
+	// Record relation -> qualifier, peeling only unbindable pins out of `statement`. Throws when a
 	// relation cannot be given one unambiguous pin (two different pins, or pinned in one scan and
 	// unpinned in another), because re-attaching by relation would conflate the two.
-	static TimeTravelPins Peel(ClientContext &context, SQLStatement &statement);
-
-	// Collect and strip foreign pins in one parse/walk, leaving an unpinned query for local binding.
-	static TimeTravelPins PeelFromSql(ClientContext &context, string &view_query_sql);
+	// Refresh can qualify each source before pin lookup, reusing the same CTE-aware traversal.
+	static TimeTravelPins Peel(ClientContext &context, SQLStatement &statement,
+	                           const std::function<void(BaseTableRef &)> &qualify_source = {});
 
 	bool Empty() const {
 		return pins.empty();
@@ -37,7 +38,7 @@ public:
 	// Strip pins from a SELECT for local stand-in execution; stored metadata keeps the pinned query.
 	string StripFrom(const string &sql) const;
 
-	// Re-attach every recorded qualifier, in `dialect`'s own spelling, to the scans of that relation
+	// Re-attach foreign qualifiers, in `dialect`'s own spelling, to the scans of that relation
 	// in already-rendered `sql`. Refresh programs for several view shapes (min/max aggregates,
 	// group recompute, interrupted-refresh recovery, ...) are assembled as SQL text rather than
 	// through the AST, so the scan resolver never sees them; without this they would ship to the target
@@ -52,6 +53,7 @@ private:
 		string catalog;
 		string schema;
 		unique_ptr<AtClause> snapshot;
+		bool binds_natively;
 	};
 
 	// Qualifiers are checked against the original catalog entry, before LPTS output overrides.
