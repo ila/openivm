@@ -26,29 +26,43 @@ private:
 
 class RefreshLocks {
 public:
-	static void LockMutation(DatabaseInstance &db, const void *owner);
-	static void UnlockMutation(DatabaseInstance &db, const void *owner);
+	// The gate for `db`, created on first use. Callers hold the returned reference for as long as
+	// they hold the lock, and that reference is what keeps the gate alive.
+	//
+	// The registry deliberately holds only weak references. It is keyed by DatabaseInstance address,
+	// and addresses are recycled: a process that opens and closes many databases, as the benchmarks
+	// do, will eventually allocate a new instance at the address of a destroyed one. Holding the
+	// gates by value or by owning pointer meant the new database inherited the dead one's gate,
+	// including its active owner and recursion depth, so a fresh database could start out already
+	// locked by a context that no longer existed and every acquirer would block forever. Weak
+	// references make a gate die with the last guard that holds it, which happens when the database
+	// and its client contexts go away, so a recycled address gets a new gate. It also stops the
+	// registry growing without bound.
+	static shared_ptr<MutationGate> AcquireGate(DatabaseInstance &db);
 
 private:
-	static MutationGate &GetMutationGate(DatabaseInstance &db);
-
 	static std::mutex map_mutex_;
-	static std::unordered_map<const DatabaseInstance *, unique_ptr<MutationGate>> mutation_gates_;
+	static std::unordered_map<const DatabaseInstance *, weak_ptr<MutationGate>> mutation_gates_;
 };
 
 class MutationLockGuard {
-	DatabaseInstance *db;
+	// Held rather than looked up again on release. The destructor previously re-resolved the gate
+	// from the database address, which is a second chance to find a different object than the one
+	// that was locked.
+	shared_ptr<MutationGate> gate;
 	const void *owner;
 
 public:
-	explicit MutationLockGuard(ClientContext &owner_p) : db(&DatabaseInstance::GetDatabase(owner_p)), owner(&owner_p) {
-		RefreshLocks::LockMutation(*db, owner);
+	explicit MutationLockGuard(ClientContext &owner_p)
+	    : gate(RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(owner_p))), owner(&owner_p) {
+		gate->Lock(owner);
 	}
-	MutationLockGuard(DatabaseInstance &db_p, const void *owner_p) : db(&db_p), owner(owner_p) {
-		RefreshLocks::LockMutation(*db, owner);
+	MutationLockGuard(DatabaseInstance &db_p, const void *owner_p)
+	    : gate(RefreshLocks::AcquireGate(db_p)), owner(owner_p) {
+		gate->Lock(owner);
 	}
 	~MutationLockGuard() {
-		RefreshLocks::UnlockMutation(*db, owner);
+		gate->Unlock(owner);
 	}
 	MutationLockGuard(const MutationLockGuard &) = delete;
 	MutationLockGuard &operator=(const MutationLockGuard &) = delete;

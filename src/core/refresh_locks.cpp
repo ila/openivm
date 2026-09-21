@@ -1,10 +1,13 @@
 #include "core/refresh_locks.hpp"
 #include "core/openivm_debug.hpp"
 
+#include <cstdio>
+#include <iterator>
+
 namespace duckdb {
 
 std::mutex RefreshLocks::map_mutex_;
-std::unordered_map<const DatabaseInstance *, unique_ptr<MutationGate>> RefreshLocks::mutation_gates_;
+std::unordered_map<const DatabaseInstance *, weak_ptr<MutationGate>> RefreshLocks::mutation_gates_;
 
 void MutationGate::Lock(const void *owner) {
 	std::unique_lock<mutex> guard(lock);
@@ -20,6 +23,19 @@ void MutationGate::Lock(const void *owner) {
 void MutationGate::Unlock(const void *owner) {
 	std::lock_guard<mutex> guard(lock);
 	if (active_owner != owner || depth == 0) {
+		// Releasing a gate this owner does not hold would hand it to an unrelated waiter, so the
+		// mismatch is reported rather than acted on.
+		//
+		// Reported unconditionally, because the bare D_ASSERT that used to stand here compiles out
+		// in release builds. A single lost unlock then left the gate held by an owner that would
+		// never release it, and every later acquirer blocked on the condition variable below with
+		// nothing to indicate why: the symptom surfaced as an unrelated statement hanging at 0% CPU,
+		// arbitrarily far from the accounting error that caused it.
+		fprintf(stderr,
+		        "[openivm] mutation gate release mismatch: owner=%p active_owner=%p depth=%llu. "
+		        "The gate stays held; subsequent OpenIVM mutations on this database will block.\n",
+		        owner, active_owner, static_cast<unsigned long long>(depth));
+		fflush(stderr);
 		D_ASSERT(false);
 		return;
 	}
@@ -30,21 +46,26 @@ void MutationGate::Unlock(const void *owner) {
 	}
 }
 
-MutationGate &RefreshLocks::GetMutationGate(DatabaseInstance &db) {
+shared_ptr<MutationGate> RefreshLocks::AcquireGate(DatabaseInstance &db) {
 	std::lock_guard<std::mutex> guard(map_mutex_);
-	auto &entry = mutation_gates_[&db];
-	if (!entry) {
-		entry = make_uniq<MutationGate>();
+	auto entry = mutation_gates_.find(&db);
+	if (entry != mutation_gates_.end()) {
+		auto existing = entry->second.lock();
+		if (existing) {
+			return existing;
+		}
+		// The address is live again but the gate behind it is gone, so this is a different database
+		// that happens to have been allocated where an old one stood. Drop the stale mapping.
+		mutation_gates_.erase(entry);
 	}
-	return *entry;
-}
-
-void RefreshLocks::LockMutation(DatabaseInstance &db, const void *owner) {
-	GetMutationGate(db).Lock(owner);
-}
-
-void RefreshLocks::UnlockMutation(DatabaseInstance &db, const void *owner) {
-	GetMutationGate(db).Unlock(owner);
+	// Discard mappings for databases that have since been closed. Without this the registry keeps an
+	// entry for every database the process ever opened.
+	for (auto it = mutation_gates_.begin(); it != mutation_gates_.end();) {
+		it = it->second.expired() ? mutation_gates_.erase(it) : std::next(it);
+	}
+	auto gate = make_shared_ptr<MutationGate>();
+	mutation_gates_[&db] = gate;
+	return gate;
 }
 
 TransactionalMVLockState &TransactionalMVLockState::Get(ClientContext &context) {
