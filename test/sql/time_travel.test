@@ -859,6 +859,19 @@ DELETE FROM tt_scope WHERE k = 2;
 statement ok
 INSERT INTO tt_scope VALUES (2, 7), (2, 7);
 
+# Adaptive planning must reuse the already-peeled query too, without a second pin walk.
+statement ok
+SET openivm_adaptive_refresh = true;
+
+query I
+SELECT COUNT(*) > 0 AND COUNT(*) FILTER (WHERE sql LIKE '%AT (VERSION%' OR sql LIKE '%VERSION AS OF%') = 0
+FROM openivm_compile_with_facts('tt_scoped', '{"target_dialect":"duckdb","compile_only":true}');
+----
+true
+
+statement ok
+SET openivm_adaptive_refresh = false;
+
 statement ok
 PRAGMA refresh('tt_scoped');
 

@@ -23,7 +23,6 @@
 #include "lpts_helpers.hpp"
 #include "lpts_sql_scanner.hpp"
 
-#include <cstring>
 #include <cctype>
 
 namespace duckdb {
@@ -278,17 +277,17 @@ TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statem
 	return result;
 }
 
-void TimeTravelPins::PeelForLocalBinding(ClientContext &context, SQLStatement &statement) {
-	Peel(context, statement);
-}
-
-TimeTravelPins TimeTravelPins::FromViewSql(ClientContext &context, const string &view_query_sql) {
+TimeTravelPins TimeTravelPins::PeelFromSql(ClientContext &context, string &view_query_sql) {
 	Parser parser(context.GetParserOptions());
 	parser.ParseQuery(view_query_sql);
 	if (parser.statements.empty()) {
 		return TimeTravelPins();
 	}
-	return Peel(context, *parser.statements[0]);
+	auto result = Peel(context, *parser.statements[0]);
+	if (!result.Empty()) {
+		view_query_sql = parser.statements[0]->ToString();
+	}
+	return result;
 }
 
 SnapshotResolver TimeTravelPins::Resolver() const {
@@ -307,14 +306,6 @@ SnapshotResolver TimeTravelPins::Resolver() const {
 		}
 		return pin.snapshot->Copy();
 	};
-}
-
-static bool IsIdentifierStart(char c) {
-	return std::isalpha(static_cast<unsigned char>(c)) || c == '_';
-}
-
-static bool IsIdentifierPart(char c) {
-	return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
 }
 
 // Copy the quoted run starting at `sql[start]` (whose delimiter is `sql[start]`) into `result`,
@@ -338,28 +329,6 @@ static idx_t CopyQuotedRun(const string &sql, idx_t start, string &result) {
 		i++;
 	}
 	return i;
-}
-
-// Index just past the `)` matching the `(` at `sql[open]`, skipping quoted runs.
-static idx_t MatchingParen(const string &sql, idx_t open) {
-	idx_t depth = 0;
-	for (idx_t i = open; i < sql.size(); i++) {
-		char c = sql[i];
-		if (c == '\'' || c == '"' || c == '`') {
-			string ignored;
-			i = CopyQuotedRun(sql, i, ignored) - 1;
-			continue;
-		}
-		if (c == '(') {
-			depth++;
-		} else if (c == ')') {
-			depth--;
-			if (depth == 0) {
-				return i + 1;
-			}
-		}
-	}
-	return DConstants::INVALID_INDEX;
 }
 
 string TimeTravelPins::StripFrom(const string &sql) const {
@@ -386,15 +355,6 @@ string TimeTravelPins::StripFrom(const string &sql) const {
 	return parser.statements[0]->ToString();
 }
 
-// Words that may legally follow a table reference; none of them can be a bare alias.
-static bool CanBeBareAlias(const string &token) {
-	// DuckDB's `alias_clause` takes a `ColId`: plain identifiers plus the unreserved and column-name
-	// keywords, but not the reserved or type/function ones. So `WHERE`, `JOIN` and `NATURAL` end the
-	// relation instead of naming it.
-	auto category = Parser::IsKeyword(StringUtil::Lower(token));
-	return category != KeywordCategory::KEYWORD_RESERVED && category != KeywordCategory::KEYWORD_TYPE_FUNC;
-}
-
 // Copy the `[catalog.][schema.]relation` chain starting at `sql[start]` into `result`, honouring
 // quoted components. Reports the unquoted final component — the relation name pins are keyed by —
 // and whether the chain carried a catalog/schema prefix, which a CTE reference never does.
@@ -407,9 +367,9 @@ static idx_t CopyQualifiedIdentifierChain(const string &sql, idx_t start, string
 			idx_t quoted_start = result.size();
 			i = CopyQuotedRun(sql, i, result);
 			final_component = result.substr(quoted_start + 1, result.size() - quoted_start - 2);
-		} else if (i < sql.size() && IsIdentifierStart(sql[i])) {
+		} else if (i < sql.size() && IsIdentStart(sql[i])) {
 			idx_t end = i;
-			while (end < sql.size() && IsIdentifierPart(sql[end])) {
+			while (end < sql.size() && (IsIdentPart(sql[end]) || sql[end] == '$')) {
 				end++;
 			}
 			final_component = sql.substr(i, end - i);
@@ -481,46 +441,6 @@ static idx_t SkipIgnorableSpan(const string &sql, idx_t pos) {
 	return pos;
 }
 
-// Read a raw DuckDB `AT (...)` qualifier belonging to the relation that ends at `pos`. Bodies that
-// never reach the AST keep their pin in normalized text, where DuckDB spells it *after* the alias
-// (`t AS p AT (VERSION => 366)`); every other dialect wants it directly behind the relation. The
-// alias text in between is handed back verbatim so it can be re-emitted after the translated pin,
-// and `end` reports where the raw clause stops so the caller drops it instead of keeping both.
-static bool TryReadRawPinAfterRelation(const string &sql, idx_t pos, string &alias_text, idx_t &end) {
-	string buffer;
-	idx_t cursor = pos;
-	// `[AS] alias` is at most two tokens, so the qualifier has to appear within three.
-	for (idx_t token_index = 0; token_index < 3; token_index++) {
-		idx_t token_start = SkipIgnorableSpan(sql, cursor);
-		idx_t token_end;
-		string token;
-		if (token_start < sql.size() && (sql[token_start] == '"' || sql[token_start] == '`')) {
-			token_end = CopyQuotedRun(sql, token_start, token);
-		} else if (!TryReadIdentifierToken(sql, token_start, token_end, token)) {
-			return false;
-		}
-		if (StringUtil::CIEquals(token, "at")) {
-			idx_t paren = SkipIgnorableSpan(sql, token_end);
-			if (paren >= sql.size() || sql[paren] != '(') {
-				return false;
-			}
-			auto close = MatchingParen(sql, paren);
-			if (close == DConstants::INVALID_INDEX) {
-				return false;
-			}
-			alias_text = buffer;
-			end = close;
-			return true;
-		}
-		if (!StringUtil::CIEquals(token, "as") && !CanBeBareAlias(token)) {
-			return false;
-		}
-		buffer.append(sql, cursor, token_end - cursor);
-		cursor = token_end;
-	}
-	return false;
-}
-
 // Words that close a FROM list, so a comma past them separates something other than relations.
 static bool EndsFromList(const string &token) {
 	static const char *const TERMINATORS[] = {"where",  "group",     "having", "qualify", "window",    "order",
@@ -573,9 +493,9 @@ static case_insensitive_set_t CollectCteNames(const string &sql) {
 			candidate = quoted.size() >= 2 ? quoted.substr(1, quoted.size() - 2) : quoted;
 			continue;
 		}
-		if (IsIdentifierStart(c)) {
+		if (IsIdentStart(c)) {
 			idx_t end = i;
-			while (end < sql.size() && IsIdentifierPart(sql[end])) {
+			while (end < sql.size() && (IsIdentPart(sql[end]) || sql[end] == '$')) {
 				end++;
 			}
 			auto token = sql.substr(i, end - i);
@@ -644,7 +564,7 @@ string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) con
 			i = end;
 			continue;
 		}
-		if (IsIdentifierStart(c) || c == '"' || c == '`') {
+		if (IsIdentStart(c) || c == '"' || c == '`') {
 			string final_component;
 			bool qualified;
 			i = CopyQualifiedIdentifierChain(sql, i, result, final_component, qualified);
@@ -658,19 +578,12 @@ string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) con
 				if (CarriesQualifierAt(sql, i, dialect_suffix)) {
 					continue;
 				}
-				string alias_text;
-				idx_t raw_pin_end;
-				bool carries_raw_pin = TryReadRawPinAfterRelation(sql, i, alias_text, raw_pin_end);
-				if (!carries_raw_pin && !qualified && cte_names.find(final_component) != cte_names.end()) {
+				if (!qualified && cte_names.find(final_component) != cte_names.end()) {
 					// A bare name this query itself binds: the scan it stands for was pinned where the
 					// CTE was defined, and only a real relation can carry a qualifier.
 					continue;
 				}
-				if (carries_raw_pin) {
-					i = raw_pin_end;
-				}
 				result += dialect_suffix;
-				result += alias_text;
 				OPENIVM_DEBUG_PRINT("[TIME TRAVEL] Restored pin '%s' onto rendered scan of '%s'\n",
 				                    dialect_suffix.c_str(), final_component.c_str());
 				continue;

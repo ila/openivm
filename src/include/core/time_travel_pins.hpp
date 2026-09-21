@@ -24,12 +24,8 @@ public:
 	// unpinned in another), because re-attaching by relation would conflate the two.
 	static TimeTravelPins Peel(ClientContext &context, SQLStatement &statement);
 
-	// Peel the pins out of `statement` and discard them: the statement is only being bound or
-	// planned locally, where the pin cannot be honoured and is not rendered back out.
-	static void PeelForLocalBinding(ClientContext &context, SQLStatement &statement);
-
-	// Peel the pins recorded by a stored materialized-view body without mutating anything.
-	static TimeTravelPins FromViewSql(ClientContext &context, const string &view_query_sql);
+	// Collect and strip foreign pins in one parse/walk, leaving an unpinned query for local binding.
+	static TimeTravelPins PeelFromSql(ClientContext &context, string &view_query_sql);
 
 	bool Empty() const {
 		return pins.empty();
@@ -45,9 +41,8 @@ public:
 	// in already-rendered `sql`. Refresh programs for several view shapes (min/max aggregates,
 	// group recompute, interrupted-refresh recovery, ...) are assembled as SQL text rather than
 	// through the AST, so the scan resolver never sees them; without this they would ship to the target
-	// engine reading the latest snapshot instead of the pinned one. A raw DuckDB `AT (...)` left on
-	// such a scan is replaced rather than duplicated, and scans that already carry the qualifier in
-	// the target spelling are left alone, so it is safe to run over AST-rendered SQL as well. Throws
+	// engine reading the latest snapshot instead of the pinned one. Foreign DuckDB pins must already
+	// be peeled from the source query. Scans with target-dialect pins are left alone. Throws
 	// through LPTS for dialects with no verified time-travel syntax rather than emitting an unpinned
 	// scan.
 	string RestoreIntoSql(const string &sql, SqlDialect dialect) const;

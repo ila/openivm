@@ -57,7 +57,7 @@ static string RenderStoredViewQueryForDialect(ClientContext &context, const stri
 	}
 	Planner planner(context);
 	// Source qualification already stripped foreign pins; native catalog snapshots remain bindable.
-	planner.CreatePlan(parser.statements[0]->Copy());
+	planner.CreatePlan(std::move(parser.statements[0]));
 	auto plan = std::move(planner.plan);
 	auto ast = LogicalPlanToAst(context, plan, dialect,
 	                            dialect == SqlDialect::DUCKDB ? SnapshotResolver() : time_travel_pins.Resolver());
@@ -489,7 +489,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	{
 		con.BeginTransaction();
 		try {
-			view_time_travel_pins = openivm::TimeTravelPins::FromViewSql(planning_context, view_query_sql);
+			view_time_travel_pins = openivm::TimeTravelPins::PeelFromSql(planning_context, view_query_sql);
 			con.Rollback();
 		} catch (...) {
 			con.Rollback();
@@ -518,7 +518,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                     "; delta_tables=" + to_string(delta_table_names.size()) +
 	                     "; target_ducklake=" + string(target_is_ducklake ? "true" : "false"));
 	auto qualify_start = profile_now();
-	view_query_sql = view_time_travel_pins.StripFrom(view_query_sql);
 	view_query_sql = QualifyViewQuerySources(metadata, con, view_name, view_query_sql, delta_sources, view_catalog_name,
 	                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 	add_profile_step("generate_refresh_sql.qualify_sources", qualify_start,
@@ -602,8 +601,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		Parser cost_parser;
 		cost_parser.ParseQuery(view_query_sql);
 		Planner cost_planner(planning_context);
-		openivm::TimeTravelPins::PeelForLocalBinding(planning_context, *cost_parser.statements[0]);
-		cost_planner.CreatePlan(cost_parser.statements[0]->Copy());
+		cost_planner.CreatePlan(std::move(cost_parser.statements[0]));
 		Optimizer cost_optimizer(*cost_planner.binder, planning_context);
 		auto cost_plan = cost_optimizer.Optimize(std::move(cost_planner.plan));
 

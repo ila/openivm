@@ -127,10 +127,9 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 
 	Parser parser;
 	parser.ParseQuery(view_query);
-	auto statement = parser.statements[0].get();
-	duckdb::openivm::TimeTravelPins::PeelForLocalBinding(context, *statement);
+	duckdb::openivm::TimeTravelPins::Peel(context, *parser.statements[0]);
 	Planner planner(context);
-	planner.CreatePlan(statement->Copy());
+	planner.CreatePlan(std::move(parser.statements[0]));
 	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] Plan:\n%s\n", planner.plan->ToString().c_str());
 
 	auto result = make_uniq<TableFunctionData>();

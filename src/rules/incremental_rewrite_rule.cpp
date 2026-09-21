@@ -97,11 +97,10 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	if (parser.statements.empty()) {
 		throw Exception(ExceptionType::PARSER, "IVM: empty view definition for '" + view + "'");
 	}
-	auto statement = parser.statements[0].get();
-	openivm::TimeTravelPins::PeelForLocalBinding(input.context, *statement);
+	openivm::TimeTravelPins::Peel(input.context, *parser.statements[0]);
 
 	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
-	planner.CreatePlan(statement->Copy());
+	planner.CreatePlan(std::move(parser.statements[0]));
 	OPENIVM_DEBUG_PRINT("[REWRITE] CreatePlan done\n");
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Unoptimized plan: \n%s\n", planner.plan->ToString().c_str());
