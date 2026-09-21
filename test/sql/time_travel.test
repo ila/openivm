@@ -162,7 +162,7 @@ FROM openivm_views WHERE view_name = 'tt_shadow';
 # (`FROM t AS p AT (VERSION => n)`), so normalization has to carry the alias across the rewrite.
 # That must keep every alias bound to the relation it was written against: an alias may never
 # migrate to a neighbouring relation, and a pin may never migrate to a neighbouring alias or be
-# dropped. Each case below is cross-checked against the parse tree by `VerifySnapshotBindings`.
+# dropped. LPTS normalizes the syntax and the parsed table reference carries each pin.
 
 # A bare (no `AS`) trailing alias is the exact shape Spark produces.
 statement ok
@@ -571,8 +571,8 @@ UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_c
 # Interrupted-refresh recovery recomputes from the stored text, so this is where a raw qualifier
 # would survive: an explicit JOIN keeps one pin per side...
 query I
-SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 o%'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 c%'
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 AS o%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 AS c%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts('tt_text_join', '{"target_dialect":"spark","compile_only":true}')
@@ -582,8 +582,8 @@ WHERE stmt_kind = 'data';
 
 # ... and so does a comma FROM list, where every implicit cross join is a scan of its own.
 query I
-SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 o, %'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 c %'
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 AS o , %'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 AS c %'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts('tt_text_comma', '{"target_dialect":"spark","compile_only":true}')
@@ -728,10 +728,10 @@ UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_p
 statement ok
 UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_derived';
 
-# Recovery recomputes from the stored text, where the parenthesized list is written out verbatim.
+# Parsed serialization removes redundant parentheses and makes aliases and INNER JOIN explicit.
 query I
-SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%(tt_orders VERSION AS OF 366 o join%'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 c %'
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 AS o INNER JOIN%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 AS c %'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts('tt_text_paren', '{"target_dialect":"spark","compile_only":true}')
@@ -741,8 +741,8 @@ WHERE stmt_kind = 'data';
 
 # Nested parentheses defer the question one level, so the innermost element is still a scan.
 query I
-SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 o %'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 c%'
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366 AS o %'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_customers VERSION AS OF 12 AS c%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts('tt_text_paren_nested', '{"target_dialect":"spark","compile_only":true}')
@@ -830,3 +830,89 @@ CREATE MATERIALIZED VIEW tt_rejected_again AS
     SELECT c_id, SUM(amount) AS total FROM tt_orders VERSION AS OF 366 GROUP BY c_id;
 ----
 syntax error
+
+# Earlier sibling CTEs are visible in later bodies, even when they shadow the pinned base.
+statement ok
+CREATE TABLE tt_scope(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO tt_scope VALUES (1, 10), (1, 10), (2, 20);
+
+statement ok
+SET openivm_input_dialect='spark';
+
+statement ok
+CREATE MATERIALIZED VIEW tt_scoped AS
+WITH tt_scope AS (SELECT * FROM tt_scope VERSION AS OF 2),
+     next_scope AS (SELECT * FROM tt_scope)
+SELECT k, SUM(v) AS total FROM next_scope GROUP BY k;
+
+statement ok
+INSERT INTO tt_scope VALUES (1, 5), (2, 30);
+
+statement ok
+UPDATE tt_scope SET v = v + 1 WHERE k = 1;
+
+statement ok
+DELETE FROM tt_scope WHERE k = 2;
+
+statement ok
+INSERT INTO tt_scope VALUES (2, 7), (2, 7);
+
+statement ok
+PRAGMA refresh('tt_scoped');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM tt_scoped EXCEPT ALL SELECT k, SUM(v) FROM tt_scope GROUP BY k)),
+       (SELECT COUNT(*) FROM (SELECT k, SUM(v) FROM tt_scope GROUP BY k EXCEPT ALL SELECT * FROM tt_scoped));
+----
+0	0
+
+# Escaped identifiers and alias column lists use the parsed table reference, not a second lexer.
+statement ok
+CREATE TABLE "tt`source"(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO "tt`source" VALUES (1, 10), (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW tt_escaped AS
+SELECT x, SUM(y) AS total FROM `tt``source` VERSION AS OF 7 AS `p``q`(x, y) GROUP BY x;
+
+statement ok
+INSERT INTO "tt`source" VALUES (1, 5), (2, 30);
+
+statement ok
+UPDATE "tt`source" SET v = v + 1 WHERE k = 1;
+
+statement ok
+DELETE FROM "tt`source" WHERE k = 2;
+
+statement ok
+INSERT INTO "tt`source" VALUES (2, 7), (2, 7);
+
+statement ok
+PRAGMA refresh('tt_escaped');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM tt_escaped EXCEPT ALL SELECT k, SUM(v) FROM "tt`source" GROUP BY k)),
+       (SELECT COUNT(*) FROM (SELECT k, SUM(v) FROM "tt`source" GROUP BY k EXCEPT ALL SELECT * FROM tt_escaped));
+----
+0	0
+
+statement ok
+SET openivm_refresh_mode='full';
+
+query I
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`tt``source` VERSION AS OF 7%'
+       AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%AT (VERSION%'
+FROM openivm_compile_with_facts('tt_escaped', '{"target_dialect":"spark","compile_only":true}')
+WHERE stmt_kind = 'data';
+----
+true
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+SET openivm_input_dialect='duckdb';

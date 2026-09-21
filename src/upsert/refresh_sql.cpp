@@ -56,17 +56,11 @@ static string RenderStoredViewQueryForDialect(ClientContext &context, const stri
 		                      static_cast<idx_t>(parser.statements.size()));
 	}
 	Planner planner(context);
-	// Source qualification already peeled any time-travel pin the local catalog cannot bind, so the
-	// plan builds here. Re-attach the pins only when rendering for a foreign engine: DuckDB-dialect
-	// output runs against this same pin-less catalog, while Spark (and any other dialect LPTS can
-	// render) must read exactly the snapshot the view was defined against.
-	openivm::TimeTravelPins::PeelForLocalBinding(context, *parser.statements[0]);
+	// Source qualification already stripped foreign pins; native catalog snapshots remain bindable.
 	planner.CreatePlan(parser.statements[0]->Copy());
 	auto plan = std::move(planner.plan);
-	auto ast = LogicalPlanToAst(context, plan, dialect);
-	if (dialect != SqlDialect::DUCKDB) {
-		time_travel_pins.RestoreInto(*ast);
-	}
+	auto ast = LogicalPlanToAst(context, plan, dialect,
+	                            dialect == SqlDialect::DUCKDB ? SnapshotResolver() : time_travel_pins.Resolver());
 	auto cte_list = AstToCteList(*ast, dialect);
 	auto rendered = cte_list->ToQuery(true, output_names);
 	if (!rendered.empty() && rendered.back() == ';') {
@@ -490,10 +484,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	if (view_query_sql.empty()) {
 		throw ParserException("View not found! Please call IVM with a materialized view.");
 	}
-	// The stored view SQL is the only place the per-relation time-travel pins survive: source
-	// qualification below rewrites every base reference to its delta-qualified name and drops the
-	// trailing `AT (...)` qualifier so the refresh binds against the local stand-in tables. Capture
-	// the pins first so foreign-dialect output can re-attach them to the very same relations.
+	// Capture pins before stripping them for local stand-in binding and source qualification.
 	openivm::TimeTravelPins view_time_travel_pins;
 	{
 		con.BeginTransaction();
@@ -505,19 +496,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			throw;
 		}
 	}
-	// Only the AST-rendered refresh paths run the pins back through `RestoreInto`. Several view
-	// shapes (min/max aggregates, group recompute, interrupted-refresh recovery, ...) assemble
-	// their refresh program as SQL text instead, which the pins never reach — those would ship to
-	// the target engine reading the latest snapshot rather than the pinned one. Every exit is
-	// therefore finalized here: scans that already carry their qualifier are left untouched, and a
-	// dialect with no time-travel syntax still refuses through LPTS. DuckDB output runs against this
-	// catalog, which holds no snapshots, so there the pin is stripped instead of translated.
+	// Text-only refresh paths still need restoration. Plan-based paths already carry typed snapshots;
+	// DuckDB output uses the unpinned local source query and must not acquire foreign pins.
 	auto finalize_refresh_sql = [&](string refresh_sql) {
-		if (view_time_travel_pins.Empty()) {
+		if (view_time_travel_pins.Empty() || active_facts.target_dialect == SqlDialect::DUCKDB) {
 			return refresh_sql;
-		}
-		if (active_facts.target_dialect == SqlDialect::DUCKDB) {
-			return view_time_travel_pins.StripFrom(refresh_sql);
 		}
 		return view_time_travel_pins.RestoreIntoSql(refresh_sql, active_facts.target_dialect);
 	};
@@ -535,6 +518,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                     "; delta_tables=" + to_string(delta_table_names.size()) +
 	                     "; target_ducklake=" + string(target_is_ducklake ? "true" : "false"));
 	auto qualify_start = profile_now();
+	view_query_sql = view_time_travel_pins.StripFrom(view_query_sql);
 	view_query_sql = QualifyViewQuerySources(metadata, con, view_name, view_query_sql, delta_sources, view_catalog_name,
 	                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 	add_profile_step("generate_refresh_sql.qualify_sources", qualify_start,
@@ -1460,13 +1444,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			try {
 				auto lpts_start = profile_now();
 				SqlDialect dialect = active_facts.target_dialect;
-				auto ast = LogicalPlanToAst(con_ctx, plan, dialect);
-				if (dialect != SqlDialect::DUCKDB) {
-					// The delta plan still scans the pinned base relations alongside the delta
-					// tables; re-attach each pin so the target engine reads the snapshot the view
-					// was defined against.
-					view_time_travel_pins.RestoreInto(*ast);
-				}
+				auto ast = LogicalPlanToAst(con_ctx, plan, dialect,
+				                            dialect == SqlDialect::DUCKDB ? SnapshotResolver()
+				                                                          : view_time_travel_pins.Resolver());
 				bool emit_spark_hints = dialect == SqlDialect::SPARK &&
 				                        (active_facts.emit_spark_hints ||
 				                         SqlUtils::GetBoolSetting(con_ctx, "openivm_emit_spark_hints", false));

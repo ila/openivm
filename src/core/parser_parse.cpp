@@ -3,7 +3,6 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
-#include "core/time_travel_pins.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -161,15 +160,8 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 	// at the plan level in PlanFunction via PlanRewrite + LPTS.
 	OPENIVM_DEBUG_PRINT("[CREATE MV] After structural rewrite: %s\n", query_lower.c_str());
 
-	vector<openivm::SnapshotBinding> pin_bindings;
 	if (input_dialect != SqlDialect::DUCKDB) {
-		// The body is written in another dialect, so DuckDB's parser cannot read it as-is — a
-		// Spark/Delta temporal clause (`FROM t VERSION AS OF 366`) dies on `AS`. LPTS rewrites the
-		// source spelling into the semantically equivalent DuckDB one, keeping the pin
-		// (`AT (VERSION => 366)`) rather than dropping it, which would silently promote the scan to
-		// "read latest". Record what each pin is written against first, so the rewrite can be held
-		// to it below.
-		pin_bindings = openivm::CollectSourceSnapshotBindings(query_lower, input_dialect);
+		// LPTS owns input syntax; the parsed AT clause below carries the snapshot and its relation.
 		query_lower = NormalizeInputSqlToDuckDB(query_lower, input_dialect);
 		OPENIVM_DEBUG_PRINT("[CREATE MV] After %s input normalization: %s\n", SqlDialectToString(input_dialect).c_str(),
 		                    query_lower.c_str());
@@ -177,9 +169,6 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 
 	Parser p;
 	p.ParseQuery(query_lower);
-	// Rewriting the temporal clause moves it across the relation's alias, so re-check against the
-	// parse tree that every pin still names the relation and alias it was written against.
-	openivm::VerifySnapshotBindings(*p.statements[0], pin_bindings);
 
 	auto parse_data = make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(std::move(p.statements[0]),
 	                                                                                      refresh_interval);

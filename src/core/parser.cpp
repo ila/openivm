@@ -445,8 +445,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	{
 		auto select_parse_plan_start = create_profile_now();
 		Parser select_parser;
-		select_parser.ParseQuery(original_view_query);
-		openivm::TimeTravelPins::PeelForLocalBinding(context, *select_parser.statements[0]);
+		select_parser.ParseQuery(local_view_query);
 		Planner select_planner(context);
 		select_planner.CreatePlan(std::move(select_parser.statements[0]));
 		auto select_plan = std::move(select_planner.plan);
@@ -545,8 +544,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			// CREATE MATERIALIZED VIEW always stores the view body in DuckDB's own dialect.
 			// Refresh-time target dialects are selected per CompileFacts.
 			SqlDialect dialect = SqlDialect::DUCKDB;
-			auto ast = LogicalPlanToAst(context, select_plan, dialect);
-			time_travel_pins.RestoreInto(*ast);
+			auto ast = LogicalPlanToAst(context, select_plan, dialect, time_travel_pins.Resolver());
 			auto cte_list = AstToCteList(*ast, dialect);
 			view_query = cte_list->ToQuery(true, output_names);
 			if (!view_query.empty() && view_query.back() == ';') {

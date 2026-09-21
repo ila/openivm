@@ -2,6 +2,7 @@
 
 #include "core/openivm_debug.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -101,15 +102,12 @@ static void VisitTableRef(TableRef &ref, const RefVisitor &visitor) {
 }
 
 static void VisitQueryNode(QueryNode &node, const RefVisitor &visitor) {
-	// A CTE body is bound in the scope that precedes its own name, so walk the bodies first with
-	// the incoming scope and only then extend the scope for the node that references them.
-	for (auto &cte : node.cte_map.map) {
-		if (cte.second->query && cte.second->query->node) {
-			VisitQueryNode(*cte.second->query->node, visitor);
-		}
-	}
+	// Each CTE body sees preceding siblings, but not its own name.
 	RefVisitor scoped {visitor.callback, visitor.cte_names};
 	for (auto &cte : node.cte_map.map) {
+		if (cte.second->query && cte.second->query->node) {
+			VisitQueryNode(*cte.second->query->node, scoped);
+		}
 		scoped.cte_names.insert(cte.first);
 	}
 	switch (node.type) {
@@ -255,20 +253,19 @@ TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statem
 		// stores the "" this map treats as "matches any qualifier".
 		pin.catalog = ref.catalog_name;
 		pin.schema = ref.schema_name;
-		pin.suffix = " " + ref.at_clause->ToString();
+		pin.snapshot = std::move(ref.at_clause);
 		auto existing = result.pins.find(ref.table_name);
 		if (existing != result.pins.end()) {
-			if (existing->second.suffix != pin.suffix) {
-				ThrowAmbiguousPin(ref.table_name, "it is pinned to both '" + existing->second.suffix.substr(1) +
-				                                      "' and '" + pin.suffix.substr(1) + "'");
+			if (!AtClause::Equals(existing->second.snapshot, pin.snapshot)) {
+				ThrowAmbiguousPin(ref.table_name, "it is pinned to both '" + existing->second.snapshot->ToString() +
+				                                      "' and '" + pin.snapshot->ToString() + "'");
 			}
 			if (existing->second.catalog != pin.catalog || existing->second.schema != pin.schema) {
 				ThrowAmbiguousPin(ref.table_name, "the same pin names two differently qualified relations");
 			}
 		}
-		OPENIVM_DEBUG_PRINT("[TIME TRAVEL] Peeled pin '%s' off relation '%s'\n", pin.suffix.c_str(),
+		OPENIVM_DEBUG_PRINT("[TIME TRAVEL] Peeled pin '%s' off relation '%s'\n", pin.snapshot->ToString().c_str(),
 		                    ref.table_name.c_str());
-		ref.at_clause.reset();
 		result.pins[ref.table_name] = std::move(pin);
 	};
 	RefVisitor visitor {callback, case_insensitive_set_t()};
@@ -294,29 +291,22 @@ TimeTravelPins TimeTravelPins::FromViewSql(ClientContext &context, const string 
 	return Peel(context, *parser.statements[0]);
 }
 
-void TimeTravelPins::RestoreInto(AstNode &ast) const {
+SnapshotResolver TimeTravelPins::Resolver() const {
 	if (pins.empty()) {
-		return;
+		return {};
 	}
-	auto get_node = dynamic_cast<AstGetNode *>(&ast);
-	if (get_node && get_node->table_name.find(" AT (") == string::npos) {
-		auto entry = pins.find(get_node->table_name);
-		if (entry != pins.end()) {
-			auto &pin = entry->second;
-			bool catalog_matches = pin.catalog.empty() || get_node->catalog.empty() ||
-			                       StringUtil::CIEquals(pin.catalog, get_node->catalog);
-			bool schema_matches =
-			    pin.schema.empty() || get_node->schema.empty() || StringUtil::CIEquals(pin.schema, get_node->schema);
-			if (catalog_matches && schema_matches) {
-				get_node->table_name += pin.suffix;
-			}
+	return [this](const TableCatalogEntry &table) -> unique_ptr<AtClause> {
+		auto entry = pins.find(table.name);
+		if (entry == pins.end()) {
+			return nullptr;
 		}
-	}
-	for (auto &child : ast.children) {
-		if (child) {
-			RestoreInto(*child);
+		auto &pin = entry->second;
+		if ((!pin.catalog.empty() && !StringUtil::CIEquals(pin.catalog, table.ParentCatalog().GetName())) ||
+		    (!pin.schema.empty() && !StringUtil::CIEquals(pin.schema, table.schema.name))) {
+			return nullptr;
 		}
-	}
+		return pin.snapshot->Copy();
+	};
 }
 
 static bool IsIdentifierStart(char c) {
@@ -372,102 +362,28 @@ static idx_t MatchingParen(const string &sql, idx_t open) {
 	return DConstants::INVALID_INDEX;
 }
 
-// The identifier a trailing qualifier belongs to. DuckDB spells a pin *after* the alias
-// (`FROM t AS v AT (VERSION => 366)`, the shape LPTS normalises Spark's `FROM t VERSION AS OF 366 v`
-// into), so the pinned relation is one alias-step behind the most recent identifier. Tracking only
-// the most recent one credits the qualifier to the alias and leaves the pin in place, which sends a
-// scan the local catalog cannot bind into SQL OpenIVM executes itself.
-struct RelationCursor {
-	string last;     // most recent identifier: the alias when the relation carries one
-	string previous; // the identifier before it: the relation itself when `last` is its alias
-
-	void Push(const string &identifier) {
-		// `AS` introduces the alias of the relation already in `last`, so it must not shift it out.
-		if (StringUtil::CIEquals(identifier, "as")) {
-			return;
-		}
-		previous = last;
-		last = identifier;
-	}
-
-	void Reset() {
-		last.clear();
-		previous.clear();
-	}
-};
-
 string TimeTravelPins::StripFrom(const string &sql) const {
 	if (pins.empty()) {
 		return sql;
 	}
-	string result;
-	result.reserve(sql.size());
-	RelationCursor cursor;
-	auto pinned_relation = [&]() {
-		if (pins.find(cursor.last) != pins.end()) {
-			return true;
-		}
-		return pins.find(cursor.previous) != pins.end();
-	};
-	idx_t i = 0;
-	while (i < sql.size()) {
-		char c = sql[i];
-		if (c == '\'') {
-			i = CopyQuotedRun(sql, i, result);
-			cursor.Reset();
-			continue;
-		}
-		if (c == '"' || c == '`') {
-			idx_t start = result.size();
-			i = CopyQuotedRun(sql, i, result);
-			cursor.Push(result.substr(start + 1, result.size() - start - 2));
-			continue;
-		}
-		if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-			while (i < sql.size() && sql[i] != '\n') {
-				result += sql[i++];
-			}
-			continue;
-		}
-		if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-			auto close = sql.find("*/", i + 2);
-			auto end = close == string::npos ? sql.size() : close + 2;
-			result.append(sql, i, end - i);
-			i = end;
-			continue;
-		}
-		if (IsIdentifierStart(c)) {
-			idx_t end = i;
-			while (end < sql.size() && IsIdentifierPart(sql[end])) {
-				end++;
-			}
-			auto token = sql.substr(i, end - i);
-			idx_t after = end;
-			while (after < sql.size() && std::isspace(static_cast<unsigned char>(sql[after]))) {
-				after++;
-			}
-			if (StringUtil::CIEquals(token, "at") && after < sql.size() && sql[after] == '(' && pinned_relation()) {
-				auto close = MatchingParen(sql, after);
-				if (close != DConstants::INVALID_INDEX) {
-					while (!result.empty() && std::isspace(static_cast<unsigned char>(result.back()))) {
-						result.pop_back();
-					}
-					i = close;
-					continue;
-				}
-			}
-			result += token;
-			cursor.Push(token);
-			i = end;
-			continue;
-		}
-		result += c;
-		if (c != '.' && !std::isspace(static_cast<unsigned char>(c))) {
-			cursor.Reset();
-		}
-		i++;
+	Parser parser;
+	parser.ParseQuery(sql);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		throw InternalException("Expected one view query while stripping time-travel pins");
 	}
-	return result;
+	BaseTableRefCallback callback = [&](BaseTableRef &ref) {
+		auto entry = pins.find(ref.table_name);
+		if (entry == pins.end()) {
+			return;
+		}
+		auto &pin = entry->second;
+		if ((pin.catalog.empty() || StringUtil::CIEquals(pin.catalog, ref.catalog_name)) &&
+		    (pin.schema.empty() || StringUtil::CIEquals(pin.schema, ref.schema_name))) {
+			ref.at_clause.reset();
+		}
+	};
+	VisitStatement(*parser.statements[0], RefVisitor {callback, {}});
+	return parser.statements[0]->ToString();
 }
 
 // Words that may legally follow a table reference; none of them can be a bare alias.
@@ -541,17 +457,6 @@ static bool CarriesQualifierAt(const string &sql, idx_t pos, const string &quali
 		qualifier_pos++;
 	}
 	return true;
-}
-
-// Render `at_suffix` (` AT (VERSION => 366)`) in `dialect`'s own spelling. LPTS owns both the
-// spelling and the refusal for dialects with no verified time-travel syntax, so this never guesses.
-static string DialectPinSuffix(const string &at_suffix, SqlDialect dialect) {
-	string base_name;
-	string dialect_suffix;
-	if (!TrySplitDialectSnapshotSuffix("openivm_pinned_relation" + at_suffix, dialect, base_name, dialect_suffix)) {
-		throw InternalException("OpenIVM could not render the time-travel pin '%s'", at_suffix);
-	}
-	return dialect_suffix;
 }
 
 // Advance past whitespace and comments so a qualifier written behind either is still found.
@@ -749,7 +654,7 @@ string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) con
 				if (entry == pins.end()) {
 					continue;
 				}
-				auto dialect_suffix = DialectPinSuffix(entry->second.suffix, dialect);
+				auto dialect_suffix = RenderSnapshotSuffix(entry->second.snapshot.get(), dialect);
 				if (CarriesQualifierAt(sql, i, dialect_suffix)) {
 					continue;
 				}
@@ -806,208 +711,6 @@ string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) con
 		}
 	}
 	return result;
-}
-
-// Collapse runs of whitespace so two spellings of the same qualifier compare equal.
-static string NormalizeQualifierText(const string &qualifier) {
-	string normalized;
-	normalized.reserve(qualifier.size());
-	bool pending_space = false;
-	for (auto c : qualifier) {
-		if (std::isspace(static_cast<unsigned char>(c))) {
-			pending_space = !normalized.empty();
-			continue;
-		}
-		if (pending_space) {
-			normalized += ' ';
-			pending_space = false;
-		}
-		normalized += c;
-	}
-	return normalized;
-}
-
-// Map a Spark/Delta temporal keyword at `pos` to the DuckDB `AT (...)` parameter carrying the same
-// snapshot. `VERSION`/`SYSTEM_VERSION` pin a commit version, `TIMESTAMP`/`SYSTEM_TIME` a point in time.
-static bool ReadTemporalKeyword(const string &sql, idx_t pos, idx_t &end, string &at_parameter) {
-	struct TemporalKeyword {
-		const char *spelling;
-		const char *at_parameter;
-	};
-	static const TemporalKeyword KEYWORDS[] = {{"system_version", "VERSION"},
-	                                           {"version", "VERSION"},
-	                                           {"system_time", "TIMESTAMP"},
-	                                           {"timestamp", "TIMESTAMP"}};
-	for (const auto &candidate : KEYWORDS) {
-		if (MatchesKeywordAt(sql, pos, candidate.spelling)) {
-			end = pos + strlen(candidate.spelling);
-			at_parameter = candidate.at_parameter;
-			return true;
-		}
-	}
-	return false;
-}
-
-// Read a whole `[FOR] VERSION|TIMESTAMP AS OF <literal>` clause at `pos`, yielding the equivalent
-// DuckDB qualifier. Requiring the full sequence keeps a column merely named `version` from matching.
-static bool TryReadSourcePin(const string &sql, idx_t pos, idx_t &end, string &qualifier) {
-	idx_t keyword_start = pos;
-	if (MatchesKeywordAt(sql, pos, "for")) {
-		keyword_start = SkipWhitespace(sql, pos + 3);
-	}
-	idx_t keyword_end;
-	string at_parameter;
-	if (!ReadTemporalKeyword(sql, keyword_start, keyword_end, at_parameter)) {
-		return false;
-	}
-	idx_t as_pos = SkipWhitespace(sql, keyword_end);
-	if (!MatchesKeywordAt(sql, as_pos, "as")) {
-		return false;
-	}
-	idx_t of_pos = SkipWhitespace(sql, as_pos + 2);
-	if (!MatchesKeywordAt(sql, of_pos, "of")) {
-		return false;
-	}
-	idx_t value_start = SkipWhitespace(sql, of_pos + 2);
-	idx_t value_end;
-	string literal;
-	string value_sql;
-	if (TryReadSingleQuotedLiteral(sql, value_start, value_end, literal)) {
-		value_sql = SingleQuotedSqlString(literal);
-	} else if (!TryReadNumericToken(sql, value_start, value_end, value_sql)) {
-		return false;
-	}
-	qualifier = "AT (" + at_parameter + " => " + value_sql + ")";
-	end = value_end;
-	return true;
-}
-
-// Read the `[AS] alias` the source dialect allows *after* a temporal clause, returning `pos`
-// unchanged when the relation is unaliased and what follows just continues the query.
-static idx_t ReadAliasAfterPin(const string &sql, idx_t pos, string &alias) {
-	idx_t cursor = SkipWhitespace(sql, pos);
-	bool explicit_as = MatchesKeywordAt(sql, cursor, "as");
-	if (explicit_as) {
-		cursor = SkipWhitespace(sql, cursor + 2);
-	}
-	if (cursor < sql.size() && (sql[cursor] == '"' || sql[cursor] == '`')) {
-		string quoted;
-		idx_t quoted_end = CopyQuotedRun(sql, cursor, quoted);
-		alias = quoted.size() >= 2 ? quoted.substr(1, quoted.size() - 2) : quoted;
-		return quoted_end;
-	}
-	idx_t token_end;
-	string token;
-	if (TryReadIdentifierToken(sql, cursor, token_end, token) && (explicit_as || CanBeBareAlias(token))) {
-		alias = token;
-		return token_end;
-	}
-	return pos;
-}
-
-vector<SnapshotBinding> CollectSourceSnapshotBindings(const string &sql, SqlDialect dialect) {
-	vector<SnapshotBinding> bindings;
-	if (dialect != SqlDialect::SPARK) {
-		return bindings;
-	}
-	// The relation the next temporal clause would pin. Reset by anything that cannot be part of a
-	// qualified relation name, so a pin is never credited to an unrelated identifier.
-	string last_identifier;
-	idx_t i = 0;
-	while (i < sql.size()) {
-		char c = sql[i];
-		if (c == '\'') {
-			string ignored;
-			i = CopyQuotedRun(sql, i, ignored);
-			last_identifier.clear();
-			continue;
-		}
-		if (c == '"' || c == '`') {
-			string quoted;
-			i = CopyQuotedRun(sql, i, quoted);
-			last_identifier = quoted.size() >= 2 ? quoted.substr(1, quoted.size() - 2) : quoted;
-			continue;
-		}
-		if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-			while (i < sql.size() && sql[i] != '\n') {
-				i++;
-			}
-			continue;
-		}
-		if (c == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-			auto close = sql.find("*/", i + 2);
-			i = close == string::npos ? sql.size() : close + 2;
-			continue;
-		}
-		if (!IsIdentifierStart(c)) {
-			if (c != '.' && !std::isspace(static_cast<unsigned char>(c))) {
-				last_identifier.clear();
-			}
-			i++;
-			continue;
-		}
-		idx_t pin_end;
-		string qualifier;
-		if (!TryReadSourcePin(sql, i, pin_end, qualifier)) {
-			idx_t end = i;
-			while (end < sql.size() && IsIdentifierPart(sql[end])) {
-				end++;
-			}
-			last_identifier = sql.substr(i, end - i);
-			i = end;
-			continue;
-		}
-		string alias;
-		idx_t alias_end = ReadAliasAfterPin(sql, pin_end, alias);
-		// A keyword in front of the clause names no relation, so there is no association to assert;
-		// the normalized text will fail to parse on its own.
-		if (!last_identifier.empty() && CanBeBareAlias(last_identifier)) {
-			bindings.push_back(SnapshotBinding {last_identifier, alias, qualifier});
-			OPENIVM_DEBUG_PRINT("[TIME TRAVEL] Source pin '%s' on relation '%s' aliased '%s'\n", qualifier.c_str(),
-			                    last_identifier.c_str(), alias.c_str());
-		}
-		last_identifier.clear();
-		i = alias_end;
-	}
-	return bindings;
-}
-
-void VerifySnapshotBindings(SQLStatement &statement, const vector<SnapshotBinding> &bindings) {
-	if (bindings.empty()) {
-		return;
-	}
-	vector<bool> matched(bindings.size(), false);
-	BaseTableRefCallback callback = [&](BaseTableRef &ref) {
-		if (!ref.at_clause) {
-			return;
-		}
-		auto qualifier = ref.at_clause->ToString();
-		for (idx_t i = 0; i < bindings.size(); i++) {
-			if (matched[i]) {
-				continue;
-			}
-			auto &binding = bindings[i];
-			if (StringUtil::CIEquals(binding.relation, ref.table_name) &&
-			    StringUtil::CIEquals(binding.alias, ref.alias) &&
-			    StringUtil::CIEquals(NormalizeQualifierText(binding.qualifier), NormalizeQualifierText(qualifier))) {
-				matched[i] = true;
-				return;
-			}
-		}
-	};
-	RefVisitor visitor {callback, case_insensitive_set_t()};
-	VisitStatement(statement, visitor);
-	for (idx_t i = 0; i < bindings.size(); i++) {
-		if (!matched[i]) {
-			auto &binding = bindings[i];
-			throw NotImplementedException(
-			    "OpenIVM lost the time-travel pin '%s' written on relation '%s' (alias '%s') while normalizing the "
-			    "view body: no scan of that relation carries it after parsing. The source dialect writes the pin "
-			    "between the relation and its alias and DuckDB wants it after both, so the clause is reordered "
-			    "before parsing; compiling on would read a different snapshot.",
-			    binding.qualifier, binding.relation, binding.alias);
-		}
-	}
 }
 
 } // namespace openivm
