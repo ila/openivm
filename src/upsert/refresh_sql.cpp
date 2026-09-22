@@ -1162,7 +1162,22 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				throw;
 			}
 		}
-		upsert_query = CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix);
+		// The non-cascade recompute path in BuildRecomputeQuery already passes the data table's unique
+		// keys so it upserts rather than deleting and re-inserting them. This path did not, so a full
+		// refresh of an AGGREGATE_GROUP view that has a downstream view failed on a reopened
+		// persistent database with "Duplicate key ... violates unique constraint": DuckDB's on-disk
+		// unique index still reports keys deleted earlier in the same transaction. Nothing caught it
+		// because the rest of the suite runs in memory, where the index is built in-session.
+		//
+		// Restricted to DuckDB output: the safe form emits INSERT OR REPLACE, which other dialects do
+		// not share.
+		vector<string> recompute_unique_keys;
+		if (active_facts.target_dialect == SqlDialect::DUCKDB &&
+		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
+			recompute_unique_keys = metadata.GetGroupColumns(view_name);
+		}
+		upsert_query =
+		    CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix, recompute_unique_keys);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));
 		break;
 	}

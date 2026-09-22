@@ -1450,9 +1450,14 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 	return delete_query + insert_query;
 }
 
-string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix) {
+string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix,
+                            const vector<string> &unique_keys) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
-	return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql);
+	string recompute_temp;
+	if (!unique_keys.empty()) {
+		recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
+	}
+	return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp);
 }
 
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
