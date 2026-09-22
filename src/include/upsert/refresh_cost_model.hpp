@@ -43,8 +43,15 @@ struct RefreshCostEstimate {
 /// Walks the plan tree, collects base table and delta table cardinalities,
 /// and computes a cost estimate for both strategies. If sufficient execution
 /// history exists, applies learned regression to calibrate predictions.
+///
+/// `incremental_plan`, when supplied, is the rewritten delta plan that the refresh will actually
+/// execute. Its estimated output cardinality comes from DuckDB's own estimator, which sees the real
+/// delta tables, join selectivities and pushed-down filters, so it replaces this model's fanout
+/// proxy. Pass nullptr when no such plan exists (adaptive refresh off, or a strategy that produces
+/// no delta), and the proxy is used instead.
 RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name,
-                                        const DeltaActivityResult *delta_activity = nullptr);
+                                        const DeltaActivityResult *delta_activity = nullptr,
+                                        LogicalOperator *incremental_plan = nullptr);
 
 /// Pragma function: returns the refresh cost estimate for a view as a string.
 string RefreshCostQuery(ClientContext &context, const FunctionParameters &parameters);

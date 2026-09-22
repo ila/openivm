@@ -365,6 +365,31 @@ static void EnsureSemiAntiAuxState(RefreshMetadata &metadata, Connection &con, c
 
 } // namespace
 
+IncrementalDeltaPlan BuildIncrementalDeltaPlan(ClientContext &con_ctx, Connection &con,
+                                               const string &internal_catalog_name, const string &internal_schema_name,
+                                               const string &view_name, bool cross_system) {
+	string compute_delta = "select * from ComputeDelta('" + SqlUtils::EscapeValue(internal_catalog_name) + "','" +
+	                       SqlUtils::EscapeValue(internal_schema_name) + "','" + SqlUtils::EscapeValue(view_name) +
+	                       "');";
+	OPENIVM_DEBUG_PRINT("[UPSERT] Planning ComputeDelta query: %s\n", compute_delta.c_str());
+	Parser p;
+	p.ParseQuery(compute_delta);
+
+	con.BeginTransaction();
+	IncrementalDeltaPlan result;
+	result.planner = make_uniq<Planner>(con_ctx);
+	result.planner->CreatePlan(std::move(p.statements[0]));
+	auto plan = std::move(result.planner->plan);
+	// deliminator: overflow guard on the deep generated SQL. Template set: keep the serialized
+	// delta plan data-independent (the rewrite rule fires within this Optimize()).
+	ScopedDisabledOptimizers disabled_optimizers(con_ctx, string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "," +
+	                                                          FinalPlanDisabledOptimizers(con_ctx, cross_system));
+	Optimizer optimizer(*result.planner->binder, con_ctx);
+	result.plan = optimizer.Optimize(std::move(plan)); // this transforms the plan into an incremental plan
+	con.Rollback();
+	return result;
+}
+
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta, string *out_post_meta,
@@ -571,8 +596,20 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 
 	bool adaptive_refresh = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
 	bool adaptive_recompute = false;
+	// Built here when the cost model needs it, and moved into the delta-production branch below so
+	// the refresh executes the very plan that was costed. Planning ComputeDelta expands an N-table
+	// join into up to 2^N-1 terms, so building it twice would be the most expensive repetition in
+	// this function. Hoisting is safe because nothing the rewrite rules can observe changes between
+	// the two points: the compile facts are final before this line, and no setting, context slot or
+	// metadata row is written in between.
+	IncrementalDeltaPlan prebuilt_delta;
 	if (adaptive_refresh) {
 		auto adaptive_start = profile_now();
+		// Skip when the strategy is already settled: the incremental plan would be discarded.
+		if (!force_full_refresh && !metadata_requires_full_refresh && view_query_type != RefreshType::FULL_REFRESH) {
+			prebuilt_delta = BuildIncrementalDeltaPlan(planning_context, con, internal_catalog_name,
+			                                           internal_schema_name, view_name, cross_system);
+		}
 		con.BeginTransaction();
 		Parser cost_parser;
 		cost_parser.ParseQuery(view_query_sql);
@@ -581,7 +618,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		Optimizer cost_optimizer(*cost_planner.binder, planning_context);
 		auto cost_plan = cost_optimizer.Optimize(std::move(cost_planner.plan));
 
-		auto cost_estimate = EstimateRefreshCost(planning_context, *cost_plan, view_name, refresh_delta_activity);
+		auto cost_estimate = EstimateRefreshCost(planning_context, *cost_plan, view_name, refresh_delta_activity,
+		                                         prebuilt_delta.plan.get());
 		con.Rollback();
 		if (out_adaptive_estimate) {
 			*out_adaptive_estimate = cost_estimate;
@@ -1386,31 +1424,20 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			}
 		}
 	} else {
-		string compute_delta = "select * from ComputeDelta('" + SqlUtils::EscapeValue(internal_catalog_name) + "','" +
-		                       SqlUtils::EscapeValue(internal_schema_name) + "','" + SqlUtils::EscapeValue(view_name) +
-		                       "');";
-		OPENIVM_DEBUG_PRINT("[UPSERT] Planning ComputeDelta query: %s\n", compute_delta.c_str());
 		auto compute_delta_plan_start = profile_now();
-		Parser p;
-		p.ParseQuery(compute_delta);
-
-		con.BeginTransaction();
 		auto &con_ctx = planning_context;
-		OPENIVM_DEBUG_PRINT("[UPSERT] Creating planner...\n");
-		Planner planner(con_ctx);
-		OPENIVM_DEBUG_PRINT("[UPSERT] CreatePlan...\n");
-		planner.CreatePlan(std::move(p.statements[0]));
-		auto plan = std::move(planner.plan);
-		OPENIVM_DEBUG_PRINT("[UPSERT] Plan created. Running optimizer...\n");
-		// deliminator: overflow guard on the deep generated SQL. Template set: keep the serialized
-		// delta plan data-independent (the rewrite rule fires within this Optimize()).
-		ScopedDisabledOptimizers disabled_optimizers(con_ctx, string(openivm::REFRESH_DISABLED_OPTIMIZERS) + "," +
-		                                                          FinalPlanDisabledOptimizers(con_ctx, cross_system));
-		Optimizer optimizer(*planner.binder, con_ctx);
-		plan = optimizer.Optimize(std::move(plan)); // this transforms the plan into an incremental plan
+		// Adopt the plan the cost model already built, so the refresh runs exactly what was costed.
+		// When adaptive refresh is off nothing was built, and we plan it here as before.
+		IncrementalDeltaPlan delta_plan = std::move(prebuilt_delta);
+		bool reused_cost_model_plan = delta_plan.plan != nullptr;
+		if (!reused_cost_model_plan) {
+			delta_plan = BuildIncrementalDeltaPlan(con_ctx, con, internal_catalog_name, internal_schema_name, view_name,
+			                                       cross_system);
+		}
+		auto &plan = delta_plan.plan;
 		OPENIVM_DEBUG_PRINT("[UPSERT] Optimizer done.\n");
-		con.Rollback();
-		add_profile_step("generate_refresh_sql.compute_delta_plan", compute_delta_plan_start);
+		add_profile_step("generate_refresh_sql.compute_delta_plan", compute_delta_plan_start,
+		                 reused_cost_model_plan ? "reused=cost_model" : "reused=none");
 		string raw_refresh_sql;
 		if (IsEmptyDeltaPlan(plan.get())) {
 			raw_refresh_sql = BuildEmptyDeltaInsert(view_name, column_names, column_types, active_facts.target_dialect);

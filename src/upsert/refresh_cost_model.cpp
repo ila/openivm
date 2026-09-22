@@ -148,6 +148,20 @@ static const char *StrategyLabelForRefreshType(RefreshType view_type) {
 // incremental's per-statement floor beats nothing; incremental wins once recompute is genuinely
 // expensive (large joins that re-materialize a big result, or a big MV whose full replace dwarfs a
 // small delta apply).
+// TODO: replace these seven constants with weights learned per operator class. Each candidate plan
+// would contribute a feature vector of estimated rows bucketed by operator (scan, join build, join
+// probe, aggregate input, aggregate output, window, sort, write), read from the same DuckDB
+// estimator that already prices both sides, and predicted time would be that vector against weights
+// fit over recorded refreshes. A `DOUBLE[]` column on `openivm_refresh_history` alongside a small
+// integer naming the feature layout stores it without a JSON parser and without schema churn when
+// the layout changes; DuckDB's per-operator profiler output (operator_type, operator_cardinality,
+// operator_timing) supplies the per-operator actuals that say which class is mispriced.
+//
+// The motivating measurement, from the cost-model benchmark at TPC-C spec scale with calibration
+// active: the incremental side predicts within about 30% while full recompute is under-predicted by
+// a factor of two to three (4.0ms predicted against 12.0ms measured for a simple grouped aggregate,
+// 10.8ms against 21.3ms for a join). Both sides being wrong in the same direction is why decisions
+// still came out right there, and is exactly what stops holding near the crossover.
 static constexpr double RECOMPUTE_SETUP_MS = 10.0;        // fixed query setup + MV replace overhead
 static constexpr double RECOMPUTE_MS_PER_UNIT = 0.000004; // vectorized scan: nearly free per row
 static constexpr double RECOMPUTE_JOIN_FACTOR = 1.5;      // each join multiplies full-output scan cost
@@ -284,6 +298,84 @@ static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_na
 		count += del_result->GetValue(0, 0).GetValue<double>();
 	}
 	return count;
+}
+
+/// Estimated number of rows the incremental delta plan will produce, read from DuckDB's own
+/// cardinality estimator on the plan the refresh is about to run. Returns -1 when no usable node is
+/// found, which tells the caller to keep its own estimate.
+///
+/// Two kinds of node are skipped on the way down, both for correctness rather than convenience:
+///
+///   INSERT reports the cardinality of the *statement result* — a single row carrying the number of
+///   rows written — not the number of rows it writes, so its own estimate is always 1.
+///
+///   PROJECTION cannot change cardinality, so its true estimate is its child's. This matters
+///   because `LogicalOperator::EstimateCardinality` caches into `estimated_cardinality` and returns
+///   the cached value on every later call. When an IVM rewrite rule replaces the subtree beneath a
+///   projection that the original plan already costed, the projection keeps the pre-rewrite number:
+///   the cardinality of a full base scan rather than of a delta scan. Reading it directly estimated
+///   a one-row delta over a 100-row table at 101 rows and flipped the decision to full recompute.
+///   Descending to the child reads a value computed after the rewrite.
+///
+/// Clearing the cached values instead would be worse: for joins the optimizer's estimator has
+/// already stored a statistics-derived cardinality that a recomputation would replace with the
+/// cruder default of the maximum over children.
+///
+/// The number this returns is an *output* estimate, to be read together with the delta *input*
+/// estimate below; see the fanout comment in EstimateRefreshCost for why the pair is used rather
+/// than this value alone.
+struct IncrementalDeltaEstimate {
+	double rows = -1; // estimated delta output rows; negative when the plan yielded nothing usable
+	// True when `rows` counts groups rather than rows, i.e. the delta output is produced by a
+	// grouping or DISTINCT operator. Such a count is sublinear in its input and must not be scaled
+	// by an input ratio the way a row count can be.
+	bool group_count = false;
+};
+
+static IncrementalDeltaEstimate EstimateIncrementalDeltaRows(ClientContext &context, LogicalOperator &plan) {
+	IncrementalDeltaEstimate result;
+	LogicalOperator *node = &plan;
+	while (node->type == LogicalOperatorType::LOGICAL_INSERT || node->type == LogicalOperatorType::LOGICAL_EXPLAIN ||
+	       node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		if (node->children.empty()) {
+			return result;
+		}
+		node = node->children[0].get();
+	}
+	double rows = static_cast<double>(node->EstimateCardinality(context));
+
+	// Grouping and DISTINCT cannot emit more rows than they consume. DuckDB can predict that they
+	// will, because it derives an output group count from the base column's distinct-value
+	// statistics while the input here is a small delta: for a two-row delta into one group of a
+	// ten-group view it estimates ten output rows, which then priced the MERGE against every group
+	// in the view instead of the one that changed. Clamping to the input restores an invariant the
+	// operator's own semantics guarantee.
+	if (node->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY ||
+	    node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+		result.group_count = true;
+		if (!node->children.empty()) {
+			rows = MinValue(rows, static_cast<double>(node->children[0]->EstimateCardinality(context)));
+		}
+	}
+	result.rows = rows;
+	return result;
+}
+
+/// Total rows DuckDB expects to read out of delta tables in the incremental plan. Summed over every
+/// scan of an `openivm_delta_*` table, which are the plan's delta inputs.
+static double EstimateIncrementalDeltaInput(ClientContext &context, LogicalOperator &op) {
+	double total = 0;
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		auto table = get.GetTable();
+		if (table && StringUtil::StartsWith(StringUtil::Lower(table->name), openivm::DELTA_PREFIX)) {
+			total += static_cast<double>(op.EstimateCardinality(context));
+		}
+	}
+	for (auto &child : op.children) {
+		total += EstimateIncrementalDeltaInput(context, *child);
+	}
+	return total;
 }
 
 /// Walk the plan tree once, collecting table stats, join info, and aggregate presence.
@@ -555,7 +647,7 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 // ============================================================================
 
 RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name,
-                                        const DeltaActivityResult *delta_activity) {
+                                        const DeltaActivityResult *delta_activity, LogicalOperator *incremental_plan) {
 	// Single connection for all cardinality queries
 	Connection con(*context.db);
 
@@ -656,6 +748,68 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		incremental_compute = total_delta;
 		// Apply both pushed-down selectivity and non-pushed-down filter selectivity
 		estimated_delta_result = filtered_delta * plan_stats.filter_selectivity;
+	}
+
+	// Take the *shape* of the computation from DuckDB and the *size* of the input from our own
+	// metadata, rather than either alone.
+	//
+	// DuckDB has been through the optimizer with the real delta tables in place, so it knows how much
+	// a delta expands or contracts on its way through joins, filters and aggregation. That ratio is
+	// exactly what the fanout proxy above was trying to guess from mv_card/actual_card.
+	//
+	// What DuckDB does not know is how much of each delta table is actually pending. A delta table
+	// retains rows that earlier refreshes already consumed, and the refresh reads only those newer
+	// than the view's last refresh timestamp; the optimizer has no selectivity for that predicate and
+	// estimates the scan from the table's full size. Taken as an absolute, its output estimate is
+	// therefore too high by the accumulated consumed rows, and the error grows over a view's
+	// lifetime rather than staying put. Our pending counts come from the delta-activity metadata and
+	// are exact.
+	//
+	// TODO: measure the delta instead of estimating it, where the delta is small enough that a probe
+	// costs less than the error. The exact answers are one query each over a table that is normally
+	// tiny: the rows satisfying the view's predicates, the distinct group keys, and the keys that
+	// already exist in the materialized data table.
+	//
+	// This is the remaining source of error here, and it is DuckDB's statistics rather than its
+	// estimator that is missing. On an ordinary table the optimizer prunes `val > 9900` over a
+	// column of zeros to an empty result from the zone map; delta rows written by the statement under
+	// test carry no usable statistics yet, so the same predicate is estimated at full pass-through.
+	// Two cases in test/sql/auto_refresh.test record the consequence: 200 inserted rows that satisfy
+	// none of the view's filter are estimated at 200 against a true 0, and an inserted join key that
+	// matches nothing is estimated at 3.7 rows against a true 0. Both are over-estimates, so they
+	// bias toward full recompute rather than toward an incorrect result.
+	//
+	// So: fanout comes from the plan, input size comes from metadata.
+	if (incremental_plan) {
+		auto plan_estimate = EstimateIncrementalDeltaRows(context, *incremental_plan);
+		double plan_delta_input = EstimateIncrementalDeltaInput(context, *incremental_plan);
+		double pending_delta_rows = 0;
+		for (auto &ts : table_stats) {
+			pending_delta_rows += ts.delta_card;
+		}
+		if (plan_estimate.rows >= 0 && plan_estimate.group_count) {
+			// A group count is sublinear in its input: 300 delta rows spread over 5 groups still
+			// produce 5. Scaling it by an input ratio would be meaningless, so take the plan's count
+			// directly, bounded by the delta rows, since no more groups can be touched than there are
+			// rows to touch them.
+			double bounded = MinValue(plan_estimate.rows, pending_delta_rows);
+			OPENIVM_DEBUG_PRINT("[COST MODEL] Delta result: proxy=%.0f, plan groups=%.0f, pending=%.0f -> %.0f\n",
+			                    estimated_delta_result, plan_estimate.rows, pending_delta_rows, bounded);
+			estimated_delta_result = bounded;
+		} else if (plan_estimate.rows >= 0 && plan_delta_input > 0) {
+			double fanout = plan_estimate.rows / plan_delta_input;
+			double plan_based_result = fanout * pending_delta_rows;
+			OPENIVM_DEBUG_PRINT("[COST MODEL] Delta result: proxy=%.0f, plan fanout=%.4f (%.0f/%.0f) x pending=%.0f "
+			                    "-> %.0f\n",
+			                    estimated_delta_result, fanout, plan_estimate.rows, plan_delta_input,
+			                    pending_delta_rows, plan_based_result);
+			estimated_delta_result = plan_based_result;
+		} else if (plan_estimate.rows >= 0) {
+			// No delta scan in the plan to scale against — use the plan's own output estimate.
+			OPENIVM_DEBUG_PRINT("[COST MODEL] Delta result: proxy=%.0f, plan estimate=%.0f (no delta input found)\n",
+			                    estimated_delta_result, plan_estimate.rows);
+			estimated_delta_result = plan_estimate.rows;
+		}
 	}
 
 	double incremental_upsert;
@@ -889,6 +1043,42 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 		}
 	}
 
+	// Cost the plan the refresh would actually run, the same way GenerateRefreshSQL now does, so a
+	// user inspecting the estimate sees the number the decision will be made on. Building it needs
+	// its own transaction, hence before the view-query planning below opens one.
+	//
+	// Any failure degrades to the analytic estimate instead of failing the pragma. This is a
+	// diagnostic, and a view whose delta plan cannot be built is exactly the kind someone is likely
+	// to be inspecting.
+	IncrementalDeltaPlan delta_plan;
+	{
+		string default_db;
+		string default_schema = "main";
+		auto db_res = con.Query("SELECT current_database()");
+		if (!db_res->HasError() && db_res->RowCount() > 0 && !db_res->GetValue(0, 0).IsNull()) {
+			default_db = db_res->GetValue(0, 0).ToString();
+		}
+		auto schema_res = con.Query("SELECT current_schema()");
+		if (!schema_res->HasError() && schema_res->RowCount() > 0 && !schema_res->GetValue(0, 0).IsNull()) {
+			default_schema = schema_res->GetValue(0, 0).ToString();
+		}
+		try {
+			delta_plan = BuildIncrementalDeltaPlan(*con.context, con, default_db, default_schema, view_name,
+			                                       /*cross_system=*/false);
+		} catch (const std::exception &e) {
+			// The builder opens a transaction before it can throw, so close it or the view-query
+			// planning below cannot begin its own.
+			try {
+				con.Rollback();
+			} catch (...) {
+			}
+			delta_plan = IncrementalDeltaPlan();
+			OPENIVM_DEBUG_PRINT("[COST MODEL] refresh_cost could not build a delta plan for '%s' (%s); "
+			                    "falling back to the analytic estimate\n",
+			                    view_name.c_str(), e.what());
+		}
+	}
+
 	con.BeginTransaction();
 
 	RefreshMetadata metadata(con);
@@ -911,7 +1101,7 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 	Optimizer optimizer(*planner.binder, con_ctx);
 	auto plan = optimizer.Optimize(std::move(planner.plan));
 
-	auto estimate = EstimateRefreshCost(con_ctx, *plan, view_name);
+	auto estimate = EstimateRefreshCost(con_ctx, *plan, view_name, nullptr, delta_plan.plan.get());
 	con.Rollback();
 
 	// `decision`: which strategy actually runs at refresh time.
