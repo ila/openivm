@@ -6,6 +6,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
+#include "core/time_travel_pins.hpp"
 #include "core/openivm_debug.hpp"
 #include "rules/column_hider.hpp"
 #include "storage/ducklake_scan.hpp"
@@ -907,7 +908,8 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 		throw ParserException("View '" + view_name + "' has an empty IVM metadata query");
 	}
 	Planner planner(con_ctx);
-	planner.CreatePlan(p.statements[0]->Copy());
+	openivm::TimeTravelPins::Peel(con_ctx, *p.statements[0]);
+	planner.CreatePlan(std::move(p.statements[0]));
 	Optimizer optimizer(*planner.binder, con_ctx);
 	auto plan = optimizer.Optimize(std::move(planner.plan));
 

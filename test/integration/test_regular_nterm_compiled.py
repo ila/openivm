@@ -23,8 +23,8 @@ def run_duckdb(binary: Path, database: Path, sql: str) -> str:
 def bag_equality_sql(view_name: str, base_query: str) -> str:
     return f"""
 SELECT
-    (SELECT COUNT(*) FROM (SELECT * FROM {view_name} EXCEPT ALL {base_query})) +
-    (SELECT COUNT(*) FROM ({base_query} EXCEPT ALL SELECT * FROM {view_name}));
+    (SELECT COUNT(*) FROM ((SELECT * FROM {view_name}) EXCEPT ALL ({base_query}))) +
+    (SELECT COUNT(*) FROM (({base_query}) EXCEPT ALL (SELECT * FROM {view_name})));
 """
 
 
@@ -48,9 +48,14 @@ def run_scenario(
     compile_sql = f"""
 SET openivm_files_path='{output_path}';
 {setup_sql}
-SELECT COUNT(*) FROM openivm_compile_with_facts('{view_name}', '{facts_json}');
+SELECT DISTINCT 'openivm_refresh_type=' || refresh_type_name
+FROM openivm_compile_with_facts('{view_name}', '{facts_json}')
+WHERE stmt_kind = 'data';
 """
-    run_duckdb(binary, database, compile_sql)
+    compile_output = run_duckdb(binary, database, compile_sql)
+    classifications = [line for line in compile_output.splitlines() if line.startswith("openivm_refresh_type=")]
+    if classifications != ["openivm_refresh_type=SIMPLE_PROJECTION"]:
+        raise AssertionError(f"{name}: compiled join must stay incremental, got {classifications!r}")
 
     program_path = output_dir / f"openivm_upsert_queries_{view_name}.sql"
     if not program_path.exists():
@@ -195,6 +200,51 @@ JOIN self_event prev
   ON cur.account_id = prev.account_id
  AND prev.event_ts < cur.event_ts
 JOIN self_account account ON cur.account_id = account.account_id""",
+        )
+        run_scenario(
+            binary,
+            root,
+            "left_join_passthrough_mixed",
+            """
+CREATE TABLE left_fact(id INTEGER, k1 INTEGER, k2 INTEGER);
+CREATE TABLE left_one(k INTEGER, label VARCHAR);
+CREATE TABLE left_two(k INTEGER, label VARCHAR);
+INSERT INTO left_fact VALUES (1, 10, 20), (2, 11, 21), (3, 10, 21), (4, 12, 22);
+INSERT INTO left_one VALUES (10, 'a'), (10, 'duplicate'), (12, 'c');
+INSERT INTO left_two VALUES (20, 'old'), (21, 'removed'), (22, 'kept');
+CREATE MATERIALIZED VIEW left_mv AS
+WITH projected AS (
+    SELECT f.id, f.k2, d1.label
+    FROM left_fact f LEFT JOIN left_one d1 ON f.k1 = d1.k
+)
+SELECT p.id, d2.label
+FROM projected p LEFT JOIN left_two d2 ON p.k2 = d2.k;
+INSERT INTO left_one VALUES (11, 'late'), (11, 'late_duplicate');
+DELETE FROM left_one WHERE label = 'duplicate';
+UPDATE left_two SET label = 'changed' WHERE k = 20;
+DELETE FROM left_two WHERE k = 21;
+INSERT INTO left_two VALUES (23, 'new');
+UPDATE left_fact SET k2 = 23 WHERE id = 1;
+DELETE FROM left_fact WHERE id = 4;
+INSERT INTO left_fact VALUES (5, 11, 20);
+""",
+            "left_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+                "delta_shape": {
+                    "left_fact": "MIXED",
+                    "left_one": "MIXED",
+                    "left_two": "MIXED",
+                },
+            },
+            """WITH projected AS (
+    SELECT f.id, f.k2, d1.label
+    FROM left_fact f LEFT JOIN left_one d1 ON f.k1 = d1.k
+)
+SELECT p.id, d2.label
+FROM projected p LEFT JOIN left_two d2 ON p.k2 = d2.k""",
         )
 
     print("regular N-term compiled SQL integration tests passed")

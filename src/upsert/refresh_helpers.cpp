@@ -10,6 +10,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
 
@@ -1287,11 +1289,12 @@ string BuildDuckLakeSnapshotQuery(RefreshMetadata &metadata, Connection &con, co
 	return snapshot_query;
 }
 
-string QualifyViewQuerySources(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                               const string &view_query_sql, const vector<RefreshMetadata::DeltaSource> &delta_sources,
-                               const string &view_catalog_name, const string &view_schema_name,
-                               const string &attached_db_catalog_name, const string &attached_db_schema_name) {
-	string qualified_query = view_query_sql;
+openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &view_name, string &view_query_sql,
+                                                const vector<RefreshMetadata::DeltaSource> &delta_sources,
+                                                const string &view_catalog_name, const string &view_schema_name,
+                                                const string &attached_db_catalog_name,
+                                                const string &attached_db_schema_name) {
+	case_insensitive_map_t<RefreshMetadata::SourceLocation> locations;
 	OPENIVM_DEBUG_PRINT("[UPSERT] Qualifying %zu sources for %s from one metadata snapshot\n", delta_sources.size(),
 	                    view_name.c_str());
 	for (auto &source : delta_sources) {
@@ -1308,10 +1311,27 @@ string QualifyViewQuerySources(RefreshMetadata &metadata, Connection &con, const
 			continue;
 		}
 		string base_name = BaseTableNameFromDeltaKey(source.table_name);
-		qualified_query = SqlUtils::ReplaceTableReferences(qualified_query, base_name,
-		                                                   SqlUtils::FullName(catalog_name, schema_name, base_name));
+		locations[base_name] = {catalog_name, schema_name};
 	}
-	return qualified_query;
+	Parser parser(con.context->GetParserOptions());
+	parser.ParseQuery(view_query_sql);
+	bool qualified = false;
+	openivm::TimeTravelPins pins;
+	con.context->RunFunctionInTransaction([&]() {
+		pins = openivm::TimeTravelPins::Peel(*con.context, *parser.statements.at(0), [&](BaseTableRef &ref) {
+			auto location = locations.find(ref.table_name);
+			if (location != locations.end() && (ref.catalog_name != location->second.catalog_name ||
+			                                    ref.schema_name != location->second.schema_name)) {
+				ref.catalog_name = location->second.catalog_name;
+				ref.schema_name = location->second.schema_name;
+				qualified = true;
+			}
+		});
+		if (qualified || !pins.Empty()) {
+			view_query_sql = parser.statements[0]->ToString();
+		}
+	});
+	return pins;
 }
 
 static string HexEncodeToken(const string &input) {

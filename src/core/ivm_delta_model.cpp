@@ -29,6 +29,23 @@ static void AddStringCI(vector<string> &values, const string &candidate) {
 	}
 }
 
+static string WindowPartitionOutputColumn(const string &partition_column) {
+	auto separator = partition_column.find('=');
+	return separator == string::npos ? partition_column : partition_column.substr(0, separator);
+}
+
+static vector<string> ProjectedWindowPartitionColumns(const vector<string> &partition_columns,
+                                                      const vector<string> &output_names) {
+	vector<string> projected;
+	for (auto &partition_column : partition_columns) {
+		auto output_column = WindowPartitionOutputColumn(partition_column);
+		if (!IncrementalTableNames::IsInternalColumn(output_column) && ContainsStringCI(output_names, output_column)) {
+			AddStringCI(projected, partition_column);
+		}
+	}
+	return projected;
+}
+
 static void AddOutputColumnName(const string &name, vector<string> &visible, vector<string> &hidden) {
 	if (name.empty()) {
 		return;
@@ -633,9 +650,21 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 	}
 	const auto &analysis = facts.analysis;
 	if (model.type == RefreshType::WINDOW_PARTITION) {
+		const auto lineage_partition_columns = model.window_partition_columns;
 		vector<RefreshMetadata::WindowPartitionLineageOp> direct_lineage_ops;
-		bool has_lineage = BuildWindowPartitionLineageOps(facts, model.window_partition_columns,
-		                                                  model.window_lineage_ops, &direct_lineage_ops);
+		bool has_lineage = BuildWindowPartitionLineageOps(facts, lineage_partition_columns, model.window_lineage_ops,
+		                                                  &direct_lineage_ops);
+		model.window_partition_columns = ProjectedWindowPartitionColumns(lineage_partition_columns, output_names);
+		for (auto &node : model.nodes) {
+			if (node.kind == DeltaModelNodeKind::WINDOW) {
+				node.affected_key_columns = model.window_partition_columns;
+			}
+		}
+		if (model.window_partition_columns.empty()) {
+			model.features.erase(
+			    std::remove(model.features.begin(), model.features.end(), DeltaModelFeature::WINDOW_AFFECTED_PARTITION),
+			    model.features.end());
+		}
 		if (analysis.found_asof_join &&
 		    (!has_lineage || AsofWindowPartitionReadsRightSideDirectly(direct_lineage_ops, model) ||
 		     !WindowLineageCoversAllSources(model.window_lineage_ops, facts))) {
@@ -644,7 +673,7 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 			ValidateDeltaViewModelInvariants(model);
 			return;
 		}
-		if (has_lineage) {
+		if (has_lineage && !model.window_partition_columns.empty()) {
 			DeltaAffectedDomain domain;
 			domain.kind = DeltaAffectedDomainKind::WINDOW_PARTITION;
 			domain.node_id = FindFirstNodeId(model, DeltaModelNodeKind::WINDOW);

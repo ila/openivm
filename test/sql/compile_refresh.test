@@ -388,6 +388,212 @@ WHERE stmt_kind = 'data';
 1
 
 # ==========================================
+# Test 10: reduced "arc_machine_status_transaction" shape — a CTE joining an
+# INNER JOIN with a LEFT JOIN, whose result feeds an outer query with two
+# further chained LEFT JOINs. Before src/delta/operators/join.cpp's
+# AppendMultiplicityToAncestorProjectionMaps fix, a deeper join's own
+# left_projection_map growing (to carry a new per-leaf multiplicity column up
+# to the root) silently shifted where its right-side contribution begins in
+# its own combined column numbering. A grandparent join's pre-existing
+# projection-map entry — fixed before that growth happened — could then
+# alias onto the just-added multiplicity column instead of the real column
+# it used to select, permanently dropping a business column and surfacing
+# as an internal arity mismatch ("union lhs column ref not in column_map").
+# ==========================================
+
+statement ok
+CREATE TABLE arcm_msf(id INT, coll_key INT);
+
+statement ok
+CREATE TABLE arcm_acd(coll_key INT, sub_id INT, arm_id VARCHAR);
+
+statement ok
+CREATE TABLE arcm_hw(arm_id VARCHAR, provider VARCHAR);
+
+statement ok
+CREATE TABLE arcm_tpid(sub_id INT, tp_id INT);
+
+statement ok
+CREATE TABLE arcm_cust(tp_id INT, cust_key INT);
+
+statement ok
+INSERT INTO arcm_msf VALUES (1, 100);
+
+statement ok
+INSERT INTO arcm_acd VALUES (100, 10, 'arm-1');
+
+statement ok
+INSERT INTO arcm_hw VALUES ('arm-1', 'azure');
+
+statement ok
+INSERT INTO arcm_tpid VALUES (10, 200);
+
+statement ok
+INSERT INTO arcm_cust VALUES (200, 21);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_arcm AS
+    WITH bff AS (
+        SELECT msf.id, acd.sub_id,
+               coalesce(hw.provider, 'N/A') AS provider
+        FROM arcm_msf msf
+        INNER JOIN arcm_acd acd ON msf.coll_key = acd.coll_key
+        LEFT JOIN arcm_hw hw ON acd.arm_id = hw.arm_id
+    )
+    SELECT bff.id,
+           coalesce(cust.cust_key, 1) AS cust_key
+    FROM bff
+    LEFT JOIN arcm_tpid tpid ON bff.sub_id = tpid.sub_id
+    LEFT JOIN arcm_cust cust ON coalesce(tpid.tp_id, -1) = cust.tp_id;
+
+statement ok
+INSERT INTO arcm_msf VALUES (2, 100);
+
+# Must compile to a real incremental cascade delta (SIMPLE_PROJECTION), never
+# FULL_REFRESH, and must not lose the `cust_key` column from the final insert.
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'mv_arcm',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+2	SIMPLE_PROJECTION
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order)
+           LIKE '%INSERT INTO openivm_delta_mv_arcm (id, cust_key, openivm_multiplicity)%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_msf%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_acd%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_hw%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_tpid%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_cust%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_arcm',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# Batched multi-leaf delta variant of the same shape: simultaneous
+# inserts/delete/update spread across ALL FIVE base tables (not just a
+# single-row insert into one leaf). This is the exact reduction that exposed
+# a second, deeper defect in src/delta/operators/join.cpp's
+# BuildInclusionExclusionTerms: leaf substitution reused a stale pointer into
+# the ORIGINAL (pre-mask-renumbering) plan instead of the mask's own
+# freshly-renumbered leaf, so a leaf feeding two joins (msf join acd AND acd
+# join hw) got its delta substituted at the wrong table_index, leaving the
+# second join's condition dangling and surfacing as
+# LPTS_UNSUPPORTED_COLUMN_REF once more than one leaf changed at once.
+statement ok
+INSERT INTO arcm_msf VALUES (3, 300);
+
+statement ok
+INSERT INTO arcm_acd VALUES (300, 30, 'arm-2');
+
+statement ok
+INSERT INTO arcm_hw VALUES ('arm-2', 'gcp');
+
+statement ok
+INSERT INTO arcm_tpid VALUES (30, 400);
+
+statement ok
+DELETE FROM arcm_msf WHERE id = 2;
+
+statement ok
+UPDATE arcm_cust SET cust_key = 99 WHERE tp_id = 200;
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'mv_arcm',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+2	SIMPLE_PROJECTION
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order)
+           LIKE '%INSERT INTO openivm_delta_mv_arcm (id, cust_key, openivm_multiplicity)%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_msf%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_acd%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_hw%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_tpid%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_cust%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_arcm',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================
+# Test 11: reduced "int_instance_status_transaction" shape — a UNION ALL of
+# two LEFT JOIN branches partitioned by an IS NOT NULL / IS NULL predicate on
+# the joined side. Before the `third_party/lpts` pin was advanced to commit
+# 77ed5e5 (fork PR #18, "Fix set-op column binding remaps"), remapping
+# duplicated UNION ALL key-projection output aliases could leave a stale
+# reference to a child alias that no longer existed in the rewritten plan,
+# surfacing as a runtime Binder Error ("Referenced column ... not found in
+# FROM clause").
+# ==========================================
+
+statement ok
+CREATE TABLE inti_isf(id INT, k INT);
+
+statement ok
+CREATE TABLE inti_ml(k INT, res VARCHAR);
+
+statement ok
+INSERT INTO inti_isf VALUES (1, 100), (2, 200);
+
+statement ok
+INSERT INTO inti_ml VALUES (100, 'machine-1');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_inti AS
+    SELECT isf.id, isf.k FROM inti_isf isf LEFT JOIN inti_ml ml ON isf.k = ml.k WHERE ml.res IS NOT NULL
+    UNION ALL
+    SELECT isf.id, isf.k FROM inti_isf isf LEFT JOIN inti_ml ml ON isf.k = ml.k WHERE ml.res IS NULL;
+
+statement ok
+INSERT INTO inti_isf VALUES (3, 300);
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'mv_inti',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+2	SIMPLE_PROJECTION
+
+query I
+SELECT CASE WHEN
+       string_agg(sql, ' ' ORDER BY stmt_order)
+           LIKE '%INSERT INTO openivm_delta_mv_inti (id, k, openivm_left_key, openivm_multiplicity)%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_inti_isf%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_inti_ml%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
+   THEN 1 ELSE 0 END
+FROM openivm_compile_with_facts(
+    'mv_inti',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+1
+
+# ==========================================
 # Test 9: openivm_compile_with_facts on a non-existent view fails cleanly
 # ==========================================
 
