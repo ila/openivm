@@ -682,11 +682,18 @@ static vector<QueryDef> BuildQueries() {
 	              {"mv_q"}, {"CUSTOMER"},
 	              "SELECT C_W_ID, ROUND(STDDEV_SAMP(C_BALANCE::DOUBLE), 2) AS sd FROM CUSTOMER GROUP BY C_W_ID",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	// ARG_MAX orders by (C_BALANCE, C_D_ID, C_ID) rather than C_BALANCE alone. TPC-C gives every
+	// customer the same starting balance, so ordering by it alone leaves tens of thousands of tied
+	// rows per warehouse and ARG_MAX may return any of them: at scale factor 25 the maximum is tied
+	// across 29,700 rows in a single group. Both the view and the base query then return correct but
+	// different answers, and the EXCEPT ALL cross-check reports a mismatch that is not one. Appending
+	// (C_D_ID, C_ID), which is unique within a warehouse, makes the ordering total and the query
+	// single-valued, while still ordering primarily by the column the mixed workload updates.
 	AddQuery(qs, {"T03", "ARG_MAX aggregate", {}, {},
-	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, ARG_MAX(C_ID, C_BALANCE) AS top_c FROM CUSTOMER "
-	               "GROUP BY C_W_ID"},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, ARG_MAX(C_ID, (C_BALANCE, C_D_ID, C_ID)) AS top_c "
+	               "FROM CUSTOMER GROUP BY C_W_ID"},
 	              {"mv_q"}, {"CUSTOMER"},
-	              "SELECT C_W_ID, ARG_MAX(C_ID, C_BALANCE) AS top_c FROM CUSTOMER GROUP BY C_W_ID",
+	              "SELECT C_W_ID, ARG_MAX(C_ID, (C_BALANCE, C_D_ID, C_ID)) AS top_c FROM CUSTOMER GROUP BY C_W_ID",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
 	AddQuery(qs, {"T04", "FULL OUTER JOIN projection", {}, {},
 	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, d.D_ID FROM WAREHOUSE w FULL OUTER JOIN DISTRICT d "
