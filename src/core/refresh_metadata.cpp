@@ -583,15 +583,31 @@ void RefreshMetadata::UpdateDuckLakeRefreshMetadata(const string &view_name, con
 void RefreshMetadata::RecordRefreshHistory(const string &view_name, const string &method,
                                            double incremental_compute_est, double incremental_upsert_est,
                                            double recompute_compute_est, double recompute_replace_est,
-                                           int64_t actual_duration_ms, idx_t max_history) {
+                                           int64_t actual_duration_ms, const vector<double> &plan_features,
+                                           int32_t feature_schema, bool exploratory, idx_t max_history) {
+	// A DuckDB list literal rather than JSON: it needs no parser to read back, and no extension to be
+	// loaded to write. NULL when absent, so "no features" is distinguishable from "all zeroes".
+	string features_sql = "NULL";
+	if (!plan_features.empty()) {
+		features_sql = "[";
+		for (idx_t i = 0; i < plan_features.size(); i++) {
+			if (i > 0) {
+				features_sql += ", ";
+			}
+			features_sql += to_string(plan_features[i]);
+		}
+		features_sql += "]::DOUBLE[]";
+	}
 	auto result = con.Query("INSERT INTO " + string(openivm::HISTORY_TABLE) +
 	                        " (view_name, method, incremental_compute_est, incremental_upsert_est,"
-	                        " recompute_compute_est, recompute_replace_est, actual_duration_ms)"
+	                        " recompute_compute_est, recompute_replace_est, actual_duration_ms,"
+	                        " plan_features, feature_schema, exploratory)"
 	                        " VALUES ('" +
 	                        SqlUtils::EscapeValue(view_name) + "', '" + SqlUtils::EscapeValue(method) + "', " +
 	                        to_string(incremental_compute_est) + ", " + to_string(incremental_upsert_est) + ", " +
 	                        to_string(recompute_compute_est) + ", " + to_string(recompute_replace_est) + ", " +
-	                        to_string(actual_duration_ms) + ")");
+	                        to_string(actual_duration_ms) + ", " + features_sql + ", " + to_string(feature_schema) +
+	                        ", " + (exploratory ? "true" : "false") + ")");
 	if (result->HasError()) {
 		OPENIVM_DEBUG_PRINT("[HISTORY] Failed to record: %s\n", result->GetError().c_str());
 		return;
@@ -617,9 +633,10 @@ vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetRefreshHistory(
 	string col2 = is_full ? "recompute_replace_est" : "incremental_upsert_est";
 
 	auto result =
-	    con.Query("SELECT " + col1 + ", " + col2 + ", actual_duration_ms FROM " + string(openivm::HISTORY_TABLE) +
-	              " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND method = '" +
-	              SqlUtils::EscapeValue(method) + "' ORDER BY refresh_timestamp ASC LIMIT " + to_string(limit));
+	    con.Query("SELECT " + col1 + ", " + col2 + ", actual_duration_ms, plan_features, feature_schema FROM " +
+	              string(openivm::HISTORY_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
+	              "' AND method = '" + SqlUtils::EscapeValue(method) + "' ORDER BY refresh_timestamp ASC LIMIT " +
+	              to_string(limit));
 
 	vector<RefreshHistoryEntry> entries;
 	if (result->HasError() || result->RowCount() == 0) {
@@ -630,8 +647,71 @@ vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetRefreshHistory(
 		entry.compute_est = result->GetValue(0, i).GetValue<double>();
 		entry.upsert_est = result->GetValue(1, i).GetValue<double>();
 		entry.actual_ms = result->GetValue(2, i).GetValue<double>();
+		auto features_value = result->GetValue(3, i);
+		if (!features_value.IsNull()) {
+			for (auto &child : ListValue::GetChildren(features_value)) {
+				entry.plan_features.push_back(child.IsNull() ? 0.0 : child.GetValue<double>());
+			}
+		}
+		auto schema_value = result->GetValue(4, i);
+		entry.feature_schema = schema_value.IsNull() ? 0 : schema_value.GetValue<int32_t>();
 		entries.push_back(entry);
 	}
+	return entries;
+}
+
+idx_t RefreshMetadata::CountPlanCostSamples(const string &method, int32_t feature_schema) {
+	auto result = con.Query("SELECT COUNT(*) FROM " + string(openivm::HISTORY_TABLE) + " WHERE method = '" +
+	                        SqlUtils::EscapeValue(method) +
+	                        "' AND plan_features IS NOT NULL AND feature_schema = " + to_string(feature_schema));
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return 0;
+	}
+	return static_cast<idx_t>(result->GetValue(0, 0).GetValue<int64_t>());
+}
+
+idx_t RefreshMetadata::CountRefreshHistory(const string &view_name) {
+	auto result = con.Query("SELECT COUNT(*) FROM " + string(openivm::HISTORY_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return 0;
+	}
+	return static_cast<idx_t>(result->GetValue(0, 0).GetValue<int64_t>());
+}
+
+vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetPlanCostHistory(const string &method,
+                                                                                 int32_t feature_schema, idx_t limit) {
+	bool is_full = (method == "full");
+	string col1 = is_full ? "recompute_compute_est" : "incremental_compute_est";
+	string col2 = is_full ? "recompute_replace_est" : "incremental_upsert_est";
+
+	// Newest first, so a bounded pull keeps the most recent evidence rather than the oldest.
+	auto result =
+	    con.Query("SELECT " + col1 + ", " + col2 + ", actual_duration_ms, plan_features, feature_schema FROM " +
+	              string(openivm::HISTORY_TABLE) + " WHERE method = '" + SqlUtils::EscapeValue(method) +
+	              "' AND plan_features IS NOT NULL AND feature_schema = " + to_string(feature_schema) +
+	              " ORDER BY refresh_timestamp DESC LIMIT " + to_string(limit));
+
+	vector<RefreshHistoryEntry> entries;
+	if (result->HasError() || result->RowCount() == 0) {
+		return entries;
+	}
+	for (idx_t i = 0; i < result->RowCount(); i++) {
+		RefreshHistoryEntry entry;
+		entry.compute_est = result->GetValue(0, i).GetValue<double>();
+		entry.upsert_est = result->GetValue(1, i).GetValue<double>();
+		entry.actual_ms = result->GetValue(2, i).GetValue<double>();
+		auto features_value = result->GetValue(3, i);
+		if (!features_value.IsNull()) {
+			for (auto &child : ListValue::GetChildren(features_value)) {
+				entry.plan_features.push_back(child.IsNull() ? 0.0 : child.GetValue<double>());
+			}
+		}
+		entry.feature_schema = feature_schema;
+		entries.push_back(entry);
+	}
+	// Oldest first, matching GetRefreshHistory, so decay weighting indexes the same way.
+	std::reverse(entries.begin(), entries.end());
 	return entries;
 }
 

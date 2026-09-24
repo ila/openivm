@@ -179,19 +179,49 @@ public:
 	// --- Refresh history (learned cost model) ---
 
 	// Record a refresh execution in the history table. Prunes entries beyond the window.
+	//
+	// The window is per view. It holds 100 rather than 20 because the per-operator cost model fits
+	// thirteen parameters and pools history across views: at 20 a deployment with one or two
+	// materialized views could never accumulate enough samples to fit, and would sit permanently on
+	// the fallback. A row is a handful of doubles, so the extra retention is negligible.
+	//
+	// `plan_features` is the per-operator-class row estimate for the plan that ran, and
+	// `feature_schema` identifies its layout so a later change to that layout does not silently
+	// reinterpret old rows. Both are opaque here: this table stores them, the cost model gives them
+	// meaning. Empty features record a refresh that predates the feature model or took a path with
+	// no plan to describe.
 	void RecordRefreshHistory(const string &view_name, const string &method, double incremental_compute_est,
 	                          double incremental_upsert_est, double recompute_compute_est, double recompute_replace_est,
-	                          int64_t actual_duration_ms, idx_t max_history = 20);
+	                          int64_t actual_duration_ms, const vector<double> &plan_features = {},
+	                          int32_t feature_schema = 0, bool exploratory = false, idx_t max_history = 100);
 
 	// Refresh history entry for regression fitting.
 	struct RefreshHistoryEntry {
 		double compute_est; // incremental_compute_est or recompute_compute_est (depending on method)
 		double upsert_est;  // incremental_upsert_est or recompute_replace_est
 		double actual_ms;
+		vector<double> plan_features; // empty when the row predates the feature model
+		int32_t feature_schema = 0;
 	};
 
 	// Get the last N history entries for a given method ('incremental' or 'full').
 	vector<RefreshHistoryEntry> GetRefreshHistory(const string &view_name, const string &method, idx_t limit = 20);
+
+	// The same, pooled across every view rather than one.
+	//
+	// The per-view window holds at most `max_history` rows, fewer than the per-operator model has
+	// parameters, so fitting it per view would be underdetermined. Pooling is also what makes the
+	// weights useful: they describe how long an operator class takes on this hardware, which is a
+	// property of the machine rather than of any one view, so a view refreshing for the first time
+	// inherits them instead of starting uncalibrated.
+	vector<RefreshHistoryEntry> GetPlanCostHistory(const string &method, int32_t feature_schema, idx_t limit = 500);
+
+	// How many usable samples exist for `method`, pooled across views. Used to tell an uncalibrated
+	// strategy from a well-measured one without pulling the rows.
+	idx_t CountPlanCostSamples(const string &method, int32_t feature_schema);
+
+	// Total refreshes recorded for one view, used to pace exploration.
+	idx_t CountRefreshHistory(const string &view_name);
 
 	// --- Aux-state DISTINCT (RefreshType::DISTINCT_INCREMENTAL) ---
 

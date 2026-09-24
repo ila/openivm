@@ -378,6 +378,75 @@ static double EstimateIncrementalDeltaInput(ClientContext &context, LogicalOpera
 	return total;
 }
 
+/// Estimated rows per operator class for `plan`. See PlanFeature for why both strategies are
+/// described this way rather than by separately tuned scalar terms.
+///
+/// Every number comes from DuckDB's own estimator on the plan in hand, so the two strategies are
+/// measured by one instrument. Joins contribute three separate features because their costs differ
+/// in kind: the build side is materialized, the probe side is streamed, and the output is whatever
+/// fan-out produces. Collapsing them was why join-heavy views carried nearly all of the tail regret
+/// in the sweep, with the large join projection averaging 6.6x and peaking at 14.5x.
+static void CollectPlanFeatures(ClientContext &context, LogicalOperator &op, PlanFeatureVector &out) {
+	auto rows = [&context](LogicalOperator &node) {
+		return static_cast<double>(node.EstimateCardinality(context));
+	};
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET:
+		Feature(out, PlanFeature::SCAN_ROWS) += rows(op);
+		break;
+	case LogicalOperatorType::LOGICAL_FILTER:
+		if (!op.children.empty()) {
+			Feature(out, PlanFeature::FILTER_ROWS) += rows(*op.children[0]);
+		}
+		break;
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+		Feature(out, PlanFeature::PROJECT_ROWS) += rows(op);
+		break;
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
+		Feature(out, PlanFeature::JOIN_OUTPUT_ROWS) += rows(op);
+		if (op.children.size() >= 2) {
+			Feature(out, PlanFeature::JOIN_PROBE_ROWS) += rows(*op.children[0]);
+			Feature(out, PlanFeature::JOIN_BUILD_ROWS) += rows(*op.children[1]);
+		}
+		break;
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+		Feature(out, PlanFeature::AGGREGATE_OUTPUT_ROWS) += rows(op);
+		if (!op.children.empty()) {
+			Feature(out, PlanFeature::AGGREGATE_INPUT_ROWS) += rows(*op.children[0]);
+		}
+		break;
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+	case LogicalOperatorType::LOGICAL_TOP_N:
+		Feature(out, PlanFeature::ORDER_ROWS) += rows(op);
+		break;
+	case LogicalOperatorType::LOGICAL_WINDOW:
+		Feature(out, PlanFeature::WINDOW_ROWS) += rows(op);
+		break;
+	case LogicalOperatorType::LOGICAL_UNION:
+	case LogicalOperatorType::LOGICAL_EXCEPT:
+	case LogicalOperatorType::LOGICAL_INTERSECT:
+		Feature(out, PlanFeature::SET_OP_ROWS) += rows(op);
+		break;
+	default:
+		break;
+	}
+	for (auto &child : op.children) {
+		CollectPlanFeatures(context, *child, out);
+	}
+}
+
+PlanFeatureVector ExtractPlanFeatures(ClientContext &context, LogicalOperator &plan) {
+	PlanFeatureVector features {};
+	features.fill(0.0);
+	CollectPlanFeatures(context, plan, features);
+	return features;
+}
+
 /// Walk the plan tree once, collecting table stats, join info, and aggregate presence.
 static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, LogicalOperator &op,
                                       const string &view_name, const DeltaActivityResult *delta_activity,
@@ -462,6 +531,175 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 	for (auto &child : op.children) {
 		CollectPlanStatsRecursive(context, con, *child, view_name, delta_activity, stats);
 	}
+}
+
+// ============================================================================
+// Learned per-operator cost model
+// ============================================================================
+
+/// Weights turning a PlanFeatureVector into milliseconds: one per feature, plus a free intercept
+/// carrying the fixed per-refresh overhead that belongs to no operator.
+struct PlanCostWeights {
+	std::array<double, PLAN_FEATURE_COUNT + 1> w {};
+	bool calibrated = false;
+};
+
+/// Solve A x = b by Gaussian elimination with partial pivoting. A is destroyed.
+static bool SolveDense(vector<vector<double>> &A, vector<double> &b, vector<double> &x) {
+	idx_t n = b.size();
+	for (idx_t col = 0; col < n; col++) {
+		idx_t pivot = col;
+		for (idx_t row = col + 1; row < n; row++) {
+			if (std::abs(A[row][col]) > std::abs(A[pivot][col])) {
+				pivot = row;
+			}
+		}
+		if (std::abs(A[pivot][col]) < 1e-12) {
+			return false;
+		}
+		if (pivot != col) {
+			std::swap(A[pivot], A[col]);
+			std::swap(b[pivot], b[col]);
+		}
+		for (idx_t row = col + 1; row < n; row++) {
+			double factor = A[row][col] / A[col][col];
+			if (factor == 0.0) {
+				continue;
+			}
+			for (idx_t j = col; j < n; j++) {
+				A[row][j] -= factor * A[col][j];
+			}
+			b[row] -= factor * b[col];
+		}
+	}
+	x.assign(n, 0.0);
+	for (idx_t i = n; i-- > 0;) {
+		double acc = b[i];
+		for (idx_t j = i + 1; j < n; j++) {
+			acc -= A[i][j] * x[j];
+		}
+		x[i] = acc / A[i][i];
+		if (!std::isfinite(x[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/// Fit ms ≈ Σ wᵢ·featureᵢ + intercept by weighted ridge least squares over `active` columns.
+static bool FitActiveSet(const vector<vector<double>> &rows, const vector<double> &targets,
+                         const vector<double> &sample_weights, const vector<idx_t> &active, double ridge,
+                         vector<double> &out) {
+	idx_t k = active.size();
+	vector<vector<double>> ata(k, vector<double>(k, 0.0));
+	vector<double> atb(k, 0.0);
+	for (idx_t s = 0; s < rows.size(); s++) {
+		double sw = sample_weights[s];
+		for (idx_t a = 0; a < k; a++) {
+			double xa = rows[s][active[a]];
+			for (idx_t b = 0; b < k; b++) {
+				ata[a][b] += sw * xa * rows[s][active[b]];
+			}
+			atb[a] += sw * xa * targets[s];
+		}
+	}
+	for (idx_t a = 0; a < k; a++) {
+		ata[a][a] += ridge;
+	}
+	return SolveDense(ata, atb, out);
+}
+
+/// Fit per-operator weights from pooled refresh history.
+///
+/// Feature weights are constrained non-negative: an operator cannot make a refresh finish sooner,
+/// and unconstrained fitting on correlated features (scans and joins move together) happily produces
+/// negative coefficients that predict nonsense on plan shapes absent from the training data. The
+/// intercept stays free so it can absorb fixed overhead. Recent samples weigh more, so the model
+/// tracks a machine whose behaviour changes rather than averaging over its whole history.
+static PlanCostWeights FitPlanCostWeights(const vector<RefreshMetadata::RefreshHistoryEntry> &history, double decay,
+                                          double ridge, idx_t samples_per_parameter, idx_t min_samples_floor) {
+	PlanCostWeights result;
+	vector<vector<double>> rows;
+	vector<double> targets;
+	vector<double> sample_weights;
+	idx_t n = history.size();
+	for (idx_t i = 0; i < n; i++) {
+		auto &entry = history[i];
+		if (entry.plan_features.size() != PLAN_FEATURE_COUNT || entry.actual_ms < 0) {
+			continue;
+		}
+		vector<double> row(PLAN_FEATURE_COUNT + 1, 0.0);
+		for (idx_t f = 0; f < PLAN_FEATURE_COUNT; f++) {
+			row[f] = entry.plan_features[f];
+		}
+		row[PLAN_FEATURE_COUNT] = 1.0; // intercept
+		rows.push_back(std::move(row));
+		targets.push_back(entry.actual_ms);
+		sample_weights.push_back(std::pow(decay, static_cast<double>(n - 1 - i)));
+	}
+	if (rows.empty()) {
+		return result;
+	}
+
+	// Fit only the features this history actually exercises, and size the sample requirement to
+	// them. Most plans leave most features at zero — a grouped aggregate over a single table has no
+	// join, window or set-operation rows — and a column that never varies contributes nothing but
+	// dimensionality, so ridge would drive it to zero anyway.
+	//
+	// The alternative, a flat threshold covering all thirteen parameters, is the worst case applied
+	// unconditionally: it would hold a workload of simple aggregates on the uncalibrated prior long
+	// after five or six varying features were well determined, and that prior was measured
+	// under-predicting by roughly a factor of two.
+	vector<idx_t> active;
+	for (idx_t f = 0; f < PLAN_FEATURE_COUNT; f++) {
+		double first = rows[0][f];
+		bool varies = false;
+		for (idx_t s = 1; s < rows.size() && !varies; s++) {
+			varies = rows[s][f] != first;
+		}
+		// A feature that is constant and non-zero is still worth fitting: it is indistinguishable
+		// from the intercept here, but ridge splits them harmlessly and it starts varying as soon as
+		// the workload does.
+		if (varies || first != 0.0) {
+			active.push_back(f);
+		}
+	}
+	active.push_back(PLAN_FEATURE_COUNT); // intercept, always fitted
+
+	idx_t required = MaxValue<idx_t>(min_samples_floor, samples_per_parameter * active.size());
+	if (rows.size() < required) {
+		return result;
+	}
+	vector<double> solved;
+	for (idx_t pass = 0; pass <= PLAN_FEATURE_COUNT; pass++) {
+		if (active.empty() || !FitActiveSet(rows, targets, sample_weights, active, ridge, solved)) {
+			return result;
+		}
+		vector<idx_t> keep;
+		for (idx_t a = 0; a < active.size(); a++) {
+			// The intercept is the last column and is allowed to be negative.
+			if (active[a] == PLAN_FEATURE_COUNT || solved[a] >= 0.0) {
+				keep.push_back(active[a]);
+			}
+		}
+		if (keep.size() == active.size()) {
+			for (idx_t a = 0; a < active.size(); a++) {
+				result.w[active[a]] = solved[a];
+			}
+			result.calibrated = true;
+			return result;
+		}
+		active = std::move(keep);
+	}
+	return result;
+}
+
+static double PredictPlanCostMs(const PlanCostWeights &weights, const PlanFeatureVector &features) {
+	double ms = weights.w[PLAN_FEATURE_COUNT];
+	for (idx_t f = 0; f < PLAN_FEATURE_COUNT; f++) {
+		ms += weights.w[f] * features[f];
+	}
+	return MaxValue(0.0, ms);
 }
 
 // ============================================================================
@@ -677,7 +915,22 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	size_t N = table_stats.size();
 	if (N == 0) {
 		// No base tables found — shouldn't happen, but default to IVM
-		return {0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, false, "incremental"};
+		RefreshCostEstimate empty;
+		empty.incremental_compute = 0.0;
+		empty.incremental_upsert = 0.0;
+		empty.recompute_compute = 0.0;
+		empty.recompute_replace = 1.0;
+		empty.incremental_cost = 0.0;
+		empty.recompute_cost = 1.0;
+		empty.incremental_predicted_ms = 0.0;
+		empty.recompute_predicted_ms = 1.0;
+		empty.calibrated = false;
+		empty.incremental_features.fill(0.0);
+		empty.recompute_features.fill(0.0);
+		empty.has_features = false;
+		empty.exploration = 0;
+		empty.strategy_label = "incremental";
+		return empty;
 	}
 
 	// 2. Compute basic metrics
@@ -909,6 +1162,22 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	//    Gated by openivm_adaptive_refresh (same gate as the cost model decision).
 	bool adaptive_on = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
 
+	// Describe both candidates in the same terms, from the same estimator. WRITE_ROWS is added here
+	// rather than read from a plan: the delta plan computes rows, it does not carry the MERGE or the
+	// delete-and-insert that writes them.
+	PlanFeatureVector incremental_features {};
+	PlanFeatureVector recompute_features {};
+	incremental_features.fill(0.0);
+	recompute_features.fill(0.0);
+	recompute_features = ExtractPlanFeatures(context, plan);
+	Feature(recompute_features, PlanFeature::WRITE_ROWS) = recompute_replace;
+	bool has_features = false;
+	if (incremental_plan) {
+		incremental_features = ExtractPlanFeatures(context, *incremental_plan);
+		Feature(incremental_features, PlanFeature::WRITE_ROWS) = strategy_upsert;
+		has_features = true;
+	}
+
 	if (adaptive_on) {
 		// Uncalibrated ms-grounded prior (see constants above). The learned regression below
 		// overrides each side once it has enough history.
@@ -966,9 +1235,45 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		constexpr double RIDGE_LAMBDA = 1e-4;
 		constexpr idx_t MIN_SAMPLES = 3;
 
+		// Preferred: per-operator weights fitted over every view's history. Tried before the two-term
+		// per-view regression because it is the model that describes both strategies in the same
+		// terms, and because it transfers — a view refreshing for the first time is priced by weights
+		// the machine has already demonstrated. Needs more samples than a two-parameter fit, so the
+		// older model remains the fallback rather than being replaced outright.
+		constexpr double FEATURE_RIDGE = 1.0;
+		// Sized against the parameters the data actually exercises rather than all thirteen: see
+		// FitPlanCostWeights. Three samples per fitted parameter, never fewer than eight, so a
+		// workload touching five features calibrates at sixteen while one touching everything still
+		// waits for around forty.
+		constexpr idx_t FEATURE_SAMPLES_PER_PARAM = 3;
+		constexpr idx_t FEATURE_MIN_SAMPLES_FLOOR = 8;
+		bool strategy_from_features = false;
+		bool recompute_from_features = false;
+		if (has_features) {
+			auto strategy_weights =
+			    FitPlanCostWeights(metadata.GetPlanCostHistory(strategy_label, PLAN_FEATURE_SCHEMA), decay,
+			                       FEATURE_RIDGE, FEATURE_SAMPLES_PER_PARAM, FEATURE_MIN_SAMPLES_FLOOR);
+			if (strategy_weights.calibrated) {
+				strategy_predicted_ms = PredictPlanCostMs(strategy_weights, incremental_features);
+				strategy_from_features = true;
+				calibrated = true;
+			}
+			auto recompute_weights =
+			    FitPlanCostWeights(metadata.GetPlanCostHistory("full", PLAN_FEATURE_SCHEMA), decay, FEATURE_RIDGE,
+			                       FEATURE_SAMPLES_PER_PARAM, FEATURE_MIN_SAMPLES_FLOOR);
+			if (recompute_weights.calibrated) {
+				recompute_predicted_ms = PredictPlanCostMs(recompute_weights, recompute_features);
+				recompute_from_features = true;
+				calibrated = true;
+			}
+			OPENIVM_DEBUG_PRINT("[COST MODEL] Feature model: %s=%s, full=%s\n", strategy_label,
+			                    strategy_from_features ? "fitted" : "insufficient history",
+			                    recompute_from_features ? "fitted" : "insufficient history");
+		}
+
 		auto strategy_history = metadata.GetRefreshHistory(view_name, strategy_label);
 		auto strategy_reg = FitRegression(strategy_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
-		if (strategy_reg.calibrated) {
+		if (strategy_reg.calibrated && !strategy_from_features) {
 			strategy_predicted_ms =
 			    std::max(0.0, strategy_reg.w_compute * strategy_compute + strategy_reg.w_upsert * strategy_upsert +
 			                      strategy_reg.w_intercept);
@@ -980,7 +1285,7 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 
 		auto rc_history = metadata.GetRefreshHistory(view_name, "full");
 		auto rc_reg = FitRegression(rc_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
-		if (rc_reg.calibrated) {
+		if (rc_reg.calibrated && !recompute_from_features) {
 			recompute_predicted_ms = std::max(0.0, rc_reg.w_compute * recompute_compute +
 			                                           rc_reg.w_upsert * recompute_replace + rc_reg.w_intercept);
 			calibrated = true;
@@ -1008,6 +1313,47 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: %s=%.0fms, Recompute=%.0fms\n", strategy_label,
 		                    strategy_predicted_ms, recompute_predicted_ms);
 	}
+	// Exploration: occasionally run the strategy the model expects to lose, when the model has too
+	// little evidence about it to be trusted.
+	//
+	// Weights are learned from executions, so a strategy the model stops choosing stops producing
+	// samples, and the estimate that caused it to lose is never corrected. A view that full recompute
+	// wins once can therefore keep winning on stale evidence. The escape is to spend a small,
+	// bounded amount of runtime measuring the alternative.
+	//
+	// Deliberately deterministic rather than random, so a run is reproducible and testable: every
+	// EXPLORE_PERIOD-th refresh of a view explores. Self-limiting, since it stops as soon as the
+	// neglected strategy has enough samples to fit. Cost is bounded at one refresh in
+	// EXPLORE_PERIOD, and only while that strategy is under-measured.
+	int8_t exploration = 0;
+	if (adaptive_on && SqlUtils::GetBoolSetting(context, "openivm_adaptive_explore", true)) {
+		constexpr idx_t EXPLORE_PERIOD = 10;
+		// Enough that the neglected strategy can be fitted under the loosest case above; exploring
+		// past that buys nothing, since the model can then price it from evidence.
+		constexpr idx_t EXPLORE_MIN_SAMPLES = 24;
+		bool would_recompute = recompute_predicted_ms < strategy_predicted_ms;
+		// Exploring towards incremental is only legal when the view can be maintained incrementally
+		// at all; full recompute is always a legal answer.
+		bool loser_is_legal =
+		    would_recompute ? (view_type != RefreshType::FULL_REFRESH && view_type != RefreshType::TOP_K) : true;
+		if (loser_is_legal) {
+			RefreshMetadata explore_meta(con);
+			string loser_method = would_recompute ? strategy_label : string("full");
+			idx_t loser_samples = explore_meta.CountPlanCostSamples(loser_method, PLAN_FEATURE_SCHEMA);
+			if (loser_samples < EXPLORE_MIN_SAMPLES) {
+				idx_t refreshes = explore_meta.CountRefreshHistory(view_name);
+				if (refreshes > 0 && refreshes % EXPLORE_PERIOD == 0) {
+					exploration = would_recompute ? -1 : 1;
+					OPENIVM_DEBUG_PRINT("[COST MODEL] Exploring: running %s despite predicting %s, "
+					                    "because %s has only %llu samples\n",
+					                    would_recompute ? strategy_label : "full",
+					                    would_recompute ? "full" : strategy_label, loser_method.c_str(),
+					                    (unsigned long long)loser_samples);
+				}
+			}
+		}
+	}
+
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n",
 	                    recompute_predicted_ms < strategy_predicted_ms ? "FULL_RECOMPUTE" : strategy_label);
 
@@ -1021,6 +1367,10 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	estimate.incremental_predicted_ms = strategy_predicted_ms;
 	estimate.recompute_predicted_ms = recompute_predicted_ms;
 	estimate.calibrated = calibrated;
+	estimate.incremental_features = incremental_features;
+	estimate.recompute_features = recompute_features;
+	estimate.has_features = has_features;
+	estimate.exploration = exploration;
 	estimate.strategy_label = std::move(strategy_label);
 	return estimate;
 }
@@ -1034,9 +1384,10 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 	// Propagate user session settings to the cost estimation connection.
 	// The new connection has defaults, so settings like openivm_adaptive_refresh
 	// must be copied from the calling context for calibration to activate.
-	for (auto &setting_name : {"openivm_adaptive_refresh", "openivm_cost_decay", "openivm_ducklake_nterm",
-	                           "openivm_fk_pruning", "openivm_skip_empty_deltas", "openivm_having_merge",
-	                           "openivm_left_join_merge", "openivm_full_outer_merge", "openivm_distinct_aux_state"}) {
+	for (auto &setting_name :
+	     {"openivm_adaptive_refresh", "openivm_cost_decay", "openivm_ducklake_nterm", "openivm_fk_pruning",
+	      "openivm_skip_empty_deltas", "openivm_having_merge", "openivm_left_join_merge", "openivm_full_outer_merge",
+	      "openivm_distinct_aux_state", "openivm_adaptive_explore"}) {
 		Value v;
 		if (context.TryGetCurrentSetting(setting_name, v) && !v.IsNull()) {
 			con.Query("SET " + string(setting_name) + " = " + v.ToString());

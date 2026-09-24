@@ -169,6 +169,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("openivm_refresh_mode", "refresh strategy: incremental, full, or auto",
 	                             LogicalType::VARCHAR, Value("incremental"));
+	db_config.AddExtensionOption(
+	    "openivm_adaptive_explore",
+	    "occasionally run the strategy the cost model expects to lose, while it has too few samples "
+	    "of that strategy to be trusted; bounded at one refresh in ten and stops once calibrated",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_adaptive_refresh",
 	                             "experimental: enable adaptive cost model (when off, always use IVM)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
@@ -291,6 +296,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " method VARCHAR, incremental_compute_est DOUBLE, incremental_upsert_est DOUBLE,"
 	          " recompute_compute_est DOUBLE, recompute_replace_est DOUBLE,"
 	          " actual_duration_ms BIGINT,"
+	          " plan_features DOUBLE[], feature_schema INTEGER DEFAULT 0,"
+	          " exploratory BOOLEAN DEFAULT false,"
 	          " PRIMARY KEY(view_name, refresh_timestamp))");
 	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::PROFILE_TABLE) +
 	          " (refresh_id VARCHAR, view_name VARCHAR, profile_timestamp TIMESTAMP DEFAULT current_timestamp,"
@@ -361,6 +368,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	con.Query("ALTER TABLE " + string(openivm::HISTORY_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS strategy VARCHAR DEFAULT 'incremental'");
+	// Per-operator-class row estimates for the plan that ran, and the layout they were recorded
+	// under. Rows written before this existed keep NULL features and schema 0, which the fitter
+	// skips rather than misreading as a different feature set.
+	con.Query("ALTER TABLE " + string(openivm::HISTORY_TABLE) + " ADD COLUMN IF NOT EXISTS plan_features DOUBLE[]");
+	con.Query("ALTER TABLE " + string(openivm::HISTORY_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS feature_schema INTEGER DEFAULT 0");
+	// Marks a refresh that ran the strategy the model expected to lose, in order to measure it.
+	// Recorded so the cost of exploration is auditable rather than invisible.
+	con.Query("ALTER TABLE " + string(openivm::HISTORY_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS exploratory BOOLEAN DEFAULT false");
 
 	auto materialized_view_parser = duckdb::MaterializedViewParserExtension();
 

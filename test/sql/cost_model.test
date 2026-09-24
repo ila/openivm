@@ -229,3 +229,220 @@ query I
 SELECT count(*) FROM openivm_refresh_history WHERE actual_duration_ms IS NULL OR actual_duration_ms < 0;
 ----
 0
+
+# ==========================================
+# Test 6: the learned per-operator cost model
+#
+# Every refresh records the row estimate per operator class for the plan that ran, paired with how
+# long it took. Once enough of those accumulate, weights are fitted over them and replace the
+# hand-tuned millisecond constants. The constants under-predicted both strategies by roughly a
+# factor of two across a 2,520-case sweep, which is what the fit exists to correct.
+# ==========================================
+
+statement ok
+SET openivm_adaptive_refresh=true;
+
+statement ok
+CREATE TABLE fm_base (g INT, v INT);
+
+statement ok
+INSERT INTO fm_base SELECT i % 8, i FROM range(1, 401) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW fm_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g;
+
+# Enough cycles to clear the fitter's requirement with margin. That requirement scales with the
+# number of features the history actually exercises, three samples each with a floor of eight, so a
+# plan shape like this one needs far fewer than the thirteen-parameter worst case would.
+loop i 0 36
+
+statement ok
+INSERT INTO fm_base VALUES (${i} % 8, ${i});
+
+statement ok
+PRAGMA refresh('fm_mv');
+
+endloop
+
+# Features are recorded, and every vector has the width the current layout declares.
+query I
+SELECT count(*) > 0 FROM openivm_refresh_history WHERE view_name = 'fm_mv' AND plan_features IS NOT NULL;
+----
+true
+
+query I
+SELECT count(DISTINCT len(plan_features)) FROM openivm_refresh_history WHERE plan_features IS NOT NULL;
+----
+1
+
+# Recorded under the current layout, so a later layout change does not silently reinterpret them.
+query I
+SELECT count(*) FROM openivm_refresh_history WHERE plan_features IS NOT NULL AND feature_schema <> 1;
+----
+0
+
+# No feature is negative: these are row counts.
+query I
+SELECT count(*) FROM (SELECT unnest(plan_features) AS f FROM openivm_refresh_history
+                        WHERE plan_features IS NOT NULL) x WHERE f < 0;
+----
+0
+
+# Enough samples under the current layout for the fitter to engage. Thirteen parameters need more
+# evidence than the two-term fallback, so this threshold is what decides whether the learned weights
+# are used at all; asserting it keeps a silent fall-through to the fallback from passing as success.
+#
+# Grouped by method rather than asserting a particular one. Weights are fitted per strategy, and a
+# view only ever records the strategy it actually ran: this one is small enough that full recompute
+# wins every time, so its samples land under 'full' and the incremental side of the model stays
+# uncalibrated. That is a real property of learning from executions rather than a quirk of the test.
+query I
+SELECT max(c) >= 24 FROM (SELECT method, count(*) AS c FROM openivm_refresh_history
+                            WHERE plan_features IS NOT NULL AND feature_schema = 1
+                            GROUP BY method) x;
+----
+true
+
+# Why the requirement scales rather than sitting at the worst case: a grouped aggregate over one
+# table exercises only a handful of the twelve feature slots. The rest are flat zero — no join, no
+# window, no set operation — and a column that never varies contributes nothing but dimensionality.
+# Asserting this keeps the sizing rule honest if the feature set grows.
+query I
+SELECT count(*) < 8 FROM (
+  SELECT idx FROM (SELECT unnest(plan_features) AS val, generate_subscripts(plan_features, 1) AS idx
+                     FROM openivm_refresh_history
+                     WHERE view_name = 'fm_mv' AND plan_features IS NOT NULL) f
+  GROUP BY idx HAVING count(DISTINCT val) > 1) x;
+----
+true
+
+# The view still refreshes correctly while all of this is being recorded.
+statement ok
+INSERT INTO fm_base VALUES (3, 9999);
+
+statement ok
+DELETE FROM fm_base WHERE v = 1;
+
+statement ok
+PRAGMA refresh('fm_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fm_mv)
+  EXCEPT ALL
+  (SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g)
+  EXCEPT ALL
+  (SELECT * FROM fm_mv)) x;
+----
+0
+
+# ==========================================
+# Test 7: exploration breaks the feedback loop
+#
+# Weights are learned from executions, so a strategy the model stops choosing stops producing the
+# samples that would show it was right. Test 6 shows that happening: a view small enough that full
+# recompute always wins records samples only under 'full'. Exploration spends a bounded amount of
+# runtime measuring the neglected strategy so the estimate that sidelined it can be corrected.
+# ==========================================
+
+statement ok
+SET openivm_adaptive_refresh=true;
+
+statement ok
+SET openivm_adaptive_explore=true;
+
+statement ok
+CREATE TABLE ex_base (g INT, v INT);
+
+statement ok
+INSERT INTO ex_base SELECT i % 4, i FROM range(1, 201) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW ex_mv AS SELECT g, SUM(v) AS total FROM ex_base GROUP BY g;
+
+loop i 0 30
+
+statement ok
+INSERT INTO ex_base VALUES (${i} % 4, ${i});
+
+statement ok
+PRAGMA refresh('ex_mv');
+
+endloop
+
+# Refreshes that ran the strategy the model expected to lose are marked as such. Counting distinct
+# methods would not prove anything here: the model flips between them on its own as the view grows,
+# so that assertion passes with exploration disabled. The flag is the only signal that isolates it.
+query I
+SELECT count(*) > 0 FROM openivm_refresh_history WHERE view_name = 'ex_mv' AND exploratory;
+----
+true
+
+# Exploration stays a small minority: it is there to gather evidence, not to override the model.
+# One refresh in ten is the cap, so at 30 refreshes it must be well under a third.
+query I
+SELECT count(*) FILTER (WHERE exploratory) * 3 < count(*) FROM openivm_refresh_history
+  WHERE view_name = 'ex_mv';
+----
+true
+
+# Every refresh stayed correct, including the explored ones, which take the strategy the model
+# expected to be slower rather than a different answer.
+query I
+SELECT count(*) FROM ((SELECT * FROM ex_mv)
+  EXCEPT ALL
+  (SELECT g, SUM(v) AS total FROM ex_base GROUP BY g)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT g, SUM(v) AS total FROM ex_base GROUP BY g)
+  EXCEPT ALL
+  (SELECT * FROM ex_mv)) x;
+----
+0
+
+# Turning it off is respected: no refresh after this point is marked exploratory.
+statement ok
+SET openivm_adaptive_explore=false;
+
+statement ok
+CREATE TABLE ex_off (g INT, v INT);
+
+statement ok
+INSERT INTO ex_off SELECT i % 4, i FROM range(1, 201) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW ex_off_mv AS SELECT g, SUM(v) AS total FROM ex_off GROUP BY g;
+
+loop i 0 25
+
+statement ok
+INSERT INTO ex_off VALUES (${i} % 4, ${i});
+
+statement ok
+PRAGMA refresh('ex_off_mv');
+
+endloop
+
+query I
+SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'ex_off_mv' AND exploratory;
+----
+0
+
+statement ok
+INSERT INTO ex_base VALUES (1, 77777);
+
+statement ok
+PRAGMA refresh('ex_mv');
+
+query I
+SELECT count(*) FROM ((SELECT g, SUM(v) AS total FROM ex_base GROUP BY g)
+  EXCEPT ALL
+  (SELECT * FROM ex_mv)) x;
+----
+0

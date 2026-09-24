@@ -138,8 +138,21 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " recompute_compute_est double, recompute_replace_est double,"
 	              " actual_duration_ms bigint,"
 	              " strategy varchar default 'incremental',"
+	              " plan_features double[], feature_schema integer default 0,"
+	              " exploratory boolean default false,"
 	              " primary key(view_name, refresh_timestamp))");
 	AddColumnIfNotExists(ddl, openivm::HISTORY_TABLE, "strategy varchar default 'incremental'");
+	AddColumnIfNotExists(ddl, openivm::HISTORY_TABLE, "plan_features double[]");
+	AddColumnIfNotExists(ddl, openivm::HISTORY_TABLE, "feature_schema integer default 0");
+	// Intentionally no DEFAULT here, unlike the column in the CREATE TABLE above and the migration in
+	// openivm_extension.cpp. Writing `exploratory boolean default false` in this batch makes the
+	// surrounding CREATE MATERIALIZED VIEW fail with "Cannot plan statement of type MULTI", while the
+	// same column with the same default is fine in the CREATE TABLE, and the same ALTER is fine
+	// without the default. DuckDB rewrites `false` to CAST('f' AS BOOLEAN), which introduces a quoted
+	// literal this DDL batch evidently does not survive. Rows predating the column therefore read
+	// NULL rather than false, which reads as "not known to be exploratory" and is correct: every row
+	// written since carries an explicit value.
+	AddColumnIfNotExists(ddl, openivm::HISTORY_TABLE, "exploratory boolean");
 	ddl.push_back("create table if not exists " + string(openivm::PROFILE_TABLE) +
 	              " (refresh_id varchar, view_name varchar,"
 	              " profile_timestamp timestamp default current_timestamp,"
