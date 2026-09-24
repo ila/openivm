@@ -59,8 +59,9 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const vector<string> &column_names = {}, bool running_window_incremental = false);
 /// Full recompute, optionally emitting new_bag - old_bag into the view's delta table.
 /// Unscopable group/window refreshes must preserve the requested cascade delta for downstream MVs.
+/// Supply the data table's unique keys to avoid deleting and reinserting surviving indexed keys.
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "",
-                            bool emit_cascade_delta = false);
+                            bool emit_cascade_delta = false, const vector<string> &unique_keys = {});
 
 /// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE`
 /// (inner-DISTINCT under aggregate). For each base table T_i with a non-empty

@@ -1451,10 +1451,14 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 }
 
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix,
-                            bool emit_cascade_delta) {
+                            bool emit_cascade_delta, const vector<string> &unique_keys) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
+	string recompute_temp;
+	if (!unique_keys.empty()) {
+		recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
+	}
 	if (!emit_cascade_delta) {
-		return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql);
+		return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp);
 	}
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
@@ -1464,7 +1468,7 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + " openivm_old;\n\n";
 	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
 	       ") openivm_recompute;\n\n";
-	sql += SqlUtils::BuildFullRecomputeSQL(data_table, "SELECT * FROM " + new_temp_table);
+	sql += SqlUtils::BuildFullRecomputeSQL(data_table, "SELECT * FROM " + new_temp_table, unique_keys, recompute_temp);
 	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
 	sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";

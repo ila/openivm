@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -681,11 +682,18 @@ static vector<QueryDef> BuildQueries() {
 	              {"mv_q"}, {"CUSTOMER"},
 	              "SELECT C_W_ID, ROUND(STDDEV_SAMP(C_BALANCE::DOUBLE), 2) AS sd FROM CUSTOMER GROUP BY C_W_ID",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	// ARG_MAX orders by (C_BALANCE, C_D_ID, C_ID) rather than C_BALANCE alone. TPC-C gives every
+	// customer the same starting balance, so ordering by it alone leaves tens of thousands of tied
+	// rows per warehouse and ARG_MAX may return any of them: at scale factor 25 the maximum is tied
+	// across 29,700 rows in a single group. Both the view and the base query then return correct but
+	// different answers, and the EXCEPT ALL cross-check reports a mismatch that is not one. Appending
+	// (C_D_ID, C_ID), which is unique within a warehouse, makes the ordering total and the query
+	// single-valued, while still ordering primarily by the column the mixed workload updates.
 	AddQuery(qs, {"T03", "ARG_MAX aggregate", {}, {},
-	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, ARG_MAX(C_ID, C_BALANCE) AS top_c FROM CUSTOMER "
-	               "GROUP BY C_W_ID"},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, ARG_MAX(C_ID, (C_BALANCE, C_D_ID, C_ID)) AS top_c "
+	               "FROM CUSTOMER GROUP BY C_W_ID"},
 	              {"mv_q"}, {"CUSTOMER"},
-	              "SELECT C_W_ID, ARG_MAX(C_ID, C_BALANCE) AS top_c FROM CUSTOMER GROUP BY C_W_ID",
+	              "SELECT C_W_ID, ARG_MAX(C_ID, (C_BALANCE, C_D_ID, C_ID)) AS top_c FROM CUSTOMER GROUP BY C_W_ID",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
 	AddQuery(qs, {"T04", "FULL OUTER JOIN projection", {}, {},
 	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, d.D_ID FROM WAREHOUSE w FULL OUTER JOIN DISTRICT d "
@@ -994,15 +1002,99 @@ static void ConfigureMode(duckdb::Connection &con, RefreshMode mode) {
 // (the decision under test) and skip it for the INCREMENTAL/FULL reference-timing runs, which avoids
 // two of the three full validations per combo. Each mode still does its own independent full setup in
 // its own session, so this changes only what we verify, not how the refresh runs.
-static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload workload, double delta_pct,
-                          FlagConfig flag_config, int scale, int rep, RefreshMode mode, bool read_cost, bool warm,
+// A case's starting state, built once and reused by every refresh mode.
+//
+// The three modes have to begin from identical state, but they used to reach it by each repeating
+// the whole setup: copy the base database, create the materialized view, apply the delta. That work
+// dwarfs the refresh it surrounds — at scale factor 50 the timed refresh was 0.4% of the sweep's
+// wall clock — and doing it three times tripled the part that was already dominant.
+//
+// It also did not produce identical state. The generated inserts embed NOW(), so each mode wrote
+// different timestamps and the three were not measuring the same delta.
+//
+// Building it once and restoring from a file copy fixes both. The copy is cheap next to what it
+// replaces: 28 MB at scale factor 25 copies in 0.02s, against seconds to minutes for the setup.
+struct PreparedCase {
+	std::unique_ptr<TempDb> snapshot;
+	bool ok = false;
+	string error;
+	int64_t dml_statements = 0;
+	int64_t delta_rows = 0;
+	int64_t base_rows = 0;
+	int64_t mv_rows = 0;
+};
+
+static PreparedCase PrepareCase(const string &src_db_path, const QueryDef &q, Workload workload, double delta_pct,
+                                FlagConfig flag_config, int scale, int rep) {
+	PreparedCase prepared;
+	string tag = q.id + "_" + WorkloadName(workload) + "_" + to_string(delta_pct) + "_" + FlagConfigName(flag_config) +
+	             "_" + to_string(rep) + "_setup";
+	prepared.snapshot.reset(new TempDb(tag));
+	if (!CopyFile(src_db_path, prepared.snapshot->path)) {
+		prepared.error = "copy db failed: " + string(strerror(errno));
+		return prepared;
+	}
+	try {
+		// Scoped so the database is closed, and therefore checkpointed, before anything copies the
+		// file. A snapshot taken while it is open could miss writes still sitting in the WAL.
+		duckdb::DuckDB db(prepared.snapshot->path);
+		duckdb::Connection con(db);
+		auto load = con.Query("LOAD openivm");
+		if (!load || load->HasError()) {
+			prepared.error = "LOAD openivm: " + (load ? load->GetError() : "null result");
+			return prepared;
+		}
+		ApplyFlagConfig(con, flag_config);
+		for (auto &sql : q.setup_sql) {
+			auto result = con.Query(sql);
+			if (!result || result->HasError()) {
+				prepared.error = "setup failed: " + (result ? result->GetError() : "null result");
+				return prepared;
+			}
+		}
+		for (auto &sql : q.query_settings) {
+			auto result = con.Query(sql);
+			if (!result || result->HasError()) {
+				prepared.error = "query setting failed: " + (result ? result->GetError() : "null result");
+				return prepared;
+			}
+		}
+		for (auto &sql : q.create_mvs) {
+			auto result = con.Query(sql);
+			if (!result || result->HasError()) {
+				prepared.error = "CREATE MV failed: " + (result ? result->GetError() : "null result");
+				return prepared;
+			}
+		}
+		prepared.dml_statements = ApplyDML(con, q, workload, delta_pct, scale);
+		prepared.delta_rows = CountPendingDeltaRows(con, q);
+		if (workload == Workload::MIXED && delta_pct > 0 && prepared.delta_rows <= 0) {
+			prepared.error = "mixed workload produced no pending delta rows";
+			return prepared;
+		}
+		prepared.base_rows = ReadBaseRows(con, q);
+		prepared.mv_rows = ReadCount(con, "SELECT COUNT(*) FROM " + q.refresh_mvs.back());
+	} catch (const std::exception &e) {
+		prepared.error = string("exception during setup: ") + e.what();
+		return prepared;
+	}
+	prepared.ok = true;
+	return prepared;
+}
+
+static ModeResult RunMode(const PreparedCase &prepared, const QueryDef &q, Workload workload, double delta_pct,
+                          FlagConfig flag_config, int rep, RefreshMode mode, bool read_cost, bool warm,
                           bool do_validate) {
 	ModeResult out;
+	out.dml_statements = prepared.dml_statements;
+	out.delta_rows = prepared.delta_rows;
+	out.base_rows = prepared.base_rows;
+	out.mv_rows = prepared.mv_rows;
 	string tag = q.id + "_" + WorkloadName(workload) + "_" + to_string(delta_pct) + "_" + FlagConfigName(flag_config) +
 	             "_" + to_string(rep) + "_" + to_string(static_cast<int>(mode));
 	TempDb temp(tag);
-	if (!CopyFile(src_db_path, temp.path)) {
-		out.error = "copy db failed: " + string(strerror(errno));
+	if (!CopyFile(prepared.snapshot->path, temp.path)) {
+		out.error = "restore snapshot failed: " + string(strerror(errno));
 		return out;
 	}
 	try {
@@ -1013,14 +1105,8 @@ static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload
 			out.error = "LOAD openivm: " + (load ? load->GetError() : "null result");
 			return out;
 		}
+		// Settings live in the session, not in the file, so they are re-applied on the restored copy.
 		ApplyFlagConfig(con, flag_config);
-		for (auto &sql : q.setup_sql) {
-			auto result = con.Query(sql);
-			if (!result || result->HasError()) {
-				out.error = "setup failed: " + (result ? result->GetError() : "null result");
-				return out;
-			}
-		}
 		for (auto &sql : q.query_settings) {
 			auto result = con.Query(sql);
 			if (!result || result->HasError()) {
@@ -1028,21 +1114,6 @@ static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload
 				return out;
 			}
 		}
-		for (auto &sql : q.create_mvs) {
-			auto result = con.Query(sql);
-			if (!result || result->HasError()) {
-				out.error = "CREATE MV failed: " + (result ? result->GetError() : "null result");
-				return out;
-			}
-		}
-		out.dml_statements = ApplyDML(con, q, workload, delta_pct, scale);
-		out.delta_rows = CountPendingDeltaRows(con, q);
-		if (workload == Workload::MIXED && delta_pct > 0 && out.delta_rows <= 0) {
-			out.error = "mixed workload produced no pending delta rows";
-			return out;
-		}
-		out.base_rows = ReadBaseRows(con, q);
-		out.mv_rows = ReadCount(con, "SELECT COUNT(*) FROM " + q.refresh_mvs.back());
 		if (warm) {
 			WarmScenario(con, q);
 		}
@@ -1294,12 +1365,21 @@ int main(int argc, char **argv) {
 						row++;
 						Log("[" + to_string(row) + "/" + to_string(total) + "] " + q.id + " wl=" + WorkloadName(wl) +
 						    " pct=" + to_string(pct) + " flags=" + FlagConfigName(config) + " rep=" + to_string(rep));
-						auto auto_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::AUTO, true,
-						                           warm, /*do_validate=*/validate);
-						auto inc_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::INCREMENTAL,
-						                          false, warm, /*do_validate=*/false);
-						auto full_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::FULL, false,
-						                           warm, /*do_validate=*/false);
+						// One setup, three refreshes from the same starting state.
+						auto prepared = PrepareCase(db_path, q, wl, pct, config, scale, rep);
+						ModeResult auto_result, inc_result, full_result;
+						if (!prepared.ok) {
+							auto_result.error = prepared.error;
+							inc_result.error = prepared.error;
+							full_result.error = prepared.error;
+						} else {
+							auto_result = RunMode(prepared, q, wl, pct, config, rep, RefreshMode::AUTO, true, warm,
+							                      /*do_validate=*/validate);
+							inc_result = RunMode(prepared, q, wl, pct, config, rep, RefreshMode::INCREMENTAL, false,
+							                     warm, /*do_validate=*/false);
+							full_result = RunMode(prepared, q, wl, pct, config, rep, RefreshMode::FULL, false, warm,
+							                      /*do_validate=*/false);
+						}
 
 						// Correctness is verified on the AUTO path (the decision under test); the forced
 						// inc/full runs are reference timings only.
