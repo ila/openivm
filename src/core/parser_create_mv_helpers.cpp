@@ -138,8 +138,11 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " recompute_compute_est double, recompute_replace_est double,"
 	              " actual_duration_ms bigint,"
 	              " strategy varchar default 'incremental',"
+	              " plan_features double[], feature_schema integer default 0,"
 	              " primary key(view_name, refresh_timestamp))");
 	AddColumnIfNotExists(ddl, openivm::HISTORY_TABLE, "strategy varchar default 'incremental'");
+	AddColumnIfNotExists(ddl, openivm::HISTORY_TABLE, "plan_features double[]");
+	AddColumnIfNotExists(ddl, openivm::HISTORY_TABLE, "feature_schema integer default 0");
 	ddl.push_back("create table if not exists " + string(openivm::PROFILE_TABLE) +
 	              " (refresh_id varchar, view_name varchar,"
 	              " profile_timestamp timestamp default current_timestamp,"

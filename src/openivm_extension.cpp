@@ -291,6 +291,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " method VARCHAR, incremental_compute_est DOUBLE, incremental_upsert_est DOUBLE,"
 	          " recompute_compute_est DOUBLE, recompute_replace_est DOUBLE,"
 	          " actual_duration_ms BIGINT,"
+	          " plan_features DOUBLE[], feature_schema INTEGER DEFAULT 0,"
 	          " PRIMARY KEY(view_name, refresh_timestamp))");
 	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::PROFILE_TABLE) +
 	          " (refresh_id VARCHAR, view_name VARCHAR, profile_timestamp TIMESTAMP DEFAULT current_timestamp,"
@@ -361,6 +362,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	con.Query("ALTER TABLE " + string(openivm::HISTORY_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS strategy VARCHAR DEFAULT 'incremental'");
+	// Per-operator-class row estimates for the plan that ran, and the layout they were recorded
+	// under. Rows written before this existed keep NULL features and schema 0, which the fitter
+	// skips rather than misreading as a different feature set.
+	con.Query("ALTER TABLE " + string(openivm::HISTORY_TABLE) + " ADD COLUMN IF NOT EXISTS plan_features DOUBLE[]");
+	con.Query("ALTER TABLE " + string(openivm::HISTORY_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS feature_schema INTEGER DEFAULT 0");
 
 	auto materialized_view_parser = duckdb::MaterializedViewParserExtension();
 

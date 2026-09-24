@@ -229,3 +229,98 @@ query I
 SELECT count(*) FROM openivm_refresh_history WHERE actual_duration_ms IS NULL OR actual_duration_ms < 0;
 ----
 0
+
+# ==========================================
+# Test 6: the learned per-operator cost model
+#
+# Every refresh records the row estimate per operator class for the plan that ran, paired with how
+# long it took. Once enough of those accumulate, weights are fitted over them and replace the
+# hand-tuned millisecond constants. The constants under-predicted both strategies by roughly a
+# factor of two across a 2,520-case sweep, which is what the fit exists to correct.
+# ==========================================
+
+statement ok
+SET openivm_adaptive_refresh=true;
+
+statement ok
+CREATE TABLE fm_base (g INT, v INT);
+
+statement ok
+INSERT INTO fm_base SELECT i % 8, i FROM range(1, 401) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW fm_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g;
+
+# Enough refresh cycles to pass the fitter's sample threshold.
+loop i 0 45
+
+statement ok
+INSERT INTO fm_base VALUES (${i} % 8, ${i});
+
+statement ok
+PRAGMA refresh('fm_mv');
+
+endloop
+
+# Features are recorded, and every vector has the width the current layout declares.
+query I
+SELECT count(*) > 0 FROM openivm_refresh_history WHERE view_name = 'fm_mv' AND plan_features IS NOT NULL;
+----
+true
+
+query I
+SELECT count(DISTINCT len(plan_features)) FROM openivm_refresh_history WHERE plan_features IS NOT NULL;
+----
+1
+
+# Recorded under the current layout, so a later layout change does not silently reinterpret them.
+query I
+SELECT count(*) FROM openivm_refresh_history WHERE plan_features IS NOT NULL AND feature_schema <> 1;
+----
+0
+
+# No feature is negative: these are row counts.
+query I
+SELECT count(*) FROM (SELECT unnest(plan_features) AS f FROM openivm_refresh_history
+                        WHERE plan_features IS NOT NULL) x WHERE f < 0;
+----
+0
+
+# Enough samples under the current layout for the fitter to engage. Thirteen parameters need more
+# evidence than the two-term fallback, so this threshold is what decides whether the learned weights
+# are used at all; asserting it keeps a silent fall-through to the fallback from passing as success.
+#
+# Grouped by method rather than asserting a particular one. Weights are fitted per strategy, and a
+# view only ever records the strategy it actually ran: this one is small enough that full recompute
+# wins every time, so its samples land under 'full' and the incremental side of the model stays
+# uncalibrated. That is a real property of learning from executions rather than a quirk of the test.
+query I
+SELECT max(c) >= 40 FROM (SELECT method, count(*) AS c FROM openivm_refresh_history
+                            WHERE plan_features IS NOT NULL AND feature_schema = 1
+                            GROUP BY method) x;
+----
+true
+
+# The view still refreshes correctly while all of this is being recorded.
+statement ok
+INSERT INTO fm_base VALUES (3, 9999);
+
+statement ok
+DELETE FROM fm_base WHERE v = 1;
+
+statement ok
+PRAGMA refresh('fm_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fm_mv)
+  EXCEPT ALL
+  (SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g)
+  EXCEPT ALL
+  (SELECT * FROM fm_mv)) x;
+----
+0

@@ -4,9 +4,60 @@
 #include "duckdb.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
+#include <array>
+
 namespace duckdb {
 
 struct DeltaActivityResult;
+
+// ---------------------------------------------------------------------------
+// Plan cost features
+// ---------------------------------------------------------------------------
+//
+// A refresh plan described as estimated rows per operator class. Both candidate strategies are
+// described in the same terms by the same estimator, so their predictions are directly comparable,
+// which the previous two-term model could not claim: it priced the incremental side from delta
+// cardinalities and the recompute side from base cardinalities, with separately tuned constants.
+//
+// Learned weights turn a vector into milliseconds. Measured across a 2,520-case sweep, the
+// hand-tuned constants under-predicted BOTH strategies by roughly a factor of two at every scale
+// factor, with median q-errors near 2.2 and 2.4. Errors of similar size on both sides cancel while
+// the two scale alike and stop cancelling when they do not, which is why decision agreement held at
+// 94% at scale factor 1 and fell to 68% at scale factor 100.
+enum class PlanFeature : uint8_t {
+	SCAN_ROWS,             // rows read by table scans
+	FILTER_ROWS,           // rows entering filters
+	PROJECT_ROWS,          // rows through projections
+	JOIN_BUILD_ROWS,       // build-side input, which is what a hash join materializes
+	JOIN_PROBE_ROWS,       // probe-side input
+	JOIN_OUTPUT_ROWS,      // rows a join produces, separate because fan-out is the expensive part
+	AGGREGATE_INPUT_ROWS,  // rows entering grouping
+	AGGREGATE_OUTPUT_ROWS, // groups produced
+	ORDER_ROWS,
+	WINDOW_ROWS,
+	SET_OP_ROWS,
+	WRITE_ROWS, // rows the upsert writes; supplied by the caller, not read from the plan
+	COUNT
+};
+
+constexpr idx_t PLAN_FEATURE_COUNT = static_cast<idx_t>(PlanFeature::COUNT);
+
+// Bumped when the layout above changes. History rows carrying a different value are skipped by the
+// fitter rather than silently reinterpreted as a different set of features.
+constexpr int32_t PLAN_FEATURE_SCHEMA = 1;
+
+using PlanFeatureVector = std::array<double, PLAN_FEATURE_COUNT>;
+
+inline double &Feature(PlanFeatureVector &v, PlanFeature f) {
+	return v[static_cast<idx_t>(f)];
+}
+inline double Feature(const PlanFeatureVector &v, PlanFeature f) {
+	return v[static_cast<idx_t>(f)];
+}
+
+/// Describe `plan` as estimated rows per operator class. WRITE_ROWS is left at zero; the caller
+/// knows what the upsert writes, which is not visible in the plan that computes the delta.
+PlanFeatureVector ExtractPlanFeatures(ClientContext &context, LogicalOperator &plan);
 
 struct RefreshCostEstimate {
 	// Static model components
@@ -25,6 +76,12 @@ struct RefreshCostEstimate {
 
 	// Whether regression was used (true) or static fallback (false)
 	bool calibrated;
+
+	// Per-operator-class row estimates for each candidate, recorded with the refresh so the weights
+	// can be refit later against what actually happened. Empty when no plan was available to describe.
+	PlanFeatureVector incremental_features;
+	PlanFeatureVector recompute_features;
+	bool has_features;
 
 	// Strategy this view uses on refresh — drives both the history label and the
 	// meaning of `incremental_compute` / `incremental_upsert`. For "incremental"

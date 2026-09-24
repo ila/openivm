@@ -375,9 +375,26 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 				}
 			}
 
+			// Record the features of the strategy that actually ran, paired with how long it took.
+			// That pairing is the whole training signal: the alternative was not executed, so its
+			// features have no measurement to learn from. The recompute description always exists,
+			// since it comes from the view query plan; the incremental one only when a delta plan was
+			// built, which is why an uncalibrated run records no features rather than zeroes.
+			vector<double> recorded_features;
+			int32_t recorded_schema = 0;
+			if (method == "full") {
+				recorded_features.assign(cost_estimate.recompute_features.begin(),
+				                         cost_estimate.recompute_features.end());
+				recorded_schema = PLAN_FEATURE_SCHEMA;
+			} else if (cost_estimate.has_features) {
+				recorded_features.assign(cost_estimate.incremental_features.begin(),
+				                         cost_estimate.incremental_features.end());
+				recorded_schema = PLAN_FEATURE_SCHEMA;
+			}
 			RefreshMetadata(exec_con).RecordRefreshHistory(
 			    vn, method, cost_estimate.incremental_compute, cost_estimate.incremental_upsert,
-			    cost_estimate.recompute_compute, cost_estimate.recompute_replace, duration_ms);
+			    cost_estimate.recompute_compute, cost_estimate.recompute_replace, duration_ms, recorded_features,
+			    recorded_schema);
 			OPENIVM_DEBUG_PRINT("[HISTORY] Recorded: view=%s, method=%s, duration=%ldms\n", vn.c_str(), method.c_str(),
 			                    (long)duration_ms);
 			profiler.AddStep("record_refresh_history", history_start, method);
