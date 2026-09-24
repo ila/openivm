@@ -6,8 +6,11 @@ Based on the [OpenIVM paper](https://dl.acm.org/doi/10.1145/3626246.3654743) (SI
 
 ## Quick start
 
+OpenIVM currently requires a source build with DuckDB v1.5.4. Follow the
+[build and setup guide](docs/build/building.md) first; the built CLI already loads OpenIVM.
+
 ```sql
-LOAD 'openivm';
+LOAD 'openivm'; -- Will be enabled in the future; for now refer to docs/build/building.md.
 
 -- Create a base table and a materialized view
 CREATE TABLE sales (region VARCHAR, product VARCHAR, amount INT);
@@ -118,4 +121,4 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 - **[Optimizations](docs/optimizations/)** — Delta consolidation, FK pruning, empty-delta skip, indexing
 - **[Internals](docs/internals/)** — Delta tables, parser, concurrency
 - **[Limitations](docs/limitations.md)** — Unsupported operators, known restrictions
-- **[Build](docs/build/)** — Building, testing, benchmarks
+- **[Build](docs/build/building.md)** — Building, testing, benchmarks
