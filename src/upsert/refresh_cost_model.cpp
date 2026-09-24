@@ -149,6 +149,20 @@ static const char *StrategyLabelForRefreshType(RefreshType view_type) {
 // incremental's per-statement floor beats nothing; incremental wins once recompute is genuinely
 // expensive (large joins that re-materialize a big result, or a big MV whose full replace dwarfs a
 // small delta apply).
+// TODO: replace these seven constants with weights learned per operator class. Each candidate plan
+// would contribute a feature vector of estimated rows bucketed by operator (scan, join build, join
+// probe, aggregate input, aggregate output, window, sort, write), read from the same DuckDB
+// estimator that already prices both sides, and predicted time would be that vector against weights
+// fit over recorded refreshes. A `DOUBLE[]` column on `openivm_refresh_history` alongside a small
+// integer naming the feature layout stores it without a JSON parser and without schema churn when
+// the layout changes; DuckDB's per-operator profiler output (operator_type, operator_cardinality,
+// operator_timing) supplies the per-operator actuals that say which class is mispriced.
+//
+// The motivating measurement, from the cost-model benchmark at TPC-C spec scale with calibration
+// active: the incremental side predicts within about 30% while full recompute is under-predicted by
+// a factor of two to three (4.0ms predicted against 12.0ms measured for a simple grouped aggregate,
+// 10.8ms against 21.3ms for a join). Both sides being wrong in the same direction is why decisions
+// still came out right there, and is exactly what stops holding near the crossover.
 static constexpr double RECOMPUTE_SETUP_MS = 10.0;        // fixed query setup + MV replace overhead
 static constexpr double RECOMPUTE_MS_PER_UNIT = 0.000004; // vectorized scan: nearly free per row
 static constexpr double RECOMPUTE_JOIN_FACTOR = 1.5;      // each join multiplies full-output scan cost
@@ -287,6 +301,153 @@ static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_na
 	return count;
 }
 
+/// Estimated number of rows the incremental delta plan will produce, read from DuckDB's own
+/// cardinality estimator on the plan the refresh is about to run. Returns -1 when no usable node is
+/// found, which tells the caller to keep its own estimate.
+///
+/// Two kinds of node are skipped on the way down, both for correctness rather than convenience:
+///
+///   INSERT reports the cardinality of the *statement result* — a single row carrying the number of
+///   rows written — not the number of rows it writes, so its own estimate is always 1.
+///
+///   PROJECTION cannot change cardinality, so its true estimate is its child's. This matters
+///   because `LogicalOperator::EstimateCardinality` caches into `estimated_cardinality` and returns
+///   the cached value on every later call. When an IVM rewrite rule replaces the subtree beneath a
+///   projection that the original plan already costed, the projection keeps the pre-rewrite number:
+///   the cardinality of a full base scan rather than of a delta scan. Reading it directly estimated
+///   a one-row delta over a 100-row table at 101 rows and flipped the decision to full recompute.
+///   Descending to the child reads a value computed after the rewrite.
+///
+/// Clearing the cached values instead would be worse: for joins the optimizer's estimator has
+/// already stored a statistics-derived cardinality that a recomputation would replace with the
+/// cruder default of the maximum over children.
+///
+/// The number this returns is an *output* estimate, to be read together with the delta *input*
+/// estimate below; see the fanout comment in EstimateRefreshCost for why the pair is used rather
+/// than this value alone.
+struct IncrementalDeltaEstimate {
+	double rows = -1; // estimated delta output rows; negative when the plan yielded nothing usable
+	// True when `rows` counts groups rather than rows, i.e. the delta output is produced by a
+	// grouping or DISTINCT operator. Such a count is sublinear in its input and must not be scaled
+	// by an input ratio the way a row count can be.
+	bool group_count = false;
+};
+
+static IncrementalDeltaEstimate EstimateIncrementalDeltaRows(ClientContext &context, LogicalOperator &plan) {
+	IncrementalDeltaEstimate result;
+	LogicalOperator *node = &plan;
+	while (node->type == LogicalOperatorType::LOGICAL_INSERT || node->type == LogicalOperatorType::LOGICAL_EXPLAIN ||
+	       node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		if (node->children.empty()) {
+			return result;
+		}
+		node = node->children[0].get();
+	}
+	double rows = static_cast<double>(node->EstimateCardinality(context));
+
+	// Grouping and DISTINCT cannot emit more rows than they consume. DuckDB can predict that they
+	// will, because it derives an output group count from the base column's distinct-value
+	// statistics while the input here is a small delta: for a two-row delta into one group of a
+	// ten-group view it estimates ten output rows, which then priced the MERGE against every group
+	// in the view instead of the one that changed. Clamping to the input restores an invariant the
+	// operator's own semantics guarantee.
+	if (node->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY ||
+	    node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
+		result.group_count = true;
+		if (!node->children.empty()) {
+			rows = MinValue(rows, static_cast<double>(node->children[0]->EstimateCardinality(context)));
+		}
+	}
+	result.rows = rows;
+	return result;
+}
+
+/// Total rows DuckDB expects to read out of delta tables in the incremental plan. Summed over every
+/// scan of an `openivm_delta_*` table, which are the plan's delta inputs.
+static double EstimateIncrementalDeltaInput(ClientContext &context, LogicalOperator &op) {
+	double total = 0;
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		auto table = get.GetTable();
+		if (table && StringUtil::StartsWith(StringUtil::Lower(table->name), openivm::DELTA_PREFIX)) {
+			total += static_cast<double>(op.EstimateCardinality(context));
+		}
+	}
+	for (auto &child : op.children) {
+		total += EstimateIncrementalDeltaInput(context, *child);
+	}
+	return total;
+}
+
+/// Estimated rows per operator class for `plan`. See PlanFeature for why both strategies are
+/// described this way rather than by separately tuned scalar terms.
+///
+/// Every number comes from DuckDB's own estimator on the plan in hand, so the two strategies are
+/// measured by one instrument. Joins contribute three separate features because their costs differ
+/// in kind: the build side is materialized, the probe side is streamed, and the output is whatever
+/// fan-out produces. Collapsing them was why join-heavy views carried nearly all of the tail regret
+/// in the sweep, with the large join projection averaging 6.6x and peaking at 14.5x.
+static void CollectPlanFeatures(ClientContext &context, LogicalOperator &op, PlanFeatureVector &out) {
+	auto rows = [&context](LogicalOperator &node) {
+		return static_cast<double>(node.EstimateCardinality(context));
+	};
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET:
+		Feature(out, PlanFeature::SCAN_ROWS) += rows(op);
+		break;
+	case LogicalOperatorType::LOGICAL_FILTER:
+		if (!op.children.empty()) {
+			Feature(out, PlanFeature::FILTER_ROWS) += rows(*op.children[0]);
+		}
+		break;
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+		Feature(out, PlanFeature::PROJECT_ROWS) += rows(op);
+		break;
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
+		Feature(out, PlanFeature::JOIN_OUTPUT_ROWS) += rows(op);
+		if (op.children.size() >= 2) {
+			Feature(out, PlanFeature::JOIN_PROBE_ROWS) += rows(*op.children[0]);
+			Feature(out, PlanFeature::JOIN_BUILD_ROWS) += rows(*op.children[1]);
+		}
+		break;
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+		Feature(out, PlanFeature::AGGREGATE_OUTPUT_ROWS) += rows(op);
+		if (!op.children.empty()) {
+			Feature(out, PlanFeature::AGGREGATE_INPUT_ROWS) += rows(*op.children[0]);
+		}
+		break;
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+	case LogicalOperatorType::LOGICAL_TOP_N:
+		Feature(out, PlanFeature::ORDER_ROWS) += rows(op);
+		break;
+	case LogicalOperatorType::LOGICAL_WINDOW:
+		Feature(out, PlanFeature::WINDOW_ROWS) += rows(op);
+		break;
+	case LogicalOperatorType::LOGICAL_UNION:
+	case LogicalOperatorType::LOGICAL_EXCEPT:
+	case LogicalOperatorType::LOGICAL_INTERSECT:
+		Feature(out, PlanFeature::SET_OP_ROWS) += rows(op);
+		break;
+	default:
+		break;
+	}
+	for (auto &child : op.children) {
+		CollectPlanFeatures(context, *child, out);
+	}
+}
+
+PlanFeatureVector ExtractPlanFeatures(ClientContext &context, LogicalOperator &plan) {
+	PlanFeatureVector features {};
+	features.fill(0.0);
+	CollectPlanFeatures(context, plan, features);
+	return features;
+}
+
 /// Walk the plan tree once, collecting table stats, join info, and aggregate presence.
 static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, LogicalOperator &op,
                                       const string &view_name, const DeltaActivityResult *delta_activity,
@@ -371,6 +532,152 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 	for (auto &child : op.children) {
 		CollectPlanStatsRecursive(context, con, *child, view_name, delta_activity, stats);
 	}
+}
+
+// ============================================================================
+// Learned per-operator cost model
+// ============================================================================
+
+/// Weights turning a PlanFeatureVector into milliseconds: one per feature, plus a free intercept
+/// carrying the fixed per-refresh overhead that belongs to no operator.
+struct PlanCostWeights {
+	std::array<double, PLAN_FEATURE_COUNT + 1> w {};
+	bool calibrated = false;
+};
+
+/// Solve A x = b by Gaussian elimination with partial pivoting. A is destroyed.
+static bool SolveDense(vector<vector<double>> &A, vector<double> &b, vector<double> &x) {
+	idx_t n = b.size();
+	for (idx_t col = 0; col < n; col++) {
+		idx_t pivot = col;
+		for (idx_t row = col + 1; row < n; row++) {
+			if (std::abs(A[row][col]) > std::abs(A[pivot][col])) {
+				pivot = row;
+			}
+		}
+		if (std::abs(A[pivot][col]) < 1e-12) {
+			return false;
+		}
+		if (pivot != col) {
+			std::swap(A[pivot], A[col]);
+			std::swap(b[pivot], b[col]);
+		}
+		for (idx_t row = col + 1; row < n; row++) {
+			double factor = A[row][col] / A[col][col];
+			if (factor == 0.0) {
+				continue;
+			}
+			for (idx_t j = col; j < n; j++) {
+				A[row][j] -= factor * A[col][j];
+			}
+			b[row] -= factor * b[col];
+		}
+	}
+	x.assign(n, 0.0);
+	for (idx_t i = n; i-- > 0;) {
+		double acc = b[i];
+		for (idx_t j = i + 1; j < n; j++) {
+			acc -= A[i][j] * x[j];
+		}
+		x[i] = acc / A[i][i];
+		if (!std::isfinite(x[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/// Fit ms ≈ Σ wᵢ·featureᵢ + intercept by weighted ridge least squares over `active` columns.
+static bool FitActiveSet(const vector<vector<double>> &rows, const vector<double> &targets,
+                         const vector<double> &sample_weights, const vector<idx_t> &active, double ridge,
+                         vector<double> &out) {
+	idx_t k = active.size();
+	vector<vector<double>> ata(k, vector<double>(k, 0.0));
+	vector<double> atb(k, 0.0);
+	for (idx_t s = 0; s < rows.size(); s++) {
+		double sw = sample_weights[s];
+		for (idx_t a = 0; a < k; a++) {
+			double xa = rows[s][active[a]];
+			for (idx_t b = 0; b < k; b++) {
+				ata[a][b] += sw * xa * rows[s][active[b]];
+			}
+			atb[a] += sw * xa * targets[s];
+		}
+	}
+	for (idx_t a = 0; a < k; a++) {
+		ata[a][a] += ridge;
+	}
+	return SolveDense(ata, atb, out);
+}
+
+/// Fit per-operator weights from pooled refresh history.
+///
+/// Feature weights are constrained non-negative: an operator cannot make a refresh finish sooner,
+/// and unconstrained fitting on correlated features (scans and joins move together) happily produces
+/// negative coefficients that predict nonsense on plan shapes absent from the training data. The
+/// intercept stays free so it can absorb fixed overhead. Recent samples weigh more, so the model
+/// tracks a machine whose behaviour changes rather than averaging over its whole history.
+static PlanCostWeights FitPlanCostWeights(const vector<RefreshMetadata::RefreshHistoryEntry> &history, double decay,
+                                          double ridge, idx_t min_samples) {
+	PlanCostWeights result;
+	vector<vector<double>> rows;
+	vector<double> targets;
+	vector<double> sample_weights;
+	idx_t n = history.size();
+	for (idx_t i = 0; i < n; i++) {
+		auto &entry = history[i];
+		if (entry.plan_features.size() != PLAN_FEATURE_COUNT || entry.actual_ms < 0) {
+			continue;
+		}
+		vector<double> row(PLAN_FEATURE_COUNT + 1, 0.0);
+		for (idx_t f = 0; f < PLAN_FEATURE_COUNT; f++) {
+			row[f] = entry.plan_features[f];
+		}
+		row[PLAN_FEATURE_COUNT] = 1.0; // intercept
+		rows.push_back(std::move(row));
+		targets.push_back(entry.actual_ms);
+		sample_weights.push_back(std::pow(decay, static_cast<double>(n - 1 - i)));
+	}
+	if (rows.size() < min_samples) {
+		return result;
+	}
+
+	// Start with every column, drop whichever went negative, refit. Dropping all at once rather than
+	// one per pass converges in a couple of iterations on this problem and cannot cycle.
+	vector<idx_t> active;
+	for (idx_t i = 0; i <= PLAN_FEATURE_COUNT; i++) {
+		active.push_back(i);
+	}
+	vector<double> solved;
+	for (idx_t pass = 0; pass <= PLAN_FEATURE_COUNT; pass++) {
+		if (active.empty() || !FitActiveSet(rows, targets, sample_weights, active, ridge, solved)) {
+			return result;
+		}
+		vector<idx_t> keep;
+		for (idx_t a = 0; a < active.size(); a++) {
+			// The intercept is the last column and is allowed to be negative.
+			if (active[a] == PLAN_FEATURE_COUNT || solved[a] >= 0.0) {
+				keep.push_back(active[a]);
+			}
+		}
+		if (keep.size() == active.size()) {
+			for (idx_t a = 0; a < active.size(); a++) {
+				result.w[active[a]] = solved[a];
+			}
+			result.calibrated = true;
+			return result;
+		}
+		active = std::move(keep);
+	}
+	return result;
+}
+
+static double PredictPlanCostMs(const PlanCostWeights &weights, const PlanFeatureVector &features) {
+	double ms = weights.w[PLAN_FEATURE_COUNT];
+	for (idx_t f = 0; f < PLAN_FEATURE_COUNT; f++) {
+		ms += weights.w[f] * features[f];
+	}
+	return MaxValue(0.0, ms);
 }
 
 // ============================================================================
@@ -556,7 +863,7 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 // ============================================================================
 
 RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name,
-                                        const DeltaActivityResult *delta_activity) {
+                                        const DeltaActivityResult *delta_activity, LogicalOperator *incremental_plan) {
 	// Single connection for all cardinality queries
 	Connection con(*context.db);
 
@@ -586,7 +893,21 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	size_t N = table_stats.size();
 	if (N == 0) {
 		// No base tables found — shouldn't happen, but default to IVM
-		return {0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, false, "incremental"};
+		RefreshCostEstimate empty;
+		empty.incremental_compute = 0.0;
+		empty.incremental_upsert = 0.0;
+		empty.recompute_compute = 0.0;
+		empty.recompute_replace = 1.0;
+		empty.incremental_cost = 0.0;
+		empty.recompute_cost = 1.0;
+		empty.incremental_predicted_ms = 0.0;
+		empty.recompute_predicted_ms = 1.0;
+		empty.calibrated = false;
+		empty.incremental_features.fill(0.0);
+		empty.recompute_features.fill(0.0);
+		empty.has_features = false;
+		empty.strategy_label = "incremental";
+		return empty;
 	}
 
 	// 2. Compute basic metrics
@@ -657,6 +978,68 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		incremental_compute = total_delta;
 		// Apply both pushed-down selectivity and non-pushed-down filter selectivity
 		estimated_delta_result = filtered_delta * plan_stats.filter_selectivity;
+	}
+
+	// Take the *shape* of the computation from DuckDB and the *size* of the input from our own
+	// metadata, rather than either alone.
+	//
+	// DuckDB has been through the optimizer with the real delta tables in place, so it knows how much
+	// a delta expands or contracts on its way through joins, filters and aggregation. That ratio is
+	// exactly what the fanout proxy above was trying to guess from mv_card/actual_card.
+	//
+	// What DuckDB does not know is how much of each delta table is actually pending. A delta table
+	// retains rows that earlier refreshes already consumed, and the refresh reads only those newer
+	// than the view's last refresh timestamp; the optimizer has no selectivity for that predicate and
+	// estimates the scan from the table's full size. Taken as an absolute, its output estimate is
+	// therefore too high by the accumulated consumed rows, and the error grows over a view's
+	// lifetime rather than staying put. Our pending counts come from the delta-activity metadata and
+	// are exact.
+	//
+	// TODO: measure the delta instead of estimating it, where the delta is small enough that a probe
+	// costs less than the error. The exact answers are one query each over a table that is normally
+	// tiny: the rows satisfying the view's predicates, the distinct group keys, and the keys that
+	// already exist in the materialized data table.
+	//
+	// This is the remaining source of error here, and it is DuckDB's statistics rather than its
+	// estimator that is missing. On an ordinary table the optimizer prunes `val > 9900` over a
+	// column of zeros to an empty result from the zone map; delta rows written by the statement under
+	// test carry no usable statistics yet, so the same predicate is estimated at full pass-through.
+	// Two cases in test/sql/auto_refresh.test record the consequence: 200 inserted rows that satisfy
+	// none of the view's filter are estimated at 200 against a true 0, and an inserted join key that
+	// matches nothing is estimated at 3.7 rows against a true 0. Both are over-estimates, so they
+	// bias toward full recompute rather than toward an incorrect result.
+	//
+	// So: fanout comes from the plan, input size comes from metadata.
+	if (incremental_plan) {
+		auto plan_estimate = EstimateIncrementalDeltaRows(context, *incremental_plan);
+		double plan_delta_input = EstimateIncrementalDeltaInput(context, *incremental_plan);
+		double pending_delta_rows = 0;
+		for (auto &ts : table_stats) {
+			pending_delta_rows += ts.delta_card;
+		}
+		if (plan_estimate.rows >= 0 && plan_estimate.group_count) {
+			// A group count is sublinear in its input: 300 delta rows spread over 5 groups still
+			// produce 5. Scaling it by an input ratio would be meaningless, so take the plan's count
+			// directly, bounded by the delta rows, since no more groups can be touched than there are
+			// rows to touch them.
+			double bounded = MinValue(plan_estimate.rows, pending_delta_rows);
+			OPENIVM_DEBUG_PRINT("[COST MODEL] Delta result: proxy=%.0f, plan groups=%.0f, pending=%.0f -> %.0f\n",
+			                    estimated_delta_result, plan_estimate.rows, pending_delta_rows, bounded);
+			estimated_delta_result = bounded;
+		} else if (plan_estimate.rows >= 0 && plan_delta_input > 0) {
+			double fanout = plan_estimate.rows / plan_delta_input;
+			double plan_based_result = fanout * pending_delta_rows;
+			OPENIVM_DEBUG_PRINT("[COST MODEL] Delta result: proxy=%.0f, plan fanout=%.4f (%.0f/%.0f) x pending=%.0f "
+			                    "-> %.0f\n",
+			                    estimated_delta_result, fanout, plan_estimate.rows, plan_delta_input,
+			                    pending_delta_rows, plan_based_result);
+			estimated_delta_result = plan_based_result;
+		} else if (plan_estimate.rows >= 0) {
+			// No delta scan in the plan to scale against — use the plan's own output estimate.
+			OPENIVM_DEBUG_PRINT("[COST MODEL] Delta result: proxy=%.0f, plan estimate=%.0f (no delta input found)\n",
+			                    estimated_delta_result, plan_estimate.rows);
+			estimated_delta_result = plan_estimate.rows;
+		}
 	}
 
 	double incremental_upsert;
@@ -756,6 +1139,22 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	//    Gated by openivm_adaptive_refresh (same gate as the cost model decision).
 	bool adaptive_on = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
 
+	// Describe both candidates in the same terms, from the same estimator. WRITE_ROWS is added here
+	// rather than read from a plan: the delta plan computes rows, it does not carry the MERGE or the
+	// delete-and-insert that writes them.
+	PlanFeatureVector incremental_features {};
+	PlanFeatureVector recompute_features {};
+	incremental_features.fill(0.0);
+	recompute_features.fill(0.0);
+	recompute_features = ExtractPlanFeatures(context, plan);
+	Feature(recompute_features, PlanFeature::WRITE_ROWS) = recompute_replace;
+	bool has_features = false;
+	if (incremental_plan) {
+		incremental_features = ExtractPlanFeatures(context, *incremental_plan);
+		Feature(incremental_features, PlanFeature::WRITE_ROWS) = strategy_upsert;
+		has_features = true;
+	}
+
 	if (adaptive_on) {
 		// Uncalibrated ms-grounded prior (see constants above). The learned regression below
 		// overrides each side once it has enough history.
@@ -813,9 +1212,38 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		constexpr double RIDGE_LAMBDA = 1e-4;
 		constexpr idx_t MIN_SAMPLES = 3;
 
+		// Preferred: per-operator weights fitted over every view's history. Tried before the two-term
+		// per-view regression because it is the model that describes both strategies in the same
+		// terms, and because it transfers — a view refreshing for the first time is priced by weights
+		// the machine has already demonstrated. Needs more samples than a two-parameter fit, so the
+		// older model remains the fallback rather than being replaced outright.
+		constexpr double FEATURE_RIDGE = 1.0;
+		constexpr idx_t FEATURE_MIN_SAMPLES = 40;
+		bool strategy_from_features = false;
+		bool recompute_from_features = false;
+		if (has_features) {
+			auto strategy_weights = FitPlanCostWeights(metadata.GetPlanCostHistory(strategy_label, PLAN_FEATURE_SCHEMA),
+			                                           decay, FEATURE_RIDGE, FEATURE_MIN_SAMPLES);
+			if (strategy_weights.calibrated) {
+				strategy_predicted_ms = PredictPlanCostMs(strategy_weights, incremental_features);
+				strategy_from_features = true;
+				calibrated = true;
+			}
+			auto recompute_weights = FitPlanCostWeights(metadata.GetPlanCostHistory("full", PLAN_FEATURE_SCHEMA), decay,
+			                                            FEATURE_RIDGE, FEATURE_MIN_SAMPLES);
+			if (recompute_weights.calibrated) {
+				recompute_predicted_ms = PredictPlanCostMs(recompute_weights, recompute_features);
+				recompute_from_features = true;
+				calibrated = true;
+			}
+			OPENIVM_DEBUG_PRINT("[COST MODEL] Feature model: %s=%s, full=%s\n", strategy_label,
+			                    strategy_from_features ? "fitted" : "insufficient history",
+			                    recompute_from_features ? "fitted" : "insufficient history");
+		}
+
 		auto strategy_history = metadata.GetRefreshHistory(view_name, strategy_label);
 		auto strategy_reg = FitRegression(strategy_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
-		if (strategy_reg.calibrated) {
+		if (strategy_reg.calibrated && !strategy_from_features) {
 			strategy_predicted_ms =
 			    std::max(0.0, strategy_reg.w_compute * strategy_compute + strategy_reg.w_upsert * strategy_upsert +
 			                      strategy_reg.w_intercept);
@@ -827,7 +1255,7 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 
 		auto rc_history = metadata.GetRefreshHistory(view_name, "full");
 		auto rc_reg = FitRegression(rc_history, decay, RIDGE_LAMBDA, MIN_SAMPLES);
-		if (rc_reg.calibrated) {
+		if (rc_reg.calibrated && !recompute_from_features) {
 			recompute_predicted_ms = std::max(0.0, rc_reg.w_compute * recompute_compute +
 			                                           rc_reg.w_upsert * recompute_replace + rc_reg.w_intercept);
 			calibrated = true;
@@ -868,6 +1296,9 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	estimate.incremental_predicted_ms = strategy_predicted_ms;
 	estimate.recompute_predicted_ms = recompute_predicted_ms;
 	estimate.calibrated = calibrated;
+	estimate.incremental_features = incremental_features;
+	estimate.recompute_features = recompute_features;
+	estimate.has_features = has_features;
 	estimate.strategy_label = std::move(strategy_label);
 	return estimate;
 }
@@ -887,6 +1318,42 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 		Value v;
 		if (context.TryGetCurrentSetting(setting_name, v) && !v.IsNull()) {
 			con.Query("SET " + string(setting_name) + " = " + v.ToString());
+		}
+	}
+
+	// Cost the plan the refresh would actually run, the same way GenerateRefreshSQL now does, so a
+	// user inspecting the estimate sees the number the decision will be made on. Building it needs
+	// its own transaction, hence before the view-query planning below opens one.
+	//
+	// Any failure degrades to the analytic estimate instead of failing the pragma. This is a
+	// diagnostic, and a view whose delta plan cannot be built is exactly the kind someone is likely
+	// to be inspecting.
+	IncrementalDeltaPlan delta_plan;
+	{
+		string default_db;
+		string default_schema = "main";
+		auto db_res = con.Query("SELECT current_database()");
+		if (!db_res->HasError() && db_res->RowCount() > 0 && !db_res->GetValue(0, 0).IsNull()) {
+			default_db = db_res->GetValue(0, 0).ToString();
+		}
+		auto schema_res = con.Query("SELECT current_schema()");
+		if (!schema_res->HasError() && schema_res->RowCount() > 0 && !schema_res->GetValue(0, 0).IsNull()) {
+			default_schema = schema_res->GetValue(0, 0).ToString();
+		}
+		try {
+			delta_plan = BuildIncrementalDeltaPlan(*con.context, con, default_db, default_schema, view_name,
+			                                       /*cross_system=*/false);
+		} catch (const std::exception &e) {
+			// The builder opens a transaction before it can throw, so close it or the view-query
+			// planning below cannot begin its own.
+			try {
+				con.Rollback();
+			} catch (...) {
+			}
+			delta_plan = IncrementalDeltaPlan();
+			OPENIVM_DEBUG_PRINT("[COST MODEL] refresh_cost could not build a delta plan for '%s' (%s); "
+			                    "falling back to the analytic estimate\n",
+			                    view_name.c_str(), e.what());
 		}
 	}
 
@@ -913,7 +1380,7 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 	Optimizer optimizer(*planner.binder, con_ctx);
 	auto plan = optimizer.Optimize(std::move(planner.plan));
 
-	auto estimate = EstimateRefreshCost(con_ctx, *plan, view_name);
+	auto estimate = EstimateRefreshCost(con_ctx, *plan, view_name, nullptr, delta_plan.plan.get());
 	con.Rollback();
 
 	// `decision`: which strategy actually runs at refresh time.

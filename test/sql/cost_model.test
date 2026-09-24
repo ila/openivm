@@ -1,0 +1,326 @@
+# name: test/sql/cost_model.test
+# description: Cost model internals — the refresh executes the plan the cost model costed
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_adaptive_refresh=true;
+
+# ==========================================
+# Test 1: aggregate view, mixed DML in one batch
+#
+# With adaptive refresh on, the delta plan is built before the strategy decision and reused for
+# SQL generation. This exercises that path end to end: a single refresh consolidating inserts,
+# deletes and updates that all land in the same groups.
+# ==========================================
+
+statement ok
+CREATE TABLE cm_sales (id INT, region VARCHAR, amount INT);
+
+statement ok
+INSERT INTO cm_sales SELECT i, 'r' || (i % 5)::VARCHAR, i FROM range(1, 501) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW cm_mv_agg AS
+  SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM cm_sales GROUP BY region;
+
+query I
+SELECT count(*) FROM cm_mv_agg;
+----
+5
+
+# Batch conflicting DML on overlapping rows before a single refresh, so the refresh has to
+# consolidate them rather than see one operation at a time.
+statement ok
+INSERT INTO cm_sales SELECT i, 'r' || (i % 5)::VARCHAR, i FROM range(501, 601) t(i);
+
+statement ok
+DELETE FROM cm_sales WHERE id BETWEEN 100 AND 150;
+
+statement ok
+UPDATE cm_sales SET amount = amount * 2 WHERE id BETWEEN 200 AND 260;
+
+statement ok
+UPDATE cm_sales SET region = 'r9' WHERE id BETWEEN 300 AND 320;
+
+statement ok
+PRAGMA refresh('cm_mv_agg');
+
+# Full bag equality against the base query, both directions.
+query I
+SELECT count(*) FROM ((SELECT * FROM cm_mv_agg)
+  EXCEPT ALL
+  (SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM cm_sales GROUP BY region)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT region, SUM(amount) AS total, COUNT(*) AS n FROM cm_sales GROUP BY region)
+  EXCEPT ALL
+  (SELECT * FROM cm_mv_agg)) x;
+----
+0
+
+# ==========================================
+# Test 2: join view — the delta plan is where plan reuse matters most, because the rewrite
+# expands a join into inclusion-exclusion terms.
+# ==========================================
+
+statement ok
+CREATE TABLE cm_cust (c_id INT, c_region VARCHAR);
+
+statement ok
+CREATE TABLE cm_ord (o_id INT, o_c_id INT, o_amount INT);
+
+statement ok
+INSERT INTO cm_cust SELECT i, 'reg' || (i % 4)::VARCHAR FROM range(1, 201) t(i);
+
+statement ok
+INSERT INTO cm_ord SELECT i, (i % 200) + 1, i * 3 FROM range(1, 1001) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW cm_mv_join AS
+  SELECT c.c_region, SUM(o.o_amount) AS revenue
+  FROM cm_cust c JOIN cm_ord o ON c.c_id = o.o_c_id
+  GROUP BY c.c_region;
+
+# Both sides of the join change in the same batch, so every inclusion-exclusion term is live.
+statement ok
+INSERT INTO cm_cust SELECT i, 'reg' || (i % 4)::VARCHAR FROM range(201, 231) t(i);
+
+statement ok
+INSERT INTO cm_ord SELECT i, (i % 230) + 1, i * 3 FROM range(1001, 1101) t(i);
+
+statement ok
+DELETE FROM cm_ord WHERE o_id BETWEEN 50 AND 90;
+
+statement ok
+UPDATE cm_ord SET o_amount = o_amount + 7 WHERE o_id BETWEEN 400 AND 450;
+
+statement ok
+PRAGMA refresh('cm_mv_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cm_mv_join)
+  EXCEPT ALL
+  (SELECT c.c_region, SUM(o.o_amount) AS revenue
+     FROM cm_cust c JOIN cm_ord o ON c.c_id = o.o_c_id GROUP BY c.c_region)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT c.c_region, SUM(o.o_amount) AS revenue
+     FROM cm_cust c JOIN cm_ord o ON c.c_id = o.o_c_id GROUP BY c.c_region)
+  EXCEPT ALL
+  (SELECT * FROM cm_mv_join)) x;
+----
+0
+
+# ==========================================
+# Test 3: the same views refresh correctly with adaptive refresh off, where no plan is
+# pre-built and the delta plan is constructed at its original point.
+# ==========================================
+
+statement ok
+SET openivm_adaptive_refresh=false;
+
+statement ok
+INSERT INTO cm_ord SELECT i, (i % 230) + 1, i FROM range(1101, 1151) t(i);
+
+statement ok
+DELETE FROM cm_cust WHERE c_id BETWEEN 210 AND 220;
+
+statement ok
+PRAGMA refresh('cm_mv_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cm_mv_join)
+  EXCEPT ALL
+  (SELECT c.c_region, SUM(o.o_amount) AS revenue
+     FROM cm_cust c JOIN cm_ord o ON c.c_id = o.o_c_id GROUP BY c.c_region)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT c.c_region, SUM(o.o_amount) AS revenue
+     FROM cm_cust c JOIN cm_ord o ON c.c_id = o.o_c_id GROUP BY c.c_region)
+  EXCEPT ALL
+  (SELECT * FROM cm_mv_join)) x;
+----
+0
+
+# ==========================================
+# Test 4: projection view under adaptive refresh, empty delta then a real delta.
+# ==========================================
+
+statement ok
+SET openivm_adaptive_refresh=true;
+
+statement ok
+CREATE TABLE cm_events (id INT, kind VARCHAR, val INT);
+
+statement ok
+INSERT INTO cm_events SELECT i, 'k' || (i % 3)::VARCHAR, i FROM range(1, 301) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW cm_mv_proj AS SELECT id, kind, val FROM cm_events WHERE val > 10;
+
+# Refresh with nothing pending must be a no-op that still leaves the view correct.
+statement ok
+PRAGMA refresh('cm_mv_proj');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cm_mv_proj)
+  EXCEPT ALL
+  (SELECT id, kind, val FROM cm_events WHERE val > 10)) x;
+----
+0
+
+statement ok
+INSERT INTO cm_events SELECT i, 'k' || (i % 3)::VARCHAR, i FROM range(301, 351) t(i);
+
+statement ok
+DELETE FROM cm_events WHERE id BETWEEN 20 AND 40;
+
+statement ok
+UPDATE cm_events SET val = 5 WHERE id BETWEEN 100 AND 120;
+
+statement ok
+PRAGMA refresh('cm_mv_proj');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cm_mv_proj)
+  EXCEPT ALL
+  (SELECT id, kind, val FROM cm_events WHERE val > 10)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id, kind, val FROM cm_events WHERE val > 10)
+  EXCEPT ALL
+  (SELECT * FROM cm_mv_proj)) x;
+----
+0
+
+# ==========================================
+# Test 5: every adaptive refresh reaches a decision and records it, which is what the learned
+# model later calibrates against. The specific strategy is data dependent, so assert that a
+# valid one was chosen rather than pinning which.
+# ==========================================
+
+query I
+SELECT count(*) > 0 FROM openivm_refresh_history
+  WHERE view_name = 'cm_mv_agg' AND method IN ('incremental', 'full');
+----
+true
+
+query I
+SELECT count(*) > 0 FROM openivm_refresh_history
+  WHERE view_name = 'cm_mv_join' AND method IN ('incremental', 'full');
+----
+true
+
+# No refresh may record a duration that is negative or absent.
+query I
+SELECT count(*) FROM openivm_refresh_history WHERE actual_duration_ms IS NULL OR actual_duration_ms < 0;
+----
+0
+
+# ==========================================
+# Test 6: the learned per-operator cost model
+#
+# Every refresh records the row estimate per operator class for the plan that ran, paired with how
+# long it took. Once enough of those accumulate, weights are fitted over them and replace the
+# hand-tuned millisecond constants. The constants under-predicted both strategies by roughly a
+# factor of two across a 2,520-case sweep, which is what the fit exists to correct.
+# ==========================================
+
+statement ok
+SET openivm_adaptive_refresh=true;
+
+statement ok
+CREATE TABLE fm_base (g INT, v INT);
+
+statement ok
+INSERT INTO fm_base SELECT i % 8, i FROM range(1, 401) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW fm_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g;
+
+# Enough refresh cycles to pass the fitter's sample threshold.
+loop i 0 45
+
+statement ok
+INSERT INTO fm_base VALUES (${i} % 8, ${i});
+
+statement ok
+PRAGMA refresh('fm_mv');
+
+endloop
+
+# Features are recorded, and every vector has the width the current layout declares.
+query I
+SELECT count(*) > 0 FROM openivm_refresh_history WHERE view_name = 'fm_mv' AND plan_features IS NOT NULL;
+----
+true
+
+query I
+SELECT count(DISTINCT len(plan_features)) FROM openivm_refresh_history WHERE plan_features IS NOT NULL;
+----
+1
+
+# Recorded under the current layout, so a later layout change does not silently reinterpret them.
+query I
+SELECT count(*) FROM openivm_refresh_history WHERE plan_features IS NOT NULL AND feature_schema <> 1;
+----
+0
+
+# No feature is negative: these are row counts.
+query I
+SELECT count(*) FROM (SELECT unnest(plan_features) AS f FROM openivm_refresh_history
+                        WHERE plan_features IS NOT NULL) x WHERE f < 0;
+----
+0
+
+# Enough samples under the current layout for the fitter to engage. Thirteen parameters need more
+# evidence than the two-term fallback, so this threshold is what decides whether the learned weights
+# are used at all; asserting it keeps a silent fall-through to the fallback from passing as success.
+#
+# Grouped by method rather than asserting a particular one. Weights are fitted per strategy, and a
+# view only ever records the strategy it actually ran: this one is small enough that full recompute
+# wins every time, so its samples land under 'full' and the incremental side of the model stays
+# uncalibrated. That is a real property of learning from executions rather than a quirk of the test.
+query I
+SELECT max(c) >= 40 FROM (SELECT method, count(*) AS c FROM openivm_refresh_history
+                            WHERE plan_features IS NOT NULL AND feature_schema = 1
+                            GROUP BY method) x;
+----
+true
+
+# The view still refreshes correctly while all of this is being recorded.
+statement ok
+INSERT INTO fm_base VALUES (3, 9999);
+
+statement ok
+DELETE FROM fm_base WHERE v = 1;
+
+statement ok
+PRAGMA refresh('fm_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fm_mv)
+  EXCEPT ALL
+  (SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g)
+  EXCEPT ALL
+  (SELECT * FROM fm_mv)) x;
+----
+0
