@@ -251,10 +251,10 @@ INSERT INTO fm_base SELECT i % 8, i FROM range(1, 401) t(i);
 statement ok
 CREATE MATERIALIZED VIEW fm_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g;
 
-# Comfortably more refresh cycles than the fitter's 40-sample threshold. Not 45: exploration diverts
-# roughly one refresh in ten to the other strategy, which would leave the dominant method sitting
-# exactly on the threshold and the assertion below tipping on ordinary variation.
-loop i 0 60
+# Enough cycles to clear the fitter's requirement with margin. That requirement scales with the
+# number of features the history actually exercises, three samples each with a floor of eight, so a
+# plan shape like this one needs far fewer than the thirteen-parameter worst case would.
+loop i 0 36
 
 statement ok
 INSERT INTO fm_base VALUES (${i} % 8, ${i});
@@ -297,9 +297,22 @@ SELECT count(*) FROM (SELECT unnest(plan_features) AS f FROM openivm_refresh_his
 # wins every time, so its samples land under 'full' and the incremental side of the model stays
 # uncalibrated. That is a real property of learning from executions rather than a quirk of the test.
 query I
-SELECT max(c) >= 40 FROM (SELECT method, count(*) AS c FROM openivm_refresh_history
+SELECT max(c) >= 24 FROM (SELECT method, count(*) AS c FROM openivm_refresh_history
                             WHERE plan_features IS NOT NULL AND feature_schema = 1
                             GROUP BY method) x;
+----
+true
+
+# Why the requirement scales rather than sitting at the worst case: a grouped aggregate over one
+# table exercises only a handful of the twelve feature slots. The rest are flat zero — no join, no
+# window, no set operation — and a column that never varies contributes nothing but dimensionality.
+# Asserting this keeps the sizing rule honest if the feature set grows.
+query I
+SELECT count(*) < 8 FROM (
+  SELECT idx FROM (SELECT unnest(plan_features) AS val, generate_subscripts(plan_features, 1) AS idx
+                     FROM openivm_refresh_history
+                     WHERE view_name = 'fm_mv' AND plan_features IS NOT NULL) f
+  GROUP BY idx HAVING count(DISTINCT val) > 1) x;
 ----
 true
 

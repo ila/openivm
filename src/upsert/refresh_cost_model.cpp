@@ -617,7 +617,7 @@ static bool FitActiveSet(const vector<vector<double>> &rows, const vector<double
 /// intercept stays free so it can absorb fixed overhead. Recent samples weigh more, so the model
 /// tracks a machine whose behaviour changes rather than averaging over its whole history.
 static PlanCostWeights FitPlanCostWeights(const vector<RefreshMetadata::RefreshHistoryEntry> &history, double decay,
-                                          double ridge, idx_t min_samples) {
+                                          double ridge, idx_t samples_per_parameter, idx_t min_samples_floor) {
 	PlanCostWeights result;
 	vector<vector<double>> rows;
 	vector<double> targets;
@@ -637,15 +637,38 @@ static PlanCostWeights FitPlanCostWeights(const vector<RefreshMetadata::RefreshH
 		targets.push_back(entry.actual_ms);
 		sample_weights.push_back(std::pow(decay, static_cast<double>(n - 1 - i)));
 	}
-	if (rows.size() < min_samples) {
+	if (rows.empty()) {
 		return result;
 	}
 
-	// Start with every column, drop whichever went negative, refit. Dropping all at once rather than
-	// one per pass converges in a couple of iterations on this problem and cannot cycle.
+	// Fit only the features this history actually exercises, and size the sample requirement to
+	// them. Most plans leave most features at zero — a grouped aggregate over a single table has no
+	// join, window or set-operation rows — and a column that never varies contributes nothing but
+	// dimensionality, so ridge would drive it to zero anyway.
+	//
+	// The alternative, a flat threshold covering all thirteen parameters, is the worst case applied
+	// unconditionally: it would hold a workload of simple aggregates on the uncalibrated prior long
+	// after five or six varying features were well determined, and that prior was measured
+	// under-predicting by roughly a factor of two.
 	vector<idx_t> active;
-	for (idx_t i = 0; i <= PLAN_FEATURE_COUNT; i++) {
-		active.push_back(i);
+	for (idx_t f = 0; f < PLAN_FEATURE_COUNT; f++) {
+		double first = rows[0][f];
+		bool varies = false;
+		for (idx_t s = 1; s < rows.size() && !varies; s++) {
+			varies = rows[s][f] != first;
+		}
+		// A feature that is constant and non-zero is still worth fitting: it is indistinguishable
+		// from the intercept here, but ridge splits them harmlessly and it starts varying as soon as
+		// the workload does.
+		if (varies || first != 0.0) {
+			active.push_back(f);
+		}
+	}
+	active.push_back(PLAN_FEATURE_COUNT); // intercept, always fitted
+
+	idx_t required = MaxValue<idx_t>(min_samples_floor, samples_per_parameter * active.size());
+	if (rows.size() < required) {
+		return result;
 	}
 	vector<double> solved;
 	for (idx_t pass = 0; pass <= PLAN_FEATURE_COUNT; pass++) {
@@ -1218,19 +1241,26 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		// the machine has already demonstrated. Needs more samples than a two-parameter fit, so the
 		// older model remains the fallback rather than being replaced outright.
 		constexpr double FEATURE_RIDGE = 1.0;
-		constexpr idx_t FEATURE_MIN_SAMPLES = 40;
+		// Sized against the parameters the data actually exercises rather than all thirteen: see
+		// FitPlanCostWeights. Three samples per fitted parameter, never fewer than eight, so a
+		// workload touching five features calibrates at sixteen while one touching everything still
+		// waits for around forty.
+		constexpr idx_t FEATURE_SAMPLES_PER_PARAM = 3;
+		constexpr idx_t FEATURE_MIN_SAMPLES_FLOOR = 8;
 		bool strategy_from_features = false;
 		bool recompute_from_features = false;
 		if (has_features) {
-			auto strategy_weights = FitPlanCostWeights(metadata.GetPlanCostHistory(strategy_label, PLAN_FEATURE_SCHEMA),
-			                                           decay, FEATURE_RIDGE, FEATURE_MIN_SAMPLES);
+			auto strategy_weights =
+			    FitPlanCostWeights(metadata.GetPlanCostHistory(strategy_label, PLAN_FEATURE_SCHEMA), decay,
+			                       FEATURE_RIDGE, FEATURE_SAMPLES_PER_PARAM, FEATURE_MIN_SAMPLES_FLOOR);
 			if (strategy_weights.calibrated) {
 				strategy_predicted_ms = PredictPlanCostMs(strategy_weights, incremental_features);
 				strategy_from_features = true;
 				calibrated = true;
 			}
-			auto recompute_weights = FitPlanCostWeights(metadata.GetPlanCostHistory("full", PLAN_FEATURE_SCHEMA), decay,
-			                                            FEATURE_RIDGE, FEATURE_MIN_SAMPLES);
+			auto recompute_weights =
+			    FitPlanCostWeights(metadata.GetPlanCostHistory("full", PLAN_FEATURE_SCHEMA), decay, FEATURE_RIDGE,
+			                       FEATURE_SAMPLES_PER_PARAM, FEATURE_MIN_SAMPLES_FLOOR);
 			if (recompute_weights.calibrated) {
 				recompute_predicted_ms = PredictPlanCostMs(recompute_weights, recompute_features);
 				recompute_from_features = true;
@@ -1298,7 +1328,9 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	int8_t exploration = 0;
 	if (adaptive_on && SqlUtils::GetBoolSetting(context, "openivm_adaptive_explore", true)) {
 		constexpr idx_t EXPLORE_PERIOD = 10;
-		constexpr idx_t EXPLORE_MIN_SAMPLES = 40;
+		// Enough that the neglected strategy can be fitted under the loosest case above; exploring
+		// past that buys nothing, since the model can then price it from evidence.
+		constexpr idx_t EXPLORE_MIN_SAMPLES = 24;
 		bool would_recompute = recompute_predicted_ms < strategy_predicted_ms;
 		// Exploring towards incremental is only legal when the view can be maintained incrementally
 		// at all; full recompute is always a legal answer.
