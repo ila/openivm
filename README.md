@@ -6,6 +6,10 @@ Based on the [OpenIVM paper](https://dl.acm.org/doi/10.1145/3626246.3654743) (SI
 
 ## Quick start
 
+OpenIVM is currently under testing. We hope to release it as a community extension
+by the end of 2026. [Issues and feature requests](https://github.com/ila/openivm/issues)
+are welcome.
+
 OpenIVM currently requires a source build with DuckDB v1.5.4. Follow the
 [build and setup guide](docs/build/building.md) first; the built CLI already loads OpenIVM.
 

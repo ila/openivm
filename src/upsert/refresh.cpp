@@ -30,9 +30,9 @@ struct RefreshProfileStep {
 
 class RefreshProfiler {
 public:
-	RefreshProfiler(ClientContext &context, string view_name_p)
-	    : enabled(false), retention_days(31), view_name(std::move(view_name_p)), next_step(0),
-	      total_start(std::chrono::steady_clock::now()) {
+	RefreshProfiler(ClientContext &context, string view_name_p, string view_catalog_p)
+	    : enabled(false), retention_days(31), view_name(std::move(view_name_p)),
+	      view_catalog(std::move(view_catalog_p)), next_step(0), total_start(std::chrono::steady_clock::now()) {
 		Value profile_val;
 		enabled = context.TryGetCurrentSetting("openivm_profile_refresh", profile_val) && !profile_val.IsNull() &&
 		          profile_val.GetValue<bool>();
@@ -77,6 +77,7 @@ public:
 			return;
 		}
 		Connection profile_con(db);
+		RefreshMetadata::UseCatalog(*profile_con.context, profile_con, view_catalog);
 		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
 		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
 		                  to_string(retention_days) + " days'");
@@ -99,6 +100,7 @@ private:
 	bool enabled;
 	int64_t retention_days;
 	string view_name;
+	string view_catalog;
 	string refresh_id;
 	int32_t next_step;
 	std::chrono::steady_clock::time_point total_start;
@@ -110,13 +112,6 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
                                 const string &view_name, const string &attached_db_catalog_name,
                                 const string &attached_db_schema_name, DeltaActivityResult *active_activity);
 
-static void UseMetadataSchema(Connection &con) {
-	auto result = con.Query("SET schema='" + string(DEFAULT_SCHEMA) + "'");
-	if (result->HasError()) {
-		throw CatalogException("OpenIVM could not select its metadata schema: %s", result->GetError());
-	}
-}
-
 // Generate and execute refresh SQL for a single view while the caller owns the mutation gate.
 // When openivm_adaptive_refresh is on, also computes a cost estimate before execution
 // and records execution history for the learned cost model.
@@ -124,10 +119,10 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
                                   const string &view_schema_name, const string &vn, bool cross_system,
                                   const string &attached_db_catalog_name, const string &attached_db_schema_name,
                                   bool skip_empty_refresh) {
-	RefreshProfiler profiler(context, vn);
+	RefreshProfiler profiler(context, vn, view_catalog_name);
 	profiler.AddMeasuredStep("acquire_locks", 0, "database mutation gate pre-acquired");
 	Connection probe_con(*context.db.get());
-	UseMetadataSchema(probe_con);
+	RefreshMetadata::UseCatalog(context, probe_con, view_catalog_name);
 	RefreshMetadata probe_meta(probe_con);
 	DeltaActivityResult delta_activity;
 	DeltaActivityResult *precomputed_delta_activity = nullptr;
@@ -148,7 +143,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 	// failure modes (e.g. rebinding errors thrown by Query itself, not reported as
 	// HasError()). Rollback-then-throw keeps the WAL clean and leaves the DB valid.
 	Connection exec_con(*context.db.get());
-	UseMetadataSchema(exec_con);
+	RefreshMetadata::UseCatalog(context, exec_con, view_catalog_name);
 	bool tx_open = false;
 	try {
 		bool adaptive_refresh = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
@@ -313,6 +308,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 				// the data refresh. Read the post-refresh watermark through a fresh
 				// connection so we do not persist an old snapshot and replay deltas.
 				Connection snap_con(*context.db.get());
+				RefreshMetadata::UseCatalog(context, snap_con, view_catalog_name);
 				RefreshMetadata snap_metadata(snap_con);
 				auto catalogs = snap_con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'");
 				if (catalogs->HasError()) {
@@ -493,7 +489,6 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 	// database-wide mutation gate. Give tracked DML in the hook the same logical
 	// owner so delta capture re-enters the gate instead of waiting on its caller.
 	TransactionalMVLockState::Get(*con.context).SetMutationOwner(&context);
-	UseMetadataSchema(con);
 
 	if (parameters.values.size() == 3) {
 		view_catalog_name = StringValue::Get(parameters.values[0]);
@@ -516,21 +511,13 @@ void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &
 		                    view_schema_name.c_str(), cross_system ? 1 : 0);
 	}
 
-	// cross_system detection: the view's catalog differs from the fresh connection's physical
-	// default. Metadata tables (openivm_views etc.) live in the physical default; data/view
-	// tables live in view_catalog_name. DuckDB forbids cross-catalog writes in one transaction,
-	// so RefreshViewSerialized must split the refresh SQL into data ops and metadata ops.
-	if (!view_catalog_name.empty()) {
-		Connection probe(*context.db.get());
-		string probe_default;
-		auto res = probe.Query("SELECT current_database()");
-		if (!res->HasError() && res->RowCount() > 0) {
-			probe_default = res->GetValue(0, 0).ToString();
-		}
-		if (!probe_default.empty() && view_catalog_name != probe_default) {
-			cross_system = true;
-		}
+	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
+	// Only external data catalogs need a separate native metadata transaction.
+	auto metadata_catalog = con.Query("SELECT current_database()");
+	if (metadata_catalog->HasError()) {
+		throw CatalogException("OpenIVM could not resolve metadata catalog: %s", metadata_catalog->GetError());
 	}
+	cross_system = !view_catalog_name.empty() && metadata_catalog->GetValue(0, 0).ToString() != view_catalog_name;
 
 	// Check cascade mode
 	string cascade_mode = "downstream";
@@ -660,7 +647,7 @@ string TransactionalRefreshQuery(ClientContext &context, const FunctionParameter
 		view_schema_name = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
 	}
 	Connection metadata_con(*context.db);
-	UseMetadataSchema(metadata_con);
+	RefreshMetadata::UseCatalog(context, metadata_con, view_catalog_name);
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->IncludeView(view_name);
 		metadata_state->Apply(metadata_con);

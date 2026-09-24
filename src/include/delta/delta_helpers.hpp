@@ -13,7 +13,8 @@ struct DeltaGetResult {
 	ColumnBinding mul_binding;
 };
 
-DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, LogicalGet *old_get, const string &view_name);
+DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binder &binder, LogicalGet *old_get,
+                                  const string &view_name);
 
 } // namespace duckdb
 

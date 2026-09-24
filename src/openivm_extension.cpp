@@ -115,6 +115,7 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 	input.named_parameters["view_schema_name"] = view_schema_name;
 
 	Connection con(*context.db);
+	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(con);
 	}
@@ -467,6 +468,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
 		    string view_name = StringValue::Get(parameters.values[0]);
 		    Connection con(*context.db.get());
+		    RefreshMetadata::UseCatalog(context, con);
 		    RefreshMetadata metadata(con);
 
 		    auto interval = metadata.GetRefreshInterval(view_name);
@@ -486,14 +488,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 			    }
 		    }
 
+		    auto location = metadata.GetStoredViewLocation(view_name);
+		    auto view_key = SqlUtils::FullName(location.catalog_name, location.schema_name, view_name);
 		    // Check daemon status
 		    string status = "'idle'";
 		    string effective_interval = interval_str;
 		    if (global_daemon) {
-			    if (global_daemon->IsRefreshing(view_name)) {
+			    if (global_daemon->IsRefreshing(view_key)) {
 				    status = "'refreshing'";
 			    }
-			    auto eff = global_daemon->GetEffectiveInterval(view_name);
+			    auto eff = global_daemon->GetEffectiveInterval(view_key);
 			    if (eff > 0) {
 				    effective_interval = to_string(eff);
 			    }

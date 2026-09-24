@@ -18,6 +18,9 @@ public:
 	explicit RefreshMetadata(Connection &con) : con(con) {
 	}
 
+	// Native view metadata belongs to the view catalog; external catalogs use the native default.
+	static void UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
+
 	// Returns true if the given table name is NOT a tracked materialized view.
 	// (i.e., it's a base table that should have its deltas captured)
 	bool IsBaseTable(const string &table_name);
@@ -103,6 +106,7 @@ public:
 	// Get all views with a non-null refresh_interval.
 	// Returns the stored relation identity plus its schedule and last refresh watermark.
 	struct ScheduledView {
+		string metadata_catalog;
 		string view_name;
 		string catalog_name;
 		string schema_name;

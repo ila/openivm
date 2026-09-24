@@ -411,10 +411,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto &con = *metadata_connection;
 	auto &planning_context = owned_connection ? *con.context : context;
 	if (owned_connection) {
-		auto schema_result = con.Query("SET schema='" + string(DEFAULT_SCHEMA) + "'");
-		if (schema_result->HasError()) {
-			throw CatalogException("OpenIVM could not select its metadata schema: %s", schema_result->GetError());
-		}
+		RefreshMetadata::UseCatalog(context, con, view_catalog_name);
 	}
 	PropagateRefreshPlanningSettings(context, planning_context);
 	// Mirror the active CompileFacts onto the inner connection's ClientContext

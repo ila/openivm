@@ -5,7 +5,6 @@
 #include "core/sql_utils.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/main/database_manager.hpp"
 
 #include <chrono>
 #include <unordered_set>
@@ -75,46 +74,6 @@ void RefreshDaemon::Run() {
 			Connection con(*db_);
 			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Woke up\n");
 
-			// Resolve the default catalog dynamically each cycle.
-			// Extensions load into the system catalog, but user tables live in the
-			// file-based catalog (e.g. "mydb"). SetDefaultDatabase is the C++ API
-			// behind DuckDB's USE command.
-			// Resolve the default catalog dynamically each cycle.
-			// Extensions load into the system catalog, but user tables live in the
-			// file-based catalog (e.g. "mydb"). We query current_database() which
-			// resolves DatabaseManager::default_database, then call SetDefaultDatabase
-			// to switch this connection to that catalog.
-			// Resolve the default catalog dynamically each cycle.
-			// Extensions load into the system catalog, but user tables live in the
-			// file-based catalog (e.g. "mydb"). USE is the SQL equivalent of
-			// SetDefaultDatabase and handles its own transaction.
-			{
-				auto &db_manager = DatabaseManager::Get(*db_);
-				if (db_manager.HasDefaultDatabase()) {
-					auto cat_r = con.Query("SELECT current_database()");
-					if (!cat_r->HasError() && cat_r->RowCount() > 0) {
-						auto catalog = cat_r->GetValue(0, 0).ToString();
-						OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Before USE: current_database='%s'\n", catalog.c_str());
-						if (!catalog.empty()) {
-							auto use_r = con.Query("USE " + catalog);
-							OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] USE result: %s\n",
-							                    use_r->HasError() ? use_r->GetError().c_str() : "OK");
-							// Verify
-							auto verify = con.Query("SELECT current_database()");
-							if (!verify->HasError() && verify->RowCount() > 0) {
-								OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] After USE: current_database='%s'\n",
-								                    verify->GetValue(0, 0).ToString().c_str());
-							}
-							// Also try direct table query
-							auto test = con.Query("SELECT count(*) FROM openivm_views");
-							OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Direct query: %s\n",
-							                    test->HasError() ? test->GetError().c_str()
-							                                     : test->GetValue(0, 0).ToString().c_str());
-						}
-					}
-				}
-			}
-
 			// Read cascade setting from the DB config
 			string cascade_mode = "downstream";
 			Value cascade_val;
@@ -140,8 +99,11 @@ void RefreshDaemon::Run() {
 					break;
 				}
 
+				RefreshMetadata::UseCatalog(*con.context, con, sv.metadata_catalog);
+				auto view_key = SqlUtils::FullName(sv.catalog_name, sv.schema_name, sv.view_name);
+
 				// Skip if already refreshed via cascade from an earlier view in this cycle
-				if (refreshed_this_cycle.count(sv.view_name)) {
+				if (refreshed_this_cycle.count(view_key)) {
 					continue;
 				}
 
@@ -149,7 +111,7 @@ void RefreshDaemon::Run() {
 				int64_t interval = sv.interval_seconds;
 				{
 					std::lock_guard<std::mutex> guard(backoff_mutex_);
-					auto it = effective_intervals_.find(sv.view_name);
+					auto it = effective_intervals_.find(view_key);
 					if (it != effective_intervals_.end()) {
 						interval = it->second;
 					}
@@ -170,7 +132,7 @@ void RefreshDaemon::Run() {
 
 				{
 					std::lock_guard<std::mutex> guard(refreshing_mutex_);
-					currently_refreshing_ = sv.view_name;
+					currently_refreshing_ = view_key;
 				}
 
 				OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Refreshing '%s'\n", sv.view_name.c_str());
@@ -200,15 +162,15 @@ void RefreshDaemon::Run() {
 				}
 
 				// Mark this view and any cascaded views as done for this cycle
-				refreshed_this_cycle.insert(sv.view_name);
+				refreshed_this_cycle.insert(view_key);
 				if (cascade_mode == "downstream" || cascade_mode == "both") {
 					for (auto &dep : metadata.GetDownstreamViews(sv.view_name)) {
-						refreshed_this_cycle.insert(dep);
+						refreshed_this_cycle.insert(SqlUtils::FullName(sv.catalog_name, sv.schema_name, dep));
 					}
 				}
 				if (cascade_mode == "upstream" || cascade_mode == "both") {
 					for (auto &dep : metadata.GetUpstreamViews(sv.view_name)) {
-						refreshed_this_cycle.insert(dep);
+						refreshed_this_cycle.insert(SqlUtils::FullName(sv.catalog_name, sv.schema_name, dep));
 					}
 				}
 
@@ -219,19 +181,19 @@ void RefreshDaemon::Run() {
 				if (adaptive_backoff_.load() && duration_seconds > sv.interval_seconds) {
 					std::lock_guard<std::mutex> guard(backoff_mutex_);
 					int64_t current = sv.interval_seconds;
-					auto it = effective_intervals_.find(sv.view_name);
+					auto it = effective_intervals_.find(view_key);
 					if (it != effective_intervals_.end()) {
 						current = it->second;
 					}
 					int64_t new_interval = std::min(current * 2, MAX_BACKOFF_SECONDS);
-					effective_intervals_[sv.view_name] = new_interval;
+					effective_intervals_[view_key] = new_interval;
 					Printer::Print("Warning: refresh of '" + sv.view_name + "' took " + to_string(duration_seconds) +
 					               "s (interval: " + to_string(sv.interval_seconds) +
 					               "s). Increasing effective interval to " + to_string(new_interval) +
 					               "s. Set openivm_adaptive_backoff = false to disable.");
 				} else if (adaptive_backoff_.load()) {
 					std::lock_guard<std::mutex> guard(backoff_mutex_);
-					effective_intervals_.erase(sv.view_name);
+					effective_intervals_.erase(view_key);
 				}
 			}
 		} catch (std::exception &e) {

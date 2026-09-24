@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/parser_ddl.hpp"
+#include "core/refresh_metadata.hpp"
 #include "core/parser_plan_helpers.hpp"
 #include "core/scoped_optimizer_settings.hpp"
 #include "core/sql_utils.hpp"
@@ -75,6 +76,7 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	auto view_schema = child_get->named_parameters["view_schema_name"].ToString();
 
 	Connection con(*input.context.db);
+	RefreshMetadata::UseCatalog(input.context, con, view_catalog);
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(input.context)) {
 		metadata_state->Apply(con);
 	}

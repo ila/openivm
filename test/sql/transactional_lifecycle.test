@@ -1437,3 +1437,156 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Native attachments own their metadata and survive a new DatabaseInstance.
+# Use a different persistent host so refresh cannot accidentally find the state there.
+load __TEST_DIR__/openivm_attachment_host.db
+
+# Keep an identically named view in the host to catch accidental metadata fallback.
+statement ok
+CREATE TABLE attached_src(id INTEGER, g INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO attached_src VALUES (999, 9, 999);
+
+statement ok
+CREATE MATERIALIZED VIEW attached_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM attached_src GROUP BY g;
+
+query I
+SELECT length(current_setting('search_path'));
+----
+0
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_attachment_state.db' AS attached_state;
+
+statement ok
+USE attached_state;
+
+statement ok
+CREATE TABLE attached_src(id INTEGER, g INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO attached_src VALUES (1, 1, 10), (2, 1, 20), (3, NULL, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW attached_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM attached_src GROUP BY g;
+
+query I
+SELECT count(*) FROM attached_state.main.openivm_views WHERE view_name = 'attached_mv';
+----
+1
+
+statement ok
+INSERT INTO attached_src VALUES (4, 1, 30), (5, 2, 40), (5, 2, 40);
+
+statement ok
+UPDATE attached_src SET v = v + 7 WHERE id IN (1, 4, 5);
+
+statement ok
+DELETE FROM attached_src WHERE id IN (2, 4);
+
+statement ok
+PRAGMA refresh('attached_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g EXCEPT ALL SELECT * FROM attached_mv));
+----
+0
+
+statement ok
+USE openivm_attachment_host;
+
+restart
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_attachment_state.db' AS attached_state;
+
+statement ok
+USE attached_state;
+
+statement ok
+INSERT INTO attached_src VALUES (6, 1, 50), (7, NULL, 60), (8, 2, 70);
+
+statement ok
+UPDATE attached_src SET g = 3, v = 11 WHERE id IN (5, 8);
+
+statement ok
+DELETE FROM attached_src WHERE id IN (1, 8);
+
+statement ok
+PRAGMA refresh('attached_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g EXCEPT ALL SELECT * FROM attached_mv));
+----
+0
+
+# Explicit caller transactions retain the same metadata owner and rollback atomically.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO attached_src VALUES (9, 4, 90), (10, 4, 100);
+
+statement ok
+UPDATE attached_src SET v = 99 WHERE id IN (6, 9);
+
+statement ok
+DELETE FROM attached_src WHERE id = 10;
+
+statement ok
+PRAGMA refresh('attached_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g EXCEPT ALL SELECT * FROM attached_mv));
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g EXCEPT ALL SELECT * FROM attached_mv));
+----
+0
+
+# Explicit catalog arguments work even when the caller uses the host database.
+statement ok
+USE openivm_attachment_host;
+
+statement ok
+INSERT INTO attached_state.attached_src VALUES (11, 5, 110), (12, 5, 120);
+
+statement ok
+UPDATE attached_state.attached_src SET v = 111 WHERE id IN (6, 11);
+
+statement ok
+DELETE FROM attached_state.attached_src WHERE id = 12;
+
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+PRAGMA refresh_options('attached_state', 'main', 'attached_mv');
+
+statement ok
+USE attached_state;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g EXCEPT ALL SELECT * FROM attached_mv));
+----
+0
+
+query I
+SELECT count(*) FROM attached_state.main.openivm_refresh_profile WHERE view_name = 'attached_mv' AND step_name = 'total_refresh';
+----
+1
+
+statement ok
+SET openivm_profile_refresh = false;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM openivm_attachment_host.attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM openivm_attachment_host.attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM openivm_attachment_host.attached_src GROUP BY g EXCEPT ALL SELECT * FROM openivm_attachment_host.attached_mv));
+----
+0

@@ -565,7 +565,8 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 			}
 			auto &leaf_ref = GetNodeAtPath(term, leaves[i].path);
 			auto leaf_bindings = leaf_ref->GetColumnBindings();
-			DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, input.context.view);
+			DeltaGetResult delta_i =
+			    CreateDeltaGetNode(context, input.context.metadata_con, binder, leaves[i].get, input.context.view);
 			auto delta_bindings = delta_i.node->GetColumnBindings();
 			AddLeafBindingReplacements(leaf_bindings, delta_bindings, output_replacements, delta_i.mul_binding);
 			mul_bindings.push_back(delta_i.mul_binding);

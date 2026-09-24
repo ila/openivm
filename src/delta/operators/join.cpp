@@ -579,10 +579,10 @@ struct TransitioningKeyCTEDefinition {
 // appearing in the delta is NOT sufficient: for a 1:many relationship (e.g. one customer with many
 // orders) a single changed order must not suppress the customer's row when other, unchanged orders
 // still match. Returns nullptr if unsupported (caller must then skip the optimization, not guess).
-static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContext &context, Binder &binder,
-                                                                    LogicalGet *base_get, idx_t key_pos,
+static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContext &context, Connection &con,
+                                                                    Binder &binder, LogicalGet *base_get, idx_t key_pos,
                                                                     const string &view_name) {
-	auto delta_result = CreateDeltaGetNode(context, binder, base_get, view_name);
+	auto delta_result = CreateDeltaGetNode(context, con, binder, base_get, view_name);
 	auto delta_renumbered = renumber_and_rebind_subtree(std::move(delta_result.node), binder);
 	auto delta_bindings = delta_renumbered.op->GetColumnBindings();
 	auto delta_types = delta_renumbered.op->types;
@@ -725,7 +725,7 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 }
 
 static unique_ptr<TransitioningKeySet>
-GetTransitioningKeySetRef(ClientContext &context, Binder &binder, LogicalGet *base_get, idx_t key_pos,
+GetTransitioningKeySetRef(ClientContext &context, Connection &con, Binder &binder, LogicalGet *base_get, idx_t key_pos,
                           size_t leaf_index, const string &view_name,
                           map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
                           vector<TransitioningKeyCTEDefinition> &transition_ctes) {
@@ -733,7 +733,7 @@ GetTransitioningKeySetRef(ClientContext &context, Binder &binder, LogicalGet *ba
 	auto existing = transition_cte_indexes.find(cache_key);
 	idx_t definition_index;
 	if (existing == transition_cte_indexes.end()) {
-		auto transitioning_keys = BuildTransitioningKeySetImpl(context, binder, base_get, key_pos, view_name);
+		auto transitioning_keys = BuildTransitioningKeySetImpl(context, con, binder, base_get, key_pos, view_name);
 		if (!transitioning_keys) {
 			return nullptr;
 		}
@@ -777,12 +777,11 @@ GetTransitioningKeySetRef(ClientContext &context, Binder &binder, LogicalGet *ba
 // its own delta table on the join key, excluding any key present there. Only applies when the
 // null-supplying side is a single, unwrapped base-table leaf directly under the join (bails
 // silently otherwise, matching this file's existing unsupported-shape convention).
-static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Binder &binder, LogicalOperator *node,
-                                          const vector<JoinLeafInfo> &leaves, uint64_t leaf_has_delta_mask,
-                                          const string &view_name, bool portable_anti_guard,
-                                          map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
-                                          vector<TransitioningKeyCTEDefinition> &transition_ctes,
-                                          vector<size_t> &path) {
+static void
+GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &binder, LogicalOperator *node,
+                              const vector<JoinLeafInfo> &leaves, uint64_t leaf_has_delta_mask, const string &view_name,
+                              bool portable_anti_guard, map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
+                              vector<TransitioningKeyCTEDefinition> &transition_ctes, vector<size_t> &path) {
 	if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto *j = dynamic_cast<LogicalComparisonJoin *>(node);
 		if (j && (j->join_type == JoinType::LEFT || j->join_type == JoinType::RIGHT) && !j->conditions.empty()) {
@@ -835,7 +834,7 @@ static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Binder &binder
 					// term" -- matching the same match-count-transition principle as the secondary-delta
 					// fix, just applied here to avoid a double-count instead of to add a missing row.
 					auto transitioning_keys =
-					    GetTransitioningKeySetRef(context, binder, current_null_side_get, key_pos, null_leaf_idx,
+					    GetTransitioningKeySetRef(context, con, binder, current_null_side_get, key_pos, null_leaf_idx,
 					                              view_name, transition_cte_indexes, transition_ctes);
 					if (transitioning_keys) {
 						auto &other_bcr = other_key_expr->Cast<BoundColumnRefExpression>();
@@ -887,20 +886,20 @@ static void GuardKeptOuterJoinsForMaskRec(ClientContext &context, Binder &binder
 	// Recursing over every child is required by the validated join tree; the >= mutant only skips descendants.
 	for (size_t ci = 0; ci < node->children.size(); ci++) { // mull-ignore: cxx_lt_to_ge
 		path.push_back(ci);
-		GuardKeptOuterJoinsForMaskRec(context, binder, node->children[ci].get(), leaves, leaf_has_delta_mask, view_name,
-		                              portable_anti_guard, transition_cte_indexes, transition_ctes, path);
+		GuardKeptOuterJoinsForMaskRec(context, con, binder, node->children[ci].get(), leaves, leaf_has_delta_mask,
+		                              view_name, portable_anti_guard, transition_cte_indexes, transition_ctes, path);
 		path.pop_back();
 	}
 }
 
-static void GuardKeptOuterJoinsForMask(ClientContext &context, Binder &binder, LogicalOperator *node,
+static void GuardKeptOuterJoinsForMask(ClientContext &context, Connection &con, Binder &binder, LogicalOperator *node,
                                        const vector<JoinLeafInfo> &leaves, uint64_t leaf_has_delta_mask,
                                        const string &view_name, bool portable_anti_guard,
                                        map<pair<size_t, idx_t>, idx_t> &transition_cte_indexes,
                                        vector<TransitioningKeyCTEDefinition> &transition_ctes) {
 	vector<size_t> path;
-	GuardKeptOuterJoinsForMaskRec(context, binder, node, leaves, leaf_has_delta_mask, view_name, portable_anti_guard,
-	                              transition_cte_indexes, transition_ctes, path);
+	GuardKeptOuterJoinsForMaskRec(context, con, binder, node, leaves, leaf_has_delta_mask, view_name,
+	                              portable_anti_guard, transition_cte_indexes, transition_ctes, path);
 }
 
 void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
@@ -1068,11 +1067,8 @@ struct DeltaStatus {
 
 /// For each leaf, detect delta status in a single query per table.
 /// Returns both insert_only_mask (no deletes) and empty_mask (no rows at all).
-static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_name,
-                                     const vector<JoinLeafInfo> &leaves) {
+static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, const vector<JoinLeafInfo> &leaves) {
 	DeltaStatus status = {0, 0, 0, 0};
-	Connection con(*context.db);
-	con.SetAutoCommit(false);
 
 	for (size_t i = 0; i < leaves.size(); i++) {
 		LogicalGet *get = GetLeafScan(leaves[i]);
@@ -1542,7 +1538,7 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 
 	// Detect delta status for all leaves (single query per table: total + delete count).
 	// Used by both FK pruning and empty-delta skipping.
-	DeltaStatus delta_status = DetectDeltaStatus(context, input.context.view, leaves);
+	DeltaStatus delta_status = DetectDeltaStatus(input.context.metadata_con, input.context.view, leaves);
 	uint64_t total_terms = (1ULL << N) - 1;
 	uint64_t non_empty_mask = total_terms & ~delta_status.empty_mask & ~delta_status.constant_mask;
 	idx_t non_empty_leaf_count = CountBits(non_empty_mask);
@@ -1736,7 +1732,8 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 					// leaf's fresh index is left dangling.
 					auto &leaf_node_ref = GetNodeAtPath(term, leaves[i].path);
 					auto &term_local_get = leaf_node_ref->Cast<LogicalGet>();
-					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, &term_local_get, input.context.view);
+					DeltaGetResult delta_i = CreateDeltaGetNode(context, input.context.metadata_con, binder,
+					                                            &term_local_get, input.context.view);
 					mul_bindings.push_back(delta_i.mul_binding);
 					leaf_node_ref = std::move(delta_i.node);
 					UpdateParentProjectionMap(term, leaves[i], delta_i.mul_binding);
@@ -1758,8 +1755,9 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 			uint64_t leaf_has_delta_mask = (~delta_status.empty_mask) & total_terms;
 			if (leaf_has_delta_mask) {
 				bool portable_anti_guard = compile_facts.target_dialect != SqlDialect::DUCKDB;
-				GuardKeptOuterJoinsForMask(context, binder, term.get(), leaves, leaf_has_delta_mask, input.context.view,
-				                           portable_anti_guard, transition_cte_indexes, transition_ctes);
+				GuardKeptOuterJoinsForMask(context, input.context.metadata_con, binder, term.get(), leaves,
+				                           leaf_has_delta_mask, input.context.view, portable_anti_guard,
+				                           transition_cte_indexes, transition_ctes);
 			}
 		}
 
@@ -1929,7 +1927,7 @@ static DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input
                                                  LogicalOperator *&term_root) {
 	if (leaf_node->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = leaf_node->Cast<LogicalGet>();
-		auto delta = CreateDeltaGetNode(context, binder, &get, input.context.view);
+		auto delta = CreateDeltaGetNode(context, input.context.metadata_con, binder, &get, input.context.view);
 		return {std::move(delta.node), delta.mul_binding};
 	}
 	return input.CompileCopiedSubtree(leaf_node, term_root);

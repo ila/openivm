@@ -379,6 +379,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		auto table_name = drop_info->name;
 		auto target_locus = ResolveDDLLocus(input.context, drop_info->catalog, drop_info->schema);
 		Connection con(*input.context.db);
+		RefreshMetadata::UseCatalog(input.context, con, target_locus.first);
 
 		auto view_check = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 		                            SqlUtils::EscapeValue(table_name) + "'");
@@ -446,6 +447,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		auto source_locus = ResolveDDLLocus(input.context, alter_info->catalog, alter_info->schema);
 
 		Connection con(*input.context.db);
+		RefreshMetadata::UseCatalog(input.context, con, source_locus.first);
 		// Check if a delta table exists for this base table (i.e., it's tracked by IVM)
 		auto delta_check = con.Query("SELECT 1 FROM information_schema.tables WHERE table_catalog = '" +
 		                             SqlUtils::EscapeValue(source_locus.first) + "' AND table_schema = '" +

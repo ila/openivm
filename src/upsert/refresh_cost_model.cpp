@@ -877,6 +877,7 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection con(db);
+	RefreshMetadata::UseCatalog(context, con);
 
 	// Propagate user session settings to the cost estimation connection.
 	// The new connection has defaults, so settings like openivm_adaptive_refresh

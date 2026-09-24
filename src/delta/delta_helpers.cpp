@@ -2,7 +2,6 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "core/parser_ddl.hpp"
 #include "core/plan_rewrite_internal.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -128,8 +127,8 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
 
 /// Build a DuckLake delta scan by directly constructing LogicalGet nodes
 /// with SCAN_INSERTIONS / SCAN_DELETIONS, avoiding SQL string round-trips.
-static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &binder, LogicalGet *old_get,
-                                              const string &view_name) {
+static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection &con, Binder &binder,
+                                              LogicalGet *old_get, const string &view_name) {
 	auto table_ref = old_get->GetTable();
 	string catalog_name = table_ref->ParentCatalog().GetName();
 	string schema_name = table_ref->schema.name;
@@ -137,12 +136,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 
 	OPENIVM_DEBUG_PRINT("[DuckLake] Creating delta node for '%s.%s'\n", catalog_name.c_str(), table_name.c_str());
 
-	// Get last snapshot from IVM metadata. Uses a separate connection because
-	// the optimizer holds a lock on the main context during plan rewriting.
-	Connection con(*context.db);
-	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
-		metadata_state->Apply(con);
-	}
+	// Reuse the compiler metadata connection, including its transaction-local snapshot.
 	auto snap_result =
 	    con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
@@ -277,12 +271,12 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
 // Standard DuckDB delta scan (existing logic)
 // ============================================================================
 
-DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, LogicalGet *old_get,
+DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binder &binder, LogicalGet *old_get,
                                   const string &view_name) {
 	// DuckLake tables: use native change tracking via direct plan construction
 	auto table_ref = old_get->GetTable();
 	if (table_ref.get() && table_ref->ParentCatalog().GetCatalogType() == "ducklake") {
-		return CreateDuckLakeDeltaNode(context, binder, old_get, view_name);
+		return CreateDuckLakeDeltaNode(context, con, binder, old_get, view_name);
 	}
 	// Table functions (generate_series, range, etc.) have no catalog-backing table
 	// and therefore no delta table. Their output is constant across refreshes, so
@@ -366,11 +360,6 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
 	}
 
 	// Timestamp filter
-	Connection con(*context.db);
-	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
-		metadata_state->Apply(con);
-	}
-	con.SetAutoCommit(false);
 	auto timestamp_query = "select last_update from " + string(openivm::DELTA_TABLES_TABLE) + " where view_name = '" +
 	                       SqlUtils::EscapeValue(view_name) + "' and table_name = '" +
 	                       SqlUtils::EscapeValue(table_name) + "';";

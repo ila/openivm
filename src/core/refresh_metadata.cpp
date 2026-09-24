@@ -2,6 +2,8 @@
 
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
 #include "rules/column_hider.hpp"
 #include <algorithm>
 #include <functional>
@@ -9,6 +11,29 @@
 #include <unordered_set>
 
 namespace duckdb {
+
+void RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
+	auto catalog = view_catalog;
+	if (catalog.empty()) {
+		catalog = ClientData::Get(context).catalog_search_path->GetDefault().catalog;
+	}
+	string target = SqlUtils::QuoteIdentifier(DEFAULT_SCHEMA);
+	if (!catalog.empty()) {
+		auto type = con.Query("SELECT type FROM duckdb_databases() WHERE NOT internal AND database_name = '" +
+		                      SqlUtils::EscapeValue(catalog) + "'");
+		if (type->HasError()) {
+			throw CatalogException("OpenIVM could not resolve metadata catalog: %s", type->GetError());
+		}
+		if (type->RowCount() && type->GetValue(0, 0).ToString() == "duckdb") {
+			target = SqlUtils::QuoteIdentifier(catalog) + "." + target;
+		}
+	}
+	auto result = con.Query("USE " + target);
+	if (result->HasError()) {
+		throw CatalogException("OpenIVM could not select metadata catalog: %s", result->GetError());
+	}
+	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s for view catalog '%s'\n", target.c_str(), catalog.c_str());
+}
 
 bool RefreshMetadata::IsBaseTable(const string &table_name) {
 	auto result = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
@@ -429,15 +454,31 @@ int64_t RefreshMetadata::GetRefreshInterval(const string &view_name) {
 }
 
 vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
-	auto result = con.Query("SELECT v.view_name, COALESCE(v.view_catalog, current_database()), "
-	                        "COALESCE(v.view_schema, '" +
-	                        string(DEFAULT_SCHEMA) +
-	                        "'), v.refresh_interval, "
-	                        "(SELECT MIN(d.last_update) FROM " +
-	                        string(openivm::DELTA_TABLES_TABLE) +
-	                        " d WHERE d.view_name = v.view_name) AS last_update "
-	                        "FROM " +
-	                        string(openivm::VIEWS_TABLE) + " v WHERE v.refresh_interval IS NOT NULL");
+	auto catalogs = con.Query("SELECT DISTINCT database_name FROM duckdb_tables() WHERE schema_name = 'main' "
+	                          "AND table_name = 'openivm_views' AND NOT internal ORDER BY database_name");
+	if (catalogs->HasError()) {
+		throw CatalogException("OpenIVM could not enumerate metadata catalogs: %s", catalogs->GetError());
+	}
+	string query;
+	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
+		auto catalog = catalogs->GetValue(0, row).ToString();
+		auto catalog_literal = "'" + SqlUtils::EscapeValue(catalog) + "'";
+		if (!query.empty()) {
+			query += " UNION ALL ";
+		}
+		query += "SELECT v.view_name, COALESCE(v.view_catalog, " + catalog_literal +
+		         "), "
+		         "COALESCE(v.view_schema, 'main'), v.refresh_interval, "
+		         "(SELECT MIN(d.last_update) FROM " +
+		         SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE) +
+		         " d WHERE d.view_name = v.view_name), " + catalog_literal + " FROM " +
+		         SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::VIEWS_TABLE) +
+		         " v WHERE v.refresh_interval IS NOT NULL";
+	}
+	if (query.empty()) {
+		return {};
+	}
+	auto result = con.Query(query);
 	vector<ScheduledView> views;
 	if (result->HasError()) {
 		OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] GetScheduledViews query error: %s\n", result->GetError().c_str());
@@ -445,6 +486,7 @@ vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
 	if (!result->HasError()) {
 		for (size_t i = 0; i < result->RowCount(); i++) {
 			ScheduledView sv;
+			sv.metadata_catalog = result->GetValue(5, i).ToString();
 			sv.view_name = result->GetValue(0, i).ToString();
 			sv.catalog_name = result->GetValue(1, i).IsNull() ? "" : result->GetValue(1, i).ToString();
 			sv.schema_name = result->GetValue(2, i).IsNull() ? DEFAULT_SCHEMA : result->GetValue(2, i).ToString();

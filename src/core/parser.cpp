@@ -240,6 +240,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	ParserExtensionPlanResult result;
 
 	Connection con(*context.db.get());
+	RefreshMetadata::UseCatalog(context, con,
+	                            ResolveMaterializedViewTarget(context, parse_data_ref.target_name).catalog_name);
 	struct CreateMVPreProfileStep {
 		string step_name;
 		int64_t duration_ms;
@@ -259,11 +261,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		create_profile_steps.push_back({step_name, duration_ms, detail});
 	};
 
-	// Capture the current catalog/schema from the originating context. DDLExecutorBindFunction
-	// creates a fresh Connection that reflects the DatabaseInstance's physical default
-	// catalog (not the session's USE setting). We only inject "USE catalog.schema" when
-	// the session's active catalog differs from that physical default — e.g. when DuckLake
-	// ("dl") is active but the file DB ("rewriter_benchmark_sf1") is the physical default.
+	// Keep source-name resolution in the caller's catalog/schema. Native metadata
+	// belongs to the target catalog's main schema; DuckLake metadata remains native.
 	auto context_start = create_profile_now();
 	string current_catalog;
 	string current_schema;
@@ -274,8 +273,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		current_schema = def.schema.empty() ? "main" : def.schema;
 	}
 	add_create_profile_step("create_compile_session_context", context_start);
-	// Query the physical default by running SELECT current_database() on the fresh `con`
-	// (created above without any USE, so it reflects the DB's true default, not the session).
+	// The helper has already selected the catalog that owns this view metadata.
 	auto default_context_start = create_profile_now();
 	string default_db;
 	string default_schema = "main";
@@ -336,11 +334,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	if (target.qualified) {
 		view_catalog_prefix = SqlUtils::QualifiedPrefix(view_target_catalog, view_target_schema);
 	} else {
-		// When the MV name is unqualified but the session is in a non-default catalog
-		// (e.g. USE dl.main), explicitly qualify so data/view tables land in dl rather
-		// than the physical default. Metadata tables (unqualified) stay in the physical
-		// default — PRAGMA refresh() always uses a fresh connection without USE.
-		if (!current_catalog.empty() && current_catalog != default_db) {
+		// Qualify the data objects when their location differs from the metadata schema.
+		if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 			view_catalog_prefix = SqlUtils::QualifiedPrefix(current_catalog, current_schema);
 		}
 	}
@@ -355,15 +350,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	string internal_catalog_prefix = view_catalog_prefix;
 	string internal_target_catalog = view_target_catalog;
 	string internal_target_schema = view_target_schema;
-	// Native MVs created from another active catalog keep OpenIVM state in the physical
-	// default DB. DuckLake-targeted MVs store their data/delta tables in DuckLake so
-	// initial materialization follows the same storage path as DuckLake CTAS.
-	if (!target_is_ducklake && !view_catalog_prefix.empty() && default_db != "memory" &&
-	    view_target_catalog != default_db) {
-		internal_catalog_prefix = SqlUtils::QualifiedPrefix(default_db, default_schema);
-		internal_target_catalog = default_db;
-		internal_target_schema = default_schema;
-	}
 	string data_table = IncrementalTableNames::DataTableName(view_name);
 	string qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
 	string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
@@ -382,7 +368,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// default. Without this, `CREATE MATERIALIZED VIEW mv AS SELECT * FROM WAREHOUSE`
 	// issued under `USE dl.main` fails during planning with "Table WAREHOUSE does not
 	// exist" because the fresh connection resolves against the physical-default catalog.
-	if (!current_catalog.empty() && current_catalog != default_db) {
+	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 		auto use_start = create_profile_now();
 		con.Query("USE " + current_catalog + "." + current_schema);
 		add_create_profile_step("create_compile_use_context", use_start, current_catalog_schema);
@@ -1366,7 +1352,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// This diagnostic intentionally reports the exact first heavy statement that
 		// CREATE MV will run. DuckLake-targeted MVs should now write openivm_data_*
 		// directly; if staging reappears, this output makes the extra copy visible.
-		if (!current_catalog.empty() && current_catalog != default_db) {
+		if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 			con.Query("USE " + current_catalog_schema);
 		}
 		string local_initial_load_query = time_travel_pins.StripFrom(context, view_query);
@@ -1401,7 +1387,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// TABLE AS so those unqualified names resolve in the MV's catalog.
 	add_profile_marker("create_mv_initial_load", "sources=" + to_string(table_names.size()) +
 	                                                 "; generated_query_bytes=" + to_string(view_query.size()));
-	if (!current_catalog.empty() && current_catalog != default_db) {
+	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 		ddl.push_back("use " + current_catalog_schema);
 	}
 	if (staged_cross_catalog_replace) {
@@ -1543,11 +1529,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		              SqlUtils::JoinQuotedColumns(aggregate_columns) + ")");
 	}
 
-	// Restore physical-default catalog so subsequent unqualified references to
+	// Restore the metadata catalog so subsequent unqualified references to
 	// system tables (openivm_delta_tables, etc.) resolve correctly. The USE
 	// inserted before `create table qdt as view_query` routed unqualified base
 	// tables through the user's catalog; flip back for the metadata UPDATE below.
-	if (!current_catalog.empty() && current_catalog != default_db) {
+	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 		add_profile_marker("create_mv_restore_catalog");
 		ddl.push_back("use " + default_catalog_schema);
 	}
@@ -1634,6 +1620,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 		SqlUtils::WriteFile(base_path + "/openivm_system_tables.sql", false, system_tables_sql);
 		SqlUtils::WriteFile(base_path + "/openivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
+	}
+
+	if (!target_is_ducklake &&
+	    (default_db != DatabaseManager::GetDefaultDatabase(context) || default_schema != current_schema)) {
+		auto original_search_path =
+		    CatalogSearchEntry::ListToString(ClientData::Get(context).catalog_search_path->GetSetPaths());
+		ddl.insert(ddl.begin(), "USE " + default_catalog_schema);
+		ddl.push_back("SET search_path = '" + SqlUtils::EscapeValue(original_search_path) + "'");
 	}
 
 	// Pass DDL via result.parameters — the bind function receives them as input.inputs.
@@ -1792,6 +1786,7 @@ static string BuildCascadeDropTableProgram(ClientContext &context, DropInfo &dro
 	}
 
 	Connection con(*context.db);
+	RefreshMetadata::UseCatalog(context, con, drop_info.catalog);
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(con);
 	}
@@ -1912,6 +1907,7 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		data_table_ref = SqlUtils::FindTableReference(view.sql, data_table_name);
 	}
 	Connection con(*context.db);
+	RefreshMetadata::UseCatalog(context, con, catalog_name);
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(con);
 	}

@@ -268,7 +268,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 	vector<unique_ptr<LogicalOperator>> terms;
 
 	// Collect last_snapshot_id for all leaves upfront in one metadata query.
-	Connection con(*context.db);
+	auto &con = input.context.metadata_con;
 	vector<int64_t> old_snapshots(N);
 	vector<int64_t> current_snapshots(N, -1);
 	vector<string> table_catalogs(N);
@@ -465,7 +465,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		if (flattened_leaves || delta_get) {
 			// Simple GET leaf — replace directly.
 			D_ASSERT(delta_get);
-			DeltaGetResult delta_result = CreateDeltaGetNode(context, binder, delta_get, input.context.view);
+			DeltaGetResult delta_result =
+			    CreateDeltaGetNode(context, input.context.metadata_con, binder, delta_get, input.context.view);
 			mul_binding = delta_result.mul_binding;
 			delta_leaf_node = std::move(delta_result.node);
 			if (flattened_leaves) {
