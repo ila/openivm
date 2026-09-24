@@ -1451,13 +1451,31 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 }
 
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix,
-                            const vector<string> &unique_keys) {
+                            bool emit_cascade_delta, const vector<string> &unique_keys) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string recompute_temp;
 	if (!unique_keys.empty()) {
 		recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
 	}
-	return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp);
+	if (!emit_cascade_delta) {
+		return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp);
+	}
+	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
+	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
+
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + " openivm_old;\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+	       ") openivm_recompute;\n\n";
+	sql += SqlUtils::BuildFullRecomputeSQL(data_table, "SELECT * FROM " + new_temp_table, unique_keys, recompute_temp);
+	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+	sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
+	OPENIVM_DEBUG_PRINT("[CompileFullRecompute] unscopable recompute for '%s' — emitting signed "
+	                    "whole-view cascade delta\n",
+	                    view_name.c_str());
+	return sql;
 }
 
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
@@ -1467,8 +1485,10 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// No GROUP BY columns or no source deltas registered → can't scope; fall back to full.
+	// A cascade delta was still requested, so emit the whole-view signed delta rather than
+	// silently producing a program with no `openivm_delta_<view>` rows.
 	if (group_columns.empty() || delta_table_specs.empty()) {
-		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
+		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix, emit_cascade_delta);
 	}
 
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);

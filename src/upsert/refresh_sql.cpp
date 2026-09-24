@@ -5,6 +5,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/scoped_optimizer_settings.hpp"
 #include "core/sql_utils.hpp"
+#include "core/time_travel_pins.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_compiler.hpp"
 #include "upsert/refresh_cost_model.hpp"
@@ -45,20 +46,27 @@ static string SparkPortableRefreshSQL(string sql) {
 	return sql;
 }
 
-static string RenderStoredViewQueryForDialect(ClientContext &context, const string &view_query_sql,
-                                              const vector<string> &output_names, SqlDialect dialect) {
-	Parser parser(context.GetParserOptions());
-	parser.ParseQuery(view_query_sql);
-	if (parser.statements.size() != 1) {
-		throw ParserException("Expected one stored view query, found %llu",
-		                      static_cast<idx_t>(parser.statements.size()));
-	}
-	Planner planner(context);
-	planner.CreatePlan(parser.statements[0]->Copy());
-	auto plan = std::move(planner.plan);
-	auto ast = LogicalPlanToAst(context, plan, dialect);
-	auto cte_list = AstToCteList(*ast, dialect);
-	auto rendered = cte_list->ToQuery(true, output_names);
+static string RenderStoredViewQueryForDialect(Connection &con, const string &view_query_sql,
+                                              const vector<string> &output_names, SqlDialect dialect,
+                                              const openivm::TimeTravelPins &time_travel_pins) {
+	string rendered;
+	con.context->RunFunctionInTransaction([&]() {
+		auto &context = *con.context;
+		Parser parser(context.GetParserOptions());
+		parser.ParseQuery(view_query_sql);
+		if (parser.statements.size() != 1) {
+			throw ParserException("Expected one stored view query, found %llu",
+			                      static_cast<idx_t>(parser.statements.size()));
+		}
+		Planner planner(context);
+		// Source qualification already stripped foreign pins; native catalog snapshots remain bindable.
+		planner.CreatePlan(std::move(parser.statements[0]));
+		auto plan = std::move(planner.plan);
+		auto ast = LogicalPlanToAst(context, plan, dialect,
+		                            dialect == SqlDialect::DUCKDB ? SnapshotResolver() : time_travel_pins.Resolver());
+		auto cte_list = AstToCteList(*ast, dialect);
+		rendered = cte_list->ToQuery(true, output_names);
+	});
 	if (!rendered.empty() && rendered.back() == ';') {
 		rendered.pop_back();
 	}
@@ -227,8 +235,8 @@ static void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext 
 	// session-scoped planning settings still need to be mirrored onto the fresh
 	// planning connection.
 	static const char *PLANNING_SETTINGS[] = {
-	    "openivm_adaptive_refresh", "openivm_cost_decay",     "openivm_skip_empty_deltas",
-	    "openivm_fk_pruning",       "openivm_ducklake_nterm", "openivm_regular_nterm",
+	    "openivm_adaptive_refresh", "openivm_cost_decay",    "openivm_skip_empty_deltas",  "openivm_fk_pruning",
+	    "openivm_ducklake_nterm",   "openivm_regular_nterm", "openivm_regular_nterm_left",
 	};
 	for (auto setting_name : PLANNING_SETTINGS) {
 		CopyOpenIvmSetting(from, to, setting_name);
@@ -494,8 +502,17 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                     "; delta_tables=" + to_string(delta_table_names.size()) +
 	                     "; target_ducklake=" + string(target_is_ducklake ? "true" : "false"));
 	auto qualify_start = profile_now();
-	view_query_sql = QualifyViewQuerySources(metadata, con, view_name, view_query_sql, delta_sources, view_catalog_name,
-	                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+	auto view_time_travel_pins =
+	    PrepareViewQuerySources(con, view_name, view_query_sql, delta_sources, view_catalog_name, view_schema_name,
+	                            attached_db_catalog_name, attached_db_schema_name);
+	// Text-only refresh paths still need restoration. Plan-based paths already carry typed snapshots;
+	// DuckDB output uses the unpinned local source query and must not acquire foreign pins.
+	auto finalize_refresh_sql = [&](string refresh_sql) {
+		if (view_time_travel_pins.Empty() || active_facts.target_dialect == SqlDialect::DUCKDB) {
+			return refresh_sql;
+		}
+		return view_time_travel_pins.RestoreIntoSql(refresh_sql, active_facts.target_dialect);
+	};
 	add_profile_step("generate_refresh_sql.qualify_sources", qualify_start,
 	                 "query_bytes=" + to_string(view_query_sql.size()));
 	auto recovery_start = profile_now();
@@ -505,8 +522,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (!flag_result->HasError() && flag_result->RowCount() > 0 && !flag_result->GetValue(0, 0).IsNull() &&
 		    flag_result->GetValue(0, 0).GetValue<bool>()) {
 			Printer::Print("Warning: recovering '" + view_name + "' from interrupted refresh via full recompute.");
+			auto recovery_source_sql = view_query_sql;
+			if (!view_time_travel_pins.Empty() && active_facts.target_dialect != SqlDialect::DUCKDB) {
+				recovery_source_sql = RenderStoredViewQueryForDialect(
+				    con, view_query_sql, vector<string>(), active_facts.target_dialect, view_time_travel_pins);
+			}
 			auto recovery_query =
-			    BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+			    BuildRecomputeQuery(metadata, view_name, recovery_source_sql, cross_system, attached_db_catalog_name,
 			                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta);
 			if (cross_system) {
 				metadata.SetRefreshInProgress(view_name, false);
@@ -515,7 +537,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                  " SET refresh_in_progress = false WHERE view_name = '" +
 				                  SqlUtils::EscapeValue(view_name) + "';\n";
 			}
-			return recovery_query;
+			return finalize_refresh_sql(recovery_query);
 		}
 	}
 	add_profile_step("generate_refresh_sql.recovery_check", recovery_start);
@@ -577,7 +599,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		Parser cost_parser;
 		cost_parser.ParseQuery(view_query_sql);
 		Planner cost_planner(planning_context);
-		cost_planner.CreatePlan(cost_parser.statements[0]->Copy());
+		cost_planner.CreatePlan(std::move(cost_parser.statements[0]));
 		Optimizer cost_optimizer(*cost_planner.binder, planning_context);
 		auto cost_plan = cost_optimizer.Optimize(std::move(cost_planner.plan));
 
@@ -608,15 +630,20 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 
 	if (use_full_recompute && !full_recompute_needs_cascade_delta) {
 		auto full_refresh_start = profile_now();
+		string recompute_source_sql = view_query_sql;
+		if (!view_time_travel_pins.Empty() && active_facts.target_dialect != SqlDialect::DUCKDB) {
+			recompute_source_sql = RenderStoredViewQueryForDialect(con, view_query_sql, vector<string>(),
+			                                                       active_facts.target_dialect, view_time_travel_pins);
+		}
 		auto recompute_query =
-		    BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
+		    BuildRecomputeQuery(metadata, view_name, recompute_source_sql, cross_system, attached_db_catalog_name,
 		                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta);
 		add_profile_step("generate_refresh_sql.dispatch", full_refresh_start,
 		                 "full_recompute=true; metadata_requires_full_refresh=" +
 		                     string(metadata_requires_full_refresh ? "true" : "false") +
 		                     "; adaptive_recompute=" + string(adaptive_recompute ? "true" : "false") +
 		                     "; sql_bytes=" + to_string(recompute_query.size()));
-		return recompute_query;
+		return finalize_refresh_sql(recompute_query);
 	}
 	RefreshType dispatch_refresh_type = use_full_recompute ? RefreshType::FULL_REFRESH : view_query_type;
 	refresh_plan.refresh_type = dispatch_refresh_type;
@@ -1152,15 +1179,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					output_names.push_back(column_name);
 				}
 			}
-			con.BeginTransaction();
-			try {
-				full_recompute_query = RenderStoredViewQueryForDialect(planning_context, view_query_sql, output_names,
-				                                                       active_facts.target_dialect);
-				con.Rollback();
-			} catch (...) {
-				con.Rollback();
-				throw;
-			}
+			full_recompute_query = RenderStoredViewQueryForDialect(con, view_query_sql, output_names,
+			                                                       active_facts.target_dialect, view_time_travel_pins);
 		}
 		// The non-cascade recompute path in BuildRecomputeQuery already passes the data table's unique
 		// keys so it upserts rather than deleting and re-inserting them. This path did not, so a full
@@ -1176,8 +1196,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
 			recompute_unique_keys = metadata.GetGroupColumns(view_name);
 		}
-		upsert_query =
-		    CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix, recompute_unique_keys);
+		upsert_query = CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix, false,
+		                                    recompute_unique_keys);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));
 		break;
 	}
@@ -1420,7 +1440,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			try {
 				auto lpts_start = profile_now();
 				SqlDialect dialect = active_facts.target_dialect;
-				auto ast = LogicalPlanToAst(con_ctx, plan, dialect);
+				auto ast = LogicalPlanToAst(con_ctx, plan, dialect,
+				                            dialect == SqlDialect::DUCKDB ? SnapshotResolver()
+				                                                          : view_time_travel_pins.Resolver());
 				bool emit_spark_hints = dialect == SqlDialect::SPARK &&
 				                        (active_facts.emit_spark_hints ||
 				                         SqlUtils::GetBoolSetting(con_ctx, "openivm_emit_spark_hints", false));
@@ -1657,6 +1679,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	} else {
 		clean_query = meta_pre_sql + data_sql + meta_post_sql;
 	}
+	clean_query = finalize_refresh_sql(std::move(clean_query));
 	Value files_path_val;
 	if (write_query_file && context.TryGetCurrentSetting("openivm_files_path", files_path_val) &&
 	    !files_path_val.IsNull()) {

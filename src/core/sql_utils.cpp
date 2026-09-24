@@ -34,7 +34,7 @@ static bool StartsWithKeyword(const string &sql, size_t pos, const string &keywo
 	return pos + keyword.size() == sql.size() || !IsIdentifierChar(sql[pos + keyword.size()]);
 }
 
-static string TrimSQLFragment(const string &input) {
+string SqlUtils::TrimSQLFragment(const string &input) {
 	idx_t start = 0;
 	while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
 		start++;

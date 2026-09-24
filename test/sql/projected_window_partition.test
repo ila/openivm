@@ -1,0 +1,94 @@
+# name: test/sql/projected_window_partition.test
+# description: Window keys omitted from the MV output never become target predicates
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE pwp_src(id INTEGER, grp INTEGER, score INTEGER);
+
+statement ok
+INSERT INTO pwp_src VALUES (1, 10, 20), (2, 10, 30), (3, 20, 10), (4, 20, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW pwp_mv AS
+SELECT id, score, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score, id) AS rn
+FROM pwp_src;
+
+query IT
+SELECT refresh_type, refresh_type_name
+FROM openivm_compile_with_facts(
+    'pwp_mv',
+    '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}'
+)
+LIMIT 1;
+----
+5	WINDOW_PARTITION
+
+query I
+SELECT bool_or(sql LIKE '%INSERT INTO openivm_delta_pwp_mv%')
+FROM openivm_compile_with_facts(
+    'pwp_mv',
+    '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
+)
+WHERE stmt_kind = 'data';
+----
+true
+
+statement ok
+CREATE MATERIALIZED VIEW pwp_down AS SELECT id, score FROM pwp_mv WHERE rn = 1;
+
+statement ok
+INSERT INTO pwp_src VALUES (5, 10, 5), (6, 20, 25);
+
+statement ok
+UPDATE pwp_src SET grp = 20, score = 15 WHERE id = 2;
+
+statement ok
+DELETE FROM pwp_src WHERE id = 3;
+
+statement ok
+PRAGMA refresh('pwp_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM pwp_mv
+    EXCEPT ALL
+    SELECT id, score, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score, id) AS rn FROM pwp_src
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score, id) AS rn FROM pwp_src
+    EXCEPT ALL
+    SELECT * FROM pwp_mv
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM pwp_down
+    EXCEPT ALL
+    SELECT id, score FROM (
+        SELECT id, score, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score, id) AS rn FROM pwp_src
+    ) ranked WHERE rn = 1
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, score FROM (
+        SELECT id, score, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score, id) AS rn FROM pwp_src
+    ) ranked WHERE rn = 1
+    EXCEPT ALL
+    SELECT * FROM pwp_down
+);
+----
+0

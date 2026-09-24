@@ -13,6 +13,7 @@
 #include "core/ivm_view_classifier.hpp"
 #include "lpts_pipeline.hpp"
 #include "core/sql_utils.hpp"
+#include "core/time_travel_pins.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_compiler.hpp"
 #include "duckdb/common/printer.hpp"
@@ -24,7 +25,10 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
@@ -405,6 +409,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// re-derives what it needs from the plan.
 	unordered_set<string> table_names;
 	auto table_names_start = create_profile_now();
+	// Peel time-travel pins the catalog cannot bind before anything plans this statement, keeping
+	// each pin keyed by its relation so it can be re-attached to the generated SQL below.
+	auto time_travel_pins = openivm::TimeTravelPins::Peel(context, *statement);
+	// SQL OpenIVM binds or executes itself runs against the very catalog that cannot honour the pin,
+	// so those copies drop it. The stored view SQL keeps it, and refresh re-attaches it when
+	// rendering for a foreign dialect.
+	auto &select_statement = *statement->Cast<CreateStatement>().info->Cast<CreateTableInfo>().query;
+	auto local_view_query = time_travel_pins.Empty() ? original_view_query : select_statement.ToString();
 	try {
 		table_names = con.GetTableNames(statement->query);
 	} catch (const std::exception &e) {
@@ -436,10 +448,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	bool has_computed_sum_aggregate_projection = false;
 	{
 		auto select_parse_plan_start = create_profile_now();
-		Parser select_parser;
-		select_parser.ParseQuery(original_view_query);
 		Planner select_planner(context);
-		select_planner.CreatePlan(std::move(select_parser.statements[0]));
+		select_planner.CreatePlan(select_statement.Copy());
 		auto select_plan = std::move(select_planner.plan);
 		visible_output_count = select_planner.names.size();
 		for (auto &name : select_planner.names) {
@@ -536,7 +546,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			// CREATE MATERIALIZED VIEW always stores the view body in DuckDB's own dialect.
 			// Refresh-time target dialects are selected per CompileFacts.
 			SqlDialect dialect = SqlDialect::DUCKDB;
-			auto ast = LogicalPlanToAst(context, select_plan, dialect);
+			auto ast = LogicalPlanToAst(context, select_plan, dialect, time_travel_pins.Resolver());
 			auto cte_list = AstToCteList(*ast, dialect);
 			view_query = cte_list->ToQuery(true, output_names);
 			if (!view_query.empty() && view_query.back() == ';') {
@@ -665,7 +675,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	FilteredGroupCountExtract filtered_group_count_extract;
 	FilteredGroupCountAuxRequirement filtered_group_count_aux_candidate;
 	if (analysis.found_nested_aggregate &&
-	    ExtractFilteredGroupCount(original_view_query, output_names, filtered_group_count_extract)) {
+	    ExtractFilteredGroupCount(local_view_query, output_names, filtered_group_count_extract)) {
 		string aux_table = "openivm_filtered_group_count_" + view_name;
 		string group_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.group_col);
 		string sum_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.sum_col);
@@ -679,7 +689,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	}
 
 	if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
-		if (ExtractSemiAntiQuery(original_view_query, semi_anti_extract)) {
+		if (ExtractSemiAntiQuery(local_view_query, semi_anti_extract)) {
 			string left_table_name = SqlUtils::LastIdentifierPart(semi_anti_extract.left_table);
 			auto col_result = con.Query("SELECT column_name FROM information_schema.columns WHERE "
 			                            "lower(table_name) = lower('" +
@@ -805,7 +815,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		if (aux_enabled && single_source) {
 			vector<string> dcols;
 			string d_input_sql, d_source, d_filter;
-			if (!ExtractInnerDistinct(original_view_query, dcols, d_input_sql, d_source, d_filter)) {
+			if (!ExtractInnerDistinct(local_view_query, dcols, d_input_sql, d_source, d_filter)) {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL extractor failed — demoting to "
 				                    "GROUP_RECOMPUTE\n");
 			} else {
@@ -893,7 +903,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				candidate_group_columns.push_back(output_names[i]);
 			}
 			CountDistinctExtract cd_extract;
-			if (ExtractCountDistinctAggregate(original_view_query, candidate_group_columns, output_names, cd_extract)) {
+			if (ExtractCountDistinctAggregate(local_view_query, candidate_group_columns, output_names, cd_extract)) {
 				count_distinct_aux_candidate = {
 				    "openivm_aux_" + view_name, SqlUtils::LastIdentifierPart(cd_extract.source),
 				    candidate_group_columns,    cd_extract.group_exprs,
@@ -1359,7 +1369,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		if (!current_catalog.empty() && current_catalog != default_db) {
 			con.Query("USE " + current_catalog_schema);
 		}
-		string initial_load_statement = "CREATE TABLE " + initial_load_target + " AS " + view_query;
+		string local_initial_load_query = time_travel_pins.StripFrom(context, view_query);
+		string initial_load_statement = "CREATE TABLE " + initial_load_target + " AS " + local_initial_load_query;
 		string diagnostic;
 		diagnostic += "\n[OpenIVM initial-load diagnostic]\n";
 		diagnostic += "view_name: " + view_name + "\n";
@@ -1369,8 +1380,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		diagnostic += "initial_load_statement:\n" + initial_load_statement + "\n\n";
 		diagnostic += "original_view_query:\n" + original_view_query + "\n\n";
 		diagnostic += "generated_view_query:\n" + view_query + "\n\n";
-		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN original_view_query:", original_view_query);
-		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN generated_view_query:", view_query);
+		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN original_view_query:", local_view_query);
+		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN generated_view_query:", local_initial_load_query);
 		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN initial_load_statement:", initial_load_statement);
 		Printer::Print(diagnostic);
 
@@ -1403,7 +1414,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		ddl.push_back(BuildSemiAntiInitialDataSQL(initial_load_target, aux_target, meta.join_type, meta.left_cols,
 		                                          meta.output_cols, meta.null_aware, meta.null_aware_left_col));
 	} else {
-		ddl.push_back("create table " + initial_load_target + " as " + view_query);
+		ddl.push_back("create table " + initial_load_target + " as " + time_travel_pins.StripFrom(context, view_query));
 	}
 	if (staged_cross_catalog_replace) {
 		// DuckDB cannot make the DuckLake objects and native metadata atomic
@@ -1523,10 +1534,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	add_cleanup("DROP TABLE IF EXISTS " + qdv);
 
 	// --- Index DDL (for aggregate group queries) ---
-	// DuckLake source scans and DuckLake-backed MV state do not support this optional
-	// native index.
+	// The index belongs to the MV state, not its sources. DuckLake-backed state cannot have it.
 	if ((refresh_type == RefreshType::AGGREGATE_GROUP || refresh_type == RefreshType::AGGREGATE_HAVING) &&
-	    !aggregate_columns.empty() && ducklake_tables.empty() && view_catalog_prefix.empty()) {
+	    !aggregate_columns.empty() && !target_is_ducklake && view_catalog_prefix.empty()) {
 		add_profile_marker("create_view_index", "columns=" + to_string(aggregate_columns.size()));
 		string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + openivm::INDEX_SUFFIX);
 		ddl.push_back("create unique index " + index_name + " on " + qdt + "(" +
@@ -1645,7 +1655,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionParameters &parameters) {
 	auto query = StringValue::Get(parameters.values[0]);
-	auto parse_result = MaterializedViewParserExtension::ParseFunction(nullptr, query);
+	auto parse_result = ParseMaterializedViewStatement(query, OpenIvmInputDialect(context));
 	if (parse_result.type != ParserExtensionResultType::PARSE_SUCCESSFUL) {
 		throw ParserException("OpenIVM could not parse the materialized-view lifecycle statement");
 	}
