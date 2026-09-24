@@ -581,7 +581,7 @@ void RefreshMetadata::RecordRefreshHistory(const string &view_name, const string
                                            double incremental_compute_est, double incremental_upsert_est,
                                            double recompute_compute_est, double recompute_replace_est,
                                            int64_t actual_duration_ms, const vector<double> &plan_features,
-                                           int32_t feature_schema, idx_t max_history) {
+                                           int32_t feature_schema, bool exploratory, idx_t max_history) {
 	// A DuckDB list literal rather than JSON: it needs no parser to read back, and no extension to be
 	// loaded to write. NULL when absent, so "no features" is distinguishable from "all zeroes".
 	string features_sql = "NULL";
@@ -595,16 +595,16 @@ void RefreshMetadata::RecordRefreshHistory(const string &view_name, const string
 		}
 		features_sql += "]::DOUBLE[]";
 	}
-	auto result =
-	    con.Query("INSERT INTO " + string(openivm::HISTORY_TABLE) +
-	              " (view_name, method, incremental_compute_est, incremental_upsert_est,"
-	              " recompute_compute_est, recompute_replace_est, actual_duration_ms,"
-	              " plan_features, feature_schema)"
-	              " VALUES ('" +
-	              SqlUtils::EscapeValue(view_name) + "', '" + SqlUtils::EscapeValue(method) + "', " +
-	              to_string(incremental_compute_est) + ", " + to_string(incremental_upsert_est) + ", " +
-	              to_string(recompute_compute_est) + ", " + to_string(recompute_replace_est) + ", " +
-	              to_string(actual_duration_ms) + ", " + features_sql + ", " + to_string(feature_schema) + ")");
+	auto result = con.Query("INSERT INTO " + string(openivm::HISTORY_TABLE) +
+	                        " (view_name, method, incremental_compute_est, incremental_upsert_est,"
+	                        " recompute_compute_est, recompute_replace_est, actual_duration_ms,"
+	                        " plan_features, feature_schema, exploratory)"
+	                        " VALUES ('" +
+	                        SqlUtils::EscapeValue(view_name) + "', '" + SqlUtils::EscapeValue(method) + "', " +
+	                        to_string(incremental_compute_est) + ", " + to_string(incremental_upsert_est) + ", " +
+	                        to_string(recompute_compute_est) + ", " + to_string(recompute_replace_est) + ", " +
+	                        to_string(actual_duration_ms) + ", " + features_sql + ", " + to_string(feature_schema) +
+	                        ", " + (exploratory ? "true" : "false") + ")");
 	if (result->HasError()) {
 		OPENIVM_DEBUG_PRINT("[HISTORY] Failed to record: %s\n", result->GetError().c_str());
 		return;
@@ -655,6 +655,25 @@ vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetRefreshHistory(
 		entries.push_back(entry);
 	}
 	return entries;
+}
+
+idx_t RefreshMetadata::CountPlanCostSamples(const string &method, int32_t feature_schema) {
+	auto result = con.Query("SELECT COUNT(*) FROM " + string(openivm::HISTORY_TABLE) + " WHERE method = '" +
+	                        SqlUtils::EscapeValue(method) +
+	                        "' AND plan_features IS NOT NULL AND feature_schema = " + to_string(feature_schema));
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return 0;
+	}
+	return static_cast<idx_t>(result->GetValue(0, 0).GetValue<int64_t>());
+}
+
+idx_t RefreshMetadata::CountRefreshHistory(const string &view_name) {
+	auto result = con.Query("SELECT COUNT(*) FROM " + string(openivm::HISTORY_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_name) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return 0;
+	}
+	return static_cast<idx_t>(result->GetValue(0, 0).GetValue<int64_t>());
 }
 
 vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetPlanCostHistory(const string &method,

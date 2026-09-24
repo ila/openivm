@@ -251,8 +251,10 @@ INSERT INTO fm_base SELECT i % 8, i FROM range(1, 401) t(i);
 statement ok
 CREATE MATERIALIZED VIEW fm_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g;
 
-# Enough refresh cycles to pass the fitter's sample threshold.
-loop i 0 45
+# Comfortably more refresh cycles than the fitter's 40-sample threshold. Not 45: exploration diverts
+# roughly one refresh in ten to the other strategy, which would leave the dominant method sitting
+# exactly on the threshold and the assertion below tipping on ordinary variation.
+loop i 0 60
 
 statement ok
 INSERT INTO fm_base VALUES (${i} % 8, ${i});
@@ -322,5 +324,112 @@ query I
 SELECT count(*) FROM ((SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g)
   EXCEPT ALL
   (SELECT * FROM fm_mv)) x;
+----
+0
+
+# ==========================================
+# Test 7: exploration breaks the feedback loop
+#
+# Weights are learned from executions, so a strategy the model stops choosing stops producing the
+# samples that would show it was right. Test 6 shows that happening: a view small enough that full
+# recompute always wins records samples only under 'full'. Exploration spends a bounded amount of
+# runtime measuring the neglected strategy so the estimate that sidelined it can be corrected.
+# ==========================================
+
+statement ok
+SET openivm_adaptive_refresh=true;
+
+statement ok
+SET openivm_adaptive_explore=true;
+
+statement ok
+CREATE TABLE ex_base (g INT, v INT);
+
+statement ok
+INSERT INTO ex_base SELECT i % 4, i FROM range(1, 201) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW ex_mv AS SELECT g, SUM(v) AS total FROM ex_base GROUP BY g;
+
+loop i 0 30
+
+statement ok
+INSERT INTO ex_base VALUES (${i} % 4, ${i});
+
+statement ok
+PRAGMA refresh('ex_mv');
+
+endloop
+
+# Refreshes that ran the strategy the model expected to lose are marked as such. Counting distinct
+# methods would not prove anything here: the model flips between them on its own as the view grows,
+# so that assertion passes with exploration disabled. The flag is the only signal that isolates it.
+query I
+SELECT count(*) > 0 FROM openivm_refresh_history WHERE view_name = 'ex_mv' AND exploratory;
+----
+true
+
+# Exploration stays a small minority: it is there to gather evidence, not to override the model.
+# One refresh in ten is the cap, so at 30 refreshes it must be well under a third.
+query I
+SELECT count(*) FILTER (WHERE exploratory) * 3 < count(*) FROM openivm_refresh_history
+  WHERE view_name = 'ex_mv';
+----
+true
+
+# Every refresh stayed correct, including the explored ones, which take the strategy the model
+# expected to be slower rather than a different answer.
+query I
+SELECT count(*) FROM ((SELECT * FROM ex_mv)
+  EXCEPT ALL
+  (SELECT g, SUM(v) AS total FROM ex_base GROUP BY g)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT g, SUM(v) AS total FROM ex_base GROUP BY g)
+  EXCEPT ALL
+  (SELECT * FROM ex_mv)) x;
+----
+0
+
+# Turning it off is respected: no refresh after this point is marked exploratory.
+statement ok
+SET openivm_adaptive_explore=false;
+
+statement ok
+CREATE TABLE ex_off (g INT, v INT);
+
+statement ok
+INSERT INTO ex_off SELECT i % 4, i FROM range(1, 201) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW ex_off_mv AS SELECT g, SUM(v) AS total FROM ex_off GROUP BY g;
+
+loop i 0 25
+
+statement ok
+INSERT INTO ex_off VALUES (${i} % 4, ${i});
+
+statement ok
+PRAGMA refresh('ex_off_mv');
+
+endloop
+
+query I
+SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'ex_off_mv' AND exploratory;
+----
+0
+
+statement ok
+INSERT INTO ex_base VALUES (1, 77777);
+
+statement ok
+PRAGMA refresh('ex_mv');
+
+query I
+SELECT count(*) FROM ((SELECT g, SUM(v) AS total FROM ex_base GROUP BY g)
+  EXCEPT ALL
+  (SELECT * FROM ex_mv)) x;
 ----
 0

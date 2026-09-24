@@ -905,6 +905,7 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		empty.incremental_features.fill(0.0);
 		empty.recompute_features.fill(0.0);
 		empty.has_features = false;
+		empty.exploration = 0;
 		empty.strategy_label = "incremental";
 		return empty;
 	}
@@ -1282,6 +1283,45 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: %s=%.0fms, Recompute=%.0fms\n", strategy_label,
 		                    strategy_predicted_ms, recompute_predicted_ms);
 	}
+	// Exploration: occasionally run the strategy the model expects to lose, when the model has too
+	// little evidence about it to be trusted.
+	//
+	// Weights are learned from executions, so a strategy the model stops choosing stops producing
+	// samples, and the estimate that caused it to lose is never corrected. A view that full recompute
+	// wins once can therefore keep winning on stale evidence. The escape is to spend a small,
+	// bounded amount of runtime measuring the alternative.
+	//
+	// Deliberately deterministic rather than random, so a run is reproducible and testable: every
+	// EXPLORE_PERIOD-th refresh of a view explores. Self-limiting, since it stops as soon as the
+	// neglected strategy has enough samples to fit. Cost is bounded at one refresh in
+	// EXPLORE_PERIOD, and only while that strategy is under-measured.
+	int8_t exploration = 0;
+	if (adaptive_on && SqlUtils::GetBoolSetting(context, "openivm_adaptive_explore", true)) {
+		constexpr idx_t EXPLORE_PERIOD = 10;
+		constexpr idx_t EXPLORE_MIN_SAMPLES = 40;
+		bool would_recompute = recompute_predicted_ms < strategy_predicted_ms;
+		// Exploring towards incremental is only legal when the view can be maintained incrementally
+		// at all; full recompute is always a legal answer.
+		bool loser_is_legal =
+		    would_recompute ? (view_type != RefreshType::FULL_REFRESH && view_type != RefreshType::TOP_K) : true;
+		if (loser_is_legal) {
+			RefreshMetadata explore_meta(con);
+			string loser_method = would_recompute ? strategy_label : string("full");
+			idx_t loser_samples = explore_meta.CountPlanCostSamples(loser_method, PLAN_FEATURE_SCHEMA);
+			if (loser_samples < EXPLORE_MIN_SAMPLES) {
+				idx_t refreshes = explore_meta.CountRefreshHistory(view_name);
+				if (refreshes > 0 && refreshes % EXPLORE_PERIOD == 0) {
+					exploration = would_recompute ? -1 : 1;
+					OPENIVM_DEBUG_PRINT("[COST MODEL] Exploring: running %s despite predicting %s, "
+					                    "because %s has only %llu samples\n",
+					                    would_recompute ? strategy_label : "full",
+					                    would_recompute ? "full" : strategy_label, loser_method.c_str(),
+					                    (unsigned long long)loser_samples);
+				}
+			}
+		}
+	}
+
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n",
 	                    recompute_predicted_ms < strategy_predicted_ms ? "FULL_RECOMPUTE" : strategy_label);
 
@@ -1298,6 +1338,7 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 	estimate.incremental_features = incremental_features;
 	estimate.recompute_features = recompute_features;
 	estimate.has_features = has_features;
+	estimate.exploration = exploration;
 	estimate.strategy_label = std::move(strategy_label);
 	return estimate;
 }
@@ -1311,9 +1352,10 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 	// Propagate user session settings to the cost estimation connection.
 	// The new connection has defaults, so settings like openivm_adaptive_refresh
 	// must be copied from the calling context for calibration to activate.
-	for (auto &setting_name : {"openivm_adaptive_refresh", "openivm_cost_decay", "openivm_ducklake_nterm",
-	                           "openivm_fk_pruning", "openivm_skip_empty_deltas", "openivm_having_merge",
-	                           "openivm_left_join_merge", "openivm_full_outer_merge", "openivm_distinct_aux_state"}) {
+	for (auto &setting_name :
+	     {"openivm_adaptive_refresh", "openivm_cost_decay", "openivm_ducklake_nterm", "openivm_fk_pruning",
+	      "openivm_skip_empty_deltas", "openivm_having_merge", "openivm_left_join_merge", "openivm_full_outer_merge",
+	      "openivm_distinct_aux_state", "openivm_adaptive_explore"}) {
 		Value v;
 		if (context.TryGetCurrentSetting(setting_name, v) && !v.IsNull()) {
 			con.Query("SET " + string(setting_name) + " = " + v.ToString());

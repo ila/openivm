@@ -91,7 +91,16 @@ struct RefreshCostEstimate {
 	// "distinct_incremental", "semi_anti_recompute", and "full".
 	string strategy_label;
 
+	// Non-zero when the strategy was chosen to gather evidence rather than because it looked cheaper:
+	// +1 forces recompute, -1 forces incremental. A model that learns only from what it runs cannot
+	// observe the road not taken, so a strategy it stops choosing stops accumulating the samples that
+	// would show it was right. See the exploration block in EstimateRefreshCost.
+	int8_t exploration;
+
 	bool ShouldRecompute() const {
+		if (exploration != 0) {
+			return exploration > 0;
+		}
 		return recompute_predicted_ms < incremental_predicted_ms;
 	}
 };

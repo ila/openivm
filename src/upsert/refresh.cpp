@@ -394,7 +394,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			RefreshMetadata(exec_con).RecordRefreshHistory(
 			    vn, method, cost_estimate.incremental_compute, cost_estimate.incremental_upsert,
 			    cost_estimate.recompute_compute, cost_estimate.recompute_replace, duration_ms, recorded_features,
-			    recorded_schema);
+			    recorded_schema, cost_estimate.exploration != 0);
 			OPENIVM_DEBUG_PRINT("[HISTORY] Recorded: view=%s, method=%s, duration=%ldms\n", vn.c_str(), method.c_str(),
 			                    (long)duration_ms);
 			profiler.AddStep("record_refresh_history", history_start, method);

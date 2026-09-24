@@ -193,7 +193,7 @@ public:
 	void RecordRefreshHistory(const string &view_name, const string &method, double incremental_compute_est,
 	                          double incremental_upsert_est, double recompute_compute_est, double recompute_replace_est,
 	                          int64_t actual_duration_ms, const vector<double> &plan_features = {},
-	                          int32_t feature_schema = 0, idx_t max_history = 100);
+	                          int32_t feature_schema = 0, bool exploratory = false, idx_t max_history = 100);
 
 	// Refresh history entry for regression fitting.
 	struct RefreshHistoryEntry {
@@ -215,6 +215,13 @@ public:
 	// property of the machine rather than of any one view, so a view refreshing for the first time
 	// inherits them instead of starting uncalibrated.
 	vector<RefreshHistoryEntry> GetPlanCostHistory(const string &method, int32_t feature_schema, idx_t limit = 500);
+
+	// How many usable samples exist for `method`, pooled across views. Used to tell an uncalibrated
+	// strategy from a well-measured one without pulling the rows.
+	idx_t CountPlanCostSamples(const string &method, int32_t feature_schema);
+
+	// Total refreshes recorded for one view, used to pace exploration.
+	idx_t CountRefreshHistory(const string &view_name);
 
 	// --- Aux-state DISTINCT (RefreshType::DISTINCT_INCREMENTAL) ---
 
