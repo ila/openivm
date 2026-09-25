@@ -144,6 +144,9 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
                                     vector<RefreshMetadata::WindowPartitionLineageOp> *direct_out = nullptr);
 bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<string> &output_names,
                                RefreshMetadata::ProjectionKeyLineage &out);
+/// A same-named source/output key for a single-source, key-local plan; empty if
+/// unproven.
+string DeriveDirectSourceGroupKey(const CreateMVPlanFacts &facts, const vector<string> &output_names);
 bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out);
 bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinNullableSources &out);
 bool PlanNeedsOriginalSqlForLpts(const CreateMVPlanFacts &facts);

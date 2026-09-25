@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -197,14 +198,28 @@ struct TempDb {
 	string path;
 	string wal;
 
-	explicit TempDb(const string &tag) {
-		path = "/tmp/cost_model_bench_" + to_string(getpid()) + "_" + tag + ".db";
+	bool keep = false;
+
+	// `case_tag` identifies the case and `variant` the file's role within it. They are separated by a
+	// dot deliberately: DuckDB derives a database's catalog name from the filename up to the FIRST
+	// dot, so every file of one case resolves to the same catalog. That matters because a
+	// materialized view's metadata records the catalog it was created in, and a refresh run against a
+	// copy under a different catalog name fails with "Catalog ... does not exist".
+	//
+	// The previous naming satisfied this by accident: the delta percentage was formatted into the
+	// filename, and the resulting "1.000000" truncated every variant to the same catalog. Removing
+	// the percentage from the name broke every refresh at once.
+	TempDb(const string &case_tag, const string &variant, bool keep_p = false) : keep(keep_p) {
+		path = "/tmp/cost_model_bench_" + to_string(getpid()) + "_" + case_tag + "." + variant + ".db";
 		wal = path + ".wal";
 		std::remove(path.c_str());
 		std::remove(wal.c_str());
 	}
 
 	~TempDb() {
+		if (keep) {
+			return; // promoted to the case's live state; the caller owns it now
+		}
 		std::remove(path.c_str());
 		std::remove(wal.c_str());
 	}
@@ -681,11 +696,18 @@ static vector<QueryDef> BuildQueries() {
 	              {"mv_q"}, {"CUSTOMER"},
 	              "SELECT C_W_ID, ROUND(STDDEV_SAMP(C_BALANCE::DOUBLE), 2) AS sd FROM CUSTOMER GROUP BY C_W_ID",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
+	// ARG_MAX orders by (C_BALANCE, C_D_ID, C_ID) rather than C_BALANCE alone. TPC-C gives every
+	// customer the same starting balance, so ordering by it alone leaves tens of thousands of tied
+	// rows per warehouse and ARG_MAX may return any of them: at scale factor 25 the maximum is tied
+	// across 29,700 rows in a single group. Both the view and the base query then return correct but
+	// different answers, and the EXCEPT ALL cross-check reports a mismatch that is not one. Appending
+	// (C_D_ID, C_ID), which is unique within a warehouse, makes the ordering total and the query
+	// single-valued, while still ordering primarily by the column the mixed workload updates.
 	AddQuery(qs, {"T03", "ARG_MAX aggregate", {}, {},
-	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, ARG_MAX(C_ID, C_BALANCE) AS top_c FROM CUSTOMER "
-	               "GROUP BY C_W_ID"},
+	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT C_W_ID, ARG_MAX(C_ID, (C_BALANCE, C_D_ID, C_ID)) AS top_c "
+	               "FROM CUSTOMER GROUP BY C_W_ID"},
 	              {"mv_q"}, {"CUSTOMER"},
-	              "SELECT C_W_ID, ARG_MAX(C_ID, C_BALANCE) AS top_c FROM CUSTOMER GROUP BY C_W_ID",
+	              "SELECT C_W_ID, ARG_MAX(C_ID, (C_BALANCE, C_D_ID, C_ID)) AS top_c FROM CUSTOMER GROUP BY C_W_ID",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}, Batch::TODO});
 	AddQuery(qs, {"T04", "FULL OUTER JOIN projection", {}, {},
 	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT w.W_ID, d.D_ID FROM WAREHOUSE w FULL OUTER JOIN DISTRICT d "
@@ -827,13 +849,21 @@ static vector<int> AllocateDeltas(duckdb::Connection &con, const vector<string> 
 	return allocated;
 }
 
-static int64_t ApplyDML(duckdb::Connection &con, const QueryDef &q, Workload workload, double delta_pct, int scale) {
+// `pk_cursor` is an in/out watermark over the synthetic primary-key space, advanced past whatever
+// this call inserts so a later cycle on the same database never reuses a key.
+//
+// A watermark rather than cycle * constant: the key columns are 32-bit, and a stride wide enough for
+// a large cycle exhausts that range within a few dozen cycles. At 1e8 per cycle the keys passed
+// INT32_MAX at cycle 22, every insert failed, and the mixed workload's deletes then drained the
+// table to empty while still reporting success. Tracking actual usage spends only what is needed.
+static int64_t ApplyDML(duckdb::Connection &con, const QueryDef &q, Workload workload, double delta_pct, int scale,
+                        int64_t &pk_cursor) {
 	if (workload == Workload::EMPTY_DELTA || delta_pct <= 0.0) {
 		return 0;
 	}
 	auto allocations = AllocateDeltas(con, q.touched_tables, delta_pct);
 	int64_t issued = 0;
-	int64_t pk_offset = 0;
+	int64_t pk_offset = pk_cursor;
 	for (idx_t i = 0; i < q.touched_tables.size(); i++) {
 		auto dml = BuildWorkload(q.touched_tables[i], allocations[i], scale, workload, pk_offset);
 		for (auto &sql : dml) {
@@ -842,8 +872,9 @@ static int64_t ApplyDML(duckdb::Connection &con, const QueryDef &q, Workload wor
 				issued++;
 			}
 		}
-		pk_offset += allocations[i] + 100000;
+		pk_offset += allocations[i] + 1000;
 	}
+	pk_cursor = pk_offset;
 	return issued;
 }
 
@@ -994,15 +1025,140 @@ static void ConfigureMode(duckdb::Connection &con, RefreshMode mode) {
 // (the decision under test) and skip it for the INCREMENTAL/FULL reference-timing runs, which avoids
 // two of the three full validations per combo. Each mode still does its own independent full setup in
 // its own session, so this changes only what we verify, not how the refresh runs.
-static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload workload, double delta_pct,
-                          FlagConfig flag_config, int scale, int rep, RefreshMode mode, bool read_cost, bool warm,
-                          bool do_validate) {
+// A case's starting state, built once and reused by every refresh mode.
+//
+// The three modes have to begin from identical state, but they used to reach it by each repeating
+// the whole setup: copy the base database, create the materialized view, apply the delta. That work
+// dwarfs the refresh it surrounds — at scale factor 50 the timed refresh was 0.4% of the sweep's
+// wall clock — and doing it three times tripled the part that was already dominant.
+//
+// It also did not produce identical state. The generated inserts embed NOW(), so each mode wrote
+// different timestamps and the three were not measuring the same delta.
+//
+// Building it once and restoring from a file copy fixes both. The copy is cheap next to what it
+// replaces: 28 MB at scale factor 25 copies in 0.02s, against seconds to minutes for the setup.
+// The case's live database, carried across refresh cycles.
+//
+// A cost model that learns from execution history cannot be measured on a database that has none.
+// Every case used to be a fresh copy refreshed exactly once, so history was empty by construction
+// and the learned weights could never reach their sample threshold: the sweep only ever exercised
+// the uncalibrated fallback. A case is now one database refreshed many times, with the accepted
+// result carried forward, so the model sees the regime it is meant to operate in.
+struct PreparedCase {
+	std::unique_ptr<TempDb> state;
+	string case_tag;         // shared by every file of this case, so they share a catalog name
+	int64_t pk_cursor = 0;   // advances across cycles so no two reuse a key
+	bool ok = false;
+	string error;
+	int64_t dml_statements = 0;
+	int64_t delta_rows = 0;
+	int64_t base_rows = 0;
+	int64_t mv_rows = 0;
+};
+
+static PreparedCase PrepareCase(const string &src_db_path, const QueryDef &q, Workload workload,
+                                FlagConfig flag_config, int rep) {
+	PreparedCase prepared;
+	prepared.case_tag =
+	    q.id + "_" + WorkloadName(workload) + "_" + FlagConfigName(flag_config) + "_" + to_string(rep);
+	prepared.state.reset(new TempDb(prepared.case_tag, "state"));
+	if (!CopyFile(src_db_path, prepared.state->path)) {
+		prepared.error = "copy db failed: " + string(strerror(errno));
+		return prepared;
+	}
+	try {
+		// Scoped so the database is closed, and therefore checkpointed, before anything copies the
+		// file. A snapshot taken while it is open could miss writes still sitting in the WAL.
+		duckdb::DuckDB db(prepared.state->path);
+		duckdb::Connection con(db);
+		auto load = con.Query("LOAD openivm");
+		if (!load || load->HasError()) {
+			prepared.error = "LOAD openivm: " + (load ? load->GetError() : "null result");
+			return prepared;
+		}
+		ApplyFlagConfig(con, flag_config);
+		for (auto &sql : q.setup_sql) {
+			auto result = con.Query(sql);
+			if (!result || result->HasError()) {
+				prepared.error = "setup failed: " + (result ? result->GetError() : "null result");
+				return prepared;
+			}
+		}
+		for (auto &sql : q.query_settings) {
+			auto result = con.Query(sql);
+			if (!result || result->HasError()) {
+				prepared.error = "query setting failed: " + (result ? result->GetError() : "null result");
+				return prepared;
+			}
+		}
+		for (auto &sql : q.create_mvs) {
+			auto result = con.Query(sql);
+			if (!result || result->HasError()) {
+				prepared.error = "CREATE MV failed: " + (result ? result->GetError() : "null result");
+				return prepared;
+			}
+		}
+		prepared.base_rows = ReadBaseRows(con, q);
+		prepared.mv_rows = ReadCount(con, "SELECT COUNT(*) FROM " + q.refresh_mvs.back());
+	} catch (const std::exception &e) {
+		prepared.error = string("exception during setup: ") + e.what();
+		return prepared;
+	}
+	prepared.ok = true;
+	return prepared;
+}
+
+// Apply one cycle's delta to the live state. Returns false with `error` set on failure.
+//
+// The cycle index offsets the synthetic key space so no cycle reuses a key an earlier one inserted,
+// and it rotates the delta percentage so the recorded history covers a range of change sizes rather
+// than repeating one. A model fitted on a single delta size would have nothing to generalise from.
+static bool ApplyCycleDelta(PreparedCase &prepared, const QueryDef &q, Workload workload, double delta_pct, int scale,
+                            string &error) {
+	try {
+		duckdb::DuckDB db(prepared.state->path);
+		duckdb::Connection con(db);
+		auto load = con.Query("LOAD openivm");
+		if (!load || load->HasError()) {
+			error = "LOAD openivm: " + (load ? load->GetError() : "null result");
+			return false;
+		}
+		for (auto &sql : q.query_settings) {
+			con.Query(sql);
+		}
+		prepared.dml_statements = ApplyDML(con, q, workload, delta_pct, scale, prepared.pk_cursor);
+		prepared.delta_rows = CountPendingDeltaRows(con, q);
+		if (prepared.dml_statements == 0 && delta_pct > 0) {
+			error = "delta applied no statements — the synthetic key space may be exhausted";
+			return false;
+		}
+		if (workload == Workload::MIXED && delta_pct > 0 && prepared.delta_rows <= 0) {
+			error = "mixed workload produced no pending delta rows";
+			return false;
+		}
+		prepared.base_rows = ReadBaseRows(con, q);
+		prepared.mv_rows = ReadCount(con, "SELECT COUNT(*) FROM " + q.refresh_mvs.back());
+	} catch (const std::exception &e) {
+		error = string("exception applying delta: ") + e.what();
+		return false;
+	}
+	return true;
+}
+
+static ModeResult RunMode(const PreparedCase &prepared, const QueryDef &q, Workload workload, double delta_pct,
+                          FlagConfig flag_config, int rep, int cycle, RefreshMode mode, bool read_cost, bool warm,
+                          bool do_validate, string *promote_path) {
 	ModeResult out;
-	string tag = q.id + "_" + WorkloadName(workload) + "_" + to_string(delta_pct) + "_" + FlagConfigName(flag_config) +
-	             "_" + to_string(rep) + "_" + to_string(static_cast<int>(mode));
-	TempDb temp(tag);
-	if (!CopyFile(src_db_path, temp.path)) {
-		out.error = "copy db failed: " + string(strerror(errno));
+	out.dml_statements = prepared.dml_statements;
+	out.delta_rows = prepared.delta_rows;
+	out.base_rows = prepared.base_rows;
+	out.mv_rows = prepared.mv_rows;
+	// Each mode branches from the same state, so the three are comparable, and only the accepted one
+	// is carried forward. Retained past this scope when it is the one to promote.
+	TempDb temp(prepared.case_tag, "c" + to_string(cycle) + "m" + to_string(static_cast<int>(mode)),
+	            promote_path != nullptr);
+	if (!CopyFile(prepared.state->path, temp.path)) {
+		out.error = "restore snapshot failed: " + string(strerror(errno));
 		return out;
 	}
 	try {
@@ -1013,14 +1169,8 @@ static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload
 			out.error = "LOAD openivm: " + (load ? load->GetError() : "null result");
 			return out;
 		}
+		// Settings live in the session, not in the file, so they are re-applied on the restored copy.
 		ApplyFlagConfig(con, flag_config);
-		for (auto &sql : q.setup_sql) {
-			auto result = con.Query(sql);
-			if (!result || result->HasError()) {
-				out.error = "setup failed: " + (result ? result->GetError() : "null result");
-				return out;
-			}
-		}
 		for (auto &sql : q.query_settings) {
 			auto result = con.Query(sql);
 			if (!result || result->HasError()) {
@@ -1028,21 +1178,6 @@ static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload
 				return out;
 			}
 		}
-		for (auto &sql : q.create_mvs) {
-			auto result = con.Query(sql);
-			if (!result || result->HasError()) {
-				out.error = "CREATE MV failed: " + (result ? result->GetError() : "null result");
-				return out;
-			}
-		}
-		out.dml_statements = ApplyDML(con, q, workload, delta_pct, scale);
-		out.delta_rows = CountPendingDeltaRows(con, q);
-		if (workload == Workload::MIXED && delta_pct > 0 && out.delta_rows <= 0) {
-			out.error = "mixed workload produced no pending delta rows";
-			return out;
-		}
-		out.base_rows = ReadBaseRows(con, q);
-		out.mv_rows = ReadCount(con, "SELECT COUNT(*) FROM " + q.refresh_mvs.back());
 		if (warm) {
 			WarmScenario(con, q);
 		}
@@ -1095,11 +1230,24 @@ static ModeResult RunMode(const string &src_db_path, const QueryDef &q, Workload
 			out.correct = true; // reference-timing run: correctness is verified on the AUTO path
 		}
 		out.ok = true;
+		if (promote_path) {
+			*promote_path = temp.path;
+		}
 		return out;
 	} catch (const std::exception &e) {
 		out.error = string("exception: ") + e.what();
 		return out;
 	}
+}
+
+// Ratio error between a predicted and a measured duration, the standard accuracy measure for cost
+// estimates: 1.0 is exact, 2.0 is off by a factor of two in either direction. Returns 0 when either
+// side is non-positive, which marks the sample as undefined rather than perfect.
+static double QError(double predicted_ms, double actual_ms) {
+	if (predicted_ms <= 0 || actual_ms <= 0) {
+		return 0;
+	}
+	return std::max(predicted_ms, actual_ms) / std::min(predicted_ms, actual_ms);
 }
 
 static string BestMethod(double incremental_ms, double full_ms) {
@@ -1129,7 +1277,7 @@ static void PrintUsage() {
 	fprintf(stderr, "cost_model_benchmark --scale N --db PATH --out CSV [--reps 3]\n"
 	                "                     [--delta-pcts 0,0.01,1,2,5,10,20,50] [--filter Q01,S06,...] [--no-warm]\n"
 	                "                     [--configs all_on,all_off,skip_empty_off] [--no-validate]\n"
-	                "                     [--batch all|validated|todo]\n");
+	                "                     [--batch all|validated|todo] [--cycles 10]\n");
 }
 
 int main(int argc, char **argv) {
@@ -1137,7 +1285,12 @@ int main(int argc, char **argv) {
 	string db_path;
 	string out_csv = "cost_model_benchmark_results.csv";
 	int reps = 3;
-	vector<double> delta_pcts = {0, 0.01, 1, 2, 5, 10, 20, 50};
+	// Refreshes per case, all against one database. The cost model learns from execution history, so
+	// a case that refreshes once can only ever exercise the uncalibrated path.
+	int cycles = 10;
+	// Rotated across cycles rather than forming a dimension of the grid: a model fitted on a single
+	// delta size has nothing to generalise from. An empty delta is now just a cycle with no change.
+	vector<double> delta_pcts = {0.01, 1, 2, 5, 10, 20, 50};
 	set<string> query_filter;
 	bool warm = true;
 	bool validate = true; // EXCEPT ALL correctness cross-check on the AUTO path
@@ -1162,6 +1315,12 @@ int main(int argc, char **argv) {
 			out_csv = next("--out");
 		} else if (arg == "--reps") {
 			reps = std::stoi(next("--reps"));
+		} else if (arg == "--cycles") {
+			cycles = std::stoi(next("--cycles"));
+			if (cycles < 1) {
+				fprintf(stderr, "--cycles must be >= 1\n");
+				return 2;
+			}
 		} else if (arg == "--delta-pcts") {
 			delta_pcts = ParseDoubleList(next("--delta-pcts"));
 		} else if (arg == "--filter") {
@@ -1214,23 +1373,24 @@ int main(int argc, char **argv) {
 		}
 	}
 	if (db_path.empty()) {
-		db_path = "/tmp/cost_model_bench_sf" + to_string(scale) + ".db";
+		db_path = "/tmp/cost_model_bench_tpcc_sf" + to_string(scale) + ".db";
 	}
 	if (!FileExists(db_path)) {
 		Log("Creating TPC-C DB at scale " + to_string(scale) + ": " + db_path);
 		duckdb::DuckDB db(db_path);
 		duckdb::Connection con(db);
 		CreateTPCCSchema(con);
-		InsertTPCCData(con, scale);
+		InsertTPCCData(con, scale, openivm_bench::TPCCScaleProfile::SPEC);
 		con.Query("PRAGMA checkpoint");
 	}
 
 	auto queries = BuildQueries();
 
 	std::ofstream out(out_csv);
-	out << "scale,query_id,description,workload,delta_pct,flag_config,rep,view_name,"
+	out << "scale,query_id,description,workload,delta_pct,flag_config,rep,cycle,view_name,"
 	       "cost_decision,incremental_cost,recompute_cost,incremental_predicted_ms,recompute_predicted_ms,calibrated,"
-	       "auto_method,auto_ms,incremental_ms,full_ms,best_method,regret_ratio,correct,base_rows,mv_rows,"
+	       "auto_method,auto_ms,incremental_ms,full_ms,best_method,regret_ratio,inc_qerror,full_qerror,"
+	       "correct,base_rows,mv_rows,"
 	       "dml_statements,delta_rows,error\n";
 
 	int total = 0;
@@ -1245,15 +1405,10 @@ int main(int argc, char **argv) {
 			continue;
 		}
 		for (auto wl : q.workloads) {
-			for (double pct : delta_pcts) {
-				if (wl == Workload::EMPTY_DELTA && pct > 0.0) {
-					continue;
-				}
-				if (wl != Workload::EMPTY_DELTA && pct <= 0.0) {
-					continue;
-				}
-				total += static_cast<int>(configs.size()) * reps;
+			if (wl == Workload::EMPTY_DELTA) {
+				continue; // an empty delta is a cycle with no change, not a case of its own
 			}
+			total += static_cast<int>(configs.size()) * reps * cycles;
 		}
 	}
 	Log("Total cost-model benchmark rows planned: " + to_string(total));
@@ -1271,24 +1426,51 @@ int main(int argc, char **argv) {
 			continue;
 		}
 		for (auto wl : q.workloads) {
-			for (double pct : delta_pcts) {
-				if (wl == Workload::EMPTY_DELTA && pct > 0.0) {
-					continue;
-				}
-				if (wl != Workload::EMPTY_DELTA && pct <= 0.0) {
-					continue;
-				}
-				for (auto config : configs) {
-					for (int rep = 1; rep <= reps; rep++) {
+			if (wl == Workload::EMPTY_DELTA) {
+				continue;
+			}
+			for (auto config : configs) {
+				for (int rep = 1; rep <= reps; rep++) {
+					// One database per case, refreshed `cycles` times. The cost model learns from
+					// execution history, so it can only be measured on a database that accumulates
+					// some; a case that refreshes once leaves it permanently uncalibrated.
+					auto prepared = PrepareCase(db_path, q, wl, config, rep);
+					for (int cycle = 1; cycle <= cycles; cycle++) {
+						double pct = delta_pcts[(cycle - 1) % delta_pcts.size()];
 						row++;
 						Log("[" + to_string(row) + "/" + to_string(total) + "] " + q.id + " wl=" + WorkloadName(wl) +
-						    " pct=" + to_string(pct) + " flags=" + FlagConfigName(config) + " rep=" + to_string(rep));
-						auto auto_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::AUTO, true,
-						                           warm, /*do_validate=*/validate);
-						auto inc_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::INCREMENTAL,
-						                          false, warm, /*do_validate=*/false);
-						auto full_result = RunMode(db_path, q, wl, pct, config, scale, rep, RefreshMode::FULL, false,
-						                           warm, /*do_validate=*/false);
+						    " cycle=" + to_string(cycle) + "/" + to_string(cycles) + " pct=" + to_string(pct) +
+						    " flags=" + FlagConfigName(config) + " rep=" + to_string(rep));
+						ModeResult auto_result, inc_result, full_result;
+						string promoted;
+						if (!prepared.ok) {
+							auto_result.error = prepared.error;
+							inc_result.error = prepared.error;
+							full_result.error = prepared.error;
+						} else if (string delta_error;
+						           !ApplyCycleDelta(prepared, q, wl, pct, scale, delta_error)) {
+							auto_result.error = delta_error;
+							inc_result.error = delta_error;
+							full_result.error = delta_error;
+							prepared.ok = false;
+						} else {
+							// All three branch from the same state so the comparison is fair; only the
+							// automatic one is carried forward, so the history the model learns from is
+							// the history of the decisions it actually made.
+							auto_result = RunMode(prepared, q, wl, pct, config, rep, cycle, RefreshMode::AUTO, true,
+							                      warm, /*do_validate=*/validate, &promoted);
+							inc_result = RunMode(prepared, q, wl, pct, config, rep, cycle, RefreshMode::INCREMENTAL,
+							                     false, warm, /*do_validate=*/false, nullptr);
+							full_result = RunMode(prepared, q, wl, pct, config, rep, cycle, RefreshMode::FULL, false,
+							                      warm, /*do_validate=*/false, nullptr);
+							if (!promoted.empty()) {
+								if (auto_result.ok) {
+									CopyFile(promoted, prepared.state->path);
+								}
+								std::remove(promoted.c_str());
+								std::remove((promoted + ".wal").c_str());
+							}
+						}
 
 						// Correctness is verified on the AUTO path (the decision under test); the forced
 						// inc/full runs are reference timings only.
@@ -1331,7 +1513,8 @@ int main(int argc, char **argv) {
 							Log(msg.str());
 						}
 						out << scale << "," << q.id << "," << CsvQuote(q.description) << "," << WorkloadName(wl) << ","
-						    << pct << "," << FlagConfigName(config) << "," << rep << "," << q.refresh_mvs.back() << ","
+						    << pct << "," << FlagConfigName(config) << "," << rep << "," << cycle << ","
+						    << q.refresh_mvs.back() << ","
 						    << CsvQuote(auto_result.cost.decision) << "," << std::fixed << std::setprecision(6)
 						    << auto_result.cost.incremental_cost << "," << auto_result.cost.recompute_cost << ","
 						    << auto_result.cost.incremental_predicted_ms << ","
@@ -1339,7 +1522,10 @@ int main(int argc, char **argv) {
 						    << (auto_result.cost.calibrated ? "true" : "false") << "," << CsvQuote(auto_result.method)
 						    << "," << std::setprecision(3) << auto_result.refresh_ms << "," << inc_result.refresh_ms
 						    << "," << full_result.refresh_ms << "," << CsvQuote(best) << "," << std::setprecision(6)
-						    << regret << "," << (correct ? "true" : "false") << "," << auto_result.base_rows << ","
+						    << regret << ","
+						    << QError(auto_result.cost.incremental_predicted_ms, inc_result.refresh_ms) << ","
+						    << QError(auto_result.cost.recompute_predicted_ms, full_result.refresh_ms) << ","
+						    << (correct ? "true" : "false") << "," << auto_result.base_rows << ","
 						    << auto_result.mv_rows << "," << auto_result.dml_statements << ","
 						    << auto_result.delta_rows << "," << CsvQuote(error) << "\n";
 						out.flush();

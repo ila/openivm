@@ -97,7 +97,360 @@ WHERE stmt_kind = 'data';
 
 # ASOF GROUP_RECOMPUTE block moved to cascade_group_recompute_delta_asof.test.
 
+# Direct source keys: latest rows per ID, including ties and duplicate bags.
+statement ok
+CREATE TABLE cgr_history (id INTEGER, ts INTEGER, payload INTEGER);
+
+statement ok
+INSERT INTO cgr_history VALUES (1,10,100),(1,20,200),(1,20,200),(2,5,50),(3,8,80),(NULL,7,70),(4,NULL,40);
+
+statement ok
+CREATE VIEW cgr_latest_query AS
+WITH rows AS (SELECT * FROM cgr_history),
+latest AS (SELECT id, MAX(ts) AS ts FROM rows GROUP BY id)
+SELECT r.* FROM rows r JOIN latest m ON r.id IS NOT DISTINCT FROM m.id AND r.ts=m.ts;
+
+statement ok
+CREATE MATERIALIZED VIEW cgr_latest AS SELECT * FROM cgr_latest_query;
+
+query T
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name='cgr_latest';
+----
+direct_source_keys
+
+query I
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_source_keys%'
+ AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%AS openivm_src WHERE EXISTS%'
+ AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%openivm_current_cgr_latest%'
+THEN 1 ELSE 0 END FROM openivm_compile_with_facts('cgr_latest',
+'{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}');
+----
+1
+
+# Out-of-order insert and conflicting updates, including a moved key.
+
+statement ok
+INSERT INTO cgr_history VALUES (1,15,150),(2,10,100),(2,10,100),(5,1,10);
+
+statement ok
+UPDATE cgr_history SET id=6 WHERE id=3;
+
+statement ok
+UPDATE cgr_history SET payload=101 WHERE id=2 AND ts=10;
+
+statement ok
+DELETE FROM cgr_history WHERE id=5;
+
+statement ok
+PRAGMA refresh('cgr_latest');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest EXCEPT ALL SELECT * FROM cgr_latest_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest_query EXCEPT ALL SELECT * FROM cgr_latest));
+----
+0	0
+
+# Delete duplicated maxima: the previously hidden row becomes the winner.
+
+statement ok
+DELETE FROM cgr_history WHERE id=1 AND ts=20;
+
+statement ok
+INSERT INTO cgr_history VALUES (1,15,150),(NULL,9,90);
+
+statement ok
+UPDATE cgr_history SET ts=3 WHERE id=2 AND ts=10;
+
+statement ok
+PRAGMA refresh('cgr_latest');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest EXCEPT ALL SELECT * FROM cgr_latest_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest_query EXCEPT ALL SELECT * FROM cgr_latest));
+----
+0	0
+
+# Delete entire groups, cancel transient rows, and move a winning NULL key.
+
+statement ok
+DELETE FROM cgr_history WHERE id=6;
+
+statement ok
+INSERT INTO cgr_history VALUES (7,1,1),(7,2,2);
+
+statement ok
+UPDATE cgr_history SET ts=3 WHERE id=7;
+
+statement ok
+DELETE FROM cgr_history WHERE id=7;
+
+statement ok
+UPDATE cgr_history SET id=8 WHERE id IS NULL;
+
+statement ok
+PRAGMA refresh('cgr_latest');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest EXCEPT ALL SELECT * FROM cgr_latest_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest_query EXCEPT ALL SELECT * FROM cgr_latest));
+----
+0	0
+
+# No pending changes.
+
+statement ok
+PRAGMA refresh('cgr_latest');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest EXCEPT ALL SELECT * FROM cgr_latest_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest_query EXCEPT ALL SELECT * FROM cgr_latest));
+----
+0	0
+
 # ==========================================
+# Reject cross-key/global dependencies and computed or renamed keys.
+statement ok
+CREATE TABLE cgr_other AS SELECT * FROM cgr_history;
+
+statement ok
+CREATE VIEW cgr_cross_key_query AS SELECT r.id,r.ts,r.payload FROM cgr_history r JOIN (SELECT id,MAX(ts) ts FROM cgr_history GROUP BY id) m ON r.payload=m.id AND r.ts=m.ts;
+
+statement ok
+CREATE MATERIALIZED VIEW cgr_cross_key AS SELECT * FROM cgr_cross_key_query;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_name='cgr_cross_key' AND group_recompute_affected_mode='direct_source_keys';
+----
+0
+
+statement ok
+CREATE VIEW cgr_global_query AS SELECT r.* FROM cgr_history r JOIN (SELECT MAX(ts) ts FROM cgr_history) m ON r.ts=m.ts;
+
+statement ok
+CREATE MATERIALIZED VIEW cgr_global AS SELECT * FROM cgr_global_query;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_name='cgr_global' AND group_recompute_affected_mode='direct_source_keys';
+----
+0
+
+statement ok
+CREATE VIEW cgr_different_source_query AS SELECT r.* FROM cgr_history r JOIN (SELECT id,MAX(ts) ts FROM cgr_other GROUP BY id) m ON r.id=m.id AND r.ts=m.ts;
+
+statement ok
+CREATE MATERIALIZED VIEW cgr_different_source AS SELECT * FROM cgr_different_source_query;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_name='cgr_different_source' AND group_recompute_affected_mode='direct_source_keys';
+----
+0
+
+statement ok
+CREATE VIEW cgr_renamed_query AS SELECT id AS renamed,ts,payload FROM cgr_latest_query;
+
+statement ok
+CREATE MATERIALIZED VIEW cgr_renamed AS SELECT * FROM cgr_renamed_query;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_name='cgr_renamed' AND group_recompute_affected_mode='direct_source_keys';
+----
+0
+
+statement ok
+CREATE VIEW cgr_computed_query AS WITH rows AS (SELECT id+1 AS id,ts,payload FROM cgr_history) SELECT r.* FROM rows r JOIN (SELECT id,MAX(ts) ts FROM rows GROUP BY id) m ON r.id=m.id AND r.ts=m.ts;
+
+statement ok
+CREATE MATERIALIZED VIEW cgr_computed AS SELECT * FROM cgr_computed_query;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_name='cgr_computed' AND group_recompute_affected_mode='direct_source_keys';
+----
+0
+
+statement ok
+INSERT INTO cgr_history VALUES (20,1000,8),(8,1000,20),(2,500,1);
+
+statement ok
+DELETE FROM cgr_history WHERE id=1;
+
+statement ok
+UPDATE cgr_history SET payload=2 WHERE id=20;
+
+statement ok
+PRAGMA refresh('cgr_cross_key');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_cross_key EXCEPT ALL SELECT * FROM cgr_cross_key_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_cross_key_query EXCEPT ALL SELECT * FROM cgr_cross_key));
+----
+0	0
+
+statement ok
+PRAGMA refresh('cgr_global');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_global EXCEPT ALL SELECT * FROM cgr_global_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_global_query EXCEPT ALL SELECT * FROM cgr_global));
+----
+0	0
+
+statement ok
+PRAGMA refresh('cgr_different_source');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_different_source EXCEPT ALL SELECT * FROM cgr_different_source_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_different_source_query EXCEPT ALL SELECT * FROM cgr_different_source));
+----
+0	0
+
+statement ok
+PRAGMA refresh('cgr_renamed');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_renamed EXCEPT ALL SELECT * FROM cgr_renamed_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_renamed_query EXCEPT ALL SELECT * FROM cgr_renamed));
+----
+0	0
+
+statement ok
+PRAGMA refresh('cgr_computed');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_computed EXCEPT ALL SELECT * FROM cgr_computed_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_computed_query EXCEPT ALL SELECT * FROM cgr_computed));
+----
+0	0
+
+# Actual augmented TPC-DI brokerage_trade shape and schema-qualified source.
+statement ok
+CREATE SCHEMA tpcdi;
+
+statement ok
+CREATE TABLE tpcdi.staging_trade (
+ cdc_flag VARCHAR,cdc_dsn BIGINT,t_id BIGINT,t_dts TIMESTAMP,t_st_id VARCHAR,t_tt_id VARCHAR,
+ t_is_cash TINYINT,t_s_symb VARCHAR,t_qty INT,t_bid_price DOUBLE,t_ca_id BIGINT,
+ t_exec_name VARCHAR,t_trade_price DOUBLE,t_chrg DOUBLE,t_comm DOUBLE,t_tax DOUBLE);
+
+statement ok
+INSERT INTO tpcdi.staging_trade (t_id,t_dts,t_st_id) VALUES
+ (1,'2020-01-01','a'),(1,'2020-01-02','b'),(2,'2020-01-03','c');
+
+statement ok
+CREATE VIEW cgr_trade_query AS
+-- Bronze: read trade from staging table (all loaded batches). The augmented
+-- feed contains one row per status transition, so expose only the latest
+-- state per trade while brokerage_trade_history retains every transition.
+with trade_rows as (
+select
+    t_id,
+    t_dts,
+    t_st_id,
+    t_tt_id,
+    t_is_cash,
+    t_s_symb,
+    t_qty,
+    t_bid_price,
+    t_ca_id,
+    t_exec_name,
+    t_trade_price,
+    t_chrg,
+    t_comm,
+    t_tax
+from tpcdi.staging_trade
+)
+, latest_events as (
+    select t_id, max(t_dts) as latest_dts
+    from trade_rows
+    group by t_id
+)
+select t.*
+from trade_rows t
+join latest_events l
+    on t.t_id = l.t_id and t.t_dts = l.latest_dts;
+
+statement ok
+CREATE MATERIALIZED VIEW cgr_trade AS SELECT * FROM cgr_trade_query;
+
+query TT
+SELECT group_columns,group_recompute_affected_mode FROM openivm_views WHERE view_name='cgr_trade';
+----
+t_id	direct_source_keys
+
+statement ok
+INSERT INTO tpcdi.staging_trade (t_id,t_dts,t_st_id) VALUES
+ (1,'2019-01-01','late'),(1,'2020-01-01','a');
+
+statement ok
+UPDATE tpcdi.staging_trade SET t_id=3 WHERE t_id=2;
+
+statement ok
+DELETE FROM tpcdi.staging_trade WHERE t_st_id='b';
+
+statement ok
+PRAGMA refresh('cgr_trade');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_trade EXCEPT ALL SELECT * FROM cgr_trade_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_trade_query EXCEPT ALL SELECT * FROM cgr_trade));
+----
+0	0
+
+# Stress one refresh with many conflicting changes, then verify the dependent MV.
+statement ok
+PRAGMA refresh('cgr_latest');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest EXCEPT ALL SELECT * FROM cgr_latest_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest_query EXCEPT ALL SELECT * FROM cgr_latest));
+----
+0	0
+
+statement ok
+CREATE MATERIALIZED VIEW cgr_summary AS SELECT id,COUNT(*) n,SUM(payload) s FROM cgr_latest GROUP BY id;
+
+statement ok
+INSERT INTO cgr_history SELECT i%50,i,i%100 FROM range(10000) t(i);
+
+statement ok
+UPDATE cgr_history SET id=id+1,ts=ts-10000 WHERE payload%3=0;
+
+statement ok
+DELETE FROM cgr_history WHERE payload%5=0;
+
+statement ok
+INSERT INTO cgr_history SELECT i%50,100000,i FROM range(50) t(i);
+
+statement ok
+DELETE FROM cgr_history WHERE ts=100000;
+
+statement ok
+PRAGMA refresh('cgr_latest');
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest EXCEPT ALL SELECT * FROM cgr_latest_query)),
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_latest_query EXCEPT ALL SELECT * FROM cgr_latest));
+----
+0	0
+
+query II
+SELECT
+ (SELECT COUNT(*) FROM (SELECT * FROM cgr_summary EXCEPT ALL SELECT id,COUNT(*),SUM(payload) FROM cgr_latest_query GROUP BY id)),
+ (SELECT COUNT(*) FROM (SELECT id,COUNT(*),SUM(payload) FROM cgr_latest_query GROUP BY id EXCEPT ALL SELECT * FROM cgr_summary));
+----
+0	0
+
 # Runtime correctness: PRAGMA refresh uses default CompileFacts (no cascade),
 # but still applies the GROUP_RECOMPUTE program to openivm_data_cgr_mv so the
 # user-visible MV stays bidirectionally consistent with the base query.

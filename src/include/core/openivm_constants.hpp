@@ -106,7 +106,12 @@ enum class RefreshType : uint8_t {
 	COUNT_DISTINCT_INCREMENTAL = 11 // COUNT(DISTINCT x) with per-(group,x) multiplicity aux state
 };
 
-enum class GroupRecomputeAffectedMode : uint8_t { SOURCE_DELTA, SOURCE_DELTA_RELAX_AGGREGATE_FILTER, CURRENT_DIFF };
+enum class GroupRecomputeAffectedMode : uint8_t {
+	SOURCE_DELTA,
+	SOURCE_DELTA_RELAX_AGGREGATE_FILTER,
+	CURRENT_DIFF,
+	DIRECT_SOURCE_KEYS
+};
 
 inline const char *RefreshTypeName(RefreshType type) {
 	switch (type) {
@@ -145,6 +150,8 @@ inline const char *GroupRecomputeAffectedModeName(GroupRecomputeAffectedMode mod
 		return "source_delta_relax_aggregate_filter";
 	case GroupRecomputeAffectedMode::CURRENT_DIFF:
 		return "current_diff";
+	case GroupRecomputeAffectedMode::DIRECT_SOURCE_KEYS:
+		return "direct_source_keys";
 	default:
 		return "current_diff";
 	}

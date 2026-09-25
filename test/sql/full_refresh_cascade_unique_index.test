@@ -1,0 +1,101 @@
+# name: test/sql/full_refresh_cascade_unique_index.test
+# description: Full refresh of an aggregate view with a downstream view, on a reopened persistent DB
+# group: [sql]
+
+#              parser.cpp gives AGGREGATE_GROUP data tables a UNIQUE index on the group keys. A full
+#              refresh that also has to emit a cascade delta compiled to `DELETE FROM t; INSERT INTO
+#              t ...`, and DuckDB's on-disk unique index still reports keys deleted earlier in the
+#              same transaction, so re-inserting a surviving group raised a spurious "Duplicate key
+#              ... violates unique constraint". The non-cascade recompute path already upserted
+#              instead; this one did not.
+#
+#              Must use `load` + `restart`: on an in-memory database the index is built in-session
+#              and the bug does not fire, which is why the rest of the suite never caught it. The
+#              downstream view is required too, since without it the refresh takes the non-cascade
+#              path that was already correct.
+
+load __TEST_DIR__/openivm_full_refresh_cascade_unique.db
+
+require openivm
+
+statement ok
+CREATE TABLE cust (w INT, d INT, bal INT);
+
+statement ok
+INSERT INTO cust SELECT i % 5, i % 10, i FROM range(1, 501) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW agg AS SELECT w, d, SUM(bal) AS s FROM cust GROUP BY w, d;
+
+statement ok
+CREATE MATERIALIZED VIEW agg_down AS SELECT w, SUM(s) AS s_tot FROM agg GROUP BY w;
+
+statement ok
+INSERT INTO cust SELECT i % 5, i % 10, i FROM range(501, 551) t(i);
+
+# Reopen so each data table's unique index is loaded from disk rather than built in this session.
+restart
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+statement ok
+PRAGMA refresh('agg');
+
+statement ok
+PRAGMA refresh('agg_down');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM agg)
+  EXCEPT ALL
+  (SELECT w, d, SUM(bal) AS s FROM cust GROUP BY w, d)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT w, d, SUM(bal) AS s FROM cust GROUP BY w, d)
+  EXCEPT ALL
+  (SELECT * FROM agg)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM agg_down)
+  EXCEPT ALL
+  (SELECT w, SUM(bal) AS s_tot FROM cust GROUP BY w)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT w, SUM(bal) AS s_tot FROM cust GROUP BY w)
+  EXCEPT ALL
+  (SELECT * FROM agg_down)) x;
+----
+0
+
+# The same view refreshed incrementally after another delta, still on the reopened database.
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+statement ok
+INSERT INTO cust SELECT i % 5, i % 10, i FROM range(551, 601) t(i);
+
+statement ok
+PRAGMA refresh('agg');
+
+statement ok
+PRAGMA refresh('agg_down');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM agg)
+  EXCEPT ALL
+  (SELECT w, d, SUM(bal) AS s FROM cust GROUP BY w, d)) x;
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT w, d, SUM(bal) AS s FROM cust GROUP BY w, d)
+  EXCEPT ALL
+  (SELECT * FROM agg)) x;
+----
+0

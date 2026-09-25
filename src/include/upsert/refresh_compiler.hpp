@@ -14,6 +14,7 @@ namespace duckdb {
 
 struct GroupRecomputeDeltaSpec {
 	string base_table;
+	string delta_table_sql;
 	string last_update;
 	idx_t source_occurrences = 1;
 	bool is_ducklake = false;
@@ -56,7 +57,12 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {},
                               bool emit_cascade_delta = false, const string &affected_keys_sql = "",
                               const vector<string> &column_names = {}, bool running_window_incremental = false);
-string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "");
+// `unique_keys` are the columns carrying the data table's UNIQUE index, which parser.cpp creates for
+// AGGREGATE_GROUP and AGGREGATE_HAVING views. Supplying them selects an upsert form that never
+// deletes and re-inserts the same key inside one transaction; leaving them empty keeps the plain
+// DELETE + INSERT. See SqlUtils::BuildFullRecomputeSQL for why the distinction matters.
+string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "",
+                            const vector<string> &unique_keys = {});
 
 /// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE`
 /// (inner-DISTINCT under aggregate). For each base table T_i with a non-empty

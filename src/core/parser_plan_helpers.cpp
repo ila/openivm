@@ -961,6 +961,142 @@ static bool GetLogicalGetColumnType(LogicalGet &get, idx_t column_index, Logical
 	return false;
 }
 
+static bool HasKeyBinding(const vector<ColumnBinding> &keys, const ColumnBinding &binding) {
+	return std::find(keys.begin(), keys.end(), binding) != keys.end();
+}
+
+static bool IsKeyReference(const Expression &expr, const vector<ColumnBinding> &keys) {
+	// Casts and computed expressions need a separate equivalence proof.
+	return expr.type == ExpressionType::BOUND_COLUMN_REF &&
+	       HasKeyBinding(keys, expr.Cast<BoundColumnRefExpression>().binding);
+}
+
+static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const CreateMVPlanFacts &facts,
+                                                     const string &key, TableCatalogEntry *&source, idx_t depth = 0) {
+	if (depth > 64) {
+		return {};
+	}
+	auto bindings = op.GetColumnBindings();
+	vector<ColumnBinding> result;
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		auto *table = get.GetTable().get();
+		if (!table || !get.children.empty() || (source && source != table)) {
+			return {};
+		}
+		source = table;
+		for (idx_t i = 0; i < bindings.size(); i++) {
+			string column;
+			if (GetLogicalGetColumnName(get, bindings[i].column_index, column) && StringUtil::CIEquals(column, key)) {
+				result.push_back(bindings[i]);
+			}
+		}
+		return result;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
+		auto &ref = op.Cast<LogicalCTERef>();
+		auto def = facts.cte_defs_by_index.find(ref.cte_index);
+		if (def == facts.cte_defs_by_index.end()) {
+			return {};
+		}
+		auto keys = DirectSourceKeyBindings(*def->second, facts, key, source, depth + 1);
+		auto outputs = def->second->GetColumnBindings();
+		for (idx_t i = 0; i < bindings.size() && i < outputs.size(); i++) {
+			if (HasKeyBinding(keys, outputs[i])) {
+				result.push_back(bindings[i]);
+			}
+		}
+		return result;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && op.children.size() == 2) {
+		return DirectSourceKeyBindings(*op.children[1], facts, key, source, depth + 1);
+	}
+	if (op.children.empty()) {
+		return {};
+	}
+	auto left = DirectSourceKeyBindings(*op.children[0], facts, key, source, depth + 1);
+	if (left.empty()) {
+		return {};
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN && op.children.size() == 2) {
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		if (join.join_type != JoinType::INNER) {
+			return {};
+		}
+		auto right = DirectSourceKeyBindings(*op.children[1], facts, key, source, depth + 1);
+		bool same_key = false;
+		for (auto &condition : join.conditions) {
+			if ((condition.comparison == ExpressionType::COMPARE_EQUAL ||
+			     condition.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
+			    IsKeyReference(*condition.left, left) && IsKeyReference(*condition.right, right)) {
+				same_key = true;
+			}
+		}
+		if (!same_key) {
+			return {};
+		}
+		for (auto &binding : bindings) {
+			if (HasKeyBinding(left, binding) || HasKeyBinding(right, binding)) {
+				result.push_back(binding);
+			}
+		}
+		return result;
+	}
+	if (op.children.size() != 1) {
+		return {};
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+		return left;
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &projection = op.Cast<LogicalProjection>();
+		for (idx_t i = 0; i < projection.expressions.size(); i++) {
+			if (IsKeyReference(*projection.expressions[i], left)) {
+				result.emplace_back(projection.table_index, i);
+			}
+		}
+	} else if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		auto &aggregate = op.Cast<LogicalAggregate>();
+		if (aggregate.grouping_sets.size() > 1) {
+			return {};
+		}
+		for (idx_t i = 0; i < aggregate.groups.size(); i++) {
+			if (IsKeyReference(*aggregate.groups[i], left) &&
+			    (aggregate.grouping_sets.empty() || aggregate.grouping_sets[0].count(i))) {
+				result.emplace_back(aggregate.group_index, i);
+			}
+		}
+	}
+	return result;
+}
+
+string DeriveDirectSourceGroupKey(const CreateMVPlanFacts &facts, const vector<string> &output_names) {
+	if (!facts.root) {
+		return "";
+	}
+	auto *root = facts.root;
+	if (root->type == LogicalOperatorType::LOGICAL_CREATE_TABLE && root->children.size() == 1) {
+		root = root->children[0].get();
+	}
+	// Inductive invariant: output partition k reads only source partition k.
+	// Selection/projection preserve it; aggregation must group by k; joins must
+	// equate k on both arms. Global aggregates, windows and cross-key joins fail.
+	// Requiring the original source name at the output avoids new lineage
+	// metadata.
+	auto outputs = root->GetColumnBindings();
+	for (idx_t i = 0; i < outputs.size() && i < output_names.size(); i++) {
+		if (IncrementalTableNames::IsInternalColumn(output_names[i])) {
+			continue;
+		}
+		TableCatalogEntry *source = nullptr;
+		auto keys = DirectSourceKeyBindings(*root, facts, output_names[i], source);
+		if (HasKeyBinding(keys, outputs[i])) {
+			return output_names[i];
+		}
+	}
+	return "";
+}
+
 static bool ResolveBindingToGetColumn(ColumnBinding binding, const CreateMVPlanFacts &facts, LogicalGet *&get,
                                       string &column) {
 	idx_t table_index = binding.table_index;

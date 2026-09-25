@@ -1236,6 +1236,8 @@ vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(RefreshMetadata &m
 			spec.ducklake_schema = loc.schema_name;
 			spec.last_snapshot_id = metadata.GetLastSnapshotId(view_name, dt);
 			spec.current_snapshot_id = metadata.GetCurrentDuckLakeSnapshot(loc.catalog_name);
+		} else {
+			spec.delta_table_sql = metadata.ResolveDeltaQualifiedName(view_name, dt);
 		}
 		delta_specs.push_back(std::move(spec));
 	}
