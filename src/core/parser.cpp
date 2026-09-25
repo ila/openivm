@@ -151,23 +151,6 @@ static bool IsSameBaseColumnExpr(string expr, const string &left_alias, const st
 	return false;
 }
 
-static bool IsIdentifierTokenChar(char c) {
-	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-}
-
-static bool MatchesPatternCI(const string &text, idx_t pos, const string &pattern) {
-	if (pos + pattern.size() > text.size()) {
-		return false;
-	}
-	for (idx_t i = 0; i < pattern.size(); i++) {
-		if (std::tolower(static_cast<unsigned char>(text[pos + i])) !=
-		    std::tolower(static_cast<unsigned char>(pattern[i]))) {
-			return false;
-		}
-	}
-	return true;
-}
-
 static bool RelationExists(ClientContext &context, const string &catalog_name, const string &schema_name,
                            const string &relation_name) {
 	QueryErrorContext error_context;
@@ -180,52 +163,6 @@ static bool RelationExists(ClientContext &context, const string &catalog_name, c
 		}
 	}
 	return false;
-}
-
-static bool HasIdentifierBoundary(const string &text, idx_t pos, idx_t len) {
-	bool left_ok = pos == 0 || !IsIdentifierTokenChar(text[pos - 1]);
-	idx_t end = pos + len;
-	bool right_ok = end >= text.size() || !IsIdentifierTokenChar(text[end]);
-	return left_ok && right_ok;
-}
-
-static string ReplaceQualifiedColumnReference(string expr, const string &pattern, const string &replacement) {
-	if (expr.empty() || pattern.empty()) {
-		return expr;
-	}
-	string result;
-	for (idx_t pos = 0; pos < expr.size();) {
-		if (expr[pos] == '\'') {
-			idx_t start = pos++;
-			while (pos < expr.size()) {
-				if (expr[pos] == '\'' && pos + 1 < expr.size() && expr[pos + 1] == '\'') {
-					pos += 2;
-					continue;
-				}
-				if (expr[pos++] == '\'') {
-					break;
-				}
-			}
-			result += expr.substr(start, pos - start);
-			continue;
-		}
-		if (MatchesPatternCI(expr, pos, pattern) && HasIdentifierBoundary(expr, pos, pattern.size())) {
-			result += replacement;
-			pos += pattern.size();
-			continue;
-		}
-		result += expr[pos++];
-	}
-	return result;
-}
-
-static string RewriteQualifiedLeftColumnRef(string expr, const string &left_alias, const string &source_col,
-                                            const string &target_col) {
-	string target = left_alias + "." + SqlUtils::QuoteIdentifier(target_col);
-	expr = ReplaceQualifiedColumnReference(expr, left_alias + "." + KeywordHelper::WriteOptionallyQuoted(source_col),
-	                                       target);
-	expr = ReplaceQualifiedColumnReference(expr, left_alias + "." + SqlUtils::QuoteIdentifier(source_col), target);
-	return expr;
 }
 
 ParserExtensionPlanResult
@@ -462,7 +399,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 		having_predicate = StripHavingFilter(select_plan, output_names);
-		StripPublicationModifiers(select_plan, output_names, current_catalog, top_k_suffix, top_k_order_suffix);
+		StripPublicationModifiers(select_plan, output_names, top_k_suffix, top_k_order_suffix);
 		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
@@ -539,7 +476,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		auto &analysis_query = plan->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ? plan->children[0] : plan;
 		auto analysis_names = output_names;
 		string analysis_suffix, analysis_order;
-		StripPublicationModifiers(analysis_query, analysis_names, current_catalog, analysis_suffix, analysis_order);
+		StripPublicationModifiers(analysis_query, analysis_names, analysis_suffix, analysis_order);
 	}
 	auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
 	if (!facts.source_table_info.empty()) {
@@ -730,12 +667,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				                            semi_anti_extract.null_aware_left_expr);
 			}
 			for (auto &rewrite : semi_anti_left_col_rewrites) {
-				semi_anti_extract.predicate = RewriteQualifiedLeftColumnRef(
-				    semi_anti_extract.predicate, semi_anti_extract.left_alias, rewrite.first, rewrite.second);
-				semi_anti_extract.post_filter = RewriteQualifiedLeftColumnRef(
-				    semi_anti_extract.post_filter, semi_anti_extract.left_alias, rewrite.first, rewrite.second);
-				semi_anti_extract.right_filter = RewriteQualifiedLeftColumnRef(
-				    semi_anti_extract.right_filter, semi_anti_extract.left_alias, rewrite.first, rewrite.second);
+				for (auto *expression :
+				     {&semi_anti_extract.predicate, &semi_anti_extract.post_filter, &semi_anti_extract.right_filter}) {
+					SqlUtils::RewriteColumnReferences(*expression, rewrite.first, rewrite.second,
+					                                  {StringUtil::Lower(semi_anti_extract.left_alias)}, false);
+				}
 			}
 		}
 	}
@@ -1487,7 +1423,21 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 		published_query +=
 		    top_k_order_suffix.empty() ? ", CAST(0 AS BIGINT)" : ", ROW_NUMBER() OVER (" + top_k_order_suffix + ")";
-		published_query += " AS " + string(openivm::PUBLISHED_ORDINAL_COL) + " FROM " + qdt + view_tail;
+		// Rank the selected rows, not every raw group before TOP_N. The ordinal
+		// describes order within the published relation, including after OFFSET.
+		// Without a bound, retain the direct form: an extra nested ORDER BY
+		// would sort the entire relation again without reducing window input.
+		bool rank_selected_rows = !stored_query_retains_top_k && !top_k_order_suffix.empty() &&
+		                          StringUtil::StartsWith(top_k_suffix.substr(top_k_order_suffix.size()), " LIMIT ");
+		string published_source = qdt + view_tail;
+		if (rank_selected_rows) {
+			published_source = "(SELECT * FROM " + published_source + ") openivm_selected";
+		}
+		published_query += " AS " + string(openivm::PUBLISHED_ORDINAL_COL) + " FROM " + published_source;
+		if (rank_selected_rows) {
+			// Also marks ordered publication as global for affected-key scoping.
+			published_query += " ORDER BY " + string(openivm::PUBLISHED_ORDINAL_COL);
+		}
 		auto published = internal_catalog_prefix + SqlUtils::QuoteIdentifier(PublishedViewName(view_name));
 		auto published_delta =
 		    internal_catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(PublishedViewName(view_name)));

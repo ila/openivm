@@ -1,3 +1,4 @@
+#include "core/metadata_json.hpp"
 #include "core/refresh_metadata.hpp"
 
 #include "core/openivm_debug.hpp"
@@ -865,131 +866,6 @@ vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetRefreshHistory(
 
 namespace {
 
-// Tiny JSON parser sufficient for `distinct_aux_meta_json` — we own the writer in
-// parser.cpp, so the input always matches `{"k":"v","k2":[...]}` shape with
-// just our minimal escaping (`\"` and `\\`). Not a general parser; do not reuse.
-static bool ExtractJsonString(const string &json, const string &key, string &val) {
-	string needle = "\"" + key + "\":\"";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return false;
-	}
-	pos += needle.size();
-	val.clear();
-	while (pos < json.size()) {
-		char c = json[pos];
-		if (c == '\\' && pos + 1 < json.size()) {
-			char esc = json[pos + 1];
-			if (esc == 'n') {
-				val += '\n';
-			} else {
-				val += esc;
-			}
-			pos += 2;
-			continue;
-		}
-		if (c == '"') {
-			return true;
-		}
-		val += c;
-		pos++;
-	}
-	return false;
-}
-
-static bool ExtractJsonStringArray(const string &json, const string &key, vector<string> &val) {
-	string needle = "\"" + key + "\":[";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return false;
-	}
-	pos += needle.size();
-	val.clear();
-	while (pos < json.size() && json[pos] != ']') {
-		while (pos < json.size() && json[pos] != '"' && json[pos] != ']') {
-			pos++;
-		}
-		if (pos >= json.size() || json[pos] == ']') {
-			break;
-		}
-		pos++; // opening quote
-		string elem;
-		while (pos < json.size() && json[pos] != '"') {
-			if (json[pos] == '\\' && pos + 1 < json.size()) {
-				elem += json[pos + 1];
-				pos += 2;
-				continue;
-			}
-			elem += json[pos];
-			pos++;
-		}
-		if (pos < json.size()) {
-			pos++; // closing quote
-		}
-		val.push_back(std::move(elem));
-	}
-	return true;
-}
-
-static vector<string> ExtractJsonObjectsFromArray(const string &json, const string &key,
-                                                  optional_ptr<bool> parsed_complete = nullptr) {
-	vector<string> objects;
-	if (parsed_complete) {
-		*parsed_complete = false;
-	}
-	string needle = "\"" + key + "\":[";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return objects;
-	}
-	pos += needle.size();
-	int depth = 0;
-	bool in_string = false;
-	bool escaped = false;
-	size_t object_start = string::npos;
-	for (; pos < json.size(); pos++) {
-		char c = json[pos];
-		if (in_string) {
-			if (escaped) {
-				escaped = false;
-			} else if (c == '\\') {
-				escaped = true;
-			} else if (c == '"') {
-				in_string = false;
-			}
-			continue;
-		}
-		if (c == '"') {
-			in_string = true;
-			continue;
-		}
-		if (c == '{') {
-			if (depth == 0) {
-				object_start = pos;
-			}
-			depth++;
-			continue;
-		}
-		if (c == '}') {
-			if (depth > 0) {
-				depth--;
-				if (depth == 0 && object_start != string::npos) {
-					objects.push_back(json.substr(object_start, pos - object_start + 1));
-					object_start = string::npos;
-				}
-			}
-			continue;
-		}
-		if (c == ']' && depth == 0) {
-			if (parsed_complete) {
-				*parsed_complete = true;
-			}
-			break;
-		}
-	}
-	return objects;
-}
-
 static vector<string> SplitPipeFields(const string &value) {
 	vector<string> fields;
 	string current;
@@ -1007,7 +883,7 @@ static vector<string> SplitPipeFields(const string &value) {
 
 static bool ParseJsonIndex(const string &json, const string &key, idx_t &out) {
 	string text;
-	if (!ExtractJsonString(json, key, text)) {
+	if (!MetadataJson::ExtractJsonString(json, key, text)) {
 		return false;
 	}
 	try {
@@ -1028,10 +904,10 @@ static bool ReadRefreshLineageEntry(Connection &con, const string &view_name, co
 	if (json.empty()) {
 		return false;
 	}
-	auto objects = ExtractJsonObjectsFromArray(json, "items");
+	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "items");
 	for (auto &object : objects) {
 		string object_kind;
-		if (ExtractJsonString(object, "k", object_kind) && object_kind == kind) {
+		if (MetadataJson::ExtractJsonString(object, "k", object_kind) && object_kind == kind) {
 			entry = std::move(object);
 			return true;
 		}
@@ -1053,10 +929,10 @@ RefreshMetadata::GetGroupRecomputeSourceOccurrences(const string &view_name) {
 	if (json.empty()) {
 		return occurrences;
 	}
-	auto objects = ExtractJsonObjectsFromArray(json, "sources");
+	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "sources");
 	for (auto &object : objects) {
 		GroupRecomputeSourceOccurrence occurrence;
-		if (!ExtractJsonString(object, "table", occurrence.table_name) ||
+		if (!MetadataJson::ExtractJsonString(object, "table", occurrence.table_name) ||
 		    !ParseJsonIndex(object, "count", occurrence.count) || occurrence.table_name.empty()) {
 			continue;
 		}
@@ -1078,7 +954,7 @@ DerivedAggregateOutputInfo RefreshMetadata::GetDerivedAggregateOutputs(const str
 	const bool has_complete_prefix = json.rfind(complete_prefix, 0) == 0;
 	const bool has_incomplete_prefix = json.rfind(incomplete_prefix, 0) == 0;
 	bool parsed_outputs_complete = false;
-	auto objects = ExtractJsonObjectsFromArray(json, "outputs", parsed_outputs_complete);
+	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "outputs", parsed_outputs_complete);
 	info.complete = has_complete_prefix && parsed_outputs_complete && json.size() >= 2 &&
 	                json.compare(json.size() - 2, 2, "]}") == 0;
 	if (!has_complete_prefix && !has_incomplete_prefix) {
@@ -1086,9 +962,9 @@ DerivedAggregateOutputInfo RefreshMetadata::GetDerivedAggregateOutputs(const str
 	}
 	for (auto &object : objects) {
 		DerivedAggregateOutput output;
-		if (ExtractJsonString(object, "column", output.output_column) &&
-		    ExtractJsonString(object, "expression", output.expression_sql) && !output.output_column.empty() &&
-		    !output.expression_sql.empty()) {
+		if (MetadataJson::ExtractJsonString(object, "column", output.output_column) &&
+		    MetadataJson::ExtractJsonString(object, "expression", output.expression_sql) &&
+		    !output.output_column.empty() && !output.expression_sql.empty()) {
 			info.outputs.push_back(std::move(output));
 		} else {
 			info.complete = false;
@@ -1135,15 +1011,15 @@ bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMet
 		return false;
 	}
 	bool ok = true;
-	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= ExtractJsonStringArray(json, "cols", out.cols);
-	ExtractJsonStringArray(json, "source_exprs", out.source_exprs);
-	ok &= ExtractJsonString(json, "input_sql", out.input_sql);
-	ok &= ExtractJsonString(json, "source", out.source);
+	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= MetadataJson::ExtractJsonStringArray(json, "cols", out.cols);
+	MetadataJson::ExtractJsonStringArray(json, "source_exprs", out.source_exprs);
+	ok &= MetadataJson::ExtractJsonString(json, "input_sql", out.input_sql);
+	ok &= MetadataJson::ExtractJsonString(json, "source", out.source);
 	// filter is optional — empty when the user didn't write a WHERE clause.
-	ExtractJsonString(json, "filter", out.filter);
-	ok &= ExtractJsonString(json, "sum_arg", out.sum_arg);
-	ok &= ExtractJsonString(json, "sum_out", out.sum_out);
+	MetadataJson::ExtractJsonString(json, "filter", out.filter);
+	ok &= MetadataJson::ExtractJsonString(json, "sum_arg", out.sum_arg);
+	ok &= MetadataJson::ExtractJsonString(json, "sum_out", out.sum_out);
 	return ok;
 }
 
@@ -1166,14 +1042,14 @@ bool RefreshMetadata::GetCountDistinctAuxMeta(const string &view_name, CountDist
 		return false;
 	}
 	bool ok = true;
-	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= ExtractJsonString(json, "source", out.source);
-	ok &= ExtractJsonStringArray(json, "group_cols", out.group_cols);
-	ExtractJsonStringArray(json, "group_source_exprs", out.group_source_exprs);
-	ok &= ExtractJsonString(json, "distinct_col", out.distinct_col);
-	ok &= ExtractJsonString(json, "distinct_expr", out.distinct_expr);
-	ok &= ExtractJsonString(json, "output_col", out.output_col);
-	ExtractJsonString(json, "filter", out.filter);
+	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= MetadataJson::ExtractJsonString(json, "source", out.source);
+	ok &= MetadataJson::ExtractJsonStringArray(json, "group_cols", out.group_cols);
+	MetadataJson::ExtractJsonStringArray(json, "group_source_exprs", out.group_source_exprs);
+	ok &= MetadataJson::ExtractJsonString(json, "distinct_col", out.distinct_col);
+	ok &= MetadataJson::ExtractJsonString(json, "distinct_expr", out.distinct_expr);
+	ok &= MetadataJson::ExtractJsonString(json, "output_col", out.output_col);
+	MetadataJson::ExtractJsonString(json, "filter", out.filter);
 	return ok;
 }
 
@@ -1198,24 +1074,24 @@ bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMet
 		return false;
 	}
 	bool ok = true;
-	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= ExtractJsonString(json, "join_type", out.join_type);
-	ok &= ExtractJsonString(json, "left_table", out.left_table);
-	ok &= ExtractJsonString(json, "left_alias", out.left_alias);
-	ok &= ExtractJsonString(json, "right_table", out.right_table);
-	ok &= ExtractJsonString(json, "right_alias", out.right_alias);
-	ok &= ExtractJsonString(json, "predicate", out.predicate);
-	ExtractJsonString(json, "post_filter", out.post_filter);
-	ExtractJsonString(json, "right_filter", out.right_filter);
+	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= MetadataJson::ExtractJsonString(json, "join_type", out.join_type);
+	ok &= MetadataJson::ExtractJsonString(json, "left_table", out.left_table);
+	ok &= MetadataJson::ExtractJsonString(json, "left_alias", out.left_alias);
+	ok &= MetadataJson::ExtractJsonString(json, "right_table", out.right_table);
+	ok &= MetadataJson::ExtractJsonString(json, "right_alias", out.right_alias);
+	ok &= MetadataJson::ExtractJsonString(json, "predicate", out.predicate);
+	MetadataJson::ExtractJsonString(json, "post_filter", out.post_filter);
+	MetadataJson::ExtractJsonString(json, "right_filter", out.right_filter);
 	string null_aware;
-	if (ExtractJsonString(json, "null_aware", null_aware)) {
+	if (MetadataJson::ExtractJsonString(json, "null_aware", null_aware)) {
 		out.null_aware = StringUtil::CIEquals(null_aware, "true");
 	}
-	ExtractJsonString(json, "null_aware_left_col", out.null_aware_left_col);
-	ExtractJsonString(json, "null_aware_right_expr", out.null_aware_right_expr);
-	ok &= ExtractJsonStringArray(json, "left_cols", out.left_cols);
-	ExtractJsonStringArray(json, "left_exprs", out.left_exprs);
-	ok &= ExtractJsonStringArray(json, "output_cols", out.output_cols);
+	MetadataJson::ExtractJsonString(json, "null_aware_left_col", out.null_aware_left_col);
+	MetadataJson::ExtractJsonString(json, "null_aware_right_expr", out.null_aware_right_expr);
+	ok &= MetadataJson::ExtractJsonStringArray(json, "left_cols", out.left_cols);
+	MetadataJson::ExtractJsonStringArray(json, "left_exprs", out.left_exprs);
+	ok &= MetadataJson::ExtractJsonStringArray(json, "output_cols", out.output_cols);
 	return ok;
 }
 
@@ -1243,23 +1119,24 @@ bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<
 	if (!ReadRefreshLineageEntry(con, view_name, "window_partition", json)) {
 		return false;
 	}
-	vector<string> objects = ExtractJsonObjectsFromArray(json, "ops");
+	vector<string> objects = MetadataJson::ExtractJsonObjectsFromArray(json, "ops");
 	for (auto &object : objects) {
 		WindowPartitionLineageOp op;
-		if (!ExtractJsonString(object, "k", op.kind) || !ExtractJsonString(object, "out", op.output_col) ||
-		    !ExtractJsonString(object, "source", op.source) ||
-		    !ExtractJsonString(object, "source_col", op.source_col)) {
+		if (!MetadataJson::ExtractJsonString(object, "k", op.kind) ||
+		    !MetadataJson::ExtractJsonString(object, "out", op.output_col) ||
+		    !MetadataJson::ExtractJsonString(object, "source", op.source) ||
+		    !MetadataJson::ExtractJsonString(object, "source_col", op.source_col)) {
 			continue;
 		}
-		ExtractJsonString(object, "source_cast", op.source_cast);
+		MetadataJson::ExtractJsonString(object, "source_cast", op.source_cast);
 		if (op.kind == "lookup") {
-			if (!ExtractJsonString(object, "lookup", op.lookup) ||
-			    !ExtractJsonString(object, "lookup_col", op.lookup_col) ||
-			    !ExtractJsonString(object, "lookup_out", op.lookup_out)) {
+			if (!MetadataJson::ExtractJsonString(object, "lookup", op.lookup) ||
+			    !MetadataJson::ExtractJsonString(object, "lookup_col", op.lookup_col) ||
+			    !MetadataJson::ExtractJsonString(object, "lookup_out", op.lookup_out)) {
 				continue;
 			}
-			ExtractJsonString(object, "lookup_cast", op.lookup_cast);
-			ExtractJsonString(object, "lookup_out_cast", op.lookup_out_cast);
+			MetadataJson::ExtractJsonString(object, "lookup_cast", op.lookup_cast);
+			MetadataJson::ExtractJsonString(object, "lookup_out_cast", op.lookup_out_cast);
 		} else if (op.kind != "direct") {
 			continue;
 		}
@@ -1303,20 +1180,23 @@ bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, Projectio
 	if (!ReadRefreshLineageEntry(con, view_name, "projection_key", json)) {
 		return false;
 	}
-	if (!ExtractJsonString(json, "out", out.output_col) || !ExtractJsonString(json, "key_source", out.key_source) ||
-	    !ParseJsonIndex(json, "key_occ", out.key_occurrence) || !ExtractJsonString(json, "key_col", out.key_col)) {
+	if (!MetadataJson::ExtractJsonString(json, "out", out.output_col) ||
+	    !MetadataJson::ExtractJsonString(json, "key_source", out.key_source) ||
+	    !ParseJsonIndex(json, "key_occ", out.key_occurrence) ||
+	    !MetadataJson::ExtractJsonString(json, "key_col", out.key_col)) {
 		return false;
 	}
 	out.arms.clear();
-	auto objects = ExtractJsonObjectsFromArray(json, "arms");
+	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "arms");
 	for (auto &object : objects) {
 		ProjectionKeyLineageArm arm;
-		if (!ExtractJsonString(object, "source", arm.source) || !ParseJsonIndex(object, "occ", arm.occurrence) ||
-		    !ExtractJsonString(object, "source_col", arm.source_col)) {
+		if (!MetadataJson::ExtractJsonString(object, "source", arm.source) ||
+		    !ParseJsonIndex(object, "occ", arm.occurrence) ||
+		    !MetadataJson::ExtractJsonString(object, "source_col", arm.source_col)) {
 			continue;
 		}
 		vector<string> steps;
-		ExtractJsonStringArray(object, "steps", steps);
+		MetadataJson::ExtractJsonStringArray(object, "steps", steps);
 		for (auto &step_text : steps) {
 			auto fields = SplitPipeFields(step_text);
 			if (fields.size() != 4) {
@@ -1372,11 +1252,11 @@ bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeyS
 	}
 	out.cardinality_transition_check_safe = false;
 	string cardinality_transition_check_safe;
-	if (ExtractJsonString(json, "cardinality_transition_check_safe", cardinality_transition_check_safe)) {
+	if (MetadataJson::ExtractJsonString(json, "cardinality_transition_check_safe", cardinality_transition_check_safe)) {
 		out.cardinality_transition_check_safe = StringUtil::CIEquals(cardinality_transition_check_safe, "true");
 	}
-	return ExtractJsonString(json, "table", out.table) && ParseJsonIndex(json, "occ", out.occurrence) &&
-	       ExtractJsonString(json, "column", out.column);
+	return MetadataJson::ExtractJsonString(json, "table", out.table) && ParseJsonIndex(json, "occ", out.occurrence) &&
+	       MetadataJson::ExtractJsonString(json, "column", out.column);
 }
 
 string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source) {
@@ -1407,10 +1287,10 @@ bool RefreshMetadata::GetLeftJoinNullableSources(const string &view_name, LeftJo
 	out.tables.clear();
 	out.complete = false;
 	string complete;
-	if (ExtractJsonString(json, "complete", complete)) {
+	if (MetadataJson::ExtractJsonString(json, "complete", complete)) {
 		out.complete = StringUtil::CIEquals(complete, "true");
 	}
-	ExtractJsonStringArray(json, "tables", out.tables);
+	MetadataJson::ExtractJsonStringArray(json, "tables", out.tables);
 	return true;
 }
 
@@ -1425,19 +1305,19 @@ bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, Filt
 		return false;
 	}
 	string kind;
-	if (!ExtractJsonString(json, "kind", kind) || kind != "filtered_group_count") {
+	if (!MetadataJson::ExtractJsonString(json, "kind", kind) || kind != "filtered_group_count") {
 		return false;
 	}
 	bool ok = true;
-	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= ExtractJsonString(json, "source", out.source);
-	ok &= ExtractJsonString(json, "group_col", out.group_col);
-	ok &= ExtractJsonString(json, "sum_col", out.sum_col);
-	ExtractJsonString(json, "source_group_expr", out.source_group_expr);
-	ExtractJsonString(json, "source_sum_expr", out.source_sum_expr);
-	ok &= ExtractJsonString(json, "output_col", out.output_col);
-	ok &= ExtractJsonString(json, "op", out.comparison_op);
-	ok &= ExtractJsonString(json, "threshold", out.threshold_sql);
+	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= MetadataJson::ExtractJsonString(json, "source", out.source);
+	ok &= MetadataJson::ExtractJsonString(json, "group_col", out.group_col);
+	ok &= MetadataJson::ExtractJsonString(json, "sum_col", out.sum_col);
+	MetadataJson::ExtractJsonString(json, "source_group_expr", out.source_group_expr);
+	MetadataJson::ExtractJsonString(json, "source_sum_expr", out.source_sum_expr);
+	ok &= MetadataJson::ExtractJsonString(json, "output_col", out.output_col);
+	ok &= MetadataJson::ExtractJsonString(json, "op", out.comparison_op);
+	ok &= MetadataJson::ExtractJsonString(json, "threshold", out.threshold_sql);
 	return ok;
 }
 
@@ -1463,15 +1343,15 @@ bool RefreshMetadata::GetLeftJoinSecondaryMeta(const string &view_name, LeftJoin
 		return false;
 	}
 	string kind;
-	if (!ExtractJsonString(json, "kind", kind) || kind != "leftjoin_secondary") {
+	if (!MetadataJson::ExtractJsonString(json, "kind", kind) || kind != "leftjoin_secondary") {
 		return false;
 	}
 	auto extract_array_or_legacy_csv = [&](const string &array_key, const string &legacy_key, vector<string> &values) {
-		if (ExtractJsonStringArray(json, array_key, values)) {
+		if (MetadataJson::ExtractJsonStringArray(json, array_key, values)) {
 			return;
 		}
 		string legacy;
-		if (ExtractJsonString(json, legacy_key, legacy) && !legacy.empty()) {
+		if (MetadataJson::ExtractJsonString(json, legacy_key, legacy) && !legacy.empty()) {
 			values = StringUtil::Split(legacy, ',');
 		}
 	};
@@ -1480,7 +1360,7 @@ bool RefreshMetadata::GetLeftJoinSecondaryMeta(const string &view_name, LeftJoin
 	extract_array_or_legacy_csv("inner_keys", "inner_key", out.inner_keys);
 	extract_array_or_legacy_csv("pres_tables", "pres_table", out.pres_tables);
 	extract_array_or_legacy_csv("pres_keys", "pres_key", out.pres_keys);
-	return ExtractJsonString(json, "sql", out.sql);
+	return MetadataJson::ExtractJsonString(json, "sql", out.sql);
 }
 
 string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta) {

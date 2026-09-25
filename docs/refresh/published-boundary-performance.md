@@ -105,3 +105,36 @@ has a measurable cost even for some unordered workloads; the final implementatio
 does not retain all of the earlier optimization's latency gains. Top-k latency
 increased by 18–47% in this workload. These measurements establish correctness
 and the observed tradeoff, not a general performance improvement.
+
+## Follow-up: rank only the selected top-k rows
+
+Bounded ordered publication now applies LIMIT/OFFSET before computing the hidden
+ordinal. The window therefore ranks only the selected rows (1,000 in this
+benchmark), rather than every raw group (100,000 here). Unbounded ORDER BY and
+OFFSET-only views retain the direct form to avoid adding a redundant sort.
+The generated publication query is stored at MV creation or replacement.
+
+Publication binding extraction also no longer invokes the full plan classifier:
+it collects only projection and aggregate bindings along the unary output path.
+This removes up to two full plan-facts walks when creating an ordered MV. These
+creation-time savings are outside the refresh timing below.
+
+A fresh sequential comparison against the ordinal implementation (`9cf2451c`) used the same
+benchmark parameters, without concurrent builds or tests. All 48 database runs
+passed every bidirectional bag check.
+
+| Pipeline | Changed keys | Before (ms) | After (ms) | Database MiB (before → after) |
+|---|---:|---:|---:|---:|
+| chain | 20 | 287.0 | 287.0 | 9.01 → 9.01 |
+| chain | 10,000 | 340.0 | 338.0 | 12.01 → 12.26 |
+| fanout | 20 | 332.0 | 329.5 | 10.26 → 10.26 |
+| fanout | 10,000 | 396.5 | 397.0 | 12.76 → 13.01 |
+| having | 20 | 90.0 | 94.0 | 5.26 → 5.26 |
+| having | 10,000 | 206.0 | 206.0 | 8.76 → 8.76 |
+| topk | 20 | 56.0 | 39.0 | 4.76 → 4.76 |
+| topk | 10,000 | 118.5 | 102.0 | 5.26 → 5.26 |
+
+The top-k improvement comes from reducing window input while preserving the
+stable publication boundary. It does not remove the small-batch unordered-chain
+overhead identified above. Database sizes and timings include the entire pipeline;
+they do not establish an improvement for every workload or storage backend.

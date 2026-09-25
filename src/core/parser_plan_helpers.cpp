@@ -32,8 +32,8 @@
 
 namespace duckdb {
 
-void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string> &output_names, const string &catalog,
-                               string &suffix, string &ordering) {
+void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string> &output_names, string &suffix,
+                               string &ordering) {
 	vector<LogicalProjection *> projections;
 	auto *slot = &plan;
 	while (*slot && (*slot)->type == LogicalOperatorType::LOGICAL_PROJECTION && (*slot)->children.size() == 1) {
@@ -78,7 +78,16 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 		return;
 	}
 	if (orders) {
-		auto facts = BuildCreateMVPlanFacts(plan.get(), catalog);
+		// Publication expressions only refer to the unary output path. Avoid
+		// re-running the full classifier (including source/join analysis) here.
+		CreateMVPlanFacts facts;
+		for (auto *node = plan.get(); node; node = node->children.size() == 1 ? node->children[0].get() : nullptr) {
+			if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+				facts.projections.push_back(&node->Cast<LogicalProjection>());
+			} else if (node->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+				facts.aggregates.push_back(&node->Cast<LogicalAggregate>());
+			}
+		}
 		vector<string> order_sql;
 		for (idx_t i = 0; i < orders->size(); i++) {
 			auto &order = (*orders)[i];

@@ -1232,3 +1232,57 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# SQL extraction uses parsed nodes: clause words inside literals and quoted
+# identifiers must not be interpreted as FROM/WHERE/IN boundaries.
+statement ok
+CREATE TABLE extractor_left("in" INTEGER, label VARCHAR);
+
+statement ok
+CREATE TABLE extractor_right("in" INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO extractor_left VALUES (1,'where, (select)'),(2,'where, (select)'),(NULL,'where, (select)');
+
+statement ok
+INSERT INTO extractor_right VALUES (1,'where, (select)'),(NULL,'where, (select)');
+
+statement ok
+CREATE MATERIALIZED VIEW extractor_mv AS SELECT l."in" AS key, l.label FROM extractor_left AS l
+WHERE l.label='where, (select)' AND l."in" NOT IN
+(SELECT r."in" FROM extractor_right AS r WHERE r.label='where, (select)');
+
+query I
+SELECT type FROM openivm_views WHERE view_name = 'extractor_mv';
+----
+9
+
+statement ok
+INSERT INTO extractor_left VALUES (3,'where, (select)'),(3,'where, (select)');
+
+statement ok
+UPDATE extractor_right SET "in"=2 WHERE "in"=1;
+
+statement ok
+DELETE FROM extractor_right WHERE "in" IS NULL;
+
+statement ok
+PRAGMA refresh('extractor_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM extractor_mv EXCEPT ALL SELECT l."in" AS key, l.label FROM extractor_left AS l
+WHERE l.label='where, (select)' AND l."in" NOT IN
+(SELECT r."in" FROM extractor_right AS r WHERE r.label='where, (select)')) UNION ALL (SELECT l."in" AS key, l.label FROM extractor_left AS l
+WHERE l.label='where, (select)' AND l."in" NOT IN
+(SELECT r."in" FROM extractor_right AS r WHERE r.label='where, (select)') EXCEPT ALL SELECT * FROM extractor_mv));
+----
+0
+
+statement ok
+DROP VIEW extractor_mv;
+
+statement ok
+DROP TABLE extractor_left;
+
+statement ok
+DROP TABLE extractor_right;

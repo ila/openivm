@@ -1,3 +1,4 @@
+#include "core/metadata_json.hpp"
 #include "compile_facts.hpp"
 
 #include "core/openivm_constants.hpp"
@@ -18,155 +19,13 @@
 namespace duckdb {
 namespace openivm {
 
-//------------------------------------------------------------------------------
-// CompileFacts: defaults
-//------------------------------------------------------------------------------
-
 CompileFacts CompileFacts::Default(SqlDialect dialect) {
 	CompileFacts out;
 	out.target_dialect = dialect;
 	return out;
 }
 
-//------------------------------------------------------------------------------
-// Minimal handrolled JSON parser
-//
-// Follows the substring-based pattern openivm already uses for its own
-// metadata JSON (see the anonymous helpers in core/refresh_metadata.cpp).
-// The CompileFacts JSON wire form is closed-loop — both writers (openivm's
-// own test fixtures and the openivm-spark driver) emit canonical form with
-// no extra whitespace and only the escape characters openivm itself
-// produces. The current facts surface only needs scalar strings, booleans,
-// and integers; a full JSON parser is unnecessary, and adding yyjson / the
-// DuckDB JSON extension would pull in an optional transitive dependency.
-//
-// These helpers are file-scoped on purpose — they assume the closed-loop
-// invariants above and are not safe for general-purpose JSON.
-//------------------------------------------------------------------------------
-
 namespace {
-
-bool ExtractJsonString(const string &json, const string &key, string &val) {
-	string needle = "\"" + key + "\":\"";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return false;
-	}
-	pos += needle.size();
-	val.clear();
-	while (pos < json.size()) {
-		char c = json[pos];
-		if (c == '\\' && pos + 1 < json.size()) {
-			char esc = json[pos + 1];
-			if (esc == 'n') {
-				val += '\n';
-			} else {
-				val += esc;
-			}
-			pos += 2;
-			continue;
-		}
-		if (c == '"') {
-			return true;
-		}
-		val += c;
-		pos++;
-	}
-	return false;
-}
-
-bool ExtractJsonStringArray(const string &json, const string &key, vector<string> &val) {
-	string needle = "\"" + key + "\":[";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return false;
-	}
-	pos += needle.size();
-	val.clear();
-	while (pos < json.size()) {
-		while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == ',')) {
-			pos++;
-		}
-		if (pos < json.size() && json[pos] == ']') {
-			return true;
-		}
-		if (pos >= json.size() || json[pos] != '"') {
-			return false;
-		}
-		pos++;
-		string item;
-		while (pos < json.size()) {
-			char c = json[pos];
-			if (c == '\\' && pos + 1 < json.size()) {
-				char esc = json[pos + 1];
-				item += (esc == 'n') ? '\n' : esc;
-				pos += 2;
-				continue;
-			}
-			if (c == '"') {
-				pos++;
-				break;
-			}
-			item += c;
-			pos++;
-		}
-		val.push_back(item);
-	}
-	return false;
-}
-
-vector<string> ExtractJsonObjectsFromArray(const string &json, const string &key) {
-	vector<string> objects;
-	string needle = "\"" + key + "\":[";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return objects;
-	}
-	pos += needle.size();
-	bool in_string = false;
-	bool escape = false;
-	int depth = 0;
-	size_t object_start = string::npos;
-	for (; pos < json.size(); pos++) {
-		char c = json[pos];
-		if (in_string) {
-			if (escape) {
-				escape = false;
-			} else if (c == '\\') {
-				escape = true;
-			} else if (c == '"') {
-				in_string = false;
-			}
-			continue;
-		}
-		if (c == '"') {
-			in_string = true;
-			continue;
-		}
-		if (c == '{') {
-			if (depth == 0) {
-				object_start = pos;
-			}
-			depth++;
-			continue;
-		}
-		if (c == '}') {
-			if (depth == 0) {
-				break;
-			}
-			depth--;
-			if (depth == 0 && object_start != string::npos) {
-				objects.push_back(json.substr(object_start, pos - object_start + 1));
-				object_start = string::npos;
-			}
-			continue;
-		}
-		if (c == ']' && depth == 0) {
-			break;
-		}
-	}
-	return objects;
-}
 
 bool ExtractJsonBool(const string &json, const string &key, bool &val) {
 	string needle = "\"" + key + "\":";
@@ -241,7 +100,7 @@ bool ExtractDeltaShapeObject(const string &json, unordered_map<string, string> &
 		}
 		string key_json = "{" + json.substr(key_start, key_end - key_start + 1) + "}";
 		string table;
-		if (!ExtractJsonString(key_json, "", table)) {
+		if (!MetadataJson::ExtractJsonString(key_json, "", table)) {
 			table = json.substr(key_start + 1, key_end - key_start - 1);
 		}
 		pos = key_end + 3;
@@ -284,7 +143,7 @@ CompileFacts ParseFactsJson(const string &json) {
 	CompileFacts out;
 
 	string dialect_str;
-	if (!ExtractJsonString(json, "target_dialect", dialect_str)) {
+	if (!MetadataJson::ExtractJsonString(json, "target_dialect", dialect_str)) {
 		throw InvalidInputException(
 		    "openivm_compile_with_facts: required field 'target_dialect' missing or not a string");
 	}
@@ -301,24 +160,24 @@ CompileFacts ParseFactsJson(const string &json) {
 	ExtractJsonBool(json, "running_window_incremental", out.running_window_incremental);
 	ExtractJsonBool(json, "emit_spark_hints", out.emit_spark_hints);
 
-	for (auto &object : ExtractJsonObjectsFromArray(json, "fk_relations")) {
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "fk_relations")) {
 		CompileFactsFkRelation fk;
-		ExtractJsonString(object, "child_table", fk.child_table);
-		ExtractJsonStringArray(object, "child_columns", fk.child_columns);
-		ExtractJsonString(object, "parent_table", fk.parent_table);
-		ExtractJsonStringArray(object, "parent_columns", fk.parent_columns);
+		MetadataJson::ExtractJsonString(object, "child_table", fk.child_table);
+		MetadataJson::ExtractJsonStringArray(object, "child_columns", fk.child_columns);
+		MetadataJson::ExtractJsonString(object, "parent_table", fk.parent_table);
+		MetadataJson::ExtractJsonStringArray(object, "parent_columns", fk.parent_columns);
 		// Also accept the roadmap draft spelling; Spark emits child_/parent_.
 		if (fk.child_table.empty()) {
-			ExtractJsonString(object, "fk_table", fk.child_table);
+			MetadataJson::ExtractJsonString(object, "fk_table", fk.child_table);
 		}
 		if (fk.child_columns.empty()) {
-			ExtractJsonStringArray(object, "fk_cols", fk.child_columns);
+			MetadataJson::ExtractJsonStringArray(object, "fk_cols", fk.child_columns);
 		}
 		if (fk.parent_table.empty()) {
-			ExtractJsonString(object, "pk_table", fk.parent_table);
+			MetadataJson::ExtractJsonString(object, "pk_table", fk.parent_table);
 		}
 		if (fk.parent_columns.empty()) {
-			ExtractJsonStringArray(object, "pk_cols", fk.parent_columns);
+			MetadataJson::ExtractJsonStringArray(object, "pk_cols", fk.parent_columns);
 		}
 		ExtractJsonBool(object, "rely", fk.rely);
 		if (fk.rely && !fk.child_table.empty() && !fk.parent_table.empty() && !fk.child_columns.empty() &&
