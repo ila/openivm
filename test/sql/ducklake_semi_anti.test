@@ -91,3 +91,194 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Chained DuckLake MVs must resolve snapshot metadata through their backing tables.
+# Cover logical MV names on either side, repeated batches, and duplicate tuples.
+# Expected results read original base tables so stale parents cannot hide a failure.
+statement ok
+USE dl;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE chain_nodes(id INT, v INT);
+
+statement ok
+CREATE TABLE chain_edges(id INT, target INT);
+
+statement ok
+CREATE TABLE chain_blocked(id INT);
+
+statement ok
+INSERT INTO chain_nodes VALUES (1,10),(2,20),(3,30);
+
+statement ok
+INSERT INTO chain_edges VALUES (1,10),(2,20);
+
+statement ok
+INSERT INTO chain_blocked VALUES (10);
+
+statement ok
+CREATE MATERIALIZED VIEW chain_left AS SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id;
+
+statement ok
+CREATE MATERIALIZED VIEW chain_right AS SELECT id FROM chain_blocked;
+
+statement ok
+CREATE MATERIALIZED VIEW chain_anti AS SELECT a.id,a.v,a.target FROM chain_left a ANTI JOIN chain_right b ON a.target=b.id;
+
+statement ok
+CREATE MATERIALIZED VIEW chain_semi AS SELECT a.id,a.v,a.target FROM chain_left a SEMI JOIN chain_right b ON a.target=b.id;
+
+statement ok
+CREATE MATERIALIZED VIEW chain_anti_base AS SELECT a.id,a.v,a.target FROM chain_left a ANTI JOIN chain_blocked b ON a.target=b.id;
+
+query I
+SELECT COUNT(*) FROM memory.main.openivm_views WHERE view_name IN ('chain_anti','chain_semi','chain_anti_base') AND type=9;
+----
+3
+
+statement ok
+INSERT INTO chain_nodes VALUES (1,5),(4,40);
+
+statement ok
+UPDATE chain_nodes SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM chain_nodes WHERE id=3;
+
+statement ok
+INSERT INTO chain_edges VALUES (4,40),(1,11);
+
+statement ok
+UPDATE chain_edges SET target=21 WHERE id=2;
+
+statement ok
+DELETE FROM chain_edges WHERE target=10;
+
+statement ok
+INSERT INTO chain_blocked VALUES (21),(40);
+
+statement ok
+DELETE FROM chain_blocked WHERE id=10;
+
+statement ok
+PRAGMA refresh('chain_left');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM chain_left EXCEPT ALL SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id)),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id EXCEPT ALL SELECT * FROM chain_left));
+----
+0	0
+
+statement ok
+PRAGMA refresh('chain_right');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM chain_right EXCEPT ALL SELECT id FROM chain_blocked)),
+       (SELECT COUNT(*) FROM (SELECT id FROM chain_blocked EXCEPT ALL SELECT * FROM chain_right));
+----
+0	0
+
+statement ok
+PRAGMA refresh('chain_anti');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM chain_anti EXCEPT ALL SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id ANTI JOIN chain_blocked b ON e.target=b.id)),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id ANTI JOIN chain_blocked b ON e.target=b.id EXCEPT ALL SELECT * FROM chain_anti));
+----
+0	0
+
+statement ok
+PRAGMA refresh('chain_anti_base');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM chain_anti_base EXCEPT ALL SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id ANTI JOIN chain_blocked b ON e.target=b.id)),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id ANTI JOIN chain_blocked b ON e.target=b.id EXCEPT ALL SELECT * FROM chain_anti_base));
+----
+0	0
+
+statement ok
+PRAGMA refresh('chain_semi');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM chain_semi EXCEPT ALL SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id SEMI JOIN chain_blocked b ON e.target=b.id)),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id SEMI JOIN chain_blocked b ON e.target=b.id EXCEPT ALL SELECT * FROM chain_semi));
+----
+0	0
+
+statement ok
+INSERT INTO chain_nodes VALUES (1,6),(5,50);
+
+statement ok
+UPDATE chain_nodes SET v=v+2 WHERE id=1;
+
+statement ok
+DELETE FROM chain_nodes WHERE id=4;
+
+statement ok
+INSERT INTO chain_edges VALUES (5,50),(1,12);
+
+statement ok
+UPDATE chain_edges SET target=22 WHERE id=2;
+
+statement ok
+DELETE FROM chain_edges WHERE target=11;
+
+statement ok
+INSERT INTO chain_blocked VALUES (12),(50),(50);
+
+statement ok
+UPDATE chain_blocked SET id=22 WHERE id=21;
+
+statement ok
+DELETE FROM chain_blocked WHERE id=40;
+
+statement ok
+PRAGMA refresh('chain_left');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM chain_left EXCEPT ALL SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id)),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id EXCEPT ALL SELECT * FROM chain_left));
+----
+0	0
+
+statement ok
+PRAGMA refresh('chain_right');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM chain_right EXCEPT ALL SELECT id FROM chain_blocked)),
+       (SELECT COUNT(*) FROM (SELECT id FROM chain_blocked EXCEPT ALL SELECT * FROM chain_right));
+----
+0	0
+
+statement ok
+PRAGMA refresh('chain_anti');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM chain_anti EXCEPT ALL SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id ANTI JOIN chain_blocked b ON e.target=b.id)),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id ANTI JOIN chain_blocked b ON e.target=b.id EXCEPT ALL SELECT * FROM chain_anti));
+----
+0	0
+
+statement ok
+PRAGMA refresh('chain_anti_base');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM chain_anti_base EXCEPT ALL SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id ANTI JOIN chain_blocked b ON e.target=b.id)),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id ANTI JOIN chain_blocked b ON e.target=b.id EXCEPT ALL SELECT * FROM chain_anti_base));
+----
+0	0
+
+statement ok
+PRAGMA refresh('chain_semi');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM chain_semi EXCEPT ALL SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id SEMI JOIN chain_blocked b ON e.target=b.id)),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,e.target FROM chain_nodes a LEFT JOIN chain_edges e ON a.id=e.id SEMI JOIN chain_blocked b ON e.target=b.id EXCEPT ALL SELECT * FROM chain_semi));
+----
+0	0
+
+statement ok
+USE memory;

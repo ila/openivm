@@ -143,11 +143,15 @@ static string ResolveDeltaMetadataKey(const string &table_name, const vector<str
 	vector<string> candidates;
 	candidates.push_back(table_name);
 	candidates.push_back(SqlUtils::LastIdentifierPart(table_name));
+	// DuckLake records a chained MV source under its physical backing table.
+	candidates.push_back(IncrementalTableNames::DataTableName(SqlUtils::LastIdentifierPart(table_name)));
 	candidates.push_back(SqlUtils::DeltaName(table_name));
 	candidates.push_back(SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name)));
 	for (auto &dt : delta_table_names) {
 		for (auto &candidate : candidates) {
 			if (StringUtil::CIEquals(dt, candidate)) {
+				OPENIVM_DEBUG_PRINT("[UPSERT] Source '%s' resolves to delta metadata '%s'\n", table_name.c_str(),
+				                    dt.c_str());
 				return dt;
 			}
 		}
