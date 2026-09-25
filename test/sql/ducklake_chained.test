@@ -584,7 +584,7 @@ FROM openivm_delta_tables
 WHERE view_name = 'catalog_chain_l2'
 ORDER BY table_name;
 ----
-openivm_data_catalog_chain_l1	dl
+openivm_visible_catalog_chain_l1	dl
 
 statement ok
 INSERT INTO dl.bronze.catalog_chain_base VALUES (3, 30);
@@ -649,12 +649,12 @@ CREATE MATERIALIZED VIEW dl.silver.catalog_window_l2 AS
 
 statement ok
 UPDATE openivm_delta_tables
-SET table_name = 'openivm_delta_catalog_window_l1',
+SET table_name = 'openivm_delta_openivm_visible_catalog_window_l1',
     catalog_type = 'duckdb',
     source_catalog = 'dl',
     source_schema = 'bronze'
 WHERE view_name = 'catalog_window_l2'
-  AND table_name = 'openivm_data_catalog_window_l1';
+  AND table_name = 'openivm_visible_catalog_window_l1';
 
 query II
 SELECT table_name, source_schema
@@ -662,7 +662,7 @@ FROM openivm_delta_tables
 WHERE view_name = 'catalog_window_l2'
 ORDER BY table_name;
 ----
-openivm_delta_catalog_window_l1	bronze
+openivm_delta_openivm_visible_catalog_window_l1	bronze
 
 statement ok
 INSERT INTO dl.bronze.catalog_window_base VALUES
@@ -676,7 +676,7 @@ PRAGMA refresh_options('dl', 'bronze', 'catalog_window_l1');
 # snapshots. Seed the companion delta table to emulate the benchmark's persisted
 # delta_<upstream_mv> dependency and force the downstream refresh to read it.
 statement ok
-INSERT INTO dl.bronze.openivm_delta_catalog_window_l1
+INSERT INTO dl.bronze.openivm_delta_openivm_visible_catalog_window_l1
 SELECT sym, trade_date, low_price, high_price, 1, now()
 FROM dl.bronze.catalog_window_l1
 WHERE trade_date IN (DATE '2026-01-02', DATE '2026-01-03');
@@ -1619,3 +1619,337 @@ SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_new EXCEPT ALL SELECT id,v+99 A
 
 statement ok
 USE memory;
+
+# A staged after-hook failure remains pending even after its input changes were consumed.
+load __TEST_DIR__/pipeline_hook_controller.db
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/pipeline_hook_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+CREATE TABLE dl.review_hook_source(id INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.review_hook_source VALUES(1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.review_hook_parent AS SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.review_hook_child AS SELECT id,v*2 AS v FROM dl.review_hook_parent;
+
+statement ok
+CREATE TABLE pipeline_hook_controller.main.review_hook_log(message VARCHAR);
+
+statement ok
+INSERT INTO pipeline_hook_controller.main.openivm_refresh_hooks VALUES('review_hook_parent','SELECT error(''review staged after-hook failure'')','after');
+
+statement ok
+INSERT INTO dl.review_hook_source VALUES(1,5),(2,3);
+
+statement ok
+UPDATE dl.review_hook_source SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM dl.review_hook_source WHERE id=2 AND v=20;
+
+statement error
+PRAGMA refresh_pipeline('review_hook_child');
+----
+review staged after-hook failure
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.review_hook_parent EXCEPT ALL SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id EXCEPT ALL SELECT * FROM dl.review_hook_parent));
+----
+0	0
+
+query I
+SELECT pending_after_hook FROM pipeline_hook_controller.main.openivm_views WHERE view_name='review_hook_parent';
+----
+true
+
+restart
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/pipeline_hook_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+UPDATE pipeline_hook_controller.main.openivm_refresh_hooks SET hook_sql='INSERT INTO pipeline_hook_controller.main.review_hook_log VALUES (''done'')' WHERE view_name='review_hook_parent';
+
+statement ok
+PRAGMA refresh_pipeline('REVIEW_HOOK_CHILD');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.review_hook_parent EXCEPT ALL SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id EXCEPT ALL SELECT * FROM dl.review_hook_parent));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.review_hook_child EXCEPT ALL SELECT id,SUM(v)*2 AS v FROM dl.review_hook_source GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v)*2 AS v FROM dl.review_hook_source GROUP BY id EXCEPT ALL SELECT * FROM dl.review_hook_child));
+----
+0	0
+
+query I
+SELECT COUNT(*) FROM pipeline_hook_controller.main.review_hook_log;
+----
+1
+
+query I
+SELECT pending_after_hook FROM pipeline_hook_controller.main.openivm_views WHERE view_name='review_hook_parent';
+----
+false
+
+statement ok
+PRAGMA refresh_pipeline('review_hook_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.review_hook_parent EXCEPT ALL SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id EXCEPT ALL SELECT * FROM dl.review_hook_parent));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.review_hook_child EXCEPT ALL SELECT id,SUM(v)*2 AS v FROM dl.review_hook_source GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v)*2 AS v FROM dl.review_hook_source GROUP BY id EXCEPT ALL SELECT * FROM dl.review_hook_child));
+----
+0	0
+
+query I
+SELECT COUNT(*) FROM pipeline_hook_controller.main.review_hook_log;
+----
+1
+
+# Replacement keeps the published DuckLake table identity and snapshot history.
+
+statement ok
+CREATE TABLE dl.publish_source(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.publish_source VALUES(1,15),(2,30),(3,4),(3,4);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_parent AS SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>10;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_child AS SELECT * FROM dl.publish_parent;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_lagging AS SELECT * FROM dl.publish_parent;
+
+statement ok
+INSERT INTO dl.publish_source VALUES(1,3),(2,5),(2,5);
+
+statement ok
+UPDATE dl.publish_source SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM dl.publish_source WHERE k=2 AND v=5;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+PRAGMA refresh_pipeline('publish_parent');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_parent EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>10)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>10 EXCEPT ALL SELECT * FROM dl.publish_parent));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_parent AS SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>20;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+PRAGMA refresh_pipeline('publish_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_parent EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>20)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>20 EXCEPT ALL SELECT * FROM dl.publish_parent));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_child EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>20)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>20 EXCEPT ALL SELECT * FROM dl.publish_child));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_parent AS SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING COUNT(*)>0;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+PRAGMA refresh_pipeline('publish_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_parent EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING COUNT(*)>0)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING COUNT(*)>0 EXCEPT ALL SELECT * FROM dl.publish_parent));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_child EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING COUNT(*)>0)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING COUNT(*)>0 EXCEPT ALL SELECT * FROM dl.publish_child));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_parent AS SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k ;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+PRAGMA refresh_pipeline('publish_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_parent EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k )),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k  EXCEPT ALL SELECT * FROM dl.publish_parent));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_child EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k )),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k  EXCEPT ALL SELECT * FROM dl.publish_child));
+----
+0	0
+
+restart
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/pipeline_hook_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+PRAGMA refresh_pipeline('publish_lagging');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_lagging EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k EXCEPT ALL SELECT * FROM dl.publish_lagging));
+----
+0	0
+
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_top AS SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_top_child AS SELECT * FROM dl.publish_top;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_top AS SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 1;
+
+statement ok
+PRAGMA refresh_pipeline('publish_top_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_top EXCEPT ALL SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 1) expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 1) expected EXCEPT ALL SELECT * FROM dl.publish_top));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_top_child EXCEPT ALL SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 1) expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 1) expected EXCEPT ALL SELECT * FROM dl.publish_top_child));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_top AS SELECT k,v FROM dl.publish_source ORDER BY v DESC,k;
+
+statement ok
+PRAGMA refresh_pipeline('publish_top_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_top EXCEPT ALL SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k) expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k) expected EXCEPT ALL SELECT * FROM dl.publish_top));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_top_child EXCEPT ALL SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k) expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k) expected EXCEPT ALL SELECT * FROM dl.publish_top_child));
+----
+0	0
+
+# Parent wrapper changes never demote the child to full refresh.
+query I
+SELECT type FROM openivm_views WHERE view_name='publish_child';
+----
+2
+
+query I
+SELECT type FROM openivm_views WHERE view_name='publish_top_child';
+----
+2
+
+# Reject an incompatible parent schema before staged replacement changes state.
+statement error
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_parent AS SELECT k,SUM(v) v,COUNT(*) n FROM dl.publish_source GROUP BY k;
+----
+Cannot change the visible schema
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_parent EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k EXCEPT ALL SELECT * FROM dl.publish_parent));
+----
+0	0
+
+# Without consumers, replacement may change the published schema.
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_leaf AS SELECT k FROM dl.publish_source;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_leaf AS SELECT k,v FROM dl.publish_source;
+
+statement ok
+INSERT INTO dl.publish_source VALUES(NULL,NULL),(4,12),(4,12);
+
+statement ok
+UPDATE dl.publish_source SET v=v+1 WHERE k=4;
+
+statement ok
+DELETE FROM dl.publish_source WHERE k=4 AND v=13;
+
+statement ok
+PRAGMA refresh_pipeline('publish_leaf');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_leaf EXCEPT ALL SELECT k,v FROM dl.publish_source)),
+       (SELECT COUNT(*) FROM (SELECT k,v FROM dl.publish_source EXCEPT ALL SELECT * FROM dl.publish_leaf));
+----
+0	0

@@ -254,6 +254,19 @@ SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_uwd_dim
 UNION ALL
 SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_uwd_dim;
 
+# The compiled program now also publishes the visible boundary consumed by
+# descendants. Preserve the raw-state delta checks below, and deliver the same
+# signed visible rows to the child's registered source.
+statement ok
+INSERT INTO openivm_delta_openivm_visible_uwd_dim
+SELECT dim_key,id,grp,val,openivm_multiplicity,openivm_timestamp FROM openivm_delta_uwd_dim;
+
+statement ok
+DELETE FROM openivm_visible_uwd_dim;
+
+statement ok
+INSERT INTO openivm_visible_uwd_dim SELECT dim_key,id,grp,val FROM openivm_data_uwd_dim;
+
 statement ok
 DROP TABLE IF EXISTS openivm_old_uwd_dim;
 

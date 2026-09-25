@@ -116,8 +116,8 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 
 	Connection con(*context.db);
 	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
-	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
-		metadata_state->Apply(con);
+	if (!context.transaction.IsAutoCommit()) {
+		RefreshMetadata(con).SnapshotTransaction(context);
 	}
 	string view_query = RefreshMetadata(con).GetViewQuery(view_name);
 	if (view_query.empty()) {
@@ -290,6 +290,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " ADD COLUMN IF NOT EXISTS refresh_interval BIGINT DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS refresh_in_progress BOOLEAN DEFAULT false");
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS pending_after_hook BOOLEAN DEFAULT NULL");
+
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS published_query VARCHAR DEFAULT NULL");
 
 	// Migration: create refresh history table for learned cost model.
 	// Silently fails on fresh DB (core_functions not yet loaded → DEFAULT

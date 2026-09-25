@@ -364,8 +364,8 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto conn = make_uniq<Connection>(db);
 	auto &helper_lock_state = TransactionalMVLockState::Get(*conn->context);
-	helper_lock_state.SetMutationOwner(&context);
-	MutationLockGuard mutation_guard(db, &context);
+	helper_lock_state.SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	MutationLockGuard mutation_guard(context);
 	bool suspended_autocommit_transaction = false;
 	auto restore_outer_transaction = [&]() {
 		if (suspended_autocommit_transaction && !context.transaction.HasActiveTransaction()) {

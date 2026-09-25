@@ -1,3 +1,4 @@
+#include "core/published_view.hpp"
 #include "upsert/refresh_internal.hpp"
 
 #include "compile_facts.hpp"
@@ -20,6 +21,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/planner.hpp"
@@ -141,6 +143,8 @@ ApplyGroupRecomputeSourceOccurrences(vector<GroupRecomputeDeltaSpec> &delta_spec
 
 static string ResolveDeltaMetadataKey(const string &table_name, const vector<string> &delta_table_names) {
 	vector<string> candidates;
+	candidates.push_back(PublishedViewName(SqlUtils::LastIdentifierPart(table_name)));
+	candidates.push_back(SqlUtils::DeltaName(PublishedViewName(SqlUtils::LastIdentifierPart(table_name))));
 	candidates.push_back(table_name);
 	candidates.push_back(SqlUtils::LastIdentifierPart(table_name));
 	// DuckLake records a chained MV source under its physical backing table.
@@ -508,7 +512,43 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                            attached_db_catalog_name, attached_db_schema_name);
 	// Text-only refresh paths still need restoration. Plan-based paths already carry typed snapshots;
 	// DuckDB output uses the unpinned local source query and must not acquire foreign pins.
-	auto finalize_refresh_sql = [&](string refresh_sql) {
+	string publication_sql;
+	vector<string> publication_columns;
+	string publication_query;
+	string publication_source_query;
+	string publication_prefix = internal_catalog_prefix;
+	auto publication = con.Query("SELECT published_query FROM openivm_views WHERE view_name='" +
+	                             SqlUtils::EscapeValue(view_name) + "'");
+	if (!publication->HasError() && publication->RowCount() && !publication->GetValue(0, 0).IsNull()) {
+		if (target_is_ducklake) {
+			publication_columns =
+			    metadata.GetTableColumns(internal_catalog_name, internal_schema_name, PublishedViewName(view_name));
+		} else {
+			auto &published_entry = Catalog::GetEntry<TableCatalogEntry>(
+			    context, internal_catalog_name, internal_schema_name, PublishedViewName(view_name));
+			for (auto &column : published_entry.GetColumns().Logical()) {
+				publication_columns.push_back(column.Name());
+			}
+		}
+		publication_query = publication->GetValue(0, 0).ToString();
+		publication_source_query = publication_query;
+		if (active_facts.target_dialect == SqlDialect::SPARK) {
+			publication_source_query = RenderStoredViewQueryForDialect(
+			    con, publication_query, publication_columns, active_facts.target_dialect, openivm::TimeTravelPins());
+			if (!internal_catalog_prefix.empty()) {
+				publication_prefix = DialectQuoteIdent(internal_catalog_name, SqlDialect::SPARK) + "." +
+				                     DialectQuoteIdent(internal_schema_name, SqlDialect::SPARK) + ".";
+			}
+		}
+		publication_sql =
+		    BuildPublishViewSQL(view_name, publication_prefix, publication_source_query, publication_columns,
+		                        target_is_ducklake, delta_metadata_table, {}, "", active_facts.target_dialect);
+	}
+	auto finalize_refresh_sql = [&](string refresh_sql, bool publish = true) {
+		if (publish) {
+			refresh_sql += active_facts.target_dialect == SqlDialect::SPARK ? SparkPortableRefreshSQL(publication_sql)
+			                                                                : publication_sql;
+		}
 		if (view_time_travel_pins.Empty() || active_facts.target_dialect == SqlDialect::DUCKDB) {
 			return refresh_sql;
 		}
@@ -625,7 +665,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 
 	string delta_view_name_bare = SqlUtils::DeltaName(view_name);
 	string delta_view_name = internal_catalog_prefix + SqlUtils::QuoteIdentifier(delta_view_name_bare);
-	bool has_downstream = metadata.HasDownstreamViews(view_name);
+	bool has_downstream = metadata.HasDownstreamViews(view_name, false);
 	bool full_recompute_needs_cascade_delta = has_downstream || active_facts.force_view_delta_cascade;
 	bool use_full_recompute = refresh_plan.RequiresFullRecompute();
 
@@ -1483,15 +1523,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			build_snapshot_companion();
 		} else if ((view_query_type == RefreshType::AGGREGATE_GROUP ||
 		            view_query_type == RefreshType::AGGREGATE_HAVING) &&
-		           has_downstream && index_delta_view_catalog_entry) {
-			auto *idx = dynamic_cast<IndexCatalogEntry *>(index_delta_view_catalog_entry.get());
-			auto key_ids = idx->column_ids;
-			vector<string> keys;
-			unordered_set<string> keys_set;
-			for (auto &kid : key_ids) {
-				keys.push_back(column_names[kid]);
-				keys_set.insert(column_names[kid]);
-			}
+		           has_downstream) {
+			auto keys = metadata.GetGroupColumns(view_name);
+			unordered_set<string> keys_set(keys.begin(), keys.end());
 
 			// Dispatch on force_view_delta_cascade:
 			//   false (default): build_affected_snapshot_companion(keys)
@@ -1662,9 +1696,41 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string clear_in_progress = "UPDATE " + views_metadata_table +
 	                           " SET refresh_in_progress = false WHERE view_name = '" +
 	                           SqlUtils::EscapeValue(view_name) + "';\n";
+	if (!publication_query.empty()) {
+		Parser publication_parser;
+		publication_parser.ParseQuery(publication_query);
+		auto &node = publication_parser.statements[0]->Cast<SelectStatement>().node;
+		bool global_publication = false;
+		for (auto &modifier : node->modifiers) {
+			global_publication |= modifier->type == ResultModifierType::LIMIT_MODIFIER ||
+			                      modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER;
+		}
+		vector<string> scope_columns;
+		bool has_scopable_delta = dispatch_refresh_type == RefreshType::AGGREGATE_GROUP ||
+		                          dispatch_refresh_type == RefreshType::AGGREGATE_HAVING ||
+		                          (dispatch_refresh_type == RefreshType::SIMPLE_PROJECTION && !source_has_left_join &&
+		                           !source_has_full_outer);
+		if (!global_publication && has_scopable_delta && !refresh_plan.SkipsDeltaProduction() && !inline_mv_delta &&
+		    !use_transient_mv_delta) {
+			scope_columns = metadata.GetGroupColumns(view_name);
+			if (scope_columns.empty()) {
+				scope_columns = publication_columns;
+			}
+			for (auto &column : scope_columns) {
+				if (std::find(publication_columns.begin(), publication_columns.end(), column) ==
+				    publication_columns.end()) {
+					scope_columns.clear();
+					break;
+				}
+			}
+		}
+		publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
+		                                      publication_columns, target_is_ducklake, delta_metadata_table,
+		                                      scope_columns, "", active_facts.target_dialect);
+	}
 	string data_sql = transient_delta_preamble + pre_companion + delta_query + "\n" + companion_query + "\n" +
-	                  upsert_query + "\n" + post_companion + compact_delta_view_query + delete_from_view_query + "\n" +
-	                  delete_from_delta_table_query;
+	                  upsert_query + "\n" + post_companion + publication_sql + compact_delta_view_query +
+	                  delete_from_view_query + "\n" + delete_from_delta_table_query;
 	const string &meta_pre_sql = set_in_progress;
 	string meta_post_sql = update_timestamp_query + snapshot_update_query + "\n" + clear_in_progress;
 	if (active_facts.target_dialect == SqlDialect::SPARK) {
@@ -1680,7 +1746,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	} else {
 		clean_query = meta_pre_sql + data_sql + meta_post_sql;
 	}
-	clean_query = finalize_refresh_sql(std::move(clean_query));
+	clean_query = finalize_refresh_sql(std::move(clean_query), false);
 	Value files_path_val;
 	if (write_query_file && context.TryGetCurrentSetting("openivm_files_path", files_path_val) &&
 	    !files_path_val.IsNull()) {

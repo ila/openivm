@@ -24,6 +24,7 @@ set(EXTENSION_SOURCES
     src/core/sql_utils.cpp
     src/core/time_travel_pins.cpp
     src/core/refresh_metadata.cpp
+    src/core/published_view.cpp
     src/core/incremental_checker.cpp
     src/core/plan_rewrite.cpp
     src/core/plan_rewrite_aggregates.cpp

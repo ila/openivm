@@ -61,8 +61,8 @@ ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExt
 		}
 
 		// DuckDB parses these statements natively, so the regular parser-extension
-		// fallback never sees them. Route tracked-view drops and cascading source
-		// drops through OpenIVM so their cleanup uses the caller transaction.
+		// fallback never sees them. Route view and source-table drops through
+		// OpenIVM so cleanup and source retractions use the caller transaction.
 		ParserOptions native_options = options;
 		native_options.extensions = nullptr;
 		Parser parser(native_options);
@@ -71,8 +71,7 @@ ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExt
 			return ParserOverrideResult();
 		}
 		auto &drop = parser.statements[0]->Cast<DropStatement>();
-		if (drop.info->type != CatalogType::VIEW_ENTRY &&
-		    (drop.info->type != CatalogType::TABLE_ENTRY || !drop.info->cascade)) {
+		if (drop.info->type != CatalogType::VIEW_ENTRY && drop.info->type != CatalogType::TABLE_ENTRY) {
 			return ParserOverrideResult();
 		}
 		vector<unique_ptr<SQLStatement>> statements;

@@ -39,6 +39,16 @@ shared_ptr<MutationGate> RefreshLocks::AcquireGate(DatabaseInstance &db) {
 	return db.GetObjectCache().GetOrCreate<MutationGate>(MutationGate::ObjectType());
 }
 
+MutationLockGuard::MutationLockGuard(ClientContext &context)
+    : MutationLockGuard(DatabaseInstance::GetDatabase(context),
+                        TransactionalMVLockState::Get(context).GetMutationOwner()) {
+}
+
+const void *TransactionalMVLockState::GetMutationOwner() {
+	lock_guard<mutex> guard(state_lock);
+	return mutation_owner;
+}
+
 TransactionalMVLockState::TransactionalMVLockState(ClientContext &context) : owner(context), mutation_owner(&context) {
 }
 

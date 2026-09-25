@@ -1153,8 +1153,8 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 	if (!entry) {
 		auto found_view =
 		    con.Query("SELECT table_catalog, table_schema FROM information_schema.tables WHERE table_type = 'VIEW' "
-		              "AND table_name = '" +
-		              SqlUtils::EscapeValue(view_name) + "' ORDER BY CASE WHEN table_catalog = '" +
+		              "AND lower(table_name) = lower('" +
+		              SqlUtils::EscapeValue(view_name) + "') ORDER BY CASE WHEN table_catalog = '" +
 		              SqlUtils::EscapeValue(resolved.view_catalog_name) + "' AND table_schema = '" +
 		              SqlUtils::EscapeValue(resolved.view_schema_name) +
 		              "' THEN 0 ELSE 1 END, table_catalog, table_schema LIMIT 1");
@@ -1178,18 +1178,9 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 
 ViewLocation ResolveViewLocation(Connection &con, const string &view_name, const string &fallback_catalog,
                                  const string &fallback_schema) {
-	string catalog_name = fallback_catalog;
-	string schema_name = fallback_schema;
-	string query = "SELECT table_catalog, table_schema FROM information_schema.tables WHERE table_type = 'VIEW' "
-	               "AND table_name = '" +
-	               SqlUtils::EscapeValue(view_name) + "' ORDER BY CASE WHEN table_catalog = '" +
-	               SqlUtils::EscapeValue(fallback_catalog) + "' AND table_schema = '" +
-	               SqlUtils::EscapeValue(fallback_schema) + "' THEN 0 ELSE 1 END, table_catalog, table_schema LIMIT 1";
-	auto found = con.Query(query);
-	if (!found->HasError() && found->RowCount() > 0) {
-		catalog_name = found->GetValue(0, 0).ToString();
-		schema_name = found->GetValue(1, 0).ToString();
-	}
+	auto location = RefreshMetadata(con).GetStoredViewLocation(view_name, fallback_catalog, fallback_schema);
+	auto &catalog_name = location.catalog_name;
+	auto &schema_name = location.schema_name;
 	auto current_database = CurrentDatabase(con);
 	bool cross_system = !catalog_name.empty() && !current_database.empty() && catalog_name != current_database;
 	return {catalog_name, schema_name, cross_system};

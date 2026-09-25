@@ -24,6 +24,7 @@ constexpr const char *TIMESTAMP_COL = "openivm_timestamp";
 // Prefixes
 constexpr const char *DELTA_PREFIX = "openivm_delta_";
 constexpr const char *DATA_TABLE_PREFIX = "openivm_data_";
+constexpr const char *VISIBLE_TABLE_PREFIX = "openivm_visible_";
 
 // Internal column names (added by IVM plan rewrites, hidden from users via VIEW)
 constexpr const char *LEFT_KEY_COL = "openivm_left_key";

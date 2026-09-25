@@ -903,7 +903,9 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_
 ----
 3
 
-# 7 profiled statements per refresh for an AGGREGATE_GROUP MERGE view:
+# 16 profiled statements per refresh: the seven maintenance statements below
+# plus nine visible-publication statements (stage the new rows and signed diff,
+# publish the delta, apply changed bags, and clean up the stages/delta).
 #   1. SET refresh_in_progress = true
 #   2. INSERT INTO openivm_delta_<view> (delta computation)
 #   3. MERGE INTO openivm_data_<view> (applies delta via CTE from the delta view)
@@ -914,7 +916,7 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_
 query I
 SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'execute_refresh_sql_stmt';
 ----
-7
+16
 
 # Re-enable adaptive refresh so subsequent refreshes record history for Test 20.
 statement ok

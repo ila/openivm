@@ -21,6 +21,9 @@ public:
 	// Native view metadata belongs to the view catalog; external catalogs use the native default.
 	static void UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
 
+	void SnapshotTransaction(ClientContext &context);
+	string ResolveViewName(const string &view_name);
+
 	// Returns true if the given table name is NOT a tracked materialized view.
 	// (i.e., it's a base table that should have its deltas captured)
 	bool IsBaseTable(const string &table_name);
@@ -73,6 +76,7 @@ public:
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
 	StoredViewLocation GetStoredViewLocation(const string &view_name, const string &fallback_catalog = "",
 	                                         const string &fallback_schema = "");
+	bool IsMaterializedViewDelta(const DeltaSource &source);
 	vector<DeltaSource> GetDeltaSources(const string &view_name, const string &fallback_catalog = "",
 	                                    const string &fallback_schema = "");
 	string ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
@@ -98,7 +102,7 @@ public:
 	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
 	vector<string> GetDownstreamViews(const string &view_name);
 	vector<string> GetDownstreamViewsStrict(const string &view_name);
-	bool HasDownstreamViews(const string &view_name);
+	bool HasDownstreamViews(const string &view_name, bool include_published = true);
 
 	// Select a multi-target pipeline and topologically order its induced dependency graph.
 	vector<string> GetPipelineRefreshOrder(const vector<string> &targets, const string &cascade_mode);

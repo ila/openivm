@@ -2,9 +2,15 @@
 
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
+#include "core/published_view.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "rules/column_hider.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/appender.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include <algorithm>
 #include <functional>
 #include <sstream>
@@ -35,6 +41,64 @@ void RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const 
 		throw CatalogException("OpenIVM could not select metadata catalog: %s", result->GetError());
 	}
 	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s for view catalog '%s'\n", target.c_str(), catalog.c_str());
+}
+
+// The compiler's helper connection cannot observe the caller's uncommitted metadata.
+// Read through the caller's storage transaction and shadow only the compiler's reads.
+void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
+	auto current = con.Query("SELECT current_database()");
+	if (current->HasError()) {
+		throw CatalogException("Cannot resolve transaction metadata catalog: %s", current->GetError());
+	}
+	auto catalog = current->GetValue(0, 0).ToString();
+	for (auto name :
+	     {openivm::VIEWS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::MV_DEPS_TABLE, "openivm_refresh_hooks"}) {
+		auto entry =
+		    Catalog::GetEntry<TableCatalogEntry>(context, catalog, DEFAULT_SCHEMA, name, OnEntryNotFound::RETURN_NULL);
+		if (!entry) {
+			continue;
+		}
+		vector<StorageIndex> column_ids;
+		vector<string> columns;
+		for (auto &column : entry->GetColumns().Physical()) {
+			column_ids.emplace_back(column.StorageOid());
+			columns.push_back(SqlUtils::QuoteIdentifier(column.Name()) + " " + column.Type().ToString());
+		}
+		auto created = con.Query("CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(name) + " (" +
+		                         StringUtil::Join(columns, ", ") + ")");
+		if (created->HasError()) {
+			throw CatalogException("Cannot snapshot transaction metadata: %s", created->GetError());
+		}
+		auto &transaction = DuckTransaction::Get(context, entry->catalog);
+		auto &storage = entry->GetStorage();
+		TableScanState scan;
+		storage.InitializeScan(context, transaction, scan, column_ids);
+		DataChunk rows;
+		rows.Initialize(Allocator::Get(context), entry->GetTypes());
+		Appender appender(con, TEMP_CATALOG, DEFAULT_SCHEMA, name);
+		while (true) {
+			rows.Reset();
+			storage.Scan(transaction, rows, scan);
+			if (rows.size() == 0) {
+				break;
+			}
+			appender.AppendDataChunk(rows);
+		}
+		appender.Close();
+	}
+	OPENIVM_DEBUG_PRINT("[METADATA] Snapshotted caller transaction in %s\n", catalog.c_str());
+}
+
+string RefreshMetadata::ResolveViewName(const string &view_name) {
+	auto result = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE lower(view_name) = lower('" + SqlUtils::EscapeValue(view_name) + "')");
+	if (result->HasError() || result->RowCount() == 0) {
+		return view_name;
+	}
+	if (result->RowCount() != 1) {
+		throw CatalogException("Ambiguous materialized view name '%s'", view_name);
+	}
+	return result->GetValue(0, 0).ToString();
 }
 
 bool RefreshMetadata::IsBaseTable(const string &table_name) {
@@ -185,6 +249,22 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
 	return loc;
 }
 
+bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source) {
+	if (!SqlUtils::IsDelta(source.table_name)) {
+		return false;
+	}
+	auto owner = PublishedSourceViewName(source.table_name);
+	auto result = con.Query(
+	    "SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name='" + SqlUtils::EscapeValue(owner) +
+	    "' AND COALESCE(view_catalog,'" + SqlUtils::EscapeValue(source.catalog_name) + "')='" +
+	    SqlUtils::EscapeValue(source.catalog_name) + "' AND COALESCE(view_schema,'" +
+	    SqlUtils::EscapeValue(source.schema_name) + "')='" + SqlUtils::EscapeValue(source.schema_name) + "'");
+	if (result->HasError()) {
+		throw CatalogException("Cannot resolve delta owner for '%s': %s", source.table_name, result->GetError());
+	}
+	return result->RowCount() != 0;
+}
+
 vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
                                                                       const string &fallback_catalog,
                                                                       const string &fallback_schema) {
@@ -300,6 +380,7 @@ vector<string> RefreshMetadata::GetUpstreamViews(const string &view_name) {
 			} else if (dt.size() > data_prefix.size() && dt.substr(0, data_prefix.size()) == data_prefix) {
 				source = dt.substr(data_prefix.size());
 			}
+			source = PublishedSourceViewName(source.empty() ? dt : source);
 			if (!source.empty() && !IsBaseTable(source) && visited.find(source) == visited.end()) {
 				visited.insert(source);
 				collect(source); // recurse deeper first (ancestors before descendants)
@@ -323,9 +404,11 @@ static vector<string> GetDownstreamViewsInternal(Connection &con, const string &
 	std::function<void(const string &)> collect = [&](const string &vn) {
 		string delta_name = SqlUtils::DeltaName(vn);
 		string data_name = IncrementalTableNames::DataTableName(vn);
-		auto dependents = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
-		                            " WHERE table_name = '" + SqlUtils::EscapeValue(delta_name) +
-		                            "' OR table_name = '" + SqlUtils::EscapeValue(data_name) + "' ORDER BY view_name");
+		auto dependents = con.Query(
+		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
+		    SqlUtils::EscapeValue(delta_name) + "' OR table_name = '" + SqlUtils::EscapeValue(data_name) +
+		    "' OR table_name = '" + SqlUtils::EscapeValue(PublishedViewName(vn)) + "' OR table_name = '" +
+		    SqlUtils::EscapeValue(SqlUtils::DeltaName(PublishedViewName(vn))) + "' ORDER BY view_name");
 		if (dependents->HasError() && throw_on_error) {
 			throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view_name,
 			                       dependents->GetError());
@@ -375,20 +458,23 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 		graph.emplace(views->GetValue(0, i).ToString(), Node());
 	}
 	std::set<string> selected;
-	for (auto &target : targets) {
+	for (auto &requested : targets) {
+		auto target = ResolveViewName(requested);
 		if (graph.find(target) == graph.end()) {
 			throw CatalogException("refresh_pipeline: materialized view '%s' does not exist", target);
 		}
 		selected.insert(target);
 	}
 	// Read the same source metadata used by single-view cascades, not the optional matcher edges.
-	auto edges =
-	    con.Query("SELECT DISTINCT p.view_name, d.view_name FROM " + string(openivm::VIEWS_TABLE) + " p JOIN " +
-	              string(openivm::DELTA_TABLES_TABLE) + " d ON (d.table_name = '" + string(openivm::DELTA_PREFIX) +
-	              "' || p.view_name OR d.table_name = '" + string(openivm::DATA_TABLE_PREFIX) +
-	              "' || p.view_name)"
-	              " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR d.source_catalog=p.view_catalog)"
-	              " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR d.source_schema=p.view_schema)");
+	auto edges = con.Query(
+	    "SELECT DISTINCT p.view_name, d.view_name FROM " + string(openivm::VIEWS_TABLE) + " p JOIN " +
+	    string(openivm::DELTA_TABLES_TABLE) + " d ON (d.table_name = '" + string(openivm::DELTA_PREFIX) +
+	    "' || p.view_name OR d.table_name = '" + string(openivm::DATA_TABLE_PREFIX) +
+	    "' || p.view_name OR d.table_name = '" + string(openivm::VISIBLE_TABLE_PREFIX) +
+	    "' || p.view_name OR d.table_name = '" + string(openivm::DELTA_PREFIX) + string(openivm::VISIBLE_TABLE_PREFIX) +
+	    "' || p.view_name)"
+	    " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR d.source_catalog=p.view_catalog)"
+	    " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR d.source_schema=p.view_schema)");
 	if (edges->HasError()) {
 		throw CatalogException("refresh_pipeline: cannot read dependencies: %s", edges->GetError());
 	}
@@ -448,9 +534,14 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 	return order;
 }
 
-bool RefreshMetadata::HasDownstreamViews(const string &view_name) {
-	auto result = con.Query("SELECT 1 FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
-	                        SqlUtils::EscapeValue(SqlUtils::DeltaName(view_name)) + "' LIMIT 1");
+bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_published) {
+	string predicate = "table_name = '" + SqlUtils::EscapeValue(SqlUtils::DeltaName(view_name)) + "'";
+	if (include_published) {
+		predicate += " OR table_name = '" + SqlUtils::EscapeValue(SqlUtils::DeltaName(PublishedViewName(view_name))) +
+		             "' OR table_name = '" + SqlUtils::EscapeValue(PublishedViewName(view_name)) + "'";
+	}
+	auto result =
+	    con.Query("SELECT 1 FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " + predicate + " LIMIT 1");
 	return !result->HasError() && result->RowCount() > 0;
 }
 

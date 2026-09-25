@@ -4,6 +4,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
+#include "core/published_view.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
@@ -232,9 +233,14 @@ static void DropTrackedMaterializedView(ClientContext &context, Connection &con,
 	                              KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name)),
 	                          location.catalog_name, location.schema_name, CatalogType::TABLE_ENTRY);
 
+	for (auto &name : {PublishedViewName(view_name), SqlUtils::DeltaName(PublishedViewName(view_name))}) {
+		DropQualifiedCatalogEntry(context, internal_prefix + SqlUtils::QuoteIdentifier(name), location.catalog_name,
+		                          location.schema_name, CatalogType::TABLE_ENTRY);
+	}
+
 	for (auto &source : delta_sources) {
 		// DuckLake entries store the base table name — never drop it.
-		if (source.catalog_type == "ducklake") {
+		if (source.catalog_type == "ducklake" || metadata.IsMaterializedViewDelta(source)) {
 			continue;
 		}
 		auto remaining = con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) +

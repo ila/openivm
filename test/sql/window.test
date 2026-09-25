@@ -521,7 +521,7 @@ statement ok
 PRAGMA refresh('w_chain_l2');
 
 query I
-SELECT count(*) FROM openivm_delta_w_chain_l2;
+SELECT count(*) FROM openivm_delta_openivm_visible_w_chain_l2;
 ----
 1
 

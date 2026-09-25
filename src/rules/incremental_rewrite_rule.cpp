@@ -77,8 +77,8 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 
 	Connection con(*input.context.db);
 	RefreshMetadata::UseCatalog(input.context, con, view_catalog);
-	if (auto metadata_state = TransactionalMVMetadataState::TryGet(input.context)) {
-		metadata_state->Apply(con);
+	if (!input.context.transaction.IsAutoCommit()) {
+		RefreshMetadata(con).SnapshotTransaction(input.context);
 	}
 
 	auto v = con.Query("select sql_string from " + string(openivm::VIEWS_TABLE) + " where view_name = '" +

@@ -72,6 +72,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_affected_mode varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_source_occurrences_json varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "derived_aggregate_outputs_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "published_query varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_catalog varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_schema varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "window_order_columns varchar default null");
@@ -95,6 +96,8 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 		              "') THEN error('Duplicate key: materialized view \"" + escaped_view_name +
 		              "\" already exists') ELSE NULL END");
 	}
+
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "pending_after_hook boolean default null");
 
 	// Refresh hooks: extensions can register custom SQL to run on MV refresh
 	// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
