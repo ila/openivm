@@ -358,7 +358,19 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// Record execution history for the learned cost model.
 		if (!cost_estimate.strategy_label.empty()) {
 			auto history_start = std::chrono::steady_clock::now();
-			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+			// Measured from before SQL generation, not from the start of execution.
+			//
+			// `start` brackets only the generated program running. Everything ahead of it — planning
+			// the delta query, firing the rewrite rules, the LPTS round trip, upsert codegen — is the
+			// refresh too, and on small views it dominates: a case measuring 5ms of execution took
+			// 15ms end to end. Training on execution alone taught the model a quantity no caller
+			// waits for, and made its predictions look like a two- to three-fold under-estimate when
+			// they were simply answering a different question.
+			//
+			// It also biased the comparison. Generation is expensive for the incremental path, which
+			// rewrites and re-plans, and cheap for full recompute, which does neither, so excluding it
+			// discounted precisely the cost that distinguishes them.
+			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - generate_start).count();
 			// Determine which method was used. Priority:
 			//   1) `openivm_refresh_mode = 'full'` overrides everything → "full".
 			//   2) If the adaptive cost model picked full recompute, record "full".
