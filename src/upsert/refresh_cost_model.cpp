@@ -1233,7 +1233,11 @@ RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator 
 
 		RefreshMetadata metadata(con);
 		constexpr double RIDGE_LAMBDA = 1e-4;
-		constexpr idx_t MIN_SAMPLES = 3;
+		// Three parameters (compute, upsert, intercept), so three samples was one per parameter and
+		// fitted noise. Measured on one database refreshed repeatedly, it engaged at the fourth
+		// refresh and predicted 4ms against 13ms measured, worse than the uncalibrated prior it
+		// replaced. Three samples per parameter, matching the rule the per-operator fit uses.
+		constexpr idx_t MIN_SAMPLES = 9;
 
 		// Preferred: per-operator weights fitted over every view's history. Tried before the two-term
 		// per-view regression because it is the model that describes both strategies in the same

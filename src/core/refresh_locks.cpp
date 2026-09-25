@@ -1,10 +1,9 @@
 #include "core/refresh_locks.hpp"
 #include "core/openivm_debug.hpp"
 
-namespace duckdb {
+#include <cstdio>
 
-std::mutex RefreshLocks::map_mutex_;
-std::unordered_map<const DatabaseInstance *, unique_ptr<MutationGate>> RefreshLocks::mutation_gates_;
+namespace duckdb {
 
 void MutationGate::Lock(const void *owner) {
 	std::unique_lock<mutex> guard(lock);
@@ -20,6 +19,12 @@ void MutationGate::Lock(const void *owner) {
 void MutationGate::Unlock(const void *owner) {
 	std::lock_guard<mutex> guard(lock);
 	if (active_owner != owner || depth == 0) {
+		// Report accounting errors in release builds without unlocking another owner's gate.
+		fprintf(stderr,
+		        "[openivm] mutation gate release mismatch: owner=%p active_owner=%p depth=%llu. "
+		        "The gate stays held; subsequent OpenIVM mutations on this database will block.\n",
+		        owner, active_owner, static_cast<unsigned long long>(depth));
+		fflush(stderr);
 		D_ASSERT(false);
 		return;
 	}
@@ -30,43 +35,28 @@ void MutationGate::Unlock(const void *owner) {
 	}
 }
 
-MutationGate &RefreshLocks::GetMutationGate(DatabaseInstance &db) {
-	std::lock_guard<std::mutex> guard(map_mutex_);
-	auto &entry = mutation_gates_[&db];
-	if (!entry) {
-		entry = make_uniq<MutationGate>();
-	}
-	return *entry;
+shared_ptr<MutationGate> RefreshLocks::AcquireGate(DatabaseInstance &db) {
+	return db.GetObjectCache().GetOrCreate<MutationGate>(MutationGate::ObjectType());
 }
 
-void RefreshLocks::LockMutation(DatabaseInstance &db, const void *owner) {
-	GetMutationGate(db).Lock(owner);
-}
-
-void RefreshLocks::UnlockMutation(DatabaseInstance &db, const void *owner) {
-	GetMutationGate(db).Unlock(owner);
+TransactionalMVLockState::TransactionalMVLockState(ClientContext &context) : owner(context), mutation_owner(&context) {
 }
 
 TransactionalMVLockState &TransactionalMVLockState::Get(ClientContext &context) {
-	auto state = context.registered_state->GetOrCreate<TransactionalMVLockState>("openivm_transactional_mv_locks");
-	state->owner = &context;
-	if (!state->mutation_owner) {
-		state->mutation_owner = &context;
-	}
-	return *state;
+	return *context.registered_state->GetOrCreate<TransactionalMVLockState>("openivm_transactional_mv_locks", context);
 }
 
 void TransactionalMVLockState::AcquireMutationLock() {
-	if (!owner) {
-		throw InternalException("OpenIVM transactional lock state has no owning client context");
-	}
+	// Parallel delta-capture workers share this state. Losing a guard here leaks its gate depth.
+	lock_guard<mutex> guard(state_lock);
 	if (!mutation_guard) {
-		mutation_guard = make_uniq<MutationLockGuard>(DatabaseInstance::GetDatabase(*owner), mutation_owner);
-		OPENIVM_DEBUG_PRINT("[LOCK] acquired database mutation lock owner=%p\n", static_cast<void *>(owner));
+		mutation_guard = make_uniq<MutationLockGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner);
+		OPENIVM_DEBUG_PRINT("[LOCK] acquired database mutation lock owner=%p\n", static_cast<void *>(&owner));
 	}
 }
 
 void TransactionalMVLockState::SetMutationOwner(const void *owner_token) {
+	lock_guard<mutex> guard(state_lock);
 	if (mutation_guard) {
 		throw InternalException("OpenIVM cannot change mutation ownership after acquiring the mutation lock");
 	}
@@ -82,7 +72,8 @@ void TransactionalMVLockState::TransactionRollback(MetaTransaction &transaction,
 }
 
 void TransactionalMVLockState::Release() {
-	OPENIVM_DEBUG_PRINT("[LOCK] release database mutation lock owner=%p\n", static_cast<void *>(owner));
+	lock_guard<mutex> guard(state_lock);
+	OPENIVM_DEBUG_PRINT("[LOCK] release database mutation lock owner=%p\n", static_cast<void *>(&owner));
 	mutation_guard.reset();
 }
 
