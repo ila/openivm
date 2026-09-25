@@ -138,3 +138,30 @@ The top-k improvement comes from reducing window input while preserving the
 stable publication boundary. It does not remove the small-batch unordered-chain
 overhead identified above. Database sizes and timings include the entire pipeline;
 they do not establish an improvement for every workload or storage backend.
+
+## Final cleanup pass — 2026-09-26
+
+Compared `93d89448` with the subsequent cleanup using the same 100,000 source rows,
+four threads, 20/10,000 changed keys, and four conflicting-DML batches per fresh
+database. This pass used two fresh databases per shape/size, with binaries run
+sequentially after builds and tests finished. Every result was checked as a bag.
+
+| Shape | Changed keys | Before median (ms) | After median (ms) |
+| --- | ---: | ---: | ---: |
+| Chain | 20 | 602 | 615.5 |
+| Chain | 10,000 | 706 | 716.5 |
+| Top-k | 20 | 99 | 97 |
+| Top-k | 10,000 | 261 | 225.5 |
+
+A separate running-window compilation trial (three fresh sessions, 30 compilations
+per session) measured 20 ms before and 19.5 ms after. These results do not establish
+a general speedup. In particular, the large top-k difference needs repeat measurement
+before attributing it to this cleanup. Absolute timings in this session are also
+higher than the earlier publication experiments; compare paired runs, not sessions.
+
+The code improvements are structural: output bindings are obtained once before
+classifier column loops, aggregate-binding resolution shares the group resolver,
+the cost model reuses its normal-equation submatrix instead of scanning history
+again, and one parsed SQL tree replaces the running-window string/regex parser.
+DuckLake snapshot-source resolution and optional metadata reads also share helpers.
+The residual persisted small-chain overhead remains a profiling target.

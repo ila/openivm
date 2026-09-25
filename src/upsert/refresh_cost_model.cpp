@@ -497,54 +497,17 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 		return result;
 	}
 
-	if (w_vec[0] < 0) {
-		// Remove compute, re-fit with (upsert, intercept)
-		double A[2][2] = {};
-		double b2[2] = {};
-		for (idx_t i = 0; i < n; i++) {
-			double w = std::pow(decay, static_cast<double>(n - 1 - i));
-			double x[2] = {history[i].upsert_est, 1.0};
-			double y = history[i].actual_ms;
-			for (int r = 0; r < 2; r++) {
-				for (int c = 0; c < 2; c++) {
-					A[r][c] += w * x[r] * x[c];
-				}
-				b2[r] += w * x[r] * y;
-			}
-		}
-		A[0][0] += ridge_lambda;
-		A[1][1] += ridge_lambda;
-		double w2_0, w2_1;
-		if (Solve2x2(A[0][0], A[0][1], A[1][0], A[1][1], b2[0], b2[1], w2_0, w2_1) && w2_0 >= 0) {
-			result = {0.0, w2_0, w2_1, true};
-		} else {
-			result = {0.0, 0.0, (weight_sum > 0) ? weighted_sum_y / weight_sum : 0.0, true};
-		}
-		return result;
-	}
-
-	if (w_vec[1] < 0) {
-		// Remove upsert, re-fit with (compute, intercept)
-		double A[2][2] = {};
-		double b2[2] = {};
-		for (idx_t i = 0; i < n; i++) {
-			double w = std::pow(decay, static_cast<double>(n - 1 - i));
-			double x[2] = {history[i].compute_est, 1.0};
-			double y = history[i].actual_ms;
-			for (int r = 0; r < 2; r++) {
-				for (int c = 0; c < 2; c++) {
-					A[r][c] += w * x[r] * x[c];
-				}
-				b2[r] += w * x[r] * y;
-			}
-		}
-		A[0][0] += ridge_lambda;
-		A[1][1] += ridge_lambda;
-		double w2_0, w2_1;
-		if (Solve2x2(A[0][0], A[0][1], A[1][0], A[1][1], b2[0], b2[1], w2_0, w2_1) && w2_0 >= 0) {
-			result = {w2_0, 0.0, w2_1, true};
-		} else {
-			result = {0.0, 0.0, (weight_sum > 0) ? weighted_sum_y / weight_sum : 0.0, true};
+	if (w_vec[0] < 0 || w_vec[1] < 0) {
+		// Dropping one feature selects a principal submatrix of the already regularized normal equations.
+		int retained = w_vec[0] < 0 ? 1 : 0;
+		double slope, intercept;
+		result = {0.0, 0.0, (weight_sum > 0) ? weighted_sum_y / weight_sum : 0.0, true};
+		if (Solve2x2(XtWX[retained][retained], XtWX[retained][2], XtWX[2][retained], XtWX[2][2], XtWy[retained],
+		             XtWy[2], slope, intercept) &&
+		    slope >= 0) {
+			result.w_compute = retained == 0 ? slope : 0.0;
+			result.w_upsert = retained == 1 ? slope : 0.0;
+			result.w_intercept = intercept;
 		}
 		return result;
 	}

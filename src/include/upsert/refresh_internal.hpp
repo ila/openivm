@@ -28,6 +28,22 @@ struct DuckLakeSourceLocation {
 	string table_name;
 };
 
+struct DuckLakeSourceSpec {
+	string metadata_key;
+	DuckLakeSourceLocation loc;
+	int64_t old_snap = -1;
+	int64_t current_snap = -1;
+};
+
+string StripOpenIVMDataPrefix(const string &name);
+const DuckLakeSourceSpec *FindDuckLakeSourceSpec(const vector<DuckLakeSourceSpec> &specs, const string &table_name);
+bool BuildDuckLakeSourceSpecs(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                              const vector<string> &delta_table_names, const string &view_catalog_name,
+                              const string &view_schema_name, const string &attached_db_catalog_name,
+                              const string &attached_db_schema_name, vector<DuckLakeSourceSpec> &specs);
+string BuildDuckLakeChangedValuesSQL(const DuckLakeSourceSpec &spec, const string &source_col,
+                                     const string &source_cast, const string &output_col);
+
 struct DeltaFastPathFlags {
 	bool insert_only = false;
 	bool skip_agg_delete = false;

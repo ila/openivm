@@ -4098,3 +4098,141 @@ DROP VIEW ordinal_expr_p CASCADE;
 
 statement ok
 DROP TABLE ordinal_expr_t;
+
+# Mark-style diamond: all sources change before one run with overlapping targets.
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+CREATE TABLE mark_edges(k INT,v INT);
+
+statement ok
+INSERT INTO mark_edges VALUES (NULL,4),(1,2),(1,2),(2,3),(4,5);
+
+statement ok
+CREATE TABLE mark_dims(k INT,v INT);
+
+statement ok
+INSERT INTO mark_dims VALUES (NULL,4),(1,2),(1,2),(2,3),(4,5);
+
+statement ok
+CREATE TABLE mark_blocked(k INT,v INT);
+
+statement ok
+INSERT INTO mark_blocked VALUES (NULL,4),(1,2),(1,2),(2,3),(4,5);
+
+statement ok
+CREATE MATERIALIZED VIEW mark_p AS SELECT e.k,e.v,d.v AS dv FROM mark_edges e LEFT JOIN mark_dims d ON e.k=d.k;
+
+statement ok
+CREATE VIEW mark_expected_p AS SELECT e.k,e.v,d.v AS dv FROM mark_edges e LEFT JOIN mark_dims d ON e.k=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW mark_q AS SELECT k,SUM(v) AS sv,COUNT(*) AS n FROM mark_dims GROUP BY k HAVING SUM(v)>0;
+
+statement ok
+CREATE VIEW mark_expected_q AS SELECT k,SUM(v) AS sv,COUNT(*) AS n FROM mark_dims GROUP BY k HAVING SUM(v)>0;
+
+statement ok
+CREATE MATERIALIZED VIEW mark_a AS SELECT mark_p.* FROM mark_p mark_p ANTI JOIN mark_blocked b ON mark_p.k=b.k;
+
+statement ok
+CREATE VIEW mark_expected_a AS SELECT mark_p.* FROM mark_expected_p mark_p ANTI JOIN mark_blocked b ON mark_p.k=b.k;
+
+statement ok
+CREATE MATERIALIZED VIEW mark_z AS SELECT mark_p.k,mark_p.v,mark_p.dv,mark_q.sv,mark_q.n FROM mark_p mark_p LEFT JOIN mark_q mark_q ON mark_p.k=mark_q.k;
+
+statement ok
+CREATE VIEW mark_expected_z AS SELECT mark_p.k,mark_p.v,mark_p.dv,mark_q.sv,mark_q.n FROM mark_expected_p mark_p LEFT JOIN mark_expected_q mark_q ON mark_p.k=mark_q.k;
+
+statement ok
+CREATE MATERIALIZED VIEW mark_cube AS SELECT k,SUM(v) AS v,COUNT(*) AS n FROM mark_z GROUP BY k;
+
+statement ok
+CREATE VIEW mark_expected_cube AS SELECT k,SUM(v) AS v,COUNT(*) AS n FROM mark_expected_z GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW mark_top AS SELECT k,v,n FROM mark_cube ORDER BY v DESC NULLS LAST,k NULLS LAST LIMIT 3;
+
+statement ok
+CREATE VIEW mark_expected_top AS SELECT k,v,n FROM mark_expected_cube ORDER BY v DESC NULLS LAST,k NULLS LAST LIMIT 3;
+
+statement ok
+CREATE MATERIALIZED VIEW mark_leaf AS SELECT * FROM mark_top;
+
+statement ok
+CREATE VIEW mark_expected_leaf AS SELECT * FROM mark_expected_top;
+
+statement ok
+INSERT INTO mark_edges VALUES (1,7),(1,7),(3,4),(NULL,9);
+
+statement ok
+UPDATE mark_edges SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM mark_edges WHERE k=1 AND v=3;
+
+statement ok
+UPDATE mark_edges SET k=5 WHERE k=4;
+
+statement ok
+INSERT INTO mark_dims VALUES (1,7),(1,7),(3,4),(NULL,9);
+
+statement ok
+UPDATE mark_dims SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM mark_dims WHERE k=1 AND v=3;
+
+statement ok
+UPDATE mark_dims SET k=5 WHERE k=4;
+
+statement ok
+INSERT INTO mark_blocked VALUES (1,7),(1,7),(3,4),(NULL,9);
+
+statement ok
+UPDATE mark_blocked SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM mark_blocked WHERE k=1 AND v=3;
+
+statement ok
+UPDATE mark_blocked SET k=5 WHERE k=4;
+
+statement ok
+PRAGMA refresh_pipeline('mark_p','mark_q','mark_a','mark_leaf','mark_cube','mark_p');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mark_p EXCEPT ALL SELECT * FROM mark_expected_p) UNION ALL (SELECT * FROM mark_expected_p EXCEPT ALL SELECT * FROM mark_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mark_q EXCEPT ALL SELECT * FROM mark_expected_q) UNION ALL (SELECT * FROM mark_expected_q EXCEPT ALL SELECT * FROM mark_q));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mark_a EXCEPT ALL SELECT * FROM mark_expected_a) UNION ALL (SELECT * FROM mark_expected_a EXCEPT ALL SELECT * FROM mark_a));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mark_z EXCEPT ALL SELECT * FROM mark_expected_z) UNION ALL (SELECT * FROM mark_expected_z EXCEPT ALL SELECT * FROM mark_z));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mark_cube EXCEPT ALL SELECT * FROM mark_expected_cube) UNION ALL (SELECT * FROM mark_expected_cube EXCEPT ALL SELECT * FROM mark_cube));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mark_top EXCEPT ALL SELECT * FROM mark_expected_top) UNION ALL (SELECT * FROM mark_expected_top EXCEPT ALL SELECT * FROM mark_top));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mark_leaf EXCEPT ALL SELECT * FROM mark_expected_leaf) UNION ALL (SELECT * FROM mark_expected_leaf EXCEPT ALL SELECT * FROM mark_leaf));
+----
+0

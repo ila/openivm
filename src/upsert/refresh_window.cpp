@@ -275,81 +275,8 @@ static bool AllWindowPartitionSourcesCovered(const vector<string> &delta_table_n
 	return !delta_table_names.empty();
 }
 
-struct DuckLakeWindowSourceSpec {
-	string metadata_key;
-	DuckLakeSourceLocation loc;
-	int64_t old_snap = -1;
-	int64_t current_snap = -1;
-};
-
-static string StripDataPrefix(const string &name) {
-	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
-	string last = SqlUtils::LastIdentifierPart(name);
-	if (last.size() > data_prefix.size() && last.rfind(data_prefix, 0) == 0) {
-		return last.substr(data_prefix.size());
-	}
-	return last;
-}
-
-static bool NamesMatch(const string &left, const string &right) {
-	return StringUtil::CIEquals(StripDataPrefix(left), StripDataPrefix(right));
-}
-
-static bool SourceSpecMatches(const DuckLakeWindowSourceSpec &spec, const string &table_name) {
-	return NamesMatch(spec.metadata_key, table_name) || NamesMatch(spec.loc.table_name, table_name);
-}
-
-static const DuckLakeWindowSourceSpec *FindSourceSpec(const vector<DuckLakeWindowSourceSpec> &specs,
-                                                      const string &table_name) {
-	for (auto &spec : specs) {
-		if (SourceSpecMatches(spec, table_name)) {
-			return &spec;
-		}
-	}
-	return nullptr;
-}
-
-static bool BuildDuckLakeWindowSourceSpecs(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                           const vector<string> &delta_table_names, const string &view_catalog_name,
-                                           const string &view_schema_name, const string &attached_db_catalog_name,
-                                           const string &attached_db_schema_name,
-                                           vector<DuckLakeWindowSourceSpec> &specs) {
-	for (auto &dt : delta_table_names) {
-		if (!metadata.IsDuckLakeTable(view_name, dt)) {
-			return false;
-		}
-		DuckLakeWindowSourceSpec spec;
-		spec.metadata_key = dt;
-		spec.loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
-		                                         attached_db_catalog_name, attached_db_schema_name);
-		spec.old_snap = metadata.GetLastSnapshotId(view_name, dt);
-		spec.current_snap = metadata.GetCurrentDuckLakeSnapshot(spec.loc.catalog_name);
-		if (spec.loc.catalog_name.empty() || spec.loc.schema_name.empty() || spec.loc.table_name.empty() ||
-		    spec.old_snap < 0 || spec.current_snap < 0) {
-			return false;
-		}
-		specs.push_back(std::move(spec));
-	}
-	return !specs.empty();
-}
-
-static string BuildDuckLakeChangedValuesSQL(const DuckLakeWindowSourceSpec &spec, const string &source_col,
-                                            const string &source_cast, const string &output_col) {
-	string source_expr = BuildLineageColumnExpr(source_col, source_cast);
-	string qoutput_col = SqlUtils::QuoteIdentifier(output_col);
-	string insertions =
-	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
-	    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.loc.catalog_name, spec.loc.schema_name,
-	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
-	string deletions =
-	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
-	    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.loc.catalog_name, spec.loc.schema_name,
-	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
-	return "(" + insertions + " UNION ALL " + deletions + ")";
-}
-
-static string BuildDuckLakeLookupChangedKeysSQL(const DuckLakeWindowSourceSpec &source_spec,
-                                                const DuckLakeWindowSourceSpec &lookup_spec,
+static string BuildDuckLakeLookupChangedKeysSQL(const DuckLakeSourceSpec &source_spec,
+                                                const DuckLakeSourceSpec &lookup_spec,
                                                 const RefreshMetadata::WindowPartitionLineageOp &op) {
 	string changed = BuildDuckLakeChangedValuesSQL(source_spec, op.source_col, op.source_cast, "openivm_join_key");
 	string lookup_table =
@@ -490,9 +417,9 @@ static bool BuildLineageDuckLakeAffectedKeysSQL(RefreshMetadata &metadata, Conne
 	auto parsed = SplitPartitionSpec(partition_cols[0]);
 	key_cols = SqlUtils::QuoteIdentifier(parsed.first);
 
-	vector<DuckLakeWindowSourceSpec> specs;
-	if (!BuildDuckLakeWindowSourceSpecs(metadata, con, view_name, delta_table_names, view_catalog_name,
-	                                    view_schema_name, attached_db_catalog_name, attached_db_schema_name, specs)) {
+	vector<DuckLakeSourceSpec> specs;
+	if (!BuildDuckLakeSourceSpecs(metadata, con, view_name, delta_table_names, view_catalog_name, view_schema_name,
+	                              attached_db_catalog_name, attached_db_schema_name, specs)) {
 		return false;
 	}
 
@@ -507,27 +434,27 @@ static bool BuildLineageDuckLakeAffectedKeysSQL(RefreshMetadata &metadata, Conne
 		if (!StringUtil::CIEquals(op.output_col, parsed.first)) {
 			continue;
 		}
-		auto *source_spec = FindSourceSpec(specs, op.source);
+		auto *source_spec = FindDuckLakeSourceSpec(specs, op.source);
 		if (!source_spec) {
 			continue;
 		}
 		if (op.kind == "direct") {
 			arms.push_back(BuildDuckLakeChangedValuesSQL(*source_spec, op.source_col, op.source_cast, op.output_col));
-			covered_sources.insert(StripDataPrefix(source_spec->metadata_key));
+			covered_sources.insert(StripOpenIVMDataPrefix(source_spec->metadata_key));
 			continue;
 		}
 		if (op.kind == "lookup") {
-			auto *lookup_spec = FindSourceSpec(specs, op.lookup);
+			auto *lookup_spec = FindDuckLakeSourceSpec(specs, op.lookup);
 			if (!lookup_spec) {
 				continue;
 			}
 			arms.push_back(BuildDuckLakeLookupChangedKeysSQL(*source_spec, *lookup_spec, op));
-			covered_sources.insert(StripDataPrefix(source_spec->metadata_key));
+			covered_sources.insert(StripOpenIVMDataPrefix(source_spec->metadata_key));
 		}
 	}
 
 	for (auto &spec : specs) {
-		if (!covered_sources.count(StripDataPrefix(spec.metadata_key))) {
+		if (!covered_sources.count(StripOpenIVMDataPrefix(spec.metadata_key))) {
 			return false;
 		}
 	}

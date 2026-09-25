@@ -711,8 +711,8 @@ static void FinalizeCreateMVPlanFacts(CreateMVPlanFacts &facts) {
 	}
 }
 
-static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
-                                   const CreateMVPlanFacts &facts, int depth = 0) {
+bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
+                             const CreateMVPlanFacts &facts, bool through_casts, int depth) {
 	if (depth > 16) {
 		return false;
 	}
@@ -725,13 +725,16 @@ static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t 
 		if (column_index >= proj.expressions.size()) {
 			return false;
 		}
-		auto &expr = proj.expressions[column_index];
+		auto *expr = proj.expressions[column_index].get();
+		while (through_casts && expr->expression_class == ExpressionClass::BOUND_CAST) {
+			expr = expr->Cast<BoundCastExpression>().child.get();
+		}
 		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
 			return false;
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		return ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
-		                              facts, depth + 1);
+		return ResolvesToOutputBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
+		                               facts, through_casts, depth + 1);
 	}
 	auto setop_it = facts.setops_by_index.find(table_index);
 	if (setop_it != facts.setops_by_index.end()) {
@@ -745,8 +748,8 @@ static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t 
 				continue;
 			}
 			auto &binding = bindings[column_index];
-			if (ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, facts,
-			                           depth + 1)) {
+			if (ResolvesToOutputBinding(binding.table_index, binding.column_index, group_index, group_count, facts,
+			                            through_casts, depth + 1)) {
 				return true;
 			}
 		}
@@ -764,10 +767,15 @@ static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t 
 			return false;
 		}
 		auto &binding = bindings[column_index];
-		return ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, facts,
-		                              depth + 1);
+		return ResolvesToOutputBinding(binding.table_index, binding.column_index, group_index, group_count, facts,
+		                               through_casts, depth + 1);
 	}
 	return false;
+}
+
+static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
+                                   const CreateMVPlanFacts &facts) {
+	return ResolvesToOutputBinding(table_index, column_index, group_index, group_count, facts, false);
 }
 
 static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,

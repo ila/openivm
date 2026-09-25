@@ -13,6 +13,9 @@ namespace duckdb {
 // behind typed methods. Takes a Connection reference — does NOT create its own.
 class RefreshMetadata {
 	Connection &con;
+	Value ReadViewValue(const string &view_name, const string &column);
+	string ReadViewString(const string &view_name, const string &column);
+	vector<string> ReadViewList(const string &view_name, const string &column);
 
 public:
 	explicit RefreshMetadata(Connection &con) : con(con) {

@@ -38,3 +38,52 @@ The caller keeps ingestion paused. Unchanged nodes can be skipped. Invalid targe
 Parallel execution, atomic publication of a complete DAG, continuous ingestion against pinned run snapshots, and MotherDuck deployment remain separate discussion items. See [pipeline refresh documentation](refresh/pipelines.md).
 
 Pipeline validation: `make test` passed 11,460 assertions across 89 test cases, with one ICU-dependent test skipped. Compiled N-term SQL integration checks passed. The loadable extension built successfully, and CLI checks passed after reopening a persistent database and renaming a source column.
+
+## Final workload sweep after publication and pipeline changes
+
+Rechecked the email requirements against the graph builder, both refresh execution paths,
+and real persisted databases. A deterministic stress workload ran twelve mixed-DML
+batches per backend, closing and reopening the controller between batches. Each run
+selected overlapping targets in a seven-MV DAG: left join, independent HAVING aggregate,
+anti join, a diamond join, grouped cube, ordered top-k, and a terminal projection.
+Every MV was compared to ordinary views over the source tables with `EXCEPT ALL` in
+both directions: 168 comparisons across native DuckDB and DuckLake. Inputs included
+duplicate tuples, NULL keys, inserts, deletes, and repeated updates before each run.
+A smaller permanent version extends both existing chained-view test files.
+
+| Mark's requirement | Current evidence and semantics |
+| --- | --- |
+| Batch source changes, then run the DAG | Both backends passed the mixed-DML/reopen sweep. Ingestion must finish before calling `refresh_pipeline`. |
+| Discover dependencies, refresh each selected MV once after its parents | The graph comes from tracked source metadata; overlapping targets are deduplicated and topologically sorted. Use `both` to include missing co-parents of downstream nodes, or `upstream` with all desired terminal targets. |
+| Parallel ready nodes | Not implemented. Pipeline nodes execute sequentially; DuckDB can parallelize individual queries. |
+| Graph traversal with optional/missing edges | The sweep covers chained left and anti joins, including duplicates and NULL keys. The existing join suites also cover full outer joins. Arbitrary combinations still require checking their selected maintenance strategy. |
+| Aggregations over materialized dimensions | The diamond and cube exercise shared dimensions and aggregation after joins. This does not establish performance for his undisclosed queries or data sizes. |
+| Reproducible DuckLake snapshots | Snapshot-based source deltas exist. A whole-DAG atomic snapshot/publish boundary and continuous ingestion against a pinned run snapshot are not implemented. |
+| Separate metadata/execution instance | A persistent native controller can attach the data catalogs; it need not be a separate server. DuckLake data and native metadata use staged transactions. |
+| Older DuckDB databases | File compatibility is separate from extension ABI compatibility. Previously tested v1.1.2/v1.2.1 files can be attached by the matching v1.5.4 build; the extension itself was rejected by those older clients. See the build guide for the exact tested scope. |
+| MotherDuck deployment | Still unverified. Local DuckDB/DuckLake coverage cannot establish that the managed service can load or execute this extension. |
+
+The additional window sweep reproduced a NULL-only suffix bug in optional running-SUM
+maintenance: an existing sum of 10 became NULL after two NULL inputs. The seed-combination
+fix retains the prior sum, preserves all-NULL partitions, and has regression coverage
+including conflicting changes in a subsequent batch. This does not change the window's
+incremental maintenance classification.
+
+An additional open finding is specific to the optional running-window suffix optimization:
+`SUM(x) OVER (PARTITION BY k ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`
+is rendered as the default RANGE frame. Starting with `(k,d,x)=(1,1,10)` and appending
+`(1,2,3),(1,2,4)` produces 17 on both new rows. Under ROWS, one new row must have an
+intermediate sum of 13 or 14, regardless of the unspecified tie order. Preserving the
+frame alone is insufficient: later batches must also seed from the true final row
+rather than an arbitrary peer selected by descending order. The strategy decision is
+pending: use the existing affected-partition maintenance for this shape, or extend
+suffix maintenance with stable tie ordering and seed state. No fix for this finding
+is claimed in the NULL-suffix correction above.
+
+Validation for this cleanup: the compiled N-term SQL integration check and full
+suite passed (12,281 assertions in 89 cases, one ICU-dependent skip). After the final
+SQL-rendering adjustment, nine focused parser, Spark-compilation, semi/anti, and
+running-window cases passed 1,010 assertions. The final CLI NULL-suffix check was
+bag-equal in both directions. The randomized reopen workload also passed all 168
+comparisons on the cleanup binary. These passing tests do not cover or resolve the
+explicit-ROWS finding above.

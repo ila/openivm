@@ -296,14 +296,7 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 	return result;
 }
 
-struct ProjectionKeySourceSpec {
-	string metadata_key;
-	DuckLakeSourceLocation loc;
-	int64_t old_snap = -1;
-	int64_t current_snap = -1;
-};
-
-static string StripOpenIVMDataPrefix(const string &name) {
+string StripOpenIVMDataPrefix(const string &name) {
 	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
 	string last = SqlUtils::LastIdentifierPart(name);
 	if (last.size() > data_prefix.size() && last.rfind(data_prefix, 0) == 0) {
@@ -312,13 +305,12 @@ static string StripOpenIVMDataPrefix(const string &name) {
 	return last;
 }
 
-static bool ProjectionSourceNameMatches(const ProjectionKeySourceSpec &spec, const string &table_name) {
+static bool ProjectionSourceNameMatches(const DuckLakeSourceSpec &spec, const string &table_name) {
 	return StringUtil::CIEquals(StripOpenIVMDataPrefix(spec.metadata_key), StripOpenIVMDataPrefix(table_name)) ||
 	       StringUtil::CIEquals(StripOpenIVMDataPrefix(spec.loc.table_name), StripOpenIVMDataPrefix(table_name));
 }
 
-static const ProjectionKeySourceSpec *FindProjectionSourceSpec(const vector<ProjectionKeySourceSpec> &specs,
-                                                               const string &table_name) {
+const DuckLakeSourceSpec *FindDuckLakeSourceSpec(const vector<DuckLakeSourceSpec> &specs, const string &table_name) {
 	for (auto &spec : specs) {
 		if (ProjectionSourceNameMatches(spec, table_name)) {
 			return &spec;
@@ -327,16 +319,15 @@ static const ProjectionKeySourceSpec *FindProjectionSourceSpec(const vector<Proj
 	return nullptr;
 }
 
-static bool BuildProjectionKeySourceSpecs(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                          const vector<string> &delta_table_names, const string &view_catalog_name,
-                                          const string &view_schema_name, const string &attached_db_catalog_name,
-                                          const string &attached_db_schema_name,
-                                          vector<ProjectionKeySourceSpec> &specs) {
+bool BuildDuckLakeSourceSpecs(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                              const vector<string> &delta_table_names, const string &view_catalog_name,
+                              const string &view_schema_name, const string &attached_db_catalog_name,
+                              const string &attached_db_schema_name, vector<DuckLakeSourceSpec> &specs) {
 	for (auto &dt : delta_table_names) {
 		if (!metadata.IsDuckLakeTable(view_name, dt)) {
 			return false;
 		}
-		ProjectionKeySourceSpec spec;
+		DuckLakeSourceSpec spec;
 		spec.metadata_key = dt;
 		spec.loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
 		                                         attached_db_catalog_name, attached_db_schema_name);
@@ -351,31 +342,31 @@ static bool BuildProjectionKeySourceSpecs(RefreshMetadata &metadata, Connection 
 	return !specs.empty();
 }
 
-static string BuildProjectionChangedValuesSQL(const ProjectionKeySourceSpec &spec, const string &source_col,
-                                              const string &output_col) {
-	string qsource_col = SqlUtils::QuoteIdentifier(source_col);
+string BuildDuckLakeChangedValuesSQL(const DuckLakeSourceSpec &spec, const string &source_col,
+                                     const string &source_cast, const string &output_col) {
+	string source_expr = SqlUtils::ApplyCastSpec(SqlUtils::QuoteIdentifier(source_col), source_cast);
 	string qoutput_col = SqlUtils::QuoteIdentifier(output_col);
 	string insertions =
-	    "SELECT " + qsource_col + " AS " + qoutput_col + " FROM " +
+	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
 	    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.loc.catalog_name, spec.loc.schema_name,
 	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
 	string deletions =
-	    "SELECT " + qsource_col + " AS " + qoutput_col + " FROM " +
+	    "SELECT " + source_expr + " AS " + qoutput_col + " FROM " +
 	    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.loc.catalog_name, spec.loc.schema_name,
 	                                    spec.loc.table_name, spec.old_snap, spec.current_snap);
 	return "(" + insertions + " UNION ALL " + deletions + ")";
 }
 
 static string BuildProjectionLineageArmSQL(const RefreshMetadata::ProjectionKeyLineageArm &arm,
-                                           const vector<ProjectionKeySourceSpec> &specs, const string &output_col,
+                                           const vector<DuckLakeSourceSpec> &specs, const string &output_col,
                                            bool current_snapshot) {
-	auto *source_spec = FindProjectionSourceSpec(specs, arm.source);
+	auto *source_spec = FindDuckLakeSourceSpec(specs, arm.source);
 	if (!source_spec) {
 		return "";
 	}
-	string sql = BuildProjectionChangedValuesSQL(*source_spec, arm.source_col, "openivm_lineage_key");
+	string sql = BuildDuckLakeChangedValuesSQL(*source_spec, arm.source_col, "", "openivm_lineage_key");
 	for (auto &step : arm.steps) {
-		auto *lookup_spec = FindProjectionSourceSpec(specs, step.table);
+		auto *lookup_spec = FindDuckLakeSourceSpec(specs, step.table);
 		if (!lookup_spec) {
 			return "";
 		}
@@ -399,12 +390,12 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
 		return false;
 	}
 
-	vector<ProjectionKeySourceSpec> specs;
-	if (!BuildProjectionKeySourceSpecs(metadata, con, view_name, delta_table_names, view_catalog_name, view_schema_name,
-	                                   attached_db_catalog_name, attached_db_schema_name, specs)) {
+	vector<DuckLakeSourceSpec> specs;
+	if (!BuildDuckLakeSourceSpecs(metadata, con, view_name, delta_table_names, view_catalog_name, view_schema_name,
+	                              attached_db_catalog_name, attached_db_schema_name, specs)) {
 		return false;
 	}
-	auto *key_spec = FindProjectionSourceSpec(specs, lineage.key_source);
+	auto *key_spec = FindDuckLakeSourceSpec(specs, lineage.key_source);
 	if (!key_spec) {
 		return false;
 	}

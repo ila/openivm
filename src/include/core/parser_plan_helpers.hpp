@@ -114,6 +114,8 @@ string QualifyCreateSourceTable(const string &table_name, const string &current_
                                 const string &default_db);
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog);
+bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
+                             const CreateMVPlanFacts &facts, bool through_casts, int depth = 0);
 bool ProducesAtMostOneRow(LogicalOperator &node);
 bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node);
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols);
