@@ -4,6 +4,46 @@ Working notes for whoever picks this up next. Covers what was built, what was me
 still unproven, and the traps that cost time. Companion to [cost_model.md](cost_model.md), which
 describes the model as it stood before this work; where the two disagree, this file is newer.
 
+## Takeover investigation (2026-09-25)
+
+The last failed ladder is [GCI run 36061442667](https://github.com/mdrakiburrahman/ivm-bench/actions/runs/36061442667).
+Both SF10 and SF100 contain exactly 130 completed rows. Their last row is Q08, mixed workload,
+2% delta, repetition 1. SF10 exited with SIGABRT; SF100 timed out. This shared boundary means the
+SF100 timeout must not be attributed to setup cost alone. The saved artifacts do not include a
+native crash diagnostic or stack trace, so the causes remain unconfirmed.
+
+PR #23 was already merged upstream but absent from this branch and the old runner build. Its two
+commits (`3ada9f57`, `99c8a450`) are now merged here in `14f92dd1`. Besides database-owned gate
+lifetime, they synchronize access to the transaction's mutation guard: parallel delta-capture
+workers previously raced to create and replace it, potentially leaking a held gate. This is a known
+defect addressed by the merge, not proof of the cause of either runner failure.
+
+Before rebuilding, a focused SF10 Q08 run completed 9 cycles without errors. The merged concurrency
+regression also passed against the old binary, so this machine did not reproduce the race. After
+rebuilding, concurrency, adaptive refresh, persistent full-refresh cascade, and cost-model tests
+passed (1,200 assertions across four test files).
+
+The benchmark also skipped result validation for forced incremental and full refreshes. All three
+modes now use the existing bidirectional `EXCEPT ALL` check when validation is enabled, and the CSV
+`correct` field requires all three to pass. Validation stays outside each refresh timing interval.
+
+With those changes, SF10 Q08 completed 30 cycles in 126.83 seconds, with zero errors across all
+90 refreshes and calibration reported for 21 cycles. This was a correctness/integration run;
+other tests overlapped its early cycles, so its timings are not an isolated performance result.
+The CSV and log are `/private/tmp/cost-takeover-q08-after.csv` and
+`/private/tmp/cost-takeover-q08-after.log`. Reproduce with:
+
+```bash
+build/release/extension/openivm/cost_model_benchmark \
+  --scale 10 --filter Q08 --reps 1 --cycles 30 --delta-pcts 1,2,5 \
+  --configs all_on --out /private/tmp/cost-takeover-q08-after.csv
+```
+
+Before another ladder, run a bounded Linux reproduction with the merged lock fix and retain the
+benchmark's stdout/stderr alongside the CSV. A local pass does not establish that the runner crash
+or timeout is fixed. The per-operator model remains unvalidated; none of these integration checks
+establish prediction quality.
+
 ## Why
 
 `PRAGMA refresh_cost` decided between incremental maintenance and full recompute using two scalar

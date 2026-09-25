@@ -1021,10 +1021,6 @@ static void ConfigureMode(duckdb::Connection &con, RefreshMode mode) {
 	}
 }
 
-// do_validate gates the (expensive) EXCEPT ALL correctness cross-check. We run it for the AUTO path
-// (the decision under test) and skip it for the INCREMENTAL/FULL reference-timing runs, which avoids
-// two of the three full validations per combo. Each mode still does its own independent full setup in
-// its own session, so this changes only what we verify, not how the refresh runs.
 // A case's starting state, built once and reused by every refresh mode.
 //
 // The three modes have to begin from identical state, but they used to reach it by each repeating
@@ -1227,7 +1223,7 @@ static ModeResult RunMode(const PreparedCase &prepared, const QueryDef &q, Workl
 				return out;
 			}
 		} else {
-			out.correct = true; // reference-timing run: correctness is verified on the AUTO path
+			out.correct = true; // validation explicitly disabled by --no-validate
 		}
 		out.ok = true;
 		if (promote_path) {
@@ -1293,7 +1289,7 @@ int main(int argc, char **argv) {
 	vector<double> delta_pcts = {0.01, 1, 2, 5, 10, 20, 50};
 	set<string> query_filter;
 	bool warm = true;
-	bool validate = true; // EXCEPT ALL correctness cross-check on the AUTO path
+	bool validate = true; // EXCEPT ALL correctness cross-check for every refresh mode
 	string batch_sel = "all"; // "all" | "validated" | "todo"
 	vector<FlagConfig> configs = {FlagConfig::ALL_ON, FlagConfig::ALL_OFF, FlagConfig::SKIP_EMPTY_OFF};
 
@@ -1460,9 +1456,9 @@ int main(int argc, char **argv) {
 							auto_result = RunMode(prepared, q, wl, pct, config, rep, cycle, RefreshMode::AUTO, true,
 							                      warm, /*do_validate=*/validate, &promoted);
 							inc_result = RunMode(prepared, q, wl, pct, config, rep, cycle, RefreshMode::INCREMENTAL,
-							                     false, warm, /*do_validate=*/false, nullptr);
+							                     false, warm, /*do_validate=*/validate, nullptr);
 							full_result = RunMode(prepared, q, wl, pct, config, rep, cycle, RefreshMode::FULL, false,
-							                      warm, /*do_validate=*/false, nullptr);
+							                      warm, /*do_validate=*/validate, nullptr);
 							if (!promoted.empty()) {
 								if (auto_result.ok) {
 									CopyFile(promoted, prepared.state->path);
@@ -1472,9 +1468,7 @@ int main(int argc, char **argv) {
 							}
 						}
 
-						// Correctness is verified on the AUTO path (the decision under test); the forced
-						// inc/full runs are reference timings only.
-						bool correct = auto_result.correct;
+						bool correct = auto_result.correct && inc_result.correct && full_result.correct;
 						bool ok = auto_result.ok && inc_result.ok && full_result.ok;
 						if (!ok || !correct) {
 							errors++;
