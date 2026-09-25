@@ -1682,7 +1682,7 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	                                    EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, error_context),
 	                                    OnEntryNotFound::RETURN_NULL);
 	if (view_entry) {
-		data_ref = SqlUtils::FindTableReference(view_entry->Cast<ViewCatalogEntry>().sql, data_name);
+		data_ref = SqlUtils::FindTableReference(view_entry->Cast<ViewCatalogEntry>().GetQuery().ToString(), data_name);
 	}
 	string internal_prefix = SqlUtils::QualifiedPrefix(location.catalog_name, location.schema_name);
 	if (!data_ref.empty()) {
@@ -1904,7 +1904,8 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	string data_table_ref;
 	if (view_entry) {
 		auto &view = view_entry->Cast<ViewCatalogEntry>();
-		data_table_ref = SqlUtils::FindTableReference(view.sql, data_table_name);
+		// External catalogs need not retain the original SQL string.
+		data_table_ref = SqlUtils::FindTableReference(view.GetQuery().ToString(), data_table_name);
 	}
 	Connection con(*context.db);
 	RefreshMetadata::UseCatalog(context, con, catalog_name);
@@ -1946,6 +1947,22 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	                             drop.info->cascade, drop.info->if_not_found);
 	auto excluded_view = "'" + SqlUtils::EscapeValue(drop.info->name) + "'";
 	AppendUnusedSourceDropProgram(con, delta_sources, excluded_view, program);
+	if (metadata.IsDuckLakeCatalog(catalog_name)) {
+		// Keep metadata ownership explicit when the staged executor uses a fresh connection.
+		auto owner = con.Query("SELECT current_database()");
+		if (owner->HasError()) {
+			throw CatalogException("OpenIVM could not resolve DROP metadata catalog: %s", owner->GetError());
+		}
+		auto prefix = SqlUtils::QualifiedPrefix(owner->GetValue(0, 0).ToString(), DEFAULT_SCHEMA);
+		for (auto table :
+		     {"openivm_refresh_hooks", openivm::MV_DEPS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::VIEWS_TABLE}) {
+			program = SqlUtils::ReplaceTableReferences(program, table, prefix + SqlUtils::QuoteIdentifier(table));
+		}
+		OPENIVM_DEBUG_PRINT("[DROP] Staging DuckLake view and native metadata cleanup for '%s'\n",
+		                    drop.info->name.c_str());
+		ExecuteStagedDDL(context, {Value(program)});
+		return "SELECT true AS Success";
+	}
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
 	if (!context.transaction.IsAutoCommit()) {
 		TransactionalMVMetadataState::Get(context).RegisterSQL(program, drop.info->name);

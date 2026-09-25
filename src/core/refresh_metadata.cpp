@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <functional>
 #include <sstream>
+#include <map>
+#include <set>
 #include <unordered_set>
 
 namespace duckdb {
@@ -353,6 +355,97 @@ vector<string> RefreshMetadata::GetDownstreamViews(const string &view_name) {
 
 vector<string> RefreshMetadata::GetDownstreamViewsStrict(const string &view_name) {
 	return GetDownstreamViewsInternal(con, view_name, true);
+}
+
+vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &targets, const string &cascade_mode) {
+	if (cascade_mode != "off" && cascade_mode != "upstream" && cascade_mode != "downstream" && cascade_mode != "both") {
+		throw InvalidInputException("refresh_pipeline: unknown cascade mode '%s'", cascade_mode);
+	}
+	struct Node {
+		vector<string> parents;
+		vector<string> children;
+		idx_t pending = 0;
+	};
+	std::map<string, Node> graph;
+	auto views = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE));
+	if (views->HasError()) {
+		throw CatalogException("refresh_pipeline: cannot read materialized views: %s", views->GetError());
+	}
+	for (idx_t i = 0; i < views->RowCount(); i++) {
+		graph.emplace(views->GetValue(0, i).ToString(), Node());
+	}
+	std::set<string> selected;
+	for (auto &target : targets) {
+		if (graph.find(target) == graph.end()) {
+			throw CatalogException("refresh_pipeline: materialized view '%s' does not exist", target);
+		}
+		selected.insert(target);
+	}
+	// Read the same source metadata used by single-view cascades, not the optional matcher edges.
+	auto edges =
+	    con.Query("SELECT DISTINCT p.view_name, d.view_name FROM " + string(openivm::VIEWS_TABLE) + " p JOIN " +
+	              string(openivm::DELTA_TABLES_TABLE) + " d ON (d.table_name = '" + string(openivm::DELTA_PREFIX) +
+	              "' || p.view_name OR d.table_name = '" + string(openivm::DATA_TABLE_PREFIX) +
+	              "' || p.view_name)"
+	              " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR d.source_catalog=p.view_catalog)"
+	              " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR d.source_schema=p.view_schema)");
+	if (edges->HasError()) {
+		throw CatalogException("refresh_pipeline: cannot read dependencies: %s", edges->GetError());
+	}
+	for (idx_t i = 0; i < edges->RowCount(); i++) {
+		auto parent = edges->GetValue(0, i).ToString();
+		auto child = edges->GetValue(1, i).ToString();
+		if (graph.find(child) == graph.end()) {
+			throw CatalogException("refresh_pipeline: dependency refers to missing materialized view '%s'", child);
+		}
+		graph.at(parent).children.push_back(child);
+		graph.at(child).parents.push_back(parent);
+	}
+	auto expand = [&](bool upstream) {
+		vector<string> queue(selected.begin(), selected.end());
+		for (idx_t i = 0; i < queue.size(); i++) {
+			auto &node = graph.at(queue[i]);
+			for (auto &next : upstream ? node.parents : node.children) {
+				if (selected.insert(next).second) {
+					queue.push_back(next);
+				}
+			}
+		}
+	};
+	if (cascade_mode == "downstream" || cascade_mode == "both") {
+		expand(false);
+	}
+	// Both completes the dependencies of the downstream selection, including co-parents.
+	if (cascade_mode == "upstream" || cascade_mode == "both") {
+		expand(true);
+	}
+	std::set<string> ready;
+	for (auto &name : selected) {
+		auto &node = graph.at(name);
+		for (auto &parent : node.parents) {
+			node.pending += selected.count(parent);
+		}
+		if (node.pending == 0) {
+			ready.insert(name);
+		}
+	}
+	vector<string> order;
+	while (!ready.empty()) {
+		auto name = *ready.begin();
+		ready.erase(ready.begin());
+		order.push_back(name);
+		for (auto &child : graph.at(name).children) {
+			if (selected.count(child) && --graph.at(child).pending == 0) {
+				ready.insert(child);
+			}
+		}
+	}
+	if (order.size() != selected.size()) {
+		throw InvalidInputException("refresh_pipeline: selected dependencies contain a cycle");
+	}
+	OPENIVM_DEBUG_PRINT("[PIPELINE] Selected %zu views for %zu targets (mode=%s)\n", order.size(), targets.size(),
+	                    cascade_mode.c_str());
+	return order;
 }
 
 bool RefreshMetadata::HasDownstreamViews(const string &view_name) {

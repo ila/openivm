@@ -1191,9 +1191,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// because the rest of the suite runs in memory, where the index is built in-session.
 		//
 		// Restricted to DuckDB output: the safe form emits INSERT OR REPLACE, which other dialects do
-		// not share.
+		// not share. DuckLake output also has no unique indexes for ON CONFLICT.
 		vector<string> recompute_unique_keys;
-		if (active_facts.target_dialect == SqlDialect::DUCKDB &&
+		if (!target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB &&
 		    (view_query_type == RefreshType::AGGREGATE_GROUP || view_query_type == RefreshType::AGGREGATE_HAVING)) {
 			recompute_unique_keys = metadata.GetGroupColumns(view_name);
 		}

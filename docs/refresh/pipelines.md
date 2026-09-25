@@ -109,3 +109,31 @@ CREATE MATERIALIZED VIEW chain_b AS
 ```
 
 With `openivm_cascade_refresh = 'downstream'`, refreshing `base_summary` automatically refreshes both `chain_a` and `chain_b`.
+
+## Refresh a selected pipeline
+
+Use `refresh_pipeline` to refresh several starting MVs and their selected dependencies as one ordered run:
+
+```sql
+SET openivm_cascade_refresh = 'upstream';
+PRAGMA refresh_pipeline('sales_report', 'inventory_report');
+```
+
+OpenIVM discovers the graph from current source metadata on each call. No pipeline registration is needed. Arguments are unqualified MV names in the current metadata catalog, as with `refresh`; use `USE` to select an attached native database. DuckLake views use their native controller's metadata.
+
+| Cascade mode | Selected views |
+|---|---|
+| `off` | Only the named MVs |
+| `upstream` | Named MVs and their ancestors |
+| `downstream` | Named MVs and their descendants |
+| `both` | Named MVs and their descendants, then all ancestors required by that selection |
+
+Every selected MV is visited once, with selected parents before their children, regardless of argument order or repeated names. Independent ready nodes are ordered by name. Shared dependencies are deduplicated across targets. Refreshes whose inputs have no pending changes may be skipped as usual. `downstream` assumes parents outside the selection are already current; `both` includes those co-parents. Ordinary views are expanded when source dependencies are captured.
+
+The run uses sequential refreshes under the existing OpenIVM mutation gate. The caller must finish ingestion before invoking it and keep ingestion paused until it returns; external DuckLake writers are not blocked by this gate. This is not an atomic publication boundary for readers.
+
+Unknown targets, dependency cycles, and definitions that no longer bind are rejected before an autocommit run refreshes any node. The graph is rediscovered after DDL changes; compatible source schema evolution uses the existing schema-update machinery. A dropped target is an error, not silently omitted. Recreate invalidated MVs before retrying.
+
+Each selected node uses its normal refresh hooks. A refresh or hook failure stops the run; earlier autocommit refreshes can already be committed. Native explicit transactions use the existing transactional refresh path and can be rolled back. DuckLake refreshes retain the existing separate data/metadata transaction behavior.
+
+DuckLake `DROP VIEW` uses staged DDL: lake-side objects are removed before native OpenIVM metadata is cleaned up. This matches the existing cross-catalog create/refresh model; it is not one atomic transaction across both catalogs.

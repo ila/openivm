@@ -633,7 +633,9 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 	auto recompute_view_type = metadata.GetViewType(view_name);
 	vector<string> unique_keys;
 	string recompute_temp;
-	if (recompute_view_type == RefreshType::AGGREGATE_GROUP || recompute_view_type == RefreshType::AGGREGATE_HAVING) {
+	auto view_location = metadata.GetStoredViewLocation(view_name, attached_catalog, attached_schema);
+	if (!metadata.IsDuckLakeCatalog(view_location.catalog_name) &&
+	    (recompute_view_type == RefreshType::AGGREGATE_GROUP || recompute_view_type == RefreshType::AGGREGATE_HAVING)) {
 		unique_keys = metadata.GetGroupColumns(view_name);
 		if (!unique_keys.empty()) {
 			recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);

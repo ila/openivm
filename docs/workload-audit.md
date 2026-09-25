@@ -28,3 +28,13 @@ Actual CLI queries exercised both storage backends, mixed changes, refresh profi
 Fixed the shared source-metadata lookup to recognize the DuckLake backing-table name for a logical MV source. The existing incremental snapshot-delta and auxiliary-state maintenance paths remain enabled. Extended `test/sql/ducklake_semi_anti.test` with the original anti-join shape, chained sources on both sides, semi joins, duplicate tuples, and two mixed-DML batches. Every refresh is checked against the original base-table query with EXCEPT ALL in both directions.
 
 Validation after the fix: 1,286 assertions passed across eight related join, chain, and auxiliary-state test cases; the compiled N-term SQL integration checks passed; the original CLI example now has zero bag differences in both native DuckDB and DuckLake. The other audit findings above remain discussion items.
+
+## Pipeline refresh implementation
+
+`PRAGMA refresh_pipeline('target_a', 'target_b')` now selects a fresh dependency graph per call, deduplicates targets, and executes selected MVs sequentially in topological order. Selection follows `openivm_cascade_refresh`: off selects targets only, upstream includes ancestors, downstream includes descendants, and both includes descendants followed by all their required ancestors. Independent ready nodes are ordered by name. No persistent pipeline registration or automatic ingestion-completion trigger is introduced.
+
+The caller keeps ingestion paused. Unchanged nodes can be skipped. Invalid targets, cycles, and unbindable definitions are rejected before an autocommit run executes any node; failures during refresh or hooks stop the run, but earlier autocommit nodes may have committed. Native explicit transactions retain rollback support. Pipeline tests cover schema changes, dropped sources/views, new graph members, and hook failure/retry in the existing chained test files. DuckLake view drops now use the same staged-DDL approach as creation: lake-side removal followed by native metadata cleanup, without claiming cross-catalog atomicity.
+
+Parallel execution, atomic publication of a complete DAG, continuous ingestion against pinned run snapshots, and MotherDuck deployment remain separate discussion items. See [pipeline refresh documentation](refresh/pipelines.md).
+
+Pipeline validation: `make test` passed 11,460 assertions across 89 test cases, with one ICU-dependent test skipped. Compiled N-term SQL integration checks passed. The loadable extension built successfully, and CLI checks passed after reopening a persistent database and renaming a source column.

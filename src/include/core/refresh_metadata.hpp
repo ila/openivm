@@ -100,6 +100,9 @@ public:
 	vector<string> GetDownstreamViewsStrict(const string &view_name);
 	bool HasDownstreamViews(const string &view_name);
 
+	// Select a multi-target pipeline and topologically order its induced dependency graph.
+	vector<string> GetPipelineRefreshOrder(const vector<string> &targets, const string &cascade_mode);
+
 	// Get refresh_interval in seconds for a view. Returns -1 if not set (manual only).
 	int64_t GetRefreshInterval(const string &view_name);
 

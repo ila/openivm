@@ -1372,3 +1372,877 @@ true
 
 statement ok
 DROP TABLE ch_noop_l2_last_update;
+
+# Pipeline refresh: selection, topological order, shared ancestors and repeated targets.
+
+statement ok
+USE memory;
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+CREATE SEQUENCE memory.main.pipe_seq;
+
+statement ok
+CREATE TABLE memory.main.pipe_log(seq BIGINT DEFAULT nextval('memory.main.pipe_seq'), name VARCHAR);
+
+statement ok
+CREATE TABLE pipe_src_a(id INT,v INT);
+
+statement ok
+CREATE TABLE pipe_src_b(id INT,w INT);
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,10),(2,20);
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,100),(2,200);
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_a AS SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id;
+
+statement ok
+CREATE VIEW pipe_bridge AS SELECT * FROM pipe_a;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_a', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_a'')', 'after');
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_b AS SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_b', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_b'')', 'after');
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_c AS SELECT id,v*2 AS v FROM pipe_bridge;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_c', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_c'')', 'after');
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_z AS SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id);
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_z', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_z'')', 'after');
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_tail AS SELECT id,v+w AS total FROM pipe_z;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_tail', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_tail'')', 'after');
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_side AS SELECT id,v+1 AS v FROM pipe_a;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_side', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_side'')', 'after');
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_tail','pipe_z','pipe_c','pipe_b','pipe_a','pipe_a');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_tail','pipe_z','pipe_tail');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='downstream';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_b','pipe_c','pipe_a','pipe_b');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_side,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_side EXCEPT ALL SELECT id,v+1 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v+1 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_side));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_c');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_a','pipe_a');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+SET openivm_cascade_refresh='downstream';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_c');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement error
+PRAGMA refresh_pipeline('pipe_a','pipe_missing');
+----
+does not exist
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+(empty)
+
+statement error
+PRAGMA refresh_pipeline(NULL);
+----
+No function matches
+
+statement error
+PRAGMA refresh_pipeline(NULL::VARCHAR);
+----
+non-empty
+
+statement error
+PRAGMA refresh_pipeline('');
+----
+non-empty
+
+statement ok
+SET openivm_cascade_refresh='invalid';
+
+statement error
+PRAGMA refresh_pipeline('pipe_a');
+----
+unknown cascade mode
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+CREATE TEMP TABLE pipe_saved_edges AS SELECT * FROM memory.main.openivm_delta_tables WHERE view_name='pipe_a';
+
+statement ok
+UPDATE memory.main.openivm_delta_tables SET table_name='openivm_delta_pipe_tail' WHERE view_name='pipe_a';
+
+statement error
+PRAGMA refresh_pipeline('pipe_tail');
+----
+cycle
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+(empty)
+
+statement ok
+DELETE FROM memory.main.openivm_delta_tables WHERE view_name='pipe_a';
+
+statement ok
+INSERT INTO memory.main.openivm_delta_tables SELECT * FROM pipe_saved_edges;
+
+statement ok
+PRAGMA refresh_pipeline('pipe_tail');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+ALTER TABLE pipe_src_a ADD COLUMN unused INT;
+
+statement ok
+ALTER TABLE pipe_src_a DROP COLUMN unused;
+
+statement ok
+ALTER TABLE pipe_src_a RENAME COLUMN v TO amount;
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,12);
+
+statement ok
+PRAGMA refresh_pipeline('pipe_tail');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,13);
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,17);
+
+statement ok
+PRAGMA refresh_pipeline('pipe_tail');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+(empty)
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+CREATE TABLE pipe_drop_src(id INT);
+
+statement ok
+INSERT INTO pipe_drop_src VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_drop_mv AS SELECT id FROM pipe_drop_src;
+
+statement ok
+DROP TABLE pipe_drop_src;
+
+statement error
+PRAGMA refresh_pipeline('pipe_a','pipe_drop_mv');
+----
+cannot bind materialized view
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+(empty)
+
+statement ok
+DROP VIEW pipe_side;
+
+query II
+SELECT (SELECT COUNT(*) FROM memory.main.openivm_views WHERE view_name='pipe_side'),
+       (SELECT COUNT(*) FROM memory.main.openivm_delta_tables WHERE view_name='pipe_side');
+----
+0	0
+
+statement error
+PRAGMA refresh_pipeline('pipe_a','pipe_side');
+----
+does not exist
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+(empty)
+
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,21);
+
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_a');
+
+query T
+SELECT string_agg(name, ',' ORDER BY seq) FROM memory.main.pipe_log;
+----
+pipe_a,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+# A failed parent hook stops the run; retry consumes the still-pending descendants.
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+UPDATE memory.main.openivm_refresh_hooks SET mode='before',hook_sql='SELECT error(''pipeline test hook failure'')' WHERE view_name='pipe_b';
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,31);
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,41);
+
+statement error
+PRAGMA refresh_pipeline('pipe_tail');
+----
+pipeline test hook failure
+
+query T
+SELECT string_agg(name, ',' ORDER BY seq) FROM memory.main.pipe_log;
+----
+pipe_a
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+statement ok
+UPDATE memory.main.openivm_refresh_hooks SET mode='after',hook_sql='INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_b'')' WHERE view_name='pipe_b';
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+PRAGMA refresh_pipeline('pipe_tail');
+
+query T
+SELECT string_agg(name, ',' ORDER BY seq) FROM memory.main.pipe_log;
+----
+pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+# New descendants are discovered on the next call without pipeline registration.
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_new AS SELECT id,v+99 AS v FROM pipe_a;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_new','INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_new'')','after');
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,51);
+
+statement ok
+PRAGMA refresh_pipeline('pipe_a');
+
+query T
+SELECT string_agg(name, ',' ORDER BY seq) FROM memory.main.pipe_log;
+----
+pipe_a,pipe_c,pipe_new,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(amount) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_new EXCEPT ALL SELECT id,v+99 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v+99 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_new));
+----
+0	0
+
+statement ok
+USE memory;

@@ -432,6 +432,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(refresh_options);
 	auto refresh = PragmaFunction::PragmaCall("refresh", TransactionalRefreshQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh);
+	loader.RegisterFunction(PragmaFunction::PragmaCall("refresh_pipeline", RefreshPipelineQuery, {LogicalType::VARCHAR},
+	                                                   LogicalType::VARCHAR));
 	auto declare_rely_fk = PragmaFunction::PragmaCall(
 	    "openivm_declare_rely_fk",
 	    [](ClientContext &, const FunctionParameters &parameters) -> string {
