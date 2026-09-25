@@ -905,6 +905,53 @@ void PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &pr
 	}
 }
 
+void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan) {
+	vector<LogicalProjection *> projections;
+	auto *node = plan.get();
+	while (node && node->children.size() == 1) {
+		if (node->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+			break;
+		}
+		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			projections.push_back(&node->Cast<LogicalProjection>());
+		} else if (node->type != LogicalOperatorType::LOGICAL_CREATE_TABLE &&
+		           node->type != LogicalOperatorType::LOGICAL_FILTER &&
+		           node->type != LogicalOperatorType::LOGICAL_ORDER_BY &&
+		           node->type != LogicalOperatorType::LOGICAL_LIMIT &&
+		           node->type != LogicalOperatorType::LOGICAL_TOP_N) {
+			return;
+		}
+		node = node->children[0].get();
+	}
+	if (!node || node->type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY || projections.empty()) {
+		return;
+	}
+	auto &aggregate = node->Cast<LogicalAggregate>();
+	for (idx_t i = 0; i < aggregate.groups.size(); i++) {
+		ColumnBinding binding(aggregate.group_index, i);
+		auto type = aggregate.groups[i]->return_type;
+		auto alias = "openivm_group_key_" + to_string(i);
+		for (auto it = projections.rbegin(); it != projections.rend(); ++it) {
+			auto &projection = **it;
+			idx_t column = 0;
+			for (; column < projection.expressions.size(); column++) {
+				auto &expression = *projection.expressions[column];
+				if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				    expression.Cast<BoundColumnRefExpression>().binding == binding) {
+					break;
+				}
+			}
+			if (column == projection.expressions.size()) {
+				binding = AppendProjectionPassthrough(projection, binding, type, alias);
+				OPENIVM_DEBUG_PRINT("[PlanRewrite] Preserving hidden group key %s\n", alias.c_str());
+			} else {
+				binding = ColumnBinding(projection.table_index, column);
+			}
+		}
+	}
+	plan->ResolveOperatorTypes();
+}
+
 /// Inject a hidden COUNT(*) (alias `openivm_count_star`) into AGGREGATE_GROUP
 /// aggregates that don't already have a reliable total-row-count aggregate.
 ///
@@ -1409,6 +1456,7 @@ static void RewritePassDerivedAggregates(PlanRewriteContext &rewrite_context) {
 }
 
 static void RewritePassGroupCountStar(PlanRewriteContext &rewrite_context) {
+	InjectHiddenGroupKeys(rewrite_context.plan);
 	InjectGroupCountStar(rewrite_context.plan);
 }
 
@@ -1507,7 +1555,8 @@ static string QuoteDerivedOutputIdentifier(const string &identifier) {
 static bool RenderDerivedOutputExpression(const Expression &expr,
                                           const unordered_map<uint64_t, string> &binding_to_column,
                                           const DerivedOutputProjectionMap &projections,
-                                          unordered_set<uint64_t> &active_bindings, string &sql) {
+                                          unordered_set<uint64_t> &active_bindings, string &sql,
+                                          bool allow_functions = false) {
 	switch (expr.expression_class) {
 	case ExpressionClass::BOUND_COLUMN_REF: {
 		auto &column = expr.Cast<BoundColumnRefExpression>();
@@ -1526,10 +1575,33 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 		    !active_bindings.insert(key).second) {
 			return false;
 		}
-		bool rendered = RenderDerivedOutputExpression(*projection->second->expressions[column.binding.column_index],
-		                                              binding_to_column, projections, active_bindings, sql);
+		bool rendered =
+		    RenderDerivedOutputExpression(*projection->second->expressions[column.binding.column_index],
+		                                  binding_to_column, projections, active_bindings, sql, allow_functions);
 		active_bindings.erase(key);
 		return rendered;
+	}
+	case ExpressionClass::BOUND_FUNCTION: {
+		if (!allow_functions) {
+			return false;
+		}
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		vector<string> children;
+		for (auto &child : function.children) {
+			string child_sql;
+			if (!RenderDerivedOutputExpression(*child, binding_to_column, projections, active_bindings, child_sql,
+			                                   allow_functions)) {
+				return false;
+			}
+			children.push_back(std::move(child_sql));
+		}
+		const auto &name = function.function.name;
+		if (children.size() == 2 && (name == "+" || name == "-" || name == "*" || name == "/" || name == "%")) {
+			sql = "(" + children[0] + " " + name + " " + children[1] + ")";
+		} else {
+			sql = name + "(" + StringUtil::Join(children, ", ") + ")";
+		}
+		return true;
 	}
 	case ExpressionClass::BOUND_CONSTANT:
 		sql = expr.Cast<BoundConstantExpression>().value.ToSQLString();
@@ -1541,16 +1613,16 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 			string when_sql;
 			string then_sql;
 			if (!RenderDerivedOutputExpression(*check.when_expr, binding_to_column, projections, active_bindings,
-			                                   when_sql) ||
+			                                   when_sql, allow_functions) ||
 			    !RenderDerivedOutputExpression(*check.then_expr, binding_to_column, projections, active_bindings,
-			                                   then_sql)) {
+			                                   then_sql, allow_functions)) {
 				return false;
 			}
 			sql += " WHEN " + when_sql + " THEN " + then_sql;
 		}
 		string else_sql;
 		if (!RenderDerivedOutputExpression(*case_expr.else_expr, binding_to_column, projections, active_bindings,
-		                                   else_sql)) {
+		                                   else_sql, allow_functions)) {
 			return false;
 		}
 		sql += " ELSE " + else_sql + " END";
@@ -1560,10 +1632,10 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 		auto &comparison = expr.Cast<BoundComparisonExpression>();
 		string left_sql;
 		string right_sql;
-		if (!RenderDerivedOutputExpression(*comparison.left, binding_to_column, projections, active_bindings,
-		                                   left_sql) ||
+		if (!RenderDerivedOutputExpression(*comparison.left, binding_to_column, projections, active_bindings, left_sql,
+		                                   allow_functions) ||
 		    !RenderDerivedOutputExpression(*comparison.right, binding_to_column, projections, active_bindings,
-		                                   right_sql)) {
+		                                   right_sql, allow_functions)) {
 			return false;
 		}
 		sql = "(" + left_sql + " " + ExpressionTypeToOperator(comparison.type) + " " + right_sql + ")";
@@ -1576,7 +1648,7 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 		for (idx_t i = 0; i < conjunction.children.size(); i++) {
 			string child_sql;
 			if (!RenderDerivedOutputExpression(*conjunction.children[i], binding_to_column, projections,
-			                                   active_bindings, child_sql)) {
+			                                   active_bindings, child_sql, allow_functions)) {
 				return false;
 			}
 			if (i > 0) {
@@ -1593,8 +1665,8 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 			return false;
 		}
 		string child_sql;
-		if (!RenderDerivedOutputExpression(*op.children[0], binding_to_column, projections, active_bindings,
-		                                   child_sql)) {
+		if (!RenderDerivedOutputExpression(*op.children[0], binding_to_column, projections, active_bindings, child_sql,
+		                                   allow_functions)) {
 			return false;
 		}
 		if (expr.type == ExpressionType::OPERATOR_IS_NULL) {
@@ -1614,7 +1686,8 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 	case ExpressionClass::BOUND_CAST: {
 		auto &cast = expr.Cast<BoundCastExpression>();
 		string child_sql;
-		if (!RenderDerivedOutputExpression(*cast.child, binding_to_column, projections, active_bindings, child_sql)) {
+		if (!RenderDerivedOutputExpression(*cast.child, binding_to_column, projections, active_bindings, child_sql,
+		                                   allow_functions)) {
 			return false;
 		}
 		sql = string(cast.try_cast ? "TRY_CAST(" : "CAST(") + child_sql + " AS " + cast.return_type.ToString() + ")";
@@ -1623,6 +1696,48 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 	default:
 		return false;
 	}
+}
+
+bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                                const vector<string> &output_names, string &sql) {
+	DerivedOutputProjectionMap projections;
+	for (auto *projection : facts.projections) {
+		projections[projection->table_index] = projection;
+	}
+	unordered_map<uint64_t, string> binding_to_column;
+	auto bindings = plan.GetColumnBindings();
+	for (idx_t i = 0; i < bindings.size() && i < output_names.size(); i++) {
+		BoundColumnRefExpression output(LogicalType::SQLNULL, bindings[i]);
+		vector<uint64_t> path;
+		auto resolved = ResolveDerivedOutputPassThrough(output, projections, &path);
+		if (resolved && resolved->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			for (auto key : path) {
+				binding_to_column[key] = output_names[i];
+			}
+		}
+	}
+	// DISTINCT normalization replaces pass-through bindings with group outputs.
+	// ORDER BY can still reference the corresponding input binding, so expose
+	// that equivalence only for group keys present in the published output.
+	for (auto *aggregate : facts.aggregates) {
+		for (idx_t i = 0; i < aggregate->groups.size(); i++) {
+			auto key = DerivedOutputBindingKey(ColumnBinding(aggregate->group_index, i));
+			auto entry = binding_to_column.find(key);
+			if (entry == binding_to_column.end()) {
+				continue;
+			}
+			auto name = entry->second;
+			vector<uint64_t> path;
+			auto resolved = ResolveDerivedOutputPassThrough(*aggregate->groups[i], projections, &path);
+			if (resolved && resolved->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+				for (auto input_key : path) {
+					binding_to_column[input_key] = name;
+				}
+			}
+		}
+	}
+	unordered_set<uint64_t> active;
+	return RenderDerivedOutputExpression(expression, binding_to_column, projections, active, sql, true);
 }
 
 DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator &plan, const CreateMVPlanFacts &facts,

@@ -442,7 +442,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		visible_output_count = select_planner.names.size();
 		for (auto &name : select_planner.names) {
 			if (StringUtil::CIEquals(name, openivm::MULTIPLICITY_COL) ||
-			    StringUtil::CIEquals(name, openivm::TIMESTAMP_COL)) {
+			    StringUtil::CIEquals(name, openivm::TIMESTAMP_COL) ||
+			    StringUtil::CIEquals(name, openivm::PUBLISHED_ORDINAL_COL)) {
 				throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'", name);
 			}
 		}
@@ -461,63 +462,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 		having_predicate = StripHavingFilter(select_plan, output_names);
-		// HAVING-only aggregates are exposed by StripHavingFilter. Inject SUM's
-		// non-NULL state afterward so visible, wrapped, and HAVING-only SUMs all
-		// use the same output-index mapping during incremental maintenance.
+		StripPublicationModifiers(select_plan, output_names, current_catalog, top_k_suffix, top_k_order_suffix);
+		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
 
-		// Keep data tables unlimited/unordered; apply ORDER BY/LIMIT in the user-facing view.
-		{
-			LogicalOperator *limit_node = nullptr;
-			LogicalOperator *order_node = nullptr;
-
-			if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_TOP_N) {
-				limit_node = select_plan.get();
-				order_node = select_plan.get(); // same node holds both orders + limit
-			} else if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_LIMIT &&
-			           !select_plan->children.empty() &&
-			           select_plan->children[0]->type == LogicalOperatorType::LOGICAL_ORDER_BY) {
-				limit_node = select_plan.get();
-				order_node = select_plan->children[0].get();
-			}
-
-			if (limit_node) {
-				if (limit_node->type == LogicalOperatorType::LOGICAL_TOP_N) {
-					auto &top_n = limit_node->Cast<LogicalTopN>();
-					top_k_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names);
-					top_k_order_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names, false);
-					select_plan = std::move(select_plan->children[0]);
-				} else {
-					auto &order_op = order_node->Cast<LogicalOrder>();
-					auto &limit_op = limit_node->Cast<LogicalLimit>();
-					idx_t lval = 0;
-					idx_t oval = 0;
-					if (limit_op.limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
-						lval = limit_op.limit_val.GetConstantValue();
-					}
-					if (limit_op.offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
-						oval = limit_op.offset_val.GetConstantValue();
-					}
-					top_k_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names);
-					top_k_order_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names, false);
-					select_plan = std::move(select_plan->children[0]->children[0]);
-				}
-				OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped top-k wrapper, suffix='%s'\n", top_k_suffix.c_str());
-			}
-		}
-
-		// Strip a standalone ORDER_BY at the top of select_plan (e.g. DISTINCT + ORDER BY
-		// without LIMIT, or simple projection + ORDER BY). The data table stores unordered
-		// rows; the suffix is appended to the CREATE VIEW instead.
-		if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_ORDER_BY && top_k_suffix.empty() &&
-		    !select_plan->children.empty()) {
-			auto &order_op = select_plan->Cast<LogicalOrder>();
-			top_k_suffix = BuildTopKSuffix(order_op.orders, 0, 0, output_names);
-			top_k_order_suffix = top_k_suffix;
-			select_plan = std::move(select_plan->children[0]);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
-		}
 		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
 		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
 		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
@@ -583,6 +532,15 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		FoldConstantScalarSubqueries(context, plan);
 	}
 
+	InjectHiddenGroupKeys(plan);
+	if (!lpts_fallback && !top_k_order_suffix.empty()) {
+		// Classification must see the unlimited maintenance plan too. In particular,
+		// an inherited ORDER BY can be separated from the outer LIMIT by projections.
+		auto &analysis_query = plan->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ? plan->children[0] : plan;
+		auto analysis_names = output_names;
+		string analysis_suffix, analysis_order;
+		StripPublicationModifiers(analysis_query, analysis_names, current_catalog, analysis_suffix, analysis_order);
+	}
 	auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
 	if (!facts.source_table_info.empty()) {
 		table_names.clear();
@@ -1088,14 +1046,15 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	AppendCreateMVSystemTablesDDL(ddl, view_name, parse_data_ref.is_replace);
 
 	bool has_downstream_views = false;
+	bool preserve_consumer_deltas = false;
 	if (parse_data_ref.is_replace) {
 		Connection dependency_con(*context.db);
 		RefreshMetadata::UseCatalog(context, dependency_con, view_target_catalog);
 		RefreshMetadata dependency_metadata(dependency_con);
 		dependency_metadata.SnapshotTransaction(context);
 		has_downstream_views = dependency_metadata.HasDownstreamViews(view_name);
+		preserve_consumer_deltas = !target_is_ducklake && dependency_metadata.HasDownstreamViews(view_name, false);
 	}
-	bool preserve_consumer_deltas = has_downstream_views && !target_is_ducklake;
 	vector<string> replacement_delta_projection;
 	string preserved_delta = SqlUtils::QuoteIdentifier("openivm_replace_delta_" + view_name);
 	string creation_timestamp = Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()).ToSQLString() + "::TIMESTAMP";
@@ -1230,11 +1189,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		vector<string> sorted_tables;
 		sorted_tables.reserve(table_names.size());
 		for (const auto &t : table_names) {
-			if (StringUtil::StartsWith(t, openivm::DATA_TABLE_PREFIX)) {
-				sorted_tables.push_back(t.substr(strlen(openivm::DATA_TABLE_PREFIX)));
-			} else {
-				sorted_tables.push_back(t);
-			}
+			sorted_tables.push_back(PublishedSourceViewName(t));
 		}
 		std::sort(sorted_tables.begin(), sorted_tables.end());
 		metadata_ddl.push_back(
@@ -1530,7 +1485,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		if (!internal_cols.empty()) {
 			published_query += " EXCLUDE (" + SqlUtils::JoinQuotedColumns(internal_cols) + ")";
 		}
-		published_query += " FROM " + qdt + view_tail;
+		published_query +=
+		    top_k_order_suffix.empty() ? ", CAST(0 AS BIGINT)" : ", ROW_NUMBER() OVER (" + top_k_order_suffix + ")";
+		published_query += " AS " + string(openivm::PUBLISHED_ORDINAL_COL) + " FROM " + qdt + view_tail;
 		auto published = internal_catalog_prefix + SqlUtils::QuoteIdentifier(PublishedViewName(view_name));
 		auto published_delta =
 		    internal_catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(PublishedViewName(view_name)));
@@ -1540,6 +1497,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				visible_columns.push_back(name);
 			}
 		}
+		visible_columns.push_back(openivm::PUBLISHED_ORDINAL_COL);
 		if (parse_data_ref.is_replace && !has_downstream_views && !target_is_ducklake) {
 			ddl.push_back("DROP TABLE IF EXISTS " + published);
 			ddl.push_back("DROP TABLE IF EXISTS " + published_delta);
@@ -1558,7 +1516,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		}
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("published_query", published_query, view_name));
 		ddl.push_back(string(staged_cross_catalog_replace ? "CREATE OR REPLACE VIEW " : "CREATE VIEW ") + qvn +
-		              " AS SELECT * FROM " + published + (top_k_order_suffix.empty() ? "" : " " + top_k_order_suffix));
+		              " AS SELECT * EXCLUDE (" + string(openivm::PUBLISHED_ORDINAL_COL) + ") FROM " + published +
+		              (top_k_order_suffix.empty() ? "" : " ORDER BY " + string(openivm::PUBLISHED_ORDINAL_COL)));
 		add_cleanup("DROP TABLE IF EXISTS " + published);
 		add_cleanup("DROP TABLE IF EXISTS " + published_delta);
 	}
@@ -1814,7 +1773,9 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	view_drop.catalog = location.catalog_name;
 	view_drop.schema = location.schema_name;
 	view_drop.name = view_name;
-	view_drop.cascade = cascade;
+	// Tracked descendants are already dropped in reverse dependency order. DuckLake
+	// rejects CASCADE syntax even when no dependencies remain.
+	view_drop.cascade = cascade && !metadata.IsDuckLakeCatalog(location.catalog_name);
 	view_drop.if_not_found = if_not_found;
 	program += BuildDropViewStatement(view_drop) + ";\n";
 	program += "DROP TABLE IF EXISTS " + data_ref + ";\n";

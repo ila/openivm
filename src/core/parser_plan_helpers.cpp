@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/plan_rewrite.hpp"
+#include "core/plan_rewrite_internal.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
@@ -21,6 +22,8 @@
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "storage/ducklake_scan.hpp"
 #include "storage/ducklake_table_entry.hpp"
@@ -29,44 +32,91 @@
 
 namespace duckdb {
 
-/// Build "ORDER BY col1 ASC, col2 DESC LIMIT k [OFFSET n]".
-/// Works for both LOGICAL_TOP_N (fused) and separate LOGICAL_ORDER_BY + LOGICAL_LIMIT nodes.
-/// output_col_names is the sanitized output column list; BoundColumnRefs are resolved via
-/// their column_index into that list.
-string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
-                       const vector<string> &output_col_names, bool include_limit) {
-	string sql = "ORDER BY ";
-	for (size_t i = 0; i < orders.size(); i++) {
-		if (i > 0) {
-			sql += ", ";
-		}
-		auto &ord = orders[i];
-		bool resolved = false;
-		if (ord.expression->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-			auto &col_ref = ord.expression->Cast<BoundColumnRefExpression>();
-			idx_t cidx = col_ref.binding.column_index;
-			if (cidx < output_col_names.size() && !output_col_names[cidx].empty()) {
-				sql += KeywordHelper::WriteOptionallyQuoted(output_col_names[cidx]);
-				resolved = true;
-			}
-		}
-		if (!resolved) {
-			const string &alias = ord.expression->alias;
-			if (!alias.empty()) {
-				sql += KeywordHelper::WriteOptionallyQuoted(alias);
-			} else {
-				sql += ord.expression->ToString();
-			}
-		}
-		sql += " " + ord.GetOrderModifier();
+void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string> &output_names, const string &catalog,
+                               string &suffix, string &ordering) {
+	vector<LogicalProjection *> projections;
+	auto *slot = &plan;
+	while (*slot && (*slot)->type == LogicalOperatorType::LOGICAL_PROJECTION && (*slot)->children.size() == 1) {
+		projections.push_back(&(*slot)->Cast<LogicalProjection>());
+		slot = &(*slot)->children[0];
 	}
-	if (include_limit && limit_val > 0) {
-		sql += " LIMIT " + to_string(limit_val);
-		if (offset_val > 0) {
-			sql += " OFFSET " + to_string(offset_val);
-		}
+	if (!*slot) {
+		return;
 	}
-	return sql;
+	vector<BoundOrderByNode> *orders = nullptr;
+	idx_t limit = DConstants::INVALID_INDEX, offset = 0;
+	unique_ptr<LogicalOperator> *order_slot = nullptr;
+	if ((*slot)->type == LogicalOperatorType::LOGICAL_TOP_N) {
+		auto &top = (*slot)->Cast<LogicalTopN>();
+		orders = &top.orders;
+		limit = top.limit;
+		offset = top.offset;
+	} else if ((*slot)->type == LogicalOperatorType::LOGICAL_LIMIT) {
+		auto &top = (*slot)->Cast<LogicalLimit>();
+		if ((top.limit_val.Type() != LimitNodeType::UNSET && top.limit_val.Type() != LimitNodeType::CONSTANT_VALUE) ||
+		    (top.offset_val.Type() != LimitNodeType::UNSET && top.offset_val.Type() != LimitNodeType::CONSTANT_VALUE)) {
+			return;
+		}
+		if (top.limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+			limit = top.limit_val.GetConstantValue();
+		}
+		if (top.offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
+			offset = top.offset_val.GetConstantValue();
+		}
+		auto *candidate = &(*slot)->children[0];
+		while ((*candidate)->type == LogicalOperatorType::LOGICAL_PROJECTION && (*candidate)->children.size() == 1) {
+			projections.push_back(&(*candidate)->Cast<LogicalProjection>());
+			candidate = &(*candidate)->children[0];
+		}
+		if ((*candidate)->type == LogicalOperatorType::LOGICAL_ORDER_BY) {
+			order_slot = candidate;
+			orders = &(*candidate)->Cast<LogicalOrder>().orders;
+		}
+	} else if ((*slot)->type == LogicalOperatorType::LOGICAL_ORDER_BY) {
+		orders = &(*slot)->Cast<LogicalOrder>().orders;
+	} else {
+		return;
+	}
+	if (orders) {
+		auto facts = BuildCreateMVPlanFacts(plan.get(), catalog);
+		vector<string> order_sql;
+		for (idx_t i = 0; i < orders->size(); i++) {
+			auto &order = (*orders)[i];
+			string expression;
+			if (!RenderPlanOutputExpression(*order.expression, *plan, facts, output_names, expression)) {
+				// The outer projection hides a sort value (e.g. SELECT k ORDER BY SUM(v)).
+				// Keep it in maintenance state; only its ordinal crosses the public boundary.
+				D_ASSERT(!projections.empty());
+				auto alias = string(openivm::SORT_VALUE_PREFIX) + to_string(i);
+				auto &projection = *projections.back();
+				auto value = order.expression->Copy();
+				value->alias = alias;
+				auto type = value->return_type;
+				ColumnBinding binding(projection.table_index, projection.expressions.size());
+				projection.expressions.push_back(std::move(value));
+				projection.ResolveOperatorTypes();
+				vector<LogicalProjection *> ancestors(projections.begin(), projections.end() - 1);
+				PropagateHiddenBindingThroughProjectionPath(ancestors, binding, type, alias);
+				output_names.push_back(alias);
+				expression = SqlUtils::QuoteIdentifier(alias);
+			}
+			order_sql.push_back(expression + " " + order.GetOrderModifier());
+		}
+		ordering = "ORDER BY " + StringUtil::Join(order_sql, ", ");
+	}
+	suffix = ordering;
+	if (limit != DConstants::INVALID_INDEX) {
+		suffix += " LIMIT " + to_string(limit);
+	}
+	if (offset > 0) {
+		suffix += " OFFSET " + to_string(offset);
+	}
+	if (order_slot) {
+		*order_slot = std::move((*order_slot)->children[0]);
+	}
+	*slot = std::move((*slot)->children[0]);
+	plan->ResolveOperatorTypes();
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Extracted publication modifiers: %s\n", suffix.c_str());
 }
 
 static bool IsDerivedAggregate(const BoundAggregateExpression &aggregate) {
@@ -761,7 +811,8 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const CreateM
 			continue;
 		}
 		string col_name = ProjectionOutputName(expr, expr_i, output_names, bcr);
-		if (!IncrementalTableNames::IsInternalColumn(col_name)) {
+		if (!IncrementalTableNames::IsInternalColumn(col_name) ||
+		    StringUtil::StartsWith(col_name, "openivm_group_key_")) {
 			group_names.push_back(col_name);
 			matched = true;
 		}
@@ -779,7 +830,8 @@ static bool AddGroupColumnsFromBindings(LogicalOperator &op, const CreateMVPlanF
 		if (!ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, facts)) {
 			continue;
 		}
-		if (!output_names[col_idx].empty() && !IncrementalTableNames::IsInternalColumn(output_names[col_idx])) {
+		if (!output_names[col_idx].empty() && (!IncrementalTableNames::IsInternalColumn(output_names[col_idx]) ||
+		                                       StringUtil::StartsWith(output_names[col_idx], "openivm_group_key_"))) {
 			group_names.push_back(output_names[col_idx]);
 			matched = true;
 		}
@@ -811,13 +863,42 @@ static bool FindGroupColumns(const CreateMVPlanFacts &facts, idx_t group_index, 
 	return false;
 }
 
+static bool IsGroupExpression(const Expression &expression, const CreateMVPlanFacts &facts, idx_t group_index,
+                              size_t group_count) {
+	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		auto &column = expression.Cast<BoundColumnRefExpression>();
+		return ResolvesToGroupBinding(column.binding.table_index, column.binding.column_index, group_index, group_count,
+		                              facts);
+	}
+	bool valid = expression.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE;
+	ExpressionIterator::EnumerateChildren(expression, [&](const Expression &child) {
+		valid = valid && IsGroupExpression(child, facts, group_index, group_count);
+	});
+	return valid;
+}
+
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
                                       const vector<string> &output_names) {
 	vector<string> group_names;
-	if (AddGroupColumnsFromBindings(*facts.root, facts, group_index, group_count, output_names, group_names)) {
-		return group_names;
+	if (!AddGroupColumnsFromBindings(*facts.root, facts, group_index, group_count, output_names, group_names)) {
+		FindGroupColumns(facts, group_index, group_count, output_names, group_names);
 	}
-	FindGroupColumns(facts, group_index, group_count, output_names, group_names);
+	// Expressions over keys are constant within a group, not additive aggregates.
+	// Retain the raw hidden key as well: a computed key need not be injective.
+	bool has_hidden_key = false;
+	for (auto &name : group_names) {
+		has_hidden_key |= StringUtil::StartsWith(name, "openivm_group_key_");
+	}
+	if (has_hidden_key && facts.first_projection) {
+		auto &expressions = facts.first_projection->expressions;
+		for (idx_t i = 0; i < expressions.size() && i < output_names.size(); i++) {
+			if (expressions[i]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF &&
+			    IsGroupExpression(*expressions[i], facts, group_index, group_count) &&
+			    std::find(group_names.begin(), group_names.end(), output_names[i]) == group_names.end()) {
+				group_names.push_back(output_names[i]);
+			}
+		}
+	}
 	return group_names;
 }
 

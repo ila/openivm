@@ -281,11 +281,12 @@ FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_tri_mv.sql');
 ----
 1
 
+# Join-delta unions plus one union consolidating old/new published rows.
 query I
 SELECT ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL'))
 FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_tri_mv.sql');
 ----
-4
+5
 
 statement ok
 SET openivm_regular_nterm = false;
@@ -296,11 +297,12 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
     '{"target_dialect":"duckdb","compile_only":true}'
 );
 
+# Join-delta unions plus one union consolidating old/new published rows.
 query I
 SELECT ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL'))
 FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_tri_mv.sql');
 ----
-6
+7
 
 statement ok
 SET openivm_regular_nterm = true;
@@ -512,7 +514,7 @@ query I
 SELECT ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL'))
 FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_self_mv.sql');
 ----
-4
+5
 
 statement ok
 INSERT INTO cspj_self_event VALUES (4, 1, 30, 'd'), (5, 2, 20, 'e'), (6, 2, 30, 'temporary');

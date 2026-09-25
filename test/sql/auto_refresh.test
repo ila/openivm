@@ -903,8 +903,8 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_
 ----
 3
 
-# 16 profiled statements per refresh: the seven maintenance statements below
-# plus nine visible-publication statements (stage the new rows and signed diff,
+# 15 profiled statements per refresh: the seven maintenance statements below
+# plus eight visible-publication statements (stage the new rows and signed diff,
 # publish the delta, apply changed bags, and clean up the stages/delta).
 #   1. SET refresh_in_progress = true
 #   2. INSERT INTO openivm_delta_<view> (delta computation)
@@ -916,7 +916,7 @@ SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_
 query I
 SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'execute_refresh_sql_stmt';
 ----
-16
+15
 
 # Re-enable adaptive refresh so subsequent refreshes record history for Test 20.
 statement ok

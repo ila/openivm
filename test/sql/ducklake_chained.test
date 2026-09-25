@@ -677,7 +677,7 @@ PRAGMA refresh_options('dl', 'bronze', 'catalog_window_l1');
 # delta_<upstream_mv> dependency and force the downstream refresh to read it.
 statement ok
 INSERT INTO dl.bronze.openivm_delta_openivm_visible_catalog_window_l1
-SELECT sym, trade_date, low_price, high_price, 1, now()
+SELECT sym, trade_date, low_price, high_price, 0::BIGINT, 1, now()
 FROM dl.bronze.catalog_window_l1
 WHERE trade_date IN (DATE '2026-01-02', DATE '2026-01-03');
 
@@ -1953,3 +1953,234 @@ SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_leaf EXCEPT ALL SELECT k,
        (SELECT COUNT(*) FROM (SELECT k,v FROM dl.publish_source EXCEPT ALL SELECT * FROM dl.publish_leaf));
 ----
 0	0
+
+# Review regressions also preserve hidden grouping state through lake snapshots.
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+CREATE TABLE dl.r2_lake_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.r2_lake_t VALUES(1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.r2_lake_p AS SELECT k+1 g,avg(v) a FROM dl.r2_lake_t GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.r2_lake_c AS SELECT * FROM dl.r2_lake_p;
+
+statement ok
+INSERT INTO dl.r2_lake_t VALUES(1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE dl.r2_lake_t SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM dl.r2_lake_t WHERE k=2;
+
+statement ok
+PRAGMA refresh_pipeline('r2_lake_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.r2_lake_p EXCEPT ALL SELECT * FROM (SELECT k+1 g,avg(v) a FROM dl.r2_lake_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k+1 g,avg(v) a FROM dl.r2_lake_t GROUP BY k) e EXCEPT ALL SELECT * FROM dl.r2_lake_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.r2_lake_c EXCEPT ALL SELECT * FROM (SELECT k+1 g,avg(v) a FROM dl.r2_lake_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k+1 g,avg(v) a FROM dl.r2_lake_t GROUP BY k) e EXCEPT ALL SELECT * FROM dl.r2_lake_c));
+----
+0
+
+statement ok
+DROP VIEW dl.r2_lake_p CASCADE;
+
+statement ok
+DROP TABLE dl.r2_lake_t;
+
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+CREATE TABLE dl.r2_lake_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.r2_lake_t VALUES(1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.r2_lake_p AS SELECT k,sum(v) s FROM dl.r2_lake_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.r2_lake_c AS SELECT * FROM dl.r2_lake_p;
+
+statement ok
+INSERT INTO dl.r2_lake_t VALUES(1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE dl.r2_lake_t SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM dl.r2_lake_t WHERE k=2;
+
+statement ok
+PRAGMA refresh_pipeline('r2_lake_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.r2_lake_p EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM dl.r2_lake_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) e) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM dl.r2_lake_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) e EXCEPT ALL SELECT * FROM dl.r2_lake_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.r2_lake_c EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM dl.r2_lake_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) e) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM dl.r2_lake_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) e EXCEPT ALL SELECT * FROM dl.r2_lake_c));
+----
+0
+
+statement ok
+DROP VIEW dl.r2_lake_p CASCADE;
+
+statement ok
+DROP TABLE dl.r2_lake_t;
+
+# Stable ordering survives a hidden sort-type change while consumers lag.
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE dl.ordinal_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.ordinal_t VALUES(1,2000000000),(1,2000000000),(2,20),(3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.ordinal_p AS SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.ordinal_c AS SELECT * FROM dl.ordinal_p LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.ordinal_lag AS SELECT * FROM dl.ordinal_p;
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name IN ('ordinal_p','ordinal_c','ordinal_lag') AND type=3;
+----
+0
+
+query T
+SELECT list(k) FROM dl.ordinal_p;
+----
+[1, 3]
+
+statement ok
+INSERT INTO dl.ordinal_t VALUES(2,2000000000),(2,2000000000);
+
+statement ok
+UPDATE dl.ordinal_t SET v=v+1 WHERE k=3;
+
+statement ok
+DELETE FROM dl.ordinal_t WHERE k=2 AND v=2000000000;
+
+statement ok
+INSERT INTO dl.ordinal_t VALUES(2,2000000000),(2,2000000000);
+
+statement ok
+PRAGMA refresh('ordinal_p');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_p));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.ordinal_p AS SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_p));
+----
+0
+
+query T
+SELECT list(k) FROM dl.ordinal_p;
+----
+[2, 3]
+
+statement ok
+PRAGMA refresh('ordinal_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_c EXCEPT ALL SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected) UNION ALL (SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected EXCEPT ALL SELECT * FROM dl.ordinal_c));
+----
+0
+
+statement ok
+PRAGMA refresh('ordinal_lag');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_lag EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_lag));
+----
+0
+
+query T
+SELECT list(k) FROM dl.ordinal_lag;
+----
+[2, 3]
+
+statement ok
+DELETE FROM dl.ordinal_t;
+
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+PRAGMA refresh_pipeline('ordinal_c','ordinal_lag');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_lag EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_lag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_c EXCEPT ALL SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected) UNION ALL (SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected EXCEPT ALL SELECT * FROM dl.ordinal_c));
+----
+0
+
+statement ok
+INSERT INTO dl.ordinal_t VALUES(1,7),(2,NULL),(3,4);
+
+statement ok
+PRAGMA refresh_pipeline('ordinal_c','ordinal_lag');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_lag EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_lag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_c EXCEPT ALL SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected) UNION ALL (SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected EXCEPT ALL SELECT * FROM dl.ordinal_c));
+----
+0
+
+query T
+SELECT list(k) FROM dl.ordinal_p;
+----
+[3, 1]
+
+query T
+SELECT list(k) FROM dl.ordinal_c;
+----
+[3]
+
+statement ok
+DROP VIEW dl.ordinal_p CASCADE;
+
+statement ok
+DROP TABLE dl.ordinal_t;

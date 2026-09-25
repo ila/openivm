@@ -716,7 +716,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		if (!has_computed_over_derived && !decomp.derived_cols.empty()) {
 			idx_t probe_idx = 0;
 			for (auto &column : aggregates) {
-				if (decomp.derived_cols.count(column) || column.find("openivm_") != string::npos) {
+				if (decomp.derived_cols.count(column) || (column.find("openivm_") != string::npos &&
+				                                          column.find(openivm::SORT_VALUE_PREFIX) == string::npos)) {
 					continue;
 				}
 				while (probe_idx < aggregate_types.size() && IsDecomposedAggregateType(aggregate_types[probe_idx])) {
@@ -800,7 +801,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		idx_t type_idx = 0;
 		for (auto &column : aggregates) {
 			if (quoted_derived_output_expressions.count(column) || decomp.derived_cols.count(column) ||
-			    column.find("openivm_") != string::npos) {
+			    (column.find("openivm_") != string::npos && column.find(openivm::SORT_VALUE_PREFIX) == string::npos)) {
 				continue;
 			}
 			// Skip decomposed aggregate_types entries (avg → SUM+COUNT hidden cols)

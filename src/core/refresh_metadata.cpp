@@ -691,8 +691,10 @@ string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string 
                                              const string &delta_metadata_table) {
 	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
-	return "DELETE FROM " + qtarget + " WHERE " + string(openivm::TIMESTAMP_COL) + " < (SELECT MIN(last_update) FROM " +
-	       metadata_table + " WHERE table_name = '" + SqlUtils::EscapeValue(metadata_key) + "');\n";
+	auto consumers = "SELECT last_update FROM " + metadata_table + " WHERE table_name = '" +
+	                 SqlUtils::EscapeValue(metadata_key) + "'";
+	return "DELETE FROM " + qtarget + " WHERE NOT EXISTS (" + consumers + ") OR " + string(openivm::TIMESTAMP_COL) +
+	       " < (SELECT MIN(last_update) FROM (" + consumers + ") consumers);\n";
 }
 
 // --- DuckLake support ---

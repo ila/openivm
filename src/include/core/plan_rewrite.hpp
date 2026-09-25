@@ -48,6 +48,11 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                  vector<string> &planner_names, const PlanRewriteNeeds &needs);
 
+bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                                const vector<string> &output_names, string &sql);
+
+void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan);
+
 /// Strip the HAVING filter (FILTER above AGGREGATE) from the plan.
 /// Returns the HAVING predicate as SQL using output column aliases, or empty if
 /// no HAVING. The plan is modified in place: the FILTER node is removed. If the

@@ -29,6 +29,8 @@ constexpr const char *VISIBLE_TABLE_PREFIX = "openivm_visible_";
 // Internal column names (added by IVM plan rewrites, hidden from users via VIEW)
 constexpr const char *LEFT_KEY_COL = "openivm_left_key";
 constexpr const char *RIGHT_KEY_COL = "openivm_right_key";
+constexpr const char *PUBLISHED_ORDINAL_COL = "openivm_ordinal";
+constexpr const char *SORT_VALUE_PREFIX = "openivm_sort_value_";
 constexpr const char *DISTINCT_COUNT_COL = "openivm_distinct_count";
 
 // Internal column prefixes (for AVG and STDDEV/VARIANCE decomposition)

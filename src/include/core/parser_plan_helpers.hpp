@@ -106,8 +106,8 @@ struct CreateMVPlanFacts {
 	bool has_descendant_distinct = false;
 };
 
-string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
-                       const vector<string> &output_col_names, bool include_limit = true);
+void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string> &output_names, const string &catalog,
+                               string &suffix, string &ordering);
 /// Collect rewrite requirements while preparing CTEs, then inline eligible CTEs.
 PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,

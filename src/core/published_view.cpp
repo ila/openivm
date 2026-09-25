@@ -66,14 +66,25 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	// HAVING threshold crossings must retract the previously published rows.
 	string create = dialect == SqlDialect::SPARK ? "CREATE TABLE " : "CREATE TEMP TABLE ";
 	string sql = create + next + " AS " + scoped_query + ";\n";
-	sql += create + changes + " AS SELECT *, CAST(-1 AS INTEGER) AS openivm_multiplicity FROM (" + old_query +
-	       " EXCEPT ALL SELECT * FROM " + next + ") old_rows;\n";
-	sql += "INSERT INTO " + changes + " SELECT *, CAST(1 AS INTEGER) FROM (SELECT * FROM " + next + " EXCEPT ALL " +
-	       old_query + ") new_rows;\n";
+	auto weight = quote("openivm_publish_weight");
+	sql += create + changes + " AS SELECT " + column_list + ", SUM(" + weight + ") AS " + weight +
+	       " FROM (SELECT *, CAST(-1 AS BIGINT) AS " + weight + " FROM (" + old_query +
+	       ") old_rows UNION ALL SELECT *, CAST(1 AS BIGINT) FROM " + next + ") signed_rows GROUP BY " + column_list +
+	       " HAVING SUM(" + weight + ") <> 0;\n";
 	if (!ducklake) {
 		string timestamp = timestamp_sql.empty() ? openivm::UTC_NOW_SQL : timestamp_sql;
-		sql += "INSERT INTO " + delta + " (" + column_list + ", openivm_multiplicity, openivm_timestamp) SELECT *, " +
-		       timestamp + " FROM " + changes + ";\n";
+		vector<string> delta_columns;
+		for (auto &column : quoted_columns) {
+			delta_columns.push_back("c." + column);
+		}
+		auto expansion = dialect == SqlDialect::SPARK
+		                     ? " LATERAL VIEW explode(sequence(CAST(1 AS BIGINT), CAST(abs(c." + weight +
+		                           ") AS BIGINT))) repetitions AS repetition"
+		                     : " CROSS JOIN UNNEST(range(CAST(abs(c." + weight + ") AS BIGINT))) repetitions";
+		sql += "INSERT INTO " + delta + " (" + column_list + ", openivm_multiplicity, openivm_timestamp) SELECT " +
+		       StringUtil::Join(delta_columns, ", ") + ", CAST(sign(c." + weight + ") AS INTEGER), " + timestamp +
+		       " FROM " + changes + " c" + expansion + " WHERE EXISTS (SELECT 1 FROM " + metadata_table +
+		       " WHERE table_name = '" + SqlUtils::EscapeValue(delta_name) + "');\n";
 	}
 	// Replace only changed bags. DuckLake keeps its table identity and records the
 	// modifications in snapshots; native consumers read the explicit signed delta.

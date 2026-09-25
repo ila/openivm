@@ -1703,7 +1703,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		bool global_publication = false;
 		for (auto &modifier : node->modifiers) {
 			global_publication |= modifier->type == ResultModifierType::LIMIT_MODIFIER ||
-			                      modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER;
+			                      modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER ||
+			                      modifier->type == ResultModifierType::ORDER_MODIFIER;
 		}
 		vector<string> scope_columns;
 		bool has_scopable_delta = dispatch_refresh_type == RefreshType::AGGREGATE_GROUP ||
@@ -1714,7 +1715,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		    !use_transient_mv_delta) {
 			scope_columns = metadata.GetGroupColumns(view_name);
 			if (scope_columns.empty()) {
-				scope_columns = publication_columns;
+				for (auto &column : publication_columns) {
+					if (column != openivm::PUBLISHED_ORDINAL_COL) {
+						scope_columns.push_back(column);
+					}
+				}
 			}
 			for (auto &column : scope_columns) {
 				if (std::find(publication_columns.begin(), publication_columns.end(), column) ==

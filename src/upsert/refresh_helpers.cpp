@@ -712,7 +712,8 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 	string affected_ctes;
 	if (!union_parts.empty()) {
 		affected_ctes = "WITH openivm_affected AS (\n  " + union_parts + "\n)\n";
-		where_clause = lk + " IN (SELECT _k FROM openivm_affected) OR " + rk + " IN (SELECT _k FROM openivm_affected)";
+		where_clause = "EXISTS (SELECT 1 FROM openivm_affected WHERE _k IS NOT DISTINCT FROM " + lk +
+		               " OR _k IS NOT DISTINCT FROM " + rk + ")";
 	} else {
 		where_clause = "TRUE";
 	}

@@ -259,13 +259,13 @@ SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_uwd_dim;
 # signed visible rows to the child's registered source.
 statement ok
 INSERT INTO openivm_delta_openivm_visible_uwd_dim
-SELECT dim_key,id,grp,val,openivm_multiplicity,openivm_timestamp FROM openivm_delta_uwd_dim;
+SELECT dim_key,id,grp,val,0::BIGINT,openivm_multiplicity,openivm_timestamp FROM openivm_delta_uwd_dim;
 
 statement ok
 DELETE FROM openivm_visible_uwd_dim;
 
 statement ok
-INSERT INTO openivm_visible_uwd_dim SELECT dim_key,id,grp,val FROM openivm_data_uwd_dim;
+INSERT INTO openivm_visible_uwd_dim SELECT dim_key,id,grp,val,0::BIGINT FROM openivm_data_uwd_dim;
 
 statement ok
 DROP TABLE IF EXISTS openivm_old_uwd_dim;

@@ -3082,3 +3082,1019 @@ query I
 SELECT count(*) FROM information_schema.tables WHERE table_name IN ('openivm_visible_publish_top','openivm_delta_openivm_visible_publish_top','openivm_visible_publish_top_child','openivm_delta_openivm_visible_publish_top_child');
 ----
 0
+
+# Review regressions: preserve grouping identity and global presentation semantics.
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+CREATE TABLE r2_t0(k INTEGER,v INTEGER);
+
+statement ok
+CREATE TABLE r2_u0(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO r2_t0 VALUES (1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+INSERT INTO r2_u0 VALUES(1,7),(3,8),(NULL,3);
+
+statement ok
+CREATE MATERIALIZED VIEW r2_p0 AS SELECT sum(v) s FROM r2_t0 GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW r2_c0 AS SELECT * FROM r2_p0;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p0 EXCEPT ALL SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_p0));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c0 EXCEPT ALL SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_c0));
+----
+0
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name='r2_p0' AND type=3;
+----
+0
+
+statement ok
+INSERT INTO r2_t0 VALUES (1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_t0 SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_t0 WHERE k=2;
+
+statement ok
+UPDATE r2_u0 SET v=v+1;
+
+statement ok
+PRAGMA refresh_pipeline('r2_c0');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p0 EXCEPT ALL SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_p0));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c0 EXCEPT ALL SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_c0));
+----
+0
+
+statement ok
+INSERT INTO r2_t0 VALUES (1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_t0 SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_t0 WHERE k=3;
+
+statement ok
+UPDATE r2_u0 SET v=v+1;
+
+statement ok
+PRAGMA refresh_pipeline('r2_c0');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p0 EXCEPT ALL SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_p0));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c0 EXCEPT ALL SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT sum(v) s FROM r2_t0 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_c0));
+----
+0
+
+statement ok
+DROP VIEW r2_p0 CASCADE;
+
+statement ok
+DROP TABLE r2_t0;
+
+statement ok
+DROP TABLE r2_u0;
+
+statement ok
+CREATE TABLE r2_t1(k INTEGER,v INTEGER);
+
+statement ok
+CREATE TABLE r2_u1(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO r2_t1 VALUES (1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+INSERT INTO r2_u1 VALUES(1,7),(3,8),(NULL,3);
+
+statement ok
+CREATE MATERIALIZED VIEW r2_p1 AS SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW r2_c1 AS SELECT * FROM r2_p1;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p1 EXCEPT ALL SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_p1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c1 EXCEPT ALL SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_c1));
+----
+0
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name='r2_p1' AND type=3;
+----
+0
+
+statement ok
+INSERT INTO r2_t1 VALUES (1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_t1 SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_t1 WHERE k=2;
+
+statement ok
+UPDATE r2_u1 SET v=v+1;
+
+statement ok
+PRAGMA refresh_pipeline('r2_c1');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p1 EXCEPT ALL SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_p1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c1 EXCEPT ALL SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_c1));
+----
+0
+
+statement ok
+INSERT INTO r2_t1 VALUES (1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_t1 SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_t1 WHERE k=3;
+
+statement ok
+UPDATE r2_u1 SET v=v+1;
+
+statement ok
+PRAGMA refresh_pipeline('r2_c1');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p1 EXCEPT ALL SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_p1));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c1 EXCEPT ALL SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT k+1 g,sum(v) s FROM r2_t1 GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_c1));
+----
+0
+
+statement ok
+DROP VIEW r2_p1 CASCADE;
+
+statement ok
+DROP TABLE r2_t1;
+
+statement ok
+DROP TABLE r2_u1;
+
+statement ok
+CREATE TABLE r2_t2(k INTEGER,v INTEGER);
+
+statement ok
+CREATE TABLE r2_u2(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO r2_t2 VALUES (1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+INSERT INTO r2_u2 VALUES(1,7),(3,8),(NULL,3);
+
+statement ok
+CREATE MATERIALIZED VIEW r2_p2 AS SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1;
+
+statement ok
+CREATE MATERIALIZED VIEW r2_c2 AS SELECT * FROM r2_p2;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p2 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected EXCEPT ALL SELECT * FROM r2_p2));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c2 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected EXCEPT ALL SELECT * FROM r2_c2));
+----
+0
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name='r2_p2' AND type=3;
+----
+0
+
+statement ok
+INSERT INTO r2_t2 VALUES (1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_t2 SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_t2 WHERE k=2;
+
+statement ok
+UPDATE r2_u2 SET v=v+1;
+
+statement ok
+PRAGMA refresh_pipeline('r2_c2');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p2 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected EXCEPT ALL SELECT * FROM r2_p2));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c2 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected EXCEPT ALL SELECT * FROM r2_c2));
+----
+0
+
+statement ok
+INSERT INTO r2_t2 VALUES (1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_t2 SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_t2 WHERE k=3;
+
+statement ok
+UPDATE r2_u2 SET v=v+1;
+
+statement ok
+PRAGMA refresh_pipeline('r2_c2');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p2 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected EXCEPT ALL SELECT * FROM r2_p2));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c2 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t2 GROUP BY k ORDER BY k OFFSET 1) expected EXCEPT ALL SELECT * FROM r2_c2));
+----
+0
+
+statement ok
+DROP VIEW r2_p2 CASCADE;
+
+statement ok
+DROP TABLE r2_t2;
+
+statement ok
+DROP TABLE r2_u2;
+
+statement ok
+CREATE TABLE r2_t3(k INTEGER,v INTEGER);
+
+statement ok
+CREATE TABLE r2_u3(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO r2_t3 VALUES (1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+INSERT INTO r2_u3 VALUES(1,7),(3,8),(NULL,3);
+
+statement ok
+CREATE MATERIALIZED VIEW r2_p3 AS SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW r2_c3 AS SELECT * FROM r2_p3;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p3 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected EXCEPT ALL SELECT * FROM r2_p3));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c3 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected EXCEPT ALL SELECT * FROM r2_c3));
+----
+0
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name='r2_p3' AND type=3;
+----
+0
+
+statement ok
+INSERT INTO r2_t3 VALUES (1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_t3 SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_t3 WHERE k=2;
+
+statement ok
+UPDATE r2_u3 SET v=v+1;
+
+statement ok
+PRAGMA refresh_pipeline('r2_c3');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p3 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected EXCEPT ALL SELECT * FROM r2_p3));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c3 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected EXCEPT ALL SELECT * FROM r2_c3));
+----
+0
+
+statement ok
+INSERT INTO r2_t3 VALUES (1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_t3 SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_t3 WHERE k=3;
+
+statement ok
+UPDATE r2_u3 SET v=v+1;
+
+statement ok
+PRAGMA refresh_pipeline('r2_c3');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p3 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected EXCEPT ALL SELECT * FROM r2_p3));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c3 EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_t3 GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) expected EXCEPT ALL SELECT * FROM r2_c3));
+----
+0
+
+statement ok
+DROP VIEW r2_p3 CASCADE;
+
+statement ok
+DROP TABLE r2_t3;
+
+statement ok
+DROP TABLE r2_u3;
+
+statement ok
+CREATE TABLE r2_t4(k INTEGER,v INTEGER);
+
+statement ok
+CREATE TABLE r2_u4(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO r2_t4 VALUES (1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+INSERT INTO r2_u4 VALUES(1,7),(3,8),(NULL,3);
+
+statement ok
+CREATE MATERIALIZED VIEW r2_p4 AS SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k;
+
+statement ok
+CREATE MATERIALIZED VIEW r2_c4 AS SELECT * FROM r2_p4;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p4 EXCEPT ALL SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected) UNION ALL (SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected EXCEPT ALL SELECT * FROM r2_p4));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c4 EXCEPT ALL SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected) UNION ALL (SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected EXCEPT ALL SELECT * FROM r2_c4));
+----
+0
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name='r2_p4' AND type=3;
+----
+0
+
+statement ok
+INSERT INTO r2_t4 VALUES (1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_t4 SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_t4 WHERE k=2;
+
+statement ok
+UPDATE r2_u4 SET v=v+1;
+
+statement ok
+PRAGMA refresh_pipeline('r2_c4');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p4 EXCEPT ALL SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected) UNION ALL (SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected EXCEPT ALL SELECT * FROM r2_p4));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c4 EXCEPT ALL SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected) UNION ALL (SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected EXCEPT ALL SELECT * FROM r2_c4));
+----
+0
+
+statement ok
+INSERT INTO r2_t4 VALUES (1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_t4 SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_t4 WHERE k=3;
+
+statement ok
+UPDATE r2_u4 SET v=v+1;
+
+statement ok
+PRAGMA refresh_pipeline('r2_c4');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_p4 EXCEPT ALL SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected) UNION ALL (SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected EXCEPT ALL SELECT * FROM r2_p4));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_c4 EXCEPT ALL SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected) UNION ALL (SELECT * FROM (SELECT a.k,a.v av,b.v bv FROM r2_t4 a FULL OUTER JOIN r2_u4 b ON a.k=b.k) expected EXCEPT ALL SELECT * FROM r2_c4));
+----
+0
+
+statement ok
+DROP VIEW r2_p4 CASCADE;
+
+statement ok
+DROP TABLE r2_t4;
+
+statement ok
+DROP TABLE r2_u4;
+
+# Publication history is unnecessary until a consumer exists, and after the last consumer drops.
+statement ok
+CREATE TABLE r2_leaf_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO r2_leaf_t VALUES(1,1);
+
+statement ok
+CREATE MATERIALIZED VIEW r2_leaf AS SELECT k,sum(v) v FROM r2_leaf_t GROUP BY k;
+
+statement ok
+UPDATE r2_leaf_t SET v=2;
+
+statement ok
+PRAGMA refresh('r2_leaf');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_leaf EXCEPT ALL SELECT * FROM (SELECT k,sum(v) v FROM r2_leaf_t GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) v FROM r2_leaf_t GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_leaf));
+----
+0
+
+query I
+SELECT count(*) FROM openivm_delta_openivm_visible_r2_leaf;
+----
+0
+
+statement ok
+UPDATE r2_leaf_t SET v=3;
+
+statement ok
+PRAGMA refresh('r2_leaf');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_leaf EXCEPT ALL SELECT * FROM (SELECT k,sum(v) v FROM r2_leaf_t GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) v FROM r2_leaf_t GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_leaf));
+----
+0
+
+query I
+SELECT count(*) FROM openivm_delta_openivm_visible_r2_leaf;
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW r2_leaf_c AS SELECT * FROM r2_leaf;
+
+statement ok
+UPDATE r2_leaf_t SET v=4;
+
+statement ok
+PRAGMA refresh_pipeline('r2_leaf_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_leaf EXCEPT ALL SELECT * FROM (SELECT k,sum(v) v FROM r2_leaf_t GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) v FROM r2_leaf_t GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_leaf));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_leaf_c EXCEPT ALL SELECT * FROM (SELECT k,sum(v) v FROM r2_leaf_t GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) v FROM r2_leaf_t GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_leaf_c));
+----
+0
+
+statement ok
+DROP VIEW r2_leaf_c;
+
+statement ok
+UPDATE r2_leaf_t SET v=5;
+
+statement ok
+PRAGMA refresh('r2_leaf');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_leaf EXCEPT ALL SELECT * FROM (SELECT k,sum(v) v FROM r2_leaf_t GROUP BY k) expected) UNION ALL (SELECT * FROM (SELECT k,sum(v) v FROM r2_leaf_t GROUP BY k) expected EXCEPT ALL SELECT * FROM r2_leaf));
+----
+0
+
+query I
+SELECT count(*) FROM openivm_delta_openivm_visible_r2_leaf;
+----
+0
+
+statement ok
+SET openivm_enable_view_matching=true;
+
+statement ok
+CREATE MATERIALIZED VIEW r2_leaf_c AS SELECT * FROM r2_leaf;
+
+query I
+SELECT count(*) FROM openivm_mv_dependencies WHERE parent_view='r2_leaf' AND child_view='r2_leaf_c';
+----
+1
+
+statement ok
+SET openivm_enable_view_matching=false;
+
+statement ok
+DROP VIEW r2_leaf CASCADE;
+
+statement ok
+DROP TABLE r2_leaf_t;
+
+# Adjacent grouping cases must survive emptying and repopulating the source.
+statement ok
+CREATE TABLE r2_adj_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO r2_adj_t VALUES (1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW r2_adj_p AS SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW r2_adj_c AS SELECT * FROM r2_adj_p;
+
+statement ok
+INSERT INTO r2_adj_t VALUES(1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_adj_t SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_adj_t WHERE k=2;
+
+statement ok
+PRAGMA refresh_pipeline('r2_adj_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_p EXCEPT ALL SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_c EXCEPT ALL SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_c));
+----
+0
+
+statement ok
+DELETE FROM r2_adj_t;
+
+statement ok
+PRAGMA refresh_pipeline('r2_adj_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_p EXCEPT ALL SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_c EXCEPT ALL SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_c));
+----
+0
+
+statement ok
+INSERT INTO r2_adj_t VALUES(1,7),(2,NULL),(NULL,50);
+
+statement ok
+PRAGMA refresh_pipeline('r2_adj_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_p EXCEPT ALL SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_c EXCEPT ALL SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k%2 g,sum(v) s FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_c));
+----
+0
+
+statement ok
+DROP VIEW r2_adj_p CASCADE;
+
+statement ok
+DROP TABLE r2_adj_t;
+
+statement ok
+CREATE TABLE r2_adj_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO r2_adj_t VALUES (1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW r2_adj_p AS SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW r2_adj_c AS SELECT * FROM r2_adj_p;
+
+statement ok
+INSERT INTO r2_adj_t VALUES(1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_adj_t SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_adj_t WHERE k=2;
+
+statement ok
+PRAGMA refresh_pipeline('r2_adj_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_p EXCEPT ALL SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_c EXCEPT ALL SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_c));
+----
+0
+
+statement ok
+DELETE FROM r2_adj_t;
+
+statement ok
+PRAGMA refresh_pipeline('r2_adj_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_p EXCEPT ALL SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_c EXCEPT ALL SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_c));
+----
+0
+
+statement ok
+INSERT INTO r2_adj_t VALUES(1,7),(2,NULL),(NULL,50);
+
+statement ok
+PRAGMA refresh_pipeline('r2_adj_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_p EXCEPT ALL SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_c EXCEPT ALL SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k+1 g,avg(v) a FROM r2_adj_t GROUP BY k) e EXCEPT ALL SELECT * FROM r2_adj_c));
+----
+0
+
+statement ok
+DROP VIEW r2_adj_p CASCADE;
+
+statement ok
+DROP TABLE r2_adj_t;
+
+statement ok
+CREATE TABLE r2_adj_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO r2_adj_t VALUES (1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW r2_adj_p AS SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1;
+
+statement ok
+CREATE MATERIALIZED VIEW r2_adj_c AS SELECT * FROM r2_adj_p;
+
+statement ok
+INSERT INTO r2_adj_t VALUES(1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE r2_adj_t SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM r2_adj_t WHERE k=2;
+
+statement ok
+PRAGMA refresh_pipeline('r2_adj_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_p EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e EXCEPT ALL SELECT * FROM r2_adj_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_c EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e EXCEPT ALL SELECT * FROM r2_adj_c));
+----
+0
+
+statement ok
+DELETE FROM r2_adj_t;
+
+statement ok
+PRAGMA refresh_pipeline('r2_adj_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_p EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e EXCEPT ALL SELECT * FROM r2_adj_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_c EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e EXCEPT ALL SELECT * FROM r2_adj_c));
+----
+0
+
+statement ok
+INSERT INTO r2_adj_t VALUES(1,7),(2,NULL),(NULL,50);
+
+statement ok
+PRAGMA refresh_pipeline('r2_adj_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_p EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e EXCEPT ALL SELECT * FROM r2_adj_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_adj_c EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM r2_adj_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2 OFFSET 1) e EXCEPT ALL SELECT * FROM r2_adj_c));
+----
+0
+
+statement ok
+DROP VIEW r2_adj_p CASCADE;
+
+statement ok
+DROP TABLE r2_adj_t;
+
+# A non-projected sort aggregate must retain top-k membership through a chained refresh.
+statement ok
+CREATE TABLE r2_hidden_order_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO r2_hidden_order_t VALUES(1,10),(2,20),(3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW r2_hidden_order_p AS SELECT k FROM r2_hidden_order_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW r2_hidden_order_c AS SELECT * FROM r2_hidden_order_p;
+
+statement ok
+INSERT INTO r2_hidden_order_t VALUES(1,40),(4,50);
+
+statement ok
+UPDATE r2_hidden_order_t SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM r2_hidden_order_t WHERE k=3;
+
+statement ok
+PRAGMA refresh_pipeline('r2_hidden_order_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_hidden_order_p EXCEPT ALL SELECT * FROM (SELECT k FROM r2_hidden_order_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2) e) UNION ALL (SELECT * FROM (SELECT k FROM r2_hidden_order_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2) e EXCEPT ALL SELECT * FROM r2_hidden_order_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM r2_hidden_order_c EXCEPT ALL SELECT * FROM (SELECT k FROM r2_hidden_order_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2) e) UNION ALL (SELECT * FROM (SELECT k FROM r2_hidden_order_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2) e EXCEPT ALL SELECT * FROM r2_hidden_order_c));
+----
+0
+
+# Stable ordering survives a hidden sort-type change while consumers lag.
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE ordinal_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO ordinal_t VALUES(1,2000000000),(1,2000000000),(2,20),(3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW ordinal_p AS SELECT k FROM ordinal_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW ordinal_c AS SELECT * FROM ordinal_p LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW ordinal_lag AS SELECT * FROM ordinal_p;
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name IN ('ordinal_p','ordinal_c','ordinal_lag') AND type=3;
+----
+0
+
+query T
+SELECT list(k) FROM ordinal_p;
+----
+[1, 3]
+
+statement ok
+INSERT INTO ordinal_t VALUES(2,2000000000),(2,2000000000);
+
+statement ok
+UPDATE ordinal_t SET v=v+1 WHERE k=3;
+
+statement ok
+DELETE FROM ordinal_t WHERE k=2 AND v=2000000000;
+
+statement ok
+INSERT INTO ordinal_t VALUES(2,2000000000),(2,2000000000);
+
+statement ok
+PRAGMA refresh('ordinal_p');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM ordinal_p));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW ordinal_p AS SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM ordinal_p));
+----
+0
+
+query T
+SELECT list(k) FROM ordinal_p;
+----
+[2, 3]
+
+statement ok
+PRAGMA refresh('ordinal_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_c EXCEPT ALL SELECT * FROM (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected) UNION ALL (SELECT * FROM (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected EXCEPT ALL SELECT * FROM ordinal_c));
+----
+0
+
+statement ok
+PRAGMA refresh('ordinal_lag');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_lag EXCEPT ALL SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM ordinal_lag));
+----
+0
+
+query T
+SELECT list(k) FROM ordinal_lag;
+----
+[2, 3]
+
+statement ok
+DELETE FROM ordinal_t;
+
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+PRAGMA refresh_pipeline('ordinal_c','ordinal_lag');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM ordinal_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_lag EXCEPT ALL SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM ordinal_lag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_c EXCEPT ALL SELECT * FROM (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected) UNION ALL (SELECT * FROM (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected EXCEPT ALL SELECT * FROM ordinal_c));
+----
+0
+
+statement ok
+INSERT INTO ordinal_t VALUES(1,7),(2,NULL),(3,4);
+
+statement ok
+PRAGMA refresh_pipeline('ordinal_c','ordinal_lag');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM ordinal_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_lag EXCEPT ALL SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM ordinal_lag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_c EXCEPT ALL SELECT * FROM (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected) UNION ALL (SELECT * FROM (SELECT * FROM (SELECT k FROM ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected EXCEPT ALL SELECT * FROM ordinal_c));
+----
+0
+
+query T
+SELECT list(k) FROM ordinal_p;
+----
+[3, 1]
+
+query T
+SELECT list(k) FROM ordinal_c;
+----
+[3]
+
+statement ok
+DROP VIEW ordinal_p CASCADE;
+
+statement ok
+DROP TABLE ordinal_t;
+
+# Reserved publication state cannot leak into or collide with user output.
+statement error
+CREATE MATERIALIZED VIEW ordinal_reserved AS SELECT 1 AS openivm_ordinal;
+----
+reserved OpenIVM column
+
+# DISTINCT group bindings and scalar CASE sort expressions must survive
+# publication rendering; the limited child consumes the parent's ordinal.
+statement ok
+CREATE TABLE ordinal_expr_t(k INTEGER);
+
+statement ok
+INSERT INTO ordinal_expr_t VALUES (1),(1),(2),(3),(NULL);
+
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+CREATE MATERIALIZED VIEW ordinal_expr_p AS SELECT DISTINCT k FROM ordinal_expr_t ORDER BY CASE WHEN k+1>2 THEN k ELSE -k END DESC NULLS LAST,k LIMIT 3;
+
+statement ok
+CREATE MATERIALIZED VIEW ordinal_expr_c AS SELECT * FROM ordinal_expr_p LIMIT 2;
+
+statement ok
+INSERT INTO ordinal_expr_t VALUES (4),(4),(5);
+
+statement ok
+UPDATE ordinal_expr_t SET k=2 WHERE k=1;
+
+statement ok
+DELETE FROM ordinal_expr_t WHERE k=4;
+
+statement ok
+PRAGMA refresh_pipeline('ordinal_expr_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_expr_p EXCEPT ALL SELECT * FROM (SELECT DISTINCT k FROM ordinal_expr_t ORDER BY CASE WHEN k+1>2 THEN k ELSE -k END DESC NULLS LAST,k LIMIT 3) e) UNION ALL (SELECT * FROM (SELECT DISTINCT k FROM ordinal_expr_t ORDER BY CASE WHEN k+1>2 THEN k ELSE -k END DESC NULLS LAST,k LIMIT 3) e EXCEPT ALL SELECT * FROM ordinal_expr_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ordinal_expr_c EXCEPT ALL SELECT * FROM (SELECT * FROM (SELECT DISTINCT k FROM ordinal_expr_t ORDER BY CASE WHEN k+1>2 THEN k ELSE -k END DESC NULLS LAST,k LIMIT 3) q LIMIT 2) e) UNION ALL (SELECT * FROM (SELECT * FROM (SELECT DISTINCT k FROM ordinal_expr_t ORDER BY CASE WHEN k+1>2 THEN k ELSE -k END DESC NULLS LAST,k LIMIT 3) q LIMIT 2) e EXCEPT ALL SELECT * FROM ordinal_expr_c));
+----
+0
+
+query T
+SELECT list(k) FROM ordinal_expr_c;
+----
+[5, 3]
+
+statement ok
+DROP VIEW ordinal_expr_p CASCADE;
+
+statement ok
+DROP TABLE ordinal_expr_t;
