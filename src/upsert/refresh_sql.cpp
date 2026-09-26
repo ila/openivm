@@ -766,6 +766,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                     "; list_mode=" + string(list_mode ? "true" : "false"));
 
 	string upsert_query;
+	bool window_uses_suffix = false;
 	string delta_ts_filter = BuildDeltaTimestampFilter(con, view_name, has_ts_col);
 	bool has_left_join =
 	    std::find(column_names.begin(), column_names.end(), openivm::LEFT_KEY_COL) != column_names.end();
@@ -1093,7 +1094,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		upsert_query = BuildWindowPartitionRefresh(
 		    metadata, con, view_name, view_query_sql, delta_table_names, column_names, data_table, delta_ts_filter,
 		    internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
-		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute, running_window_incremental);
+		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute, running_window_incremental,
+		    &window_uses_suffix);
 		break;
 	}
 	case RefreshType::COUNT_DISTINCT_INCREMENTAL: {
@@ -1723,13 +1725,25 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                           SqlUtils::EscapeValue(view_name) + "';\n";
 	if (!publication_query.empty()) {
 		vector<string> scope_columns = window_publication_keys;
+		if (!scope_columns.empty() && !window_uses_suffix) {
+			// Partition recompute emits every old/new row in the affected partitions.
+			// Hashing those wide tuples adds work without narrowing publication.
+			auto partition_columns = PartitionOutputColumns(group_cols);
+			if (std::all_of(partition_columns.begin(), partition_columns.end(), [&](const string &column) {
+				    return std::find(publication_columns.begin(), publication_columns.end(), column) !=
+				           publication_columns.end();
+			    })) {
+				scope_columns = std::move(partition_columns);
+				OPENIVM_DEBUG_PRINT("[PUBLISH] Using partition keys for recomputed window %s\n", view_name.c_str());
+			}
+		}
 		bool has_scopable_delta = dispatch_refresh_type == RefreshType::AGGREGATE_GROUP ||
 		                          dispatch_refresh_type == RefreshType::AGGREGATE_HAVING ||
 		                          (dispatch_refresh_type == RefreshType::SIMPLE_PROJECTION && !source_has_left_join &&
 		                           !source_has_full_outer);
 		if (!global_publication && has_scopable_delta && !refresh_plan.SkipsDeltaProduction() && !inline_mv_delta &&
 		    !use_transient_mv_delta) {
-			scope_columns = metadata.GetGroupColumns(view_name);
+			scope_columns = group_cols;
 			if (scope_columns.empty()) {
 				for (auto &column : publication_columns) {
 					if (column != openivm::PUBLISHED_ORDINAL_COL) {

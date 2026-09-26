@@ -1362,7 +1362,10 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const string &catalog_prefix, const vector<string> &partition_columns,
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta,
                               const string &affected_keys_sql, const vector<string> &column_names,
-                              bool running_window_incremental) {
+                              bool running_window_incremental, bool *uses_running_suffix) {
+	if (uses_running_suffix) {
+		*uses_running_suffix = false;
+	}
 	bool have_affected_keys = !affected_keys_sql.empty();
 	if (!have_affected_keys && (partition_columns.empty() || partition_delta_specs.empty())) {
 		// No PARTITION BY (global surrogate-key window) or no partition key resolvable in any
@@ -1375,6 +1378,9 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 		                                                     partition_columns, partition_delta_specs, column_names,
 		                                                     emit_cascade_delta);
 		if (!suffix_sql.empty()) {
+			if (uses_running_suffix) {
+				*uses_running_suffix = true;
+			}
 			return suffix_sql;
 		}
 	}

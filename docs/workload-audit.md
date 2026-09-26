@@ -257,3 +257,40 @@ binary before rebuilding:
 python3 benchmark/poc/running_rows_poc.py /path/to/b9356c8c/duckdb build/release/duckdb --before-suffix --output /tmp/window-one
 python3 benchmark/poc/running_rows_poc.py /path/to/b9356c8c/duckdb build/release/duckdb --before-suffix --partitions 1000 --output /tmp/window-many
 ```
+
+### Mixed-DML publication follow-up
+
+Native window partition recompute now scopes publication by partition keys when
+all of those keys are visible. Its raw delta already contains every old and new
+row in the affected partitions, so hashing complete visible tuples adds work
+without narrowing the comparison. When a partition key is hidden, publication
+retains the complete visible-tuple scope. Running-suffix programs also retain
+that tuple scope because their changed rows can cover only part of a partition.
+The compiler reports the selected maintenance path; enabling the suffix setting
+alone does not select tuple scoping for an ineligible shape such as DESC ordering.
+Ordered or limited publication still uses the global comparison.
+
+This applies to both standalone refreshes and pipeline refreshes. The same
+change reuses loaded group-column metadata instead of querying it again; it
+introduces no additional logical-plan walk.
+
+Five focused window tests passed 516 assertions, including a DESC mixed-DML
+refresh checked with bidirectional EXCEPT ALL and generated-SQL checks for both
+scope choices. A separate real-CLI benchmark verified bag equality after all 24
+refreshes. Each fresh database started with 100,000 rows, appended 20 rows,
+updated every x value, and deleted rows where d % 17 = 0 before one refresh.
+The view projected the source columns and running SUM/COUNT with a ROWS frame.
+Four repetitions per binary/configuration alternated execution order and used
+four DuckDB threads. Baseline: `0f418dbc`.
+
+| Partitions | Extra projected columns | Before median (ms) | After median (ms) |
+|---:|---:|---:|---:|
+| 1 | 0 | 262 | 252 |
+| 1,000 | 0 | 273 | 254 |
+| 1,000 | 16 | 744 | 599 |
+
+Other CPU-heavy jobs were active during these measurements. The observed
+4–20% reduction is approximate and does not establish a universal speedup.
+
+The final full run passed the compiled N-term integration check and all 12,570
+assertions in 89 SQL test cases (one ICU-dependent skip).

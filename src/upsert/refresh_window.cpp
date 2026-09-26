@@ -571,7 +571,11 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &delta_ts_filter, const string &internal_catalog_prefix,
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
-                                   bool cross_system, bool emit_cascade_delta, bool running_window_incremental) {
+                                   bool cross_system, bool emit_cascade_delta, bool running_window_incremental,
+                                   bool *uses_running_suffix) {
+	if (uses_running_suffix) {
+		*uses_running_suffix = false;
+	}
 	auto partition_cols = metadata.GetGroupColumns(view_name); // reuses group_columns field
 	auto order_cols = metadata.GetWindowOrderColumns(view_name);
 	auto partition_delta_specs =
@@ -629,7 +633,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 	}
 	return CompileWindowRecompute(view_name, view_query_sql, delta_ts_filter, internal_catalog_prefix, partition_cols,
 	                              partition_delta_specs, emit_cascade_delta, affected_keys_sql,
-	                              running_window_column_names, running_window_incremental);
+	                              running_window_column_names, running_window_incremental, uses_running_suffix);
 }
 
 } // namespace duckdb

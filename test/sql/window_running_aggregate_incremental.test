@@ -1125,8 +1125,40 @@ SELECT COUNT(*) FROM ((SELECT * FROM wb_keyed EXCEPT ALL SELECT * FROM expected)
 ----
 0
 
+# Suffix append scopes exact tuples; recomputing a partition uses its narrower keys.
 query I
-SELECT COUNT(*) FROM openivm_compile_with_facts('wb_keyed','{"target_dialect":"duckdb","compile_only":true}')
+SELECT COUNT(*) FROM openivm_compile_with_facts('wb_keyed','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}')
 WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next_wb_keyed AS%' AND sql LIKE '%v.s IS NOT DISTINCT FROM d.s%';
 ----
 1
+
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('wb_keyed','{"target_dialect":"duckdb","compile_only":true}')
+WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next_wb_keyed AS%' AND sql LIKE '%v.k IS NOT DISTINCT FROM d.k%' AND sql NOT LIKE '%v.s IS NOT DISTINCT FROM d.s%';
+----
+1
+
+# An enabled setting does not prove suffix eligibility (DESC recomputes partitions).
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('wf_desc','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}')
+WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next_wf_desc AS%' AND sql LIKE '%v.k IS NOT DISTINCT FROM d.k%' AND sql NOT LIKE '%v.s IS NOT DISTINCT FROM d.s%';
+----
+1
+
+statement ok
+INSERT INTO wf_source VALUES(42,1,8),(42,2,0);
+
+statement ok
+UPDATE wf_source SET x=x+1 WHERE k=42;
+
+statement ok
+DELETE FROM wf_source WHERE k=42 AND d=2;
+
+statement ok
+PRAGMA refresh('wf_desc');
+
+query I
+WITH expected AS (SELECT *,SUM(x) OVER (PARTITION BY k ORDER BY d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wf_source)
+SELECT COUNT(*) FROM ((SELECT * FROM wf_desc EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM wf_desc));
+----
+0
