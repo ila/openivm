@@ -18,6 +18,7 @@ struct PlanRewriteNeeds {
 	bool has_aggregate = false;
 	bool outer_join_support = false;
 	bool semi_anti_subqueries = false;
+	bool rows_window_state = false;
 };
 
 /// Strip AGG(...) FILTER (WHERE p) by converting to AGG(CASE WHEN p THEN arg

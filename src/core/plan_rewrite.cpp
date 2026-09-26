@@ -23,6 +23,8 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -1469,6 +1471,73 @@ static void RewritePassOuterJoinSupport(PlanRewriteContext &rewrite_context) {
 	                        rewrite_context.needs.has_aggregate);
 }
 
+// Keep the position produced by the same window sort as the ROWS aggregate. Its
+// value identifies the actual final peer when a later batch needs a cumulative seed.
+static void RewritePassRowsWindowState(PlanRewriteContext &context) {
+	vector<LogicalProjection *> projections;
+	idx_t position_count = 0;
+	std::function<void(LogicalOperator &)> visit = [&](LogicalOperator &node) {
+		if (node.children.size() != 1) {
+			return;
+		}
+		if (node.type != LogicalOperatorType::LOGICAL_PROJECTION && node.type != LogicalOperatorType::LOGICAL_WINDOW &&
+		    node.type != LogicalOperatorType::LOGICAL_FILTER && node.type != LogicalOperatorType::LOGICAL_ORDER_BY &&
+		    node.type != LogicalOperatorType::LOGICAL_LIMIT && node.type != LogicalOperatorType::LOGICAL_TOP_N &&
+		    node.type != LogicalOperatorType::LOGICAL_CREATE_TABLE) {
+			return;
+		}
+		if (node.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			projections.push_back(&node.Cast<LogicalProjection>());
+		}
+		visit(*node.children[0]);
+		if (node.type == LogicalOperatorType::LOGICAL_WINDOW) {
+			auto &window = node.Cast<LogicalWindow>();
+			vector<BoundWindowExpression *> ordered_groups;
+			auto expression_count = window.expressions.size();
+			for (idx_t i = 0; i < expression_count; i++) {
+				auto &expression = window.expressions[i]->Cast<BoundWindowExpression>();
+				if (expression.start != WindowBoundary::UNBOUNDED_PRECEDING ||
+				    expression.end != WindowBoundary::CURRENT_ROW_ROWS || expression.orders.empty()) {
+					continue;
+				}
+				bool exists = false;
+				for (auto *group : ordered_groups) {
+					exists = exists || (group->PartitionsAreEquivalent(expression) &&
+					                    group->orders.size() == expression.orders.size() &&
+					                    group->GetSharedOrders(expression) == expression.orders.size());
+				}
+				if (exists) {
+					continue;
+				}
+				ordered_groups.push_back(&expression);
+				auto position = make_uniq<BoundWindowExpression>(ExpressionType::WINDOW_ROW_NUMBER, LogicalType::BIGINT,
+				                                                 nullptr, nullptr);
+				for (auto &partition : expression.partitions) {
+					position->partitions.push_back(partition->Copy());
+					position->partitions_stats.push_back(nullptr);
+				}
+				for (auto &order : expression.orders) {
+					position->orders.push_back(order.Copy());
+				}
+				position->start = WindowBoundary::UNBOUNDED_PRECEDING;
+				position->end = WindowBoundary::CURRENT_ROW_ROWS;
+				auto alias = string(openivm::ROWS_POSITION_PREFIX) + to_string(position_count++);
+				position->alias = alias;
+				ColumnBinding binding(window.window_index, window.expressions.size());
+				window.expressions.push_back(std::move(position));
+				window.ResolveOperatorTypes();
+				PropagateHiddenBindingThroughProjectionPath(projections, binding, LogicalType::BIGINT, alias);
+				OPENIVM_DEBUG_PRINT("[PlanRewrite] Added ROWS seed position %s\n", alias.c_str());
+			}
+		}
+		if (node.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			projections.pop_back();
+		}
+		node.ResolveOperatorTypes();
+	};
+	visit(*context.plan);
+}
+
 static void RewritePassSemiAntiSubqueries(PlanRewriteContext &rewrite_context) {
 	if (RewriteMarkJoinFilters(rewrite_context.plan)) {
 		Deliminator deliminator;
@@ -1490,6 +1559,7 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	    {"hidden_aggregate_propagation", RewritePassHiddenAggregatePropagation, &PlanRewriteNeeds::derived_aggregates},
 	    {"outer_join_support", RewritePassOuterJoinSupport, &PlanRewriteNeeds::outer_join_support},
 	    {"semi_anti_subqueries", RewritePassSemiAntiSubqueries, &PlanRewriteNeeds::semi_anti_subqueries},
+	    {"rows_window_state", RewritePassRowsWindowState, &PlanRewriteNeeds::rows_window_state},
 	};
 
 	for (const auto &pass : passes) {

@@ -69,21 +69,63 @@ fix retains the prior sum, preserves all-NULL partitions, and has regression cov
 including conflicting changes in a subsequent batch. This does not change the window's
 incremental maintenance classification.
 
-An additional open finding is specific to the optional running-window suffix optimization:
-`SUM(x) OVER (PARTITION BY k ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`
-is rendered as the default RANGE frame. Starting with `(k,d,x)=(1,1,10)` and appending
-`(1,2,3),(1,2,4)` produces 17 on both new rows. Under ROWS, one new row must have an
-intermediate sum of 13 or 14, regardless of the unspecified tie order. Preserving the
-frame alone is insufficient: later batches must also seed from the true final row
-rather than an arbitrary peer selected by descending order. The strategy decision is
-pending: use the existing affected-partition maintenance for this shape, or extend
-suffix maintenance with stable tie ordering and seed state. No fix for this finding
-is claimed in the NULL-suffix correction above.
+The explicit-ROWS finding is now fixed by extending suffix maintenance. For
+`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, creation stores a hidden
+row position from the same window ordering as the cumulative aggregate. Refresh
+seeds each aggregate from its final stored position, materializes incoming peer
+positions once, and uses those positions for both the data update and cascade
+deltas. This preserves intermediate values for tied keys, including negative
+sums, instead of treating peers as a RANGE frame.
+
+For the optional suffix path (`openivm_running_window_incremental=true`),
+equal-key ROWS arrivals follow the already stored peers. SQL does not prescribe
+an order among otherwise tied rows; add a unique ordering key if the application
+requires one. NULL placement is preserved explicitly. Mixed ROWS/RANGE windows
+still revisit a partition when new rows join an existing RANGE peer group.
+Backdated changes and mixed DML retain affected-partition incremental maintenance.
+Reopening the database retains the positions; recreating a view creates new seed
+state. Pre-change views without this state use their existing partition path.
 
 Validation for this cleanup: the compiled N-term SQL integration check and full
 suite passed (12,281 assertions in 89 cases, one ICU-dependent skip). After the final
 SQL-rendering adjustment, nine focused parser, Spark-compilation, semi/anti, and
 running-window cases passed 1,010 assertions. The final CLI NULL-suffix check was
 bag-equal in both directions. The randomized reopen workload also passed all 168
-comparisons on the cleanup binary. These passing tests do not cover or resolve the
-explicit-ROWS finding above.
+comparisons on the cleanup binary. These numbers describe the preceding cleanup,
+before the ROWS extension.
+
+The ROWS extension subsequently passed the compiled N-term integration check and
+full SQL suite: 12,371 assertions in 89 cases, with one ICU-dependent skip.
+Coverage includes negative cumulative seeds, identical tied peers, NULL values
+and NULL order keys, mixed ROWS/RANGE frames, AVG/COUNT/MIN/MAX, nested windows,
+reopen, downstream refresh, and conflicting INSERT/UPDATE/DELETE batches. A real
+CLI run executed exported SQL with forced cascade deltas and checked both the
+visible result and emitted raw delta bags in both directions.
+
+### ROWS suffix performance
+
+Measured sequentially on the same Apple M1 host with four DuckDB threads,
+three fresh in-memory databases per configuration and three append batches per
+database. Each source has one partition and pairs of identical peers. Timings
+cover `PRAGMA refresh` only; all 54 refreshes passed bidirectional `EXCEPT ALL`
+checks. The baseline is commit `b61e8aca` with suffix optimization disabled,
+using correct affected-partition maintenance. Its incorrect ROWS suffix path
+is not used as a performance baseline.
+
+| Initial rows | Appended rows per batch | Partition baseline (ms) | ROWS suffix (ms) |
+|---|---:|---:|---:|
+| 100,000 | 20 | 96 | 99 |
+| 100,000 | 10,000 | 105 | 117 |
+| 1,000,000 | 20 | 636 | 642 |
+
+These median timings show no end-to-end speedup for this workload. The new
+suffix path avoids reevaluating prior window frames but still scans stored rows
+for seeds and publishes the visible result. The setting remains optional.
+Reproduce with a saved baseline binary and the new build:
+
+```sh
+python3 benchmark/poc/running_rows_poc.py /path/to/baseline/duckdb build/release/duckdb --output /tmp/rows-benchmark
+```
+
+Use a new output directory. It retains each SQL workload, CLI log, and timing
+results, and stops on SQL errors or bag mismatches.

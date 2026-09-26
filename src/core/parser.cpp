@@ -380,7 +380,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		for (auto &name : select_planner.names) {
 			if (StringUtil::CIEquals(name, openivm::MULTIPLICITY_COL) ||
 			    StringUtil::CIEquals(name, openivm::TIMESTAMP_COL) ||
-			    StringUtil::CIEquals(name, openivm::PUBLISHED_ORDINAL_COL)) {
+			    StringUtil::CIEquals(name, openivm::PUBLISHED_ORDINAL_COL) ||
+			    StringUtil::CIStartsWith(name, openivm::ROWS_POSITION_PREFIX)) {
 				throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'", name);
 			}
 		}

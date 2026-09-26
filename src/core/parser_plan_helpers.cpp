@@ -150,6 +150,12 @@ static bool PrepareCtesForInlining(LogicalOperator *op, PlanRewriteNeeds &needs)
 			needs.aggregate_filters = needs.aggregate_filters || bound_aggregate.filter;
 			needs.derived_aggregates = needs.derived_aggregates || IsDerivedAggregate(bound_aggregate);
 		}
+	} else if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
+		for (auto &expression : op->expressions) {
+			auto &window = expression->Cast<BoundWindowExpression>();
+			needs.rows_window_state = needs.rows_window_state || (window.start == WindowBoundary::UNBOUNDED_PRECEDING &&
+			                                                      window.end == WindowBoundary::CURRENT_ROW_ROWS);
+		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_DISTINCT) {
 		needs.distinct = true;
 	} else if (op->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
