@@ -251,16 +251,22 @@ INSERT INTO fm_base SELECT i % 8, i FROM range(1, 401) t(i);
 statement ok
 CREATE MATERIALIZED VIEW fm_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GROUP BY g;
 
-# Enough cycles to clear the fitter's requirement with margin. That requirement scales with the
-# number of features the history actually exercises, three samples each with a floor of eight, so a
-# plan shape like this one needs far fewer than the thirteen-parameter worst case would.
-loop i 0 36
+# Forty-eight cycles guarantee at least 24 samples for one of the two strategies,
+# regardless of timing-dependent choices or exploration. Keep the fitter's evidence
+# threshold independent of which strategy happens to win on this machine.
+loop i 0 48
 
 statement ok
 INSERT INTO fm_base VALUES (${i} % 8, ${i});
 
 statement ok
 PRAGMA refresh('fm_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM fm_mv EXCEPT ALL SELECT g,SUM(v),COUNT(*) FROM fm_base GROUP BY g)
+  UNION ALL (SELECT g,SUM(v),COUNT(*) FROM fm_base GROUP BY g EXCEPT ALL SELECT * FROM fm_mv));
+----
+0
 
 endloop
 
@@ -292,10 +298,8 @@ SELECT count(*) FROM (SELECT unnest(plan_features) AS f FROM openivm_refresh_his
 # evidence than the two-term fallback, so this threshold is what decides whether the learned weights
 # are used at all; asserting it keeps a silent fall-through to the fallback from passing as success.
 #
-# Grouped by method rather than asserting a particular one. Weights are fitted per strategy, and a
-# view only ever records the strategy it actually ran: this one is small enough that full recompute
-# wins every time, so its samples land under 'full' and the incremental side of the model stays
-# uncalibrated. That is a real property of learning from executions rather than a quirk of the test.
+# Weights are fitted per strategy. The view records whichever strategy ran, so
+# allow both choices while requiring one to have enough real execution samples.
 query I
 SELECT max(c) >= 24 FROM (SELECT method, count(*) AS c FROM openivm_refresh_history
                             WHERE plan_features IS NOT NULL AND feature_schema = 1
@@ -344,8 +348,8 @@ SELECT count(*) FROM ((SELECT g, SUM(v) AS total, COUNT(*) AS n FROM fm_base GRO
 # Test 7: exploration breaks the feedback loop
 #
 # Weights are learned from executions, so a strategy the model stops choosing stops producing the
-# samples that would show it was right. Test 6 shows that happening: a view small enough that full
-# recompute always wins records samples only under 'full'. Exploration spends a bounded amount of
+# samples that would show it was right. A view can repeatedly choose full recompute
+# and leave the incremental side untrained. Exploration spends a bounded amount of
 # runtime measuring the neglected strategy so the estimate that sidelined it can be corrected.
 # ==========================================
 
@@ -354,6 +358,11 @@ SET openivm_adaptive_refresh=true;
 
 statement ok
 SET openivm_adaptive_explore=true;
+
+# Exploration counts samples across views. Start with untrained history so Test 6
+# cannot satisfy both strategy quotas before this scenario begins.
+statement ok
+DELETE FROM openivm_refresh_history;
 
 statement ok
 CREATE TABLE ex_base (g INT, v INT);
@@ -371,6 +380,12 @@ INSERT INTO ex_base VALUES (${i} % 4, ${i});
 
 statement ok
 PRAGMA refresh('ex_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ex_mv EXCEPT ALL SELECT g,SUM(v) FROM ex_base GROUP BY g)
+  UNION ALL (SELECT g,SUM(v) FROM ex_base GROUP BY g EXCEPT ALL SELECT * FROM ex_mv));
+----
+0
 
 endloop
 
@@ -426,6 +441,12 @@ INSERT INTO ex_off VALUES (${i} % 4, ${i});
 
 statement ok
 PRAGMA refresh('ex_off_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ex_off_mv EXCEPT ALL SELECT g,SUM(v) FROM ex_off GROUP BY g)
+  UNION ALL (SELECT g,SUM(v) FROM ex_off GROUP BY g EXCEPT ALL SELECT * FROM ex_off_mv));
+----
+0
 
 endloop
 

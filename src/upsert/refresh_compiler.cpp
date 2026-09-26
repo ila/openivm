@@ -1463,7 +1463,7 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs, const string &catalog_prefix,
                              const string &lpts_table_prefix, bool emit_cascade_delta,
-                             GroupRecomputeAffectedMode affected_mode) {
+                             GroupRecomputeAffectedMode affected_mode, const string &additional_affected_groups) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// No GROUP BY columns or no source deltas registered → can't scope; fall back to full.
@@ -1506,21 +1506,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		const auto &spec = delta_table_specs[i];
 		const string &base = spec.base_table;
 
-		string delta_subselect;
-		if (spec.is_ducklake) {
-			delta_subselect =
-			    "(SELECT * FROM " +
-			    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.ducklake_catalog,
-			                                    spec.ducklake_schema, base, spec.last_snapshot_id,
-			                                    spec.current_snapshot_id) +
-			    "\nUNION ALL\nSELECT * FROM " +
-			    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.ducklake_catalog, spec.ducklake_schema,
-			                                    base, spec.last_snapshot_id, spec.current_snapshot_id) +
-			    ")";
-		} else {
-			delta_subselect = BuildStandardDeltaRowsSQL(spec.delta_table_sql, spec.last_update);
-		}
-
+		string delta_subselect = BuildGroupRecomputeDeltaRowsSQL(spec);
 		if (affected_mode == GroupRecomputeAffectedMode::DIRECT_SOURCE_KEYS) {
 			// Both signs/images participate: deleting a maximum or moving a key
 			// must repair the old group as well as any new group. Do not run the
@@ -1575,6 +1561,10 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 			affected_subquery += "SELECT DISTINCT " + group_csv + " FROM (" + filtered_variants[occurrence] +
 			                     ") openivm_src_" + to_string(i) + "_" + to_string(occurrence);
 		}
+	}
+
+	if (!additional_affected_groups.empty()) {
+		affected_subquery += "\n  UNION\n  " + additional_affected_groups;
 	}
 
 	// EXISTS-based, NULL-safe match (IS NOT DISTINCT FROM). The affected-keys subquery is shared by

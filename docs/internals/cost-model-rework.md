@@ -44,6 +44,96 @@ benchmark's stdout/stderr alongside the CSV. A local pass does not establish tha
 or timeout is fixed. The per-operator model remains unvalidated; none of these integration checks
 establish prediction quality.
 
+## Failed ladder investigation (2026-09-26)
+
+[GCI run 36144081484](https://github.com/mdrakiburrahman/ivm-bench/actions/runs/36144081484)
+ran OpenIVM `2f1d17bf` (same source tree as `8731cbe0`) and failed after 19h 31m.
+SF1, SF10 and SF25 each recorded all 5,040 cycle rows; SF50 recorded 4,310 and SF100
+recorded 563 before aborting. Both aborts reported
+`corrupted size vs. prev_size while consolidating`. The artifacts are recovered under
+`/private/tmp/cost-gci-36144081484-results`.
+
+The investigation separated four defects (fixes and validation are recorded below):
+
+1. **Confirmed daemon use-after-free.** `src/openivm_extension.cpp` stores a process-global
+   `global_daemon`, while `RefreshDaemon::Start` retains only a raw `DatabaseInstance *`.
+   Closing a database does not destroy or stop that global daemon. On its next 30-second
+   wake it calls `Connection(*db_)` on the freed database. A standalone program that
+   creates an MV, inserts, refreshes, checks both `EXCEPT ALL` directions, closes the
+   database, then waits reproduced this with AddressSanitizer:
+   `Connection::Connection(DatabaseInstance&)` called by `RefreshDaemon::Run`, with the
+   allocation freed by `DuckDB::~DuckDB()`. The ordinary release run survived; the
+   instrumented run aborted. For this diagnosis only, DuckDB's main compilation unit
+   was rebuilt with ASan and substituted into a temporary copy of its static library;
+   no DuckDB source was edited. Evidence: `/private/tmp/cost-daemon-lifetime.cpp` and
+   `/private/tmp/cost-asan-main/repro.log`. This establishes the lifetime defect, but the
+   original GCI crashes have no stack trace proving that it caused those specific aborts.
+
+2. **S04 compares non-deterministic row numbers.** The window orders by `val` alone;
+   generated inserts repeat values within a partition. At cycle 4, a local reproduction
+   reported four rows across the two difference directions with `ORDER BY val`, and zero
+   with `ORDER BY val, id`, using the same data and incremental refreshes. All six tested
+   cycles passed with the total order. This accounts for 360 mismatch rows across the
+   four shards that reached S04; they are not evidence of a window-maintenance bug.
+   Evidence: `/private/tmp/cost-window-ties.sql` and `.log`.
+
+3. **T05 exposes a real full-outer affected-group bug.** A minimal reproduction has one
+   left row `(1)` and two matching right rows. After deleting the left row, incremental
+   refresh returns an empty MV instead of `(NULL, 2)` for
+   `SELECT w.wid, COUNT(d.did) FROM w FULL OUTER JOIN d ON w.wid=d.wid GROUP BY w.wid`.
+   Metadata classifies it as `GROUP_RECOMPUTE`, with affected mode `source_delta`.
+   `CompileGroupRecompute` substitutes the deleted left row into the query to discover
+   groups, yielding the old key `1` but missing the newly unmatched NULL group. This
+   path does not use the full-outer handling in the `AGGREGATE_GROUP` dispatch branch.
+   Disabling empty-delta skipping, data-dependent optimization, or full-outer MERGE
+   independently does not change the failure. Evidence: `/private/tmp/cost-t05-repro.sql`
+   and `/private/tmp/cost-t05-metadata.log`. Three GCI mismatch rows are T05 at SF1.
+
+4. **The mixed generator exhausts its fixed delete targets.** For a one-row allocation,
+   `BuildWorkload` generates a delete without an insert. `GenerateExistingDeletes` keeps
+   selecting the same original keys (or synthetic machine names), even after previous
+   cycles deleted them. Q05 reproduces the no-pending-delta failure at SF1, cycle 3.
+   There are 60 initial no-pending-delta failures across the shards. Another 1,644 rows
+   are subsequent invalid cycles with an empty error: `ApplyCycleDelta` sets a local
+   `delta_error`, but the caller marks `prepared.ok=false` without retaining that error
+   in `prepared.error`. `ApplyDML` also silently ignores failed SQL statements, which
+   makes statement counts insufficient evidence that a batch succeeded.
+
+## Repairs and verification (2026-09-26)
+
+- The daemon retains a weak database reference and locks it for each scheduling cycle.
+  Closing a database while the daemon sleeps no longer leaves a dangling pointer. The
+  same ASan reproducer now survives the wake without a sanitizer report
+  (`/private/tmp/cost-asan-main/repro-fixed.log`). This does not retrospectively establish
+  the stack of the GCI allocator aborts.
+- FULL OUTER group recompute adds delta-key-scoped null-extended group projections to
+  its affected-key table. Both sides' old/new unmatched groups participate; the refresh
+  remains incremental. The original `(NULL, 2)` reproducer and batched match-transition
+  regressions in `test/sql/full_outer_join.test` pass.
+- S04 uses `ORDER BY val, id` in both its materialized view and reference query.
+- Mixed workloads select live row IDs each cycle and issue overlapping updates/deletes.
+  Tiny allocations include inserts, updates where supported, and deletes. Actual delta
+  counts remain in the CSV; nominal percentages can therefore be exceeded on tiny tables.
+  SQL errors now fail the batch and persist into subsequent invalid-cycle diagnostics.
+- The stronger workload exposed another real bug: S02's full refresh left DISTINCT
+  support counts stale, so a later incremental refresh produced wrong zero crossings.
+  Full refresh now rebuilds that auxiliary state using the existing builder, including
+  the recovery and cascade paths. Alternating full/incremental batched-DML regressions
+  were added to `test/sql/distinct.test`.
+- Cost-model tests assumed timing-dependent strategy choices. The evidence test now
+  runs 48 cycles, guaranteeing 24 samples for at least one strategy without lowering
+  its assertion. Exploration starts with empty history because sample quotas are shared
+  across views. Every refresh in those loops now checks bidirectional bag equality.
+
+The focused SF1 benchmark (Q05,Q07,S01,S02,S03,S04,T04,T05; 30 cycles; percentages 1,2,5;
+all_on; one repetition) passed all 480 rows / 1,440 refreshes. Every mixed cycle had
+pending deltas. Evidence: `/private/tmp/cost-fixes-focused2.csv` and `.log`.
+`make test` passed 10,760 assertions in 84 test cases; one ICU-dependent case was
+skipped because ICU is unavailable locally. Expanded regressions also pass for groups
+on either outer-join side and DISTINCT full refresh with downstream delta emission.
+The full SF1 query sweep is in progress. These local runs can overlap and are correctness
+checks, not isolated cost-model performance results.
+
 ## Why
 
 `PRAGMA refresh_cost` decided between incremental maintenance and full recompute using two scalar

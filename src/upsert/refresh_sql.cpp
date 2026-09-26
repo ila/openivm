@@ -523,6 +523,22 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 	add_profile_step("generate_refresh_sql.qualify_sources", qualify_start,
 	                 "query_bytes=" + to_string(view_query_sql.size()));
+	// Full refresh must replace DISTINCT support counts along with the visible rows;
+	// the next incremental refresh uses these counts to detect zero crossings.
+	auto rebuild_distinct_aux = [&]() -> string {
+		RefreshMetadata::DistinctAuxMeta meta;
+		if (!metadata.GetDistinctAuxMeta(view_name, meta)) {
+			return "";
+		}
+		auto delta_source = ResolveDeltaMetadataKey(meta.source, delta_table_names);
+		auto source = ResolveSourceTableSQL(metadata, view_name, delta_source, meta.source, view_catalog_name,
+		                                    view_schema_name, attached_db_catalog_name, attached_db_schema_name);
+		OPENIVM_DEBUG_PRINT("[UPSERT] Rebuilding DISTINCT support counts for %s after full refresh\n",
+		                    view_name.c_str());
+		return BuildDistinctAuxStateCreateSQL(internal_catalog_prefix + SqlUtils::QuoteIdentifier(meta.aux_table),
+		                                      meta.cols, meta.source_exprs, source, meta.filter, true) +
+		       ";\n";
+	};
 	auto recovery_start = profile_now();
 	{
 		auto flag_result = con.Query("SELECT refresh_in_progress FROM " + string(openivm::VIEWS_TABLE) +
@@ -533,6 +549,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto recovery_query =
 			    BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
 			                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta);
+			recovery_query += rebuild_distinct_aux();
 			if (cross_system) {
 				metadata.SetRefreshInProgress(view_name, false);
 			} else {
@@ -649,6 +666,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		auto recompute_query =
 		    BuildRecomputeQuery(metadata, view_name, view_query_sql, cross_system, attached_db_catalog_name,
 		                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta);
+		recompute_query += rebuild_distinct_aux();
 		add_profile_step("generate_refresh_sql.dispatch", full_refresh_start,
 		                 "full_recompute=true; metadata_requires_full_refresh=" +
 		                     string(metadata_requires_full_refresh ? "true" : "false") +
@@ -1170,9 +1188,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		string lpts_cat = view_catalog_name.empty() ? "memory" : view_catalog_name;
 		string lpts_sch = view_schema_name.empty() ? "main" : view_schema_name;
 		string lpts_table_prefix = SqlUtils::QualifiedPrefix(lpts_cat, lpts_sch);
+		string unmatched_groups;
+		if (source_has_full_outer) {
+			unmatched_groups = BuildFullOuterUnmatchedGroups(metadata, view_name, delta_table_names, group_columns,
+			                                                 view_query_sql, delta_specs, lpts_table_prefix);
+		}
 		upsert_query =
 		    CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs, internal_catalog_prefix,
-		                          lpts_table_prefix, emit_cascade_delta_for_recompute, affected_mode);
+		                          lpts_table_prefix, emit_cascade_delta_for_recompute, affected_mode, unmatched_groups);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: GROUP_RECOMPUTE "
 		                    "(%zu group cols, %zu sources, "
 		                    "affected_mode=%s)\n",
@@ -1216,6 +1239,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		upsert_query =
 		    CompileFullRecompute(view_name, full_recompute_query, internal_catalog_prefix, recompute_unique_keys);
+		upsert_query += rebuild_distinct_aux();
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));
 		break;
 	}

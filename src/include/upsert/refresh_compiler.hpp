@@ -84,7 +84,8 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs,
                              const string &catalog_prefix = "", const string &lpts_table_prefix = "",
                              bool emit_cascade_delta = false,
-                             GroupRecomputeAffectedMode affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF);
+                             GroupRecomputeAffectedMode affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF,
+                             const string &additional_affected_groups = "");
 
 /// Aux-state DBSP-correct DISTINCT pipeline. v0: single-source view, single SUM
 /// aggregate. Generates a multi-statement SQL batch:

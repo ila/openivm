@@ -111,6 +111,78 @@ string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &la
 	       ") FROM " + delta_table_sql + where_clause + ")";
 }
 
+string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec) {
+	string delta_subselect;
+	if (spec.is_ducklake) {
+		delta_subselect =
+		    "(SELECT * FROM " +
+		    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.ducklake_catalog, spec.ducklake_schema,
+		                                    spec.base_table, spec.last_snapshot_id, spec.current_snapshot_id) +
+		    "\nUNION ALL\nSELECT * FROM " +
+		    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.ducklake_catalog, spec.ducklake_schema,
+		                                    spec.base_table, spec.last_snapshot_id, spec.current_snapshot_id) +
+		    ")";
+	} else {
+		delta_subselect = BuildStandardDeltaRowsSQL(spec.delta_table_sql, spec.last_update);
+	}
+
+	return delta_subselect;
+}
+
+// Delta substitution finds matched groups, but not the null-extended groups that
+// appear/disappear when a match is gained or lost. Restrict the opposite side by
+// changed join keys, then evaluate both null-extended projections to recover them.
+string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
+                                     const vector<string> &delta_table_names, const vector<string> &group_columns,
+                                     const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs,
+                                     const string &lpts_table_prefix) {
+	auto join = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
+	if (join.left_col.empty() || join.right_col.empty() || join.left_table == join.right_table) {
+		return "";
+	}
+	string groups;
+	for (const auto &spec : delta_specs) {
+		bool left = StringUtil::CIEquals(spec.base_table, join.left_table);
+		if (!left && !StringUtil::CIEquals(spec.base_table, join.right_table)) {
+			continue;
+		}
+		const auto &other_table = left ? join.right_table : join.left_table;
+		const auto &source_key = left ? join.left_col : join.right_col;
+		const auto &other_key = left ? join.right_col : join.left_col;
+		auto source_ref = SqlUtils::FindTableReference(view_query_sql, lpts_table_prefix + spec.base_table);
+		auto other_ref = SqlUtils::FindTableReference(view_query_sql, lpts_table_prefix + other_table);
+		if (source_ref.empty() || other_ref.empty()) {
+			continue;
+		}
+		auto delta = BuildGroupRecomputeDeltaRowsSQL(spec);
+		string other_rows = "SELECT * FROM " + other_ref;
+		for (const auto &other_spec : delta_specs) {
+			if (StringUtil::CIEquals(other_spec.base_table, other_table)) {
+				// Deleted opposite-side rows can carry an old unmatched group too.
+				other_rows += " UNION ALL SELECT * FROM " + BuildGroupRecomputeDeltaRowsSQL(other_spec);
+			}
+		}
+		string affected_other = "(SELECT openivm_other.* FROM (" + other_rows +
+		                        ") openivm_other WHERE EXISTS (SELECT 1 FROM " + delta +
+		                        " openivm_changed WHERE openivm_other." + SqlUtils::QuoteIdentifier(other_key) +
+		                        " = openivm_changed." + SqlUtils::QuoteIdentifier(source_key) + "))";
+		auto append_groups = [&](const string &source_rows, const string &opposite_rows) {
+			auto query = SqlUtils::ReplaceTableReferences(view_query_sql, source_ref, source_rows);
+			query = SqlUtils::ReplaceTableReferences(query, other_ref, opposite_rows);
+			if (!groups.empty()) {
+				groups += "\nUNION\n";
+			}
+			groups += "SELECT DISTINCT " + SqlUtils::JoinQuotedColumns(group_columns) + " FROM (" + query +
+			          ") openivm_unmatched_groups";
+		};
+		append_groups(delta, "(SELECT * FROM " + other_ref + " WHERE false)");
+		append_groups("(SELECT * FROM " + source_ref + " WHERE false)", affected_other);
+	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] Full outer unmatched group discovery for %s: %zu changed sources\n",
+	                    view_name.c_str(), delta_specs.size());
+	return groups;
+}
+
 static bool GroupColumnMatchesJoinColumn(const string &group_col, const string &join_col) {
 	auto group_norm = NormalizeColumnNameForMatch(group_col);
 	if (group_norm == NormalizeColumnNameForMatch(join_col)) {

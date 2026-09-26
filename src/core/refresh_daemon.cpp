@@ -17,7 +17,7 @@ void RefreshDaemon::Start(DatabaseInstance &db) {
 	if (!started_.compare_exchange_strong(expected, true)) {
 		return; // already started
 	}
-	db_ = &db;
+	db_ = db.shared_from_this();
 	shutdown_ = false;
 	thread_ = std::thread(&RefreshDaemon::Run, this);
 }
@@ -70,9 +70,14 @@ void RefreshDaemon::Run() {
 			break;
 		}
 		wake_requested_ = false;
+		auto db = db_.lock();
+		if (!db) {
+			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Database closed; stopping\n");
+			break;
+		}
 
 		try {
-			Connection con(*db_);
+			Connection con(*db);
 			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Woke up\n");
 
 			// Resolve the default catalog dynamically each cycle.
@@ -89,7 +94,7 @@ void RefreshDaemon::Run() {
 			// file-based catalog (e.g. "mydb"). USE is the SQL equivalent of
 			// SetDefaultDatabase and handles its own transaction.
 			{
-				auto &db_manager = DatabaseManager::Get(*db_);
+				auto &db_manager = DatabaseManager::Get(*db);
 				if (db_manager.HasDefaultDatabase()) {
 					auto cat_r = con.Query("SELECT current_database()");
 					if (!cat_r->HasError() && cat_r->RowCount() > 0) {
@@ -178,7 +183,7 @@ void RefreshDaemon::Run() {
 
 				bool refresh_succeeded = false;
 				try {
-					Connection refresh_con(*db_);
+					Connection refresh_con(*db);
 					auto result = refresh_con.Query(
 					    "PRAGMA refresh_options('" + SqlUtils::EscapeValue(sv.catalog_name) + "', '" +
 					    SqlUtils::EscapeValue(sv.schema_name) + "', '" + SqlUtils::EscapeValue(sv.view_name) + "')");
