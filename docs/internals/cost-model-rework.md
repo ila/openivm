@@ -131,8 +131,20 @@ pending deltas. Evidence: `/private/tmp/cost-fixes-focused2.csv` and `.log`.
 `make test` passed 10,760 assertions in 84 test cases; one ICU-dependent case was
 skipped because ICU is unavailable locally. Expanded regressions also pass for groups
 on either outer-join side and DISTINCT full refresh with downstream delta emission.
-The full SF1 query sweep is in progress. These local runs can overlap and are correctness
-checks, not isolated cost-model performance results.
+The full SF1 sweep passed all 1,680 rows / 5,040 validated refreshes across 29 query IDs,
+with zero errors and no empty mixed-workload deltas. It used all queries, one repetition,
+30 cycles, delta percentages 1,2,5, and all_on. Evidence:
+`/private/tmp/cost-fixes-all-sf1.csv` and `.log`. These local runs can overlap and are
+correctness checks, not isolated cost-model performance results.
+
+
+The full rerun is [GCI 36249790313](https://github.com/mdrakiburrahman/ivm-bench/actions/runs/36249790313),
+dispatched against runner revision `024c2e0bd2777a7523ae64ec304afe38ab2ba697`, pinned
+directly to OpenIVM fix commit `7d6cf800e1a9cb556ac70a1a804a0012d853eec9` on
+`ila/cost-model-plan-reuse`. The run covers SF1,10,25,50,100, all queries, three
+repetitions, 30 cycles, delta percentages 1,2,5, all_on, with a 48-hour job timeout.
+It was confirmed in progress; its results are pending. No additional OpenIVM build
+branch was needed for this rerun.
 
 ## Why
 
