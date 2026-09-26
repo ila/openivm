@@ -23,10 +23,9 @@ CREATE MATERIALIZED VIEW cw_mv AS
     FROM cw_src;
 
 # ==========================================
-# Compile-only: force_view_delta_cascade=false should emit the
-# in-place WINDOW_PARTITION program (DELETE/INSERT on data,
-# DELETE FROM openivm_delta_<base>) with no signed-cascade INSERT
-# into openivm_delta_cw_mv.
+# Native publication needs a signed raw delta to restrict the old/new comparison
+# to affected partitions even without an explicit cascade request. The program
+# must use that scope and clean up the raw delta afterward.
 # ==========================================
 
 query IT
@@ -44,7 +43,8 @@ SELECT CASE WHEN
        string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data_cw_mv%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_cw_mv%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM openivm_delta_cw_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO openivm_delta_cw_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cw_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%WHERE EXISTS (SELECT 1 FROM openivm_delta_cw_mv d WHERE%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'cw_mv',

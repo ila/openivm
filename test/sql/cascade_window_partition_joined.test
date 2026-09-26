@@ -40,9 +40,9 @@ CREATE MATERIALIZED VIEW cwj_mv AS
       ON c.tax_id = t.tx_id;
 
 # ==========================================
-# Compile-only: force_view_delta_cascade=false should emit the
-# in-place WINDOW_PARTITION program with no signed-cascade INSERT
-# into openivm_delta_cwj_mv.
+# Native publication needs a signed raw delta to restrict the old/new comparison
+# to affected partitions even without an explicit cascade request. The program
+# must use that scope and clean up the raw delta afterward.
 # ==========================================
 
 query IT
@@ -61,7 +61,8 @@ SELECT CASE WHEN
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data_cwj_mv%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_cwj_mv%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM openivm_delta_cwj_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO openivm_delta_cwj_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cwj_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%WHERE EXISTS (SELECT 1 FROM openivm_delta_cwj_mv d WHERE%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'cwj_mv',

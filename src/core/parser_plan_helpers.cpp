@@ -153,8 +153,7 @@ static bool PrepareCtesForInlining(LogicalOperator *op, PlanRewriteNeeds &needs)
 	} else if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
 		for (auto &expression : op->expressions) {
 			auto &window = expression->Cast<BoundWindowExpression>();
-			needs.rows_window_state = needs.rows_window_state || (window.start == WindowBoundary::UNBOUNDED_PRECEDING &&
-			                                                      window.end == WindowBoundary::CURRENT_ROW_ROWS);
+			needs.running_window_state = needs.running_window_state || IsRunningWindowCandidate(window);
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_DISTINCT) {
 		needs.distinct = true;

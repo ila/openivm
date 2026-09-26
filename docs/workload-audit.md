@@ -129,3 +129,64 @@ python3 benchmark/poc/running_rows_poc.py /path/to/baseline/duckdb build/release
 
 Use a new output directory. It retains each SQL workload, CLI log, and timing
 results, and stops on SQL errors or bag mismatches.
+
+### Running-window correctness and publication follow-up
+
+The next sweep found a precision bug in AVG suffix seeds: reconstructing a sum as
+`average * count` lost the low bit of BIGINT `9007199254740993`, so appending
+`-9007199254740992` produced 0 instead of 0.5. Seeds now aggregate the retained
+input directly. Creation preserves missing order and AVG inputs as hidden
+maintenance columns, so omitting either from the public projection no longer
+produces invalid suffix SQL. Regression coverage includes renamed outputs,
+quoted identifiers containing dots, and an output named `new_count` that exposed
+an ambiguous reference in the combined seed/bounds query.
+
+The same change removes repeated recursive type-resolution walks during hidden
+column insertion and avoids generating ROWS state for ineligible window shapes.
+Bounds and seeds share a grouped scan. The computed suffix is materialized once
+and reused for stored rows and raw cascade deltas. Native window publication
+compares only affected partitions when their keys are visible; global ORDER BY
+or LIMIT retains global publication. Backdated changes and conflicting DML still
+use affected-partition incremental maintenance.
+
+Shared partition-column handling and suffix emission replace duplicate helpers
+and repeated SQL construction. The auxiliary compiler is 49 lines smaller and a
+nine-line duplicate helper is removed; across production sources the correctness
+and optimization changes add six net lines. This is not an additional large LOC
+reduction.
+
+Validation passed the compiled N-term SQL integration check and the full SQL
+suite: 12,461 assertions in 89 cases, with one ICU-dependent skip. New tests cover
+missing inputs, BIGINT cancellation, reopen, downstream propagation, partition
+moves/deletion, global top-k publication, and conflicting DML. A separate native
+and DuckLake workload passed 168 bidirectional bag comparisons over seven-view
+DAGs and 12 reopened batches per backend. The exported suffix program was also
+executed directly, checking both the visible result and the signed raw delta.
+
+Both binaries in this follow-up benchmark use the optional suffix path. The
+baseline is commit `675520d4`; the query uses SUM and COUNT, avoiding its AVG bug.
+Measurements use four threads on the same Apple M1 host, three fresh databases
+per configuration and three append batches per database. Every one of the 108
+refreshes passed bidirectional bag checks. Medians cover `PRAGMA refresh` only.
+
+| Partitions | Initial rows | Appended rows per batch | Before (ms) | After (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 100,000 | 20 | 195 | 204 |
+| 1 | 100,000 | 10,000 | 220 | 267 |
+| 1 | 1,000,000 | 20 | 1,077 | 1,234 |
+| 1,000 | 100,000 | 20 | 228 | 181 |
+| 1,000 | 100,000 | 10,000 | 257 | 304 |
+| 1,000 | 1,000,000 | 20 | 1,505 | 866 |
+
+Sparse changes across 1,000 partitions improve refresh time by approximately
+21–42%. Single-partition workloads are 5–21% slower, and touching all 1,000
+partitions is 18% slower in this run. The added publication scope/delta work does
+not pay off when nearly all stored rows belong to affected partitions. These
+measurements do not establish a universal suffix speedup; the setting remains
+optional. An adaptive publication-scope choice is a possible follow-up, not part
+of this change.
+
+```sh
+python3 benchmark/poc/running_rows_poc.py /path/to/675520d4/duckdb build/release/duckdb --before-suffix --output /tmp/rows-one
+python3 benchmark/poc/running_rows_poc.py /path/to/675520d4/duckdb build/release/duckdb --before-suffix --partitions 1000 --output /tmp/rows-many
+```

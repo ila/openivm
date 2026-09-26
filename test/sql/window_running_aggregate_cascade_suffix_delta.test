@@ -171,7 +171,7 @@ WITH compiled AS (
 ), program AS (
     SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS sql FROM compiled
 ), fast_delta AS (
-    SELECT sql FROM compiled WHERE sql LIKE 'INSERT INTO openivm_delta_wrcas_daily_mv%openivm_l1 AS%'
+    SELECT sql FROM compiled WHERE sql LIKE 'INSERT INTO openivm_delta_wrcas_daily_mv%FROM openivm_run_result_wrcas_daily_mv%'
 )
 SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast_wrcas_daily_mv%'
          AND (SELECT sql FROM program) LIKE '%openivm_run_fallback_wrcas_daily_mv%'

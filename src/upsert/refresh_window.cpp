@@ -293,15 +293,6 @@ static string BuildDuckLakeLookupChangedKeysSQL(const DuckLakeSourceSpec &source
 	return "(" + current_lookup + " UNION ALL " + old_lookup + ")";
 }
 
-static vector<string> PartitionOutputColumns(const vector<string> &partition_cols) {
-	vector<string> output_columns;
-	output_columns.reserve(partition_cols.size());
-	for (auto &partition_col : partition_cols) {
-		output_columns.push_back(SplitPartitionSpec(partition_col).first);
-	}
-	return output_columns;
-}
-
 static string BuildAffectedPartitionRefreshSQL(const string &data_table, const string &view_query_sql,
                                                const string &affected_keys_sql, const string &affected_temp_table,
                                                const vector<string> &partition_cols) {

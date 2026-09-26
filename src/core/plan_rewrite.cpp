@@ -891,12 +891,13 @@ static ColumnBinding AppendProjectionPassthrough(LogicalProjection &proj, const 
 	auto passthrough = make_uniq<BoundColumnRefExpression>(type, binding);
 	passthrough->alias = alias;
 	proj.expressions.push_back(std::move(passthrough));
-	proj.ResolveOperatorTypes();
-	auto bindings = proj.GetColumnBindings();
-	if (bindings.empty()) {
-		throw InternalException("OpenIVM: projection produced no bindings after appending hidden passthrough");
+	// Projection types depend only on the bound expressions, not a recursive
+	// resolution of its entire child plan for every appended helper column.
+	proj.types.clear();
+	for (auto &expression : proj.expressions) {
+		proj.types.push_back(expression->return_type);
 	}
-	return bindings.back();
+	return ColumnBinding(proj.table_index, proj.expressions.size() - 1);
 }
 
 void PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &projection_path, ColumnBinding binding,
@@ -1471,71 +1472,113 @@ static void RewritePassOuterJoinSupport(PlanRewriteContext &rewrite_context) {
 	                        rewrite_context.needs.has_aggregate);
 }
 
-// Keep the position produced by the same window sort as the ROWS aggregate. Its
-// value identifies the actual final peer when a later batch needs a cumulative seed.
-static void RewritePassRowsWindowState(PlanRewriteContext &context) {
+bool IsRunningWindowCandidate(const BoundWindowExpression &window) {
+	if (!window.aggregate || window.partitions.size() != 1 || window.orders.size() != 1 ||
+	    window.orders[0].type != OrderType::ASCENDING || window.filter_expr || window.distinct ||
+	    !window.arg_orders.empty() || window.exclude_clause != WindowExcludeMode::NO_OTHER ||
+	    window.start != WindowBoundary::UNBOUNDED_PRECEDING ||
+	    (window.end != WindowBoundary::CURRENT_ROW_ROWS && window.end != WindowBoundary::CURRENT_ROW_RANGE) ||
+	    window.orders[0].expression->expression_class != ExpressionClass::BOUND_COLUMN_REF ||
+	    window.partitions[0]->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+		return false;
+	}
+	auto &name = window.aggregate->name;
+	return name == "sum" || name == "min" || name == "max" || name == "count" || name == "count_star" || name == "avg";
+}
+
+// Seed inputs are maintenance state even when omitted from the public projection.
+// ROWS positions share the aggregate's sort, identifying its actual final peer.
+static void RewritePassRunningWindowState(PlanRewriteContext &context) {
 	vector<LogicalProjection *> projections;
-	idx_t position_count = 0;
-	std::function<void(LogicalOperator &)> visit = [&](LogicalOperator &node) {
-		if (node.children.size() != 1) {
+	idx_t position_count = 0, input_count = 0;
+	bool changed = false;
+	auto expose_input = [&](const Expression &expression) {
+		if (expression.expression_class != ExpressionClass::BOUND_COLUMN_REF) {
 			return;
 		}
-		if (node.type != LogicalOperatorType::LOGICAL_PROJECTION && node.type != LogicalOperatorType::LOGICAL_WINDOW &&
-		    node.type != LogicalOperatorType::LOGICAL_FILTER && node.type != LogicalOperatorType::LOGICAL_ORDER_BY &&
-		    node.type != LogicalOperatorType::LOGICAL_LIMIT && node.type != LogicalOperatorType::LOGICAL_TOP_N &&
-		    node.type != LogicalOperatorType::LOGICAL_CREATE_TABLE) {
-			return;
+		auto binding = expression.Cast<BoundColumnRefExpression>().binding;
+		auto alias = string(openivm::RUNNING_INPUT_PREFIX) + to_string(input_count++);
+		for (auto it = projections.rbegin(); it != projections.rend(); ++it) {
+			auto &projection = **it;
+			idx_t index = 0;
+			for (; index < projection.expressions.size(); index++) {
+				auto &item = *projection.expressions[index];
+				if (item.expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+				    item.Cast<BoundColumnRefExpression>().binding == binding) {
+					break;
+				}
+			}
+			if (index == projection.expressions.size()) {
+				AppendProjectionPassthrough(projection, binding, expression.return_type, alias);
+				changed = true;
+			}
+			binding = ColumnBinding(projection.table_index, index);
+		}
+	};
+	std::function<bool(LogicalOperator &)> visit = [&](LogicalOperator &node) {
+		if (node.children.empty()) {
+			return node.type == LogicalOperatorType::LOGICAL_GET;
+		}
+		if (node.children.size() != 1 ||
+		    (node.type != LogicalOperatorType::LOGICAL_PROJECTION && node.type != LogicalOperatorType::LOGICAL_WINDOW &&
+		     node.type != LogicalOperatorType::LOGICAL_ORDER_BY && node.type != LogicalOperatorType::LOGICAL_LIMIT &&
+		     node.type != LogicalOperatorType::LOGICAL_TOP_N &&
+		     node.type != LogicalOperatorType::LOGICAL_CREATE_TABLE)) {
+			return false;
+		}
+		if (node.type == LogicalOperatorType::LOGICAL_WINDOW) {
+			auto &first = node.expressions[0]->Cast<BoundWindowExpression>();
+			for (auto &item : node.expressions) {
+				auto &window = item->Cast<BoundWindowExpression>();
+				if (!IsRunningWindowCandidate(window) || !first.PartitionsAreEquivalent(window) ||
+				    first.GetSharedOrders(window) != 1) {
+					return false;
+				}
+			}
 		}
 		if (node.type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			projections.push_back(&node.Cast<LogicalProjection>());
 		}
-		visit(*node.children[0]);
-		if (node.type == LogicalOperatorType::LOGICAL_WINDOW) {
+		bool eligible = visit(*node.children[0]);
+		if (eligible && node.type == LogicalOperatorType::LOGICAL_WINDOW) {
 			auto &window = node.Cast<LogicalWindow>();
-			vector<BoundWindowExpression *> ordered_groups;
+			bool have_position = false;
 			auto expression_count = window.expressions.size();
 			for (idx_t i = 0; i < expression_count; i++) {
 				auto &expression = window.expressions[i]->Cast<BoundWindowExpression>();
-				if (expression.start != WindowBoundary::UNBOUNDED_PRECEDING ||
-				    expression.end != WindowBoundary::CURRENT_ROW_ROWS || expression.orders.empty()) {
+				expose_input(*expression.orders[0].expression);
+				if (expression.aggregate->name == "avg" && expression.children.size() == 1) {
+					expose_input(*expression.children[0]);
+				}
+				if (expression.end != WindowBoundary::CURRENT_ROW_ROWS || have_position) {
 					continue;
 				}
-				bool exists = false;
-				for (auto *group : ordered_groups) {
-					exists = exists || (group->PartitionsAreEquivalent(expression) &&
-					                    group->orders.size() == expression.orders.size() &&
-					                    group->GetSharedOrders(expression) == expression.orders.size());
-				}
-				if (exists) {
-					continue;
-				}
-				ordered_groups.push_back(&expression);
+				have_position = true;
 				auto position = make_uniq<BoundWindowExpression>(ExpressionType::WINDOW_ROW_NUMBER, LogicalType::BIGINT,
 				                                                 nullptr, nullptr);
-				for (auto &partition : expression.partitions) {
-					position->partitions.push_back(partition->Copy());
-					position->partitions_stats.push_back(nullptr);
-				}
-				for (auto &order : expression.orders) {
-					position->orders.push_back(order.Copy());
-				}
+				position->partitions.push_back(expression.partitions[0]->Copy());
+				position->partitions_stats.push_back(nullptr);
+				position->orders.push_back(expression.orders[0].Copy());
 				position->start = WindowBoundary::UNBOUNDED_PRECEDING;
 				position->end = WindowBoundary::CURRENT_ROW_ROWS;
 				auto alias = string(openivm::ROWS_POSITION_PREFIX) + to_string(position_count++);
 				position->alias = alias;
 				ColumnBinding binding(window.window_index, window.expressions.size());
 				window.expressions.push_back(std::move(position));
-				window.ResolveOperatorTypes();
 				PropagateHiddenBindingThroughProjectionPath(projections, binding, LogicalType::BIGINT, alias);
-				OPENIVM_DEBUG_PRINT("[PlanRewrite] Added ROWS seed position %s\n", alias.c_str());
+				changed = true;
 			}
 		}
 		if (node.type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			projections.pop_back();
 		}
-		node.ResolveOperatorTypes();
+		return eligible;
 	};
 	visit(*context.plan);
+	if (changed) {
+		context.plan->ResolveOperatorTypes();
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Added running-window seed inputs and %llu peer positions\n", position_count);
+	}
 }
 
 static void RewritePassSemiAntiSubqueries(PlanRewriteContext &rewrite_context) {
@@ -1559,7 +1602,7 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	    {"hidden_aggregate_propagation", RewritePassHiddenAggregatePropagation, &PlanRewriteNeeds::derived_aggregates},
 	    {"outer_join_support", RewritePassOuterJoinSupport, &PlanRewriteNeeds::outer_join_support},
 	    {"semi_anti_subqueries", RewritePassSemiAntiSubqueries, &PlanRewriteNeeds::semi_anti_subqueries},
-	    {"rows_window_state", RewritePassRowsWindowState, &PlanRewriteNeeds::rows_window_state},
+	    {"running_window_state", RewritePassRunningWindowState, &PlanRewriteNeeds::running_window_state},
 	};
 
 	for (const auto &pass : passes) {

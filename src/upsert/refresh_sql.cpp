@@ -515,6 +515,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string publication_sql;
 	vector<string> publication_columns;
 	string publication_query;
+	bool global_publication = false;
 	string publication_source_query;
 	string publication_prefix = internal_catalog_prefix;
 	auto publication = con.Query("SELECT published_query FROM openivm_views WHERE view_name='" +
@@ -532,6 +533,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		publication_query = publication->GetValue(0, 0).ToString();
 		publication_source_query = publication_query;
+		Parser publication_parser;
+		publication_parser.ParseQuery(publication_query);
+		auto &node = publication_parser.statements[0]->Cast<SelectStatement>().node;
+		for (auto &modifier : node->modifiers) {
+			global_publication |= modifier->type == ResultModifierType::LIMIT_MODIFIER ||
+			                      modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER ||
+			                      modifier->type == ResultModifierType::ORDER_MODIFIER;
+		}
+
 		if (active_facts.target_dialect == SqlDialect::SPARK) {
 			publication_source_query = RenderStoredViewQueryForDialect(
 			    con, publication_query, publication_columns, active_facts.target_dialect, openivm::TimeTravelPins());
@@ -688,9 +698,24 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	}
 	RefreshType dispatch_refresh_type = use_full_recompute ? RefreshType::FULL_REFRESH : view_query_type;
 	refresh_plan.refresh_type = dispatch_refresh_type;
+	vector<string> window_publication_keys;
+	if (dispatch_refresh_type == RefreshType::WINDOW_PARTITION && !publication_query.empty() && !global_publication &&
+	    !target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB &&
+	    std::none_of(delta_sources.begin(), delta_sources.end(), [](const RefreshMetadata::DeltaSource &source) {
+		    return StringUtil::CIEquals(source.catalog_type, "ducklake");
+	    })) {
+		window_publication_keys = PartitionOutputColumns(metadata.GetGroupColumns(view_name));
+		for (auto &key : window_publication_keys) {
+			if (std::find(publication_columns.begin(), publication_columns.end(), key) == publication_columns.end()) {
+				window_publication_keys.clear();
+				break;
+			}
+		}
+	}
 	bool emit_cascade_delta_for_recompute =
-	    active_facts.force_view_delta_cascade && (dispatch_refresh_type == RefreshType::WINDOW_PARTITION ||
-	                                              dispatch_refresh_type == RefreshType::GROUP_RECOMPUTE);
+	    (active_facts.force_view_delta_cascade || !window_publication_keys.empty()) &&
+	    (dispatch_refresh_type == RefreshType::WINDOW_PARTITION ||
+	     dispatch_refresh_type == RefreshType::GROUP_RECOMPUTE);
 	auto column_metadata_start = profile_now();
 	vector<string> column_names;
 	vector<LogicalType> column_types;
@@ -1697,16 +1722,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                           " SET refresh_in_progress = false WHERE view_name = '" +
 	                           SqlUtils::EscapeValue(view_name) + "';\n";
 	if (!publication_query.empty()) {
-		Parser publication_parser;
-		publication_parser.ParseQuery(publication_query);
-		auto &node = publication_parser.statements[0]->Cast<SelectStatement>().node;
-		bool global_publication = false;
-		for (auto &modifier : node->modifiers) {
-			global_publication |= modifier->type == ResultModifierType::LIMIT_MODIFIER ||
-			                      modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER ||
-			                      modifier->type == ResultModifierType::ORDER_MODIFIER;
-		}
-		vector<string> scope_columns;
+		vector<string> scope_columns = window_publication_keys;
 		bool has_scopable_delta = dispatch_refresh_type == RefreshType::AGGREGATE_GROUP ||
 		                          dispatch_refresh_type == RefreshType::AGGREGATE_HAVING ||
 		                          (dispatch_refresh_type == RefreshType::SIMPLE_PROJECTION && !source_has_left_join &&

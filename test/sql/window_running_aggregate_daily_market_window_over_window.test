@@ -63,17 +63,17 @@ WITH compiled AS (
     WHERE stmt_kind = 'data'
 ), program AS (
     SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS sql FROM compiled
-), fast_insert AS (
-    SELECT sql FROM compiled WHERE sql LIKE 'INSERT INTO openivm_data_wradwow_mv (%'
+), suffix_result AS (
+    SELECT sql FROM compiled WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_run_result_wradwow_mv AS%'
 )
 SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast_wradwow_mv%'
-         AND (SELECT sql FROM fast_insert) LIKE '%openivm_l1 AS%'
-         AND (SELECT sql FROM fast_insert) LIKE '%MIN(d.dm_low)%'
-         AND (SELECT sql FROM fast_insert) LIKE '%MAX(d.dm_high)%'
-         AND (SELECT sql FROM fast_insert) LIKE '%CASE  WHEN ((dm_low = fifty_two_week_low)) THEN (dm_date) ELSE CAST(NULL AS DATE) END%'
-         AND (SELECT sql FROM fast_insert) LIKE '%CASE  WHEN ((dm_high = fifty_two_week_high)) THEN (dm_date) ELSE CAST(NULL AS DATE) END%'
-         AND (SELECT sql FROM fast_insert) LIKE '%MAX(f.low_date_flag)%'
-         AND (SELECT sql FROM fast_insert) LIKE '%MAX(f.high_date_flag)%'
+         AND (SELECT sql FROM suffix_result) LIKE '%openivm_l1 AS%'
+         AND (SELECT sql FROM suffix_result) LIKE '%MIN(d.dm_low)%'
+         AND (SELECT sql FROM suffix_result) LIKE '%MAX(d.dm_high)%'
+         AND (SELECT sql FROM suffix_result) LIKE '%CASE  WHEN ((dm_low = fifty_two_week_low)) THEN (dm_date) ELSE CAST(NULL AS DATE) END%'
+         AND (SELECT sql FROM suffix_result) LIKE '%CASE  WHEN ((dm_high = fifty_two_week_high)) THEN (dm_date) ELSE CAST(NULL AS DATE) END%'
+         AND (SELECT sql FROM suffix_result) LIKE '%MAX(f.low_date_flag)%'
+         AND (SELECT sql FROM suffix_result) LIKE '%MAX(f.high_date_flag)%'
     THEN 1 ELSE 0 END;
 ----
 1

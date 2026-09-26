@@ -5,6 +5,7 @@
 
 namespace duckdb {
 namespace openivm {
+constexpr const char *RUNNING_INPUT_PREFIX = "openivm_running_";
 constexpr const char *ROWS_POSITION_PREFIX = "openivm_rows_position_";
 
 // System table names
