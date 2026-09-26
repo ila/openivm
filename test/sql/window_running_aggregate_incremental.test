@@ -875,3 +875,258 @@ WITH expected AS (SELECT *,SUM(x) OVER (PARTITION BY k ORDER BY d ROWS BETWEEN U
 SELECT COUNT(*) FROM ((SELECT * FROM wf_alias_names_mv EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM wf_alias_names_mv));
 ----
 0
+
+# Bounds counters cannot shadow user partition columns, including NULL order transitions.
+foreach key new_count new_nulls
+
+statement ok
+CREATE TABLE wc_${key}_last(${key} INT,d INT,x INT);
+
+statement ok
+INSERT INTO wc_${key}_last VALUES (7,1,4),(8,1,2);
+
+statement ok
+CREATE MATERIALIZED VIEW wc_${key}_last_mv AS SELECT *,SUM(x) OVER (PARTITION BY ${key} ORDER BY d NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wc_${key}_last;
+
+statement ok
+CREATE VIEW wc_${key}_last_expected AS SELECT *,SUM(x) OVER (PARTITION BY ${key} ORDER BY d NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wc_${key}_last;
+
+statement ok
+INSERT INTO wc_${key}_last VALUES (7,NULL,3),(7,NULL,3),(8,NULL,5);
+
+statement ok
+PRAGMA refresh('wc_${key}_last_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM wc_${key}_last_mv EXCEPT ALL SELECT * FROM wc_${key}_last_expected) UNION ALL (SELECT * FROM wc_${key}_last_expected EXCEPT ALL SELECT * FROM wc_${key}_last_mv));
+----
+0
+
+statement ok
+INSERT INTO wc_${key}_last VALUES (7,0,9),(9,2,4);
+
+statement ok
+UPDATE wc_${key}_last SET x=x+1 WHERE ${key}=7;
+
+statement ok
+DELETE FROM wc_${key}_last WHERE ${key}=8 OR x=10;
+
+statement ok
+PRAGMA refresh('wc_${key}_last_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM wc_${key}_last_mv EXCEPT ALL SELECT * FROM wc_${key}_last_expected) UNION ALL (SELECT * FROM wc_${key}_last_expected EXCEPT ALL SELECT * FROM wc_${key}_last_mv));
+----
+0
+
+statement ok
+CREATE TABLE wc_${key}_first(${key} INT,d INT,x INT);
+
+statement ok
+INSERT INTO wc_${key}_first VALUES (7,NULL,4),(8,NULL,2);
+
+statement ok
+CREATE MATERIALIZED VIEW wc_${key}_first_mv AS SELECT *,SUM(x) OVER (PARTITION BY ${key} ORDER BY d NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wc_${key}_first;
+
+statement ok
+CREATE VIEW wc_${key}_first_expected AS SELECT *,SUM(x) OVER (PARTITION BY ${key} ORDER BY d NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wc_${key}_first;
+
+statement ok
+INSERT INTO wc_${key}_first VALUES (7,1,3),(7,1,3),(8,1,5);
+
+statement ok
+PRAGMA refresh('wc_${key}_first_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM wc_${key}_first_mv EXCEPT ALL SELECT * FROM wc_${key}_first_expected) UNION ALL (SELECT * FROM wc_${key}_first_expected EXCEPT ALL SELECT * FROM wc_${key}_first_mv));
+----
+0
+
+statement ok
+INSERT INTO wc_${key}_first VALUES (7,0,9),(9,2,4);
+
+statement ok
+UPDATE wc_${key}_first SET x=x+1 WHERE ${key}=7;
+
+statement ok
+DELETE FROM wc_${key}_first WHERE ${key}=8 OR x=10;
+
+statement ok
+PRAGMA refresh('wc_${key}_first_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM wc_${key}_first_mv EXCEPT ALL SELECT * FROM wc_${key}_first_expected) UNION ALL (SELECT * FROM wc_${key}_first_expected EXCEPT ALL SELECT * FROM wc_${key}_first_mv));
+----
+0
+
+endloop
+
+# Literal text that happens to match an LPTS alias must not be renamed.
+statement ok
+CREATE TABLE wl_source(k INT,d INT,x INT);
+
+statement ok
+INSERT INTO wl_source VALUES(1,1,4);
+
+statement ok
+CREATE MATERIALIZED VIEW wl_parent AS
+SELECT k,d,x,s,MAX(flag) OVER (PARTITION BY k ORDER BY d) f
+FROM (SELECT *,CASE WHEN s>5 THEN 't5_window_0' ELSE 'none' END flag
+      FROM (SELECT *,SUM(x) OVER (PARTITION BY k ORDER BY d) s FROM wl_source));
+
+statement ok
+CREATE MATERIALIZED VIEW wl_child AS SELECT * FROM wl_parent;
+
+statement ok
+CREATE VIEW wl_expected AS
+SELECT k,d,x,s,MAX(flag) OVER (PARTITION BY k ORDER BY d) f
+FROM (SELECT *,CASE WHEN s>5 THEN 't5_window_0' ELSE 'none' END flag
+      FROM (SELECT *,SUM(x) OVER (PARTITION BY k ORDER BY d) s FROM wl_source));
+
+statement ok
+INSERT INTO wl_source VALUES(1,2,3),(1,3,2),(2,1,8);
+
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('wl_parent','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}')
+WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_run_result_wl_parent AS%' AND sql LIKE '%t5_window_0%';
+----
+1
+
+statement ok
+PRAGMA refresh_pipeline('wl_parent','wl_child');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM wl_parent EXCEPT ALL SELECT * FROM wl_expected) UNION ALL (SELECT * FROM wl_expected EXCEPT ALL SELECT * FROM wl_parent));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM wl_child EXCEPT ALL SELECT * FROM wl_expected) UNION ALL (SELECT * FROM wl_expected EXCEPT ALL SELECT * FROM wl_child));
+----
+0
+
+# A backdated partition uses the filtered fallback while another appends normally.
+statement ok
+INSERT INTO wl_source VALUES(1,0,2),(2,2,3);
+
+statement ok
+PRAGMA refresh_pipeline('wl_parent','wl_child');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM wl_parent EXCEPT ALL SELECT * FROM wl_expected) UNION ALL (SELECT * FROM wl_expected EXCEPT ALL SELECT * FROM wl_parent));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM wl_child EXCEPT ALL SELECT * FROM wl_expected) UNION ALL (SELECT * FROM wl_expected EXCEPT ALL SELECT * FROM wl_child));
+----
+0
+
+# Full-tuple publication scope must include values, not only the partition key.
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('wl_parent','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}')
+WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next_wl_parent AS%' AND sql LIKE '%v.f IS NOT DISTINCT FROM d.f%';
+----
+1
+
+foreach key openivm_delta_min_order openivm_append
+
+statement ok
+CREATE TABLE wc_${key}_last(${key} INT,d INT,x INT);
+
+statement ok
+INSERT INTO wc_${key}_last VALUES (7,1,4),(8,1,2);
+
+statement ok
+CREATE MATERIALIZED VIEW wc_${key}_last_mv AS SELECT *,SUM(x) OVER (PARTITION BY ${key} ORDER BY d NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wc_${key}_last;
+
+statement ok
+CREATE VIEW wc_${key}_last_expected AS SELECT d,x,SUM(x) OVER (PARTITION BY ${key} ORDER BY d NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wc_${key}_last;
+
+statement ok
+INSERT INTO wc_${key}_last VALUES (7,NULL,3),(7,NULL,3),(8,NULL,5);
+
+statement ok
+PRAGMA refresh('wc_${key}_last_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM wc_${key}_last_mv EXCEPT ALL SELECT * FROM wc_${key}_last_expected) UNION ALL (SELECT * FROM wc_${key}_last_expected EXCEPT ALL SELECT * FROM wc_${key}_last_mv));
+----
+0
+
+# Internal-looking source keys are hidden publicly; verify their stored bags too.
+query I
+WITH expected AS (SELECT *,SUM(x) OVER (PARTITION BY ${key} ORDER BY d NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wc_${key}_last)
+SELECT COUNT(*) FROM ((SELECT ${key},d,x,s FROM openivm_data_wc_${key}_last_mv EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT ${key},d,x,s FROM openivm_data_wc_${key}_last_mv));
+----
+0
+
+statement ok
+INSERT INTO wc_${key}_last VALUES (7,0,9),(9,2,4);
+
+statement ok
+UPDATE wc_${key}_last SET x=x+1 WHERE ${key}=7;
+
+statement ok
+DELETE FROM wc_${key}_last WHERE ${key}=8 OR x=10;
+
+statement ok
+PRAGMA refresh('wc_${key}_last_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM wc_${key}_last_mv EXCEPT ALL SELECT * FROM wc_${key}_last_expected) UNION ALL (SELECT * FROM wc_${key}_last_expected EXCEPT ALL SELECT * FROM wc_${key}_last_mv));
+----
+0
+
+# Internal-looking source keys are hidden publicly; verify their stored bags too.
+query I
+WITH expected AS (SELECT *,SUM(x) OVER (PARTITION BY ${key} ORDER BY d NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wc_${key}_last)
+SELECT COUNT(*) FROM ((SELECT ${key},d,x,s FROM openivm_data_wc_${key}_last_mv EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT ${key},d,x,s FROM openivm_data_wc_${key}_last_mv));
+----
+0
+
+
+endloop
+
+# Equal visible rows from unrelated partitions retain their complete multiplicity.
+statement ok
+CREATE TABLE wb_source(k INT,d INT,x INT);
+
+statement ok
+INSERT INTO wb_source VALUES(1,1,4),(2,1,4),(3,1,4);
+
+statement ok
+CREATE MATERIALIZED VIEW wb_mv AS SELECT SUM(x) OVER (PARTITION BY k ORDER BY d) s FROM wb_source;
+
+statement ok
+CREATE MATERIALIZED VIEW wb_keyed AS SELECT k,SUM(x) OVER (PARTITION BY k ORDER BY d) s FROM wb_source;
+
+statement ok
+INSERT INTO wb_source VALUES(1,2,0),(2,2,1);
+
+statement ok
+DELETE FROM wb_source WHERE k=3;
+
+statement ok
+UPDATE wb_source SET x=3 WHERE k=2 AND d=1;
+
+statement ok
+PRAGMA refresh_pipeline('wb_mv','wb_keyed');
+
+query I
+WITH expected AS (SELECT SUM(x) OVER (PARTITION BY k ORDER BY d) s FROM wb_source)
+SELECT COUNT(*) FROM ((SELECT * FROM wb_mv EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM wb_mv));
+----
+0
+
+query I
+WITH expected AS (SELECT k,SUM(x) OVER (PARTITION BY k ORDER BY d) s FROM wb_source)
+SELECT COUNT(*) FROM ((SELECT * FROM wb_keyed EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM wb_keyed));
+----
+0
+
+query I
+SELECT COUNT(*) FROM openivm_compile_with_facts('wb_keyed','{"target_dialect":"duckdb","compile_only":true}')
+WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next_wb_keyed AS%' AND sql LIKE '%v.s IS NOT DISTINCT FROM d.s%';
+----
+1

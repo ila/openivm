@@ -241,6 +241,18 @@ string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string
 	       "\nUNION ALL\nSELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM " + new_source + ";\n";
 }
 
+// The same affected-row predicate applies to the old snapshot, recomputed rows,
+// and deletion target. Use one alias so callers cannot accidentally scope them differently.
+string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &query, const string &delta_table,
+                                    const string &old_table, const string &new_table, const string &filter) {
+	string predicate = " openivm_target\nWHERE " + filter;
+	return "CREATE OR REPLACE TEMP TABLE " + old_table + " AS\nSELECT * FROM " + data_table + predicate + ";\n" +
+	       "CREATE OR REPLACE TEMP TABLE " + new_table + " AS\nSELECT * FROM (" + query + ")" + predicate + ";\n" +
+	       "DELETE FROM " + data_table + " AS" + predicate + ";\n" + "INSERT INTO " + data_table + "\nSELECT * FROM " +
+	       new_table + ";\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_table, new_table) +
+	       "DROP TABLE IF EXISTS " + old_table + ";\nDROP TABLE IF EXISTS " + new_table + ";\n";
+}
+
 static string BuildDeleteUsingInsertRefreshSQL(const string &data_table, const string &view_query_sql,
                                                const string &recompute_alias, const string &using_source,
                                                const string &using_alias, const string &delete_match,

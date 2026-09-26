@@ -190,3 +190,70 @@ of this change.
 python3 benchmark/poc/running_rows_poc.py /path/to/675520d4/duckdb build/release/duckdb --before-suffix --output /tmp/rows-one
 python3 benchmark/poc/running_rows_poc.py /path/to/675520d4/duckdb build/release/duckdb --before-suffix --partitions 1000 --output /tmp/rows-many
 ```
+
+
+### Alias safety and narrower window refresh work
+
+The next review reproduced two silent suffix errors. Partition columns named
+`new_count` or `new_nulls` could shadow the append-bounds counters and leave a
+NULL-order append in neither the fast nor fallback set. Internal bounds names
+now use the reserved running-state prefix. Nested CASE expressions could also
+have string literals such as `'t5_window_0'` rewritten to `'s'`; identifier
+translation now visits parsed column references and leaves constants intact.
+
+For eligible single-source running windows, the fallback partition predicate is
+pushed into the source scan before window evaluation. This avoids evaluating the
+window over all source rows when the fallback set is empty. Native unordered
+partitioned-window publication uses all changed visible column values as its scope, rather
+than every row in each affected partition. The signed raw delta contains exact
+old/new rows, so its projection covers every potentially changed visible bag;
+matching duplicates from other partitions are still counted. Ordered or limited
+publication retains the global comparison.
+
+The suffix and regular window paths now share snapshot/delta SQL emission, and
+null-safe identifier matching delegates to the existing predicate helper. No
+new logical-plan traversal or full-refresh workaround was introduced. These
+changes apply to standalone `PRAGMA refresh` and to views refreshed by
+`refresh_pipeline`; the timings below use standalone refresh calls.
+
+The final build passed the compiled N-term integration check and all 12,563 SQL
+assertions in 89 cases (one ICU-dependent skip). Real CLI executions verified
+both reported wrong-result reproductions and exported SQL's visible and raw-delta
+bags. The native/DuckLake reopened DAG sweep passed all 168 comparisons. The
+production-source diff removes 17 net lines while adding the fixes and filtering
+logic; repeated regression cases use SQLLogicTest loops.
+
+The follow-up append benchmark compares `b9356c8c` with this change, with suffix
+maintenance enabled in both. Each configuration uses three fresh databases,
+three append batches, and four DuckDB threads. All 108 refreshes passed
+bidirectional bag checks. These runs experienced competing CPU-heavy jobs on the
+host; the medians below are observed timings, not a controlled speedup claim.
+
+| Partitions | Initial rows | Appended rows per batch | Before (ms) | After (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 100,000 | 20 | 253 | 184 |
+| 1 | 100,000 | 10,000 | 258 | 227 |
+| 1 | 1,000,000 | 20 | 2,343 | 763 |
+| 1,000 | 100,000 | 20 | 245 | 228 |
+| 1,000 | 100,000 | 10,000 | 399 | 267 |
+| 1,000 | 1,000,000 | 20 | 1,468 | 948 |
+
+A separate mixed-DML check used 100,000 initial rows, appended 20 rows, incremented
+all `x` values, and deleted rows where `d % 17 = 0` before one refresh. Across
+three fresh databases per binary/configuration, median refresh times were
+216 → 218 ms for one partition and 214 → 225 ms for 1,000 partitions. All 12
+refreshes passed bag checks. Mixed-DML refresh was approximately 1–5% slower in
+this small sample; the improvement is workload-dependent.
+
+An operator-level check with one million initial rows and 20 appended rows
+confirmed an empty fallback key set. Before the change, its window input still
+scanned 1,000,020 source rows; after the change the window receives no rows.
+Publication now groups only visible tuples matching the raw delta for this case.
+
+Reproduce append measurements using the existing benchmark, saving the baseline
+binary before rebuilding:
+
+```sh
+python3 benchmark/poc/running_rows_poc.py /path/to/b9356c8c/duckdb build/release/duckdb --before-suffix --output /tmp/window-one
+python3 benchmark/poc/running_rows_poc.py /path/to/b9356c8c/duckdb build/release/duckdb --before-suffix --partitions 1000 --output /tmp/window-many
+```

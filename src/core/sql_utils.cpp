@@ -751,15 +751,7 @@ string SqlUtils::BuildAnyNullPredicate(const vector<string> &columns, const stri
 }
 
 string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += " AND ";
-		}
-		result += lhs_alias + "." + QuoteIdentifier(columns[i]) + " IS NOT DISTINCT FROM " + rhs_alias + "." +
-		          QuoteIdentifier(columns[i]);
-	}
-	return result;
+	return BuildNullSafeKeyPredicate(columns, lhs_alias + ".", rhs_alias + ".");
 }
 
 string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,

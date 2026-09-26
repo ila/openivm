@@ -166,6 +166,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &recompute_temp_table = "");
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
+string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &query, const string &delta_table,
+                                    const string &old_table, const string &new_table, const string &filter);
 bool IsSummableLogicalType(const LogicalType &type);
 string NormalizeColumnNameForMatch(const string &name);
 string BaseTableNameFromDeltaKey(const string &delta_key);

@@ -698,17 +698,18 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	}
 	RefreshType dispatch_refresh_type = use_full_recompute ? RefreshType::FULL_REFRESH : view_query_type;
 	refresh_plan.refresh_type = dispatch_refresh_type;
+	auto group_cols = metadata.GetGroupColumns(view_name);
 	vector<string> window_publication_keys;
-	if (dispatch_refresh_type == RefreshType::WINDOW_PARTITION && !publication_query.empty() && !global_publication &&
-	    !target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB &&
+	if (dispatch_refresh_type == RefreshType::WINDOW_PARTITION && !group_cols.empty() && !publication_query.empty() &&
+	    !global_publication && !target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB &&
 	    std::none_of(delta_sources.begin(), delta_sources.end(), [](const RefreshMetadata::DeltaSource &source) {
 		    return StringUtil::CIEquals(source.catalog_type, "ducklake");
 	    })) {
-		window_publication_keys = PartitionOutputColumns(metadata.GetGroupColumns(view_name));
-		for (auto &key : window_publication_keys) {
-			if (std::find(publication_columns.begin(), publication_columns.end(), key) == publication_columns.end()) {
-				window_publication_keys.clear();
-				break;
+		// Recompute emits exact old/new rows, not aggregate arithmetic. Restrict
+		// publication to their visible tuples instead of every row in a partition.
+		for (auto &column : publication_columns) {
+			if (column != openivm::PUBLISHED_ORDINAL_COL) {
+				window_publication_keys.push_back(column);
 			}
 		}
 	}
@@ -792,7 +793,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	    (active_facts.running_window_incremental && active_facts.assume_insert_only) ||
 	    (insert_only && SqlUtils::GetBoolSetting(context, "openivm_running_window_incremental", false));
 	refresh_plan.delta_flags = fast_paths;
-	auto group_cols = metadata.GetGroupColumns(view_name);
 	auto agg_types = metadata.GetAggregateTypes(view_name);
 	auto derived_output_info = metadata.GetDerivedAggregateOutputs(view_name);
 	unordered_map<string, string> derived_output_expressions;
