@@ -635,7 +635,7 @@ vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetRefreshHistory(
 	auto result =
 	    con.Query("SELECT " + col1 + ", " + col2 + ", actual_duration_ms, plan_features, feature_schema FROM " +
 	              string(openivm::HISTORY_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
-	              "' AND method = '" + SqlUtils::EscapeValue(method) + "' ORDER BY refresh_timestamp ASC LIMIT " +
+	              "' AND method = '" + SqlUtils::EscapeValue(method) + "' ORDER BY refresh_timestamp DESC LIMIT " +
 	              to_string(limit));
 
 	vector<RefreshHistoryEntry> entries;
@@ -657,6 +657,8 @@ vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetRefreshHistory(
 		entry.feature_schema = schema_value.IsNull() ? 0 : schema_value.GetValue<int32_t>();
 		entries.push_back(entry);
 	}
+	// Bound the window to the newest evidence, then return oldest first for decay weighting.
+	std::reverse(entries.begin(), entries.end());
 	return entries;
 }
 

@@ -4,6 +4,58 @@ Working notes for whoever picks this up next. Covers what was built, what was me
 still unproven, and the traps that cost time. Companion to [cost_model.md](cost_model.md), which
 describes the model as it stood before this work; where the two disagree, this file is newer.
 
+## Calibration follow-up (2026-09-28)
+
+Analysis of the successful rows from GCI run 36249790313 found a mid-run decision-accuracy dip:
+one strategy could fit its runtime while the other remained on its initial estimate until its ninth
+observation. The per-view fallback now learns only an intercept (a decayed mean runtime) after three
+observations, retaining the nine-observation threshold for its three-parameter regression. The pooled
+operator model retains its existing evidence requirements and precedence. This uses three samples
+per fitted parameter without fitting slopes from sparse evidence. The early mean cannot extrapolate
+to changing work sizes; it is an interim estimate until the richer fits have enough evidence.
+
+`GetRefreshHistory` also selected the oldest 20 records despite its documented latest-window contract.
+It now selects the newest records and reverses them into chronological order before decay weighting,
+matching the existing pooled-history helper.
+
+Deterministic SQL coverage in `test/sql/cost_model.test` seeds known durations, checks the two/three
+sample transition, verifies newest-window selection and decay ordering, and checks a constant early
+prediction across different historical work estimates. Actual refreshes are cross-checked with
+bidirectional `EXCEPT ALL`, including conflicting batched DML. The test passes 442 assertions.
+
+A local before/after SF10 comparison used Q01, Q04, Q06, T13 and T14, both workloads,
+30 cycles, delta percentages 1/2/5, `all_on`, and one repetition. Both builds completed 300 correct
+rows (900 validated refreshes each). This is preliminary: timings varied substantially on the shared
+machine, and this was not a randomized or repeated performance experiment.
+
+| Metric | Before | After |
+|---|---:|---:|
+| Faster strategy selected | 62.3% | 66.3% |
+| Sum of chosen forced-mode times / sum of per-row fastest times | 1.434× | 1.283× |
+| Median incremental prediction q-error | 1.550× | 1.266× |
+| Median full-refresh prediction q-error | 1.476× | 1.486× |
+| Decision accuracy, cycles 1–10 | 77% | 60% |
+| Decision accuracy, cycles 11–20 | 40% | 72% |
+| Decision accuracy, cycles 21–30 | 70% | 67% |
+
+Calibration first engages at cycle 4 rather than cycle 9–10. T14 mixed switches away from the
+expensive full-refresh path at cycle 4; T14 overall choice accuracy increases from 68.3% to 88.3%.
+Improvements are not uniform: Q01 choice accuracy drops from 55% to 50%, and the choice-time ratio
+also worsens for Q06 and T13 despite better incremental predictions. The deterministic history-window
+fix is independently covered by the regression test. Exploration policy is unchanged.
+
+Reproduce the comparison against the two builds with:
+
+```sh
+build/release/extension/openivm/cost_model_benchmark --scale 10 \
+  --filter Q01,Q04,Q06,T13,T14 --configs all_on --delta-pcts 1,2,5 \
+  --cycles 30 --reps 1 --out /private/tmp/calibration-after.csv
+```
+
+Local artifacts: `/private/tmp/calibration-before.csv`, `/private/tmp/calibration-after.csv`,
+`/private/tmp/calibration-comparison.json`, and `/private/tmp/compare-calibration.py`.
+The full GCI ladder has not been rerun with these calibration changes.
+
 ## Takeover investigation (2026-09-25)
 
 The last failed ladder is [GCI run 36061442667](https://github.com/mdrakiburrahman/ivm-bench/actions/runs/36061442667).

@@ -776,7 +776,26 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 	RegressionWeights result = {1.0, 1.0, 0.0, false};
 	idx_t n = history.size();
 	if (n < min_samples) {
-		return result; // cold start — use static model
+		// Before there is evidence for three independent coefficients, fit only the intercept.
+		// Keep three samples per parameter: fitting all three after three
+		// executions overfits, but ignoring those executions leaves the less-used strategy
+		// on an optimistic prior while its competitor has already calibrated.
+		// A rate through the origin would misprice the fixed refresh overhead as per-row work.
+		constexpr idx_t INTERCEPT_MIN_SAMPLES = 3;
+		if (n < INTERCEPT_MIN_SAMPLES) {
+			return result;
+		}
+		double weighted_ms = 0.0;
+		double weight_sum = 0.0;
+		for (idx_t i = 0; i < n; i++) {
+			double weight = std::pow(decay, static_cast<double>(n - 1 - i));
+			weighted_ms += weight * history[i].actual_ms;
+			weight_sum += weight;
+		}
+		result = {0.0, 0.0, weighted_ms / weight_sum, true};
+		OPENIVM_DEBUG_PRINT("[COST MODEL] Early calibration: samples=%llu, mean_ms=%.3f\n", (unsigned long long)n,
+		                    result.w_intercept);
+		return result;
 	}
 
 	// Build weighted normal equations: (X'WX + λI) w = X'Wy

@@ -467,3 +467,147 @@ SELECT count(*) FROM ((SELECT g, SUM(v) AS total FROM ex_base GROUP BY g)
   (SELECT * FROM ex_mv)) x;
 ----
 0
+
+# Sparse calibration learns an intercept after three observations, without fitting
+# three independent coefficients to three samples. Synthetic durations make the
+# decision deterministic; the refresh and mixed-DML correctness checks are real.
+statement ok
+SET openivm_adaptive_explore=false;
+
+statement ok
+CREATE TABLE early_base(id INTEGER, g INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO early_base SELECT i, i % 4, i FROM range(100) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW early_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM early_base GROUP BY g;
+
+loop samples 2 4
+
+statement ok
+DELETE FROM openivm_refresh_history;
+
+# The competitor already has enough evidence for its full regression.
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, recompute_compute_est, recompute_replace_est, actual_duration_ms)
+SELECT 'early_mv', TIMESTAMP '2020-01-01' + i * INTERVAL '1 second', 'full', 0, 0, 1000
+FROM range(9) t(i);
+
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est, actual_duration_ms)
+SELECT 'early_mv', TIMESTAMP '2020-01-02' + i * INTERVAL '1 second', 'incremental', 1, 1, 1000000000
+FROM range(${samples}) t(i);
+
+statement ok
+INSERT INTO early_base VALUES (100, 1, 10), (101, 2, 20);
+
+statement ok
+UPDATE early_base SET v = v + 5 WHERE id IN (0, 100, 101);
+
+statement ok
+DELETE FROM early_base WHERE id IN (100, 101);
+
+statement ok
+PRAGMA refresh('early_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM early_mv EXCEPT ALL SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g)
+UNION ALL (SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g EXCEPT ALL SELECT * FROM early_mv));
+----
+0
+
+query I
+SELECT method = CASE WHEN ${samples} = 2 THEN 'incremental' ELSE 'full' END
+FROM openivm_refresh_history WHERE view_name = 'early_mv' ORDER BY refresh_timestamp DESC LIMIT 1;
+----
+true
+
+endloop
+
+# A bounded history window must retain the newest observations. The old twenty
+# samples say incremental is slow; the new twenty say it is fast. Neither set has
+# feature vectors, so this isolates the per-view fallback from the pooled fit.
+# With decay zero, only the very newest sample is fast: this also checks that the
+# selected window is returned in chronological order before weighting.
+loop decay 0 2
+
+statement ok
+SET openivm_cost_decay=${decay};
+
+statement ok
+DELETE FROM openivm_refresh_history;
+
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, recompute_compute_est, recompute_replace_est, actual_duration_ms)
+SELECT 'early_mv', TIMESTAMP '2020-01-01' + i * INTERVAL '1 second', 'full', 0, 0, 1000
+FROM range(9) t(i);
+
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est, actual_duration_ms)
+SELECT 'early_mv', TIMESTAMP '2020-01-02' + i * INTERVAL '1 second', 'incremental', 1000000, 1000000,
+       CASE WHEN i < CASE WHEN ${decay} = 0 THEN 39 ELSE 20 END THEN 1000000000 ELSE 1 END
+FROM range(40) t(i);
+
+statement ok
+INSERT INTO early_base VALUES (100, 1, 10), (101, 2, 20);
+
+statement ok
+UPDATE early_base SET v = v + 5 WHERE id IN (0, 100, 101);
+
+statement ok
+DELETE FROM early_base WHERE id IN (100, 101);
+
+statement ok
+PRAGMA refresh('early_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM early_mv EXCEPT ALL SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g)
+UNION ALL (SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g EXCEPT ALL SELECT * FROM early_mv));
+----
+0
+
+query T
+SELECT method FROM openivm_refresh_history WHERE view_name = 'early_mv' ORDER BY refresh_timestamp DESC LIMIT 1;
+----
+incremental
+
+endloop
+
+# With only three observations, learn their level without inventing a per-row
+# slope: the same fixed duration was observed at three different work estimates.
+statement ok
+DELETE FROM openivm_refresh_history;
+
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, recompute_compute_est, recompute_replace_est, actual_duration_ms)
+SELECT 'early_mv', TIMESTAMP '2020-01-01' + i * INTERVAL '1 second', 'full', 0, 0, 1000
+FROM range(9) t(i);
+
+statement ok
+INSERT INTO openivm_refresh_history
+(view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est, actual_duration_ms)
+SELECT 'early_mv', TIMESTAMP '2020-01-02' + i * INTERVAL '1 second', 'incremental', i + 1, 0, 100
+FROM range(3) t(i);
+
+statement ok
+INSERT INTO early_base VALUES (102, 1, 20);
+
+query TTTTTT
+PRAGMA refresh_cost('early_mv');
+----
+incremental	<REGEX>:.*	<REGEX>:.*	<REGEX>:100(\.0+)?	<REGEX>:.*	true
+
+statement ok
+PRAGMA refresh('early_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM early_mv EXCEPT ALL SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g)
+UNION ALL (SELECT g,SUM(v),COUNT(*) FROM early_base GROUP BY g EXCEPT ALL SELECT * FROM early_mv));
+----
+0
