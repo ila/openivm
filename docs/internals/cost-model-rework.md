@@ -143,8 +143,42 @@ dispatched against runner revision `024c2e0bd2777a7523ae64ec304afe38ab2ba697`, p
 directly to OpenIVM fix commit `7d6cf800e1a9cb556ac70a1a804a0012d853eec9` on
 `ila/cost-model-plan-reuse`. The run covers SF1,10,25,50,100, all queries, three
 repetitions, 30 cycles, delta percentages 1,2,5, all_on, with a 48-hour job timeout.
-It was confirmed in progress; its results are pending. No additional OpenIVM build
-branch was needed for this rerun.
+It completed SF1, SF10 and SF25 with 5,040 rows and zero errors each. SF50
+completed 4,986 rows with zero errors before the separate 43,200-second per-scale
+subprocess timeout fired. SF100 never started because TimeoutExpired escaped the
+scale loop. No allocator abort or correctness failure was recorded in this run.
+No additional OpenIVM build branch was needed for this rerun.
+
+
+## Timeout handling and generator overhead (2026-09-28)
+
+Runner commit `9adea51` catches `subprocess.TimeoutExpired` per scale, preserves the
+partial CSV and log, continues remaining scales, and reports all failures at the end.
+All 51 benchmark-server tests pass, including deterministic timeout regressions at
+first, middle and last scale positions. This changes timeout handling, not the default
+per-scale limit.
+
+Temporary phase profiling showed that generating/parsing large literal INSERT VALUES
+batches, plus validation, dominate the measured local overhead; file copying was small.
+The benchmark now generates those same rows with INSERT SELECT over range(), reusing
+the set-based approach already used by the TPC-C seed generator. Refresh timing,
+mode isolation, and both EXCEPT ALL directions remain unchanged.
+
+An isolated sequential before/after run at SF10 (Q01,S02,T14; one repetition; three
+cycles; 1,2,5 percent; all_on) dropped from 78.909s to 36.965s, a 53.2% wall-time
+reduction. Both runs passed all 18 rows and have identical workload, base-row, MV-row,
+and delta-row fields. This is a local measurement, not a claim of the same speedup
+on GCI or at SF100. Evidence: `/private/tmp/cost-overhead-comparison.json` and
+`/private/tmp/cost-overhead-isolated-{before,after}.{csv,log}`.
+
+All-query SF10 validation passed 168 rows / 504 refreshes (three cycles, one repetition).
+The old and new generators also passed 156 bidirectional bag comparisons covering all
+13 source table shapes, batches of 0/1/10,001 rows, two scales and two key offsets.
+Both inserts execute in the same transaction so NOW() is comparable. A separate row-ID
+order diagnostic differed even between two executions of the old VALUES generator;
+physical row IDs are not an across-run equivalence invariant under parallel insertion.
+Evidence: `/private/tmp/cost-overhead-all-sf10.{csv,log}`, and
+`/private/tmp/cost-batch-large-bag.{sql,log}`. Temporary profiling code was removed.
 
 ## Why
 

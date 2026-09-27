@@ -226,64 +226,43 @@ struct TempDb {
 	}
 };
 
-// Build one multi-row INSERT (a single VALUES list) instead of n per-row statements. The tuple
-// values are identical to the old per-row generation, so the captured delta is unchanged; this just
-// collapses n con.Query() calls into one, which matters a lot at scale. The VALUES/constant path in
-// the delta-capture rule handles the multi-row list.
+// Generate the same deterministic batch in SQL instead of parsing one literal tuple per row.
 static vector<string> GenerateInserts(const string &table, int n, int scale, int64_t pk_offset) {
-	vector<string> tuples;
-	tuples.reserve(n);
-	for (int i = 0; i < n; i++) {
-		int64_t pk = kPkBase + pk_offset + i;
-		int w = 1 + (i % std::max(scale, 1));
-		int d = 1 + (i % 10);
-		int c = 1 + (i % 30);
-		if (table == "CUSTOMER") {
-			tuples.push_back("(" + to_string(w) + ", " + to_string(d) + ", " + to_string(pk) +
-			                 ", 0.05, 'GC', 'Last" + to_string(pk) + "', 'First" + to_string(pk) + "', 50000.00, " +
-			                 to_string(100 + (i % 500)) +
-			                 ".00, 0.0, 0, 0, 'S1', 'S2', 'City', 'ST', '12345', '1234567890', NOW(), 'M', 'data')");
-		} else if (table == "WAREHOUSE") {
-			tuples.push_back("(" + to_string(pk) + ", 0.00, 0.05, 'W', 'S1', 'S2', 'City', 'ST', '123456789')");
-		} else if (table == "DISTRICT") {
-			tuples.push_back("(" + to_string(w) + ", " + to_string(pk) +
-			                 ", 0.00, 0.05, 1, 'D', 'S1', 'S2', 'City', 'ST', '123456789')");
-		} else if (table == "OORDER") {
-			tuples.push_back("(" + to_string(w) + ", " + to_string(d) + ", " + to_string(pk) + ", " + to_string(c) +
-			                 ", NULL, 5, 1, NOW())");
-		} else if (table == "ORDER_LINE") {
-			tuples.push_back("(" + to_string(w) + ", " + to_string(d) + ", " + to_string(pk) + ", 1, " +
-			                 to_string(1 + (i % 100)) + ", NULL, " + to_string(10 + (i % 400)) + ".00, " + to_string(w) +
-			                 ", 5.00, 'D')");
-		} else if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
-			tuples.push_back("(" + to_string(1 + (i % 20)) + ", 'm" + to_string(pk) + "', " + to_string(1 + (i % 64)) +
-			                 ")");
-		} else if (table == "cm_saj_r") {
-			tuples.push_back("(" + to_string(10 + (i % 1000)) + ")");
-		} else if (table == "cm_win_src") {
-			tuples.push_back("(" + to_string(pk) + ", " + to_string(1 + (i % 20)) + ", " + to_string(i % 1000) + ")");
-		} else if (table == "cm_asof_prices") {
-			tuples.push_back("('A', TIMESTAMP '2024-01-02 00:00:00' + INTERVAL '" + to_string(i) + " minutes', " +
-			                 to_string(100 + (i % 500)) + ")");
-		} else if (table == "ed_a") {
-			tuples.push_back("(" + to_string(pk) + ", " + to_string(pk * 10) + ")");
-		} else if (table == "ed_b") {
-			tuples.push_back("(" + to_string(pk) + ", 'b_" + to_string(pk) + "')");
-		} else if (table == "ed_c") {
-			tuples.push_back("(" + to_string(pk) + ", 'c_" + to_string(pk) + "')");
-		}
-	}
-	if (tuples.empty()) {
+	if (n <= 0) {
 		return {};
 	}
 	string values;
-	for (size_t i = 0; i < tuples.size(); i++) {
-		if (i > 0) {
-			values += ", ";
-		}
-		values += tuples[i];
+	if (table == "CUSTOMER") {
+		values = "w, d, pk, 0.05, 'GC', 'Last' || pk, 'First' || pk, 50000.00, "
+		         "100 + i % 500, 0.0, 0, 0, 'S1', 'S2', 'City', 'ST', '12345', '1234567890', NOW(), 'M', 'data'";
+	} else if (table == "WAREHOUSE") {
+		values = "pk, 0.00, 0.05, 'W', 'S1', 'S2', 'City', 'ST', '123456789'";
+	} else if (table == "DISTRICT") {
+		values = "w, pk, 0.00, 0.05, 1, 'D', 'S1', 'S2', 'City', 'ST', '123456789'";
+	} else if (table == "OORDER") {
+		values = "w, d, pk, c, NULL, 5, 1, NOW()";
+	} else if (table == "ORDER_LINE") {
+		values = "w, d, pk, 1, 1 + i % 100, NULL, 10 + i % 400, w, 5.00, 'D'";
+	} else if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
+		values = "1 + i % 20, 'm' || pk, 1 + i % 64";
+	} else if (table == "cm_saj_r") {
+		values = "10 + i % 1000";
+	} else if (table == "cm_win_src") {
+		values = "pk, 1 + i % 20, i % 1000";
+	} else if (table == "cm_asof_prices") {
+		values = "'A', TIMESTAMP '2024-01-02 00:00:00' + i * INTERVAL '1 minute', 100 + i % 500";
+	} else if (table == "ed_a") {
+		values = "pk, pk * 10";
+	} else if (table == "ed_b") {
+		values = "pk, 'b_' || pk";
+	} else if (table == "ed_c") {
+		values = "pk, 'c_' || pk";
+	} else {
+		return {};
 	}
-	return {"INSERT INTO " + table + " VALUES " + values};
+	return {"INSERT INTO " + table + " SELECT " + values + " FROM (SELECT i, " +
+	        to_string(kPkBase + pk_offset) + " + i AS pk, 1 + i % " + to_string(std::max(scale, 1)) +
+	        " AS w, 1 + i % 10 AS d, 1 + i % 30 AS c FROM range(" + to_string(n) + ") batch(i)) batch"};
 }
 
 // Pick live rows each cycle. Fixed original keys eventually disappear under repeated deletes.
