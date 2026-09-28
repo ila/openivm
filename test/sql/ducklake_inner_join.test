@@ -684,3 +684,24 @@ SELECT contains(content, 'SELECT v.* FROM (SELECT *, CAST(0 AS BIGINT) AS openiv
 FROM read_text('__TEST_DIR__/openivm_upsert_queries_projection_key_holdings.sql');
 ----
 1
+
+# DuckLake uses the helper-connection DDL executor with measured statement profiles.
+statement ok
+SET openivm_profile_refresh=true;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.profile_ddl_probe AS SELECT id,name FROM dl.customers;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_ddl_probe EXCEPT ALL SELECT id,name FROM dl.customers)),
+       (SELECT count(*) FROM (SELECT id,name FROM dl.customers EXCEPT ALL SELECT * FROM dl.profile_ddl_probe));
+----
+0	0
+
+query I
+SELECT count(*) >= 3 AND bool_and(duration_ms >= 0)
+FROM openivm_refresh_profile
+WHERE view_name = 'profile_ddl_probe' AND step_name = 'create_mv_sql_stmt'
+  AND starts_with(detail, 'phase=create_mv_user_view; statement=');
+----
+1
