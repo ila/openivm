@@ -186,14 +186,13 @@ string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const strin
                                           const string &data_table, const string &view_query_sql,
                                           const string &delta_ts_filter, const string &catalog_prefix,
                                           const string &recompute_alias);
-string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
-                                const vector<string> &delta_table_names, const string &data_table,
-                                const string &view_query_sql, const string &delta_ts_filter,
-                                const string &catalog_prefix, bool has_full_outer, bool has_left_join,
-                                bool skip_proj_delete, bool insert_only = false,
-                                const vector<string> &active_delta_table_names = {},
-                                bool can_use_runtime_delta_shape = false,
-                                ProjectionDeleteRetryPlan *delete_retry_plan = nullptr);
+string
+CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
+                         const vector<string> &delta_table_names, const string &data_table,
+                         const string &view_query_sql, const string &delta_ts_filter, const string &catalog_prefix,
+                         bool has_full_outer, bool has_left_join, bool skip_proj_delete, bool insert_only = false,
+                         const vector<string> &active_delta_table_names = {}, bool can_use_runtime_delta_shape = false,
+                         ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, string *appended_rows = nullptr);
 bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,

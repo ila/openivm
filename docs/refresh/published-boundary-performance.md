@@ -165,3 +165,39 @@ the cost model reuses its normal-equation submatrix instead of scanning history
 again, and one parsed SQL tree replaces the running-window string/regex parser.
 DuckLake snapshot-source resolution and optional metadata reads also share helpers.
 The residual persisted small-chain overhead remains a profiling target.
+
+## Append-only projection publication
+
+The SF100 DuckLake TPC-DI run at `38929faa` exposed a large regression: batch 2
+of `fact_market_history` spent approximately 46 minutes publishing visible rows
+after 148 ms computing the delta and 53 ms appending maintenance rows. The
+unscoped publication path compared the entire wide relation for a LEFT JOIN,
+even though the projection compiler had proved that this refresh only appends.
+
+Publication now reuses the exact append query produced by the projection
+compiler, including timestamp filtering and positive multiplicity expansion.
+The stable visible table and child-facing change tracking remain in place.
+LEFT JOINs qualify only when the nullable side is quiet. Nullable-side insertions
+can retract NULL-extended rows even when the primary delta has only positive
+weights. Those batches now use the existing per-key cardinality proof and
+transition-key correction, rather than the unsafe positive-weight shortcut.
+ORDER BY/LIMIT wrappers,
+replacement, HAVING, and maintenance programs with retractions keep the signed
+visible-result comparison. This change does not remove their existing costs or
+the initial visible-table copy.
+
+Local comparison on 2026-09-28, four threads, DuckDB `08e34c447b`, DuckLake,
+15 visible columns, and two consecutive batches of 100 appended rows:
+
+| Stored rows | `38929faa` refresh seconds | Append publication refresh seconds |
+|---|---|---|
+| 500,000 | 0.533 / 0.526 | 0.123 / 0.131 |
+| 5,000,000 | 3.963 / 3.952 | 0.120 / 0.121 |
+
+Each case used a fresh database. The source was `(i % 1000 AS k, i AS v)`,
+LEFT JOINed to 500 dimension keys with string labels, projecting the two source
+columns, the label, and twelve `v + constant` columns. Only refresh was timed;
+each batch was checked against the original query with `EXCEPT ALL` in both
+directions. These are local microbenchmarks, not an SF100 end-to-end result.
+The original top-k pipeline benchmark also passes all bag checks at 100,000
+rows, with both 20 and 10,000 changed keys over four conflicting-mutation batches.

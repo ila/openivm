@@ -2322,3 +2322,185 @@ query I
 SELECT count(*) FROM ((SELECT * FROM dl.mark_leaf EXCEPT ALL SELECT * FROM dl.mark_expected_leaf) UNION ALL (SELECT * FROM dl.mark_expected_leaf EXCEPT ALL SELECT * FROM dl.mark_leaf));
 ----
 0
+
+# Publication of preserved-side appends must not scan/diff the full visible MV.
+# Keep two consumers to exercise independent DuckLake watermarks.
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE dl.pub_append_l(k INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.pub_append_r(k INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO dl.pub_append_l VALUES (1,10),(2,20),(NULL,30);
+
+statement ok
+INSERT INTO dl.pub_append_r VALUES (1,'a'),(1,'a');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.pub_append_parent AS SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.pub_append_child AS SELECT * FROM dl.pub_append_parent;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.pub_append_lagging AS SELECT * FROM dl.pub_append_parent;
+
+statement ok
+INSERT INTO dl.pub_append_l VALUES (1,11),(1,11),(2,22),(NULL,33);
+
+statement ok
+PRAGMA refresh('pub_append_parent');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_parent EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_parent));
+----
+0	0
+
+query I
+SELECT NOT contains(content, 'openivm_publish_next_') AND NOT contains(content, 'openivm_publish_changes_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_pub_append_parent.sql');
+----
+1
+
+statement ok
+PRAGMA refresh('pub_append_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_child EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_child));
+----
+0	0
+
+statement ok
+INSERT INTO dl.pub_append_l VALUES (1,11),(1,11),(2,22),(NULL,33);
+
+statement ok
+PRAGMA refresh('pub_append_parent');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_parent EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_parent));
+----
+0	0
+
+query I
+SELECT NOT contains(content, 'openivm_publish_next_') AND NOT contains(content, 'openivm_publish_changes_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_pub_append_parent.sql');
+----
+1
+
+statement ok
+PRAGMA refresh('pub_append_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_child EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_child));
+----
+0	0
+
+statement ok
+PRAGMA refresh('pub_append_lagging');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_lagging EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_lagging));
+----
+0	0
+
+# An insert-only source batch can still remove a NULL-extended join row.
+statement ok
+INSERT INTO dl.pub_append_r VALUES (2,'first match');
+
+statement ok
+PRAGMA refresh('pub_append_parent');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_parent EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_parent));
+----
+0	0
+
+statement ok
+PRAGMA refresh('pub_append_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_child EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_child));
+----
+0	0
+
+statement ok
+PRAGMA refresh('pub_append_lagging');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_lagging EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_lagging));
+----
+0	0
+
+query I
+SELECT contains(content, 'openivm_publish_changes_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_pub_append_parent.sql');
+----
+1
+
+# Nullable-side insertions can retract NULL-extended output even when all source
+# deltas are positive. Conflicting mutations must use the signed publication path.
+statement ok
+INSERT INTO dl.pub_append_r VALUES (2,'b'),(1,'discard');
+
+statement ok
+UPDATE dl.pub_append_r SET label='changed' WHERE k=1 AND label='a';
+
+statement ok
+DELETE FROM dl.pub_append_r WHERE label='discard';
+
+statement ok
+INSERT INTO dl.pub_append_l VALUES (2,44);
+
+statement ok
+UPDATE dl.pub_append_l SET v=99 WHERE k=1 AND v=10;
+
+statement ok
+DELETE FROM dl.pub_append_l WHERE v=20;
+
+statement ok
+PRAGMA refresh('pub_append_parent');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_parent EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_parent));
+----
+0	0
+
+statement ok
+PRAGMA refresh('pub_append_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_child EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_child));
+----
+0	0
+
+statement ok
+PRAGMA refresh('pub_append_lagging');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_lagging EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_lagging));
+----
+0	0
+
+query I
+SELECT contains(content, 'openivm_publish_changes_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_pub_append_parent.sql');
+----
+1

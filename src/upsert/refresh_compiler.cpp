@@ -1371,7 +1371,8 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 }
 
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
-                                 const string &delta_ts_filter, const string &catalog_prefix, bool insert_only) {
+                                 const string &delta_ts_filter, const string &catalog_prefix, bool insert_only,
+                                 string *appended_rows) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string mul = string(openivm::MULTIPLICITY_COL);
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
@@ -1403,9 +1404,12 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 		// consolidation/delete path here; byte-identical duplicates are distinct bag entries and
 		// must be appended once per positive multiplicity.
 		string mul_filter = delta_ts_filter.empty() ? "WHERE " + mul + " > 0" : ts_where + " AND " + mul + " > 0";
-		string insert_query = "INSERT INTO " + data_table + " SELECT " + select_columns + "\nFROM " + delta_view +
-		                      "\nCROSS JOIN generate_series(1, " + mul + "::BIGINT)\n" + mul_filter + ";\n";
-		return insert_query;
+		string rows = "SELECT " + select_columns + "\nFROM " + delta_view + "\nCROSS JOIN generate_series(1, " + mul +
+		              "::BIGINT)\n" + mul_filter;
+		if (appended_rows) {
+			*appended_rows = rows;
+		}
+		return "INSERT INTO " + data_table + " " + rows + ";\n";
 	}
 
 	// Consolidate deltas into net changes per distinct tuple (1 pass over delta_view).

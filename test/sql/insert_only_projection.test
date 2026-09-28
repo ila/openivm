@@ -290,3 +290,44 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Appending to maintenance state can evict visible top-k rows. Publication must
+# still compare the selected bag, and children must consume that visible delta.
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+CREATE TABLE iop_topk_src(k INTEGER);
+
+statement ok
+INSERT INTO iop_topk_src VALUES (1),(2),(3);
+
+statement ok
+CREATE MATERIALIZED VIEW iop_topk_parent AS SELECT k FROM iop_topk_src ORDER BY k LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW iop_topk_child AS SELECT * FROM iop_topk_parent;
+
+statement ok
+INSERT INTO iop_topk_src VALUES (0),(0);
+
+statement ok
+PRAGMA refresh_pipeline('iop_topk_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM iop_topk_parent EXCEPT ALL (SELECT k FROM iop_topk_src ORDER BY k LIMIT 2))),
+       (SELECT count(*) FROM ((SELECT k FROM iop_topk_src ORDER BY k LIMIT 2) EXCEPT ALL SELECT * FROM iop_topk_parent));
+----
+0	0
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM iop_topk_child EXCEPT ALL (SELECT k FROM iop_topk_src ORDER BY k LIMIT 2))),
+       (SELECT count(*) FROM ((SELECT k FROM iop_topk_src ORDER BY k LIMIT 2) EXCEPT ALL SELECT * FROM iop_topk_child));
+----
+0	0
+
+query I
+SELECT contains(content, 'openivm_publish_changes_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_iop_topk_parent.sql');
+----
+1

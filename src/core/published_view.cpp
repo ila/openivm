@@ -24,7 +24,8 @@ string PublishedSourceViewName(string source_name) {
 
 string BuildPublishViewSQL(const string &view_name, const string &prefix, const string &query,
                            const vector<string> &columns, bool ducklake, const string &metadata_table,
-                           const vector<string> &scope_columns, const string &timestamp_sql, SqlDialect dialect) {
+                           const vector<string> &scope_columns, const string &timestamp_sql, SqlDialect dialect,
+                           const string &appended_rows) {
 	auto quote = [&](const string &name) {
 		return DialectQuoteIdent(name, dialect);
 	};
@@ -38,6 +39,28 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 		quoted_columns.push_back(quote(column));
 	}
 	auto column_list = StringUtil::Join(quoted_columns, ", ");
+	if (!appended_rows.empty()) {
+		// The projection compiler supplies the exact rows appended to maintenance
+		// state, including bag expansion and the refresh timestamp filter. Reuse
+		// them instead of scanning and diffing the entire published relation.
+		vector<string> projection;
+		for (auto &column : columns) {
+			projection.push_back(column == openivm::PUBLISHED_ORDINAL_COL ? "CAST(0 AS BIGINT) AS " + quote(column)
+			                                                              : quote(column));
+		}
+		auto rows = "SELECT " + StringUtil::Join(projection, ", ") + " FROM (" + appended_rows + ") appended_rows";
+		string sql = "INSERT INTO " + visible + " " + rows + ";\n";
+		if (!ducklake) {
+			auto timestamp = timestamp_sql.empty() ? openivm::UTC_NOW_SQL : timestamp_sql;
+			sql += "INSERT INTO " + delta + " (" + column_list +
+			       ", openivm_multiplicity, openivm_timestamp) SELECT *, 1::INTEGER, " + timestamp + " FROM (" + rows +
+			       ") published_rows WHERE EXISTS (SELECT 1 FROM " + metadata_table + " WHERE table_name = '" +
+			       SqlUtils::EscapeValue(delta_name) + "');\n";
+			sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table);
+		}
+		OPENIVM_DEBUG_PRINT("[PUBLISH] Appending visible projection delta for %s\n", view_name.c_str());
+		return sql;
+	}
 	string equality;
 	for (auto &column : columns) {
 		if (!equality.empty()) {

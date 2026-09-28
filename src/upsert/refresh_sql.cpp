@@ -766,6 +766,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                     "; list_mode=" + string(list_mode ? "true" : "false"));
 
 	string upsert_query;
+	string appended_projection_rows;
 	bool window_uses_suffix = false;
 	string delta_ts_filter = BuildDeltaTimestampFilter(con, view_name, has_ts_col);
 	bool has_left_join =
@@ -1050,7 +1051,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			upsert_query = CompileProjectionRefresh(
 			    metadata, view_name, column_names, delta_table_names, data_table, view_query_sql, delta_ts_filter,
 			    internal_catalog_prefix, has_full_outer, has_left_join, skip_proj_delete, insert_only,
-			    fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only, delete_retry_plan);
+			    fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only, delete_retry_plan,
+			    &appended_projection_rows);
 		}
 		break;
 	}
@@ -1759,9 +1761,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				}
 			}
 		}
+		// Append-only maintenance does not imply append-only visible output for
+		// ORDER BY/LIMIT. Keep the signed visible diff for those global wrappers.
+		if (global_publication || active_facts.target_dialect != SqlDialect::DUCKDB) {
+			appended_projection_rows.clear();
+		}
 		publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
 		                                      publication_columns, target_is_ducklake, delta_metadata_table,
-		                                      scope_columns, "", active_facts.target_dialect);
+		                                      scope_columns, "", active_facts.target_dialect, appended_projection_rows);
 	}
 	string data_sql = transient_delta_preamble + pre_companion + delta_query + "\n" + companion_query + "\n" +
 	                  upsert_query + "\n" + post_companion + publication_sql + compact_delta_view_query +
