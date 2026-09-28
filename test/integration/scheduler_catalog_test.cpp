@@ -50,6 +50,11 @@ int main(int argc, char **argv) {
 		    views[0].view_name != "scheduled" || views[1].view_name != "scheduled") {
 			throw InvalidInputException("Scheduler did not discover both native metadata catalogs");
 		}
+		// A native schema change must synchronize its delta table even while an
+		// unrelated DuckLake catalog is locked. A global information_schema scan
+		// can fail and silently skip that synchronization.
+		Execute(con, "ALTER TABLE source ADD COLUMN extra INTEGER DEFAULT 7;");
+		Execute(con, "SELECT extra FROM openivm_delta_source LIMIT 0;");
 		std::cout << "PASS" << std::endl;
 	} catch (const std::exception &e) {
 		std::cerr << e.what() << std::endl;

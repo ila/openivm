@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A scheduler scan must not access an unrelated, locked DuckLake catalog."""
+"""Native metadata discovery and ALTER must not access an unrelated, locked DuckLake catalog."""
 
 import sqlite3
 import subprocess
@@ -32,4 +32,4 @@ with tempfile.TemporaryDirectory(prefix="openivm-scheduler-") as directory:
             if process.poll() is None:
                 process.kill()
                 process.communicate()
-print("Scheduler discovers native views without accessing locked DuckLake metadata")
+print("Native scheduling and delta schema synchronization work with locked DuckLake metadata")
