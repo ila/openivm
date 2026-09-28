@@ -133,6 +133,9 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
         list(APPEND OPENIVM_LINK_LIBS jemalloc_extension)
     endif()
 
+    add_executable(scheduler_catalog_test test/integration/scheduler_catalog_test.cpp)
+    target_link_libraries(scheduler_catalog_test ${OPENIVM_LINK_LIBS})
+
     # TPC-C data generation tool
     add_executable(tpcc_setup benchmark/src/tpcc_setup.cpp)
     target_link_libraries(tpcc_setup ${OPENIVM_LINK_LIBS})
