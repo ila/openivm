@@ -2322,3 +2322,56 @@ query I
 SELECT count(*) FROM ((SELECT * FROM dl.mark_leaf EXCEPT ALL SELECT * FROM dl.mark_expected_leaf) UNION ALL (SELECT * FROM dl.mark_expected_leaf EXCEPT ALL SELECT * FROM dl.mark_leaf));
 ----
 0
+
+# A rejected cross-schema short-name collision must preserve the existing MV and metadata.
+statement ok
+CREATE SCHEMA dl.observation;
+
+statement ok
+CREATE SCHEMA dl.other_observation;
+
+statement ok
+CREATE TABLE dl.observation.schema_sales(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.observation.schema_sales VALUES(1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.observation.schema_summary AS
+SELECT k,SUM(v) total FROM dl.observation.schema_sales GROUP BY k;
+
+statement error
+CREATE MATERIALIZED VIEW dl.other_observation.schema_summary AS
+SELECT k,SUM(v) total FROM dl.observation.schema_sales GROUP BY k;
+----
+requires unique MV short names across schemas
+
+statement error
+CREATE OR REPLACE MATERIALIZED VIEW dl.other_observation.schema_summary AS
+SELECT k,SUM(v)+100 total FROM dl.observation.schema_sales GROUP BY k;
+----
+short name is registered in another catalog or schema
+
+query ITT
+SELECT count(*),min(view_catalog),min(view_schema) FROM openivm_views WHERE view_name='schema_summary';
+----
+1	dl	observation
+
+statement ok
+INSERT INTO dl.observation.schema_sales VALUES(1,5),(3,8);
+
+statement ok
+UPDATE dl.observation.schema_sales SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM dl.observation.schema_sales WHERE k=2;
+
+statement ok
+PRAGMA refresh('schema_summary');
+
+query I
+WITH expected AS (SELECT k,SUM(v) total FROM dl.observation.schema_sales GROUP BY k)
+SELECT count(*) FROM ((SELECT * FROM dl.observation.schema_summary EXCEPT ALL SELECT * FROM expected)
+UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM dl.observation.schema_summary));
+----
+0

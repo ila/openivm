@@ -30,7 +30,8 @@ string BuildUpdateViewJsonSQL(const string &column_name, const string &json, con
 	       SqlUtils::EscapeSingleQuotes(json) + "' WHERE view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'";
 }
 
-void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name, bool is_replace) {
+void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name, bool is_replace,
+                                   const string &view_catalog, const string &view_schema) {
 	// Matcher metadata columns (signature_hash..nullified_columns_json) stay
 	// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
 	ddl.push_back("create table if not exists " + string(openivm::VIEWS_TABLE) +
@@ -76,6 +77,17 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_catalog varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_schema varchar default null");
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "window_order_columns varchar default null");
+	if (is_replace) {
+		// A short-name match must never replace metadata owned by another schema.
+		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(openivm::VIEWS_TABLE) +
+		              " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
+		              "' AND (lower(COALESCE(view_catalog, current_database())) <> lower('" +
+		              SqlUtils::EscapeValue(view_catalog) + "') OR lower(COALESCE(view_schema, 'main')) <> lower('" +
+		              SqlUtils::EscapeValue(view_schema) +
+		              "'))) THEN error('Cannot replace materialized view: its short name is registered in another "
+		              "catalog or schema. Use the original qualified name or choose a different MV short name.') "
+		              "ELSE NULL END AS openivm_name_check");
+	}
 	if (!is_replace) {
 		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
 		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));
@@ -94,7 +106,8 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(openivm::VIEWS_TABLE) +
 		              " WHERE view_name = '" + escaped_view_name +
 		              "') THEN error('Duplicate key: materialized view \"" + escaped_view_name +
-		              "\" already exists') ELSE NULL END");
+		              "\" already exists. OpenIVM currently requires unique MV short names across schemas in this "
+		              "metadata catalog; choose a different name.') ELSE NULL END AS openivm_name_check");
 	}
 
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "pending_after_hook boolean default null");

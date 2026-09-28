@@ -16,6 +16,7 @@
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/connection.hpp"
@@ -468,6 +469,47 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "refresh_cross_system", TransactionalRefreshQuery,
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cross_system);
+
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "openivm_files",
+	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
+		    auto view_name = StringValue::Get(parameters.values[0]);
+		    Connection con(*context.db);
+		    RefreshMetadata::UseCatalog(context, con);
+		    RefreshMetadata(con).GetViewType(view_name);
+		    Value directory;
+		    bool enabled = context.TryGetCurrentSetting("openivm_files_path", directory) && !directory.IsNull();
+		    auto &fs = FileSystem::GetFileSystem(context);
+		    auto cwd = FileSystem::GetWorkingDirectory();
+		    vector<string> rows;
+		    const vector<pair<string, string>> files = {
+		        {"system", "openivm_system_tables.sql"},
+		        {"create", "openivm_compiled_queries_" + view_name + ".sql"},
+		        {"refresh", "openivm_upsert_queries_" + view_name + ".sql"},
+		        {"explain", "openivm_initial_load_explain_" + view_name + ".txt"}};
+		    for (const auto &file : files) {
+			    string path;
+			    bool exists = false;
+			    string status =
+			        "disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh";
+			    if (enabled) {
+				    path = directory.ToString() + "/" + file.second;
+				    if (!fs.IsPathAbsolute(path)) {
+					    path = fs.JoinPath(cwd, path);
+				    }
+				    exists = fs.FileExists(path);
+				    status = exists ? "exists; may be from an earlier compilation" : "not generated at this path";
+			    }
+			    rows.push_back("(" + Value(file.first).ToSQLString() + ", " +
+			                   (enabled ? Value(path).ToSQLString() : "NULL::VARCHAR") + ", " +
+			                   (exists ? "true" : "false") + ", " + Value(status).ToSQLString() + ", " +
+			                   Value(cwd).ToSQLString() + ")");
+		    }
+		    OPENIVM_DEBUG_PRINT("[FILES] Inspecting reference files for %s (enabled=%d)\n", view_name.c_str(), enabled);
+		    return "SELECT * FROM (VALUES " + StringUtil::Join(rows, ", ") +
+		           ") AS files(kind, path, file_exists, status, working_directory)";
+	    },
+	    {LogicalType::VARCHAR}));
 
 	// PRAGMA refresh_status('view_name') — returns refresh status for a materialized view.
 	auto refresh_status = PragmaFunction::PragmaCall(

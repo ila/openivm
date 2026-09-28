@@ -981,7 +981,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	add_profile_marker("create_mv_system_tables", "refresh_type=" + string(RefreshTypeName(refresh_type)) +
 	                                                  "; lpts_fallback=" + string(lpts_fallback ? "true" : "false"));
-	AppendCreateMVSystemTablesDDL(ddl, view_name, parse_data_ref.is_replace);
+	AppendCreateMVSystemTablesDDL(ddl, view_name, parse_data_ref.is_replace, view_target_catalog, view_target_schema);
+	auto system_ddl_end = ddl.size();
 
 	bool has_downstream_views = false;
 	bool preserve_consumer_deltas = false;
@@ -1608,8 +1609,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	// Publish the MV metadata last. CREATE MV touches both the physical DuckDB catalog
 	// and DuckLake's external metadata catalog, so OpenIVM cannot rely on a single
-	// cross-catalog transaction. The executor registers cleanup DDL up front and this
-	// late publish keeps incomplete attempts out of openivm_views.
+	// cross-catalog transaction. Cleanup is armed after the duplicate-name guard;
+	// late publication keeps incomplete attempts out of openivm_views.
 	add_profile_marker("create_mv_publish_metadata",
 	                   "rows=" + to_string(metadata_ddl.size() + aux_metadata_ddl.size()));
 	ddl.insert(ddl.end(), metadata_ddl.begin(), metadata_ddl.end());
@@ -1625,17 +1626,16 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	Value files_path_val;
 	if (context.TryGetCurrentSetting("openivm_files_path", files_path_val) && !files_path_val.IsNull()) {
 		string base_path = files_path_val.ToString();
-		// System tables DDL (first 3 statements: openivm_views, openivm_refresh_hooks,
-		// openivm_delta_tables)
+		// Export system setup separately from the view-specific program.
 		string system_tables_sql;
 		// Compiled queries (everything after the system tables)
 		string compiled_sql;
-		idx_t visible_ddl_idx = 0;
 		for (size_t i = 0; i < ddl.size(); i++) {
-			if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_PREFIX)) {
+			if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_PREFIX) ||
+			    StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
 				continue;
 			}
-			if (visible_ddl_idx < 3) {
+			if (i < system_ddl_end) {
 				system_tables_sql += ddl[i] + ";\n\n";
 			} else if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
 				compiled_sql += "-- OpenIVM derives the MV delta-table schema from the "
@@ -1644,11 +1644,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			} else {
 				compiled_sql += ddl[i] + ";\n\n";
 			}
-			visible_ddl_idx++;
 		}
 		SqlUtils::WriteFile(base_path + "/openivm_system_tables.sql", false, system_tables_sql);
 		SqlUtils::WriteFile(base_path + "/openivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
 	}
+
+	// Only arm cleanup after system setup and the duplicate-name guard have succeeded.
+	ddl.insert(ddl.begin() + system_ddl_end, cleanup_ddl.begin(), cleanup_ddl.end());
 
 	if (!target_is_ducklake &&
 	    (default_db != DatabaseManager::GetDefaultDatabase(context) || default_schema != current_schema)) {
@@ -1660,9 +1662,6 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	// Pass DDL via result.parameters — the bind function receives them as input.inputs.
 	// This replaces the fragile thread-local pending-DDL mechanism.
-	for (auto &q : cleanup_ddl) {
-		result.parameters.push_back(Value(q));
-	}
 	for (auto &q : ddl) {
 		result.parameters.push_back(Value(q));
 	}

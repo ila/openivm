@@ -6,7 +6,8 @@
 namespace duckdb {
 
 string SqlCsvLiteralOrNull(const vector<string> &values);
-void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name, bool is_replace);
+void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name, bool is_replace,
+                                   const string &view_catalog, const string &view_schema);
 string BuildUpdateViewJsonSQL(const string &column_name, const string &json, const string &view_name);
 
 } // namespace duckdb

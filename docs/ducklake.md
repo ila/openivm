@@ -2,7 +2,10 @@
 
 OpenIVM supports materialized views over [DuckLake](https://ducklake.select/) tables. DuckLake is a lakehouse extension for DuckDB that stores metadata in DuckDB and data as Parquet files. It provides snapshot-based time travel and tracks which files were added or removed per transaction.
 
-When base tables are in a DuckLake catalog, OpenIVM leverages these features to replace delta tables with native change tracking. This enables a more efficient join delta rule (N terms instead of 2^N - 1) and eliminates the storage overhead of separate delta tables.
+When base tables are in a DuckLake catalog, OpenIVM uses snapshot-based change
+tracking instead of maintaining separate source-table delta copies. This enables
+a more efficient join delta rule (N terms instead of 2^N - 1). Internal MV delta
+tables are still created; they are distinct from source-table change tracking.
 
 ## Quick start
 
@@ -34,6 +37,73 @@ SELECT * FROM dl.product_summary ORDER BY pname;
 -- Beta  | 400 | 1
 ```
 
+## Schemas, metadata, and internal tables
+
+Schemas are recorded, but MV identity is not yet fully schema-qualified. In the
+current implementation, MV short names must be unique within their OpenIVM metadata
+catalog, including across DuckLake schemas sharing that metadata catalog.
+`PRAGMA refresh('observation.product_summary')` does not resolve a qualified name;
+use the recorded short name:
+
+```sql
+-- Run this metadata query in the native frontend database's main schema.
+SELECT view_name, view_catalog, view_schema FROM openivm_views;
+PRAGMA refresh('product_summary');
+```
+
+This restriction does not mean data is stored in `main`. For a view created as
+`dl.observation.product_summary`, its backing, visible-output, and internal MV
+delta tables live in `dl.observation`. Native source-table delta tables live with
+their source table. Inspect actual locations rather than relying on `SHOW TABLES`
+under the current search path:
+
+```sql
+SELECT database_name, schema_name, table_name
+FROM duckdb_tables()
+WHERE starts_with(table_name, 'openivm_')
+ORDER BY database_name, schema_name, table_name;
+```
+
+For DuckLake MVs, OpenIVM's control tables (`openivm_views`,
+`openivm_delta_tables`, dependency and refresh-history tables) already live in
+`main` of the native DuckDB frontend database, not as Parquet tables in DuckLake.
+Start the CLI with a persistent frontend file to retain them between sessions:
+
+```bash
+./build/release/duckdb /absolute/path/to/openivm_frontend.duckdb
+```
+
+Then attach the lake and create views in its catalog as in the quick start. After
+reopening the same frontend file, attach the same lake under the same catalog name
+before refreshing. Starting the CLI without a filename uses an in-memory frontend;
+its OpenIVM metadata will not survive closing the process. There is currently no
+setting to relocate OpenIVM control tables into an `openivm` schema. Do not move
+those tables manually.
+
+### Empty delta tables
+
+DuckLake source tables do not get physical `openivm_delta_<source>` tables. Their
+rows in the native `openivm_delta_tables` metadata table record source locations
+and snapshot watermarks; the similarly named metadata table is not a row-change
+buffer.
+
+OpenIVM still creates `openivm_delta_<view>` and, where a visible-output boundary
+is used, `openivm_delta_openivm_visible_<view>`. These are internal MV maintenance
+objects, even for DuckLake targets. Empty contents do not mean change tracking is
+broken: DuckLake changes are obtained from snapshots, and native delta buffers
+can also be cleared after consumption. Keep these internal objects intact; they
+are currently part of view creation and lifecycle handling. Removing unnecessary
+DuckLake MV delta objects would require a code change, not manual deletion.
+
+### Compiled SQL and file paths
+
+SQL files are written only when `openivm_files_path` is set before the relevant
+compilation. `PRAGMA openivm_files('product_summary')` shows their paths and whether
+they exist. See [Inspect the generated SQL](build/building.md#inspect-the-generated-sql)
+for directory setup and [saving compiled SQL in a table](build/building.md#inspect-or-save-compiled-sql-without-files).
+Saving compiler output as rows already works; automatically retaining the last
+executed program in OpenIVM's own metadata is not currently implemented.
+
 ## How it works
 
 ### Detection
@@ -43,7 +113,7 @@ is backed by a DuckLake catalog, its entry in `openivm_delta_tables` is stored w
 `catalog_type = 'ducklake'`. No user configuration is needed — DuckLake-specific
 optimizations activate automatically.
 
-### Delta detection (no delta tables)
+### Source delta detection (snapshot-based)
 
 Standard DuckDB tables use separate delta tables (`openivm_delta_<table>`) with a multiplicity
 column and timestamp. DuckLake tables don't need delta tables — DuckLake's built-in

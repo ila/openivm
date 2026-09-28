@@ -294,3 +294,51 @@ Other CPU-heavy jobs were active during these measurements. The observed
 
 The final full run passed the compiled N-term integration check and all 12,570
 assertions in 89 SQL test cases (one ICU-dependent skip).
+
+### Mark's first DuckLake session: schema and SQL-output audit (2026-09-28)
+
+Checked against main `38929faa` with a persistent native frontend, a DuckLake
+attachment, and a materialized view in `dl.observation`. The findings were checked
+against source, live CLI queries, and close/reopen refreshes.
+
+| Question | Verified behavior |
+|---|---|
+| Qualified refresh and duplicate MV names | `refresh('observation.product_summary')` fails; the short name succeeds. Locations are recorded, but `openivm_views` uses the short name as its primary key. Same-named MVs in different schemas sharing that metadata catalog are not supported. |
+| All internal tables in main? | Control metadata is in native `frontend.main`; backing, visible, and MV delta tables were in `dl.observation`. Native source deltas were in the source schema. |
+| Empty DuckLake deltas | No source delta table was created. MV delta and visible-output delta objects were still created. Source changes came from snapshot watermarks. |
+| Separate metadata schema/frontend | A persistent native frontend already holds OpenIVM metadata, outside DuckLake Parquet storage. A configurable metadata schema is not implemented. |
+| Missing SQL files | Output is opt-in, relative to the process working directory. A missing output directory previously caused silent write failure. |
+| SQL stored as rows | `CREATE TABLE saved_refresh AS SELECT * FROM openivm_compile_with_facts(...)` worked and persisted across reopen. Automatic retention of each executed program is not implemented. |
+
+The duplicate-MV experiment exposed a separate correctness bug: a failed CREATE
+in a second DuckLake schema removed the first MV's metadata. The staged executor
+had registered failure cleanup before checking for duplicate names. Cleanup now
+becomes active only after system setup and that check succeed. The existing
+DuckLake chained tests cover the rejected CREATE followed by conflicting DML and
+a successful refresh of the original MV with full bag equality.
+
+Usability changes add `PRAGMA openivm_files('view_name')` with absolute paths,
+existence, status, and working directory; actionable missing-metadata and
+duplicate-name errors; and checked SQL-file writes. File existence is explicitly
+not a freshness guarantee. The existing compile-refresh tests cover disabled
+output, absent directories, unknown names, path reporting, and saving SQL as rows.
+
+Separate native-schema checks used two tables both named sales with distinct MV
+names, then a join between those tables. All three mixed-DML refreshes matched
+full recomputation. This verifies those cases, not general schema-qualified MV
+identity. DuckLake bag checks also passed after the duplicate-name failure and
+after reopening the frontend and reattaching the lake.
+
+SQL reference export also leaked internal profiling records and treated the first
+three records as system DDL. Export now omits both profiling marker types and
+uses the actual system-setup boundary; regression checks inspect both files.
+
+A cross-schema CREATE OR REPLACE also reproduced metadata reassignment: both
+physical views remained while only the second location was registered. Replacement
+now checks the registered catalog/schema before any cleanup or replacement work.
+The original MV remains refreshable after both rejected operations.
+
+Final validation passed 1,166 focused assertions and the full suite's 12,645
+assertions in 89 cases (one ICU-dependent skip), plus compiled N-term SQL
+integration. The documented demo also passed from a working directory containing
+spaces, with all three SQL paths reported correctly and no leaked profiler records.

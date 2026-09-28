@@ -322,8 +322,18 @@ void SqlUtils::WriteFile(const string &filename, bool append, const string &comp
 	} else {
 		file.open(filename);
 	}
+	if (!file.is_open()) {
+		throw IOException(
+		    "OpenIVM could not open compiled SQL file '%s'. Create the directory set by "
+		    "openivm_files_path and check write permissions; relative paths use the process working directory.",
+		    filename);
+	}
 	file << compiled_query << '\n';
 	file.close();
+	if (file.fail()) {
+		throw IOException("OpenIVM could not finish writing compiled SQL file '%s'. Check free space and permissions.",
+		                  filename);
+	}
 }
 
 string SqlUtils::ExtractTableName(const string &sql) {

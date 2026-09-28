@@ -490,6 +490,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			continue;
 		}
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_CLEANUP_PREFIX)) {
+			flush_pending();
 			cleanup_ddl.push_back(q.substr(strlen(OPENIVM_DDL_CLEANUP_PREFIX)));
 			continue;
 		}
