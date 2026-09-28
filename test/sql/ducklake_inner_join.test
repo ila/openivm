@@ -705,3 +705,60 @@ WHERE view_name = 'profile_ddl_probe' AND step_name = 'create_mv_sql_stmt'
   AND starts_with(detail, 'phase=create_mv_user_view; statement=');
 ----
 1
+
+# An up-to-date metadata schema must not run ALTER migrations again.
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'profile_ddl_probe' AND step_name = 'create_mv_sql_stmt'
+  AND contains(detail, 'sql=alter table openivm_');
+----
+0
+
+# Simulate an older database. Missing columns must still be migrated, independently
+# for each metadata table, before creation and incremental refresh proceed.
+statement ok
+ALTER TABLE openivm_views DROP COLUMN pending_after_hook;
+
+statement ok
+ALTER TABLE openivm_delta_tables DROP COLUMN pending_estimate_ts;
+
+statement ok
+ALTER TABLE openivm_refresh_history DROP COLUMN strategy;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.profile_migration_probe AS SELECT id,name FROM dl.customers;
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'profile_migration_probe' AND step_name = 'create_mv_sql_stmt'
+  AND contains(detail, 'sql=alter table openivm_');
+----
+3
+
+statement ok
+INSERT INTO dl.customers VALUES (901, NULL), (901, NULL), (902, 'temporary');
+
+statement ok
+DELETE FROM dl.customers WHERE id = 902;
+
+statement ok
+UPDATE dl.customers SET name = 'updated' WHERE id = 901;
+
+statement ok
+PRAGMA refresh('profile_migration_probe');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_migration_probe EXCEPT ALL SELECT id,name FROM dl.customers)),
+       (SELECT count(*) FROM (SELECT id,name FROM dl.customers EXCEPT ALL SELECT * FROM dl.profile_migration_probe));
+----
+0	0
+
+statement ok
+CREATE MATERIALIZED VIEW dl.profile_migrated_probe AS SELECT id,name FROM dl.customers;
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'profile_migrated_probe' AND step_name = 'create_mv_sql_stmt'
+  AND contains(detail, 'sql=alter table openivm_');
+----
+0

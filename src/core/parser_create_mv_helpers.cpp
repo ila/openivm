@@ -2,6 +2,9 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/sql_utils.hpp"
+#include "core/openivm_debug.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "rules/column_hider.hpp"
 
 namespace duckdb {
@@ -21,7 +24,11 @@ string SqlCsvLiteralOrNull(const vector<string> &values) {
 	return result;
 }
 
-static void AddColumnIfNotExists(vector<string> &ddl, const string &table_name, const string &column_definition) {
+static void AddColumnIfNotExists(vector<string> &ddl, const string &table_name, optional_ptr<TableCatalogEntry> table,
+                                 const string &column_definition) {
+	if (table && table->ColumnExists(column_definition.substr(0, column_definition.find(' ')))) {
+		return;
+	}
 	ddl.push_back("alter table " + table_name + " add column if not exists " + column_definition);
 }
 
@@ -30,7 +37,17 @@ string BuildUpdateViewJsonSQL(const string &column_name, const string &json, con
 	       SqlUtils::EscapeSingleQuotes(json) + "' WHERE view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'";
 }
 
-void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name, bool is_replace) {
+void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog, const string &schema,
+                                   vector<string> &ddl, const string &view_name, bool is_replace) {
+	// Inspect this transaction's catalog, not a process-wide initialization flag: older
+	// databases and other attached catalogs must still receive missing columns.
+	auto views = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::VIEWS_TABLE,
+	                                                  OnEntryNotFound::RETURN_NULL);
+	auto deltas = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::DELTA_TABLES_TABLE,
+	                                                   OnEntryNotFound::RETURN_NULL);
+	auto history = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::HISTORY_TABLE,
+	                                                    OnEntryNotFound::RETURN_NULL);
+	OPENIVM_DEBUG_PRINT("[CREATE] Checking metadata schema in %s.%s\n", catalog.c_str(), schema.c_str());
 	// Matcher metadata columns (signature_hash..nullified_columns_json) stay
 	// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
 	ddl.push_back("create table if not exists " + string(openivm::VIEWS_TABLE) +
@@ -60,22 +77,26 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " distinct_aux_meta_json varchar default null,"
 	              " count_distinct_aux_meta_json varchar default null,"
 	              " semi_anti_aux_meta_json varchar default null,"
-	              " lineage_json varchar default null)");
+	              " lineage_json varchar default null,"
+	              " leftjoin_secondary_meta_json varchar default null,"
+	              " published_query varchar default null,"
+	              " pending_after_hook boolean default null)");
 	// Forward-compat ALTER for existing DBs that pre-date `distinct_aux_meta_json`
 	// (the CREATE IF NOT EXISTS above is a no-op when the table exists with the older schema).
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "distinct_aux_meta_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "count_distinct_aux_meta_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "semi_anti_aux_meta_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "lineage_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "leftjoin_secondary_meta_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "has_join boolean default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_affected_mode varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "group_recompute_source_occurrences_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "derived_aggregate_outputs_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "published_query varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_catalog varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "view_schema varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "window_order_columns varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "distinct_aux_meta_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "count_distinct_aux_meta_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "semi_anti_aux_meta_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "lineage_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "leftjoin_secondary_meta_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "has_join boolean default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "group_recompute_affected_mode varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views,
+	                     "group_recompute_source_occurrences_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "derived_aggregate_outputs_json varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "published_query varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "view_catalog varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "view_schema varchar default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "window_order_columns varchar default null");
 	if (!is_replace) {
 		string escaped_view_name = SqlUtils::EscapeSingleQuotes(view_name);
 		string escaped_data_table = SqlUtils::EscapeSingleQuotes(IncrementalTableNames::DataTableName(view_name));
@@ -97,7 +118,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 		              "\" already exists') ELSE NULL END");
 	}
 
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, "pending_after_hook boolean default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "pending_after_hook boolean default null");
 
 	// Refresh hooks: extensions can register custom SQL to run on MV refresh
 	// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
@@ -117,12 +138,12 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " source_table_id bigint default null,"
 	              " primary key(view_name, table_name))");
 	// Backfill for existing databases without the columns (added post-release).
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "last_refresh_ts timestamp default null");
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "pending_row_estimate bigint default null");
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "pending_estimate_ts timestamp default null");
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_catalog varchar default null");
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_schema varchar default null");
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, "source_table_id bigint default null");
+	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "last_refresh_ts timestamp default null");
+	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "pending_row_estimate bigint default null");
+	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "pending_estimate_ts timestamp default null");
+	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_catalog varchar default null");
+	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_schema varchar default null");
+	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_table_id bigint default null");
 	ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) +
 	              " SET has_join = true WHERE has_join IS NULL AND (COALESCE(has_left_join, false) OR "
 	              "COALESCE(has_full_outer, false) OR view_name IN (SELECT view_name FROM " +
@@ -142,7 +163,7 @@ void AppendCreateMVSystemTablesDDL(vector<string> &ddl, const string &view_name,
 	              " actual_duration_ms bigint,"
 	              " strategy varchar default 'incremental',"
 	              " primary key(view_name, refresh_timestamp))");
-	AddColumnIfNotExists(ddl, openivm::HISTORY_TABLE, "strategy varchar default 'incremental'");
+	AddColumnIfNotExists(ddl, openivm::HISTORY_TABLE, history, "strategy varchar default 'incremental'");
 	ddl.push_back("create table if not exists " + string(openivm::PROFILE_TABLE) +
 	              " (refresh_id varchar, view_name varchar,"
 	              " profile_timestamp timestamp default current_timestamp,"

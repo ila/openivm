@@ -1590,3 +1590,39 @@ query I
 SELECT count(*) FROM ((SELECT * FROM openivm_attachment_host.attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM openivm_attachment_host.attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM openivm_attachment_host.attached_src GROUP BY g EXCEPT ALL SELECT * FROM openivm_attachment_host.attached_mv));
 ----
 0
+
+# Legacy metadata upgrades participate in the caller's transaction and rollback.
+# The attached catalog has its own schema; another initialized catalog must not
+# suppress this migration.
+statement ok
+ALTER TABLE openivm_views DROP COLUMN pending_after_hook;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW metadata_upgrade_rollback AS SELECT id, g, v FROM attached_src;
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'attached_state'
+  AND table_name = 'openivm_views' AND column_name = 'pending_after_hook';
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'attached_state'
+  AND table_name = 'openivm_views' AND column_name = 'pending_after_hook';
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW metadata_upgrade_retry AS SELECT id, g, v FROM attached_src;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM metadata_upgrade_retry EXCEPT ALL SELECT id, g, v FROM attached_src)),
+       (SELECT count(*) FROM (SELECT id, g, v FROM attached_src EXCEPT ALL SELECT * FROM metadata_upgrade_retry));
+----
+0	0
