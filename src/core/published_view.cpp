@@ -25,7 +25,7 @@ string PublishedSourceViewName(string source_name) {
 string BuildPublishViewSQL(const string &view_name, const string &prefix, const string &query,
                            const vector<string> &columns, bool ducklake, const string &metadata_table,
                            const vector<string> &scope_columns, const string &timestamp_sql, SqlDialect dialect,
-                           const string &appended_rows) {
+                           const string &appended_rows, const string &scope_rows) {
 	auto quote = [&](const string &name) {
 		return DialectQuoteIdent(name, dialect);
 	};
@@ -80,7 +80,8 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	string scoped_query = query;
 	string old_query = "SELECT * FROM " + visible;
 	if (!scope.empty()) {
-		auto raw_delta = prefix + quote(SqlUtils::DeltaName(view_name));
+		OPENIVM_DEBUG_PRINT("[PUBLISH] Scoping %s by %zu affected columns\n", view_name.c_str(), scope_columns.size());
+		auto raw_delta = scope_rows.empty() ? prefix + quote(SqlUtils::DeltaName(view_name)) : scope_rows;
 		auto predicate = " WHERE EXISTS (SELECT 1 FROM " + raw_delta + " d WHERE " + scope + ")";
 		scoped_query = "SELECT v.* FROM (" + query + ") v" + predicate;
 		old_query = "SELECT v.* FROM " + visible + " v" + predicate;

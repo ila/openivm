@@ -52,6 +52,9 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
                                  const string &delta_ts_filter = "", const string &catalog_prefix = "",
                                  bool insert_only = false, string *appended_rows = nullptr);
+string CompileProjectionDelta(const string &data_table, const string &delta_view, const vector<string> &column_names,
+                              const string &delta_ts_filter = "", bool insert_only = false,
+                              string *appended_rows = nullptr);
 vector<string> PartitionOutputColumns(const vector<string> &partition_columns);
 
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter = "",

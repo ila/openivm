@@ -201,3 +201,32 @@ each batch was checked against the original query with `EXCEPT ALL` in both
 directions. These are local microbenchmarks, not an SF100 end-to-end result.
 The original top-k pipeline benchmark also passes all bag checks at 100,000
 rows, with both 20 and 10,000 changed keys over four conflicting-mutation batches.
+
+
+## Follow-up: retain affected scopes and apply signed projection deltas
+
+The SF100 run at `f49c27ab` spent 43.2/42.1 seconds in visible publication during
+batches 2/3, despite the earlier append optimization. Keyed projection and
+DuckLake window maintenance discarded their affected-key tables before
+publication, forcing a second comparison of the whole visible relation.
+
+Retain those tables until publication completes. Compact window diffs retain
+old keys as well as new keys, including NULLs, so deleted rows and vanished
+partitions remain in scope. For ordinary signed projections, reuse the existing
+bag-aware projection delta compiler against the visible table; do not rediscover
+those deltas by comparing stored results. Ordered/limited publication and
+outer-join correction paths retain their existing handling.
+
+Local four-thread DuckLake checks used 500,000 stored rows, two refreshes each,
+and conflicting inserts/deletes/updates before every refresh. Full bidirectional
+EXCEPT ALL checks passed. The baseline binary at `38929faa` has the same
+publication paths for these mixed-DML cases as `f49c27ab`:
+
+| Shape | Before (s), batches 1/2 | After (s), batches 1/2 |
+|---|---:|---:|
+| Bounded window, 12 output columns | 0.367 / 0.402 | 0.335 / 0.366 |
+| Signed projection, 11 output columns | 0.285 / 0.308 | 0.146 / 0.167 |
+
+These small local tests establish neither SF100 performance nor parity with the
+older `f5935aed` benchmark. The SF10 validation and SF100 timing rerun must verify
+that separately. Initial visible-table copying and aggregate publication remain.

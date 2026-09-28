@@ -295,13 +295,17 @@ static string BuildDuckLakeLookupChangedKeysSQL(const DuckLakeSourceSpec &source
 
 static string BuildAffectedPartitionRefreshSQL(const string &data_table, const string &view_query_sql,
                                                const string &affected_keys_sql, const string &affected_temp_table,
-                                               const vector<string> &partition_cols) {
+                                               const vector<string> &partition_cols,
+                                               RefreshPublicationScope *publication_scope) {
 	auto output_columns = PartitionOutputColumns(partition_cols);
 	string target_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_target");
 	string recompute_match = SqlUtils::BuildNullSafeMatch(output_columns, "openivm_aff", "openivm_recompute");
+	if (publication_scope) {
+		publication_scope->columns = output_columns;
+	}
 	return BuildAffectedKeyRefreshSQL(data_table, view_query_sql, affected_keys_sql, "openivm_target",
 	                                  "openivm_recompute", "openivm_aff", target_match, recompute_match,
-	                                  affected_temp_table);
+	                                  affected_temp_table, {}, "", publication_scope);
 }
 
 static bool AddWindowRowKeyColumns(const vector<string> &specs, const vector<string> &visible_columns,
@@ -336,8 +340,8 @@ static string QualifiedColumns(const vector<string> &columns, const string &alia
 static string BuildDuckLakeWindowRowDiffRefreshSQL(const string &view_name, const string &data_table,
                                                    const string &view_query_sql, const string &affected_keys_sql,
                                                    const vector<string> &partition_cols,
-                                                   const vector<string> &order_cols,
-                                                   const vector<string> &column_names) {
+                                                   const vector<string> &order_cols, const vector<string> &column_names,
+                                                   RefreshPublicationScope *publication_scope) {
 	vector<string> visible_columns;
 	for (auto &column : column_names) {
 		if (!IncrementalTableNames::IsInternalColumn(column)) {
@@ -365,6 +369,22 @@ static string BuildDuckLakeWindowRowDiffRefreshSQL(const string &view_name, cons
 	string distinct_rows = "(" + QualifiedColumns(visible_columns, "openivm_old") + ") IS DISTINCT FROM (" +
 	                       QualifiedColumns(visible_columns, "openivm_new") + ")";
 
+	// Deleted rows have no new image. Retain their old keys so publication also
+	// retracts vanished rows and partitions; the row-key join is NULL-safe.
+	string old_publication_keys;
+	if (publication_scope) {
+		vector<string> scope_projection;
+		for (idx_t i = 0; i < row_keys.size(); i++) {
+			auto key = SqlUtils::QuoteIdentifier(row_keys[i]);
+			auto old_key = SqlUtils::QuoteIdentifier("openivm_old_key_" + to_string(i));
+			old_publication_keys += "openivm_old." + key + " AS " + old_key + ", ";
+			scope_projection.push_back("COALESCE(" + key + ", " + old_key + ") AS " + key);
+		}
+		publication_scope->columns = row_keys;
+		publication_scope->rows =
+		    "(SELECT " + StringUtil::Join(scope_projection, ", ") + " FROM " + changed_table + ")";
+		publication_scope->cleanup_sql = "DROP TABLE IF EXISTS " + changed_table + ";\n";
+	}
 	string old_partition_by = QualifiedColumns(row_keys, "openivm_target");
 	string new_partition_by = QualifiedColumns(row_keys, "openivm_recompute");
 	string sql;
@@ -378,8 +398,8 @@ static string BuildDuckLakeWindowRowDiffRefreshSQL(const string &view_name, cons
 	       affected_table + " openivm_aff WHERE " + target_affected + ")\n), openivm_new AS (\n  SELECT " +
 	       new_columns + ", TRUE AS openivm_new_present,\n    ROW_NUMBER() OVER (PARTITION BY " + new_partition_by +
 	       ") AS openivm_match_id\n  FROM " + recompute_table + " openivm_recompute\n)\nSELECT " +
-	       "openivm_old.openivm_old_rowid, openivm_new.openivm_new_present, " + changed_new_columns +
-	       "\nFROM openivm_old\nFULL OUTER JOIN openivm_new ON " + row_key_match +
+	       "openivm_old.openivm_old_rowid, openivm_new.openivm_new_present, " + old_publication_keys +
+	       changed_new_columns + "\nFROM openivm_old\nFULL OUTER JOIN openivm_new ON " + row_key_match +
 	       " AND openivm_old.openivm_match_id = openivm_new.openivm_match_id\nWHERE " +
 	       "openivm_old.openivm_old_rowid IS NULL OR openivm_new.openivm_new_present IS NULL OR " + distinct_rows +
 	       ";\n\n";
@@ -388,7 +408,9 @@ static string BuildDuckLakeWindowRowDiffRefreshSQL(const string &view_name, cons
 	sql += "INSERT INTO " + data_table + " (" + insert_columns + ")\nSELECT " +
 	       QualifiedColumns(visible_columns, "openivm_changed") + "\nFROM " + changed_table +
 	       " openivm_changed\nWHERE openivm_new_present;\n\n";
-	sql += "DROP TABLE IF EXISTS " + changed_table + ";\n";
+	if (!publication_scope) {
+		sql += "DROP TABLE IF EXISTS " + changed_table + ";\n";
+	}
 	sql += "DROP TABLE IF EXISTS " + recompute_table + ";\n";
 	sql += "DROP TABLE IF EXISTS " + affected_table + ";\n";
 	OPENIVM_DEBUG_PRINT("[UPSERT] WINDOW_PARTITION DuckLake compact row diff for %s (%zu row keys)\n",
@@ -468,7 +490,8 @@ static string BuildSingleSourceDuckLakeWindowRefresh(
     RefreshMetadata &metadata, Connection &con, const string &view_name, const string &view_query_sql,
     const vector<string> &partition_cols, const vector<string> &order_cols, const vector<string> &column_names,
     const string &data_table, const string &view_catalog_name, const string &view_schema_name,
-    const string &attached_db_catalog_name, const string &attached_db_schema_name, const string &base_name) {
+    const string &attached_db_catalog_name, const string &attached_db_schema_name, const string &base_name,
+    RefreshPublicationScope *publication_scope) {
 	int64_t old_snap = metadata.GetLastSnapshotId(view_name, base_name);
 	auto loc = ResolveDuckLakeSourceLocation(con, view_name, base_name, view_catalog_name, view_schema_name,
 	                                         attached_db_catalog_name, attached_db_schema_name);
@@ -501,27 +524,26 @@ static string BuildSingleSourceDuckLakeWindowRefresh(
 	string affected_keys = "SELECT DISTINCT " + affected_cols + " FROM ((" + insertions + ") UNION ALL (" + deletions +
 	                       ")) openivm_changed_partitions";
 	if (!order_cols.empty()) {
-		auto compact_diff = BuildDuckLakeWindowRowDiffRefreshSQL(view_name, data_table, view_query_sql, affected_keys,
-		                                                         partition_cols, order_cols, column_names);
+		auto compact_diff =
+		    BuildDuckLakeWindowRowDiffRefreshSQL(view_name, data_table, view_query_sql, affected_keys, partition_cols,
+		                                         order_cols, column_names, publication_scope);
 		if (!compact_diff.empty()) {
 			return compact_diff;
 		}
 	}
-	string upsert_query =
-	    BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, affected_keys, qtemp_affected, partition_cols);
+	string upsert_query = BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, affected_keys, qtemp_affected,
+	                                                       partition_cols, publication_scope);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake change-feed, %zu "
 	                    "partition cols, old_snap=%ld, current_snap=%ld)\n",
 	                    partition_cols.size(), (long)old_snap, (long)current_snap);
 	return upsert_query;
 }
 
-static string BuildMultiSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                                    const string &view_query_sql,
-                                                    const vector<string> &delta_table_names,
-                                                    const vector<string> &partition_cols, const string &data_table,
-                                                    const string &view_catalog_name, const string &view_schema_name,
-                                                    const string &attached_db_catalog_name,
-                                                    const string &attached_db_schema_name) {
+static string BuildMultiSourceDuckLakeWindowRefresh(
+    RefreshMetadata &metadata, Connection &con, const string &view_name, const string &view_query_sql,
+    const vector<string> &delta_table_names, const vector<string> &partition_cols, const string &data_table,
+    const string &view_catalog_name, const string &view_schema_name, const string &attached_db_catalog_name,
+    const string &attached_db_schema_name, RefreshPublicationScope *publication_scope) {
 	string key_cols;
 	string affected_keys;
 	if (BuildLineageDuckLakeAffectedKeysSQL(metadata, con, view_name, delta_table_names, partition_cols,
@@ -535,7 +557,7 @@ static string BuildMultiSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, C
 		// Conservative lineage can over-include partitions, but must cover every changed source.
 		// If lineage is incomplete, the full logical view diff below preserves correctness.
 		return BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, affected_keys, qtemp_affected,
-		                                        partition_cols);
+		                                        partition_cols, publication_scope);
 	}
 
 	key_cols.clear();
@@ -562,7 +584,7 @@ static string BuildMultiSourceDuckLakeWindowRefresh(RefreshMetadata &metadata, C
 	// Materialize the affected partition keys once; otherwise DuckDB/DuckLake repeats the
 	// full view diff independently for DELETE and INSERT.
 	return BuildAffectedPartitionRefreshSQL(data_table, view_query_sql, fallback_affected_keys, qtemp_affected,
-	                                        partition_cols);
+	                                        partition_cols, publication_scope);
 }
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
@@ -572,7 +594,7 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
                                    bool cross_system, bool emit_cascade_delta, bool running_window_incremental,
-                                   bool *uses_running_suffix) {
+                                   bool *uses_running_suffix, RefreshPublicationScope *publication_scope) {
 	if (uses_running_suffix) {
 		*uses_running_suffix = false;
 	}
@@ -589,12 +611,12 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
 		return BuildSingleSourceDuckLakeWindowRefresh(metadata, con, view_name, view_query_sql, partition_cols,
 		                                              order_cols, column_names, data_table, view_catalog_name,
 		                                              view_schema_name, attached_db_catalog_name,
-		                                              attached_db_schema_name, delta_table_names[0]);
+		                                              attached_db_schema_name, delta_table_names[0], publication_scope);
 	}
 	if (safe_for_snapdiff && any_ducklake) {
-		return BuildMultiSourceDuckLakeWindowRefresh(metadata, con, view_name, view_query_sql, delta_table_names,
-		                                             partition_cols, data_table, view_catalog_name, view_schema_name,
-		                                             attached_db_catalog_name, attached_db_schema_name);
+		return BuildMultiSourceDuckLakeWindowRefresh(
+		    metadata, con, view_name, view_query_sql, delta_table_names, partition_cols, data_table, view_catalog_name,
+		    view_schema_name, attached_db_catalog_name, attached_db_schema_name, publication_scope);
 	}
 	if (any_ducklake) {
 		OPENIVM_DEBUG_PRINT(

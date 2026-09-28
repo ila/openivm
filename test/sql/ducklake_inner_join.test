@@ -15,6 +15,9 @@ LOAD ducklake;
 statement ok
 ATTACH '__TEST_DIR__/ducklake_inner_join.db' AS dl (TYPE ducklake);
 
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
 # ==========================================
 # Test 1: 2-table INNER JOIN — INSERT left, then right
 # ==========================================
@@ -673,3 +676,11 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# The existing conflicting updates above must publish only the retained key scope.
+query I
+SELECT contains(content, 'SELECT v.* FROM (SELECT *, CAST(0 AS BIGINT) AS openivm_ordinal')
+   AND contains(content, 'FROM openivm_old_affected_projection_key_holdings d WHERE')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries_projection_key_holdings.sql');
+----
+1

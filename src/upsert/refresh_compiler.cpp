@@ -1374,8 +1374,13 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
                                  const string &delta_ts_filter, const string &catalog_prefix, bool insert_only,
                                  string *appended_rows) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
-	string mul = string(openivm::MULTIPLICITY_COL);
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	return CompileProjectionDelta(data_table, delta_view, column_names, delta_ts_filter, insert_only, appended_rows);
+}
+
+string CompileProjectionDelta(const string &data_table, const string &delta_view, const vector<string> &column_names,
+                              const string &delta_ts_filter, bool insert_only, string *appended_rows) {
+	string mul = string(openivm::MULTIPLICITY_COL);
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
 	string select_columns;
@@ -1390,10 +1395,9 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 		}
 	}
 	if (select_columns.empty()) {
-		throw InvalidInputException("Cannot compile projection refresh for materialized view '%s': delta "
-		                            "view '%s' has no "
+		throw InvalidInputException("Cannot compile projection refresh for table '%s': delta relation '%s' has no "
 		                            "user-visible columns",
-		                            view_name, SqlUtils::DeltaName(view_name));
+		                            data_table, delta_view);
 	}
 	match_conditions.erase(match_conditions.size() - 5, 5);
 	select_columns.erase(select_columns.size() - 2, 2);
