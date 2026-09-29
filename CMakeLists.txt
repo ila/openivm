@@ -119,8 +119,8 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
-# Test and benchmark tools - only build for native platforms
-if(NOT EMSCRIPTEN AND NOT WIN32)
+# Integration tests run on all native platforms, including Windows.
+if(NOT EMSCRIPTEN)
     set(OPENIVM_LINK_LIBS
         duckdb_static
         duckdb_generated_extension_loader
@@ -135,7 +135,10 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
 
     add_executable(scheduler_catalog_test test/integration/scheduler_catalog_test.cpp)
     target_link_libraries(scheduler_catalog_test ${OPENIVM_LINK_LIBS})
+endif()
 
+# Benchmark tools are currently supported on Unix native platforms.
+if(NOT EMSCRIPTEN AND NOT WIN32)
     # TPC-C data generation tool
     add_executable(tpcc_setup benchmark/src/tpcc_setup.cpp)
     target_link_libraries(tpcc_setup ${OPENIVM_LINK_LIBS})
