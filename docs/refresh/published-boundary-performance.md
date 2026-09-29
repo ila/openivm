@@ -230,3 +230,49 @@ publication paths for these mixed-DML cases as `f49c27ab`:
 These small local tests establish neither SF100 performance nor parity with the
 older `f5935aed` benchmark. The SF10 validation and SF100 timing rerun must verify
 that separately. Initial visible-table copying and aggregate publication remain.
+
+## Follow-up: metadata setup and exact window publication
+
+The SF100 statement profile at `6db895a0` recorded 122.423 seconds in system-table
+setup, including 111.702 seconds in 1,029 repeated ALTER statements. The ALTER
+hook checked for delta tables through `information_schema.tables`, enumerating
+unrelated external catalogs even for no-op metadata migrations. A held-SQLite-lock
+regression also exposed a correctness failure: a native source ALTER could succeed
+without synchronizing its delta schema when that catalog enumeration failed.
+
+Inspect the caller's metadata schema, migrate only missing columns, resolve ALTER
+delta tables directly, and run stale-row catalog checks only when the caller's
+snapshot contains matching metadata. Existing schema upgrades, NULL backfills,
+duplicate detection, stale-row recovery, and transactional rollback remain.
+Empty DuckLake publication deltas use the existing schema-only creation helper.
+
+A local four-thread SQLite-backed DuckLake comparison created 49 projection views
+of a 100,000-row source in fresh databases. Metadata setup decreased from 147.824
+to 0.193 seconds; profiled creation totals decreased from 172.202 to 14.076 seconds.
+Every initial view and the final mixed-DML refresh passed bidirectional bag checks.
+These timings are local measurements, not predictions for SF100. The first remote
+metadata fix (`e134bb56`) validated all 49 models in all three SF10 batches and
+measured 430.954 / 96.634 / 90.573 seconds at SF100. That run predates the final
+stale-row cleanup and publication optimizations.
+
+For incremental publication, compact window maintenance now retains both changed
+row images and passes their signed bag directly to the existing projection-delta
+compiler. Filtering and global ordering/limit wrappers retain their comparison
+path. Native publication SQL uses explicit semijoins and DELETE USING: with the
+existing deliminator safety guard, correlated EXISTS otherwise introduces a
+redundant target-side grouping step. Spark SQL generation retains its syntax.
+
+Local comparison against `91107fa4`, 500,000 source rows, four threads, two
+consecutive mixed-DML batches, one fresh database per binary:
+
+| Shape | Before (s), batches 1/2 | After (s), batches 1/2 |
+|---|---:|---:|
+| Bounded window, 12 output columns | 0.338 / 0.395 | 0.203 / 0.232 |
+| MIN/MAX/COUNT aggregate, three long string group keys | 0.892 / 0.851 | 0.575 / 0.579 |
+
+The window uses 1,000 partitions and `RANGE BETWEEN 3 PRECEDING AND CURRENT ROW`; each batch
+inserts 100 rows, deletes 10 and updates 10. The aggregate groups 500,000 distinct
+keys plus three string columns; each batch inserts 100 rows, deletes five and
+updates five. Only refresh is timed. Each result is checked with EXCEPT ALL in
+both directions. Initial publication copying and end-to-end SF100 parity still
+require separate measurement.

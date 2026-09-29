@@ -82,7 +82,12 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	if (!scope.empty()) {
 		OPENIVM_DEBUG_PRINT("[PUBLISH] Scoping %s by %zu affected columns\n", view_name.c_str(), scope_columns.size());
 		auto raw_delta = scope_rows.empty() ? prefix + quote(SqlUtils::DeltaName(view_name)) : scope_rows;
-		auto predicate = " WHERE EXISTS (SELECT 1 FROM " + raw_delta + " d WHERE " + scope + ")";
+		// The native executor disables deliminator for deeply nested maintenance
+		// SQL. Express the semijoin directly to avoid grouping all target rows
+		// merely to decorrelate an EXISTS predicate.
+		auto predicate = dialect == SqlDialect::DUCKDB
+		                     ? " SEMI JOIN " + raw_delta + " d ON " + scope
+		                     : " WHERE EXISTS (SELECT 1 FROM " + raw_delta + " d WHERE " + scope + ")";
 		scoped_query = "SELECT v.* FROM (" + query + ") v" + predicate;
 		old_query = "SELECT v.* FROM " + visible + " v" + predicate;
 	}
@@ -112,9 +117,16 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	}
 	// Replace only changed bags. DuckLake keeps its table identity and records the
 	// modifications in snapshots; native consumers read the explicit signed delta.
-	sql += "DELETE FROM " + visible + " AS v WHERE EXISTS (SELECT 1 FROM " + changes + " d WHERE " + equality + ");\n";
-	sql += "INSERT INTO " + visible + " SELECT v.* FROM " + next + " v WHERE EXISTS (SELECT 1 FROM " + changes +
-	       " d WHERE " + equality + ");\n";
+	if (dialect == SqlDialect::DUCKDB) {
+		sql += "DELETE FROM " + visible + " AS v USING " + changes + " d WHERE " + equality + ";\n";
+		sql += "INSERT INTO " + visible + " SELECT v.* FROM " + next + " v SEMI JOIN " + changes + " d ON " + equality +
+		       ";\n";
+	} else {
+		sql +=
+		    "DELETE FROM " + visible + " AS v WHERE EXISTS (SELECT 1 FROM " + changes + " d WHERE " + equality + ");\n";
+		sql += "INSERT INTO " + visible + " SELECT v.* FROM " + next + " v WHERE EXISTS (SELECT 1 FROM " + changes +
+		       " d WHERE " + equality + ");\n";
+	}
 	sql += "DROP TABLE " + changes + ";\nDROP TABLE " + next + ";\n";
 	if (!ducklake) {
 		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table);

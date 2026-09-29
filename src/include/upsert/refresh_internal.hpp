@@ -21,6 +21,7 @@ struct RefreshPublicationScope {
 	vector<string> columns;
 	string rows;
 	string cleanup_sql;
+	string signed_rows;
 };
 
 struct ViewLocation {

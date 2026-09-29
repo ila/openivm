@@ -204,8 +204,10 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.scope_child EXCEPT ALL SELECT * F
 0	0
 
 query I
-SELECT contains(content, 'COALESCE(symbol, openivm_old_key_0)')
-   AND contains(content, 'FROM openivm_window_changed_scope_window) d WHERE')
+SELECT contains(content, 'openivm_old_value_0 AS symbol')
+   AND contains(content, 'WHERE openivm_old_rowid IS NOT NULL UNION ALL SELECT')
+   AND NOT contains(content, 'openivm_publish_next_scope_window')
+   AND NOT contains(content, 'openivm_publish_changes_scope_window')
 FROM read_text('__TEST_DIR__/openivm_upsert_queries_scope_window.sql');
 ----
 1

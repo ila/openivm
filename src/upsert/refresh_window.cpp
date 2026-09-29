@@ -369,20 +369,29 @@ static string BuildDuckLakeWindowRowDiffRefreshSQL(const string &view_name, cons
 	string distinct_rows = "(" + QualifiedColumns(visible_columns, "openivm_old") + ") IS DISTINCT FROM (" +
 	                       QualifiedColumns(visible_columns, "openivm_new") + ")";
 
-	// Deleted rows have no new image. Retain their old keys so publication also
-	// retracts vanished rows and partitions; the row-key join is NULL-safe.
-	string old_publication_keys;
+	// Retain both row images from the diff already required for maintenance.
+	// Publication can then apply the exact signed bag without comparing again.
+	string old_publication_columns;
 	if (publication_scope) {
+		vector<string> old_projection;
 		vector<string> scope_projection;
-		for (idx_t i = 0; i < row_keys.size(); i++) {
-			auto key = SqlUtils::QuoteIdentifier(row_keys[i]);
-			auto old_key = SqlUtils::QuoteIdentifier("openivm_old_key_" + to_string(i));
-			old_publication_keys += "openivm_old." + key + " AS " + old_key + ", ";
-			scope_projection.push_back("COALESCE(" + key + ", " + old_key + ") AS " + key);
+		for (idx_t i = 0; i < visible_columns.size(); i++) {
+			auto column = SqlUtils::QuoteIdentifier(visible_columns[i]);
+			auto old_column = SqlUtils::QuoteIdentifier("openivm_old_value_" + to_string(i));
+			old_publication_columns += "openivm_old." + column + " AS " + old_column + ", ";
+			old_projection.push_back(old_column + " AS " + column);
+			if (std::find(row_keys.begin(), row_keys.end(), visible_columns[i]) != row_keys.end()) {
+				scope_projection.push_back("COALESCE(" + column + ", " + old_column + ") AS " + column);
+			}
 		}
 		publication_scope->columns = row_keys;
 		publication_scope->rows =
 		    "(SELECT " + StringUtil::Join(scope_projection, ", ") + " FROM " + changed_table + ")";
+		publication_scope->signed_rows = "(SELECT " + StringUtil::Join(old_projection, ", ") + ", -1::INTEGER AS " +
+		                                 string(openivm::MULTIPLICITY_COL) + " FROM " + changed_table +
+		                                 " WHERE openivm_old_rowid IS NOT NULL UNION ALL SELECT " + insert_columns +
+		                                 ", 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + " FROM " +
+		                                 changed_table + " WHERE openivm_new_present)";
 		publication_scope->cleanup_sql = "DROP TABLE IF EXISTS " + changed_table + ";\n";
 	}
 	string old_partition_by = QualifiedColumns(row_keys, "openivm_target");
@@ -398,7 +407,7 @@ static string BuildDuckLakeWindowRowDiffRefreshSQL(const string &view_name, cons
 	       affected_table + " openivm_aff WHERE " + target_affected + ")\n), openivm_new AS (\n  SELECT " +
 	       new_columns + ", TRUE AS openivm_new_present,\n    ROW_NUMBER() OVER (PARTITION BY " + new_partition_by +
 	       ") AS openivm_match_id\n  FROM " + recompute_table + " openivm_recompute\n)\nSELECT " +
-	       "openivm_old.openivm_old_rowid, openivm_new.openivm_new_present, " + old_publication_keys +
+	       "openivm_old.openivm_old_rowid, openivm_new.openivm_new_present, " + old_publication_columns +
 	       changed_new_columns + "\nFROM openivm_old\nFULL OUTER JOIN openivm_new ON " + row_key_match +
 	       " AND openivm_old.openivm_match_id = openivm_new.openivm_match_id\nWHERE " +
 	       "openivm_old.openivm_old_rowid IS NULL OR openivm_new.openivm_new_present IS NULL OR " + distinct_rows +
