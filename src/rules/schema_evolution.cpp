@@ -22,7 +22,16 @@
 namespace duckdb {
 
 static bool NamesMatch(const string &left, const string &right) {
-	return StringUtil::CIEquals(SqlUtils::LastIdentifierPart(left), SqlUtils::LastIdentifierPart(right));
+	auto lparts = SqlUtils::ParseQualifiedIdentifier(left);
+	auto rparts = SqlUtils::ParseQualifiedIdentifier(right);
+	for (idx_t i = 0; i < MinValue(lparts.size(), rparts.size()); i++) {
+		const auto &l = lparts[lparts.size() - i - 1];
+		const auto &r = rparts[rparts.size() - i - 1];
+		if (!l.empty() && !r.empty() && !StringUtil::CIEquals(l, r)) {
+			return false;
+		}
+	}
+	return true;
 }
 
 struct DependentView {
@@ -34,12 +43,9 @@ struct DependentView {
 static vector<DependentView> GetDependentViews(Connection &con, const string &delta_name, const string &source_catalog,
                                                const string &source_schema) {
 	vector<DependentView> views;
-	auto result = con.Query("SELECT DISTINCT d.view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	                        " d WHERE d.table_name = '" + SqlUtils::EscapeValue(delta_name) +
-	                        "' AND COALESCE(d.source_catalog, '" + SqlUtils::EscapeValue(source_catalog) + "') = '" +
-	                        SqlUtils::EscapeValue(source_catalog) + "' AND COALESCE(d.source_schema, '" +
-	                        SqlUtils::EscapeValue(source_schema) + "') = '" + SqlUtils::EscapeValue(source_schema) +
-	                        "' ORDER BY 1");
+	auto result =
+	    con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
+	              RefreshMetadata::SourcePredicate(delta_name, source_catalog, source_schema) + " ORDER BY 1");
 	if (result->HasError()) {
 		return views;
 	}
@@ -84,7 +90,14 @@ static void AddLocalTableAliases(TableRef &ref, const string &table_name, unorde
 	}
 	auto &base = ref.Cast<BaseTableRef>();
 	AddAlias(all_aliases, base.table_name);
-	if (!NamesMatch(base.table_name, table_name)) {
+	auto source_name = SqlUtils::QuoteIdentifier(base.table_name);
+	if (!base.schema_name.empty()) {
+		source_name = SqlUtils::QuoteIdentifier(base.schema_name) + "." + source_name;
+	}
+	if (!base.catalog_name.empty()) {
+		source_name = SqlUtils::QuoteIdentifier(base.catalog_name) + "." + source_name;
+	}
+	if (!NamesMatch(source_name, table_name)) {
 		return;
 	}
 	AddAlias(target_aliases, base.table_name);
@@ -565,9 +578,10 @@ static bool AuxMetadataReferencesColumn(RefreshMetadata &metadata, const string 
 string FirstMVReferencingColumn(Connection &con, const string &delta_name, const string &source_catalog,
                                 const string &source_schema, const string &table_name, const string &col_name) {
 	RefreshMetadata metadata(con);
+	auto qualified_source = SqlUtils::FullName(source_catalog, source_schema, table_name);
 	for (auto &view : GetDependentViews(con, delta_name, source_catalog, source_schema)) {
-		if (RewriteStoredViewQuery(con, metadata, view.name, table_name, col_name, col_name, /*persist=*/false) ||
-		    AuxMetadataReferencesColumn(metadata, view.name, table_name, col_name)) {
+		if (RewriteStoredViewQuery(con, metadata, view.name, qualified_source, col_name, col_name, /*persist=*/false) ||
+		    AuxMetadataReferencesColumn(metadata, view.name, qualified_source, col_name)) {
 			return view.name;
 		}
 	}
@@ -578,17 +592,18 @@ void RewriteDependentViewMetadataForRename(Connection &con, const string &delta_
                                            const string &source_schema, const string &table_name,
                                            const string &old_name, const string &new_name) {
 	RefreshMetadata metadata(con);
+	auto qualified_source = SqlUtils::FullName(source_catalog, source_schema, table_name);
 	auto views = GetDependentViews(con, delta_name, source_catalog, source_schema);
 	bool tx_open = false;
 	try {
 		con.BeginTransaction();
 		tx_open = true;
 		for (auto &view : views) {
-			RewriteStoredViewQuery(con, metadata, view.name, table_name, old_name, new_name, /*persist=*/true);
-			RewriteDistinctAuxMeta(con, metadata, view.name, table_name, old_name, new_name);
-			RewriteFilteredGroupCountMeta(con, metadata, view.name, table_name, old_name, new_name);
-			RewriteSemiAntiAuxMeta(con, metadata, view.name, table_name, old_name, new_name);
-			RewriteLineageMeta(con, metadata, view.name, table_name, old_name, new_name);
+			RewriteStoredViewQuery(con, metadata, view.name, qualified_source, old_name, new_name, /*persist=*/true);
+			RewriteDistinctAuxMeta(con, metadata, view.name, qualified_source, old_name, new_name);
+			RewriteFilteredGroupCountMeta(con, metadata, view.name, qualified_source, old_name, new_name);
+			RewriteSemiAntiAuxMeta(con, metadata, view.name, qualified_source, old_name, new_name);
+			RewriteLineageMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteWindowGroupColumnSources(con, metadata, view.name, old_name, new_name);
 		}
 		con.Commit();

@@ -33,7 +33,14 @@ string BuildUpdateViewJsonSQL(const string &column_name, const string &json, con
 	       SqlUtils::EscapeSingleQuotes(json) + "' WHERE view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'";
 }
 
+string CreateMVDependenciesSQL() {
+	return "CREATE TABLE IF NOT EXISTS " + string(openivm::MV_DEPS_TABLE) +
+	       " (parent_view VARCHAR, child_view VARCHAR, edge_kind VARCHAR DEFAULT 'direct',"
+	       " PRIMARY KEY (parent_view, child_view))";
+}
+
 static void AppendMetadataSchemaDDL(vector<string> &ddl) {
+	ddl.push_back(CreateMVDependenciesSQL());
 	// Matcher metadata columns (signature_hash..nullified_columns_json) stay
 	// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
 	ddl.push_back("create table if not exists " + string(openivm::VIEWS_TABLE) +
@@ -178,8 +185,9 @@ static void InitializeSharedDDL(ClientContext &context, Connection &con, const s
 void InitializeMVMetadata(ClientContext &context, Connection &con) {
 	InitializeSharedDDL(context, con,
 	                    "SELECT v.view_sql_name, v.pending_after_hook, d.source_table_id, h.mode, "
-	                    "r.strategy, p.step_order FROM openivm_views v, openivm_delta_tables d, "
-	                    "openivm_refresh_hooks h, openivm_refresh_history r, openivm_refresh_profile p LIMIT 0",
+	                    "r.strategy, p.step_order, dep.edge_kind FROM openivm_views v, openivm_delta_tables d, "
+	                    "openivm_refresh_hooks h, openivm_refresh_history r, openivm_refresh_profile p, "
+	                    "openivm_mv_dependencies dep LIMIT 0",
 	                    AppendMetadataSchemaDDL);
 }
 

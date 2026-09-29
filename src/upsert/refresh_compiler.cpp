@@ -1552,7 +1552,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 			affected_subquery += "SELECT DISTINCT " + group_csv + " FROM " + delta_subselect + " openivm_source_keys";
 			// The key-locality proof allows restriction of every source occurrence,
 			// including below aggregates; do not rely on backend semi-join pushdown.
-			string source_full = (lpts_table_prefix.empty() ? catalog_prefix : lpts_table_prefix) + base;
+			const string &source_full = spec.source_sql;
 			string source_ref = SqlUtils::FindTableReference(view_query_sql, source_full);
 			if (source_ref.empty()) {
 				source_ref = SqlUtils::FindTableReference(view_query_sql, base);
@@ -1573,16 +1573,17 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		// Original-SQL recompute paths (e.g. ROLLUP/GROUPING SETS) can contain unqualified
 		// table names, so fall back to identifier-safe bare replacement when the exact LPTS
 		// form is absent.
-		string source_full = (lpts_table_prefix.empty() ? catalog_prefix : lpts_table_prefix) + base;
+		const string &source_full = spec.source_sql;
 		auto filtered_variants =
 		    SqlUtils::ReplaceEachPlainOccurrence(affected_view_query_sql, source_full, delta_subselect);
 		if (filtered_variants.empty()) {
-			filtered_variants = SqlUtils::ReplaceEachTableReference(affected_view_query_sql, base, delta_subselect);
+			filtered_variants =
+			    SqlUtils::ReplaceEachTableReference(affected_view_query_sql, source_full, delta_subselect);
 		}
 		if (filtered_variants.empty()) {
 			string filtered = SqlUtils::ReplaceAllOccurrences(affected_view_query_sql, source_full, delta_subselect);
 			if (filtered == affected_view_query_sql) {
-				filtered = SqlUtils::ReplaceTableReferences(affected_view_query_sql, base, delta_subselect);
+				filtered = SqlUtils::ReplaceTableReferences(affected_view_query_sql, source_full, delta_subselect);
 			}
 			filtered_variants.push_back(std::move(filtered));
 		}

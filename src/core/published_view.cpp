@@ -24,7 +24,8 @@ string PublishedSourceViewName(string source_name) {
 
 string BuildPublishViewSQL(const string &view_name, const string &prefix, const string &query,
                            const vector<string> &columns, bool ducklake, const string &metadata_table,
-                           const vector<string> &scope_columns, const string &timestamp_sql, SqlDialect dialect) {
+                           const vector<string> &scope_columns, const string &timestamp_sql, SqlDialect dialect,
+                           const vector<string> &metadata_catalogs) {
 	auto quote = [&](const string &name) {
 		return DialectQuoteIdent(name, dialect);
 	};
@@ -93,7 +94,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	       " d WHERE " + equality + ");\n";
 	sql += "DROP TABLE " + changes + ";\nDROP TABLE " + next + ";\n";
 	if (!ducklake) {
-		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table);
+		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, metadata_catalogs);
 	}
 	OPENIVM_DEBUG_PRINT("[PUBLISH] Compiled visible-row publication for %s\n", view_name.c_str());
 	return sql;

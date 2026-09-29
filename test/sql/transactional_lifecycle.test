@@ -1590,3 +1590,221 @@ query I
 SELECT count(*) FROM ((SELECT * FROM openivm_attachment_host.attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM openivm_attachment_host.attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM openivm_attachment_host.attached_src GROUP BY g EXCEPT ALL SELECT * FROM openivm_attachment_host.attached_mv));
 ----
 0
+
+# Qualified source keys survive quoted identifiers, rollback, and reopening.
+load __TEST_DIR__/qualified_source_lifecycle.db
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE SCHEMA "Source A";
+
+statement ok
+CREATE SCHEMA "Source.B";
+
+statement ok
+CREATE TABLE "Source A"."rows.with""quote"(id INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO "Source A"."rows.with""quote" VALUES (1,10),(2,20),(2,20),(3,30);
+
+statement ok
+CREATE TABLE "Source.B"."rows.with""quote"(id INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO "Source.B"."rows.with""quote" VALUES (1,10),(2,20),(2,20),(3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW "quoted""sources" AS SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id);
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE "Source A"."rows.with""quote" SET v=99 WHERE id=1;
+
+statement ok
+DELETE FROM "Source A"."rows.with""quote" WHERE id=2;
+
+statement ok
+INSERT INTO "Source A"."rows.with""quote" VALUES(4,44);
+
+statement ok
+PRAGMA refresh('"quoted""sources"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "quoted""sources" EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id) EXCEPT ALL SELECT * FROM "quoted""sources"));
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "quoted""sources" EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id) EXCEPT ALL SELECT * FROM "quoted""sources"));
+----
+0
+
+statement ok
+UPDATE "Source A"."rows.with""quote" SET v=v+1;
+
+statement ok
+DELETE FROM "Source.B"."rows.with""quote" WHERE id=3;
+
+statement ok
+INSERT INTO "Source.B"."rows.with""quote" VALUES(1,11),(2,22);
+
+restart
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+PRAGMA refresh('"quoted""sources"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "quoted""sources" EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id) EXCEPT ALL SELECT * FROM "quoted""sources"));
+----
+0
+
+statement ok
+ALTER TABLE "Source A"."rows.with""quote" ADD COLUMN unused INTEGER;
+
+statement ok
+ALTER TABLE "Source A"."rows.with""quote" DROP COLUMN unused;
+
+statement error
+ALTER TABLE "Source A"."rows.with""quote" DROP COLUMN v;
+----
+referenced by materialized view
+
+statement ok
+ALTER TABLE "Source A"."rows.with""quote" RENAME COLUMN v TO amount;
+
+statement ok
+UPDATE "Source A"."rows.with""quote" SET amount=amount+4;
+
+statement ok
+DELETE FROM "Source A"."rows.with""quote" WHERE id=2;
+
+statement ok
+INSERT INTO "Source A"."rows.with""quote" VALUES(2,222),(2,222);
+
+statement ok
+PRAGMA refresh('"quoted""sources"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "quoted""sources" EXCEPT ALL SELECT a.id, a.amount av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id)) UNION ALL (SELECT a.id, a.amount av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id) EXCEPT ALL SELECT * FROM "quoted""sources"));
+----
+0
+
+statement ok
+DROP TABLE "Source A"."rows.with""quote" CASCADE;
+
+query I
+SELECT count(*) FROM main.openivm_views WHERE view_sql_name='quoted"sources';
+----
+0
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/qualified_source_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE SCHEMA dl.a;
+
+statement ok
+CREATE TABLE dl.a.t(id INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.a.t VALUES(1,10),(2,20),(2,20);
+
+statement ok
+CREATE SCHEMA dl.b;
+
+statement ok
+CREATE TABLE dl.b.t(id INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.b.t VALUES(1,10),(2,20),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.reopened_sources AS SELECT a.id,a.v av,b.v bv FROM dl.a.t a JOIN dl.b.t b USING(id);
+
+statement ok
+UPDATE dl.a.t SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM dl.a.t WHERE id=2;
+
+statement ok
+INSERT INTO dl.a.t VALUES(2,22),(2,22);
+
+restart
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/qualified_source_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+PRAGMA refresh('dl.reopened_sources');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.reopened_sources EXCEPT ALL SELECT a.id,a.v av,b.v bv FROM dl.a.t a JOIN dl.b.t b USING(id)) UNION ALL (SELECT a.id,a.v av,b.v bv FROM dl.a.t a JOIN dl.b.t b USING(id) EXCEPT ALL SELECT * FROM dl.reopened_sources));
+----
+0
+
+statement ok
+UPDATE dl.b.t SET v=v+7;
+
+statement ok
+DELETE FROM dl.b.t WHERE id=1;
+
+statement ok
+INSERT INTO dl.b.t VALUES(1,100);
+
+statement ok
+PRAGMA refresh('dl.reopened_sources');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.reopened_sources EXCEPT ALL SELECT a.id,a.v av,b.v bv FROM dl.a.t a JOIN dl.b.t b USING(id)) UNION ALL (SELECT a.id,a.v av,b.v bv FROM dl.a.t a JOIN dl.b.t b USING(id) EXCEPT ALL SELECT * FROM dl.reopened_sources));
+----
+0
+
+# Unquoted Unicode identifiers and dollar signs remain valid in pragma arguments.
+statement ok
+CREATE TABLE données(id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO données VALUES (1,10),(1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW résumé$final AS SELECT id, SUM(v) total FROM données GROUP BY id;
+
+statement ok
+UPDATE données SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM données WHERE id=2;
+
+statement ok
+INSERT INTO données VALUES (2,30),(2,30);
+
+statement ok
+PRAGMA refresh('résumé$final');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM résumé$final EXCEPT ALL SELECT id,SUM(v) total FROM données GROUP BY id) UNION ALL (SELECT id,SUM(v) total FROM données GROUP BY id EXCEPT ALL SELECT * FROM résumé$final));
+----
+0

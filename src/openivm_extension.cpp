@@ -1,3 +1,4 @@
+#include "core/parser_create_mv_helpers.hpp"
 #define DUCKDB_EXTENSION_MAIN
 
 #include "core/openivm_extension.hpp"
@@ -328,10 +329,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " chosen_cost_est DOUBLE,"
 	          " actual_duration_ms BIGINT,"
 	          " PRIMARY KEY (query_hash, log_timestamp))");
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::MV_DEPS_TABLE) +
-	          " (parent_view VARCHAR, child_view VARCHAR,"
-	          " edge_kind VARCHAR DEFAULT 'direct',"
-	          " PRIMARY KEY (parent_view, child_view))");
+	con.Query(CreateMVDependenciesSQL());
 	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::CONSTRAINTS_CACHE_TABLE) +
 	          " (table_name VARCHAR, constraint_kind VARCHAR,"
 	          " columns_json VARCHAR, referenced_table VARCHAR,"

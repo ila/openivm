@@ -68,6 +68,7 @@ public:
 	static TransactionalMVLockState &Get(ClientContext &context);
 
 	void AcquireMutationLock();
+	void DeferDeltaCleanup(vector<string> statements);
 	void SetMutationOwner(const void *owner_token);
 	const void *GetMutationOwner();
 
@@ -81,6 +82,7 @@ private:
 	unique_ptr<MutationLockGuard> mutation_guard;
 	ClientContext &owner;
 	const void *mutation_owner;
+	vector<string> deferred_delta_cleanup;
 };
 
 } // namespace duckdb

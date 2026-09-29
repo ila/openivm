@@ -356,7 +356,12 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 		auto &table = *table_ref.get();
 		string table_name = table.name;
 		if (!table_name.empty() && !SqlUtils::IsDelta(table_name)) {
-			facts.source_table_info[table_name] = {table_name, table.ParentCatalog().GetName(), table.schema.name};
+			auto key = SqlUtils::FullName(table.ParentCatalog().GetName(), table.schema.name, table_name);
+			if (facts.source_table_info
+			        .emplace(key, SourceTableInfo {table_name, table.ParentCatalog().GetName(), table.schema.name})
+			        .second) {
+				facts.source_name_counts[table_name]++;
+			}
 		}
 		string table_lc = StringUtil::Lower(table_name);
 		ProjectionSourceOccurrence source;
@@ -370,7 +375,6 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 		return;
 	}
 	auto &info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
-	string lc = StringUtil::Lower(info.table_name);
 	string cat = info.table.ParentCatalog().GetName();
 	if (cat.empty()) {
 		if (current_catalog.empty()) {
@@ -378,24 +382,12 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 		}
 		cat = current_catalog;
 	}
-	auto existing = facts.ducklake_table_info.find(lc);
-	if (existing != facts.ducklake_table_info.end()) {
-		if (!StringUtil::CIEquals(existing->second.catalog_name, cat) ||
-		    !StringUtil::CIEquals(existing->second.schema_name, info.table.schema.name) ||
-		    existing->second.table_id != static_cast<int64_t>(info.table_id.index)) {
-			throw NotImplementedException(
-			    "DuckLake materialized views cannot reference different source tables with the same unqualified "
-			    "name '%s'; rename one source before creating the materialized view",
-			    info.table_name);
-		}
-		return;
-	}
 	DuckLakeSourceTableInfo source_info;
 	source_info.table_name = info.table_name;
 	source_info.catalog_name = cat;
 	source_info.schema_name = info.table.schema.name;
 	source_info.table_id = static_cast<int64_t>(info.table_id.index);
-	facts.ducklake_table_info[lc] = source_info;
+	facts.ducklake_table_info[SqlUtils::FullName(cat, info.table.schema.name, info.table_name)] = source_info;
 }
 
 static string NullableGetTableName(LogicalGet &get);
@@ -1233,7 +1225,7 @@ static bool ResolveBindingToBaseRef(ColumnBinding binding, const CreateMVPlanFac
 	if (!ResolveBindingToGetColumn(binding, facts, get, out.column) || !get->GetTable().get()) {
 		return false;
 	}
-	out.table = get->GetTable().get()->name;
+	out.table = facts.occurrence_by_index.at(get->table_index).table;
 	return true;
 }
 
@@ -1431,6 +1423,16 @@ CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &cu
 	unordered_map<string, idx_t> next_occurrence;
 	CollectCreateMVPlanFacts(plan, current_catalog, facts, next_occurrence, false, false,
 	                         facts.has_top_level_redundant_distinct ? top : nullptr, facts.analysis);
+	next_occurrence.clear();
+	for (auto &source : facts.source_occurrences) {
+		if (facts.source_name_counts[source.table] <= 1) {
+			continue;
+		}
+		auto table = facts.gets_by_index.at(source.table_index)->GetTable();
+		source.table = SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, table->name);
+		source.occurrence = next_occurrence[source.table]++;
+		facts.occurrence_by_index[source.table_index] = source;
+	}
 	FinalizeCreateMVPlanFacts(facts);
 	AddJoinEdgesFromFacts(facts);
 	return facts;
@@ -2159,6 +2161,15 @@ string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
 			auto it = facts.first_table_name.find(join->children[1].get());
 			right_table = it == facts.first_table_name.end() ? string() : it->second;
 		}
+		BaseColumnRef left_source, right_source;
+		auto left_ref = GetColumnRefThroughCasts(condition.left.get());
+		auto right_ref = GetColumnRefThroughCasts(condition.right.get());
+		if (left_ref && ResolveBindingToBaseRef(left_ref->binding, facts, left_source)) {
+			left_table = left_source.table;
+		}
+		if (right_ref && ResolveBindingToBaseRef(right_ref->binding, facts, right_source)) {
+			right_table = right_source.table;
+		}
 		if (!left_col_name.empty() && !right_col_name.empty() && !left_table.empty() && !right_table.empty()) {
 			return left_table + ":" + left_col_name + "," + right_table + ":" + right_col_name;
 		}
@@ -2471,7 +2482,8 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	}
 	idx_t inner_tidx = inner_get->table_index;
 	string inner_table = inner_get->GetTable().get()->name;
-	auto sti = facts.source_table_info.find(inner_table);
+	auto sti = facts.source_table_info.find(SqlUtils::FullName(inner_get->GetTable()->ParentCatalog().GetName(),
+	                                                           inner_get->GetTable()->schema.name, inner_table));
 	if (sti == facts.source_table_info.end()) {
 		return "";
 	}
@@ -2506,7 +2518,8 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		// shape.
 		return "";
 	}
-	auto pres_sti = facts.source_table_info.find(pres_table);
+	auto pres_sti = facts.source_table_info.find(SqlUtils::FullName(pres_get->GetTable()->ParentCatalog().GetName(),
+	                                                                pres_get->GetTable()->schema.name, pres_table));
 	if (pres_sti == facts.source_table_info.end()) {
 		return "";
 	}

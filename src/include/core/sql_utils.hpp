@@ -30,6 +30,7 @@ public:
 	static string SQLStatementPreview(const string &statement);
 	static string DeltaName(const string &name);
 	static string LastIdentifierPart(string name);
+	static vector<string> ParseQualifiedIdentifier(const string &name);
 	static string FullName(const string &catalog, const string &schema, const string &table);
 	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
 	static string QualifiedPrefix(const string &catalog, const string &schema);

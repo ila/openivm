@@ -51,6 +51,12 @@ PRAGMA refresh('dl.observation.product_summary');
 PRAGMA openivm_files('dl.observation.product_summary');
 ```
 
+Source tables also retain their catalog and schema identity. One MV can join
+`dl.observation.products` with `dl.reference.products`, including repeated uses
+of either source in a self-join. DuckLake sources in different attached catalogs
+use independent snapshot watermarks. Qualify source names in the view definition
+when the names would otherwise be ambiguous.
+
 New views receive an internal key derived from their catalog, schema, and name.
 Key allocation does not wait for other views to register their names. Existing
 views retain their stored keys. First-time setup of the shared metadata and native
@@ -87,6 +93,13 @@ before refreshing. Starting the CLI without a filename uses an in-memory fronten
 its OpenIVM metadata will not survive closing the process. There is currently no
 setting to relocate OpenIVM control tables into an `openivm` schema. Do not move
 those tables manually.
+
+For native sources in another attached DuckDB database, refresh commits the MV
+and its watermark together, then cleans up external source deltas. Rollback
+cancels that cleanup. Cleanup retains changes needed by other consumers, including
+MVs whose metadata lives in another native catalog. If cleanup encounters a
+conflict, OpenIVM reports that the refresh committed and cleanup was deferred;
+the committed watermark prevents those retained changes from being applied twice.
 
 ### Empty delta tables
 
@@ -197,4 +210,3 @@ DuckLake-backed views support the same operator families as standard DuckDB tabl
 
 - **No FK constraints.** DuckLake does not support `FOREIGN KEY` constraints, so the [FK-aware pruning](optimizations/fk-aware-pruning.md) optimization is not available. The [empty-delta term skipping](#empty-delta-term-skipping) optimization covers the most common case (unchanged dimension tables).
 - **No ART indexes.** DuckLake tables don't support ART index creation. For `AGGREGATE_GROUP` views, group column identification falls back to metadata instead of the index catalog.
-- **Single DuckLake catalog.** All base tables in a DuckLake-backed materialized view must be in the same DuckLake catalog.

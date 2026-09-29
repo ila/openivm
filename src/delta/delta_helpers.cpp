@@ -4,6 +4,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/plan_rewrite_internal.hpp"
 #include "core/sql_utils.hpp"
+#include "core/refresh_metadata.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/connection.hpp"
@@ -20,8 +21,23 @@
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "storage/ducklake_scan.hpp"
+#include "storage/ducklake_table_entry.hpp"
 
 namespace duckdb {
+
+void PopulateDuckLakeChangeScanParameters(LogicalGet &get) {
+	if (get.function.name != "ducklake_scan" || !get.function.function_info) {
+		return;
+	}
+	auto &info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
+	if (info.scan_type != DuckLakeScanType::SCAN_INSERTIONS && info.scan_type != DuckLakeScanType::SCAN_DELETIONS) {
+		return;
+	}
+	D_ASSERT(info.start_snapshot);
+	get.parameters = {Value(info.table.ParentCatalog().GetName()), Value(info.table.schema.name),
+	                  Value(info.table_name), Value::BIGINT(static_cast<int64_t>(info.start_snapshot->snapshot_id)),
+	                  Value::BIGINT(static_cast<int64_t>(info.snapshot.snapshot_id))};
+}
 
 static bool CompactDeltasEnabled(ClientContext &context) {
 	Value compact_val;
@@ -137,9 +153,9 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 	OPENIVM_DEBUG_PRINT("[DuckLake] Creating delta node for '%s.%s'\n", catalog_name.c_str(), table_name.c_str());
 
 	// Reuse the compiler metadata connection, including its transaction-local snapshot.
-	auto snap_result =
-	    con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+	auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) +
+	                             " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND " +
+	                             RefreshMetadata::SourcePredicate(table_name, catalog_name, schema_name));
 	if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
 		throw Exception(ExceptionType::CATALOG,
 		                "IVM: no snapshot ID recorded for DuckLake table '" + table_name + "' in view '" + view_name +
@@ -214,8 +230,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 		}
 
 		// Set parameters so LPTS can reconstruct the ducklake_table_insertions/deletions SQL.
-		get->parameters = {Value(catalog_name), Value(schema_name), Value(table_name), Value::BIGINT(start_snap),
-		                   Value::BIGINT(cur_snap)};
+		PopulateDuckLakeChangeScanParameters(*get);
 
 		get->ResolveOperatorTypes();
 		return get;
@@ -360,9 +375,10 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 	}
 
 	// Timestamp filter
-	auto timestamp_query = "select last_update from " + string(openivm::DELTA_TABLES_TABLE) + " where view_name = '" +
-	                       SqlUtils::EscapeValue(view_name) + "' and table_name = '" +
-	                       SqlUtils::EscapeValue(table_name) + "';";
+	auto timestamp_query =
+	    "select last_update from " + string(openivm::DELTA_TABLES_TABLE) + " where view_name = '" +
+	    SqlUtils::EscapeValue(view_name) + "' and " +
+	    RefreshMetadata::SourcePredicate(table_name, table_entry.ParentCatalog().GetName(), table_entry.schema.name);
 	auto r = con.Query(timestamp_query);
 	if (r->HasError()) {
 		throw Exception(ExceptionType::EXECUTOR, "IVM: failed to read last_update for view '" + view_name +

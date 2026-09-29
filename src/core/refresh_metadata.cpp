@@ -269,6 +269,37 @@ string RefreshMetadata::GetLastUpdate(const string &view_name, const string &tab
 	return result->GetValue(0, 0).ToString();
 }
 
+vector<string> RefreshMetadata::MetadataCatalogs(Connection &con) {
+	auto rows = con.Query("SELECT DISTINCT database_name FROM duckdb_tables() WHERE schema_name='main' "
+	                      "AND table_name='openivm_delta_tables' AND NOT temporary ORDER BY database_name");
+	if (rows->HasError()) {
+		throw CatalogException("OpenIVM could not locate source metadata: %s", rows->GetError());
+	}
+	vector<string> catalogs;
+	for (idx_t row = 0; row < rows->RowCount(); row++) {
+		catalogs.push_back(rows->GetValue(0, row).ToString());
+	}
+	return catalogs;
+}
+
+string RefreshMetadata::SourceTableName(const string &key, const string &catalog, const string &schema) {
+	if (!StringUtil::StartsWith(key, SqlUtils::QualifiedPrefix(catalog, schema))) {
+		return key;
+	}
+	return SqlUtils::ParseQualifiedIdentifier(key).back();
+}
+
+string RefreshMetadata::SourcePredicate(const string &table, const string &catalog, const string &schema) {
+	auto name = SourceTableName(table, catalog, schema);
+	return "table_name IN ('" + SqlUtils::EscapeValue(name) + "', '" +
+	       SqlUtils::EscapeValue(SqlUtils::FullName(catalog, schema, name)) +
+	       "') AND "
+	       "COALESCE(source_catalog, '" +
+	       SqlUtils::EscapeValue(catalog) + "') = '" + SqlUtils::EscapeValue(catalog) +
+	       "' AND COALESCE(source_schema, '" + SqlUtils::EscapeValue(schema) + "') = '" +
+	       SqlUtils::EscapeValue(schema) + "'";
+}
+
 RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string &view_name, const string &table_name,
                                                                    const string &fallback_catalog,
                                                                    const string &fallback_schema) {
@@ -287,6 +318,7 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 			loc.schema_name = result->GetValue(1, 0).ToString();
 		}
 	}
+	loc.table_name = SourceTableName(table_name, loc.catalog_name, loc.schema_name);
 	return loc;
 }
 
@@ -358,12 +390,12 @@ string RefreshMetadata::ResolveDeltaQualifiedName(const string &view_name, const
                                                   const string &fallback_catalog, const string &fallback_schema) {
 	auto loc = GetSourceLocation(view_name, delta_table_name, fallback_catalog, fallback_schema);
 	if (loc.catalog_name.empty()) {
-		return SqlUtils::QuoteIdentifier(delta_table_name);
+		return SqlUtils::QuoteIdentifier(loc.table_name);
 	}
 	if (loc.schema_name.empty()) {
 		loc.schema_name = "main";
 	}
-	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, delta_table_name);
+	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, loc.table_name);
 }
 
 RefreshMetadata::DeltaChangeStats RefreshMetadata::GetStandardDeltaChangeStats(const string &delta_table_sql,
@@ -718,13 +750,35 @@ void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_prog
 }
 
 string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
-                                             const string &delta_metadata_table) {
+                                             const string &delta_metadata_table, vector<string> *deferred_cleanup,
+                                             const vector<string> &metadata_catalogs) {
 	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 	auto consumers = "SELECT last_update FROM " + metadata_table + " WHERE table_name = '" +
 	                 SqlUtils::EscapeValue(metadata_key) + "'";
-	return "DELETE FROM " + qtarget + " WHERE NOT EXISTS (" + consumers + ") OR " + string(openivm::TIMESTAMP_COL) +
-	       " < (SELECT MIN(last_update) FROM (" + consumers + ") consumers);\n";
+	auto parts = SqlUtils::ParseQualifiedIdentifier(qtarget);
+	if (parts.size() == 3) {
+		auto predicate = SourcePredicate(parts[2], parts[0], parts[1]);
+		consumers = "SELECT last_update FROM " + metadata_table + " WHERE " + predicate;
+		for (auto &catalog : metadata_catalogs) {
+			auto other = SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE);
+			if (!StringUtil::CIEquals(other, metadata_table)) {
+				consumers += " UNION ALL SELECT last_update FROM " + other + " WHERE " + predicate;
+			}
+		}
+	}
+	auto sql = "DELETE FROM " + qtarget + " WHERE NOT EXISTS (" + consumers + ") OR " + string(openivm::TIMESTAMP_COL) +
+	           " < (SELECT MIN(last_update) FROM (" + consumers + ") consumers);\n";
+	if (deferred_cleanup && parts.size() == 3) {
+		auto metadata_parts = SqlUtils::ParseQualifiedIdentifier(metadata_table);
+		if (metadata_parts.size() == 3 && !StringUtil::CIEquals(parts[0], metadata_parts[0])) {
+			// Only housekeeping crosses the native write boundary. MV state and its
+			// watermark commit together; cleanup reads the committed consumer minimum.
+			deferred_cleanup->push_back(std::move(sql));
+			return "";
+		}
+	}
+	return sql;
 }
 
 // --- DuckLake support ---
@@ -781,7 +835,7 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	DuckLakeSourceIdentity identity;
 	auto result =
 	    con.Query("SELECT source_table_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+	              SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name));
 	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
 		identity.stored_table_id = result->GetValue(0, 0).GetValue<int64_t>();
 	}
@@ -791,13 +845,13 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 
 	string catalog_prefix = SqlUtils::QuoteIdentifier("__ducklake_metadata_" + catalog_name) + ".";
 	string schema_filter = schema_name.empty() ? "main" : schema_name;
-	auto current_result =
-	    con.Query("SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
-	              "ducklake_schema s ON t.schema_id = s.schema_id WHERE "
-	              "t.end_snapshot IS NULL AND "
-	              "s.end_snapshot IS NULL AND t.table_name = '" +
-	              SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" + SqlUtils::EscapeValue(schema_filter) +
-	              "' ORDER BY t.table_id DESC LIMIT 1");
+	auto current_result = con.Query(
+	    "SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
+	    "ducklake_schema s ON t.schema_id = s.schema_id WHERE "
+	    "t.end_snapshot IS NULL AND "
+	    "s.end_snapshot IS NULL AND t.table_name = '" +
+	    SqlUtils::EscapeValue(SourceTableName(table_name, catalog_name, schema_name)) + "' AND s.schema_name = '" +
+	    SqlUtils::EscapeValue(schema_filter) + "' ORDER BY t.table_id DESC LIMIT 1");
 	if (current_result->HasError() || current_result->RowCount() == 0 || current_result->GetValue(0, 0).IsNull()) {
 		return identity;
 	}
@@ -811,7 +865,7 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	auto update =
 	    con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
 	              " SET source_table_id = " + to_string(identity.current_table_id) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+	              SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name));
 	if (update->HasError()) {
 		OPENIVM_DEBUG_PRINT("[DuckLake] Could not backfill source_table_id for %s.%s: %s\n", view_name.c_str(),
 		                    table_name.c_str(), update->GetError().c_str());

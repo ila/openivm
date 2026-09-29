@@ -1049,3 +1049,74 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# A conflicting external garbage collection must not fail an already-committed refresh.
+statement ok
+ATTACH ':memory:' AS source_gc;
+
+statement ok
+CREATE TABLE source_gc.gc_source(id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO source_gc.gc_source VALUES(1,10),(2,20),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW gc_mv AS SELECT id,SUM(v) total FROM source_gc.gc_source GROUP BY id;
+
+statement ok
+UPDATE source_gc.gc_source SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM source_gc.gc_source WHERE id=2;
+
+statement ok
+INSERT INTO source_gc.gc_source VALUES(2,22),(2,22);
+
+statement ok
+CREATE TABLE gc_pending AS SELECT * FROM source_gc.openivm_delta_gc_source;
+
+statement ok gc_blocker
+BEGIN;
+
+# This internal delta-table write holds a DuckDB row conflict without taking the IVM mutation gate.
+statement ok gc_blocker
+DELETE FROM source_gc.openivm_delta_gc_source;
+
+statement ok
+PRAGMA refresh('gc_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM gc_mv EXCEPT ALL SELECT id,SUM(v) total FROM source_gc.gc_source GROUP BY id) UNION ALL (SELECT id,SUM(v) total FROM source_gc.gc_source GROUP BY id EXCEPT ALL SELECT * FROM gc_mv));
+----
+0
+
+statement ok gc_blocker
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_gc.openivm_delta_gc_source EXCEPT ALL SELECT * FROM gc_pending) UNION ALL (SELECT * FROM gc_pending EXCEPT ALL SELECT * FROM source_gc.openivm_delta_gc_source));
+----
+0
+
+# A later batch must exclude retained, already-applied rows and retry cleanup.
+statement ok
+UPDATE source_gc.gc_source SET v=v+7;
+
+statement ok
+DELETE FROM source_gc.gc_source WHERE id=1;
+
+statement ok
+INSERT INTO source_gc.gc_source VALUES(1,77),(1,77);
+
+statement ok
+PRAGMA refresh('gc_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM gc_mv EXCEPT ALL SELECT id,SUM(v) total FROM source_gc.gc_source GROUP BY id) UNION ALL (SELECT id,SUM(v) total FROM source_gc.gc_source GROUP BY id EXCEPT ALL SELECT * FROM gc_mv));
+----
+0
+
+query I
+SELECT count(*) FROM source_gc.openivm_delta_gc_source;
+----
+0

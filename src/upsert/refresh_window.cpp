@@ -16,10 +16,12 @@ static std::pair<string, string> SplitPartitionSpec(const string &raw) {
 	return std::make_pair(raw.substr(0, pos), raw.substr(pos + 1));
 }
 
-static bool DeltaHasColumn(Connection &con, const string &delta_table, const string &column_name) {
-	auto col_result =
-	    con.Query("SELECT 1 FROM information_schema.columns WHERE table_name = '" + SqlUtils::EscapeValue(delta_table) +
-	              "' AND lower(column_name) = lower('" + SqlUtils::EscapeValue(column_name) + "') LIMIT 1");
+static bool DeltaHasColumn(Connection &con, const RefreshMetadata::SourceLocation &source, const string &column_name) {
+	auto col_result = con.Query("SELECT 1 FROM information_schema.columns WHERE table_name = '" +
+	                            SqlUtils::EscapeValue(source.table_name) + "' AND table_catalog = '" +
+	                            SqlUtils::EscapeValue(source.catalog_name) + "' AND table_schema = '" +
+	                            SqlUtils::EscapeValue(source.schema_name) + "' AND lower(column_name) = lower('" +
+	                            SqlUtils::EscapeValue(column_name) + "') LIMIT 1");
 	return !col_result->HasError() && col_result->RowCount() > 0;
 }
 
@@ -35,9 +37,8 @@ static vector<WindowPartitionDeltaSpec> BuildWindowPartitionDeltaSpecs(RefreshMe
 			if (metadata.IsDuckLakeTable(view_name, dt)) {
 				continue;
 			}
-			if (DeltaHasColumn(con, dt, parsed.second)) {
-				string delta_table_sql =
-				    cross_system ? metadata.ResolveDeltaQualifiedName(view_name, dt) : SqlUtils::QuoteIdentifier(dt);
+			if (DeltaHasColumn(con, metadata.GetSourceLocation(view_name, dt), parsed.second)) {
+				string delta_table_sql = metadata.ResolveDeltaQualifiedName(view_name, dt);
 				partition_delta_specs.push_back({dt, delta_table_sql, parsed.first, parsed.second});
 			}
 		}

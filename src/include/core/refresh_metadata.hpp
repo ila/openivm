@@ -62,6 +62,11 @@ public:
 	// Get the last_update timestamp for a specific delta table entry.
 	string GetLastUpdate(const string &view_name, const string &table_name);
 
+	// Accept both legacy short keys and qualified keys for sources with colliding names.
+	static vector<string> MetadataCatalogs(Connection &con);
+	static string SourceTableName(const string &key, const string &catalog, const string &schema);
+	static string SourcePredicate(const string &table, const string &catalog, const string &schema);
+
 	struct SourceLocation {
 		string catalog_name;
 		string schema_name;
@@ -135,7 +140,9 @@ public:
 	// target: the (possibly schema-qualified) table to delete from.
 	// metadata_key: the name used in openivm_delta_tables (unqualified delta name).
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
-	                                   const string &delta_metadata_table = "");
+	                                   const string &delta_metadata_table = "",
+	                                   vector<string> *deferred_cleanup = nullptr,
+	                                   const vector<string> &metadata_catalogs = {});
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);

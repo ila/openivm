@@ -1,5 +1,7 @@
 #include "core/refresh_locks.hpp"
 #include "core/openivm_debug.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/common/printer.hpp"
 
 #include <cstdio>
 
@@ -73,7 +75,39 @@ void TransactionalMVLockState::SetMutationOwner(const void *owner_token) {
 	mutation_owner = owner_token;
 }
 
+void TransactionalMVLockState::DeferDeltaCleanup(vector<string> statements) {
+	lock_guard<mutex> guard(state_lock);
+	for (auto &statement : statements) {
+		if (std::find(deferred_delta_cleanup.begin(), deferred_delta_cleanup.end(), statement) ==
+		    deferred_delta_cleanup.end()) {
+			deferred_delta_cleanup.push_back(std::move(statement));
+		}
+	}
+}
+
 void TransactionalMVLockState::TransactionCommit(MetaTransaction &transaction, ClientContext &context) {
+	vector<string> cleanup;
+	{
+		lock_guard<mutex> guard(state_lock);
+		cleanup.swap(deferred_delta_cleanup);
+	}
+	if (!cleanup.empty()) {
+		// The caller is already committed. Housekeeping failures must never report
+		// a failed commit or roll back a successfully refreshed MV. Retained deltas
+		// are excluded by the committed watermark and retried on a later refresh.
+		try {
+			Connection con(*context.db);
+			Get(*con.context).SetMutationOwner(GetMutationOwner());
+			for (auto &sql : cleanup) {
+				auto result = con.Query(sql);
+				if (result->HasError()) {
+					Printer::Print("OpenIVM refresh committed; external delta cleanup deferred: " + result->GetError());
+				}
+			}
+		} catch (const std::exception &ex) {
+			Printer::Print(string("OpenIVM refresh committed; external delta cleanup deferred: ") + ex.what());
+		}
+	}
 	Release();
 }
 
@@ -84,6 +118,7 @@ void TransactionalMVLockState::TransactionRollback(MetaTransaction &transaction,
 void TransactionalMVLockState::Release() {
 	lock_guard<mutex> guard(state_lock);
 	OPENIVM_DEBUG_PRINT("[LOCK] release database mutation lock owner=%p\n", static_cast<void *>(&owner));
+	deferred_delta_cleanup.clear();
 	mutation_guard.reset();
 }
 

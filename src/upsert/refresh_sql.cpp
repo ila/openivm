@@ -21,7 +21,6 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -134,7 +133,8 @@ ApplyGroupRecomputeSourceOccurrences(vector<GroupRecomputeDeltaSpec> &delta_spec
                                      const vector<RefreshMetadata::GroupRecomputeSourceOccurrence> &occurrences) {
 	for (auto &spec : delta_specs) {
 		for (auto &occurrence : occurrences) {
-			if (StringUtil::CIEquals(spec.base_table, occurrence.table_name)) {
+			if (StringUtil::CIEquals(spec.source_sql, occurrence.table_name) ||
+			    StringUtil::CIEquals(spec.base_table, occurrence.table_name)) {
 				spec.source_occurrences = occurrence.count == 0 ? 1 : occurrence.count;
 				break;
 			}
@@ -153,11 +153,12 @@ static string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &v
 	candidates.push_back(IncrementalTableNames::DataTableName(SqlUtils::LastIdentifierPart(table_name)));
 	candidates.push_back(SqlUtils::DeltaName(table_name));
 	candidates.push_back(SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name)));
-	auto parts = QualifiedName::ParseComponents(table_name);
+	auto parts = SqlUtils::ParseQualifiedIdentifier(table_name);
 	for (auto &dt : delta_table_names) {
+		auto loc = metadata.GetSourceLocation(view_name, dt);
 		bool matches = false;
 		for (const auto &candidate : candidates) {
-			matches = matches || StringUtil::CIEquals(dt, candidate);
+			matches = matches || StringUtil::CIEquals(loc.table_name, candidate);
 		}
 		if (!matches) {
 			// Auxiliary definitions retain public SQL names; chained sources store
@@ -168,7 +169,6 @@ static string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &v
 			continue;
 		}
 		if (parts.size() > 1) {
-			auto loc = metadata.GetSourceLocation(view_name, dt);
 			if (parts.size() == 3 && (!StringUtil::CIEquals(loc.catalog_name, parts[0]) ||
 			                          !StringUtil::CIEquals(loc.schema_name, parts[1]))) {
 				continue;
@@ -408,7 +408,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           RefreshCompileProfile *compile_profile, const DeltaActivityResult *precomputed_delta_activity,
                           RefreshCostEstimate *out_adaptive_estimate, const openivm::CompileFacts *facts_in,
                           Connection *metadata_connection, ProjectionDeleteRetryPlan *delete_retry_plan,
-                          bool write_query_file) {
+                          bool write_query_file, vector<string> *deferred_cleanup) {
 	if (delete_retry_plan) {
 		*delete_retry_plan = {};
 	}
@@ -485,6 +485,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string internal_catalog_prefix = catalog_prefix;
 	auto metadata_start = profile_now();
 	RefreshMetadata metadata(con);
+	auto metadata_catalogs =
+	    active_facts.target_dialect == SqlDialect::DUCKDB ? RefreshMetadata::MetadataCatalogs(con) : vector<string>();
 	bool target_is_ducklake = metadata.IsDuckLakeCatalog(view_catalog_name);
 	if (!target_is_ducklake && cross_system && !default_db.empty() && default_db != "memory" &&
 	    view_catalog_name != default_db) {
@@ -571,9 +573,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                     DialectQuoteIdent(internal_schema_name, SqlDialect::SPARK) + ".";
 			}
 		}
-		publication_sql =
-		    BuildPublishViewSQL(view_name, publication_prefix, publication_source_query, publication_columns,
-		                        target_is_ducklake, delta_metadata_table, {}, "", active_facts.target_dialect);
+		publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
+		                                      publication_columns, target_is_ducklake, delta_metadata_table, {}, "",
+		                                      active_facts.target_dialect, metadata_catalogs);
 	}
 	auto finalize_refresh_sql = [&](string refresh_sql, bool publish = true) {
 		if (publish) {
@@ -601,7 +603,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			}
 			auto recovery_query =
 			    BuildRecomputeQuery(metadata, view_name, recovery_source_sql, cross_system, attached_db_catalog_name,
-			                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta);
+			                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta,
+			                        deferred_cleanup, metadata_catalogs);
 			if (cross_system) {
 				metadata.SetRefreshInProgress(view_name, false);
 			} else {
@@ -659,7 +662,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				continue;
 			}
 			const char *shape = !source.has_changes ? "UNCHANGED" : (source.has_deletes ? "MIXED" : "INSERT_ONLY");
-			inner_facts_slot_facts->delta_shape[source.source_table_name] = shape;
+			inner_facts_slot_facts
+			    ->delta_shape[SqlUtils::FullName(source.catalog_name, source.schema_name, source.source_table_name)] =
+			    shape;
 		}
 	}
 
@@ -707,9 +712,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			recompute_source_sql = RenderStoredViewQueryForDialect(con, view_query_sql, vector<string>(),
 			                                                       active_facts.target_dialect, view_time_travel_pins);
 		}
-		auto recompute_query =
-		    BuildRecomputeQuery(metadata, view_name, recompute_source_sql, cross_system, attached_db_catalog_name,
-		                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta);
+		auto recompute_query = BuildRecomputeQuery(
+		    metadata, view_name, recompute_source_sql, cross_system, attached_db_catalog_name, attached_db_schema_name,
+		    internal_catalog_prefix, metadata_prefix, out_post_meta, deferred_cleanup, metadata_catalogs);
 		add_profile_step("generate_refresh_sql.dispatch", full_refresh_start,
 		                 "full_recompute=true; metadata_requires_full_refresh=" +
 		                     string(metadata_requires_full_refresh ? "true" : "false") +
@@ -1687,8 +1692,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			    BuildCompactDeltaViewSQL(view_name, delta_view_name, column_names, delta_ts_filter);
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n", compact_delta_view_query.c_str());
 		}
-		delete_from_view_query =
-		    RefreshMetadata::BuildDeltaCleanupSQL(delta_view_name, delta_view_name_bare, delta_metadata_table);
+		delete_from_view_query = RefreshMetadata::BuildDeltaCleanupSQL(
+		    delta_view_name, delta_view_name_bare, delta_metadata_table, nullptr, metadata_catalogs);
 	} else {
 		delete_from_view_query = inline_mv_delta          ? ""
 		                         : use_transient_mv_delta ? "DROP TABLE IF EXISTS " + transient_delta_name + ";"
@@ -1725,8 +1730,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (schema_name.empty()) {
 			schema_name = DEFAULT_SCHEMA;
 		}
-		string resolved =
-		    catalog_name.empty() ? SqlUtils::QuoteIdentifier(dt) : SqlUtils::FullName(catalog_name, schema_name, dt);
+		string physical_name = RefreshMetadata::SourceTableName(dt, source.catalog_name, source.schema_name);
+		string resolved = catalog_name.empty() ? SqlUtils::QuoteIdentifier(physical_name)
+		                                       : SqlUtils::FullName(catalog_name, schema_name, physical_name);
 		update_timestamp_query += "UPDATE " + delta_metadata_table +
 		                          " SET last_update = COALESCE("
 		                          "(SELECT MAX(" +
@@ -1736,7 +1742,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                          SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 		                          SqlUtils::EscapeValue(dt) + "';\n";
 		if (!cross_system) {
-			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt, delta_metadata_table);
+			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt, delta_metadata_table,
+			                                                                       deferred_cleanup, metadata_catalogs);
 		}
 	}
 	string set_in_progress = "UPDATE " + views_metadata_table + " SET refresh_in_progress = true WHERE view_name = '" +
@@ -1782,7 +1789,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
 		                                      publication_columns, target_is_ducklake, delta_metadata_table,
-		                                      scope_columns, "", active_facts.target_dialect);
+		                                      scope_columns, "", active_facts.target_dialect, metadata_catalogs);
 	}
 	string data_sql = transient_delta_preamble + pre_companion + delta_query + "\n" + companion_query + "\n" +
 	                  upsert_query + "\n" + post_companion + publication_sql + compact_delta_view_query +

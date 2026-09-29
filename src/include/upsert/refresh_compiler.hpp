@@ -14,6 +14,7 @@ namespace duckdb {
 
 struct GroupRecomputeDeltaSpec {
 	string base_table;
+	string source_sql;
 	string delta_table_sql;
 	string last_update;
 	idx_t source_occurrences = 1;

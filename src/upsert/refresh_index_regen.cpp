@@ -1,5 +1,6 @@
 #include "upsert/refresh_index_regen.hpp"
 #include "core/openivm_debug.hpp"
+#include "delta/delta_helpers.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -95,6 +96,9 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 	}
 	case LogicalOperatorType::LOGICAL_GET: {
 		unique_ptr<LogicalGet> get_ptr = unique_ptr_cast<LogicalOperator, LogicalGet>(std::move(plan));
+		// Copy serializes DuckLake's bound scan but drops its SQL parameter cache.
+		// Restore it from the bound snapshot while already visiting copied scans.
+		PopulateDuckLakeChangeScanParameters(*get_ptr);
 		const idx_t current_idx = get_ptr->table_index;
 		const idx_t new_idx = binder.GenerateTableIndex();
 		get_ptr->table_index = new_idx;

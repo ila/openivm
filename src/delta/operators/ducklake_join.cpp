@@ -275,8 +275,9 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 	vector<string> table_schemas(N);
 	vector<string> table_names(N);
 	unordered_map<string, int64_t> stored_snapshots;
-	auto snapshot_result = con.Query("SELECT table_name, last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	                                 " WHERE view_name = '" + SqlUtils::EscapeValue(input.context.view) + "'");
+	auto snapshot_result = con.Query("SELECT table_name, last_snapshot_id, source_catalog, source_schema FROM " +
+	                                 string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	                                 SqlUtils::EscapeValue(input.context.view) + "'");
 	if (snapshot_result->HasError()) {
 		throw Exception(ExceptionType::CATALOG, "IVM: could not read DuckLake snapshot metadata for view '" +
 		                                            input.context.view + "': " + snapshot_result->GetError());
@@ -285,7 +286,10 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		if (snapshot_result->GetValue(0, row).IsNull() || snapshot_result->GetValue(1, row).IsNull()) {
 			continue;
 		}
-		stored_snapshots[StringUtil::Lower(snapshot_result->GetValue(0, row).ToString())] =
+		auto catalog = snapshot_result->GetValue(2, row).ToString();
+		auto schema = snapshot_result->GetValue(3, row).ToString();
+		auto name = RefreshMetadata::SourceTableName(snapshot_result->GetValue(0, row).ToString(), catalog, schema);
+		stored_snapshots[StringUtil::Lower(SqlUtils::FullName(catalog, schema, name))] =
 		    snapshot_result->GetValue(1, row).GetValue<int64_t>();
 	}
 	for (size_t i = 0; i < N; i++) {
@@ -296,7 +300,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		table_catalogs[i] = table_ref->ParentCatalog().GetName();
 		table_schemas[i] = table_ref->schema.name;
 		table_names[i] = table_name;
-		auto stored_snapshot = stored_snapshots.find(StringUtil::Lower(table_name));
+		auto stored_snapshot = stored_snapshots.find(
+		    StringUtil::Lower(SqlUtils::FullName(table_catalogs[i], table_schemas[i], table_name)));
 		if (stored_snapshot == stored_snapshots.end()) {
 			throw Exception(ExceptionType::CATALOG, "IVM: no snapshot ID recorded for DuckLake table '" + table_name +
 			                                            "' in view '" + input.context.view + "'");
@@ -322,7 +327,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		// Compile facts are an optimization cache; skipping this scan falls back to authoritative metadata probes.
 		for (size_t i = 0; i < N; i++) { // mull-ignore: cxx_lt_to_ge
 			for (auto &entry : compile_facts.delta_shape) {
-				if (!StringUtil::CIEquals(SqlUtils::LastIdentifierPart(entry.first), table_names[i])) {
+				if (!StringUtil::CIEquals(entry.first,
+				                          SqlUtils::FullName(table_catalogs[i], table_schemas[i], table_names[i]))) {
 					continue;
 				}
 				if (StringUtil::CIEquals(entry.second, "UNCHANGED")) {

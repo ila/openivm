@@ -179,7 +179,8 @@ string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_na
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
                            bool cross_system, const string &attached_catalog = "", const string &attached_schema = "",
                            const string &catalog_prefix = "", const string &metadata_prefix = "",
-                           string *out_post_meta = nullptr);
+                           string *out_post_meta = nullptr, vector<string> *deferred_cleanup = nullptr,
+                           const vector<string> &metadata_catalogs = {});
 
 string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const string &view_name,
                                           const vector<string> &delta_table_names, const vector<string> &group_cols,
@@ -272,7 +273,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           const DeltaActivityResult *precomputed_delta_activity = nullptr,
                           RefreshCostEstimate *out_adaptive_estimate = nullptr,
                           const openivm::CompileFacts *facts = nullptr, Connection *metadata_connection = nullptr,
-                          ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, bool write_query_file = true);
+                          ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, bool write_query_file = true,
+                          vector<string> *deferred_cleanup = nullptr);
 
 } // namespace duckdb
 

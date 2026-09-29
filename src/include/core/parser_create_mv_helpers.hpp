@@ -5,6 +5,7 @@
 
 namespace duckdb {
 
+string CreateMVDependenciesSQL();
 void InitializeMVMetadata(ClientContext &context, Connection &con);
 void InitializeSourceDelta(ClientContext &context, Connection &con, const string &delta_table, const string &ddl);
 string SqlCsvLiteralOrNull(const vector<string> &values);

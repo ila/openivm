@@ -361,3 +361,30 @@ conflict semantics. The existing refresh/mutation locks are unchanged.
 
 Permanent DuckLake MV delta tables remain in place. Compiled filenames now contain
 the internal key; use `PRAGMA openivm_files('catalog.schema.view')` to discover them.
+
+### Same-named source tables and cross-catalog lifecycle follow-up (2026-09-29)
+
+A single MV could previously conflate native sources such as `a.items` and
+`b.items`; DuckLake rejected that shape. Source identity now includes catalog and
+schema through creation, delta compilation, affected-key lineage, refresh,
+rename, and drop. Repeated scans of one physical source retain separate occurrence
+identities. DuckLake snapshots are recorded independently per catalog.
+
+The expanded tests also cover quoted and Unicode identifiers, conflicting DML
+batches, duplicate and NULL rows, inner/self/outer/semi/anti joins, aggregates,
+replacement, reopen, and transaction rollback. Copying a DuckLake delta plan now
+restores its SQL scan arguments from the bound snapshot during the existing index
+renumbering traversal.
+
+Native cross-catalog refresh defers external delta cleanup until commit. A
+forced cleanup conflict verifies that the MV remains correct and the next batch
+does not replay retained changes. Cleanup and source lifecycle operations account
+for consumers in other native metadata catalogs; column-rename rollback restores
+metadata to its original catalog. Cross-catalog cascade drops use staged DDL.
+
+Validation: the full SQL suite passed 13,316 assertions across 89 test cases,
+with one ICU-dependent test skipped. Compiled N-term SQL integration and real
+CLI checks passed, including mixed-case ALTER, Unicode and dollar-sign names,
+cross-catalog rename/rollback/drop, and DuckLake self-joins. Existing native
+delta-retention assertions remain unchanged; external cleanup is tested after
+commit, including a deterministic write conflict and subsequent retry.

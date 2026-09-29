@@ -22,8 +22,7 @@ static bool AllSourcesAreDuckLake(const CreateMVPlanFacts &facts) {
 		return false;
 	}
 	for (auto &entry : facts.source_table_info) {
-		if (facts.ducklake_table_info.find(StringUtil::Lower(entry.second.table_name)) ==
-		    facts.ducklake_table_info.end()) {
+		if (facts.ducklake_table_info.find(entry.first) == facts.ducklake_table_info.end()) {
 			return false;
 		}
 	}

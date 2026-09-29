@@ -159,6 +159,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// For cross_system (DuckLake) MVs, split the refresh SQL into data ops (dl catalog)
 		// and metadata ops (physical-default catalog) to avoid the cross-catalog write error.
 		string meta_pre_sql, meta_post_sql;
+		vector<string> deferred_cleanup;
 		RefreshCompileProfile compile_profile;
 		ProjectionDeleteRetryPlan delete_retry_plan;
 		auto generate_start = std::chrono::steady_clock::now();
@@ -167,7 +168,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		                       attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr,
 		                       cross_system ? &meta_post_sql : nullptr, profiler.Enabled() ? &compile_profile : nullptr,
 		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr,
-		                       /*facts=*/nullptr, /*metadata_connection=*/nullptr, &delete_retry_plan);
+		                       /*facts=*/nullptr, /*metadata_connection=*/nullptr, &delete_retry_plan,
+		                       /*write_query_file=*/true, cross_system ? nullptr : &deferred_cleanup);
 		string fallback_sql;
 		if (delete_retry_plan.IsActive()) {
 			// Compile the ranked rowid program before setting refresh_in_progress. It is only
@@ -221,6 +223,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		if (!cross_system || delete_retry_plan.IsActive()) {
 			exec_con.BeginTransaction();
 			tx_open = true;
+			TransactionalMVLockState::Get(*exec_con.context).DeferDeltaCleanup(std::move(deferred_cleanup));
 		}
 		auto start = std::chrono::steady_clock::now();
 		unique_ptr<MaterializedQueryResult> result;
@@ -758,9 +761,12 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	auto facts = openivm::CompileFacts::Default();
 	facts.compile_only = true;
 	ScopedDisabledOptimizers disabled_optimizers(context, openivm::TEMPLATE_DATA_DEPENDENT_OPTIMIZERS);
-	auto program = GenerateRefreshSQL(context, view_catalog_name, view_schema_name, view_name, false,
-	                                  attached_db_catalog_name, attached_db_schema_name, nullptr, nullptr, nullptr,
-	                                  &conservative_activity, nullptr, &facts, &metadata_con);
+	vector<string> deferred_cleanup;
+	auto program =
+	    GenerateRefreshSQL(context, view_catalog_name, view_schema_name, view_name, false, attached_db_catalog_name,
+	                       attached_db_schema_name, nullptr, nullptr, nullptr, &conservative_activity, nullptr, &facts,
+	                       &metadata_con, nullptr, true, &deferred_cleanup);
+	TransactionalMVLockState::Get(context).DeferDeltaCleanup(std::move(deferred_cleanup));
 	// DEFAULT now() is transaction-stable. Stamp this invocation's emitted MV deltas
 	// explicitly, and use the same boundary for its metadata, so subsequent refreshes
 	// can distinguish them from deltas retained for other consumers.
