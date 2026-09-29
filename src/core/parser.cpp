@@ -1350,6 +1350,12 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// TABLE AS so those unqualified names resolve in the MV's catalog.
 	add_profile_marker("create_mv_initial_load", "sources=" + to_string(table_names.size()) +
 	                                                 "; generated_query_bytes=" + to_string(view_query.size()));
+	const bool batch_ducklake_creation = target_is_ducklake && !parse_data_ref.is_replace;
+	if (batch_ducklake_creation) {
+		// Keep the initial data and publication in one DuckLake commit. Native
+		// metadata remains outside this transaction, as required across catalogs.
+		ddl.push_back("BEGIN TRANSACTION");
+	}
 	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 		ddl.push_back("use " + current_catalog_schema);
 	}
@@ -1478,6 +1484,10 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		              (top_k_order_suffix.empty() ? "" : " ORDER BY " + string(openivm::PUBLISHED_ORDINAL_COL)));
 		add_cleanup("DROP TABLE IF EXISTS " + published);
 		add_cleanup("DROP TABLE IF EXISTS " + published_delta);
+	}
+	if (batch_ducklake_creation) {
+		add_profile_marker("create_mv_physical_commit");
+		ddl.push_back("COMMIT");
 	}
 
 	vector<string> native_watermark_ddl;

@@ -393,6 +393,9 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	}
 	vector<string> cleanup_ddl;
 	auto run_cleanup = [&]() {
+		if (!conn->context->transaction.IsAutoCommit()) {
+			conn->Rollback();
+		}
 		for (const auto &cleanup : cleanup_ddl) {
 			OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Cleanup DDL: %s\n", cleanup.c_str());
 			auto cleanup_result = conn->Query(cleanup);
