@@ -708,6 +708,41 @@ WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265
 ----
 1
 
+# Fail after source metadata is written, while publishing the view row. The
+# native metadata transaction and the committed DuckLake objects must both
+# be cleaned up, without removing metadata belonging to an existing view.
+statement ok
+CREATE UNIQUE INDEX profile_metadata_failure ON openivm_views(view_name, view_sql_name);
+
+statement error
+CREATE MATERIALIZED VIEW dl.profile_metadata_retry AS SELECT id,name FROM dl.customers;
+----
+Conflict target has to be provided
+
+query II
+SELECT (SELECT count(*) FROM openivm_views WHERE view_sql_name='profile_metadata_retry'),
+       (SELECT count(*) FROM openivm_delta_tables WHERE view_name='__openivm_mv_646c_6d61696e_70726f66696c655f6d657461646174615f7265747279_');
+----
+0	0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='dl' AND contains(table_name, '__openivm_mv_646c_6d61696e_70726f66696c655f6d657461646174615f7265747279_');
+----
+0
+
+statement ok
+DROP INDEX profile_metadata_failure;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.profile_metadata_retry AS SELECT id,name FROM dl.customers;
+
+query III
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_metadata_retry EXCEPT ALL SELECT id,name FROM dl.customers)),
+       (SELECT count(*) FROM (SELECT id,name FROM dl.customers EXCEPT ALL SELECT * FROM dl.profile_metadata_retry)),
+       (SELECT count(*) FROM openivm_views WHERE view_sql_name='profile_ddl_probe');
+----
+0	0	1
+
 # An up-to-date metadata schema must not run ALTER migrations again.
 query I
 SELECT count(*) FROM openivm_refresh_profile
