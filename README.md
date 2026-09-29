@@ -103,7 +103,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `openivm_distinct_aux_state` | BOOLEAN | `false` | Use aux-state maintenance for supported inner-DISTINCT-under-aggregate shapes | [Distinct](docs/operators/distinct.md) |
 | `openivm_regular_nterm` | BOOLEAN | `true` | Use N-term telescoping for eligible regular-table inner joins compiled for external engines | [Inner join](docs/operators/inner-join.md#regular-table-n-term-compilation) |
 | `openivm_profile_refresh` | BOOLEAN | `false` | Record per-step refresh timings in `openivm_refresh_profile` | [Automatic refresh](docs/refresh/automatic-refresh.md) |
-| `openivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files | [Internals](docs/internals/delta-tables.md) |
+| `openivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files | [SQL export](docs/build/building.md#inspect-the-generated-sql) |
 | `openivm_input_dialect` | VARCHAR | `duckdb` | Dialect of incoming `CREATE MATERIALIZED VIEW` bodies (e.g. `spark` for `VERSION AS OF`) | [Parser](docs/internals/parser.md#input-dialect) |
 
 
@@ -111,11 +111,41 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 
 | Pragma | Description |
 |--------|-------------|
-| `PRAGMA refresh('view_name')` | Refresh a materialized view |
+| `PRAGMA refresh('view_name')` | Refresh a materialized view; accepts `schema.view` or `catalog.schema.view` |
+| `PRAGMA refresh_pipeline('view_a', 'view_b')` | Refresh selected views and dependencies once, in dependency order; see [pipelines](docs/refresh/pipelines.md#refresh-a-selected-pipeline) |
+| `PRAGMA openivm_files('view_name')` | Show absolute compiled SQL paths, file existence, status, and working directory; see [SQL export](docs/build/building.md#inspect-the-generated-sql) |
 | `PRAGMA refresh_cost('view_name')` | Show incremental refresh vs full recompute cost estimate (static + calibrated) |
 | `PRAGMA refresh_history('view_name')` | Show refresh execution history (for learned cost model) |
 | `PRAGMA refresh_options(catalog, schema, view_name)` | Refresh with explicit catalog/schema |
 | `PRAGMA refresh_status('view_name')` | Show refresh interval, last/next refresh, and status |
+
+## Schemas, metadata, and compiled SQL
+
+- **Can schemas contain same-named views or source tables?** Yes. Use
+  `PRAGMA refresh('dl.observation.product_summary')` to identify a view explicitly.
+  A short name works when it identifies one MV; ambiguous names produce an error.
+- **Where are internal tables stored?** For DuckLake views, control metadata stays
+  in the native frontend database's `main` schema. MV backing and internal delta
+  tables live in the MV's schema; native source deltas live with their source.
+- **Why are DuckLake delta tables empty?** DuckLake source changes come from
+  snapshots. Internal MV delta tables are still created for lifecycle handling
+  and can be empty. Leave them in place.
+- **Can metadata stay outside DuckLake?** It already does. Start the built CLI with
+  `./build/release/duckdb openivm_frontend.duckdb`, then attach your lake. Reopen
+  that frontend and reattach the same lake under the same name in later sessions.
+  A configurable metadata schema such as `openivm` is not implemented; use `main`.
+- **Where is the generated SQL?** File export is opt-in. Create an output directory
+  and set `openivm_files_path` before CREATE or refresh. Then call
+  `PRAGMA openivm_files('dl.observation.product_summary')` to inspect exact paths.
+  This pragma reports files; it does not generate them.
+- **Can compiled SQL be stored in a table?** Yes: select from
+  `openivm_compile_with_facts` into your own table. Automatic archival in OpenIVM
+  metadata is not implemented. Compiled SQL contains state-specific cutoffs;
+  compile again for later refreshes.
+
+See [schema and metadata examples](docs/ducklake.md#schemas-metadata-and-internal-tables),
+[exporting and inspecting SQL files](docs/build/building.md#inspect-the-generated-sql),
+and [saving compiled SQL as rows](docs/build/building.md#inspect-or-save-compiled-sql-without-files).
 
 ## Documentation
 

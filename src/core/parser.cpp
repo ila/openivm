@@ -1638,7 +1638,8 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 	}
 
 	// Only arm cleanup after system setup and the duplicate-name guard have succeeded.
-	ddl.insert(ddl.begin() + system_ddl_end, cleanup_ddl.begin(), cleanup_ddl.end());
+	ddl.insert(ddl.begin() + static_cast<vector<string>::difference_type>(system_ddl_end), cleanup_ddl.begin(),
+	           cleanup_ddl.end());
 
 	if (!target_is_ducklake &&
 	    (default_db != DatabaseManager::GetDefaultDatabase(context) || default_schema != current_schema)) {
