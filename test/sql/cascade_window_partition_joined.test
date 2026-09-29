@@ -62,7 +62,7 @@ SELECT CASE WHEN
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_cwj_mv%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM openivm_delta_cwj_mv%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cwj_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%WHERE EXISTS (SELECT 1 FROM openivm_delta_cwj_mv d WHERE%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%SEMI JOIN openivm_delta_cwj_mv d ON%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'cwj_mv',
