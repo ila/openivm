@@ -10,6 +10,7 @@ from pathlib import Path
 
 with tempfile.TemporaryDirectory(prefix="openivm-scheduler-") as directory:
     catalog = str(Path(directory) / "lake.sqlite")
+    Path(catalog + ".files").mkdir()
     with subprocess.Popen(
         [str(Path(sys.argv[1]).resolve()), catalog],
         stdin=subprocess.PIPE,

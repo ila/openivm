@@ -55,6 +55,12 @@ struct JoinColumnRef {
 	string last_update;
 };
 
+static string JoinSourceSQL(const JoinColumnRef &ref, bool delta) {
+	auto table = ref.get->GetTable();
+	return SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name,
+	                          delta ? ref.delta_name : ref.table_name);
+}
+
 static string QualifyColumn(const string &alias, const string &column_name) {
 	return alias + "." + SqlUtils::QuoteIdentifier(column_name);
 }
@@ -86,10 +92,10 @@ static bool DeltaKeyHasBaseMatch(Connection &con, const JoinColumnRef &delta_ref
 	string delta_filter = delta_ref.get ? BuildPushedFilterSQL(*delta_ref.get, "openivm_delta") : string();
 	string other_filter = other_ref.get ? BuildPushedFilterSQL(*other_ref.get, "openivm_other") : string();
 	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("openivm_delta", delta_column) +
-	             " AS openivm_key FROM " + SqlUtils::QuoteIdentifier(delta_ref.delta_name) + " openivm_delta WHERE " +
+	             " AS openivm_key FROM " + JoinSourceSQL(delta_ref, true) + " openivm_delta WHERE " +
 	             QualifyColumn("openivm_delta", openivm::TIMESTAMP_COL) + " >= '" +
 	             SqlUtils::EscapeValue(delta_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(delta_filter) +
-	             ") openivm_delta_keys JOIN " + SqlUtils::QuoteIdentifier(other_ref.table_name) +
+	             ") openivm_delta_keys JOIN " + JoinSourceSQL(other_ref, false) +
 	             " openivm_other ON openivm_delta_keys.openivm_key = " + QualifyColumn("openivm_other", other_column) +
 	             (other_filter.empty() ? string() : " WHERE " + other_filter) + " LIMIT 1)";
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Key probe SQL: %s\n", sql.c_str());
@@ -107,14 +113,13 @@ static bool DeltaKeyHasDeltaMatch(Connection &con, const JoinColumnRef &left_ref
 	string left_filter = left_ref.get ? BuildPushedFilterSQL(*left_ref.get, "openivm_left_delta") : string();
 	string right_filter = right_ref.get ? BuildPushedFilterSQL(*right_ref.get, "openivm_right_delta") : string();
 	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("openivm_left_delta", left_column) +
-	             " AS openivm_key FROM " + SqlUtils::QuoteIdentifier(left_ref.delta_name) +
-	             " openivm_left_delta WHERE " + QualifyColumn("openivm_left_delta", openivm::TIMESTAMP_COL) + " >= '" +
+	             " AS openivm_key FROM " + JoinSourceSQL(left_ref, true) + " openivm_left_delta WHERE " +
+	             QualifyColumn("openivm_left_delta", openivm::TIMESTAMP_COL) + " >= '" +
 	             SqlUtils::EscapeValue(left_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(left_filter) +
 	             ") openivm_left_delta_keys JOIN (SELECT " + QualifyColumn("openivm_right_delta", right_column) +
-	             " AS openivm_key FROM " + SqlUtils::QuoteIdentifier(right_ref.delta_name) +
-	             " openivm_right_delta WHERE " + QualifyColumn("openivm_right_delta", openivm::TIMESTAMP_COL) +
-	             " >= '" + SqlUtils::EscapeValue(right_ref.last_update) + "'::TIMESTAMP" +
-	             AppendFilterSQL(right_filter) +
+	             " AS openivm_key FROM " + JoinSourceSQL(right_ref, true) + " openivm_right_delta WHERE " +
+	             QualifyColumn("openivm_right_delta", openivm::TIMESTAMP_COL) + " >= '" +
+	             SqlUtils::EscapeValue(right_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(right_filter) +
 	             ") openivm_right_delta_keys ON openivm_left_delta_keys.openivm_key = "
 	             "openivm_right_delta_keys.openivm_key LIMIT 1)";
 	auto result = con.Query(sql);
@@ -1103,9 +1108,10 @@ static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, c
 		}
 		string delta_name = SqlUtils::DeltaName(table_ref.get()->name);
 		// Get last_update timestamp for this view+table pair
-		auto ts_result = con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
-		                           " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
-		                           SqlUtils::EscapeValue(delta_name) + "'");
+		auto ts_result = con.Query(
+		    "SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+		    SqlUtils::EscapeValue(view_name) + "' AND " +
+		    RefreshMetadata::SourcePredicate(delta_name, table_ref->ParentCatalog().GetName(), table_ref->schema.name));
 		if (ts_result->HasError() || ts_result->RowCount() == 0) {
 			continue;
 		}
@@ -1115,18 +1121,19 @@ static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, c
 		// cardinality. The base count lets us define "tiny" as <= max(8 rows,
 		// 5% of the source table), avoiding both a hard-coded absolute-only
 		// threshold and silly behavior on very small tables.
-		auto result =
-		    con.Query("SELECT "
-		              "(SELECT COUNT(*) FROM " +
-		              SqlUtils::QuoteIdentifier(delta_name) + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
-		              SqlUtils::EscapeValue(last_update) +
-		              "'::TIMESTAMP), "
-		              "(SELECT COUNT(*) FROM " +
-		              SqlUtils::QuoteIdentifier(delta_name) + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
-		              SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP AND " + string(openivm::MULTIPLICITY_COL) +
-		              " < 0), "
-		              "(SELECT COUNT(*) FROM " +
-		              SqlUtils::QuoteIdentifier(table_ref.get()->name) + ")");
+		auto result = con.Query(
+		    "SELECT "
+		    "(SELECT COUNT(*) FROM " +
+		    SqlUtils::FullName(table_ref->ParentCatalog().GetName(), table_ref->schema.name, delta_name) + " WHERE " +
+		    string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) +
+		    "'::TIMESTAMP), "
+		    "(SELECT COUNT(*) FROM " +
+		    SqlUtils::FullName(table_ref->ParentCatalog().GetName(), table_ref->schema.name, delta_name) + " WHERE " +
+		    string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP AND " +
+		    string(openivm::MULTIPLICITY_COL) +
+		    " < 0), "
+		    "(SELECT COUNT(*) FROM " +
+		    SqlUtils::FullName(table_ref->ParentCatalog().GetName(), table_ref->schema.name, table_ref->name) + ")");
 		if (result->HasError()) {
 			continue;
 		}
@@ -1434,6 +1441,13 @@ static uint64_t ComputeSkipBits(const vector<FKRelation> &fk_relations, uint64_t
 	return skip_bits;
 }
 
+static bool SourceFactMatches(const string &fact, TableCatalogEntry &table) {
+	auto parts = SqlUtils::ParseQualifiedIdentifier(fact);
+	return parts.size() <= 3 && StringUtil::CIEquals(parts.back(), table.name) &&
+	       (parts.size() < 2 || StringUtil::CIEquals(parts[parts.size() - 2], table.schema.name)) &&
+	       (parts.size() < 3 || StringUtil::CIEquals(parts[0], table.ParentCatalog().GetName()));
+}
+
 static bool DeltaShapeIsInsertOnlyForPruning(const string &shape) {
 	return StringUtil::CIEquals(shape, "INSERT_ONLY") || StringUtil::CIEquals(shape, "UNCHANGED");
 }
@@ -1445,13 +1459,12 @@ static uint64_t ComputeFactsInsertOnlyMask(const openivm::CompileFacts &facts, c
 		if (!get || get->GetTable().get() == nullptr) {
 			continue;
 		}
-		auto table_name = get->GetTable().get()->name;
 		if (facts.assume_insert_only) {
 			mask |= (1ULL << i);
 			continue;
 		}
 		for (auto &entry : facts.delta_shape) {
-			if (TableNameMatches(entry.first, table_name) && DeltaShapeIsInsertOnlyForPruning(entry.second)) {
+			if (SourceFactMatches(entry.first, *get->GetTable()) && DeltaShapeIsInsertOnlyForPruning(entry.second)) {
 				mask |= (1ULL << i);
 				break;
 			}
@@ -1475,7 +1488,7 @@ static uint64_t ComputeFactsUnchangedMask(const openivm::CompileFacts &facts, co
 				}
 				bool table_unchanged = false;
 				for (auto &entry : facts.delta_shape) {
-					if (TableNameMatches(entry.first, get.GetTable().get()->name) &&
+					if (SourceFactMatches(entry.first, *get.GetTable()) &&
 					    StringUtil::CIEquals(entry.second, "UNCHANGED")) {
 						table_unchanged = true;
 						break;
@@ -1606,9 +1619,11 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 			}
 			string table_name = table_ref.get()->name;
 			string delta_name = SqlUtils::DeltaName(table_name);
-			auto ts_result = key_probe_con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
-			                                     " WHERE view_name = '" + SqlUtils::EscapeValue(input.context.view) +
-			                                     "' AND table_name = '" + SqlUtils::EscapeValue(delta_name) + "'");
+			auto ts_result =
+			    key_probe_con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
+			                        " WHERE view_name = '" + SqlUtils::EscapeValue(input.context.view) + "' AND " +
+			                        RefreshMetadata::SourcePredicate(delta_name, table_ref->ParentCatalog().GetName(),
+			                                                         table_ref->schema.name));
 			if (ts_result->HasError() || ts_result->RowCount() == 0 || ts_result->GetValue(0, 0).IsNull()) {
 				continue;
 			}

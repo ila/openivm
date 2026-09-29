@@ -42,7 +42,7 @@ PRAGMA refresh('wrab_max_mv');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT * FROM openivm_data_wrab_sum_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261625f73756d5f6d76_
     EXCEPT ALL
     SELECT id, k, d, x, SUM(x) OVER (PARTITION BY k ORDER BY d) AS running_sum FROM wrab_sales
 );
@@ -53,14 +53,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT id, k, d, x, SUM(x) OVER (PARTITION BY k ORDER BY d) AS running_sum FROM wrab_sales
     EXCEPT ALL
-    SELECT * FROM openivm_data_wrab_sum_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261625f73756d5f6d76_
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT * FROM openivm_data_wrab_max_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261625f6d61785f6d76_
     EXCEPT ALL
     SELECT id, k, d, x, MAX(x) OVER (PARTITION BY k ORDER BY d) AS running_max FROM wrab_sales
 );
@@ -71,7 +71,7 @@ query I
 SELECT COUNT(*) FROM (
     SELECT id, k, d, x, MAX(x) OVER (PARTITION BY k ORDER BY d) AS running_max FROM wrab_sales
     EXCEPT ALL
-    SELECT * FROM openivm_data_wrab_max_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261625f6d61785f6d76_
 );
 ----
 0

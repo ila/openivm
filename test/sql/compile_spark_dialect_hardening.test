@@ -178,11 +178,11 @@ SET openivm_refresh_mode = 'full';
 
 query I
 SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%TEMP TABLE%'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_sph_full_mv%'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%SELECT `from`, `val`, -1 FROM openivm_data_sph_full_mv%'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%SELECT `from`, `val`, 1 FROM openivm_data_sph_full_mv%'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM openivm_data_sph_full_mv%'
-             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_data_sph_full_mv%`sph_full_src`%AS `from`%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7370685f66756c6c5f6d76_%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%SELECT `from`, `val`, -1 FROM memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_7370685f66756c6c5f6d76_%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%SELECT `from`, `val`, 1 FROM memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_7370685f66756c6c5f6d76_%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_7370685f66756c6c5f6d76_%'
+             AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_7370685f66756c6c5f6d76_%`sph_full_src`%AS `from`%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%"from"%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
@@ -269,7 +269,7 @@ query I
 SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%::%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`%'
              AND string_agg(sql, ' ' ORDER BY stmt_order)
-                  LIKE '%INSERT INTO openivm_delta_sph_arcm_mv (id, cust_key, openivm_multiplicity)%'
+                  LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7370685f6172636d5f6d76_ (id, cust_key, openivm_multiplicity)%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'sph_arcm_mv',
@@ -322,7 +322,7 @@ LIMIT 1;
 query I
 SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%::%'
              AND string_agg(sql, ' ' ORDER BY stmt_order)
-                  LIKE '%INSERT INTO openivm_delta_sph_inti_mv (id, k, openivm_left_key, openivm_multiplicity)%'
+                  LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7370685f696e74695f6d76_ (id, k, openivm_left_key, openivm_multiplicity)%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
@@ -442,7 +442,7 @@ LIMIT 1;
 query I
 SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%::%'
              AND string_agg(sql, ' ' ORDER BY stmt_order)
-                  LIKE '%INSERT INTO openivm_delta_sph_ms_mv (event_time, machine_arm_id, customer_key, openivm_left_key, openivm_multiplicity)%'
+                  LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7370685f6d735f6d76_ (event_time, machine_arm_id, customer_key, openivm_left_key, openivm_multiplicity)%'
              AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%UNION ALL%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(

@@ -90,16 +90,77 @@ void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
 	OPENIVM_DEBUG_PRINT("[METADATA] Snapshotted caller transaction in %s\n", catalog.c_str());
 }
 
-string RefreshMetadata::ResolveViewName(const string &view_name) {
-	auto result = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE lower(view_name) = lower('" + SqlUtils::EscapeValue(view_name) + "')");
-	if (result->HasError() || result->RowCount() == 0) {
-		return view_name;
+string RefreshMetadata::GetViewSQLName(const string &view_key) {
+	auto name = ReadViewString(view_key, "view_sql_name");
+	return name.empty() ? view_key : name;
+}
+
+string RefreshMetadata::FindViewKey(const string &catalog, const string &schema, const string &name) {
+	auto query = [&](const string &name_expression) {
+		return con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE lower(" + name_expression +
+		                 ") = lower(" + Value(name).ToSQLString() + ") AND lower(COALESCE(view_catalog, " +
+		                 Value(catalog).ToSQLString() + ")) = lower(" + Value(catalog).ToSQLString() +
+		                 ") AND lower(COALESCE(view_schema, 'main')) = lower(" + Value(schema).ToSQLString() + ")");
+	};
+	auto result = query("COALESCE(view_sql_name, view_name)");
+	if (result->HasError()) {
+		result = query("view_name"); // Metadata written before SQL names were stored separately.
+	}
+	if (result->HasError() || !result->RowCount()) {
+		return "";
 	}
 	if (result->RowCount() != 1) {
-		throw CatalogException("Ambiguous materialized view name '%s'", view_name);
+		throw CatalogException("Ambiguous materialized view '%s'", SqlUtils::FullName(catalog, schema, name));
 	}
 	return result->GetValue(0, 0).ToString();
+}
+
+string RefreshMetadata::AllocateViewKey(const string &catalog, const string &schema, const string &name) {
+	auto existing = FindViewKey(catalog, schema, name);
+	if (!existing.empty()) {
+		return existing;
+	}
+	// Allocation must not depend on other CREATEs having committed their metadata.
+	// Encode all identifier bytes, including separators, to avoid schema/name collisions.
+	string key = "__openivm_mv_";
+	const char *hex = "0123456789abcdef";
+	for (auto &part : {catalog, schema, name}) {
+		for (unsigned char c : StringUtil::Lower(part)) {
+			key += hex[c >> 4];
+			key += hex[c & 15];
+		}
+		key += '_';
+	}
+	return key;
+}
+
+string RefreshMetadata::ResolveViewName(const string &view_name, const string &catalog, const string &schema) {
+	// Public names resolve by location; internal graph edges already contain storage keys.
+	auto exact = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
+	                       " WHERE view_name = " + Value(view_name).ToSQLString());
+	if (exact->HasError()) {
+		return view_name;
+	}
+	if (!catalog.empty() && !schema.empty()) {
+		auto preferred = FindViewKey(catalog, schema, view_name);
+		if (!preferred.empty()) {
+			return preferred;
+		}
+	}
+	auto matches =
+	    con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
+	              " WHERE lower(COALESCE(view_sql_name, view_name)) = lower(" + Value(view_name).ToSQLString() + ")");
+	if (matches->HasError()) {
+		matches = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
+		                    " WHERE lower(view_name) = lower(" + Value(view_name).ToSQLString() + ")");
+	}
+	if (!matches->HasError() && matches->RowCount() > 1) {
+		throw CatalogException("Ambiguous materialized view '%s'; use catalog.schema.view", view_name);
+	}
+	if (!matches->HasError() && matches->RowCount() == 1) {
+		return matches->GetValue(0, 0).ToString();
+	}
+	return exact->RowCount() == 1 ? exact->GetValue(0, 0).ToString() : view_name;
 }
 
 bool RefreshMetadata::IsBaseTable(const string &table_name) {
@@ -141,7 +202,10 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 			throw ParserException("Could not read IVM metadata for materialized view '%s'%s: %s", view_name, locus_text,
 			                      result->GetError());
 		}
-		throw ParserException("Materialized view '%s' does not exist in IVM metadata.", view_name);
+		throw ParserException("Materialized view '%s' does not exist in IVM metadata. Refresh currently looks up the "
+		                      "MV short name, not schema.name. Check view_name, view_catalog and view_schema in "
+		                      "openivm_views in the native metadata database, then pass its view_name to refresh.",
+		                      view_name);
 	}
 	auto raw_type = result->GetValue(0, 0).GetValue<int8_t>();
 	return static_cast<RefreshType>(raw_type);
@@ -205,6 +269,37 @@ string RefreshMetadata::GetLastUpdate(const string &view_name, const string &tab
 	return result->GetValue(0, 0).ToString();
 }
 
+vector<string> RefreshMetadata::MetadataCatalogs(Connection &con) {
+	auto rows = con.Query("SELECT DISTINCT database_name FROM duckdb_tables() WHERE schema_name='main' "
+	                      "AND table_name='openivm_delta_tables' AND NOT temporary ORDER BY database_name");
+	if (rows->HasError()) {
+		throw CatalogException("OpenIVM could not locate source metadata: %s", rows->GetError());
+	}
+	vector<string> catalogs;
+	for (idx_t row = 0; row < rows->RowCount(); row++) {
+		catalogs.push_back(rows->GetValue(0, row).ToString());
+	}
+	return catalogs;
+}
+
+string RefreshMetadata::SourceTableName(const string &key, const string &catalog, const string &schema) {
+	if (!StringUtil::StartsWith(key, SqlUtils::QualifiedPrefix(catalog, schema))) {
+		return key;
+	}
+	return SqlUtils::ParseQualifiedIdentifier(key).back();
+}
+
+string RefreshMetadata::SourcePredicate(const string &table, const string &catalog, const string &schema) {
+	auto name = SourceTableName(table, catalog, schema);
+	return "table_name IN ('" + SqlUtils::EscapeValue(name) + "', '" +
+	       SqlUtils::EscapeValue(SqlUtils::FullName(catalog, schema, name)) +
+	       "') AND "
+	       "COALESCE(source_catalog, '" +
+	       SqlUtils::EscapeValue(catalog) + "') = '" + SqlUtils::EscapeValue(catalog) +
+	       "' AND COALESCE(source_schema, '" + SqlUtils::EscapeValue(schema) + "') = '" +
+	       SqlUtils::EscapeValue(schema) + "'";
+}
+
 RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string &view_name, const string &table_name,
                                                                    const string &fallback_catalog,
                                                                    const string &fallback_schema) {
@@ -223,6 +318,7 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 			loc.schema_name = result->GetValue(1, 0).ToString();
 		}
 	}
+	loc.table_name = SourceTableName(table_name, loc.catalog_name, loc.schema_name);
 	return loc;
 }
 
@@ -294,12 +390,12 @@ string RefreshMetadata::ResolveDeltaQualifiedName(const string &view_name, const
                                                   const string &fallback_catalog, const string &fallback_schema) {
 	auto loc = GetSourceLocation(view_name, delta_table_name, fallback_catalog, fallback_schema);
 	if (loc.catalog_name.empty()) {
-		return SqlUtils::QuoteIdentifier(delta_table_name);
+		return SqlUtils::QuoteIdentifier(loc.table_name);
 	}
 	if (loc.schema_name.empty()) {
 		loc.schema_name = "main";
 	}
-	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, delta_table_name);
+	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, loc.table_name);
 }
 
 RefreshMetadata::DeltaChangeStats RefreshMetadata::GetStandardDeltaChangeStats(const string &delta_table_sql,
@@ -462,7 +558,7 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 	}
 	std::set<string> selected;
 	for (auto &requested : targets) {
-		auto target = ResolveViewName(requested);
+		auto target = requested;
 		if (graph.find(target) == graph.end()) {
 			throw CatalogException("refresh_pipeline: materialized view '%s' does not exist", target);
 		}
@@ -660,13 +756,35 @@ void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_prog
 }
 
 string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
-                                             const string &delta_metadata_table) {
+                                             const string &delta_metadata_table, vector<string> *deferred_cleanup,
+                                             const vector<string> &metadata_catalogs) {
 	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 	auto consumers = "SELECT last_update FROM " + metadata_table + " WHERE table_name = '" +
 	                 SqlUtils::EscapeValue(metadata_key) + "'";
-	return "DELETE FROM " + qtarget + " WHERE NOT EXISTS (" + consumers + ") OR " + string(openivm::TIMESTAMP_COL) +
-	       " < (SELECT MIN(last_update) FROM (" + consumers + ") consumers);\n";
+	auto parts = SqlUtils::ParseQualifiedIdentifier(qtarget);
+	if (parts.size() == 3) {
+		auto predicate = SourcePredicate(parts[2], parts[0], parts[1]);
+		consumers = "SELECT last_update FROM " + metadata_table + " WHERE " + predicate;
+		for (auto &catalog : metadata_catalogs) {
+			auto other = SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE);
+			if (!StringUtil::CIEquals(other, metadata_table)) {
+				consumers += " UNION ALL SELECT last_update FROM " + other + " WHERE " + predicate;
+			}
+		}
+	}
+	auto sql = "DELETE FROM " + qtarget + " WHERE NOT EXISTS (" + consumers + ") OR " + string(openivm::TIMESTAMP_COL) +
+	           " < (SELECT MIN(last_update) FROM (" + consumers + ") consumers);\n";
+	if (deferred_cleanup && parts.size() == 3) {
+		auto metadata_parts = SqlUtils::ParseQualifiedIdentifier(metadata_table);
+		if (metadata_parts.size() == 3 && !StringUtil::CIEquals(parts[0], metadata_parts[0])) {
+			// Only housekeeping crosses the native write boundary. MV state and its
+			// watermark commit together; cleanup reads the committed consumer minimum.
+			deferred_cleanup->push_back(std::move(sql));
+			return "";
+		}
+	}
+	return sql;
 }
 
 // --- DuckLake support ---
@@ -723,7 +841,7 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	DuckLakeSourceIdentity identity;
 	auto result =
 	    con.Query("SELECT source_table_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+	              SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name));
 	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
 		identity.stored_table_id = result->GetValue(0, 0).GetValue<int64_t>();
 	}
@@ -733,13 +851,13 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 
 	string catalog_prefix = SqlUtils::QuoteIdentifier("__ducklake_metadata_" + catalog_name) + ".";
 	string schema_filter = schema_name.empty() ? "main" : schema_name;
-	auto current_result =
-	    con.Query("SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
-	              "ducklake_schema s ON t.schema_id = s.schema_id WHERE "
-	              "t.end_snapshot IS NULL AND "
-	              "s.end_snapshot IS NULL AND t.table_name = '" +
-	              SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" + SqlUtils::EscapeValue(schema_filter) +
-	              "' ORDER BY t.table_id DESC LIMIT 1");
+	auto current_result = con.Query(
+	    "SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
+	    "ducklake_schema s ON t.schema_id = s.schema_id WHERE "
+	    "t.end_snapshot IS NULL AND "
+	    "s.end_snapshot IS NULL AND t.table_name = '" +
+	    SqlUtils::EscapeValue(SourceTableName(table_name, catalog_name, schema_name)) + "' AND s.schema_name = '" +
+	    SqlUtils::EscapeValue(schema_filter) + "' ORDER BY t.table_id DESC LIMIT 1");
 	if (current_result->HasError() || current_result->RowCount() == 0 || current_result->GetValue(0, 0).IsNull()) {
 		return identity;
 	}
@@ -753,7 +871,7 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	auto update =
 	    con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
 	              " SET source_table_id = " + to_string(identity.current_table_id) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+	              SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name));
 	if (update->HasError()) {
 		OPENIVM_DEBUG_PRINT("[DuckLake] Could not backfill source_table_id for %s.%s: %s\n", view_name.c_str(),
 		                    table_name.c_str(), update->GetError().c_str());

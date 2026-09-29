@@ -4,6 +4,40 @@
 
 require openivm
 
+# Inspection must explain disabled output without creating any files.
+statement ok
+CREATE TABLE file_probe_source(k INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW file_probe AS SELECT k FROM file_probe_source;
+
+query TTTTT
+PRAGMA openivm_files('file_probe');
+----
+system	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
+create	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
+refresh	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
+explain	NULL	false	disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh	<REGEX>:.*
+
+statement error
+PRAGMA openivm_files('missing_view');
+----
+does not exist in IVM metadata
+
+# Missing output directories must not silently discard compiled SQL.
+statement ok
+SET openivm_files_path='__TEST_DIR__/missing_reference_directory';
+
+statement error
+CREATE MATERIALIZED VIEW file_write_error AS SELECT k FROM file_probe_source;
+----
+Create the directory set by openivm_files_path
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_66696c655f77726974655f6572726f72_';
+----
+0
+
 statement ok
 SET openivm_files_path='__TEST_DIR__';
 
@@ -20,6 +54,22 @@ INSERT INTO sales VALUES ('east', 100), ('west', 200);
 statement ok
 CREATE MATERIALIZED VIEW mv_region AS
     SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM sales GROUP BY region;
+
+# Reference files contain SQL, not internal profiler protocol records.
+query I
+SELECT count(*) FROM read_text('__TEST_DIR__/openivm_system_tables.sql')
+WHERE content LIKE '%create table if not exists openivm_views%'
+AND content LIKE '%create table if not exists openivm_refresh_hooks%'
+AND content LIKE '%create table if not exists openivm_delta_tables%'
+AND content NOT LIKE '%openivm_profile%';
+----
+1
+
+query I
+SELECT count(*) FROM read_text('__TEST_DIR__/openivm_compiled_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f726567696f6e_.sql')
+WHERE content LIKE '%openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f726567696f6e_%' AND content NOT LIKE '%openivm_profile%';
+----
+1
 
 # Snapshot the MV state before the compile call so we can prove it is
 # untouched by `openivm_compile_with_facts` afterwards.
@@ -44,11 +94,11 @@ FROM openivm_compile_with_facts(
     'mv_region',
     '{"target_dialect":"duckdb","compile_only":true}'
 )
-WHERE stmt_kind = 'data' AND sql LIKE '%openivm_delta_mv_region%'
+WHERE stmt_kind = 'data' AND sql LIKE '%openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f726567696f6e_%'
 ORDER BY stmt_order
 LIMIT 1;
 ----
-0	AGGREGATE_GROUP	<REGEX>:.*INSERT INTO.*openivm_delta_mv_region.*
+0	AGGREGATE_GROUP	<REGEX>:.*INSERT INTO.*openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f726567696f6e_.*
 
 # ==========================================
 # Test 2: openivm_compile_with_facts did NOT mutate the materialized view
@@ -122,7 +172,7 @@ INSERT INTO compile_only_proj_src VALUES (3, 'three');
 
 query I
 SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%delete from %openivm_data_mv_compile_only_proj%'
+                 LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f70726f6a_%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'mv_compile_only_proj',
@@ -149,7 +199,7 @@ INSERT INTO compile_only_agg_src VALUES (1, 5);
 
 query I
 SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%delete from %openivm_data_mv_compile_only_agg%'
+                 LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f616767_%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'mv_compile_only_agg',
@@ -169,11 +219,12 @@ SET openivm_refresh_mode = 'full';
 
 query I
 SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%delete from openivm_data_mv_compile_only_proj;%insert into openivm_data_mv_compile_only_proj select%'
+                 LIKE ('%delete from ' || current_database() || '.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f70726f6a_;%insert into ' ||
+                       current_database() || '.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f70726f6a_ select%')
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
                  LIKE '%from %compile_only_proj_src%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%insert into openivm_delta_mv_compile_only_proj%'
+                 LIKE ('%insert into ' || current_database() || '.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f70726f6a_%')
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
                  NOT LIKE '%openivm_net%'
             THEN 1 ELSE 0 END
@@ -254,9 +305,9 @@ CREATE MATERIALIZED VIEW mv_compile_only_watches AS
 
 query I
 SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%merge into %openivm_data_mv_compile_only_watches%'
+                 LIKE '%merge into %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f77617463686573_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 NOT LIKE '%delete from %openivm_data_mv_compile_only_watches%'
+                 NOT LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f77617463686573_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
                  LIKE '%status = case when%removed_at%'
             THEN 1 ELSE 0 END
@@ -270,7 +321,7 @@ WHERE stmt_kind = 'data';
 
 query I
 SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":true%' THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'mv_compile_only_watches';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f77617463686573_';
 ----
 1
 
@@ -289,7 +340,7 @@ SELECT grp, min_value, ROUND(min_value / 3.0, 2) AS rounded_value FROM grouped;
 
 query I
 SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":false%' THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'mv_compile_only_round';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_';
 ----
 1
 
@@ -314,13 +365,13 @@ query I
 SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"complete":false%'
                  AND derived_aggregate_outputs_json LIKE '%"column":"marker"%'
             THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'mv_compile_only_escaped_metadata';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f657363617065645f6d65746164617461_';
 ----
 1
 
 query I
 SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%delete from %openivm_data_mv_compile_only_escaped_metadata%'
+                 LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f657363617065645f6d65746164617461_%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'mv_compile_only_escaped_metadata',
@@ -351,15 +402,15 @@ query I
 SELECT CASE WHEN derived_aggregate_outputs_json LIKE '%"column":"high_flag"%'
                  AND derived_aggregate_outputs_json LIKE '%max_value%'
             THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'mv_compile_only_nested';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f6e6573746564_';
 ----
 1
 
 query I
 SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%merge into %openivm_data_mv_compile_only_nested%'
+                 LIKE '%merge into %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f6e6573746564_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 NOT LIKE '%delete from %openivm_data_mv_compile_only_nested%'
+                 NOT LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f6e6573746564_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
                  LIKE '%high_flag = case when%'
             THEN 1 ELSE 0 END
@@ -373,11 +424,11 @@ WHERE stmt_kind = 'data';
 
 query I
 SELECT CASE WHEN string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 NOT LIKE '%merge into %openivm_data_mv_compile_only_round%'
+                 NOT LIKE '%merge into %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%delete from %openivm_data_mv_compile_only_round%'
+                 LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
             AND string_agg(lower(sql), ' ' ORDER BY stmt_order)
-                 LIKE '%insert into %openivm_data_mv_compile_only_round%'
+                 LIKE '%insert into %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70696c655f6f6e6c795f726f756e64_%'
             THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'mv_compile_only_round',
@@ -464,7 +515,7 @@ LIMIT 1;
 query I
 SELECT CASE WHEN
        string_agg(sql, ' ' ORDER BY stmt_order)
-           LIKE '%INSERT INTO openivm_delta_mv_arcm (id, cust_key, openivm_multiplicity)%'
+           LIKE ('%INSERT INTO ' || current_database() || '.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6172636d_ (id, cust_key, openivm_multiplicity)%')
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_msf%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_acd%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_hw%'
@@ -520,7 +571,7 @@ LIMIT 1;
 query I
 SELECT CASE WHEN
        string_agg(sql, ' ' ORDER BY stmt_order)
-           LIKE '%INSERT INTO openivm_delta_mv_arcm (id, cust_key, openivm_multiplicity)%'
+           LIKE ('%INSERT INTO ' || current_database() || '.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6172636d_ (id, cust_key, openivm_multiplicity)%')
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_msf%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_acd%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_hw%'
@@ -580,7 +631,7 @@ LIMIT 1;
 query I
 SELECT CASE WHEN
        string_agg(sql, ' ' ORDER BY stmt_order)
-           LIKE '%INSERT INTO openivm_delta_mv_inti (id, k, openivm_left_key, openivm_multiplicity)%'
+           LIKE ('%INSERT INTO ' || current_database() || '.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f696e7469_ (id, k, openivm_left_key, openivm_multiplicity)%')
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_inti_isf%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_inti_ml%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
@@ -603,4 +654,71 @@ SELECT * FROM openivm_compile_with_facts(
     '{"target_dialect":"duckdb","compile_only":true}'
 );
 ----
-materialized view 'does_not_exist' not found
+Materialized view 'does_not_exist' does not exist in IVM metadata
+
+# The configured path is resolved from the process working directory, not the database.
+query TTTTT
+PRAGMA openivm_files('file_probe');
+----
+system	<REGEX>:.*[/\\]openivm_system_tables.sql	true	exists; may be from an earlier compilation	<REGEX>:.*
+create	<REGEX>:.*[/\\]openivm_compiled_queries___openivm_mv_6d656d6f7279_6d61696e_66696c655f70726f6265_.sql	false	not generated at this path	<REGEX>:.*
+refresh	<REGEX>:.*[/\\]openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_66696c655f70726f6265_.sql	false	not generated at this path	<REGEX>:.*
+explain	<REGEX>:.*[/\\]openivm_initial_load_explain___openivm_mv_6d656d6f7279_6d61696e_66696c655f70726f6265_.txt	false	not generated at this path	<REGEX>:.*
+
+# Capture SQL into an ordinary table without requiring a file or executing the refresh.
+statement ok
+CREATE TABLE saved_file_probe_program AS SELECT * FROM openivm_compile_with_facts(
+ 'file_probe', '{"target_dialect":"duckdb","compile_only":true}');
+
+query I
+SELECT count(*)>0 FROM saved_file_probe_program;
+----
+true
+
+statement ok
+PRAGMA refresh('main.file_probe');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM file_probe EXCEPT ALL SELECT k FROM file_probe_source) UNION ALL (SELECT k FROM file_probe_source EXCEPT ALL SELECT * FROM file_probe));
+----
+0
+
+# Native cross-schema replacement creates a separate MV and preserves the first registration.
+statement ok
+CREATE SCHEMA file_guard_a;
+
+statement ok
+CREATE SCHEMA file_guard_b;
+
+statement ok
+CREATE MATERIALIZED VIEW file_guard_a.file_guard AS SELECT k FROM file_probe_source;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW file_guard_b.file_guard AS SELECT k+10 k FROM file_probe_source;
+
+statement ok
+INSERT INTO file_probe_source VALUES(1),(2),(2);
+
+statement ok
+UPDATE file_probe_source SET k=k+10 WHERE k=1;
+
+statement ok
+DELETE FROM file_probe_source WHERE k=11;
+
+statement ok
+PRAGMA refresh('file_guard_a.file_guard');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM file_guard_a.file_guard EXCEPT ALL SELECT k FROM file_probe_source)
+UNION ALL (SELECT k FROM file_probe_source EXCEPT ALL SELECT * FROM file_guard_a.file_guard));
+----
+0
+
+statement ok
+PRAGMA refresh('file_guard_b.file_guard');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM file_guard_b.file_guard EXCEPT ALL SELECT k+10 FROM file_probe_source)
+UNION ALL (SELECT k+10 FROM file_probe_source EXCEPT ALL SELECT * FROM file_guard_b.file_guard));
+----
+0

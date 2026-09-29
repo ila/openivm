@@ -47,7 +47,8 @@ int main(int argc, char **argv) {
 		std::getline(std::cin, line);
 		auto views = metadata.GetScheduledViews();
 		if (views.size() != 2 || views[0].metadata_catalog != "memory" || views[1].metadata_catalog != "other" ||
-		    views[0].view_name != "scheduled" || views[1].view_name != "scheduled") {
+		    views[0].view_name != "__openivm_mv_6d656d6f7279_6d61696e_7363686564756c6564_" ||
+		    views[1].view_name != "__openivm_mv_6f74686572_6d61696e_7363686564756c6564_") {
 			throw InvalidInputException("Scheduler did not discover both native metadata catalogs");
 		}
 		// A native schema change must synchronize its delta table even while an

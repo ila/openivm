@@ -181,12 +181,12 @@ PRAGMA refresh_status('mv_argmax');
 
 # Verify the stored type value directly (AGGREGATE_GROUP = 0)
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_argmin';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6172676d696e_';
 ----
 0
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_argmax';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6172676d6178_';
 ----
 0
 

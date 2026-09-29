@@ -7,7 +7,6 @@
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/parser/statement/pragma_statement.hpp"
 #include "lpts_parser.hpp"
@@ -110,7 +109,7 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 			                      "or ALTER MATERIALIZED VIEW <name> SET REFRESH MANUAL");
 		}
 		string alter_view_name = match[1].str();
-		auto name_components = QualifiedName::ParseComponents(alter_view_name);
+		auto name_components = SqlUtils::ParseQualifiedIdentifier(alter_view_name);
 		if (name_components.empty()) {
 			throw ParserException("Invalid materialized-view target '%s'", alter_view_name);
 		}

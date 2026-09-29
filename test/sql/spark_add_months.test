@@ -50,12 +50,12 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 # Real SIMPLE_PROJECTION delta emitted (no full-refresh demotion)
 query I
 SELECT CASE
-           WHEN contains(content, 'INSERT INTO openivm_delta_am_mv') AND
+           WHEN contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_616d5f6d76_') AND
                 contains(content, 'openivm_delta_am_item') AND
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_am_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_616d5f6d76_.sql');
 ----
 1
 

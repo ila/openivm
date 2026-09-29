@@ -639,12 +639,12 @@ SELECT COUNT(*) FROM (
 # with dimension-side pass-through columns uses affected-key group recompute.
 # Type 6 = GROUP_RECOMPUTE.
 query I
-SELECT type FROM openivm_views WHERE view_name = 'avg_under_join';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6176675f756e6465725f6a6f696e_';
 ----
 6
 
 query I
-SELECT group_columns FROM openivm_views WHERE view_name = 'avg_under_join';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6176675f756e6465725f6a6f696e_';
 ----
 ol_d_id,w_id
 
@@ -666,12 +666,12 @@ CREATE MATERIALIZED VIEW stddev_under_join AS
     FROM wh w JOIN district_stats ds ON w.w_id = ds.ol_w_id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'stddev_under_join';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_7374646465765f756e6465725f6a6f696e_';
 ----
 6
 
 query I
-SELECT group_columns FROM openivm_views WHERE view_name = 'stddev_under_join';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_7374646465765f756e6465725f6a6f696e_';
 ----
 ol_d_id,w_id
 
@@ -808,7 +808,7 @@ SELECT
 FROM branch;
 
 query T
-SELECT group_columns FROM openivm_views WHERE view_name = 'union_group_key_reordered';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_756e696f6e5f67726f75705f6b65795f72656f726465726564_';
 ----
 k1,k2,k3,k4
 
@@ -871,7 +871,7 @@ UNION ALL
 SELECT ws.W_ID, ws.W_YTD, 'ytd' FROM w_stats ws;
 
 query T
-SELECT group_columns FROM openivm_views WHERE view_name = 'union_group_key_alias';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_756e696f6e5f67726f75705f6b65795f616c696173_';
 ----
 w
 
@@ -947,7 +947,7 @@ JOIN gr_many_t t31 ON t0.k = t31.k
 GROUP BY t0.k;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'gr_many_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_67725f6d616e795f6d76_';
 ----
 6
 
@@ -958,14 +958,14 @@ statement ok
 PRAGMA refresh('gr_many_mv');
 
 query I
-SELECT contains(content, 'openivm_current_gr_many_mv')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_gr_many_mv.sql');
+SELECT contains(content, 'openivm_current___openivm_mv_6d656d6f7279_6d61696e_67725f6d616e795f6d76_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_67725f6d616e795f6d76_.sql');
 ----
 true
 
 query I
 SELECT contains(content, 'openivm_src_')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_gr_many_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_67725f6d616e795f6d76_.sql');
 ----
 false
 
@@ -1009,7 +1009,7 @@ FROM gr_measure_t
 GROUP BY k;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'gr_measure_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_67725f6d6561737572655f6d76_';
 ----
 6
 
@@ -1021,7 +1021,7 @@ PRAGMA refresh('gr_measure_mv');
 
 query I
 SELECT contains(content, 'openivm_measure_delta')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_gr_measure_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_67725f6d6561737572655f6d76_.sql');
 ----
 false
 
@@ -1084,7 +1084,7 @@ PRAGMA refresh('gr_measure_expr_mv');
 
 query I
 SELECT contains(content, 'openivm_measure_delta')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_gr_measure_expr_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_67725f6d6561737572655f657870725f6d76_.sql');
 ----
 false
 

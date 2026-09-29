@@ -42,17 +42,17 @@ CREATE MATERIALIZED VIEW cgr_asof_mv AS
 query IT
 SELECT type, group_recompute_affected_mode
 FROM openivm_views
-WHERE view_name = 'cgr_asof_mv';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6367725f61736f665f6d76_';
 ----
 6	current_diff
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_current_cgr_asof_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%EXCEPT ALL SELECT * FROM %openivm_data_cgr_asof_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_cgr_asof_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_cgr_asof_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cgr_asof_mv%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_current___openivm_mv_6d656d6f7279_6d61696e_6367725f61736f665f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%EXCEPT ALL SELECT * FROM %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6367725f61736f665f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_6367725f61736f665f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_6367725f61736f665f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6367725f61736f665f6d76_%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%SELECT DISTINCT price FROM%openivm_delta_cgr_asof_prices%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%SELECT DISTINCT price FROM%openivm_delta_cgr_asof_trades%'
    THEN 1 ELSE 0 END

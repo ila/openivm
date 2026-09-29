@@ -40,7 +40,7 @@ CREATE MATERIALIZED VIEW mv_oprec_asof_projection AS
      AND t.ts >= p.ts;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_projection';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f61736f665f70726f6a656374696f6e_';
 ----
 3
 
@@ -132,7 +132,7 @@ CREATE MATERIALIZED VIEW mv_oprec_asof_cascade_parent AS
      AND t.ts >= p.ts;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_cascade_parent';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f61736f665f636173636164655f706172656e74_';
 ----
 3
 
@@ -255,12 +255,12 @@ CREATE MATERIALIZED VIEW mv_oprec_asof_group AS
     GROUP BY t.symbol;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_group';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f61736f665f67726f7570_';
 ----
 6
 
 query T
-SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_oprec_asof_group';
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f61736f665f67726f7570_';
 ----
 current_diff
 
@@ -360,7 +360,7 @@ CREATE MATERIALIZED VIEW mv_oprec_asof_window AS
     ) q;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_window';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f61736f665f77696e646f77_';
 ----
 5
 
@@ -473,7 +473,7 @@ CREATE MATERIALIZED VIEW mv_oprec_asof_rhs_window AS
     ) q;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_asof_rhs_window';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f61736f665f7268735f77696e646f77_';
 ----
 3
 
@@ -585,12 +585,12 @@ CREATE MATERIALIZED VIEW mv_oprec_cte_asof AS
     GROUP BY m1.symbol;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_cte_asof';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f6374655f61736f66_';
 ----
 6
 
 query T
-SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_oprec_cte_asof';
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f6374655f61736f66_';
 ----
 current_diff
 

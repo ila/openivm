@@ -110,7 +110,7 @@ FROM openivm_compile_with_facts(
       "delta_shape":{"fact":"MIXED","d1":"INSERT_ONLY","d2":"MIXED","d3":"MIXED","d4":"UNCHANGED","d5":"UNCHANGED"}}'
 )
 WHERE stmt_kind = 'data' AND refresh_type_name = 'SIMPLE_PROJECTION'
-  AND sql LIKE '%openivm_delta_mv%';
+  AND sql LIKE '%openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d76_%';
 ----
 true
 

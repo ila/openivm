@@ -1037,7 +1037,7 @@ CREATE MATERIALIZED VIEW mv_tf_customer_count AS
     GROUP BY generated_id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_tf_customer_count';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f74665f637573746f6d65725f636f756e74_';
 ----
 6
 
@@ -1103,7 +1103,7 @@ CREATE MATERIALIZED VIEW mv_tf_stock_thresholds AS
     GROUP BY threshold;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_tf_stock_thresholds';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f74665f73746f636b5f7468726573686f6c6473_';
 ----
 6
 

@@ -34,7 +34,7 @@ statement ok
 CREATE TABLE hook_log (msg VARCHAR);
 
 statement ok
-INSERT INTO openivm_refresh_hooks VALUES ('mv', 'INSERT INTO hook_log VALUES(''after-hook ran'')', 'after');
+INSERT INTO openivm_refresh_hooks VALUES ('__openivm_mv_6d656d6f7279_6d61696e_6d76_', 'INSERT INTO hook_log VALUES(''after-hook ran'')', 'after');
 
 statement ok
 INSERT INTO t VALUES (2, 200);
@@ -62,7 +62,7 @@ statement ok
 DELETE FROM hook_log;
 
 statement ok
-UPDATE openivm_refresh_hooks SET hook_sql = 'INSERT INTO hook_log VALUES(''before-hook ran'')', mode = 'before' WHERE view_name = 'mv';
+UPDATE openivm_refresh_hooks SET hook_sql = 'INSERT INTO hook_log VALUES(''before-hook ran'')', mode = 'before' WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d76_';
 
 statement ok
 INSERT INTO t VALUES (3, 300);
@@ -90,7 +90,7 @@ statement ok
 DELETE FROM hook_log;
 
 statement ok
-UPDATE openivm_refresh_hooks SET hook_sql = 'INSERT INTO hook_log VALUES(''replace-hook ran'')', mode = 'replace' WHERE view_name = 'mv';
+UPDATE openivm_refresh_hooks SET hook_sql = 'INSERT INTO hook_log VALUES(''replace-hook ran'')', mode = 'replace' WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d76_';
 
 statement ok
 INSERT INTO t VALUES (4, 400);
@@ -115,7 +115,7 @@ replace-hook ran
 # ============================================================
 
 statement ok
-DELETE FROM openivm_refresh_hooks WHERE view_name = 'mv';
+DELETE FROM openivm_refresh_hooks WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d76_';
 
 statement ok
 DELETE FROM hook_log;
@@ -148,7 +148,7 @@ SELECT id, amount FROM tracked_hook_src;
 
 statement ok
 INSERT INTO openivm_refresh_hooks VALUES (
-    'tracked_hook_mv',
+    '__openivm_mv_6d656d6f7279_6d61696e_747261636b65645f686f6f6b5f6d76_',
     'INSERT INTO tracked_hook_src VALUES (4, 40)',
     'before'
 );
@@ -209,7 +209,7 @@ SELECT count(*) AS cnt FROM daemon_hook_src;
 
 statement ok
 INSERT INTO openivm_refresh_hooks VALUES (
-    'daemon_hook_mv',
+    '__openivm_mv_6d656d6f7279_6d61696e_6461656d6f6e5f686f6f6b5f6d76_',
     'INSERT INTO hook_log VALUES(''daemon-hook ran'')',
     'after'
 );
@@ -219,12 +219,12 @@ INSERT INTO daemon_hook_src VALUES (1), (2);
 
 statement ok
 UPDATE openivm_views SET refresh_interval = 60
-WHERE view_name = 'daemon_hook_mv';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6461656d6f6e5f686f6f6b5f6d76_';
 
 statement ok
 UPDATE openivm_delta_tables
 SET last_update = now()::TIMESTAMP - INTERVAL '2 minutes'
-WHERE view_name = 'daemon_hook_mv';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6461656d6f6e5f686f6f6b5f6d76_';
 
 statement ok
 PRAGMA refresh_start_daemon;
@@ -256,7 +256,7 @@ SELECT count(*) FROM (
 0
 
 statement ok
-UPDATE openivm_views SET refresh_interval = NULL WHERE view_name = 'daemon_hook_mv';
+UPDATE openivm_views SET refresh_interval = NULL WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6461656d6f6e5f686f6f6b5f6d76_';
 
 statement ok
 DELETE FROM hook_log;
@@ -272,7 +272,7 @@ SELECT count(*) AS cnt FROM dropped_hook_src;
 
 statement ok
 INSERT INTO openivm_refresh_hooks VALUES (
-    'dropped_hook_mv',
+    '__openivm_mv_6d656d6f7279_6d61696e_64726f707065645f686f6f6b5f6d76_',
     'INSERT INTO hook_log VALUES(''stale hook ran'')',
     'after'
 );
@@ -281,7 +281,7 @@ statement ok
 DROP VIEW dropped_hook_mv;
 
 query I
-SELECT count(*) FROM openivm_refresh_hooks WHERE view_name = 'dropped_hook_mv';
+SELECT count(*) FROM openivm_refresh_hooks WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_64726f707065645f686f6f6b5f6d76_';
 ----
 0
 
@@ -319,7 +319,7 @@ CREATE MATERIALIZED VIEW hook_cascade_child AS
 
 statement ok
 INSERT INTO openivm_refresh_hooks VALUES (
-    'hook_cascade_parent',
+    '__openivm_mv_6d656d6f7279_6d61696e_686f6f6b5f636173636164655f706172656e74_',
     'INSERT INTO hook_log VALUES(''empty-parent hook ran'')',
     'before'
 );

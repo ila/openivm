@@ -34,14 +34,14 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 
 query I
 SELECT CASE
-           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_eq_mv') AND
+           WHEN contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706a5f65715f6d76_') AND
                 contains(content, 'openivm_delta_cspj_eq_watch') AND
                 contains(content, 'openivm_delta_cspj_eq_security') AND
                 contains(content, 'UNION ALL') AND
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_eq_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f65715f6d76_.sql');
 ----
 1
 
@@ -106,7 +106,7 @@ FROM openivm_compile_with_facts(
     '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{"cspj_values_customer":"MIXED"}}'
 )
 WHERE stmt_kind = 'data'
-  AND contains(sql, 'INSERT INTO openivm_delta_cspj_values_mv');
+  AND contains(sql, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706a5f76616c7565735f6d76_');
 ----
 1
 
@@ -120,7 +120,7 @@ FROM openivm_compile_with_facts(
     '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{"cspj_values_customer":"UNCHANGED"}}'
 )
 WHERE stmt_kind = 'data'
-  AND contains(sql, 'INSERT INTO openivm_delta_cspj_values_mv');
+  AND contains(sql, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706a5f76616c7565735f6d76_');
 ----
 1
 
@@ -183,14 +183,14 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 
 query I
 SELECT CASE
-           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_rng_mv') AND
+           WHEN contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706a5f726e675f6d76_') AND
                 contains(content, 'openivm_delta_cspj_rng_txn') AND
                 contains(content, 'openivm_delta_cspj_rng_window') AND
                 contains(content, 'UNION ALL') AND
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_rng_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f726e675f6d76_.sql');
 ----
 1
 
@@ -269,7 +269,7 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 
 query I
 SELECT CASE
-           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_tri_mv') AND
+           WHEN contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706a5f7472695f6d76_') AND
                 contains(content, 'openivm_delta_cspj_tri_account') AND
                 contains(content, 'openivm_delta_cspj_tri_customer') AND
                 contains(content, 'openivm_delta_cspj_tri_broker') AND
@@ -277,14 +277,14 @@ SELECT CASE
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_tri_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f7472695f6d76_.sql');
 ----
 1
 
 # Join-delta unions plus one union consolidating old/new published rows.
 query I
 SELECT ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL'))
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_tri_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f7472695f6d76_.sql');
 ----
 5
 
@@ -300,7 +300,7 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 # Join-delta unions plus one union consolidating old/new published rows.
 query I
 SELECT ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL'))
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_tri_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f7472695f6d76_.sql');
 ----
 7
 
@@ -326,7 +326,7 @@ FROM openivm_compile_with_facts(
     '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{"cspj_tri_account":"UNCHANGED","cspj_tri_customer":"UNCHANGED","cspj_tri_broker":"MIXED"}}'
 )
 WHERE stmt_kind = 'data'
-  AND contains(sql, 'INSERT INTO openivm_delta_cspj_tri_mv');
+  AND contains(sql, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706a5f7472695f6d76_');
 ----
 1
 
@@ -343,7 +343,7 @@ FROM openivm_compile_with_facts(
     '{"target_dialect":"duckdb","compile_only":true,"delta_shape":{"cspj_tri_account":"UNCHANGED","cspj_tri_customer":"UNCHANGED","cspj_tri_broker":"UNCHANGED"}}'
 )
 WHERE stmt_kind = 'data'
-  AND contains(sql, 'INSERT INTO openivm_delta_cspj_tri_mv');
+  AND contains(sql, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706a5f7472695f6d76_');
 ----
 1
 
@@ -418,14 +418,14 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 
 query I
 SELECT CASE
-           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_cte_mv') AND
+           WHEN contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706a5f6374655f6d76_') AND
                 contains(content, 'openivm_delta_cspj_cte_holdings') AND
                 contains(content, 'openivm_delta_cspj_cte_security') AND
                 contains(content, 'UNION ALL') AND
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_cte_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f6374655f6d76_.sql');
 ----
 1
 
@@ -512,7 +512,7 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 
 query I
 SELECT ((length(content) - length(replace(content, 'UNION ALL', ''))) / length('UNION ALL'))
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_self_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f73656c665f6d76_.sql');
 ----
 5
 
@@ -631,7 +631,7 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 
 query I
 SELECT CASE
-           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_arcm_mv') AND
+           WHEN contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706a5f6172636d5f6d76_') AND
                 contains(content, 'openivm_delta_cspj_arcm_msf') AND
                 contains(content, 'openivm_delta_cspj_arcm_acd') AND
                 contains(content, 'openivm_delta_cspj_arcm_hw') AND
@@ -640,7 +640,7 @@ SELECT CASE
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_arcm_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f6172636d5f6d76_.sql');
 ----
 1
 
@@ -733,14 +733,14 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 
 query I
 SELECT CASE
-           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_inti_mv') AND
+           WHEN contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706a5f696e74695f6d76_') AND
                 contains(content, 'openivm_delta_cspj_inti_isf') AND
                 contains(content, 'openivm_delta_cspj_inti_ml') AND
                 contains(content, 'UNION ALL') AND
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_inti_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f696e74695f6d76_.sql');
 ----
 1
 
@@ -842,14 +842,14 @@ LIMIT 1;
 
 query I
 SELECT CASE
-           WHEN contains(content, 'INSERT INTO openivm_delta_cspj_ms_mv') AND
+           WHEN contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706a5f6d735f6d76_') AND
                 contains(content, 'openivm_delta_cspj_ms_terms') AND
                 contains(content, 'openivm_delta_cspj_ms_status') AND
                 contains(content, 'UNION ALL') AND
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspj_ms_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706a5f6d735f6d76_.sql');
 ----
 1
 

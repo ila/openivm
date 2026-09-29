@@ -1170,12 +1170,12 @@ JOIN cteagg_o o ON cb.c_w_id = o.o_w_id AND o.o_c_id = cb.c_id
 JOIN order_total ot ON o.o_w_id = ot.ol_w_id AND o.o_d_id = ot.ol_d_id AND o.o_id = ot.ol_o_id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_cteagg_join_projection';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6374656167675f6a6f696e5f70726f6a656374696f6e_';
 ----
 6
 
 query T
-SELECT group_columns FROM openivm_views WHERE view_name = 'mv_cteagg_join_projection';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6374656167675f6a6f696e5f70726f6a656374696f6e_';
 ----
 w_id,d_id,c_id,c_balance
 
@@ -1306,7 +1306,7 @@ CREATE MATERIALIZED VIEW mv_const_unnest_join AS
     GROUP BY threshold;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_const_unnest_join';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f6e73745f756e6e6573745f6a6f696e_';
 ----
 0
 
@@ -1378,12 +1378,12 @@ PRAGMA refresh('mv_skip_join_key');
 
 query I
 SELECT contains(content, 'SELECT NULL::INTEGER, NULL::INTEGER, NULL::INTEGER, NULL::INTEGER WHERE false')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_join_key.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f736b69705f6a6f696e5f6b6579_.sql');
 ----
 true
 
 query I
-SELECT contains(content, 'JOIN skj_right') FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_join_key.sql');
+SELECT contains(content, 'JOIN skj_right') FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f736b69705f6a6f696e5f6b6579_.sql');
 ----
 false
 
@@ -1414,7 +1414,7 @@ PRAGMA refresh('mv_skip_join_key');
 
 query I
 SELECT contains(content, 'SELECT NULL::INTEGER, NULL::INTEGER, NULL::INTEGER, NULL::INTEGER WHERE false')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_join_key.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f736b69705f6a6f696e5f6b6579_.sql');
 ----
 true
 

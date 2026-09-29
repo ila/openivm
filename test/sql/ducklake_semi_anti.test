@@ -41,7 +41,7 @@ CREATE MATERIALIZED VIEW mv_dl_saj_in AS
     );
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_dl_saj_in';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f646c5f73616a5f696e_';
 ----
 9
 
@@ -135,7 +135,7 @@ statement ok
 CREATE MATERIALIZED VIEW chain_anti_base AS SELECT a.id,a.v,a.target FROM chain_left a ANTI JOIN chain_blocked b ON a.target=b.id;
 
 query I
-SELECT COUNT(*) FROM memory.main.openivm_views WHERE view_name IN ('chain_anti','chain_semi','chain_anti_base') AND type=9;
+SELECT COUNT(*) FROM memory.main.openivm_views WHERE view_name IN ('__openivm_mv_646c_6d61696e_636861696e5f616e7469_','__openivm_mv_646c_6d61696e_636861696e5f73656d69_','__openivm_mv_646c_6d61696e_636861696e5f616e74695f62617365_') AND type=9;
 ----
 3
 

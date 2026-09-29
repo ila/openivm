@@ -294,3 +294,97 @@ Other CPU-heavy jobs were active during these measurements. The observed
 
 The final full run passed the compiled N-term integration check and all 12,570
 assertions in 89 SQL test cases (one ICU-dependent skip).
+
+### Mark's first DuckLake session: schema and SQL-output audit (2026-09-28)
+
+Checked against main `38929faa` with a persistent native frontend, a DuckLake
+attachment, and a materialized view in `dl.observation`. The findings were checked
+against source, live CLI queries, and close/reopen refreshes.
+
+| Question | Verified behavior |
+|---|---|
+| Qualified refresh and duplicate MV names | `refresh('observation.product_summary')` fails; the short name succeeds. Locations are recorded, but `openivm_views` uses the short name as its primary key. Same-named MVs in different schemas sharing that metadata catalog are not supported. |
+| All internal tables in main? | Control metadata is in native `frontend.main`; backing, visible, and MV delta tables were in `dl.observation`. Native source deltas were in the source schema. |
+| Empty DuckLake deltas | No source delta table was created. MV delta and visible-output delta objects were still created. Source changes came from snapshot watermarks. |
+| Separate metadata schema/frontend | A persistent native frontend already holds OpenIVM metadata, outside DuckLake Parquet storage. A configurable metadata schema is not implemented. |
+| Missing SQL files | Output is opt-in, relative to the process working directory. A missing output directory previously caused silent write failure. |
+| SQL stored as rows | `CREATE TABLE saved_refresh AS SELECT * FROM openivm_compile_with_facts(...)` worked and persisted across reopen. Automatic retention of each executed program is not implemented. |
+
+The duplicate-MV experiment exposed a separate correctness bug: a failed CREATE
+in a second DuckLake schema removed the first MV's metadata. The staged executor
+had registered failure cleanup before checking for duplicate names. Cleanup now
+becomes active only after system setup and that check succeed. The existing
+DuckLake chained tests cover the rejected CREATE followed by conflicting DML and
+a successful refresh of the original MV with full bag equality.
+
+Usability changes add `PRAGMA openivm_files('view_name')` with absolute paths,
+existence, status, and working directory; actionable missing-metadata and
+duplicate-name errors; and checked SQL-file writes. File existence is explicitly
+not a freshness guarantee. The existing compile-refresh tests cover disabled
+output, absent directories, unknown names, path reporting, and saving SQL as rows.
+
+Separate native-schema checks used two tables both named sales with distinct MV
+names, then a join between those tables. All three mixed-DML refreshes matched
+full recomputation. This verifies those cases, not general schema-qualified MV
+identity. DuckLake bag checks also passed after the duplicate-name failure and
+after reopening the frontend and reattaching the lake.
+
+SQL reference export also leaked internal profiling records and treated the first
+three records as system DDL. Export now omits both profiling marker types and
+uses the actual system-setup boundary; regression checks inspect both files.
+
+A cross-schema CREATE OR REPLACE also reproduced metadata reassignment: both
+physical views remained while only the second location was registered. Replacement
+now checks the registered catalog/schema before any cleanup or replacement work.
+The original MV remains refreshable after both rejected operations.
+
+Final validation passed 1,166 focused assertions and the full suite's 12,645
+assertions in 89 cases (one ICU-dependent skip), plus compiled N-term SQL
+integration. The documented demo also passed from a working directory containing
+spaces, with all three SQL paths reported correctly and no leaked profiler records.
+
+### Schema identity and concurrent creation follow-up (2026-09-29)
+
+The short-name restriction described in the first-session audit above is removed.
+Refresh, pipeline targets, compiled-SQL inspection, and lifecycle operations resolve
+qualified MV names. New MVs use deterministic internal keys derived from their
+catalog, schema, and SQL name; existing stored keys are retained. Control metadata
+stays in the native database's `main` schema. See [schema and metadata usage](ducklake.md#schemas-metadata-and-internal-tables).
+
+Concurrent creates in separate schemas no longer compete for an available short
+key. Autocommit first-time setup briefly serializes creation of shared control
+tables and native source-delta tables, then releases the initialization guard
+before MV planning or materialization. Concurrent creates of the same qualified
+view have one winner and ordinary catalog conflicts for the other callers.
+Explicit transactions keep rollbackable initialization and DuckDB's transaction
+conflict semantics. The existing refresh/mutation locks are unchanged.
+
+Permanent DuckLake MV delta tables remain in place. Compiled filenames now contain
+the internal key; use `PRAGMA openivm_files('catalog.schema.view')` to discover them.
+
+### Same-named source tables and cross-catalog lifecycle follow-up (2026-09-29)
+
+A single MV could previously conflate native sources such as `a.items` and
+`b.items`; DuckLake rejected that shape. Source identity now includes catalog and
+schema through creation, delta compilation, affected-key lineage, refresh,
+rename, and drop. Repeated scans of one physical source retain separate occurrence
+identities. DuckLake snapshots are recorded independently per catalog.
+
+The expanded tests also cover quoted and Unicode identifiers, conflicting DML
+batches, duplicate and NULL rows, inner/self/outer/semi/anti joins, aggregates,
+replacement, reopen, and transaction rollback. Copying a DuckLake delta plan now
+restores its SQL scan arguments from the bound snapshot during the existing index
+renumbering traversal.
+
+Native cross-catalog refresh defers external delta cleanup until commit. A
+forced cleanup conflict verifies that the MV remains correct and the next batch
+does not replay retained changes. Cleanup and source lifecycle operations account
+for consumers in other native metadata catalogs; column-rename rollback restores
+metadata to its original catalog. Cross-catalog cascade drops use staged DDL.
+
+Validation: the full SQL suite passed 13,316 assertions across 89 test cases,
+with one ICU-dependent test skipped. Compiled N-term SQL integration and real
+CLI checks passed, including mixed-case ALTER, Unicode and dollar-sign names,
+cross-catalog rename/rollback/drop, and DuckLake self-joins. Existing native
+delta-retention assertions remain unchanged; external cleanup is tested after
+commit, including a deterministic write conflict and subsequent retry.

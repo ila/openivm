@@ -50,7 +50,7 @@ SELECT count(*) FROM openivm_delta_tables;
 # ==========================================
 
 query II
-SELECT view_name, type FROM openivm_views ORDER BY view_name;
+SELECT view_sql_name, type FROM openivm_views ORDER BY view_name;
 ----
 mv1	0
 mv2	2
@@ -59,7 +59,7 @@ mv2	2
 
 # Verify the stored SQL is non-empty and contains the expected table/column references
 query I
-SELECT sql_string IS NOT NULL AND LENGTH(sql_string) > 0 AND sql_string LIKE '%sum%' AND sql_string LIKE '%grp%' FROM openivm_views WHERE view_name = 'mv1';
+SELECT sql_string IS NOT NULL AND LENGTH(sql_string) > 0 AND sql_string LIKE '%sum%' AND sql_string LIKE '%grp%' FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7631_';
 ----
 true
 
@@ -68,7 +68,7 @@ true
 # ==========================================
 
 query II
-SELECT view_name, table_name FROM openivm_delta_tables ORDER BY view_name;
+SELECT v.view_sql_name, d.table_name FROM openivm_delta_tables d JOIN openivm_views v USING (view_name) ORDER BY v.view_sql_name;
 ----
 mv1	openivm_delta_t1
 mv2	openivm_delta_t2
@@ -88,12 +88,12 @@ SELECT count(*) FROM openivm_delta_t2;
 0
 
 query I
-SELECT count(*) FROM openivm_delta_mv1;
+SELECT count(*) FROM openivm_delta___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7631_;
 ----
 0
 
 query I
-SELECT count(*) FROM openivm_delta_mv2;
+SELECT count(*) FROM openivm_delta___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7632_;
 ----
 0
 
@@ -178,19 +178,19 @@ DROP VIEW mv1;
 
 # Entry should be removed from openivm_views
 query I
-SELECT count(*) FROM openivm_views WHERE view_name = 'mv1';
+SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7631_';
 ----
 0
 
 # Entries should be removed from openivm_delta_tables
 query I
-SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'mv1';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7631_';
 ----
 0
 
 # Delta view for the MV should be dropped
 statement error
-SELECT count(*) FROM openivm_delta_mv1;
+SELECT count(*) FROM openivm_delta___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7631_;
 ----
 does not exist
 
@@ -202,12 +202,12 @@ does not exist
 
 # mv2 metadata should be untouched
 query I
-SELECT count(*) FROM openivm_views WHERE view_name = 'mv2';
+SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7632_';
 ----
 1
 
 query I
-SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'mv2';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7632_';
 ----
 1
 
@@ -238,7 +238,7 @@ b	20
 c	100
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name = 'mv1';
+SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7631_';
 ----
 1
 
@@ -251,17 +251,17 @@ statement ok
 DROP VIEW mv2;
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name = 'mv2';
+SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7632_';
 ----
 0
 
 query I
-SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'mv2';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7632_';
 ----
 0
 
 statement error
-SELECT count(*) FROM openivm_delta_mv2;
+SELECT count(*) FROM openivm_delta___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7632_;
 ----
 does not exist
 
@@ -330,7 +330,7 @@ statement ok
 CREATE MATERIALIZED VIEW mv_t3 AS SELECT sum(val) as total FROM t3;
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name = 'mv_t3';
+SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f7433_';
 ----
 1
 
@@ -347,12 +347,12 @@ does not exist
 
 # Metadata should be cleaned up
 query I
-SELECT count(*) FROM openivm_views WHERE view_name = 'mv_t3';
+SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f7433_';
 ----
 0
 
 query I
-SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'mv_t3';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f7433_';
 ----
 0
 
@@ -363,7 +363,7 @@ SELECT count(*) FROM openivm_delta_t3;
 does not exist
 
 statement error
-SELECT count(*) FROM openivm_delta_mv_t3;
+SELECT count(*) FROM openivm_delta___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f7433_;
 ----
 does not exist
 
@@ -508,7 +508,7 @@ SELECT COUNT(*) FROM (SELECT * FROM mv_view_test);
 
 # Verify the data table exists separately
 query I
-SELECT COUNT(*) FROM openivm_data_mv_view_test;
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f766965775f74657374_;
 ----
 2
 
@@ -527,17 +527,17 @@ CREATE MATERIALIZED VIEW mv_drop_test AS SELECT val FROM drop_test;
 
 # Verify everything exists
 query I
-SELECT COUNT(*) FROM openivm_views WHERE view_name = 'mv_drop_test';
+SELECT COUNT(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f64726f705f74657374_';
 ----
 1
 
 query I
-SELECT COUNT(*) FROM openivm_delta_tables WHERE view_name = 'mv_drop_test';
+SELECT COUNT(*) FROM openivm_delta_tables WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f64726f705f74657374_';
 ----
 1
 
 query I
-SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_data_mv_drop_test';
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_data___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f64726f705f74657374_';
 ----
 1
 
@@ -546,21 +546,21 @@ statement ok
 DROP VIEW mv_drop_test;
 
 query I
-SELECT COUNT(*) FROM openivm_views WHERE view_name = 'mv_drop_test';
+SELECT COUNT(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f64726f705f74657374_';
 ----
 0
 
 query I
-SELECT COUNT(*) FROM openivm_delta_tables WHERE view_name = 'mv_drop_test';
+SELECT COUNT(*) FROM openivm_delta_tables WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f64726f705f74657374_';
 ----
 0
 
 query I
-SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_data_mv_drop_test';
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_data___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f64726f705f74657374_';
 ----
 0
 
 query I
-SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_delta_mv_drop_test';
+SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_delta___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f64726f705f74657374_';
 ----
 0

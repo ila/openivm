@@ -10,6 +10,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
@@ -58,7 +59,10 @@ static bool ReadSource(TableRef &ref, string &table, string &alias) {
 static bool ReadOutputs(SelectNode &select, vector<string> &names, vector<string> &expressions) {
 	for (auto &expression : select.select_list) {
 		if (expression->GetExpressionClass() == ExpressionClass::STAR) {
-			return false;
+			auto &star = expression->Cast<StarExpression>();
+			// The caller obtains the bound left-source columns for an unmodified star.
+			return select.select_list.size() == 1 && star.exclude_list.empty() && star.replace_list.empty() &&
+			       star.rename_list.empty() && !star.expr && !star.columns;
 		}
 		names.push_back(expression->GetName());
 		expressions.push_back(expression->ToString());
@@ -280,12 +284,24 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 	if (select->from_table->type == TableReferenceType::JOIN) {
 		auto &join = select->from_table->Cast<JoinRef>();
 		if (join.type == JoinType::SEMI || join.type == JoinType::ANTI) {
-			if (!join.condition || !ReadSource(*join.left, out.left_table, out.left_alias) ||
+			if ((!join.condition && join.using_columns.empty()) ||
+			    !ReadSource(*join.left, out.left_table, out.left_alias) ||
 			    !ReadSource(*join.right, out.right_table, out.right_alias)) {
 				return false;
 			}
 			out.join_type = join.type == JoinType::SEMI ? "semi" : "anti";
-			out.predicate = join.condition->ToString();
+			if (join.condition) {
+				out.predicate = join.condition->ToString();
+			} else {
+				vector<string> equalities;
+				for (const auto &column : join.using_columns) {
+					auto quoted = SqlUtils::QuoteIdentifier(column);
+					equalities.push_back(SqlUtils::QuoteIdentifier(out.left_alias) + "." + quoted + " = " +
+					                     SqlUtils::QuoteIdentifier(out.right_alias) + "." + quoted);
+				}
+				out.predicate = StringUtil::Join(equalities, " AND ");
+				OPENIVM_DEBUG_PRINT("[SEMI/ANTI] Expanded USING predicate: %s\n", out.predicate.c_str());
+			}
 			out.post_filter = ExprSQL(select->where_clause);
 			return true;
 		}

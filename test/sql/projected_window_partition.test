@@ -29,7 +29,7 @@ LIMIT 1;
 5	WINDOW_PARTITION
 
 query I
-SELECT bool_or(sql LIKE '%INSERT INTO openivm_delta_pwp_mv%')
+SELECT bool_or(sql LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7077705f6d76_%')
 FROM openivm_compile_with_facts(
     'pwp_mv',
     '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'

@@ -685,7 +685,7 @@ CREATE MATERIALIZED VIEW mv_uoa AS
 
 # Verify classification is GROUP_RECOMPUTE (6), not SIMPLE_AGGREGATE (1)
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_uoa';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f756f61_';
 ----
 6
 
@@ -820,7 +820,7 @@ CREATE MATERIALIZED VIEW mv_uod AS
     SELECT w_id, SUM(amount) FROM uod_history GROUP BY w_id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_uod';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f756f64_';
 ----
 6
 

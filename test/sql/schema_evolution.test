@@ -253,7 +253,7 @@ SELECT count(*) FROM (
 0
 
 query III
-SELECT machine, cores, _count FROM openivm_distinct_count_se_dist_mv ORDER BY machine;
+SELECT machine, cores, _count FROM openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f646973745f6d76_ ORDER BY machine;
 ----
 m2	16	1
 m3	5	1
@@ -265,7 +265,7 @@ ALTER TABLE se_dist DROP COLUMN cpu;
 referenced by materialized view
 
 statement ok
-DROP TABLE openivm_distinct_count_se_dist_mv;
+DROP TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f646973745f6d76_;
 
 statement ok
 PRAGMA refresh('se_dist_mv');
@@ -424,13 +424,13 @@ CREATE MATERIALIZED VIEW se_fgc_schema_mv AS
     WHERE total < 0;
 
 statement ok
-DROP TABLE openivm_filtered_group_count_se_fgc_schema_mv;
+DROP TABLE openivm_filtered_group_count___openivm_mv_6d656d6f7279_6d61696e_73655f6667635f736368656d615f6d76_;
 
 statement ok
 PRAGMA refresh('se_fgc_schema_mv');
 
 query II
-SELECT wid, openivm_sum FROM openivm_filtered_group_count_se_fgc_schema_mv ORDER BY wid;
+SELECT wid, openivm_sum FROM openivm_filtered_group_count___openivm_mv_6d656d6f7279_6d61696e_73655f6667635f736368656d615f6d76_ ORDER BY wid;
 ----
 1	-5.0
 2	10.0
@@ -649,7 +649,7 @@ CREATE MATERIALIZED VIEW se_pending_aux_mv AS
     GROUP BY grp;
 
 statement ok
-DROP TABLE openivm_distinct_count_se_pending_aux_mv;
+DROP TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f70656e64696e675f6175785f6d76_;
 
 statement ok
 INSERT INTO se_pending_aux VALUES (1, 'm3', 32);
@@ -843,8 +843,8 @@ DROP TABLE se_identity_a.drop_shared CASCADE;
 
 query II
 SELECT
-    (SELECT count(*) FROM openivm_views WHERE view_name = 'se_identity_drop_a_mv'),
-    (SELECT count(*) FROM openivm_views WHERE view_name = 'se_identity_drop_b_mv');
+    (SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_73655f6964656e746974795f64726f705f615f6d76_'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_73655f6964656e746974795f64726f705f625f6d76_');
 ----
 0	1
 
@@ -1036,3 +1036,733 @@ SELECT (SELECT count(*) FROM (SELECT * FROM se_uncommitted_mv EXCEPT ALL SELECT 
        (SELECT count(*) FROM (SELECT id, v FROM se_uncommitted_src EXCEPT ALL SELECT * FROM se_uncommitted_mv));
 ----
 0	0
+
+
+
+# Same-named physical sources must retain distinct delta identities.
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE SCHEMA source_a;
+
+statement ok
+CREATE SCHEMA source_b;
+
+statement ok
+CREATE TABLE source_a.items(id INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE source_b.items(id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO source_a.items VALUES (1,10),(2,20),(3,30),(3,30), (NULL,40),(5,NULL);
+
+statement ok
+INSERT INTO source_b.items VALUES (1,100),(2,200),(3,300),(3,300), (NULL,40),(5,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW source_join AS SELECT a.id, a.v av, b.v bv FROM source_a.items a JOIN source_b.items b USING(id);
+
+statement ok
+CREATE MATERIALIZED VIEW source_copy AS SELECT * FROM source_a.items;
+
+statement ok
+CREATE MATERIALIZED VIEW source_self AS SELECT a.id, a.v av, x.v xv, b.v bv FROM source_a.items a JOIN source_a.items x USING(id) JOIN source_b.items b USING(id);
+
+statement ok
+CREATE MATERIALIZED VIEW source_left AS SELECT a.id, a.v av, b.v bv FROM source_a.items a LEFT JOIN source_b.items b USING(id);
+
+statement ok
+CREATE MATERIALIZED VIEW source_full AS SELECT a.id aid, a.v av, b.id bid, b.v bv FROM source_a.items a FULL OUTER JOIN source_b.items b USING(id);
+
+statement ok
+CREATE MATERIALIZED VIEW source_aggregate AS SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id;
+
+statement ok
+CREATE MATERIALIZED VIEW source_min AS SELECT a.id, MIN(b.v) lo FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id;
+
+statement ok
+CREATE MATERIALIZED VIEW source_anti AS SELECT a.* FROM source_a.items a ANTI JOIN source_b.items b USING(id);
+
+statement ok
+CREATE MATERIALIZED VIEW source_semi AS SELECT * FROM source_a.items a SEMI JOIN source_b.items b USING(id,v);
+
+query I
+SELECT count(*) FROM main.openivm_views WHERE starts_with(view_sql_name,'source_') AND type=3;
+----
+0
+
+statement ok
+UPDATE source_a.items SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM source_a.items WHERE id=2;
+
+statement ok
+INSERT INTO source_a.items VALUES (2,22),(4,44),(4,44);
+
+statement ok
+PRAGMA refresh('source_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_join EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM source_a.items a JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM source_a.items a JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_join));
+----
+0
+
+statement ok
+PRAGMA refresh('source_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_copy EXCEPT ALL SELECT * FROM source_a.items) UNION ALL (SELECT * FROM source_a.items EXCEPT ALL SELECT * FROM source_copy));
+----
+0
+
+statement ok
+PRAGMA refresh('source_self');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_self EXCEPT ALL SELECT a.id, a.v av, x.v xv, b.v bv FROM source_a.items a JOIN source_a.items x USING(id) JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, x.v xv, b.v bv FROM source_a.items a JOIN source_a.items x USING(id) JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_self));
+----
+0
+
+statement ok
+PRAGMA refresh('source_left');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_left EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM source_a.items a LEFT JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM source_a.items a LEFT JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_left));
+----
+0
+
+statement ok
+PRAGMA refresh('source_full');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_full EXCEPT ALL SELECT a.id aid, a.v av, b.id bid, b.v bv FROM source_a.items a FULL OUTER JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id aid, a.v av, b.id bid, b.v bv FROM source_a.items a FULL OUTER JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_full));
+----
+0
+
+statement ok
+PRAGMA refresh('source_aggregate');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_aggregate EXCEPT ALL SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM source_aggregate));
+----
+0
+
+statement ok
+PRAGMA refresh('source_min');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_min EXCEPT ALL SELECT a.id, MIN(b.v) lo FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, MIN(b.v) lo FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM source_min));
+----
+0
+
+statement ok
+PRAGMA refresh('source_semi');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_semi EXCEPT ALL SELECT * FROM source_a.items a SEMI JOIN source_b.items b USING(id,v)) UNION ALL (SELECT * FROM source_a.items a SEMI JOIN source_b.items b USING(id,v) EXCEPT ALL SELECT * FROM source_semi));
+----
+0
+
+statement ok
+PRAGMA refresh('source_anti');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_anti EXCEPT ALL SELECT a.* FROM source_a.items a ANTI JOIN source_b.items b USING(id)) UNION ALL (SELECT a.* FROM source_a.items a ANTI JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_anti));
+----
+0
+
+statement ok
+UPDATE source_b.items SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM source_b.items WHERE id=2;
+
+statement ok
+INSERT INTO source_b.items VALUES (2,22),(4,44),(4,44);
+
+statement ok
+PRAGMA refresh('source_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_join EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM source_a.items a JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM source_a.items a JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_join));
+----
+0
+
+statement ok
+PRAGMA refresh('source_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_copy EXCEPT ALL SELECT * FROM source_a.items) UNION ALL (SELECT * FROM source_a.items EXCEPT ALL SELECT * FROM source_copy));
+----
+0
+
+statement ok
+PRAGMA refresh('source_self');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_self EXCEPT ALL SELECT a.id, a.v av, x.v xv, b.v bv FROM source_a.items a JOIN source_a.items x USING(id) JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, x.v xv, b.v bv FROM source_a.items a JOIN source_a.items x USING(id) JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_self));
+----
+0
+
+statement ok
+PRAGMA refresh('source_left');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_left EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM source_a.items a LEFT JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM source_a.items a LEFT JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_left));
+----
+0
+
+statement ok
+PRAGMA refresh('source_full');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_full EXCEPT ALL SELECT a.id aid, a.v av, b.id bid, b.v bv FROM source_a.items a FULL OUTER JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id aid, a.v av, b.id bid, b.v bv FROM source_a.items a FULL OUTER JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_full));
+----
+0
+
+statement ok
+PRAGMA refresh('source_aggregate');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_aggregate EXCEPT ALL SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM source_aggregate));
+----
+0
+
+statement ok
+PRAGMA refresh('source_min');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_min EXCEPT ALL SELECT a.id, MIN(b.v) lo FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, MIN(b.v) lo FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM source_min));
+----
+0
+
+statement ok
+PRAGMA refresh('source_semi');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_semi EXCEPT ALL SELECT * FROM source_a.items a SEMI JOIN source_b.items b USING(id,v)) UNION ALL (SELECT * FROM source_a.items a SEMI JOIN source_b.items b USING(id,v) EXCEPT ALL SELECT * FROM source_semi));
+----
+0
+
+statement ok
+PRAGMA refresh('source_anti');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_anti EXCEPT ALL SELECT a.* FROM source_a.items a ANTI JOIN source_b.items b USING(id)) UNION ALL (SELECT a.* FROM source_a.items a ANTI JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_anti));
+----
+0
+
+statement ok
+SET openivm_skip_empty_deltas=false;
+
+statement ok
+UPDATE source_b.items SET v=v+7 WHERE id=3;
+
+statement ok
+DELETE FROM source_b.items WHERE id=1;
+
+statement ok
+INSERT INTO source_b.items VALUES (1,111),(5,500);
+
+statement ok
+UPDATE source_a.items SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM source_a.items WHERE id=2;
+
+statement ok
+INSERT INTO source_a.items VALUES (2,22),(4,44),(4,44);
+
+statement ok
+PRAGMA refresh('source_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_join EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM source_a.items a JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM source_a.items a JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_join));
+----
+0
+
+statement ok
+PRAGMA refresh('source_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_copy EXCEPT ALL SELECT * FROM source_a.items) UNION ALL (SELECT * FROM source_a.items EXCEPT ALL SELECT * FROM source_copy));
+----
+0
+
+statement ok
+PRAGMA refresh('source_self');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_self EXCEPT ALL SELECT a.id, a.v av, x.v xv, b.v bv FROM source_a.items a JOIN source_a.items x USING(id) JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, x.v xv, b.v bv FROM source_a.items a JOIN source_a.items x USING(id) JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_self));
+----
+0
+
+statement ok
+PRAGMA refresh('source_left');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_left EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM source_a.items a LEFT JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM source_a.items a LEFT JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_left));
+----
+0
+
+statement ok
+PRAGMA refresh('source_full');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_full EXCEPT ALL SELECT a.id aid, a.v av, b.id bid, b.v bv FROM source_a.items a FULL OUTER JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id aid, a.v av, b.id bid, b.v bv FROM source_a.items a FULL OUTER JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_full));
+----
+0
+
+statement ok
+PRAGMA refresh('source_aggregate');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_aggregate EXCEPT ALL SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM source_aggregate));
+----
+0
+
+statement ok
+PRAGMA refresh('source_min');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_min EXCEPT ALL SELECT a.id, MIN(b.v) lo FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, MIN(b.v) lo FROM source_a.items a JOIN source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM source_min));
+----
+0
+
+statement ok
+PRAGMA refresh('source_semi');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_semi EXCEPT ALL SELECT * FROM source_a.items a SEMI JOIN source_b.items b USING(id,v)) UNION ALL (SELECT * FROM source_a.items a SEMI JOIN source_b.items b USING(id,v) EXCEPT ALL SELECT * FROM source_semi));
+----
+0
+
+statement ok
+PRAGMA refresh('source_anti');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_anti EXCEPT ALL SELECT a.* FROM source_a.items a ANTI JOIN source_b.items b USING(id)) UNION ALL (SELECT a.* FROM source_a.items a ANTI JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_anti));
+----
+0
+
+statement ok
+SET openivm_skip_empty_deltas=true;
+
+statement ok
+PRAGMA refresh('source_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_join EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM source_a.items a JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM source_a.items a JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_join));
+----
+0
+
+# Replacement can introduce, then remove, a short-name collision in source metadata.
+statement ok
+CREATE MATERIALIZED VIEW source_replace AS SELECT id,v av FROM source_a.items;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW source_replace AS SELECT a.id,a.v av FROM source_a.items a JOIN source_b.items b USING(id);
+
+statement ok
+UPDATE source_a.items SET v=v+1 WHERE id=2;
+
+statement ok
+DELETE FROM source_a.items WHERE id=5;
+
+statement ok
+INSERT INTO source_a.items VALUES(5,555),(5,555);
+
+statement ok
+PRAGMA refresh('source_replace');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_replace EXCEPT ALL SELECT a.id,a.v av FROM source_a.items a JOIN source_b.items b USING(id)) UNION ALL (SELECT a.id,a.v av FROM source_a.items a JOIN source_b.items b USING(id) EXCEPT ALL SELECT * FROM source_replace));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW source_replace AS SELECT id,v av FROM source_a.items;
+
+statement ok
+UPDATE source_a.items SET v=v+1 WHERE id=2;
+
+statement ok
+DELETE FROM source_a.items WHERE id=5;
+
+statement ok
+INSERT INTO source_a.items VALUES(5,555),(5,555);
+
+statement ok
+PRAGMA refresh('source_replace');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_replace EXCEPT ALL SELECT id,v av FROM source_a.items) UNION ALL (SELECT id,v av FROM source_a.items EXCEPT ALL SELECT * FROM source_replace));
+----
+0
+
+statement ok
+DROP VIEW source_replace;
+
+statement ok
+DROP VIEW source_self;
+
+statement ok
+DROP VIEW source_left;
+
+statement ok
+DROP VIEW source_full;
+
+statement ok
+DROP VIEW source_aggregate;
+
+statement ok
+DROP VIEW source_min;
+
+statement ok
+DROP VIEW source_anti;
+
+statement ok
+DROP VIEW source_semi;
+
+statement ok
+DROP VIEW source_join;
+
+statement ok
+UPDATE source_a.items SET v=v+2;
+
+statement ok
+PRAGMA refresh('source_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_copy EXCEPT ALL SELECT * FROM source_a.items) UNION ALL (SELECT * FROM source_a.items EXCEPT ALL SELECT * FROM source_copy));
+----
+0
+
+statement ok
+DROP VIEW source_copy;
+
+statement ok
+DROP SCHEMA source_a CASCADE;
+
+statement ok
+DROP SCHEMA source_b CASCADE;
+
+# Catalog identity is part of a source key, even when both schemas are main.
+statement ok
+ATTACH ':memory:' AS source_other;
+
+statement ok
+CREATE TABLE cross_catalog_source(id INTEGER,v INTEGER);
+
+statement ok
+CREATE TABLE source_other.cross_catalog_source(id INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO cross_catalog_source VALUES(1,10),(2,20),(2,20);
+
+statement ok
+INSERT INTO source_other.cross_catalog_source VALUES(1,100),(2,200);
+
+statement ok
+CREATE MATERIALIZED VIEW cross_catalog_join AS SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id);
+
+statement ok
+UPDATE cross_catalog_source SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM cross_catalog_source WHERE id=2;
+
+statement ok
+INSERT INTO cross_catalog_source VALUES(2,22),(2,22);
+
+statement ok
+PRAGMA refresh('cross_catalog_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_join EXCEPT ALL SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id)) UNION ALL (SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id) EXCEPT ALL SELECT * FROM cross_catalog_join));
+----
+0
+
+statement ok
+UPDATE source_other.cross_catalog_source SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM source_other.cross_catalog_source WHERE id=2;
+
+statement ok
+INSERT INTO source_other.cross_catalog_source VALUES(2,22),(2,22);
+
+statement ok
+PRAGMA refresh('cross_catalog_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_join EXCEPT ALL SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id)) UNION ALL (SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id) EXCEPT ALL SELECT * FROM cross_catalog_join));
+----
+0
+
+# An external source delta shared with a slower consumer must survive cleanup.
+statement ok
+CREATE MATERIALIZED VIEW cross_catalog_copy AS SELECT * FROM source_other.cross_catalog_source;
+
+statement ok
+CREATE MATERIALIZED VIEW source_other.local_copy AS SELECT * FROM source_other.cross_catalog_source;
+
+statement ok
+UPDATE source_other.cross_catalog_source SET v=v+7;
+
+statement ok
+DELETE FROM source_other.cross_catalog_source WHERE id=1;
+
+statement ok
+INSERT INTO source_other.cross_catalog_source VALUES(1,99),(1,99);
+
+statement ok
+CREATE TABLE cross_catalog_before AS SELECT * FROM cross_catalog_join;
+
+statement ok
+CREATE TABLE cross_catalog_pending AS SELECT * FROM source_other.openivm_delta_cross_catalog_source;
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA refresh('cross_catalog_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_join EXCEPT ALL SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id)) UNION ALL (SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id) EXCEPT ALL SELECT * FROM cross_catalog_join));
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_join EXCEPT ALL SELECT * FROM cross_catalog_before) UNION ALL (SELECT * FROM cross_catalog_before EXCEPT ALL SELECT * FROM cross_catalog_join));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_other.openivm_delta_cross_catalog_source EXCEPT ALL SELECT * FROM cross_catalog_pending) UNION ALL (SELECT * FROM cross_catalog_pending EXCEPT ALL SELECT * FROM source_other.openivm_delta_cross_catalog_source));
+----
+0
+
+statement ok
+BEGIN;
+
+statement ok
+PRAGMA refresh('cross_catalog_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_join EXCEPT ALL SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id)) UNION ALL (SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id) EXCEPT ALL SELECT * FROM cross_catalog_join));
+----
+0
+
+statement ok
+COMMIT;
+
+# The unrefreshed copy retains the source changes even after successful commit.
+query I
+SELECT count(*) FROM ((SELECT * FROM source_other.openivm_delta_cross_catalog_source EXCEPT ALL SELECT * FROM cross_catalog_pending) UNION ALL (SELECT * FROM cross_catalog_pending EXCEPT ALL SELECT * FROM source_other.openivm_delta_cross_catalog_source));
+----
+0
+
+statement ok
+PRAGMA refresh('cross_catalog_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_copy EXCEPT ALL SELECT * FROM source_other.cross_catalog_source) UNION ALL (SELECT * FROM source_other.cross_catalog_source EXCEPT ALL SELECT * FROM cross_catalog_copy));
+----
+0
+
+# Metadata in another native catalog participates in the retention watermark.
+statement ok
+PRAGMA refresh('source_other.local_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_other.local_copy EXCEPT ALL SELECT * FROM source_other.cross_catalog_source) UNION ALL (SELECT * FROM source_other.cross_catalog_source EXCEPT ALL SELECT * FROM source_other.local_copy));
+----
+0
+
+# Native refresh retains its latest batch. Run the external consumer last to collect it
+# after commit, even when its watermark already excludes those retained rows.
+statement ok
+SET openivm_skip_empty_deltas=false;
+
+statement ok
+PRAGMA refresh('cross_catalog_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_copy EXCEPT ALL SELECT * FROM source_other.cross_catalog_source) UNION ALL (SELECT * FROM source_other.cross_catalog_source EXCEPT ALL SELECT * FROM cross_catalog_copy));
+----
+0
+
+statement ok
+SET openivm_skip_empty_deltas=true;
+
+query I
+SELECT count(*) FROM source_other.openivm_delta_cross_catalog_source;
+----
+0
+
+# The explicitly requested full-refresh path uses the same deferred housekeeping.
+statement ok
+UPDATE source_other.cross_catalog_source SET v=v+3;
+
+statement ok
+DELETE FROM source_other.cross_catalog_source WHERE id=2;
+
+statement ok
+INSERT INTO source_other.cross_catalog_source VALUES(2,55),(2,55);
+
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+PRAGMA refresh('cross_catalog_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_join EXCEPT ALL SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id)) UNION ALL (SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id) EXCEPT ALL SELECT * FROM cross_catalog_join));
+----
+0
+
+statement ok
+PRAGMA refresh('cross_catalog_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_copy EXCEPT ALL SELECT * FROM source_other.cross_catalog_source) UNION ALL (SELECT * FROM source_other.cross_catalog_source EXCEPT ALL SELECT * FROM cross_catalog_copy));
+----
+0
+
+statement ok
+SET openivm_refresh_mode='incremental';
+
+# Metadata in another native catalog participates in the retention watermark.
+statement ok
+PRAGMA refresh('source_other.local_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_other.local_copy EXCEPT ALL SELECT * FROM source_other.cross_catalog_source) UNION ALL (SELECT * FROM source_other.cross_catalog_source EXCEPT ALL SELECT * FROM source_other.local_copy));
+----
+0
+
+# Native refresh retains its latest batch. Run the external consumer last to collect it
+# after commit, even when its watermark already excludes those retained rows.
+statement ok
+SET openivm_skip_empty_deltas=false;
+
+statement ok
+PRAGMA refresh('cross_catalog_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_copy EXCEPT ALL SELECT * FROM source_other.cross_catalog_source) UNION ALL (SELECT * FROM source_other.cross_catalog_source EXCEPT ALL SELECT * FROM cross_catalog_copy));
+----
+0
+
+statement ok
+SET openivm_skip_empty_deltas=true;
+
+query I
+SELECT count(*) FROM source_other.openivm_delta_cross_catalog_source;
+----
+0
+
+# Rollback and committed rename must update every metadata owner, not just the source catalog.
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE SOURCE_OTHER.CROSS_CATALOG_SOURCE RENAME COLUMN V TO amount;
+
+statement ok
+ROLLBACK;
+
+statement ok
+UPDATE source_other.cross_catalog_source SET v=v+9;
+
+statement ok
+DELETE FROM source_other.cross_catalog_source WHERE id=1;
+
+statement ok
+INSERT INTO source_other.cross_catalog_source VALUES(1,81),(1,81);
+
+statement ok
+PRAGMA refresh('cross_catalog_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_join EXCEPT ALL SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id)) UNION ALL (SELECT a.id,a.v av,b.v bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id) EXCEPT ALL SELECT * FROM cross_catalog_join));
+----
+0
+
+statement ok
+PRAGMA refresh('cross_catalog_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_copy EXCEPT ALL SELECT * FROM source_other.cross_catalog_source) UNION ALL (SELECT * FROM source_other.cross_catalog_source EXCEPT ALL SELECT * FROM cross_catalog_copy));
+----
+0
+
+statement ok
+PRAGMA refresh('source_other.local_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_other.local_copy EXCEPT ALL SELECT * FROM source_other.cross_catalog_source) UNION ALL (SELECT * FROM source_other.cross_catalog_source EXCEPT ALL SELECT * FROM source_other.local_copy));
+----
+0
+
+statement ok
+ALTER TABLE source_other.cross_catalog_source ADD COLUMN unused INTEGER;
+
+statement ok
+ALTER TABLE source_other.cross_catalog_source DROP COLUMN unused;
+
+statement ok
+ALTER TABLE SOURCE_OTHER.CROSS_CATALOG_SOURCE RENAME COLUMN V TO amount;
+
+statement error
+ALTER TABLE SOURCE_OTHER.CROSS_CATALOG_SOURCE DROP COLUMN AMOUNT;
+----
+referenced by materialized view
+
+statement ok
+UPDATE source_other.cross_catalog_source SET amount=amount+9;
+
+statement ok
+DELETE FROM source_other.cross_catalog_source WHERE id=1;
+
+statement ok
+INSERT INTO source_other.cross_catalog_source VALUES(1,81),(1,81);
+
+statement ok
+PRAGMA refresh('cross_catalog_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_join EXCEPT ALL SELECT a.id,a.v av,b.amount bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id)) UNION ALL (SELECT a.id,a.v av,b.amount bv FROM cross_catalog_source a JOIN source_other.cross_catalog_source b USING(id) EXCEPT ALL SELECT * FROM cross_catalog_join));
+----
+0
+
+statement ok
+PRAGMA refresh('cross_catalog_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM cross_catalog_copy EXCEPT ALL SELECT * FROM source_other.cross_catalog_source) UNION ALL (SELECT * FROM source_other.cross_catalog_source EXCEPT ALL SELECT * FROM cross_catalog_copy));
+----
+0
+
+statement ok
+PRAGMA refresh('source_other.local_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_other.local_copy EXCEPT ALL SELECT * FROM source_other.cross_catalog_source) UNION ALL (SELECT * FROM source_other.cross_catalog_source EXCEPT ALL SELECT * FROM source_other.local_copy));
+----
+0
+
+statement ok
+DROP TABLE source_other.cross_catalog_source CASCADE;
+
+query I
+SELECT count(*) FROM main.openivm_views WHERE view_sql_name='cross_catalog_join';
+----
+0

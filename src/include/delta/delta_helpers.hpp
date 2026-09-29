@@ -13,6 +13,9 @@ struct DeltaGetResult {
 	ColumnBinding mul_binding;
 };
 
+// Restore the SQL arguments that DuckLake plan serialization omits.
+void PopulateDuckLakeChangeScanParameters(LogicalGet &get);
+
 DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binder &binder, LogicalGet *old_get,
                                   const string &view_name);
 

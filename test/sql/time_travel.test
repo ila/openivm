@@ -56,7 +56,7 @@ SELECT c_id, total FROM tt_single ORDER BY c_id;
 # The pin is preserved on the stored view SQL, in DuckDB spelling, on the pinned relation.
 query I
 SELECT CASE WHEN sql_string LIKE '%tt_orders AT (VERSION => 366)%' THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_single';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f73696e676c65_';
 ----
 1
 
@@ -69,7 +69,7 @@ CREATE MATERIALIZED VIEW tt_stamp AS
 
 query I
 SELECT CASE WHEN sql_string LIKE '%tt_orders AT (TIMESTAMP => ''2024-01-01 00:00:00'')%' THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_stamp';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f7374616d70_';
 ----
 1
 
@@ -97,7 +97,7 @@ SELECT CASE WHEN sql_string LIKE '%tt_orders AT (VERSION => 366)%'
              AND sql_string NOT LIKE '%tt_orders AT (VERSION => 12)%'
              AND sql_string NOT LIKE '%tt_customers AT (VERSION => 366)%'
             THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_join';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f6a6f696e_';
 ----
 1
 
@@ -114,7 +114,7 @@ query II
 SELECT (length(sql_string) - length(replace(sql_string, 'tt_orders AT (VERSION => 366)', ''))) /
            length('tt_orders AT (VERSION => 366)'),
        (length(sql_string) - length(replace(sql_string, 'tt_orders', ''))) / length('tt_orders')
-FROM openivm_views WHERE view_name = 'tt_cte';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f637465_';
 ----
 2	2
 
@@ -131,7 +131,7 @@ query I
 SELECT CASE WHEN sql_string LIKE '%tt_orders AT (VERSION => 366)%'
              AND sql_string LIKE '%tt_customers AT (VERSION => 12)%'
             THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_backtick';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f6261636b7469636b_';
 ----
 1
 
@@ -150,7 +150,7 @@ CREATE MATERIALIZED VIEW tt_shadow AS
 
 query I
 SELECT CASE WHEN sql_string LIKE '%tt_orders AT (VERSION => 366)%' THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_shadow';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f736861646f77_';
 ----
 1
 
@@ -173,7 +173,7 @@ CREATE MATERIALIZED VIEW tt_bare_alias AS
 
 query I
 SELECT CASE WHEN sql_string LIKE '%tt_orders AT (VERSION => 2)%' THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_bare_alias';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f626172655f616c696173_';
 ----
 1
 
@@ -198,7 +198,7 @@ SELECT CASE WHEN sql_string LIKE '%tt_orders AT (VERSION => 366)%'
              AND sql_string NOT LIKE '%tt_orders AT (VERSION => 12)%'
              AND sql_string NOT LIKE '%tt_customers AT (VERSION => 366)%'
             THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_alias_swap';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f616c6961735f73776170_';
 ----
 1
 
@@ -222,7 +222,7 @@ SELECT CASE WHEN sql_string LIKE '%tt_orders AT (VERSION => 2)%'
              AND sql_string NOT LIKE '%tt_orders AT (VERSION => 7)%'
              AND sql_string NOT LIKE '%tt_customers AT (VERSION => 2)%'
             THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_two_bare_aliases';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f74776f5f626172655f616c6961736573_';
 ----
 1
 
@@ -243,7 +243,7 @@ CREATE MATERIALIZED VIEW tt_no_alias AS
 
 query I
 SELECT CASE WHEN sql_string LIKE '%tt_orders AT (VERSION => 366)%' THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_no_alias';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f6e6f5f616c696173_';
 ----
 1
 
@@ -262,7 +262,7 @@ CREATE MATERIALIZED VIEW tt_column_alias AS
 
 query I
 SELECT CASE WHEN sql_string LIKE '%tt_orders AT (VERSION => 366)%' THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_column_alias';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f636f6c756d6e5f616c696173_';
 ----
 1
 
@@ -284,7 +284,7 @@ query I
 SELECT CASE WHEN sql_string LIKE '%tt_orders AT (VERSION => 366)%'
              AND sql_string NOT LIKE '%tt_customers AT (%'
             THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_half_pinned';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f68616c665f70696e6e6564_';
 ----
 1
 
@@ -418,7 +418,7 @@ SELECT c_id, total FROM tt_fallback_alias ORDER BY c_id;
 
 query I
 SELECT CASE WHEN sql_string LIKE '%tt_orders p AT (VERSION => 366)%' THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_fallback_alias';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f66616c6c6261636b5f616c696173_';
 ----
 1
 
@@ -452,7 +452,7 @@ WHERE stmt_kind = 'data';
 # An interrupted refresh recovers by recomputing from source, and that recovery program is built as
 # text as well, so both pins have to survive it.
 statement ok
-UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_join';
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f6a6f696e_';
 
 query I
 SELECT CASE WHEN (string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%tt_orders VERSION AS OF 366%'
@@ -479,7 +479,7 @@ WHERE stmt_kind = 'data';
 1
 
 statement ok
-UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = 'tt_join';
+UPDATE openivm_views SET refresh_in_progress = false WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f6a6f696e_';
 
 # ==========================================
 # Text-carried pins: the qualifier is translated in place, never duplicated
@@ -517,7 +517,7 @@ query I
 SELECT CASE WHEN sql_string LIKE '%tt_orders o AT (VERSION => 366)%'
              AND sql_string LIKE '%tt_customers c AT (VERSION => 12)%'
             THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_text_join';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f746578745f6a6f696e_';
 ----
 1
 
@@ -563,10 +563,10 @@ SELECT CASE WHEN (SELECT string_agg(sql, ' ' ORDER BY stmt_order)
 1
 
 statement ok
-UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_join';
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f746578745f6a6f696e_';
 
 statement ok
-UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_comma';
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f746578745f636f6d6d61_';
 
 # Recovery renders through LPTS: original aliases become CTE bindings, and each qualified
 # source scan must retain its own pin in the target dialect.
@@ -644,7 +644,7 @@ CREATE MATERIALIZED VIEW tt_text_shadow AS
     SELECT c_id, SUM(amount) AS total FROM tt_orders GROUP BY c_id;
 
 statement ok
-UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_shadow';
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f746578745f736861646f77_';
 
 query I
 SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%`memory`.`main`.`tt_orders` VERSION AS OF 366%'
@@ -754,13 +754,13 @@ WHERE stmt_kind = 'data';
 1
 
 statement ok
-UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_paren';
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f746578745f706172656e_';
 
 statement ok
-UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_paren_nested';
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f746578745f706172656e5f6e6573746564_';
 
 statement ok
-UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'tt_text_derived';
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f746578745f64657269766564_';
 
 # LPTS renders the parenthesized join through CTEs; pins stay on the correct qualified scans.
 query I
@@ -826,7 +826,7 @@ CREATE MATERIALIZED VIEW tt_plain AS
 
 query I
 SELECT CASE WHEN sql_string NOT LIKE '%AT (%' THEN 1 ELSE 0 END
-FROM openivm_views WHERE view_name = 'tt_plain';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_74745f706c61696e_';
 ----
 1
 
@@ -874,7 +874,7 @@ FROM memory.tt_identity VERSION AS OF 7 a
 JOIN memory.main.tt_identity VERSION AS OF 7 b ON a.k = b.k GROUP BY a.k;
 
 query I
-SELECT sql_string LIKE '%AT (VERSION => 7)%' FROM openivm_views WHERE view_name='tt_identity_mv';
+SELECT sql_string LIKE '%AT (VERSION => 7)%' FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_74745f6964656e746974795f6d76_';
 ----
 true
 

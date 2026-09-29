@@ -43,8 +43,8 @@ SELECT (SELECT DISTINCT refresh_type_name
         FROM openivm_compile_with_facts(
             'mv_saio', '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')) = 'SIMPLE_AGGREGATE'
    AND (SELECT prog FROM saio_sql_general) = (SELECT prog FROM saio_sql_insert_only)
-   AND lower((SELECT prog FROM saio_sql_insert_only)) LIKE '%update openivm_data_mv_saio%'
-   AND lower((SELECT prog FROM saio_sql_insert_only)) NOT LIKE '%delete from openivm_data_mv_saio;%'
+   AND lower((SELECT prog FROM saio_sql_insert_only)) LIKE '%update memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f7361696f_%'
+   AND lower((SELECT prog FROM saio_sql_insert_only)) NOT LIKE '%delete from memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f7361696f_;%'
    AS scalar_insert_only_compile_is_incremental_and_stable;
 ----
 true
@@ -91,7 +91,7 @@ SELECT (SELECT DISTINCT refresh_type_name
    AND lower((SELECT string_agg(sql, '\n' ORDER BY stmt_order)
               FROM openivm_compile_with_facts(
                   'mv_saio_extreme', '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}')
-              WHERE stmt_kind = 'data')) LIKE '%delete from openivm_data_mv_saio_extreme%'
+              WHERE stmt_kind = 'data')) LIKE '%delete from memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f7361696f5f65787472656d65_%'
    AS minmax_insert_only_compile_uses_safe_recompute;
 ----
 true

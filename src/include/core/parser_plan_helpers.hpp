@@ -70,6 +70,7 @@ struct CreateMVPlanFacts {
 	idx_t max_table_index = 0;
 	PlanAnalysis analysis;
 	unordered_map<string, SourceTableInfo> source_table_info;
+	case_insensitive_map_t<idx_t> source_name_counts;
 	unordered_map<string, DuckLakeSourceTableInfo> ducklake_table_info;
 	LogicalProjection *first_projection = nullptr;
 	vector<LogicalProjection *> projections;

@@ -156,19 +156,70 @@ script from the DuckDB prompt, after creating the output directory in your termi
 
 ### Inspect the generated SQL
 
-The demo sets `openivm_files_path` before creating the view. After it finishes,
-inspect the generated files from your terminal:
+SQL file output is **opt-in**. The included `docs/build/demo.sql` sets
+`openivm_files_path`; the SQL pasted above does not. No default output directory
+is selected. Create a directory in your terminal, then configure it in the DuckDB
+session **before** creating or refreshing a view:
+
+```bash
+mkdir -p /absolute/path/to/openivm_sql
+```
+
+```sql
+SET openivm_files_path = '/absolute/path/to/openivm_sql';
+PRAGMA openivm_files('regional_totals');
+```
+
+The pragma reports the absolute path, existence, and status of each reference file,
+plus the process working directory. It does not generate files. If output is
+disabled, it explains how to enable it. Relative paths are relative to the working
+directory of the DuckDB process, **not** the attached database file. A file that
+exists may come from an earlier compilation; existence does not prove freshness.
+The setting applies to the current session and must be set again after reopening.
+An unwritable or missing directory now produces an error with the affected path.
+
+After running the included demo from the repository root, inspect its files from
+your terminal:
 
 ```bash
 cat openivm_generated_sql/openivm_system_tables.sql
-cat openivm_generated_sql/openivm_compiled_queries_regional_totals.sql
-cat openivm_generated_sql/openivm_upsert_queries_regional_totals.sql
+cat openivm_generated_sql/openivm_compiled_queries_*.sql
+cat openivm_generated_sql/openivm_upsert_queries_*.sql
 ```
+
+The wildcards include all views in that directory. For one view, use the exact
+paths returned by `PRAGMA openivm_files('regional_totals')`; filenames use an
+internal key derived from the view's catalog, schema, and name.
 
 These contain system-table DDL, view setup SQL, and the SQL compiled for the refresh,
 respectively. The refresh file is overwritten when a new refresh is compiled and
 contains that refresh's catalog names and delta cutoff timestamps. It is an
-inspection artifact, not the demo's input script.
+inspection artifact, not the demo's input script. The optional
+`openivm_initial_load_explain_<internal_key>.txt` contains the initial-load plan. A refresh
+that skips empty deltas may not compile a new file. Setting the path after CREATE
+does not retroactively create the setup files; do not replace an existing MV just
+to obtain an inspection file.
+
+### Inspect or save compiled SQL without files
+
+The compiler also returns SQL as rows. This works without `openivm_files_path`:
+
+```sql
+SELECT stmt_order, stmt_kind, sql
+FROM openivm_compile_with_facts(
+    'regional_totals', '{"target_dialect":"duckdb","compile_only":true}')
+ORDER BY stmt_order;
+
+CREATE TABLE saved_refresh_sql AS
+SELECT * FROM openivm_compile_with_facts(
+    'regional_totals', '{"target_dialect":"duckdb","compile_only":true}');
+```
+
+This compiles a refresh without executing it or consuming the pending changes.
+The saved table is an ordinary user table, not automatically maintained OpenIVM
+metadata. The generated program depends on current state, including delta cutoffs
+and snapshot IDs. Compile again for a later refresh; do not treat an old saved
+program as a reusable refresh procedure. Use `PRAGMA refresh` for normal execution.
 
 Use the prompt or a SQL file rather than putting creation and refresh together in
 one `-c` argument: refresh metadata can be resolved before the preceding view

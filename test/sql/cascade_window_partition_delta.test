@@ -40,11 +40,11 @@ LIMIT 1;
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data_cw_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_cw_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM openivm_delta_cw_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cw_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%SEMI JOIN openivm_delta_cw_mv d ON%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%SEMI JOIN memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_ d ON%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'cw_mv',
@@ -71,14 +71,14 @@ LIMIT 1;
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_cw_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_cw_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cw_mv%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old_cw_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new_cw_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'cw_mv',
@@ -105,7 +105,7 @@ PRAGMA refresh('cw_mv');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT * FROM openivm_data_cw_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_
     EXCEPT ALL
     SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
 );
@@ -116,7 +116,7 @@ query I
 SELECT COUNT(*) FROM (
     SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
     EXCEPT ALL
-    SELECT * FROM openivm_data_cw_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_
 );
 ----
 0
@@ -129,7 +129,7 @@ PRAGMA refresh('cw_mv');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT * FROM openivm_data_cw_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_
     EXCEPT ALL
     SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
 );
@@ -140,7 +140,7 @@ query I
 SELECT COUNT(*) FROM (
     SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
     EXCEPT ALL
-    SELECT * FROM openivm_data_cw_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_
 );
 ----
 0
@@ -153,7 +153,7 @@ PRAGMA refresh('cw_mv');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT * FROM openivm_data_cw_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_
     EXCEPT ALL
     SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
 );
@@ -164,7 +164,7 @@ query I
 SELECT COUNT(*) FROM (
     SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cw_src
     EXCEPT ALL
-    SELECT * FROM openivm_data_cw_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63775f6d76_
 );
 ----
 0

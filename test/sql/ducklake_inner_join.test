@@ -268,7 +268,7 @@ CREATE MATERIALIZED VIEW dl.projection_key_holdings AS
     JOIN dl.pk_securities s ON h.symbol = s.symbol;
 
 query I
-SELECT lineage_json LIKE '{"v":1,"items":[{"k":"projection_key"%' FROM openivm_views WHERE view_name = 'projection_key_holdings';
+SELECT lineage_json LIKE '{"v":1,"items":[{"k":"projection_key"%' FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_';
 ----
 true
 
@@ -374,7 +374,7 @@ SELECT COUNT(*) FROM (
 
 query I
 SELECT count(*) FROM openivm_refresh_profile
-WHERE view_name = 'projection_key_holdings'
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_'
   AND step_name = 'execute_refresh_sql_stmt'
   AND detail LIKE '%ComputeDelta%';
 ----
@@ -680,10 +680,10 @@ SELECT COUNT(*) FROM (
 # The existing conflicting updates above must publish only the retained key scope.
 query I
 SELECT contains(content, 'SELECT v.* FROM (SELECT *, CAST(0 AS BIGINT) AS openivm_ordinal')
-   AND contains(content, 'SEMI JOIN openivm_old_affected_projection_key_holdings d ON')
-   AND contains(content, 'USING openivm_publish_changes_projection_key_holdings d WHERE')
-   AND contains(content, 'SEMI JOIN openivm_publish_changes_projection_key_holdings d ON')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_projection_key_holdings.sql');
+   AND contains(content, 'SEMI JOIN openivm_old_affected___openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_ d ON')
+   AND contains(content, 'USING openivm_publish_changes___openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_ d WHERE')
+   AND contains(content, 'SEMI JOIN openivm_publish_changes___openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_ d ON')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_.sql');
 ----
 1
 
@@ -703,7 +703,7 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_ddl_probe EXCEPT ALL SELE
 query I
 SELECT count(*) >= 3 AND bool_and(duration_ms >= 0)
 FROM openivm_refresh_profile
-WHERE view_name = 'profile_ddl_probe' AND step_name = 'create_mv_sql_stmt'
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_' AND step_name = 'create_mv_sql_stmt'
   AND starts_with(detail, 'phase=create_mv_user_view; statement=');
 ----
 1
@@ -711,7 +711,7 @@ WHERE view_name = 'profile_ddl_probe' AND step_name = 'create_mv_sql_stmt'
 # An up-to-date metadata schema must not run ALTER migrations again.
 query I
 SELECT count(*) FROM openivm_refresh_profile
-WHERE view_name = 'profile_ddl_probe' AND step_name = 'create_mv_sql_stmt'
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_' AND step_name = 'create_mv_sql_stmt'
   AND contains(detail, 'sql=alter table openivm_');
 ----
 0
@@ -732,7 +732,7 @@ CREATE MATERIALIZED VIEW dl.profile_migration_probe AS SELECT id,name FROM dl.cu
 
 query I
 SELECT count(*) FROM openivm_refresh_profile
-WHERE view_name = 'profile_migration_probe' AND step_name = 'create_mv_sql_stmt'
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f6d6967726174696f6e5f70726f6265_' AND step_name = 'create_mv_sql_stmt'
   AND contains(detail, 'sql=alter table openivm_');
 ----
 3
@@ -760,7 +760,7 @@ CREATE MATERIALIZED VIEW dl.profile_migrated_probe AS SELECT id,name FROM dl.cus
 
 query I
 SELECT count(*) FROM openivm_refresh_profile
-WHERE view_name = 'profile_migrated_probe' AND step_name = 'create_mv_sql_stmt'
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f6d696772617465645f70726f6265_' AND step_name = 'create_mv_sql_stmt'
   AND contains(detail, 'sql=alter table openivm_');
 ----
 0
@@ -769,22 +769,22 @@ WHERE view_name = 'profile_migrated_probe' AND step_name = 'create_mv_sql_stmt'
 # maintenance deltas. Keep the companion available for legacy delta consumers.
 query I
 SELECT count(*) FROM openivm_refresh_profile
-WHERE view_name = 'profile_ddl_probe' AND step_name = 'create_mv_user_view'
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_' AND step_name = 'create_mv_user_view'
   AND contains(detail, 'derived_from_data_schema=true');
 ----
 1
 
 query II
-SELECT (SELECT count(*) FROM dl.openivm_delta_openivm_visible_profile_ddl_probe),
+SELECT (SELECT count(*) FROM dl.openivm_delta_openivm_visible___openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_),
        (SELECT count(*) FROM duckdb_columns() WHERE database_name = 'dl'
-        AND table_name = 'openivm_delta_openivm_visible_profile_ddl_probe'
+        AND table_name = 'openivm_delta_openivm_visible___openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_'
         AND column_name IN ('id', 'name', 'openivm_ordinal', 'openivm_multiplicity', 'openivm_timestamp'));
 ----
 0	5
 
 query I
 SELECT count(*) FROM openivm_refresh_profile
-WHERE view_name = 'profile_ddl_probe' AND step_name = 'create_mv_sql_stmt'
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_' AND step_name = 'create_mv_sql_stmt'
   AND contains(detail, 'sql=DELETE FROM openivm_views');
 ----
 0
@@ -815,7 +815,7 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_stale_probe EXCEPT ALL SE
 # DuckLake transaction. An execution failure must roll back before cleanup/retry.
 query I
 SELECT count(*) FROM openivm_refresh_profile
-WHERE view_name='profile_ddl_probe' AND step_name='create_mv_physical_commit';
+WHERE view_name='__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_' AND step_name='create_mv_physical_commit';
 ----
 1
 
@@ -832,8 +832,8 @@ Could not convert string
 
 query II
 SELECT (SELECT count(*) FROM duckdb_tables() WHERE database_name='dl' AND table_name IN
-        ('openivm_data_profile_creation_retry', 'openivm_visible_profile_creation_retry', 'openivm_delta_openivm_visible_profile_creation_retry')),
-       (SELECT count(*) FROM openivm_views WHERE view_name='profile_creation_retry');
+        ('openivm_data___openivm_mv_646c_6d61696e_70726f66696c655f6372656174696f6e5f7265747279_', 'openivm_visible___openivm_mv_646c_6d61696e_70726f66696c655f6372656174696f6e5f7265747279_', 'openivm_delta_openivm_visible___openivm_mv_646c_6d61696e_70726f66696c655f6372656174696f6e5f7265747279_')),
+       (SELECT count(*) FROM openivm_views WHERE view_name='__openivm_mv_646c_6d61696e_70726f66696c655f6372656174696f6e5f7265747279_');
 ----
 0	0
 
@@ -866,3 +866,373 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_creation_retry EXCEPT ALL
        (SELECT count(*) FROM (SELECT v::INTEGER FROM dl.profile_creation_fail_source EXCEPT ALL SELECT * FROM dl.profile_creation_retry));
 ----
 0	0
+
+# Same-named physical sources must retain distinct delta identities.
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE SCHEMA dl.source_a;
+
+statement ok
+CREATE SCHEMA dl.source_b;
+
+statement ok
+CREATE TABLE dl.source_a.items(id INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.source_b.items(id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.source_a.items VALUES (1,10),(2,20),(3,30),(3,30), (NULL,40),(5,NULL);
+
+statement ok
+INSERT INTO dl.source_b.items VALUES (1,100),(2,200),(3,300),(3,300), (NULL,40),(5,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.source_join AS SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a JOIN dl.source_b.items b USING(id);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.source_copy AS SELECT * FROM dl.source_a.items;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.source_self AS SELECT a.id, a.v av, x.v xv, b.v bv FROM dl.source_a.items a JOIN dl.source_a.items x USING(id) JOIN dl.source_b.items b USING(id);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.source_left AS SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a LEFT JOIN dl.source_b.items b USING(id);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.source_full AS SELECT a.id aid, a.v av, b.id bid, b.v bv FROM dl.source_a.items a FULL OUTER JOIN dl.source_b.items b USING(id);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.source_aggregate AS SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.source_min AS SELECT a.id, MIN(b.v) lo FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.source_anti AS SELECT a.* FROM dl.source_a.items a ANTI JOIN dl.source_b.items b USING(id);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.source_semi AS SELECT * FROM dl.source_a.items a SEMI JOIN dl.source_b.items b USING(id,v);
+
+query I
+SELECT count(*) FROM main.openivm_views WHERE starts_with(view_sql_name,'source_') AND type=3;
+----
+0
+
+statement ok
+UPDATE dl.source_a.items SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM dl.source_a.items WHERE id=2;
+
+statement ok
+INSERT INTO dl.source_a.items VALUES (2,22),(4,44),(4,44);
+
+statement ok
+PRAGMA refresh('dl.source_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_join EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_join));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_copy EXCEPT ALL SELECT * FROM dl.source_a.items) UNION ALL (SELECT * FROM dl.source_a.items EXCEPT ALL SELECT * FROM dl.source_copy));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_self');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_self EXCEPT ALL SELECT a.id, a.v av, x.v xv, b.v bv FROM dl.source_a.items a JOIN dl.source_a.items x USING(id) JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, x.v xv, b.v bv FROM dl.source_a.items a JOIN dl.source_a.items x USING(id) JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_self));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_left');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_left EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a LEFT JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a LEFT JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_left));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_full');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_full EXCEPT ALL SELECT a.id aid, a.v av, b.id bid, b.v bv FROM dl.source_a.items a FULL OUTER JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id aid, a.v av, b.id bid, b.v bv FROM dl.source_a.items a FULL OUTER JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_full));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_aggregate');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_aggregate EXCEPT ALL SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM dl.source_aggregate));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_min');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_min EXCEPT ALL SELECT a.id, MIN(b.v) lo FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, MIN(b.v) lo FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM dl.source_min));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_semi');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_semi EXCEPT ALL SELECT * FROM dl.source_a.items a SEMI JOIN dl.source_b.items b USING(id,v)) UNION ALL (SELECT * FROM dl.source_a.items a SEMI JOIN dl.source_b.items b USING(id,v) EXCEPT ALL SELECT * FROM dl.source_semi));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_anti');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_anti EXCEPT ALL SELECT a.* FROM dl.source_a.items a ANTI JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.* FROM dl.source_a.items a ANTI JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_anti));
+----
+0
+
+statement ok
+UPDATE dl.source_b.items SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM dl.source_b.items WHERE id=2;
+
+statement ok
+INSERT INTO dl.source_b.items VALUES (2,22),(4,44),(4,44);
+
+statement ok
+PRAGMA refresh('dl.source_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_join EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_join));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_copy EXCEPT ALL SELECT * FROM dl.source_a.items) UNION ALL (SELECT * FROM dl.source_a.items EXCEPT ALL SELECT * FROM dl.source_copy));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_self');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_self EXCEPT ALL SELECT a.id, a.v av, x.v xv, b.v bv FROM dl.source_a.items a JOIN dl.source_a.items x USING(id) JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, x.v xv, b.v bv FROM dl.source_a.items a JOIN dl.source_a.items x USING(id) JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_self));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_left');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_left EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a LEFT JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a LEFT JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_left));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_full');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_full EXCEPT ALL SELECT a.id aid, a.v av, b.id bid, b.v bv FROM dl.source_a.items a FULL OUTER JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id aid, a.v av, b.id bid, b.v bv FROM dl.source_a.items a FULL OUTER JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_full));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_aggregate');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_aggregate EXCEPT ALL SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM dl.source_aggregate));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_min');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_min EXCEPT ALL SELECT a.id, MIN(b.v) lo FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, MIN(b.v) lo FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM dl.source_min));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_semi');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_semi EXCEPT ALL SELECT * FROM dl.source_a.items a SEMI JOIN dl.source_b.items b USING(id,v)) UNION ALL (SELECT * FROM dl.source_a.items a SEMI JOIN dl.source_b.items b USING(id,v) EXCEPT ALL SELECT * FROM dl.source_semi));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_anti');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_anti EXCEPT ALL SELECT a.* FROM dl.source_a.items a ANTI JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.* FROM dl.source_a.items a ANTI JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_anti));
+----
+0
+
+statement ok
+SET openivm_skip_empty_deltas=false;
+
+statement ok
+SET openivm_ducklake_nterm=false;
+
+statement ok
+UPDATE dl.source_b.items SET v=v+7 WHERE id=3;
+
+statement ok
+DELETE FROM dl.source_b.items WHERE id=1;
+
+statement ok
+INSERT INTO dl.source_b.items VALUES (1,111),(5,500);
+
+statement ok
+UPDATE dl.source_a.items SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM dl.source_a.items WHERE id=2;
+
+statement ok
+INSERT INTO dl.source_a.items VALUES (2,22),(4,44),(4,44);
+
+statement ok
+PRAGMA refresh('dl.source_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_join EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_join));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_copy EXCEPT ALL SELECT * FROM dl.source_a.items) UNION ALL (SELECT * FROM dl.source_a.items EXCEPT ALL SELECT * FROM dl.source_copy));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_self');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_self EXCEPT ALL SELECT a.id, a.v av, x.v xv, b.v bv FROM dl.source_a.items a JOIN dl.source_a.items x USING(id) JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, x.v xv, b.v bv FROM dl.source_a.items a JOIN dl.source_a.items x USING(id) JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_self));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_left');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_left EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a LEFT JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a LEFT JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_left));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_full');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_full EXCEPT ALL SELECT a.id aid, a.v av, b.id bid, b.v bv FROM dl.source_a.items a FULL OUTER JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id aid, a.v av, b.id bid, b.v bv FROM dl.source_a.items a FULL OUTER JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_full));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_aggregate');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_aggregate EXCEPT ALL SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, SUM(a.v+b.v) total, COUNT(*) n FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM dl.source_aggregate));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_min');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_min EXCEPT ALL SELECT a.id, MIN(b.v) lo FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id) UNION ALL (SELECT a.id, MIN(b.v) lo FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) GROUP BY a.id EXCEPT ALL SELECT * FROM dl.source_min));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_semi');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_semi EXCEPT ALL SELECT * FROM dl.source_a.items a SEMI JOIN dl.source_b.items b USING(id,v)) UNION ALL (SELECT * FROM dl.source_a.items a SEMI JOIN dl.source_b.items b USING(id,v) EXCEPT ALL SELECT * FROM dl.source_semi));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.source_anti');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_anti EXCEPT ALL SELECT a.* FROM dl.source_a.items a ANTI JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.* FROM dl.source_a.items a ANTI JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_anti));
+----
+0
+
+statement ok
+SET openivm_skip_empty_deltas=true;
+
+statement ok
+SET openivm_ducklake_nterm=true;
+
+statement ok
+PRAGMA refresh('dl.source_join');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_join EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a JOIN dl.source_b.items b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM dl.source_a.items a JOIN dl.source_b.items b USING(id) EXCEPT ALL SELECT * FROM dl.source_join));
+----
+0
+
+statement ok
+DROP VIEW dl.source_self;
+
+statement ok
+DROP VIEW dl.source_left;
+
+statement ok
+DROP VIEW dl.source_full;
+
+statement ok
+DROP VIEW dl.source_aggregate;
+
+statement ok
+DROP VIEW dl.source_min;
+
+statement ok
+DROP VIEW dl.source_anti;
+
+statement ok
+DROP VIEW dl.source_semi;
+
+statement ok
+DROP VIEW dl.source_join;
+
+statement ok
+UPDATE dl.source_a.items SET v=v+2;
+
+statement ok
+PRAGMA refresh('dl.source_copy');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.source_copy EXCEPT ALL SELECT * FROM dl.source_a.items) UNION ALL (SELECT * FROM dl.source_a.items EXCEPT ALL SELECT * FROM dl.source_copy));
+----
+0
+
+statement ok
+DROP VIEW dl.source_copy;
+
+statement ok
+DROP SCHEMA dl.source_a CASCADE;
+
+statement ok
+DROP SCHEMA dl.source_b CASCADE;

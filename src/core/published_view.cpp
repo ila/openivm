@@ -25,7 +25,8 @@ string PublishedSourceViewName(string source_name) {
 string BuildPublishViewSQL(const string &view_name, const string &prefix, const string &query,
                            const vector<string> &columns, bool ducklake, const string &metadata_table,
                            const vector<string> &scope_columns, const string &timestamp_sql, SqlDialect dialect,
-                           const string &appended_rows, const string &scope_rows) {
+                           const string &appended_rows, const string &scope_rows,
+                           const vector<string> &metadata_catalogs) {
 	auto quote = [&](const string &name) {
 		return DialectQuoteIdent(name, dialect);
 	};
@@ -56,7 +57,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 			       ", openivm_multiplicity, openivm_timestamp) SELECT *, 1::INTEGER, " + timestamp + " FROM (" + rows +
 			       ") published_rows WHERE EXISTS (SELECT 1 FROM " + metadata_table + " WHERE table_name = '" +
 			       SqlUtils::EscapeValue(delta_name) + "');\n";
-			sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table);
+			sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, metadata_catalogs);
 		}
 		OPENIVM_DEBUG_PRINT("[PUBLISH] Appending visible projection delta for %s\n", view_name.c_str());
 		return sql;
@@ -129,7 +130,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	}
 	sql += "DROP TABLE " + changes + ";\nDROP TABLE " + next + ";\n";
 	if (!ducklake) {
-		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table);
+		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, metadata_catalogs);
 	}
 	OPENIVM_DEBUG_PRINT("[PUBLISH] Compiled visible-row publication for %s\n", view_name.c_str());
 	return sql;

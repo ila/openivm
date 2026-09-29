@@ -65,7 +65,7 @@ CREATE MATERIALIZED VIEW nested_distinct_projection AS
     );
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'nested_distinct_projection';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6e65737465645f64697374696e63745f70726f6a656374696f6e_';
 ----
 6
 
@@ -531,7 +531,7 @@ CREATE MATERIALIZED VIEW mv_union_distinct AS
     SELECT id FROM u_dist_c;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_union_distinct';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f756e696f6e5f64697374696e6374_';
 ----
 6
 
@@ -601,7 +601,7 @@ CREATE MATERIALIZED VIEW mv_union_labeled AS
     SELECT id, 'b' FROM u_dist_b;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_union_labeled';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f756e696f6e5f6c6162656c6564_';
 ----
 6
 
@@ -822,7 +822,7 @@ SELECT COUNT(*) FROM (
 # `decision = group_recompute` (verified manually — sqllogictest can't run
 # PRAGMA inside CREATE TABLE AS, so the test only asserts the type column).
 query I
-SELECT type FROM openivm_views WHERE view_name = 'idist_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_69646973745f6d76_';
 ----
 6
 
@@ -855,7 +855,7 @@ CREATE MATERIALIZED VIEW idist_mv_token_literal AS
     GROUP BY grp;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'idist_mv_token_literal';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_69646973745f6d765f746f6b656e5f6c69746572616c_';
 ----
 8
 
@@ -902,7 +902,7 @@ CREATE MATERIALIZED VIEW idist_mv_aux AS
 
 # Single-source view classifies as DISTINCT_INCREMENTAL (type 8).
 query I
-SELECT type FROM openivm_views WHERE view_name = 'idist_mv_aux';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_69646973745f6d765f617578_';
 ----
 8
 
@@ -959,7 +959,7 @@ CREATE MATERIALIZED VIEW idist_aux_v3 AS
 # Aux table seeded from the (DISTINCT-stripped) input subquery: (1,m1,8) has
 # count 2 (two duplicate input rows), (1,m2,16) has count 1.
 query III
-SELECT machine, cores, _count FROM openivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+SELECT machine, cores, _count FROM openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_69646973745f6175785f7633_ ORDER BY machine, cores;
 ----
 m1	8	2
 m2	16	1
@@ -978,7 +978,7 @@ SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
 1	24
 
 query III
-SELECT machine, cores, _count FROM openivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+SELECT machine, cores, _count FROM openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_69646973745f6175785f7633_ ORDER BY machine, cores;
 ----
 m1	8	3
 m2	16	1
@@ -996,7 +996,7 @@ SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
 1	124
 
 query III
-SELECT machine, cores, _count FROM openivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+SELECT machine, cores, _count FROM openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_69646973745f6175785f7633_ ORDER BY machine, cores;
 ----
 m1	8	3
 m2	16	1
@@ -1015,7 +1015,7 @@ SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
 1	124
 
 query III
-SELECT machine, cores, _count FROM openivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+SELECT machine, cores, _count FROM openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_69646973745f6175785f7633_ ORDER BY machine, cores;
 ----
 m1	8	2
 m2	16	1
@@ -1034,7 +1034,7 @@ SELECT grp, s FROM idist_aux_v3 ORDER BY grp;
 1	116
 
 query III
-SELECT machine, cores, _count FROM openivm_distinct_count_idist_aux_v3 ORDER BY machine, cores;
+SELECT machine, cores, _count FROM openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_69646973745f6175785f7633_ ORDER BY machine, cores;
 ----
 m2	16	1
 m9	100	1

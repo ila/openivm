@@ -4,6 +4,63 @@
 
 require openivm
 
+# The first concurrent CREATEs must initialize both metadata and a shared source delta once.
+statement ok
+SET openivm_disable_daemon = true;
+
+statement ok
+CREATE TABLE cold_shared_source(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO cold_shared_source VALUES (1, 10), (2, 20);
+
+loop schemaid 0 8
+
+statement ok
+CREATE SCHEMA cold_identity_${schemaid};
+
+endloop
+
+concurrentloop schemaid 0 8
+
+statement ok
+CREATE MATERIALIZED VIEW cold_identity_${schemaid}.summary AS
+SELECT k, SUM(v) AS total FROM cold_shared_source GROUP BY k;
+
+endloop
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_schema LIKE 'cold_identity_%';
+----
+8
+
+statement ok
+INSERT INTO cold_shared_source VALUES (1, 7), (3, 9);
+
+statement ok
+UPDATE cold_shared_source SET v = v + 1 WHERE k = 1;
+
+statement ok
+DELETE FROM cold_shared_source WHERE k = 3;
+
+loop schemaid 0 8
+
+statement ok
+PRAGMA refresh('cold_identity_${schemaid}.summary');
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM cold_identity_${schemaid}.summary
+  EXCEPT ALL SELECT k, SUM(v) FROM cold_shared_source GROUP BY k)
+ UNION ALL
+ (SELECT k, SUM(v) FROM cold_shared_source GROUP BY k
+  EXCEPT ALL SELECT * FROM cold_identity_${schemaid}.summary)
+);
+----
+0
+
+endloop
+
 statement ok
 SET openivm_files_path='__TEST_DIR__';
 
@@ -881,3 +938,185 @@ PRAGMA disable_verify_parallelism;
 
 statement ok
 RESET threads;
+
+# Concurrent creation must keep identical SQL names in different schemas independent.
+loop schemaid 0 8
+
+statement ok
+CREATE SCHEMA concurrent_identity_${schemaid};
+
+statement ok
+CREATE TABLE concurrent_identity_${schemaid}.source(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO concurrent_identity_${schemaid}.source VALUES (1, 10), (2, 20);
+
+endloop
+
+concurrentloop schemaid 0 8
+
+loop roundid 0 5
+
+statement ok
+CREATE MATERIALIZED VIEW concurrent_identity_${schemaid}.summary_${roundid} AS
+SELECT k, SUM(v) AS total FROM concurrent_identity_${schemaid}.source GROUP BY k;
+
+endloop
+
+endloop
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_schema LIKE 'concurrent_identity_%';
+----
+40
+
+loop schemaid 0 8
+
+statement ok
+INSERT INTO concurrent_identity_${schemaid}.source VALUES (1, 7), (3, 9);
+
+statement ok
+UPDATE concurrent_identity_${schemaid}.source SET v = v + ${schemaid} + 1 WHERE k = 1;
+
+statement ok
+DELETE FROM concurrent_identity_${schemaid}.source WHERE k = 3;
+
+loop roundid 0 5
+
+statement ok
+PRAGMA refresh('concurrent_identity_${schemaid}.summary_${roundid}');
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM concurrent_identity_${schemaid}.summary_${roundid}
+  EXCEPT ALL SELECT k, SUM(v) FROM concurrent_identity_${schemaid}.source GROUP BY k)
+ UNION ALL
+ (SELECT k, SUM(v) FROM concurrent_identity_${schemaid}.source GROUP BY k
+  EXCEPT ALL SELECT * FROM concurrent_identity_${schemaid}.summary_${roundid})
+);
+----
+0
+
+endloop
+
+endloop
+
+# Racing on the exact same identity has one winner; only catalog conflicts are expected.
+statement ok
+CREATE TABLE identity_create_winners(threadid INTEGER);
+
+concurrentloop threadid 0 8
+
+statement maybe
+CREATE MATERIALIZED VIEW cold_identity_0.same_target AS
+SELECT k, SUM(v) AS total FROM cold_shared_source GROUP BY k;
+INSERT INTO identity_create_winners VALUES (${threadid});
+----
+<REGEX>:.*(already exists|write-write conflict|Duplicate key).*
+
+endloop
+
+query I
+SELECT count(*) FROM identity_create_winners;
+----
+1
+
+query I
+SELECT count(*) FROM openivm_views
+WHERE view_sql_name = 'same_target' AND view_schema = 'cold_identity_0';
+----
+1
+
+statement ok
+INSERT INTO cold_shared_source VALUES (1, 17), (4, 40);
+
+statement ok
+UPDATE cold_shared_source SET v = v + 1 WHERE k = 1;
+
+statement ok
+DELETE FROM cold_shared_source WHERE k = 4;
+
+statement ok
+PRAGMA refresh('cold_identity_0.same_target');
+
+query I
+SELECT count(*) FROM (
+ (SELECT * FROM cold_identity_0.same_target
+  EXCEPT ALL SELECT k, SUM(v) FROM cold_shared_source GROUP BY k)
+ UNION ALL
+ (SELECT k, SUM(v) FROM cold_shared_source GROUP BY k
+  EXCEPT ALL SELECT * FROM cold_identity_0.same_target)
+);
+----
+0
+
+# A conflicting external garbage collection must not fail an already-committed refresh.
+statement ok
+ATTACH ':memory:' AS source_gc;
+
+statement ok
+CREATE TABLE source_gc.gc_source(id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO source_gc.gc_source VALUES(1,10),(2,20),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW gc_mv AS SELECT id,SUM(v) total FROM source_gc.gc_source GROUP BY id;
+
+statement ok
+UPDATE source_gc.gc_source SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM source_gc.gc_source WHERE id=2;
+
+statement ok
+INSERT INTO source_gc.gc_source VALUES(2,22),(2,22);
+
+statement ok
+CREATE TABLE gc_pending AS SELECT * FROM source_gc.openivm_delta_gc_source;
+
+statement ok gc_blocker
+BEGIN;
+
+# This internal delta-table write holds a DuckDB row conflict without taking the IVM mutation gate.
+statement ok gc_blocker
+DELETE FROM source_gc.openivm_delta_gc_source;
+
+statement ok
+PRAGMA refresh('gc_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM gc_mv EXCEPT ALL SELECT id,SUM(v) total FROM source_gc.gc_source GROUP BY id) UNION ALL (SELECT id,SUM(v) total FROM source_gc.gc_source GROUP BY id EXCEPT ALL SELECT * FROM gc_mv));
+----
+0
+
+statement ok gc_blocker
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM source_gc.openivm_delta_gc_source EXCEPT ALL SELECT * FROM gc_pending) UNION ALL (SELECT * FROM gc_pending EXCEPT ALL SELECT * FROM source_gc.openivm_delta_gc_source));
+----
+0
+
+# A later batch must exclude retained, already-applied rows and retry cleanup.
+statement ok
+UPDATE source_gc.gc_source SET v=v+7;
+
+statement ok
+DELETE FROM source_gc.gc_source WHERE id=1;
+
+statement ok
+INSERT INTO source_gc.gc_source VALUES(1,77),(1,77);
+
+statement ok
+PRAGMA refresh('gc_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM gc_mv EXCEPT ALL SELECT id,SUM(v) total FROM source_gc.gc_source GROUP BY id) UNION ALL (SELECT id,SUM(v) total FROM source_gc.gc_source GROUP BY id EXCEPT ALL SELECT * FROM gc_mv));
+----
+0
+
+query I
+SELECT count(*) FROM source_gc.openivm_delta_gc_source;
+----
+0
