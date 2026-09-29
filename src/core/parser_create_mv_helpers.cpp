@@ -5,6 +5,9 @@
 #include "core/openivm_debug.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include "rules/column_hider.hpp"
 
 namespace duckdb {
@@ -30,6 +33,31 @@ static void AddColumnIfNotExists(vector<string> &ddl, const string &table_name, 
 		return;
 	}
 	ddl.push_back("alter table " + table_name + " add column if not exists " + column_definition);
+}
+
+// Read the caller's snapshot, including metadata inserted earlier in this
+// transaction. A helper SQL connection would miss uncommitted stale rows.
+static bool HasViewMetadata(ClientContext &context, TableCatalogEntry &table, const string &view_name) {
+	auto &transaction = DuckTransaction::Get(context, table.catalog);
+	auto &storage = table.GetStorage();
+	vector<StorageIndex> columns;
+	columns.emplace_back(table.GetColumn("view_name").StorageOid());
+	TableScanState scan;
+	storage.InitializeScan(context, transaction, scan, columns);
+	DataChunk rows;
+	rows.Initialize(Allocator::Get(context), {LogicalType::VARCHAR});
+	while (true) {
+		rows.Reset();
+		storage.Scan(transaction, rows, scan);
+		if (rows.size() == 0) {
+			return false;
+		}
+		for (idx_t row = 0; row < rows.size(); row++) {
+			if (rows.GetValue(0, row).ToString() == view_name) {
+				return true;
+			}
+		}
+	}
 }
 
 string BuildUpdateViewJsonSQL(const string &column_name, const string &json, const string &view_name) {
@@ -111,7 +139,11 @@ void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog
 		// a DuckDB file lock after writing metadata but before creating the physical
 		// DuckLake/default-catalog objects, a retry should clean that stale row rather
 		// than report a misleading duplicate MV.
-		ddl.push_back("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);
+		// A new name has no stale row to clean. Retain the execution-time object
+		// checks for existing metadata, and always retain the duplicate check.
+		if (views && HasViewMetadata(context, *views, view_name)) {
+			ddl.push_back("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);
+		}
 		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(openivm::VIEWS_TABLE) +
 		              " WHERE view_name = '" + escaped_view_name +
 		              "') THEN error('Duplicate key: materialized view \"" + escaped_view_name +

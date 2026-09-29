@@ -1626,3 +1626,41 @@ SELECT (SELECT count(*) FROM (SELECT * FROM metadata_upgrade_retry EXCEPT ALL SE
        (SELECT count(*) FROM (SELECT id, g, v FROM attached_src EXCEPT ALL SELECT * FROM metadata_upgrade_retry));
 ----
 0	0
+
+# Stale metadata still recovers, including rows inserted in this transaction.
+# New names skip the expensive external-catalog cleanup; existing metadata must
+# retain its execution-time object checks so a duplicate cannot erase a live MV.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO openivm_views (view_name, sql_string, type) VALUES
+('metadata_stale_retry', 'SELECT id, g, v FROM attached_src', 0);
+
+statement ok
+CREATE MATERIALIZED VIEW metadata_stale_retry AS SELECT id, g, v FROM attached_src;
+
+statement ok
+COMMIT;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM metadata_stale_retry EXCEPT ALL SELECT id, g, v FROM attached_src)),
+       (SELECT count(*) FROM (SELECT id, g, v FROM attached_src EXCEPT ALL SELECT * FROM metadata_stale_retry));
+----
+0	0
+
+statement error
+CREATE MATERIALIZED VIEW metadata_stale_retry AS SELECT id, g, v FROM attached_src;
+----
+already exists
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name = 'metadata_stale_retry';
+----
+1
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM metadata_stale_retry EXCEPT ALL SELECT id, g, v FROM attached_src)),
+       (SELECT count(*) FROM (SELECT id, g, v FROM attached_src EXCEPT ALL SELECT * FROM metadata_stale_retry));
+----
+0	0

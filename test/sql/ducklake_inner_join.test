@@ -779,3 +779,31 @@ SELECT (SELECT count(*) FROM dl.openivm_delta_openivm_visible_profile_ddl_probe)
         AND column_name IN ('id', 'name', 'openivm_ordinal', 'openivm_multiplicity', 'openivm_timestamp'));
 ----
 0	5
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'profile_ddl_probe' AND step_name = 'create_mv_sql_stmt'
+  AND contains(detail, 'sql=DELETE FROM openivm_views');
+----
+0
+
+# A committed stale row also remains recoverable on the helper-connection path.
+statement ok
+INSERT INTO openivm_views (view_name, sql_string, type) VALUES
+('profile_stale_probe', 'SELECT id, name FROM dl.customers', 0);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.profile_stale_probe AS SELECT id, name FROM dl.customers;
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'profile_stale_probe' AND step_name = 'create_mv_sql_stmt'
+  AND contains(detail, 'sql=DELETE FROM openivm_views');
+----
+1
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_stale_probe EXCEPT ALL SELECT id, name FROM dl.customers)),
+       (SELECT count(*) FROM (SELECT id, name FROM dl.customers EXCEPT ALL SELECT * FROM dl.profile_stale_probe));
+----
+0	0
