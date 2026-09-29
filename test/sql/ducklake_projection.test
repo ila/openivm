@@ -900,7 +900,7 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.signed_child EXCEPT ALL SELECT * 
 0	0
 
 query I
-SELECT NOT contains(content, 'openivm_publish_next_') AND contains(content, 'openivm_visible_signed_parent')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_signed_parent.sql');
+SELECT NOT contains(content, 'openivm_publish_next_') AND contains(content, 'openivm_visible___openivm_mv_646c_6d61696e_7369676e65645f706172656e74_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_7369676e65645f706172656e74_.sql');
 ----
 1
