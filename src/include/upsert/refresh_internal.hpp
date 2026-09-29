@@ -216,12 +216,12 @@ ViewLocation ResolveViewLocation(Connection &con, const string &view_name, const
 //! the `openivm_compile_with_facts` bind to fail fast with a useful
 //! message.
 struct ResolvedViewCatalog {
+	string view_name;
 	string view_catalog_name;
 	string view_schema_name;
 	bool cross_system = false;
 };
-ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connection &con, const string &view_name,
-                                                  bool throw_if_not_found = false);
+ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connection &con, const string &view_name);
 DuckLakeSourceLocation ResolveDuckLakeSourceLocation(Connection &con, const string &view_name, const string &table_name,
                                                      const string &fallback_catalog, const string &fallback_schema,
                                                      const string &attached_catalog, const string &attached_schema);

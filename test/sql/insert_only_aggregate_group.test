@@ -34,7 +34,7 @@ INSERT INTO io_sum_sales VALUES ('east', 7), ('north', 3);
 query I
 SELECT string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_old.total%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_new.total%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%MERGE INTO openivm_data_mv_io_sum%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%MERGE INTO memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f696f5f73756d_%'
 FROM openivm_compile_with_facts(
     'mv_io_sum',
     '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"force_view_delta_cascade":true}'
@@ -49,8 +49,8 @@ true
 query I
 SELECT string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%openivm_old_snapshot_mv_io_sum_merge%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%openivm_old_affected_mv_io_sum_merge%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%MERGE INTO openivm_data_mv_io_sum%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%FROM openivm_delta_mv_io_sum d%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%MERGE INTO memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f696f5f73756d_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%FROM memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f696f5f73756d_ d%'
 FROM openivm_compile_with_facts(
     'mv_io_sum',
     '{"target_dialect":"spark","compile_only":true,"assume_insert_only":true,"force_view_delta_cascade":true}'
@@ -140,7 +140,7 @@ statement ok
 DELETE FROM io_mixed_sales WHERE region = 'west';
 
 query I
-SELECT string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM openivm_data_mv_io_mixed%'
+SELECT string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f696f5f6d69786564_%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%LEAST%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%GREATEST%'
 FROM openivm_compile_with_facts(

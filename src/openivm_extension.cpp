@@ -12,6 +12,7 @@
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh.hpp"
+#include "upsert/refresh_internal.hpp"
 
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
@@ -475,7 +476,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
 		    auto view_name = StringValue::Get(parameters.values[0]);
 		    Connection con(*context.db);
-		    RefreshMetadata::UseCatalog(context, con);
+		    view_name = ResolveViewCatalogFromContext(context, con, view_name).view_name;
 		    RefreshMetadata(con).GetViewType(view_name);
 		    Value directory;
 		    bool enabled = context.TryGetCurrentSetting("openivm_files_path", directory) && !directory.IsNull();
@@ -517,7 +518,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
 		    string view_name = StringValue::Get(parameters.values[0]);
 		    Connection con(*context.db.get());
-		    RefreshMetadata::UseCatalog(context, con);
+		    view_name = ResolveViewCatalogFromContext(context, con, view_name).view_name;
 		    RefreshMetadata metadata(con);
 
 		    auto interval = metadata.GetRefreshInterval(view_name);
@@ -569,7 +570,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 			    }
 		    }
 
-		    return "SELECT '" + SqlUtils::EscapeValue(view_name) + "' AS view_name, " + interval_str +
+		    return "SELECT " + parameters.values[0].ToSQLString() + " AS view_name, " + interval_str +
 		           " AS refresh_interval, " + last_refresh + " AS last_refresh, " + next_refresh +
 		           " AS next_refresh, " + status + " AS status, " + effective_interval + " AS effective_interval, " +
 		           strategy_str + " AS refresh_strategy;";

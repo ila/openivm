@@ -39,21 +39,29 @@ SELECT * FROM dl.product_summary ORDER BY pname;
 
 ## Schemas, metadata, and internal tables
 
-Schemas are recorded, but MV identity is not yet fully schema-qualified. In the
-current implementation, MV short names must be unique within their OpenIVM metadata
-catalog, including across DuckLake schemas sharing that metadata catalog.
-`PRAGMA refresh('observation.product_summary')` does not resolve a qualified name;
-use the recorded short name:
+Materialized views are identified by catalog, schema, and SQL name. Different
+schemas can contain views with the same name. Use a qualified name when refreshing
+or inspecting one of those views:
 
 ```sql
--- Run this metadata query in the native frontend database's main schema.
-SELECT view_name, view_catalog, view_schema FROM openivm_views;
-PRAGMA refresh('product_summary');
+-- Control metadata stays in the native frontend database's main schema.
+SELECT view_sql_name, view_catalog, view_schema, view_name AS internal_key
+FROM main.openivm_views;
+PRAGMA refresh('dl.observation.product_summary');
+PRAGMA openivm_files('dl.observation.product_summary');
 ```
 
-This restriction does not mean data is stored in `main`. For a view created as
-`dl.observation.product_summary`, its backing, visible-output, and internal MV
-delta tables live in `dl.observation`. Native source-table delta tables live with
+New views receive an internal key derived from their catalog, schema, and name.
+Key allocation does not wait for other views to register their names. Existing
+views retain their stored keys. First-time setup of the shared metadata and native
+source-delta tables is briefly serialized; the initialization guard does not
+cover view planning or initial materialization. Explicit transactions retain
+rollbackable setup and DuckDB transaction-conflict semantics. Internal backing-table and compiled-file names
+use these keys; use `PRAGMA openivm_files` to discover generated file paths.
+
+For a view created as `dl.observation.product_summary`, its backing,
+visible-output, and internal MV delta tables live in `dl.observation`.
+Native source-table delta tables live with
 their source table. Inspect actual locations rather than relying on `SHOW TABLES`
 under the current search path:
 
@@ -87,8 +95,8 @@ rows in the native `openivm_delta_tables` metadata table record source locations
 and snapshot watermarks; the similarly named metadata table is not a row-change
 buffer.
 
-OpenIVM still creates `openivm_delta_<view>` and, where a visible-output boundary
-is used, `openivm_delta_openivm_visible_<view>`. These are internal MV maintenance
+OpenIVM still creates `openivm_delta_<internal_key>` and, where a visible-output boundary
+is used, `openivm_delta_openivm_visible_<internal_key>`. These are internal MV maintenance
 objects, even for DuckLake targets. Empty contents do not mean change tracking is
 broken: DuckLake changes are obtained from snapshots, and native delta buffers
 can also be cleared after consumption. Keep these internal objects intact; they

@@ -71,7 +71,7 @@ CREATE MATERIALIZED VIEW mv_volatile_unnest AS
     SELECT x, unnest([nextval('volatile_unnest_seq')]) AS seq_value FROM t3;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_volatile_unnest';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f766f6c6174696c655f756e6e657374_';
 ----
 3
 
@@ -101,8 +101,8 @@ statement ok
 CREATE MATERIALIZED VIEW mv_min_model AS SELECT a, MIN(b) AS min_b FROM t1 GROUP BY a;
 
 query TI
-SELECT view_name, type FROM openivm_views
-WHERE view_name IN ('mv_avg', 'mv_count', 'mv_filter', 'mv_inner', 'mv_min_model', 'mv_proj', 'mv_sum')
+SELECT view_sql_name, type FROM openivm_views
+WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_6d765f617667_', '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f756e74_', '__openivm_mv_6d656d6f7279_6d61696e_6d765f66696c746572_', '__openivm_mv_6d656d6f7279_6d61696e_6d765f696e6e6572_', '__openivm_mv_6d656d6f7279_6d61696e_6d765f6d696e5f6d6f64656c_', '__openivm_mv_6d656d6f7279_6d61696e_6d765f70726f6a_', '__openivm_mv_6d656d6f7279_6d61696e_6d765f73756d_')
 ORDER BY view_name;
 ----
 mv_avg	0
@@ -114,7 +114,7 @@ mv_proj	2
 mv_sum	0
 
 query I
-SELECT has_minmax::INT FROM openivm_views WHERE view_name = 'mv_min_model';
+SELECT has_minmax::INT FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6d696e5f6d6f64656c_';
 ----
 1
 
@@ -343,7 +343,7 @@ CREATE MATERIALIZED VIEW mv_window_rank AS
     FROM w_src;
 
 query IT
-SELECT type, group_columns FROM openivm_views WHERE view_name = 'mv_window_rank';
+SELECT type, group_columns FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f77696e646f775f72616e6b_';
 ----
 5	dept=dept
 
@@ -353,7 +353,7 @@ CREATE MATERIALIZED VIEW mv_window_volatile AS
     FROM w_src;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_window_volatile';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f77696e646f775f766f6c6174696c65_';
 ----
 3
 

@@ -265,7 +265,7 @@ CREATE MATERIALIZED VIEW dl.projection_key_holdings AS
     JOIN dl.pk_securities s ON h.symbol = s.symbol;
 
 query I
-SELECT lineage_json LIKE '{"v":1,"items":[{"k":"projection_key"%' FROM openivm_views WHERE view_name = 'projection_key_holdings';
+SELECT lineage_json LIKE '{"v":1,"items":[{"k":"projection_key"%' FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_';
 ----
 true
 
@@ -371,7 +371,7 @@ SELECT COUNT(*) FROM (
 
 query I
 SELECT count(*) FROM openivm_refresh_profile
-WHERE view_name = 'projection_key_holdings'
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_'
   AND step_name = 'execute_refresh_sql_stmt'
   AND detail LIKE '%ComputeDelta%';
 ----

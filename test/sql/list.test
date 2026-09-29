@@ -61,7 +61,7 @@ CREATE MATERIALIZED VIEW mv_list_filter AS
     FROM list_filter_items GROUP BY grp;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_list_filter';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f66696c746572_';
 ----
 6
 
@@ -108,12 +108,12 @@ CREATE MATERIALIZED VIEW mv_list_filter_having AS
     HAVING COUNT(*) > 1;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_list_filter_having';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f66696c7465725f686176696e67_';
 ----
 6
 
 query T
-SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_list_filter_having';
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f66696c7465725f686176696e67_';
 ----
 source_delta_relax_aggregate_filter
 
@@ -197,12 +197,12 @@ CREATE MATERIALIZED VIEW mv_list_filter_topk AS
     LIMIT 1;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_list_filter_topk';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f66696c7465725f746f706b_';
 ----
 6
 
 query T
-SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_list_filter_topk';
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f66696c7465725f746f706b_';
 ----
 current_diff
 
@@ -458,8 +458,8 @@ query I
 SELECT COUNT(*) FROM information_schema.tables
 WHERE table_name IN (
     'mv_list_schema_cleanup',
-    'openivm_data_mv_list_schema_cleanup',
-    'openivm_delta_mv_list_schema_cleanup'
+    'openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f736368656d615f636c65616e7570_',
+    'openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6973745f736368656d615f636c65616e7570_'
 );
 ----
 0

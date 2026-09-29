@@ -21,6 +21,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -141,7 +142,8 @@ ApplyGroupRecomputeSourceOccurrences(vector<GroupRecomputeDeltaSpec> &delta_spec
 	}
 }
 
-static string ResolveDeltaMetadataKey(const string &table_name, const vector<string> &delta_table_names) {
+static string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
+                                      const vector<string> &delta_table_names) {
 	vector<string> candidates;
 	candidates.push_back(PublishedViewName(SqlUtils::LastIdentifierPart(table_name)));
 	candidates.push_back(SqlUtils::DeltaName(PublishedViewName(SqlUtils::LastIdentifierPart(table_name))));
@@ -151,14 +153,33 @@ static string ResolveDeltaMetadataKey(const string &table_name, const vector<str
 	candidates.push_back(IncrementalTableNames::DataTableName(SqlUtils::LastIdentifierPart(table_name)));
 	candidates.push_back(SqlUtils::DeltaName(table_name));
 	candidates.push_back(SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name)));
+	auto parts = QualifiedName::ParseComponents(table_name);
 	for (auto &dt : delta_table_names) {
-		for (auto &candidate : candidates) {
-			if (StringUtil::CIEquals(dt, candidate)) {
-				OPENIVM_DEBUG_PRINT("[UPSERT] Source '%s' resolves to delta metadata '%s'\n", table_name.c_str(),
-				                    dt.c_str());
-				return dt;
+		bool matches = false;
+		for (const auto &candidate : candidates) {
+			matches = matches || StringUtil::CIEquals(dt, candidate);
+		}
+		if (!matches) {
+			// Auxiliary definitions retain public SQL names; chained sources store
+			// the parent's internal key in their physical delta/visible-table name.
+			matches = StringUtil::CIEquals(metadata.GetViewSQLName(PublishedSourceViewName(dt)), parts.back());
+		}
+		if (!matches) {
+			continue;
+		}
+		if (parts.size() > 1) {
+			auto loc = metadata.GetSourceLocation(view_name, dt);
+			if (parts.size() == 3 && (!StringUtil::CIEquals(loc.catalog_name, parts[0]) ||
+			                          !StringUtil::CIEquals(loc.schema_name, parts[1]))) {
+				continue;
+			}
+			if (parts.size() == 2 && !StringUtil::CIEquals(loc.schema_name, parts[0]) &&
+			    !(StringUtil::CIEquals(loc.catalog_name, parts[0]) && loc.schema_name == DEFAULT_SCHEMA)) {
+				continue;
 			}
 		}
+		OPENIVM_DEBUG_PRINT("[UPSERT] Source '%s' resolves to delta metadata '%s'\n", table_name.c_str(), dt.c_str());
+		return dt;
 	}
 	return SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name));
 }
@@ -199,7 +220,7 @@ static SemiAntiSourceInput ResolveSemiAntiSourceInput(RefreshMetadata &metadata,
                                                       const string &attached_db_catalog_name,
                                                       const string &attached_db_schema_name) {
 	SemiAntiSourceInput input;
-	string metadata_key = ResolveDeltaMetadataKey(table_name, delta_table_names);
+	string metadata_key = ResolveDeltaMetadataKey(metadata, view_name, table_name, delta_table_names);
 	if (metadata.IsDuckLakeTable(view_name, metadata_key)) {
 		auto loc = ResolveDuckLakeSourceLocation(con, view_name, metadata_key, view_catalog_name, view_schema_name,
 		                                         attached_db_catalog_name, attached_db_schema_name);
@@ -299,7 +320,7 @@ static void EnsureDistinctAuxState(RefreshMetadata &metadata, Connection &con, c
                                    const string &internal_schema_name, const string &catalog_prefix,
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name) {
-	string delta_source = ResolveDeltaMetadataKey(meta.source, delta_table_names);
+	string delta_source = ResolveDeltaMetadataKey(metadata, view_name, meta.source, delta_table_names);
 	EnsureAuxState(metadata, con, view_name, meta.aux_table, RefreshMetadata::ExpectedDistinctAuxColumns(meta),
 	               internal_catalog_name, internal_schema_name, vector<string> {delta_source}, view_catalog_name,
 	               view_schema_name, [&]() {
@@ -318,7 +339,7 @@ static void EnsureCountDistinctAuxState(RefreshMetadata &metadata, Connection &c
                                         const string &internal_schema_name, const string &catalog_prefix,
                                         const string &view_catalog_name, const string &view_schema_name,
                                         const string &attached_db_catalog_name, const string &attached_db_schema_name) {
-	string delta_source = ResolveDeltaMetadataKey(meta.source, delta_table_names);
+	string delta_source = ResolveDeltaMetadataKey(metadata, view_name, meta.source, delta_table_names);
 	EnsureAuxState(metadata, con, view_name, meta.aux_table, RefreshMetadata::ExpectedCountDistinctAuxColumns(meta),
 	               internal_catalog_name, internal_schema_name, vector<string> {delta_source}, view_catalog_name,
 	               view_schema_name, [&]() {
@@ -339,7 +360,7 @@ static void EnsureFilteredGroupCountAuxState(RefreshMetadata &metadata, Connecti
                                              const string &catalog_prefix, const string &view_catalog_name,
                                              const string &view_schema_name, const string &attached_db_catalog_name,
                                              const string &attached_db_schema_name) {
-	string delta_source = ResolveDeltaMetadataKey(meta.source, delta_table_names);
+	string delta_source = ResolveDeltaMetadataKey(metadata, view_name, meta.source, delta_table_names);
 	EnsureAuxState(metadata, con, view_name, meta.aux_table,
 	               RefreshMetadata::ExpectedFilteredGroupCountAuxColumns(meta), internal_catalog_name,
 	               internal_schema_name, vector<string> {delta_source}, view_catalog_name, view_schema_name, [&]() {
@@ -360,8 +381,8 @@ static void EnsureSemiAntiAuxState(RefreshMetadata &metadata, Connection &con, c
                                    const string &internal_schema_name, const string &catalog_prefix,
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name) {
-	string left_delta = ResolveDeltaMetadataKey(meta.left_table, delta_table_names);
-	string right_delta = ResolveDeltaMetadataKey(meta.right_table, delta_table_names);
+	string left_delta = ResolveDeltaMetadataKey(metadata, view_name, meta.left_table, delta_table_names);
+	string right_delta = ResolveDeltaMetadataKey(metadata, view_name, meta.right_table, delta_table_names);
 	EnsureAuxState(metadata, con, view_name, meta.aux_table, RefreshMetadata::ExpectedSemiAntiAuxColumns(meta),
 	               internal_catalog_name, internal_schema_name, vector<string> {left_delta, right_delta},
 	               view_catalog_name, view_schema_name, [&]() {
@@ -1066,7 +1087,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                                 view_catalog_name, view_schema_name, attached_db_catalog_name,
 				                                 attached_db_schema_name);
 			}
-			string delta_source = ResolveDeltaMetadataKey(aux_meta.source, delta_table_names);
+			string delta_source = ResolveDeltaMetadataKey(metadata, view_name, aux_meta.source, delta_table_names);
 			string delta_source_sql =
 			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
 			string ts = metadata.GetLastUpdate(view_name, delta_source);
@@ -1109,7 +1130,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                            view_catalog_name, view_schema_name, attached_db_catalog_name,
 				                            attached_db_schema_name);
 			}
-			string delta_source = ResolveDeltaMetadataKey(aux_meta.source, delta_table_names);
+			string delta_source = ResolveDeltaMetadataKey(metadata, view_name, aux_meta.source, delta_table_names);
 			string delta_source_sql =
 			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
 			string ts = metadata.GetLastUpdate(view_name, delta_source);
@@ -1138,7 +1159,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				                       view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 			}
 			auto group_columns = metadata.GetGroupColumns(view_name);
-			string delta_source = ResolveDeltaMetadataKey(aux_meta.source, delta_table_names);
+			string delta_source = ResolveDeltaMetadataKey(metadata, view_name, aux_meta.source, delta_table_names);
 			string delta_source_sql =
 			    metadata.ResolveDeltaQualifiedName(view_name, delta_source, view_catalog_name, view_schema_name);
 			string ts = metadata.GetLastUpdate(view_name, delta_source);

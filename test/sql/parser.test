@@ -31,12 +31,12 @@ west	200	1
 
 # System tables should be populated
 query I
-SELECT count(*) FROM openivm_views WHERE view_name = 'mv_sales';
+SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f73616c6573_';
 ----
 1
 
 query I
-SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'mv_sales';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f73616c6573_';
 ----
 1
 
@@ -47,7 +47,7 @@ SELECT count(*) FROM openivm_delta_sales;
 0
 
 query I
-SELECT count(*) FROM openivm_delta_mv_sales;
+SELECT count(*) FROM openivm_delta___openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f73616c6573_;
 ----
 0
 
@@ -387,12 +387,12 @@ east	300	3
 west	200	1
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name = 'mv_sales';
+SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f73616c6573_';
 ----
 1
 
 query I
-SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_mv_sales';
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data___openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f73616c6573_';
 ----
 1
 
@@ -777,7 +777,7 @@ CREATE MATERIALIZED VIEW mv_t31_5min REFRESH EVERY '5 minutes' AS
 
 # refresh_interval should be 300 seconds
 query I
-SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_5min';
+SELECT refresh_interval FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f7433315f356d696e_';
 ----
 300
 
@@ -786,7 +786,7 @@ CREATE MATERIALIZED VIEW mv_t31_2hr REFRESH EVERY '2 hours' AS
     SELECT val, SUM(val) AS total FROM t31 GROUP BY val;
 
 query I
-SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_2hr';
+SELECT refresh_interval FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f7433315f326872_';
 ----
 7200
 
@@ -795,7 +795,7 @@ CREATE MATERIALIZED VIEW mv_t31_1day REFRESH EVERY '1 day' AS
     SELECT id, val FROM t31;
 
 query I
-SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_1day';
+SELECT refresh_interval FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f7433315f31646179_';
 ----
 86400
 
@@ -808,7 +808,7 @@ CREATE MATERIALIZED VIEW mv_t31_manual AS
     SELECT val, COUNT(*) AS cnt FROM t31 GROUP BY val;
 
 query I
-SELECT refresh_interval IS NULL FROM openivm_views WHERE view_name = 'mv_t31_manual';
+SELECT refresh_interval IS NULL FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f7433315f6d616e75616c_';
 ----
 true
 
@@ -867,7 +867,7 @@ CREATE MATERIALIZED VIEW mv_t31_1min REFRESH EVERY '1 minute' AS
     SELECT id FROM t31;
 
 query I
-SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_1min';
+SELECT refresh_interval FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f7433315f316d696e_';
 ----
 60
 
@@ -879,7 +879,7 @@ statement ok
 ALTER MATERIALIZED VIEW mv_t31_5min SET REFRESH EVERY '10 minutes';
 
 query I
-SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_5min';
+SELECT refresh_interval FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f7433315f356d696e_';
 ----
 600
 
@@ -891,7 +891,7 @@ statement ok
 ALTER MATERIALIZED VIEW mv_t31_5min SET REFRESH MANUAL;
 
 query I
-SELECT refresh_interval IS NULL FROM openivm_views WHERE view_name = 'mv_t31_5min';
+SELECT refresh_interval IS NULL FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f7433315f356d696e_';
 ----
 true
 
@@ -912,7 +912,7 @@ statement ok
 ALTER MATERIALIZED VIEW mv_t31_1min SET REFRESH EVERY '2 hours';
 
 query I
-SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t31_1min';
+SELECT refresh_interval FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f7433315f316d696e_';
 ----
 7200
 
@@ -1004,7 +1004,7 @@ CREATE OR REPLACE MATERIALIZED VIEW mv_t41 REFRESH EVERY '3 hours' AS
     SELECT grp, SUM(val) AS total FROM t41 GROUP BY grp;
 
 query I
-SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_t41';
+SELECT refresh_interval FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_6d765f743431_';
 ----
 10800
 
@@ -1253,7 +1253,7 @@ WHERE l.label='where, (select)' AND l."in" NOT IN
 (SELECT r."in" FROM extractor_right AS r WHERE r.label='where, (select)');
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'extractor_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e6d6174657269616c697a65645f766965775f7061727365725f74657374_6d61696e_657874726163746f725f6d76_';
 ----
 9
 

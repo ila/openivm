@@ -253,7 +253,7 @@ SELECT count(*) FROM (
 0
 
 query III
-SELECT machine, cores, _count FROM openivm_distinct_count_se_dist_mv ORDER BY machine;
+SELECT machine, cores, _count FROM openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f646973745f6d76_ ORDER BY machine;
 ----
 m2	16	1
 m3	5	1
@@ -265,7 +265,7 @@ ALTER TABLE se_dist DROP COLUMN cpu;
 referenced by materialized view
 
 statement ok
-DROP TABLE openivm_distinct_count_se_dist_mv;
+DROP TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f646973745f6d76_;
 
 statement ok
 PRAGMA refresh('se_dist_mv');
@@ -424,13 +424,13 @@ CREATE MATERIALIZED VIEW se_fgc_schema_mv AS
     WHERE total < 0;
 
 statement ok
-DROP TABLE openivm_filtered_group_count_se_fgc_schema_mv;
+DROP TABLE openivm_filtered_group_count___openivm_mv_6d656d6f7279_6d61696e_73655f6667635f736368656d615f6d76_;
 
 statement ok
 PRAGMA refresh('se_fgc_schema_mv');
 
 query II
-SELECT wid, openivm_sum FROM openivm_filtered_group_count_se_fgc_schema_mv ORDER BY wid;
+SELECT wid, openivm_sum FROM openivm_filtered_group_count___openivm_mv_6d656d6f7279_6d61696e_73655f6667635f736368656d615f6d76_ ORDER BY wid;
 ----
 1	-5.0
 2	10.0
@@ -649,7 +649,7 @@ CREATE MATERIALIZED VIEW se_pending_aux_mv AS
     GROUP BY grp;
 
 statement ok
-DROP TABLE openivm_distinct_count_se_pending_aux_mv;
+DROP TABLE openivm_distinct_count___openivm_mv_6d656d6f7279_6d61696e_73655f70656e64696e675f6175785f6d76_;
 
 statement ok
 INSERT INTO se_pending_aux VALUES (1, 'm3', 32);
@@ -843,8 +843,8 @@ DROP TABLE se_identity_a.drop_shared CASCADE;
 
 query II
 SELECT
-    (SELECT count(*) FROM openivm_views WHERE view_name = 'se_identity_drop_a_mv'),
-    (SELECT count(*) FROM openivm_views WHERE view_name = 'se_identity_drop_b_mv');
+    (SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_73655f6964656e746974795f64726f705f615f6d76_'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_73655f6964656e746974795f64726f705f625f6d76_');
 ----
 0	1
 

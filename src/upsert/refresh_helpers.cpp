@@ -1,4 +1,6 @@
 #include "upsert/refresh_internal.hpp"
+#include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/main/database_manager.hpp"
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
@@ -1142,41 +1144,70 @@ static string CurrentDatabase(Connection &con) {
 	return "";
 }
 
-ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connection &con, const string &view_name,
-                                                  bool throw_if_not_found) {
+ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connection &con, const string &view_name) {
 	ResolvedViewCatalog resolved;
-	auto &search_path = ClientData::Get(context).catalog_search_path;
-	auto default_entry = search_path->GetDefault();
-	resolved.view_catalog_name = default_entry.catalog;
-	resolved.view_schema_name = default_entry.schema;
-
-	QueryErrorContext err_ctx;
-	auto entry =
-	    Catalog::GetEntry(context, resolved.view_catalog_name, resolved.view_schema_name,
-	                      EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, err_ctx), OnEntryNotFound::RETURN_NULL);
-	if (!entry) {
-		auto found_view =
-		    con.Query("SELECT table_catalog, table_schema FROM information_schema.tables WHERE table_type = 'VIEW' "
-		              "AND lower(table_name) = lower('" +
-		              SqlUtils::EscapeValue(view_name) + "') ORDER BY CASE WHEN table_catalog = '" +
-		              SqlUtils::EscapeValue(resolved.view_catalog_name) + "' AND table_schema = '" +
-		              SqlUtils::EscapeValue(resolved.view_schema_name) +
-		              "' THEN 0 ELSE 1 END, table_catalog, table_schema LIMIT 1");
-		if (!found_view->HasError() && found_view->RowCount() > 0) {
-			resolved.view_catalog_name = found_view->GetValue(0, 0).ToString();
-			resolved.view_schema_name = found_view->GetValue(1, 0).ToString();
-		} else if (throw_if_not_found) {
-			throw CatalogException("openivm_compile_with_facts: materialized view '%s' not found in any attached "
-			                       "catalog (pass an unqualified short name only)",
-			                       view_name.c_str());
+	auto parts = QualifiedName::ParseComponents(view_name);
+	if (parts.empty() || parts.size() > 3) {
+		throw InvalidInputException("Invalid materialized view name '%s'; use [catalog.][schema.]view", view_name);
+	}
+	auto &entry = ClientData::Get(context).catalog_search_path->GetDefault();
+	resolved.view_catalog_name = entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : entry.catalog;
+	resolved.view_schema_name = entry.schema.empty() ? DEFAULT_SCHEMA : entry.schema;
+	auto name = parts.back();
+	if (parts.size() == 3) {
+		resolved.view_catalog_name = parts[0];
+		resolved.view_schema_name = parts[1];
+	} else if (parts.size() == 2) {
+		if (DatabaseManager::Get(context).GetDatabase(context, parts[0])) {
+			resolved.view_catalog_name = parts[0];
+			resolved.view_schema_name = DEFAULT_SCHEMA;
+		} else {
+			resolved.view_schema_name = parts[0];
 		}
 	}
-
-	auto current_database = CurrentDatabase(con);
-	if (!resolved.view_catalog_name.empty() && !current_database.empty() &&
-	    resolved.view_catalog_name != current_database && resolved.view_catalog_name != "memory") {
-		resolved.cross_system = true;
+	RefreshMetadata::UseCatalog(context, con, resolved.view_catalog_name);
+	RefreshMetadata metadata(con);
+	auto key = metadata.FindViewKey(resolved.view_catalog_name, resolved.view_schema_name, name);
+	if (key.empty() && parts.size() == 1) {
+		key = metadata.ResolveViewName(name, resolved.view_catalog_name, resolved.view_schema_name);
+		if (metadata.GetViewQuery(key).empty()) {
+			key.clear();
+		}
 	}
+	if (key.empty() && parts.size() == 1) {
+		auto candidates = con.Query("SELECT table_catalog, table_schema FROM information_schema.tables "
+		                            "WHERE table_type = 'VIEW' AND lower(table_name) = lower(" +
+		                            Value(name).ToSQLString() + ")");
+		if (!candidates->HasError()) {
+			for (idx_t row = 0; row < candidates->RowCount(); row++) {
+				auto catalog = candidates->GetValue(0, row).ToString();
+				auto schema = candidates->GetValue(1, row).ToString();
+				RefreshMetadata::UseCatalog(context, con, catalog);
+				auto candidate = metadata.FindViewKey(catalog, schema, name);
+				if (candidate.empty()) {
+					continue;
+				}
+				if (!key.empty()) {
+					throw CatalogException("Ambiguous materialized view '%s'; use catalog.schema.view", view_name);
+				}
+				key = candidate;
+				resolved.view_catalog_name = catalog;
+				resolved.view_schema_name = schema;
+			}
+		}
+		RefreshMetadata::UseCatalog(context, con, resolved.view_catalog_name);
+	}
+
+	if (key.empty()) {
+		throw CatalogException("Materialized view '%s' does not exist in IVM metadata; check view_sql_name, "
+		                       "view_catalog and view_schema in the native database's main.openivm_views",
+		                       view_name);
+	}
+	auto location = metadata.GetStoredViewLocation(key, resolved.view_catalog_name, resolved.view_schema_name);
+	resolved.view_catalog_name = location.catalog_name;
+	resolved.view_schema_name = location.schema_name;
+	resolved.view_name = key;
+	resolved.cross_system = resolved.view_catalog_name != CurrentDatabase(con);
 	return resolved;
 }
 

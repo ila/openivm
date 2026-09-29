@@ -90,16 +90,77 @@ void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
 	OPENIVM_DEBUG_PRINT("[METADATA] Snapshotted caller transaction in %s\n", catalog.c_str());
 }
 
-string RefreshMetadata::ResolveViewName(const string &view_name) {
-	auto result = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE lower(view_name) = lower('" + SqlUtils::EscapeValue(view_name) + "')");
-	if (result->HasError() || result->RowCount() == 0) {
-		return view_name;
+string RefreshMetadata::GetViewSQLName(const string &view_key) {
+	auto name = ReadViewString(view_key, "view_sql_name");
+	return name.empty() ? view_key : name;
+}
+
+string RefreshMetadata::FindViewKey(const string &catalog, const string &schema, const string &name) {
+	auto query = [&](const string &name_expression) {
+		return con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE lower(" + name_expression +
+		                 ") = lower(" + Value(name).ToSQLString() + ") AND lower(COALESCE(view_catalog, " +
+		                 Value(catalog).ToSQLString() + ")) = lower(" + Value(catalog).ToSQLString() +
+		                 ") AND lower(COALESCE(view_schema, 'main')) = lower(" + Value(schema).ToSQLString() + ")");
+	};
+	auto result = query("COALESCE(view_sql_name, view_name)");
+	if (result->HasError()) {
+		result = query("view_name"); // Metadata written before SQL names were stored separately.
+	}
+	if (result->HasError() || !result->RowCount()) {
+		return "";
 	}
 	if (result->RowCount() != 1) {
-		throw CatalogException("Ambiguous materialized view name '%s'", view_name);
+		throw CatalogException("Ambiguous materialized view '%s'", SqlUtils::FullName(catalog, schema, name));
 	}
 	return result->GetValue(0, 0).ToString();
+}
+
+string RefreshMetadata::AllocateViewKey(const string &catalog, const string &schema, const string &name) {
+	auto existing = FindViewKey(catalog, schema, name);
+	if (!existing.empty()) {
+		return existing;
+	}
+	// Allocation must not depend on other CREATEs having committed their metadata.
+	// Encode all identifier bytes, including separators, to avoid schema/name collisions.
+	string key = "__openivm_mv_";
+	const char *hex = "0123456789abcdef";
+	for (auto &part : {catalog, schema, name}) {
+		for (unsigned char c : StringUtil::Lower(part)) {
+			key += hex[c >> 4];
+			key += hex[c & 15];
+		}
+		key += '_';
+	}
+	return key;
+}
+
+string RefreshMetadata::ResolveViewName(const string &view_name, const string &catalog, const string &schema) {
+	// Public names resolve by location; internal graph edges already contain storage keys.
+	auto exact = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
+	                       " WHERE view_name = " + Value(view_name).ToSQLString());
+	if (exact->HasError()) {
+		return view_name;
+	}
+	if (!catalog.empty() && !schema.empty()) {
+		auto preferred = FindViewKey(catalog, schema, view_name);
+		if (!preferred.empty()) {
+			return preferred;
+		}
+	}
+	auto matches =
+	    con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
+	              " WHERE lower(COALESCE(view_sql_name, view_name)) = lower(" + Value(view_name).ToSQLString() + ")");
+	if (matches->HasError()) {
+		matches = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
+		                    " WHERE lower(view_name) = lower(" + Value(view_name).ToSQLString() + ")");
+	}
+	if (!matches->HasError() && matches->RowCount() > 1) {
+		throw CatalogException("Ambiguous materialized view '%s'; use catalog.schema.view", view_name);
+	}
+	if (!matches->HasError() && matches->RowCount() == 1) {
+		return matches->GetValue(0, 0).ToString();
+	}
+	return exact->RowCount() == 1 ? exact->GetValue(0, 0).ToString() : view_name;
 }
 
 bool RefreshMetadata::IsBaseTable(const string &table_name) {
@@ -465,7 +526,7 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 	}
 	std::set<string> selected;
 	for (auto &requested : targets) {
-		auto target = ResolveViewName(requested);
+		auto target = requested;
 		if (graph.find(target) == graph.end()) {
 			throw CatalogException("refresh_pipeline: materialized view '%s' does not exist", target);
 		}

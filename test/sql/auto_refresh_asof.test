@@ -42,7 +42,7 @@ PRAGMA refresh('mv_cm_asof_full');
 
 query I
 SELECT CASE WHEN method = 'full' THEN 1 ELSE 0 END
-FROM openivm_refresh_history WHERE view_name = 'mv_cm_asof_full' ORDER BY refresh_timestamp DESC LIMIT 1;
+FROM openivm_refresh_history WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636d5f61736f665f66756c6c_' ORDER BY refresh_timestamp DESC LIMIT 1;
 ----
 1
 

@@ -59,12 +59,12 @@ statement ok
 PRAGMA refresh('mv_emp');
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_emp' AND step_name IN ('metadata_pre_sql', 'metadata_post_sql');
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f656d70_' AND step_name IN ('metadata_pre_sql', 'metadata_post_sql');
 ----
 2
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_emp' AND step_name IN ('generate_refresh_sql', 'execute_refresh_sql', 'total_refresh') AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f656d70_' AND step_name IN ('generate_refresh_sql', 'execute_refresh_sql', 'total_refresh') AND duration_ms >= 0;
 ----
 3
 
@@ -94,7 +94,7 @@ statement ok
 PRAGMA refresh('mv_emp');
 
 query I
-SELECT count(DISTINCT refresh_id) FROM openivm_refresh_profile WHERE view_name = 'mv_emp';
+SELECT count(DISTINCT refresh_id) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f656d70_';
 ----
 2
 
@@ -423,13 +423,13 @@ query I
 SELECT count(*) FROM information_schema.tables
 WHERE table_catalog = 'lakecat'
   AND table_schema = 'main'
-  AND table_name IN ('openivm_data_alt_mv', 'openivm_delta_alt_mv');
+  AND table_name IN ('openivm_data___openivm_mv_6c616b65636174_6d61696e_616c745f6d76_', 'openivm_delta___openivm_mv_6c616b65636174_6d61696e_616c745f6d76_');
 ----
 2
 
 query I
 SELECT count(*) FROM openivm_delta_tables
-WHERE view_name = 'alt_mv'
+WHERE view_name = '__openivm_mv_6c616b65636174_6d61696e_616c745f6d76_'
   AND table_name = 'alt_src'
   AND source_catalog = 'lakecat';
 ----
@@ -472,13 +472,13 @@ query I
 SELECT count(*) FROM information_schema.tables
 WHERE table_catalog = 'lakecat'
   AND table_schema = 'main'
-  AND table_name IN ('openivm_data_alt_mv_from_use', 'openivm_delta_alt_mv_from_use');
+  AND table_name IN ('openivm_data___openivm_mv_6c616b65636174_6d61696e_616c745f6d765f66726f6d5f757365_', 'openivm_delta___openivm_mv_6c616b65636174_6d61696e_616c745f6d765f66726f6d5f757365_');
 ----
 2
 
 query I
 SELECT count(*) FROM openivm_delta_tables
-WHERE view_name = 'alt_mv_from_use'
+WHERE view_name = '__openivm_mv_6c616b65636174_6d61696e_616c745f6d765f66726f6d5f757365_'
   AND table_name = 'alt_src'
   AND source_catalog = 'lakecat';
 ----
@@ -533,14 +533,14 @@ query I
 SELECT count(*) FROM information_schema.tables
 WHERE table_catalog = 'lakecat'
   AND table_schema = 'main'
-  AND table_name IN ('openivm_data_mv_two_catalogs', 'openivm_delta_mv_two_catalogs');
+  AND table_name IN ('openivm_data___openivm_mv_6c616b65636174_6d61696e_6d765f74776f5f636174616c6f6773_', 'openivm_delta___openivm_mv_6c616b65636174_6d61696e_6d765f74776f5f636174616c6f6773_');
 ----
 2
 
 query II rowsort
 SELECT table_name, source_catalog
 FROM openivm_delta_tables
-WHERE view_name = 'mv_two_catalogs'
+WHERE view_name = '__openivm_mv_6c616b65636174_6d61696e_6d765f74776f5f636174616c6f6773_'
 ORDER BY table_name;
 ----
 cat_a	lakecat
@@ -583,7 +583,7 @@ query I
 SELECT count(*) FROM information_schema.tables
 WHERE table_catalog = 'lakecat2'
   AND table_schema = 'main'
-  AND table_name IN ('openivm_data_mv_two_catalogs_inverse', 'openivm_delta_mv_two_catalogs_inverse');
+  AND table_name IN ('openivm_data___openivm_mv_6c616b6563617432_6d61696e_6d765f74776f5f636174616c6f67735f696e7665727365_', 'openivm_delta___openivm_mv_6c616b6563617432_6d61696e_6d765f74776f5f636174616c6f67735f696e7665727365_');
 ----
 2
 
@@ -591,7 +591,7 @@ query I
 SELECT count(*) FROM information_schema.tables
 WHERE table_catalog = 'lakecat'
   AND table_schema = 'main'
-  AND table_name IN ('openivm_data_mv_two_catalogs_inverse', 'openivm_delta_mv_two_catalogs_inverse');
+  AND table_name IN ('openivm_data___openivm_mv_6c616b6563617432_6d61696e_6d765f74776f5f636174616c6f67735f696e7665727365_', 'openivm_delta___openivm_mv_6c616b6563617432_6d61696e_6d765f74776f5f636174616c6f67735f696e7665727365_');
 ----
 0
 
@@ -638,7 +638,7 @@ query I
 SELECT count(*) FROM information_schema.tables
 WHERE table_catalog = 'lakecat2'
   AND table_schema = 'main'
-  AND table_name IN ('openivm_data_mv_two_catalogs_from_use', 'openivm_delta_mv_two_catalogs_from_use');
+  AND table_name IN ('openivm_data___openivm_mv_6c616b6563617432_6d61696e_6d765f74776f5f636174616c6f67735f66726f6d5f757365_', 'openivm_delta___openivm_mv_6c616b6563617432_6d61696e_6d765f74776f5f636174616c6f67735f66726f6d5f757365_');
 ----
 2
 
@@ -687,7 +687,7 @@ CREATE MATERIALIZED VIEW dl.mv_value_join AS
       ON c.credit = v.credit;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_value_join';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f76616c75655f6a6f696e_';
 ----
 2
 

@@ -14,6 +14,8 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/constraint.hpp"
@@ -840,7 +842,7 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 
 	auto &db = DatabaseInstance::GetDatabase(context);
 	Connection con(db);
-	RefreshMetadata::UseCatalog(context, con);
+	view_name = ResolveViewCatalogFromContext(context, con, view_name).view_name;
 
 	// Propagate user session settings to the cost estimation connection.
 	// The new connection has defaults, so settings like openivm_adaptive_refresh
@@ -897,11 +899,15 @@ string RefreshCostQuery(ClientContext &context, const FunctionParameters &parame
 
 string RefreshCostHistoryQuery(ClientContext &context, const FunctionParameters &parameters) {
 	auto view_name = StringValue::Get(parameters.values[0]);
-	return "SELECT view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est,"
+	Connection con(*context.db);
+	view_name = ResolveViewCatalogFromContext(context, con, view_name).view_name;
+	return "SELECT " + parameters.values[0].ToSQLString() +
+	       " AS view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est,"
 	       " recompute_compute_est, recompute_replace_est, actual_duration_ms"
 	       " FROM " +
-	       string(openivm::HISTORY_TABLE) + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
-	       "' ORDER BY refresh_timestamp DESC LIMIT 20";
+	       SqlUtils::FullName(ClientData::Get(*con.context).catalog_search_path->GetDefault().catalog, DEFAULT_SCHEMA,
+	                          openivm::HISTORY_TABLE) +
+	       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' ORDER BY refresh_timestamp DESC LIMIT 20";
 }
 
 vector<StrategyCostEstimate> EstimatePerQuery(ClientContext &context, const string &view_name,

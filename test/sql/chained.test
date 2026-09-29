@@ -106,7 +106,7 @@ statement ok
 PRAGMA refresh('compact_proj');
 
 query I
-SELECT COUNT(*) FROM openivm_delta_openivm_visible_compact_proj;
+SELECT COUNT(*) FROM openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_636f6d706163745f70726f6a_;
 ----
 1
 
@@ -154,7 +154,7 @@ statement ok
 PRAGMA refresh('compact_cancel_proj');
 
 query I
-SELECT COUNT(*) FROM openivm_delta_openivm_visible_compact_cancel_proj;
+SELECT COUNT(*) FROM openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_636f6d706163745f63616e63656c5f70726f6a_;
 ----
 0
 
@@ -1358,7 +1358,7 @@ statement ok
 CREATE TEMP TABLE ch_noop_l2_last_update AS
 SELECT last_update
 FROM openivm_delta_tables
-WHERE view_name = 'ch_noop_l2';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_63685f6e6f6f705f6c32_';
 
 statement ok
 PRAGMA refresh('ch_noop_l2');
@@ -1366,7 +1366,7 @@ PRAGMA refresh('ch_noop_l2');
 query I
 SELECT d.last_update = p.last_update
 FROM openivm_delta_tables d, ch_noop_l2_last_update p
-WHERE d.view_name = 'ch_noop_l2';
+WHERE d.view_name = '__openivm_mv_6d656d6f7279_6d61696e_63685f6e6f6f705f6c32_';
 ----
 true
 
@@ -1406,37 +1406,37 @@ statement ok
 CREATE VIEW pipe_bridge AS SELECT * FROM pipe_a;
 
 statement ok
-INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_a', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_a'')', 'after');
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_6d656d6f7279_6d61696e_706970655f61_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_a'')', 'after');
 
 statement ok
 CREATE MATERIALIZED VIEW pipe_b AS SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id;
 
 statement ok
-INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_b', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_b'')', 'after');
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_6d656d6f7279_6d61696e_706970655f62_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_b'')', 'after');
 
 statement ok
 CREATE MATERIALIZED VIEW pipe_c AS SELECT id,v*2 AS v FROM pipe_bridge;
 
 statement ok
-INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_c', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_c'')', 'after');
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_6d656d6f7279_6d61696e_706970655f63_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_c'')', 'after');
 
 statement ok
 CREATE MATERIALIZED VIEW pipe_z AS SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id);
 
 statement ok
-INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_z', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_z'')', 'after');
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_6d656d6f7279_6d61696e_706970655f7a_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_z'')', 'after');
 
 statement ok
 CREATE MATERIALIZED VIEW pipe_tail AS SELECT id,v+w AS total FROM pipe_z;
 
 statement ok
-INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_tail', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_tail'')', 'after');
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_6d656d6f7279_6d61696e_706970655f7461696c_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_tail'')', 'after');
 
 statement ok
 CREATE MATERIALIZED VIEW pipe_side AS SELECT id,v+1 AS v FROM pipe_a;
 
 statement ok
-INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_side', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_side'')', 'after');
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_6d656d6f7279_6d61696e_706970655f73696465_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_side'')', 'after');
 
 statement ok
 DELETE FROM memory.main.pipe_log;
@@ -1823,10 +1823,10 @@ statement ok
 SET openivm_cascade_refresh='upstream';
 
 statement ok
-CREATE TEMP TABLE pipe_saved_edges AS SELECT * FROM memory.main.openivm_delta_tables WHERE view_name='pipe_a';
+CREATE TEMP TABLE pipe_saved_edges AS SELECT * FROM memory.main.openivm_delta_tables WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_706970655f61_';
 
 statement ok
-UPDATE memory.main.openivm_delta_tables SET table_name='openivm_delta_pipe_tail' WHERE view_name='pipe_a';
+UPDATE memory.main.openivm_delta_tables SET table_name='openivm_delta___openivm_mv_6d656d6f7279_6d61696e_706970655f7461696c_' WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_706970655f61_';
 
 statement error
 PRAGMA refresh_pipeline('pipe_tail');
@@ -1839,7 +1839,7 @@ SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_lo
 (empty)
 
 statement ok
-DELETE FROM memory.main.openivm_delta_tables WHERE view_name='pipe_a';
+DELETE FROM memory.main.openivm_delta_tables WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_706970655f61_';
 
 statement ok
 INSERT INTO memory.main.openivm_delta_tables SELECT * FROM pipe_saved_edges;
@@ -2052,8 +2052,8 @@ statement ok
 DROP VIEW pipe_side;
 
 query II
-SELECT (SELECT COUNT(*) FROM memory.main.openivm_views WHERE view_name='pipe_side'),
-       (SELECT COUNT(*) FROM memory.main.openivm_delta_tables WHERE view_name='pipe_side');
+SELECT (SELECT COUNT(*) FROM memory.main.openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_706970655f73696465_'),
+       (SELECT COUNT(*) FROM memory.main.openivm_delta_tables WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_706970655f73696465_');
 ----
 0	0
 
@@ -2118,7 +2118,7 @@ statement ok
 DELETE FROM memory.main.pipe_log;
 
 statement ok
-UPDATE memory.main.openivm_refresh_hooks SET mode='before',hook_sql='SELECT error(''pipeline test hook failure'')' WHERE view_name='pipe_b';
+UPDATE memory.main.openivm_refresh_hooks SET mode='before',hook_sql='SELECT error(''pipeline test hook failure'')' WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_706970655f62_';
 
 statement ok
 INSERT INTO pipe_src_a VALUES (1,31);
@@ -2143,7 +2143,7 @@ SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(amou
 0	0
 
 statement ok
-UPDATE memory.main.openivm_refresh_hooks SET mode='after',hook_sql='INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_b'')' WHERE view_name='pipe_b';
+UPDATE memory.main.openivm_refresh_hooks SET mode='after',hook_sql='INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_b'')' WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_706970655f62_';
 
 statement ok
 DELETE FROM memory.main.pipe_log;
@@ -2192,7 +2192,7 @@ statement ok
 CREATE MATERIALIZED VIEW pipe_new AS SELECT id,v+99 AS v FROM pipe_a;
 
 statement ok
-INSERT INTO memory.main.openivm_refresh_hooks VALUES ('pipe_new','INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_new'')','after');
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_6d656d6f7279_6d61696e_706970655f6e6577_','INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_new'')','after');
 
 statement ok
 DELETE FROM memory.main.pipe_log;
@@ -2606,7 +2606,7 @@ statement ok
 CREATE TABLE rev_hook_log(message VARCHAR);
 
 statement ok
-INSERT INTO openivm_refresh_hooks VALUES('rev_parent','SELECT error(''review after-hook failure'')','after');
+INSERT INTO openivm_refresh_hooks VALUES('__openivm_mv_6d656d6f7279_6d61696e_7265765f706172656e74_','SELECT error(''review after-hook failure'')','after');
 
 statement ok
 INSERT INTO rev_source VALUES(1,9);
@@ -2617,7 +2617,7 @@ PRAGMA refresh_pipeline('rev_child');
 review after-hook failure
 
 statement ok
-UPDATE openivm_refresh_hooks SET hook_sql='INSERT INTO rev_hook_log VALUES (''done'')' WHERE view_name='rev_parent';
+UPDATE openivm_refresh_hooks SET hook_sql='INSERT INTO rev_hook_log VALUES (''done'')' WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_7265765f706172656e74_';
 
 statement ok
 PRAGMA refresh_pipeline('rev_child');
@@ -2748,7 +2748,7 @@ statement ok
 CREATE TABLE pipeline_audit.events(v INTEGER);
 
 statement ok
-INSERT INTO openivm_refresh_hooks VALUES('replacement_tx_parent','INSERT INTO pipeline_audit.events SELECT CASE WHEN SUM(v)>0 THEN error(''audit unavailable'') ELSE 1 END FROM replacement_tx_source','after');
+INSERT INTO openivm_refresh_hooks VALUES('__openivm_mv_6d656d6f7279_6d61696e_7265706c6163656d656e745f74785f706172656e74_','INSERT INTO pipeline_audit.events SELECT CASE WHEN SUM(v)>0 THEN error(''audit unavailable'') ELSE 1 END FROM replacement_tx_source','after');
 
 statement ok
 INSERT INTO replacement_tx_source VALUES(1,5),(2,6);
@@ -2771,12 +2771,12 @@ SELECT (SELECT COUNT(*) FROM (SELECT * FROM replacement_tx_parent EXCEPT ALL SEL
 0	0
 
 query I
-SELECT COUNT(*) FROM openivm_views WHERE view_name='replacement_tx_parent' AND pending_after_hook;
+SELECT COUNT(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_7265706c6163656d656e745f74785f706172656e74_' AND pending_after_hook;
 ----
 1
 
 statement ok
-UPDATE openivm_refresh_hooks SET hook_sql='INSERT INTO pipeline_audit.events VALUES(1)' WHERE view_name='replacement_tx_parent';
+UPDATE openivm_refresh_hooks SET hook_sql='INSERT INTO pipeline_audit.events VALUES(1)' WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_7265706c6163656d656e745f74785f706172656e74_';
 
 statement ok
 PRAGMA refresh_pipeline('replacement_tx_parent');
@@ -2788,7 +2788,7 @@ SELECT (SELECT COUNT(*) FROM (SELECT * FROM replacement_tx_parent EXCEPT ALL SEL
 0	0
 
 query II
-SELECT (SELECT COUNT(*) FROM pipeline_audit.events), (SELECT COUNT(*) FROM openivm_views WHERE view_name='replacement_tx_parent' AND pending_after_hook);
+SELECT (SELECT COUNT(*) FROM pipeline_audit.events), (SELECT COUNT(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_7265706c6163656d656e745f74785f706172656e74_' AND pending_after_hook);
 ----
 1	0
 
@@ -2812,7 +2812,7 @@ statement ok
 CREATE TABLE pipeline_local_audit(v INTEGER);
 
 statement ok
-UPDATE openivm_refresh_hooks SET hook_sql='INSERT INTO pipeline_audit.events SELECT CASE WHEN SUM(v)>0 THEN error(''audit unavailable again'') ELSE 1 END FROM replacement_tx_source' WHERE view_name='replacement_tx_parent';
+UPDATE openivm_refresh_hooks SET hook_sql='INSERT INTO pipeline_audit.events SELECT CASE WHEN SUM(v)>0 THEN error(''audit unavailable again'') ELSE 1 END FROM replacement_tx_source' WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_7265706c6163656d656e745f74785f706172656e74_';
 
 statement ok
 INSERT INTO replacement_tx_source VALUES(3,7);
@@ -2829,7 +2829,7 @@ SELECT (SELECT COUNT(*) FROM (SELECT * FROM replacement_tx_parent EXCEPT ALL SEL
 0	0
 
 statement ok
-UPDATE openivm_refresh_hooks SET hook_sql='INSERT INTO pipeline_local_audit VALUES(1)' WHERE view_name='replacement_tx_parent';
+UPDATE openivm_refresh_hooks SET hook_sql='INSERT INTO pipeline_local_audit VALUES(1)' WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_7265706c6163656d656e745f74785f706172656e74_';
 
 statement ok
 PRAGMA refresh_pipeline('replacement_tx_parent');
@@ -2841,7 +2841,7 @@ SELECT (SELECT COUNT(*) FROM (SELECT * FROM replacement_tx_parent EXCEPT ALL SEL
 0	0
 
 query II
-SELECT (SELECT COUNT(*) FROM pipeline_local_audit), (SELECT COUNT(*) FROM openivm_views WHERE view_name='replacement_tx_parent' AND pending_after_hook);
+SELECT (SELECT COUNT(*) FROM pipeline_local_audit), (SELECT COUNT(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_7265706c6163656d656e745f74785f706172656e74_' AND pending_after_hook);
 ----
 1	0
 
@@ -3023,12 +3023,12 @@ SELECT (SELECT COUNT(*) FROM (SELECT * FROM publish_top_child EXCEPT ALL SELECT 
 
 # Parent wrapper changes never demote the child to full refresh.
 query I
-SELECT type FROM openivm_views WHERE view_name='publish_child';
+SELECT type FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_7075626c6973685f6368696c64_';
 ----
 2
 
 query I
-SELECT type FROM openivm_views WHERE view_name='publish_top_child';
+SELECT type FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_7075626c6973685f746f705f6368696c64_';
 ----
 2
 
@@ -3079,7 +3079,7 @@ statement ok
 DROP VIEW publish_top CASCADE;
 
 query I
-SELECT count(*) FROM information_schema.tables WHERE table_name IN ('openivm_visible_publish_top','openivm_delta_openivm_visible_publish_top','openivm_visible_publish_top_child','openivm_delta_openivm_visible_publish_top_child');
+SELECT count(*) FROM information_schema.tables WHERE table_name IN ('openivm_visible___openivm_mv_6d656d6f7279_6d61696e_7075626c6973685f746f70_','openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_7075626c6973685f746f70_','openivm_visible___openivm_mv_6d656d6f7279_6d61696e_7075626c6973685f746f705f6368696c64_','openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_7075626c6973685f746f705f6368696c64_');
 ----
 0
 
@@ -3116,7 +3116,7 @@ SELECT count(*) FROM ((SELECT * FROM r2_c0 EXCEPT ALL SELECT * FROM (SELECT sum(
 0
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name='r2_p0' AND type=3;
+SELECT count(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_72325f7030_' AND type=3;
 ----
 0
 
@@ -3208,7 +3208,7 @@ SELECT count(*) FROM ((SELECT * FROM r2_c1 EXCEPT ALL SELECT * FROM (SELECT k+1 
 0
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name='r2_p1' AND type=3;
+SELECT count(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_72325f7031_' AND type=3;
 ----
 0
 
@@ -3300,7 +3300,7 @@ SELECT count(*) FROM ((SELECT * FROM r2_c2 EXCEPT ALL SELECT * FROM (SELECT k,su
 0
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name='r2_p2' AND type=3;
+SELECT count(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_72325f7032_' AND type=3;
 ----
 0
 
@@ -3392,7 +3392,7 @@ SELECT count(*) FROM ((SELECT * FROM r2_c3 EXCEPT ALL SELECT * FROM (SELECT k,su
 0
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name='r2_p3' AND type=3;
+SELECT count(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_72325f7033_' AND type=3;
 ----
 0
 
@@ -3484,7 +3484,7 @@ SELECT count(*) FROM ((SELECT * FROM r2_c4 EXCEPT ALL SELECT * FROM (SELECT a.k,
 0
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name='r2_p4' AND type=3;
+SELECT count(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_72325f7034_' AND type=3;
 ----
 0
 
@@ -3569,7 +3569,7 @@ SELECT count(*) FROM ((SELECT * FROM r2_leaf EXCEPT ALL SELECT * FROM (SELECT k,
 0
 
 query I
-SELECT count(*) FROM openivm_delta_openivm_visible_r2_leaf;
+SELECT count(*) FROM openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_72325f6c656166_;
 ----
 0
 
@@ -3585,7 +3585,7 @@ SELECT count(*) FROM ((SELECT * FROM r2_leaf EXCEPT ALL SELECT * FROM (SELECT k,
 0
 
 query I
-SELECT count(*) FROM openivm_delta_openivm_visible_r2_leaf;
+SELECT count(*) FROM openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_72325f6c656166_;
 ----
 0
 
@@ -3623,7 +3623,7 @@ SELECT count(*) FROM ((SELECT * FROM r2_leaf EXCEPT ALL SELECT * FROM (SELECT k,
 0
 
 query I
-SELECT count(*) FROM openivm_delta_openivm_visible_r2_leaf;
+SELECT count(*) FROM openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_72325f6c656166_;
 ----
 0
 
@@ -3634,7 +3634,7 @@ statement ok
 CREATE MATERIALIZED VIEW r2_leaf_c AS SELECT * FROM r2_leaf;
 
 query I
-SELECT count(*) FROM openivm_mv_dependencies WHERE parent_view='r2_leaf' AND child_view='r2_leaf_c';
+SELECT count(*) FROM openivm_mv_dependencies WHERE parent_view='__openivm_mv_6d656d6f7279_6d61696e_72325f6c656166_' AND child_view='__openivm_mv_6d656d6f7279_6d61696e_72325f6c6561665f63_';
 ----
 1
 
@@ -3919,7 +3919,7 @@ statement ok
 CREATE MATERIALIZED VIEW ordinal_lag AS SELECT * FROM ordinal_p;
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name IN ('ordinal_p','ordinal_c','ordinal_lag') AND type=3;
+SELECT count(*) FROM openivm_views WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_6f7264696e616c5f70_','__openivm_mv_6d656d6f7279_6d61696e_6f7264696e616c5f63_','__openivm_mv_6d656d6f7279_6d61696e_6f7264696e616c5f6c6167_') AND type=3;
 ----
 0
 
@@ -4236,3 +4236,117 @@ query I
 SELECT count(*) FROM ((SELECT * FROM mark_leaf EXCEPT ALL SELECT * FROM mark_expected_leaf) UNION ALL (SELECT * FROM mark_expected_leaf EXCEPT ALL SELECT * FROM mark_leaf));
 ----
 0
+
+# Same SQL name in separate schemas: refresh, fan-in, replacement, and isolated drop.
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE SCHEMA identity_a;
+
+statement ok
+CREATE SCHEMA identity_b;
+
+statement ok
+CREATE TABLE identity_a.t(k INT,v INT);
+
+statement ok
+CREATE TABLE identity_b.t(k INT,v INT);
+
+statement ok
+INSERT INTO identity_a.t VALUES(1,10),(2,20);
+
+statement ok
+INSERT INTO identity_b.t VALUES(1,100),(2,200);
+
+statement ok
+CREATE MATERIALIZED VIEW identity_a.summary AS SELECT k,SUM(v) total FROM identity_a.t GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW identity_b.summary AS SELECT k,SUM(v) total FROM identity_b.t GROUP BY k;
+
+statement ok
+INSERT INTO identity_a.t VALUES(1,4),(3,5);
+
+statement ok
+UPDATE identity_a.t SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM identity_a.t WHERE k=3;
+
+statement ok
+INSERT INTO identity_b.t VALUES(2,8),(3,9);
+
+statement ok
+UPDATE identity_b.t SET v=v+1 WHERE k=2;
+
+statement ok
+DELETE FROM identity_b.t WHERE k=3;
+
+statement ok
+PRAGMA refresh('identity_a.summary');
+
+query T
+WITH expected AS (SELECT k,SUM(v) total FROM identity_a.t GROUP BY k) SELECT CASE WHEN EXISTS ((SELECT * FROM identity_a.summary EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM identity_a.summary)) THEN error('a bag mismatch') ELSE 'a correct' END;
+----
+a correct
+
+statement ok
+PRAGMA refresh('identity_b.summary');
+
+query T
+WITH expected AS (SELECT k,SUM(v) total FROM identity_b.t GROUP BY k) SELECT CASE WHEN EXISTS ((SELECT * FROM identity_b.summary EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM identity_b.summary)) THEN error('b bag mismatch') ELSE 'b correct' END;
+----
+b correct
+
+statement ok
+CREATE MATERIALIZED VIEW identity_combined AS SELECT a.k,a.total av,b.total bv FROM identity_a.summary a JOIN identity_b.summary b USING(k);
+
+statement ok
+INSERT INTO identity_a.t VALUES(2,4);
+
+statement ok
+INSERT INTO identity_b.t VALUES(2,7);
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+PRAGMA refresh_pipeline('identity_combined');
+
+query T
+WITH expected AS (SELECT a.k,a.total av,b.total bv FROM (SELECT k,SUM(v) total FROM identity_a.t GROUP BY k) a JOIN (SELECT k,SUM(v) total FROM identity_b.t GROUP BY k) b USING(k)) SELECT CASE WHEN EXISTS ((SELECT * FROM identity_combined EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM identity_combined)) THEN error('pipeline bag mismatch') ELSE 'pipeline correct' END;
+----
+pipeline correct
+
+statement ok
+DROP VIEW identity_combined;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW identity_b.summary AS SELECT k,SUM(v)+10 total FROM identity_b.t GROUP BY k;
+
+statement ok
+PRAGMA refresh('identity_b.summary');
+
+query T
+WITH expected AS (SELECT k,SUM(v)+10 total FROM identity_b.t GROUP BY k) SELECT CASE WHEN EXISTS ((SELECT * FROM identity_b.summary EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM identity_b.summary)) THEN error('replace bag mismatch') ELSE 'replace correct' END;
+----
+replace correct
+
+statement ok
+DROP VIEW identity_b.summary;
+
+statement ok
+INSERT INTO identity_a.t VALUES(1,7);
+
+statement ok
+PRAGMA refresh('identity_a.summary');
+
+query T
+WITH expected AS (SELECT k,SUM(v) total FROM identity_a.t GROUP BY k) SELECT CASE WHEN EXISTS ((SELECT * FROM identity_a.summary EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM identity_a.summary)) THEN error('drop isolation mismatch') ELSE 'drop isolation correct' END;
+----
+drop isolation correct

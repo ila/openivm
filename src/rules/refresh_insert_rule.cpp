@@ -189,10 +189,10 @@ static bool SameRelationLocus(const string &left_catalog, const string &left_sch
 }
 
 static string MVInternalPrefix(ClientContext &context, const RefreshMetadata::StoredViewLocation &location,
-                               const string &view_name) {
+                               const string &view_name, const string &sql_name) {
 	QueryErrorContext error_context;
 	auto entry = Catalog::GetEntry(context, location.catalog_name, location.schema_name,
-	                               EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, error_context),
+	                               EntryLookupInfo(CatalogType::VIEW_ENTRY, sql_name, error_context),
 	                               OnEntryNotFound::RETURN_NULL);
 	if (entry) {
 		auto data_table = IncrementalTableNames::DataTableName(view_name);
@@ -210,7 +210,8 @@ static void DropTrackedMaterializedView(ClientContext &context, Connection &con,
                                         const string &view_name, bool drop_user_view) {
 	auto location = metadata.GetStoredViewLocation(view_name);
 	auto delta_sources = metadata.GetDeltaSources(view_name, location.catalog_name, location.schema_name);
-	auto internal_prefix = MVInternalPrefix(context, location, view_name);
+	auto sql_name = metadata.GetViewSQLName(view_name);
+	auto internal_prefix = MVInternalPrefix(context, location, view_name, sql_name);
 	auto escaped_view_name = SqlUtils::EscapeValue(view_name);
 	auto view_predicate = "view_name = '" + escaped_view_name + "'";
 	RegisterMetadataRestore(context, con, openivm::VIEWS_TABLE, view_predicate);
@@ -223,7 +224,7 @@ static void DropTrackedMaterializedView(ClientContext &context, Connection &con,
 	                                  escaped_view_name + "'");
 	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE " + dependency_predicate);
 	if (drop_user_view) {
-		DropCatalogEntry(context, location.catalog_name, location.schema_name, view_name, CatalogType::VIEW_ENTRY);
+		DropCatalogEntry(context, location.catalog_name, location.schema_name, sql_name, CatalogType::VIEW_ENTRY);
 	}
 	DropQualifiedCatalogEntry(context,
 	                          internal_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name)),

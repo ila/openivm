@@ -40,8 +40,8 @@ INSERT INTO wrai_sales VALUES
     (13, NULL, 3, 2);
 
 query I
-SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_run_fast_wrai_sum_mv%'
-         AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_run_fallback_wrai_sum_mv%'
+SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_run_fast___openivm_mv_6d656d6f7279_6d61696e_777261695f73756d5f6d76_%'
+         AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_run_fallback___openivm_mv_6d656d6f7279_6d61696e_777261695f73756d5f6d76_%'
     THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'wrai_sum_mv',
@@ -59,7 +59,7 @@ PRAGMA refresh('wrai_max_mv');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT * FROM openivm_data_wrai_sum_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261695f73756d5f6d76_
     EXCEPT ALL
     SELECT id, k, d, x, SUM(x) OVER (PARTITION BY k ORDER BY d) AS running_sum FROM wrai_sales
 );
@@ -70,14 +70,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT id, k, d, x, SUM(x) OVER (PARTITION BY k ORDER BY d) AS running_sum FROM wrai_sales
     EXCEPT ALL
-    SELECT * FROM openivm_data_wrai_sum_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261695f73756d5f6d76_
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT * FROM openivm_data_wrai_max_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261695f6d61785f6d76_
     EXCEPT ALL
     SELECT id, k, d, x, MAX(x) OVER (PARTITION BY k ORDER BY d) AS running_max FROM wrai_sales
 );
@@ -88,7 +88,7 @@ query I
 SELECT COUNT(*) FROM (
     SELECT id, k, d, x, MAX(x) OVER (PARTITION BY k ORDER BY d) AS running_max FROM wrai_sales
     EXCEPT ALL
-    SELECT * FROM openivm_data_wrai_max_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261695f6d61785f6d76_
 );
 ----
 0
@@ -108,7 +108,7 @@ PRAGMA refresh('wrai_max_mv');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT * FROM openivm_data_wrai_sum_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261695f73756d5f6d76_
     EXCEPT ALL
     SELECT id, k, d, x, SUM(x) OVER (PARTITION BY k ORDER BY d) AS running_sum FROM wrai_sales
 );
@@ -119,14 +119,14 @@ query I
 SELECT COUNT(*) FROM (
     SELECT id, k, d, x, SUM(x) OVER (PARTITION BY k ORDER BY d) AS running_sum FROM wrai_sales
     EXCEPT ALL
-    SELECT * FROM openivm_data_wrai_sum_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261695f73756d5f6d76_
 );
 ----
 0
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT * FROM openivm_data_wrai_max_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261695f6d61785f6d76_
     EXCEPT ALL
     SELECT id, k, d, x, MAX(x) OVER (PARTITION BY k ORDER BY d) AS running_max FROM wrai_sales
 );
@@ -137,7 +137,7 @@ query I
 SELECT COUNT(*) FROM (
     SELECT id, k, d, x, MAX(x) OVER (PARTITION BY k ORDER BY d) AS running_max FROM wrai_sales
     EXCEPT ALL
-    SELECT * FROM openivm_data_wrai_max_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_777261695f6d61785f6d76_
 );
 ----
 0
@@ -221,10 +221,10 @@ statement ok
 INSERT INTO wrai_rows VALUES (1,3,2),(1,3,2),(1,3,2),(2,2,NULL),(NULL,2,NULL);
 
 query I
-SELECT CASE WHEN string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_suffix_wrai_rows_mv%'
+SELECT CASE WHEN string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_suffix___openivm_mv_777261695f726f7773_6d61696e_777261695f726f77735f6d76_%'
  AND string_agg(sql,' ' ORDER BY stmt_order) LIKE '%ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW%'
  AND string_agg(sql,' ' ORDER BY stmt_order) LIKE '%MAX_BY(%openivm_rows_position_%'
- AND string_agg(sql,' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_wrai_rows_mv%'
+ AND string_agg(sql,' ' ORDER BY stmt_order) LIKE '%INSERT INTO wrai_rows.main.openivm_delta___openivm_mv_777261695f726f7773_6d61696e_777261695f726f77735f6d76_%'
  THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts('wrai_rows_mv','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true,"force_view_delta_cascade":true}')
 WHERE stmt_kind='data';
@@ -482,7 +482,7 @@ statement ok
 INSERT INTO wrnested VALUES (1,3,-4),(1,3,-4),(2,1,5);
 
 query I
-SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_suffix_wrnested_mv%' AS INTEGER) FROM openivm_compile_with_facts('wrnested_mv','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
+SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_suffix___openivm_mv_777261695f726f7773_6d61696e_77726e65737465645f6d76_%' AS INTEGER) FROM openivm_compile_with_facts('wrnested_mv','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
 ----
 1
 
@@ -498,7 +498,7 @@ statement ok
 INSERT INTO wrnested VALUES (1,3,-4),(1,4,-5),(1,4,-5),(2,2,4);
 
 query I
-SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_suffix_wrnested_mv%' AS INTEGER) FROM openivm_compile_with_facts('wrnested_mv','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
+SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_suffix___openivm_mv_777261695f726f7773_6d61696e_77726e65737465645f6d76_%' AS INTEGER) FROM openivm_compile_with_facts('wrnested_mv','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
 ----
 1
 
@@ -574,7 +574,7 @@ statement ok
 INSERT INTO wf_source VALUES (1,2,-9007199254740992),(2,2,4),(3,2,-3);
 
 query I
-SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_result_wf_avg%' AS INTEGER) FROM openivm_compile_with_facts('wf_avg','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
+SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_result___openivm_mv_777261695f726f7773_6d61696e_77665f617667_%' AS INTEGER) FROM openivm_compile_with_facts('wf_avg','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
 ----
 1
 
@@ -587,7 +587,7 @@ SELECT COUNT(*) FROM ((SELECT * FROM wf_avg EXCEPT ALL SELECT * FROM wf_avg_expe
 0
 
 query I
-SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_result_wf_order%' AS INTEGER) FROM openivm_compile_with_facts('wf_order','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
+SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_result___openivm_mv_777261695f726f7773_6d61696e_77665f6f72646572_%' AS INTEGER) FROM openivm_compile_with_facts('wf_order','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
 ----
 1
 
@@ -600,7 +600,7 @@ SELECT COUNT(*) FROM ((SELECT * FROM wf_order EXCEPT ALL SELECT * FROM wf_order_
 0
 
 query I
-SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_result_wf_range%' AS INTEGER) FROM openivm_compile_with_facts('wf_range','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
+SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_result___openivm_mv_777261695f726f7773_6d61696e_77665f72616e6765_%' AS INTEGER) FROM openivm_compile_with_facts('wf_range','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
 ----
 1
 
@@ -613,7 +613,7 @@ SELECT COUNT(*) FROM ((SELECT * FROM wf_range EXCEPT ALL SELECT * FROM wf_range_
 0
 
 query I
-SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_result_wf_alias%' AS INTEGER) FROM openivm_compile_with_facts('wf_alias','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
+SELECT CAST(string_agg(sql,' ' ORDER BY stmt_order) LIKE '%openivm_run_result___openivm_mv_777261695f726f7773_6d61696e_77665f616c696173_%' AS INTEGER) FROM openivm_compile_with_facts('wf_alias','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}');
 ----
 1
 
@@ -738,13 +738,13 @@ statement ok
 CREATE MATERIALIZED VIEW wf_desc AS SELECT *,SUM(x) OVER (PARTITION BY k ORDER BY d DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wf_source;
 
 query I
-SELECT COUNT(*) FROM information_schema.columns WHERE table_name='openivm_data_wf_desc' AND column_name LIKE 'openivm_rows_position_%';
+SELECT COUNT(*) FROM information_schema.columns WHERE table_name='openivm_data___openivm_mv_777261695f726f7773_6d61696e_77665f64657363_' AND column_name LIKE 'openivm_rows_position_%';
 ----
 0
 
 # Publishing an unordered native window scopes both old and new rows by its raw delta.
 query I
-SELECT CAST(sql LIKE '%WHERE EXISTS (SELECT 1 FROM openivm_delta_wf_avg d WHERE%' AS INTEGER) FROM openivm_compile_with_facts('wf_avg','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}') WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next_wf_avg AS%';
+SELECT CAST(sql LIKE '%WHERE EXISTS (SELECT 1 FROM wrai_rows.main.openivm_delta___openivm_mv_777261695f726f7773_6d61696e_77665f617667_ d WHERE%' AS INTEGER) FROM openivm_compile_with_facts('wf_avg','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}') WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next___openivm_mv_777261695f726f7773_6d61696e_77665f617667_ AS%';
 ----
 1
 
@@ -802,7 +802,7 @@ statement ok
 CREATE VIEW wf_top_expected AS SELECT *,SUM(x) OVER (PARTITION BY k ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wf_source ORDER BY s DESC,k,d LIMIT 2;
 
 query I
-SELECT CAST(sql NOT LIKE '%WHERE EXISTS (SELECT 1 FROM openivm_delta_wf_top d WHERE%' AS INTEGER) FROM openivm_compile_with_facts('wf_top','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}') WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next_wf_top AS%';
+SELECT CAST(sql NOT LIKE '%WHERE EXISTS (SELECT 1 FROM wrai_rows.main.openivm_delta___openivm_mv_777261695f726f7773_6d61696e_77665f746f70_ d WHERE%' AS INTEGER) FROM openivm_compile_with_facts('wf_top','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}') WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next___openivm_mv_777261695f726f7773_6d61696e_77665f746f70_ AS%';
 ----
 1
 
@@ -988,7 +988,7 @@ INSERT INTO wl_source VALUES(1,2,3),(1,3,2),(2,1,8);
 
 query I
 SELECT COUNT(*) FROM openivm_compile_with_facts('wl_parent','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}')
-WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_run_result_wl_parent AS%' AND sql LIKE '%t5_window_0%';
+WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_run_result___openivm_mv_777261695f726f7773_6d61696e_776c5f706172656e74_ AS%' AND sql LIKE '%t5_window_0%';
 ----
 1
 
@@ -1025,7 +1025,7 @@ SELECT COUNT(*) FROM ((SELECT * FROM wl_child EXCEPT ALL SELECT * FROM wl_expect
 # Full-tuple publication scope must include values, not only the partition key.
 query I
 SELECT COUNT(*) FROM openivm_compile_with_facts('wl_parent','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}')
-WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next_wl_parent AS%' AND sql LIKE '%v.f IS NOT DISTINCT FROM d.f%';
+WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next___openivm_mv_777261695f726f7773_6d61696e_776c5f706172656e74_ AS%' AND sql LIKE '%v.f IS NOT DISTINCT FROM d.f%';
 ----
 1
 
@@ -1054,10 +1054,13 @@ SELECT COUNT(*) FROM ((SELECT * FROM wc_${key}_last_mv EXCEPT ALL SELECT * FROM 
 ----
 0
 
+statement ok
+SET VARIABLE wc_data_table = (SELECT 'openivm_data_' || view_name FROM openivm_views WHERE view_sql_name = 'wc_${key}_last_mv');
+
 # Internal-looking source keys are hidden publicly; verify their stored bags too.
 query I
 WITH expected AS (SELECT *,SUM(x) OVER (PARTITION BY ${key} ORDER BY d NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wc_${key}_last)
-SELECT COUNT(*) FROM ((SELECT ${key},d,x,s FROM openivm_data_wc_${key}_last_mv EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT ${key},d,x,s FROM openivm_data_wc_${key}_last_mv));
+SELECT COUNT(*) FROM ((SELECT ${key},d,x,s FROM query_table(getvariable('wc_data_table')) EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT ${key},d,x,s FROM query_table(getvariable('wc_data_table'))));
 ----
 0
 
@@ -1081,7 +1084,7 @@ SELECT COUNT(*) FROM ((SELECT * FROM wc_${key}_last_mv EXCEPT ALL SELECT * FROM 
 # Internal-looking source keys are hidden publicly; verify their stored bags too.
 query I
 WITH expected AS (SELECT *,SUM(x) OVER (PARTITION BY ${key} ORDER BY d NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wc_${key}_last)
-SELECT COUNT(*) FROM ((SELECT ${key},d,x,s FROM openivm_data_wc_${key}_last_mv EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT ${key},d,x,s FROM openivm_data_wc_${key}_last_mv));
+SELECT COUNT(*) FROM ((SELECT ${key},d,x,s FROM query_table(getvariable('wc_data_table')) EXCEPT ALL SELECT * FROM expected) UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT ${key},d,x,s FROM query_table(getvariable('wc_data_table'))));
 ----
 0
 
@@ -1128,20 +1131,20 @@ SELECT COUNT(*) FROM ((SELECT * FROM wb_keyed EXCEPT ALL SELECT * FROM expected)
 # Suffix append scopes exact tuples; recomputing a partition uses its narrower keys.
 query I
 SELECT COUNT(*) FROM openivm_compile_with_facts('wb_keyed','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}')
-WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next_wb_keyed AS%' AND sql LIKE '%v.s IS NOT DISTINCT FROM d.s%';
+WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next___openivm_mv_777261695f726f7773_6d61696e_77625f6b65796564_ AS%' AND sql LIKE '%v.s IS NOT DISTINCT FROM d.s%';
 ----
 1
 
 query I
 SELECT COUNT(*) FROM openivm_compile_with_facts('wb_keyed','{"target_dialect":"duckdb","compile_only":true}')
-WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next_wb_keyed AS%' AND sql LIKE '%v.k IS NOT DISTINCT FROM d.k%' AND sql NOT LIKE '%v.s IS NOT DISTINCT FROM d.s%';
+WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next___openivm_mv_777261695f726f7773_6d61696e_77625f6b65796564_ AS%' AND sql LIKE '%v.k IS NOT DISTINCT FROM d.k%' AND sql NOT LIKE '%v.s IS NOT DISTINCT FROM d.s%';
 ----
 1
 
 # An enabled setting does not prove suffix eligibility (DESC recomputes partitions).
 query I
 SELECT COUNT(*) FROM openivm_compile_with_facts('wf_desc','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}')
-WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next_wf_desc AS%' AND sql LIKE '%v.k IS NOT DISTINCT FROM d.k%' AND sql NOT LIKE '%v.s IS NOT DISTINCT FROM d.s%';
+WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next___openivm_mv_777261695f726f7773_6d61696e_77665f64657363_ AS%' AND sql LIKE '%v.k IS NOT DISTINCT FROM d.k%' AND sql NOT LIKE '%v.s IS NOT DISTINCT FROM d.s%';
 ----
 1
 

@@ -79,7 +79,7 @@ Carol	NULL	0
 
 # count_star must reflect OUTPUT rows: 1 for a surviving unmatched group, not 0
 query I
-SELECT openivm_count_star FROM openivm_data_mv_lj WHERE name = 'Alice';
+SELECT openivm_count_star FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6a_ WHERE name = 'Alice';
 ----
 1
 

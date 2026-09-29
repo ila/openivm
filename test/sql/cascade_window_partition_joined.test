@@ -57,12 +57,12 @@ LIMIT 1;
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_affected_cwj_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data_cwj_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_cwj_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM openivm_delta_cwj_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cwj_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%WHERE EXISTS (SELECT 1 FROM openivm_delta_cwj_mv d WHERE%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_affected___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%WHERE EXISTS (SELECT 1 FROM memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_ d WHERE%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'cwj_mv',
@@ -89,16 +89,16 @@ LIMIT 1;
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_affected_cwj_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_cwj_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_cwj_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cwj_mv%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_affected___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_affected_cwj_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old_cwj_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new_cwj_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_affected___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'cwj_mv',
@@ -124,7 +124,7 @@ PRAGMA refresh('cwj_mv');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT id, grp, tax_id, rate, rn FROM openivm_data_cwj_mv
+    SELECT id, grp, tax_id, rate, rn FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_
     EXCEPT ALL
     SELECT c.id,
            c.grp,
@@ -155,7 +155,7 @@ SELECT COUNT(*) FROM (
     LEFT JOIN cwj_tax t
       ON c.tax_id = t.tx_id
     EXCEPT ALL
-    SELECT id, grp, tax_id, rate, rn FROM openivm_data_cwj_mv
+    SELECT id, grp, tax_id, rate, rn FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f6d76_
 );
 ----
 0
@@ -231,7 +231,7 @@ PRAGMA refresh('cwj_cast_mv');
 query I
 SELECT COUNT(*) FROM (
     SELECT symbol, cik, company_name, rank_score, rn
-    FROM openivm_data_cwj_cast_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f636173745f6d76_
     EXCEPT ALL
     SELECT s.symbol,
            s.cik,
@@ -263,7 +263,7 @@ SELECT COUNT(*) FROM (
       ON CAST(s.cik AS VARCHAR) = CAST(c.company_id AS VARCHAR)
     EXCEPT ALL
     SELECT symbol, cik, company_name, rank_score, rn
-    FROM openivm_data_cwj_cast_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f636173745f6d76_
 );
 ----
 0
@@ -336,7 +336,7 @@ PRAGMA refresh('cwj_cast_int_mv');
 query I
 SELECT COUNT(*) FROM (
     SELECT symbol, key_txt, company_name, rank_score, rn
-    FROM openivm_data_cwj_cast_int_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f636173745f696e745f6d76_
     EXCEPT ALL
     SELECT s.symbol,
            s.key_txt,
@@ -368,7 +368,7 @@ SELECT COUNT(*) FROM (
       ON CAST(s.key_txt AS INTEGER) = c.key_int
     EXCEPT ALL
     SELECT symbol, key_txt, company_name, rank_score, rn
-    FROM openivm_data_cwj_cast_int_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f636173745f696e745f6d76_
 );
 ----
 0
@@ -379,14 +379,14 @@ SELECT COUNT(*) FROM (
 statement ok
 UPDATE openivm_views
 SET lineage_json = regexp_replace(lineage_json, ',"lookup_cast":"INTEGER"', '', 'g')
-WHERE view_name = 'cwj_cast_int_mv';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_63776a5f636173745f696e745f6d76_';
 
 query I
 SELECT CASE WHEN
        string_agg(lower(sql), ' ' ORDER BY stmt_order) LIKE
-       '%delete from %openivm_data_cwj_cast_int_mv%;%'
+       '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f636173745f696e745f6d76_%;%'
    AND string_agg(lower(sql), ' ' ORDER BY stmt_order) LIKE
-       '%insert into %openivm_data_cwj_cast_int_mv%'
+       '%insert into %openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f636173745f696e745f6d76_%'
    AND string_agg(lower(sql), ' ' ORDER BY stmt_order) NOT LIKE
        '%cast%key_int%as varchar%'
    THEN 1 ELSE 0 END
@@ -409,7 +409,7 @@ PRAGMA refresh('cwj_cast_int_mv');
 query I
 SELECT COUNT(*) FROM (
     SELECT symbol, key_txt, company_name, rank_score, rn
-    FROM openivm_data_cwj_cast_int_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f636173745f696e745f6d76_
     EXCEPT ALL
     SELECT s.symbol,
            s.key_txt,
@@ -441,7 +441,7 @@ SELECT COUNT(*) FROM (
       ON CAST(s.key_txt AS INTEGER) = c.key_int
     EXCEPT ALL
     SELECT symbol, key_txt, company_name, rank_score, rn
-    FROM openivm_data_cwj_cast_int_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f636173745f696e745f6d76_
 );
 ----
 0
@@ -514,7 +514,7 @@ PRAGMA refresh('cwj_inner_cast_mv');
 query I
 SELECT COUNT(*) FROM (
     SELECT k, payload, score, rn
-    FROM openivm_data_cwj_inner_cast_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f696e6e65725f636173745f6d76_
     EXCEPT ALL
     SELECT l.k,
            l.payload,
@@ -544,7 +544,7 @@ SELECT COUNT(*) FROM (
       ON CAST(l.k AS VARCHAR) = r.kstr
     EXCEPT ALL
     SELECT k, payload, score, rn
-    FROM openivm_data_cwj_inner_cast_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f696e6e65725f636173745f6d76_
 );
 ----
 0
@@ -612,7 +612,7 @@ PRAGMA refresh('cwj_nested_cast_mv');
 query I
 SELECT COUNT(*) FROM (
     SELECT grp, key_txt, score, rn
-    FROM openivm_data_cwj_nested_cast_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f6e65737465645f636173745f6d76_
     EXCEPT ALL
     SELECT l.grp,
            l.key_txt,
@@ -642,7 +642,7 @@ SELECT COUNT(*) FROM (
       ON CAST(CAST(l.key_txt AS INTEGER) AS VARCHAR) = r.key_txt
     EXCEPT ALL
     SELECT grp, key_txt, score, rn
-    FROM openivm_data_cwj_nested_cast_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f6e65737465645f636173745f6d76_
 );
 ----
 0
@@ -683,7 +683,7 @@ CREATE MATERIALIZED VIEW cwj_legacy_self_mv AS
 statement ok
 UPDATE openivm_views
 SET lineage_json = regexp_replace(lineage_json, ',"lookup_cast":"INTEGER"', '', 'g')
-WHERE view_name = 'cwj_legacy_self_mv';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_63776a5f6c65676163795f73656c665f6d76_';
 
 query I
 SELECT COUNT(*)
@@ -692,7 +692,7 @@ FROM openivm_compile_with_facts(
     '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":false}'
 )
 WHERE stmt_kind = 'data'
-  AND lower(trim(sql)) = 'delete from openivm_data_cwj_legacy_self_mv;';
+  AND lower(trim(sql)) = 'delete from memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f6c65676163795f73656c665f6d76_;';
 ----
 1
 
@@ -705,7 +705,7 @@ PRAGMA refresh('cwj_legacy_self_mv');
 query I
 SELECT COUNT(*) FROM (
     SELECT id, grp, score, rn
-    FROM openivm_data_cwj_legacy_self_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f6c65676163795f73656c665f6d76_
     EXCEPT ALL
     SELECT l.id,
            l.grp,
@@ -735,7 +735,7 @@ SELECT COUNT(*) FROM (
       ON CAST(l.key_txt AS INTEGER) = r.key_int
     EXCEPT ALL
     SELECT id, grp, score, rn
-    FROM openivm_data_cwj_legacy_self_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f6c65676163795f73656c665f6d76_
 );
 ----
 0
@@ -782,7 +782,7 @@ PRAGMA refresh('cwj_try_cast_mv');
 query I
 SELECT COUNT(*) FROM (
     SELECT grp, key_txt, score, rn
-    FROM openivm_data_cwj_try_cast_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f7472795f636173745f6d76_
     EXCEPT ALL
     SELECT l.grp,
            l.key_txt,
@@ -812,7 +812,7 @@ SELECT COUNT(*) FROM (
       ON CAST(TRY_CAST(l.key_txt AS INTEGER) AS VARCHAR) = r.key_txt
     EXCEPT ALL
     SELECT grp, key_txt, score, rn
-    FROM openivm_data_cwj_try_cast_mv
+    FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_63776a5f7472795f636173745f6d76_
 );
 ----
 0

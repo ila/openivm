@@ -342,3 +342,22 @@ Final validation passed 1,166 focused assertions and the full suite's 12,645
 assertions in 89 cases (one ICU-dependent skip), plus compiled N-term SQL
 integration. The documented demo also passed from a working directory containing
 spaces, with all three SQL paths reported correctly and no leaked profiler records.
+
+### Schema identity and concurrent creation follow-up (2026-09-29)
+
+The short-name restriction described in the first-session audit above is removed.
+Refresh, pipeline targets, compiled-SQL inspection, and lifecycle operations resolve
+qualified MV names. New MVs use deterministic internal keys derived from their
+catalog, schema, and SQL name; existing stored keys are retained. Control metadata
+stays in the native database's `main` schema. See [schema and metadata usage](ducklake.md#schemas-metadata-and-internal-tables).
+
+Concurrent creates in separate schemas no longer compete for an available short
+key. Autocommit first-time setup briefly serializes creation of shared control
+tables and native source-delta tables, then releases the initialization guard
+before MV planning or materialization. Concurrent creates of the same qualified
+view have one winner and ordinary catalog conflicts for the other callers.
+Explicit transactions keep rollbackable initialization and DuckDB's transaction
+conflict semantics. The existing refresh/mutation locks are unchanged.
+
+Permanent DuckLake MV delta tables remain in place. Compiled filenames now contain
+the internal key; use `PRAGMA openivm_files('catalog.schema.view')` to discover them.

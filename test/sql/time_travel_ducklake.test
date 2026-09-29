@@ -61,7 +61,7 @@ SELECT c_id, SUM(amount) AS total FROM dl.tt_orders AT (VERSION => 2) GROUP BY c
 
 query I
 SELECT COUNT(*) FROM openivm_views
-WHERE view_name IN ('tt_native_snapshot', 'tt_native_short') AND sql_string LIKE '%AT (VERSION => 2)%';
+WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_74745f6e61746976655f736e617073686f74_', '__openivm_mv_6d656d6f7279_6d61696e_74745f6e61746976655f73686f7274_') AND sql_string LIKE '%AT (VERSION => 2)%';
 ----
 2
 
@@ -74,7 +74,7 @@ scanned both pinned and unpinned
 
 query I
 SELECT COUNT(*) FROM duckdb_indexes()
-WHERE table_name IN ('openivm_data_tt_native_snapshot', 'openivm_data_tt_native_short') AND is_unique;
+WHERE table_name IN ('openivm_data___openivm_mv_6d656d6f7279_6d61696e_74745f6e61746976655f736e617073686f74_', 'openivm_data___openivm_mv_6d656d6f7279_6d61696e_74745f6e61746976655f73686f7274_') AND is_unique;
 ----
 2
 
@@ -126,7 +126,7 @@ SELECT (SELECT COUNT(*) FROM (SELECT * FROM tt_native_short EXCEPT ALL SELECT * 
 
 # Interrupted-refresh recovery must render native pins in the requested output dialect too.
 statement ok
-UPDATE openivm_views SET refresh_in_progress=true WHERE view_name='tt_native_snapshot';
+UPDATE openivm_views SET refresh_in_progress=true WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_74745f6e61746976655f736e617073686f74_';
 
 query I
 SELECT COUNT(*) > 0 AND COUNT(*) FILTER (WHERE sql LIKE '%`tt_orders` VERSION AS OF 2%') > 0

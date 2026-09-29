@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import csv
 import json
 import subprocess
 import sys
@@ -57,7 +58,15 @@ WHERE stmt_kind = 'data';
     if classifications != ["openivm_refresh_type=SIMPLE_PROJECTION"]:
         raise AssertionError(f"{name}: compiled join must stay incremental, got {classifications!r}")
 
-    program_path = output_dir / f"openivm_upsert_queries_{view_name}.sql"
+    file_listing = run_duckdb(
+        binary,
+        database,
+        f"SET openivm_files_path='{output_path}';\nPRAGMA openivm_files('{view_name}');\n",
+    )
+    refresh_paths = [row[1] for row in csv.reader(file_listing.splitlines()) if row[0] == "refresh"]
+    if len(refresh_paths) != 1:
+        raise AssertionError(f"{name}: expected one compiled refresh path, got {refresh_paths!r}")
+    program_path = Path(refresh_paths[0])
     if not program_path.exists():
         raise RuntimeError(f"OpenIVM did not emit {program_path}")
     run_duckdb(binary, database, program_path.read_text())

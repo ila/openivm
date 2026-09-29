@@ -33,14 +33,14 @@ SELECT CASE WHEN
          'mv_iop_empty',
          '{"target_dialect":"duckdb","compile_only":true}'
      )
-     WHERE stmt_kind = 'data') LIKE '%delete from %openivm_data_mv_iop_empty%'
+     WHERE stmt_kind = 'data') LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f656d707479_%'
     AND
     (SELECT string_agg(lower(sql), ' ' ORDER BY stmt_order)
      FROM openivm_compile_with_facts(
          'mv_iop_empty',
          '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}'
      )
-     WHERE stmt_kind = 'data') LIKE '%insert into openivm_data_mv_iop_empty select%'
+     WHERE stmt_kind = 'data') LIKE '%insert into memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f656d707479_ select%'
     AND
     (SELECT string_agg(lower(sql), ' ' ORDER BY stmt_order)
      FROM openivm_compile_with_facts(
@@ -54,7 +54,7 @@ SELECT CASE WHEN
          'mv_iop_empty',
          '{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true}'
      )
-     WHERE stmt_kind = 'data') NOT LIKE '%delete from %openivm_data_mv_iop_empty%'
+     WHERE stmt_kind = 'data') NOT LIKE '%delete from %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f656d707479_%'
     AND
     (SELECT string_agg(lower(sql), ' ' ORDER BY stmt_order)
      FROM openivm_compile_with_facts(
@@ -97,10 +97,10 @@ SELECT count(*) FROM mv_iop_empty WHERE id = 1 AND val = 'dup';
 
 query I
 SELECT CASE WHEN content LIKE '%generate_series(1, openivm_multiplicity::BIGINT)%'
-            AND content NOT LIKE '%DELETE FROM openivm_data_mv_iop_empty%'
+            AND content NOT LIKE '%DELETE FROM memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f656d707479_%'
             AND content NOT LIKE '%SUM(openivm_multiplicity)%'
        THEN 1 ELSE 0 END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_iop_empty.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f656d707479_.sql');
 ----
 1
 
@@ -116,7 +116,7 @@ CREATE MATERIALIZED VIEW mv_iop_join_word AS
     FROM iop_join_word_src;
 
 query I
-SELECT has_join FROM openivm_views WHERE view_name = 'mv_iop_join_word';
+SELECT has_join FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f6a6f696e5f776f7264_';
 ----
 false
 
@@ -128,9 +128,9 @@ PRAGMA refresh('mv_iop_join_word');
 
 query I
 SELECT CASE WHEN content LIKE '%generate_series(1, openivm_multiplicity::BIGINT)%'
-            AND content NOT LIKE '%DELETE FROM openivm_data_mv_iop_join_word%'
+            AND content NOT LIKE '%DELETE FROM memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f6a6f696e5f776f7264_%'
        THEN 1 ELSE 0 END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_iop_join_word.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f6a6f696e5f776f7264_.sql');
 ----
 1
 
@@ -234,10 +234,10 @@ statement ok
 PRAGMA refresh('mv_iop_mut');
 
 query I
-SELECT CASE WHEN content LIKE '%DELETE FROM openivm_data_mv_iop_mut%'
+SELECT CASE WHEN content LIKE '%DELETE FROM memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f6d7574_%'
             AND content LIKE '%SUM(openivm_multiplicity)%'
        THEN 1 ELSE 0 END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_iop_mut.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f6d7574_.sql');
 ----
 1
 
@@ -266,10 +266,10 @@ statement ok
 PRAGMA refresh('mv_iop_mut');
 
 query I
-SELECT CASE WHEN content LIKE '%DELETE FROM openivm_data_mv_iop_mut%'
+SELECT CASE WHEN content LIKE '%DELETE FROM memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f6d7574_%'
             AND content LIKE '%SUM(openivm_multiplicity)%'
        THEN 1 ELSE 0 END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_iop_mut.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f696f705f6d7574_.sql');
 ----
 1
 

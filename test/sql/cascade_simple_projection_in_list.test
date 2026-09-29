@@ -27,12 +27,12 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 
 query I
 SELECT CASE
-           WHEN contains(content, 'INSERT INTO openivm_delta_cspl_in2_mv') AND
+           WHEN contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706c5f696e325f6d76_') AND
                 contains(content, 'openivm_delta_cspl_in2_item') AND
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspl_in2_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706c5f696e325f6d76_.sql');
 ----
 1
 
@@ -91,12 +91,12 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 
 query I
 SELECT CASE
-           WHEN contains(content, 'INSERT INTO openivm_delta_cspl_in10_mv') AND
+           WHEN contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706c5f696e31305f6d76_') AND
                 contains(content, 'openivm_delta_cspl_in10_item') AND
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspl_in10_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706c5f696e31305f6d76_.sql');
 ----
 1
 
@@ -167,12 +167,12 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 
 query I
 SELECT CASE
-           WHEN contains(content, 'INSERT INTO openivm_delta_cspl_in50_mv') AND
+           WHEN contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6373706c5f696e35305f6d76_') AND
                 contains(content, 'openivm_delta_cspl_in50_item') AND
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cspl_in50_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6373706c5f696e35305f6d76_.sql');
 ----
 1
 

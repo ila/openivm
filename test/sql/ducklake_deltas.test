@@ -31,13 +31,13 @@ CREATE MATERIALIZED VIEW dl.mv_snap AS SELECT grp, SUM(val) as total, COUNT(*) a
 
 # Snapshot should be set after CREATE MV
 query I
-SELECT last_snapshot_id IS NOT NULL FROM openivm_delta_tables WHERE view_name = 'mv_snap';
+SELECT last_snapshot_id IS NOT NULL FROM openivm_delta_tables WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736e6170_';
 ----
 true
 
 # Record the initial snapshot (value varies, just check it's positive)
 query I
-SELECT last_snapshot_id > 0 FROM openivm_delta_tables WHERE view_name = 'mv_snap';
+SELECT last_snapshot_id > 0 FROM openivm_delta_tables WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736e6170_';
 ----
 true
 
@@ -46,14 +46,14 @@ INSERT INTO dl.snap_test VALUES (3, 'A', 30);
 
 # Save pre-refresh snapshot for comparison
 statement ok
-CREATE TEMP TABLE snap_before AS SELECT last_snapshot_id AS snap FROM openivm_delta_tables WHERE view_name = 'mv_snap';
+CREATE TEMP TABLE snap_before AS SELECT last_snapshot_id AS snap FROM openivm_delta_tables WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736e6170_';
 
 statement ok
 PRAGMA refresh('mv_snap');
 
 # Snapshot should have advanced after refresh
 query I
-SELECT last_snapshot_id > (SELECT snap FROM snap_before) FROM openivm_delta_tables WHERE view_name = 'mv_snap';
+SELECT last_snapshot_id > (SELECT snap FROM snap_before) FROM openivm_delta_tables WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736e6170_';
 ----
 true
 
@@ -83,13 +83,13 @@ SELECT count(*) FROM (SELECT grp, SUM(val), COUNT(*) FROM dl.snap_test GROUP BY 
 # ==========================================
 
 query I
-SELECT sql_string NOT LIKE '%AT (VERSION%' FROM openivm_views WHERE view_name = 'mv_snap';
+SELECT sql_string NOT LIKE '%AT (VERSION%' FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736e6170_';
 ----
 true
 
 # Catalog type should be ducklake
 query I
-SELECT catalog_type FROM openivm_delta_tables WHERE view_name = 'mv_snap';
+SELECT catalog_type FROM openivm_delta_tables WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736e6170_';
 ----
 ducklake
 
@@ -219,7 +219,7 @@ statement ok
 CREATE TEMP TABLE replay_after_insert AS
 SELECT last_snapshot_id AS snap
 FROM openivm_delta_tables
-WHERE view_name = 'mv_replay_sales';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f7265706c61795f73616c6573_';
 
 statement ok
 DELETE FROM dl.replay_sales WHERE id = 1;
@@ -237,7 +237,7 @@ west	200	1
 query I
 SELECT last_snapshot_id > (SELECT snap FROM replay_after_insert)
 FROM openivm_delta_tables
-WHERE view_name = 'mv_replay_sales';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f7265706c61795f73616c6573_';
 ----
 true
 
@@ -245,7 +245,7 @@ statement ok
 CREATE TEMP TABLE replay_after_delete AS
 SELECT last_snapshot_id AS snap
 FROM openivm_delta_tables
-WHERE view_name = 'mv_replay_sales';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f7265706c61795f73616c6573_';
 
 statement ok
 PRAGMA refresh('mv_replay_sales');
@@ -253,7 +253,7 @@ PRAGMA refresh('mv_replay_sales');
 query I
 SELECT last_snapshot_id = (SELECT snap FROM replay_after_delete)
 FROM openivm_delta_tables
-WHERE view_name = 'mv_replay_sales';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f7265706c61795f73616c6573_';
 ----
 true
 
@@ -309,23 +309,23 @@ SELECT count(*) FROM dl.blocked_publish_mv;
 
 query I
 SELECT count(*) FROM duckdb_tables()
-WHERE database_name = current_database() AND table_name LIKE 'openivm_stage_blocked_publish_mv%';
+WHERE database_name = current_database() AND table_name LIKE 'openivm_stage___openivm_mv_646c_6d61696e_626c6f636b65645f7075626c6973685f6d76_%';
 ----
 0
 
 query I
 SELECT count(*) FROM duckdb_tables()
-WHERE database_name = current_database() AND table_name IN ('openivm_data_blocked_publish_mv', 'openivm_delta_blocked_publish_mv');
+WHERE database_name = current_database() AND table_name IN ('openivm_data___openivm_mv_646c_6d61696e_626c6f636b65645f7075626c6973685f6d76_', 'openivm_delta___openivm_mv_646c_6d61696e_626c6f636b65645f7075626c6973685f6d76_');
 ----
 0
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name = 'blocked_publish_mv';
+SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_626c6f636b65645f7075626c6973685f6d76_';
 ----
 0
 
 query I
-SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'blocked_publish_mv';
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = '__openivm_mv_646c_6d61696e_626c6f636b65645f7075626c6973685f6d76_';
 ----
 0
 
@@ -372,7 +372,7 @@ SELECT id, v FROM dl.skip_base;
 query I
 SELECT source_table_id IS NOT NULL
 FROM openivm_delta_tables
-WHERE view_name = 'mv_skip_base';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736b69705f62617365_';
 ----
 true
 
@@ -380,7 +380,7 @@ statement ok
 CREATE TEMP TABLE skip_base_snapshot AS
 SELECT last_snapshot_id AS snap
 FROM openivm_delta_tables
-WHERE view_name = 'mv_skip_base';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736b69705f62617365_';
 
 statement ok
 INSERT INTO dl.skip_unrelated VALUES (1);
@@ -391,7 +391,7 @@ PRAGMA refresh('mv_skip_base');
 query I
 SELECT last_snapshot_id > (SELECT snap FROM skip_base_snapshot)
 FROM openivm_delta_tables
-WHERE view_name = 'mv_skip_base';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736b69705f62617365_';
 ----
 true
 
@@ -401,13 +401,13 @@ DROP TABLE skip_base_snapshot;
 statement ok
 UPDATE openivm_delta_tables
 SET source_table_id = NULL
-WHERE view_name = 'mv_skip_base';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736b69705f62617365_';
 
 statement ok
 CREATE TEMP TABLE skip_base_snapshot_backfill AS
 SELECT last_snapshot_id AS snap
 FROM openivm_delta_tables
-WHERE view_name = 'mv_skip_base';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736b69705f62617365_';
 
 statement ok
 INSERT INTO dl.skip_unrelated VALUES (2);
@@ -418,14 +418,14 @@ PRAGMA refresh('mv_skip_base');
 query I
 SELECT source_table_id IS NOT NULL
 FROM openivm_delta_tables
-WHERE view_name = 'mv_skip_base';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736b69705f62617365_';
 ----
 true
 
 query I
 SELECT last_snapshot_id > (SELECT snap FROM skip_base_snapshot_backfill)
 FROM openivm_delta_tables
-WHERE view_name = 'mv_skip_base';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f736b69705f62617365_';
 ----
 true
 
@@ -489,20 +489,20 @@ SELECT source_table_id = (
     AND s.schema_name = 'same_b'
 )
 FROM openivm_delta_tables
-WHERE view_name = 'mv_same_schema';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f73616d655f736368656d61_';
 ----
 true
 
 statement ok
 UPDATE openivm_delta_tables
 SET source_table_id = source_table_id + 100000
-WHERE view_name = 'mv_same_schema';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f73616d655f736368656d61_';
 
 statement ok
 CREATE TEMP TABLE same_schema_snapshot AS
 SELECT last_snapshot_id AS snap
 FROM openivm_delta_tables
-WHERE view_name = 'mv_same_schema';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f73616d655f736368656d61_';
 
 statement ok
 SET openivm_profile_refresh = true;
@@ -516,7 +516,7 @@ PRAGMA refresh('mv_same_schema');
 query I
 SELECT count(*)
 FROM openivm_refresh_profile
-WHERE view_name = 'mv_same_schema'
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f73616d655f736368656d61_'
   AND step_name = 'generate_refresh_sql.dispatch'
   AND detail LIKE '%metadata_requires_full_refresh=true%';
 ----
@@ -528,7 +528,7 @@ SET openivm_profile_refresh = false;
 query I
 SELECT last_snapshot_id > (SELECT snap FROM same_schema_snapshot)
 FROM openivm_delta_tables
-WHERE view_name = 'mv_same_schema';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f73616d655f736368656d61_';
 ----
 true
 
@@ -543,7 +543,7 @@ SELECT source_table_id = (
     AND s.schema_name = 'same_b'
 )
 FROM openivm_delta_tables
-WHERE view_name = 'mv_same_schema';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f73616d655f736368656d61_';
 ----
 true
 
@@ -593,17 +593,17 @@ statement ok
 PRAGMA refresh('mv_skip_unchanged_join');
 
 query I
-SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_unchanged_join.sql');
+SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f736b69705f756e6368616e6765645f6a6f696e_.sql');
 ----
 0
 
 query I
-SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_unchanged_join.sql');
+SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f736b69705f756e6368616e6765645f6a6f696e_.sql');
 ----
 0
 
 query I
-SELECT contains(content, 'ducklake_table_insertions(''dl'', ''main'', ''skip_right''') FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_unchanged_join.sql');
+SELECT contains(content, 'ducklake_table_insertions(''dl'', ''main'', ''skip_right''') FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f736b69705f756e6368616e6765645f6a6f696e_.sql');
 ----
 false
 
@@ -650,12 +650,12 @@ statement ok
 PRAGMA refresh('mv_skip_disjoint_key');
 
 query I
-SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_disjoint_key.sql');
+SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f736b69705f6469736a6f696e745f6b6579_.sql');
 ----
 0
 
 query I
-SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_skip_disjoint_key.sql');
+SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f736b69705f6469736a6f696e745f6b6579_.sql');
 ----
 0
 

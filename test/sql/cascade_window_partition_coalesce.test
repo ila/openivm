@@ -46,7 +46,7 @@ SELECT CASE WHEN lineage_json IS NOT NULL THEN 1 ELSE 0 END,
        CASE WHEN contains(lineage_json, '"lookup_col":"company_id"') THEN 1 ELSE 0 END,
        CASE WHEN contains(lineage_json, '"lookup_col":"name"') THEN 1 ELSE 0 END
 FROM openivm_views
-WHERE view_name = 'cwpc_mv';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_';
 ----
 1	1	1
 
@@ -58,14 +58,14 @@ SELECT COUNT(*) FROM openivm_compile_with_facts(
 
 query I
 SELECT CASE
-           WHEN contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_affected_cwpc_mv AS') AND
-                contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_old_cwpc_mv AS') AND
-                contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_new_cwpc_mv AS') AND
-                contains(content, 'INSERT INTO openivm_delta_cwpc_mv') AND
+           WHEN contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_affected___openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_ AS') AND
+                contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_ AS') AND
+                contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_ AS') AND
+                contains(content, 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_') AND
                 NOT contains(content, 'SELECT NULL::')
            THEN 1 ELSE 0
        END
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_cwpc_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_637770635f6d76_.sql');
 ----
 1
 

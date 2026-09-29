@@ -58,9 +58,9 @@ LIMIT 1;
 # must not write into the view's own delta table.
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data_uwd_dim%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_uwd_dim%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO openivm_delta_uwd_dim%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'uwd_dim',
@@ -74,16 +74,16 @@ WHERE stmt_kind = 'data';
 # snapshots and publish the signed whole-view delta.
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_uwd_dim AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_uwd_dim AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data_uwd_dim%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_uwd_dim%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_uwd_dim%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old_uwd_dim%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new_uwd_dim%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old_uwd_dim%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new_uwd_dim%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'uwd_dim',
@@ -127,7 +127,7 @@ LIMIT 1;
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO openivm_delta_uwd_os_dim%'
+       string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f6f735f64696d_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'uwd_os_dim',
@@ -139,12 +139,12 @@ WHERE stmt_kind = 'data';
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_uwd_os_dim AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_uwd_os_dim AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_uwd_os_dim%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old_uwd_os_dim%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new_uwd_os_dim%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new_uwd_os_dim%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f6f735f64696d_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f6f735f64696d_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f6f735f64696d_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f6f735f64696d_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f6f735f64696d_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f6f735f64696d_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'uwd_os_dim',
@@ -189,11 +189,11 @@ LIMIT 1;
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_uwd_target AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_uwd_target AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_uwd_target%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old_uwd_target%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new_uwd_target%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f746172676574_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f746172676574_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f746172676574_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f746172676574_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f746172676574_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'uwd_target',
@@ -228,55 +228,55 @@ statement ok
 UPDATE uwd_src SET val = 12 WHERE id = 3;
 
 statement ok
-CREATE TABLE uwd_old_snapshot AS SELECT * FROM openivm_data_uwd_dim;
+CREATE TABLE uwd_old_snapshot AS SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
 
 statement ok
-CREATE OR REPLACE TEMP TABLE openivm_old_uwd_dim AS
-SELECT * FROM openivm_data_uwd_dim openivm_old;
+CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ AS
+SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ openivm_old;
 
 statement ok
-CREATE OR REPLACE TEMP TABLE openivm_new_uwd_dim AS
+CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ AS
 SELECT * FROM (
     SELECT CAST(ROW_NUMBER() OVER (ORDER BY grp, id) AS INT) AS dim_key, id, grp, val
     FROM uwd_src
 ) openivm_recompute;
 
 statement ok
-DELETE FROM openivm_data_uwd_dim;
+DELETE FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
 
 statement ok
-INSERT INTO openivm_data_uwd_dim
-SELECT * FROM openivm_new_uwd_dim;
+INSERT INTO openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_
+SELECT * FROM openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
 
 statement ok
-INSERT INTO openivm_delta_uwd_dim
-SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_uwd_dim
+INSERT INTO openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_
+SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_
 UNION ALL
-SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_uwd_dim;
+SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
 
 # The compiled program now also publishes the visible boundary consumed by
 # descendants. Preserve the raw-state delta checks below, and deliver the same
 # signed visible rows to the child's registered source.
 statement ok
-INSERT INTO openivm_delta_openivm_visible_uwd_dim
-SELECT dim_key,id,grp,val,0::BIGINT,openivm_multiplicity,openivm_timestamp FROM openivm_delta_uwd_dim;
+INSERT INTO openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_
+SELECT dim_key,id,grp,val,0::BIGINT,openivm_multiplicity,openivm_timestamp FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
 
 statement ok
-DELETE FROM openivm_visible_uwd_dim;
+DELETE FROM openivm_visible___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
 
 statement ok
-INSERT INTO openivm_visible_uwd_dim SELECT dim_key,id,grp,val,0::BIGINT FROM openivm_data_uwd_dim;
+INSERT INTO openivm_visible___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ SELECT dim_key,id,grp,val,0::BIGINT FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
 
 statement ok
-DROP TABLE IF EXISTS openivm_old_uwd_dim;
+DROP TABLE IF EXISTS openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
 
 statement ok
-DROP TABLE IF EXISTS openivm_new_uwd_dim;
+DROP TABLE IF EXISTS openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_;
 
 # The retraction leg is exactly the pre-refresh content (bag equality).
 query I
 SELECT COUNT(*) FROM (
-    SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = -1
+    SELECT dim_key, id, grp, val FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ WHERE openivm_multiplicity = -1
     EXCEPT ALL
     SELECT dim_key, id, grp, val FROM uwd_old_snapshot
 );
@@ -287,7 +287,7 @@ query I
 SELECT COUNT(*) FROM (
     SELECT dim_key, id, grp, val FROM uwd_old_snapshot
     EXCEPT ALL
-    SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = -1
+    SELECT dim_key, id, grp, val FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ WHERE openivm_multiplicity = -1
 );
 ----
 0
@@ -299,15 +299,15 @@ WITH applied AS (
     (
         SELECT dim_key, id, grp, val FROM uwd_old_snapshot
         UNION ALL
-        SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = 1
+        SELECT dim_key, id, grp, val FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ WHERE openivm_multiplicity = 1
     )
     EXCEPT ALL
-    SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = -1
+    SELECT dim_key, id, grp, val FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ WHERE openivm_multiplicity = -1
 )
 SELECT COUNT(*) FROM (
     SELECT dim_key, id, grp, val FROM applied
     EXCEPT ALL
-    SELECT dim_key, id, grp, val FROM openivm_data_uwd_dim
+    SELECT dim_key, id, grp, val FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_
 );
 ----
 0
@@ -317,13 +317,13 @@ WITH applied AS (
     (
         SELECT dim_key, id, grp, val FROM uwd_old_snapshot
         UNION ALL
-        SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = 1
+        SELECT dim_key, id, grp, val FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ WHERE openivm_multiplicity = 1
     )
     EXCEPT ALL
-    SELECT dim_key, id, grp, val FROM openivm_delta_uwd_dim WHERE openivm_multiplicity = -1
+    SELECT dim_key, id, grp, val FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_ WHERE openivm_multiplicity = -1
 )
 SELECT COUNT(*) FROM (
-    SELECT dim_key, id, grp, val FROM openivm_data_uwd_dim
+    SELECT dim_key, id, grp, val FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_
     EXCEPT ALL
     SELECT dim_key, id, grp, val FROM applied
 );
@@ -333,7 +333,7 @@ SELECT COUNT(*) FROM (
 # The refreshed view itself matches its base query.
 query I
 SELECT COUNT(*) FROM (
-    SELECT dim_key, id, grp, val FROM openivm_data_uwd_dim
+    SELECT dim_key, id, grp, val FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_
     EXCEPT ALL
     SELECT CAST(ROW_NUMBER() OVER (ORDER BY grp, id) AS INT) AS dim_key, id, grp, val FROM uwd_src
 );
@@ -344,7 +344,7 @@ query I
 SELECT COUNT(*) FROM (
     SELECT CAST(ROW_NUMBER() OVER (ORDER BY grp, id) AS INT) AS dim_key, id, grp, val FROM uwd_src
     EXCEPT ALL
-    SELECT dim_key, id, grp, val FROM openivm_data_uwd_dim
+    SELECT dim_key, id, grp, val FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f64696d_
 );
 ----
 0
@@ -356,7 +356,7 @@ PRAGMA refresh('uwd_down');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT dim_key, grp, val FROM openivm_data_uwd_down
+    SELECT dim_key, grp, val FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f646f776e_
     EXCEPT ALL
     SELECT dim_key, grp, val FROM (
         SELECT CAST(ROW_NUMBER() OVER (ORDER BY grp, id) AS INT) AS dim_key, id, grp, val FROM uwd_src
@@ -373,7 +373,7 @@ SELECT COUNT(*) FROM (
     ) d
     WHERE val > 6
     EXCEPT ALL
-    SELECT dim_key, grp, val FROM openivm_data_uwd_down
+    SELECT dim_key, grp, val FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f646f776e_
 );
 ----
 0
@@ -405,9 +405,9 @@ LIMIT 1;
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_uwd_bag_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old_uwd_bag_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new_uwd_bag_mv%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'uwd_bag_mv',
@@ -421,48 +421,48 @@ statement ok
 INSERT INTO uwd_bag_src VALUES ('a', 1), ('c', 3);
 
 statement ok
-CREATE TABLE uwd_bag_old AS SELECT * FROM openivm_data_uwd_bag_mv;
+CREATE TABLE uwd_bag_old AS SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_;
 
 statement ok
-CREATE OR REPLACE TEMP TABLE openivm_old_uwd_bag_mv AS
-SELECT * FROM openivm_data_uwd_bag_mv openivm_old;
+CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_ AS
+SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_ openivm_old;
 
 statement ok
-CREATE OR REPLACE TEMP TABLE openivm_new_uwd_bag_mv AS
+CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_ AS
 SELECT * FROM (
     SELECT grp, val, CAST(SUM(val) OVER () AS INT) AS total FROM uwd_bag_src
 ) openivm_recompute;
 
 statement ok
-DELETE FROM openivm_data_uwd_bag_mv;
+DELETE FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_;
 
 statement ok
-INSERT INTO openivm_data_uwd_bag_mv
-SELECT * FROM openivm_new_uwd_bag_mv;
+INSERT INTO openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_
+SELECT * FROM openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_;
 
 statement ok
-INSERT INTO openivm_delta_uwd_bag_mv
-SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old_uwd_bag_mv
+INSERT INTO openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_
+SELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_
 UNION ALL
-SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new_uwd_bag_mv;
+SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_;
 
 statement ok
-DROP TABLE IF EXISTS openivm_old_uwd_bag_mv;
+DROP TABLE IF EXISTS openivm_old___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_;
 
 statement ok
-DROP TABLE IF EXISTS openivm_new_uwd_bag_mv;
+DROP TABLE IF EXISTS openivm_new___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_;
 
 # Three identical ('a', 1, 5) rows must be retracted three times, and four
 # identical ('a', 1, 9) rows must be inserted four times.
 query III
-SELECT grp, val, COUNT(*) FROM openivm_delta_uwd_bag_mv
+SELECT grp, val, COUNT(*) FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_
 WHERE openivm_multiplicity = -1 AND grp = 'a'
 GROUP BY grp, val;
 ----
 a	1	3
 
 query III
-SELECT grp, val, COUNT(*) FROM openivm_delta_uwd_bag_mv
+SELECT grp, val, COUNT(*) FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_
 WHERE openivm_multiplicity = 1 AND grp = 'a'
 GROUP BY grp, val;
 ----
@@ -473,15 +473,15 @@ WITH applied AS (
     (
         SELECT grp, val, total FROM uwd_bag_old
         UNION ALL
-        SELECT grp, val, total FROM openivm_delta_uwd_bag_mv WHERE openivm_multiplicity = 1
+        SELECT grp, val, total FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_ WHERE openivm_multiplicity = 1
     )
     EXCEPT ALL
-    SELECT grp, val, total FROM openivm_delta_uwd_bag_mv WHERE openivm_multiplicity = -1
+    SELECT grp, val, total FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_ WHERE openivm_multiplicity = -1
 )
 SELECT COUNT(*) FROM (
     SELECT grp, val, total FROM applied
     EXCEPT ALL
-    SELECT grp, val, total FROM openivm_data_uwd_bag_mv
+    SELECT grp, val, total FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_
 );
 ----
 0
@@ -491,13 +491,13 @@ WITH applied AS (
     (
         SELECT grp, val, total FROM uwd_bag_old
         UNION ALL
-        SELECT grp, val, total FROM openivm_delta_uwd_bag_mv WHERE openivm_multiplicity = 1
+        SELECT grp, val, total FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_ WHERE openivm_multiplicity = 1
     )
     EXCEPT ALL
-    SELECT grp, val, total FROM openivm_delta_uwd_bag_mv WHERE openivm_multiplicity = -1
+    SELECT grp, val, total FROM openivm_delta___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_ WHERE openivm_multiplicity = -1
 )
 SELECT COUNT(*) FROM (
-    SELECT grp, val, total FROM openivm_data_uwd_bag_mv
+    SELECT grp, val, total FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_7577645f6261675f6d76_
     EXCEPT ALL
     SELECT grp, val, total FROM applied
 );
@@ -539,4 +539,4 @@ SELECT * FROM openivm_compile_with_facts(
     '{"target_dialect":"duckdb","compile_only":true,"force_view_delta_cascade":true}'
 );
 ----
-materialized view 'uwd_does_not_exist' not found
+Materialized view 'uwd_does_not_exist' does not exist in IVM metadata

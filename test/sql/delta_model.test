@@ -22,7 +22,7 @@ CREATE MATERIALIZED VIEW mv_dm_profile AS SELECT id, name FROM dm_profile_base;
 
 query I
 SELECT count(*) FROM openivm_refresh_profile
-WHERE view_name = 'mv_dm_profile'
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f646d5f70726f66696c65_'
   AND step_name = 'create_compile_classification'
   AND contains(detail, 'model_nodes=')
   AND contains(detail, 'scan_occurrences=1')
@@ -48,7 +48,7 @@ CREATE MATERIALIZED VIEW mv_dm_group AS
 
 query I
 SELECT count(*) FROM openivm_refresh_profile
-WHERE view_name = 'mv_dm_group'
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f646d5f67726f7570_'
   AND step_name = 'create_compile_classification'
   AND contains(detail, 'refresh_type=AGGREGATE_GROUP')
   AND contains(detail, 'delta_state_nodes=1');
@@ -73,7 +73,7 @@ CREATE MATERIALIZED VIEW mv_dm_self_join AS
 
 query I
 SELECT count(*) FROM openivm_refresh_profile
-WHERE view_name = 'mv_dm_self_join'
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f646d5f73656c665f6a6f696e_'
   AND step_name = 'create_compile_classification'
   AND contains(detail, 'scan_occurrences=2')
   AND contains(detail, 'model_nodes=')

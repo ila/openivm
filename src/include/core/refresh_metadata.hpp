@@ -25,7 +25,10 @@ public:
 	static void UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
 
 	void SnapshotTransaction(ClientContext &context);
-	string ResolveViewName(const string &view_name);
+	string ResolveViewName(const string &view_name, const string &catalog = "", const string &schema = "");
+	string FindViewKey(const string &catalog, const string &schema, const string &name);
+	string GetViewSQLName(const string &view_key);
+	string AllocateViewKey(const string &catalog, const string &schema, const string &name);
 
 	// Returns true if the given table name is NOT a tracked materialized view.
 	// (i.e., it's a base table that should have its deltas captured)

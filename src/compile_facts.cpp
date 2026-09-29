@@ -323,16 +323,11 @@ unique_ptr<FunctionData> OpenIvmCompileWithFactsBind(ClientContext &context, Tab
 	string view_name = StringValue::Get(input.inputs[0]);
 	string facts_json = StringValue::Get(input.inputs[1]);
 
-	if (view_name.find('.') != string::npos) {
-		throw InvalidInputException(
-		    "openivm_compile_with_facts: cannot resolve qualified view_name '%s'; pass unqualified short name only",
-		    view_name.c_str());
-	}
-
 	auto facts_owned = make_shared_ptr<CompileFacts>(ParseFactsJson(facts_json));
 
 	Connection con(*context.db.get());
-	auto resolved = ResolveViewCatalogFromContext(context, con, view_name, /*throw_if_not_found=*/true);
+	auto resolved = ResolveViewCatalogFromContext(context, con, view_name);
+	view_name = resolved.view_name;
 	RefreshMetadata metadata(con);
 	RefreshType type = metadata.GetViewType(view_name);
 

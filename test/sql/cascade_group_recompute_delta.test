@@ -45,11 +45,11 @@ LIMIT 1;
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_affected_cgr_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data_cgr_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data_cgr_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_affected_cgr_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO openivm_delta_cgr_mv%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_affected___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DELETE FROM %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO %openivm_data___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_affected___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'cgr_mv',
@@ -77,15 +77,15 @@ LIMIT 1;
 
 query I
 SELECT CASE WHEN
-       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_cgr_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_cgr_mv AS%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO openivm_delta_cgr_mv%'
+       string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_ AS%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%-1%INTEGER%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%UNION ALL%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%CAST%1%INTEGER%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_affected_cgr_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old_cgr_mv%'
-   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new_cgr_mv%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_affected___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_old___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_%'
+   AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%DROP TABLE IF EXISTS openivm_new___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_%'
    THEN 1 ELSE 0 END
 FROM openivm_compile_with_facts(
     'cgr_mv',
@@ -114,14 +114,14 @@ statement ok
 CREATE MATERIALIZED VIEW cgr_latest AS SELECT * FROM cgr_latest_query;
 
 query T
-SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name='cgr_latest';
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_6367725f6c6174657374_';
 ----
 direct_source_keys
 
 query I
 SELECT CASE WHEN string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_source_keys%'
  AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%AS openivm_src WHERE EXISTS%'
- AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%openivm_current_cgr_latest%'
+ AND string_agg(sql, ' ' ORDER BY stmt_order) NOT LIKE '%openivm_current___openivm_mv_6d656d6f7279_6d61696e_6367725f6c6174657374_%'
 THEN 1 ELSE 0 END FROM openivm_compile_with_facts('cgr_latest',
 '{"target_dialect":"spark","compile_only":true,"force_view_delta_cascade":true}');
 ----
@@ -223,7 +223,7 @@ statement ok
 CREATE MATERIALIZED VIEW cgr_cross_key AS SELECT * FROM cgr_cross_key_query;
 
 query I
-SELECT COUNT(*) FROM openivm_views WHERE view_name='cgr_cross_key' AND group_recompute_affected_mode='direct_source_keys';
+SELECT COUNT(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_6367725f63726f73735f6b6579_' AND group_recompute_affected_mode='direct_source_keys';
 ----
 0
 
@@ -234,7 +234,7 @@ statement ok
 CREATE MATERIALIZED VIEW cgr_global AS SELECT * FROM cgr_global_query;
 
 query I
-SELECT COUNT(*) FROM openivm_views WHERE view_name='cgr_global' AND group_recompute_affected_mode='direct_source_keys';
+SELECT COUNT(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_6367725f676c6f62616c_' AND group_recompute_affected_mode='direct_source_keys';
 ----
 0
 
@@ -245,7 +245,7 @@ statement ok
 CREATE MATERIALIZED VIEW cgr_different_source AS SELECT * FROM cgr_different_source_query;
 
 query I
-SELECT COUNT(*) FROM openivm_views WHERE view_name='cgr_different_source' AND group_recompute_affected_mode='direct_source_keys';
+SELECT COUNT(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_6367725f646966666572656e745f736f75726365_' AND group_recompute_affected_mode='direct_source_keys';
 ----
 0
 
@@ -256,7 +256,7 @@ statement ok
 CREATE MATERIALIZED VIEW cgr_renamed AS SELECT * FROM cgr_renamed_query;
 
 query I
-SELECT COUNT(*) FROM openivm_views WHERE view_name='cgr_renamed' AND group_recompute_affected_mode='direct_source_keys';
+SELECT COUNT(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_6367725f72656e616d6564_' AND group_recompute_affected_mode='direct_source_keys';
 ----
 0
 
@@ -267,7 +267,7 @@ statement ok
 CREATE MATERIALIZED VIEW cgr_computed AS SELECT * FROM cgr_computed_query;
 
 query I
-SELECT COUNT(*) FROM openivm_views WHERE view_name='cgr_computed' AND group_recompute_affected_mode='direct_source_keys';
+SELECT COUNT(*) FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_6367725f636f6d7075746564_' AND group_recompute_affected_mode='direct_source_keys';
 ----
 0
 
@@ -381,7 +381,7 @@ statement ok
 CREATE MATERIALIZED VIEW cgr_trade AS SELECT * FROM cgr_trade_query;
 
 query TT
-SELECT group_columns,group_recompute_affected_mode FROM openivm_views WHERE view_name='cgr_trade';
+SELECT group_columns,group_recompute_affected_mode FROM openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_6367725f7472616465_';
 ----
 t_id	direct_source_keys
 
@@ -467,7 +467,7 @@ PRAGMA refresh('cgr_mv');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data_cgr_mv
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_
     EXCEPT ALL
     SELECT warehouse, district, COUNT(DISTINCT item), COUNT(*), SUM(amount)
     FROM cgr_items GROUP BY warehouse, district
@@ -480,7 +480,7 @@ SELECT COUNT(*) FROM (
     SELECT warehouse, district, COUNT(DISTINCT item), COUNT(*), SUM(amount)
     FROM cgr_items GROUP BY warehouse, district
     EXCEPT ALL
-    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data_cgr_mv
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_
 );
 ----
 0
@@ -493,7 +493,7 @@ PRAGMA refresh('cgr_mv');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data_cgr_mv
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_
     EXCEPT ALL
     SELECT warehouse, district, COUNT(DISTINCT item), COUNT(*), SUM(amount)
     FROM cgr_items GROUP BY warehouse, district
@@ -506,7 +506,7 @@ SELECT COUNT(*) FROM (
     SELECT warehouse, district, COUNT(DISTINCT item), COUNT(*), SUM(amount)
     FROM cgr_items GROUP BY warehouse, district
     EXCEPT ALL
-    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data_cgr_mv
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_
 );
 ----
 0
@@ -519,7 +519,7 @@ PRAGMA refresh('cgr_mv');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data_cgr_mv
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_
     EXCEPT ALL
     SELECT warehouse, district, COUNT(DISTINCT item), COUNT(*), SUM(amount)
     FROM cgr_items GROUP BY warehouse, district
@@ -532,7 +532,7 @@ SELECT COUNT(*) FROM (
     SELECT warehouse, district, COUNT(DISTINCT item), COUNT(*), SUM(amount)
     FROM cgr_items GROUP BY warehouse, district
     EXCEPT ALL
-    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data_cgr_mv
+    SELECT warehouse, district, unique_items, total_lines, total_amount FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6367725f6d76_
 );
 ----
 0

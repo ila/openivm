@@ -183,15 +183,19 @@ your terminal:
 
 ```bash
 cat openivm_generated_sql/openivm_system_tables.sql
-cat openivm_generated_sql/openivm_compiled_queries_regional_totals.sql
-cat openivm_generated_sql/openivm_upsert_queries_regional_totals.sql
+cat openivm_generated_sql/openivm_compiled_queries_*.sql
+cat openivm_generated_sql/openivm_upsert_queries_*.sql
 ```
+
+The wildcards include all views in that directory. For one view, use the exact
+paths returned by `PRAGMA openivm_files('regional_totals')`; filenames use an
+internal key derived from the view's catalog, schema, and name.
 
 These contain system-table DDL, view setup SQL, and the SQL compiled for the refresh,
 respectively. The refresh file is overwritten when a new refresh is compiled and
 contains that refresh's catalog names and delta cutoff timestamps. It is an
 inspection artifact, not the demo's input script. The optional
-`openivm_initial_load_explain_<view>.txt` contains the initial-load plan. A refresh
+`openivm_initial_load_explain_<internal_key>.txt` contains the initial-load plan. A refresh
 that skips empty deltas may not compile a new file. Setting the path after CREATE
 does not retroactively create the setup files; do not replace an existing MV just
 to obtain an inspection file.

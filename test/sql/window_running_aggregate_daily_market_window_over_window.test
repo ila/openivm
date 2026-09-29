@@ -64,9 +64,9 @@ WITH compiled AS (
 ), program AS (
     SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS sql FROM compiled
 ), suffix_result AS (
-    SELECT sql FROM compiled WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_run_result_wradwow_mv AS%'
+    SELECT sql FROM compiled WHERE sql LIKE 'CREATE OR REPLACE TEMP TABLE openivm_run_result___openivm_mv_6d656d6f7279_6d61696e_77726164776f775f6d76_ AS%'
 )
-SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast_wradwow_mv%'
+SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast___openivm_mv_6d656d6f7279_6d61696e_77726164776f775f6d76_%'
          AND (SELECT sql FROM suffix_result) LIKE '%openivm_l1 AS%'
          AND (SELECT sql FROM suffix_result) LIKE '%MIN(d.dm_low)%'
          AND (SELECT sql FROM suffix_result) LIKE '%MAX(d.dm_high)%'
@@ -102,7 +102,7 @@ WITH expected AS (
     FROM flagged
 )
 SELECT COUNT(*) FROM (
-    SELECT * FROM openivm_data_wradwow_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726164776f775f6d76_
     EXCEPT ALL
     SELECT * FROM expected
 );
@@ -132,7 +132,7 @@ WITH expected AS (
 SELECT COUNT(*) FROM (
     SELECT * FROM expected
     EXCEPT ALL
-    SELECT * FROM openivm_data_wradwow_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726164776f775f6d76_
 );
 ----
 0
@@ -167,7 +167,7 @@ WITH expected AS (
     FROM flagged
 )
 SELECT COUNT(*) FROM (
-    SELECT * FROM openivm_data_wradwow_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726164776f775f6d76_
     EXCEPT ALL
     SELECT * FROM expected
 );
@@ -197,7 +197,7 @@ WITH expected AS (
 SELECT COUNT(*) FROM (
     SELECT * FROM expected
     EXCEPT ALL
-    SELECT * FROM openivm_data_wradwow_mv
+    SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726164776f775f6d76_
 );
 ----
 0

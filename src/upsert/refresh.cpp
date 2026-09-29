@@ -653,7 +653,7 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 		auto resolved = ResolveViewCatalogFromContext(context, con, StringValue::Get(parameters.values[0]));
 		view_catalog_name = resolved.view_catalog_name;
 		view_schema_name = resolved.view_schema_name;
-		view_name = StringValue::Get(parameters.values[0]);
+		view_name = resolved.view_name;
 		cross_system = resolved.cross_system;
 		OPENIVM_DEBUG_PRINT("[UPSERT] Resolved catalog='%s', schema='%s', cross_system=%d\n", view_catalog_name.c_str(),
 		                    view_schema_name.c_str(), cross_system ? 1 : 0);
@@ -675,15 +675,22 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 	}
 
 	RefreshMetadata metadata(con);
+	if (!pipeline && parameters.values.size() > 1) {
+		view_name = metadata.FindViewKey(view_catalog_name, view_schema_name, metadata.GetViewSQLName(view_name));
+	}
 	if (pipeline) {
-		auto order = metadata.GetPipelineRefreshOrder(PipelineTargets(parameters), cascade_mode);
+		auto targets = PipelineTargets(parameters);
+		for (auto &target : targets) {
+			target = ResolveViewCatalogFromContext(context, con, target).view_name;
+		}
+		auto order = metadata.GetPipelineRefreshOrder(targets, cascade_mode);
 		// Rebind every selected definition before any refresh. A dropped source or an
 		// incompatible schema must not be discovered after earlier nodes have committed.
 		for (auto &node : order) {
 			auto location = metadata.GetStoredViewLocation(node, view_catalog_name, view_schema_name);
-			for (auto &query :
-			     {metadata.GetViewQuery(node),
-			      "SELECT * FROM " + SqlUtils::FullName(location.catalog_name, location.schema_name, node)}) {
+			for (auto &query : {metadata.GetViewQuery(node),
+			                    "SELECT * FROM " + SqlUtils::FullName(location.catalog_name, location.schema_name,
+			                                                          metadata.GetViewSQLName(node))}) {
 				auto bound = con.Query("EXPLAIN " + query);
 				if (bound->HasError()) {
 					throw CatalogException("refresh_pipeline: cannot bind materialized view '%s': %s", node,
@@ -848,9 +855,13 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		auto resolved = ResolveViewCatalogFromContext(context, metadata_con, view_name);
 		view_catalog_name = resolved.view_catalog_name;
 		view_schema_name = resolved.view_schema_name;
+		view_name = resolved.view_name;
 		cross_system = resolved.cross_system;
 	}
-	view_name = RefreshMetadata(metadata_con).ResolveViewName(view_name);
+	if (!pipeline && parameters.values.size() > 1) {
+		RefreshMetadata names(metadata_con);
+		view_name = names.FindViewKey(view_catalog_name, view_schema_name, names.GetViewSQLName(view_name));
+	}
 	if (RefreshMetadata(metadata_con).GetViewQuery(view_name).empty()) {
 		throw CatalogException("Materialized view '%s' does not exist", view_name);
 	}
@@ -882,7 +893,11 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 
 	vector<string> refresh_order;
 	if (pipeline) {
-		refresh_order = metadata.GetPipelineRefreshOrder(PipelineTargets(parameters), cascade_mode);
+		auto targets = PipelineTargets(parameters);
+		for (auto &target : targets) {
+			target = ResolveViewCatalogFromContext(context, metadata_con, target).view_name;
+		}
+		refresh_order = metadata.GetPipelineRefreshOrder(targets, cascade_mode);
 	} else {
 		if (cascade_mode == "upstream" || cascade_mode == "both") {
 			auto upstream = metadata.GetUpstreamViews(view_name);

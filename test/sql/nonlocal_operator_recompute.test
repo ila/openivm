@@ -34,7 +34,7 @@ CREATE MATERIALIZED VIEW mv_oprec_sample AS
     FROM oprec_sample USING SAMPLE reservoir(4 ROWS) REPEATABLE (17);
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_sample';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f73616d706c65_';
 ----
 3
 
@@ -91,7 +91,7 @@ CREATE MATERIALIZED VIEW mv_oprec_sample_volatile AS
     SELECT id FROM oprec_sample_volatile USING SAMPLE reservoir(1 ROWS);
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_sample_volatile';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f73616d706c655f766f6c6174696c65_';
 ----
 3
 
@@ -127,7 +127,7 @@ CREATE MATERIALIZED VIEW mv_oprec_positional AS
     POSITIONAL JOIN oprec_pos_r r;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_positional';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f706f736974696f6e616c_';
 ----
 3
 
@@ -208,7 +208,7 @@ CREATE MATERIALIZED VIEW mv_oprec_sample_cascade_parent AS
     FROM oprec_sample_cascade USING SAMPLE reservoir(4 ROWS) REPEATABLE (29);
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_sample_cascade_parent';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f73616d706c655f636173636164655f706172656e74_';
 ----
 3
 
@@ -303,7 +303,7 @@ CREATE MATERIALIZED VIEW mv_oprec_pos_cascade_parent AS
     POSITIONAL JOIN oprec_pos_cascade_r r;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_pos_cascade_parent';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f706f735f636173636164655f706172656e74_';
 ----
 3
 
@@ -418,7 +418,7 @@ CREATE MATERIALIZED VIEW mv_oprec_cte_sample AS
     GROUP BY grp;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_cte_sample';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f6374655f73616d706c65_';
 ----
 3
 
@@ -490,7 +490,7 @@ CREATE MATERIALIZED VIEW mv_oprec_cte_positional AS
     FROM paired;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_oprec_cte_positional';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6f707265635f6374655f706f736974696f6e616c_';
 ----
 3
 

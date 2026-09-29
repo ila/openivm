@@ -42,12 +42,12 @@ WHERE H_AMOUNT > 0;
 # The partition source column is the fifth source column, but it is the first MV
 # output column. Refresh must filter affected partitions on H_W_ID, not H_D_ID.
 query I
-SELECT group_columns FROM openivm_views WHERE view_name = 'mv_history_window';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f686973746f72795f77696e646f77_';
 ----
 H_W_ID=H_W_ID
 
 query I
-SELECT (lineage_json LIKE '{"v":1,"items":[{"k":"window_partition"%')::INT FROM openivm_views WHERE view_name = 'mv_history_window';
+SELECT (lineage_json LIKE '{"v":1,"items":[{"k":"window_partition"%')::INT FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f686973746f72795f77696e646f77_';
 ----
 1
 
@@ -129,7 +129,7 @@ LEFT JOIN dl.window_join_codes c
     ON e.code = c.code;
 
 query I
-SELECT group_columns FROM openivm_views WHERE view_name = 'mv_window_join';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f77696e646f775f6a6f696e_';
 ----
 acct_id=acct_id
 
@@ -149,14 +149,14 @@ statement ok
 PRAGMA refresh('mv_window_join');
 
 query I
-SELECT contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_old_affected_mv_window_join')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_window_join.sql');
+SELECT contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_old_affected___openivm_mv_646c_6d61696e_6d765f77696e646f775f6a6f696e_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f77696e646f775f6a6f696e_.sql');
 ----
 true
 
 query I
-SELECT contains(content, 'DROP TABLE IF EXISTS openivm_old_affected_mv_window_join')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_window_join.sql');
+SELECT contains(content, 'DROP TABLE IF EXISTS openivm_old_affected___openivm_mv_646c_6d61696e_6d765f77696e646f775f6a6f696e_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f77696e646f775f6a6f696e_.sql');
 ----
 true
 
@@ -235,7 +235,7 @@ SELECT
 FROM flagged;
 
 query T
-SELECT window_order_columns FROM openivm_views WHERE view_name = 'mv_window_compact';
+SELECT window_order_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f77696e646f775f636f6d70616374_';
 ----
 event_day=event_day
 
@@ -268,8 +268,8 @@ statement ok
 PRAGMA refresh('mv_window_compact');
 
 query I
-SELECT contains(content, 'openivm_window_changed_mv_window_compact')::INT
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_window_compact.sql');
+SELECT contains(content, 'openivm_window_changed___openivm_mv_646c_6d61696e_6d765f77696e646f775f636f6d70616374_')::INT
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f77696e646f775f636f6d70616374_.sql');
 ----
 1
 
@@ -426,7 +426,7 @@ SELECT
 FROM dl.window_composite_src;
 
 query I
-SELECT group_columns FROM openivm_views WHERE view_name = 'mv_composite_window';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f636f6d706f736974655f77696e646f77_';
 ----
 w_id=w_id,d_id=d_id
 
@@ -451,15 +451,15 @@ statement ok
 PRAGMA refresh('mv_composite_window');
 
 query I
-SELECT content LIKE '%DELETE FROM%openivm_data_mv_composite_window;%' AND
-       content LIKE '%INSERT INTO%openivm_data_mv_composite_window%'
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_composite_window.sql');
+SELECT content LIKE '%DELETE FROM%openivm_data___openivm_mv_646c_6d61696e_6d765f636f6d706f736974655f77696e646f77_;%' AND
+       content LIKE '%INSERT INTO%openivm_data___openivm_mv_646c_6d61696e_6d765f636f6d706f736974655f77696e646f77_%'
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f636f6d706f736974655f77696e646f77_.sql');
 ----
 true
 
 query I
-SELECT contains(content, 'w_id IN (SELECT w_id FROM openivm_old_affected_mv_composite_window) OR d_id IN (SELECT d_id FROM openivm_old_affected_mv_composite_window)')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_composite_window.sql');
+SELECT contains(content, 'w_id IN (SELECT w_id FROM openivm_old_affected___openivm_mv_646c_6d61696e_6d765f636f6d706f736974655f77696e646f77_) OR d_id IN (SELECT d_id FROM openivm_old_affected___openivm_mv_646c_6d61696e_6d765f636f6d706f736974655f77696e646f77_)')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f636f6d706f736974655f77696e646f77_.sql');
 ----
 false
 
@@ -595,20 +595,20 @@ statement ok
 PRAGMA refresh('mv_trades_history_like');
 
 query I
-SELECT contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_old_affected_mv_trades_history_like')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_trades_history_like.sql');
+SELECT contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_old_affected___openivm_mv_646c_6d61696e_6d765f7472616465735f686973746f72795f6c696b65_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f7472616465735f686973746f72795f6c696b65_.sql');
 ----
 true
 
 query I
-SELECT contains(content, 'SELECT * FROM dl.main.openivm_data_mv_trades_history_like openivm_old_rows')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_trades_history_like.sql');
+SELECT contains(content, 'SELECT * FROM dl.main.openivm_data___openivm_mv_646c_6d61696e_6d765f7472616465735f686973746f72795f6c696b65_ openivm_old_rows')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f7472616465735f686973746f72795f6c696b65_.sql');
 ----
 false
 
 query I
 SELECT contains(content, 'ducklake_table_insertions')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_trades_history_like.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f7472616465735f686973746f72795f6c696b65_.sql');
 ----
 true
 
@@ -952,7 +952,7 @@ LEFT JOIN "dl"."main"."accounts_tax" ltx
 WHERE c.ca_id IS NOT NULL;
 
 query I
-SELECT group_columns FROM openivm_views WHERE view_name = 'mv_accounts_like';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f6163636f756e74735f6c696b65_';
 ----
 account_id=ca_id
 
@@ -1159,7 +1159,7 @@ SELECT count(*) FROM dl.mv_ducklake_stage_lock;
 20
 
 query I
-SELECT count(*) FROM information_schema.tables WHERE table_name = 'openivm_stage_mv_ducklake_stage_lock';
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'openivm_stage___openivm_mv_646c_6d61696e_6d765f6475636b6c616b655f73746167655f6c6f636b_';
 ----
 0
 
@@ -1315,7 +1315,7 @@ SELECT
 FROM dl.window_upstream_base;
 
 query I
-SELECT group_columns FROM openivm_views WHERE view_name = 'mv_window_upstream';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f77696e646f775f757073747265616d_';
 ----
 acct_id=acct_id
 

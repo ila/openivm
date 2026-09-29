@@ -580,7 +580,7 @@ CREATE MATERIALIZED VIEW mv_min_having AS
     HAVING COUNT(*) > 0;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_min_having';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6d696e5f686176696e67_';
 ----
 4
 
@@ -636,7 +636,7 @@ CREATE MATERIALIZED VIEW mv_max_having AS
     HAVING MAX(val) > 0;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_max_having';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6d61785f686176696e67_';
 ----
 4
 
@@ -686,7 +686,7 @@ CREATE MATERIALIZED VIEW mv_computed_min_having AS
     HAVING COUNT(*) > 0;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_computed_min_having';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f6d70757465645f6d696e5f686176696e67_';
 ----
 6
 
@@ -746,7 +746,7 @@ CREATE MATERIALIZED VIEW mv_hidden_max_having AS
     HAVING MAX(val) > 10;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_hidden_max_having';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f68696464656e5f6d61785f686176696e67_';
 ----
 6
 
@@ -1027,13 +1027,13 @@ CREATE MATERIALIZED VIEW mv_retained_aggregate_filter AS
     ) WHERE total < 0;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_retained_aggregate_filter';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f72657461696e65645f6167677265676174655f66696c746572_';
 ----
 6
 
 query T
 SELECT group_recompute_affected_mode FROM openivm_views
-WHERE view_name = 'mv_retained_aggregate_filter';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f72657461696e65645f6167677265676174655f66696c746572_';
 ----
 source_delta_relax_aggregate_filter
 
@@ -2317,7 +2317,7 @@ CREATE MATERIALIZED VIEW mv_ua_multi_counts AS
     SELECT 'empty', COUNT(*) FROM ua_multi_empty;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_ua_multi_counts';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f75615f6d756c74695f636f756e7473_';
 ----
 1
 
@@ -2415,7 +2415,7 @@ CREATE MATERIALIZED VIEW mv_flat_sd AS
 # Derived aggregates already carry their own hidden SUM/COUNT state. The
 # SUM NULL-state rewrite must not add redundant counts for those helper SUMs.
 query I
-SELECT count(*) FROM pragma_table_info('openivm_data_mv_flat_sd')
+SELECT count(*) FROM pragma_table_info('openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f666c61745f7364_')
 WHERE name LIKE 'openivm_nonnull_sum_count_%';
 ----
 0
@@ -2545,7 +2545,7 @@ SELECT count(*) FROM (
 
 # MV should have hidden sum+count columns (decomposition succeeded).
 query I
-SELECT count(*) FROM pragma_table_info('openivm_data_mv_hva') WHERE name LIKE 'openivm_sum_%';
+SELECT count(*) FROM pragma_table_info('openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f687661_') WHERE name LIKE 'openivm_sum_%';
 ----
 1
 
@@ -3504,7 +3504,7 @@ CREATE MATERIALIZED VIEW mv_sum_null_computed AS
     FROM sum_null_computed GROUP BY grp;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_sum_null_computed';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f73756d5f6e756c6c5f636f6d7075746564_';
 ----
 6
 
@@ -3544,7 +3544,7 @@ CREATE MATERIALIZED VIEW mv_sum_null_computed_scalar AS
     SELECT ROUND(SUM(amount), 0) AS rounded FROM sum_null_computed;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_sum_null_computed_scalar';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f73756d5f6e756c6c5f636f6d70757465645f7363616c6172_';
 ----
 3
 
@@ -3585,7 +3585,7 @@ CREATE MATERIALIZED VIEW mv_sum_null_distinct AS
     SELECT DISTINCT SUM(amount) AS total FROM sum_null_distinct;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_sum_null_distinct';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f73756d5f6e756c6c5f64697374696e6374_';
 ----
 1
 
@@ -3627,7 +3627,7 @@ CREATE MATERIALIZED VIEW mv_sum_null_group_distinct AS
     FROM sum_null_group_distinct GROUP BY grp;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_sum_null_group_distinct';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f73756d5f6e756c6c5f67726f75705f64697374696e6374_';
 ----
 3
 
@@ -3686,7 +3686,7 @@ CREATE MATERIALIZED VIEW mv_redundant_group_distinct AS
     HAVING COUNT(*) > 0;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_redundant_group_distinct';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f726564756e64616e745f67726f75705f64697374696e6374_';
 ----
 4
 
@@ -3755,7 +3755,7 @@ CREATE MATERIALIZED VIEW mv_redundant_outer_distinct AS
     GROUP BY g;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_redundant_outer_distinct';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f726564756e64616e745f6f757465725f64697374696e6374_';
 ----
 6
 
@@ -3823,7 +3823,7 @@ CREATE MATERIALIZED VIEW mv_nested_redundant_distinct AS
     GROUP BY g.grp;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_nested_redundant_distinct';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6e65737465645f726564756e64616e745f64697374696e6374_';
 ----
 6
 
@@ -3937,7 +3937,7 @@ CREATE MATERIALIZED VIEW mv_sum_null_shape AS
     FROM sum_null_shape GROUP BY grp;
 
 query I
-SELECT count(*) FROM pragma_table_info('openivm_data_mv_sum_null_shape')
+SELECT count(*) FROM pragma_table_info('openivm_data___openivm_mv_6d656d6f7279_6d61696e_6d765f73756d5f6e756c6c5f7368617065_')
 WHERE name LIKE 'openivm_nonnull_sum_count_%';
 ----
 1
@@ -3994,7 +3994,7 @@ CREATE MATERIALIZED VIEW mv_count_distinct_constant AS
   GROUP BY o.id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_count_distinct_constant';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636f756e745f64697374696e63745f636f6e7374616e74_';
 ----
 6
 
