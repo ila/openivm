@@ -1,11 +1,12 @@
 # Parser
 
-OpenIVM intercepts `CREATE MATERIALIZED VIEW`, `CREATE OR REPLACE MATERIALIZED VIEW`, and `ALTER MATERIALIZED VIEW` statements through a DuckDB parser extension. The parser rewrites CREATE statements into a sequence of DDL operations that set up the materialized view, its delta tables, and its metadata.
-The original statement is rewritten to `CREATE TABLE IF NOT EXISTS <name> AS <query>`, which materializes the query result into a regular DuckDB table. `CREATE OR REPLACE` drops the old MV (view, data table, delta tables, metadata) before creating the new one.
+OpenIVM intercepts `CREATE MATERIALIZED VIEW`, `CREATE OR REPLACE MATERIALIZED VIEW`, and `ALTER MATERIALIZED VIEW` statements through a DuckDB parser override (`MaterializedViewParserExtension::OverrideFunction` in `src/core/parser_parse.cpp`). A recognized statement is replaced by the internal pragma `openivm_materialized_view_lifecycle`, which plans the view and returns the sequence of DDL operations that set up the materialized view, its delta tables, and its metadata. Native `DROP VIEW` and `DROP TABLE` statements are routed through the internal pragma `openivm_materialized_view_drop`, so dropping an MV or a tracked source table cleans up OpenIVM objects in the caller transaction.
+
+Before planning, the statement text is lowercased outside single-quoted string literals, `--` comments are stripped, and `MATERIALIZED VIEW` is replaced with `TABLE IF NOT EXISTS` so DuckDB can parse the body. The query result is materialized into the data table `openivm_data_<internal_key>` (see [Metadata Columns](metadata-columns.md)). `CREATE OR REPLACE` replaces the old MV (view, data table, delta tables, metadata); changes still pending for downstream consumers are preserved in the replacement's delta table.
 
 ## Aggregate function aliasing
 
-Before parsing, the query is lowercased and aggregate functions are given explicit aliases. This ensures that the upsert compiler can reference aggregate columns by a stable name.
+Output columns without an explicit alias get a stable name derived from DuckDB's default column name when the plan is analyzed (`SanitizeOutputName` in `src/core/parser_plan_helpers.cpp`). This ensures that the upsert compiler can reference aggregate columns by a stable name.
 
 | Expression | Rewritten to |
 |---|---|
@@ -16,21 +17,19 @@ Before parsing, the query is lowercased and aggregate functions are given explic
 | `MAX(price)` | `MAX(price) AS max_price` |
 | `AVG(score)` | `AVG(score) AS avg_score` |
 
-Expressions that already have an explicit `AS` alias are left unchanged. Non-alphanumeric characters in the argument are replaced with underscores in the alias (e.g., `SUM(a + b)` becomes `SUM(a + b) AS sum_a___b`).
-
-The HAVING clause is split from the SELECT before aggregate aliasing and re-attached afterward. This prevents the rewriter from injecting `AS alias` inside the HAVING expression, which would produce invalid SQL.
+Expressions that already have an explicit `AS` alias are left unchanged. Each run of non-alphanumeric characters in the default name becomes one underscore, and a trailing underscore is dropped (e.g., `SUM(a + b)` becomes `sum_a_b`).
 
 ## DISTINCT rewriting
 
-The parser rewrites `SELECT DISTINCT` into `GROUP BY` + hidden `COUNT(*)` before planning, classifying it as `AGGREGATE_GROUP`. See [Distinct](../operators/distinct.md) for details.
+The plan rewrite turns a top-level `SELECT DISTINCT` into a grouped aggregate with a hidden `COUNT(*)` (`openivm_distinct_count`), classifying it as `AGGREGATE_GROUP`. See [Distinct](../operators/distinct.md) for details.
 
 ## AVG decomposition
 
-The parser decomposes `AVG(x)` into hidden `openivm_sum_*` and `openivm_count_*` columns so that AVG can be maintained incrementally via MERGE. See [Metadata Columns](metadata-columns.md#openivm_sum_-and-openivm_count_) for details.
+The plan rewrite decomposes `AVG(x)` into hidden `openivm_sum_*` and `openivm_count_*` columns so that AVG can be maintained incrementally via MERGE. See [Metadata Columns](metadata-columns.md#aggregate-helper-columns) for details.
 
 ## LEFT JOIN key injection
 
-For `LEFT JOIN` or `RIGHT JOIN` queries, the parser adds a hidden `openivm_left_key` column containing the preserved-side join key, used by the upsert for partial recompute. For `RIGHT JOIN`, DuckDB internally rewrites it to `LEFT JOIN` (swapping the table order), so the preserved side is always the left table after rewriting. See [Metadata Columns](metadata-columns.md#openivm_left_key) for details.
+For `LEFT JOIN` or `RIGHT JOIN` queries, the plan rewrite adds a hidden `openivm_left_key` column containing the preserved-side join key, used by the upsert for partial recompute. For `RIGHT JOIN`, DuckDB internally rewrites it to `LEFT JOIN` (swapping the table order), so the preserved side is always the left table after rewriting. See [Metadata Columns](metadata-columns.md#openivm_left_key-and-openivm_right_key) for details.
 
 ## REFRESH EVERY
 
@@ -41,7 +40,7 @@ CREATE MATERIALIZED VIEW mv REFRESH EVERY '5 minutes' AS
     SELECT region, SUM(amount) FROM sales GROUP BY region;
 ```
 
-The parsed interval (300 seconds) is stored in the `refresh_interval` column of `openivm_views`. When omitted, `refresh_interval` is `NULL` (manual refresh only). See [Automatic Refresh](../refresh/automatic-refresh.md) for how the daemon uses this.
+The parsed interval (300 seconds) is stored in the `refresh_interval` column of `openivm_views`. When omitted, `refresh_interval` is `NULL` (manual refresh only). An existing view can be changed with `ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>'` or `ALTER MATERIALIZED VIEW <name> SET REFRESH MANUAL`; `<name>` may be qualified as `schema.name` or `catalog.schema.name`. Other `ALTER MATERIALIZED VIEW` forms are rejected. See [Automatic Refresh](../refresh/automatic-refresh.md) for how the daemon uses this.
 
 ## Input dialect
 
@@ -88,11 +87,14 @@ After rewriting, the parser plans the query and walks the logical plan to classi
 | `AGGREGATE_HAVING` | 4 | Aggregation with GROUP BY and HAVING clause. Uses group-recompute since groups may enter/leave the result set. |
 | `WINDOW_PARTITION` | 5 | Window functions maintained by partition recompute. |
 | `GROUP_RECOMPUTE` | 6 | Affected-key DELETE + INSERT for non-linear group shapes. |
-| `TOP_K` | 7 | Legacy enum value. Current top-k support stores the full data table and applies ORDER BY/LIMIT in the user-facing view. |
+| `TOP_K` | 7 | Legacy enum value. Current top-k support stores the full data table and applies ORDER BY/LIMIT when publishing the visible rows. |
 | `DISTINCT_INCREMENTAL` | 8 | Aux-state path for supported inner-DISTINCT-under-aggregate shapes. |
 | `SEMI_ANTI_RECOMPUTE` | 9 | Aux-state path for supported SEMI/ANTI/EXISTS projection shapes. |
+| `COUNT_DISTINCT_INCREMENTAL` | 11 | Single-source grouped `COUNT(DISTINCT x)` with a per-(group, value) multiplicity aux table. Opt-in with `SET openivm_stateful_auxstate = true`; otherwise grouped DISTINCT aggregates use `GROUP_RECOMPUTE`. |
 
-The IVM compatibility checker validates the entire plan tree, flagging unsupported join shapes, unsupported aggregate functions, and non-deterministic functions (e.g., `RANDOM()`, `NOW()`). Supported join plans include inner joins, cross products, arbitrary-predicate joins, left/right/full outer joins, and the aux-state semi/anti projection shapes. Supported aggregate functions include `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `LIST`, `STDDEV`/`VARIANCE`, `BOOL_AND`, `BOOL_OR`, `ARG_MIN`, and `ARG_MAX`. If any unsupported construct is found, the view is classified as `FULL_REFRESH` and a warning is printed.
+Value 10 is unused. The refresh type is chosen by `SelectRefreshType` in `src/core/ivm_view_classifier.cpp`.
+
+The IVM compatibility checker validates the entire plan tree, flagging unsupported join shapes, unsupported aggregate functions, and non-deterministic functions (e.g., `RANDOM()`, `NOW()`). Supported join plans include inner joins, cross products, arbitrary-predicate joins, left/right/full outer joins, and the aux-state semi/anti projection shapes. Supported aggregate functions include `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `LIST`, `STDDEV`/`VARIANCE`, `BOOL_AND`, `BOOL_OR`, `ARG_MIN`, and `ARG_MAX`. If any unsupported construct is found, the view is classified as `FULL_REFRESH` and a warning is printed. SAMPLE and POSITIONAL JOIN are always `FULL_REFRESH`; ASOF joins use `WINDOW_PARTITION` or `GROUP_RECOMPUTE` when affected partitions or groups can be identified, and `FULL_REFRESH` otherwise.
 
 ## Generated DDL
 
@@ -104,12 +106,13 @@ constrained temporary shadow tables for compilation. DuckLake and other
 cross-catalog lifecycles use staged execution because DuckDB cannot commit writes to
 two attached catalogs in one transaction.
 
-1. **System tables**: `CREATE TABLE IF NOT EXISTS openivm_views (...)` and `openivm_delta_tables (...)`.
-2. **Metadata inserts**: Registers the view name, query string, type, and source table mappings.
-3. **MV table**: `CREATE TABLE <view_name> AS <query>` to materialize the initial result.
-4. **Delta tables**: One `openivm_delta_<table_name>` per source table, with `openivm_multiplicity` and `openivm_timestamp` columns.
-5. **Delta view table**: `openivm_delta_<view_name>` for downstream chained MV support, with `DEFAULT now()` on the timestamp column.
-6. **Index** (AGGREGATE_GROUP only): A unique index on the GROUP BY columns, used by the MERGE INTO upsert strategy.
+1. **System tables**: `openivm_views`, `openivm_delta_tables`, `openivm_mv_dependencies`, `openivm_refresh_hooks`, `openivm_refresh_history`, and `openivm_refresh_profile`, created once in `main` of the native default database. In autocommit mode this runs in a short, serialized setup transaction; see [Concurrency](concurrency.md#locking).
+2. **Metadata inserts**: Registers the internal key, SQL name, location, query string, type, and source table mappings.
+3. **MV table**: `CREATE TABLE openivm_data_<internal_key> AS <query>` to materialize the initial result.
+4. **Published table and view**: `openivm_visible_<internal_key>` holds the visible rows, `openivm_delta_openivm_visible_<internal_key>` their signed changes, and the SQL view `<view_name>` selects from the published table.
+5. **Delta tables**: One `openivm_delta_<table_name>` per native source table, in the source's catalog and schema, with `openivm_multiplicity` and `openivm_timestamp` columns. DuckLake sources get none.
+6. **Delta view table**: `openivm_delta_<internal_key>` for downstream chained MV support.
+7. **Index** (`AGGREGATE_GROUP` and `AGGREGATE_HAVING`, native MVs only): A unique index `openivm_data_<internal_key>openivm_index` on the GROUP BY columns, used by the MERGE INTO upsert strategy.
 
 ## System tables
 
@@ -119,27 +122,35 @@ Stores one row per materialized view.
 
 | Column | Type | Description |
 |---|---|---|
-| `view_name` | `VARCHAR` (PK) | Name of the materialized view. |
+| `view_name` | `VARCHAR` (PK) | Internal key of the materialized view (`__openivm_mv_...` for new views); used to name its internal tables. |
+| `view_sql_name` | `VARCHAR` | SQL name of the user-facing view. |
 | `view_catalog` | `VARCHAR` | Catalog containing the user-facing view. |
 | `view_schema` | `VARCHAR` | Schema containing the user-facing view. |
 | `sql_string` | `VARCHAR` | The original SELECT query defining the view. |
 | `type` | `TINYINT` | View classification (see IVM compatibility classification above). |
 | `has_minmax` | `BOOLEAN` | Whether the view uses MIN/MAX or another aggregate shape that may need group-recompute. |
 | `has_left_join` | `BOOLEAN` | Whether the view involves a LEFT/RIGHT JOIN. |
+| `has_join` | `BOOLEAN` | Whether the view involves any join. |
 | `last_update` | `TIMESTAMP` | When the view was last created or replaced. |
 | `refresh_interval` | `BIGINT` | Automatic refresh interval in seconds. `NULL` = manual only. See [Automatic Refresh](../refresh/automatic-refresh.md). |
 | `refresh_in_progress` | `BOOLEAN` | Crash safety flag — `true` while a refresh is in flight. See [Automatic Refresh: Crash safety](../refresh/automatic-refresh.md#crash-safety). |
 | `group_columns` | `VARCHAR` | Comma-separated group keys, window partition keys, or source mappings used by refresh. |
+| `window_order_columns` | `VARCHAR` | Common window ORDER BY keys, when every window function shares them. |
 | `aggregate_types` | `VARCHAR` | Aggregate function names used by aggregate refresh compilation. |
+| `derived_aggregate_outputs_json` | `VARCHAR` | JSON metadata for outputs computed from aggregates. |
+| `group_recompute_affected_mode`, `group_recompute_source_occurrences_json` | `VARCHAR` | How `GROUP_RECOMPUTE` finds affected keys, and which source occurrences feed them. |
 | `having_predicate` | `VARCHAR` | Stored HAVING predicate for user-facing view filtering. |
 | `has_full_outer` | `BOOLEAN` | Whether the view contains a FULL OUTER JOIN. |
 | `full_outer_join_cols` | `VARCHAR` | Join-key metadata for FULL OUTER recompute paths. |
 | `source_tables_json` | `VARCHAR` | JSON list of source tables used for dependency tracking. |
 | `aggregate_decomposition_json` | `VARCHAR` | JSON metadata for aggregate helper paths, including filtered group-count aux state. |
 | `distinct_aux_meta_json` | `VARCHAR` | JSON metadata for DISTINCT aux-state maintenance. |
+| `count_distinct_aux_meta_json` | `VARCHAR` | JSON metadata for `COUNT_DISTINCT_INCREMENTAL` aux state. |
 | `semi_anti_aux_meta_json` | `VARCHAR` | JSON metadata for SEMI/ANTI aux-state maintenance. |
 | `lineage_json` | `VARCHAR` | JSON lineage metadata for window and projection-key refresh paths. |
 | `leftjoin_secondary_meta_json` | `VARCHAR` | Structured source/key identities for supported LEFT JOIN aggregate correction deltas. |
+| `published_query` | `VARCHAR` | Query that produces the visible rows published to `openivm_visible_<internal_key>`. |
+| `pending_after_hook` | `BOOLEAN` | Set while a committed refresh still has to deliver its `after` [refresh hook](../refresh_hooks.md). |
 | `signature_hash`, `canonical_plan_blob`, `output_columns_json`, `predicate_summary_json`, `fd_summary_json`, `nullified_columns_json` | Mixed | View-matching metadata. These stay NULL unless view matching is enabled. |
 
 Example content:
@@ -156,7 +167,7 @@ Tracks which delta tables feed each materialized view, along with the timestamp 
 | Column | Type | Description |
 |---|---|---|
 | `view_name` | `VARCHAR` | Name of the materialized view. |
-| `table_name` | `VARCHAR` | Name of the delta table (e.g., `openivm_delta_sales`). |
+| `table_name` | `VARCHAR` | Name of the native delta table (e.g., `openivm_delta_sales`) or the DuckLake table name. When a view has same-named sources in different schemas or catalogs, the stored key is qualified to keep them distinct. |
 | `last_update` | `TIMESTAMP` | Timestamp of the last refresh for this view-table pair. |
 | `catalog_type` | `VARCHAR` | `duckdb` or `ducklake`. |
 | `last_snapshot_id` | `BIGINT` | Last consumed DuckLake snapshot for DuckLake sources. |

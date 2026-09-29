@@ -194,7 +194,6 @@ port vs. invent.
     outerjoins" SIGMOD 1990, Moerkotte-Neumann "Dynamic programming strikes
     back" SIGMOD 2008. Does *not* cite Calcite, Camacho-Rodríguez (Hive MV
     rewrite), Enzyme (too recent).
-  - **Local copy**: `/home/ila/Code/openivm/Master_Thesis__View_Matching (21).pdf`.
 
 **Implications for OpenIVM.** The base matcher algorithm is essentially done; the
 open extensions are precisely the ones OpenIVM's infrastructure already supports
@@ -330,8 +329,7 @@ with aggregate rollup + IVM-aware freshness + snapshot-interval residuals."
   custom catalog for cache metadata, and background cache-build scheduling (the
   Wasm single-thread case is most of the paper). Adjacent to OpenIVM as
   infrastructure precedent (parser extension, custom catalog, background
-  population) but orthogonal in problem space. Local copy:
-  `/home/ila/.claude/projects/-home-ila-Code-openivm/b103b57e-7e6e-4e16-82e9-4af49a69c2be/tool-results/webfetch-1777023079907-0kaco3.pdf`.
+  population) but orthogonal in problem space.
 
 ### 3.12 SingleStore / MemSQL
 - MVs supported; matcher limited; result cache per node.

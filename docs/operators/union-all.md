@@ -65,16 +65,22 @@ WITH openivm_net AS (
     GROUP BY id, product
     HAVING SUM(openivm_multiplicity) != 0
 )
--- Delete net-removed copies
-DELETE FROM all_orders WHERE rowid IN (
-    SELECT v.rowid FROM (
-        SELECT rowid, id, product,
-            ROW_NUMBER() OVER (PARTITION BY id, product ORDER BY rowid) AS _rn
-        FROM all_orders
-    ) v JOIN openivm_net d
+-- Delete net-removed copies: join negative net tuples to the MV first,
+-- then rank only the matched candidates
+, openivm_delete_net AS (
+    SELECT * FROM openivm_net WHERE _net < 0
+), openivm_delete_candidates AS (
+    SELECT v.rowid, v.id AS id, v.product AS product, d._net
+    FROM all_orders v JOIN openivm_delete_net d
         ON v.id IS NOT DISTINCT FROM d.id
        AND v.product IS NOT DISTINCT FROM d.product
-    WHERE d._net < 0 AND v._rn <= -d._net
+), openivm_ranked_deletes AS (
+    SELECT rowid, _net,
+        ROW_NUMBER() OVER (PARTITION BY id, product ORDER BY rowid) AS _rn
+    FROM openivm_delete_candidates
+)
+DELETE FROM all_orders WHERE rowid IN (
+    SELECT rowid FROM openivm_ranked_deletes WHERE _rn <= -_net
 );
 
 -- Insert net-added copies
@@ -106,3 +112,10 @@ CREATE MATERIALIZED VIEW joined_union AS
 ```
 
 The join rule treats the UNION ALL subtree as an opaque leaf and delegates to the union rule for rewriting.
+
+## UNION (distinct)
+
+`UNION` without `ALL` is not linear: a row stays in the result while any branch still produces it.
+OpenIVM maintains it with affected-key recompute (`GROUP_RECOMPUTE`) over the visible output
+columns — output rows touched by the delta are deleted and recomputed from the view query. A
+`UNION` over aggregates is recomputed by the aggregate's group keys.

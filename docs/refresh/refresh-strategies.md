@@ -8,16 +8,21 @@ The `openivm_refresh_mode` setting controls which strategy is used at refresh ti
 
 | Mode            | Behavior |
 |-----------------|---|
-| `auto`          | The system decides. Uses incremental refresh when the view supports it; falls back to full refresh otherwise. |
-| `incremental`  (default)  | Forces the IVM delta pipeline. Fails if the view was classified as `FULL_REFRESH` at creation time. |
-| `full`          | Forces a complete DELETE + INSERT recomputation, regardless of whether the view supports IVM. |
+| `auto`          | Same as `incremental`. |
+| `incremental`  (default)  | Uses the strategy selected at view creation. Views classified as `FULL_REFRESH` are recomputed in full; this is not an error. |
+| `full`          | Forces a complete recomputation, regardless of whether the view supports IVM. |
+
+Only `full` changes the refresh path; any other value behaves like `incremental`. Choosing between
+incremental maintenance and recompute per refresh is controlled separately by
+`openivm_adaptive_refresh` (see below). OpenIVM also recomputes in full when it recovers from an
+interrupted refresh or when a DuckLake source's table identity or schema changed since the last refresh.
 
 ```sql
 -- Use incremental refresh (default)
 SET openivm_refresh_mode = 'incremental';
 PRAGMA refresh('monthly_totals');
 
--- Let the system decide (incremental when supported, full otherwise)
+-- Equivalent to 'incremental'
 SET openivm_refresh_mode = 'auto';
 PRAGMA refresh('monthly_totals');
 
@@ -36,7 +41,7 @@ The incremental refresh compiles different SQL depending on the view's `RefreshT
 | `SIMPLE_AGGREGATE` | `UPDATE` (single row) | No GROUP BY means the MV always has exactly one row (SQL guarantees ungrouped aggregates return one row, even on empty input). A plain UPDATE is sufficient. |
 | `SIMPLE_PROJECTION` | `DELETE` (rowid + ROW_NUMBER) then `INSERT` (generate_series) | No keys at all — the MV is a bag of tuples with valid duplicates. MERGE cannot target specific duplicate copies, so row-level addressing via rowid is required. |
 
-For views containing `MIN`, `MAX`, or `HAVING`, a **group-recompute** strategy is used instead: affected groups are deleted and re-inserted from the original query.
+For views containing `MIN`, `MAX`, `ARG_MIN`, or `ARG_MAX`, a **group-recompute** strategy is used instead: affected groups are deleted and re-inserted from the original query. Insert-only batches maintain `MIN`/`MAX` with `GREATEST`/`LEAST` instead (see [Append-only optimizations](../optimizations/append-only.md)). `HAVING` views use MERGE over all stored groups when `openivm_having_merge = true` (the default) and group recompute otherwise.
 
 MERGE requires a key to match source and target rows. `AGGREGATE_GROUP` views have natural keys (the GROUP BY columns), but the other two types do not:
 
@@ -95,7 +100,7 @@ Returns a single row:
 - `recompute_predicted_ms`: learned prediction for full recompute, or the static estimate before calibration.
 - `calibrated`: `true` when refresh history was sufficient to fit the learned model.
 
-Use `PRAGMA refresh_history('view_name')` to inspect the refresh records used by the learned model.
+Use `PRAGMA refresh_history('view_name')` to inspect the 20 most recent refresh records used by the learned model. History rows are recorded only for refreshes that run with `openivm_adaptive_refresh = true`.
 For implementation details and preliminary validation results, see
 [Cost Model](../internals/cost_model.md).
 

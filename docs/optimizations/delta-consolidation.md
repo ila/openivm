@@ -9,8 +9,19 @@ and redundant work.
 
 ## Solution
 
-Before applying deltas, OpenIVM consolidates them using a CTE that collapses all entries
-for the same logical row into a single net change.
+OpenIVM consolidates deltas at two points:
+
+1. **Source delta scans** (`openivm_compact_deltas`, default `true`): each delta scan in the
+   incremental plan, for both standard delta tables and DuckLake insertion/deletion scans, is
+   grouped by the source columns the view reads, with `SUM(openivm_multiplicity)` and rows with
+   a net weight of 0 removed. The view's pushed-down scan filters and the
+   `openivm_timestamp >= last_update` watermark are applied first.
+2. **Upsert**: the refresh SQL collapses the view's own delta (`openivm_delta_<view>`) into
+   one net change per logical row, as described below.
+
+```sql
+SET openivm_compact_deltas = false;  -- keep raw delta rows in the incremental plan
+```
 
 ### Projection Views
 
@@ -91,17 +102,17 @@ WITH consolidated AS (
 A SQL `UPDATE` is decomposed into a retraction (`-1`) of the old row plus an insertion
 (`+1`) of the new row. Both rows must commit together — if a concurrent refresh snapshots
 the database between them, it sees a half-applied UPDATE and consolidation produces a
-spurious net insert or net delete. To prevent that, the insert rule emits both rows in a
-**single multi-row INSERT** with `UNION ALL` (sharing one transaction and one `now()`):
+spurious net insert or net delete. To prevent that, the insert rule adds a streaming
+capture operator (`OPENIVM_TRANSACTIONAL_DELTA_CAPTURE`) to the `UPDATE` plan. For each
+updated row it fetches the old row by `rowid` and appends it to `openivm_delta_<table>` with
+multiplicity `-1`, followed by the new row with `+1`, through the caller's transaction. Rows are
+deduplicated by `rowid`, so a row is captured once per statement. `DELETE`, `INSERT`, and
+`MERGE INTO` use the same capture path; for `MERGE INTO`, only rows that an action actually
+inserts, updates, or deletes are captured.
 
-```sql
-INSERT INTO openivm_delta_t (..., openivm_multiplicity, openivm_timestamp)
-SELECT * FROM (... old row select with mul=-1 ...)
-UNION ALL
-SELECT * FROM (... new row select with mul=+1 ...);
-```
-
-This is what makes UPDATE-driven consolidation safe under concurrent refresh.
+This is what makes UPDATE-driven consolidation safe under concurrent refresh: the delta rows
+commit or roll back with the base-table change, and tracked DML is serialized with refresh by
+the OpenIVM mutation gate.
 
 ### Bag Semantics
 
@@ -120,18 +131,22 @@ WHERE _net > 0;
 ```
 
 **Precise deletes:** When `_net < 0`, exactly `|_net|` copies must be removed. OpenIVM
-assigns a deterministic ordering via `rowid` + `ROW_NUMBER()` to select which copies
-to delete:
+first joins the net-negative tuples to the MV (`IS NOT DISTINCT FROM` on every column), then
+ranks only those candidate rows by `rowid` to select which copies to delete:
 
 ```sql
 -- Remove exactly |_net| copies of each tuple
--- ROW_NUMBER assigns a stable ordering so we always delete the same copies
+WITH openivm_net AS (...),
+openivm_delete_candidates AS (
+    SELECT v.rowid, v.col1, v.col2, ..., d._net
+    FROM mv v JOIN openivm_net d
+      ON v.col1 IS NOT DISTINCT FROM d.col1 AND v.col2 IS NOT DISTINCT FROM d.col2 ...
+    WHERE d._net < 0
+), openivm_ranked_deletes AS (
+    SELECT rowid, _net,
+           ROW_NUMBER() OVER (PARTITION BY col1, col2, ... ORDER BY rowid) AS _rn
+    FROM openivm_delete_candidates
+)
 DELETE FROM mv
-WHERE rowid IN (
-    SELECT rowid FROM (
-        SELECT rowid, ROW_NUMBER() OVER (PARTITION BY col1, col2, ...) AS rn
-        FROM mv
-    )
-    WHERE rn <= abs(_net)
-);
+WHERE rowid IN (SELECT rowid FROM openivm_ranked_deletes WHERE _rn <= -_net);
 ```

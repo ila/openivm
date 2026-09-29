@@ -22,7 +22,7 @@ INSERT INTO orders VALUES (3, 75);
 PRAGMA refresh('customers_with_orders');
 ```
 
-`NOT EXISTS` and explicit `SEMI JOIN` / `ANTI JOIN` use the same maintenance path.
+`NOT EXISTS`, `IN (subquery)`, `NOT IN (subquery)`, and explicit `SEMI JOIN` / `ANTI JOIN` use the same maintenance path.
 
 ## How IVM handles it
 
@@ -39,6 +39,11 @@ OpenIVM keeps an auxiliary table named `openivm_semi_anti_state_<view>`. It stor
 |---|---|
 | `_left_count` | Bag multiplicity of the left tuple. |
 | `_match_count` | Number of right rows matching that left tuple under the original predicate. |
+
+For `NOT IN`, the aux table also stores the right-side row count (`_right_count`) and the number of
+right rows whose key is NULL (`_right_null_count`), plus a hidden left column recording whether the left
+key is NULL. Visibility then follows SQL's null-aware `NOT IN` semantics: a left tuple is visible if it
+has no match and either the right side is empty, or its key is not NULL and the right side has no NULL keys.
 
 Refresh uses the aux state instead of emitting raw right-side join matches:
 
@@ -59,19 +64,20 @@ The aux-state path supports:
 
 - Explicit `SEMI JOIN` and `ANTI JOIN`.
 - `WHERE EXISTS (...)` and `WHERE NOT EXISTS (...)` when DuckDB produces the supported semi/anti shape.
-- One left base table and one right base table.
+- `WHERE x IN (SELECT y FROM ...)` and `WHERE x NOT IN (SELECT y FROM ...)` (equality membership over a single-column subquery), including computed keys such as `CAST(x AS BIGINT)`.
+- One left base table and one right base table. For `IN` / `NOT IN`, the left side may also be a derived query.
 - Projection/filter stacks over the left tuple.
 - Arbitrary predicates, including non-equality predicates and right-side filters inside the `EXISTS` subquery.
 - Duplicate left rows under bag semantics.
 
 ## Limitations
 
-Unsupported semi/anti shapes fall back to full refresh:
+Aggregates over semi/anti output do not use the aux state. They are classified `GROUP_RECOMPUTE`: with `GROUP BY` keys only the affected groups are recomputed; without group keys the whole (single-row) result is recomputed and diffed against the stored one.
 
-- Aggregates over semi/anti output, including `GROUP BY`.
+Other unsupported semi/anti shapes fall back to full refresh:
+
 - Join chains where the left side of the semi/anti join is itself a join or another subplan.
 - Semi/anti joins whose right input is a derived subquery in `FROM`.
 - `UNION ALL` branches containing independent semi/anti views.
-- `IN` and `NOT IN` are not documented as aux-state supported because DuckDB may use MARK joins to preserve SQL NULL semantics.
 
 For ordinary inner/cross/arbitrary-predicate joins, see [Inner join, cross join, and arbitrary join predicates](inner-join.md).

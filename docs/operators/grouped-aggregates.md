@@ -24,7 +24,12 @@ PRAGMA refresh('sales_summary');
 new_MV[key] = old_MV[key] + openivm_delta_agg[key]
 ```
 
-For each group key, the delta aggregate is computed from the delta table and merged with the existing value. New groups are inserted; groups whose aggregates reach zero are deleted.
+For each group key, the delta aggregate is computed from the delta table and merged with the existing value. New groups are inserted; groups whose row count reaches zero are deleted.
+
+Hidden helper columns keep this exact:
+
+- If the view has no plain `COUNT(*)`, a hidden `openivm_count_star` column is added so emptied groups can be detected (a `COUNT(col)` or `SUM` can legitimately be 0 for a live group).
+- Each `SUM` gets a hidden `openivm_nonnull_sum_count_<n>` column (`COUNT` of its argument), so a group whose remaining inputs are all NULL gets `SUM = NULL` rather than 0.
 
 The delta table is scanned, grouped by the same keys as the view, and consolidated into net changes per group. A `MERGE INTO` statement atomically updates existing groups and inserts new ones.
 
@@ -74,8 +79,8 @@ WHEN MATCHED THEN UPDATE SET total = v.total + d.total, cnt = v.cnt + d.cnt
 -- New group: insert the delta as the initial value
 WHEN NOT MATCHED THEN INSERT (region, total, cnt) VALUES (d.region, d.total, d.cnt);
 
--- Remove groups where all rows have been deleted (aggregates sum to zero)
-DELETE FROM sales_summary WHERE total = 0 AND cnt = 0;
+-- Remove groups where all rows have been deleted (the COUNT columns reach zero)
+DELETE FROM sales_summary WHERE COALESCE(cnt, 0) = 0;
 ```
 
 ## Supported aggregates
@@ -86,11 +91,12 @@ DELETE FROM sales_summary WHERE total = 0 AND cnt = 0;
 | `COUNT`, `COUNT(*)` | Incremental (MERGE) | Delta added to existing count. |
 | `AVG` | Incremental (decomposed) | Rewritten to hidden SUM + COUNT columns. MERGE updates both; AVG recomputed as SUM / NULLIF(COUNT, 0). |
 | `STDDEV`, `VARIANCE` | Incremental (decomposed) | Rewritten to hidden SUM, SUM-of-squares, and COUNT columns. The final value is recomputed after MERGE. |
-| `MIN`, `MAX` | Group recompute | Affected groups deleted and re-inserted from the original query. Deleting the current min/max requires a full group rescan. |
+| `MIN`, `MAX` | Group recompute (insert-only: MERGE) | Affected groups deleted and re-inserted from the original query. Deleting the current min/max requires a full group rescan. Insert-only deltas merge with `LEAST`/`GREATEST` instead (`openivm_minmax_incremental`, default `true`). |
 | `BOOL_AND`, `BOOL_OR` | Group recompute | BOOLEAN is a non-summable type; affected groups are recomputed from the view query. Z-set correct: `BOOL_AND = false_count = 0`, `BOOL_OR = true_count > 0`. |
 | `ARG_MIN`, `ARG_MAX` | Group recompute | The winning value may change when the current extremum is deleted. |
-| `LIST` | Incremental or group recompute | Numeric list-valued expressions can use list arithmetic. `LIST(...) FILTER` and non-summable list shapes use group recompute. |
-| `HAVING` | Group recompute | Groups may enter or leave the result set after changes. |
+| `COUNT(DISTINCT x)` | Group recompute | Or per-(group, x) aux state with `openivm_stateful_auxstate=true` (default `false`). |
+| `LIST` | Group recompute | Every `LIST` aggregate, including `LIST(...) FILTER`, uses affected-group recompute. See [list-valued aggregates](list-aggregates.md). |
+| `HAVING` | Incremental (MERGE) | With `openivm_having_merge=true` (default) the data table stores all groups and the user-facing view applies the HAVING predicate. With the setting off, affected groups are recomputed; MIN/MAX and ARG_MIN/ARG_MAX follow their own rows above. |
 | `STRING_AGG`, `LISTAGG`, `MEDIAN`, quantiles | Full refresh | Automatically detected; view uses full recompute. |
 
 ## FILTER (WHERE predicate)
@@ -106,7 +112,7 @@ CREATE MATERIALIZED VIEW active_stats AS
     FROM employees GROUP BY dept;
 ```
 
-**Note**: `COUNT(DISTINCT x) FILTER (WHERE p)` still triggers full refresh — DISTINCT-aggregate variants are not supported regardless of the FILTER.
+**Note**: `COUNT(DISTINCT x) FILTER (WHERE p)` is rewritten the same way and then maintained like any `COUNT(DISTINCT)` (affected-group recompute). `LIST(...) FILTER` is not rewritten, because `LIST` keeps NULL elements; it uses affected-group recompute with the original SQL.
 
 ## Expressions
 
