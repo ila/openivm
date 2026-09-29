@@ -459,16 +459,16 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		string delta_name = SqlUtils::DeltaName(table_name);
 		auto source_locus = std::make_pair(source->ParentCatalog().GetName(), source->schema.name);
 
-		Connection con(*input.context.db);
-		RefreshMetadata::UseCatalog(input.context, con, source_locus.first);
-		// Check if a delta table exists for this base table (i.e., it's tracked by IVM)
-		auto delta_check = con.Query("SELECT 1 FROM information_schema.tables WHERE table_catalog = '" +
-		                             SqlUtils::EscapeValue(source_locus.first) + "' AND table_schema = '" +
-		                             SqlUtils::EscapeValue(source_locus.second) + "' AND table_name = '" +
-		                             SqlUtils::EscapeValue(delta_name) + "'");
-		if (delta_check->HasError() || delta_check->RowCount() == 0) {
+		// Resolve only the source's delta table in the caller transaction. Scanning
+		// information_schema touches unrelated external catalogs and can silently
+		// skip schema synchronization when one of them is unavailable.
+		auto delta_entry = Catalog::GetEntry<TableCatalogEntry>(input.context, source_locus.first, source_locus.second,
+		                                                        delta_name, OnEntryNotFound::RETURN_NULL);
+		if (!delta_entry) {
 			return; // not an IVM-tracked table
 		}
+		Connection con(*input.context.db);
+		RefreshMetadata::UseCatalog(input.context, con, source_locus.first);
 		TransactionalMVLockState::Get(input.context).AcquireMutationLock();
 
 		switch (alter_info->alter_table_type) {

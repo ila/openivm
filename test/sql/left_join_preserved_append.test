@@ -48,6 +48,8 @@ PRAGMA refresh('ljpa_mh');
 
 query I
 SELECT contains(content, 'generate_series') AND NOT contains(content, 'openivm_affected')
+       AND NOT contains(content, 'openivm_publish_next_')
+       AND NOT contains(content, 'openivm_publish_changes_')
 FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6c6a70615f6d68_.sql');
 ----
 1
@@ -201,6 +203,8 @@ PRAGMA refresh('ljpa2_mh');
 
 query I
 SELECT contains(content, 'generate_series') AND NOT contains(content, 'openivm_affected')
+       AND NOT contains(content, 'openivm_publish_next_')
+       AND NOT contains(content, 'openivm_publish_changes_')
 FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6c6a7061325f6d68_.sql');
 ----
 1

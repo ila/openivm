@@ -165,3 +165,114 @@ the cost model reuses its normal-equation submatrix instead of scanning history
 again, and one parsed SQL tree replaces the running-window string/regex parser.
 DuckLake snapshot-source resolution and optional metadata reads also share helpers.
 The residual persisted small-chain overhead remains a profiling target.
+
+## Append-only projection publication
+
+The SF100 DuckLake TPC-DI run at `38929faa` exposed a large regression: batch 2
+of `fact_market_history` spent approximately 46 minutes publishing visible rows
+after 148 ms computing the delta and 53 ms appending maintenance rows. The
+unscoped publication path compared the entire wide relation for a LEFT JOIN,
+even though the projection compiler had proved that this refresh only appends.
+
+Publication now reuses the exact append query produced by the projection
+compiler, including timestamp filtering and positive multiplicity expansion.
+The stable visible table and child-facing change tracking remain in place.
+LEFT JOINs qualify only when the nullable side is quiet. Nullable-side insertions
+can retract NULL-extended rows even when the primary delta has only positive
+weights. Those batches now use the existing per-key cardinality proof and
+transition-key correction, rather than the unsafe positive-weight shortcut.
+ORDER BY/LIMIT wrappers,
+replacement, HAVING, and maintenance programs with retractions keep the signed
+visible-result comparison. This change does not remove their existing costs or
+the initial visible-table copy.
+
+Local comparison on 2026-09-28, four threads, DuckDB `08e34c447b`, DuckLake,
+15 visible columns, and two consecutive batches of 100 appended rows:
+
+| Stored rows | `38929faa` refresh seconds | Append publication refresh seconds |
+|---|---|---|
+| 500,000 | 0.533 / 0.526 | 0.123 / 0.131 |
+| 5,000,000 | 3.963 / 3.952 | 0.120 / 0.121 |
+
+Each case used a fresh database. The source was `(i % 1000 AS k, i AS v)`,
+LEFT JOINed to 500 dimension keys with string labels, projecting the two source
+columns, the label, and twelve `v + constant` columns. Only refresh was timed;
+each batch was checked against the original query with `EXCEPT ALL` in both
+directions. These are local microbenchmarks, not an SF100 end-to-end result.
+The original top-k pipeline benchmark also passes all bag checks at 100,000
+rows, with both 20 and 10,000 changed keys over four conflicting-mutation batches.
+
+
+## Follow-up: retain affected scopes and apply signed projection deltas
+
+The SF100 run at `f49c27ab` spent 43.2/42.1 seconds in visible publication during
+batches 2/3, despite the earlier append optimization. Keyed projection and
+DuckLake window maintenance discarded their affected-key tables before
+publication, forcing a second comparison of the whole visible relation.
+
+Retain those tables until publication completes. Compact window diffs retain
+old keys as well as new keys, including NULLs, so deleted rows and vanished
+partitions remain in scope. For ordinary signed projections, reuse the existing
+bag-aware projection delta compiler against the visible table; do not rediscover
+those deltas by comparing stored results. Ordered/limited publication and
+outer-join correction paths retain their existing handling.
+
+Local four-thread DuckLake checks used 500,000 stored rows, two refreshes each,
+and conflicting inserts/deletes/updates before every refresh. Full bidirectional
+EXCEPT ALL checks passed. The baseline binary at `38929faa` has the same
+publication paths for these mixed-DML cases as `f49c27ab`:
+
+| Shape | Before (s), batches 1/2 | After (s), batches 1/2 |
+|---|---:|---:|
+| Bounded window, 12 output columns | 0.367 / 0.402 | 0.335 / 0.366 |
+| Signed projection, 11 output columns | 0.285 / 0.308 | 0.146 / 0.167 |
+
+These small local tests establish neither SF100 performance nor parity with the
+older `f5935aed` benchmark. The SF10 validation and SF100 timing rerun must verify
+that separately. Initial visible-table copying and aggregate publication remain.
+
+## Follow-up: metadata setup and exact window publication
+
+The SF100 statement profile at `6db895a0` recorded 122.423 seconds in system-table
+setup, including 111.702 seconds in 1,029 repeated ALTER statements. The ALTER
+hook checked for delta tables through `information_schema.tables`, enumerating
+unrelated external catalogs even for no-op metadata migrations. A held-SQLite-lock
+regression also exposed a correctness failure: a native source ALTER could succeed
+without synchronizing its delta schema when that catalog enumeration failed.
+
+Inspect the caller's metadata schema, migrate only missing columns, resolve ALTER
+delta tables directly, and run stale-row catalog checks only when the caller's
+snapshot contains matching metadata. Existing schema upgrades, NULL backfills,
+duplicate detection, stale-row recovery, and transactional rollback remain.
+Empty DuckLake publication deltas use the existing schema-only creation helper.
+
+A local four-thread SQLite-backed DuckLake comparison created 49 projection views
+of a 100,000-row source in fresh databases. Metadata setup decreased from 147.824
+to 0.193 seconds; profiled creation totals decreased from 172.202 to 14.076 seconds.
+Every initial view and the final mixed-DML refresh passed bidirectional bag checks.
+These timings are local measurements, not predictions for SF100. The first remote
+metadata fix (`e134bb56`) validated all 49 models in all three SF10 batches and
+measured 430.954 / 96.634 / 90.573 seconds at SF100. That run predates the final
+stale-row cleanup and publication optimizations.
+
+For incremental publication, compact window maintenance now retains both changed
+row images and passes their signed bag directly to the existing projection-delta
+compiler. Filtering and global ordering/limit wrappers retain their comparison
+path. Native publication SQL uses explicit semijoins and DELETE USING: with the
+existing deliminator safety guard, correlated EXISTS otherwise introduces a
+redundant target-side grouping step. Spark SQL generation retains its syntax.
+
+Local comparison against `91107fa4`, 500,000 source rows, four threads, two
+consecutive mixed-DML batches, one fresh database per binary:
+
+| Shape | Before (s), batches 1/2 | After (s), batches 1/2 |
+|---|---:|---:|
+| Bounded window, 12 output columns | 0.338 / 0.395 | 0.203 / 0.232 |
+| MIN/MAX/COUNT aggregate, three long string group keys | 0.892 / 0.851 | 0.575 / 0.579 |
+
+The window uses 1,000 partitions and `RANGE BETWEEN 3 PRECEDING AND CURRENT ROW`; each batch
+inserts 100 rows, deletes 10 and updates 10. The aggregate groups 500,000 distinct
+keys plus three string columns; each batch inserts 100 rows, deletes five and
+updates five. Only refresh is timed. Each result is checked with EXCEPT ALL in
+both directions. Initial publication copying and end-to-end SF100 parity still
+require separate measurement.

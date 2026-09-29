@@ -251,7 +251,7 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 		return result;
 	}
 
-	InitializeMVMetadata(context, con);
+	InitializeMVMetadata(context, con, default_db, default_schema);
 
 	// PAC compatibility boundary: internal planning uses a fresh connection, so
 	// forward PAC settings when that extension is loaded in the caller session.
@@ -270,6 +270,11 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 	auto target = ResolveMaterializedViewTarget(context, full_view_name);
 	string view_catalog_prefix;
 	string sql_view_name = target.view_name;
+	if (!context.transaction.IsAutoCommit()) {
+		// Reuse legacy keys written earlier in the caller transaction as well.
+		// Otherwise the helper allocates a second key for the same SQL name.
+		RefreshMetadata(con).SnapshotTransaction(context);
+	}
 	string view_name = RefreshMetadata(con).AllocateViewKey(target.catalog_name, target.schema_name, sql_view_name);
 	view_key = view_name;
 	string view_target_catalog = target.catalog_name;
@@ -989,8 +994,8 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 
 	add_profile_marker("create_mv_system_tables", "refresh_type=" + string(RefreshTypeName(refresh_type)) +
 	                                                  "; lpts_fallback=" + string(lpts_fallback ? "true" : "false"));
-	AppendCreateMVSystemTablesDDL(ddl, view_name, parse_data_ref.is_replace, view_target_catalog, view_target_schema,
-	                              sql_view_name);
+	AppendCreateMVSystemTablesDDL(context, default_db, default_schema, ddl, view_name, parse_data_ref.is_replace,
+	                              view_target_catalog, view_target_schema, sql_view_name);
 	auto system_ddl_end = ddl.size();
 
 	bool has_downstream_views = false;
@@ -1360,6 +1365,12 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 	// TABLE AS so those unqualified names resolve in the MV's catalog.
 	add_profile_marker("create_mv_initial_load", "sources=" + to_string(table_names.size()) +
 	                                                 "; generated_query_bytes=" + to_string(view_query.size()));
+	const bool batch_ducklake_creation = target_is_ducklake && !parse_data_ref.is_replace;
+	if (batch_ducklake_creation) {
+		// Keep the initial data and publication in one DuckLake commit. Native
+		// metadata remains outside this transaction, as required across catalogs.
+		ddl.push_back("BEGIN TRANSACTION");
+	}
 	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 		ddl.push_back("use " + current_catalog_schema);
 	}
@@ -1467,15 +1478,21 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 		ddl.push_back(string(staged_cross_catalog_replace && !has_downstream_views ? "CREATE OR REPLACE TABLE "
 		                                                                           : "CREATE TABLE IF NOT EXISTS ") +
 		              published + " AS " + published_query);
-		ddl.push_back(string(staged_cross_catalog_replace && !has_downstream_views ? "CREATE OR REPLACE TABLE "
-		                                                                           : "CREATE TABLE IF NOT EXISTS ") +
-		              published_delta + " AS SELECT *, 1::INTEGER AS openivm_multiplicity, " +
-		              string(openivm::UTC_NOW_SQL) + " AS openivm_timestamp FROM " + published + " LIMIT 0");
+		if (target_is_ducklake) {
+			// Derive the empty companion schema directly, as for the maintenance
+			// delta table, without running another DuckLake CTAS pipeline.
+			ddl.push_back(BuildCreateDeltaFromDataOperation(published_delta, published,
+			                                                staged_cross_catalog_replace && !has_downstream_views));
+		} else {
+			ddl.push_back("CREATE TABLE IF NOT EXISTS " + published_delta +
+			              " AS SELECT *, 1::INTEGER AS openivm_multiplicity, " + string(openivm::UTC_NOW_SQL) +
+			              " AS openivm_timestamp FROM " + published + " LIMIT 0");
+		}
 		if (parse_data_ref.is_replace) {
 			ddl.push_back(BuildPublishViewSQL(
 			    view_name, internal_catalog_prefix, published_query, visible_columns, target_is_ducklake,
 			    SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE), {}, creation_timestamp,
-			    SqlDialect::DUCKDB, RefreshMetadata::MetadataCatalogs(con)));
+			    SqlDialect::DUCKDB, "", "", RefreshMetadata::MetadataCatalogs(con)));
 		}
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("published_query", published_query, view_name));
 		ddl.push_back(string(staged_cross_catalog_replace ? "CREATE OR REPLACE VIEW " : "CREATE VIEW ") + qvn +
@@ -1483,6 +1500,10 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 		              (top_k_order_suffix.empty() ? "" : " ORDER BY " + string(openivm::PUBLISHED_ORDINAL_COL)));
 		add_cleanup("DROP TABLE IF EXISTS " + published);
 		add_cleanup("DROP TABLE IF EXISTS " + published_delta);
+	}
+	if (batch_ducklake_creation) {
+		add_profile_marker("create_mv_physical_commit");
+		ddl.push_back("COMMIT");
 	}
 
 	vector<string> native_watermark_ddl;

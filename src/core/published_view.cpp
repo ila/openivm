@@ -25,6 +25,7 @@ string PublishedSourceViewName(string source_name) {
 string BuildPublishViewSQL(const string &view_name, const string &prefix, const string &query,
                            const vector<string> &columns, bool ducklake, const string &metadata_table,
                            const vector<string> &scope_columns, const string &timestamp_sql, SqlDialect dialect,
+                           const string &appended_rows, const string &scope_rows,
                            const vector<string> &metadata_catalogs) {
 	auto quote = [&](const string &name) {
 		return DialectQuoteIdent(name, dialect);
@@ -39,6 +40,28 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 		quoted_columns.push_back(quote(column));
 	}
 	auto column_list = StringUtil::Join(quoted_columns, ", ");
+	if (!appended_rows.empty()) {
+		// The projection compiler supplies the exact rows appended to maintenance
+		// state, including bag expansion and the refresh timestamp filter. Reuse
+		// them instead of scanning and diffing the entire published relation.
+		vector<string> projection;
+		for (auto &column : columns) {
+			projection.push_back(column == openivm::PUBLISHED_ORDINAL_COL ? "CAST(0 AS BIGINT) AS " + quote(column)
+			                                                              : quote(column));
+		}
+		auto rows = "SELECT " + StringUtil::Join(projection, ", ") + " FROM (" + appended_rows + ") appended_rows";
+		string sql = "INSERT INTO " + visible + " " + rows + ";\n";
+		if (!ducklake) {
+			auto timestamp = timestamp_sql.empty() ? openivm::UTC_NOW_SQL : timestamp_sql;
+			sql += "INSERT INTO " + delta + " (" + column_list +
+			       ", openivm_multiplicity, openivm_timestamp) SELECT *, 1::INTEGER, " + timestamp + " FROM (" + rows +
+			       ") published_rows WHERE EXISTS (SELECT 1 FROM " + metadata_table + " WHERE table_name = '" +
+			       SqlUtils::EscapeValue(delta_name) + "');\n";
+			sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, metadata_catalogs);
+		}
+		OPENIVM_DEBUG_PRINT("[PUBLISH] Appending visible projection delta for %s\n", view_name.c_str());
+		return sql;
+	}
 	string equality;
 	for (auto &column : columns) {
 		if (!equality.empty()) {
@@ -58,8 +81,14 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	string scoped_query = query;
 	string old_query = "SELECT * FROM " + visible;
 	if (!scope.empty()) {
-		auto raw_delta = prefix + quote(SqlUtils::DeltaName(view_name));
-		auto predicate = " WHERE EXISTS (SELECT 1 FROM " + raw_delta + " d WHERE " + scope + ")";
+		OPENIVM_DEBUG_PRINT("[PUBLISH] Scoping %s by %zu affected columns\n", view_name.c_str(), scope_columns.size());
+		auto raw_delta = scope_rows.empty() ? prefix + quote(SqlUtils::DeltaName(view_name)) : scope_rows;
+		// The native executor disables deliminator for deeply nested maintenance
+		// SQL. Express the semijoin directly to avoid grouping all target rows
+		// merely to decorrelate an EXISTS predicate.
+		auto predicate = dialect == SqlDialect::DUCKDB
+		                     ? " SEMI JOIN " + raw_delta + " d ON " + scope
+		                     : " WHERE EXISTS (SELECT 1 FROM " + raw_delta + " d WHERE " + scope + ")";
 		scoped_query = "SELECT v.* FROM (" + query + ") v" + predicate;
 		old_query = "SELECT v.* FROM " + visible + " v" + predicate;
 	}
@@ -89,9 +118,16 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	}
 	// Replace only changed bags. DuckLake keeps its table identity and records the
 	// modifications in snapshots; native consumers read the explicit signed delta.
-	sql += "DELETE FROM " + visible + " AS v WHERE EXISTS (SELECT 1 FROM " + changes + " d WHERE " + equality + ");\n";
-	sql += "INSERT INTO " + visible + " SELECT v.* FROM " + next + " v WHERE EXISTS (SELECT 1 FROM " + changes +
-	       " d WHERE " + equality + ");\n";
+	if (dialect == SqlDialect::DUCKDB) {
+		sql += "DELETE FROM " + visible + " AS v USING " + changes + " d WHERE " + equality + ";\n";
+		sql += "INSERT INTO " + visible + " SELECT v.* FROM " + next + " v SEMI JOIN " + changes + " d ON " + equality +
+		       ";\n";
+	} else {
+		sql +=
+		    "DELETE FROM " + visible + " AS v WHERE EXISTS (SELECT 1 FROM " + changes + " d WHERE " + equality + ");\n";
+		sql += "INSERT INTO " + visible + " SELECT v.* FROM " + next + " v WHERE EXISTS (SELECT 1 FROM " + changes +
+		       " d WHERE " + equality + ");\n";
+	}
 	sql += "DROP TABLE " + changes + ";\nDROP TABLE " + next + ";\n";
 	if (!ducklake) {
 		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, metadata_catalogs);

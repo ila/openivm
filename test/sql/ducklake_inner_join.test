@@ -15,6 +15,9 @@ LOAD ducklake;
 statement ok
 ATTACH '__TEST_DIR__/ducklake_inner_join.db' AS dl (TYPE ducklake);
 
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
 # ==========================================
 # Test 1: 2-table INNER JOIN — INSERT left, then right
 # ==========================================
@@ -673,6 +676,196 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# The existing conflicting updates above must publish only the retained key scope.
+query I
+SELECT contains(content, 'SELECT v.* FROM (SELECT *, CAST(0 AS BIGINT) AS openivm_ordinal')
+   AND contains(content, 'SEMI JOIN openivm_old_affected___openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_ d ON')
+   AND contains(content, 'USING openivm_publish_changes___openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_ d WHERE')
+   AND contains(content, 'SEMI JOIN openivm_publish_changes___openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_ d ON')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_70726f6a656374696f6e5f6b65795f686f6c64696e6773_.sql');
+----
+1
+
+# DuckLake uses the helper-connection DDL executor with measured statement profiles.
+statement ok
+SET openivm_profile_refresh=true;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.profile_ddl_probe AS SELECT id,name FROM dl.customers;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_ddl_probe EXCEPT ALL SELECT id,name FROM dl.customers)),
+       (SELECT count(*) FROM (SELECT id,name FROM dl.customers EXCEPT ALL SELECT * FROM dl.profile_ddl_probe));
+----
+0	0
+
+query I
+SELECT count(*) >= 3 AND bool_and(duration_ms >= 0)
+FROM openivm_refresh_profile
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_' AND step_name = 'create_mv_sql_stmt'
+  AND starts_with(detail, 'phase=create_mv_user_view; statement=');
+----
+1
+
+# An up-to-date metadata schema must not run ALTER migrations again.
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_' AND step_name = 'create_mv_sql_stmt'
+  AND contains(detail, 'sql=alter table openivm_');
+----
+0
+
+# Simulate an older database. Missing columns must still be migrated, independently
+# for each metadata table, before creation and incremental refresh proceed.
+statement ok
+ALTER TABLE openivm_views DROP COLUMN pending_after_hook;
+
+statement ok
+ALTER TABLE openivm_delta_tables DROP COLUMN pending_estimate_ts;
+
+statement ok
+ALTER TABLE openivm_refresh_history DROP COLUMN strategy;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.profile_migration_probe AS SELECT id,name FROM dl.customers;
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f6d6967726174696f6e5f70726f6265_' AND step_name = 'create_mv_sql_stmt'
+  AND contains(detail, 'sql=alter table openivm_');
+----
+3
+
+statement ok
+INSERT INTO dl.customers VALUES (901, NULL), (901, NULL), (902, 'temporary');
+
+statement ok
+DELETE FROM dl.customers WHERE id = 902;
+
+statement ok
+UPDATE dl.customers SET name = 'updated' WHERE id = 901;
+
+statement ok
+PRAGMA refresh('profile_migration_probe');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_migration_probe EXCEPT ALL SELECT id,name FROM dl.customers)),
+       (SELECT count(*) FROM (SELECT id,name FROM dl.customers EXCEPT ALL SELECT * FROM dl.profile_migration_probe));
+----
+0	0
+
+statement ok
+CREATE MATERIALIZED VIEW dl.profile_migrated_probe AS SELECT id,name FROM dl.customers;
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f6d696772617465645f70726f6265_' AND step_name = 'create_mv_sql_stmt'
+  AND contains(detail, 'sql=alter table openivm_');
+----
+0
+
+# The empty published-delta companion uses the same schema-only creation path as
+# maintenance deltas. Keep the companion available for legacy delta consumers.
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_' AND step_name = 'create_mv_user_view'
+  AND contains(detail, 'derived_from_data_schema=true');
+----
+1
+
+query II
+SELECT (SELECT count(*) FROM dl.openivm_delta_openivm_visible___openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_),
+       (SELECT count(*) FROM duckdb_columns() WHERE database_name = 'dl'
+        AND table_name = 'openivm_delta_openivm_visible___openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_'
+        AND column_name IN ('id', 'name', 'openivm_ordinal', 'openivm_multiplicity', 'openivm_timestamp'));
+----
+0	5
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_' AND step_name = 'create_mv_sql_stmt'
+  AND contains(detail, 'sql=DELETE FROM openivm_views');
+----
+0
+
+# A committed stale row also remains recoverable on the helper-connection path.
+statement ok
+INSERT INTO openivm_views (view_name, sql_string, type) VALUES
+('profile_stale_probe', 'SELECT id, name FROM dl.customers', 0);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.profile_stale_probe AS SELECT id, name FROM dl.customers;
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'profile_stale_probe' AND step_name = 'create_mv_sql_stmt'
+  AND contains(detail, 'sql=DELETE FROM openivm_views');
+----
+1
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_stale_probe EXCEPT ALL SELECT id, name FROM dl.customers)),
+       (SELECT count(*) FROM (SELECT id, name FROM dl.customers EXCEPT ALL SELECT * FROM dl.profile_stale_probe));
+----
+0	0
+
+
+# Initial physical tables are committed together; metadata remains outside the
+# DuckLake transaction. An execution failure must roll back before cleanup/retry.
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name='__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_' AND step_name='create_mv_physical_commit';
+----
+1
+
+statement ok
+CREATE TABLE dl.profile_creation_fail_source(v VARCHAR);
+
+statement ok
+INSERT INTO dl.profile_creation_fail_source VALUES ('10'), ('bad');
+
+statement error
+CREATE MATERIALIZED VIEW dl.profile_creation_retry AS SELECT v::INTEGER AS v FROM dl.profile_creation_fail_source;
+----
+Could not convert string
+
+query II
+SELECT (SELECT count(*) FROM duckdb_tables() WHERE database_name='dl' AND table_name IN
+        ('openivm_data___openivm_mv_646c_6d61696e_70726f66696c655f6372656174696f6e5f7265747279_', 'openivm_visible___openivm_mv_646c_6d61696e_70726f66696c655f6372656174696f6e5f7265747279_', 'openivm_delta_openivm_visible___openivm_mv_646c_6d61696e_70726f66696c655f6372656174696f6e5f7265747279_')),
+       (SELECT count(*) FROM openivm_views WHERE view_name='__openivm_mv_646c_6d61696e_70726f66696c655f6372656174696f6e5f7265747279_');
+----
+0	0
+
+statement ok
+UPDATE dl.profile_creation_fail_source SET v='20' WHERE v='bad';
+
+statement ok
+CREATE MATERIALIZED VIEW dl.profile_creation_retry AS SELECT v::INTEGER AS v FROM dl.profile_creation_fail_source;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_creation_retry EXCEPT ALL SELECT v::INTEGER FROM dl.profile_creation_fail_source)),
+       (SELECT count(*) FROM (SELECT v::INTEGER FROM dl.profile_creation_fail_source EXCEPT ALL SELECT * FROM dl.profile_creation_retry));
+----
+0	0
+
+statement ok
+INSERT INTO dl.profile_creation_fail_source VALUES ('30'), ('30');
+
+statement ok
+DELETE FROM dl.profile_creation_fail_source WHERE v='10';
+
+statement ok
+UPDATE dl.profile_creation_fail_source SET v='25' WHERE v='20';
+
+statement ok
+PRAGMA refresh('profile_creation_retry');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.profile_creation_retry EXCEPT ALL SELECT v::INTEGER FROM dl.profile_creation_fail_source)),
+       (SELECT count(*) FROM (SELECT v::INTEGER FROM dl.profile_creation_fail_source EXCEPT ALL SELECT * FROM dl.profile_creation_retry));
+----
+0	0
 
 # Same-named physical sources must retain distinct delta identities.
 statement ok

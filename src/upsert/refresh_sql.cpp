@@ -22,6 +22,7 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/planner.hpp"
@@ -539,6 +540,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	vector<string> publication_columns;
 	string publication_query;
 	bool global_publication = false;
+	bool publication_has_filter = false;
 	string publication_source_query;
 	string publication_prefix = internal_catalog_prefix;
 	auto publication = con.Query("SELECT published_query FROM openivm_views WHERE view_name='" +
@@ -559,6 +561,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		Parser publication_parser;
 		publication_parser.ParseQuery(publication_query);
 		auto &node = publication_parser.statements[0]->Cast<SelectStatement>().node;
+		publication_has_filter =
+		    node->type != QueryNodeType::SELECT_NODE || bool(node->Cast<SelectNode>().where_clause);
 		for (auto &modifier : node->modifiers) {
 			global_publication |= modifier->type == ResultModifierType::LIMIT_MODIFIER ||
 			                      modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER ||
@@ -575,7 +579,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
 		                                      publication_columns, target_is_ducklake, delta_metadata_table, {}, "",
-		                                      active_facts.target_dialect, metadata_catalogs);
+		                                      active_facts.target_dialect, "", "", metadata_catalogs);
 	}
 	auto finalize_refresh_sql = [&](string refresh_sql, bool publish = true) {
 		if (publish) {
@@ -725,6 +729,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	RefreshType dispatch_refresh_type = use_full_recompute ? RefreshType::FULL_REFRESH : view_query_type;
 	refresh_plan.refresh_type = dispatch_refresh_type;
 	auto group_cols = metadata.GetGroupColumns(view_name);
+	RefreshPublicationScope retained_publication_scope;
+	auto publication_scope = !publication_query.empty() && !global_publication && target_is_ducklake &&
+	                                 active_facts.target_dialect == SqlDialect::DUCKDB
+	                             ? &retained_publication_scope
+	                             : nullptr;
 	vector<string> window_publication_keys;
 	if (dispatch_refresh_type == RefreshType::WINDOW_PARTITION && !group_cols.empty() && !publication_query.empty() &&
 	    !global_publication && !target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB &&
@@ -792,6 +801,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                     "; list_mode=" + string(list_mode ? "true" : "false"));
 
 	string upsert_query;
+	string appended_projection_rows;
 	bool window_uses_suffix = false;
 	string delta_ts_filter = BuildDeltaTimestampFilter(con, view_name, has_ts_col);
 	bool has_left_join =
@@ -1068,15 +1078,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	}
 	case RefreshType::SIMPLE_PROJECTION: {
 		if (!has_full_outer && !has_left_join &&
-		    TryBuildDuckLakeProjectionKeyRefresh(metadata, con, view_name, delta_table_names, data_table,
-		                                         view_query_sql, view_catalog_name, view_schema_name,
-		                                         attached_db_catalog_name, attached_db_schema_name, upsert_query)) {
+		    TryBuildDuckLakeProjectionKeyRefresh(
+		        metadata, con, view_name, delta_table_names, data_table, view_query_sql, view_catalog_name,
+		        view_schema_name, attached_db_catalog_name, attached_db_schema_name, upsert_query, publication_scope)) {
 			refresh_plan.skip_projection_key_delta = true;
 		} else {
 			upsert_query = CompileProjectionRefresh(
 			    metadata, view_name, column_names, delta_table_names, data_table, view_query_sql, delta_ts_filter,
 			    internal_catalog_prefix, has_full_outer, has_left_join, skip_proj_delete, insert_only,
-			    fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only, delete_retry_plan);
+			    fast_paths.active_delta_table_names, cross_system && !active_facts.compile_only, delete_retry_plan,
+			    &appended_projection_rows);
 		}
 		break;
 	}
@@ -1121,7 +1132,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		    metadata, con, view_name, view_query_sql, delta_table_names, column_names, data_table, delta_ts_filter,
 		    internal_catalog_prefix, view_catalog_name, view_schema_name, attached_db_catalog_name,
 		    attached_db_schema_name, cross_system, emit_cascade_delta_for_recompute, running_window_incremental,
-		    &window_uses_suffix);
+		    &window_uses_suffix, publication_scope);
 		break;
 	}
 	case RefreshType::COUNT_DISTINCT_INCREMENTAL: {
@@ -1787,9 +1798,41 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				}
 			}
 		}
-		publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
-		                                      publication_columns, target_is_ducklake, delta_metadata_table,
-		                                      scope_columns, "", active_facts.target_dialect, metadata_catalogs);
+		// Append-only maintenance does not imply append-only visible output for
+		// ORDER BY/LIMIT. Keep the signed visible diff for those global wrappers.
+		if (global_publication || active_facts.target_dialect != SqlDialect::DUCKDB) {
+			appended_projection_rows.clear();
+		}
+		if (!retained_publication_scope.rows.empty()) {
+			scope_columns = retained_publication_scope.columns;
+		}
+		// Reuse exact row changes where the published output is a row projection.
+		// The existing compiler preserves NULLs and duplicate multiplicities.
+		string signed_publication_rows;
+		string signed_publication_filter;
+		if (!retained_publication_scope.signed_rows.empty() && !global_publication && !publication_has_filter) {
+			signed_publication_rows = std::move(retained_publication_scope.signed_rows);
+		} else if (target_is_ducklake && active_facts.target_dialect == SqlDialect::DUCKDB && !global_publication &&
+		           dispatch_refresh_type == RefreshType::SIMPLE_PROJECTION && !source_has_left_join &&
+		           !source_has_full_outer && !refresh_plan.SkipsDeltaProduction() && !inline_mv_delta &&
+		           !use_transient_mv_delta && appended_projection_rows.empty()) {
+			signed_publication_rows = publication_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+			signed_publication_filter = delta_ts_filter;
+		}
+		if (!signed_publication_rows.empty()) {
+			auto visible = publication_prefix + SqlUtils::QuoteIdentifier(PublishedViewName(view_name));
+			auto visible_delta = "(SELECT *, CAST(0 AS BIGINT) AS " + string(openivm::PUBLISHED_ORDINAL_COL) +
+			                     " FROM " + signed_publication_rows + ")";
+			publication_sql =
+			    CompileProjectionDelta(visible, visible_delta, publication_columns, signed_publication_filter);
+			OPENIVM_DEBUG_PRINT("[PUBLISH] Applying exact signed row changes for %s\n", view_name.c_str());
+		} else {
+			publication_sql = BuildPublishViewSQL(
+			    view_name, publication_prefix, publication_source_query, publication_columns, target_is_ducklake,
+			    delta_metadata_table, scope_columns, "", active_facts.target_dialect, appended_projection_rows,
+			    retained_publication_scope.rows, metadata_catalogs);
+		}
+		publication_sql += retained_publication_scope.cleanup_sql;
 	}
 	string data_sql = transient_delta_preamble + pre_companion + delta_query + "\n" + companion_query + "\n" +
 	                  upsert_query + "\n" + post_companion + publication_sql + compact_delta_view_query +

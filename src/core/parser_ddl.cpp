@@ -171,6 +171,10 @@ public:
 		refresh_id = "create_mv_" + to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 	}
 
+	bool Enabled() const {
+		return enabled;
+	}
+
 	void SetViewName(const string &view_name_p) {
 		if (view_name.empty()) {
 			view_name = view_name_p;
@@ -208,18 +212,21 @@ public:
 		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
 		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
 		                  to_string(retention_days) + " days'");
+		// Statement profiles should not add a metadata commit for every DDL operation.
+		string values;
 		for (auto &step : steps) {
-			auto result = profile_con.Query(
-			    "INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
-			    " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES ('" +
-			    SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) + "', " +
-			    to_string(step.step_order) + ", '" + SqlUtils::EscapeValue(step.step_name) + "', " +
-			    to_string(step.duration_ms) + ", '" + SqlUtils::EscapeValue(step.detail) + "')");
-			if (result->HasError()) {
-				OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record CREATE MV step '%s': %s\n", step.step_name.c_str(),
-				                    result->GetError().c_str());
-				return;
+			if (!values.empty()) {
+				values += ", ";
 			}
+			values += "('" + SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) + "', " +
+			          to_string(step.step_order) + ", '" + SqlUtils::EscapeValue(step.step_name) + "', " +
+			          to_string(step.duration_ms) + ", '" + SqlUtils::EscapeValue(step.detail) + "')";
+		}
+		auto result =
+		    profile_con.Query("INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
+		                      " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES " + values);
+		if (result->HasError()) {
+			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record CREATE MV profile: %s\n", result->GetError().c_str());
 		}
 	}
 
@@ -386,6 +393,9 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	}
 	vector<string> cleanup_ddl;
 	auto run_cleanup = [&]() {
+		if (!conn->context->transaction.IsAutoCommit()) {
+			conn->Rollback();
+		}
 		for (const auto &cleanup : cleanup_ddl) {
 			OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Cleanup DDL: %s\n", cleanup.c_str());
 			auto cleanup_result = conn->Query(cleanup);
@@ -418,7 +428,23 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Executing DDL batch (%lu statements): %s\n",
 		                    (unsigned long)pending_ddl.size(), query.c_str());
 		auto ddl_start = std::chrono::steady_clock::now();
-		auto r = conn->Query(query);
+		unique_ptr<MaterializedQueryResult> r;
+		if (profiler.Enabled()) {
+			auto statements = SqlUtils::SplitSQLStatements(query);
+			for (idx_t i = 0; i < statements.size(); i++) {
+				auto statement_start = std::chrono::steady_clock::now();
+				r = conn->Query(statements[i]);
+				profiler.AddStep("create_mv_sql_stmt", statement_start,
+				                 "phase=" + current_profile_step + "; statement=" + to_string(i + 1) + "/" +
+				                     to_string(statements.size()) +
+				                     "; sql=" + SqlUtils::SQLStatementPreview(statements[i]));
+				if (r->HasError()) {
+					break;
+				}
+			}
+		} else {
+			r = conn->Query(query);
+		}
 		profiler.AddStep(current_profile_step, ddl_start,
 		                 current_profile_detail + "; statements=" + to_string(pending_ddl.size()) +
 		                     "; bytes=" + to_string(bytes));
@@ -480,7 +506,11 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 				                 current_profile_detail + "; delta_schema_derivation_failed=true");
 				fail_ddl(ex.what());
 			}
+			auto statement_start = std::chrono::steady_clock::now();
 			auto r = conn->Query(derived.sql);
+			profiler.AddStep("create_mv_sql_stmt", statement_start,
+			                 "phase=" + current_profile_step +
+			                     "; statement=1/1; sql=" + SqlUtils::SQLStatementPreview(derived.sql));
 			profiler.AddStep(current_profile_step, ddl_start,
 			                 current_profile_detail + "; statements=1; bytes=" + to_string(derived.sql.size()) +
 			                     "; derived_from_data_schema=true; columns=" + to_string(derived.column_count));
