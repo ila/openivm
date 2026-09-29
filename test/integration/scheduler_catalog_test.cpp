@@ -45,6 +45,10 @@ int main(int argc, char **argv) {
 		std::cout << "READY" << std::endl;
 		string line;
 		std::getline(std::cin, line);
+		auto catalogs = RefreshMetadata::MetadataCatalogs(con);
+		if (catalogs != vector<string> {"memory", "other"}) {
+			throw InvalidInputException("Source metadata discovery did not find both native catalogs");
+		}
 		auto views = metadata.GetScheduledViews();
 		if (views.size() != 2 || views[0].metadata_catalog != "memory" || views[1].metadata_catalog != "other" ||
 		    views[0].view_name != "__openivm_mv_6d656d6f7279_6d61696e_7363686564756c6564_" ||
