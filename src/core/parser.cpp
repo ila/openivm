@@ -1501,6 +1501,20 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 		add_cleanup("DROP TABLE IF EXISTS " + published);
 		add_cleanup("DROP TABLE IF EXISTS " + published_delta);
 	}
+	// Delta table for the MV — based on the DATA table (has all columns)
+	add_profile_marker("create_mv_mv_delta_table");
+	string qdv = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
+	ddl.push_back(BuildCreateDeltaFromDataOperation(qdv, qdt, staged_cross_catalog_replace));
+	if (preserve_consumer_deltas) {
+		ddl.push_back("INSERT INTO " + qdv + " BY NAME SELECT " + StringUtil::Join(replacement_delta_projection, ", ") +
+		              " FROM " + preserved_delta);
+		ddl.push_back("DROP TABLE " + preserved_delta);
+		ddl.push_back("INSERT INTO " + qdv + " BY NAME SELECT *, 1::INTEGER AS openivm_multiplicity, " +
+		              creation_timestamp + " AS openivm_timestamp FROM " + qdt);
+	}
+
+	add_cleanup("DROP TABLE IF EXISTS " + qdv);
+
 	if (batch_ducklake_creation) {
 		add_profile_marker("create_mv_physical_commit");
 		ddl.push_back("COMMIT");
@@ -1540,20 +1554,6 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 		    " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 		    SqlUtils::EscapeValue(source_metadata_key(source, SqlUtils::DeltaName(table_name))) + "'");
 	}
-
-	// Delta table for the MV — based on the DATA table (has all columns)
-	add_profile_marker("create_mv_mv_delta_table");
-	string qdv = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
-	ddl.push_back(BuildCreateDeltaFromDataOperation(qdv, qdt, staged_cross_catalog_replace));
-	if (preserve_consumer_deltas) {
-		ddl.push_back("INSERT INTO " + qdv + " BY NAME SELECT " + StringUtil::Join(replacement_delta_projection, ", ") +
-		              " FROM " + preserved_delta);
-		ddl.push_back("DROP TABLE " + preserved_delta);
-		ddl.push_back("INSERT INTO " + qdv + " BY NAME SELECT *, 1::INTEGER AS openivm_multiplicity, " +
-		              creation_timestamp + " AS openivm_timestamp FROM " + qdt);
-	}
-
-	add_cleanup("DROP TABLE IF EXISTS " + qdv);
 
 	// --- Index DDL (for aggregate group queries) ---
 	// The index belongs to the MV state, not its sources. DuckLake-backed state cannot have it.

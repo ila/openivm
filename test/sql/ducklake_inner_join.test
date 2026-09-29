@@ -819,6 +819,15 @@ WHERE view_name='__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_'
 ----
 1
 
+# The empty maintenance companion belongs to the same physical commit.
+query I
+SELECT max(step_order) FILTER (WHERE step_name='create_mv_mv_delta_table')
+     < min(step_order) FILTER (WHERE step_name='create_mv_physical_commit')
+FROM openivm_refresh_profile
+WHERE view_name='__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265_';
+----
+1
+
 statement ok
 CREATE TABLE dl.profile_creation_fail_source(v VARCHAR);
 
