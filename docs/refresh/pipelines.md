@@ -119,7 +119,7 @@ SET openivm_cascade_refresh = 'upstream';
 PRAGMA refresh_pipeline('sales_report', 'inventory_report');
 ```
 
-OpenIVM discovers the graph from current source metadata on each call. No pipeline registration is needed. Arguments are unqualified MV names in the current metadata catalog, as with `refresh`; use `USE` to select an attached native database. DuckLake views use their native controller's metadata.
+OpenIVM discovers the graph from current source metadata on each call. No pipeline registration is needed. Arguments accept unqualified, `schema.view`, or `catalog.schema.view` names, as with `refresh`; qualify names that would otherwise be ambiguous. Use `USE` to select an attached native metadata database. DuckLake views use their native controller's metadata.
 
 | Cascade mode | Selected views |
 |---|---|
