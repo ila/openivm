@@ -1457,10 +1457,16 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		ddl.push_back(string(staged_cross_catalog_replace && !has_downstream_views ? "CREATE OR REPLACE TABLE "
 		                                                                           : "CREATE TABLE IF NOT EXISTS ") +
 		              published + " AS " + published_query);
-		ddl.push_back(string(staged_cross_catalog_replace && !has_downstream_views ? "CREATE OR REPLACE TABLE "
-		                                                                           : "CREATE TABLE IF NOT EXISTS ") +
-		              published_delta + " AS SELECT *, 1::INTEGER AS openivm_multiplicity, " +
-		              string(openivm::UTC_NOW_SQL) + " AS openivm_timestamp FROM " + published + " LIMIT 0");
+		if (target_is_ducklake) {
+			// Derive the empty companion schema directly, as for the maintenance
+			// delta table, without running another DuckLake CTAS pipeline.
+			ddl.push_back(BuildCreateDeltaFromDataOperation(published_delta, published,
+			                                                staged_cross_catalog_replace && !has_downstream_views));
+		} else {
+			ddl.push_back("CREATE TABLE IF NOT EXISTS " + published_delta +
+			              " AS SELECT *, 1::INTEGER AS openivm_multiplicity, " + string(openivm::UTC_NOW_SQL) +
+			              " AS openivm_timestamp FROM " + published + " LIMIT 0");
+		}
 		if (parse_data_ref.is_replace) {
 			ddl.push_back(BuildPublishViewSQL(
 			    view_name, internal_catalog_prefix, published_query, visible_columns, target_is_ducklake,

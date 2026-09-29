@@ -762,3 +762,20 @@ WHERE view_name = 'profile_migrated_probe' AND step_name = 'create_mv_sql_stmt'
   AND contains(detail, 'sql=alter table openivm_');
 ----
 0
+
+# The empty published-delta companion uses the same schema-only creation path as
+# maintenance deltas. Keep the companion available for legacy delta consumers.
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name = 'profile_ddl_probe' AND step_name = 'create_mv_user_view'
+  AND contains(detail, 'derived_from_data_schema=true');
+----
+1
+
+query II
+SELECT (SELECT count(*) FROM dl.openivm_delta_openivm_visible_profile_ddl_probe),
+       (SELECT count(*) FROM duckdb_columns() WHERE database_name = 'dl'
+        AND table_name = 'openivm_delta_openivm_visible_profile_ddl_probe'
+        AND column_name IN ('id', 'name', 'openivm_ordinal', 'openivm_multiplicity', 'openivm_timestamp'));
+----
+0	5

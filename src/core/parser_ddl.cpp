@@ -503,7 +503,11 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 				                 current_profile_detail + "; delta_schema_derivation_failed=true");
 				fail_ddl(ex.what());
 			}
+			auto statement_start = std::chrono::steady_clock::now();
 			auto r = conn->Query(derived.sql);
+			profiler.AddStep("create_mv_sql_stmt", statement_start,
+			                 "phase=" + current_profile_step +
+			                     "; statement=1/1; sql=" + SqlUtils::SQLStatementPreview(derived.sql));
 			profiler.AddStep(current_profile_step, ddl_start,
 			                 current_profile_detail + "; statements=1; bytes=" + to_string(derived.sql.size()) +
 			                     "; derived_from_data_schema=true; columns=" + to_string(derived.column_count));
