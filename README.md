@@ -153,7 +153,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 
 | Call | Description | Documentation |
 |------|-------------|---------------|
-| `PRAGMA refresh('view_name')` | Refresh a materialized view; accepts `schema.view` or `catalog.view` | [Refresh strategies](docs/refresh/refresh-strategies.md) |
+| `PRAGMA refresh('view_name')` | Refresh a materialized view; accepts `schema.view`, `catalog.view`, or `catalog.schema.view` | [Refresh strategies](docs/refresh/refresh-strategies.md) |
 | `PRAGMA refresh_options(catalog, schema, view_name)` | Refresh with explicit catalog/schema | — |
 | `PRAGMA refresh_pipeline('view_name', ...)` | Refresh one or more MVs and their cascade dependencies as one ordered run | [Pipelines](docs/refresh/pipelines.md) |
 | `PRAGMA refresh_status('view_name')` | Show refresh interval, last/next refresh, daemon status, and refresh strategy | [Automatic refresh](docs/refresh/automatic-refresh.md) |
@@ -163,6 +163,34 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `PRAGMA openivm_files('view_name')` | Show paths and status of the compiled SQL reference files | [Build: inspect SQL](docs/build/building.md#inspect-the-generated-sql) |
 | `PRAGMA openivm_declare_rely_fk(child_table, child_columns, parent_table, parent_columns)` | Declare a trusted (RELY) foreign key used by FK-aware join pruning | — |
 | `openivm_compile_with_facts(view_name, facts_json)` | Table function: compile a refresh program as rows without executing it | [Build: compiled SQL](docs/build/building.md#inspect-or-save-compiled-sql-without-files) |
+
+## Schemas, metadata, and compiled SQL
+
+- **Can schemas contain same-named views or source tables?** Yes. Use
+  `PRAGMA refresh('dl.observation.product_summary')` to identify a view explicitly.
+  A short name works when it identifies one MV; ambiguous names produce an error.
+- **Where are internal tables stored?** For DuckLake views, control metadata stays
+  in the native frontend database's `main` schema. MV backing and internal delta
+  tables live in the MV's schema; native source deltas live with their source.
+- **Why are DuckLake delta tables empty?** DuckLake source changes come from
+  snapshots. Internal MV delta tables are still created for lifecycle handling
+  and can be empty. Leave them in place.
+- **Can metadata stay outside DuckLake?** It already does. Start the built CLI with
+  `./build/release/duckdb openivm_frontend.duckdb`, then attach your lake. Reopen
+  that frontend and reattach the same lake under the same name in later sessions.
+  A configurable metadata schema such as `openivm` is not implemented; use `main`.
+- **Where is the generated SQL?** File export is opt-in. Create an output directory
+  and set `openivm_files_path` before CREATE or refresh. Then call
+  `PRAGMA openivm_files('dl.observation.product_summary')` to inspect exact paths.
+  This pragma reports files; it does not generate them.
+- **Can compiled SQL be stored in a table?** Yes: select from
+  `openivm_compile_with_facts` into your own table. Automatic archival in OpenIVM
+  metadata is not implemented. Compiled SQL contains state-specific cutoffs;
+  compile again for later refreshes.
+
+See [schema and metadata examples](docs/ducklake.md#schemas-metadata-and-internal-tables),
+[exporting and inspecting SQL files](docs/build/building.md#inspect-the-generated-sql),
+and [saving compiled SQL as rows](docs/build/building.md#inspect-or-save-compiled-sql-without-files).
 
 ## Documentation
 

@@ -274,7 +274,7 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
                                   const string &affected_temp_table, const vector<string> &upsert_keys,
-                                  const string &recompute_temp_table) {
+                                  const string &recompute_temp_table, RefreshPublicationScope *publication_scope) {
 	string affected_block = "(\n" + affected_subquery + "\n)";
 	string affected_source = affected_temp_table.empty() ? affected_block : affected_temp_table;
 	string delete_where =
@@ -310,7 +310,13 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
 		          "\nWHERE " + insert_where + ";\n";
 	}
 	if (!affected_temp_table.empty()) {
-		result += "\nDROP TABLE IF EXISTS " + affected_temp_table + ";\n";
+		auto cleanup = "\nDROP TABLE IF EXISTS " + affected_temp_table + ";\n";
+		if (publication_scope) {
+			publication_scope->rows = affected_temp_table;
+			publication_scope->cleanup_sql = cleanup;
+		} else {
+			result += cleanup;
+		}
 	}
 	return result;
 }
@@ -411,7 +417,8 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,
                                           const string &view_schema_name, const string &attached_db_catalog_name,
-                                          const string &attached_db_schema_name, string &upsert_query) {
+                                          const string &attached_db_schema_name, string &upsert_query,
+                                          RefreshPublicationScope *publication_scope) {
 	RefreshMetadata::ProjectionKeyLineage lineage;
 	if (!metadata.GetProjectionKeyLineage(view_name, lineage)) {
 		return false;
@@ -476,7 +483,13 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
 	upsert_query += "DELETE FROM " + data_table + " AS " + target_alias + "\nWHERE EXISTS (SELECT 1 FROM " +
 	                temp_affected + " openivm_aff WHERE " + target_match + ");\n\n";
 	upsert_query += "INSERT INTO " + data_table + "\n" + pushed_query + ";\n\n";
-	upsert_query += "DROP TABLE IF EXISTS " + temp_affected + ";\n";
+	if (publication_scope) {
+		publication_scope->columns = {lineage.output_col};
+		publication_scope->rows = temp_affected;
+		publication_scope->cleanup_sql = "DROP TABLE IF EXISTS " + temp_affected + ";\n";
+	} else {
+		upsert_query += "DROP TABLE IF EXISTS " + temp_affected + ";\n";
+	}
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling SIMPLE_PROJECTION DuckLake affected-key refresh (%s via %s[%llu])\n",
 	                    lineage.output_col.c_str(), lineage.key_source.c_str(),
 	                    static_cast<unsigned long long>(lineage.key_occurrence));
@@ -814,7 +827,7 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
                                                    const vector<string> &column_names,
                                                    const vector<string> &delta_table_names, const string &data_table,
                                                    const string &view_query_sql, const string &qdv,
-                                                   const string &delta_ts_filter, const string &lk, bool insert_only,
+                                                   const string &delta_ts_filter, const string &lk,
                                                    bool can_use_runtime_delta_shape, bool nullable_side_quiet,
                                                    ProjectionDeleteRetryPlan *delete_retry_plan) {
 	// The primary LEFT JOIN delta omits NULL-padding transition corrections. For a single outer join,
@@ -822,7 +835,7 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 	// primary cardinality prediction with the current query. Exact tuple deltas are safe for matching
 	// keys; only transition keys need the existing delete/recompute path. Multiple outer joins are not
 	// eligible because cardinality corrections at different levels or join predicates can cancel.
-	if (insert_only || !can_use_runtime_delta_shape || delta_table_names.empty()) {
+	if (!can_use_runtime_delta_shape || delta_table_names.empty()) {
 		return "";
 	}
 	for (auto &delta_table : delta_table_names) {
@@ -999,21 +1012,22 @@ static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const st
                                              const vector<string> &column_names,
                                              const vector<string> &delta_table_names, const string &data_table,
                                              const string &view_query_sql, const string &delta_ts_filter,
-                                             const string &catalog_prefix, bool insert_only,
-                                             bool can_use_runtime_delta_shape, bool nullable_side_quiet,
-                                             ProjectionDeleteRetryPlan *delete_retry_plan) {
+                                             const string &catalog_prefix, bool can_use_runtime_delta_shape,
+                                             bool nullable_side_quiet, ProjectionDeleteRetryPlan *delete_retry_plan) {
 	string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
 	string lk = KeywordHelper::WriteOptionallyQuoted(string(openivm::LEFT_KEY_COL));
 	string mul = KeywordHelper::WriteOptionallyQuoted(string(openivm::MULTIPLICITY_COL));
 	string negative_delta_guard;
-	if (can_use_runtime_delta_shape) {
+	// Primary deltas omit NULL-padding retractions when nullable-side inserts
+	// create a first match. Positive weights alone do not prove an append.
+	if (can_use_runtime_delta_shape && nullable_side_quiet) {
 		string negative_where = delta_ts_filter.empty() ? " WHERE " : " WHERE " + delta_ts_filter + " AND ";
 		negative_delta_guard = "EXISTS (SELECT 1 FROM " + qdv + " openivm_delta_shape" + negative_where +
 		                       "openivm_delta_shape." + mul + " < 0 LIMIT 1)";
 	}
 	string hybrid_refresh = BuildLeftJoinHybridProjectionRefresh(
 	    metadata, view_name, column_names, delta_table_names, data_table, view_query_sql, qdv, delta_ts_filter, lk,
-	    insert_only, can_use_runtime_delta_shape, nullable_side_quiet, delete_retry_plan);
+	    can_use_runtime_delta_shape, nullable_side_quiet, delete_retry_plan);
 	if (!hybrid_refresh.empty()) {
 		return hybrid_refresh;
 	}
@@ -1030,7 +1044,7 @@ static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const st
 		                                             affected + data_table + "." + lk + delta_where + ")",
 		                                             affected + "openivm_lj." + lk + delta_where + ")");
 	}
-	if (!can_use_runtime_delta_shape) {
+	if (negative_delta_guard.empty()) {
 		return pushed_refresh;
 	}
 
@@ -1096,7 +1110,8 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
                                 const string &view_query_sql, const string &delta_ts_filter,
                                 const string &catalog_prefix, bool has_full_outer, bool has_left_join,
                                 bool skip_proj_delete, bool insert_only, const vector<string> &active_delta_table_names,
-                                bool can_use_runtime_delta_shape, ProjectionDeleteRetryPlan *delete_retry_plan) {
+                                bool can_use_runtime_delta_shape, ProjectionDeleteRetryPlan *delete_retry_plan,
+                                string *appended_rows) {
 	if (has_full_outer) {
 		return BuildFullOuterProjectionRefresh(metadata, view_name, delta_table_names, data_table, view_query_sql,
 		                                       delta_ts_filter, catalog_prefix);
@@ -1107,13 +1122,14 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
 			OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN insert-only append for %s (nullable side quiet)\n",
 			                    view_name.c_str());
 			return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix,
-			                                 /*insert_only=*/true);
+			                                 /*insert_only=*/true, appended_rows);
 		}
 		return BuildLeftJoinProjectionRefresh(metadata, view_name, column_names, delta_table_names, data_table,
-		                                      view_query_sql, delta_ts_filter, catalog_prefix, insert_only,
+		                                      view_query_sql, delta_ts_filter, catalog_prefix,
 		                                      can_use_runtime_delta_shape, nullable_side_quiet, delete_retry_plan);
 	}
-	return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete);
+	return CompileProjectionsFilters(view_name, column_names, delta_ts_filter, catalog_prefix, skip_proj_delete,
+	                                 appended_rows);
 }
 
 void AppendSimpleAggregateEmptySourceNulling(RefreshMetadata &metadata, string &upsert_query, const string &view_name,

@@ -67,7 +67,7 @@ SELECT count(*) FROM (
 0
 
 # ==========================================
-# Runtime output-delta append guard
+# Runtime cardinality proof for nullable-side changes
 # ==========================================
 
 statement ok
@@ -92,7 +92,9 @@ CREATE MATERIALIZED VIEW dl.mv_runtime_left_join AS
 # Touch both sides so the static preserved-side fast path cannot fire. Adding
 # matches to an already-matched key only produces positive output deltas. The
 # duplicate right rows exercise multiplicity expansion, while the NULL-keyed
-# left row remains in the materialized bag.
+# left row remains in the materialized bag. Positive primary weights alone
+# cannot rule out NULL-padding retractions: prove cardinalities per affected
+# key and reserve recompute for transition keys, as with mixed DML.
 statement ok
 INSERT INTO dl.runtime_left VALUES (NULL, 'second-null-key');
 
@@ -103,10 +105,10 @@ statement ok
 PRAGMA refresh('mv_runtime_left_join');
 
 query I
-SELECT contains(content, 'openivm_delta_shape')
-       AND contains(content, 'openivm_multiplicity < 0')
-       AND contains(content, 'generate_series')
-       AND NOT contains(content, 'openivm_lj_key_stats_')
+SELECT contains(content, 'openivm_lj_safe_net_')
+       AND contains(content, 'openivm_lj_key_stats_')
+       AND contains(content, 'WHERE NOT openivm_stats.openivm_safe')
+       AND NOT contains(content, 'openivm_delta_shape')
 FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a6f696e_.sql');
 ----
 true

@@ -270,14 +270,19 @@ string RefreshMetadata::GetLastUpdate(const string &view_name, const string &tab
 }
 
 vector<string> RefreshMetadata::MetadataCatalogs(Connection &con) {
-	auto rows = con.Query("SELECT DISTINCT database_name FROM duckdb_tables() WHERE schema_name='main' "
-	                      "AND table_name='openivm_delta_tables' AND NOT temporary ORDER BY database_name");
+	// Source metadata lives in native catalogs. Enumerating external tables also
+	// opens their metadata transactions and can block on unrelated DuckLake writes.
+	auto rows = con.Query("SELECT database_name FROM duckdb_databases() WHERE type='duckdb' "
+	                      "AND NOT internal ORDER BY database_name");
 	if (rows->HasError()) {
 		throw CatalogException("OpenIVM could not locate source metadata: %s", rows->GetError());
 	}
 	vector<string> catalogs;
 	for (idx_t row = 0; row < rows->RowCount(); row++) {
-		catalogs.push_back(rows->GetValue(0, row).ToString());
+		auto catalog = rows->GetValue(0, row).ToString();
+		if (con.TableInfo(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE)) {
+			catalogs.push_back(std::move(catalog));
+		}
 	}
 	return catalogs;
 }
@@ -700,14 +705,20 @@ int64_t RefreshMetadata::GetRefreshInterval(const string &view_name) {
 }
 
 vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
-	auto catalogs = con.Query("SELECT DISTINCT database_name FROM duckdb_tables() WHERE schema_name = 'main' "
-	                          "AND table_name = 'openivm_views' AND NOT internal ORDER BY database_name");
+	// Scheduler metadata belongs to native catalogs. Scanning duckdb_tables()
+	// also opens external catalogs, taking DuckLake/SQLite read locks while a
+	// foreground refresh may be committing its writes.
+	auto catalogs = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'duckdb' "
+	                          "AND NOT internal ORDER BY database_name");
 	if (catalogs->HasError()) {
 		throw CatalogException("OpenIVM could not enumerate metadata catalogs: %s", catalogs->GetError());
 	}
 	string query;
 	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
 		auto catalog = catalogs->GetValue(0, row).ToString();
+		if (!con.TableInfo(catalog, DEFAULT_SCHEMA, openivm::VIEWS_TABLE)) {
+			continue;
+		}
 		auto catalog_literal = "'" + SqlUtils::EscapeValue(catalog) + "'";
 		if (!query.empty()) {
 			query += " UNION ALL ";

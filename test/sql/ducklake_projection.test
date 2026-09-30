@@ -834,3 +834,73 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Signed publication must retract only the changed copies of duplicate tuples.
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE dl.signed_source(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.signed_source VALUES (1,10),(1,10),(1,10),(NULL,20),(2,NULL),(3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.signed_parent AS SELECT k,v FROM dl.signed_source;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.signed_child AS SELECT * FROM dl.signed_parent;
+
+statement ok
+INSERT INTO dl.signed_source VALUES (1,10),(NULL,20),(4,40);
+
+statement ok
+DELETE FROM dl.signed_source WHERE rowid=(SELECT min(rowid) FROM dl.signed_source WHERE k=1);
+
+statement ok
+UPDATE dl.signed_source SET v=NULL WHERE k=3;
+
+statement ok
+PRAGMA refresh('signed_parent');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.signed_parent EXCEPT ALL SELECT * FROM dl.signed_source)),
+       (SELECT count(*) FROM (SELECT * FROM dl.signed_source EXCEPT ALL SELECT * FROM dl.signed_parent));
+----
+0	0
+
+statement ok
+DELETE FROM dl.signed_source WHERE k IS NULL;
+
+statement ok
+UPDATE dl.signed_source SET k=NULL WHERE k=4;
+
+statement ok
+INSERT INTO dl.signed_source VALUES (2,NULL);
+
+statement ok
+PRAGMA refresh('signed_parent');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.signed_parent EXCEPT ALL SELECT * FROM dl.signed_source)),
+       (SELECT count(*) FROM (SELECT * FROM dl.signed_source EXCEPT ALL SELECT * FROM dl.signed_parent));
+----
+0	0
+
+statement ok
+PRAGMA refresh('signed_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.signed_child EXCEPT ALL SELECT * FROM dl.signed_source)),
+       (SELECT count(*) FROM (SELECT * FROM dl.signed_source EXCEPT ALL SELECT * FROM dl.signed_child));
+----
+0	0
+
+query I
+SELECT NOT contains(content, 'openivm_publish_next_') AND contains(content, 'openivm_visible___openivm_mv_646c_6d61696e_7369676e65645f706172656e74_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_7369676e65645f706172656e74_.sql');
+----
+1

@@ -16,6 +16,14 @@ namespace duckdb {
 
 constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
 
+// A maintenance compiler may retain its affected rows until publication finishes.
+struct RefreshPublicationScope {
+	vector<string> columns;
+	string rows;
+	string cleanup_sql;
+	string signed_rows;
+};
+
 struct ViewLocation {
 	string catalog_name;
 	string schema_name;
@@ -163,7 +171,8 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
                                   const string &affected_temp_table = "", const vector<string> &upsert_keys = {},
-                                  const string &recompute_temp_table = "");
+                                  const string &recompute_temp_table = "",
+                                  RefreshPublicationScope *publication_scope = nullptr);
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
 string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &query, const string &delta_table,
@@ -187,19 +196,19 @@ string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const strin
                                           const string &data_table, const string &view_query_sql,
                                           const string &delta_ts_filter, const string &catalog_prefix,
                                           const string &recompute_alias);
-string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
-                                const vector<string> &delta_table_names, const string &data_table,
-                                const string &view_query_sql, const string &delta_ts_filter,
-                                const string &catalog_prefix, bool has_full_outer, bool has_left_join,
-                                bool skip_proj_delete, bool insert_only = false,
-                                const vector<string> &active_delta_table_names = {},
-                                bool can_use_runtime_delta_shape = false,
-                                ProjectionDeleteRetryPlan *delete_retry_plan = nullptr);
+string
+CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
+                         const vector<string> &delta_table_names, const string &data_table,
+                         const string &view_query_sql, const string &delta_ts_filter, const string &catalog_prefix,
+                         bool has_full_outer, bool has_left_join, bool skip_proj_delete, bool insert_only = false,
+                         const vector<string> &active_delta_table_names = {}, bool can_use_runtime_delta_shape = false,
+                         ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, string *appended_rows = nullptr);
 bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,
                                           const string &view_schema_name, const string &attached_db_catalog_name,
-                                          const string &attached_db_schema_name, string &upsert_query);
+                                          const string &attached_db_schema_name, string &upsert_query,
+                                          RefreshPublicationScope *publication_scope = nullptr);
 void AppendSimpleAggregateEmptySourceNulling(RefreshMetadata &metadata, string &upsert_query, const string &view_name,
                                              const vector<string> &column_names, const string &data_table,
                                              const string &view_catalog_name, const string &view_schema_name,
@@ -265,7 +274,8 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
                                    bool cross_system, bool emit_cascade_delta = false,
-                                   bool running_window_incremental = false, bool *uses_running_suffix = nullptr);
+                                   bool running_window_incremental = false, bool *uses_running_suffix = nullptr,
+                                   RefreshPublicationScope *publication_scope = nullptr);
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta = nullptr,

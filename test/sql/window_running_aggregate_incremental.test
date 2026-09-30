@@ -744,7 +744,7 @@ SELECT COUNT(*) FROM information_schema.columns WHERE table_name='openivm_data__
 
 # Publishing an unordered native window scopes both old and new rows by its raw delta.
 query I
-SELECT CAST(sql LIKE '%WHERE EXISTS (SELECT 1 FROM wrai_rows.main.openivm_delta___openivm_mv_777261695f726f7773_6d61696e_77665f617667_ d WHERE%' AS INTEGER) FROM openivm_compile_with_facts('wf_avg','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}') WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next___openivm_mv_777261695f726f7773_6d61696e_77665f617667_ AS%';
+SELECT CAST(sql LIKE '%SEMI JOIN wrai_rows.main.openivm_delta___openivm_mv_777261695f726f7773_6d61696e_77665f617667_ d ON%' AS INTEGER) FROM openivm_compile_with_facts('wf_avg','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}') WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next___openivm_mv_777261695f726f7773_6d61696e_77665f617667_ AS%';
 ----
 1
 
@@ -802,7 +802,7 @@ statement ok
 CREATE VIEW wf_top_expected AS SELECT *,SUM(x) OVER (PARTITION BY k ORDER BY d ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) s FROM wf_source ORDER BY s DESC,k,d LIMIT 2;
 
 query I
-SELECT CAST(sql NOT LIKE '%WHERE EXISTS (SELECT 1 FROM wrai_rows.main.openivm_delta___openivm_mv_777261695f726f7773_6d61696e_77665f746f70_ d WHERE%' AS INTEGER) FROM openivm_compile_with_facts('wf_top','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}') WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next___openivm_mv_777261695f726f7773_6d61696e_77665f746f70_ AS%';
+SELECT CAST(sql NOT LIKE '%SEMI JOIN wrai_rows.main.openivm_delta___openivm_mv_777261695f726f7773_6d61696e_77665f746f70_ d ON%' AS INTEGER) FROM openivm_compile_with_facts('wf_top','{"target_dialect":"duckdb","compile_only":true,"assume_insert_only":true,"running_window_incremental":true}') WHERE sql LIKE 'CREATE TEMP TABLE openivm_publish_next___openivm_mv_777261695f726f7773_6d61696e_77665f746f70_ AS%';
 ----
 1
 
