@@ -15,6 +15,8 @@ static constexpr const char *OPENIVM_DDL_CLEANUP_PREFIX = "openivm_cleanup:";
 static constexpr const char *OPENIVM_DDL_PROFILE_PREFIX = "openivm_profile:";
 static constexpr const char *OPENIVM_DDL_PROFILE_RECORD_PREFIX = "openivm_profile_record:";
 static constexpr const char *OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX = "openivm_create_delta_from_data:";
+static constexpr const char *OPENIVM_DDL_CREATE_PUBLICATION_FROM_FILES_PREFIX =
+    "openivm_create_publication_from_files:";
 static constexpr const char *OPENIVM_TRANSACTIONAL_DDL_FUNCTION = "openivm_transactional_ddl";
 static constexpr const char *OPENIVM_STAGED_DDL_FUNCTION = "openivm_staged_ddl";
 

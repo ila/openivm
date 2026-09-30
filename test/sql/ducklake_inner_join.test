@@ -712,12 +712,21 @@ WHERE view_name = '__openivm_mv_646c_6d61696e_70726f66696c655f64646c5f70726f6265
 # native metadata transaction and the committed DuckLake objects must both
 # be cleaned up, without removing metadata belonging to an existing view.
 statement ok
+CALL ducklake_set_option('dl', 'data_inlining_row_limit', 0);
+
+statement ok
 CREATE UNIQUE INDEX profile_metadata_failure ON openivm_views(view_name, view_sql_name);
 
 statement error
 CREATE MATERIALIZED VIEW dl.profile_metadata_retry AS SELECT id,name FROM dl.customers;
 ----
 Conflict target has to be provided
+
+query I
+SELECT count(*) FROM openivm_refresh_profile
+WHERE view_name='__openivm_mv_646c_6d61696e_70726f66696c655f6d657461646174615f7265747279_' AND step_name='publication_file_copy';
+----
+1
 
 query II
 SELECT (SELECT count(*) FROM openivm_views WHERE view_sql_name='profile_metadata_retry'),

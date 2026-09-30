@@ -1475,9 +1475,25 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 			ddl.push_back("DROP TABLE IF EXISTS " + published);
 			ddl.push_back("DROP TABLE IF EXISTS " + published_delta);
 		}
-		ddl.push_back(string(staged_cross_catalog_replace && !has_downstream_views ? "CREATE OR REPLACE TABLE "
-		                                                                           : "CREATE TABLE IF NOT EXISTS ") +
-		              published + " AS " + published_query);
+		bool physical_filename = false;
+		for (const auto &name : output_names) {
+			physical_filename |= StringUtil::CIEquals(name, "filename");
+		}
+		if (batch_ducklake_creation && internal_cols.empty() && view_tail.empty() && top_k_order_suffix.empty() &&
+		    !physical_filename) {
+			vector<string> parameters;
+			for (const auto &value : {internal_target_catalog, internal_target_schema, PublishedViewName(view_name),
+			                          qdt, published_query}) {
+				parameters.push_back("'" + SqlUtils::EscapeValue(value) + "'");
+			}
+			ddl.push_back(string(OPENIVM_DDL_CREATE_PUBLICATION_FROM_FILES_PREFIX) + "SELECT " +
+			              StringUtil::Join(parameters, ", "));
+		} else {
+			ddl.push_back(string(staged_cross_catalog_replace && !has_downstream_views
+			                         ? "CREATE OR REPLACE TABLE "
+			                         : "CREATE TABLE IF NOT EXISTS ") +
+			              published + " AS " + published_query);
+		}
 		if (target_is_ducklake) {
 			// Derive the empty companion schema directly, as for the maintenance
 			// delta table, without running another DuckLake CTAS pipeline.
@@ -1659,6 +1675,9 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 				compiled_sql += "-- OpenIVM derives the MV delta-table schema from the "
 				                "physical data table "
 				                "at DDL execution time.\n\n";
+			} else if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_CREATE_PUBLICATION_FROM_FILES_PREFIX)) {
+				compiled_sql += "-- OpenIVM creates publication from independent Parquet copies when eligible, "
+				                "otherwise from the publication query, at DDL execution time.\n\n";
 			} else {
 				compiled_sql += ddl[i] + ";\n\n";
 			}

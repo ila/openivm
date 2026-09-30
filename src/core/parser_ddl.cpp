@@ -2,10 +2,12 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/published_view.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/printer.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parser.hpp"
@@ -399,10 +401,18 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		throw CatalogException("Failed to configure OpenIVM DDL connection: " + preserve_result->GetError());
 	}
 	vector<string> cleanup_ddl;
+	vector<string> uncommitted_publication_files;
 	auto run_cleanup = [&]() {
 		if (!conn->context->transaction.IsAutoCommit()) {
 			conn->Rollback();
 		}
+		// Imported files are caller-owned until the DuckLake transaction commits.
+		// After commit they belong to DuckLake, including its retained snapshots.
+		auto &fs = FileSystem::GetFileSystem(*conn->context);
+		for (const auto &path : uncommitted_publication_files) {
+			fs.TryRemoveFile(path);
+		}
+		uncommitted_publication_files.clear();
 		for (const auto &cleanup : cleanup_ddl) {
 			OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Cleanup DDL: %s\n", cleanup.c_str());
 			auto cleanup_result = conn->Query(cleanup);
@@ -435,6 +445,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Executing DDL batch (%lu statements): %s\n",
 		                    (unsigned long)pending_ddl.size(), query.c_str());
 		auto ddl_start = std::chrono::steady_clock::now();
+		bool commits_physical_objects = current_profile_step == "create_mv_physical_commit";
 		unique_ptr<MaterializedQueryResult> r;
 		if (profiler.Enabled()) {
 			auto statements = SqlUtils::SplitSQLStatements(query);
@@ -467,6 +478,9 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			}
 			fail_ddl(r->GetError());
 		}
+		if (commits_physical_objects) {
+			uncommitted_publication_files.clear();
+		}
 		pending_ddl.clear();
 	};
 	for (auto &q : ddl) {
@@ -491,6 +505,38 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			                           current_profile_step, current_profile_detail);
 			if (!marker_view_name.empty()) {
 				profiler.SetViewName(marker_view_name);
+			}
+			continue;
+		}
+		if (StringUtil::StartsWith(q, OPENIVM_DDL_CREATE_PUBLICATION_FROM_FILES_PREFIX)) {
+			flush_pending();
+			auto start = std::chrono::steady_clock::now();
+			try {
+				auto parameters = conn->Query(q.substr(strlen(OPENIVM_DDL_CREATE_PUBLICATION_FROM_FILES_PREFIX)));
+				if (parameters->HasError()) {
+					throw CatalogException(parameters->GetError());
+				}
+				D_ASSERT(parameters->RowCount() == 1 && parameters->ColumnCount() == 5);
+				vector<string> values;
+				for (idx_t i = 0; i < 5; i++) {
+					values.push_back(parameters->GetValue(i, 0).ToString());
+				}
+				bool copied = TryCreatePublicationFromFiles(
+				    *conn, values[0], values[1], values[2], values[3], values[4], uncommitted_publication_files,
+				    [&](const string &name, int64_t duration_ms) { profiler.AddMeasuredStep(name, duration_ms, ""); });
+				if (!copied) {
+					auto result = conn->Query("CREATE TABLE IF NOT EXISTS " +
+					                          SqlUtils::FullName(values[0], values[1], values[2]) + " AS " + values[4]);
+					if (result->HasError()) {
+						throw CatalogException(result->GetError());
+					}
+				}
+				profiler.AddStep("create_mv_sql_stmt", start,
+				                 string("phase=") + current_profile_step +
+				                     "; statement=1/1; independent_file_copy=" + (copied ? "true" : "false"));
+				profiler.AddStep(current_profile_step, start);
+			} catch (std::exception &error) {
+				fail_ddl(error.what());
 			}
 			continue;
 		}
