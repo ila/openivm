@@ -105,8 +105,9 @@ SELECT COUNT(*) FROM (
 0
 
 # ============================================================
-# ANTI JOIN under GROUP BY. This currently uses FULL_REFRESH rather
-# than aux-state SEMI/ANTI, but it must remain correct for batched DML.
+# ANTI JOIN under GROUP BY. This uses GROUP_RECOMPUTE
+# (source_delta affected keys) rather than aux-state SEMI/ANTI,
+# but it must remain correct for batched DML.
 # ============================================================
 
 statement ok
