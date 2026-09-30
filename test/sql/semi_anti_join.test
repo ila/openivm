@@ -105,8 +105,9 @@ SELECT COUNT(*) FROM (
 0
 
 # ============================================================
-# ANTI JOIN under GROUP BY. This currently uses FULL_REFRESH rather
-# than aux-state SEMI/ANTI, but it must remain correct for batched DML.
+# ANTI JOIN under GROUP BY. This uses GROUP_RECOMPUTE
+# (source_delta affected keys) rather than aux-state SEMI/ANTI,
+# but it must remain correct for batched DML.
 # ============================================================
 
 statement ok
@@ -126,6 +127,11 @@ CREATE MATERIALIZED VIEW mv_ag_anti AS
     SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
     FROM ag_l l ANTI JOIN ag_r r ON abs(l.x - r.y) <= 1
     GROUP BY l.grp;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f61675f616e7469_';
+----
+6
 
 statement ok
 INSERT INTO ag_r VALUES (3, 20), (4, 50);
