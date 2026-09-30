@@ -1037,8 +1037,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		//   (c) left-side (preserved-side) aggregates — SUM(left_col), AVG(left_col), etc.
 		//       Identified by is_preserved_side() below and given the ungated update like
 		//       (a), since they don't change when mc_new transitions. In practice the
-		//       classifier (OuterJoinAggregateNeedsRecompute in ivm_view_classifier.cpp)
-		//       already routes most such shapes to GROUP_RECOMPUTE, so MERGE is reached
+		//       classifier (calls OuterJoinAggregateNeedsRecompute, defined in
+		//       parser_plan_helpers.cpp) already routes most such shapes to GROUP_RECOMPUTE, so MERGE is reached
 		//       only by plain right-side SUM/COUNT aggregates grouped by the join key.
 		string mc_new = "(COALESCE(v." + match_count_col + ", 0) + d." + match_count_col + ")";
 		string lj_update_set;
