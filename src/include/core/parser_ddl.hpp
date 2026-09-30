@@ -47,7 +47,7 @@ private:
 
 void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result,
                                 DDLExecutionMode mode = DDLExecutionMode::STAGED_CROSS_CATALOG);
-string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters);
+string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog);
 void ExecuteStagedDDL(ClientContext &context, const vector<Value> &parameters);
 string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace);
 string BuildDropViewStatement(const DropInfo &drop_info);

@@ -872,7 +872,7 @@ void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChun
 	state.finished = true;
 }
 
-string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters) {
+string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog) {
 	struct ProfileRow {
 		string view_name;
 		string step_name;
@@ -996,9 +996,12 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 			auto now = std::chrono::steady_clock::now().time_since_epoch();
 			auto refresh_id = view_name + "_create_tx_" +
 			                  to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+			// The lifecycle program restores the caller search path before these writes.
+			auto profile_table = SqlUtils::FullName(metadata_catalog, DEFAULT_SCHEMA, openivm::PROFILE_TABLE);
+			OPENIVM_DEBUG_PRINT("[PROFILE] Recording CREATE MV profile in %s\n", profile_table.c_str());
 			for (idx_t step_order = 0; step_order < profile_rows.size(); step_order++) {
 				auto &row = profile_rows[step_order];
-				append_statement("INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
+				append_statement("INSERT OR REPLACE INTO " + profile_table +
 				                     " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES ('" +
 				                     SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(row.view_name) +
 				                     "', " + to_string(step_order) + ", '" + SqlUtils::EscapeValue(row.step_name) +

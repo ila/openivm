@@ -164,8 +164,9 @@ static bool RelationExists(ClientContext &context, const string &catalog_name, c
 	return false;
 }
 
-static ParserExtensionPlanResult
-PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData> parse_data, string &view_key) {
+static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
+                                                      unique_ptr<ParserExtensionParseData> parse_data, string &view_key,
+                                                      string *metadata_catalog = nullptr) {
 	// CREATE MATERIALIZED VIEW stores a relation. Physical insertion order is not
 	// semantically observable unless users query with ORDER BY, so keep OpenIVM's
 	// whole execution path on DuckDB's lower-memory unordered mode.
@@ -223,6 +224,9 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 		if (!schema_res->HasError() && schema_res->RowCount() > 0) {
 			default_schema = schema_res->GetValue(0, 0).ToString();
 		}
+	}
+	if (metadata_catalog) {
+		*metadata_catalog = default_db;
 	}
 	add_create_profile_step("create_compile_default_context", default_context_start);
 	string default_catalog_schema =
@@ -1707,7 +1711,8 @@ string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionPara
 		throw ParserException("OpenIVM could not parse the materialized-view lifecycle statement");
 	}
 	string view_key;
-	auto plan_result = PlanMaterializedView(context, std::move(parse_result.parse_data), view_key);
+	string metadata_catalog;
+	auto plan_result = PlanMaterializedView(context, std::move(parse_result.parse_data), view_key, &metadata_catalog);
 	if (plan_result.function.name == OPENIVM_TRANSACTIONAL_DDL_FUNCTION) {
 		if (!view_key.empty()) {
 			TransactionalMVLockState::Get(context).AcquireMutationLock();
@@ -1715,7 +1720,7 @@ string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionPara
 		if (!context.transaction.IsAutoCommit()) {
 			TransactionalMVMetadataState::Get(context).Register(context, plan_result.parameters, view_key);
 		}
-		return RenderTransactionalDDL(context, plan_result.parameters);
+		return RenderTransactionalDDL(context, plan_result.parameters, metadata_catalog);
 	}
 	ExecuteStagedDDL(context, plan_result.parameters);
 	return "SELECT true AS \"MATERIALIZED VIEW CREATION\"";

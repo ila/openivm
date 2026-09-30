@@ -1884,3 +1884,100 @@ query I
 SELECT count(*) FROM ((SELECT * FROM résumé$final EXCEPT ALL SELECT id,SUM(v) total FROM données GROUP BY id) UNION ALL (SELECT id,SUM(v) total FROM données GROUP BY id EXCEPT ALL SELECT * FROM résumé$final));
 ----
 0
+
+
+# CREATE profiles follow the metadata owner even after the caller search path is restored.
+load __TEST_DIR__/profile_creation_host.db
+
+statement ok
+ATTACH '__TEST_DIR__/profile_creation_target.db' AS "profile.target";
+
+statement ok
+CREATE SCHEMA "profile.target"."observation.data";
+
+statement ok
+CREATE TABLE "profile.target"."observation.data".source(i INTEGER);
+
+statement ok
+INSERT INTO "profile.target"."observation.data".source VALUES (1), (1), (2);
+
+statement ok
+SET openivm_profile_refresh=true;
+
+# The caller has no profile table: an unqualified profile INSERT would fail.
+statement ok
+DROP TABLE IF EXISTS main.openivm_refresh_profile;
+
+statement ok
+CREATE MATERIALIZED VIEW "profile.target"."observation.data".mv AS SELECT * FROM "profile.target"."observation.data".source;
+
+query I
+SELECT count(*) > 0 FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
+----
+1
+
+query TT
+SELECT current_database(), current_schema();
+----
+profile_creation_host	main
+
+# With a caller profile table present, profiles must not silently go there either.
+statement ok
+CREATE TABLE source(i INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW host_mv AS SELECT * FROM source;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW "profile.target"."observation.data".mv AS SELECT i FROM "profile.target"."observation.data".source WHERE i>0;
+
+query I
+SELECT count(*) FROM main.openivm_refresh_profile p WHERE NOT EXISTS (SELECT 1 FROM main.openivm_views v WHERE v.view_name=p.view_name);
+----
+0
+
+query I
+SELECT count(*) FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
+----
+2
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW "profile.target"."observation.data".rolled_back AS SELECT * FROM "profile.target"."observation.data".source;
+
+query I
+SELECT count(*) FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
+----
+3
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
+----
+2
+
+query I
+SELECT count(*) FROM "profile.target".main.openivm_views WHERE view_sql_name='rolled_back';
+----
+0
+
+statement ok
+INSERT INTO "profile.target"."observation.data".source VALUES (3), (3), (4);
+
+statement ok
+DELETE FROM "profile.target"."observation.data".source WHERE i=2;
+
+statement ok
+UPDATE "profile.target"."observation.data".source SET i=5 WHERE i=4;
+
+statement ok
+PRAGMA refresh('"profile.target"."observation.data".mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "profile.target"."observation.data".mv EXCEPT ALL SELECT i FROM "profile.target"."observation.data".source WHERE i>0) UNION ALL (SELECT i FROM "profile.target"."observation.data".source WHERE i>0 EXCEPT ALL SELECT * FROM "profile.target"."observation.data".mv));
+----
+0
