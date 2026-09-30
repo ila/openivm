@@ -6,6 +6,12 @@
 make test
 ```
 
+This runs every `test/sql/*.test` file with `build/release/test/unittest`, then the
+compiled N-term SQL integration check
+(`python3 test/integration/test_regular_nterm_compiled.py ./build/release/duckdb`).
+Use `make test_debug` after a debug build. The DuckLake tests run `INSTALL ducklake`,
+so they need network access unless the extension is already installed.
+
 ## Run a Single Test
 
 ```bash
@@ -36,6 +42,16 @@ All tests live in `test/sql/*.test` using DuckDB's SQLLogicTest format.
 | `insert_rule.test` | Insert rules and delta generation |
 | `auto_refresh.test` | Automatic refresh triggers |
 | `list.test` | LIST aggregate support |
+| `distinct.test` | `SELECT DISTINCT` and DISTINCT aux state |
+| `cte.test` | CTE-based view definitions |
+| `schema_evolution.test` | `ALTER TABLE` delta sync, referenced-column blocking and rename rewrites |
+| `concurrency.test` | MV reads, DML, and refresh under concurrency |
+| `transactional_lifecycle.test` | MV lifecycle and refresh inside caller transactions, rollback |
+| `refresh_hooks.test` | Refresh hooks |
+| `delta_model.test` | CREATE-time delta model metadata |
+| `compile_refresh.test` | `openivm_compile_with_facts` compile-only refresh |
+| `time_travel.test`, `time_travel_ducklake.test` | Time-travel pins |
+| `ducklake_*.test` | The same operator families over DuckLake sources |
 
 ## Verification Pattern
 
@@ -49,6 +65,14 @@ SELECT <mv_query> FROM base_tables EXCEPT ALL SELECT * FROM mv;
 ```
 
 This catches both missing rows and extra rows, including duplicates under bag semantics.
+
+Two rules follow from this:
+
+- **Never hide a correctness bug.** Don't weaken an assertion, and don't demote a view to `FULL_REFRESH` or tune the
+  cost model to route around a wrong incremental result. The cost model only chooses between strategies that are
+  already correct; it must never compensate for classifier uncertainty.
+- **Test more than delta row counts.** A test that only checks how many rows landed in a delta table does not prove
+  the view is right; every behavioral MV test should end with the bidirectional check above.
 
 ## Rewriter Benchmark Checks
 
@@ -65,7 +89,8 @@ build/release/extension/openivm/rewriter_benchmark \
 ```
 
 The current TPCC metadata is expected to match OpenIVM's actual classification. The
-latest checked result was:
+latest recorded result (2026-05-05, when the directory held 2386 queries; it now holds
+2505, so rerun before relying on these numbers) was:
 
 | Metric | Result |
 |---|---:|

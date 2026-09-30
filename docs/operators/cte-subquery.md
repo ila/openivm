@@ -32,6 +32,8 @@ This means:
   DuckDB's scalar `SINGLE` `DELIM_JOIN` shape
 - **EXISTS** subqueries can be maintained through the [semi-join aux-state path](semi-anti-join.md)
 - **NOT EXISTS** subqueries can be maintained through the [anti-join aux-state path](semi-anti-join.md)
+- **IN** / **NOT IN** subqueries can be maintained through the same [semi/anti aux-state path](semi-anti-join.md)
+- **Uncorrelated constant scalar subqueries** are folded to literals before classification
 
 The IVM delta rules apply to the decorrelated plan as usual. If DuckDB decorrelates a subquery into a plan shape OpenIVM does not support, the view falls back to full refresh.
 
@@ -61,4 +63,4 @@ semantics, including transitions between a matched value and `NULL`.
 - **Lateral joins** are incremental when they lower to supported `DELIM_JOIN` /
   `DEPENDENT_JOIN` shapes with visible correlated keys. Other lateral shapes fall back
   to full refresh.
-- **IN** and **NOT IN** are not documented as aux-state semi/anti support because their NULL semantics may require MARK joins. Those views are incremental only when the final decorrelated plan uses supported operators.
+- **IN** and **NOT IN** subqueries (`x IN (SELECT y FROM ...)`) use the [semi/anti aux-state path](semi-anti-join.md), with null-aware state for `NOT IN`. Other membership shapes are incremental only when the final decorrelated plan uses supported operators.

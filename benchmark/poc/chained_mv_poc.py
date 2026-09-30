@@ -36,8 +36,9 @@ import tempfile
 import time
 from pathlib import Path
 
-DUCKDB = "/home/ila/Code/openivm/build/release/duckdb"
-EXT = "/home/ila/Code/openivm/build/release/extension/openivm/openivm.duckdb_extension"
+REPO = Path(__file__).resolve().parents[2]
+DUCKDB = os.environ.get("OPENIVM_DUCKDB", str(REPO / "build/release/duckdb"))
+EXT = os.environ.get("OPENIVM_EXTENSION", str(REPO / "build/release/extension/openivm/openivm.duckdb_extension"))
 
 DEFAULT_DELTAS = [0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5]
 STRATEGIES = ("bypass", "stale_b", "cascade", "cascade_auto", "stale_plus_residual")

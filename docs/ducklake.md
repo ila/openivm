@@ -184,7 +184,7 @@ back to the standard 2^N - 1 inclusion-exclusion rule (also works with DuckLake 
 
 ### Empty-delta term skipping
 
-When a table hasn't changed since the last refresh (`last_snapshot_id == current_snapshot_id`), its delta is empty and its term produces zero rows. OpenIVM detects this at plan time by comparing snapshot IDs and skips generating that term entirely — avoiding the cost of plan copying, renumbering, delta scan creation, and SQL generation.
+When a table hasn't changed since the last refresh, its delta is empty and its term produces zero rows. OpenIVM detects this at plan time and skips generating that term entirely — avoiding the cost of plan copying, renumbering, delta scan creation, and SQL generation. Equal snapshot IDs (`last_snapshot_id == current_snapshot_id`) prove emptiness. Because snapshot IDs are catalog-wide, a changed ID may come from another table, so OpenIVM also probes `ducklake_table_insertions`/`ducklake_table_deletions` for the table itself. For inner joins, a term is also skipped when none of the delta's join keys matches the other side. These checks follow `openivm_skip_empty_deltas` (default `true`).
 
 In a typical star schema (1 fact table + 4 dimensions), only the fact table changes between refreshes. The term count drops from 5 to 1.
 
@@ -197,8 +197,8 @@ DuckLake-backed views support the same operator families as standard DuckDB tabl
 - Projection, filter, expressions
 - Grouped and ungrouped aggregates, including AVG and STDDEV/VARIANCE decomposition
 - Inner joins, cross joins, and arbitrary-predicate joins
-- DuckLake inner joins use N-term telescoping when every join leaf is a DuckLake scan
-- Left, right, and full outer joins use the standard partial-recompute/MERGE paths
+- Joins use N-term telescoping when every join leaf is a DuckLake scan; for LEFT joins, each term demotes only the outer joins whose NULL-supplying side carries that term's delta
+- Left, right, and full outer joins additionally use the standard partial-recompute/MERGE paths for NULL-padded rows
 - UNION ALL
 - DISTINCT
 - Semi/anti joins for supported aux-state shapes
@@ -207,6 +207,14 @@ DuckLake-backed views support the same operator families as standard DuckDB tabl
 - Chained/cascading materialized views
 
 ## Limitations
+
+- **Metadata and data are separate transactions.** OpenIVM's metadata lives in the native DuckDB database that
+  loaded the extension (no separate server needed), while data and deltas live in the attached DuckLake catalog. A
+  refresh commits lake-side writes and native metadata separately, not atomically; creation, refresh and `DROP VIEW`
+  use staged steps for this reason. A DuckLake file being readable by another DuckDB build says nothing about
+  OpenIVM extension compatibility.
+- **MotherDuck is unverified.** There is no integration coverage for managed DuckLake on MotherDuck; local success
+  does not establish it.
 
 - **No FK constraints.** DuckLake does not support `FOREIGN KEY` constraints, so the [FK-aware pruning](optimizations/fk-aware-pruning.md) optimization is not available. The [empty-delta term skipping](#empty-delta-term-skipping) optimization covers the most common case (unchanged dimension tables).
 - **No ART indexes.** DuckLake tables don't support ART index creation. For `AGGREGATE_GROUP` views, group column identification falls back to metadata instead of the index catalog.

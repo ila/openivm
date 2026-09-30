@@ -74,7 +74,7 @@ UPDATE total_score SET
 
 ### MIN/MAX (full recompute)
 
-MIN and MAX are not decomposable — deleting the current minimum requires re-scanning the base table to find the new minimum. OpenIVM detects MIN/MAX and replaces the upsert with a full DELETE + INSERT:
+MIN and MAX are not decomposable — deleting the current minimum requires re-scanning the base table to find the new minimum. OpenIVM detects MIN/MAX (and any other non-summable output column, e.g. `LIST`, `COUNT(DISTINCT)`, a VARCHAR result) and replaces the upsert with a full DELETE + INSERT. Unlike grouped aggregates, there is no insert-only `LEAST`/`GREATEST` fast path:
 
 ```sql
 -- Cannot incrementally update MIN: the deleted row may have been the minimum
@@ -93,6 +93,22 @@ INSERT INTO total_score SELECT MIN(val) AS min_val, COUNT(*) AS cnt FROM scores;
 | `STDDEV`, `VARIANCE` | Incremental (decomposed) | Hidden SUM, SUM-of-squares, and COUNT columns maintained independently; final value recomputed after UPDATE. |
 | `MIN`, `MAX` | Full recompute | Entire MV deleted and re-inserted from original query. |
 | `STRING_AGG`, `LISTAGG`, `MEDIAN`, quantiles | Full refresh | View classified as `FULL_REFRESH` at creation time. |
+
+## Filtered group count
+
+A count over a filtered grouped subquery has its own aux-state path:
+
+```sql
+CREATE MATERIALIZED VIEW positive_groups AS
+    SELECT COUNT(*) AS n FROM (
+        SELECT g, SUM(x) AS s FROM t GROUP BY g
+    ) WHERE s > 0;
+```
+
+The shape must be a single-table `GROUP BY` on one column with one plain `SUM`, filtered by
+`s > 0` or `s < 0` (the threshold must be 0). OpenIVM keeps a per-group sum in
+`openivm_filtered_group_count_<view>` and updates the count from the groups whose sum crosses
+the threshold.
 
 ## Limitations
 

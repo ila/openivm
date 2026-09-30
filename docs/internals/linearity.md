@@ -1,18 +1,30 @@
 # Operator linearity
 
-Each node in the delta model carries a **rule kind** that determines how its delta rule is
+Each node in the delta model carries a **rule kind** that describes how its delta rule is
 derived from the operator's algebra. The classification is captured in
-`DeltaRuleKind`/`DeltaModelNode` (see `src/include/core/ivm_view_classifier.hpp`) and
-compiled by the recursive delta operator planner under `src/delta/operators/`:
+`DeltaRuleKind`/`DeltaModelNode` (see `src/include/core/ivm_view_classifier.hpp`),
+assigned by `RuleKindForNode` in `src/core/ivm_delta_model.cpp`, and the nodes are
+compiled by the recursive delta operator planner under `src/delta/operators/`
+(`CompileDeltaOperatorWithModel` in `dispatch.cpp` selects the rule by node kind):
 
 ```cpp
 enum class DeltaRuleKind { LINEAR, PRODUCT, STATEFUL, NON_LINEAR, FULL_ONLY };
 ```
 
-This taxonomy is the same one DBSP §6 uses (Budiu et al., VLDB 2023) and determines the
-shape of `ΔQ` for an operator `Q`.
+The taxonomy follows DBSP §6 (Budiu et al., VLDB 2023): linear, bilinear (`PRODUCT`),
+and non-linear operators, with non-linear operators split into those OpenIVM maintains
+with state or affected-key recompute (`STATEFUL`) and those it cannot maintain locally
+(`NON_LINEAR`). Any node of a view with an unsupported construct is `FULL_ONLY`.
 
-## The three classes
+| Rule kind | Node kinds |
+|---|---|
+| `LINEAR` | Scan, filter, projection, UNION ALL, UNNEST, CTE, constant leaves |
+| `PRODUCT` | Inner, cross, and arbitrary-predicate joins |
+| `STATEFUL` | LEFT/RIGHT/FULL OUTER joins, ASOF joins, aggregates without MIN/MAX, `COUNT(DISTINCT)` or LIST, DISTINCT, SEMI/ANTI, window, top-k |
+| `NON_LINEAR` | Aggregates with MIN/MAX/ARG_MIN/ARG_MAX, DISTINCT aggregates, or LIST; POSITIONAL joins; SAMPLE |
+| `FULL_ONLY` | Every node when the view has an unsupported-construct reason |
+
+## Rule kinds
 
 ### LINEAR
 
@@ -25,16 +37,17 @@ state is needed and cost is proportional to `|delta|`.
 | Projection | `CompileProjectionDelta` |
 | Filter | `CompileFilterDelta` |
 | UNION ALL (bag union) | `CompileUnionDelta` |
-| `SUM`, `COUNT` (over linear inputs) | propagated through `CompileAggregateDelta` |
+| UNNEST | `CompileUnnestDelta` |
+| CTE / CTE reference | `CompileCteDelta` |
+| Constant leaf | `CompileConstantZeroDelta` |
 
-The aggregate delta compiler is structurally LINEAR for summable aggregates: it passes the
-multiplicity column through as a group-by key. AVG and STDDEV/VARIANCE are decomposed into linear helper
-columns before upsert compilation. Non-linear aggregate forms such as MIN/MAX deletes,
-LIST filters, and non-summable output columns are detected at compile time and routed
-to **group recompute** in `CompileAggregateGroups`, so the per-rule classification stays
-clean.
+Aggregates are classified `STATEFUL` even when summable: `CompileAggregateDelta` groups
+the delta by the multiplicity column, but the net change must then be merged into the
+stored group state. AVG and STDDEV/VARIANCE are decomposed into summable helper columns
+before upsert compilation. Non-summable forms such as MIN/MAX deletes, LIST filters, and
+non-summable output columns are routed to **group recompute** in `CompileAggregateGroups`.
 
-### BILINEAR
+### PRODUCT (bilinear)
 
 Linear in each input separately. The delta rule expands to multiple terms, each weighted
 by the **Z-set bilinear product** of leaf multiplicities. The default current-state
@@ -45,29 +58,32 @@ for external engines.
 
 | Operator | Delta rule |
 |---|---|
-| INNER JOIN, CROSS JOIN, arbitrary-predicate joins | `CompileJoinDelta` |
-| LEFT JOIN, RIGHT JOIN, FULL OUTER JOIN | `CompileJoinDelta` plus outer-join upsert paths |
+| INNER JOIN, CROSS JOIN, arbitrary-predicate joins | `CompileJoinDelta` (inclusion-exclusion by default) |
 | DuckLake telescoping join | `BuildDuckLakeJoinTerms` |
 | Regular-table compile-only telescoping join | `BuildRegularJoinTerms` |
 
 See [`operators/inner-join.md`](../operators/inner-join.md) for the algebraic derivation
 of the combined-multiplicity formula.
 
-### NON_LINEAR
+### STATEFUL
 
-Neither linear nor bilinear. The delta requires the *accumulated* state of one or more
-inputs — there is no closed-form per-row rule. OpenIVM falls back to:
+Not linear, but maintainable from the delta plus stored state or an affected-key
+recompute:
 
-- **Auxiliary state** for threshold operators such as SEMI/ANTI
-- **Group recompute** for affected groups (DISTINCT, MIN/MAX with deletes, LIST filters)
+- **Stored group state** for aggregates (MERGE of summed deltas)
+- **Auxiliary state** for threshold operators such as SEMI/ANTI and DISTINCT
 - **Partition recompute** for affected partitions (window functions)
-- **Full refresh** when neither fits
+- **Outer-join key recompute or match counts** for LEFT/RIGHT/FULL OUTER joins
 
-| Operator | Delta rule | Fallback |
+| Operator | Delta rule | State |
 |---|---|---|
-| `DISTINCT` (δ in DBSP) | `CompileDistinctDelta` | Group recompute via COUNT(*) sentinel |
-| `SEMI JOIN`, `ANTI JOIN` | `CompileDelimJoinDelta` + aux-state upsert | Match-count threshold state |
+| Aggregate | `CompileAggregateDelta` | MV group state, MERGE |
+| LEFT JOIN, RIGHT JOIN, FULL OUTER JOIN | `CompileJoinDelta` plus outer-join upsert paths | Preserved-side keys, match counts |
+| `DISTINCT` (δ in DBSP) | `CompileDistinctDelta` | COUNT(*) sentinel or distinct-count aux table |
+| `SEMI JOIN`, `ANTI JOIN` | `CompileDelimJoinDelta` / `CompileJoinDelta` + aux-state upsert | Match-count threshold state |
 | Window functions | `CompileWindowDelta` | Partition recompute |
+| Top-k (`ORDER BY` + `LIMIT`) | `CompileTopKDelta` (strips the limit) | Unlimited backing table |
+| ASOF join | Guard only (`CompileAsofJoinDelta`) | Maintained by `WINDOW_PARTITION`, `GROUP_RECOMPUTE`, or full refresh |
 
 DISTINCT is non-linear *even on positive Z-sets* — it drops duplicates, which can't be
 expressed as a sum over deltas. SEMI and ANTI joins are threshold operators over
@@ -75,13 +91,22 @@ right-side match counts. Window functions (ROW_NUMBER, RANK, NTILE, LAG, LEAD,
 running aggregates) depend on partition order; a single insert/delete can re-rank
 every row in the partition.
 
+### NON_LINEAR
+
+The delta requires the *accumulated* state of an input and has no local rule.
+Aggregates with MIN/MAX (and ARG_MIN/ARG_MAX), DISTINCT aggregates, or LIST use
+group recompute or an aux table (`COUNT_DISTINCT_INCREMENTAL`). POSITIONAL joins and
+SAMPLE have guard-only rules (`CompilePositionalJoinDelta`, `CompileSampleDelta`) and
+are always classified `FULL_REFRESH`.
+
 ## Why this matters
 
 The rule kind is a **document-time invariant**: it tells you what cost to expect
-and what state OpenIVM has to maintain to keep the MV correct. It also gates the
+and what state OpenIVM has to maintain to keep the MV correct. The delta model derives
+`DeltaUpdateSemantics` alongside it (`AddNodeUpdateSemantics`), which gates the
 `append-only` optimisation (see [`optimizations/append-only.md`](../optimizations/append-only.md)).
-LINEAR operators preserve insert-only semantics directly. For BILINEAR joins, safety
-depends on the selected join rule and whether its emitted delta contains negative weights.
+Projections and linear aggregates are append-only safe; joins, DISTINCT, SEMI/ANTI, and
+window nodes are marked delete- and update-sensitive.
 
 Adding a new operator should start with: pick the linearity class, then derive the
 delta rule that the class permits.

@@ -33,6 +33,17 @@ The `openivm_cascade_refresh` setting controls how `PRAGMA refresh()` handles de
 | `downstream` (default) | After refreshing the named view, refresh all descendant views that depend on it. |
 | `both` | Refresh ancestors first, then the named view, then descendants. |
 
+Ancestors and descendants are refreshed in dependency order. In an autocommit `PRAGMA refresh`, cascaded views skip themselves when their own deltas are empty and do not run their [refresh hooks](../refresh_hooks.md); only the named view runs its hook. Inside an explicit transaction, every cascaded view's hooks are included. Unrecognized values behave like `off` in `PRAGMA refresh` and are rejected by `refresh_pipeline`. The [refresh daemon](automatic-refresh.md) reads the global value, so use `SET GLOBAL openivm_cascade_refresh = ...` for scheduled refreshes.
+
+Cascades order only the graph reachable from the named view. In a diamond `A → P → Z ← Q ← B`, refreshing `P` and
+then `Q` with `downstream` refreshes `Z` twice, and the first time it sees a stale `Q`. Refresh the shared descendant
+with `upstream` (or use [`refresh_pipeline`](#refresh-a-selected-pipeline) for several targets) so each node runs once
+with fresh inputs.
+
+Dependency edges come from `openivm_delta_tables` (which view reads which source or parent delta). The
+`openivm_mv_dependencies` table is only populated when experimental view matching is enabled, so don't rely on it
+for pipeline discovery.
+
 ### off
 
 Each view is refreshed independently. The user must call `PRAGMA refresh()` in the correct order.
@@ -119,7 +130,7 @@ SET openivm_cascade_refresh = 'upstream';
 PRAGMA refresh_pipeline('sales_report', 'inventory_report');
 ```
 
-OpenIVM discovers the graph from current source metadata on each call. No pipeline registration is needed. Arguments accept unqualified, `schema.view`, or `catalog.schema.view` names, as with `refresh`; qualify names that would otherwise be ambiguous. Use `USE` to select an attached native metadata database. DuckLake views use their native controller's metadata.
+OpenIVM discovers the graph from current source metadata on each call. No pipeline registration is needed. Arguments are MV names resolved as with `refresh`: `view`, `schema.view`, `catalog.view`, or `catalog.schema.view`; unqualified names resolve first in the current catalog and schema, with an unambiguous metadata lookup as fallback. Qualify ambiguous names, and use `USE` to select an attached native metadata database. DuckLake views use their native controller's metadata.
 
 | Cascade mode | Selected views |
 |---|---|
@@ -128,13 +139,13 @@ OpenIVM discovers the graph from current source metadata on each call. No pipeli
 | `downstream` | Named MVs and their descendants |
 | `both` | Named MVs and their descendants, then all ancestors required by that selection |
 
-Every selected MV is visited once, with selected parents before their children, regardless of argument order or repeated names. Independent ready nodes are ordered by name. Shared dependencies are deduplicated across targets. Refreshes whose inputs have no pending changes may be skipped as usual. `downstream` assumes parents outside the selection are already current; `both` includes those co-parents. Ordinary views are expanded when source dependencies are captured.
+Every selected MV is visited once, with selected parents before their children, regardless of argument order or repeated names. Independent ready nodes are ordered by their internal view key (`openivm_views.view_name`). Shared dependencies are deduplicated across targets. Refreshes whose inputs have no pending changes may be skipped as usual. `downstream` assumes parents outside the selection are already current; `both` includes those co-parents. Ordinary views are expanded when source dependencies are captured.
 
 The run uses sequential refreshes under the existing OpenIVM mutation gate. The caller must finish ingestion before invoking it and keep ingestion paused until it returns; external DuckLake writers are not blocked by this gate. This is not an atomic publication boundary for readers.
 
 Unknown targets, dependency cycles, and definitions that no longer bind are rejected before an autocommit run refreshes any node. The graph is rediscovered after DDL changes; compatible source schema evolution uses the existing schema-update machinery. A dropped target is an error, not silently omitted. Recreate invalidated MVs before retrying.
 
-Each selected node uses its normal refresh hooks. A refresh or hook failure stops the run; earlier autocommit refreshes can already be committed. Native explicit transactions use the existing transactional refresh path and can be rolled back. DuckLake refreshes retain the existing separate data/metadata transaction behavior.
+Each selected node uses its normal refresh hooks, including cascaded dependencies. A refresh or hook failure stops the run; earlier autocommit refreshes can already be committed. Native explicit transactions use the existing transactional refresh path and can be rolled back. DuckLake refreshes retain the existing separate data/metadata transaction behavior.
 
 DuckLake `DROP VIEW` uses staged DDL: lake-side objects are removed before native OpenIVM metadata is cleaned up. This matches the existing cross-catalog create/refresh model; it is not one atomic transaction across both catalogs.
 

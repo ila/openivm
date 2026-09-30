@@ -24,6 +24,7 @@ cleanup steps during refresh:
 | `openivm_skip_aggregate_delete` | `true` | Skip zero-row DELETE for grouped aggregates when insert-only |
 | `openivm_skip_projection_delete` | `true` | Skip DELETE and consolidation for projections when insert-only |
 | `openivm_minmax_incremental` | `true` | Use GREATEST/LEAST for MIN/MAX when insert-only |
+| `openivm_running_window_incremental` | `false` | Opt-in: extend cumulative running window aggregates with only the new suffix rows when insert-only |
 
 Set to `false` to disable and fall back to the traditional IVM path:
 ```sql
@@ -77,8 +78,14 @@ WHERE openivm_timestamp >= last_update AND openivm_multiplicity < 0
 ```
 Also checks total row count to determine if the delta is empty (no changes at all).
 
-**DuckLake tables**: Compare `last_snapshot_id` with `current_snapshot()` to detect changes,
-then query `ducklake_table_deletions()` to check for deletes.
+**DuckLake tables**: Compare `last_snapshot_id` with the current snapshot, then read the
+`ducklake_snapshots()` change manifest for the source table: any delete (or inlined delete),
+alter, or drop makes the batch non-insert-only. When the manifest is unavailable, OpenIVM
+counts `ducklake_table_deletions()` between the two snapshots.
+
+**Compile-only callers** (`openivm_compile_with_facts`) cannot observe the pending batch, so the
+fast paths are off unless the facts set `assume_insert_only = true`; the three settings above
+still apply.
 
 ## Insert-only fast path: multiplicity fan-out
 

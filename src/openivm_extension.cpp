@@ -258,7 +258,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::DOUBLE, Value::DOUBLE(0.9));
 
 	// View matching (master flag — ALL matcher behavior gated by this).
-	// Default false. See `feedback_view_matching_flag` memory note.
+	// Default false: view matching is experimental.
 	db_config.AddExtensionOption("openivm_enable_view_matching",
 	                             "enable smart view matching at query time (master flag)", LogicalType::BOOLEAN,
 	                             Value::BOOLEAN(false));
