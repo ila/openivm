@@ -1287,12 +1287,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			full_recompute_query = RenderStoredViewQueryForDialect(con, view_query_sql, output_names,
 			                                                       active_facts.target_dialect, view_time_travel_pins);
 		}
-		// The non-cascade recompute path in BuildRecomputeQuery already passes the data table's unique
-		// keys so it upserts rather than deleting and re-inserting them. This path did not, so a full
-		// refresh of an AGGREGATE_GROUP view that has a downstream view failed on a reopened
-		// persistent database with "Duplicate key ... violates unique constraint": DuckDB's on-disk
-		// unique index still reports keys deleted earlier in the same transaction. Nothing caught it
-		// because the rest of the suite runs in memory, where the index is built in-session.
+		// Invariant: like the non-cascade recompute path in BuildRecomputeQuery, this path passes the
+		// data table's unique keys so the recompute upserts instead of deleting and re-inserting them.
+		// DuckDB's on-disk unique index still reports keys deleted earlier in the same transaction, so
+		// a DELETE + INSERT of surviving groups on a reopened persistent database would raise
+		// "Duplicate key ... violates unique constraint". Only a persistent (reopened) database
+		// exercises this; covered by test/sql/full_refresh_cascade_unique_index.test.
 		//
 		// Restricted to DuckDB output: the safe form emits INSERT OR REPLACE, which other dialects do
 		// not share. DuckLake output also has no unique indexes for ON CONFLICT.
