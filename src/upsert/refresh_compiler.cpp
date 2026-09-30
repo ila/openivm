@@ -1076,8 +1076,9 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			//     Preserve v.col — the CREATE-time value already reflects the NULL-padded row
 			//     semantics for this column, including any projection-folded constants like
 			//     SUM(COALESCE(x, 0)) = 0 or COUNT(right_col) = 0. Resetting to null_val would
-			//     wipe legitimate folded values (q1686 SUM(COALESCE(o.x,0)) stored 0 at CREATE
-			//     but would become NULL after any zero-net delta pass).
+			//     wipe legitimate folded values (a SUM(COALESCE(o.x, 0)) stored as 0 at CREATE
+			//     must not become NULL after a zero-net delta pass). Covered by the Fix E cases in
+			//     test/sql/left_join.test.
 			//   else: transition from matched to unmatched (v.mc > 0, d.mc = -v.mc). Right-side
 			//     data is gone; reset to null_val. Folded projections such as
 			//     SUM(COALESCE(r.x, 0)) or COALESCE(SUM(r.x), 0) would need 0 instead of NULL
@@ -1205,10 +1206,10 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// cleanup in that case to avoid deleting valid rows.
 	// Also skip when insert_only (groups can't reach zero from inserts alone).
 	//
-	// LEFT JOIN views (openivm_match_count present) were previously skipped outright, because a
-	// preserved-side row with no match legitimately has inner-side COUNT = 0 and would look "empty".
-	// That left genuinely emptied groups behind forever as zeroed rows. The right discriminator is the
-	// OUTPUT-row count: a NULL-padded group still has count_star >= 1, whereas a group with no
+	// LEFT JOIN views (openivm_match_count present): a preserved-side row with no match legitimately has
+	// inner-side COUNT = 0 and would look "empty", so inner-side counts alone cannot decide emptiness;
+	// skipping these views would leave genuinely emptied groups behind as zeroed rows. The discriminator
+	// is the OUTPUT-row count: a NULL-padded group still has count_star >= 1, whereas a group with no
 	// preserved-side rows left has count_star = 0. Since the predicate ANDs every count column, the
 	// NULL-padded case is preserved as long as count_star is among them -- so LEFT JOIN views are
 	// included when a count_star-type column anchors the predicate, and skipped otherwise.
