@@ -1034,11 +1034,13 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		//   (b) right-side aggregates — COUNT(right_col), SUM(right_col), AVG(right_col),
 		//       etc. When mc_new = 0, these must reset to 0/NULL because the NULL-padded
 		//       row contributes NULL for right_col. Use the CASE gating.
-		//   (c) left-side non-count aggregates (SUM(left_col), AVG(left_col)) — not
-		//       currently distinguishable here; fall through to the CASE gating, which
-		//       is incorrect for those but rare in practice. (Left-side aggregates
-		//       don't go to NULL when mc_new transitions, so this remains a known
-		//       limitation for uncommon queries; documented in limitations.md.)
+		//   (c) left-side (preserved-side) aggregates — SUM(left_col), AVG(left_col), etc.
+		//       Identified by is_preserved_side() below and given the ungated update like
+		//       (a), since they don't change when mc_new transitions. Separately, the
+		//       classifier (OuterJoinAggregateNeedsRecompute in parser_plan_helpers.cpp)
+		//       sends computed aggregate children (e.g. SUM(COALESCE(r.x, 0))) and
+		//       non-pass-through projection wrappers over non-group bindings (e.g.
+		//       COALESCE(SUM(r.x), 0)) to GROUP_RECOMPUTE, so those never reach this code.
 		string mc_new = "(COALESCE(v." + match_count_col + ", 0) + d." + match_count_col + ")";
 		string lj_update_set;
 		bool first_lj = true;
@@ -1077,9 +1079,10 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			//     wipe legitimate folded values (q1686 SUM(COALESCE(o.x,0)) stored 0 at CREATE
 			//     but would become NULL after any zero-net delta pass).
 			//   else: transition from matched to unmatched (v.mc > 0, d.mc = -v.mc). Right-side
-			//     data is gone; reset to null_val. This remains imperfect for folded projections
-			//     (a transitioning group whose stored COALESCE'd column was 0 resets to NULL)
-			//     — a known limitation.
+			//     data is gone; reset to null_val. Folded projections such as
+			//     SUM(COALESCE(r.x, 0)) or COALESCE(SUM(r.x), 0) would need 0 instead of NULL
+			//     here, but the classifier (OuterJoinAggregateNeedsRecompute) sends those
+			//     shapes to GROUP_RECOMPUTE, so this branch never sees them.
 			string matched_update = BuildUpdatedAggregateColumn(col);
 			auto sum_count = sum_null_count_cols.find(col);
 			if (sum_count != sum_null_count_cols.end()) {
