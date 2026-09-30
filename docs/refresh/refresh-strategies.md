@@ -101,6 +101,12 @@ Returns a single row:
 - `calibrated`: `true` when refresh history was sufficient to fit the learned model.
 
 Use `PRAGMA refresh_history('view_name')` to inspect the 20 most recent refresh records used by the learned model. History rows are recorded only for refreshes that run with `openivm_adaptive_refresh = true`.
+`PRAGMA refresh_history` returns `view_name`, `refresh_timestamp`, `method`, `incremental_compute_est`, `incremental_upsert_est`, `recompute_compute_est`, `recompute_replace_est` and `actual_duration_ms`; each column is described in the [Cost Model](../internals/cost_model.md#refresh-history).
+
+### Explicit catalog arguments
+
+`PRAGMA refresh` also accepts a view located by catalog. `PRAGMA refresh_options(catalog, schema, view)` takes three VARCHAR arguments. `PRAGMA refresh_cross_system(view_catalog, view_schema, attached_catalog, attached_schema, view)` takes five VARCHAR arguments and refreshes the view as a cross-system view, using the attached catalog and schema given in the third and fourth arguments. For cross-system views the refresh is split into data statements in the view's catalog and metadata statements on a separate connection, because DuckDB does not allow writing two catalogs in one transaction. A native refresh runs in one transaction. A full cross-system guide (PostgreSQL setup, supported view shapes, limitations) is not yet written.
+
 For implementation details and preliminary validation results, see
 [Cost Model](../internals/cost_model.md).
 
