@@ -209,6 +209,8 @@ public:
 		}
 		flushed = true;
 		Connection profile_con(db);
+		// Retention and the new profile share one durable metadata commit.
+		profile_con.BeginTransaction();
 		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
 		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
 		                  to_string(retention_days) + " days'");
@@ -227,6 +229,11 @@ public:
 		                      " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES " + values);
 		if (result->HasError()) {
 			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record CREATE MV profile: %s\n", result->GetError().c_str());
+			return;
+		}
+		auto committed = profile_con.Query("COMMIT");
+		if (committed->HasError()) {
+			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to commit CREATE MV profile: %s\n", committed->GetError().c_str());
 		}
 	}
 

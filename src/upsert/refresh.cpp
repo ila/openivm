@@ -83,6 +83,8 @@ public:
 		}
 		Connection profile_con(db);
 		RefreshMetadata::UseCatalog(*profile_con.context, profile_con, view_catalog);
+		// Persist all steps together instead of synchronizing the WAL for every row.
+		profile_con.BeginTransaction();
 		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
 		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
 		                  to_string(retention_days) + " days'");
@@ -98,6 +100,10 @@ public:
 				                    result->GetError().c_str());
 				return;
 			}
+		}
+		auto committed = profile_con.Query("COMMIT");
+		if (committed->HasError()) {
+			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to commit refresh profile: %s\n", committed->GetError().c_str());
 		}
 	}
 
