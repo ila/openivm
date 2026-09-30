@@ -95,7 +95,7 @@ This adds two small UPDATE statements per refresh cycle (one before, one after t
 
 Automatic refresh uses the same database-wide mutation gate as manual `PRAGMA refresh()`:
 
-- **Reads during refresh**: always safe (DuckDB MVCC — readers see a consistent snapshot)
+- **Reads during refresh**: native MVs are read consistently (the refresh commits in one transaction); DuckLake refreshes are not yet atomic for readers ([#88](https://github.com/ila/openivm/issues/88)). See [concurrency and operations](../concurrency.md).
 - **Concurrent refreshes**: serialized by the mutation gate. The daemon and manual refreshes wait for the active mutation to finish.
 - **Tracked DML during refresh**: serialized by the same gate, preventing delta writes from racing with refresh bookkeeping.
 
