@@ -1036,10 +1036,11 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		//       row contributes NULL for right_col. Use the CASE gating.
 		//   (c) left-side (preserved-side) aggregates — SUM(left_col), AVG(left_col), etc.
 		//       Identified by is_preserved_side() below and given the ungated update like
-		//       (a), since they don't change when mc_new transitions. In practice the
-		//       classifier (calls OuterJoinAggregateNeedsRecompute, defined in
-		//       parser_plan_helpers.cpp) already routes most such shapes to GROUP_RECOMPUTE, so MERGE is reached
-		//       only by plain right-side SUM/COUNT aggregates grouped by the join key.
+		//       (a), since they don't change when mc_new transitions. Separately, the
+		//       classifier (OuterJoinAggregateNeedsRecompute in parser_plan_helpers.cpp)
+		//       sends computed aggregate children (e.g. SUM(COALESCE(r.x, 0))) and
+		//       non-pass-through projection wrappers over non-group bindings (e.g.
+		//       COALESCE(SUM(r.x), 0)) to GROUP_RECOMPUTE, so those never reach this code.
 		string mc_new = "(COALESCE(v." + match_count_col + ", 0) + d." + match_count_col + ")";
 		string lj_update_set;
 		bool first_lj = true;
