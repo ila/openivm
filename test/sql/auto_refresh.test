@@ -725,6 +725,78 @@ SELECT grp, sum(val), count(val) FROM mode_base GROUP BY grp ORDER BY grp;
 even	1650	27
 odd	925	325
 
+# Invalid modes are rejected, and the previous value is kept
+statement error
+SET openivm_refresh_mode = 'bogus';
+----
+expected one of incremental, full, auto
+
+statement error
+SET openivm_refresh_mode = 'FULLL';
+----
+expected one of incremental, full, auto
+
+statement error
+SET openivm_refresh_mode = '';
+----
+expected one of incremental, full, auto
+
+query T
+SELECT current_setting('openivm_refresh_mode');
+----
+auto
+
+# Valid values are case-insensitive and normalized to lower case
+statement ok
+SET openivm_refresh_mode = 'FULL';
+
+query T
+SELECT current_setting('openivm_refresh_mode');
+----
+full
+
+statement ok
+SET openivm_refresh_mode = 'Incremental';
+
+query T
+SELECT current_setting('openivm_refresh_mode');
+----
+incremental
+
+# A rejected value must not silently behave like incremental on refresh
+statement ok
+INSERT INTO mode_base VALUES (1000, 'odd', 5);
+
+statement error
+SET openivm_refresh_mode = 'bogus';
+----
+expected one of incremental, full, auto
+
+statement ok
+PRAGMA refresh('mv_mode');
+
+query III
+SELECT grp, total, cnt FROM mv_mode ORDER BY grp;
+----
+even	1650	27
+odd	930	326
+
+query III
+SELECT grp, sum(val), count(val) FROM mode_base GROUP BY grp ORDER BY grp;
+----
+even	1650	27
+odd	930	326
+
+query I
+SELECT count(*) FROM (SELECT grp, total, cnt FROM mv_mode EXCEPT ALL SELECT grp, sum(val), count(val) FROM mode_base GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, sum(val), count(val) FROM mode_base GROUP BY grp EXCEPT ALL SELECT grp, total, cnt FROM mv_mode);
+----
+0
+
 # ==========================================
 # Test 15: Filter selectivity — cost model accounts for selective filters
 # ==========================================
