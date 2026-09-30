@@ -1577,6 +1577,11 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 	// Record source-table metadata only after physical MV objects exist. If a later
 	// DuckLake publish fails, the DDL executor removes these rows before the retry.
 	add_profile_marker("create_mv_source_metadata", "rows=" + to_string(source_metadata_ddl.size()));
+	if (batch_ducklake_creation) {
+		// Physical objects are committed; register their native metadata atomically
+		// without paying a separate durable commit for every row and watermark.
+		ddl.push_back("BEGIN TRANSACTION");
+	}
 	if (staged_cross_catalog_replace) {
 		ddl.push_back("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 		              SqlUtils::EscapeSingleQuotes(view_name) + "'");
@@ -1624,6 +1629,10 @@ PlanMaterializedView(ClientContext &context, unique_ptr<ParserExtensionParseData
 	                   "rows=" + to_string(metadata_ddl.size() + aux_metadata_ddl.size()));
 	ddl.insert(ddl.end(), metadata_ddl.begin(), metadata_ddl.end());
 	ddl.insert(ddl.end(), aux_metadata_ddl.begin(), aux_metadata_ddl.end());
+	if (batch_ducklake_creation) {
+		add_profile_marker("create_mv_metadata_commit");
+		ddl.push_back("COMMIT");
+	}
 	add_cleanup("DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE child_view = '" +
 	            SqlUtils::EscapeSingleQuotes(view_name) + "'");
 	add_cleanup("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
