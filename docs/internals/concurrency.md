@@ -1,5 +1,8 @@
 # Concurrency
 
+This page covers the mechanics. For the guarantees users can rely on and operating advice, see
+[concurrency and operations](../concurrency.md).
+
 ## Mutation serialization
 
 OpenIVM serializes tracked source-table writes, refreshes, and materialized-view
