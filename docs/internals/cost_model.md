@@ -37,26 +37,37 @@ PRAGMA refresh_cost('monthly_totals');
 | `recompute_predicted_ms` | Learned prediction for full recompute, or the ms-grounded prior before calibration. |
 | `calibrated` | Whether enough refresh history existed to fit a learned model. |
 
-### Refresh History
+## Refresh History
 
-`PRAGMA refresh_history('view_name')` returns the 20 most recent rows of the
-`openivm_refresh_history` table for the view, newest first. A row is written after a
-refresh that runs with `openivm_adaptive_refresh = true`.
+Every refresh that runs with `openivm_adaptive_refresh = true` appends one row to the
+`openivm_refresh_history` table. The learned calibration (see below) is fit from these
+rows. `PRAGMA refresh_history('view_name')` returns the 20 most recent rows for a view,
+newest first:
+
+```sql
+PRAGMA refresh_history('monthly_totals');
+```
 
 | Column | Meaning | Use in calibration |
 |---|---|---|
-| `view_name` | View the row belongs to (the pragma echoes the name it was given). | Rows are fitted per view. |
-| `refresh_timestamp` | When the row was recorded. | Orders samples; newer samples get more weight (`openivm_cost_decay`). |
-| `method` | Strategy that ran: the selected strategy label (for example `incremental`, `group_recompute`, `window_partition`), or `full` when the cost model chose recompute or `openivm_refresh_mode = 'full'`. | Selects which model is fitted: `full` rows feed the recompute model, every other value feeds the non-full model. |
+| `view_name` | View the row belongs to (the pragma echoes the name it was given). The table's primary key is `(view_name, refresh_timestamp)`. | Rows are fitted per view. |
+| `refresh_timestamp` | When the row was recorded (defaults to `current_timestamp`). | Orders samples; newer samples get more weight (`openivm_cost_decay`), oldest are pruned first. |
+| `method` | Strategy that ran: the selected strategy label (for example `incremental`, `group_recompute`, `window_partition`), or `full` when the cost model chose recompute or `openivm_refresh_mode = 'full'`. | Selects which model the row trains: `full` rows feed the recompute model; rows whose `method` equals the view's current non-full strategy label feed the non-full model. Rows with any other label are ignored. |
 | `incremental_compute_est` | Static compute estimate of the selected non-full strategy at refresh time. | Regressor `compute_est` for non-full rows. |
-| `incremental_upsert_est` | Static upsert estimate of the selected non-full strategy. | Regressor `upsert_est` for non-full rows. |
+| `incremental_upsert_est` | Static upsert (write-side) estimate of the selected non-full strategy. | Regressor `upsert_est` for non-full rows. |
 | `recompute_compute_est` | Static compute estimate of full recompute. | Regressor `compute_est` for `full` rows. |
-| `recompute_replace_est` | Static replace estimate of full recompute. | Regressor `upsert_est` for `full` rows. |
-| `actual_duration_ms` | Measured wall-clock refresh duration. | Target `actual_ms` of the regression. |
+| `recompute_replace_est` | Static replace (delete + insert) estimate of full recompute. | Regressor `upsert_est` for `full` rows. |
+| `actual_duration_ms` | Measured wall-clock refresh duration, in milliseconds. | Target `actual_ms` of the regression. |
 
 All four estimate columns are written on every row, but a row only contributes the pair
-that matches its `method`. The table also has a `strategy` column (default
-`'incremental'`); `PRAGMA refresh_history` does not return it, but it can be read from
+that matches its `method`. Each fit reads at most 20 matching rows, oldest first, and a
+strategy needs at least three rows to be calibrated. Only the 20 newest rows per view are
+kept; older rows are deleted on each insert. Rows are also deleted when the view is
+replaced with `CREATE OR REPLACE MATERIALIZED VIEW`.
+
+The table also has a `strategy` column (default `'incremental'`). The refresh path does
+not write it and calibration does not use it; `method` is the field that distinguishes
+strategies. `PRAGMA refresh_history` does not return `strategy`, but it can be read from
 `openivm_refresh_history` directly.
 
 ## Static Model
