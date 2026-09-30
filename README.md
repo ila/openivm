@@ -199,5 +199,6 @@ and [saving compiled SQL as rows](docs/build/building.md#inspect-or-save-compile
 - **[Refresh](docs/refresh/)** — Refresh strategies, automatic refresh, pipelines, and [refresh hooks](docs/refresh_hooks.md)
 - **[Optimizations](docs/optimizations/)** — Delta consolidation, FK pruning, empty-delta skip, append-only, indexing
 - **[Internals](docs/internals/)** — Delta tables, parser, concurrency, cost model, schema evolution
+- **[Concurrency and operations](docs/concurrency.md)** — What concurrent readers, writers and refreshes can rely on; running the daemon, upgrading, troubleshooting
 - **[Limitations](docs/limitations.md)** — Unsupported operators, known restrictions
 - **[Build](docs/build/building.md)** — Building, testing, benchmarks

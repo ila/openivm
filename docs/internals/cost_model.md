@@ -39,7 +39,7 @@ PRAGMA refresh_cost('monthly_totals');
 
 ## Refresh History
 
-Every refresh that goes through the cost model appends one row to the
+Every refresh that runs with `openivm_adaptive_refresh = true` appends one row to the
 `openivm_refresh_history` table. The learned calibration (see below) is fit from these
 rows. `PRAGMA refresh_history('view_name')` returns the 20 most recent rows for a view,
 newest first:
@@ -48,32 +48,27 @@ newest first:
 PRAGMA refresh_history('monthly_totals');
 ```
 
-| Column | Meaning |
-|---|---|
-| `view_name` | The view the row belongs to. The table's primary key is `(view_name, refresh_timestamp)`. |
-| `refresh_timestamp` | When the row was recorded (defaults to `current_timestamp`). Orders samples: newest are weighted most, oldest are pruned first. |
-| `method` | Strategy that actually ran: `full` if the cost model chose recompute or `openivm_refresh_mode = 'full'`, otherwise the selected non-full strategy label (for example `incremental`, `group_recompute`, `window_partition`). Selects which regression the row trains. |
-| `incremental_compute_est` | Static compute estimate of the selected non-full strategy at refresh time. |
-| `incremental_upsert_est` | Static upsert (write-side) estimate of the selected non-full strategy. |
-| `recompute_compute_est` | Static compute estimate of full recompute. |
-| `recompute_replace_est` | Static replace (delete + insert) estimate of full recompute. |
-| `actual_duration_ms` | Measured wall-clock duration of the refresh, in milliseconds. This is the regression target. |
+| Column | Meaning | Use in calibration |
+|---|---|---|
+| `view_name` | View the row belongs to (the pragma echoes the name it was given). The table's primary key is `(view_name, refresh_timestamp)`. | Rows are fitted per view. |
+| `refresh_timestamp` | When the row was recorded (defaults to `current_timestamp`). | Orders samples; newer samples get more weight (`openivm_cost_decay`), oldest are pruned first. |
+| `method` | Strategy that ran: the selected strategy label (for example `incremental`, `group_recompute`, `window_partition`), or `full` when the cost model chose recompute or `openivm_refresh_mode = 'full'`. | Selects which model the row trains: `full` rows feed the recompute model; rows whose `method` equals the view's current non-full strategy label feed the non-full model. Rows with any other label are ignored. |
+| `incremental_compute_est` | Static compute estimate of the selected non-full strategy at refresh time. | Regressor `compute_est` for non-full rows. |
+| `incremental_upsert_est` | Static upsert (write-side) estimate of the selected non-full strategy. | Regressor `upsert_est` for non-full rows. |
+| `recompute_compute_est` | Static compute estimate of full recompute. | Regressor `compute_est` for `full` rows. |
+| `recompute_replace_est` | Static replace (delete + insert) estimate of full recompute. | Regressor `upsert_est` for `full` rows. |
+| `actual_duration_ms` | Measured wall-clock refresh duration, in milliseconds. | Target `actual_ms` of the regression. |
 
-How each field feeds calibration:
+All four estimate columns are written on every row, but a row only contributes the pair
+that matches its `method`. Each fit reads at most 20 matching rows, oldest first, and a
+strategy needs at least three rows to be calibrated. Only the 20 newest rows per view are
+kept; older rows are deleted on each insert. Rows are also deleted when the view is
+replaced with `CREATE OR REPLACE MATERIALIZED VIEW`.
 
-- Rows with `method = 'full'` train the recompute model, with `recompute_compute_est` and
-  `recompute_replace_est` as the two features. Rows whose `method` equals the current
-  non-full strategy label train the incremental model, with `incremental_compute_est` and
-  `incremental_upsert_est` as features. Rows for other methods are ignored by that fit.
-- `actual_duration_ms` is the value being predicted (`actual_ms` in the formula below).
-- Each fit reads at most 20 rows, oldest first, and weights recent rows more according to
-  `openivm_cost_decay`. A strategy needs at least three rows to be calibrated.
-- Only the 20 newest rows per view are kept; older rows are deleted on each insert. Rows
-  are also deleted when the view is dropped or replaced.
-
-The table also has a `strategy` column (default `'incremental'`). It is not written by the
-refresh path, not returned by `PRAGMA refresh_history`, and not used by calibration;
-`method` is the field that distinguishes strategies.
+The table also has a `strategy` column (default `'incremental'`). The refresh path does
+not write it and calibration does not use it; `method` is the field that distinguishes
+strategies. `PRAGMA refresh_history` does not return `strategy`, but it can be read from
+`openivm_refresh_history` directly.
 
 ## Static Model
 
