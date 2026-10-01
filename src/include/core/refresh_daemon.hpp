@@ -12,10 +12,7 @@
 namespace duckdb {
 
 // Background thread that periodically refreshes materialized views with a REFRESH EVERY interval.
-// Holds a raw, non-owning pointer to the DatabaseInstance passed to Start(). The pointer is only valid while
-// that instance is alive: the extension is process-wide and outlives any single database, and nothing stops
-// the daemon when the instance shuts down. The owner must call Stop() (or replace the daemon) before the
-// instance is destroyed, otherwise the next wake dereferences a dangling pointer.
+// Holds the database alive only while executing a scheduling cycle.
 // The daemon wakes every 30 seconds, checks which views are due, and refreshes them
 // after acquiring the shared OpenIVM mutation gate.
 class RefreshDaemon {
@@ -40,7 +37,7 @@ public:
 private:
 	void Run();
 
-	DatabaseInstance *db_ = nullptr;
+	weak_ptr<DatabaseInstance> db_;
 	std::thread thread_;
 	std::atomic<bool> shutdown_ {false};
 	std::atomic<bool> started_ {false};

@@ -16,7 +16,7 @@ void RefreshDaemon::Start(DatabaseInstance &db) {
 	if (!started_.compare_exchange_strong(expected, true)) {
 		return; // already started
 	}
-	db_ = &db;
+	db_ = db.shared_from_this();
 	shutdown_ = false;
 	thread_ = std::thread(&RefreshDaemon::Run, this);
 }
@@ -69,9 +69,14 @@ void RefreshDaemon::Run() {
 			break;
 		}
 		wake_requested_ = false;
+		auto db = db_.lock();
+		if (!db) {
+			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Database closed; stopping\n");
+			break;
+		}
 
 		try {
-			Connection con(*db_);
+			Connection con(*db);
 			OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] Woke up\n");
 
 			// Read cascade setting from the DB config
@@ -140,7 +145,7 @@ void RefreshDaemon::Run() {
 
 				bool refresh_succeeded = false;
 				try {
-					Connection refresh_con(*db_);
+					Connection refresh_con(*db);
 					auto result = refresh_con.Query(
 					    "PRAGMA refresh_options('" + SqlUtils::EscapeValue(sv.catalog_name) + "', '" +
 					    SqlUtils::EscapeValue(sv.schema_name) + "', '" + SqlUtils::EscapeValue(sv.view_name) + "')");
