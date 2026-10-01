@@ -377,7 +377,19 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// Record execution history for the learned cost model.
 		if (!cost_estimate.strategy_label.empty()) {
 			auto history_start = std::chrono::steady_clock::now();
-			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+			// Measured from before SQL generation, not from the start of execution.
+			//
+			// `start` brackets only the generated program running. Everything ahead of it — planning
+			// the delta query, firing the rewrite rules, the LPTS round trip, upsert codegen — is the
+			// refresh too, and on small views it dominates: a case measuring 5ms of execution took
+			// 15ms end to end. Training on execution alone taught the model a quantity no caller
+			// waits for, and made its predictions look like a two- to three-fold under-estimate when
+			// they were simply answering a different question.
+			//
+			// It also biased the comparison. Generation is expensive for the incremental path, which
+			// rewrites and re-plans, and cheap for full recompute, which does neither, so excluding it
+			// discounted precisely the cost that distinguishes them.
+			auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - generate_start).count();
 			// Determine which method was used. Priority:
 			//   1) `openivm_refresh_mode = 'full'` overrides everything → "full".
 			//   2) If the adaptive cost model picked full recompute, record "full".
@@ -394,9 +406,26 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 				}
 			}
 
+			// Record the features of the strategy that actually ran, paired with how long it took.
+			// That pairing is the whole training signal: the alternative was not executed, so its
+			// features have no measurement to learn from. The recompute description always exists,
+			// since it comes from the view query plan; the incremental one only when a delta plan was
+			// built, which is why an uncalibrated run records no features rather than zeroes.
+			vector<double> recorded_features;
+			int32_t recorded_schema = 0;
+			if (method == "full") {
+				recorded_features.assign(cost_estimate.recompute_features.begin(),
+				                         cost_estimate.recompute_features.end());
+				recorded_schema = PLAN_FEATURE_SCHEMA;
+			} else if (cost_estimate.has_features) {
+				recorded_features.assign(cost_estimate.incremental_features.begin(),
+				                         cost_estimate.incremental_features.end());
+				recorded_schema = PLAN_FEATURE_SCHEMA;
+			}
 			RefreshMetadata(exec_con).RecordRefreshHistory(
 			    vn, method, cost_estimate.incremental_compute, cost_estimate.incremental_upsert,
-			    cost_estimate.recompute_compute, cost_estimate.recompute_replace, duration_ms);
+			    cost_estimate.recompute_compute, cost_estimate.recompute_replace, duration_ms, recorded_features,
+			    recorded_schema, cost_estimate.exploration != 0);
 			OPENIVM_DEBUG_PRINT("[HISTORY] Recorded: view=%s, method=%s, duration=%ldms\n", vn.c_str(), method.c_str(),
 			                    (long)duration_ms);
 			profiler.AddStep("record_refresh_history", history_start, method);

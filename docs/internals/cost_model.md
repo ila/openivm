@@ -1,5 +1,13 @@
 # Cost Model
 
+> **Superseded in parts.** This page describes the two-term model and its hand-tuned millisecond
+> constants. That model is now the fallback beneath a learned per-operator one, the decision is made
+> on the plan that actually runs, and the "Preliminary Benchmark Results" below were produced by a
+> generator 30x below TPC-C scale, which made full recompute win everything regardless of model
+> quality. See [cost-model-rework.md](cost-model-rework.md) for current state, measurements and open
+> questions.
+
+
 OpenIVM uses the cost model when `openivm_adaptive_refresh` is enabled. The model
 compares the view's normal maintenance path with a full recompute, then chooses the
 lower predicted cost.
