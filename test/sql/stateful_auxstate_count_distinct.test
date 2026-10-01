@@ -28,7 +28,7 @@ LIMIT 1;
 6	GROUP_RECOMPUTE
 
 query I
-SELECT count(*) FROM information_schema.tables WHERE table_name = 'openivm_aux_cdaux_off_mv';
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'openivm_aux___openivm_mv_6d656d6f7279_6d61696e_63646175785f6f66665f6d76_';
 ----
 0
 
@@ -62,7 +62,7 @@ LIMIT 1;
 11	COUNT_DISTINCT_INCREMENTAL
 
 query I
-SELECT count(*) FROM information_schema.tables WHERE table_name = 'openivm_aux_cdaux_mv';
+SELECT count(*) FROM information_schema.tables WHERE table_name = 'openivm_aux___openivm_mv_6d656d6f7279_6d61696e_63646175785f6d76_';
 ----
 1
 
@@ -179,9 +179,9 @@ true
 
 # The emitted program is aux-state MERGE SQL, not GROUP_RECOMPUTE's affected-key DELETE+INSERT.
 query I
-SELECT contains(string_agg(lower(sql), ' ' ORDER BY stmt_order), 'openivm_aux_cdaux_mv')
-   AND contains(string_agg(lower(sql), ' ' ORDER BY stmt_order), 'merge into openivm_data_cdaux_mv')
-   AND NOT contains(string_agg(lower(sql), ' ' ORDER BY stmt_order), 'openivm_affected_cdaux_mv')
+SELECT contains(string_agg(lower(sql), ' ' ORDER BY stmt_order), 'openivm_aux___openivm_mv_6d656d6f7279_6d61696e_63646175785f6d76_')
+   AND contains(string_agg(lower(sql), ' ' ORDER BY stmt_order), 'merge into memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_63646175785f6d76_')
+   AND NOT contains(string_agg(lower(sql), ' ' ORDER BY stmt_order), 'openivm_affected___openivm_mv_6d656d6f7279_6d61696e_63646175785f6d76_')
 FROM openivm_compile_with_facts(
     'cdaux_mv',
     '{"target_dialect":"duckdb","compile_only":true}'

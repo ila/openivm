@@ -435,7 +435,7 @@ CREATE MATERIALIZED VIEW mv_window_range AS
     WHERE h_date IS NOT NULL;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_window_range';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f77696e646f775f72616e6765_';
 ----
 5
 
@@ -521,7 +521,7 @@ statement ok
 PRAGMA refresh('w_chain_l2');
 
 query I
-SELECT count(*) FROM openivm_delta_w_chain_l2;
+SELECT count(*) FROM openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_775f636861696e5f6c32_;
 ----
 1
 

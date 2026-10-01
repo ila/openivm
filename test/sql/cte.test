@@ -386,7 +386,7 @@ CREATE MATERIALIZED VIEW mv_cte_joinagg AS
     FROM customer_segments cs JOIN cte_joinagg_wh wh ON cs.w = wh.w;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_cte_joinagg';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6374655f6a6f696e616767_';
 ----
 6
 
@@ -481,17 +481,17 @@ CREATE MATERIALIZED VIEW mv_cte_having AS
     FROM cte_hav_item i JOIN item_revenue ir ON i.i_id = ir.ol_i_id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_cte_having';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6374655f686176696e67_';
 ----
 6
 
 query T
-SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_cte_having';
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6374655f686176696e67_';
 ----
 current_diff
 
 query I
-SELECT group_recompute_source_occurrences_json IS NOT NULL FROM openivm_views WHERE view_name = 'mv_cte_having';
+SELECT group_recompute_source_occurrences_json IS NOT NULL FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6374655f686176696e67_';
 ----
 true
 
@@ -535,9 +535,9 @@ PRAGMA refresh('mv_cte_having');
 
 query I
 SELECT count(*) > 0 FROM openivm_refresh_profile
-WHERE view_name = 'mv_cte_having'
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6374655f686176696e67_'
   AND step_name = 'execute_refresh_sql_stmt'
-  AND contains(detail, 'openivm_current_mv_cte_having');
+  AND contains(detail, 'openivm_current___openivm_mv_6d656d6f7279_6d61696e_6d765f6374655f686176696e67_');
 ----
 true
 
@@ -748,7 +748,7 @@ SELECT COUNT(*) FROM (
 
 # Classification: SIMPLE_PROJECTION (type 2), not FULL_REFRESH.
 query I
-SELECT type FROM openivm_views WHERE view_name = 'selfjoin_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_73656c666a6f696e5f6d76_';
 ----
 2
 
@@ -778,7 +778,7 @@ CREATE MATERIALIZED VIEW mv_jia AS
 
 # Verify classification is GROUP_RECOMPUTE (6)
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_jia';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6a6961_';
 ----
 6
 
@@ -869,7 +869,7 @@ CREATE MATERIALIZED VIEW mv_cra AS
 
 # Verify classification is GROUP_RECOMPUTE (6): outer COUNT(*) counts inner groups (non-linear over source deltas)
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_cra';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f637261_';
 ----
 6
 
@@ -931,7 +931,7 @@ JOIN cte_joa_customer c ON c.c_id = ot.o_c_id
 WHERE ot.n > 1;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_cte_join_agg_reordered_keys';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6374655f6a6f696e5f6167675f72656f7264657265645f6b657973_';
 ----
 6
 
@@ -1017,7 +1017,7 @@ FROM ord_agg oa
 WHERE oa.n > 1;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_cte_scalar_projected_agg';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6374655f7363616c61725f70726f6a65637465645f616767_';
 ----
 6
 
@@ -1095,12 +1095,12 @@ CREATE MATERIALIZED VIEW mv_fgc AS
     SELECT * FROM step3;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_fgc';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f666763_';
 ----
 1
 
 query I
-SELECT aggregate_decomposition_json IS NOT NULL FROM openivm_views WHERE view_name = 'mv_fgc';
+SELECT aggregate_decomposition_json IS NOT NULL FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f666763_';
 ----
 true
 
@@ -1203,12 +1203,12 @@ JOIN cte_dist d ON w.w_id = d.d_w_id
 JOIN ol_by_district od ON d.d_w_id = od.ol_w_id AND d.d_id = od.ol_d_id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_cte_join_keys';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6374655f6a6f696e5f6b657973_';
 ----
 6
 
 query I
-SELECT group_columns FROM openivm_views WHERE view_name = 'mv_cte_join_keys';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6374655f6a6f696e5f6b657973_';
 ----
 w_id,d_id
 

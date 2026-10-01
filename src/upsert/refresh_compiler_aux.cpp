@@ -6,6 +6,14 @@
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_internal.hpp"
 
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+
 #include <map>
 #include <regex>
 
@@ -20,44 +28,10 @@ static string DeltaSourceRef(const string &source, const string &catalog_prefix)
 	return catalog_prefix + SqlUtils::QuoteIdentifier(source);
 }
 
-static string TrimCopy(const string &input) {
-	idx_t start = 0;
-	while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
-		start++;
-	}
-	idx_t end = input.size();
-	while (end > start && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
-		end--;
-	}
-	return input.substr(start, end - start);
-}
-
-static string LowerCopy(string input) {
-	std::transform(input.begin(), input.end(), input.begin(),
-	               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-	return input;
-}
-
-static string StripIdentifierQuotes(string input) {
-	input = TrimCopy(input);
-	if (input.size() >= 2 && input.front() == '"' && input.back() == '"') {
-		return input.substr(1, input.size() - 2);
-	}
-	return SqlUtils::LastIdentifierPart(input);
-}
-
 static string PartitionOutputColumn(const string &input) {
 	auto pos = input.find('=');
-	return StripIdentifierQuotes(pos == string::npos ? input : input.substr(0, pos));
-}
-
-static vector<string> PartitionOutputColumns(const vector<string> &partition_columns) {
-	vector<string> output_columns;
-	output_columns.reserve(partition_columns.size());
-	for (auto &partition_column : partition_columns) {
-		output_columns.push_back(PartitionOutputColumn(partition_column));
-	}
-	return output_columns;
+	// Metadata stores a column name, not a qualified SQL identifier.
+	return pos == string::npos ? input : input.substr(0, pos);
 }
 
 static string BuildAffectedTableFilter(const vector<string> &columns, const string &outer_alias,
@@ -86,65 +60,13 @@ static string BuildDeltaAffectedFilter(const vector<WindowPartitionDeltaSpec> &p
 	return filter;
 }
 
-static vector<string> SplitTopLevelComma(const string &input) {
-	vector<string> parts;
-	idx_t start = 0;
-	int depth = 0;
-	for (idx_t i = 0; i < input.size(); i++) {
-		char c = input[i];
-		if (c == '(') {
-			depth++;
-		} else if (c == ')' && depth > 0) {
-			depth--;
-		} else if (c == ',' && depth == 0) {
-			parts.push_back(TrimCopy(input.substr(start, i - start)));
-			start = i + 1;
-		}
-	}
-	parts.push_back(TrimCopy(input.substr(start)));
-	return parts;
-}
-
-static idx_t FindTopLevelFrom(const string &input) {
-	string lower = LowerCopy(input);
-	int depth = 0;
-	for (idx_t i = 0; i + 6 <= lower.size(); i++) {
-		char c = lower[i];
-		if (c == '(') {
-			depth++;
-		} else if (c == ')' && depth > 0) {
-			depth--;
-		}
-
-		if (depth == 0 && lower.compare(i, 6, " from ") == 0) {
-			return i;
-		}
-	}
-	return string::npos;
-}
-
-static idx_t FindTopLevelKeyword(const string &input, const string &keyword, idx_t start = 0) {
-	string lower = LowerCopy(input);
-	string needle = " " + keyword + " ";
-	int depth = 0;
-	for (idx_t i = start; i + needle.size() <= lower.size(); i++) {
-		char c = lower[i];
-		if (c == '(') {
-			depth++;
-		} else if (c == ')' && depth > 0) {
-			depth--;
-		}
-		if (depth == 0 && lower.compare(i, needle.size(), needle) == 0) {
-			return i;
-		}
-	}
-	return string::npos;
-}
-
 struct RunningWindowExpr {
 	string function_name;
 	string argument;
 	string output_column;
+	bool rows_frame = false;
+	bool nulls_first = false;
+	string position_column;
 };
 
 struct RunningDerivedExpr {
@@ -153,393 +75,230 @@ struct RunningDerivedExpr {
 };
 
 struct RunningWindowPlan {
-	string source_table;
 	string partition_column;
 	string order_column;
 	vector<string> output_columns;
 	vector<pair<string, string>> passthrough_columns;
 	vector<RunningWindowExpr> window_exprs;
 	vector<RunningDerivedExpr> derived_exprs;
+	vector<string> position_columns;
+	vector<string> source_columns;
+	string suffix_position = "openivm_rows_position_suffix";
+	bool nulls_first = false;
 };
 
-static bool ParsePassthroughProjection(const string &item, pair<string, string> &out) {
-	static const std::regex alias_regex(R"(^\s*(.+?)\s+as\s+("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$)",
-	                                    std::regex_constants::icase);
-	std::smatch match;
-	string expr = item;
-	string output;
-	if (std::regex_match(item, match, alias_regex)) {
-		expr = TrimCopy(match[1].str());
-		output = StripIdentifierQuotes(match[2].str());
-	} else {
-		output = StripIdentifierQuotes(expr);
-	}
-	string source = StripIdentifierQuotes(expr);
-	if (source.empty() || source.find(' ') != string::npos || source.find('(') != string::npos) {
-		return false;
-	}
-	out = std::make_pair(source, output);
-	return true;
+static string RunningColumn(const ParsedExpression &expr) {
+	return expr.GetExpressionClass() == ExpressionClass::COLUMN_REF ? expr.Cast<ColumnRefExpression>().GetColumnName()
+	                                                                : "";
 }
 
-static bool ParseWindowSpec(const string &spec_input, string &partition_col, string &order_col) {
-	string spec = TrimCopy(spec_input);
-	string spec_lower = LowerCopy(spec);
-	auto part_pos = spec_lower.find("partition by ");
-	auto order_pos = spec_lower.find(" order by ");
-	if (part_pos == string::npos || order_pos == string::npos || order_pos <= part_pos) {
+static bool ParseRunningWindowExpression(const ParsedExpression &expression, RunningWindowExpr &out,
+                                         string &partition_col, string &order_col) {
+	if (expression.GetExpressionClass() != ExpressionClass::WINDOW) {
 		return false;
 	}
-	string part_expr = TrimCopy(spec.substr(part_pos + 13, order_pos - (part_pos + 13)));
-	string order_expr = TrimCopy(spec.substr(order_pos + 10));
-	string order_lower = LowerCopy(order_expr);
-	auto frame_pos = order_lower.find(" rows ");
-	if (frame_pos == string::npos) {
-		frame_pos = order_lower.find(" range ");
+	auto &window = expression.Cast<WindowExpression>();
+	auto function = StringUtil::Lower(window.function_name);
+	if (function == "count_star") {
+		function = "count";
 	}
-	if (frame_pos != string::npos) {
-		string frame = order_lower.substr(frame_pos);
-		if (frame.find("unbounded preceding") == string::npos || frame.find("current row") == string::npos) {
-			return false;
-		}
-		order_expr = TrimCopy(order_expr.substr(0, frame_pos));
-	}
-	auto nulls_pos = LowerCopy(order_expr).find(" nulls ");
-	if (nulls_pos != string::npos) {
-		order_expr = TrimCopy(order_expr.substr(0, nulls_pos));
-	}
-	auto order_space = order_expr.find(' ');
-	if (order_space != string::npos) {
-		string suffix = LowerCopy(TrimCopy(order_expr.substr(order_space + 1)));
-		if (suffix != "asc") {
-			return false;
-		}
-		order_expr = TrimCopy(order_expr.substr(0, order_space));
-	}
-	string parsed_part = StripIdentifierQuotes(part_expr);
-	string parsed_order = StripIdentifierQuotes(order_expr);
-	if (parsed_part.empty() || parsed_order.empty() || part_expr.find(',') != string::npos ||
-	    order_expr.find(',') != string::npos) {
+	if ((function != "sum" && function != "min" && function != "max" && function != "count" && function != "avg" &&
+	     function != "row_number") ||
+	    window.partitions.size() != 1 || window.orders.size() != 1 || window.children.size() > 1 ||
+	    window.filter_expr || window.distinct || !window.arg_orders.empty() ||
+	    window.exclude_clause != WindowExcludeMode::NO_OTHER || window.start != WindowBoundary::UNBOUNDED_PRECEDING ||
+	    (window.end != WindowBoundary::CURRENT_ROW_RANGE && window.end != WindowBoundary::CURRENT_ROW_ROWS) ||
+	    window.orders[0].type == OrderType::DESCENDING) {
 		return false;
 	}
-	if (!partition_col.empty() && !StringUtil::CIEquals(partition_col, parsed_part)) {
+	auto partition = RunningColumn(*window.partitions[0]);
+	auto order = RunningColumn(*window.orders[0].expression);
+	if (partition.empty() || order.empty() ||
+	    (!partition_col.empty() && !StringUtil::CIEquals(partition_col, partition)) ||
+	    (!order_col.empty() && !StringUtil::CIEquals(order_col, order))) {
 		return false;
 	}
-	if (!order_col.empty() && !StringUtil::CIEquals(order_col, parsed_order)) {
-		return false;
-	}
-	partition_col = parsed_part;
-	order_col = parsed_order;
-	return true;
+	out.function_name = function;
+	out.rows_frame = window.end == WindowBoundary::CURRENT_ROW_ROWS;
+	out.nulls_first = window.orders[0].null_order == OrderByNullType::NULLS_FIRST;
+	out.argument = window.children.empty() && (function == "count" || function == "row_number") ? "*"
+	               : window.children.empty()                                                    ? ""
+	                                         : RunningColumn(*window.children[0]);
+	out.output_column = expression.GetName();
+	partition_col = partition;
+	order_col = order;
+	return !out.argument.empty();
 }
 
-static bool ParseNamedWindows(const string &tail, std::map<string, string> &named_windows) {
-	for (auto &item : SplitTopLevelComma(tail)) {
-		static const std::regex named_regex(R"(^\s*("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s+as\s*\((.*)\)\s*$)",
-		                                    std::regex_constants::icase);
-		std::smatch match;
-		if (!std::regex_match(item, match, named_regex)) {
-			return false;
-		}
-		named_windows[StringUtil::Lower(StripIdentifierQuotes(match[1].str()))] = TrimCopy(match[2].str());
+static unique_ptr<SelectStatement> ParseRunningSelect(const string &sql) {
+	Parser parser;
+	try {
+		parser.ParseQuery(sql);
+	} catch (const ParserException &) {
+		return nullptr;
 	}
-	return !named_windows.empty();
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		return nullptr;
+	}
+	return unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
 }
 
-static bool ParseRunningWindowProjection(const string &item, const std::map<string, string> &named_windows,
-                                         RunningWindowExpr &out, string &partition_col, string &order_col) {
-	static const std::regex alias_regex(R"(^\s*(.+?)\s+as\s+("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$)",
-	                                    std::regex_constants::icase);
-	std::smatch alias_match;
-	if (!std::regex_match(item, alias_match, alias_regex)) {
-		return false;
+static SelectNode *RunningSelect(QueryNode &node) {
+	if (node.type != QueryNodeType::SELECT_NODE) {
+		return nullptr;
 	}
-	string expr = TrimCopy(alias_match[1].str());
-	out.output_column = StripIdentifierQuotes(alias_match[2].str());
-	static const std::regex window_regex(R"(^\s*(sum|min|max|count|avg)\s*\(\s*([^)]+?)\s*\)\s+over\s*\((.*)\)\s*$)",
-	                                     std::regex_constants::icase);
-	static const std::regex named_window_regex(
-	    R"(^\s*(sum|min|max|count|avg)\s*\(\s*([^)]+?)\s*\)\s+over\s+("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)\s*$)",
-	    std::regex_constants::icase);
-	std::smatch window_match;
-	string spec;
-	if (!std::regex_match(expr, window_match, window_regex)) {
-		if (!std::regex_match(expr, window_match, named_window_regex)) {
-			return false;
-		}
-		auto found = named_windows.find(StringUtil::Lower(StripIdentifierQuotes(window_match[3].str())));
-		if (found == named_windows.end()) {
-			return false;
-		}
-		spec = found->second;
-	} else {
-		spec = TrimCopy(window_match[3].str());
+	auto &select = node.Cast<SelectNode>();
+	if (select.where_clause || select.having || select.qualify || select.sample ||
+	    !select.groups.group_expressions.empty() || !select.modifiers.empty() || !select.from_table ||
+	    select.from_table->type != TableReferenceType::BASE_TABLE) {
+		return nullptr;
 	}
-	if (!ParseWindowSpec(spec, partition_col, order_col)) {
-		return false;
-	}
-	out.function_name = LowerCopy(window_match[1].str());
-	out.argument = StripIdentifierQuotes(window_match[2].str());
-	return true;
+	return &select;
 }
 
-static bool ParseRunningWindowExpression(const string &expr, RunningWindowExpr &out, string &partition_col,
-                                         string &order_col) {
-	static const std::regex window_regex(R"(^\s*(sum|min|max|count|avg)\s*\(\s*([^)]+?)\s*\)\s+over\s*\((.*)\)\s*$)",
-	                                     std::regex_constants::icase);
-	std::smatch window_match;
-	if (!std::regex_match(expr, window_match, window_regex)) {
-		return false;
-	}
-	if (!ParseWindowSpec(TrimCopy(window_match[3].str()), partition_col, order_col)) {
-		return false;
-	}
-	out.function_name = LowerCopy(window_match[1].str());
-	out.argument = StripIdentifierQuotes(window_match[2].str());
-	return true;
+static string RefreshExpressionSQL(ParsedExpression &expression) {
+	// Resolve builtin cast names so portable SQL uses DATE rather than an unresolved quoted type name.
+	ParsedExpressionIterator::VisitExpressionMutable<CastExpression>(
+	    expression, [&](CastExpression &cast) { cast.cast_type = UnboundType::TryDefaultBind(cast.cast_type); });
+	return expression.ToString();
 }
 
-static string TranslateExpressionIdentifiers(const string &expr, const std::map<string, string> &alias_to_output) {
-	static const std::regex ident_regex(R"("[^"]+"|[A-Za-z_][A-Za-z0-9_]*)");
-	string result;
-	idx_t pos = 0;
-	for (std::sregex_iterator it(expr.begin(), expr.end(), ident_regex), end; it != end; ++it) {
-		const auto &match = *it;
-		result += expr.substr(pos, match.position() - pos);
-		string token = match.str();
-		string key = StringUtil::Lower(StripIdentifierQuotes(token));
-		auto found = alias_to_output.find(key);
-		result += found == alias_to_output.end() ? token : SqlUtils::QuoteIdentifier(found->second);
-		pos = match.position() + match.length();
-	}
-	result += expr.substr(pos);
-	return result;
-}
-
-static bool LooksLikeLptsAlias(const string &expr) {
-	static const std::regex lpts_alias_regex(R"(\bt[0-9]+_[A-Za-z0-9_]+\b)");
-	return std::regex_search(expr, lpts_alias_regex);
-}
-
-static bool TryParseRunningWindowPlan(const string &view_query_sql, const vector<string> &partition_columns,
-                                      const vector<string> &column_names, RunningWindowPlan &plan) {
-	string query = TrimCopy(view_query_sql);
-	if (!StringUtil::StartsWith(LowerCopy(query), "select ")) {
-		return false;
-	}
-	auto from_pos = FindTopLevelFrom(query);
-	if (from_pos == string::npos) {
-		return false;
-	}
-	string select_list = query.substr(7, from_pos - 7);
-	string from_tail = TrimCopy(query.substr(from_pos + 6));
-	std::map<string, string> named_windows;
-	auto window_pos = FindTopLevelKeyword(" " + from_tail, "window");
-	if (window_pos != string::npos) {
-		string source_tail = TrimCopy(from_tail.substr(0, window_pos - 1));
-		string window_tail = TrimCopy(from_tail.substr(window_pos + 7));
-		if (!ParseNamedWindows(window_tail, named_windows)) {
-			return false;
-		}
-		from_tail = source_tail;
-	}
-	if (from_tail.empty() || from_tail.find(' ') != string::npos || from_tail.find(',') != string::npos) {
-		return false;
-	}
-	plan.source_table = StripIdentifierQuotes(from_tail);
-	auto parsed_partition = partition_columns.empty() ? "" : PartitionOutputColumn(partition_columns[0]);
-	string parsed_order;
-	for (auto &item : SplitTopLevelComma(select_list)) {
-		if (LowerCopy(item).find(" over ") != string::npos) {
-			RunningWindowExpr expr;
-			if (!ParseRunningWindowProjection(item, named_windows, expr, parsed_partition, parsed_order)) {
-				return false;
-			}
-			plan.window_exprs.push_back(expr);
+static string TranslateExpressionIdentifiers(const ParsedExpression &expression,
+                                             const std::map<string, string> &alias_to_output) {
+	auto copy = expression.Copy();
+	bool resolved = true;
+	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*copy, [&](ColumnRefExpression &column) {
+		auto found = alias_to_output.find(StringUtil::Lower(column.GetColumnName()));
+		if (found == alias_to_output.end()) {
+			resolved = false;
 		} else {
-			pair<string, string> pass;
-			if (!ParsePassthroughProjection(item, pass)) {
-				return false;
-			}
-			plan.passthrough_columns.push_back(pass);
+			column.column_names = {found->second};
 		}
-	}
-	if (plan.window_exprs.empty() || parsed_partition.empty() || parsed_order.empty() ||
-	    partition_columns.size() != 1) {
+	});
+	return resolved ? RefreshExpressionSQL(*copy) : "";
+}
+
+static bool TryParseRunningWindowPlan(SelectNode &select, const vector<string> &partition_columns,
+                                      const vector<string> &column_names, RunningWindowPlan &plan) {
+	if (partition_columns.size() != 1 || !select.cte_map.map.empty()) {
 		return false;
 	}
-	plan.partition_column = parsed_partition;
-	plan.order_column = parsed_order;
-	for (auto &col : column_names) {
-		bool found = false;
-		for (auto &pass : plan.passthrough_columns) {
-			found = found || StringUtil::CIEquals(col, pass.second);
+	plan.partition_column = PartitionOutputColumn(partition_columns[0]);
+	for (auto &item : select.select_list) {
+		if (item->GetExpressionClass() == ExpressionClass::WINDOW) {
+			RunningWindowExpr expr;
+			if (!ParseRunningWindowExpression(*item, expr, plan.partition_column, plan.order_column)) {
+				return false;
+			}
+			if (expr.rows_frame || expr.function_name == "row_number" ||
+			    (!plan.window_exprs.empty() && plan.nulls_first != expr.nulls_first)) {
+				return false;
+			}
+			plan.nulls_first = expr.nulls_first;
+			plan.window_exprs.push_back(std::move(expr));
+		} else {
+			auto source = RunningColumn(*item);
+			if (source.empty()) {
+				return false;
+			}
+			plan.passthrough_columns.emplace_back(source, item->GetName());
 		}
-		for (auto &expr : plan.window_exprs) {
-			found = found || StringUtil::CIEquals(col, expr.output_column);
+	}
+	for (auto &column : column_names) {
+		bool found = false;
+		for (auto &item : select.select_list) {
+			found = found || StringUtil::CIEquals(column, item->GetName());
 		}
 		if (!found) {
 			return false;
 		}
 	}
 	plan.output_columns = column_names;
-	return true;
+	return !plan.window_exprs.empty();
 }
 
-// Normalize an LPTS-emitted CTE program into the compact, single-space token stream that the
-// structural navigation in TryParseLptsRunningWindowPlan expects. The LPTS refactor (cwida lpts
-// Release 1.0.0) switched CTE bodies to a multi-line, aligned pretty-print (e.g. "AS (\n    SELECT
-// ...\n    FROM  ...\n)") and renamed CTEs from "scan_0"/"projection_1" to "t0_scan"/"t1_projection".
-// Collapsing whitespace and tightening parentheses restores "AS (SELECT ... source)" so the same
-// find()/rfind() navigation continues to work regardless of the layout. The window/order/partition
-// expressions themselves are re-parsed with whitespace-tolerant regexes, so no information is lost.
-static string NormalizeLptsRunningWindowSql(const string &sql) {
-	string collapsed;
-	collapsed.reserve(sql.size());
-	bool prev_space = false;
-	for (unsigned char c : sql) {
-		if (std::isspace(c)) {
-			if (!prev_space) {
-				collapsed += ' ';
-				prev_space = true;
-			}
-		} else {
-			collapsed += static_cast<char>(c);
-			prev_space = false;
-		}
-	}
-	auto replace_all = [](string &s, const string &from, const string &to) {
-		size_t pos = 0;
-		while ((pos = s.find(from, pos)) != string::npos) {
-			s.replace(pos, from.size(), to);
-			pos += to.size();
-		}
-	};
-	replace_all(collapsed, "( ", "(");
-	replace_all(collapsed, " )", ")");
-	return collapsed;
-}
-
-static bool TryParseLptsRunningWindowPlan(const string &raw_view_query_sql, const vector<string> &partition_columns,
+static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<string> &partition_columns,
                                           const vector<string> &column_names, RunningWindowPlan &plan) {
-	string view_query_sql = NormalizeLptsRunningWindowSql(raw_view_query_sql);
-	string lower = LowerCopy(view_query_sql);
-	// The first CTE in a running-window LPTS program is the base table scan. Locate it via the
-	// leading WITH rather than the CTE name, which the refactor changed from "scan_0" to "t0_scan".
-	auto scan_pos = lower.find("with");
-	if (scan_pos == string::npos) {
+	if (select.cte_map.map.empty()) {
 		return false;
 	}
-	scan_pos += 4;
-	auto alias_start = view_query_sql.find('(', scan_pos);
-	if (alias_start == string::npos) {
-		return false;
-	}
-	auto alias_end = view_query_sql.find(')', alias_start + 1);
-	if (alias_end == string::npos) {
-		return false;
-	}
-	auto select_pos = lower.find(" as (select ", alias_end);
-	if (select_pos == string::npos) {
-		return false;
-	}
-	select_pos += 12;
-	auto from_pos = lower.find(" from ", select_pos);
-	if (from_pos == string::npos) {
-		return false;
-	}
-	auto source_end = view_query_sql.find(')', from_pos + 6);
-	if (source_end == string::npos) {
-		return false;
-	}
-	auto scan_aliases = SplitTopLevelComma(view_query_sql.substr(alias_start + 1, alias_end - alias_start - 1));
-	auto source_cols = SplitTopLevelComma(view_query_sql.substr(select_pos, from_pos - select_pos));
-	if (scan_aliases.size() != source_cols.size()) {
+	auto &scan_cte = *select.cte_map.map.begin()->second;
+	auto *scan = RunningSelect(*scan_cte.query->node);
+	if (!scan || scan_cte.aliases.size() != scan->select_list.size()) {
 		return false;
 	}
 	std::map<string, string> alias_to_source;
 	std::map<string, string> alias_to_output;
-	for (idx_t i = 0; i < scan_aliases.size(); i++) {
-		string alias = StringUtil::Lower(StripIdentifierQuotes(scan_aliases[i]));
-		string source = StripIdentifierQuotes(source_cols[i]);
+	for (idx_t i = 0; i < scan_cte.aliases.size(); i++) {
+		auto source = RunningColumn(*scan->select_list[i]);
+		if (source.empty()) {
+			return false;
+		}
+		auto alias = StringUtil::Lower(scan_cte.aliases[i]);
+		plan.source_columns.push_back(source);
 		alias_to_source[alias] = source;
 		alias_to_output[alias] = source;
 	}
-	plan.source_table = StripIdentifierQuotes(view_query_sql.substr(from_pos + 6, source_end - from_pos - 6));
-	vector<string> output_names = column_names;
-	auto final_select = lower.rfind("\nselect ");
-	if (final_select == string::npos) {
-		final_select = lower.rfind(" select ");
-	}
-	if (final_select != string::npos) {
-		auto final_from = lower.find(" from ", final_select + 8);
-		if (final_from != string::npos) {
-			vector<string> parsed_outputs;
-			for (auto &item :
-			     SplitTopLevelComma(view_query_sql.substr(final_select + 8, final_from - final_select - 8))) {
-				pair<string, string> pass;
-				if (!ParsePassthroughProjection(item, pass)) {
-					parsed_outputs.clear();
-					break;
-				}
-				parsed_outputs.push_back(pass.second);
-			}
-			if (!parsed_outputs.empty()) {
-				output_names = parsed_outputs;
-			}
+	vector<string> output_names;
+	for (auto &item : select.select_list) {
+		if (RunningColumn(*item).empty()) {
+			output_names = column_names;
+			break;
 		}
-	}
-	vector<string> non_base_outputs;
-	for (auto &col : output_names) {
-		bool is_base = false;
-		for (auto &entry : alias_to_source) {
-			if (StringUtil::CIEquals(col, entry.second)) {
-				plan.passthrough_columns.push_back(std::make_pair(entry.second, col));
-				is_base = true;
-				break;
-			}
-		}
-		if (!is_base) {
-			non_base_outputs.push_back(col);
-		}
+		output_names.push_back(item->GetName());
 	}
 	plan.output_columns = output_names;
-	if (non_base_outputs.empty()) {
-		return false;
+	// Resolve final output names through passthrough CTEs once. Window outputs need
+	// not appear in function order, and hidden positions are appended at the end.
+	std::map<string, string> final_names;
+	for (auto &item : select.select_list) {
+		final_names[StringUtil::Lower(RunningColumn(*item))] = item->GetName();
 	}
+	vector<CommonTableExpressionInfo *> ctes;
+	for (auto &entry : select.cte_map.map) {
+		ctes.push_back(entry.second.get());
+	}
+	for (auto it = ctes.rbegin(); it != ctes.rend(); ++it) {
+		auto *body = RunningSelect(*(*it)->query->node);
+		if (!body || (*it)->aliases.size() != body->select_list.size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < body->select_list.size(); i++) {
+			auto target = final_names.find(StringUtil::Lower((*it)->aliases[i]));
+			auto source = RunningColumn(*body->select_list[i]);
+			if (target != final_names.end() && !source.empty()) {
+				final_names.emplace(StringUtil::Lower(source), target->second);
+			}
+		}
+	}
+	for (auto &source : alias_to_source) {
+		auto output = final_names.find(source.first);
+		if (output != final_names.end()) {
+			plan.passthrough_columns.emplace_back(source.second, output->second);
+		}
+	}
+	auto window_count = output_names.size() - plan.passthrough_columns.size();
 	idx_t window_idx = 0;
 	string expected_partition = partition_columns.empty() ? "" : PartitionOutputColumn(partition_columns[0]);
 	string parsed_partition;
 	string parsed_order;
-	idx_t cte_search = 0;
-	while (true) {
-		auto cte_as = lower.find(" as (select ", cte_search);
-		if (cte_as == string::npos) {
-			break;
-		}
-		auto cte_alias_start = view_query_sql.rfind('(', cte_as);
-		auto cte_alias_end = view_query_sql.rfind(')', cte_as);
-		if (cte_alias_start == string::npos || cte_alias_end == string::npos || cte_alias_end < cte_alias_start) {
+	for (auto &entry : select.cte_map.map) {
+		auto &cte = *entry.second;
+		auto *body = RunningSelect(*cte.query->node);
+		if (!body || cte.aliases.size() != body->select_list.size()) {
 			return false;
 		}
-		auto cte_aliases =
-		    SplitTopLevelComma(view_query_sql.substr(cte_alias_start + 1, cte_alias_end - cte_alias_start - 1));
-		auto cte_select = cte_as + 12;
-		auto cte_from = lower.find(" from ", cte_select);
-		if (cte_from == string::npos) {
-			break;
-		}
-		auto cte_items = SplitTopLevelComma(view_query_sql.substr(cte_select, cte_from - cte_select));
-		if (cte_aliases.size() != cte_items.size()) {
-			return false;
-		}
+		auto &cte_aliases = cte.aliases;
+		auto &cte_items = body->select_list;
 		std::map<string, string> next_alias_to_output;
+		idx_t first_window = plan.window_exprs.size();
+		string position_column;
 		for (idx_t item_idx = 0; item_idx < cte_items.size(); item_idx++) {
 			auto &item = cte_items[item_idx];
-			string output_alias = StripIdentifierQuotes(cte_aliases[item_idx]);
+			string output_alias = cte_aliases[item_idx];
 			string output_key = StringUtil::Lower(output_alias);
-			if (LowerCopy(item).find(" over ") == string::npos) {
-				string source_key = StringUtil::Lower(StripIdentifierQuotes(item));
+			if (item->GetExpressionClass() != ExpressionClass::WINDOW) {
+				string source_key = StringUtil::Lower(RunningColumn(*item));
 				auto passthrough = alias_to_output.find(source_key);
 				if (passthrough != alias_to_output.end()) {
 					next_alias_to_output[output_key] = passthrough->second;
@@ -550,12 +309,11 @@ static bool TryParseLptsRunningWindowPlan(const string &raw_view_query_sql, cons
 					next_alias_to_output[output_key] = scan_passthrough->second;
 					continue;
 				}
-				string item_lower = LowerCopy(TrimCopy(item));
-				if (StringUtil::StartsWith(item_lower, "case ")) {
+				if (item->GetExpressionClass() == ExpressionClass::CASE) {
 					RunningDerivedExpr derived;
 					derived.output_column = output_alias;
-					derived.expression = TranslateExpressionIdentifiers(item, alias_to_output);
-					if (LooksLikeLptsAlias(derived.expression)) {
+					derived.expression = TranslateExpressionIdentifiers(*item, alias_to_output);
+					if (derived.expression.empty()) {
 						return false;
 					}
 					plan.derived_exprs.push_back(derived);
@@ -564,17 +322,17 @@ static bool TryParseLptsRunningWindowPlan(const string &raw_view_query_sql, cons
 				}
 				continue;
 			}
-			if (window_idx >= non_base_outputs.size()) {
+			if (window_idx >= window_count) {
 				return false;
 			}
 			RunningWindowExpr expr;
 			string expr_partition;
 			string expr_order;
-			if (!ParseRunningWindowExpression(item, expr, expr_partition, expr_order)) {
+			if (!ParseRunningWindowExpression(*item, expr, expr_partition, expr_order)) {
 				return false;
 			}
 			auto translate = [&](const string &alias) -> string {
-				auto found = alias_to_output.find(StringUtil::Lower(StripIdentifierQuotes(alias)));
+				auto found = alias_to_output.find(StringUtil::Lower(alias));
 				return found == alias_to_output.end() ? "" : found->second;
 			};
 			if (expr.argument != "*") {
@@ -596,27 +354,48 @@ static bool TryParseLptsRunningWindowPlan(const string &raw_view_query_sql, cons
 			}
 			parsed_partition = expr_partition;
 			parsed_order = expr_order;
-			expr.output_column = non_base_outputs[window_idx++];
-			plan.window_exprs.push_back(expr);
+			auto output = final_names.find(output_key);
+			if (output == final_names.end()) {
+				return false;
+			}
+			expr.output_column = output->second;
+			window_idx++;
+			if (window_idx > 1 && plan.nulls_first != expr.nulls_first) {
+				return false;
+			}
+			plan.nulls_first = expr.nulls_first;
+			if (expr.function_name == "row_number") {
+				if (!StringUtil::StartsWith(expr.output_column, openivm::ROWS_POSITION_PREFIX)) {
+					return false;
+				}
+				position_column = expr.output_column;
+				plan.position_columns.push_back(position_column);
+			} else {
+				plan.window_exprs.push_back(expr);
+			}
 			next_alias_to_output[output_key] = expr.output_column;
 		}
-		alias_to_output = next_alias_to_output;
-		cte_search = cte_from + 6;
+		for (idx_t i = first_window; i < plan.window_exprs.size(); i++) {
+			if (plan.window_exprs[i].rows_frame) {
+				if (position_column.empty()) {
+					return false;
+				}
+				plan.window_exprs[i].position_column = position_column;
+			}
+		}
+		alias_to_output = std::move(next_alias_to_output);
+	}
+	while (std::any_of(plan.source_columns.begin(), plan.source_columns.end(),
+	                   [&](const string &name) { return StringUtil::CIEquals(name, plan.suffix_position); })) {
+		plan.suffix_position += "_";
 	}
 	plan.partition_column = parsed_partition;
 	plan.order_column = parsed_order;
-	return !plan.window_exprs.empty() && window_idx == non_base_outputs.size() && partition_columns.size() == 1;
+	return !plan.window_exprs.empty() && window_idx == window_count && partition_columns.size() == 1;
 }
 
 static string QualifiedColumn(const string &alias, const string &column) {
 	return alias + "." + SqlUtils::QuoteIdentifier(column);
-}
-
-static string RunningLocalExpr(const RunningWindowExpr &expr, const RunningWindowPlan &plan) {
-	string arg = expr.argument == "*" ? "*" : QualifiedColumn("d", expr.argument);
-	string over = " OVER (PARTITION BY " + QualifiedColumn("d", plan.partition_column) + " ORDER BY " +
-	              QualifiedColumn("d", plan.order_column) + ")";
-	return StringUtil::Upper(expr.function_name) + "(" + arg + ")" + over;
 }
 
 static bool IsRunningDerivedArgument(const RunningWindowExpr &expr, const RunningWindowPlan &plan) {
@@ -628,57 +407,42 @@ static bool IsRunningDerivedArgument(const RunningWindowExpr &expr, const Runnin
 	return false;
 }
 
+static string RunningStoredColumn(const RunningWindowPlan &plan, const string &source) {
+	for (auto &column : plan.passthrough_columns) {
+		if (StringUtil::CIEquals(column.first, source)) {
+			return column.second;
+		}
+	}
+	return "";
+}
+
 static string RunningSeedColumn(const RunningWindowExpr &expr) {
 	return "openivm_seed_" + expr.output_column;
+}
+
+static string RunningWindowClause(const RunningWindowExpr &expr, const RunningWindowPlan &plan, const string &alias) {
+	string order = QualifiedColumn(alias, plan.order_column) + (plan.nulls_first ? " NULLS FIRST" : " NULLS LAST");
+	if (expr.rows_frame) {
+		order += ", " + QualifiedColumn(alias, plan.suffix_position);
+	}
+	return " OVER (PARTITION BY " + QualifiedColumn(alias, plan.partition_column) + " ORDER BY " + order +
+	       (expr.rows_frame ? " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)" : ")");
 }
 
 static string RunningLocalExprFromAlias(const RunningWindowExpr &expr, const RunningWindowPlan &plan,
                                         const string &alias) {
 	string arg = expr.argument == "*" ? "*" : QualifiedColumn(alias, expr.argument);
-	string over = " OVER (PARTITION BY " + QualifiedColumn(alias, plan.partition_column) + " ORDER BY " +
-	              QualifiedColumn(alias, plan.order_column) + ")";
-	return StringUtil::Upper(expr.function_name) + "(" + arg + ")" + over;
+	return StringUtil::Upper(expr.function_name) + "(" + arg + ")" + RunningWindowClause(expr, plan, alias);
 }
 
 static string RunningAvgPriorCountColumn(const RunningWindowExpr &expr) {
-	return "openivm_prior_count_" + expr.output_column;
-}
-
-static string RunningAdjustedExpr(const RunningWindowExpr &expr, const RunningWindowPlan &plan) {
-	string local = RunningLocalExpr(expr, plan);
-	string state_col = QualifiedColumn("s", expr.output_column);
-	if (expr.function_name == "sum") {
-		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " ELSE " + state_col + " + " + local + " END";
-	}
-	if (expr.function_name == "count") {
-		return "COALESCE(" + state_col + ", 0) + " + local;
-	}
-	if (expr.function_name == "min") {
-		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " WHEN " + local + " IS NULL THEN " + state_col +
-		       " ELSE LEAST(" + state_col + ", " + local + ") END";
-	}
-	if (expr.function_name == "max") {
-		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " WHEN " + local + " IS NULL THEN " + state_col +
-		       " ELSE GREATEST(" + state_col + ", " + local + ") END";
-	}
-	if (expr.function_name == "avg" && expr.argument != "*") {
-		string sum_local = "SUM(" + QualifiedColumn("d", expr.argument) + ") OVER (PARTITION BY " +
-		                   QualifiedColumn("d", plan.partition_column) + " ORDER BY " +
-		                   QualifiedColumn("d", plan.order_column) + ")";
-		string count_local = "COUNT(" + QualifiedColumn("d", expr.argument) + ") OVER (PARTITION BY " +
-		                     QualifiedColumn("d", plan.partition_column) + " ORDER BY " +
-		                     QualifiedColumn("d", plan.order_column) + ")";
-		string prior_count_col = QualifiedColumn("s", RunningAvgPriorCountColumn(expr));
-		string prior_count = "COALESCE(" + prior_count_col + ", 0)";
-		return "((COALESCE(" + state_col + " * " + prior_count_col + ", 0)) + COALESCE(" + sum_local +
-		       ", 0)) / NULLIF(" + prior_count + " + " + count_local + ", 0)";
-	}
-	return "";
+	return "openivm_running_count_" + expr.output_column;
 }
 
 static string RunningAdjustedExprWithSeed(const RunningWindowExpr &expr, const string &local, const string &state_col) {
 	if (expr.function_name == "sum") {
-		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " ELSE " + state_col + " + " + local + " END";
+		return "CASE WHEN " + state_col + " IS NULL THEN " + local + " ELSE " + state_col + " + COALESCE(" + local +
+		       ", 0) END";
 	}
 	if (expr.function_name == "count") {
 		return "COALESCE(" + state_col + ", 0) + " + local;
@@ -692,6 +456,21 @@ static string RunningAdjustedExprWithSeed(const RunningWindowExpr &expr, const s
 		       " ELSE GREATEST(" + state_col + ", " + local + ") END";
 	}
 	return "";
+}
+
+static string RunningAdjustedExpr(const RunningWindowExpr &expr, const RunningWindowPlan &plan) {
+	string local = RunningLocalExprFromAlias(expr, plan, "d");
+	string state_col = QualifiedColumn("s", expr.output_column);
+	if (expr.function_name == "avg" && expr.argument != "*") {
+		string over = RunningWindowClause(expr, plan, "d");
+		string sum_local = "SUM(" + QualifiedColumn("d", expr.argument) + ")" + over;
+		string count_local = "COUNT(" + QualifiedColumn("d", expr.argument) + ")" + over;
+		string prior_count_col = QualifiedColumn("s", RunningAvgPriorCountColumn(expr));
+		string prior_count = "COALESCE(" + prior_count_col + ", 0)";
+		return "(COALESCE(" + state_col + ", 0) + COALESCE(" + sum_local + ", 0)) / NULLIF(" + prior_count + " + " +
+		       count_local + ", 0)";
+	}
+	return RunningAdjustedExprWithSeed(expr, local, state_col);
 }
 
 static string SparkPortableTimestampCasts(const string &sql) {
@@ -714,11 +493,24 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 			visible_column_names.push_back(col);
 		}
 	}
+	auto statement = ParseRunningSelect(view_query_sql);
+	auto *select = statement ? RunningSelect(*statement->node) : nullptr;
+	if (!select) {
+		return "";
+	}
 	RunningWindowPlan plan;
-	if (plan.window_exprs.empty() &&
-	    !TryParseRunningWindowPlan(view_query_sql, partition_columns, visible_column_names, plan)) {
+	if (!TryParseRunningWindowPlan(*select, partition_columns, visible_column_names, plan)) {
 		plan = RunningWindowPlan();
-		if (!TryParseLptsRunningWindowPlan(view_query_sql, partition_columns, visible_column_names, plan)) {
+		if (!TryParseLptsRunningWindowPlan(*select, partition_columns, visible_column_names, plan)) {
+			return "";
+		}
+	}
+	auto stored_order = RunningStoredColumn(plan, plan.order_column);
+	if (stored_order.empty()) {
+		return "";
+	}
+	for (auto &expr : plan.window_exprs) {
+		if (expr.function_name == "avg" && RunningStoredColumn(plan, expr.argument).empty()) {
 			return "";
 		}
 	}
@@ -741,9 +533,6 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	string delta_positive = QualifiedColumn("d", openivm::MULTIPLICITY_COL) + " > 0" + delta_filter;
 	string part_q = SqlUtils::QuoteIdentifier(plan.partition_column);
 	string order_q = SqlUtils::QuoteIdentifier(plan.order_column);
-	string key_match_df = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "fk");
-	string key_match_dt_fk = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "dt", "fk");
-	string key_match_b_m = "b." + part_q + " IS NOT DISTINCT FROM m." + part_q;
 	string key_match_d_fk = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "fk");
 	string affected_data_filter =
 	    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "dt", affected_table);
@@ -752,83 +541,120 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS\nSELECT DISTINCT " +
 	       QualifiedColumn("d", plan.partition_column) + " AS " + part_q + "\nFROM " + delta_q + " d\nWHERE " +
 	       delta_positive + ";\n\n";
-	sql += "CREATE OR REPLACE TEMP TABLE " + bounds_table + " AS\nWITH old_max AS (\n  SELECT dt." + part_q +
-	       ", MAX(dt." + order_q + ") AS openivm_old_max_order FROM " + data_table + " dt WHERE " +
-	       affected_data_filter + " GROUP BY dt." + part_q + "\n), delta_min AS (\n  SELECT " +
-	       QualifiedColumn("d", plan.partition_column) + " AS " + part_q + ", MIN(" +
-	       QualifiedColumn("d", plan.order_column) + ") AS openivm_delta_min_order\n  FROM " + delta_q +
-	       " d\n  WHERE " + delta_positive + "\n  GROUP BY " + QualifiedColumn("d", plan.partition_column) +
-	       "\n)\nSELECT a." + part_q + ", m.openivm_old_max_order, b.openivm_delta_min_order\nFROM " + affected_table +
-	       " a\nLEFT JOIN old_max m ON a." + part_q + " IS NOT DISTINCT FROM m." + part_q + "\nJOIN delta_min b ON a." +
-	       part_q + " IS NOT DISTINCT FROM b." + part_q + ";\n\n";
-	sql += "CREATE OR REPLACE TEMP TABLE " + fast_table + " AS\nSELECT " + part_q + " FROM " + bounds_table +
-	       "\nWHERE openivm_old_max_order IS NULL OR openivm_delta_min_order > openivm_old_max_order;\n\n";
-	sql += "CREATE OR REPLACE TEMP TABLE " + fallback_table + " AS\nSELECT " + part_q + " FROM " + bounds_table +
-	       "\nWHERE openivm_old_max_order IS NOT NULL AND openivm_delta_min_order <= openivm_old_max_order;\n\n";
-	auto state_columns = plan.output_columns.empty() ? visible_column_names : plan.output_columns;
-	string state_outer_cols = SqlUtils::JoinQuotedColumns(state_columns);
-	state_outer_cols += ", openivm_prior_count";
-	string state_inner_cols;
-	for (idx_t i = 0; i < state_columns.size(); i++) {
-		if (i > 0) {
-			state_inner_cols += ", ";
-		}
-		state_inner_cols +=
-		    QualifiedColumn("dt", state_columns[i]) + " AS " + SqlUtils::QuoteIdentifier(state_columns[i]);
-	}
+	// One scan supplies both append bounds and seeds. AVG retains its exact sum
+	// and count instead of reconstructing a sum from an already rounded mean.
+	string order = QualifiedColumn("dt", stored_order);
+	string seeds = "dt." + part_q + ", MAX(" + order +
+	               ") AS openivm_running_max, "
+	               "COUNT(*) AS openivm_running_count, COUNT(*)-COUNT(" +
+	               order + ") AS openivm_running_nulls";
+	bool rows_only = true;
 	for (auto &expr : plan.window_exprs) {
-		if (expr.function_name == "avg" && expr.argument != "*") {
-			string prior_count_col = RunningAvgPriorCountColumn(expr);
-			state_outer_cols += ", " + SqlUtils::QuoteIdentifier(prior_count_col);
-			state_inner_cols += ", COUNT(" + QualifiedColumn("dt", expr.argument) + ") OVER (PARTITION BY " +
-			                    QualifiedColumn("dt", plan.partition_column) + ") AS " +
-			                    SqlUtils::QuoteIdentifier(prior_count_col);
+		rows_only = rows_only && expr.rows_frame;
+		string value = QualifiedColumn("dt", expr.output_column);
+		string seed;
+		if (expr.function_name == "avg") {
+			auto argument = QualifiedColumn("dt", RunningStoredColumn(plan, expr.argument));
+			seed = "SUM(" + argument + ")";
+			seeds += ", COUNT(" + argument + ") AS " + SqlUtils::QuoteIdentifier(RunningAvgPriorCountColumn(expr));
+		} else if (expr.rows_frame) {
+			seed = "MAX_BY(" + value + ", " + QualifiedColumn("dt", expr.position_column) + ")";
+		} else {
+			// RANGE peers have identical cumulative outputs, including NULL peers.
+			auto nonnull = "MAX_BY(" + value + ", " + order + ")";
+			auto nulls = "MAX(CASE WHEN " + order + " IS NULL THEN " + value + " END)";
+			seed = "COALESCE(" + (plan.nulls_first ? nonnull + ", " + nulls : nulls + ", " + nonnull) + ")";
 		}
+		seeds += ", " + seed + " AS " + SqlUtils::QuoteIdentifier(expr.output_column);
 	}
-	sql += "CREATE OR REPLACE TEMP TABLE " + state_table + " AS\nSELECT " + state_outer_cols + " FROM (\n  SELECT " +
-	       state_inner_cols + ", COUNT(*) OVER (PARTITION BY " + QualifiedColumn("dt", plan.partition_column) +
-	       ") AS openivm_prior_count, ROW_NUMBER() OVER (PARTITION BY " + QualifiedColumn("dt", plan.partition_column) +
-	       " ORDER BY " + QualifiedColumn("dt", plan.order_column) + " DESC) AS openivm_rn\n  FROM " + data_table +
-	       " dt\n  JOIN " + fast_table + " fk ON " + key_match_dt_fk +
-	       "\n) openivm_state_ranked\nWHERE openivm_rn = 1;\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + state_table + " AS SELECT " + seeds + " FROM " + data_table +
+	       " dt WHERE " + affected_data_filter + " GROUP BY dt." + part_q + ";\n\n";
+	string old_null =
+	    plan.nulls_first ? "m.openivm_running_nulls = m.openivm_running_count" : "m.openivm_running_nulls > 0";
+	string new_null = plan.nulls_first ? "b.openivm_running_delta_nulls > 0"
+	                                   : "b.openivm_running_delta_nulls = b.openivm_running_delta_count";
+	string advances = "CASE WHEN m.openivm_running_count IS NULL THEN true WHEN (" + old_null + ") AND (" + new_null +
+	                  ") THEN " + (rows_only ? "true" : "false") + " WHEN (" + old_null + ") <> (" + new_null +
+	                  ") THEN " + (plan.nulls_first ? "(" + old_null + ")" : "(" + new_null + ")") +
+	                  " ELSE b.openivm_running_delta_min_order " + (rows_only ? ">= " : "> ") +
+	                  "m.openivm_running_max END";
+	sql += "CREATE OR REPLACE TEMP TABLE " + bounds_table + " AS\nWITH delta_min AS (\n SELECT d." + part_q +
+	       ", MIN(d." + order_q +
+	       ") AS openivm_running_delta_min_order, COUNT(*) AS openivm_running_delta_count, "
+	       "COUNT(*)-COUNT(d." +
+	       order_q + ") AS openivm_running_delta_nulls FROM " + delta_q + " d WHERE " + delta_positive +
+	       " GROUP BY d." + part_q + "\n) SELECT b." + part_q + ", " + advances +
+	       " AS openivm_running_append FROM delta_min b LEFT JOIN " + state_table + " m ON b." + part_q +
+	       " IS NOT DISTINCT FROM m." + part_q + ";\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + fast_table + " AS SELECT " + part_q + " FROM " + bounds_table +
+	       " WHERE openivm_running_append;\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + fallback_table + " AS SELECT " + part_q + " FROM " + bounds_table +
+	       " WHERE NOT openivm_running_append;\n\n";
+	string suffix_table;
+	if (!plan.position_columns.empty()) {
+		suffix_table = SqlUtils::QuoteIdentifier("openivm_run_suffix_" + view_name);
+		string order = QualifiedColumn("d", plan.order_column) + (plan.nulls_first ? " NULLS FIRST" : " NULLS LAST");
+		// Materialize positions once so repeated data/cascade statements use the
+		// same peer order, independent of join or parallel scan scheduling.
+		sql += "CREATE OR REPLACE TEMP TABLE " + suffix_table + " AS SELECT " +
+		       SqlUtils::JoinQualifiedQuotedColumns(plan.source_columns, "d") + ", d." + openivm::MULTIPLICITY_COL +
+		       ", d." + openivm::TIMESTAMP_COL +
+		       ", "
+		       "COALESCE(s.openivm_running_count,0) + ROW_NUMBER() OVER (PARTITION BY d." +
+		       part_q + " ORDER BY " + order + ") AS " + SqlUtils::QuoteIdentifier(plan.suffix_position) + " FROM " +
+		       delta_q + " d JOIN " + fast_table + " fk ON " + key_match_d_fk + " LEFT JOIN " + state_table +
+		       " s ON d." + part_q + " IS NOT DISTINCT FROM s." + part_q + " WHERE " + delta_positive + ";\n\n";
+		delta_q = suffix_table;
+	}
+	// Apply the partition restriction at the source, before blocking window operators.
+	// The suffix parser proved that every window uses this same partition key.
+	auto *scan =
+	    select->cte_map.map.empty() ? select : RunningSelect(*select->cte_map.map.begin()->second->query->node);
+	D_ASSERT(scan && !scan->where_clause);
+	auto &source = scan->from_table->Cast<BaseTableRef>();
+	auto source_alias = source.alias.empty() ? source.table_name : source.alias;
+	auto predicate = "EXISTS (SELECT 1 FROM " + fallback_table + " openivm_aff WHERE " +
+	                 QualifiedColumn("openivm_aff", plan.partition_column) + " IS NOT DISTINCT FROM " +
+	                 QualifiedColumn(source_alias, spec.source_column) + ")";
+	auto filters = Parser::ParseExpressionList(predicate);
+	scan->where_clause = std::move(filters[0]);
+	string fallback_query = statement->ToString();
+	OPENIVM_DEBUG_PRINT("[CompileWindowSuffixExtend] Pushed fallback partition filter into source scan\n");
 	string fallback_keys = "SELECT " + part_q + " FROM " + fallback_table;
 	string fallback_target_match =
 	    SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "openivm_aff", "openivm_target");
 	string fallback_recompute_match =
 	    SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "openivm_aff", "openivm_recompute");
 	if (emit_cascade_delta) {
-		string fallback_old_filter =
-		    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "openivm_old", fallback_table);
-		string fallback_new_filter =
-		    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "openivm_recompute", fallback_table);
-		string fallback_delete_filter =
-		    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "openivm_target", fallback_table);
-		sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table +
-		       " openivm_old\nWHERE " + fallback_old_filter + ";\n\n";
-		sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
-		       ") openivm_recompute\nWHERE " + fallback_new_filter + ";\n\n";
-		sql += "DELETE FROM " + data_table + " AS openivm_target WHERE " + fallback_delete_filter + ";\n";
-		sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
-		sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+		sql += BuildSnapshotDeltaRefreshSQL(
+		    data_table, fallback_query, delta_table, old_temp_table, new_temp_table,
+		    BuildAffectedTableFilter(vector<string> {plan.partition_column}, "openivm_target", fallback_table));
 	} else {
 		sql +=
-		    BuildAffectedKeyRefreshSQL(data_table, view_query_sql, fallback_keys, "openivm_target", "openivm_recompute",
+		    BuildAffectedKeyRefreshSQL(data_table, fallback_query, fallback_keys, "openivm_target", "openivm_recompute",
 		                               "openivm_aff", fallback_target_match, fallback_recompute_match);
 	}
 
 	auto emit_column_names = plan.output_columns.empty() ? visible_column_names : plan.output_columns;
 	string insert_cols = SqlUtils::JoinQuotedColumns(emit_column_names);
+	auto append_output = [](string &list, const string &expression, const string &name) {
+		if (!list.empty()) {
+			list += ", ";
+		}
+		list += expression + " AS " + SqlUtils::QuoteIdentifier(name);
+	};
+	string suffix_query;
 	if (!plan.derived_exprs.empty()) {
-		vector<RunningWindowExpr> level1_exprs;
-		vector<RunningWindowExpr> level3_exprs;
+		vector<const RunningWindowExpr *> level1_exprs;
+		vector<const RunningWindowExpr *> level3_exprs;
 		for (auto &expr : plan.window_exprs) {
 			if (IsRunningDerivedArgument(expr, plan)) {
 				if (expr.function_name != "max") {
 					return "";
 				}
-				level3_exprs.push_back(expr);
+				level3_exprs.push_back(&expr);
 			} else {
-				level1_exprs.push_back(expr);
+				level1_exprs.push_back(&expr);
 			}
 		}
 		if (level1_exprs.empty() || level3_exprs.empty()) {
@@ -844,128 +670,101 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 			return "";
 		}
 		string l1_select;
-		auto append_l1 = [&](const string &expr_sql, const string &alias) {
-			if (!l1_select.empty()) {
-				l1_select += ", ";
-			}
-			l1_select += expr_sql + " AS " + SqlUtils::QuoteIdentifier(alias);
-		};
+
 		for (auto &pass : plan.passthrough_columns) {
-			append_l1(QualifiedColumn("d", pass.first), pass.second);
+			append_output(l1_select, QualifiedColumn("d", pass.first), pass.second);
 		}
-		for (auto &expr : level1_exprs) {
-			append_l1(RunningAdjustedExpr(expr, plan), expr.output_column);
+		for (auto *expr : level1_exprs) {
+			append_output(l1_select, RunningAdjustedExpr(*expr, plan), expr->output_column);
 		}
-		for (auto &expr : level3_exprs) {
-			append_l1(QualifiedColumn("s", expr.output_column), RunningSeedColumn(expr));
+		for (auto *expr : level3_exprs) {
+			append_output(l1_select, QualifiedColumn("s", expr->output_column), RunningSeedColumn(*expr));
+		}
+		if (!plan.position_columns.empty()) {
+			append_output(l1_select, QualifiedColumn("d", plan.suffix_position), plan.suffix_position);
 		}
 		string lflags_select = "*";
 		for (auto &derived : plan.derived_exprs) {
 			lflags_select += ", " + derived.expression + " AS " + SqlUtils::QuoteIdentifier(derived.output_column);
 		}
 		string l3_select;
-		auto append_l3 = [&](const string &expr_sql, const string &alias) {
-			if (!l3_select.empty()) {
-				l3_select += ", ";
-			}
-			l3_select += expr_sql + " AS " + SqlUtils::QuoteIdentifier(alias);
-		};
+
 		for (auto &pass : plan.passthrough_columns) {
-			append_l3(QualifiedColumn("f", pass.second), pass.second);
+			append_output(l3_select, QualifiedColumn("f", pass.second), pass.second);
 		}
-		for (auto &expr : level1_exprs) {
-			append_l3(QualifiedColumn("f", expr.output_column), expr.output_column);
+		for (auto *expr : level1_exprs) {
+			append_output(l3_select, QualifiedColumn("f", expr->output_column), expr->output_column);
 		}
-		for (auto &expr : level3_exprs) {
-			string local = RunningLocalExprFromAlias(expr, plan, "f");
-			string adjusted = RunningAdjustedExprWithSeed(expr, local, QualifiedColumn("f", RunningSeedColumn(expr)));
+		for (auto *expr : level3_exprs) {
+			string local = RunningLocalExprFromAlias(*expr, plan, "f");
+			string adjusted = RunningAdjustedExprWithSeed(*expr, local, QualifiedColumn("f", RunningSeedColumn(*expr)));
 			if (adjusted.empty()) {
 				return "";
 			}
-			append_l3(adjusted, expr.output_column);
+			append_output(l3_select, adjusted, expr->output_column);
 		}
-		string final_select;
+		for (auto &position : plan.position_columns) {
+			append_output(l3_select, QualifiedColumn("f", plan.suffix_position), position);
+		}
+		string final_select = SqlUtils::JoinQualifiedQuotedColumns(emit_column_names, "r");
+		string state_match = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "s");
+		suffix_query = "WITH openivm_l1 AS (\n  SELECT " + l1_select + "\n  FROM " + delta_q + " d\n  JOIN " +
+		               fast_table + " fk ON " + key_match_d_fk + "\n  LEFT JOIN " + state_table + " s ON " +
+		               state_match + "\n  WHERE " + delta_positive + "\n), openivm_flags AS (\n  SELECT " +
+		               lflags_select + "\n  FROM openivm_l1\n), openivm_l3 AS (\n  SELECT " + l3_select +
+		               "\n  FROM openivm_flags f\n)\nSELECT " + final_select + "\nFROM openivm_l3 r";
+	} else {
+		string select_list;
 		for (idx_t i = 0; i < emit_column_names.size(); i++) {
 			if (i > 0) {
-				final_select += ", ";
+				select_list += ", ";
 			}
-			final_select += QualifiedColumn("r", emit_column_names[i]);
+			string expr_sql;
+			for (auto &pass : plan.passthrough_columns) {
+				if (StringUtil::CIEquals(emit_column_names[i], pass.second)) {
+					expr_sql = QualifiedColumn("d", pass.first);
+					break;
+				}
+			}
+			for (auto &expr : plan.window_exprs) {
+				if (StringUtil::CIEquals(emit_column_names[i], expr.output_column)) {
+					expr_sql = RunningAdjustedExpr(expr, plan);
+					break;
+				}
+			}
+			for (auto &position : plan.position_columns) {
+				if (StringUtil::CIEquals(emit_column_names[i], position)) {
+					expr_sql = QualifiedColumn("d", plan.suffix_position);
+				}
+			}
+			if (expr_sql.empty()) {
+				return "";
+			}
+			select_list += expr_sql + " AS " + SqlUtils::QuoteIdentifier(emit_column_names[i]);
 		}
 		string state_match = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "s");
-		sql += "INSERT INTO " + data_table + " (" + insert_cols + ")\nWITH openivm_l1 AS (\n  SELECT " + l1_select +
-		       "\n  FROM " + delta_q + " d\n  JOIN " + fast_table + " fk ON " + key_match_d_fk + "\n  LEFT JOIN " +
-		       state_table + " s ON " + state_match + "\n  WHERE " + delta_positive +
-		       "\n), openivm_flags AS (\n  SELECT " + lflags_select +
-		       "\n  FROM openivm_l1\n), openivm_l3 AS (\n  SELECT " + l3_select +
-		       "\n  FROM openivm_flags f\n)\nSELECT " + final_select + "\nFROM openivm_l3 r;\n\n";
-		if (emit_cascade_delta) {
-			sql += "INSERT INTO " + delta_table + "\nWITH openivm_l1 AS (\n  SELECT " + l1_select + "\n  FROM " +
-			       delta_q + " d\n  JOIN " + fast_table + " fk ON " + key_match_d_fk + "\n  LEFT JOIN " + state_table +
-			       " s ON " + state_match + "\n  WHERE " + delta_positive + "\n), openivm_flags AS (\n  SELECT " +
-			       lflags_select + "\n  FROM openivm_l1\n), openivm_l3 AS (\n  SELECT " + l3_select +
-			       "\n  FROM openivm_flags f\n)\nSELECT " + final_select +
-			       ", CAST(1 AS INTEGER), CURRENT_TIMESTAMP\nFROM openivm_l3 r;\n\n";
-			sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
-			sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
-		}
-		sql += "DROP TABLE IF EXISTS " + state_table + ";\n";
-		sql += "DROP TABLE IF EXISTS " + fallback_table + ";\n";
-		sql += "DROP TABLE IF EXISTS " + fast_table + ";\n";
-		sql += "DROP TABLE IF EXISTS " + bounds_table + ";\n";
-		sql += "DROP TABLE IF EXISTS " + affected_table + ";\n";
-		OPENIVM_DEBUG_PRINT(
-		    "[CompileWindowSuffixExtend] view=%s partition=%s order=%s window_exprs=%zu derived_exprs=%zu\n",
-		    view_name.c_str(), plan.partition_column.c_str(), plan.order_column.c_str(), plan.window_exprs.size(),
-		    plan.derived_exprs.size());
-		(void)key_match_df;
-		(void)key_match_b_m;
-		return sql;
+		suffix_query = "SELECT " + select_list + "\nFROM " + delta_q + " d\nJOIN " + fast_table + " fk ON " +
+		               key_match_d_fk + "\nLEFT JOIN " + state_table + " s ON " + state_match + "\nWHERE " +
+		               delta_positive;
 	}
-	string select_list;
-	for (idx_t i = 0; i < emit_column_names.size(); i++) {
-		if (i > 0) {
-			select_list += ", ";
-		}
-		string expr_sql;
-		for (auto &pass : plan.passthrough_columns) {
-			if (StringUtil::CIEquals(emit_column_names[i], pass.second)) {
-				expr_sql = QualifiedColumn("d", pass.first);
-				break;
-			}
-		}
-		for (auto &expr : plan.window_exprs) {
-			if (StringUtil::CIEquals(emit_column_names[i], expr.output_column)) {
-				expr_sql = RunningAdjustedExpr(expr, plan);
-				break;
-			}
-		}
-		if (expr_sql.empty()) {
-			return "";
-		}
-		select_list += expr_sql + " AS " + SqlUtils::QuoteIdentifier(emit_column_names[i]);
-	}
-	string state_match = SqlUtils::BuildNullSafeMatch(vector<string> {plan.partition_column}, "d", "s");
-	sql += "INSERT INTO " + data_table + " (" + insert_cols + ")\nSELECT " + select_list + "\nFROM " + delta_q +
-	       " d\nJOIN " + fast_table + " fk ON " + key_match_d_fk + "\nLEFT JOIN " + state_table + " s ON " +
-	       state_match + "\nWHERE " + delta_positive + ";\n\n";
+	// Materialize the computed suffix once, including its window calculations,
+	// so data and cascade consumers share both the work and the chosen peer order.
+	string result_table = SqlUtils::QuoteIdentifier("openivm_run_result_" + view_name);
+	sql += "CREATE OR REPLACE TEMP TABLE " + result_table + " AS " + suffix_query + ";\n";
+	sql += "INSERT INTO " + data_table + " (" + insert_cols + ") SELECT * FROM " + result_table + ";\n";
 	if (emit_cascade_delta) {
-		sql += "INSERT INTO " + delta_table + "\nSELECT " + select_list +
-		       ", CAST(1 AS INTEGER), CURRENT_TIMESTAMP\nFROM " + delta_q + " d\nJOIN " + fast_table + " fk ON " +
-		       key_match_d_fk + "\nLEFT JOIN " + state_table + " s ON " + state_match + "\nWHERE " + delta_positive +
-		       ";\n\n";
-		sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
-		sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
+		sql += "INSERT INTO " + delta_table + " SELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM " + result_table +
+		       ";\n";
 	}
-	sql += "DROP TABLE IF EXISTS " + state_table + ";\n";
-	sql += "DROP TABLE IF EXISTS " + fallback_table + ";\n";
-	sql += "DROP TABLE IF EXISTS " + fast_table + ";\n";
-	sql += "DROP TABLE IF EXISTS " + bounds_table + ";\n";
-	sql += "DROP TABLE IF EXISTS " + affected_table + ";\n";
+	for (auto &table :
+	     {result_table, suffix_table, state_table, fallback_table, fast_table, bounds_table, affected_table}) {
+		if (!table.empty()) {
+			sql += "DROP TABLE IF EXISTS " + table + ";\n";
+		}
+	}
 	OPENIVM_DEBUG_PRINT("[CompileWindowSuffixExtend] view=%s partition=%s order=%s window_exprs=%zu\n",
 	                    view_name.c_str(), plan.partition_column.c_str(), plan.order_column.c_str(),
 	                    plan.window_exprs.size());
-	(void)key_match_df;
-	(void)key_match_b_m;
 	return sql;
 }
 
@@ -1000,79 +799,45 @@ static void BuildAliasedSourceLists(const vector<string> &cols, const vector<str
 	}
 }
 
-static bool IsIdentifierTokenChar(char c) {
-	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-}
-
-static bool MatchesPatternCI(const string &text, idx_t pos, const string &pattern) {
-	if (pos + pattern.size() > text.size()) {
-		return false;
-	}
-	for (idx_t i = 0; i < pattern.size(); i++) {
-		if (std::tolower(static_cast<unsigned char>(text[pos + i])) !=
-		    std::tolower(static_cast<unsigned char>(pattern[i]))) {
-			return false;
-		}
-	}
-	return true;
-}
-
-static string RewriteQualifiedAliasPrefix(string expr, const string &source_alias, const string &target_alias) {
-	string pattern = source_alias + ".";
-	string replacement = target_alias + ".";
-	string result;
-	for (idx_t pos = 0; pos < expr.size();) {
-		if (expr[pos] == '\'') {
-			idx_t start = pos++;
-			while (pos < expr.size()) {
-				if (expr[pos] == '\'' && pos + 1 < expr.size() && expr[pos + 1] == '\'') {
-					pos += 2;
-					continue;
-				}
-				if (expr[pos++] == '\'') {
-					break;
-				}
+static bool VisitQualifiedAlias(ParsedExpression &expression, const string &alias, const string *replacement) {
+	bool found = false;
+	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(expression, [&](ColumnRefExpression &column) {
+		if (column.column_names.size() >= 2 && StringUtil::CIEquals(column.column_names[0], alias)) {
+			found = true;
+			if (replacement) {
+				column.column_names[0] = *replacement;
 			}
-			result += expr.substr(start, pos - start);
-			continue;
 		}
-		bool left_boundary = pos == 0 || !IsIdentifierTokenChar(expr[pos - 1]);
-		if (left_boundary && MatchesPatternCI(expr, pos, pattern)) {
-			result += replacement;
-			pos += pattern.size();
-			continue;
-		}
-		result += expr[pos++];
-	}
-	return result;
+	});
+	return found;
+}
+
+static string RewriteQualifiedAliasPrefix(const string &expr, const string &source_alias, const string &target_alias) {
+	auto expressions = Parser::ParseExpressionList(expr);
+	D_ASSERT(expressions.size() == 1);
+	VisitQualifiedAlias(*expressions[0], source_alias, &target_alias);
+	return RefreshExpressionSQL(*expressions[0]);
 }
 
 static bool ReferencesQualifiedAlias(const string &expr, const string &alias) {
-	string pattern = alias + ".";
-	for (idx_t pos = 0; pos < expr.size();) {
-		if (expr[pos] == '\'') {
-			pos++;
-			while (pos < expr.size()) {
-				if (expr[pos] == '\'' && pos + 1 < expr.size() && expr[pos + 1] == '\'') {
-					pos += 2;
-					continue;
-				}
-				if (expr[pos++] == '\'') {
-					break;
-				}
-			}
-			continue;
-		}
-		bool left_boundary = pos == 0 || !IsIdentifierTokenChar(expr[pos - 1]);
-		if (left_boundary && MatchesPatternCI(expr, pos, pattern)) {
-			return true;
-		}
-		pos++;
+	if (expr.empty()) {
+		return false;
 	}
-	return false;
+	auto expressions = Parser::ParseExpressionList(expr);
+	D_ASSERT(expressions.size() == 1);
+	return VisitQualifiedAlias(*expressions[0], alias, nullptr);
 }
 
 } // namespace
+
+vector<string> PartitionOutputColumns(const vector<string> &partition_columns) {
+	vector<string> output_columns;
+	output_columns.reserve(partition_columns.size());
+	for (auto &partition_column : partition_columns) {
+		output_columns.push_back(PartitionOutputColumn(partition_column));
+	}
+	return output_columns;
+}
 
 string BuildDistinctAuxStateCreateSQL(const string &target_table, const vector<string> &distinct_cols,
                                       const vector<string> &source_exprs, const string &source_relation,
@@ -1597,16 +1362,25 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
                               const string &catalog_prefix, const vector<string> &partition_columns,
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs, bool emit_cascade_delta,
                               const string &affected_keys_sql, const vector<string> &column_names,
-                              bool running_window_incremental) {
+                              bool running_window_incremental, bool *uses_running_suffix) {
+	if (uses_running_suffix) {
+		*uses_running_suffix = false;
+	}
 	bool have_affected_keys = !affected_keys_sql.empty();
 	if (!have_affected_keys && (partition_columns.empty() || partition_delta_specs.empty())) {
-		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
+		// No PARTITION BY (global surrogate-key window) or no partition key resolvable in any
+		// source delta table → nothing to scope the recompute to. Keep the cascade delta the
+		// caller asked for so downstream MVs stay incremental.
+		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix, emit_cascade_delta);
 	}
 	if (running_window_incremental) {
 		auto suffix_sql = BuildRunningWindowSuffixRefreshSQL(view_name, view_query_sql, delta_ts_filter, catalog_prefix,
 		                                                     partition_columns, partition_delta_specs, column_names,
 		                                                     emit_cascade_delta);
 		if (!suffix_sql.empty()) {
+			if (uses_running_suffix) {
+				*uses_running_suffix = true;
+			}
 			return suffix_sql;
 		}
 	}
@@ -1641,27 +1415,13 @@ string CompileWindowRecompute(const string &view_name, const string &view_query_
 	if (have_affected_keys) {
 		sql += "CREATE OR REPLACE TEMP TABLE " + affected_temp_table + " AS\n" + affected_keys_sql + ";\n\n";
 	}
-	string old_filter = have_affected_keys
-	                        ? BuildAffectedTableFilter(output_columns, "openivm_old", affected_temp_table)
-	                        : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_old");
-	string recompute_filter = have_affected_keys
-	                              ? BuildAffectedTableFilter(output_columns, "openivm_recompute", affected_temp_table)
-	                              : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_recompute");
-	string target_filter = have_affected_keys
-	                           ? BuildAffectedTableFilter(output_columns, "openivm_target", affected_temp_table)
-	                           : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_target");
-	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table +
-	       " openivm_old\nWHERE " + old_filter + ";\n\n";
-	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
-	       ") openivm_recompute\nWHERE " + recompute_filter + ";\n\n";
-	sql += "DELETE FROM " + data_table + " AS openivm_target WHERE " + target_filter + ";\n";
-	sql += "INSERT INTO " + data_table + "\nSELECT * FROM " + new_temp_table + ";\n";
-	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+	string filter = have_affected_keys ? BuildAffectedTableFilter(output_columns, "openivm_target", affected_temp_table)
+	                                   : BuildDeltaAffectedFilter(partition_delta_specs, delta_where, "openivm_target");
+	sql +=
+	    BuildSnapshotDeltaRefreshSQL(data_table, view_query_sql, delta_table, old_temp_table, new_temp_table, filter);
 	if (have_affected_keys) {
 		sql += "\nDROP TABLE IF EXISTS " + affected_temp_table + ";\n";
 	}
-	sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
-	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
 	return sql;
 }
 

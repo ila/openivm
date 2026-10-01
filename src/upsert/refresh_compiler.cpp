@@ -716,7 +716,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		if (!has_computed_over_derived && !decomp.derived_cols.empty()) {
 			idx_t probe_idx = 0;
 			for (auto &column : aggregates) {
-				if (decomp.derived_cols.count(column) || column.find("openivm_") != string::npos) {
+				if (decomp.derived_cols.count(column) || (column.find("openivm_") != string::npos &&
+				                                          column.find(openivm::SORT_VALUE_PREFIX) == string::npos)) {
 					continue;
 				}
 				while (probe_idx < aggregate_types.size() && IsDecomposedAggregateType(aggregate_types[probe_idx])) {
@@ -800,7 +801,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		idx_t type_idx = 0;
 		for (auto &column : aggregates) {
 			if (quoted_derived_output_expressions.count(column) || decomp.derived_cols.count(column) ||
-			    column.find("openivm_") != string::npos) {
+			    (column.find("openivm_") != string::npos && column.find(openivm::SORT_VALUE_PREFIX) == string::npos)) {
 				continue;
 			}
 			// Skip decomposed aggregate_types entries (avg → SUM+COUNT hidden cols)
@@ -1033,11 +1034,13 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		//   (b) right-side aggregates — COUNT(right_col), SUM(right_col), AVG(right_col),
 		//       etc. When mc_new = 0, these must reset to 0/NULL because the NULL-padded
 		//       row contributes NULL for right_col. Use the CASE gating.
-		//   (c) left-side non-count aggregates (SUM(left_col), AVG(left_col)) — not
-		//       currently distinguishable here; fall through to the CASE gating, which
-		//       is incorrect for those but rare in practice. (Left-side aggregates
-		//       don't go to NULL when mc_new transitions, so this remains a known
-		//       limitation for uncommon queries; documented in limitations.md.)
+		//   (c) left-side (preserved-side) aggregates — SUM(left_col), AVG(left_col), etc.
+		//       Identified by is_preserved_side() below and given the ungated update like
+		//       (a), since they don't change when mc_new transitions. Separately, the
+		//       classifier (OuterJoinAggregateNeedsRecompute in parser_plan_helpers.cpp)
+		//       sends computed aggregate children (e.g. SUM(COALESCE(r.x, 0))) and
+		//       non-pass-through projection wrappers over non-group bindings (e.g.
+		//       COALESCE(SUM(r.x), 0)) to GROUP_RECOMPUTE, so those never reach this code.
 		string mc_new = "(COALESCE(v." + match_count_col + ", 0) + d." + match_count_col + ")";
 		string lj_update_set;
 		bool first_lj = true;
@@ -1073,12 +1076,14 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 			//     Preserve v.col — the CREATE-time value already reflects the NULL-padded row
 			//     semantics for this column, including any projection-folded constants like
 			//     SUM(COALESCE(x, 0)) = 0 or COUNT(right_col) = 0. Resetting to null_val would
-			//     wipe legitimate folded values (q1686 SUM(COALESCE(o.x,0)) stored 0 at CREATE
-			//     but would become NULL after any zero-net delta pass).
+			//     wipe legitimate folded values (a SUM(COALESCE(o.x, 0)) stored as 0 at CREATE
+			//     must not become NULL after a zero-net delta pass). Covered by the Fix E cases in
+			//     test/sql/left_join.test.
 			//   else: transition from matched to unmatched (v.mc > 0, d.mc = -v.mc). Right-side
-			//     data is gone; reset to null_val. This remains imperfect for folded projections
-			//     (a transitioning group whose stored COALESCE'd column was 0 resets to NULL)
-			//     — a known limitation.
+			//     data is gone; reset to null_val. Folded projections such as
+			//     SUM(COALESCE(r.x, 0)) or COALESCE(SUM(r.x), 0) would need 0 instead of NULL
+			//     here, but the classifier (OuterJoinAggregateNeedsRecompute) sends those
+			//     shapes to GROUP_RECOMPUTE, so this branch never sees them.
 			string matched_update = BuildUpdatedAggregateColumn(col);
 			auto sum_count = sum_null_count_cols.find(col);
 			if (sum_count != sum_null_count_cols.end()) {
@@ -1201,10 +1206,10 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 	// cleanup in that case to avoid deleting valid rows.
 	// Also skip when insert_only (groups can't reach zero from inserts alone).
 	//
-	// LEFT JOIN views (openivm_match_count present) were previously skipped outright, because a
-	// preserved-side row with no match legitimately has inner-side COUNT = 0 and would look "empty".
-	// That left genuinely emptied groups behind forever as zeroed rows. The right discriminator is the
-	// OUTPUT-row count: a NULL-padded group still has count_star >= 1, whereas a group with no
+	// LEFT JOIN views (openivm_match_count present): a preserved-side row with no match legitimately has
+	// inner-side COUNT = 0 and would look "empty", so inner-side counts alone cannot decide emptiness;
+	// skipping these views would leave genuinely emptied groups behind as zeroed rows. The discriminator
+	// is the OUTPUT-row count: a NULL-padded group still has count_star >= 1, whereas a group with no
 	// preserved-side rows left has count_star = 0. Since the predicate ANDs every count column, the
 	// NULL-padded case is preserved as long as count_star is among them -- so LEFT JOIN views are
 	// included when a count_star-type column anchors the predicate, and skipped otherwise.
@@ -1370,10 +1375,16 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 }
 
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
-                                 const string &delta_ts_filter, const string &catalog_prefix, bool insert_only) {
+                                 const string &delta_ts_filter, const string &catalog_prefix, bool insert_only,
+                                 string *appended_rows) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
-	string mul = string(openivm::MULTIPLICITY_COL);
 	string delta_view = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	return CompileProjectionDelta(data_table, delta_view, column_names, delta_ts_filter, insert_only, appended_rows);
+}
+
+string CompileProjectionDelta(const string &data_table, const string &delta_view, const vector<string> &column_names,
+                              const string &delta_ts_filter, bool insert_only, string *appended_rows) {
+	string mul = string(openivm::MULTIPLICITY_COL);
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
 	string select_columns;
@@ -1388,10 +1399,9 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 		}
 	}
 	if (select_columns.empty()) {
-		throw InvalidInputException("Cannot compile projection refresh for materialized view '%s': delta "
-		                            "view '%s' has no "
+		throw InvalidInputException("Cannot compile projection refresh for table '%s': delta relation '%s' has no "
 		                            "user-visible columns",
-		                            view_name, SqlUtils::DeltaName(view_name));
+		                            data_table, delta_view);
 	}
 	match_conditions.erase(match_conditions.size() - 5, 5);
 	select_columns.erase(select_columns.size() - 2, 2);
@@ -1402,9 +1412,12 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 		// consolidation/delete path here; byte-identical duplicates are distinct bag entries and
 		// must be appended once per positive multiplicity.
 		string mul_filter = delta_ts_filter.empty() ? "WHERE " + mul + " > 0" : ts_where + " AND " + mul + " > 0";
-		string insert_query = "INSERT INTO " + data_table + " SELECT " + select_columns + "\nFROM " + delta_view +
-		                      "\nCROSS JOIN generate_series(1, " + mul + "::BIGINT)\n" + mul_filter + ";\n";
-		return insert_query;
+		string rows = "SELECT " + select_columns + "\nFROM " + delta_view + "\nCROSS JOIN generate_series(1, " + mul +
+		              "::BIGINT)\n" + mul_filter;
+		if (appended_rows) {
+			*appended_rows = rows;
+		}
+		return "INSERT INTO " + data_table + " " + rows + ";\n";
 	}
 
 	// Consolidate deltas into net changes per distinct tuple (1 pass over delta_view).
@@ -1451,13 +1464,31 @@ string CompileProjectionsFilters(const string &view_name, const vector<string> &
 }
 
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix,
-                            const vector<string> &unique_keys) {
+                            bool emit_cascade_delta, const vector<string> &unique_keys) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 	string recompute_temp;
 	if (!unique_keys.empty()) {
 		recompute_temp = SqlUtils::QuoteIdentifier("openivm_full_recompute_" + view_name);
 	}
-	return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp);
+	if (!emit_cascade_delta) {
+		return SqlUtils::BuildFullRecomputeSQL(data_table, view_query_sql, unique_keys, recompute_temp);
+	}
+	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
+	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
+	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
+
+	string sql;
+	sql += "CREATE OR REPLACE TEMP TABLE " + old_temp_table + " AS\nSELECT * FROM " + data_table + " openivm_old;\n\n";
+	sql += "CREATE OR REPLACE TEMP TABLE " + new_temp_table + " AS\nSELECT * FROM (" + view_query_sql +
+	       ") openivm_recompute;\n\n";
+	sql += SqlUtils::BuildFullRecomputeSQL(data_table, "SELECT * FROM " + new_temp_table, unique_keys, recompute_temp);
+	sql += "\n" + BuildSignedMultisetDeltaInsertSQL(delta_table, old_temp_table, new_temp_table);
+	sql += "DROP TABLE IF EXISTS " + old_temp_table + ";\n";
+	sql += "DROP TABLE IF EXISTS " + new_temp_table + ";\n";
+	OPENIVM_DEBUG_PRINT("[CompileFullRecompute] unscopable recompute for '%s' — emitting signed "
+	                    "whole-view cascade delta\n",
+	                    view_name.c_str());
+	return sql;
 }
 
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
@@ -1467,8 +1498,10 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// No GROUP BY columns or no source deltas registered → can't scope; fall back to full.
+	// A cascade delta was still requested, so emit the whole-view signed delta rather than
+	// silently producing a program with no `openivm_delta_<view>` rows.
 	if (group_columns.empty() || delta_table_specs.empty()) {
-		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix);
+		return CompileFullRecompute(view_name, view_query_sql, catalog_prefix, emit_cascade_delta);
 	}
 
 	string group_csv = SqlUtils::JoinQuotedColumns(group_columns);
@@ -1517,7 +1550,7 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 			affected_subquery += "SELECT DISTINCT " + group_csv + " FROM " + delta_subselect + " openivm_source_keys";
 			// The key-locality proof allows restriction of every source occurrence,
 			// including below aggregates; do not rely on backend semi-join pushdown.
-			string source_full = (lpts_table_prefix.empty() ? catalog_prefix : lpts_table_prefix) + base;
+			const string &source_full = spec.source_sql;
 			string source_ref = SqlUtils::FindTableReference(view_query_sql, source_full);
 			if (source_ref.empty()) {
 				source_ref = SqlUtils::FindTableReference(view_query_sql, base);
@@ -1538,16 +1571,17 @@ string CompileGroupRecompute(const string &view_name, const string &view_query_s
 		// Original-SQL recompute paths (e.g. ROLLUP/GROUPING SETS) can contain unqualified
 		// table names, so fall back to identifier-safe bare replacement when the exact LPTS
 		// form is absent.
-		string source_full = (lpts_table_prefix.empty() ? catalog_prefix : lpts_table_prefix) + base;
+		const string &source_full = spec.source_sql;
 		auto filtered_variants =
 		    SqlUtils::ReplaceEachPlainOccurrence(affected_view_query_sql, source_full, delta_subselect);
 		if (filtered_variants.empty()) {
-			filtered_variants = SqlUtils::ReplaceEachTableReference(affected_view_query_sql, base, delta_subselect);
+			filtered_variants =
+			    SqlUtils::ReplaceEachTableReference(affected_view_query_sql, source_full, delta_subselect);
 		}
 		if (filtered_variants.empty()) {
 			string filtered = SqlUtils::ReplaceAllOccurrences(affected_view_query_sql, source_full, delta_subselect);
 			if (filtered == affected_view_query_sql) {
-				filtered = SqlUtils::ReplaceTableReferences(affected_view_query_sql, base, delta_subselect);
+				filtered = SqlUtils::ReplaceTableReferences(affected_view_query_sql, source_full, delta_subselect);
 			}
 			filtered_variants.push_back(std::move(filtered));
 		}

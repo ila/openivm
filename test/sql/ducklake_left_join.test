@@ -67,7 +67,7 @@ SELECT count(*) FROM (
 0
 
 # ==========================================
-# Runtime output-delta append guard
+# Runtime cardinality proof for nullable-side changes
 # ==========================================
 
 statement ok
@@ -92,7 +92,9 @@ CREATE MATERIALIZED VIEW dl.mv_runtime_left_join AS
 # Touch both sides so the static preserved-side fast path cannot fire. Adding
 # matches to an already-matched key only produces positive output deltas. The
 # duplicate right rows exercise multiplicity expansion, while the NULL-keyed
-# left row remains in the materialized bag.
+# left row remains in the materialized bag. Positive primary weights alone
+# cannot rule out NULL-padding retractions: prove cardinalities per affected
+# key and reserve recompute for transition keys, as with mixed DML.
 statement ok
 INSERT INTO dl.runtime_left VALUES (NULL, 'second-null-key');
 
@@ -103,11 +105,11 @@ statement ok
 PRAGMA refresh('mv_runtime_left_join');
 
 query I
-SELECT contains(content, 'openivm_delta_shape')
-       AND contains(content, 'openivm_multiplicity < 0')
-       AND contains(content, 'generate_series')
-       AND NOT contains(content, 'openivm_lj_key_stats_')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_runtime_left_join.sql');
+SELECT contains(content, 'openivm_lj_safe_net_')
+       AND contains(content, 'openivm_lj_key_stats_')
+       AND contains(content, 'WHERE NOT openivm_stats.openivm_safe')
+       AND NOT contains(content, 'openivm_delta_shape')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a6f696e_.sql');
 ----
 true
 
@@ -159,8 +161,8 @@ query IIII
 SELECT contains(content, 'openivm_lj_safe_net_'),
        contains(content, 'openivm_lj_key_stats_'),
        contains(content, 'WHERE NOT openivm_stats.openivm_safe'),
-       contains(content, 'openivm_refresh_delta_mv_runtime_left_join')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_runtime_left_join.sql');
+       contains(content, 'openivm_refresh_delta___openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a6f696e_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a6f696e_.sql');
 ----
 true	true	true	true
 
@@ -207,18 +209,18 @@ PRAGMA refresh('mv_runtime_left_join');
 query IIIIII
 SELECT contains(content, 'openivm_lj_safe_net_'),
        contains(content, 'openivm_expected_delete_rows'),
-       contains(content, 'DELETE FROM dl.main.openivm_data_mv_runtime_left_join openivm_target USING'),
+       contains(content, 'DELETE FROM dl.main.openivm_data___openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a6f696e_ openivm_target USING'),
        NOT contains(content, 'openivm_lj_key_stats_'),
        contains(content, 'openivm_inline_delta'),
-       NOT contains(content, 'openivm_refresh_delta_mv_runtime_left_join')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_runtime_left_join.sql');
+       NOT contains(content, 'openivm_refresh_delta___openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a6f696e_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a6f696e_.sql');
 ----
 true	true	true	true	true	true
 
 query I
 SELECT count(*)
 FROM openivm_refresh_profile
-WHERE view_name = 'mv_runtime_left_join' AND step_name = 'projection_delete_retry';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a6f696e_' AND step_name = 'projection_delete_retry';
 ----
 0
 
@@ -263,7 +265,7 @@ PRAGMA refresh('mv_runtime_left_join');
 query I
 SELECT count(*)
 FROM openivm_refresh_profile
-WHERE view_name = 'mv_runtime_left_join' AND step_name = 'projection_delete_retry';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a6f696e_' AND step_name = 'projection_delete_retry';
 ----
 1
 
@@ -331,7 +333,7 @@ PRAGMA refresh('mv_composite_left_join');
 query I
 SELECT contains(content, 'openivm_lj_src INNER JOIN openivm_affected')
        AND NOT contains(content, 'openivm_lj_key_stats_')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_composite_left_join.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f636f6d706f736974655f6c6566745f6a6f696e_.sql');
 ----
 true
 
@@ -403,7 +405,7 @@ PRAGMA refresh('mv_any_left_join');
 
 query I
 SELECT NOT contains(content, 'openivm_lj_key_stats_')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_any_left_join.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f616e795f6c6566745f6a6f696e_.sql');
 ----
 true
 
@@ -554,7 +556,7 @@ CREATE MATERIALIZED VIEW dl.mv_star_projection AS
 
 query I
 SELECT lineage_json LIKE '%"k":"left_join_key_source"%' FROM openivm_views
-WHERE view_name = 'mv_star_projection';
+WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f737461725f70726f6a656374696f6e_';
 ----
 true
 
@@ -604,25 +606,25 @@ PRAGMA refresh('mv_star_projection');
 query I
 SELECT contains(content, 'openivm_lj_src INNER JOIN openivm_affected')
        AND NOT contains(content, 'openivm_lj_key_stats_')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_star_projection.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f737461725f70726f6a656374696f6e_.sql');
 ----
 true
 
 query I
 SELECT len(regexp_extract_all(content, 'ducklake_table_insertions')) <= 11
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_star_projection.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f737461725f70726f6a656374696f6e_.sql');
 ----
 true
 
 query I
 SELECT len(regexp_extract_all(content, 'ducklake_table_deletions')) <= 11
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_star_projection.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f737461725f70726f6a656374696f6e_.sql');
 ----
 true
 
 query I
 SELECT length(content) < 1000000
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_star_projection.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f737461725f70726f6a656374696f6e_.sql');
 ----
 true
 
@@ -724,12 +726,12 @@ SELECT count(*) FROM (
   SELECT column_name, ordinal_position, data_type
   FROM information_schema.columns
   WHERE table_schema = 'main'
-    AND table_name = 'openivm_data_mv_cust_orders'
+    AND table_name = 'openivm_data___openivm_mv_646c_6d61696e_6d765f637573745f6f7264657273_'
   EXCEPT ALL
   SELECT column_name, ordinal_position, data_type
   FROM information_schema.columns
   WHERE table_schema = 'main'
-    AND table_name = 'openivm_delta_mv_cust_orders'
+    AND table_name = 'openivm_delta___openivm_mv_646c_6d61696e_6d765f637573745f6f7264657273_'
     AND column_name NOT IN ('openivm_multiplicity', 'openivm_timestamp')
 );
 ----
@@ -740,13 +742,13 @@ SELECT count(*) FROM (
   SELECT column_name, ordinal_position, data_type
   FROM information_schema.columns
   WHERE table_schema = 'main'
-    AND table_name = 'openivm_delta_mv_cust_orders'
+    AND table_name = 'openivm_delta___openivm_mv_646c_6d61696e_6d765f637573745f6f7264657273_'
     AND column_name NOT IN ('openivm_multiplicity', 'openivm_timestamp')
   EXCEPT ALL
   SELECT column_name, ordinal_position, data_type
   FROM information_schema.columns
   WHERE table_schema = 'main'
-    AND table_name = 'openivm_data_mv_cust_orders'
+    AND table_name = 'openivm_data___openivm_mv_646c_6d61696e_6d765f637573745f6f7264657273_'
 );
 ----
 0

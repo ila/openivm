@@ -23,7 +23,7 @@ CREATE MATERIALIZED VIEW mv_saj_semi AS
     SELECT l.id, l.x FROM saj_l l SEMI JOIN saj_r r ON abs(l.x - r.y) <= 2;
 
 query II
-SELECT type, (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_saj_semi';
+SELECT type, (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f73616a5f73656d69_';
 ----
 9	1
 
@@ -105,8 +105,9 @@ SELECT COUNT(*) FROM (
 0
 
 # ============================================================
-# ANTI JOIN under GROUP BY. This currently uses FULL_REFRESH rather
-# than aux-state SEMI/ANTI, but it must remain correct for batched DML.
+# ANTI JOIN under GROUP BY. This uses GROUP_RECOMPUTE
+# (source_delta affected keys) rather than aux-state SEMI/ANTI,
+# but it must remain correct for batched DML.
 # ============================================================
 
 statement ok
@@ -126,6 +127,11 @@ CREATE MATERIALIZED VIEW mv_ag_anti AS
     SELECT l.grp, COUNT(*) AS cnt, SUM(l.x) AS total
     FROM ag_l l ANTI JOIN ag_r r ON abs(l.x - r.y) <= 1
     GROUP BY l.grp;
+
+query I
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f61675f616e7469_';
+----
+6
 
 statement ok
 INSERT INTO ag_r VALUES (3, 20), (4, 50);
@@ -325,7 +331,7 @@ CREATE MATERIALIZED VIEW mv_not_in_cast AS
     WHERE CAST(x AS BIGINT) NOT IN (SELECT CAST(y AS BIGINT) FROM in_cast_r);
 
 query I
-SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_not_in_cast';
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6e6f745f696e5f63617374_';
 ----
 1
 
@@ -382,7 +388,7 @@ CREATE MATERIALIZED VIEW mv_in_null AS
     SELECT x FROM in_null_l WHERE x IN (SELECT y FROM in_null_r);
 
 query I
-SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_in_null';
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f696e5f6e756c6c_';
 ----
 1
 
@@ -449,7 +455,7 @@ CREATE MATERIALIZED VIEW mv_in_shadow AS
     SELECT x + 1 AS x FROM in_shadow_l WHERE x IN (SELECT y FROM in_shadow_r);
 
 query I
-SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_in_shadow';
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f696e5f736861646f77_';
 ----
 1
 
@@ -513,7 +519,7 @@ CREATE MATERIALIZED VIEW mv_in_prefix AS
     WHERE l.x1 IN (SELECT y FROM in_prefix_r) AND l.x1 > 0;
 
 query I
-SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_in_prefix';
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f696e5f707265666978_';
 ----
 1
 
@@ -585,7 +591,7 @@ CREATE MATERIALIZED VIEW mv_not_in_null AS
     SELECT x FROM not_in_null_l WHERE x NOT IN (SELECT y FROM not_in_null_r WHERE active);
 
 query I
-SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_not_in_null';
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6e6f745f696e5f6e756c6c_';
 ----
 1
 
@@ -698,7 +704,7 @@ CREATE MATERIALIZED VIEW mv_not_in_corr AS
     SELECT x, z FROM not_in_corr_l l WHERE x NOT IN (SELECT y FROM not_in_corr_r r WHERE r.z = l.z);
 
 query I
-SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_not_in_corr';
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6e6f745f696e5f636f7272_';
 ----
 1
 
@@ -760,7 +766,7 @@ CREATE MATERIALIZED VIEW mv_not_in_shadow AS
     SELECT x + 1 AS x FROM not_in_shadow_l WHERE x NOT IN (SELECT y FROM not_in_shadow_r);
 
 query I
-SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = 'mv_not_in_shadow';
+SELECT (semi_anti_aux_meta_json IS NOT NULL)::INT FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6e6f745f696e5f736861646f77_';
 ----
 1
 
@@ -843,7 +849,7 @@ CREATE MATERIALIZED VIEW mv_exists_anti AS
 
 query I
 SELECT COUNT(*) FROM openivm_views
-WHERE view_name IN ('mv_exists_semi', 'mv_exists_anti') AND semi_anti_aux_meta_json IS NOT NULL;
+WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_6d765f6578697374735f73656d69_', '__openivm_mv_6d656d6f7279_6d61696e_6d765f6578697374735f616e7469_') AND semi_anti_aux_meta_json IS NOT NULL;
 ----
 2
 
@@ -959,7 +965,7 @@ CREATE MATERIALIZED VIEW mv_exists_multi_anti_group AS
 
 query I
 SELECT COUNT(*) FROM openivm_views
-WHERE view_name = 'mv_exists_multi_anti_group'
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6578697374735f6d756c74695f616e74695f67726f7570_'
   AND (length(lower(sql_string)) - length(replace(lower(sql_string), 'anti join', ''))) / length('anti join') = 2
   AND strpos(lower(sql_string), '__mark') = 0
   AND strpos(lower(sql_string), ' on (true)') = 0
@@ -1045,7 +1051,7 @@ CREATE MATERIALIZED VIEW mv_exists_group AS
     GROUP BY l.grp;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_exists_group';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6578697374735f67726f7570_';
 ----
 6
 
@@ -1067,7 +1073,7 @@ CREATE MATERIALIZED VIEW mv_exists_union AS
 
 query I
 SELECT COUNT(*) FROM openivm_views
-WHERE view_name IN ('mv_exists_group', 'mv_exists_union') AND semi_anti_aux_meta_json IS NOT NULL;
+WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_6d765f6578697374735f67726f7570_', '__openivm_mv_6d656d6f7279_6d61696e_6d765f6578697374735f756e696f6e_') AND semi_anti_aux_meta_json IS NOT NULL;
 ----
 0
 

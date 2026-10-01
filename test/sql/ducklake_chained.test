@@ -135,7 +135,7 @@ statement ok
 CREATE TEMP TABLE chain_skip_snapshots AS
 SELECT view_name, table_name, last_snapshot_id AS snap
 FROM openivm_delta_tables
-WHERE view_name IN ('chain_skip_l1', 'chain_skip_l2');
+WHERE view_name IN ('__openivm_mv_646c_6d61696e_636861696e5f736b69705f6c31_', '__openivm_mv_646c_6d61696e_636861696e5f736b69705f6c32_');
 
 statement ok
 INSERT INTO dl.chain_skip_unrelated VALUES (1);
@@ -259,14 +259,14 @@ SELECT id, amount, amount * 2 AS doubled FROM chain_b.pipeline_l1;
 query II rowsort
 SELECT table_catalog, table_name
 FROM information_schema.tables
-WHERE table_name IN ('openivm_data_pipeline_l1', 'openivm_delta_pipeline_l1',
-                     'openivm_data_pipeline_l2', 'openivm_delta_pipeline_l2')
+WHERE table_name IN ('openivm_data___openivm_mv_636861696e5f62_6d61696e_706970656c696e655f6c31_', 'openivm_delta___openivm_mv_636861696e5f62_6d61696e_706970656c696e655f6c31_',
+                     'openivm_data___openivm_mv_636861696e5f61_6d61696e_706970656c696e655f6c32_', 'openivm_delta___openivm_mv_636861696e5f61_6d61696e_706970656c696e655f6c32_')
 ORDER BY table_catalog, table_name;
 ----
-chain_a	openivm_data_pipeline_l2
-chain_a	openivm_delta_pipeline_l2
-chain_b	openivm_data_pipeline_l1
-chain_b	openivm_delta_pipeline_l1
+chain_a	openivm_data___openivm_mv_636861696e5f61_6d61696e_706970656c696e655f6c32_
+chain_a	openivm_delta___openivm_mv_636861696e5f61_6d61696e_706970656c696e655f6c32_
+chain_b	openivm_data___openivm_mv_636861696e5f62_6d61696e_706970656c696e655f6c31_
+chain_b	openivm_delta___openivm_mv_636861696e5f62_6d61696e_706970656c696e655f6c31_
 
 statement ok
 INSERT INTO chain_a.pipeline_src VALUES (3, 30);
@@ -445,7 +445,7 @@ CREATE MATERIALIZED VIEW dl.silver.cross_schema_l1 AS
 
 statement ok
 CREATE MATERIALIZED VIEW dl.gold.cross_schema_l2 AS
-  SELECT id, amount FROM dl.silver.openivm_data_cross_schema_l1;
+  SELECT id, amount FROM dl.silver.openivm_data___openivm_mv_646c_73696c766572_63726f73735f736368656d615f6c31_;
 
 statement ok
 INSERT INTO dl.bronze.cross_schema_base VALUES (2, 20);
@@ -581,10 +581,10 @@ CREATE MATERIALIZED VIEW dl.silver.catalog_chain_l2 AS
 query II
 SELECT table_name, source_catalog
 FROM openivm_delta_tables
-WHERE view_name = 'catalog_chain_l2'
+WHERE view_name = '__openivm_mv_646c_73696c766572_636174616c6f675f636861696e5f6c32_'
 ORDER BY table_name;
 ----
-openivm_data_catalog_chain_l1	dl
+openivm_visible___openivm_mv_646c_62726f6e7a65_636174616c6f675f636861696e5f6c31_	dl
 
 statement ok
 INSERT INTO dl.bronze.catalog_chain_base VALUES (3, 30);
@@ -649,20 +649,20 @@ CREATE MATERIALIZED VIEW dl.silver.catalog_window_l2 AS
 
 statement ok
 UPDATE openivm_delta_tables
-SET table_name = 'openivm_delta_catalog_window_l1',
+SET table_name = 'openivm_delta_openivm_visible___openivm_mv_646c_62726f6e7a65_636174616c6f675f77696e646f775f6c31_',
     catalog_type = 'duckdb',
     source_catalog = 'dl',
     source_schema = 'bronze'
-WHERE view_name = 'catalog_window_l2'
-  AND table_name = 'openivm_data_catalog_window_l1';
+WHERE view_name = '__openivm_mv_646c_73696c766572_636174616c6f675f77696e646f775f6c32_'
+  AND table_name = 'openivm_visible___openivm_mv_646c_62726f6e7a65_636174616c6f675f77696e646f775f6c31_';
 
 query II
 SELECT table_name, source_schema
 FROM openivm_delta_tables
-WHERE view_name = 'catalog_window_l2'
+WHERE view_name = '__openivm_mv_646c_73696c766572_636174616c6f675f77696e646f775f6c32_'
 ORDER BY table_name;
 ----
-openivm_delta_catalog_window_l1	bronze
+openivm_delta_openivm_visible___openivm_mv_646c_62726f6e7a65_636174616c6f675f77696e646f775f6c31_	bronze
 
 statement ok
 INSERT INTO dl.bronze.catalog_window_base VALUES
@@ -676,8 +676,8 @@ PRAGMA refresh_options('dl', 'bronze', 'catalog_window_l1');
 # snapshots. Seed the companion delta table to emulate the benchmark's persisted
 # delta_<upstream_mv> dependency and force the downstream refresh to read it.
 statement ok
-INSERT INTO dl.bronze.openivm_delta_catalog_window_l1
-SELECT sym, trade_date, low_price, high_price, 1, now()
+INSERT INTO dl.bronze.openivm_delta_openivm_visible___openivm_mv_646c_62726f6e7a65_636174616c6f675f77696e646f775f6c31_
+SELECT sym, trade_date, low_price, high_price, 0::BIGINT, 1, now()
 FROM dl.bronze.catalog_window_l1
 WHERE trade_date IN (DATE '2026-01-02', DATE '2026-01-03');
 
@@ -819,5 +819,1747 @@ SELECT count(*) FROM (
   EXCEPT ALL
   SELECT region, total, cnt FROM dl.mv_top
 );
+----
+0
+
+# Pipeline refresh: selection, topological order, shared ancestors and repeated targets.
+
+statement ok
+USE dl;
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+CREATE SEQUENCE memory.main.pipe_seq;
+
+statement ok
+CREATE TABLE memory.main.pipe_log(seq BIGINT DEFAULT nextval('memory.main.pipe_seq'), name VARCHAR);
+
+statement ok
+CREATE TABLE pipe_src_a(id INT,v INT);
+
+statement ok
+CREATE TABLE pipe_src_b(id INT,w INT);
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,10),(2,20);
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,100),(2,200);
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_a AS SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id;
+
+statement ok
+CREATE VIEW pipe_bridge AS SELECT * FROM pipe_a;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_646c_6d61696e_706970655f61_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_a'')', 'after');
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_b AS SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_646c_6d61696e_706970655f62_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_b'')', 'after');
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_c AS SELECT id,v*2 AS v FROM pipe_bridge;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_646c_6d61696e_706970655f63_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_c'')', 'after');
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_z AS SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id);
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_646c_6d61696e_706970655f7a_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_z'')', 'after');
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_tail AS SELECT id,v+w AS total FROM pipe_z;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_646c_6d61696e_706970655f7461696c_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_tail'')', 'after');
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_side AS SELECT id,v+1 AS v FROM pipe_a;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_646c_6d61696e_706970655f73696465_', 'INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_side'')', 'after');
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_tail','pipe_z','pipe_c','pipe_b','pipe_a','pipe_a');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_tail','pipe_z','pipe_tail');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='downstream';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_b','pipe_c','pipe_a','pipe_b');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_side,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_side EXCEPT ALL SELECT id,v+1 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v+1 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_side));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_c');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_a','pipe_a');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+SET openivm_cascade_refresh='downstream';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_c');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement error
+PRAGMA refresh_pipeline('pipe_a','pipe_missing');
+----
+does not exist
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+(empty)
+
+statement error
+PRAGMA refresh_pipeline(NULL);
+----
+No function matches
+
+statement error
+PRAGMA refresh_pipeline(NULL::VARCHAR);
+----
+non-empty
+
+statement error
+PRAGMA refresh_pipeline('');
+----
+non-empty
+
+statement ok
+SET openivm_cascade_refresh='invalid';
+
+statement error
+PRAGMA refresh_pipeline('pipe_a');
+----
+unknown cascade mode
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+CREATE TEMP TABLE pipe_saved_edges AS SELECT * FROM memory.main.openivm_delta_tables WHERE view_name='__openivm_mv_646c_6d61696e_706970655f61_';
+
+statement ok
+UPDATE memory.main.openivm_delta_tables SET table_name='openivm_data___openivm_mv_646c_6d61696e_706970655f7461696c_' WHERE view_name='__openivm_mv_646c_6d61696e_706970655f61_';
+
+statement error
+PRAGMA refresh_pipeline('pipe_tail');
+----
+cycle
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+(empty)
+
+statement ok
+DELETE FROM memory.main.openivm_delta_tables WHERE view_name='__openivm_mv_646c_6d61696e_706970655f61_';
+
+statement ok
+INSERT INTO memory.main.openivm_delta_tables SELECT * FROM pipe_saved_edges;
+
+statement ok
+PRAGMA refresh_pipeline('pipe_tail');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+ALTER TABLE pipe_src_a ADD COLUMN unused INT;
+
+statement ok
+ALTER TABLE pipe_src_a DROP COLUMN unused;
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,5),(99,9);
+
+statement ok
+UPDATE pipe_src_a SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_a WHERE id=99;
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,7),(99,9);
+
+statement ok
+UPDATE pipe_src_b SET w=w+1 WHERE id=1;
+
+statement ok
+DELETE FROM pipe_src_b WHERE id=99;
+
+statement ok
+PRAGMA refresh_pipeline('pipe_tail');
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+pipe_a,pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+CREATE TABLE pipe_drop_src(id INT);
+
+statement ok
+INSERT INTO pipe_drop_src VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_drop_mv AS SELECT id FROM pipe_drop_src;
+
+statement ok
+DROP TABLE pipe_drop_src;
+
+statement error
+PRAGMA refresh_pipeline('pipe_a','pipe_drop_mv');
+----
+cannot bind materialized view
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+(empty)
+
+statement ok
+DROP VIEW pipe_side;
+
+query II
+SELECT (SELECT COUNT(*) FROM memory.main.openivm_views WHERE view_name='__openivm_mv_646c_6d61696e_706970655f73696465_'),
+       (SELECT COUNT(*) FROM memory.main.openivm_delta_tables WHERE view_name='__openivm_mv_646c_6d61696e_706970655f73696465_');
+----
+0	0
+
+statement error
+PRAGMA refresh_pipeline('pipe_a','pipe_side');
+----
+does not exist
+
+query T
+SELECT COALESCE(string_agg(name, ',' ORDER BY seq), '') FROM memory.main.pipe_log;
+----
+(empty)
+
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,21);
+
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+PRAGMA refresh_pipeline('pipe_a');
+
+query T
+SELECT string_agg(name, ',' ORDER BY seq) FROM memory.main.pipe_log;
+----
+pipe_a,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+# A failed parent hook stops the run; retry consumes the still-pending descendants.
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+UPDATE memory.main.openivm_refresh_hooks SET mode='before',hook_sql='SELECT error(''pipeline test hook failure'')' WHERE view_name='__openivm_mv_646c_6d61696e_706970655f62_';
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,31);
+
+statement ok
+INSERT INTO pipe_src_b VALUES (1,41);
+
+statement error
+PRAGMA refresh_pipeline('pipe_tail');
+----
+pipeline test hook failure
+
+query T
+SELECT string_agg(name, ',' ORDER BY seq) FROM memory.main.pipe_log;
+----
+pipe_a
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+statement ok
+UPDATE memory.main.openivm_refresh_hooks SET mode='after',hook_sql='INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_b'')' WHERE view_name='__openivm_mv_646c_6d61696e_706970655f62_';
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+PRAGMA refresh_pipeline('pipe_tail');
+
+query T
+SELECT string_agg(name, ',' ORDER BY seq) FROM memory.main.pipe_log;
+----
+pipe_b,pipe_c,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+# New descendants are discovered on the next call without pipeline registration.
+
+statement ok
+CREATE MATERIALIZED VIEW pipe_new AS SELECT id,v+99 AS v FROM pipe_a;
+
+statement ok
+INSERT INTO memory.main.openivm_refresh_hooks VALUES ('__openivm_mv_646c_6d61696e_706970655f6e6577_','INSERT INTO memory.main.pipe_log(name) VALUES (''pipe_new'')','after');
+
+statement ok
+DELETE FROM memory.main.pipe_log;
+
+statement ok
+INSERT INTO pipe_src_a VALUES (1,51);
+
+statement ok
+PRAGMA refresh_pipeline('pipe_a');
+
+query T
+SELECT string_agg(name, ',' ORDER BY seq) FROM memory.main.pipe_log;
+----
+pipe_a,pipe_c,pipe_new,pipe_z,pipe_tail
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_a EXCEPT ALL SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM pipe_src_a GROUP BY id EXCEPT ALL SELECT * FROM pipe_a));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_b EXCEPT ALL SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(w) AS w FROM pipe_src_b GROUP BY id EXCEPT ALL SELECT * FROM pipe_b));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_c EXCEPT ALL SELECT id,v*2 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v*2 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_c));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_z EXCEPT ALL SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id))),
+       (SELECT COUNT(*) FROM (SELECT a.id,a.v,b.w FROM pipe_c a JOIN pipe_b b USING(id) EXCEPT ALL SELECT * FROM pipe_z));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_tail EXCEPT ALL SELECT id,v+w AS total FROM pipe_z)),
+       (SELECT COUNT(*) FROM (SELECT id,v+w AS total FROM pipe_z EXCEPT ALL SELECT * FROM pipe_tail));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM pipe_new EXCEPT ALL SELECT id,v+99 AS v FROM pipe_a)),
+       (SELECT COUNT(*) FROM (SELECT id,v+99 AS v FROM pipe_a EXCEPT ALL SELECT * FROM pipe_new));
+----
+0	0
+
+statement ok
+USE memory;
+
+# A staged after-hook failure remains pending even after its input changes were consumed.
+load __TEST_DIR__/pipeline_hook_controller.db
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/pipeline_hook_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+CREATE TABLE dl.review_hook_source(id INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.review_hook_source VALUES(1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.review_hook_parent AS SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.review_hook_child AS SELECT id,v*2 AS v FROM dl.review_hook_parent;
+
+statement ok
+CREATE TABLE pipeline_hook_controller.main.review_hook_log(message VARCHAR);
+
+statement ok
+INSERT INTO pipeline_hook_controller.main.openivm_refresh_hooks VALUES('__openivm_mv_646c_6d61696e_7265766965775f686f6f6b5f706172656e74_','SELECT error(''review staged after-hook failure'')','after');
+
+statement ok
+INSERT INTO dl.review_hook_source VALUES(1,5),(2,3);
+
+statement ok
+UPDATE dl.review_hook_source SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM dl.review_hook_source WHERE id=2 AND v=20;
+
+statement error
+PRAGMA refresh_pipeline('review_hook_child');
+----
+review staged after-hook failure
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.review_hook_parent EXCEPT ALL SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id EXCEPT ALL SELECT * FROM dl.review_hook_parent));
+----
+0	0
+
+query I
+SELECT pending_after_hook FROM pipeline_hook_controller.main.openivm_views WHERE view_name='__openivm_mv_646c_6d61696e_7265766965775f686f6f6b5f706172656e74_';
+----
+true
+
+restart
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/pipeline_hook_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+UPDATE pipeline_hook_controller.main.openivm_refresh_hooks SET hook_sql='INSERT INTO pipeline_hook_controller.main.review_hook_log VALUES (''done'')' WHERE view_name='__openivm_mv_646c_6d61696e_7265766965775f686f6f6b5f706172656e74_';
+
+statement ok
+PRAGMA refresh_pipeline('REVIEW_HOOK_CHILD');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.review_hook_parent EXCEPT ALL SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id EXCEPT ALL SELECT * FROM dl.review_hook_parent));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.review_hook_child EXCEPT ALL SELECT id,SUM(v)*2 AS v FROM dl.review_hook_source GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v)*2 AS v FROM dl.review_hook_source GROUP BY id EXCEPT ALL SELECT * FROM dl.review_hook_child));
+----
+0	0
+
+query I
+SELECT COUNT(*) FROM pipeline_hook_controller.main.review_hook_log;
+----
+1
+
+query I
+SELECT pending_after_hook FROM pipeline_hook_controller.main.openivm_views WHERE view_name='__openivm_mv_646c_6d61696e_7265766965775f686f6f6b5f706172656e74_';
+----
+false
+
+statement ok
+PRAGMA refresh_pipeline('review_hook_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.review_hook_parent EXCEPT ALL SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v) AS v FROM dl.review_hook_source GROUP BY id EXCEPT ALL SELECT * FROM dl.review_hook_parent));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.review_hook_child EXCEPT ALL SELECT id,SUM(v)*2 AS v FROM dl.review_hook_source GROUP BY id)),
+       (SELECT COUNT(*) FROM (SELECT id,SUM(v)*2 AS v FROM dl.review_hook_source GROUP BY id EXCEPT ALL SELECT * FROM dl.review_hook_child));
+----
+0	0
+
+query I
+SELECT COUNT(*) FROM pipeline_hook_controller.main.review_hook_log;
+----
+1
+
+# Replacement keeps the published DuckLake table identity and snapshot history.
+
+statement ok
+CREATE TABLE dl.publish_source(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.publish_source VALUES(1,15),(2,30),(3,4),(3,4);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_parent AS SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>10;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_child AS SELECT * FROM dl.publish_parent;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_lagging AS SELECT * FROM dl.publish_parent;
+
+statement ok
+INSERT INTO dl.publish_source VALUES(1,3),(2,5),(2,5);
+
+statement ok
+UPDATE dl.publish_source SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM dl.publish_source WHERE k=2 AND v=5;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+PRAGMA refresh_pipeline('publish_parent');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_parent EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>10)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>10 EXCEPT ALL SELECT * FROM dl.publish_parent));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_parent AS SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>20;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+PRAGMA refresh_pipeline('publish_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_parent EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>20)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>20 EXCEPT ALL SELECT * FROM dl.publish_parent));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_child EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>20)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING SUM(v)>20 EXCEPT ALL SELECT * FROM dl.publish_child));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_parent AS SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING COUNT(*)>0;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+PRAGMA refresh_pipeline('publish_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_parent EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING COUNT(*)>0)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING COUNT(*)>0 EXCEPT ALL SELECT * FROM dl.publish_parent));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_child EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING COUNT(*)>0)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k HAVING COUNT(*)>0 EXCEPT ALL SELECT * FROM dl.publish_child));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_parent AS SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k ;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+PRAGMA refresh_pipeline('publish_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_parent EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k )),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k  EXCEPT ALL SELECT * FROM dl.publish_parent));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_child EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k )),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k  EXCEPT ALL SELECT * FROM dl.publish_child));
+----
+0	0
+
+restart
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/pipeline_hook_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='upstream';
+
+statement ok
+PRAGMA refresh_pipeline('publish_lagging');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_lagging EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k EXCEPT ALL SELECT * FROM dl.publish_lagging));
+----
+0	0
+
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_top AS SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_top_child AS SELECT * FROM dl.publish_top;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_top AS SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 1;
+
+statement ok
+PRAGMA refresh_pipeline('publish_top_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_top EXCEPT ALL SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 1) expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 1) expected EXCEPT ALL SELECT * FROM dl.publish_top));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_top_child EXCEPT ALL SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 1) expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k LIMIT 1) expected EXCEPT ALL SELECT * FROM dl.publish_top_child));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_top AS SELECT k,v FROM dl.publish_source ORDER BY v DESC,k;
+
+statement ok
+PRAGMA refresh_pipeline('publish_top_child');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_top EXCEPT ALL SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k) expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k) expected EXCEPT ALL SELECT * FROM dl.publish_top));
+----
+0	0
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_top_child EXCEPT ALL SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k) expected)),
+       (SELECT COUNT(*) FROM (SELECT * FROM (SELECT k,v FROM dl.publish_source ORDER BY v DESC,k) expected EXCEPT ALL SELECT * FROM dl.publish_top_child));
+----
+0	0
+
+# Parent wrapper changes never demote the child to full refresh.
+query I
+SELECT type FROM openivm_views WHERE view_name='__openivm_mv_646c_6d61696e_7075626c6973685f6368696c64_';
+----
+2
+
+query I
+SELECT type FROM openivm_views WHERE view_name='__openivm_mv_646c_6d61696e_7075626c6973685f746f705f6368696c64_';
+----
+2
+
+# Reject an incompatible parent schema before staged replacement changes state.
+statement error
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_parent AS SELECT k,SUM(v) v,COUNT(*) n FROM dl.publish_source GROUP BY k;
+----
+Cannot change the visible schema
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_parent EXCEPT ALL SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k)),
+       (SELECT COUNT(*) FROM (SELECT k,SUM(v) v FROM dl.publish_source GROUP BY k EXCEPT ALL SELECT * FROM dl.publish_parent));
+----
+0	0
+
+# Without consumers, replacement may change the published schema.
+statement ok
+CREATE MATERIALIZED VIEW dl.publish_leaf AS SELECT k FROM dl.publish_source;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.publish_leaf AS SELECT k,v FROM dl.publish_source;
+
+statement ok
+INSERT INTO dl.publish_source VALUES(NULL,NULL),(4,12),(4,12);
+
+statement ok
+UPDATE dl.publish_source SET v=v+1 WHERE k=4;
+
+statement ok
+DELETE FROM dl.publish_source WHERE k=4 AND v=13;
+
+statement ok
+PRAGMA refresh_pipeline('publish_leaf');
+
+query II
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM dl.publish_leaf EXCEPT ALL SELECT k,v FROM dl.publish_source)),
+       (SELECT COUNT(*) FROM (SELECT k,v FROM dl.publish_source EXCEPT ALL SELECT * FROM dl.publish_leaf));
+----
+0	0
+
+# Review regressions also preserve hidden grouping state through lake snapshots.
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+CREATE TABLE dl.r2_lake_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.r2_lake_t VALUES(1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.r2_lake_p AS SELECT k+1 g,avg(v) a FROM dl.r2_lake_t GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.r2_lake_c AS SELECT * FROM dl.r2_lake_p;
+
+statement ok
+INSERT INTO dl.r2_lake_t VALUES(1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE dl.r2_lake_t SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM dl.r2_lake_t WHERE k=2;
+
+statement ok
+PRAGMA refresh_pipeline('r2_lake_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.r2_lake_p EXCEPT ALL SELECT * FROM (SELECT k+1 g,avg(v) a FROM dl.r2_lake_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k+1 g,avg(v) a FROM dl.r2_lake_t GROUP BY k) e EXCEPT ALL SELECT * FROM dl.r2_lake_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.r2_lake_c EXCEPT ALL SELECT * FROM (SELECT k+1 g,avg(v) a FROM dl.r2_lake_t GROUP BY k) e) UNION ALL (SELECT * FROM (SELECT k+1 g,avg(v) a FROM dl.r2_lake_t GROUP BY k) e EXCEPT ALL SELECT * FROM dl.r2_lake_c));
+----
+0
+
+statement ok
+DROP VIEW dl.r2_lake_p CASCADE;
+
+statement ok
+DROP TABLE dl.r2_lake_t;
+
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+CREATE TABLE dl.r2_lake_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.r2_lake_t VALUES(1,10),(1,10),(2,20),(NULL,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.r2_lake_p AS SELECT k,sum(v) s FROM dl.r2_lake_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.r2_lake_c AS SELECT * FROM dl.r2_lake_p;
+
+statement ok
+INSERT INTO dl.r2_lake_t VALUES(1,3),(NULL,4),(4,50);
+
+statement ok
+UPDATE dl.r2_lake_t SET v=v+2 WHERE k=1;
+
+statement ok
+DELETE FROM dl.r2_lake_t WHERE k=2;
+
+statement ok
+PRAGMA refresh_pipeline('r2_lake_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.r2_lake_p EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM dl.r2_lake_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) e) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM dl.r2_lake_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) e EXCEPT ALL SELECT * FROM dl.r2_lake_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.r2_lake_c EXCEPT ALL SELECT * FROM (SELECT k,sum(v) s FROM dl.r2_lake_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) e) UNION ALL (SELECT * FROM (SELECT k,sum(v) s FROM dl.r2_lake_t GROUP BY k ORDER BY sum(v)+1 DESC LIMIT 2) e EXCEPT ALL SELECT * FROM dl.r2_lake_c));
+----
+0
+
+statement ok
+DROP VIEW dl.r2_lake_p CASCADE;
+
+statement ok
+DROP TABLE dl.r2_lake_t;
+
+# Stable ordering survives a hidden sort-type change while consumers lag.
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE dl.ordinal_t(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.ordinal_t VALUES(1,2000000000),(1,2000000000),(2,20),(3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.ordinal_p AS SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.ordinal_c AS SELECT * FROM dl.ordinal_p LIMIT 1;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.ordinal_lag AS SELECT * FROM dl.ordinal_p;
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name IN ('__openivm_mv_646c_6d61696e_6f7264696e616c5f70_','__openivm_mv_646c_6d61696e_6f7264696e616c5f63_','__openivm_mv_646c_6d61696e_6f7264696e616c5f6c6167_') AND type=3;
+----
+0
+
+query T
+SELECT list(k) FROM dl.ordinal_p;
+----
+[1, 3]
+
+statement ok
+INSERT INTO dl.ordinal_t VALUES(2,2000000000),(2,2000000000);
+
+statement ok
+UPDATE dl.ordinal_t SET v=v+1 WHERE k=3;
+
+statement ok
+DELETE FROM dl.ordinal_t WHERE k=2 AND v=2000000000;
+
+statement ok
+INSERT INTO dl.ordinal_t VALUES(2,2000000000),(2,2000000000);
+
+statement ok
+PRAGMA refresh('ordinal_p');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY SUM(v) DESC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_p));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.ordinal_p AS SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_p));
+----
+0
+
+query T
+SELECT list(k) FROM dl.ordinal_p;
+----
+[2, 3]
+
+statement ok
+PRAGMA refresh('ordinal_c');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_c EXCEPT ALL SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected) UNION ALL (SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected EXCEPT ALL SELECT * FROM dl.ordinal_c));
+----
+0
+
+statement ok
+PRAGMA refresh('ordinal_lag');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_lag EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_lag));
+----
+0
+
+query T
+SELECT list(k) FROM dl.ordinal_lag;
+----
+[2, 3]
+
+statement ok
+DELETE FROM dl.ordinal_t;
+
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+PRAGMA refresh_pipeline('ordinal_c','ordinal_lag');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_lag EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_lag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_c EXCEPT ALL SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected) UNION ALL (SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected EXCEPT ALL SELECT * FROM dl.ordinal_c));
+----
+0
+
+statement ok
+INSERT INTO dl.ordinal_t VALUES(1,7),(2,NULL),(3,4);
+
+statement ok
+PRAGMA refresh_pipeline('ordinal_c','ordinal_lag');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_p EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_lag EXCEPT ALL SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected) UNION ALL (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) expected EXCEPT ALL SELECT * FROM dl.ordinal_lag));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.ordinal_c EXCEPT ALL SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected) UNION ALL (SELECT * FROM (SELECT * FROM (SELECT k FROM dl.ordinal_t GROUP BY k ORDER BY MIN(v) ASC,k LIMIT 2) q LIMIT 1) expected EXCEPT ALL SELECT * FROM dl.ordinal_c));
+----
+0
+
+query T
+SELECT list(k) FROM dl.ordinal_p;
+----
+[3, 1]
+
+query T
+SELECT list(k) FROM dl.ordinal_c;
+----
+[3]
+
+statement ok
+DROP VIEW dl.ordinal_p CASCADE;
+
+statement ok
+DROP TABLE dl.ordinal_t;
+
+# Mark-style diamond: all sources change before one run with overlapping targets.
+statement ok
+SET openivm_cascade_refresh='both';
+
+statement ok
+CREATE TABLE dl.mark_edges(k INT,v INT);
+
+statement ok
+INSERT INTO dl.mark_edges VALUES (NULL,4),(1,2),(1,2),(2,3),(4,5);
+
+statement ok
+CREATE TABLE dl.mark_dims(k INT,v INT);
+
+statement ok
+INSERT INTO dl.mark_dims VALUES (NULL,4),(1,2),(1,2),(2,3),(4,5);
+
+statement ok
+CREATE TABLE dl.mark_blocked(k INT,v INT);
+
+statement ok
+INSERT INTO dl.mark_blocked VALUES (NULL,4),(1,2),(1,2),(2,3),(4,5);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mark_p AS SELECT e.k,e.v,d.v AS dv FROM dl.mark_edges e LEFT JOIN dl.mark_dims d ON e.k=d.k;
+
+statement ok
+CREATE VIEW dl.mark_expected_p AS SELECT e.k,e.v,d.v AS dv FROM dl.mark_edges e LEFT JOIN dl.mark_dims d ON e.k=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mark_q AS SELECT k,SUM(v) AS sv,COUNT(*) AS n FROM dl.mark_dims GROUP BY k HAVING SUM(v)>0;
+
+statement ok
+CREATE VIEW dl.mark_expected_q AS SELECT k,SUM(v) AS sv,COUNT(*) AS n FROM dl.mark_dims GROUP BY k HAVING SUM(v)>0;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mark_a AS SELECT mark_p.* FROM dl.mark_p mark_p ANTI JOIN dl.mark_blocked b ON mark_p.k=b.k;
+
+statement ok
+CREATE VIEW dl.mark_expected_a AS SELECT mark_p.* FROM dl.mark_expected_p mark_p ANTI JOIN dl.mark_blocked b ON mark_p.k=b.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mark_z AS SELECT mark_p.k,mark_p.v,mark_p.dv,mark_q.sv,mark_q.n FROM dl.mark_p mark_p LEFT JOIN dl.mark_q mark_q ON mark_p.k=mark_q.k;
+
+statement ok
+CREATE VIEW dl.mark_expected_z AS SELECT mark_p.k,mark_p.v,mark_p.dv,mark_q.sv,mark_q.n FROM dl.mark_expected_p mark_p LEFT JOIN dl.mark_expected_q mark_q ON mark_p.k=mark_q.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mark_cube AS SELECT k,SUM(v) AS v,COUNT(*) AS n FROM dl.mark_z GROUP BY k;
+
+statement ok
+CREATE VIEW dl.mark_expected_cube AS SELECT k,SUM(v) AS v,COUNT(*) AS n FROM dl.mark_expected_z GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mark_top AS SELECT k,v,n FROM dl.mark_cube ORDER BY v DESC NULLS LAST,k NULLS LAST LIMIT 3;
+
+statement ok
+CREATE VIEW dl.mark_expected_top AS SELECT k,v,n FROM dl.mark_expected_cube ORDER BY v DESC NULLS LAST,k NULLS LAST LIMIT 3;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mark_leaf AS SELECT * FROM dl.mark_top;
+
+statement ok
+CREATE VIEW dl.mark_expected_leaf AS SELECT * FROM dl.mark_expected_top;
+
+statement ok
+INSERT INTO dl.mark_edges VALUES (1,7),(1,7),(3,4),(NULL,9);
+
+statement ok
+UPDATE dl.mark_edges SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM dl.mark_edges WHERE k=1 AND v=3;
+
+statement ok
+UPDATE dl.mark_edges SET k=5 WHERE k=4;
+
+statement ok
+INSERT INTO dl.mark_dims VALUES (1,7),(1,7),(3,4),(NULL,9);
+
+statement ok
+UPDATE dl.mark_dims SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM dl.mark_dims WHERE k=1 AND v=3;
+
+statement ok
+UPDATE dl.mark_dims SET k=5 WHERE k=4;
+
+statement ok
+INSERT INTO dl.mark_blocked VALUES (1,7),(1,7),(3,4),(NULL,9);
+
+statement ok
+UPDATE dl.mark_blocked SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM dl.mark_blocked WHERE k=1 AND v=3;
+
+statement ok
+UPDATE dl.mark_blocked SET k=5 WHERE k=4;
+
+statement ok
+PRAGMA refresh_pipeline('mark_p','mark_q','mark_a','mark_leaf','mark_cube','mark_p');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.mark_p EXCEPT ALL SELECT * FROM dl.mark_expected_p) UNION ALL (SELECT * FROM dl.mark_expected_p EXCEPT ALL SELECT * FROM dl.mark_p));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.mark_q EXCEPT ALL SELECT * FROM dl.mark_expected_q) UNION ALL (SELECT * FROM dl.mark_expected_q EXCEPT ALL SELECT * FROM dl.mark_q));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.mark_a EXCEPT ALL SELECT * FROM dl.mark_expected_a) UNION ALL (SELECT * FROM dl.mark_expected_a EXCEPT ALL SELECT * FROM dl.mark_a));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.mark_z EXCEPT ALL SELECT * FROM dl.mark_expected_z) UNION ALL (SELECT * FROM dl.mark_expected_z EXCEPT ALL SELECT * FROM dl.mark_z));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.mark_cube EXCEPT ALL SELECT * FROM dl.mark_expected_cube) UNION ALL (SELECT * FROM dl.mark_expected_cube EXCEPT ALL SELECT * FROM dl.mark_cube));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.mark_top EXCEPT ALL SELECT * FROM dl.mark_expected_top) UNION ALL (SELECT * FROM dl.mark_expected_top EXCEPT ALL SELECT * FROM dl.mark_top));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.mark_leaf EXCEPT ALL SELECT * FROM dl.mark_expected_leaf) UNION ALL (SELECT * FROM dl.mark_expected_leaf EXCEPT ALL SELECT * FROM dl.mark_leaf));
+----
+0
+
+# Publication of preserved-side appends must not scan/diff the full visible MV.
+# Keep two consumers to exercise independent DuckLake watermarks.
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE dl.pub_append_l(k INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.pub_append_r(k INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO dl.pub_append_l VALUES (1,10),(2,20),(NULL,30);
+
+statement ok
+INSERT INTO dl.pub_append_r VALUES (1,'a'),(1,'a');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.pub_append_parent AS SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.pub_append_child AS SELECT * FROM dl.pub_append_parent;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.pub_append_lagging AS SELECT * FROM dl.pub_append_parent;
+
+statement ok
+INSERT INTO dl.pub_append_l VALUES (1,11),(1,11),(2,22),(NULL,33);
+
+statement ok
+PRAGMA refresh('pub_append_parent');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_parent EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_parent));
+----
+0	0
+
+query I
+SELECT NOT contains(content, 'openivm_publish_next_') AND NOT contains(content, 'openivm_publish_changes_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_7075625f617070656e645f706172656e74_.sql');
+----
+1
+
+statement ok
+PRAGMA refresh('pub_append_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_child EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_child));
+----
+0	0
+
+statement ok
+INSERT INTO dl.pub_append_l VALUES (1,11),(1,11),(2,22),(NULL,33);
+
+statement ok
+PRAGMA refresh('pub_append_parent');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_parent EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_parent));
+----
+0	0
+
+query I
+SELECT NOT contains(content, 'openivm_publish_next_') AND NOT contains(content, 'openivm_publish_changes_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_7075625f617070656e645f706172656e74_.sql');
+----
+1
+
+statement ok
+PRAGMA refresh('pub_append_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_child EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_child));
+----
+0	0
+
+statement ok
+PRAGMA refresh('pub_append_lagging');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_lagging EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_lagging));
+----
+0	0
+
+# An insert-only source batch can still remove a NULL-extended join row.
+statement ok
+INSERT INTO dl.pub_append_r VALUES (2,'first match');
+
+statement ok
+PRAGMA refresh('pub_append_parent');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_parent EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_parent));
+----
+0	0
+
+statement ok
+PRAGMA refresh('pub_append_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_child EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_child));
+----
+0	0
+
+statement ok
+PRAGMA refresh('pub_append_lagging');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_lagging EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_lagging));
+----
+0	0
+
+query I
+SELECT contains(content, 'openivm_publish_changes_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_7075625f617070656e645f706172656e74_.sql');
+----
+1
+
+# Nullable-side insertions can retract NULL-extended output even when all source
+# deltas are positive. Conflicting mutations must use the signed publication path.
+statement ok
+INSERT INTO dl.pub_append_r VALUES (2,'b'),(1,'discard');
+
+statement ok
+UPDATE dl.pub_append_r SET label='changed' WHERE k=1 AND label='a';
+
+statement ok
+DELETE FROM dl.pub_append_r WHERE label='discard';
+
+statement ok
+INSERT INTO dl.pub_append_l VALUES (2,44);
+
+statement ok
+UPDATE dl.pub_append_l SET v=99 WHERE k=1 AND v=10;
+
+statement ok
+DELETE FROM dl.pub_append_l WHERE v=20;
+
+statement ok
+PRAGMA refresh('pub_append_parent');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_parent EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_parent));
+----
+0	0
+
+statement ok
+PRAGMA refresh('pub_append_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_child EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_child));
+----
+0	0
+
+statement ok
+PRAGMA refresh('pub_append_lagging');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.pub_append_lagging EXCEPT ALL SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k)),
+       (SELECT count(*) FROM (SELECT l.k,l.v,r.label FROM dl.pub_append_l l LEFT JOIN dl.pub_append_r r ON l.k=r.k EXCEPT ALL SELECT * FROM dl.pub_append_lagging));
+----
+0	0
+
+query I
+SELECT contains(content, 'openivm_publish_changes_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_7075625f617070656e645f706172656e74_.sql');
+----
+1
+
+# Same-named DuckLake MVs retain separate metadata and refresh independently.
+statement ok
+CREATE SCHEMA dl.observation;
+
+statement ok
+CREATE SCHEMA dl.other_observation;
+
+statement ok
+CREATE TABLE dl.observation.schema_sales(k INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.observation.schema_sales VALUES(1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.observation.schema_summary AS
+SELECT k,SUM(v) total FROM dl.observation.schema_sales GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.other_observation.schema_summary AS
+SELECT k,SUM(v) total FROM dl.observation.schema_sales GROUP BY k;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.other_observation.schema_summary AS
+SELECT k,SUM(v)+100 total FROM dl.observation.schema_sales GROUP BY k;
+
+query ITT
+SELECT count(*),min(view_catalog),min(view_schema) FROM openivm_views WHERE view_name='__openivm_mv_646c_6f62736572766174696f6e_736368656d615f73756d6d617279_';
+----
+1	dl	observation
+
+statement ok
+INSERT INTO dl.observation.schema_sales VALUES(1,5),(3,8);
+
+statement ok
+UPDATE dl.observation.schema_sales SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM dl.observation.schema_sales WHERE k=2;
+
+statement ok
+PRAGMA refresh('dl.observation.schema_summary');
+
+query I
+WITH expected AS (SELECT k,SUM(v) total FROM dl.observation.schema_sales GROUP BY k)
+SELECT count(*) FROM ((SELECT * FROM dl.observation.schema_summary EXCEPT ALL SELECT * FROM expected)
+UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM dl.observation.schema_summary));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.other_observation.schema_summary');
+
+query I
+WITH expected AS (SELECT k,SUM(v)+100 total FROM dl.observation.schema_sales GROUP BY k)
+SELECT count(*) FROM ((SELECT * FROM dl.other_observation.schema_summary EXCEPT ALL SELECT * FROM expected)
+UNION ALL (SELECT * FROM expected EXCEPT ALL SELECT * FROM dl.other_observation.schema_summary));
 ----
 0

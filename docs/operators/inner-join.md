@@ -44,6 +44,12 @@ This is the default rule for `INNER JOIN`, `CROSS JOIN`, and DuckDB's
 arbitrary-predicate join plan (`LOGICAL_ANY_JOIN`). A cross product is the same join
 without a predicate. Non-equality predicates are preserved in the generated terms.
 
+Term pruning (with `openivm_skip_empty_deltas`, default `true`): terms that include a leaf with an
+empty delta are skipped, and for joins without outer joins, when only one leaf changed (or all changed
+deltas are tiny) OpenIVM probes whether a term's delta join keys can match the other side at all and
+skips terms whose key domain is empty. [FK-aware pruning](../optimizations/fk-aware-pruning.md) can
+remove further terms.
+
 The maximum supported join width is 16 tables.
 
 ## Compiled SQL (2-table join, 3 terms)
@@ -109,9 +115,12 @@ The regular N-term path applies only when all of these conditions hold:
 
 - OpenIVM is compiling SQL for an external engine (`compile_only`).
 - The materialized view is a `SIMPLE_PROJECTION`.
-- The join tree contains only inner joins, cross joins, or arbitrary inner predicates.
+- The join tree contains only inner joins, cross joins, or arbitrary inner predicates — or,
+  with `openivm_regular_nterm_left` (default `true`), only inner and LEFT joins. For LEFT joins
+  each term demotes only the LEFT JOIN whose right subtree holds that term's delta leaf, and the
+  [left join](left-join.md) partial-recompute upsert fixes NULL-padded rows.
 - Every leaf is a supported table scan or transparent single-input projection.
-- FK-aware pruning would not remove inclusion-exclusion terms.
+- For inner-only joins, FK-aware pruning would not remove inclusion-exclusion terms.
 
 OpenIVM keeps inclusion-exclusion for outer joins, aggregates, unsupported leaf shapes,
 normal in-process refreshes, and cases where FK pruning produces a smaller plan.
@@ -124,9 +133,12 @@ SET openivm_regular_nterm = false;
 
 ## DuckLake tables
 
-When all join leaves are DuckLake scans, OpenIVM uses the **N-term telescoping** formula
+When all join leaves are DuckLake scans (and `openivm_ducklake_nterm`, default `true`, is on), OpenIVM uses the **N-term telescoping** formula
 instead of inclusion-exclusion. This produces exactly N terms instead of 2^N - 1 by
 leveraging DuckLake's time travel (`AT VERSION`) to read the old state of non-delta tables.
+
+For `SIMPLE_PROJECTION` views, leaves wrapped in single-child filters or projections are
+flattened to their underlying DuckLake scans first.
 
 Additionally, terms for unchanged tables (where `last_snapshot_id == current_snapshot_id`)
 are skipped at plan time via [empty-delta term skipping](../optimizations/empty-delta-skip.md).

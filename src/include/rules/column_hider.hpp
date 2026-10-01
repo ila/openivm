@@ -30,7 +30,8 @@ struct IncrementalTableNames {
 
 	/// Returns true if a table name is an IVM data table.
 	static bool IsDataTable(const std::string &name) {
-		return StringUtil::StartsWith(name, openivm::DATA_TABLE_PREFIX);
+		return StringUtil::StartsWith(name, openivm::DATA_TABLE_PREFIX) ||
+		       StringUtil::StartsWith(name, openivm::VISIBLE_TABLE_PREFIX);
 	}
 };
 

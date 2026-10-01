@@ -1,19 +1,24 @@
+#include "core/parser_create_mv_helpers.hpp"
 #define DUCKDB_EXTENSION_MAIN
 
 #include "core/openivm_extension.hpp"
 #include "compile_facts.hpp"
+#include "spark_scalar_functions.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_daemon.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
+#include "core/time_travel_pins.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh.hpp"
+#include "upsert/refresh_internal.hpp"
 
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/connection.hpp"
@@ -113,8 +118,9 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 	input.named_parameters["view_schema_name"] = view_schema_name;
 
 	Connection con(*context.db);
-	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
-		metadata_state->Apply(con);
+	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
+	if (!context.transaction.IsAutoCommit()) {
+		RefreshMetadata(con).SnapshotTransaction(context);
 	}
 	string view_query = RefreshMetadata(con).GetViewQuery(view_name);
 	if (view_query.empty()) {
@@ -125,9 +131,9 @@ static duckdb::unique_ptr<FunctionData> ComputeDeltaBind(ClientContext &context,
 
 	Parser parser;
 	parser.ParseQuery(view_query);
-	auto statement = parser.statements[0].get();
+	duckdb::openivm::TimeTravelPins::Peel(context, *parser.statements[0]);
 	Planner planner(context);
-	planner.CreatePlan(statement->Copy());
+	planner.CreatePlan(std::move(parser.statements[0]));
 	OPENIVM_DEBUG_PRINT("[ComputeDelta Bind] Plan:\n%s\n", planner.plan->ToString().c_str());
 
 	auto result = make_uniq<TableFunctionData>();
@@ -166,6 +172,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// statement OpenIVM does not recognize with DuckDB's native parser.
 	db_config.SetOption(AllowParserOverrideExtensionSetting::SettingIndex, Value("fallback"));
 
+	RegisterSparkScalarFunctions(loader);
+
 	db_config.AddExtensionOption("openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
 	db_config.AddExtensionOption("openivm_refresh_mode", "refresh strategy: incremental, full, or auto",
 	                             LogicalType::VARCHAR, Value("incremental"));
@@ -202,11 +210,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_regular_nterm", "use N-term telescoping for compile-only regular inner joins",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	db_config.AddExtensionOption("openivm_regular_nterm_left",
+	                             "extend compile-only N-term telescoping to LEFT-join projection views",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_fk_pruning", "prune inclusion-exclusion join terms using FK constraints",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	db_config.AddExtensionOption("openivm_emit_spark_hints",
 	                             "emit Spark optimizer hints in target_dialect=spark compiled refresh SQL",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption(duckdb::OPENIVM_INPUT_DIALECT_SETTING,
+	                             "SQL dialect materialized-view bodies are written in: duckdb (default) or spark",
+	                             LogicalType::VARCHAR, Value("duckdb"), duckdb::SetOpenIvmInputDialect);
 	db_config.AddExtensionOption("openivm_skip_aggregate_delete",
 	                             "skip zero-row DELETE for grouped aggregates when deltas are insert-only",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(true));
@@ -249,7 +263,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::DOUBLE, Value::DOUBLE(0.9));
 
 	// View matching (master flag — ALL matcher behavior gated by this).
-	// Default false. See `feedback_view_matching_flag` memory note.
+	// Default false: view matching is experimental.
 	db_config.AddExtensionOption("openivm_enable_view_matching",
 	                             "enable smart view matching at query time (master flag)", LogicalType::BOOLEAN,
 	                             Value::BOOLEAN(false));
@@ -284,6 +298,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " ADD COLUMN IF NOT EXISTS refresh_interval BIGINT DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS refresh_in_progress BOOLEAN DEFAULT false");
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS pending_after_hook BOOLEAN DEFAULT NULL");
+
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS published_query VARCHAR DEFAULT NULL");
 
 	// Migration: create refresh history table for learned cost model.
 	// Silently fails on fresh DB (core_functions not yet loaded → DEFAULT
@@ -317,10 +336,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " chosen_cost_est DOUBLE,"
 	          " actual_duration_ms BIGINT,"
 	          " PRIMARY KEY (query_hash, log_timestamp))");
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::MV_DEPS_TABLE) +
-	          " (parent_view VARCHAR, child_view VARCHAR,"
-	          " edge_kind VARCHAR DEFAULT 'direct',"
-	          " PRIMARY KEY (parent_view, child_view))");
+	con.Query(CreateMVDependenciesSQL());
 	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::CONSTRAINTS_CACHE_TABLE) +
 	          " (table_name VARCHAR, constraint_kind VARCHAR,"
 	          " columns_json VARCHAR, referenced_table VARCHAR,"
@@ -438,6 +454,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(refresh_options);
 	auto refresh = PragmaFunction::PragmaCall("refresh", TransactionalRefreshQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh);
+	loader.RegisterFunction(PragmaFunction::PragmaCall("refresh_pipeline", RefreshPipelineQuery, {LogicalType::VARCHAR},
+	                                                   LogicalType::VARCHAR));
 	auto declare_rely_fk = PragmaFunction::PragmaCall(
 	    "openivm_declare_rely_fk",
 	    [](ClientContext &, const FunctionParameters &parameters) -> string {
@@ -468,12 +486,54 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cross_system);
 
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
+	    "openivm_files",
+	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
+		    auto view_name = StringValue::Get(parameters.values[0]);
+		    Connection con(*context.db);
+		    view_name = ResolveViewCatalogFromContext(context, con, view_name).view_name;
+		    RefreshMetadata(con).GetViewType(view_name);
+		    Value directory;
+		    bool enabled = context.TryGetCurrentSetting("openivm_files_path", directory) && !directory.IsNull();
+		    auto &fs = FileSystem::GetFileSystem(context);
+		    auto cwd = FileSystem::GetWorkingDirectory();
+		    vector<string> rows;
+		    const vector<pair<string, string>> files = {
+		        {"system", "openivm_system_tables.sql"},
+		        {"create", "openivm_compiled_queries_" + view_name + ".sql"},
+		        {"refresh", "openivm_upsert_queries_" + view_name + ".sql"},
+		        {"explain", "openivm_initial_load_explain_" + view_name + ".txt"}};
+		    for (const auto &file : files) {
+			    string path;
+			    bool exists = false;
+			    string status =
+			        "disabled: SET openivm_files_path to an existing writable directory before CREATE/refresh";
+			    if (enabled) {
+				    path = directory.ToString() + "/" + file.second;
+				    if (!fs.IsPathAbsolute(path)) {
+					    path = fs.JoinPath(cwd, path);
+				    }
+				    exists = fs.FileExists(path);
+				    status = exists ? "exists; may be from an earlier compilation" : "not generated at this path";
+			    }
+			    rows.push_back("(" + Value(file.first).ToSQLString() + ", " +
+			                   (enabled ? Value(path).ToSQLString() : "NULL::VARCHAR") + ", " +
+			                   (exists ? "true" : "false") + ", " + Value(status).ToSQLString() + ", " +
+			                   Value(cwd).ToSQLString() + ")");
+		    }
+		    OPENIVM_DEBUG_PRINT("[FILES] Inspecting reference files for %s (enabled=%d)\n", view_name.c_str(), enabled);
+		    return "SELECT * FROM (VALUES " + StringUtil::Join(rows, ", ") +
+		           ") AS files(kind, path, file_exists, status, working_directory)";
+	    },
+	    {LogicalType::VARCHAR}));
+
 	// PRAGMA refresh_status('view_name') — returns refresh status for a materialized view.
 	auto refresh_status = PragmaFunction::PragmaCall(
 	    "refresh_status",
 	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
 		    string view_name = StringValue::Get(parameters.values[0]);
 		    Connection con(*context.db.get());
+		    view_name = ResolveViewCatalogFromContext(context, con, view_name).view_name;
 		    RefreshMetadata metadata(con);
 
 		    auto interval = metadata.GetRefreshInterval(view_name);
@@ -493,14 +553,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 			    }
 		    }
 
+		    auto location = metadata.GetStoredViewLocation(view_name);
+		    auto view_key = SqlUtils::FullName(location.catalog_name, location.schema_name, view_name);
 		    // Check daemon status
 		    string status = "'idle'";
 		    string effective_interval = interval_str;
 		    if (global_daemon) {
-			    if (global_daemon->IsRefreshing(view_name)) {
+			    if (global_daemon->IsRefreshing(view_key)) {
 				    status = "'refreshing'";
 			    }
-			    auto eff = global_daemon->GetEffectiveInterval(view_name);
+			    auto eff = global_daemon->GetEffectiveInterval(view_key);
 			    if (eff > 0) {
 				    effective_interval = to_string(eff);
 			    }
@@ -523,7 +585,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 			    }
 		    }
 
-		    return "SELECT '" + SqlUtils::EscapeValue(view_name) + "' AS view_name, " + interval_str +
+		    return "SELECT " + parameters.values[0].ToSQLString() + " AS view_name, " + interval_str +
 		           " AS refresh_interval, " + last_refresh + " AS last_refresh, " + next_refresh +
 		           " AS next_refresh, " + status + " AS status, " + effective_interval + " AS effective_interval, " +
 		           strategy_str + " AS refresh_strategy;";

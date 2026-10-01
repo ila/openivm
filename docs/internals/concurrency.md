@@ -1,5 +1,8 @@
 # Concurrency
 
+This page covers the mechanics. For the guarantees users can rely on and operating advice, see
+[concurrency and operations](../concurrency.md).
+
 ## Mutation serialization
 
 OpenIVM serializes tracked source-table writes, refreshes, and materialized-view
@@ -25,6 +28,11 @@ isolation additionally ensures:
 - The refresh sees transaction-local changes made before it acquired its snapshot
 - Non-OpenIVM activity cannot change the refresh's visible snapshot
 
+Autocommit refresh uses the locked helper connection because DuckDB's query-pragma preprocessing ends the caller's
+transaction before the generated program runs; this stays until refresh has a native operator. Inside an explicit
+transaction, OpenIVM can't rely on precomputed delta activity, so it compiles conservatively (for example without
+empty-delta skipping).
+
 For DuckLake tables, the snapshot is determined by the `DuckLakeFunctionInfo::snapshot_id`
 bound at plan time. `AT VERSION` pinning reads exactly the state at that snapshot.
 
@@ -34,8 +42,8 @@ Each `(view, base_table)` pair tracks two timestamps in `openivm_delta_tables`:
 
 | Column | Set to | Used by |
 |---|---|---|
-| `last_update` | `MAX(openivm_timestamp) + 1µs` over rows visible in *this transaction's snapshot*. Falls back to `now()` if the snapshot saw zero delta rows. | The base-delta scan filter on the *next* refresh: `openivm_timestamp >= last_update`. |
-| `last_refresh_ts` | `now()` at refresh-transaction-start wall clock. | Filtering `openivm_delta_<view>` companion rows from chained refreshes (companion rows carry refresh-time timestamps, not base-row timestamps, so they need a separate cursor). |
+| `last_update` | `MAX(openivm_timestamp) + 1µs` over rows visible in *this transaction's snapshot*. Falls back to the current UTC time (`make_timestamp(epoch_us(now()))`) if the snapshot saw zero delta rows. | The base-delta scan filter on the *next* refresh: `openivm_timestamp >= last_update`. |
+| `last_refresh_ts` | Current UTC time at refresh-transaction start. | Filtering `openivm_delta_<view>` companion rows from chained refreshes (companion rows carry refresh-time timestamps, not base-row timestamps, so they need a separate cursor). |
 
 `last_update` is anchored to `MAX(base_ts)+1µs` rather than `now()` to make the cursor race-safe. The naive `now()` approach has a subtle bug:
 
@@ -47,11 +55,29 @@ Each `(view, base_table)` pair tracks two timestamps in `openivm_delta_tables`:
 
 Anchoring `last_update` to the maximum timestamp we *actually* processed eliminates the gap: the next refresh's filter excludes everything we've seen and includes everything we haven't. See `GenerateRefreshSQL()` in `src/upsert/refresh_sql.cpp` for the implementation.
 
+All watermark and captured delta timestamps are UTC: transactional delta capture stamps
+rows with `Timestamp::GetCurrentTimestamp()`, and generated SQL uses
+`make_timestamp(epoch_us(now()))` (`openivm::UTC_NOW_SQL`) instead of casting
+`now()`, which would apply the session time zone.
+
 ## Locking
 
 | Lock | Scope | Held during | Used by |
 |---|---|---|---|
-| Mutation gate | Per DuckDB database instance | Entire explicit transaction or autocommit OpenIVM mutation | Delta capture, refresh, lifecycle DDL |
-| Map mutex | Global (static) | Mutation-gate lookup | Internal — protects the gate map |
+| Mutation gate | Per DuckDB database instance | Entire explicit transaction or autocommit OpenIVM mutation | Delta capture, refresh, lifecycle DDL, `ALTER TABLE` on tracked tables, first-time metadata setup |
 
-Transactional lock state retains the mutation guard through commit or rollback.
+The gate (`MutationGate` in `src/core/refresh_locks.cpp`) is stored in the database
+instance's object cache, so its lifetime is tied to that database and it is never
+evicted. Delta capture acquires it when a DML statement writes its first delta row.
+`TransactionalMVLockState` retains the guard through commit or rollback.
+
+First-time creation of the shared metadata tables and native source delta tables runs
+in its own short transaction under the gate; view planning and initial materialization
+are not serialized by it. Inside an explicit transaction this setup instead stays part
+of the caller transaction and rolls back with it.
+
+When a refresh consumes native source deltas stored in another attached DuckDB
+database, their cleanup is deferred until the caller transaction commits
+(`TransactionalMVLockState::DeferDeltaCleanup`). Rollback discards it. If the deferred
+cleanup fails, the refresh still reports success and prints that cleanup was deferred;
+the committed watermark prevents the retained rows from being applied twice.

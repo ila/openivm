@@ -3,11 +3,13 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/parser/statement/pragma_statement.hpp"
+#include "lpts_parser.hpp"
 
 #include <regex>
 
@@ -20,10 +22,37 @@ static unique_ptr<SQLStatement> BuildInternalPragma(const string &name, const st
 	return std::move(statement);
 }
 
+SqlDialect OpenIvmInputDialect(ClientContext &context) {
+	Value setting_value;
+	if (!context.TryGetCurrentSetting(OPENIVM_INPUT_DIALECT_SETTING, setting_value) || setting_value.IsNull()) {
+		return SqlDialect::DUCKDB;
+	}
+	return ParseSqlDialectSetting(setting_value.ToString(), OPENIVM_INPUT_DIALECT_SETTING);
+}
+
+void SetOpenIvmInputDialect(ClientContext &context, SetScope scope, Value &parameter) {
+	auto dialect = parameter.IsNull() ? SqlDialect::DUCKDB
+	                                  : ParseSqlDialectSetting(parameter.ToString(), OPENIVM_INPUT_DIALECT_SETTING);
+	// `parser_override` and `parse_function` are handed the extension info, not a ClientContext, so
+	// mirror the resolved dialect there. The info is owned by the DBConfig, so the mirror stays
+	// scoped to this database.
+	for (auto &extension : ExtensionCallbackManager::Get(context).ParserExtensions()) {
+		auto info = dynamic_cast<MaterializedViewParserExtensionInfo *>(extension.parser_info.get());
+		if (info) {
+			info->SetInputDialect(dialect);
+		}
+	}
+}
+
+static SqlDialect InputDialectFromInfo(ParserExtensionInfo *info) {
+	auto materialized_view_info = dynamic_cast<MaterializedViewParserExtensionInfo *>(info);
+	return materialized_view_info ? materialized_view_info->InputDialect() : SqlDialect::DUCKDB;
+}
+
 ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExtensionInfo *info, const string &query,
                                                                        ParserOptions &options) {
 	try {
-		auto extension_result = ParseFunction(info, query);
+		auto extension_result = ParseMaterializedViewStatement(query, InputDialectFromInfo(info));
 		if (extension_result.type == ParserExtensionResultType::PARSE_SUCCESSFUL) {
 			vector<unique_ptr<SQLStatement>> statements;
 			statements.push_back(BuildInternalPragma("openivm_materialized_view_lifecycle", query));
@@ -31,8 +60,8 @@ ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExt
 		}
 
 		// DuckDB parses these statements natively, so the regular parser-extension
-		// fallback never sees them. Route tracked-view drops and cascading source
-		// drops through OpenIVM so their cleanup uses the caller transaction.
+		// fallback never sees them. Route view and source-table drops through
+		// OpenIVM so cleanup and source retractions use the caller transaction.
 		ParserOptions native_options = options;
 		native_options.extensions = nullptr;
 		Parser parser(native_options);
@@ -41,8 +70,7 @@ ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExt
 			return ParserOverrideResult();
 		}
 		auto &drop = parser.statements[0]->Cast<DropStatement>();
-		if (drop.info->type != CatalogType::VIEW_ENTRY &&
-		    (drop.info->type != CatalogType::TABLE_ENTRY || !drop.info->cascade)) {
+		if (drop.info->type != CatalogType::VIEW_ENTRY && drop.info->type != CatalogType::TABLE_ENTRY) {
 			return ParserOverrideResult();
 		}
 		vector<unique_ptr<SQLStatement>> statements;
@@ -55,6 +83,10 @@ ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExt
 
 ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(ParserExtensionInfo *info,
                                                                           const string &query) {
+	return ParseMaterializedViewStatement(query, InputDialectFromInfo(info));
+}
+
+ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, SqlDialect input_dialect) {
 	auto query_lower = SqlUtils::SQLToLowercase(StringUtil::Replace(query, ";", ""));
 	StringUtil::Trim(query_lower);
 	// Strip SQL line comments (-- to end of line) before whitespace normalization.
@@ -77,7 +109,7 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 			                      "or ALTER MATERIALIZED VIEW <name> SET REFRESH MANUAL");
 		}
 		string alter_view_name = match[1].str();
-		auto name_components = QualifiedName::ParseComponents(alter_view_name);
+		auto name_components = SqlUtils::ParseQualifiedIdentifier(alter_view_name);
 		if (name_components.empty()) {
 			throw ParserException("Invalid materialized-view target '%s'", alter_view_name);
 		}
@@ -125,6 +157,13 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 	// All other rewrites (DISTINCT, AVG, LEFT JOIN key, aggregate aliases) are done
 	// at the plan level in PlanFunction via PlanRewrite + LPTS.
 	OPENIVM_DEBUG_PRINT("[CREATE MV] After structural rewrite: %s\n", query_lower.c_str());
+
+	if (input_dialect != SqlDialect::DUCKDB) {
+		// LPTS owns input syntax; the parsed AT clause below carries the snapshot and its relation.
+		query_lower = NormalizeInputSqlToDuckDB(query_lower, input_dialect);
+		OPENIVM_DEBUG_PRINT("[CREATE MV] After %s input normalization: %s\n", SqlDialectToString(input_dialect).c_str(),
+		                    query_lower.c_str());
+	}
 
 	Parser p;
 	p.ParseQuery(query_lower);

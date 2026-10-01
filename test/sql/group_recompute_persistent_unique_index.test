@@ -262,13 +262,13 @@ INSERT INTO ord VALUES (16,1,6);
 
 # Simulate a crash mid-refresh: set the flag without refreshing.
 statement ok
-UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv';
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = '__openivm_mv_6f70656e69766d5f67726f75705f7265636f6d707574655f756e697175655f696e646578_6d61696e_6d76_';
 
 statement ok
 PRAGMA refresh('mv');
 
 query I
-SELECT refresh_in_progress FROM openivm_views WHERE view_name = 'mv';
+SELECT refresh_in_progress FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f67726f75705f7265636f6d707574655f756e697175655f696e646578_6d61696e_6d76_';
 ----
 false
 
@@ -299,7 +299,7 @@ statement ok
 DELETE FROM cust WHERE nation = 'B';
 
 statement ok
-UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv';
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = '__openivm_mv_6f70656e69766d5f67726f75705f7265636f6d707574655f756e697175655f696e646578_6d61696e_6d76_';
 
 statement ok
 PRAGMA refresh('mv');

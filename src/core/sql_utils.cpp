@@ -15,10 +15,11 @@ static constexpr const char *CAST_EXPRESSION_PREFIX = "openivm_expr:";
 static constexpr const char *CAST_COLUMN_PLACEHOLDER = "{openivm_column}";
 
 static bool IsIdentifierChar(char c) {
-	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+	return static_cast<unsigned char>(c) >= 128 || std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
 }
 
-static void SkipWhitespace(const string &sql, size_t &pos) {
+template <class INDEX>
+static void SkipWhitespace(const string &sql, INDEX &pos) {
 	while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
 		pos++;
 	}
@@ -34,7 +35,7 @@ static bool StartsWithKeyword(const string &sql, size_t pos, const string &keywo
 	return pos + keyword.size() == sql.size() || !IsIdentifierChar(sql[pos + keyword.size()]);
 }
 
-static string TrimSQLFragment(const string &input) {
+string SqlUtils::TrimSQLFragment(const string &input) {
 	idx_t start = 0;
 	while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
 		start++;
@@ -169,7 +170,7 @@ static bool ReadCreateTargetName(const string &sql, const string &object_keyword
 		if (i > 0) {
 			out += ".";
 		}
-		out += parts[i];
+		out += SqlUtils::QuoteIdentifier(parts[i]);
 	}
 	return true;
 }
@@ -186,12 +187,12 @@ static bool ReadIdentifierSegmentSpan(const string &sql, idx_t &pos, IdentifierS
 	}
 	segment.start = pos;
 	segment.value.clear();
-	if (sql[pos] == '"') {
-		pos++;
+	if (sql[pos] == '"' || sql[pos] == '`') {
+		auto quote = sql[pos++];
 		while (pos < sql.size()) {
-			if (sql[pos] == '"') {
-				if (pos + 1 < sql.size() && sql[pos + 1] == '"') {
-					segment.value += '"';
+			if (sql[pos] == quote) {
+				if (pos + 1 < sql.size() && sql[pos + 1] == quote) {
+					segment.value += quote;
 					pos += 2;
 					continue;
 				}
@@ -203,7 +204,8 @@ static bool ReadIdentifierSegmentSpan(const string &sql, idx_t &pos, IdentifierS
 		}
 		return false;
 	}
-	if (!(std::isalpha(static_cast<unsigned char>(sql[pos])) || sql[pos] == '_')) {
+	if (!(static_cast<unsigned char>(sql[pos]) >= 128 || std::isalpha(static_cast<unsigned char>(sql[pos])) ||
+	      sql[pos] == '_')) {
 		return false;
 	}
 	while (pos < sql.size() && IsIdentifierChar(sql[pos])) {
@@ -220,6 +222,26 @@ static bool ReadIdentifierSegment(const string &sql, idx_t &pos, string &segment
 	}
 	segment = std::move(span.value);
 	return true;
+}
+
+vector<string> SqlUtils::ParseQualifiedIdentifier(const string &name) {
+	vector<string> parts;
+	idx_t pos = 0;
+	while (true) {
+		SkipWhitespace(name, pos);
+		string part;
+		if (!ReadIdentifierSegment(name, pos, part)) {
+			throw ParserException("Invalid qualified identifier '%s'", name);
+		}
+		parts.push_back(std::move(part));
+		SkipWhitespace(name, pos);
+		if (pos == name.size()) {
+			return parts;
+		}
+		if (name[pos++] != '.') {
+			throw ParserException("Invalid qualified identifier '%s'", name);
+		}
+	}
 }
 
 static bool ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end, string &identifier) {
@@ -322,8 +344,18 @@ void SqlUtils::WriteFile(const string &filename, bool append, const string &comp
 	} else {
 		file.open(filename);
 	}
+	if (!file.is_open()) {
+		throw IOException(
+		    "OpenIVM could not open compiled SQL file '%s'. Create the directory set by "
+		    "openivm_files_path and check write permissions; relative paths use the process working directory.",
+		    filename);
+	}
 	file << compiled_query << '\n';
 	file.close();
+	if (file.fail()) {
+		throw IOException("OpenIVM could not finish writing compiled SQL file '%s'. Check free space and permissions.",
+		                  filename);
+	}
 }
 
 string SqlUtils::ExtractTableName(const string &sql) {
@@ -338,7 +370,7 @@ string SqlUtils::ExtractTableName(const string &sql) {
 	if (std::regex_search(sql, match, table_name_regex)) {
 		auto name = match[1].str();
 		if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
-			name = name.substr(1, name.size() - 2);
+			name = StringUtil::Replace(name.substr(1, name.size() - 2), "\"\"", "\"");
 		}
 		return name;
 	}
@@ -619,7 +651,7 @@ string SqlUtils::LastIdentifierPart(string name) {
 		name = name.substr(dot_pos + 1);
 	}
 	if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
-		name = name.substr(1, name.size() - 2);
+		name = StringUtil::Replace(name.substr(1, name.size() - 2), "\"\"", "\"");
 	}
 	return name;
 }
@@ -751,15 +783,7 @@ string SqlUtils::BuildAnyNullPredicate(const vector<string> &columns, const stri
 }
 
 string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += " AND ";
-		}
-		result += lhs_alias + "." + QuoteIdentifier(columns[i]) + " IS NOT DISTINCT FROM " + rhs_alias + "." +
-		          QuoteIdentifier(columns[i]);
-	}
-	return result;
+	return BuildNullSafeKeyPredicate(columns, lhs_alias + ".", rhs_alias + ".");
 }
 
 string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,

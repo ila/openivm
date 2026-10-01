@@ -84,7 +84,8 @@ A term with bitmask `mask` is pruned if:
     (mask & skip_bits) != 0
 
 where `skip_bits` is the OR of all PK leaf bits that satisfy:
-1. The PK leaf is the referenced side of a FOREIGN KEY declared in the join
+1. The PK leaf is the referenced side of a FOREIGN KEY between two leaves of the join, and
+   the join predicates equate every FK column with its referenced column
 2. The PK leaf's delta is insert-only (no `openivm_multiplicity < 0` rows)
 
 This is a single bitmask check per term — O(1).
@@ -103,9 +104,27 @@ build + hash join probe + UNION ALL branch.
 
 ## When It Applies
 
-- Base tables have declared `FOREIGN KEY` constraints
+- An FK relationship is known from one of:
+  - a declared `FOREIGN KEY` constraint in the catalog;
+  - a trusted RELY FK declared with
+    `PRAGMA openivm_declare_rely_fk(child_table, child_columns, parent_table, parent_columns)`
+    and stored in `openivm_constraints_cache` (useful when the catalog carries no FK);
+  - `fk_relations` passed to `openivm_compile_with_facts` for compile-only calls
 - The referenced (PK-side) table's delta contains only inserts since last refresh
+  (for compile-only calls: `delta_shape` is `INSERT_ONLY` or `UNCHANGED`, or
+  `assume_insert_only = true`)
 - The join is an inner join between the FK and PK tables
+- Pruning is evaluated only when it is likely to pay for the constraint inspection:
+  exactly one join input has a non-empty delta, a trusted FK/RELY_FK for a join leaf is in
+  `openivm_constraints_cache`, or compile facts supply `fk_relations`. With only catalog
+  constraints and several changed inputs, all inclusion-exclusion terms are built.
+
+```sql
+PRAGMA openivm_declare_rely_fk('fact_sales', 'product_id', 'dim_product', 'product_id');
+```
+
+Column lists are comma-separated or a JSON array of strings; both lists must have the same
+length.
 
 For eligible external-engine projection plans, OpenIVM can also use
 [regular N-term compilation](../operators/inner-join.md#regular-table-n-term-compilation).
@@ -134,7 +153,8 @@ uses the N-term plan.
 ## How it works
 
 1. **FK detection:** Walk the join tree, inspect each base table's declared constraints
-   for `FOREIGN KEY` references to other tables in the join.
+   and trusted `openivm_constraints_cache` entries (or the compile facts) for FK references
+   to other tables in the join whose columns are all joined by equality.
 2. **Insert-only check:** For each referenced (PK-side) table, check whether its delta
    contains any deletions since the last refresh. If not, the delta is insert-only.
 3. **Skip bits:** Build a bitmask of all insert-only PK leaves.
@@ -157,6 +177,8 @@ CREATE MATERIALIZED VIEW sales_by_product AS
     GROUP BY p.name;
 
 -- Mixed batch: dim insert + fact insert + fact delete.
+-- Both inputs changed, so pruning is evaluated only with a trusted RELY FK.
+PRAGMA openivm_declare_rely_fk('fact_sales', 'product_id', 'dim_product', 'product_id');
 -- dim_product delta is insert-only → 2/3 terms pruned, 1 remaining.
 -- The surviving term (ΔF ⋈ D_current) correctly picks up the new product.
 INSERT INTO dim_product VALUES (99, 'NewProduct');

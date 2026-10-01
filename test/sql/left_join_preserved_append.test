@@ -36,7 +36,7 @@ query I
 SELECT contains(lineage_json, '"k":"left_join_key_source"')
        AND contains(lineage_json, '"table":"ljpa_sec"')
        AND contains(lineage_json, '"column":"ckey"')
-FROM openivm_views WHERE view_name = 'ljpa_mh';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a70615f6d68_';
 ----
 1
 
@@ -48,7 +48,9 @@ PRAGMA refresh('ljpa_mh');
 
 query I
 SELECT contains(content, 'generate_series') AND NOT contains(content, 'openivm_affected')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_ljpa_mh.sql');
+       AND NOT contains(content, 'openivm_publish_next_')
+       AND NOT contains(content, 'openivm_publish_changes_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6c6a70615f6d68_.sql');
 ----
 1
 
@@ -98,11 +100,11 @@ statement ok
 PRAGMA refresh('ljpa_mh');
 
 query I
-SELECT contains(content, 'DELETE FROM openivm_data_ljpa_mh')
+SELECT contains(content, 'DELETE FROM memory.main.openivm_data___openivm_mv_6d656d6f7279_6d61696e_6c6a70615f6d68_')
        AND contains(content, 'SELECT DISTINCT openivm_left_key')
        AND contains(content, 'openivm_lj_src INNER JOIN openivm_affected')
        AND NOT contains(content, 'generate_series')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_ljpa_mh.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6c6a70615f6d68_.sql');
 ----
 1
 
@@ -201,7 +203,9 @@ PRAGMA refresh('ljpa2_mh');
 
 query I
 SELECT contains(content, 'generate_series') AND NOT contains(content, 'openivm_affected')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_ljpa2_mh.sql');
+       AND NOT contains(content, 'openivm_publish_next_')
+       AND NOT contains(content, 'openivm_publish_changes_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6c6a7061325f6d68_.sql');
 ----
 1
 

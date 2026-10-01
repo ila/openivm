@@ -622,7 +622,7 @@ CREATE MATERIALIZED VIEW dl.mv_hav_scalar AS
     JOIN dl.hav_customer c ON o.w = c.w AND o.d = c.d AND o.c = c.c;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_hav_scalar';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f6861765f7363616c6172_';
 ----
 6
 
@@ -700,7 +700,7 @@ CREATE MATERIALIZED VIEW dl.mv_gr_distinct AS
     GROUP BY i.category;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_gr_distinct';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f67725f64697374696e6374_';
 ----
 6
 
@@ -720,8 +720,8 @@ statement ok
 PRAGMA refresh('mv_gr_distinct');
 
 query I
-SELECT contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_affected_mv_gr_distinct')
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_mv_gr_distinct.sql');
+SELECT contains(content, 'CREATE OR REPLACE TEMP TABLE openivm_affected___openivm_mv_646c_6d61696e_6d765f67725f64697374696e6374_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_6d765f67725f64697374696e6374_.sql');
 ----
 true
 
@@ -1074,12 +1074,12 @@ CREATE MATERIALIZED VIEW dl.mv_minmax_join_having AS
     FROM rollup;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_minmax_join_having';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f6d696e6d61785f6a6f696e5f686176696e67_';
 ----
 6
 
 query T
-SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = 'mv_minmax_join_having';
+SELECT group_recompute_affected_mode FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f6d696e6d61785f6a6f696e5f686176696e67_';
 ----
 current_diff
 

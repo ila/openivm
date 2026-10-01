@@ -231,7 +231,7 @@ Run `make format-fix` to auto-format. Claude Code also runs it automatically via
 
 Codex reads this file through `AGENTS.md`, which should be a symlink to `CLAUDE.md` so project memory has one source of truth.
 
-Project and shared DuckDB skills live in `.claude/skills/`. Codex sees them through symlinks in `/home/ila/.codex/skills/`; refresh those links with `.claude/sync-codex-skills.sh` after adding or renaming a skill.
+Project and shared DuckDB skills live in `.claude/skills/`. Codex sees them through symlinks in `~/.codex/skills/`; refresh those links with `.claude/sync-codex-skills.sh` after adding or renaming a skill.
 
 The `.codex` path in this checkout is a read-only runtime mount, not a project directory, so project-local Codex skills cannot live there.
 

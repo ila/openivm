@@ -50,59 +50,13 @@ static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
 	return &expr->Cast<BoundColumnRefExpression>();
 }
 
-static bool ResolvesToAggregateValueBinding(idx_t table_index, idx_t column_index, const CreateMVPlanFacts &facts,
-                                            int depth = 0) {
-	if (depth > 16) {
-		return false;
-	}
+static bool ResolvesToAggregateValueBinding(idx_t table_index, idx_t column_index, const CreateMVPlanFacts &facts) {
 	for (auto *aggregate : facts.aggregates) {
-		if (!aggregate || aggregate->group_index != facts.analysis.group_index ||
-		    table_index != aggregate->aggregate_index) {
-			continue;
+		if (aggregate && aggregate->group_index == facts.analysis.group_index &&
+		    ResolvesToOutputBinding(table_index, column_index, aggregate->aggregate_index,
+		                            aggregate->expressions.size(), facts, true)) {
+			return true;
 		}
-		return column_index < aggregate->expressions.size();
-	}
-	auto projection_it = facts.projections_by_index.find(table_index);
-	if (projection_it != facts.projections_by_index.end()) {
-		auto &proj = *projection_it->second;
-		if (column_index >= proj.expressions.size()) {
-			return false;
-		}
-		auto *bcr = GetColumnRefThroughCasts(proj.expressions[column_index].get());
-		return bcr &&
-		       ResolvesToAggregateValueBinding(bcr->binding.table_index, bcr->binding.column_index, facts, depth + 1);
-	}
-	auto setop_it = facts.setops_by_index.find(table_index);
-	if (setop_it != facts.setops_by_index.end()) {
-		auto &setop = *setop_it->second;
-		if (column_index >= setop.column_count) {
-			return false;
-		}
-		for (auto &child : setop.children) {
-			auto bindings = child->GetColumnBindings();
-			if (column_index >= bindings.size()) {
-				continue;
-			}
-			auto &binding = bindings[column_index];
-			if (ResolvesToAggregateValueBinding(binding.table_index, binding.column_index, facts, depth + 1)) {
-				return true;
-			}
-		}
-		return false;
-	}
-	auto cte_ref_it = facts.cte_refs_by_table_index.find(table_index);
-	if (cte_ref_it != facts.cte_refs_by_table_index.end()) {
-		auto &cte_ref = *cte_ref_it->second;
-		auto cte_def_it = facts.cte_defs_by_index.find(cte_ref.cte_index);
-		if (cte_def_it == facts.cte_defs_by_index.end()) {
-			return false;
-		}
-		auto bindings = cte_def_it->second->GetColumnBindings();
-		if (column_index >= bindings.size()) {
-			return false;
-		}
-		auto &binding = bindings[column_index];
-		return ResolvesToAggregateValueBinding(binding.table_index, binding.column_index, facts, depth + 1);
 	}
 	return false;
 }
@@ -119,9 +73,9 @@ static bool HasCaseInsensitiveName(const unordered_set<string> &names, const str
 	return names.count(StringUtil::Lower(name)) > 0;
 }
 
-static bool VisibleOutputResolvesToAggregateValue(const CreateMVPlanFacts &facts, idx_t output_idx) {
+static bool VisibleOutputResolvesToAggregateValue(const CreateMVPlanFacts &facts, const vector<ColumnBinding> &bindings,
+                                                  idx_t output_idx) {
 	if (facts.root) {
-		auto bindings = facts.root->GetColumnBindings();
 		if (output_idx < bindings.size()) {
 			auto &binding = bindings[output_idx];
 			return ResolvesToAggregateValueBinding(binding.table_index, binding.column_index, facts);
@@ -134,8 +88,9 @@ static bool VisibleOutputResolvesToAggregateValue(const CreateMVPlanFacts &facts
 	return bcr && ResolvesToAggregateValueBinding(bcr->binding.table_index, bcr->binding.column_index, facts);
 }
 
-static bool CanInspectVisibleOutputBinding(const CreateMVPlanFacts &facts, idx_t output_idx) {
-	if (facts.root && output_idx < facts.root->GetColumnBindings().size()) {
+static bool CanInspectVisibleOutputBinding(const CreateMVPlanFacts &facts, const vector<ColumnBinding> &bindings,
+                                           idx_t output_idx) {
+	if (facts.root && output_idx < bindings.size()) {
 		return true;
 	}
 	return facts.first_projection && output_idx < facts.first_projection->expressions.size();
@@ -152,15 +107,17 @@ static bool HasVisibleNonGroupNonAggregateOutput(const DeltaViewModel &model, co
 		aggregate_outputs.insert(StringUtil::Lower(name));
 	}
 	auto visible_count = GetVisibleOutputCount(output_names, visible_output_count);
+	auto bindings = facts.root ? facts.root->GetColumnBindings() : vector<ColumnBinding>();
 	for (idx_t output_idx = 0; output_idx < visible_count; output_idx++) {
 		auto &name = output_names[output_idx];
 		if (IncrementalTableNames::IsInternalColumn(name) || HasCaseInsensitiveName(group_outputs, name)) {
 			continue;
 		}
-		if (VisibleOutputResolvesToAggregateValue(facts, output_idx)) {
+		if (VisibleOutputResolvesToAggregateValue(facts, bindings, output_idx)) {
 			continue;
 		}
-		if (!CanInspectVisibleOutputBinding(facts, output_idx) && HasCaseInsensitiveName(aggregate_outputs, name)) {
+		if (!CanInspectVisibleOutputBinding(facts, bindings, output_idx) &&
+		    HasCaseInsensitiveName(aggregate_outputs, name)) {
 			continue;
 		}
 		return true;
@@ -176,12 +133,15 @@ static void AddVisibleNonAggregateOutputNames(vector<string> &group_columns, con
 		aggregate_outputs.insert(StringUtil::Lower(name));
 	}
 	idx_t visible_count = GetVisibleOutputCount(output_names, visible_output_count);
+	auto bindings = facts.root ? facts.root->GetColumnBindings() : vector<ColumnBinding>();
 	for (idx_t output_idx = 0; output_idx < visible_count; output_idx++) {
 		auto &name = output_names[output_idx];
-		if (IncrementalTableNames::IsInternalColumn(name) || VisibleOutputResolvesToAggregateValue(facts, output_idx)) {
+		if (IncrementalTableNames::IsInternalColumn(name) ||
+		    VisibleOutputResolvesToAggregateValue(facts, bindings, output_idx)) {
 			continue;
 		}
-		if (!CanInspectVisibleOutputBinding(facts, output_idx) && HasCaseInsensitiveName(aggregate_outputs, name)) {
+		if (!CanInspectVisibleOutputBinding(facts, bindings, output_idx) &&
+		    HasCaseInsensitiveName(aggregate_outputs, name)) {
 			continue;
 		}
 		group_columns.push_back(name);

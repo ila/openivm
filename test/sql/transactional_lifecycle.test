@@ -34,8 +34,8 @@ ROLLBACK;
 query IIII
 SELECT
     (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_create_mv'),
-    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_create_mv'),
-    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_lifecycle_create_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data___openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f6372656174655f6d76_'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta___openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f6372656174655f6d76_'),
     (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_views');
 ----
 0	0	0	0
@@ -67,7 +67,7 @@ SELECT id, v FROM lifecycle_replace_mv;
 1	10
 
 query I
-SELECT refresh_interval FROM openivm_views WHERE view_name = 'lifecycle_replace_mv';
+SELECT refresh_interval FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f7265706c6163655f6d76_';
 ----
 300
 
@@ -104,7 +104,7 @@ statement ok
 ROLLBACK;
 
 query I
-SELECT refresh_interval FROM openivm_views WHERE view_name = 'lifecycle_replace_mv';
+SELECT refresh_interval FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f7265706c6163655f6d76_';
 ----
 300
 
@@ -131,8 +131,8 @@ ROLLBACK;
 query III
 SELECT
     (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_drop_mv'),
-    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_drop_mv'),
-    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_drop_mv');
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data___openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f64726f705f6d76_'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f64726f705f6d76_');
 ----
 1	1	1
 
@@ -174,7 +174,7 @@ SELECT id, v FROM lifecycle_same_tx_cascade_src;
 
 statement ok
 INSERT INTO openivm_refresh_hooks VALUES (
-    'lifecycle_same_tx_cascade_mv',
+    '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f73616d655f74785f636173636164655f6d76_',
     'SELECT true',
     'after'
 );
@@ -189,11 +189,11 @@ query IIIIIII
 SELECT
     (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'lifecycle_same_tx_cascade_src'),
     (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_same_tx_cascade_mv'),
-    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_same_tx_cascade_mv'),
-    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_lifecycle_same_tx_cascade_mv'),
-    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_same_tx_cascade_mv'),
-    (SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'lifecycle_same_tx_cascade_mv'),
-    (SELECT count(*) FROM openivm_refresh_hooks WHERE view_name = 'lifecycle_same_tx_cascade_mv');
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data___openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f73616d655f74785f636173636164655f6d76_'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta___openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f73616d655f74785f636173636164655f6d76_'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f73616d655f74785f636173636164655f6d76_'),
+    (SELECT count(*) FROM openivm_delta_tables WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f73616d655f74785f636173636164655f6d76_'),
+    (SELECT count(*) FROM openivm_refresh_hooks WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f73616d655f74785f636173636164655f6d76_');
 ----
 0	0	0	0	0	0	0
 
@@ -222,8 +222,8 @@ query IIII
 SELECT
     (SELECT count(*) FROM lifecycle_same_tx_cascade_rollback_src),
     (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_same_tx_cascade_rollback_mv'),
-    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_same_tx_cascade_rollback_mv'),
-    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_same_tx_cascade_rollback_mv');
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data___openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f73616d655f74785f636173636164655f726f6c6c6261636b5f6d76_'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f73616d655f74785f636173636164655f726f6c6c6261636b5f6d76_');
 ----
 1	0	0	0
 
@@ -238,7 +238,7 @@ SELECT id FROM lifecycle_autocommit_cascade_src;
 
 statement ok
 INSERT INTO openivm_refresh_hooks VALUES (
-    'lifecycle_autocommit_cascade_mv',
+    '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f6175746f636f6d6d69745f636173636164655f6d76_',
     'SELECT true',
     'after'
 );
@@ -249,8 +249,8 @@ DROP TABLE lifecycle_autocommit_cascade_src CASCADE;
 query III
 SELECT
     (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_autocommit_cascade_mv'),
-    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_autocommit_cascade_mv'),
-    (SELECT count(*) FROM openivm_refresh_hooks WHERE view_name = 'lifecycle_autocommit_cascade_mv');
+    (SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f6175746f636f6d6d69745f636173636164655f6d76_'),
+    (SELECT count(*) FROM openivm_refresh_hooks WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f6175746f636f6d6d69745f636173636164655f6d76_');
 ----
 0	0	0
 
@@ -390,7 +390,7 @@ ALTER MATERIALIZED VIEW "lifecycle_alt"."qualified_mv" SET REFRESH EVERY '5 minu
 
 query I
 SELECT count(*) FROM openivm_views
-WHERE view_name = 'qualified_mv'
+WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6c6966656379636c655f616c74_7175616c69666965645f6d76_'
   AND view_catalog = 'openivm_transactional_lifecycle'
   AND view_schema = 'lifecycle_alt'
   AND refresh_interval = 300;
@@ -481,7 +481,7 @@ ALTER MATERIALIZED VIEW "lifecycle-alt-quoted"."qualified-mv" SET REFRESH EVERY 
 
 query I
 SELECT count(*) FROM openivm_views
-WHERE view_name = 'qualified-mv'
+WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6c6966656379636c652d616c742d71756f746564_7175616c69666965642d6d76_'
   AND view_schema = 'lifecycle-alt-quoted'
   AND refresh_interval = 420;
 ----
@@ -514,7 +514,7 @@ does not exist in OpenIVM metadata
 
 query I
 SELECT refresh_interval FROM openivm_views
-WHERE view_name = 'qualified-mv' AND view_schema = 'lifecycle-alt-quoted';
+WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6c6966656379636c652d616c742d71756f746564_7175616c69666965642d6d76_' AND view_schema = 'lifecycle-alt-quoted';
 ----
 420
 
@@ -575,8 +575,8 @@ query III
 SELECT
     (SELECT count(*) FROM duckdb_views() WHERE schema_name = 'main'
         AND view_name = 'lifecycle_drop_collision_mv'),
-    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_drop_collision_mv'),
-    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_drop_collision_mv');
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data___openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f64726f705f636f6c6c6973696f6e5f6d76_'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f64726f705f636f6c6c6973696f6e5f6d76_');
 ----
 1	1	1
 
@@ -936,10 +936,10 @@ COMMIT;
 query IIIII
 SELECT
     (SELECT count(*) FROM duckdb_views() WHERE view_name = 'lifecycle_same_tx_drop_mv'),
-    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_same_tx_drop_mv'),
-    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_lifecycle_same_tx_drop_mv'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data___openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f73616d655f74785f64726f705f6d76_'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta___openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f73616d655f74785f64726f705f6d76_'),
     (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_lifecycle_same_tx_drop_src'),
-    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_same_tx_drop_mv');
+    (SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f73616d655f74785f64726f705f6d76_');
 ----
 0	0	0	0	0
 
@@ -961,7 +961,7 @@ CREATE SCHEMA lifecycle_spoof;
 
 statement ok
 CREATE VIEW lifecycle_spoof.lifecycle_exact_drop_mv AS
-SELECT * FROM main.openivm_data_lifecycle_exact_drop_mv;
+SELECT * FROM main.openivm_data___openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f65786163745f64726f705f6d76_;
 
 statement ok
 DROP VIEW lifecycle_spoof.lifecycle_exact_drop_mv;
@@ -986,8 +986,8 @@ SELECT count(*) FROM (
 
 query III
 SELECT
-    (SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_exact_drop_mv'),
-    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data_lifecycle_exact_drop_mv'),
+    (SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f65786163745f64726f705f6d76_'),
+    (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_data___openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f65786163745f64726f705f6d76_'),
     (SELECT count(*) FROM duckdb_views()
      WHERE schema_name = 'lifecycle_spoof' AND view_name = 'lifecycle_exact_drop_mv');
 ----
@@ -1193,7 +1193,7 @@ ROLLBACK;
 
 query I
 SELECT count(*) FROM openivm_views
-WHERE view_name IN ('lifecycle_drop_chain_parent', 'lifecycle_drop_chain_child');
+WHERE view_name IN ('__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f64726f705f636861696e5f706172656e74_', '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f64726f705f636861696e5f6368696c64_');
 ----
 2
 
@@ -1247,7 +1247,7 @@ DROP TABLE lifecycle_drop_chain_src CASCADE;
 
 query I
 SELECT count(*) FROM openivm_views
-WHERE view_name IN ('lifecycle_drop_chain_parent', 'lifecycle_drop_chain_child');
+WHERE view_name IN ('__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f64726f705f636861696e5f706172656e74_', '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f64726f705f636861696e5f6368696c64_');
 ----
 0
 
@@ -1315,7 +1315,7 @@ SELECT count(*) FROM lifecycle_dl.lifecycle_mixed_dimension;
 2
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name = 'lifecycle_mixed_mv';
+SELECT count(*) FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f7472616e73616374696f6e616c5f6c6966656379636c65_6d61696e_6c6966656379636c655f6d697865645f6d76_';
 ----
 0
 
@@ -1374,7 +1374,7 @@ SELECT id, v FROM lifecycle_dl.replace_mv;
 query I
 SELECT count(*) FROM duckdb_tables()
 WHERE database_name = 'lifecycle_dl'
-  AND table_name = 'openivm_stage_replace_mv';
+  AND table_name = 'openivm_stage___openivm_mv_6c6966656379636c655f646c_6d61696e_7265706c6163655f6d76_';
 ----
 0
 
@@ -1435,5 +1435,549 @@ SELECT count(*) FROM (
     EXCEPT ALL
     SELECT id, v FROM lifecycle_dl.replace_mv
 );
+----
+0
+
+# Native attachments own their metadata and survive a new DatabaseInstance.
+# Use a different persistent host so refresh cannot accidentally find the state there.
+load __TEST_DIR__/openivm_attachment_host.db
+
+# Keep an identically named view in the host to catch accidental metadata fallback.
+statement ok
+CREATE TABLE attached_src(id INTEGER, g INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO attached_src VALUES (999, 9, 999);
+
+statement ok
+CREATE MATERIALIZED VIEW attached_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM attached_src GROUP BY g;
+
+query I
+SELECT length(current_setting('search_path'));
+----
+0
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_attachment_state.db' AS attached_state;
+
+statement ok
+USE attached_state;
+
+statement ok
+CREATE TABLE attached_src(id INTEGER, g INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO attached_src VALUES (1, 1, 10), (2, 1, 20), (3, NULL, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW attached_mv AS SELECT g, SUM(v) AS total, COUNT(*) AS n FROM attached_src GROUP BY g;
+
+query I
+SELECT count(*) FROM attached_state.main.openivm_views WHERE view_name = '__openivm_mv_61747461636865645f7374617465_6d61696e_61747461636865645f6d76_';
+----
+1
+
+statement ok
+INSERT INTO attached_src VALUES (4, 1, 30), (5, 2, 40), (5, 2, 40);
+
+statement ok
+UPDATE attached_src SET v = v + 7 WHERE id IN (1, 4, 5);
+
+statement ok
+DELETE FROM attached_src WHERE id IN (2, 4);
+
+statement ok
+PRAGMA refresh('attached_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g EXCEPT ALL SELECT * FROM attached_mv));
+----
+0
+
+statement ok
+USE openivm_attachment_host;
+
+restart
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_attachment_state.db' AS attached_state;
+
+statement ok
+USE attached_state;
+
+statement ok
+INSERT INTO attached_src VALUES (6, 1, 50), (7, NULL, 60), (8, 2, 70);
+
+statement ok
+UPDATE attached_src SET g = 3, v = 11 WHERE id IN (5, 8);
+
+statement ok
+DELETE FROM attached_src WHERE id IN (1, 8);
+
+statement ok
+PRAGMA refresh('attached_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g EXCEPT ALL SELECT * FROM attached_mv));
+----
+0
+
+# Explicit caller transactions retain the same metadata owner and rollback atomically.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO attached_src VALUES (9, 4, 90), (10, 4, 100);
+
+statement ok
+UPDATE attached_src SET v = 99 WHERE id IN (6, 9);
+
+statement ok
+DELETE FROM attached_src WHERE id = 10;
+
+statement ok
+PRAGMA refresh('attached_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g EXCEPT ALL SELECT * FROM attached_mv));
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g EXCEPT ALL SELECT * FROM attached_mv));
+----
+0
+
+# Explicit catalog arguments work even when the caller uses the host database.
+statement ok
+USE openivm_attachment_host;
+
+statement ok
+INSERT INTO attached_state.attached_src VALUES (11, 5, 110), (12, 5, 120);
+
+statement ok
+UPDATE attached_state.attached_src SET v = 111 WHERE id IN (6, 11);
+
+statement ok
+DELETE FROM attached_state.attached_src WHERE id = 12;
+
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+PRAGMA refresh_options('attached_state', 'main', 'attached_mv');
+
+statement ok
+USE attached_state;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM attached_src GROUP BY g EXCEPT ALL SELECT * FROM attached_mv));
+----
+0
+
+query I
+SELECT count(*) FROM attached_state.main.openivm_refresh_profile WHERE view_name = '__openivm_mv_61747461636865645f7374617465_6d61696e_61747461636865645f6d76_' AND step_name = 'total_refresh';
+----
+1
+
+statement ok
+SET openivm_profile_refresh = false;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM openivm_attachment_host.attached_mv EXCEPT ALL SELECT g, SUM(v), COUNT(*) FROM openivm_attachment_host.attached_src GROUP BY g) UNION ALL (SELECT g, SUM(v), COUNT(*) FROM openivm_attachment_host.attached_src GROUP BY g EXCEPT ALL SELECT * FROM openivm_attachment_host.attached_mv));
+----
+0
+
+# Legacy metadata upgrades participate in the caller's transaction and rollback.
+# The attached catalog has its own schema; another initialized catalog must not
+# suppress this migration.
+statement ok
+ALTER TABLE openivm_views DROP COLUMN pending_after_hook;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW metadata_upgrade_rollback AS SELECT id, g, v FROM attached_src;
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'attached_state'
+  AND table_name = 'openivm_views' AND column_name = 'pending_after_hook';
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'attached_state'
+  AND table_name = 'openivm_views' AND column_name = 'pending_after_hook';
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW metadata_upgrade_retry AS SELECT id, g, v FROM attached_src;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM metadata_upgrade_retry EXCEPT ALL SELECT id, g, v FROM attached_src)),
+       (SELECT count(*) FROM (SELECT id, g, v FROM attached_src EXCEPT ALL SELECT * FROM metadata_upgrade_retry));
+----
+0	0
+
+# Stale metadata still recovers, including rows inserted in this transaction.
+# New names skip the expensive external-catalog cleanup; existing metadata must
+# retain its execution-time object checks so a duplicate cannot erase a live MV.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO openivm_views (view_name, sql_string, type) VALUES
+('metadata_stale_retry', 'SELECT id, g, v FROM attached_src', 0);
+
+statement ok
+CREATE MATERIALIZED VIEW metadata_stale_retry AS SELECT id, g, v FROM attached_src;
+
+statement ok
+COMMIT;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM metadata_stale_retry EXCEPT ALL SELECT id, g, v FROM attached_src)),
+       (SELECT count(*) FROM (SELECT id, g, v FROM attached_src EXCEPT ALL SELECT * FROM metadata_stale_retry));
+----
+0	0
+
+statement error
+CREATE MATERIALIZED VIEW metadata_stale_retry AS SELECT id, g, v FROM attached_src;
+----
+already exists
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name = 'metadata_stale_retry';
+----
+1
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM metadata_stale_retry EXCEPT ALL SELECT id, g, v FROM attached_src)),
+       (SELECT count(*) FROM (SELECT id, g, v FROM attached_src EXCEPT ALL SELECT * FROM metadata_stale_retry));
+----
+0	0
+
+
+
+# Qualified source keys survive quoted identifiers, rollback, and reopening.
+load __TEST_DIR__/qualified_source_lifecycle.db
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE SCHEMA "Source A";
+
+statement ok
+CREATE SCHEMA "Source.B";
+
+statement ok
+CREATE TABLE "Source A"."rows.with""quote"(id INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO "Source A"."rows.with""quote" VALUES (1,10),(2,20),(2,20),(3,30);
+
+statement ok
+CREATE TABLE "Source.B"."rows.with""quote"(id INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO "Source.B"."rows.with""quote" VALUES (1,10),(2,20),(2,20),(3,30);
+
+statement ok
+CREATE MATERIALIZED VIEW "quoted""sources" AS SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id);
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE "Source A"."rows.with""quote" SET v=99 WHERE id=1;
+
+statement ok
+DELETE FROM "Source A"."rows.with""quote" WHERE id=2;
+
+statement ok
+INSERT INTO "Source A"."rows.with""quote" VALUES(4,44);
+
+statement ok
+PRAGMA refresh('"quoted""sources"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "quoted""sources" EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id) EXCEPT ALL SELECT * FROM "quoted""sources"));
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "quoted""sources" EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id) EXCEPT ALL SELECT * FROM "quoted""sources"));
+----
+0
+
+statement ok
+UPDATE "Source A"."rows.with""quote" SET v=v+1;
+
+statement ok
+DELETE FROM "Source.B"."rows.with""quote" WHERE id=3;
+
+statement ok
+INSERT INTO "Source.B"."rows.with""quote" VALUES(1,11),(2,22);
+
+restart
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+PRAGMA refresh('"quoted""sources"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "quoted""sources" EXCEPT ALL SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id)) UNION ALL (SELECT a.id, a.v av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id) EXCEPT ALL SELECT * FROM "quoted""sources"));
+----
+0
+
+statement ok
+ALTER TABLE "Source A"."rows.with""quote" ADD COLUMN unused INTEGER;
+
+statement ok
+ALTER TABLE "Source A"."rows.with""quote" DROP COLUMN unused;
+
+statement error
+ALTER TABLE "Source A"."rows.with""quote" DROP COLUMN v;
+----
+referenced by materialized view
+
+statement ok
+ALTER TABLE "Source A"."rows.with""quote" RENAME COLUMN v TO amount;
+
+statement ok
+UPDATE "Source A"."rows.with""quote" SET amount=amount+4;
+
+statement ok
+DELETE FROM "Source A"."rows.with""quote" WHERE id=2;
+
+statement ok
+INSERT INTO "Source A"."rows.with""quote" VALUES(2,222),(2,222);
+
+statement ok
+PRAGMA refresh('"quoted""sources"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "quoted""sources" EXCEPT ALL SELECT a.id, a.amount av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id)) UNION ALL (SELECT a.id, a.amount av, b.v bv FROM "Source A"."rows.with""quote" a JOIN "Source.B"."rows.with""quote" b USING(id) EXCEPT ALL SELECT * FROM "quoted""sources"));
+----
+0
+
+statement ok
+DROP TABLE "Source A"."rows.with""quote" CASCADE;
+
+query I
+SELECT count(*) FROM main.openivm_views WHERE view_sql_name='quoted"sources';
+----
+0
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/qualified_source_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE SCHEMA dl.a;
+
+statement ok
+CREATE TABLE dl.a.t(id INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.a.t VALUES(1,10),(2,20),(2,20);
+
+statement ok
+CREATE SCHEMA dl.b;
+
+statement ok
+CREATE TABLE dl.b.t(id INTEGER,v INTEGER);
+
+statement ok
+INSERT INTO dl.b.t VALUES(1,10),(2,20),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.reopened_sources AS SELECT a.id,a.v av,b.v bv FROM dl.a.t a JOIN dl.b.t b USING(id);
+
+statement ok
+UPDATE dl.a.t SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM dl.a.t WHERE id=2;
+
+statement ok
+INSERT INTO dl.a.t VALUES(2,22),(2,22);
+
+restart
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/qualified_source_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+PRAGMA refresh('dl.reopened_sources');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.reopened_sources EXCEPT ALL SELECT a.id,a.v av,b.v bv FROM dl.a.t a JOIN dl.b.t b USING(id)) UNION ALL (SELECT a.id,a.v av,b.v bv FROM dl.a.t a JOIN dl.b.t b USING(id) EXCEPT ALL SELECT * FROM dl.reopened_sources));
+----
+0
+
+statement ok
+UPDATE dl.b.t SET v=v+7;
+
+statement ok
+DELETE FROM dl.b.t WHERE id=1;
+
+statement ok
+INSERT INTO dl.b.t VALUES(1,100);
+
+statement ok
+PRAGMA refresh('dl.reopened_sources');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.reopened_sources EXCEPT ALL SELECT a.id,a.v av,b.v bv FROM dl.a.t a JOIN dl.b.t b USING(id)) UNION ALL (SELECT a.id,a.v av,b.v bv FROM dl.a.t a JOIN dl.b.t b USING(id) EXCEPT ALL SELECT * FROM dl.reopened_sources));
+----
+0
+
+# Unquoted Unicode identifiers and dollar signs remain valid in pragma arguments.
+statement ok
+CREATE TABLE données(id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO données VALUES (1,10),(1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW résumé$final AS SELECT id, SUM(v) total FROM données GROUP BY id;
+
+statement ok
+UPDATE données SET v=v+1 WHERE id=1;
+
+statement ok
+DELETE FROM données WHERE id=2;
+
+statement ok
+INSERT INTO données VALUES (2,30),(2,30);
+
+statement ok
+PRAGMA refresh('résumé$final');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM résumé$final EXCEPT ALL SELECT id,SUM(v) total FROM données GROUP BY id) UNION ALL (SELECT id,SUM(v) total FROM données GROUP BY id EXCEPT ALL SELECT * FROM résumé$final));
+----
+0
+
+
+# CREATE profiles follow the metadata owner even after the caller search path is restored.
+load __TEST_DIR__/profile_creation_host.db
+
+statement ok
+ATTACH '__TEST_DIR__/profile_creation_target.db' AS "profile.target";
+
+statement ok
+CREATE SCHEMA "profile.target"."observation.data";
+
+statement ok
+CREATE TABLE "profile.target"."observation.data".source(i INTEGER);
+
+statement ok
+INSERT INTO "profile.target"."observation.data".source VALUES (1), (1), (2);
+
+statement ok
+SET openivm_profile_refresh=true;
+
+# The caller has no profile table: an unqualified profile INSERT would fail.
+statement ok
+DROP TABLE IF EXISTS main.openivm_refresh_profile;
+
+statement ok
+CREATE MATERIALIZED VIEW "profile.target"."observation.data".mv AS SELECT * FROM "profile.target"."observation.data".source;
+
+query I
+SELECT count(*) > 0 FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
+----
+1
+
+query TT
+SELECT current_database(), current_schema();
+----
+profile_creation_host	main
+
+# With a caller profile table present, profiles must not silently go there either.
+statement ok
+CREATE TABLE source(i INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW host_mv AS SELECT * FROM source;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW "profile.target"."observation.data".mv AS SELECT i FROM "profile.target"."observation.data".source WHERE i>0;
+
+query I
+SELECT count(*) FROM main.openivm_refresh_profile p WHERE NOT EXISTS (SELECT 1 FROM main.openivm_views v WHERE v.view_name=p.view_name);
+----
+0
+
+query I
+SELECT count(*) FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
+----
+2
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW "profile.target"."observation.data".rolled_back AS SELECT * FROM "profile.target"."observation.data".source;
+
+query I
+SELECT count(*) FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
+----
+3
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM "profile.target".main.openivm_refresh_profile WHERE step_name='create_mv_total';
+----
+2
+
+query I
+SELECT count(*) FROM "profile.target".main.openivm_views WHERE view_sql_name='rolled_back';
+----
+0
+
+statement ok
+INSERT INTO "profile.target"."observation.data".source VALUES (3), (3), (4);
+
+statement ok
+DELETE FROM "profile.target"."observation.data".source WHERE i=2;
+
+statement ok
+UPDATE "profile.target"."observation.data".source SET i=5 WHERE i=4;
+
+statement ok
+PRAGMA refresh('"profile.target"."observation.data".mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "profile.target"."observation.data".mv EXCEPT ALL SELECT i FROM "profile.target"."observation.data".source WHERE i>0) UNION ALL (SELECT i FROM "profile.target"."observation.data".source WHERE i>0 EXCEPT ALL SELECT * FROM "profile.target"."observation.data".mv));
 ----
 0

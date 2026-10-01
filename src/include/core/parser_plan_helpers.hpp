@@ -70,6 +70,7 @@ struct CreateMVPlanFacts {
 	idx_t max_table_index = 0;
 	PlanAnalysis analysis;
 	unordered_map<string, SourceTableInfo> source_table_info;
+	case_insensitive_map_t<idx_t> source_name_counts;
 	unordered_map<string, DuckLakeSourceTableInfo> ducklake_table_info;
 	LogicalProjection *first_projection = nullptr;
 	vector<LogicalProjection *> projections;
@@ -106,14 +107,16 @@ struct CreateMVPlanFacts {
 	bool has_descendant_distinct = false;
 };
 
-string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limit_val, idx_t offset_val,
-                       const vector<string> &output_col_names, bool include_limit = true);
+void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string> &output_names, string &suffix,
+                               string &ordering);
 /// Collect rewrite requirements while preparing CTEs, then inline eligible CTEs.
 PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
 string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
                                 const string &default_db);
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog);
+bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,
+                             const CreateMVPlanFacts &facts, bool through_casts, int depth = 0);
 bool ProducesAtMostOneRow(LogicalOperator &node);
 bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node);
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols);

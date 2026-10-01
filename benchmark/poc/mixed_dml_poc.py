@@ -25,8 +25,9 @@ import tempfile
 import time
 from pathlib import Path
 
-DUCKDB = "/home/ila/Code/openivm/build/release/duckdb"
-EXT = "/home/ila/Code/openivm/build/release/extension/openivm/openivm.duckdb_extension"
+REPO = Path(__file__).resolve().parents[2]
+DUCKDB = os.environ.get("OPENIVM_DUCKDB", str(REPO / "build/release/duckdb"))
+EXT = os.environ.get("OPENIVM_EXTENSION", str(REPO / "build/release/extension/openivm/openivm.duckdb_extension"))
 
 
 def run_sql(db_path: str, sql: str, timeout: int = 600) -> tuple[str, str, int]:

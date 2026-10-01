@@ -13,10 +13,22 @@ namespace duckdb {
 // behind typed methods. Takes a Connection reference — does NOT create its own.
 class RefreshMetadata {
 	Connection &con;
+	Value ReadViewValue(const string &view_name, const string &column);
+	string ReadViewString(const string &view_name, const string &column);
+	vector<string> ReadViewList(const string &view_name, const string &column);
 
 public:
 	explicit RefreshMetadata(Connection &con) : con(con) {
 	}
+
+	// Native view metadata belongs to the view catalog; external catalogs use the native default.
+	static void UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
+
+	void SnapshotTransaction(ClientContext &context);
+	string ResolveViewName(const string &view_name, const string &catalog = "", const string &schema = "");
+	string FindViewKey(const string &catalog, const string &schema, const string &name);
+	string GetViewSQLName(const string &view_key);
+	string AllocateViewKey(const string &catalog, const string &schema, const string &name);
 
 	// Returns true if the given table name is NOT a tracked materialized view.
 	// (i.e., it's a base table that should have its deltas captured)
@@ -50,6 +62,11 @@ public:
 	// Get the last_update timestamp for a specific delta table entry.
 	string GetLastUpdate(const string &view_name, const string &table_name);
 
+	// Accept both legacy short keys and qualified keys for sources with colliding names.
+	static vector<string> MetadataCatalogs(Connection &con);
+	static string SourceTableName(const string &key, const string &catalog, const string &schema);
+	static string SourcePredicate(const string &table, const string &catalog, const string &schema);
+
 	struct SourceLocation {
 		string catalog_name;
 		string schema_name;
@@ -70,6 +87,7 @@ public:
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
 	StoredViewLocation GetStoredViewLocation(const string &view_name, const string &fallback_catalog = "",
 	                                         const string &fallback_schema = "");
+	bool IsMaterializedViewDelta(const DeltaSource &source);
 	vector<DeltaSource> GetDeltaSources(const string &view_name, const string &fallback_catalog = "",
 	                                    const string &fallback_schema = "");
 	string ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
@@ -95,7 +113,10 @@ public:
 	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
 	vector<string> GetDownstreamViews(const string &view_name);
 	vector<string> GetDownstreamViewsStrict(const string &view_name);
-	bool HasDownstreamViews(const string &view_name);
+	bool HasDownstreamViews(const string &view_name, bool include_published = true);
+
+	// Select a multi-target pipeline and topologically order its induced dependency graph.
+	vector<string> GetPipelineRefreshOrder(const vector<string> &targets, const string &cascade_mode);
 
 	// Get refresh_interval in seconds for a view. Returns -1 if not set (manual only).
 	int64_t GetRefreshInterval(const string &view_name);
@@ -103,6 +124,7 @@ public:
 	// Get all views with a non-null refresh_interval.
 	// Returns the stored relation identity plus its schedule and last refresh watermark.
 	struct ScheduledView {
+		string metadata_catalog;
 		string view_name;
 		string catalog_name;
 		string schema_name;
@@ -118,7 +140,9 @@ public:
 	// target: the (possibly schema-qualified) table to delete from.
 	// metadata_key: the name used in openivm_delta_tables (unqualified delta name).
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
-	                                   const string &delta_metadata_table = "");
+	                                   const string &delta_metadata_table = "",
+	                                   vector<string> *deferred_cleanup = nullptr,
+	                                   const vector<string> &metadata_catalogs = {});
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);

@@ -1,66 +1,334 @@
-# Building OpenIVM
+# Building and running OpenIVM
 
-## Prerequisites
+OpenIVM currently requires **DuckDB v1.5.4** and must be built from source.
+The build below produces both a DuckDB command-line
+program with OpenIVM built in and a loadable extension.
 
-- **git**
-- **cmake** (>= 3.5)
-- **ninja** (optional but recommended — significantly faster builds)
-- **C++ compiler** with C++14 support
+You do not need to replace your existing DuckDB installation. Use the executable
+from this build for OpenIVM, and open an existing database with it as described below.
 
-## Clone
+## 1. Install the build tools
+
+You need Git, CMake (>= 3.5), Make, Python 3, and a C++ compiler. Ninja is recommended.
+The commands below are for macOS and Linux; run shell commands in Terminal, and SQL
+in the DuckDB prompt after launching it.
+
+### macOS (including Apple Silicon)
+
+Install Apple's command-line developer tools, then install the remaining tools
+with [Homebrew](https://brew.sh/) if you use it:
+
+```bash
+xcode-select --install
+brew install cmake ninja python
+```
+
+### Ubuntu / Debian
+
+```bash
+sudo apt-get update
+sudo apt-get install build-essential git cmake ninja-build python3
+```
+
+## 2. Clone the source and its dependencies
 
 ```bash
 git clone --recurse-submodules https://github.com/ila/openivm.git
 cd openivm
 ```
 
-If you already cloned without `--recurse-submodules`, run:
+For an existing clone that is missing dependencies:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-## Build
+Use the submodule revisions recorded in the repository. They include the matching
+DuckDB source and LPTS SQL compiler; installing DuckDB separately does not provide
+these build dependencies. Do not update the submodules to their latest branches
+when following this guide.
+
+## 3. Compile
+
+Run the commands for your platform, replacing `/path/to/openivm` with your clone's location.
+
+### macOS
 
 ```bash
-GEN=ninja make        # release build (recommended)
-make                  # release build without ninja
-GEN=ninja make debug  # debug build
+cd /path/to/openivm
+CMAKE_BUILD_PARALLEL_LEVEL=4 GEN=ninja make
 ```
 
-The extension is built into:
-
-```
-build/release/extension/openivm/openivm.duckdb_extension   # release
-build/debug/extension/openivm/openivm.duckdb_extension     # debug
-```
-
-## Format Code
+### Linux
 
 ```bash
-make format-fix
+cd /path/to/openivm
+GEN=ninja make
 ```
 
-## Updating the DuckDB Version
+On Linux you can also set `CMAKE_BUILD_PARALLEL_LEVEL=4` to limit build concurrency.
 
-The DuckDB version is pinned via the `duckdb` and `extension-ci-tools` submodules. To update to a new release:
+This builds DuckDB as well as OpenIVM, so the first build can take a while. The four
+build workers used in the macOS command are a conservative starting point; lower the number if compilation
+runs out of memory. You can rerun the same command after an interrupted build.
+
+The main outputs are:
+
+| File | Purpose |
+|---|---|
+| `build/release/duckdb` | DuckDB CLI with OpenIVM built in; use this for the steps below |
+| `build/release/extension/openivm/openivm.duckdb_extension` | Loadable extension for a matching DuckDB build and platform |
+
+Without Ninja, use `CMAKE_BUILD_PARALLEL_LEVEL=4 make` in a fresh checkout. Keep the
+same generator when reusing a build directory.
+
+## 4. Launch OpenIVM and check the version
+
+From the repository root:
 
 ```bash
-cd duckdb && git fetch --tags && git checkout v1.X.0
-cd ../extension-ci-tools && git fetch && git checkout origin/v1.X.0
-cd ..
-git add duckdb extension-ci-tools
-git commit -m "Bump DuckDB to v1.X.0"
+./build/release/duckdb openivm_demo.duckdb
 ```
 
-Replace `v1.X.0` with the target version tag. See [UPDATING.md](../UPDATING.md) for details on handling DuckDB API changes.
+This opens or creates a persistent database in the current directory. Calling just
+`duckdb` may start a different installation. At the DuckDB prompt, run:
 
-## Updating Shared Claude Code Skills
+```sql
+SELECT version(); -- expected: v1.5.4
+SELECT extension_name, loaded
+FROM duckdb_extensions()
+WHERE extension_name = 'openivm'; -- expected: openivm | true
+```
 
-Shared Claude Code skills live in `.claude/skills/shared/` (a git submodule from [duckdb-claude-skills](https://github.com/ila/duckdb-claude-skills)). To pull the latest:
+OpenIVM is already loaded in this executable; no `INSTALL` or `LOAD` is needed.
+Use `.quit` to exit the CLI.
+
+## 5. Try an incremental refresh
+
+In a fresh demo database, paste the following SQL into the DuckDB prompt:
+
+```sql
+CREATE TABLE sales (region VARCHAR, product VARCHAR, amount INT);
+INSERT INTO sales VALUES ('US', 'Widget', 100), ('EU', 'Gadget', 200);
+
+CREATE MATERIALIZED VIEW regional_totals AS
+    SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
+    FROM sales GROUP BY region;
+
+-- Batch changes before refreshing once.
+INSERT INTO sales VALUES ('US', 'Bolt', 50), ('JP', 'Gear', 300);
+UPDATE sales SET amount = 110 WHERE product = 'Widget';
+DELETE FROM sales WHERE product = 'Gadget';
+PRAGMA refresh('regional_totals');
+
+SELECT * FROM regional_totals ORDER BY region;
+-- JP | 300 | 1
+-- US | 160 | 2
+
+-- Both checks must return zero rows, including when duplicates are present.
+SELECT * FROM regional_totals
+EXCEPT ALL
+SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region;
+
+SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region
+EXCEPT ALL
+SELECT * FROM regional_totals;
+```
+
+The same example is included in [`docs/build/demo.sql`](demo.sql). From the repository
+root, run it directly (no copying or saving SQL is needed):
 
 ```bash
-git submodule update --remote .claude/skills/shared
-git add .claude/skills/shared
-git commit -m "Update shared Claude Code skills"
+mkdir -p openivm_generated_sql
+./build/release/duckdb -bail < docs/build/demo.sql
 ```
+
+With no database filename, each run uses a fresh in-memory database. To keep the
+results, pass a new database filename before `<`, for example
+`./build/release/duckdb -bail openivm_demo.duckdb < docs/build/demo.sql`.
+
+In a fresh CLI session launched from the repository root, you can also run the
+script from the DuckDB prompt, after creating the output directory in your terminal:
+
+```text
+.read docs/build/demo.sql
+```
+
+### Inspect the generated SQL
+
+SQL file output is **opt-in**. The included `docs/build/demo.sql` sets
+`openivm_files_path`; the SQL pasted above does not. No default output directory
+is selected. Create a directory in your terminal, then configure it in the DuckDB
+session **before** creating or refreshing a view:
+
+```bash
+mkdir -p /absolute/path/to/openivm_sql
+```
+
+```sql
+SET openivm_files_path = '/absolute/path/to/openivm_sql';
+PRAGMA openivm_files('regional_totals');
+```
+
+The pragma reports the absolute path, existence, and status of each reference file,
+plus the process working directory. It does not generate files. If output is
+disabled, it explains how to enable it. Relative paths are relative to the working
+directory of the DuckDB process, **not** the attached database file. A file that
+exists may come from an earlier compilation; existence does not prove freshness.
+The setting applies to the current session and must be set again after reopening.
+An unwritable or missing directory now produces an error with the affected path.
+
+After running the included demo from the repository root, inspect its files from
+your terminal:
+
+```bash
+cat openivm_generated_sql/openivm_system_tables.sql
+cat openivm_generated_sql/openivm_compiled_queries_*.sql
+cat openivm_generated_sql/openivm_upsert_queries_*.sql
+```
+
+The wildcards include all views in that directory. For one view, use the exact
+paths returned by `PRAGMA openivm_files('regional_totals')`; filenames use an
+internal key derived from the view's catalog, schema, and name.
+
+These contain system-table DDL, view setup SQL, and the SQL compiled for the refresh,
+respectively. The refresh file is overwritten when a new refresh is compiled and
+contains that refresh's catalog names and delta cutoff timestamps. It is an
+inspection artifact, not the demo's input script. The optional
+`openivm_initial_load_explain_<internal_key>.txt` contains the initial-load plan. A refresh
+that skips empty deltas may not compile a new file. Setting the path after CREATE
+does not retroactively create the setup files; do not replace an existing MV just
+to obtain an inspection file.
+
+### Inspect or save compiled SQL without files
+
+The compiler also returns SQL as rows. This works without `openivm_files_path`:
+
+```sql
+SELECT stmt_order, stmt_kind, sql
+FROM openivm_compile_with_facts(
+    'regional_totals', '{"target_dialect":"duckdb","compile_only":true}')
+ORDER BY stmt_order;
+
+CREATE TABLE saved_refresh_sql AS
+SELECT * FROM openivm_compile_with_facts(
+    'regional_totals', '{"target_dialect":"duckdb","compile_only":true}');
+```
+
+This compiles a refresh without executing it or consuming the pending changes.
+The saved table is an ordinary user table, not automatically maintained OpenIVM
+metadata. The generated program depends on current state, including delta cutoffs
+and snapshot IDs. Compile again for a later refresh; do not treat an old saved
+program as a reusable refresh procedure. Use `PRAGMA refresh` for normal execution.
+
+Use the prompt or a SQL file rather than putting creation and refresh together in
+one `-c` argument: refresh metadata can be resolved before the preceding view
+creation has executed.
+
+## 6. Use an existing DuckDB database
+
+Start with a backup or test copy, and close other processes that have the database
+open for writing. You can open the file directly:
+
+```bash
+./build/release/duckdb /absolute/path/to/analytics.duckdb
+```
+
+Or launch `./build/release/duckdb` and attach it at the SQL prompt:
+
+```sql
+ATTACH '/absolute/path/to/analytics.duckdb' AS analytics;
+USE analytics;
+SHOW TABLES;
+```
+
+Replace the path with an existing file: DuckDB otherwise creates a new database.
+`USE analytics` makes it the default catalog for subsequent unqualified table and
+view names. You can now create materialized views over its tables and refresh them
+as in the example above. You do not have to export and reimport compatible files.
+
+OpenIVM runs inside this DuckDB process; a separate metadata server is not required.
+For this workflow, keep the source tables and materialized views in the same
+writable database. OpenIVM creates its metadata, backing tables, and delta tables
+there. A `READ_ONLY` attachment is useful for inspecting data, but cannot support
+this in-place maintenance workflow.
+
+For ordinary DuckDB tables, perform subsequent inserts, updates, and deletes through
+connections with OpenIVM loaded so it can record the changes. Writes made through
+another DuckDB installation without OpenIVM are not automatically captured.
+DuckLake uses a different snapshot-based change-tracking path; see
+[DuckLake integration](../ducklake.md).
+
+### Databases created by other DuckDB versions
+
+The **extension version requirement** and the **database file format** are separate:
+
+- OpenIVM must run with its matching DuckDB v1.5.4 build. A locally compiled
+  extension cannot be loaded into an arbitrary DuckDB version.
+- DuckDB supports reading older database formats, with backward compatibility
+  established from v0.10. A database does not need to have been created with v1.5.4
+  to be usable here.
+- Reading a file written by a newer DuckDB release depends on the storage features
+  used; forward compatibility is not guaranteed. `ATTACH` does not convert an
+  incompatible format.
+
+See DuckDB's [storage compatibility documentation](https://duckdb.org/docs/stable/internals/storage).
+Files created with DuckDB v1.1.2 and v1.2.1 were tested with the v1.5.4 OpenIVM
+build, both opened directly and attached. Each case passed MV creation, mixed-DML
+refresh, and another refresh after closing and reopening the process. Results were
+checked against full recomputation with `EXCEPT ALL` in both directions. These checks
+do not cover every file version, extension-defined type, or stored SQL definition.
+
+If the file is incompatible, open it with a DuckDB version that can read it, export
+the required tables to Parquet, and import them into a new database using the
+OpenIVM build. Recreate views and other schema objects as needed. Keep the original
+file until the imported data and queries have been verified.
+
+## Loading the extension into another DuckDB client
+
+**This extension will not load into any other DuckDB version.** It is compiled for
+**v1.5.4**; v1.1.2 and v1.2.1 clients were both tested and rejected it with a version
+mismatch, even with unsigned extensions enabled. This is separate from opening
+older database files using the v1.5.4 executable.
+
+The built CLI is the simplest starting point. For a separate compatible DuckDB
+v1.5.4 CLI, enable unsigned local extensions when launching it:
+
+```bash
+duckdb -unsigned /absolute/path/to/test.duckdb
+```
+
+Then load the compiled file by its full path:
+
+```sql
+LOAD '/absolute/path/to/openivm/build/release/extension/openivm/openivm.duckdb_extension';
+```
+
+The DuckDB version, operating system, architecture, and build platform must match.
+`-unsigned` allows loading your local build; it does not bypass version or platform
+compatibility. Likewise, a Python client uses its own DuckDB library: building the
+CLI does not update an installed Python package. Hosted services also have their
+own extension-loading policies; a successful local build does not establish
+MotherDuck deployment support.
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---|---|
+| `LOAD 'openivm'` cannot find the extension | Use `./build/release/duckdb`, or load the compiled extension by its full path in a matching client. |
+| Extension version/platform mismatch | Check `SELECT version()` and use the DuckDB executable produced by this build. |
+| Unsigned extension error | Launch a compatible external CLI with `-unsigned` before loading the local extension. |
+| Missing DuckDB/LPTS source or build files | Run `git submodule update --init --recursive` from the repository root. |
+| Compiler killed / out of memory | Rerun with `CMAKE_BUILD_PARALLEL_LEVEL=2 GEN=ninja make`. |
+| Database lock error | Close the other process using the file, or work with a separate test copy. |
+| Incompatible database storage version | Follow the file compatibility guidance above; rebuilding OpenIVM does not convert the database. |
+
+When reporting a problem, include your OS/architecture, `SELECT version()` output,
+`git rev-parse HEAD`, the command you ran, and the complete error message.
+
+## Development
+
+For a debug build, use `GEN=ninja make debug`; its outputs are under `build/debug/`.
+Run `make format-fix` after C++ edits. See [testing](testing.md) for the test suite,
+[UPDATING.md](../UPDATING.md) for maintainer instructions on changing the pinned
+DuckDB version, and [pipelines](../refresh/pipelines.md) for refresh orchestration.

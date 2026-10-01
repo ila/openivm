@@ -1,19 +1,183 @@
+#include "core/metadata_json.hpp"
 #include "core/refresh_metadata.hpp"
 
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
+#include "core/published_view.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
 #include "rules/column_hider.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/appender.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include <algorithm>
 #include <functional>
 #include <sstream>
+#include <map>
+#include <set>
 #include <unordered_set>
 
 namespace duckdb {
+
+void RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
+	auto catalog = view_catalog;
+	if (catalog.empty()) {
+		catalog = ClientData::Get(context).catalog_search_path->GetDefault().catalog;
+	}
+	string target = SqlUtils::QuoteIdentifier(DEFAULT_SCHEMA);
+	if (!catalog.empty()) {
+		auto type = con.Query("SELECT type FROM duckdb_databases() WHERE NOT internal AND database_name = '" +
+		                      SqlUtils::EscapeValue(catalog) + "'");
+		if (type->HasError()) {
+			throw CatalogException("OpenIVM could not resolve metadata catalog: %s", type->GetError());
+		}
+		if (type->RowCount() && type->GetValue(0, 0).ToString() == "duckdb") {
+			target = SqlUtils::QuoteIdentifier(catalog) + "." + target;
+		}
+	}
+	auto result = con.Query("USE " + target);
+	if (result->HasError()) {
+		throw CatalogException("OpenIVM could not select metadata catalog: %s", result->GetError());
+	}
+	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s for view catalog '%s'\n", target.c_str(), catalog.c_str());
+}
+
+// The compiler's helper connection cannot observe the caller's uncommitted metadata.
+// Read through the caller's storage transaction and shadow only the compiler's reads.
+void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
+	auto current = con.Query("SELECT current_database()");
+	if (current->HasError()) {
+		throw CatalogException("Cannot resolve transaction metadata catalog: %s", current->GetError());
+	}
+	auto catalog = current->GetValue(0, 0).ToString();
+	for (auto name :
+	     {openivm::VIEWS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::MV_DEPS_TABLE, "openivm_refresh_hooks"}) {
+		auto entry =
+		    Catalog::GetEntry<TableCatalogEntry>(context, catalog, DEFAULT_SCHEMA, name, OnEntryNotFound::RETURN_NULL);
+		if (!entry) {
+			continue;
+		}
+		vector<StorageIndex> column_ids;
+		vector<string> columns;
+		for (auto &column : entry->GetColumns().Physical()) {
+			column_ids.emplace_back(column.StorageOid());
+			columns.push_back(SqlUtils::QuoteIdentifier(column.Name()) + " " + column.Type().ToString());
+		}
+		auto created = con.Query("CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(name) + " (" +
+		                         StringUtil::Join(columns, ", ") + ")");
+		if (created->HasError()) {
+			throw CatalogException("Cannot snapshot transaction metadata: %s", created->GetError());
+		}
+		auto &transaction = DuckTransaction::Get(context, entry->catalog);
+		auto &storage = entry->GetStorage();
+		TableScanState scan;
+		storage.InitializeScan(context, transaction, scan, column_ids);
+		DataChunk rows;
+		rows.Initialize(Allocator::Get(context), entry->GetTypes());
+		Appender appender(con, TEMP_CATALOG, DEFAULT_SCHEMA, name);
+		while (true) {
+			rows.Reset();
+			storage.Scan(transaction, rows, scan);
+			if (rows.size() == 0) {
+				break;
+			}
+			appender.AppendDataChunk(rows);
+		}
+		appender.Close();
+	}
+	OPENIVM_DEBUG_PRINT("[METADATA] Snapshotted caller transaction in %s\n", catalog.c_str());
+}
+
+string RefreshMetadata::GetViewSQLName(const string &view_key) {
+	auto name = ReadViewString(view_key, "view_sql_name");
+	return name.empty() ? view_key : name;
+}
+
+string RefreshMetadata::FindViewKey(const string &catalog, const string &schema, const string &name) {
+	auto query = [&](const string &name_expression) {
+		return con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE lower(" + name_expression +
+		                 ") = lower(" + Value(name).ToSQLString() + ") AND lower(COALESCE(view_catalog, " +
+		                 Value(catalog).ToSQLString() + ")) = lower(" + Value(catalog).ToSQLString() +
+		                 ") AND lower(COALESCE(view_schema, 'main')) = lower(" + Value(schema).ToSQLString() + ")");
+	};
+	auto result = query("COALESCE(view_sql_name, view_name)");
+	if (result->HasError()) {
+		result = query("view_name"); // Metadata written before SQL names were stored separately.
+	}
+	if (result->HasError() || !result->RowCount()) {
+		return "";
+	}
+	if (result->RowCount() != 1) {
+		throw CatalogException("Ambiguous materialized view '%s'", SqlUtils::FullName(catalog, schema, name));
+	}
+	return result->GetValue(0, 0).ToString();
+}
+
+string RefreshMetadata::AllocateViewKey(const string &catalog, const string &schema, const string &name) {
+	auto existing = FindViewKey(catalog, schema, name);
+	if (!existing.empty()) {
+		return existing;
+	}
+	// Allocation must not depend on other CREATEs having committed their metadata.
+	// Encode all identifier bytes, including separators, to avoid schema/name collisions.
+	string key = "__openivm_mv_";
+	const char *hex = "0123456789abcdef";
+	for (auto &part : {catalog, schema, name}) {
+		for (unsigned char c : StringUtil::Lower(part)) {
+			key += hex[c >> 4];
+			key += hex[c & 15];
+		}
+		key += '_';
+	}
+	return key;
+}
+
+string RefreshMetadata::ResolveViewName(const string &view_name, const string &catalog, const string &schema) {
+	// Public names resolve by location; internal graph edges already contain storage keys.
+	auto exact = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
+	                       " WHERE view_name = " + Value(view_name).ToSQLString());
+	if (exact->HasError()) {
+		return view_name;
+	}
+	if (!catalog.empty() && !schema.empty()) {
+		auto preferred = FindViewKey(catalog, schema, view_name);
+		if (!preferred.empty()) {
+			return preferred;
+		}
+	}
+	auto matches =
+	    con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
+	              " WHERE lower(COALESCE(view_sql_name, view_name)) = lower(" + Value(view_name).ToSQLString() + ")");
+	if (matches->HasError()) {
+		matches = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
+		                    " WHERE lower(view_name) = lower(" + Value(view_name).ToSQLString() + ")");
+	}
+	if (!matches->HasError() && matches->RowCount() > 1) {
+		throw CatalogException("Ambiguous materialized view '%s'; use catalog.schema.view", view_name);
+	}
+	if (!matches->HasError() && matches->RowCount() == 1) {
+		return matches->GetValue(0, 0).ToString();
+	}
+	return exact->RowCount() == 1 ? exact->GetValue(0, 0).ToString() : view_name;
+}
 
 bool RefreshMetadata::IsBaseTable(const string &table_name) {
 	auto result = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(table_name) + "'");
 	return !result->HasError() && result->RowCount() == 0;
+}
+
+Value RefreshMetadata::ReadViewValue(const string &view_name, const string &column) {
+	auto result = con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::VIEWS_TABLE) +
+	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	return result->HasError() || result->RowCount() == 0 ? Value() : result->GetValue(0, 0);
+}
+
+string RefreshMetadata::ReadViewString(const string &view_name, const string &column) {
+	auto value = ReadViewValue(view_name, column);
+	return value.IsNull() ? "" : value.ToString();
 }
 
 string RefreshMetadata::GetViewQuery(const string &view_name) {
@@ -38,55 +202,49 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 			throw ParserException("Could not read IVM metadata for materialized view '%s'%s: %s", view_name, locus_text,
 			                      result->GetError());
 		}
-		throw ParserException("Materialized view '%s' does not exist in IVM metadata.", view_name);
+		throw ParserException("Materialized view '%s' does not exist in IVM metadata. Refresh currently looks up the "
+		                      "MV short name, not schema.name. Check view_name, view_catalog and view_schema in "
+		                      "openivm_views in the native metadata database, then pass its view_name to refresh.",
+		                      view_name);
 	}
 	auto raw_type = result->GetValue(0, 0).GetValue<int8_t>();
 	return static_cast<RefreshType>(raw_type);
 }
 
 bool RefreshMetadata::HasMinMax(const string &view_name) {
-	auto result = con.Query("SELECT has_minmax FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	auto value = ReadViewValue(view_name, "has_minmax");
+	if (value.IsNull()) {
 		return false;
 	}
-	return result->GetValue(0, 0).GetValue<bool>();
+	return value.GetValue<bool>();
 }
 
 bool RefreshMetadata::HasLeftJoin(const string &view_name) {
-	auto result = con.Query("SELECT has_left_join FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	auto value = ReadViewValue(view_name, "has_left_join");
+	if (value.IsNull()) {
 		return false;
 	}
-	return result->GetValue(0, 0).GetValue<bool>();
+	return value.GetValue<bool>();
 }
 
 bool RefreshMetadata::HasJoin(const string &view_name) {
-	auto result = con.Query("SELECT has_join FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	auto value = ReadViewValue(view_name, "has_join");
+	if (value.IsNull()) {
 		return HasLeftJoin(view_name) || HasFullOuter(view_name);
 	}
-	return result->GetValue(0, 0).GetValue<bool>();
+	return value.GetValue<bool>();
 }
 
 bool RefreshMetadata::HasFullOuter(const string &view_name) {
-	auto result = con.Query("SELECT has_full_outer FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	auto value = ReadViewValue(view_name, "has_full_outer");
+	if (value.IsNull()) {
 		return false;
 	}
-	return result->GetValue(0, 0).GetValue<bool>();
+	return value.GetValue<bool>();
 }
 
 string RefreshMetadata::GetFullOuterJoinCols(const string &view_name) {
-	auto result = con.Query("SELECT full_outer_join_cols FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return "";
-	}
-	return result->GetValue(0, 0).ToString();
+	return ReadViewString(view_name, "full_outer_join_cols");
 }
 
 vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
@@ -111,6 +269,42 @@ string RefreshMetadata::GetLastUpdate(const string &view_name, const string &tab
 	return result->GetValue(0, 0).ToString();
 }
 
+vector<string> RefreshMetadata::MetadataCatalogs(Connection &con) {
+	// Source metadata lives in native catalogs. Enumerating external tables also
+	// opens their metadata transactions and can block on unrelated DuckLake writes.
+	auto rows = con.Query("SELECT database_name FROM duckdb_databases() WHERE type='duckdb' "
+	                      "AND NOT internal ORDER BY database_name");
+	if (rows->HasError()) {
+		throw CatalogException("OpenIVM could not locate source metadata: %s", rows->GetError());
+	}
+	vector<string> catalogs;
+	for (idx_t row = 0; row < rows->RowCount(); row++) {
+		auto catalog = rows->GetValue(0, row).ToString();
+		if (con.TableInfo(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE)) {
+			catalogs.push_back(std::move(catalog));
+		}
+	}
+	return catalogs;
+}
+
+string RefreshMetadata::SourceTableName(const string &key, const string &catalog, const string &schema) {
+	if (!StringUtil::StartsWith(key, SqlUtils::QualifiedPrefix(catalog, schema))) {
+		return key;
+	}
+	return SqlUtils::ParseQualifiedIdentifier(key).back();
+}
+
+string RefreshMetadata::SourcePredicate(const string &table, const string &catalog, const string &schema) {
+	auto name = SourceTableName(table, catalog, schema);
+	return "table_name IN ('" + SqlUtils::EscapeValue(name) + "', '" +
+	       SqlUtils::EscapeValue(SqlUtils::FullName(catalog, schema, name)) +
+	       "') AND "
+	       "COALESCE(source_catalog, '" +
+	       SqlUtils::EscapeValue(catalog) + "') = '" + SqlUtils::EscapeValue(catalog) +
+	       "' AND COALESCE(source_schema, '" + SqlUtils::EscapeValue(schema) + "') = '" +
+	       SqlUtils::EscapeValue(schema) + "'";
+}
+
 RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string &view_name, const string &table_name,
                                                                    const string &fallback_catalog,
                                                                    const string &fallback_schema) {
@@ -129,6 +323,7 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 			loc.schema_name = result->GetValue(1, 0).ToString();
 		}
 	}
+	loc.table_name = SourceTableName(table_name, loc.catalog_name, loc.schema_name);
 	return loc;
 }
 
@@ -158,6 +353,22 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
 	return loc;
 }
 
+bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source) {
+	if (!SqlUtils::IsDelta(source.table_name)) {
+		return false;
+	}
+	auto owner = PublishedSourceViewName(source.table_name);
+	auto result = con.Query(
+	    "SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name='" + SqlUtils::EscapeValue(owner) +
+	    "' AND COALESCE(view_catalog,'" + SqlUtils::EscapeValue(source.catalog_name) + "')='" +
+	    SqlUtils::EscapeValue(source.catalog_name) + "' AND COALESCE(view_schema,'" +
+	    SqlUtils::EscapeValue(source.schema_name) + "')='" + SqlUtils::EscapeValue(source.schema_name) + "'");
+	if (result->HasError()) {
+		throw CatalogException("Cannot resolve delta owner for '%s': %s", source.table_name, result->GetError());
+	}
+	return result->RowCount() != 0;
+}
+
 vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
                                                                       const string &fallback_catalog,
                                                                       const string &fallback_schema) {
@@ -184,12 +395,12 @@ string RefreshMetadata::ResolveDeltaQualifiedName(const string &view_name, const
                                                   const string &fallback_catalog, const string &fallback_schema) {
 	auto loc = GetSourceLocation(view_name, delta_table_name, fallback_catalog, fallback_schema);
 	if (loc.catalog_name.empty()) {
-		return SqlUtils::QuoteIdentifier(delta_table_name);
+		return SqlUtils::QuoteIdentifier(loc.table_name);
 	}
 	if (loc.schema_name.empty()) {
 		loc.schema_name = "main";
 	}
-	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, delta_table_name);
+	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, loc.table_name);
 }
 
 RefreshMetadata::DeltaChangeStats RefreshMetadata::GetStandardDeltaChangeStats(const string &delta_table_sql,
@@ -273,6 +484,7 @@ vector<string> RefreshMetadata::GetUpstreamViews(const string &view_name) {
 			} else if (dt.size() > data_prefix.size() && dt.substr(0, data_prefix.size()) == data_prefix) {
 				source = dt.substr(data_prefix.size());
 			}
+			source = PublishedSourceViewName(source.empty() ? dt : source);
 			if (!source.empty() && !IsBaseTable(source) && visited.find(source) == visited.end()) {
 				visited.insert(source);
 				collect(source); // recurse deeper first (ancestors before descendants)
@@ -296,9 +508,11 @@ static vector<string> GetDownstreamViewsInternal(Connection &con, const string &
 	std::function<void(const string &)> collect = [&](const string &vn) {
 		string delta_name = SqlUtils::DeltaName(vn);
 		string data_name = IncrementalTableNames::DataTableName(vn);
-		auto dependents = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
-		                            " WHERE table_name = '" + SqlUtils::EscapeValue(delta_name) +
-		                            "' OR table_name = '" + SqlUtils::EscapeValue(data_name) + "' ORDER BY view_name");
+		auto dependents = con.Query(
+		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
+		    SqlUtils::EscapeValue(delta_name) + "' OR table_name = '" + SqlUtils::EscapeValue(data_name) +
+		    "' OR table_name = '" + SqlUtils::EscapeValue(PublishedViewName(vn)) + "' OR table_name = '" +
+		    SqlUtils::EscapeValue(SqlUtils::DeltaName(PublishedViewName(vn))) + "' ORDER BY view_name");
 		if (dependents->HasError() && throw_on_error) {
 			throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view_name,
 			                       dependents->GetError());
@@ -330,82 +544,145 @@ vector<string> RefreshMetadata::GetDownstreamViewsStrict(const string &view_name
 	return GetDownstreamViewsInternal(con, view_name, true);
 }
 
-bool RefreshMetadata::HasDownstreamViews(const string &view_name) {
-	auto result = con.Query("SELECT 1 FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
-	                        SqlUtils::EscapeValue(SqlUtils::DeltaName(view_name)) + "' LIMIT 1");
+vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &targets, const string &cascade_mode) {
+	if (cascade_mode != "off" && cascade_mode != "upstream" && cascade_mode != "downstream" && cascade_mode != "both") {
+		throw InvalidInputException("refresh_pipeline: unknown cascade mode '%s'", cascade_mode);
+	}
+	struct Node {
+		vector<string> parents;
+		vector<string> children;
+		idx_t pending = 0;
+	};
+	std::map<string, Node> graph;
+	auto views = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE));
+	if (views->HasError()) {
+		throw CatalogException("refresh_pipeline: cannot read materialized views: %s", views->GetError());
+	}
+	for (idx_t i = 0; i < views->RowCount(); i++) {
+		graph.emplace(views->GetValue(0, i).ToString(), Node());
+	}
+	std::set<string> selected;
+	for (auto &requested : targets) {
+		auto target = requested;
+		if (graph.find(target) == graph.end()) {
+			throw CatalogException("refresh_pipeline: materialized view '%s' does not exist", target);
+		}
+		selected.insert(target);
+	}
+	// Read the same source metadata used by single-view cascades, not the optional matcher edges.
+	auto edges = con.Query(
+	    "SELECT DISTINCT p.view_name, d.view_name FROM " + string(openivm::VIEWS_TABLE) + " p JOIN " +
+	    string(openivm::DELTA_TABLES_TABLE) + " d ON (d.table_name = '" + string(openivm::DELTA_PREFIX) +
+	    "' || p.view_name OR d.table_name = '" + string(openivm::DATA_TABLE_PREFIX) +
+	    "' || p.view_name OR d.table_name = '" + string(openivm::VISIBLE_TABLE_PREFIX) +
+	    "' || p.view_name OR d.table_name = '" + string(openivm::DELTA_PREFIX) + string(openivm::VISIBLE_TABLE_PREFIX) +
+	    "' || p.view_name)"
+	    " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR d.source_catalog=p.view_catalog)"
+	    " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR d.source_schema=p.view_schema)");
+	if (edges->HasError()) {
+		throw CatalogException("refresh_pipeline: cannot read dependencies: %s", edges->GetError());
+	}
+	for (idx_t i = 0; i < edges->RowCount(); i++) {
+		auto parent = edges->GetValue(0, i).ToString();
+		auto child = edges->GetValue(1, i).ToString();
+		if (graph.find(child) == graph.end()) {
+			throw CatalogException("refresh_pipeline: dependency refers to missing materialized view '%s'", child);
+		}
+		graph.at(parent).children.push_back(child);
+		graph.at(child).parents.push_back(parent);
+	}
+	auto expand = [&](bool upstream) {
+		vector<string> queue(selected.begin(), selected.end());
+		for (idx_t i = 0; i < queue.size(); i++) {
+			auto &node = graph.at(queue[i]);
+			for (auto &next : upstream ? node.parents : node.children) {
+				if (selected.insert(next).second) {
+					queue.push_back(next);
+				}
+			}
+		}
+	};
+	if (cascade_mode == "downstream" || cascade_mode == "both") {
+		expand(false);
+	}
+	// Both completes the dependencies of the downstream selection, including co-parents.
+	if (cascade_mode == "upstream" || cascade_mode == "both") {
+		expand(true);
+	}
+	std::set<string> ready;
+	for (auto &name : selected) {
+		auto &node = graph.at(name);
+		for (auto &parent : node.parents) {
+			node.pending += selected.count(parent);
+		}
+		if (node.pending == 0) {
+			ready.insert(name);
+		}
+	}
+	vector<string> order;
+	while (!ready.empty()) {
+		auto name = *ready.begin();
+		ready.erase(ready.begin());
+		order.push_back(name);
+		for (auto &child : graph.at(name).children) {
+			if (selected.count(child) && --graph.at(child).pending == 0) {
+				ready.insert(child);
+			}
+		}
+	}
+	if (order.size() != selected.size()) {
+		throw InvalidInputException("refresh_pipeline: selected dependencies contain a cycle");
+	}
+	OPENIVM_DEBUG_PRINT("[PIPELINE] Selected %zu views for %zu targets (mode=%s)\n", order.size(), targets.size(),
+	                    cascade_mode.c_str());
+	return order;
+}
+
+bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_published) {
+	string predicate = "table_name = '" + SqlUtils::EscapeValue(SqlUtils::DeltaName(view_name)) + "'";
+	if (include_published) {
+		predicate += " OR table_name = '" + SqlUtils::EscapeValue(SqlUtils::DeltaName(PublishedViewName(view_name))) +
+		             "' OR table_name = '" + SqlUtils::EscapeValue(PublishedViewName(view_name)) + "'";
+	}
+	auto result =
+	    con.Query("SELECT 1 FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " + predicate + " LIMIT 1");
 	return !result->HasError() && result->RowCount() > 0;
 }
 
-vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
-	auto result = con.Query("SELECT group_columns FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	vector<string> cols;
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return cols;
-	}
-	string raw = result->GetValue(0, 0).ToString();
-	// Split comma-separated column names
-	std::istringstream ss(raw);
+vector<string> RefreshMetadata::ReadViewList(const string &view_name, const string &column) {
+	vector<string> values;
+	std::istringstream stream(ReadViewString(view_name, column));
 	string token;
-	while (std::getline(ss, token, ',')) {
+	while (std::getline(stream, token, ',')) {
 		if (!token.empty()) {
-			cols.push_back(token);
+			values.push_back(token);
 		}
 	}
-	return cols;
+	return values;
+}
+
+vector<string> RefreshMetadata::GetGroupColumns(const string &view_name) {
+	return ReadViewList(view_name, "group_columns");
 }
 
 vector<string> RefreshMetadata::GetWindowOrderColumns(const string &view_name) {
-	auto result = con.Query("SELECT window_order_columns FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	vector<string> cols;
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return cols;
-	}
-	std::istringstream ss(result->GetValue(0, 0).ToString());
-	string token;
-	while (std::getline(ss, token, ',')) {
-		if (!token.empty()) {
-			cols.push_back(token);
-		}
-	}
-	return cols;
+	return ReadViewList(view_name, "window_order_columns");
 }
 
 vector<string> RefreshMetadata::GetAggregateTypes(const string &view_name) {
-	auto result = con.Query("SELECT aggregate_types FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	vector<string> types;
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return types;
-	}
-	string raw = result->GetValue(0, 0).ToString();
-	std::istringstream ss(raw);
-	string token;
-	while (std::getline(ss, token, ',')) {
-		if (!token.empty()) {
-			types.push_back(token);
-		}
-	}
-	return types;
+	return ReadViewList(view_name, "aggregate_types");
 }
 
 string RefreshMetadata::GetHavingPredicate(const string &view_name) {
-	auto result = con.Query("SELECT having_predicate FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return "";
-	}
-	return result->GetValue(0, 0).ToString();
+	return ReadViewString(view_name, "having_predicate");
 }
 
 GroupRecomputeAffectedMode RefreshMetadata::GetGroupRecomputeAffectedMode(const string &view_name) {
-	auto result = con.Query("SELECT group_recompute_affected_mode FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	auto value = ReadViewValue(view_name, "group_recompute_affected_mode");
+	if (value.IsNull()) {
 		return GroupRecomputeAffectedMode::CURRENT_DIFF;
 	}
-	string mode = result->GetValue(0, 0).ToString();
+	string mode = value.ToString();
 	if (StringUtil::CIEquals(mode, GroupRecomputeAffectedModeName(GroupRecomputeAffectedMode::DIRECT_SOURCE_KEYS))) {
 		return GroupRecomputeAffectedMode::DIRECT_SOURCE_KEYS;
 	}
@@ -420,24 +697,45 @@ GroupRecomputeAffectedMode RefreshMetadata::GetGroupRecomputeAffectedMode(const 
 }
 
 int64_t RefreshMetadata::GetRefreshInterval(const string &view_name) {
-	auto result = con.Query("SELECT refresh_interval FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	auto value = ReadViewValue(view_name, "refresh_interval");
+	if (value.IsNull()) {
 		return -1;
 	}
-	return result->GetValue(0, 0).GetValue<int64_t>();
+	return value.GetValue<int64_t>();
 }
 
 vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
-	auto result = con.Query("SELECT v.view_name, COALESCE(v.view_catalog, current_database()), "
-	                        "COALESCE(v.view_schema, '" +
-	                        string(DEFAULT_SCHEMA) +
-	                        "'), v.refresh_interval, "
-	                        "(SELECT MIN(d.last_update) FROM " +
-	                        string(openivm::DELTA_TABLES_TABLE) +
-	                        " d WHERE d.view_name = v.view_name) AS last_update "
-	                        "FROM " +
-	                        string(openivm::VIEWS_TABLE) + " v WHERE v.refresh_interval IS NOT NULL");
+	// Scheduler metadata belongs to native catalogs. Scanning duckdb_tables()
+	// also opens external catalogs, taking DuckLake/SQLite read locks while a
+	// foreground refresh may be committing its writes.
+	auto catalogs = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'duckdb' "
+	                          "AND NOT internal ORDER BY database_name");
+	if (catalogs->HasError()) {
+		throw CatalogException("OpenIVM could not enumerate metadata catalogs: %s", catalogs->GetError());
+	}
+	string query;
+	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
+		auto catalog = catalogs->GetValue(0, row).ToString();
+		if (!con.TableInfo(catalog, DEFAULT_SCHEMA, openivm::VIEWS_TABLE)) {
+			continue;
+		}
+		auto catalog_literal = "'" + SqlUtils::EscapeValue(catalog) + "'";
+		if (!query.empty()) {
+			query += " UNION ALL ";
+		}
+		query += "SELECT v.view_name, COALESCE(v.view_catalog, " + catalog_literal +
+		         "), "
+		         "COALESCE(v.view_schema, 'main'), v.refresh_interval, "
+		         "(SELECT MIN(d.last_update) FROM " +
+		         SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE) +
+		         " d WHERE d.view_name = v.view_name), " + catalog_literal + " FROM " +
+		         SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::VIEWS_TABLE) +
+		         " v WHERE v.refresh_interval IS NOT NULL";
+	}
+	if (query.empty()) {
+		return {};
+	}
+	auto result = con.Query(query);
 	vector<ScheduledView> views;
 	if (result->HasError()) {
 		OPENIVM_DEBUG_PRINT("[REFRESH DAEMON] GetScheduledViews query error: %s\n", result->GetError().c_str());
@@ -445,6 +743,7 @@ vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
 	if (!result->HasError()) {
 		for (size_t i = 0; i < result->RowCount(); i++) {
 			ScheduledView sv;
+			sv.metadata_catalog = result->GetValue(5, i).ToString();
 			sv.view_name = result->GetValue(0, i).ToString();
 			sv.catalog_name = result->GetValue(1, i).IsNull() ? "" : result->GetValue(1, i).ToString();
 			sv.schema_name = result->GetValue(2, i).IsNull() ? DEFAULT_SCHEMA : result->GetValue(2, i).ToString();
@@ -462,11 +761,35 @@ void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_prog
 }
 
 string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
-                                             const string &delta_metadata_table) {
+                                             const string &delta_metadata_table, vector<string> *deferred_cleanup,
+                                             const vector<string> &metadata_catalogs) {
 	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
-	return "DELETE FROM " + qtarget + " WHERE " + string(openivm::TIMESTAMP_COL) + " < (SELECT MIN(last_update) FROM " +
-	       metadata_table + " WHERE table_name = '" + SqlUtils::EscapeValue(metadata_key) + "');\n";
+	auto consumers = "SELECT last_update FROM " + metadata_table + " WHERE table_name = '" +
+	                 SqlUtils::EscapeValue(metadata_key) + "'";
+	auto parts = SqlUtils::ParseQualifiedIdentifier(qtarget);
+	if (parts.size() == 3) {
+		auto predicate = SourcePredicate(parts[2], parts[0], parts[1]);
+		consumers = "SELECT last_update FROM " + metadata_table + " WHERE " + predicate;
+		for (auto &catalog : metadata_catalogs) {
+			auto other = SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE);
+			if (!StringUtil::CIEquals(other, metadata_table)) {
+				consumers += " UNION ALL SELECT last_update FROM " + other + " WHERE " + predicate;
+			}
+		}
+	}
+	auto sql = "DELETE FROM " + qtarget + " WHERE NOT EXISTS (" + consumers + ") OR " + string(openivm::TIMESTAMP_COL) +
+	           " < (SELECT MIN(last_update) FROM (" + consumers + ") consumers);\n";
+	if (deferred_cleanup && parts.size() == 3) {
+		auto metadata_parts = SqlUtils::ParseQualifiedIdentifier(metadata_table);
+		if (metadata_parts.size() == 3 && !StringUtil::CIEquals(parts[0], metadata_parts[0])) {
+			// Only housekeeping crosses the native write boundary. MV state and its
+			// watermark commit together; cleanup reads the committed consumer minimum.
+			deferred_cleanup->push_back(std::move(sql));
+			return "";
+		}
+	}
+	return sql;
 }
 
 // --- DuckLake support ---
@@ -523,7 +846,7 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	DuckLakeSourceIdentity identity;
 	auto result =
 	    con.Query("SELECT source_table_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+	              SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name));
 	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
 		identity.stored_table_id = result->GetValue(0, 0).GetValue<int64_t>();
 	}
@@ -533,13 +856,13 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 
 	string catalog_prefix = SqlUtils::QuoteIdentifier("__ducklake_metadata_" + catalog_name) + ".";
 	string schema_filter = schema_name.empty() ? "main" : schema_name;
-	auto current_result =
-	    con.Query("SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
-	              "ducklake_schema s ON t.schema_id = s.schema_id WHERE "
-	              "t.end_snapshot IS NULL AND "
-	              "s.end_snapshot IS NULL AND t.table_name = '" +
-	              SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" + SqlUtils::EscapeValue(schema_filter) +
-	              "' ORDER BY t.table_id DESC LIMIT 1");
+	auto current_result = con.Query(
+	    "SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
+	    "ducklake_schema s ON t.schema_id = s.schema_id WHERE "
+	    "t.end_snapshot IS NULL AND "
+	    "s.end_snapshot IS NULL AND t.table_name = '" +
+	    SqlUtils::EscapeValue(SourceTableName(table_name, catalog_name, schema_name)) + "' AND s.schema_name = '" +
+	    SqlUtils::EscapeValue(schema_filter) + "' ORDER BY t.table_id DESC LIMIT 1");
 	if (current_result->HasError() || current_result->RowCount() == 0 || current_result->GetValue(0, 0).IsNull()) {
 		return identity;
 	}
@@ -553,7 +876,7 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	auto update =
 	    con.Query("UPDATE " + string(openivm::DELTA_TABLES_TABLE) +
 	              " SET source_table_id = " + to_string(identity.current_table_id) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
+	              SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name));
 	if (update->HasError()) {
 		OPENIVM_DEBUG_PRINT("[DuckLake] Could not backfill source_table_id for %s.%s: %s\n", view_name.c_str(),
 		                    table_name.c_str(), update->GetError().c_str());
@@ -719,131 +1042,6 @@ vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetPlanCostHistory
 
 namespace {
 
-// Tiny JSON parser sufficient for `distinct_aux_meta_json` — we own the writer in
-// parser.cpp, so the input always matches `{"k":"v","k2":[...]}` shape with
-// just our minimal escaping (`\"` and `\\`). Not a general parser; do not reuse.
-static bool ExtractJsonString(const string &json, const string &key, string &val) {
-	string needle = "\"" + key + "\":\"";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return false;
-	}
-	pos += needle.size();
-	val.clear();
-	while (pos < json.size()) {
-		char c = json[pos];
-		if (c == '\\' && pos + 1 < json.size()) {
-			char esc = json[pos + 1];
-			if (esc == 'n') {
-				val += '\n';
-			} else {
-				val += esc;
-			}
-			pos += 2;
-			continue;
-		}
-		if (c == '"') {
-			return true;
-		}
-		val += c;
-		pos++;
-	}
-	return false;
-}
-
-static bool ExtractJsonStringArray(const string &json, const string &key, vector<string> &val) {
-	string needle = "\"" + key + "\":[";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return false;
-	}
-	pos += needle.size();
-	val.clear();
-	while (pos < json.size() && json[pos] != ']') {
-		while (pos < json.size() && json[pos] != '"' && json[pos] != ']') {
-			pos++;
-		}
-		if (pos >= json.size() || json[pos] == ']') {
-			break;
-		}
-		pos++; // opening quote
-		string elem;
-		while (pos < json.size() && json[pos] != '"') {
-			if (json[pos] == '\\' && pos + 1 < json.size()) {
-				elem += json[pos + 1];
-				pos += 2;
-				continue;
-			}
-			elem += json[pos];
-			pos++;
-		}
-		if (pos < json.size()) {
-			pos++; // closing quote
-		}
-		val.push_back(std::move(elem));
-	}
-	return true;
-}
-
-static vector<string> ExtractJsonObjectsFromArray(const string &json, const string &key,
-                                                  optional_ptr<bool> parsed_complete = nullptr) {
-	vector<string> objects;
-	if (parsed_complete) {
-		*parsed_complete = false;
-	}
-	string needle = "\"" + key + "\":[";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return objects;
-	}
-	pos += needle.size();
-	int depth = 0;
-	bool in_string = false;
-	bool escaped = false;
-	size_t object_start = string::npos;
-	for (; pos < json.size(); pos++) {
-		char c = json[pos];
-		if (in_string) {
-			if (escaped) {
-				escaped = false;
-			} else if (c == '\\') {
-				escaped = true;
-			} else if (c == '"') {
-				in_string = false;
-			}
-			continue;
-		}
-		if (c == '"') {
-			in_string = true;
-			continue;
-		}
-		if (c == '{') {
-			if (depth == 0) {
-				object_start = pos;
-			}
-			depth++;
-			continue;
-		}
-		if (c == '}') {
-			if (depth > 0) {
-				depth--;
-				if (depth == 0 && object_start != string::npos) {
-					objects.push_back(json.substr(object_start, pos - object_start + 1));
-					object_start = string::npos;
-				}
-			}
-			continue;
-		}
-		if (c == ']' && depth == 0) {
-			if (parsed_complete) {
-				*parsed_complete = true;
-			}
-			break;
-		}
-	}
-	return objects;
-}
-
 static vector<string> SplitPipeFields(const string &value) {
 	vector<string> fields;
 	string current;
@@ -861,7 +1059,7 @@ static vector<string> SplitPipeFields(const string &value) {
 
 static bool ParseJsonIndex(const string &json, const string &key, idx_t &out) {
 	string text;
-	if (!ExtractJsonString(json, key, text)) {
+	if (!MetadataJson::ExtractJsonString(json, key, text)) {
 		return false;
 	}
 	try {
@@ -872,20 +1070,14 @@ static bool ParseJsonIndex(const string &json, const string &key, idx_t &out) {
 	}
 }
 
-static bool ReadRefreshLineageEntry(Connection &con, const string &view_name, const string &kind, string &entry) {
-	auto result = con.Query("SELECT lineage_json FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	string json = result->GetValue(0, 0).ToString();
+static bool ReadRefreshLineageEntry(const string &json, const string &kind, string &entry) {
 	if (json.empty()) {
 		return false;
 	}
-	auto objects = ExtractJsonObjectsFromArray(json, "items");
+	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "items");
 	for (auto &object : objects) {
 		string object_kind;
-		if (ExtractJsonString(object, "k", object_kind) && object_kind == kind) {
+		if (MetadataJson::ExtractJsonString(object, "k", object_kind) && object_kind == kind) {
 			entry = std::move(object);
 			return true;
 		}
@@ -898,19 +1090,14 @@ static bool ReadRefreshLineageEntry(Connection &con, const string &view_name, co
 vector<RefreshMetadata::GroupRecomputeSourceOccurrence>
 RefreshMetadata::GetGroupRecomputeSourceOccurrences(const string &view_name) {
 	vector<GroupRecomputeSourceOccurrence> occurrences;
-	auto result = con.Query("SELECT group_recompute_source_occurrences_json FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return occurrences;
-	}
-	string json = result->GetValue(0, 0).ToString();
+	string json = ReadViewString(view_name, "group_recompute_source_occurrences_json");
 	if (json.empty()) {
 		return occurrences;
 	}
-	auto objects = ExtractJsonObjectsFromArray(json, "sources");
+	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "sources");
 	for (auto &object : objects) {
 		GroupRecomputeSourceOccurrence occurrence;
-		if (!ExtractJsonString(object, "table", occurrence.table_name) ||
+		if (!MetadataJson::ExtractJsonString(object, "table", occurrence.table_name) ||
 		    !ParseJsonIndex(object, "count", occurrence.count) || occurrence.table_name.empty()) {
 			continue;
 		}
@@ -921,18 +1108,13 @@ RefreshMetadata::GetGroupRecomputeSourceOccurrences(const string &view_name) {
 
 DerivedAggregateOutputInfo RefreshMetadata::GetDerivedAggregateOutputs(const string &view_name) {
 	DerivedAggregateOutputInfo info;
-	auto result = con.Query("SELECT derived_aggregate_outputs_json FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return info;
-	}
-	const auto json = result->GetValue(0, 0).ToString();
+	const auto json = ReadViewString(view_name, "derived_aggregate_outputs_json");
 	const string complete_prefix = "{\"complete\":true,\"outputs\":[";
 	const string incomplete_prefix = "{\"complete\":false,\"outputs\":[";
 	const bool has_complete_prefix = json.rfind(complete_prefix, 0) == 0;
 	const bool has_incomplete_prefix = json.rfind(incomplete_prefix, 0) == 0;
 	bool parsed_outputs_complete = false;
-	auto objects = ExtractJsonObjectsFromArray(json, "outputs", parsed_outputs_complete);
+	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "outputs", parsed_outputs_complete);
 	info.complete = has_complete_prefix && parsed_outputs_complete && json.size() >= 2 &&
 	                json.compare(json.size() - 2, 2, "]}") == 0;
 	if (!has_complete_prefix && !has_incomplete_prefix) {
@@ -940,9 +1122,9 @@ DerivedAggregateOutputInfo RefreshMetadata::GetDerivedAggregateOutputs(const str
 	}
 	for (auto &object : objects) {
 		DerivedAggregateOutput output;
-		if (ExtractJsonString(object, "column", output.output_column) &&
-		    ExtractJsonString(object, "expression", output.expression_sql) && !output.output_column.empty() &&
-		    !output.expression_sql.empty()) {
+		if (MetadataJson::ExtractJsonString(object, "column", output.output_column) &&
+		    MetadataJson::ExtractJsonString(object, "expression", output.expression_sql) &&
+		    !output.output_column.empty() && !output.expression_sql.empty()) {
 			info.outputs.push_back(std::move(output));
 		} else {
 			info.complete = false;
@@ -979,25 +1161,20 @@ RefreshMetadata::GroupRecomputeSourceOccurrencesToJson(const vector<GroupRecompu
 }
 
 bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
-	auto result = con.Query("SELECT distinct_aux_meta_json FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	string json = result->GetValue(0, 0).ToString();
+	string json = ReadViewString(view_name, "distinct_aux_meta_json");
 	if (json.empty()) {
 		return false;
 	}
 	bool ok = true;
-	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= ExtractJsonStringArray(json, "cols", out.cols);
-	ExtractJsonStringArray(json, "source_exprs", out.source_exprs);
-	ok &= ExtractJsonString(json, "input_sql", out.input_sql);
-	ok &= ExtractJsonString(json, "source", out.source);
+	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= MetadataJson::ExtractJsonStringArray(json, "cols", out.cols);
+	MetadataJson::ExtractJsonStringArray(json, "source_exprs", out.source_exprs);
+	ok &= MetadataJson::ExtractJsonString(json, "input_sql", out.input_sql);
+	ok &= MetadataJson::ExtractJsonString(json, "source", out.source);
 	// filter is optional — empty when the user didn't write a WHERE clause.
-	ExtractJsonString(json, "filter", out.filter);
-	ok &= ExtractJsonString(json, "sum_arg", out.sum_arg);
-	ok &= ExtractJsonString(json, "sum_out", out.sum_out);
+	MetadataJson::ExtractJsonString(json, "filter", out.filter);
+	ok &= MetadataJson::ExtractJsonString(json, "sum_arg", out.sum_arg);
+	ok &= MetadataJson::ExtractJsonString(json, "sum_out", out.sum_out);
 	return ok;
 }
 
@@ -1010,24 +1187,19 @@ string RefreshMetadata::DistinctAuxMetaToJson(const DistinctAuxMeta &meta) {
 }
 
 bool RefreshMetadata::GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out) {
-	auto result = con.Query("SELECT count_distinct_aux_meta_json FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	string json = result->GetValue(0, 0).ToString();
+	string json = ReadViewString(view_name, "count_distinct_aux_meta_json");
 	if (json.empty()) {
 		return false;
 	}
 	bool ok = true;
-	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= ExtractJsonString(json, "source", out.source);
-	ok &= ExtractJsonStringArray(json, "group_cols", out.group_cols);
-	ExtractJsonStringArray(json, "group_source_exprs", out.group_source_exprs);
-	ok &= ExtractJsonString(json, "distinct_col", out.distinct_col);
-	ok &= ExtractJsonString(json, "distinct_expr", out.distinct_expr);
-	ok &= ExtractJsonString(json, "output_col", out.output_col);
-	ExtractJsonString(json, "filter", out.filter);
+	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= MetadataJson::ExtractJsonString(json, "source", out.source);
+	ok &= MetadataJson::ExtractJsonStringArray(json, "group_cols", out.group_cols);
+	MetadataJson::ExtractJsonStringArray(json, "group_source_exprs", out.group_source_exprs);
+	ok &= MetadataJson::ExtractJsonString(json, "distinct_col", out.distinct_col);
+	ok &= MetadataJson::ExtractJsonString(json, "distinct_expr", out.distinct_expr);
+	ok &= MetadataJson::ExtractJsonString(json, "output_col", out.output_col);
+	MetadataJson::ExtractJsonString(json, "filter", out.filter);
 	return ok;
 }
 
@@ -1042,34 +1214,29 @@ string RefreshMetadata::CountDistinctAuxMetaToJson(const CountDistinctAuxMeta &m
 }
 
 bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out) {
-	auto result = con.Query("SELECT semi_anti_aux_meta_json FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	string json = result->GetValue(0, 0).ToString();
+	string json = ReadViewString(view_name, "semi_anti_aux_meta_json");
 	if (json.empty()) {
 		return false;
 	}
 	bool ok = true;
-	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= ExtractJsonString(json, "join_type", out.join_type);
-	ok &= ExtractJsonString(json, "left_table", out.left_table);
-	ok &= ExtractJsonString(json, "left_alias", out.left_alias);
-	ok &= ExtractJsonString(json, "right_table", out.right_table);
-	ok &= ExtractJsonString(json, "right_alias", out.right_alias);
-	ok &= ExtractJsonString(json, "predicate", out.predicate);
-	ExtractJsonString(json, "post_filter", out.post_filter);
-	ExtractJsonString(json, "right_filter", out.right_filter);
+	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= MetadataJson::ExtractJsonString(json, "join_type", out.join_type);
+	ok &= MetadataJson::ExtractJsonString(json, "left_table", out.left_table);
+	ok &= MetadataJson::ExtractJsonString(json, "left_alias", out.left_alias);
+	ok &= MetadataJson::ExtractJsonString(json, "right_table", out.right_table);
+	ok &= MetadataJson::ExtractJsonString(json, "right_alias", out.right_alias);
+	ok &= MetadataJson::ExtractJsonString(json, "predicate", out.predicate);
+	MetadataJson::ExtractJsonString(json, "post_filter", out.post_filter);
+	MetadataJson::ExtractJsonString(json, "right_filter", out.right_filter);
 	string null_aware;
-	if (ExtractJsonString(json, "null_aware", null_aware)) {
+	if (MetadataJson::ExtractJsonString(json, "null_aware", null_aware)) {
 		out.null_aware = StringUtil::CIEquals(null_aware, "true");
 	}
-	ExtractJsonString(json, "null_aware_left_col", out.null_aware_left_col);
-	ExtractJsonString(json, "null_aware_right_expr", out.null_aware_right_expr);
-	ok &= ExtractJsonStringArray(json, "left_cols", out.left_cols);
-	ExtractJsonStringArray(json, "left_exprs", out.left_exprs);
-	ok &= ExtractJsonStringArray(json, "output_cols", out.output_cols);
+	MetadataJson::ExtractJsonString(json, "null_aware_left_col", out.null_aware_left_col);
+	MetadataJson::ExtractJsonString(json, "null_aware_right_expr", out.null_aware_right_expr);
+	ok &= MetadataJson::ExtractJsonStringArray(json, "left_cols", out.left_cols);
+	MetadataJson::ExtractJsonStringArray(json, "left_exprs", out.left_exprs);
+	ok &= MetadataJson::ExtractJsonStringArray(json, "output_cols", out.output_cols);
 	return ok;
 }
 
@@ -1094,26 +1261,27 @@ string RefreshMetadata::SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta) {
 bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out) {
 	out.clear();
 	string json;
-	if (!ReadRefreshLineageEntry(con, view_name, "window_partition", json)) {
+	if (!ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "window_partition", json)) {
 		return false;
 	}
-	vector<string> objects = ExtractJsonObjectsFromArray(json, "ops");
+	vector<string> objects = MetadataJson::ExtractJsonObjectsFromArray(json, "ops");
 	for (auto &object : objects) {
 		WindowPartitionLineageOp op;
-		if (!ExtractJsonString(object, "k", op.kind) || !ExtractJsonString(object, "out", op.output_col) ||
-		    !ExtractJsonString(object, "source", op.source) ||
-		    !ExtractJsonString(object, "source_col", op.source_col)) {
+		if (!MetadataJson::ExtractJsonString(object, "k", op.kind) ||
+		    !MetadataJson::ExtractJsonString(object, "out", op.output_col) ||
+		    !MetadataJson::ExtractJsonString(object, "source", op.source) ||
+		    !MetadataJson::ExtractJsonString(object, "source_col", op.source_col)) {
 			continue;
 		}
-		ExtractJsonString(object, "source_cast", op.source_cast);
+		MetadataJson::ExtractJsonString(object, "source_cast", op.source_cast);
 		if (op.kind == "lookup") {
-			if (!ExtractJsonString(object, "lookup", op.lookup) ||
-			    !ExtractJsonString(object, "lookup_col", op.lookup_col) ||
-			    !ExtractJsonString(object, "lookup_out", op.lookup_out)) {
+			if (!MetadataJson::ExtractJsonString(object, "lookup", op.lookup) ||
+			    !MetadataJson::ExtractJsonString(object, "lookup_col", op.lookup_col) ||
+			    !MetadataJson::ExtractJsonString(object, "lookup_out", op.lookup_out)) {
 				continue;
 			}
-			ExtractJsonString(object, "lookup_cast", op.lookup_cast);
-			ExtractJsonString(object, "lookup_out_cast", op.lookup_out_cast);
+			MetadataJson::ExtractJsonString(object, "lookup_cast", op.lookup_cast);
+			MetadataJson::ExtractJsonString(object, "lookup_out_cast", op.lookup_out_cast);
 		} else if (op.kind != "direct") {
 			continue;
 		}
@@ -1154,23 +1322,26 @@ string RefreshMetadata::WindowPartitionLineageToJson(const vector<WindowPartitio
 
 bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out) {
 	string json;
-	if (!ReadRefreshLineageEntry(con, view_name, "projection_key", json)) {
+	if (!ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "projection_key", json)) {
 		return false;
 	}
-	if (!ExtractJsonString(json, "out", out.output_col) || !ExtractJsonString(json, "key_source", out.key_source) ||
-	    !ParseJsonIndex(json, "key_occ", out.key_occurrence) || !ExtractJsonString(json, "key_col", out.key_col)) {
+	if (!MetadataJson::ExtractJsonString(json, "out", out.output_col) ||
+	    !MetadataJson::ExtractJsonString(json, "key_source", out.key_source) ||
+	    !ParseJsonIndex(json, "key_occ", out.key_occurrence) ||
+	    !MetadataJson::ExtractJsonString(json, "key_col", out.key_col)) {
 		return false;
 	}
 	out.arms.clear();
-	auto objects = ExtractJsonObjectsFromArray(json, "arms");
+	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "arms");
 	for (auto &object : objects) {
 		ProjectionKeyLineageArm arm;
-		if (!ExtractJsonString(object, "source", arm.source) || !ParseJsonIndex(object, "occ", arm.occurrence) ||
-		    !ExtractJsonString(object, "source_col", arm.source_col)) {
+		if (!MetadataJson::ExtractJsonString(object, "source", arm.source) ||
+		    !ParseJsonIndex(object, "occ", arm.occurrence) ||
+		    !MetadataJson::ExtractJsonString(object, "source_col", arm.source_col)) {
 			continue;
 		}
 		vector<string> steps;
-		ExtractJsonStringArray(object, "steps", steps);
+		MetadataJson::ExtractJsonStringArray(object, "steps", steps);
 		for (auto &step_text : steps) {
 			auto fields = SplitPipeFields(step_text);
 			if (fields.size() != 4) {
@@ -1221,16 +1392,16 @@ string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &l
 
 bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out) {
 	string json;
-	if (!ReadRefreshLineageEntry(con, view_name, "left_join_key_source", json)) {
+	if (!ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "left_join_key_source", json)) {
 		return false;
 	}
 	out.cardinality_transition_check_safe = false;
 	string cardinality_transition_check_safe;
-	if (ExtractJsonString(json, "cardinality_transition_check_safe", cardinality_transition_check_safe)) {
+	if (MetadataJson::ExtractJsonString(json, "cardinality_transition_check_safe", cardinality_transition_check_safe)) {
 		out.cardinality_transition_check_safe = StringUtil::CIEquals(cardinality_transition_check_safe, "true");
 	}
-	return ExtractJsonString(json, "table", out.table) && ParseJsonIndex(json, "occ", out.occurrence) &&
-	       ExtractJsonString(json, "column", out.column);
+	return MetadataJson::ExtractJsonString(json, "table", out.table) && ParseJsonIndex(json, "occ", out.occurrence) &&
+	       MetadataJson::ExtractJsonString(json, "column", out.column);
 }
 
 string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source) {
@@ -1255,43 +1426,38 @@ string RefreshMetadata::LeftJoinNullableSourcesToJson(const LeftJoinNullableSour
 
 bool RefreshMetadata::GetLeftJoinNullableSources(const string &view_name, LeftJoinNullableSources &out) {
 	string json;
-	if (!ReadRefreshLineageEntry(con, view_name, "left_join_nullable", json)) {
+	if (!ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "left_join_nullable", json)) {
 		return false;
 	}
 	out.tables.clear();
 	out.complete = false;
 	string complete;
-	if (ExtractJsonString(json, "complete", complete)) {
+	if (MetadataJson::ExtractJsonString(json, "complete", complete)) {
 		out.complete = StringUtil::CIEquals(complete, "true");
 	}
-	ExtractJsonStringArray(json, "tables", out.tables);
+	MetadataJson::ExtractJsonStringArray(json, "tables", out.tables);
 	return true;
 }
 
 bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {
-	auto result = con.Query("SELECT aggregate_decomposition_json FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	string json = result->GetValue(0, 0).ToString();
+	string json = ReadViewString(view_name, "aggregate_decomposition_json");
 	if (json.empty()) {
 		return false;
 	}
 	string kind;
-	if (!ExtractJsonString(json, "kind", kind) || kind != "filtered_group_count") {
+	if (!MetadataJson::ExtractJsonString(json, "kind", kind) || kind != "filtered_group_count") {
 		return false;
 	}
 	bool ok = true;
-	ok &= ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= ExtractJsonString(json, "source", out.source);
-	ok &= ExtractJsonString(json, "group_col", out.group_col);
-	ok &= ExtractJsonString(json, "sum_col", out.sum_col);
-	ExtractJsonString(json, "source_group_expr", out.source_group_expr);
-	ExtractJsonString(json, "source_sum_expr", out.source_sum_expr);
-	ok &= ExtractJsonString(json, "output_col", out.output_col);
-	ok &= ExtractJsonString(json, "op", out.comparison_op);
-	ok &= ExtractJsonString(json, "threshold", out.threshold_sql);
+	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
+	ok &= MetadataJson::ExtractJsonString(json, "source", out.source);
+	ok &= MetadataJson::ExtractJsonString(json, "group_col", out.group_col);
+	ok &= MetadataJson::ExtractJsonString(json, "sum_col", out.sum_col);
+	MetadataJson::ExtractJsonString(json, "source_group_expr", out.source_group_expr);
+	MetadataJson::ExtractJsonString(json, "source_sum_expr", out.source_sum_expr);
+	ok &= MetadataJson::ExtractJsonString(json, "output_col", out.output_col);
+	ok &= MetadataJson::ExtractJsonString(json, "op", out.comparison_op);
+	ok &= MetadataJson::ExtractJsonString(json, "threshold", out.threshold_sql);
 	return ok;
 }
 
@@ -1307,25 +1473,20 @@ string RefreshMetadata::FilteredGroupCountAuxMetaToJson(const FilteredGroupCount
 }
 
 bool RefreshMetadata::GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out) {
-	auto result = con.Query("SELECT leftjoin_secondary_meta_json FROM " + string(openivm::VIEWS_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return false;
-	}
-	string json = result->GetValue(0, 0).ToString();
+	string json = ReadViewString(view_name, "leftjoin_secondary_meta_json");
 	if (json.empty()) {
 		return false;
 	}
 	string kind;
-	if (!ExtractJsonString(json, "kind", kind) || kind != "leftjoin_secondary") {
+	if (!MetadataJson::ExtractJsonString(json, "kind", kind) || kind != "leftjoin_secondary") {
 		return false;
 	}
 	auto extract_array_or_legacy_csv = [&](const string &array_key, const string &legacy_key, vector<string> &values) {
-		if (ExtractJsonStringArray(json, array_key, values)) {
+		if (MetadataJson::ExtractJsonStringArray(json, array_key, values)) {
 			return;
 		}
 		string legacy;
-		if (ExtractJsonString(json, legacy_key, legacy) && !legacy.empty()) {
+		if (MetadataJson::ExtractJsonString(json, legacy_key, legacy) && !legacy.empty()) {
 			values = StringUtil::Split(legacy, ',');
 		}
 	};
@@ -1334,7 +1495,7 @@ bool RefreshMetadata::GetLeftJoinSecondaryMeta(const string &view_name, LeftJoin
 	extract_array_or_legacy_csv("inner_keys", "inner_key", out.inner_keys);
 	extract_array_or_legacy_csv("pres_tables", "pres_table", out.pres_tables);
 	extract_array_or_legacy_csv("pres_keys", "pres_key", out.pres_keys);
-	return ExtractJsonString(json, "sql", out.sql);
+	return MetadataJson::ExtractJsonString(json, "sql", out.sql);
 }
 
 string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta) {

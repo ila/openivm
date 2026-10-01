@@ -45,10 +45,8 @@ class MutationLockGuard {
 	const void *owner;
 
 public:
-	explicit MutationLockGuard(ClientContext &owner_p)
-	    : gate(RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(owner_p))), owner(&owner_p) {
-		gate->Lock(owner);
-	}
+	explicit MutationLockGuard(ClientContext &owner_p);
+
 	MutationLockGuard(DatabaseInstance &db_p, const void *owner_p)
 	    : gate(RefreshLocks::AcquireGate(db_p)), owner(owner_p) {
 		gate->Lock(owner);
@@ -70,7 +68,9 @@ public:
 	static TransactionalMVLockState &Get(ClientContext &context);
 
 	void AcquireMutationLock();
+	void DeferDeltaCleanup(vector<string> statements);
 	void SetMutationOwner(const void *owner_token);
+	const void *GetMutationOwner();
 
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
 	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override;
@@ -82,6 +82,7 @@ private:
 	unique_ptr<MutationLockGuard> mutation_guard;
 	ClientContext &owner;
 	const void *mutation_owner;
+	vector<string> deferred_delta_cleanup;
 };
 
 } // namespace duckdb

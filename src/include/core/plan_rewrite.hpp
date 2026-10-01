@@ -8,6 +8,8 @@
 namespace duckdb {
 
 struct CreateMVPlanFacts;
+class BoundWindowExpression;
+bool IsRunningWindowCandidate(const BoundWindowExpression &window);
 
 struct PlanRewriteNeeds {
 	bool inline_cte_refs = false;
@@ -18,6 +20,7 @@ struct PlanRewriteNeeds {
 	bool has_aggregate = false;
 	bool outer_join_support = false;
 	bool semi_anti_subqueries = false;
+	bool running_window_state = false;
 };
 
 /// Strip AGG(...) FILTER (WHERE p) by converting to AGG(CASE WHEN p THEN arg
@@ -47,6 +50,11 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 /// that cannot match the plan are skipped without another preflight traversal.
 void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                  vector<string> &planner_names, const PlanRewriteNeeds &needs);
+
+bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &plan, const CreateMVPlanFacts &facts,
+                                const vector<string> &output_names, string &sql);
+
+void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan);
 
 /// Strip the HAVING filter (FILTER above AGGREGATE) from the plan.
 /// Returns the HAVING predicate as SQL using output column aliases, or empty if

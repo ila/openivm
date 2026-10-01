@@ -1,7 +1,9 @@
 # View Matching POCs
 
-Proof-of-concept experiments supporting the smart-view-matching research direction
-(see `~/.claude/projects/-home-ila-Code-openivm/memory/project_view_matching_roadmap.md`).
+Proof-of-concept experiments supporting the smart-view-matching research direction.
+
+The scripts use `build/release/duckdb` and the built extension from this repository by default; set
+`OPENIVM_DUCKDB` and `OPENIVM_EXTENSION` to point at other builds.
 
 ## POC 1 — single-table aggregate (goldilocks_poc.py)
 

@@ -14,6 +14,7 @@ namespace duckdb {
 
 struct GroupRecomputeDeltaSpec {
 	string base_table;
+	string source_sql;
 	string delta_table_sql;
 	string last_update;
 	idx_t source_occurrences = 1;
@@ -51,18 +52,23 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
                                bool *out_full_recompute = nullptr);
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
                                  const string &delta_ts_filter = "", const string &catalog_prefix = "",
-                                 bool insert_only = false);
+                                 bool insert_only = false, string *appended_rows = nullptr);
+string CompileProjectionDelta(const string &data_table, const string &delta_view, const vector<string> &column_names,
+                              const string &delta_ts_filter = "", bool insert_only = false,
+                              string *appended_rows = nullptr);
+vector<string> PartitionOutputColumns(const vector<string> &partition_columns);
+
 string CompileWindowRecompute(const string &view_name, const string &view_query_sql, const string &delta_ts_filter = "",
                               const string &catalog_prefix = "", const vector<string> &partition_columns = {},
                               const vector<WindowPartitionDeltaSpec> &partition_delta_specs = {},
                               bool emit_cascade_delta = false, const string &affected_keys_sql = "",
-                              const vector<string> &column_names = {}, bool running_window_incremental = false);
-// `unique_keys` are the columns carrying the data table's UNIQUE index, which parser.cpp creates for
-// AGGREGATE_GROUP and AGGREGATE_HAVING views. Supplying them selects an upsert form that never
-// deletes and re-inserts the same key inside one transaction; leaving them empty keeps the plain
-// DELETE + INSERT. See SqlUtils::BuildFullRecomputeSQL for why the distinction matters.
+                              const vector<string> &column_names = {}, bool running_window_incremental = false,
+                              bool *uses_running_suffix = nullptr);
+/// Full recompute, optionally emitting new_bag - old_bag into the view's delta table.
+/// Unscopable group/window refreshes must preserve the requested cascade delta for downstream MVs.
+/// Supply the data table's unique keys to avoid deleting and reinserting surviving indexed keys.
 string CompileFullRecompute(const string &view_name, const string &view_query_sql, const string &catalog_prefix = "",
-                            const vector<string> &unique_keys = {});
+                            bool emit_cascade_delta = false, const vector<string> &unique_keys = {});
 
 /// Group-level partial recompute, used by `RefreshType::GROUP_RECOMPUTE`
 /// (inner-DISTINCT under aggregate). For each base table T_i with a non-empty

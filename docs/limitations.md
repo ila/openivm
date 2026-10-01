@@ -13,19 +13,22 @@ anything it flags as `incremental_compatible = false` routes to `RefreshType::FU
 
 | Construct | Why |
 |---|---|
-| `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, `AVG(DISTINCT x)`, any `DISTINCT`-variant aggregate | A delta row's value may already be present in the MV (no change) or new (+1) — requires auxiliary per-value state we don't maintain. Detected via `BoundAggregateExpression::IsDistinct()`. |
-| `<agg>(...) FILTER (WHERE predicate)` | Rewritten to `AGG(CASE WHEN p THEN arg END)` by `RewriteAggregateFilters` before the checker sees the plan. Fully incremental — **no full refresh**. Exception: `COUNT(DISTINCT x) FILTER (WHERE p)` still triggers full refresh (DISTINCT not supported). |
-| `GROUPING SETS`, `CUBE`, `ROLLUP` | Our delta pipeline groups once; can't emit the cross-grouped subtotal rows. Detected via `LogicalAggregate::grouping_sets.size() > 1`. Also note: LPTS doesn't round-trip the ROLLUP annotation, so for these views the parser substitutes the user's original SQL for both initial populate and recompute. |
+| `<agg>(...) FILTER (WHERE predicate)` | Rewritten to `AGG(CASE WHEN p THEN arg END)` by `RewriteAggregateFilters` before the checker sees the plan. Fully incremental — **no full refresh**. Exception: a `FILTER` that survives normalization (e.g. on a DISTINCT aggregate) triggers full refresh; `LIST(...) FILTER` uses group recompute. |
+| `GROUPING SETS`, `CUBE`, `ROLLUP` without visible group keys | Our delta pipeline groups once; can't emit the cross-grouped subtotal rows. Detected via `LogicalAggregate::grouping_sets.size() > 1`. With visible group keys these views use `GROUP_RECOMPUTE` instead (see below). LPTS doesn't round-trip the ROLLUP annotation, so the parser substitutes the user's original SQL for both initial populate and recompute. |
 | Aggregates not in `SUPPORTED_AGGREGATES` (STRING_AGG, LISTAGG, GROUP_CONCAT, MEDIAN, percentiles, APPROX_*, QUANTILE_*, ANY_VALUE, …) | Order-dependent, holistic, or non-decomposable; no known delta formula. Supported set: `count_star`, `count`, `sum`, `min`, `max`, `avg`, `list`, `stddev`, `stddev_samp`, `stddev_pop`, `variance`, `var_samp`, `var_pop`, `bool_and`, `bool_or`, `arg_min`, and `arg_max`. |
 | Correlation / regression aggregates: `CORR`, `COVAR_POP`, `COVAR_SAMP`, `REGR_*` (`REGR_AVGX`, `REGR_AVGY`, `REGR_COUNT`, `REGR_INTERCEPT`, `REGR_R2`, `REGR_SLOPE`, `REGR_SXX`, `REGR_SXY`, `REGR_SYY`) | LPTS does not round-trip these aggregates back to SQL, so the delta plan can't be serialised. Routed to FULL_REFRESH. |
 | `HAVING` referencing `IS NULL` / `IS NOT NULL` / a `BOUND_AGGREGATE` directly | Detected by the HAVING rewriter; treated as group-recompute (same path as other partial-recompute HAVING views). |
+| `SELECT DISTINCT` over aggregate results | The DISTINCT key is an aggregate value, not a source key that affected-group recompute can recover (`SelectRefreshType`). |
+| Aggregates over `SEMI`/`ANTI` joins without visible group keys | No affected key can be derived. With group keys they use `GROUP_RECOMPUTE`. |
 
 ### Operators
 
 | Construct | Why |
 |---|---|
 | Recursive CTEs | Semi-naive evaluation not yet implemented. |
-| `MARK` joins and semi/anti shapes outside the aux-state extractor | SQL NULL-aware membership and complex correlated shapes need state OpenIVM does not maintain. Supported `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, and `NOT EXISTS` projection shapes use the aux-state path; see [Semi and anti join](operators/semi-anti-join.md). |
+| `MARK` joins and semi/anti shapes outside the aux-state extractor | Complex correlated shapes need state OpenIVM does not maintain. Supported `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, `NOT EXISTS`, `IN (subquery)`, and NULL-aware `NOT IN (subquery)` projection shapes use the aux-state path; see [Semi and anti join](operators/semi-anti-join.md). |
+| `POSITIONAL JOIN`, `TABLESAMPLE` / `USING SAMPLE` | Output depends on physical row positions or sampling, not on a local delta rule. A sample without a fixed seed is also volatile. |
+| `ASOF JOIN` outside window or grouped-aggregate shapes | ASOF joins are maintained by partition recompute (under a window) or group recompute (under a grouped aggregate); other shapes use full refresh. |
 | `LIMIT` without deterministic `ORDER BY` (or with ties on the ORDER BY key) | Row selection is non-deterministic between MV creation and recompute — the MV and the base query can legitimately return different subsets, so recompute and the `EXCEPT ALL` verify diverge. Not a code bug; add a unique `ORDER BY` to make the view deterministic. |
 | Any operator the plan walk doesn't recognize (falls into the `default:` branch of the compatibility check) | Conservatively treated as unsupported until a rewrite rule lands. |
 | Any plan that LPTS (`LogicalPlanToString`) can't serialise back to SQL | Caught at refresh-plan compile time; OpenIVM falls back to full recompute (`DELETE FROM data; INSERT INTO data SELECT * FROM view_query`). Subsumes ordered-set aggregates and a few other corner cases — covered without per-construct enumeration. |
@@ -43,9 +46,11 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 
 | Construct | Strategy |
 |---|---|
-| `GROUP BY … ORDER BY col LIMIT k` (aggregate top-k) | Genuinely incremental O(D + G): all groups are maintained in `openivm_data_<view>` via the normal `AGGREGATE_GROUP` path; `ORDER BY … LIMIT k` is applied by the VIEW at read time. Empty-delta skip avoids any work when no rows changed. See [operators/top-k.md](operators/top-k.md). |
-| `SELECT cols … ORDER BY col LIMIT k` (projection top-k, no GROUP BY) | Incremental maintenance over the unlimited `SIMPLE_PROJECTION` result. The user-facing view applies `ORDER BY … LIMIT k` at read time. See [operators/top-k.md](operators/top-k.md). |
+| `GROUP BY … ORDER BY col LIMIT k` (aggregate top-k) | All groups are maintained in `openivm_data_<view>` via the normal `AGGREGATE_GROUP` path; `ORDER BY … LIMIT k` is applied when the visible rows are published to `openivm_visible_<view>` after each refresh. Empty-delta skip avoids any work when no rows changed. See [operators/top-k.md](operators/top-k.md). |
+| `SELECT cols … ORDER BY col LIMIT k` (projection top-k, no GROUP BY) | Incremental maintenance over the unlimited `SIMPLE_PROJECTION` result. `ORDER BY … LIMIT k` is applied when the visible rows are published. See [operators/top-k.md](operators/top-k.md). |
 | `UNION ALL` over per-branch aggregates | Classified as `SIMPLE_AGGREGATE` when there is no reliable single group-key set. The MERGE formula applies delta sums over all output columns without a per-group key index. Z-set-correct, but less precise than a branch-aware aggregate path. |
+| `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, other DISTINCT aggregates with GROUP BY | `GROUP_RECOMPUTE` of the affected groups by default. With `SET openivm_stateful_auxstate = true`, a single-source grouped `COUNT(DISTINCT x)` uses `COUNT_DISTINCT_INCREMENTAL` with per-(group, value) multiplicity state. |
+| `GROUPING SETS`, `CUBE`, `ROLLUP` with visible group keys | `GROUP_RECOMPUTE` of the affected keys. |
 | Inner `DISTINCT` directly inside a subquery feeding an outer `AGGREGATE` (e.g. `SELECT g, SUM(c) FROM (SELECT DISTINCT g, m, c FROM t) GROUP BY g`) | Two paths are available. **Default (`GROUP_RECOMPUTE`)**: for each base table with a non-empty delta, the LPTS view query is scoped to delta-touched rows; the affected-keys set drives `DELETE` + `INSERT` on `openivm_data_<view>`. Correct but does more work than strictly necessary. **Aux-state path (`openivm_distinct_aux_state = true`, `RefreshType::DISTINCT_INCREMENTAL`)**: DBSP-correct Z-set maintenance via a per-tuple count auxiliary table `openivm_distinct_count_<view>`. Δdistinct fires only when the input count crosses zero (`sgn(R[t])`), driving ±1 into the parent SUM/COUNT MERGE. Strictly minimal delta; only v0 (single base-table DISTINCT, single SUM aggregate). Multi-source DISTINCT demotes to `GROUP_RECOMPUTE`. |
 | `LATERAL` / correlated subquery shapes represented as `DELIM_JOIN` / `DEPENDENT_JOIN` | Affected-key `GROUP_RECOMPUTE`: visible correlated output columns are used as recompute keys, then only those keys are deleted/reinserted from the view query. This supports correlated aggregate lateral shapes and scalar correlated subqueries planned as `SINGLE` `DELIM_JOIN`. It is correct and incremental, but less precise than a fully algebraic correlated delta. |
 | Window functions (`ROW_NUMBER`, `RANK`, `NTILE`, `LAG`, `LEAD`, …) on a single table | Partition-recompute: only partitions with delta rows are re-evaluated. See [operators/window-functions.md](operators/window-functions.md). **Caveat**: NTILE / RANK / ROW_NUMBER with ties on the `ORDER BY` key are inherently non-deterministic — multiple recomputes of the same data may legitimately produce different bucket / rank assignments. |
@@ -59,10 +64,11 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 - Maximum **16 tables** in a single join (`openivm::MAX_JOIN_TABLES`).
 - `INNER JOIN`, `CROSS JOIN`, and arbitrary-predicate joins use the inclusion-exclusion
   delta rule by default. Eligible `SIMPLE_PROJECTION` refresh SQL compiled for external
-  engines uses the regular-table N-term rule instead. `CROSS JOIN` is treated as a join
+  engines uses the regular-table N-term rule instead, and joins whose leaves are all
+  DuckLake scans use [N-term telescoping](ducklake.md#n-term-telescoping-join-rule). `CROSS JOIN` is treated as a join
   without a condition. See [Inner join](operators/inner-join.md#regular-table-n-term-compilation).
 - Partial-recompute strategies for `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN` are documented in the partial-recompute table above.
-- `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, and `NOT EXISTS` are incrementally maintained only for the projection/filter shapes documented in [Semi and anti join](operators/semi-anti-join.md). Aggregates over semi/anti output, join-chain inputs, and `IN`/`NOT IN` membership semantics fall back to full refresh.
+- `SEMI JOIN`, `ANTI JOIN`, `EXISTS`, and `NOT EXISTS` are incrementally maintained only for the projection/filter shapes documented in [Semi and anti join](operators/semi-anti-join.md). This includes `IN` and `NOT IN` subqueries. Ungrouped aggregates over semi/anti output fall back to full refresh; grouped ones use `GROUP_RECOMPUTE`.
 
 ## DuckLake-specific limitations
 
@@ -70,7 +76,6 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
   [FK-aware pruning](optimizations/fk-aware-pruning.md) is not available.
 - **No ART indexes.** DuckLake does not support DuckDB-native index types.
   Group column identification uses metadata instead.
-- **Single catalog.** All base tables must be in the same DuckLake catalog.
 
 ## Supported aggregates and their maintenance strategy
 
@@ -99,9 +104,15 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
   blocked with an error. Renaming a referenced column rewrites stored MV SQL and refresh
   metadata, including supported aux-state and lineage metadata.
 
-- **Transaction isolation during refresh** uses a separate Connection with snapshot
-  isolation. Concurrent DML during refresh does not affect the in-progress refresh, but
-  the interaction has not been exhaustively audited.
+- **Concurrency.** Tracked source writes, refreshes, and MV lifecycle operations in one
+  database are serialized by a single mutation gate, so unrelated OpenIVM writes also
+  wait for each other; see [Concurrency](internals/concurrency.md).
+
+- **Refresh in a multi-statement query string.** `PRAGMA refresh` resolves view metadata
+  when DuckDB expands the pragma, before earlier statements in the same query string have
+  run. A single `duckdb -c "CREATE MATERIALIZED VIEW ...; PRAGMA refresh(...)"` call
+  therefore fails with *"Table with name openivm_views does not exist"* on a fresh database.
+  Run the statements separately, from a script, or at the prompt.
 
 - **Window functions over DuckLake with non-output partition keys or unsupported lineage
   shapes** fall back to full recompute (`DELETE FROM data; INSERT INTO data SELECT * FROM

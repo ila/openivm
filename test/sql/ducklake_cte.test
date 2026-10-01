@@ -31,12 +31,12 @@ CREATE MATERIALIZED VIEW dl.mv_prices AS
 
 # The stored view query should reference dl.main.products without AT VERSION
 query I
-SELECT sql_string LIKE '%dl.main.products%' FROM openivm_views WHERE view_name = 'mv_prices';
+SELECT sql_string LIKE '%dl.main.products%' FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f707269636573_';
 ----
 true
 
 query I
-SELECT sql_string NOT LIKE '%AT (VERSION%' FROM openivm_views WHERE view_name = 'mv_prices';
+SELECT sql_string NOT LIKE '%AT (VERSION%' FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f707269636573_';
 ----
 true
 
@@ -138,12 +138,12 @@ CREATE MATERIALIZED VIEW dl.mv_cte_reuse AS
   CROSS JOIN (SELECT AVG(sb) AS av FROM s) g;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_cte_reuse';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f6374655f7265757365_';
 ----
 6
 
 query I
-SELECT group_columns FROM openivm_views WHERE view_name = 'mv_cte_reuse';
+SELECT group_columns FROM openivm_views WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f6374655f7265757365_';
 ----
 a
 

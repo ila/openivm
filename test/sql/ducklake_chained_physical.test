@@ -71,7 +71,7 @@ PRAGMA refresh_options('dl', 'bronze', 'l1');
 # state to DuckLake. Downstream MVs track changes on the upstream DuckLake
 # openivm_data_* table directly, so no companion rows are needed in openivm_delta_l1.
 query I
-SELECT count(*) FROM dl.bronze.openivm_delta_l1;
+SELECT count(*) FROM dl.bronze.openivm_delta___openivm_mv_646c_62726f6e7a65_6c31_;
 ----
 0
 
@@ -82,7 +82,7 @@ PRAGMA refresh_options('dl', 'silver', 'l2');
 # openivm_data_* table, downstream refresh can use DuckLake change tracking instead
 # of companion rows in openivm_delta_l2.
 query I
-SELECT count(*) FROM dl.silver.openivm_delta_l2;
+SELECT count(*) FROM dl.silver.openivm_delta___openivm_mv_646c_73696c766572_6c32_;
 ----
 0
 

@@ -60,22 +60,22 @@ statement ok
 CREATE MATERIALIZED VIEW mv_profile_proj AS SELECT id, name FROM profile_proj_base;
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'create_mv_initial_load' AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f70726f66696c655f70726f6a_' AND step_name = 'create_mv_initial_load' AND duration_ms >= 0;
 ----
 1
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'create_mv_total' AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f70726f66696c655f70726f6a_' AND step_name = 'create_mv_total' AND duration_ms >= 0;
 ----
 1
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name IN ('create_compile_full_plan', 'create_compile_lpts') AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f70726f66696c655f70726f6a_' AND step_name IN ('create_compile_full_plan', 'create_compile_lpts') AND duration_ms >= 0;
 ----
 2
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'create_mv_mv_delta_table' AND contains(detail, 'statements=1');
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f70726f66696c655f70726f6a_' AND step_name = 'create_mv_mv_delta_table' AND contains(detail, 'statements=1');
 ----
 1
 
@@ -86,22 +86,22 @@ statement ok
 PRAGMA refresh('mv_profile_proj');
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'total_refresh';
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f70726f66696c655f70726f6a_' AND step_name = 'total_refresh';
 ----
 1
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name = 'adaptive_cost_estimate';
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f70726f66696c655f70726f6a_' AND step_name = 'adaptive_cost_estimate';
 ----
 0
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name IN ('acquire_locks', 'generate_refresh_sql', 'execute_refresh_sql', 'total_refresh') AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f70726f66696c655f70726f6a_' AND step_name IN ('acquire_locks', 'generate_refresh_sql', 'execute_refresh_sql', 'total_refresh') AND duration_ms >= 0;
 ----
 4
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_profile_proj' AND step_name IN ('generate_refresh_sql.context', 'generate_refresh_sql.metadata_lookup', 'generate_refresh_sql.dispatch', 'generate_refresh_sql.assembly') AND duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f70726f66696c655f70726f6a_' AND step_name IN ('generate_refresh_sql.context', 'generate_refresh_sql.metadata_lookup', 'generate_refresh_sql.dispatch', 'generate_refresh_sql.assembly') AND duration_ms >= 0;
 ----
 4
 
@@ -902,15 +902,23 @@ PRAGMA refresh('mv_lt');
 
 # History recorded: 3 entries with non-negative durations
 query I
-SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt' AND actual_duration_ms >= 0;
+SELECT count(*) FROM openivm_refresh_history WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c74_' AND actual_duration_ms >= 0;
 ----
 3
 
 # Profiling is off by default.
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt';
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c74_';
 ----
 0
+
+# Force deterministic incremental path for the profiling assertions below.
+# The adaptive cost model (still enabled from Test 18 setup) can nondeterministically
+# choose full recompute vs incremental depending on prior refresh durations, which
+# changes the statement count (6 vs 7). The profiling feature is path-independent;
+# the adaptive cost model is already validated by the history assertions above.
+statement ok
+SET openivm_adaptive_refresh = false;
 
 statement ok
 SET openivm_profile_refresh = true;
@@ -922,22 +930,31 @@ statement ok
 PRAGMA refresh('mv_lt');
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name IN ('generate_refresh_sql', 'execute_refresh_sql', 'total_refresh');
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c74_' AND step_name IN ('generate_refresh_sql', 'execute_refresh_sql', 'total_refresh');
 ----
 3
 
-# 6, not 4: the full-recompute path for AGGREGATE_GROUP views emits four statements
-# (CREATE TEMP TABLE / DELETE vanished keys / INSERT OR REPLACE / DROP) instead of a plain
-# DELETE + INSERT, because their data table carries a UNIQUE index and DuckDB's on-disk unique
-# index rejects re-inserting a key deleted earlier in the same transaction. See
-# test/sql/group_recompute_persistent_unique_index.test.
+# 15 profiled statements per refresh: the seven maintenance statements below
+# plus eight visible-publication statements (stage the new rows and signed diff,
+# publish the delta, apply changed bags, and clean up the stages/delta).
+#   1. SET refresh_in_progress = true
+#   2. INSERT INTO openivm_delta_<view> (delta computation)
+#   3. MERGE INTO openivm_data_<view> (applies delta via CTE from the delta view)
+#   4. DELETE FROM openivm_delta_<view> (view delta cleanup)
+#   5. DELETE FROM openivm_delta_<source> (source delta cleanup)
+#   6. UPDATE openivm_delta_tables SET last_update (metadata timestamp)
+#   7. SET refresh_in_progress = false
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'execute_refresh_sql_stmt';
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c74_' AND step_name = 'execute_refresh_sql_stmt';
 ----
-6
+15
+
+# Re-enable adaptive refresh so subsequent refreshes record history for Test 20.
+statement ok
+SET openivm_adaptive_refresh = true;
 
 query I
-SELECT CASE WHEN count(*) >= 13 THEN 1 ELSE 0 END FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND duration_ms >= 0;
+SELECT CASE WHEN count(*) >= 13 THEN 1 ELSE 0 END FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c74_' AND duration_ms >= 0;
 ----
 1
 
@@ -967,12 +984,12 @@ statement ok
 PRAGMA refresh('mv_lt');
 
 query I
-SELECT count(DISTINCT refresh_id) FROM openivm_refresh_profile WHERE view_name = 'mv_lt';
+SELECT count(DISTINCT refresh_id) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c74_';
 ----
 1
 
 query I
-SELECT count(*) FROM openivm_refresh_profile WHERE view_name = 'mv_lt' AND step_name = 'total_refresh';
+SELECT count(*) FROM openivm_refresh_profile WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c74_' AND step_name = 'total_refresh';
 ----
 1
 
@@ -1041,16 +1058,19 @@ SET openivm_skip_empty_deltas = true;
 # Test 20: Learned cost model — history cleanup on REPLACE
 # ==========================================
 
+# 5 history rows: 3 from Test 18 setup + 2 from profiling retention tests.
+# The profiled refresh itself ran with openivm_adaptive_refresh = false (for deterministic
+# statement count), so it did not record a history entry.
 query I
-SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt';
+SELECT count(*) FROM openivm_refresh_history WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c74_';
 ----
-6
+5
 
 statement ok
 CREATE OR REPLACE MATERIALIZED VIEW mv_lt AS SELECT grp, sum(val) as total FROM lt GROUP BY grp;
 
 query I
-SELECT count(*) FROM openivm_refresh_history WHERE view_name = 'mv_lt';
+SELECT count(*) FROM openivm_refresh_history WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c74_';
 ----
 0
 
@@ -1082,7 +1102,7 @@ PRAGMA refresh('mv_cm_group_recompute');
 
 query I
 SELECT CASE WHEN method IN ('full', 'group_recompute') THEN 1 ELSE 0 END
-FROM openivm_refresh_history WHERE view_name = 'mv_cm_group_recompute' ORDER BY refresh_timestamp DESC LIMIT 1;
+FROM openivm_refresh_history WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636d5f67726f75705f7265636f6d70757465_' ORDER BY refresh_timestamp DESC LIMIT 1;
 ----
 1
 
@@ -1130,7 +1150,7 @@ PRAGMA refresh('mv_cm_distinct_incremental');
 
 query I
 SELECT CASE WHEN method IN ('full', 'distinct_incremental') THEN 1 ELSE 0 END
-FROM openivm_refresh_history WHERE view_name = 'mv_cm_distinct_incremental' ORDER BY refresh_timestamp DESC LIMIT 1;
+FROM openivm_refresh_history WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636d5f64697374696e63745f696e6372656d656e74616c_' ORDER BY refresh_timestamp DESC LIMIT 1;
 ----
 1
 
@@ -1178,7 +1198,7 @@ PRAGMA refresh('mv_cm_semi_anti');
 
 query I
 SELECT CASE WHEN method IN ('full', 'semi_anti_recompute') THEN 1 ELSE 0 END
-FROM openivm_refresh_history WHERE view_name = 'mv_cm_semi_anti' ORDER BY refresh_timestamp DESC LIMIT 1;
+FROM openivm_refresh_history WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636d5f73656d695f616e7469_' ORDER BY refresh_timestamp DESC LIMIT 1;
 ----
 1
 
@@ -1216,7 +1236,7 @@ PRAGMA refresh('mv_cm_window_partition');
 
 query I
 SELECT CASE WHEN method IN ('full', 'window_partition') THEN 1 ELSE 0 END
-FROM openivm_refresh_history WHERE view_name = 'mv_cm_window_partition' ORDER BY refresh_timestamp DESC LIMIT 1;
+FROM openivm_refresh_history WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f636d5f77696e646f775f706172746974696f6e_' ORDER BY refresh_timestamp DESC LIMIT 1;
 ----
 1
 

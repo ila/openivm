@@ -3,6 +3,7 @@
 
 #include "compile_facts.hpp"
 #include "core/refresh_metadata.hpp"
+#include "core/time_travel_pins.hpp"
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -16,6 +17,14 @@ namespace duckdb {
 
 constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
 
+// A maintenance compiler may retain its affected rows until publication finishes.
+struct RefreshPublicationScope {
+	vector<string> columns;
+	string rows;
+	string cleanup_sql;
+	string signed_rows;
+};
+
 struct ViewLocation {
 	string catalog_name;
 	string schema_name;
@@ -27,6 +36,22 @@ struct DuckLakeSourceLocation {
 	string schema_name;
 	string table_name;
 };
+
+struct DuckLakeSourceSpec {
+	string metadata_key;
+	DuckLakeSourceLocation loc;
+	int64_t old_snap = -1;
+	int64_t current_snap = -1;
+};
+
+string StripOpenIVMDataPrefix(const string &name);
+const DuckLakeSourceSpec *FindDuckLakeSourceSpec(const vector<DuckLakeSourceSpec> &specs, const string &table_name);
+bool BuildDuckLakeSourceSpecs(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                              const vector<string> &delta_table_names, const string &view_catalog_name,
+                              const string &view_schema_name, const string &attached_db_catalog_name,
+                              const string &attached_db_schema_name, vector<DuckLakeSourceSpec> &specs);
+string BuildDuckLakeChangedValuesSQL(const DuckLakeSourceSpec &spec, const string &source_col,
+                                     const string &source_cast, const string &output_col);
 
 struct DeltaFastPathFlags {
 	bool insert_only = false;
@@ -163,9 +188,12 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   const string &recompute_alias, const string &affected_alias,
                                   const string &target_match, const string &recompute_match,
                                   const string &affected_temp_table = "", const vector<string> &upsert_keys = {},
-                                  const string &recompute_temp_table = "");
+                                  const string &recompute_temp_table = "",
+                                  RefreshPublicationScope *publication_scope = nullptr);
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
+string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &query, const string &delta_table,
+                                    const string &old_table, const string &new_table, const string &filter);
 bool IsSummableLogicalType(const LogicalType &type);
 string NormalizeColumnNameForMatch(const string &name);
 string BaseTableNameFromDeltaKey(const string &delta_key);
@@ -182,26 +210,27 @@ string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_na
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
                            bool cross_system, const string &attached_catalog = "", const string &attached_schema = "",
                            const string &catalog_prefix = "", const string &metadata_prefix = "",
-                           string *out_post_meta = nullptr);
+                           string *out_post_meta = nullptr, vector<string> *deferred_cleanup = nullptr,
+                           const vector<string> &metadata_catalogs = {});
 
 string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const string &view_name,
                                           const vector<string> &delta_table_names, const vector<string> &group_cols,
                                           const string &data_table, const string &view_query_sql,
                                           const string &delta_ts_filter, const string &catalog_prefix,
                                           const string &recompute_alias);
-string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
-                                const vector<string> &delta_table_names, const string &data_table,
-                                const string &view_query_sql, const string &delta_ts_filter,
-                                const string &catalog_prefix, bool has_full_outer, bool has_left_join,
-                                bool skip_proj_delete, bool insert_only = false,
-                                const vector<string> &active_delta_table_names = {},
-                                bool can_use_runtime_delta_shape = false,
-                                ProjectionDeleteRetryPlan *delete_retry_plan = nullptr);
+string
+CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_name, const vector<string> &column_names,
+                         const vector<string> &delta_table_names, const string &data_table,
+                         const string &view_query_sql, const string &delta_ts_filter, const string &catalog_prefix,
+                         bool has_full_outer, bool has_left_join, bool skip_proj_delete, bool insert_only = false,
+                         const vector<string> &active_delta_table_names = {}, bool can_use_runtime_delta_shape = false,
+                         ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, string *appended_rows = nullptr);
 bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                           const vector<string> &delta_table_names, const string &data_table,
                                           const string &view_query_sql, const string &view_catalog_name,
                                           const string &view_schema_name, const string &attached_db_catalog_name,
-                                          const string &attached_db_schema_name, string &upsert_query);
+                                          const string &attached_db_schema_name, string &upsert_query,
+                                          RefreshPublicationScope *publication_scope = nullptr);
 void AppendSimpleAggregateEmptySourceNulling(RefreshMetadata &metadata, string &upsert_query, const string &view_name,
                                              const vector<string> &column_names, const string &data_table,
                                              const string &view_catalog_name, const string &view_schema_name,
@@ -219,12 +248,12 @@ ViewLocation ResolveViewLocation(Connection &con, const string &view_name, const
 //! the `openivm_compile_with_facts` bind to fail fast with a useful
 //! message.
 struct ResolvedViewCatalog {
+	string view_name;
 	string view_catalog_name;
 	string view_schema_name;
 	bool cross_system = false;
 };
-ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connection &con, const string &view_name,
-                                                  bool throw_if_not_found = false);
+ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connection &con, const string &view_name);
 DuckLakeSourceLocation ResolveDuckLakeSourceLocation(Connection &con, const string &view_name, const string &table_name,
                                                      const string &fallback_catalog, const string &fallback_schema,
                                                      const string &attached_catalog, const string &attached_schema);
@@ -236,10 +265,11 @@ string BuildDuckLakeSnapshotQuery(RefreshMetadata &metadata, Connection &con, co
                                   const string &view_query_sql, const vector<string> &delta_table_names,
                                   const string &view_catalog_name, const string &view_schema_name,
                                   const string &attached_db_catalog_name, const string &attached_db_schema_name);
-string QualifyViewQuerySources(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                               const string &view_query_sql, const vector<RefreshMetadata::DeltaSource> &delta_sources,
-                               const string &view_catalog_name, const string &view_schema_name,
-                               const string &attached_db_catalog_name, const string &attached_db_schema_name);
+openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &view_name, string &view_query_sql,
+                                                const vector<RefreshMetadata::DeltaSource> &delta_sources,
+                                                const string &view_catalog_name, const string &view_schema_name,
+                                                const string &attached_db_catalog_name,
+                                                const string &attached_db_schema_name);
 string DuckLakeSnapshotPlaceholder(const string &catalog_name);
 
 DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMetadata &metadata, Connection &con,
@@ -266,7 +296,8 @@ string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, c
                                    const string &view_catalog_name, const string &view_schema_name,
                                    const string &attached_db_catalog_name, const string &attached_db_schema_name,
                                    bool cross_system, bool emit_cascade_delta = false,
-                                   bool running_window_incremental = false);
+                                   bool running_window_incremental = false, bool *uses_running_suffix = nullptr,
+                                   RefreshPublicationScope *publication_scope = nullptr);
 string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_name, const string &view_schema_name,
                           const string &view_name, bool cross_system, const string &attached_db_catalog_name,
                           const string &attached_db_schema_name, string *out_pre_meta = nullptr,
@@ -274,7 +305,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
                           const DeltaActivityResult *precomputed_delta_activity = nullptr,
                           RefreshCostEstimate *out_adaptive_estimate = nullptr,
                           const openivm::CompileFacts *facts = nullptr, Connection *metadata_connection = nullptr,
-                          ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, bool write_query_file = true);
+                          ProjectionDeleteRetryPlan *delete_retry_plan = nullptr, bool write_query_file = true,
+                          vector<string> *deferred_cleanup = nullptr);
 
 } // namespace duckdb
 

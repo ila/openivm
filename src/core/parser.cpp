@@ -9,10 +9,12 @@
 #include "core/plan_rewrite_internal.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/refresh_metadata.hpp"
+#include "core/published_view.hpp"
 #include "core/ivm_delta_model.hpp"
 #include "core/ivm_view_classifier.hpp"
 #include "lpts_pipeline.hpp"
 #include "core/sql_utils.hpp"
+#include "core/time_travel_pins.hpp"
 #include "rules/column_hider.hpp"
 #include "upsert/refresh_compiler.hpp"
 #include "duckdb/common/printer.hpp"
@@ -23,14 +25,17 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/binder.hpp"
 
 #include "core/openivm_debug.hpp"
 
@@ -46,7 +51,7 @@ struct MaterializedViewTarget {
 };
 
 static MaterializedViewTarget ResolveMaterializedViewTarget(ClientContext &context, const string &target_name) {
-	auto components = QualifiedName::ParseComponents(target_name);
+	auto components = SqlUtils::ParseQualifiedIdentifier(target_name);
 	if (components.empty() || components.size() > 3) {
 		throw ParserException("Invalid materialized-view target '%s'", target_name);
 	}
@@ -145,23 +150,6 @@ static bool IsSameBaseColumnExpr(string expr, const string &left_alias, const st
 	return false;
 }
 
-static bool IsIdentifierTokenChar(char c) {
-	return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-}
-
-static bool MatchesPatternCI(const string &text, idx_t pos, const string &pattern) {
-	if (pos + pattern.size() > text.size()) {
-		return false;
-	}
-	for (idx_t i = 0; i < pattern.size(); i++) {
-		if (std::tolower(static_cast<unsigned char>(text[pos + i])) !=
-		    std::tolower(static_cast<unsigned char>(pattern[i]))) {
-			return false;
-		}
-	}
-	return true;
-}
-
 static bool RelationExists(ClientContext &context, const string &catalog_name, const string &schema_name,
                            const string &relation_name) {
 	QueryErrorContext error_context;
@@ -176,55 +164,9 @@ static bool RelationExists(ClientContext &context, const string &catalog_name, c
 	return false;
 }
 
-static bool HasIdentifierBoundary(const string &text, idx_t pos, idx_t len) {
-	bool left_ok = pos == 0 || !IsIdentifierTokenChar(text[pos - 1]);
-	idx_t end = pos + len;
-	bool right_ok = end >= text.size() || !IsIdentifierTokenChar(text[end]);
-	return left_ok && right_ok;
-}
-
-static string ReplaceQualifiedColumnReference(string expr, const string &pattern, const string &replacement) {
-	if (expr.empty() || pattern.empty()) {
-		return expr;
-	}
-	string result;
-	for (idx_t pos = 0; pos < expr.size();) {
-		if (expr[pos] == '\'') {
-			idx_t start = pos++;
-			while (pos < expr.size()) {
-				if (expr[pos] == '\'' && pos + 1 < expr.size() && expr[pos + 1] == '\'') {
-					pos += 2;
-					continue;
-				}
-				if (expr[pos++] == '\'') {
-					break;
-				}
-			}
-			result += expr.substr(start, pos - start);
-			continue;
-		}
-		if (MatchesPatternCI(expr, pos, pattern) && HasIdentifierBoundary(expr, pos, pattern.size())) {
-			result += replacement;
-			pos += pattern.size();
-			continue;
-		}
-		result += expr[pos++];
-	}
-	return result;
-}
-
-static string RewriteQualifiedLeftColumnRef(string expr, const string &left_alias, const string &source_col,
-                                            const string &target_col) {
-	string target = left_alias + "." + SqlUtils::QuoteIdentifier(target_col);
-	expr = ReplaceQualifiedColumnReference(expr, left_alias + "." + KeywordHelper::WriteOptionallyQuoted(source_col),
-	                                       target);
-	expr = ReplaceQualifiedColumnReference(expr, left_alias + "." + SqlUtils::QuoteIdentifier(source_col), target);
-	return expr;
-}
-
-ParserExtensionPlanResult
-MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientContext &context,
-                                              unique_ptr<ParserExtensionParseData> parse_data) {
+static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
+                                                      unique_ptr<ParserExtensionParseData> parse_data, string &view_key,
+                                                      string *metadata_catalog = nullptr) {
 	// CREATE MATERIALIZED VIEW stores a relation. Physical insertion order is not
 	// semantically observable unless users query with ORDER BY, so keep OpenIVM's
 	// whole execution path on DuckDB's lower-memory unordered mode.
@@ -236,6 +178,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	ParserExtensionPlanResult result;
 
 	Connection con(*context.db.get());
+	RefreshMetadata::UseCatalog(context, con,
+	                            ResolveMaterializedViewTarget(context, parse_data_ref.target_name).catalog_name);
 	struct CreateMVPreProfileStep {
 		string step_name;
 		int64_t duration_ms;
@@ -255,11 +199,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		create_profile_steps.push_back({step_name, duration_ms, detail});
 	};
 
-	// Capture the current catalog/schema from the originating context. DDLExecutorBindFunction
-	// creates a fresh Connection that reflects the DatabaseInstance's physical default
-	// catalog (not the session's USE setting). We only inject "USE catalog.schema" when
-	// the session's active catalog differs from that physical default — e.g. when DuckLake
-	// ("dl") is active but the file DB ("rewriter_benchmark_sf1") is the physical default.
+	// Keep source-name resolution in the caller's catalog/schema. Native metadata
+	// belongs to the target catalog's main schema; DuckLake metadata remains native.
 	auto context_start = create_profile_now();
 	string current_catalog;
 	string current_schema;
@@ -270,8 +211,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		current_schema = def.schema.empty() ? "main" : def.schema;
 	}
 	add_create_profile_step("create_compile_session_context", context_start);
-	// Query the physical default by running SELECT current_database() on the fresh `con`
-	// (created above without any USE, so it reflects the DB's true default, not the session).
+	// The helper has already selected the catalog that owns this view metadata.
 	auto default_context_start = create_profile_now();
 	string default_db;
 	string default_schema = "main";
@@ -285,6 +225,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			default_schema = schema_res->GetValue(0, 0).ToString();
 		}
 	}
+	if (metadata_catalog) {
+		*metadata_catalog = default_db;
+	}
 	add_create_profile_step("create_compile_default_context", default_context_start);
 	string default_catalog_schema =
 	    KeywordHelper::WriteOptionallyQuoted(default_db) + "." + KeywordHelper::WriteOptionallyQuoted(default_schema);
@@ -295,10 +238,12 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	if (!parse_data_ref.alter_sql.empty()) {
 		auto target = ResolveMaterializedViewTarget(context, parse_data_ref.target_name);
 		auto metadata_table = SqlUtils::FullName(default_db, default_schema, openivm::VIEWS_TABLE);
-		auto target_filter = "view_name = '" + SqlUtils::EscapeValue(target.view_name) +
-		                     "' AND COALESCE(view_catalog, '" + SqlUtils::EscapeValue(default_db) + "') = '" +
-		                     SqlUtils::EscapeValue(target.catalog_name) + "' AND COALESCE(view_schema, '" +
-		                     string(DEFAULT_SCHEMA) + "') = '" + SqlUtils::EscapeValue(target.schema_name) + "'";
+		auto target_key = RefreshMetadata(con).FindViewKey(target.catalog_name, target.schema_name, target.view_name);
+		view_key = target_key;
+		auto target_filter = "view_name = '" + SqlUtils::EscapeValue(target_key) + "' AND COALESCE(view_catalog, '" +
+		                     SqlUtils::EscapeValue(default_db) + "') = '" + SqlUtils::EscapeValue(target.catalog_name) +
+		                     "' AND COALESCE(view_schema, '" + string(DEFAULT_SCHEMA) + "') = '" +
+		                     SqlUtils::EscapeValue(target.schema_name) + "'";
 		auto tracked = con.Query("SELECT 1 FROM " + metadata_table + " WHERE " + target_filter);
 		if (tracked->HasError() || tracked->RowCount() == 0) {
 			throw CatalogException("Materialized view '%s' does not exist in OpenIVM metadata",
@@ -309,6 +254,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		ConfigureDDLExecutorResult(result, DDLExecutionMode::CALLER_TRANSACTION);
 		return result;
 	}
+
+	InitializeMVMetadata(context, con, default_db, default_schema);
 
 	// PAC compatibility boundary: internal planning uses a fresh connection, so
 	// forward PAC settings when that extension is loaded in the caller session.
@@ -326,17 +273,21 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	auto target = ResolveMaterializedViewTarget(context, full_view_name);
 	string view_catalog_prefix;
-	string view_name = target.view_name;
+	string sql_view_name = target.view_name;
+	if (!context.transaction.IsAutoCommit()) {
+		// Reuse legacy keys written earlier in the caller transaction as well.
+		// Otherwise the helper allocates a second key for the same SQL name.
+		RefreshMetadata(con).SnapshotTransaction(context);
+	}
+	string view_name = RefreshMetadata(con).AllocateViewKey(target.catalog_name, target.schema_name, sql_view_name);
+	view_key = view_name;
 	string view_target_catalog = target.catalog_name;
 	string view_target_schema = target.schema_name;
 	if (target.qualified) {
 		view_catalog_prefix = SqlUtils::QualifiedPrefix(view_target_catalog, view_target_schema);
 	} else {
-		// When the MV name is unqualified but the session is in a non-default catalog
-		// (e.g. USE dl.main), explicitly qualify so data/view tables land in dl rather
-		// than the physical default. Metadata tables (unqualified) stay in the physical
-		// default — PRAGMA refresh() always uses a fresh connection without USE.
-		if (!current_catalog.empty() && current_catalog != default_db) {
+		// Qualify the data objects when their location differs from the metadata schema.
+		if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 			view_catalog_prefix = SqlUtils::QualifiedPrefix(current_catalog, current_schema);
 		}
 	}
@@ -351,18 +302,9 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	string internal_catalog_prefix = view_catalog_prefix;
 	string internal_target_catalog = view_target_catalog;
 	string internal_target_schema = view_target_schema;
-	// Native MVs created from another active catalog keep OpenIVM state in the physical
-	// default DB. DuckLake-targeted MVs store their data/delta tables in DuckLake so
-	// initial materialization follows the same storage path as DuckLake CTAS.
-	if (!target_is_ducklake && !view_catalog_prefix.empty() && default_db != "memory" &&
-	    view_target_catalog != default_db) {
-		internal_catalog_prefix = SqlUtils::QualifiedPrefix(default_db, default_schema);
-		internal_target_catalog = default_db;
-		internal_target_schema = default_schema;
-	}
 	string data_table = IncrementalTableNames::DataTableName(view_name);
 	string qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
-	string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
+	string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(sql_view_name);
 	bool staged_cross_catalog_replace = target_is_ducklake && parse_data_ref.is_replace;
 	string staged_data_table = "openivm_stage_" + view_name;
 	string staged_qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(staged_data_table);
@@ -378,7 +320,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// default. Without this, `CREATE MATERIALIZED VIEW mv AS SELECT * FROM WAREHOUSE`
 	// issued under `USE dl.main` fails during planning with "Table WAREHOUSE does not
 	// exist" because the fresh connection resolves against the physical-default catalog.
-	if (!current_catalog.empty() && current_catalog != default_db) {
+	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 		auto use_start = create_profile_now();
 		con.Query("USE " + current_catalog + "." + current_schema);
 		add_create_profile_step("create_compile_use_context", use_start, current_catalog_schema);
@@ -405,6 +347,14 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// re-derives what it needs from the plan.
 	unordered_set<string> table_names;
 	auto table_names_start = create_profile_now();
+	// Peel time-travel pins the catalog cannot bind before anything plans this statement, keeping
+	// each pin keyed by its relation so it can be re-attached to the generated SQL below.
+	auto time_travel_pins = openivm::TimeTravelPins::Peel(context, *statement);
+	// SQL OpenIVM binds or executes itself runs against the very catalog that cannot honour the pin,
+	// so those copies drop it. The stored view SQL keeps it, and refresh re-attaches it when
+	// rendering for a foreign dialect.
+	auto &select_statement = *statement->Cast<CreateStatement>().info->Cast<CreateTableInfo>().query;
+	auto local_view_query = time_travel_pins.Empty() ? original_view_query : select_statement.ToString();
 	try {
 		table_names = con.GetTableNames(statement->query);
 	} catch (const std::exception &e) {
@@ -436,15 +386,16 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	bool has_computed_sum_aggregate_projection = false;
 	{
 		auto select_parse_plan_start = create_profile_now();
-		Parser select_parser;
-		select_parser.ParseQuery(original_view_query);
 		Planner select_planner(context);
-		select_planner.CreatePlan(std::move(select_parser.statements[0]));
+		select_planner.CreatePlan(select_statement.Copy());
 		auto select_plan = std::move(select_planner.plan);
 		visible_output_count = select_planner.names.size();
 		for (auto &name : select_planner.names) {
 			if (StringUtil::CIEquals(name, openivm::MULTIPLICITY_COL) ||
-			    StringUtil::CIEquals(name, openivm::TIMESTAMP_COL)) {
+			    StringUtil::CIEquals(name, openivm::TIMESTAMP_COL) ||
+			    StringUtil::CIEquals(name, openivm::PUBLISHED_ORDINAL_COL) ||
+			    StringUtil::CIStartsWith(name, openivm::ROWS_POSITION_PREFIX) ||
+			    StringUtil::CIStartsWith(name, openivm::RUNNING_INPUT_PREFIX)) {
 				throw BinderException("Materialized-view output uses reserved OpenIVM column '%s'", name);
 			}
 		}
@@ -463,63 +414,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// Strip HAVING filter from plan — data table stores all groups.
 		// The predicate is extracted as SQL (using output aliases) for the VIEW WHERE clause.
 		having_predicate = StripHavingFilter(select_plan, output_names);
-		// HAVING-only aggregates are exposed by StripHavingFilter. Inject SUM's
-		// non-NULL state afterward so visible, wrapped, and HAVING-only SUMs all
-		// use the same output-index mapping during incremental maintenance.
+		StripPublicationModifiers(select_plan, output_names, top_k_suffix, top_k_order_suffix);
+		// Expose SUM's non-NULL counts after HAVING and hidden ordering outputs.
 		InjectSumNonNullCounts(context, select_plan);
 		output_names = PrepareOutputNames(select_plan.get(), select_planner.names);
 
-		// Keep data tables unlimited/unordered; apply ORDER BY/LIMIT in the user-facing view.
-		{
-			LogicalOperator *limit_node = nullptr;
-			LogicalOperator *order_node = nullptr;
-
-			if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_TOP_N) {
-				limit_node = select_plan.get();
-				order_node = select_plan.get(); // same node holds both orders + limit
-			} else if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_LIMIT &&
-			           !select_plan->children.empty() &&
-			           select_plan->children[0]->type == LogicalOperatorType::LOGICAL_ORDER_BY) {
-				limit_node = select_plan.get();
-				order_node = select_plan->children[0].get();
-			}
-
-			if (limit_node) {
-				if (limit_node->type == LogicalOperatorType::LOGICAL_TOP_N) {
-					auto &top_n = limit_node->Cast<LogicalTopN>();
-					top_k_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names);
-					top_k_order_suffix = BuildTopKSuffix(top_n.orders, top_n.limit, top_n.offset, output_names, false);
-					select_plan = std::move(select_plan->children[0]);
-				} else {
-					auto &order_op = order_node->Cast<LogicalOrder>();
-					auto &limit_op = limit_node->Cast<LogicalLimit>();
-					idx_t lval = 0;
-					idx_t oval = 0;
-					if (limit_op.limit_val.Type() == LimitNodeType::CONSTANT_VALUE) {
-						lval = limit_op.limit_val.GetConstantValue();
-					}
-					if (limit_op.offset_val.Type() == LimitNodeType::CONSTANT_VALUE) {
-						oval = limit_op.offset_val.GetConstantValue();
-					}
-					top_k_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names);
-					top_k_order_suffix = BuildTopKSuffix(order_op.orders, lval, oval, output_names, false);
-					select_plan = std::move(select_plan->children[0]->children[0]);
-				}
-				OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped top-k wrapper, suffix='%s'\n", top_k_suffix.c_str());
-			}
-		}
-
-		// Strip a standalone ORDER_BY at the top of select_plan (e.g. DISTINCT + ORDER BY
-		// without LIMIT, or simple projection + ORDER BY). The data table stores unordered
-		// rows; the suffix is appended to the CREATE VIEW instead.
-		if (select_plan && select_plan->type == LogicalOperatorType::LOGICAL_ORDER_BY && top_k_suffix.empty() &&
-		    !select_plan->children.empty()) {
-			auto &order_op = select_plan->Cast<LogicalOrder>();
-			top_k_suffix = BuildTopKSuffix(order_op.orders, 0, 0, output_names);
-			top_k_order_suffix = top_k_suffix;
-			select_plan = std::move(select_plan->children[0]);
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Stripped standalone ORDER_BY, suffix='%s'\n", top_k_suffix.c_str());
-		}
 		auto post_rewrite_facts = BuildCreateMVPlanFacts(select_plan.get(), current_catalog);
 		stored_query_has_aggregate_filter = post_rewrite_facts.has_filter_above_aggregate;
 		has_hidden_minmax_having = post_rewrite_facts.has_hidden_minmax_having_column;
@@ -536,7 +435,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			// CREATE MATERIALIZED VIEW always stores the view body in DuckDB's own dialect.
 			// Refresh-time target dialects are selected per CompileFacts.
 			SqlDialect dialect = SqlDialect::DUCKDB;
-			auto ast = LogicalPlanToAst(context, select_plan, dialect);
+			auto ast = LogicalPlanToAst(context, select_plan, dialect, time_travel_pins.Resolver());
 			auto cte_list = AstToCteList(*ast, dialect);
 			view_query = cte_list->ToQuery(true, output_names);
 			if (!view_query.empty() && view_query.back() == ';') {
@@ -585,6 +484,15 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		FoldConstantScalarSubqueries(context, plan);
 	}
 
+	InjectHiddenGroupKeys(plan);
+	if (!lpts_fallback && !top_k_order_suffix.empty()) {
+		// Classification must see the unlimited maintenance plan too. In particular,
+		// an inherited ORDER BY can be separated from the outer LIMIT by projections.
+		auto &analysis_query = plan->type == LogicalOperatorType::LOGICAL_CREATE_TABLE ? plan->children[0] : plan;
+		auto analysis_names = output_names;
+		string analysis_suffix, analysis_order;
+		StripPublicationModifiers(analysis_query, analysis_names, analysis_suffix, analysis_order);
+	}
 	auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
 	if (!facts.source_table_info.empty()) {
 		table_names.clear();
@@ -665,7 +573,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	FilteredGroupCountExtract filtered_group_count_extract;
 	FilteredGroupCountAuxRequirement filtered_group_count_aux_candidate;
 	if (analysis.found_nested_aggregate &&
-	    ExtractFilteredGroupCount(original_view_query, output_names, filtered_group_count_extract)) {
+	    ExtractFilteredGroupCount(local_view_query, output_names, filtered_group_count_extract)) {
 		string aux_table = "openivm_filtered_group_count_" + view_name;
 		string group_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.group_col);
 		string sum_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.sum_col);
@@ -679,12 +587,16 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	}
 
 	if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
-		if (ExtractSemiAntiQuery(original_view_query, semi_anti_extract)) {
-			string left_table_name = SqlUtils::LastIdentifierPart(semi_anti_extract.left_table);
-			auto col_result = con.Query("SELECT column_name FROM information_schema.columns WHERE "
-			                            "lower(table_name) = lower('" +
-			                            SqlUtils::EscapeSingleQuotes(left_table_name) + "') AND table_schema = '" +
-			                            SqlUtils::EscapeSingleQuotes(current_schema) + "' ORDER BY ordinal_position");
+		if (ExtractSemiAntiQuery(local_view_query, semi_anti_extract)) {
+			auto col_result = con.Query("DESCRIBE SELECT * FROM " + semi_anti_extract.left_table);
+			if (semi_anti_extract.output_cols.empty() && !col_result->HasError()) {
+				for (idx_t i = 0; i < col_result->RowCount(); i++) {
+					auto name = col_result->GetValue(0, i).ToString();
+					semi_anti_extract.output_cols.push_back(name);
+					semi_anti_extract.output_exprs.push_back(SqlUtils::QuoteIdentifier(semi_anti_extract.left_alias) +
+					                                         "." + SqlUtils::QuoteIdentifier(name));
+				}
+			}
 			auto add_semi_anti_left_col = [&](const string &col_name) {
 				if (!ContainsColumnCI(semi_anti_left_cols, col_name)) {
 					semi_anti_left_cols.push_back(col_name);
@@ -774,12 +686,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				                            semi_anti_extract.null_aware_left_expr);
 			}
 			for (auto &rewrite : semi_anti_left_col_rewrites) {
-				semi_anti_extract.predicate = RewriteQualifiedLeftColumnRef(
-				    semi_anti_extract.predicate, semi_anti_extract.left_alias, rewrite.first, rewrite.second);
-				semi_anti_extract.post_filter = RewriteQualifiedLeftColumnRef(
-				    semi_anti_extract.post_filter, semi_anti_extract.left_alias, rewrite.first, rewrite.second);
-				semi_anti_extract.right_filter = RewriteQualifiedLeftColumnRef(
-				    semi_anti_extract.right_filter, semi_anti_extract.left_alias, rewrite.first, rewrite.second);
+				for (auto *expression :
+				     {&semi_anti_extract.predicate, &semi_anti_extract.post_filter, &semi_anti_extract.right_filter}) {
+					SqlUtils::RewriteColumnReferences(*expression, rewrite.first, rewrite.second,
+					                                  {StringUtil::Lower(semi_anti_extract.left_alias)}, false);
+				}
 			}
 		}
 	}
@@ -801,11 +712,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		if (context.TryGetCurrentSetting("openivm_distinct_aux_state", aux_val) && !aux_val.IsNull()) {
 			aux_enabled = aux_val.GetValue<bool>();
 		}
-		bool single_source = table_names.size() == 1;
+		bool single_source = facts.source_table_info.size() == 1;
 		if (aux_enabled && single_source) {
 			vector<string> dcols;
 			string d_input_sql, d_source, d_filter;
-			if (!ExtractInnerDistinct(original_view_query, dcols, d_input_sql, d_source, d_filter)) {
+			if (!ExtractInnerDistinct(local_view_query, dcols, d_input_sql, d_source, d_filter)) {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] DISTINCT_INCREMENTAL extractor failed — demoting to "
 				                    "GROUP_RECOMPUTE\n");
 			} else {
@@ -880,7 +791,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		model_input.distinct_aux_candidate = &distinct_aux_candidate;
 	}
 	RefreshMetadata::CountDistinctAuxMeta count_distinct_aux_candidate;
-	if (analysis.found_count_distinct && table_names.size() == 1 && analysis.group_count > 0 &&
+	if (analysis.found_count_distinct && facts.source_table_info.size() == 1 && analysis.group_count > 0 &&
 	    analysis.group_count < output_names.size()) {
 		Value aux_val;
 		bool aux_enabled = false;
@@ -893,7 +804,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 				candidate_group_columns.push_back(output_names[i]);
 			}
 			CountDistinctExtract cd_extract;
-			if (ExtractCountDistinctAggregate(original_view_query, candidate_group_columns, output_names, cd_extract)) {
+			if (ExtractCountDistinctAggregate(local_view_query, candidate_group_columns, output_names, cd_extract)) {
 				count_distinct_aux_candidate = {
 				    "openivm_aux_" + view_name, SqlUtils::LastIdentifierPart(cd_extract.source),
 				    candidate_group_columns,    cd_extract.group_exprs,
@@ -984,12 +895,12 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	string full_outer_join_cols = std::move(view_model.full_outer_join_cols);
 
 	if (view_model.warn_unsupported_incremental) {
-		Printer::Print("Warning: materialized view '" + view_name +
+		Printer::Print("Warning: materialized view '" + sql_view_name +
 		               "' uses constructs not supported for incremental maintenance. "
 		               "Full refresh will be used.");
 	}
 	if (view_model.warn_unrecognized_pattern) {
-		Printer::Print("Warning: materialized view '" + view_name +
+		Printer::Print("Warning: materialized view '" + sql_view_name +
 		               "' has an unrecognized query pattern. Full refresh will be used.");
 	}
 
@@ -1087,11 +998,82 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	add_profile_marker("create_mv_system_tables", "refresh_type=" + string(RefreshTypeName(refresh_type)) +
 	                                                  "; lpts_fallback=" + string(lpts_fallback ? "true" : "false"));
-	AppendCreateMVSystemTablesDDL(ddl, view_name, parse_data_ref.is_replace);
+	AppendCreateMVSystemTablesDDL(context, default_db, default_schema, ddl, view_name, parse_data_ref.is_replace,
+	                              view_target_catalog, view_target_schema, sql_view_name);
+	auto system_ddl_end = ddl.size();
+
+	bool has_downstream_views = false;
+	bool preserve_consumer_deltas = false;
+	if (parse_data_ref.is_replace) {
+		Connection dependency_con(*context.db);
+		RefreshMetadata::UseCatalog(context, dependency_con, view_target_catalog);
+		RefreshMetadata dependency_metadata(dependency_con);
+		dependency_metadata.SnapshotTransaction(context);
+		has_downstream_views = dependency_metadata.HasDownstreamViews(view_name);
+		preserve_consumer_deltas = !target_is_ducklake && dependency_metadata.HasDownstreamViews(view_name, false);
+	}
+	vector<string> replacement_delta_projection;
+	string preserved_delta = SqlUtils::QuoteIdentifier("openivm_replace_delta_" + view_name);
+	string creation_timestamp = Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()).ToSQLString() + "::TIMESTAMP";
+	if (has_downstream_views) {
+		Parser replacement_parser;
+		replacement_parser.ParseQuery(view_query);
+		Planner replacement_planner(context);
+		replacement_planner.CreatePlan(std::move(replacement_parser.statements[0]));
+		vector<string> old_names, old_visible, new_visible;
+		vector<LogicalType> old_visible_types, new_visible_types;
+		auto record_old_column = [&](const ColumnDefinition &column) {
+			old_names.push_back(column.Name());
+			if (!IncrementalTableNames::IsInternalColumn(column.Name())) {
+				old_visible.push_back(column.Name());
+				old_visible_types.push_back(column.Type());
+			}
+		};
+		if (target_is_ducklake) {
+			// Do not open a lake read transaction on the caller before staged DDL
+			// commits through its helper (SQLite metadata would retain a read lock).
+			auto old_data = con.TableInfo(internal_target_catalog, internal_target_schema, data_table);
+			if (!old_data) {
+				throw CatalogException("Missing maintenance table for materialized view '%s'", view_name);
+			}
+			for (auto &column : old_data->columns) {
+				record_old_column(column);
+			}
+		} else {
+			auto &old_data = Catalog::GetEntry<TableCatalogEntry>(context, internal_target_catalog,
+			                                                      internal_target_schema, data_table);
+			for (auto &column : old_data.GetColumns().Logical()) {
+				record_old_column(column);
+			}
+		}
+		for (idx_t i = 0; i < replacement_planner.names.size(); i++) {
+			auto &name = replacement_planner.names[i];
+			if (!IncrementalTableNames::IsInternalColumn(name)) {
+				new_visible.push_back(name);
+				new_visible_types.push_back(replacement_planner.types[i]);
+			}
+			auto column = SqlUtils::QuoteIdentifier(name);
+			replacement_delta_projection.push_back(
+			    std::find(old_names.begin(), old_names.end(), name) != old_names.end() ? column : "NULL AS " + column);
+		}
+		if (old_visible != new_visible || old_visible_types != new_visible_types) {
+			throw BinderException(
+			    "Cannot change the visible schema of materialized view '%s' while dependent views exist", view_name);
+		}
+	}
+	if (preserve_consumer_deltas) {
+		replacement_delta_projection.push_back(openivm::MULTIPLICITY_COL);
+		replacement_delta_projection.push_back(openivm::TIMESTAMP_COL);
+		ddl.push_back("CREATE TEMP TABLE " + preserved_delta + " AS SELECT * FROM " + internal_catalog_prefix +
+		              SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name)));
+		ddl.push_back("INSERT INTO " + preserved_delta + " BY NAME SELECT *, -1::INTEGER AS openivm_multiplicity, " +
+		              creation_timestamp + " AS openivm_timestamp FROM " + qdt);
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Retaining consumer deltas across replacement of %s\n", view_name.c_str());
+	}
 
 	if (parse_data_ref.is_replace && !staged_cross_catalog_replace) {
 		add_profile_marker("create_mv_replace_cleanup");
-		string qvn_drop = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(view_name);
+		string qvn_drop = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(sql_view_name);
 		string qdt_drop = internal_catalog_prefix +
 		                  KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
 		string qdv_drop =
@@ -1130,20 +1112,20 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	metadata_ddl.push_back(
 	    "insert or replace into " + string(openivm::VIEWS_TABLE) +
-	    " (view_name, view_catalog, view_schema, sql_string, type, has_minmax, has_left_join, "
+	    " (view_name, view_sql_name, view_catalog, view_schema, sql_string, type, has_minmax, has_left_join, "
 	    "has_join, last_update, "
 	    "refresh_interval, refresh_in_progress, group_columns, window_order_columns, aggregate_types, "
 	    "having_predicate, group_recompute_affected_mode, "
 	    "group_recompute_source_occurrences_json, has_full_outer, "
 	    "full_outer_join_cols) values ('" +
-	    view_name + "', '" + SqlUtils::EscapeSingleQuotes(view_target_catalog) + "', '" +
-	    SqlUtils::EscapeSingleQuotes(view_target_schema) + "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " +
-	    to_string((int)refresh_type) + ", " + (has_minmax_metadata ? "true" : "false") + ", " +
-	    (analysis.found_left_join ? "true" : "false") + ", " + (analysis.found_join ? "true" : "false") + ", " +
-	    string(openivm::UTC_NOW_SQL) + ", " + refresh_val + ", false, " + group_cols_val + ", " +
-	    window_order_cols_val + ", " + agg_types_val + ", " + having_val + ", " + group_recompute_mode_val + ", " +
-	    group_recompute_source_occurrences_val + ", " + (analysis.found_full_outer ? "true" : "false") + ", " +
-	    full_outer_join_cols_val + ")");
+	    SqlUtils::EscapeSingleQuotes(view_name) + "', '" + SqlUtils::EscapeSingleQuotes(sql_view_name) + "', '" +
+	    SqlUtils::EscapeSingleQuotes(view_target_catalog) + "', '" + SqlUtils::EscapeSingleQuotes(view_target_schema) +
+	    "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)refresh_type) + ", " +
+	    (has_minmax_metadata ? "true" : "false") + ", " + (analysis.found_left_join ? "true" : "false") + ", " +
+	    (analysis.found_join ? "true" : "false") + ", " + string(openivm::UTC_NOW_SQL) + ", " + refresh_val +
+	    ", false, " + group_cols_val + ", " + window_order_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
+	    group_recompute_mode_val + ", " + group_recompute_source_occurrences_val + ", " +
+	    (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
 
 	if (!lineage_json.empty()) {
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));
@@ -1164,11 +1146,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		vector<string> sorted_tables;
 		sorted_tables.reserve(table_names.size());
 		for (const auto &t : table_names) {
-			if (StringUtil::StartsWith(t, openivm::DATA_TABLE_PREFIX)) {
-				sorted_tables.push_back(t.substr(strlen(openivm::DATA_TABLE_PREFIX)));
-			} else {
-				sorted_tables.push_back(t);
-			}
+			sorted_tables.push_back(PublishedSourceViewName(t));
 		}
 		std::sort(sorted_tables.begin(), sorted_tables.end());
 		metadata_ddl.push_back(
@@ -1273,54 +1251,54 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	}
 
 	const auto &source_table_info = facts.source_table_info;
-	const auto &dl_table_info = facts.ducklake_table_info; // keyed by lowercased name
+	const auto &dl_table_info = facts.ducklake_table_info; // keyed by qualified physical name
+	auto source_metadata_key = [&](const SourceTableInfo &source, const string &name) {
+		return facts.source_name_counts.at(source.table_name) > 1
+		           ? SqlUtils::FullName(source.catalog_name, source.schema_name, name)
+		           : name;
+	};
 
-	unordered_set<string> ducklake_tables;
-	// Single snapshot query per DuckLake catalog (all tables share the same snapshot).
-	string dl_snapshot_val = "null";
-	if (!dl_table_info.empty()) {
-		// Use the first entry's catalog — all source tables in one MV share one catalog.
-		string cat = dl_table_info.begin()->second.catalog_name;
-		auto snapshot_id = metadata.GetCurrentDuckLakeSnapshot(cat);
-		if (snapshot_id >= 0) {
-			dl_snapshot_val = to_string(snapshot_id);
+	unordered_map<string, string> snapshots_by_catalog;
+	for (const auto &entry : dl_table_info) {
+		const auto &cat = entry.second.catalog_name;
+		if (!snapshots_by_catalog.count(cat)) {
+			auto snapshot = metadata.GetCurrentDuckLakeSnapshot(cat);
+			snapshots_by_catalog[cat] = snapshot < 0 ? "null" : to_string(snapshot);
 		}
 	}
 
 	vector<string> source_metadata_values;
 	unordered_map<string, vector<string>> snapshot_update_tables_by_catalog;
 	unordered_set<string> inserted_meta_table_names;
-	for (const auto &table_name : table_names) {
+	for (const auto &source_entry : source_table_info) {
+		const auto &source = source_entry.second;
+		const auto &table_name = source.table_name;
 		string catalog_type = "duckdb";
 		string snapshot_val = "null";
 		string source_table_id_val = "null";
 		string meta_table_name = SqlUtils::DeltaName(table_name);
-		string source_catalog_val = current_catalog.empty() ? "memory" : current_catalog;
-		string source_schema_val = current_schema.empty() ? "main" : current_schema;
+		string source_catalog_val = source.catalog_name;
+		string source_schema_val = source.schema_name;
 
-		string table_lc = StringUtil::Lower(table_name);
-		auto source_info_it = source_table_info.find(table_name);
-		if (source_info_it != source_table_info.end()) {
-			source_catalog_val = source_info_it->second.catalog_name;
-			source_schema_val = source_info_it->second.schema_name;
-		}
-		auto it = dl_table_info.find(table_lc);
+		auto it = dl_table_info.find(source_entry.first);
 		if (it != dl_table_info.end()) {
 			catalog_type = "ducklake";
 			meta_table_name = it->second.table_name; // case-preserved name
-			ducklake_tables.insert(it->second.table_name);
-			ducklake_tables.insert(table_name); // also insert SQL-parsed name
-			snapshot_val = dl_snapshot_val;
+			snapshot_val = snapshots_by_catalog.at(it->second.catalog_name);
 			if (it->second.table_id >= 0) {
 				source_table_id_val = to_string(it->second.table_id);
 			}
 			source_catalog_val = it->second.catalog_name;
 			source_schema_val = it->second.schema_name;
-			snapshot_update_tables_by_catalog[source_catalog_val].push_back(meta_table_name);
+			snapshot_update_tables_by_catalog[source_catalog_val].push_back(
+			    source_metadata_key(source, meta_table_name));
 			OPENIVM_DEBUG_PRINT("[CREATE MV] DuckLake table '%s' → meta_name='%s', snap=%s\n", table_name.c_str(),
 			                    meta_table_name.c_str(), snapshot_val.c_str());
 		}
 
+		meta_table_name = source_metadata_key(source, meta_table_name);
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Source %s -> metadata key %s\n", source_entry.first.c_str(),
+		                    meta_table_name.c_str());
 		// A single physical source can appear under multiple logical names after planning.
 		// DuckLake chained views are the common case: the query can contain both the
 		// user-facing MV name and its backing openivm_data_* table. Metadata is keyed by
@@ -1356,10 +1334,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		// This diagnostic intentionally reports the exact first heavy statement that
 		// CREATE MV will run. DuckLake-targeted MVs should now write openivm_data_*
 		// directly; if staging reappears, this output makes the extra copy visible.
-		if (!current_catalog.empty() && current_catalog != default_db) {
+		if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 			con.Query("USE " + current_catalog_schema);
 		}
-		string initial_load_statement = "CREATE TABLE " + initial_load_target + " AS " + view_query;
+		string local_initial_load_query = time_travel_pins.StripFrom(context, view_query);
+		string initial_load_statement = "CREATE TABLE " + initial_load_target + " AS " + local_initial_load_query;
 		string diagnostic;
 		diagnostic += "\n[OpenIVM initial-load diagnostic]\n";
 		diagnostic += "view_name: " + view_name + "\n";
@@ -1369,8 +1348,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		diagnostic += "initial_load_statement:\n" + initial_load_statement + "\n\n";
 		diagnostic += "original_view_query:\n" + original_view_query + "\n\n";
 		diagnostic += "generated_view_query:\n" + view_query + "\n\n";
-		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN original_view_query:", original_view_query);
-		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN generated_view_query:", view_query);
+		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN original_view_query:", local_view_query);
+		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN generated_view_query:", local_initial_load_query);
 		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN initial_load_statement:", initial_load_statement);
 		Printer::Print(diagnostic);
 
@@ -1390,7 +1369,13 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// TABLE AS so those unqualified names resolve in the MV's catalog.
 	add_profile_marker("create_mv_initial_load", "sources=" + to_string(table_names.size()) +
 	                                                 "; generated_query_bytes=" + to_string(view_query.size()));
-	if (!current_catalog.empty() && current_catalog != default_db) {
+	const bool batch_ducklake_creation = target_is_ducklake && !parse_data_ref.is_replace;
+	if (batch_ducklake_creation) {
+		// Keep the initial data and publication in one DuckLake commit. Native
+		// metadata remains outside this transaction, as required across catalogs.
+		ddl.push_back("BEGIN TRANSACTION");
+	}
+	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 		ddl.push_back("use " + current_catalog_schema);
 	}
 	if (staged_cross_catalog_replace) {
@@ -1403,7 +1388,7 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		ddl.push_back(BuildSemiAntiInitialDataSQL(initial_load_target, aux_target, meta.join_type, meta.left_cols,
 		                                          meta.output_cols, meta.null_aware, meta.null_aware_left_col));
 	} else {
-		ddl.push_back("create table " + initial_load_target + " as " + view_query);
+		ddl.push_back("create table " + initial_load_target + " as " + time_travel_pins.StripFrom(context, view_query));
 	}
 	if (staged_cross_catalog_replace) {
 		// DuckDB cannot make the DuckLake objects and native metadata atomic
@@ -1459,53 +1444,96 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			top_k_view_suffix = top_k_suffix.empty() ? "" : " " + top_k_suffix;
 		}
 		string view_tail = having_where + top_k_view_suffix;
-		if (internal_cols.empty()) {
-			ddl.push_back(string(staged_cross_catalog_replace ? "create or replace view " : "create view ") + qvn +
-			              " as select * from " + qdt + view_tail);
-		} else {
-			ddl.push_back(string(staged_cross_catalog_replace ? "create or replace view " : "create view ") + qvn +
-			              " as select * exclude (" + SqlUtils::JoinQuotedColumns(internal_cols) + ") from " + qdt +
-			              view_tail);
+		string published_query = "SELECT *";
+		if (!internal_cols.empty()) {
+			published_query += " EXCLUDE (" + SqlUtils::JoinQuotedColumns(internal_cols) + ")";
 		}
+		published_query +=
+		    top_k_order_suffix.empty() ? ", CAST(0 AS BIGINT)" : ", ROW_NUMBER() OVER (" + top_k_order_suffix + ")";
+		// Rank the selected rows, not every raw group before TOP_N. The ordinal
+		// describes order within the published relation, including after OFFSET.
+		// Without a bound, retain the direct form: an extra nested ORDER BY
+		// would sort the entire relation again without reducing window input.
+		bool rank_selected_rows = !stored_query_retains_top_k && !top_k_order_suffix.empty() &&
+		                          StringUtil::StartsWith(top_k_suffix.substr(top_k_order_suffix.size()), " LIMIT ");
+		string published_source = qdt + view_tail;
+		if (rank_selected_rows) {
+			published_source = "(SELECT * FROM " + published_source + ") openivm_selected";
+		}
+		published_query += " AS " + string(openivm::PUBLISHED_ORDINAL_COL) + " FROM " + published_source;
+		if (rank_selected_rows) {
+			// Also marks ordered publication as global for affected-key scoping.
+			published_query += " ORDER BY " + string(openivm::PUBLISHED_ORDINAL_COL);
+		}
+		auto published = internal_catalog_prefix + SqlUtils::QuoteIdentifier(PublishedViewName(view_name));
+		auto published_delta =
+		    internal_catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(PublishedViewName(view_name)));
+		vector<string> visible_columns;
+		for (auto &name : output_names) {
+			if (!IncrementalTableNames::IsInternalColumn(name)) {
+				visible_columns.push_back(name);
+			}
+		}
+		visible_columns.push_back(openivm::PUBLISHED_ORDINAL_COL);
+		if (parse_data_ref.is_replace && !has_downstream_views && !target_is_ducklake) {
+			ddl.push_back("DROP TABLE IF EXISTS " + published);
+			ddl.push_back("DROP TABLE IF EXISTS " + published_delta);
+		}
+		ddl.push_back(string(staged_cross_catalog_replace && !has_downstream_views ? "CREATE OR REPLACE TABLE "
+		                                                                           : "CREATE TABLE IF NOT EXISTS ") +
+		              published + " AS " + published_query);
+		if (target_is_ducklake) {
+			// Derive the empty companion schema directly, as for the maintenance
+			// delta table, without running another DuckLake CTAS pipeline.
+			ddl.push_back(BuildCreateDeltaFromDataOperation(published_delta, published,
+			                                                staged_cross_catalog_replace && !has_downstream_views));
+		} else {
+			ddl.push_back("CREATE TABLE IF NOT EXISTS " + published_delta +
+			              " AS SELECT *, 1::INTEGER AS openivm_multiplicity, " + string(openivm::UTC_NOW_SQL) +
+			              " AS openivm_timestamp FROM " + published + " LIMIT 0");
+		}
+		if (parse_data_ref.is_replace) {
+			ddl.push_back(BuildPublishViewSQL(
+			    view_name, internal_catalog_prefix, published_query, visible_columns, target_is_ducklake,
+			    SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE), {}, creation_timestamp,
+			    SqlDialect::DUCKDB, "", "", RefreshMetadata::MetadataCatalogs(con)));
+		}
+		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("published_query", published_query, view_name));
+		ddl.push_back(string(staged_cross_catalog_replace ? "CREATE OR REPLACE VIEW " : "CREATE VIEW ") + qvn +
+		              " AS SELECT * EXCLUDE (" + string(openivm::PUBLISHED_ORDINAL_COL) + ") FROM " + published +
+		              (top_k_order_suffix.empty() ? "" : " ORDER BY " + string(openivm::PUBLISHED_ORDINAL_COL)));
+		add_cleanup("DROP TABLE IF EXISTS " + published);
+		add_cleanup("DROP TABLE IF EXISTS " + published_delta);
+	}
+	// Delta table for the MV — based on the DATA table (has all columns)
+	add_profile_marker("create_mv_mv_delta_table");
+	string qdv = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
+	ddl.push_back(BuildCreateDeltaFromDataOperation(qdv, qdt, staged_cross_catalog_replace));
+	if (preserve_consumer_deltas) {
+		ddl.push_back("INSERT INTO " + qdv + " BY NAME SELECT " + StringUtil::Join(replacement_delta_projection, ", ") +
+		              " FROM " + preserved_delta);
+		ddl.push_back("DROP TABLE " + preserved_delta);
+		ddl.push_back("INSERT INTO " + qdv + " BY NAME SELECT *, 1::INTEGER AS openivm_multiplicity, " +
+		              creation_timestamp + " AS openivm_timestamp FROM " + qdt);
 	}
 
-	add_profile_marker("create_mv_source_delta_tables", "source_count=" + to_string(table_names.size()));
-	for (const auto &table_name : table_names) {
-		// DuckLake tables don't need delta tables — change tracking is native.
-		// `ducklake_tables` stores the catalog-normalized (lowercase) name, so
-		// compare against a normalized copy of the SQL-parsed name.
-		string table_lc = StringUtil::Lower(table_name);
-		if (ducklake_tables.count(table_name) || ducklake_tables.count(table_lc)) {
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Skipping delta table for DuckLake table '%s'\n", table_name.c_str());
+	add_cleanup("DROP TABLE IF EXISTS " + qdv);
+
+	if (batch_ducklake_creation) {
+		add_profile_marker("create_mv_physical_commit");
+		ddl.push_back("COMMIT");
+	}
+
+	vector<string> native_watermark_ddl;
+	add_profile_marker("create_mv_source_delta_tables", "source_count=" + to_string(source_table_info.size()));
+	for (const auto &source_entry : source_table_info) {
+		const auto &source = source_entry.second;
+		const auto &table_name = source.table_name;
+		if (dl_table_info.count(source_entry.first)) {
 			continue;
 		}
-
-		Value catalog_value;
-		Value schema_value;
-		auto source_it = source_table_info.find(table_name);
-		if (source_it != source_table_info.end()) {
-			catalog_value = Value(source_it->second.catalog_name);
-			schema_value = Value(source_it->second.schema_name);
-		}
-
-		if (catalog_value.IsNull() && !context.db->config.options.database_path.empty()) {
-			// Look up the catalog name for this table via Catalog API
-			con.BeginTransaction();
-			auto entry = Catalog::GetEntry<TableCatalogEntry>(*con.context, INVALID_CATALOG, DEFAULT_SCHEMA, table_name,
-			                                                  OnEntryNotFound::RETURN_NULL);
-			if (entry) {
-				catalog_value = Value(entry->ParentCatalog().GetName());
-				schema_value = Value(entry->schema.name);
-			}
-			con.Rollback();
-		}
-		if (catalog_value.IsNull()) {
-			catalog_value = Value(current_catalog.empty() ? "memory" : current_catalog);
-		}
-
-		if (schema_value.IsNull()) {
-			schema_value = Value(current_schema.empty() ? "main" : current_schema);
-		}
+		Value catalog_value(source.catalog_name);
+		Value schema_value(source.schema_name);
 
 		auto catalog_schema = SqlUtils::QualifiedPrefix(catalog_value.ToString(), schema_value.ToString());
 
@@ -1514,30 +1542,38 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		              " as select *, 1::INTEGER as " + string(openivm::MULTIPLICITY_COL) + ", " +
 		              string(openivm::UTC_NOW_SQL) + " as " + string(openivm::TIMESTAMP_COL) + " from " +
 		              catalog_schema + KeywordHelper::WriteOptionallyQuoted(table_name) + " limit 0");
+		// The initial load already includes every visible source delta, including
+		// writes earlier in this transaction and changes retained for other MVs.
+		auto source_delta = catalog_schema + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(table_name));
+		InitializeSourceDelta(context, con, source_delta, ddl.back());
+		if (context.transaction.IsAutoCommit()) {
+			// Shared initialization has committed this DDL already. Reissuing even
+			// CREATE IF NOT EXISTS would enlist an attached native source as a writer.
+			ddl.pop_back();
+		}
+		native_watermark_ddl.push_back(
+		    "UPDATE " + SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE) +
+		    " SET last_update = COALESCE((SELECT MAX(openivm_timestamp) + INTERVAL '1 microsecond' FROM " +
+		    source_delta + "), " + creation_timestamp + "), last_refresh_ts = " + creation_timestamp +
+		    " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
+		    SqlUtils::EscapeValue(source_metadata_key(source, SqlUtils::DeltaName(table_name))) + "'");
 	}
 
-	// Delta table for the MV — based on the DATA table (has all columns)
-	add_profile_marker("create_mv_mv_delta_table");
-	string qdv = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
-	ddl.push_back(BuildCreateDeltaFromDataOperation(qdv, qdt, staged_cross_catalog_replace));
-	add_cleanup("DROP TABLE IF EXISTS " + qdv);
-
 	// --- Index DDL (for aggregate group queries) ---
-	// DuckLake source scans and DuckLake-backed MV state do not support this optional
-	// native index.
+	// The index belongs to the MV state, not its sources. DuckLake-backed state cannot have it.
 	if ((refresh_type == RefreshType::AGGREGATE_GROUP || refresh_type == RefreshType::AGGREGATE_HAVING) &&
-	    !aggregate_columns.empty() && ducklake_tables.empty() && view_catalog_prefix.empty()) {
+	    !aggregate_columns.empty() && !target_is_ducklake && view_catalog_prefix.empty()) {
 		add_profile_marker("create_view_index", "columns=" + to_string(aggregate_columns.size()));
 		string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + openivm::INDEX_SUFFIX);
 		ddl.push_back("create unique index " + index_name + " on " + qdt + "(" +
 		              SqlUtils::JoinQuotedColumns(aggregate_columns) + ")");
 	}
 
-	// Restore physical-default catalog so subsequent unqualified references to
+	// Restore the metadata catalog so subsequent unqualified references to
 	// system tables (openivm_delta_tables, etc.) resolve correctly. The USE
 	// inserted before `create table qdt as view_query` routed unqualified base
 	// tables through the user's catalog; flip back for the metadata UPDATE below.
-	if (!current_catalog.empty() && current_catalog != default_db) {
+	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 		add_profile_marker("create_mv_restore_catalog");
 		ddl.push_back("use " + default_catalog_schema);
 	}
@@ -1545,6 +1581,11 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	// Record source-table metadata only after physical MV objects exist. If a later
 	// DuckLake publish fails, the DDL executor removes these rows before the retry.
 	add_profile_marker("create_mv_source_metadata", "rows=" + to_string(source_metadata_ddl.size()));
+	if (batch_ducklake_creation) {
+		// Physical objects are committed; register their native metadata atomically
+		// without paying a separate durable commit for every row and watermark.
+		ddl.push_back("BEGIN TRANSACTION");
+	}
 	if (staged_cross_catalog_replace) {
 		ddl.push_back("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 		              SqlUtils::EscapeSingleQuotes(view_name) + "'");
@@ -1552,6 +1593,8 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 		              SqlUtils::EscapeSingleQuotes(view_name) + "'");
 	}
 	ddl.insert(ddl.end(), source_metadata_ddl.begin(), source_metadata_ddl.end());
+	ddl.insert(ddl.end(), native_watermark_ddl.begin(), native_watermark_ddl.end());
+
 	add_cleanup("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	            SqlUtils::EscapeSingleQuotes(view_name) + "'");
 
@@ -1584,12 +1627,16 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 
 	// Publish the MV metadata last. CREATE MV touches both the physical DuckDB catalog
 	// and DuckLake's external metadata catalog, so OpenIVM cannot rely on a single
-	// cross-catalog transaction. The executor registers cleanup DDL up front and this
-	// late publish keeps incomplete attempts out of openivm_views.
+	// cross-catalog transaction. Cleanup is armed after the duplicate-name guard;
+	// late publication keeps incomplete attempts out of openivm_views.
 	add_profile_marker("create_mv_publish_metadata",
 	                   "rows=" + to_string(metadata_ddl.size() + aux_metadata_ddl.size()));
 	ddl.insert(ddl.end(), metadata_ddl.begin(), metadata_ddl.end());
 	ddl.insert(ddl.end(), aux_metadata_ddl.begin(), aux_metadata_ddl.end());
+	if (batch_ducklake_creation) {
+		add_profile_marker("create_mv_metadata_commit");
+		ddl.push_back("COMMIT");
+	}
 	add_cleanup("DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE child_view = '" +
 	            SqlUtils::EscapeSingleQuotes(view_name) + "'");
 	add_cleanup("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
@@ -1601,17 +1648,16 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	Value files_path_val;
 	if (context.TryGetCurrentSetting("openivm_files_path", files_path_val) && !files_path_val.IsNull()) {
 		string base_path = files_path_val.ToString();
-		// System tables DDL (first 3 statements: openivm_views, openivm_refresh_hooks,
-		// openivm_delta_tables)
+		// Export system setup separately from the view-specific program.
 		string system_tables_sql;
 		// Compiled queries (everything after the system tables)
 		string compiled_sql;
-		idx_t visible_ddl_idx = 0;
 		for (size_t i = 0; i < ddl.size(); i++) {
-			if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_PREFIX)) {
+			if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_PREFIX) ||
+			    StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
 				continue;
 			}
-			if (visible_ddl_idx < 3) {
+			if (i < system_ddl_end) {
 				system_tables_sql += ddl[i] + ";\n\n";
 			} else if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
 				compiled_sql += "-- OpenIVM derives the MV delta-table schema from the "
@@ -1620,17 +1666,25 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 			} else {
 				compiled_sql += ddl[i] + ";\n\n";
 			}
-			visible_ddl_idx++;
 		}
 		SqlUtils::WriteFile(base_path + "/openivm_system_tables.sql", false, system_tables_sql);
 		SqlUtils::WriteFile(base_path + "/openivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
 	}
 
+	// Only arm cleanup after system setup and the duplicate-name guard have succeeded.
+	ddl.insert(ddl.begin() + static_cast<vector<string>::difference_type>(system_ddl_end), cleanup_ddl.begin(),
+	           cleanup_ddl.end());
+
+	if (!target_is_ducklake &&
+	    (default_db != DatabaseManager::GetDefaultDatabase(context) || default_schema != current_schema)) {
+		auto original_search_path =
+		    CatalogSearchEntry::ListToString(ClientData::Get(context).catalog_search_path->GetSetPaths());
+		ddl.insert(ddl.begin(), "USE " + default_catalog_schema);
+		ddl.push_back("SET search_path = '" + SqlUtils::EscapeValue(original_search_path) + "'");
+	}
+
 	// Pass DDL via result.parameters — the bind function receives them as input.inputs.
 	// This replaces the fragile thread-local pending-DDL mechanism.
-	for (auto &q : cleanup_ddl) {
-		result.parameters.push_back(Value(q));
-	}
 	for (auto &q : ddl) {
 		result.parameters.push_back(Value(q));
 	}
@@ -1643,25 +1697,30 @@ MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientC
 	return result;
 }
 
+ParserExtensionPlanResult
+MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientContext &context,
+                                              unique_ptr<ParserExtensionParseData> parse_data) {
+	string view_key;
+	return PlanMaterializedView(context, std::move(parse_data), view_key);
+}
+
 string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionParameters &parameters) {
 	auto query = StringValue::Get(parameters.values[0]);
-	auto parse_result = MaterializedViewParserExtension::ParseFunction(nullptr, query);
+	auto parse_result = ParseMaterializedViewStatement(query, OpenIvmInputDialect(context));
 	if (parse_result.type != ParserExtensionResultType::PARSE_SUCCESSFUL) {
 		throw ParserException("OpenIVM could not parse the materialized-view lifecycle statement");
 	}
-	auto view_name = dynamic_cast<MaterializedViewParseData &>(*parse_result.parse_data).target_name;
-	auto target = ResolveMaterializedViewTarget(context, view_name);
-	auto lock_view_name = target.view_name;
-	auto plan_result =
-	    MaterializedViewParserExtension::PlanFunction(nullptr, context, std::move(parse_result.parse_data));
+	string view_key;
+	string metadata_catalog;
+	auto plan_result = PlanMaterializedView(context, std::move(parse_result.parse_data), view_key, &metadata_catalog);
 	if (plan_result.function.name == OPENIVM_TRANSACTIONAL_DDL_FUNCTION) {
-		if (!lock_view_name.empty()) {
+		if (!view_key.empty()) {
 			TransactionalMVLockState::Get(context).AcquireMutationLock();
 		}
 		if (!context.transaction.IsAutoCommit()) {
-			TransactionalMVMetadataState::Get(context).Register(context, plan_result.parameters, lock_view_name);
+			TransactionalMVMetadataState::Get(context).Register(context, plan_result.parameters, view_key);
 		}
-		return RenderTransactionalDDL(context, plan_result.parameters);
+		return RenderTransactionalDDL(context, plan_result.parameters, metadata_catalog);
 	}
 	ExecuteStagedDDL(context, plan_result.parameters);
 	return "SELECT true AS \"MATERIALIZED VIEW CREATION\"";
@@ -1674,11 +1733,12 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	QueryErrorContext error_context;
 	auto data_name = IncrementalTableNames::DataTableName(view_name);
 	string data_ref;
-	auto view_entry = Catalog::GetEntry(context, location.catalog_name, location.schema_name,
-	                                    EntryLookupInfo(CatalogType::VIEW_ENTRY, view_name, error_context),
-	                                    OnEntryNotFound::RETURN_NULL);
+	auto view_entry =
+	    Catalog::GetEntry(context, location.catalog_name, location.schema_name,
+	                      EntryLookupInfo(CatalogType::VIEW_ENTRY, metadata.GetViewSQLName(view_name), error_context),
+	                      OnEntryNotFound::RETURN_NULL);
 	if (view_entry) {
-		data_ref = SqlUtils::FindTableReference(view_entry->Cast<ViewCatalogEntry>().sql, data_name);
+		data_ref = SqlUtils::FindTableReference(view_entry->Cast<ViewCatalogEntry>().GetQuery().ToString(), data_name);
 	}
 	string internal_prefix = SqlUtils::QualifiedPrefix(location.catalog_name, location.schema_name);
 	if (!data_ref.empty()) {
@@ -1692,13 +1752,19 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	view_drop.type = CatalogType::VIEW_ENTRY;
 	view_drop.catalog = location.catalog_name;
 	view_drop.schema = location.schema_name;
-	view_drop.name = view_name;
-	view_drop.cascade = cascade;
+	view_drop.name = metadata.GetViewSQLName(view_name);
+	// Tracked descendants are already dropped in reverse dependency order. DuckLake
+	// rejects CASCADE syntax even when no dependencies remain.
+	view_drop.cascade = cascade && !metadata.IsDuckLakeCatalog(location.catalog_name);
 	view_drop.if_not_found = if_not_found;
 	program += BuildDropViewStatement(view_drop) + ";\n";
 	program += "DROP TABLE IF EXISTS " + data_ref + ";\n";
 	program += "DROP TABLE IF EXISTS " + internal_prefix +
 	           KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name)) + ";\n";
+	program +=
+	    "DROP TABLE IF EXISTS " + internal_prefix + SqlUtils::QuoteIdentifier(PublishedViewName(view_name)) + ";\n";
+	program += "DROP TABLE IF EXISTS " + internal_prefix +
+	           SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(PublishedViewName(view_name))) + ";\n";
 	program += "DELETE FROM openivm_refresh_hooks WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
 	program += "DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE parent_view = '" +
 	           SqlUtils::EscapeValue(view_name) + "' OR child_view = '" + SqlUtils::EscapeValue(view_name) + "';\n";
@@ -1710,30 +1776,47 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	sources.insert(sources.end(), view_sources.begin(), view_sources.end());
 }
 
+static string QualifyDropMetadata(const string &program, const string &catalog) {
+	auto qualified = program;
+	for (auto table :
+	     {"openivm_refresh_hooks", openivm::MV_DEPS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::VIEWS_TABLE}) {
+		qualified =
+		    SqlUtils::ReplaceTableReferences(qualified, table, SqlUtils::FullName(catalog, DEFAULT_SCHEMA, table));
+	}
+	return qualified;
+}
+
 static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshMetadata::DeltaSource> &sources,
                                           const string &excluded_views, string &program) {
 	unordered_set<string> checked_sources;
+	auto metadata_catalogs = RefreshMetadata::MetadataCatalogs(con);
 	for (auto &source : sources) {
-		if (source.catalog_type == "ducklake") {
+		if (source.catalog_type == "ducklake" || RefreshMetadata(con).IsMaterializedViewDelta(source)) {
 			continue;
 		}
 		auto identity = source.catalog_name + "\n" + source.schema_name + "\n" + source.table_name;
 		if (!checked_sources.insert(identity).second) {
 			continue;
 		}
-		auto remaining = con.Query(
-		    "SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
-		    SqlUtils::EscapeValue(source.table_name) + "' AND COALESCE(source_catalog, '" +
-		    SqlUtils::EscapeValue(source.catalog_name) + "') = '" + SqlUtils::EscapeValue(source.catalog_name) +
-		    "' AND COALESCE(source_schema, '" + SqlUtils::EscapeValue(source.schema_name) + "') = '" +
-		    SqlUtils::EscapeValue(source.schema_name) + "' AND view_name NOT IN (" + excluded_views + ")");
-		if (remaining->HasError()) {
-			throw CatalogException("OpenIVM could not verify delta-table consumers for '%s': %s", source.table_name,
-			                       remaining->GetError());
+		bool has_consumers = false;
+		for (auto &catalog : metadata_catalogs) {
+			auto remaining =
+			    con.Query("SELECT count(*) FROM " +
+			              SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE) + " WHERE " +
+			              RefreshMetadata::SourcePredicate(source.table_name, source.catalog_name, source.schema_name) +
+			              " AND view_name NOT IN (" + excluded_views + ")");
+			if (remaining->HasError()) {
+				throw CatalogException("OpenIVM could not verify delta-table consumers for '%s': %s", source.table_name,
+				                       remaining->GetError());
+			}
+			has_consumers |= remaining->GetValue(0, 0).GetValue<int64_t>() != 0;
 		}
-		if (remaining->RowCount() > 0 && remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
+		if (!has_consumers) {
 			program += "DROP TABLE IF EXISTS " +
-			           SqlUtils::FullName(source.catalog_name, source.schema_name, source.table_name) + ";\n";
+			           SqlUtils::FullName(source.catalog_name, source.schema_name,
+			                              RefreshMetadata::SourceTableName(source.table_name, source.catalog_name,
+			                                                               source.schema_name)) +
+			           ";\n";
 		}
 	}
 }
@@ -1756,7 +1839,7 @@ static string ExecuteAutocommitDropProgram(Connection &con, const string &progra
 	return "SELECT true AS Success";
 }
 
-static string BuildCascadeDropTableProgram(ClientContext &context, DropInfo &drop_info) {
+static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop_info) {
 	unique_ptr<MutationLockGuard> autocommit_guard;
 	if (context.transaction.IsAutoCommit()) {
 		autocommit_guard = make_uniq<MutationLockGuard>(context);
@@ -1769,6 +1852,7 @@ static string BuildCascadeDropTableProgram(ClientContext &context, DropInfo &dro
 	                                     EntryLookupInfo(CatalogType::TABLE_ENTRY, drop_info.name, error_context),
 	                                     OnEntryNotFound::RETURN_NULL);
 	if (table_entry) {
+		drop_info.name = table_entry->name;
 		drop_info.catalog = table_entry->ParentCatalog().GetName();
 		drop_info.schema = table_entry->ParentSchema().name;
 	}
@@ -1781,68 +1865,92 @@ static string BuildCascadeDropTableProgram(ClientContext &context, DropInfo &dro
 		drop_info.schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
 	}
 
+	// Lifecycle/refresh programs own their internal state cleanup. They are not
+	// source-table deletions and must not produce a second set of retractions.
+	if (!table_entry || SqlUtils::IsDelta(drop_info.name) || IncrementalTableNames::IsDataTable(drop_info.name)) {
+		return BuildDropTableStatement(drop_info) + ";\n";
+	}
+
 	Connection con(*context.db);
+	RefreshMetadata::UseCatalog(context, con, drop_info.catalog);
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(con);
 	}
-	auto dependent_rows =
-	    con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE table_name = '" +
-	              SqlUtils::EscapeValue(SqlUtils::DeltaName(drop_info.name)) + "' AND COALESCE(source_catalog, '" +
-	              SqlUtils::EscapeValue(drop_info.catalog) + "') = '" + SqlUtils::EscapeValue(drop_info.catalog) +
-	              "' AND COALESCE(source_schema, '" + SqlUtils::EscapeValue(drop_info.schema) + "') = '" +
-	              SqlUtils::EscapeValue(drop_info.schema) + "' ORDER BY view_name");
-	if (dependent_rows->HasError()) {
-		throw CatalogException("OpenIVM could not resolve materialized views depending on '%s': %s", drop_info.name,
-		                       dependent_rows->GetError());
-	}
-	if (dependent_rows->RowCount() == 0) {
-		auto program = BuildDropTableStatement(drop_info) + ";\n";
-		return context.transaction.IsAutoCommit() ? ExecuteAutocommitDropProgram(con, program) : program;
-	}
-
-	RefreshMetadata metadata(con);
+	auto catalogs = RefreshMetadata::MetadataCatalogs(con);
 	vector<string> dependent_views;
-	unordered_set<string> seen;
-	for (idx_t row = 0; row < dependent_rows->RowCount(); row++) {
-		auto direct_view = dependent_rows->GetValue(0, row).ToString();
-		auto downstream = metadata.GetDownstreamViewsStrict(direct_view);
-		for (auto it = downstream.rbegin(); it != downstream.rend(); ++it) {
-			if (seen.insert(*it).second) {
-				dependent_views.push_back(*it);
+	vector<RefreshMetadata::DeltaSource> sources;
+	string program;
+	string excluded_views;
+	bool staged_drop = false;
+	for (auto &catalog : catalogs) {
+		RefreshMetadata::UseCatalog(context, con, catalog);
+		auto dependent_rows = con.Query(
+		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
+		    RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(drop_info.name), drop_info.catalog, drop_info.schema) +
+		    " ORDER BY view_name");
+		if (dependent_rows->HasError()) {
+			throw CatalogException("OpenIVM could not resolve materialized views depending on '%s': %s", drop_info.name,
+			                       dependent_rows->GetError());
+		}
+		if (!dependent_rows->RowCount()) {
+			continue;
+		}
+		if (!drop_info.cascade) {
+			// Retained MVs must observe removal before a same-named replacement.
+			auto source = SqlUtils::FullName(drop_info.catalog, drop_info.schema, drop_info.name);
+			auto retract = "DELETE FROM " + source + ";\n" + BuildDropTableStatement(drop_info) + ";\n";
+			TransactionalMVLockState::Get(*con.context)
+			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+			return context.transaction.IsAutoCommit() ? ExecuteAutocommitDropProgram(con, retract) : retract;
+		}
+		RefreshMetadata metadata(con);
+		vector<string> local_views;
+		unordered_set<string> seen;
+		for (idx_t row = 0; row < dependent_rows->RowCount(); row++) {
+			auto direct_view = dependent_rows->GetValue(0, row).ToString();
+			auto downstream = metadata.GetDownstreamViewsStrict(direct_view);
+			for (auto it = downstream.rbegin(); it != downstream.rend(); ++it) {
+				if (seen.insert(*it).second) {
+					local_views.push_back(*it);
+				}
+			}
+			if (seen.insert(direct_view).second) {
+				local_views.push_back(std::move(direct_view));
 			}
 		}
-		if (seen.insert(direct_view).second) {
-			dependent_views.push_back(std::move(direct_view));
+		string local_program;
+		for (auto &view_name : local_views) {
+			auto location = metadata.GetStoredViewLocation(view_name);
+			AppendTrackedViewDropProgram(context, metadata, view_name, location, local_program, sources, true,
+			                             OnEntryNotFound::RETURN_NULL);
+			if (!excluded_views.empty()) {
+				excluded_views += ", ";
+			}
+			excluded_views += "'" + SqlUtils::EscapeValue(view_name) + "'";
 		}
+		program += QualifyDropMetadata(local_program, catalog);
+		dependent_views.insert(dependent_views.end(), local_views.begin(), local_views.end());
+		staged_drop |= !StringUtil::CIEquals(catalog, drop_info.catalog);
 	}
-
-	string excluded_views;
-	for (auto &view_name : dependent_views) {
-		if (!excluded_views.empty()) {
-			excluded_views += ", ";
-		}
-		excluded_views += "'" + SqlUtils::EscapeValue(view_name) + "'";
+	if (dependent_views.empty()) {
+		return BuildDropTableStatement(drop_info) + ";\n";
 	}
-
-	string program;
-	vector<RefreshMetadata::DeltaSource> sources;
-	for (auto &view_name : dependent_views) {
-		auto location = metadata.GetStoredViewLocation(view_name);
-		AppendTrackedViewDropProgram(context, metadata, view_name, location, program, sources, true,
-		                             OnEntryNotFound::RETURN_NULL);
-	}
-
 	AppendUnusedSourceDropProgram(con, sources, excluded_views, program);
+	for (auto &source : sources) {
+		staged_drop |= !StringUtil::CIEquals(source.catalog_name, drop_info.catalog);
+	}
 	program += BuildDropTableStatement(drop_info) + ";\n";
-
 	if (context.transaction.IsAutoCommit()) {
-		return ExecuteAutocommitDropProgram(con, program);
-	} else {
-		auto &state = TransactionalMVMetadataState::Get(context);
-		state.RegisterSQL(program, dependent_views.front());
-		for (idx_t index = 1; index < dependent_views.size(); index++) {
-			state.IncludeView(dependent_views[index]);
+		if (staged_drop) {
+			ExecuteStagedDDL(context, {Value(program)});
+			return "SELECT true AS Success";
 		}
+		return ExecuteAutocommitDropProgram(con, program);
+	}
+	auto &state = TransactionalMVMetadataState::Get(context);
+	state.RegisterSQL(program, dependent_views.front());
+	for (idx_t index = 1; index < dependent_views.size(); index++) {
+		state.IncludeView(dependent_views[index]);
 	}
 	return program;
 }
@@ -1857,8 +1965,9 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		throw InternalException("OpenIVM DROP rewrite expected one DROP statement");
 	}
 	auto &drop = parser.statements[0]->Cast<DropStatement>();
-	if (drop.info->type == CatalogType::TABLE_ENTRY && drop.info->cascade) {
-		return BuildCascadeDropTableProgram(context, *drop.info);
+	Binder::BindSchemaOrCatalog(context, drop.info->catalog, drop.info->schema);
+	if (drop.info->type == CatalogType::TABLE_ENTRY) {
+		return BuildSourceDropTableProgram(context, *drop.info);
 	}
 	if (drop.info->type != CatalogType::VIEW_ENTRY) {
 		throw InternalException("OpenIVM DROP rewrite expected DROP VIEW");
@@ -1894,23 +2003,33 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	drop.info->catalog = catalog_name;
 	drop.info->schema = schema_name;
 
-	string program = BuildDropViewStatement(*drop.info) + ";\n";
-	string data_table_name = IncrementalTableNames::DataTableName(drop.info->name);
-	string data_table_ref;
-	if (view_entry) {
-		auto &view = view_entry->Cast<ViewCatalogEntry>();
-		data_table_ref = SqlUtils::FindTableReference(view.sql, data_table_name);
-	}
 	Connection con(*context.db);
+	RefreshMetadata::UseCatalog(context, con, catalog_name);
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(con);
 	}
+	auto view_key = RefreshMetadata(con).FindViewKey(catalog_name, schema_name, drop.info->name);
+	if (view_key.empty()) {
+		return BuildDropViewStatement(*drop.info) + ";\n";
+	}
+	string program = BuildDropViewStatement(*drop.info) + ";\n";
+	string data_table_name = IncrementalTableNames::DataTableName(view_key);
+	string data_table_ref;
+	if (view_entry) {
+		auto &view = view_entry->Cast<ViewCatalogEntry>();
+		// External catalogs need not retain the original SQL string.
+		data_table_ref = SqlUtils::FindTableReference(view.GetQuery().ToString(), data_table_name);
+		if (data_table_ref.empty() &&
+		    !SqlUtils::FindTableReference(view.GetQuery().ToString(), PublishedViewName(view_key)).empty()) {
+			data_table_ref = SqlUtils::FullName(catalog_name, schema_name, data_table_name);
+		}
+	}
 	auto tracked = con.Query("SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) +
-	                         " WHERE view_name = '" + SqlUtils::EscapeValue(drop.info->name) + "'");
+	                         " WHERE view_name = '" + SqlUtils::EscapeValue(view_key) + "'");
 	bool legacy_identity = tracked->HasError();
 	if (legacy_identity) {
 		tracked = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-		                    SqlUtils::EscapeValue(drop.info->name) + "'");
+		                    SqlUtils::EscapeValue(view_key) + "'");
 	}
 	if (data_table_ref.empty() || tracked->HasError() || tracked->RowCount() == 0) {
 		return program;
@@ -1935,14 +2054,47 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	RefreshMetadata metadata(con);
 	program.clear();
 	vector<RefreshMetadata::DeltaSource> delta_sources;
-	RefreshMetadata::StoredViewLocation location {catalog_name, schema_name};
-	AppendTrackedViewDropProgram(context, metadata, drop.info->name, location, program, delta_sources,
-	                             drop.info->cascade, drop.info->if_not_found);
-	auto excluded_view = "'" + SqlUtils::EscapeValue(drop.info->name) + "'";
-	AppendUnusedSourceDropProgram(con, delta_sources, excluded_view, program);
+	vector<string> drop_views;
+	if (drop.info->cascade) {
+		drop_views = metadata.GetDownstreamViewsStrict(view_key);
+		std::reverse(drop_views.begin(), drop_views.end());
+	}
+	drop_views.push_back(view_key);
+	string excluded_views;
+	bool staged_drop = false;
+	for (auto &view_name : drop_views) {
+		auto location = metadata.GetStoredViewLocation(view_name, catalog_name, schema_name);
+		staged_drop |= metadata.IsDuckLakeCatalog(location.catalog_name);
+		AppendTrackedViewDropProgram(context, metadata, view_name, location, program, delta_sources, drop.info->cascade,
+		                             view_name == view_key ? drop.info->if_not_found : OnEntryNotFound::RETURN_NULL);
+		if (!excluded_views.empty()) {
+			excluded_views += ", ";
+		}
+		excluded_views += "'" + SqlUtils::EscapeValue(view_name) + "'";
+	}
+	AppendUnusedSourceDropProgram(con, delta_sources, excluded_views, program);
+	for (auto &source : delta_sources) {
+		staged_drop |= !StringUtil::CIEquals(source.catalog_name, catalog_name);
+	}
+	if (staged_drop) {
+		// Keep metadata ownership explicit when the staged executor uses a fresh connection.
+		auto owner = con.Query("SELECT current_database()");
+		if (owner->HasError()) {
+			throw CatalogException("OpenIVM could not resolve DROP metadata catalog: %s", owner->GetError());
+		}
+		program = QualifyDropMetadata(program, owner->GetValue(0, 0).ToString());
+		OPENIVM_DEBUG_PRINT("[DROP] Staging DuckLake view and native metadata cleanup for '%s'\n",
+		                    drop.info->name.c_str());
+		ExecuteStagedDDL(context, {Value(program)});
+		return "SELECT true AS Success";
+	}
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
 	if (!context.transaction.IsAutoCommit()) {
-		TransactionalMVMetadataState::Get(context).RegisterSQL(program, drop.info->name);
+		auto &state = TransactionalMVMetadataState::Get(context);
+		state.RegisterSQL(program, drop.info->name);
+		for (auto &view_name : drop_views) {
+			state.IncludeView(view_name);
+		}
 	}
 	return program;
 }

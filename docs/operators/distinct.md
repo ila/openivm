@@ -33,7 +33,7 @@ SELECT DISTINCT cols FROM T
 → SELECT cols, COUNT(*) AS openivm_distinct_count FROM T GROUP BY cols
 ```
 
-The parser rewrites `SELECT DISTINCT` into a `GROUP BY` with a hidden `COUNT(*)` column before planning. The hidden `openivm_distinct_count` column tracks how many source rows map to each distinct output row. You never see it in query results.
+OpenIVM's plan rewrite (`RewriteDistinct` in `src/core/plan_rewrite.cpp`) replaces the logical `DISTINCT` operator with a `GROUP BY` aggregate carrying a hidden `COUNT(*)` column. The hidden `openivm_distinct_count` column tracks how many source rows map to each distinct output row. You never see it in query results.
 
 The view is classified as `AGGREGATE_GROUP` and maintained incrementally using the same MERGE upsert as any other grouped aggregate:
 
@@ -99,4 +99,12 @@ CREATE MATERIALIZED VIEW distinct_pairs AS
 ## Limitations
 
 - `DISTINCT` adds a hidden column to the MV table. This is invisible to `SELECT *` but present in the physical storage.
-- `SELECT DISTINCT` combined with aggregates (e.g., `SELECT DISTINCT region, SUM(amount)`) is not rewritten — the `GROUP BY` from the aggregate already handles deduplication.
+- A redundant `DISTINCT` is dropped: one whose output is exactly the GROUP BY keys of an aggregate (e.g., `SELECT DISTINCT region FROM sales GROUP BY region`), or one over a scalar aggregate. Any other top-level `DISTINCT` over aggregate results (e.g., `SELECT DISTINCT region, SUM(amount) ... GROUP BY region`) is treated as a second non-linear level and falls back to full refresh.
+
+## DISTINCT inside a larger query
+
+A `DISTINCT` below another operator is not maintained with the MERGE above:
+
+- **Inner DISTINCT under an aggregate** (e.g., `SELECT g, COUNT(*) FROM (SELECT DISTINCT g, x FROM t) GROUP BY g`) uses affected-group recompute (`GROUP_RECOMPUTE`). With `SET openivm_distinct_aux_state = true` (default `false`), single-source views instead keep a per-tuple count aux table and propagate ±1 only when a tuple's count crosses zero (`DISTINCT_INCREMENTAL`); multi-source views still use group recompute.
+- **Inner DISTINCT below an outer projection** (no aggregate) uses affected-group recompute over the visible output columns.
+- For `UNION` without `ALL`, see [union](union-all.md#union-distinct).

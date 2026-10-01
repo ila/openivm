@@ -3,6 +3,10 @@
 `openivm_skip_empty_deltas` should gate all optimizations that prove a source delta
 cannot affect a refresh, or that a smaller equivalent delta can be used.
 
+Each rule lists its implementation status. See also
+[Empty delta skip](optimizations/empty-delta-skip.md) and
+[FK-aware pruning](optimizations/fk-aware-pruning.md).
+
 ## 1. DuckLake Table No-Op Skip
 
 Problem: DuckLake snapshot ids are catalog-wide. A source table can have
@@ -16,6 +20,11 @@ skip the term for `T`.
 Correctness: the delta relation for `T` is the zero Z-set, so every join term that
 uses `delta(T)` is zero.
 
+Status: implemented. OpenIVM first checks the `ducklake_snapshots()` change manifest for
+`T`'s table id and falls back to counting `ducklake_table_insertions`/`ducklake_table_deletions`.
+Unchanged tables skip their N-term join term, and when no source changed the refresh is skipped
+and the stored snapshot ids are advanced.
+
 ## 2. Key-Domain Join Skip
 
 Problem: a non-empty source delta may still have no matching join keys in the
@@ -28,6 +37,12 @@ under the relevant snapshot.
 Correctness: the join term is empty if the delta key domain is disjoint from the
 opposite input key domain.
 
+Status: implemented for native inclusion-exclusion inner joins without LEFT JOINs. Each
+equi-join key of a term's delta leaf is probed with an `EXISTS` query against the other
+side's base table, or its delta when both sides are delta leaves in the term. Probing runs only
+when exactly one input changed or every changed delta is tiny (at most max(8 rows, 5% of the
+source table)).
+
 ## 3. Predicate-Disjoint Delta Skip
 
 Problem: delta rows may fail filters or range predicates before they reach the
@@ -38,6 +53,10 @@ filtered delta is empty, skip that delta term.
 
 Correctness: selection is linear over Z-sets: `sigma_p(delta(R)) = 0` means every
 term using that filtered delta is zero.
+
+Status: partial. Scan filters pushed into a source are copied onto its delta scan and applied
+inside the key-domain probes of rule 2. There is no separate filtered-emptiness probe; the
+empty-term check counts unfiltered delta rows.
 
 ## 4. Unused-Right LEFT JOIN Rewrite
 
@@ -55,6 +74,8 @@ Correctness: this is valid only when the right side affects output exclusively
 through bag multiplicity and join existence, not through projected values or
 predicates above the join.
 
+Status: not implemented. The workload-specific `fact_market_history` shortcut was removed.
+
 ## 5. Functional-Dependency / Uniqueness Skip
 
 Problem: joins to key-unique dimensions can be irrelevant when no dimension
@@ -65,6 +86,9 @@ right columns are unused, remove or skip the right-side delta for that join.
 
 Correctness: the join is multiplicity-preserving under the constraint, so changes
 to non-output right columns cannot change the view.
+
+Status: not implemented in refresh. The related FK rule prunes inclusion-exclusion terms
+for insert-only PK-side deltas ([FK-aware pruning](optimizations/fk-aware-pruning.md)).
 
 ## 6. Append-Only Window Suffix Skip
 
@@ -77,6 +101,10 @@ maximum order key for each touched partition, only compute the new suffix rows.
 Correctness: previous rows' frames are unchanged when all new rows occur after
 them and the frame only looks backward.
 
+Status: implemented as an opt-in for cumulative running aggregates on insert-only batches
+(`openivm_running_window_incremental`, default `false`). Other window refreshes recompute the
+affected partitions.
+
 ## 7. Downstream Empty-Net-Delta Skip
 
 Problem: a view refresh may produce an empty net delta, but downstream dependent
@@ -87,3 +115,7 @@ skip downstream refreshes that depend only on that delta.
 
 Correctness: downstream delta rules are functions of upstream deltas. If the
 upstream delta is zero, every downstream term containing it is zero.
+
+Status: implemented. Downstream views are still visited, but each skips its refresh when its
+own deltas are empty. Publication emits only changed visible rows, and an MV delta retained
+for consumers is compacted to net rows, so an unchanged result yields an empty downstream delta.

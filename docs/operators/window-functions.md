@@ -51,6 +51,33 @@ Window functions without PARTITION BY treat the entire result as one partition.
 Any delta triggers a full recompute (equivalent to full refresh), but the view
 still benefits from empty-delta skipping — no-op when nothing changed.
 
+## Running aggregates (opt-in)
+
+With `SET openivm_running_window_incremental = true` (default `false`), insert-only refreshes of
+cumulative running aggregates can append to a partition instead of recomputing it:
+
+```sql
+CREATE MATERIALIZED VIEW running_totals AS
+    SELECT account, ts, amount,
+           SUM(amount) OVER (PARTITION BY account ORDER BY ts) AS balance
+    FROM txns;
+```
+
+Eligible windows are `SUM`, `COUNT`, `AVG`, `MIN`, `MAX` with a single PARTITION BY column, a single
+ascending ORDER BY column, and a frame from `UNBOUNDED PRECEDING` to `CURRENT ROW` (`ROWS` or
+`RANGE`); all windows in the view must share the partition and order. For each partition touched by
+the batch, if every new row sorts after the partition's current last row (`>=` for `ROWS`), the new
+suffix is computed seeded from the stored running state and appended. Other partitions fall back to
+partition recompute.
+
+Seeds aggregate the retained input directly (not `avg * count`, which loses precision on large integers), and ORDER BY
+or AVG inputs missing from the public projection are kept as hidden maintenance columns. `ROWS` frames need a
+deterministic order among peers, so prefer a unique ORDER BY key.
+
+The setting is off by default because it is not a universal speedup: in measurements on 100k–1M-row inputs it cut
+refresh time by roughly 20–40% when a batch touched few of many partitions, but was 5–20% slower when a batch touched
+one large partition or nearly all partitions, since the extra publication and delta work doesn't pay off there.
+
 ## Composite operations
 
 Window functions work with other operators:
@@ -91,12 +118,14 @@ downstream views. This lets chained MVs consume window recompute changes increme
   changed partition values. If those values cannot be derived from the changed source
   table or lineage metadata, OpenIVM falls back to full recompute. Single-table windows
   and supported lineage shapes use partition recompute.
-- **No insert-only optimization.** Unlike grouped aggregates, window functions always
-  require full partition recompute regardless of delta type. A single insertion can
-  change the numbering of all rows in the partition.
+- **Insert-only optimization is opt-in and narrow.** By default window functions
+  always require full partition recompute regardless of delta type — a single insertion
+  can change the numbering of all rows in the partition. See
+  [Running aggregates](#running-aggregates-opt-in) for the one exception.
 - **ComputeDelta bypass.** Window views use a dedicated partition-recompute refresh path
   instead of the generic ComputeDelta/LPTS pipeline. Downstream delta rows are generated
   from the recomputed old-to-new transition.
-- **LPTS fallback.** The view query is stored as the original user SQL, not the
-  LPTS-rewritten form. This means plan-level rewrites (AVG/STDDEV decomposition) are
-  not applied within window view queries.
+- **LPTS fallback (DuckLake).** For window views over DuckLake sources or targets, the
+  view query is stored as the original user SQL, not the LPTS-rewritten form, so
+  plan-level rewrites (AVG/STDDEV decomposition) are not applied. DuckLake window views
+  with a multi-column PARTITION BY use full recompute.

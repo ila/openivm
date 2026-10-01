@@ -89,7 +89,7 @@ CREATE MATERIALIZED VIEW ljfb_preserved_sum AS
     GROUP BY l.id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'ljfb_preserved_sum';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a66625f7072657365727665645f73756d_';
 ----
 6
 
@@ -142,7 +142,7 @@ CREATE MATERIALIZED VIEW ljfb_self_mv AS
     GROUP BY child.id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'ljfb_self_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a66625f73656c665f6d76_';
 ----
 6
 
@@ -201,7 +201,7 @@ CREATE MATERIALIZED VIEW ljfb_comp_mv AS
     GROUP BY l.a, l.b;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'ljfb_comp_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a66625f636f6d705f6d76_';
 ----
 6
 
@@ -260,7 +260,7 @@ CREATE MATERIALIZED VIEW ljfb_range_mv AS
     GROUP BY l.id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'ljfb_range_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a66625f72616e67655f6d76_';
 ----
 6
 
@@ -320,7 +320,7 @@ CREATE MATERIALIZED VIEW ljfb_filter_mv AS
     GROUP BY l.id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'ljfb_filter_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a66625f66696c7465725f6d76_';
 ----
 6
 
@@ -381,7 +381,7 @@ CREATE MATERIALIZED VIEW ljfb_pres_filter_mv AS
     GROUP BY l.id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'ljfb_pres_filter_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a66625f707265735f66696c7465725f6d76_';
 ----
 6
 
@@ -447,7 +447,7 @@ CREATE MATERIALIZED VIEW ljfb_nullable_count_mv AS
     GROUP BY l.id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'ljfb_nullable_count_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a66625f6e756c6c61626c655f636f756e745f6d76_';
 ----
 6
 
@@ -508,13 +508,13 @@ CREATE MATERIALIZED VIEW lj_comma_mv AS
     GROUP BY l.id;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'lj_comma_mv';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 ----
 0
 
 query I
 SELECT contains(leftjoin_secondary_meta_json, '"inner_tables":["lj,r"]')::INT
-FROM openivm_views WHERE view_name = 'lj_comma_mv';
+FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 ----
 1
 
@@ -559,25 +559,25 @@ statement ok
 UPDATE openivm_views
 SET leftjoin_secondary_meta_json =
     replace(leftjoin_secondary_meta_json, '"inner_tables":["lj,r"]', '"inner_table":"lj,r"')
-WHERE view_name = 'lj_comma_mv';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 
 statement ok
 UPDATE openivm_views
 SET leftjoin_secondary_meta_json =
     replace(leftjoin_secondary_meta_json, '"inner_keys":["id"]', '"inner_key":"id"')
-WHERE view_name = 'lj_comma_mv';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 
 statement ok
 UPDATE openivm_views
 SET leftjoin_secondary_meta_json =
     replace(leftjoin_secondary_meta_json, '"pres_tables":["lj_comma_left"]', '"pres_table":"lj_comma_left"')
-WHERE view_name = 'lj_comma_mv';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 
 statement ok
 UPDATE openivm_views
 SET leftjoin_secondary_meta_json =
     replace(leftjoin_secondary_meta_json, '"pres_keys":["id"]', '"pres_key":"id"')
-WHERE view_name = 'lj_comma_mv';
+WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6c6a5f636f6d6d615f6d76_';
 
 statement ok
 DELETE FROM "lj,r" WHERE id = 2;

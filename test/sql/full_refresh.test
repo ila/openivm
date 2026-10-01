@@ -57,7 +57,7 @@ CREATE MATERIALIZED VIEW mv_unnest_values AS
 SELECT unnest(['BC', 'GC']) AS credit_type;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_unnest_values';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f756e6e6573745f76616c756573_';
 ----
 2
 
@@ -89,7 +89,7 @@ EXCEPT ALL
 SELECT a, b FROM t1;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_except_all';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6578636570745f616c6c_';
 ----
 3
 
@@ -228,7 +228,7 @@ CREATE MATERIALIZED VIEW mv_pivot AS
     SELECT * FROM (PIVOT pivot_src ON metric IN ('cost', 'sales') USING SUM(amount) GROUP BY region);
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_pivot';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f7069766f74_';
 ----
 0
 

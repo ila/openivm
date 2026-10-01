@@ -164,7 +164,7 @@ PRAGMA refresh('transition_share_mv');
 
 query I
 SELECT len(regexp_extract_all(content, 'current_count'))
-FROM read_text('__TEST_DIR__/openivm_upsert_queries_transition_share_mv.sql');
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_7472616e736974696f6e5f73686172655f6d76_.sql');
 ----
 15
 

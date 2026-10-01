@@ -27,7 +27,7 @@ CREATE MATERIALIZED VIEW mv_ssf_proj AS
     FROM ssf_t;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_ssf_proj';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f7373665f70726f6a_';
 ----
 2
 
@@ -78,7 +78,7 @@ CREATE MATERIALIZED VIEW mv_ssf_agg AS
     GROUP BY CASE WHEN code = (SELECT good FROM params) THEN 'good' ELSE 'other' END;
 
 query I
-SELECT type FROM openivm_views WHERE view_name = 'mv_ssf_agg';
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f7373665f616767_';
 ----
 6
 

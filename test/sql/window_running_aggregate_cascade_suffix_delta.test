@@ -72,7 +72,7 @@ WITH expected AS (
            max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
     FROM flagged
 )
-SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_daily_mv EXCEPT ALL SELECT * FROM expected);
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_ EXCEPT ALL SELECT * FROM expected);
 ----
 0
 
@@ -96,7 +96,7 @@ WITH expected AS (
            max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
     FROM flagged
 )
-SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_daily_mv);
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_);
 ----
 0
 
@@ -123,7 +123,7 @@ WITH expected AS (
     SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
     FROM daily
 )
-SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_down_mv EXCEPT ALL SELECT * FROM expected);
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f646f776e5f6d76_ EXCEPT ALL SELECT * FROM expected);
 ----
 0
 
@@ -150,7 +150,7 @@ WITH expected AS (
     SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
     FROM daily
 )
-SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_down_mv);
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f646f776e5f6d76_);
 ----
 0
 
@@ -171,13 +171,13 @@ WITH compiled AS (
 ), program AS (
     SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS sql FROM compiled
 ), fast_delta AS (
-    SELECT sql FROM compiled WHERE sql LIKE 'INSERT INTO openivm_delta_wrcas_daily_mv%openivm_l1 AS%'
+    SELECT sql FROM compiled WHERE sql LIKE 'INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_%FROM openivm_run_result___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_%'
 )
-SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast_wrcas_daily_mv%'
-         AND (SELECT sql FROM program) LIKE '%openivm_run_fallback_wrcas_daily_mv%'
-         AND (SELECT sql FROM program) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old_wrcas_daily_mv AS%'
-         AND (SELECT sql FROM program) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new_wrcas_daily_mv AS%'
-         AND (SELECT sql FROM program) LIKE '%INSERT INTO openivm_delta_wrcas_daily_mv%'
+SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_%'
+         AND (SELECT sql FROM program) LIKE '%openivm_run_fallback___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_%'
+         AND (SELECT sql FROM program) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_old___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_ AS%'
+         AND (SELECT sql FROM program) LIKE '%CREATE OR REPLACE TEMP TABLE openivm_new___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_ AS%'
+         AND (SELECT sql FROM program) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_%'
          AND (SELECT sql FROM program) LIKE '%CAST(-1 AS INTEGER)%'
          AND (SELECT sql FROM program) LIKE '%CAST(1 AS INTEGER)%'
          AND (SELECT sql FROM fast_delta) LIKE '%CAST(1 AS INTEGER), CURRENT_TIMESTAMP%'
@@ -211,7 +211,7 @@ WITH expected AS (
            max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
     FROM flagged
 )
-SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_daily_mv EXCEPT ALL SELECT * FROM expected);
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_ EXCEPT ALL SELECT * FROM expected);
 ----
 0
 
@@ -235,7 +235,7 @@ WITH expected AS (
            max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
     FROM flagged
 )
-SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_daily_mv);
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_);
 ----
 0
 
@@ -262,7 +262,7 @@ WITH expected AS (
     SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
     FROM daily
 )
-SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_down_mv EXCEPT ALL SELECT * FROM expected);
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f646f776e5f6d76_ EXCEPT ALL SELECT * FROM expected);
 ----
 0
 
@@ -289,7 +289,7 @@ WITH expected AS (
     SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
     FROM daily
 )
-SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_down_mv);
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f646f776e5f6d76_);
 ----
 0
 
@@ -310,11 +310,11 @@ WITH compiled AS (
 ), program AS (
     SELECT string_agg(sql, ' ' ORDER BY stmt_order) AS sql FROM compiled
 )
-SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast_wrcas_daily_mv%'
-         AND (SELECT sql FROM program) LIKE '%openivm_run_fallback_wrcas_daily_mv%'
-         AND (SELECT sql FROM program) LIKE '%openivm_old_wrcas_daily_mv%'
-         AND (SELECT sql FROM program) LIKE '%openivm_new_wrcas_daily_mv%'
-         AND (SELECT sql FROM program) LIKE '%INSERT INTO openivm_delta_wrcas_daily_mv%'
+SELECT CASE WHEN (SELECT sql FROM program) LIKE '%openivm_run_fast___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_%'
+         AND (SELECT sql FROM program) LIKE '%openivm_run_fallback___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_%'
+         AND (SELECT sql FROM program) LIKE '%openivm_old___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_%'
+         AND (SELECT sql FROM program) LIKE '%openivm_new___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_%'
+         AND (SELECT sql FROM program) LIKE '%INSERT INTO memory.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_%'
     THEN 1 ELSE 0 END;
 ----
 1
@@ -345,7 +345,7 @@ WITH expected AS (
            max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
     FROM flagged
 )
-SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_daily_mv EXCEPT ALL SELECT * FROM expected);
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_ EXCEPT ALL SELECT * FROM expected);
 ----
 0
 
@@ -369,7 +369,7 @@ WITH expected AS (
            max(high_date_flag) OVER (PARTITION BY dm_s_symb ORDER BY dm_date) AS fifty_two_week_high_date
     FROM flagged
 )
-SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_daily_mv);
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f6461696c795f6d76_);
 ----
 0
 
@@ -396,7 +396,7 @@ WITH expected AS (
     SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
     FROM daily
 )
-SELECT COUNT(*) FROM (SELECT * FROM openivm_data_wrcas_down_mv EXCEPT ALL SELECT * FROM expected);
+SELECT COUNT(*) FROM (SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f646f776e5f6d76_ EXCEPT ALL SELECT * FROM expected);
 ----
 0
 
@@ -423,6 +423,6 @@ WITH expected AS (
     SELECT dm_s_symb, dm_date, fifty_two_week_low, fifty_two_week_high, fifty_two_week_low_date, fifty_two_week_high_date
     FROM daily
 )
-SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data_wrcas_down_mv);
+SELECT COUNT(*) FROM (SELECT * FROM expected EXCEPT ALL SELECT * FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_77726361735f646f776e5f6d76_);
 ----
 0

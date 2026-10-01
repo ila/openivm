@@ -58,21 +58,22 @@ Bidirectional key-based partial recompute using hidden `openivm_left_key` and `o
 2. DELETE from the MV all rows where `openivm_left_key` or `openivm_right_key` matches an affected key.
 3. Re-INSERT from the original FULL OUTER JOIN query, filtered to those keys.
 
-The match predicate is **NULL-safe** — `EXISTS (SELECT 1 FROM affected _a WHERE _a.k IS NOT DISTINCT FROM target.k)` rather than tuple `IN`. SQL's `(a, b, NULL) IN (...)` returns NULL (not TRUE), so any partially-NULL key tuple — common when COALESCE over JOIN-padded NULLs is the GROUP BY key — would be silently skipped by tuple-IN. The all-NULL group (every key column NULL, produced by FULL OUTER unmatched-right rows) is also covered explicitly via an `OR (k1 IS NULL AND k2 IS NULL ...)` clause so it gets re-evaluated on every refresh whose delta touched it.
+The match predicate is **NULL-safe** — `EXISTS (SELECT 1 FROM openivm_affected WHERE _k IS NOT DISTINCT FROM openivm_left_key OR _k IS NOT DISTINCT FROM openivm_right_key)` rather than `IN`, so NULL keys on either side are still matched.
 
 ### Aggregate views (with GROUP BY)
 
 Two modes are available, controlled by `openivm_full_outer_merge` (default: on):
 
-**MERGE mode (default):** uses the Larson & Zhou `openivm_match_count` column to track how many right rows match each left group. When the count transitions between 0 and positive, right-side aggregate columns transition between NULL and actual values. The NULL group (unmatched-right rows) is recomputed separately to handle cross-group transfers.
+**MERGE mode (default):** adds hidden `openivm_match_count` (`COUNT` of the right join key) and `openivm_right_match_count` (`COUNT` of the left join key) columns to track matches from each side. When a count transitions between 0 and positive, that side's aggregate columns transition between NULL and actual values. After the MERGE, OpenIVM additionally deletes and re-inserts the affected groups (the same affected-key set as group-recompute mode, below) plus the all-NULL group, to handle unmatched-row changes and cross-group transfers.
 
-**Group-recompute mode** (`SET openivm_full_outer_merge = false`) identifies affected GROUP BY keys from 4 sources:
+**Group-recompute mode** (`SET openivm_full_outer_merge = false`) identifies affected GROUP BY keys from these sources:
 1. Delta view (matched-row group keys)
-2. Left delta table (group column directly available for unmatched-left changes)
-3. Left base table lookup (maps right-side join keys to group keys)
-4. NULL group (always recomputed for unmatched-right changes)
+2. If a GROUP BY column matches a join column: groups of the view query whose key is a changed join key from either base delta table
+3. With a single GROUP BY column: the left delta table (group column directly available for unmatched-left changes)
+4. With a single GROUP BY column: a left base table lookup (maps right-side join keys to group keys)
+5. The all-NULL group (always recomputed for unmatched-right changes)
 
-DELETE + re-INSERT only the affected groups.
+DELETE + re-INSERT only the affected groups. Group keys are matched NULL-safely (`EXISTS ... IS NOT DISTINCT FROM`) rather than with tuple `IN`: SQL's `(a, b, NULL) IN (...)` returns NULL (not TRUE), so partially-NULL key tuples — common when COALESCE over JOIN-padded NULLs is the GROUP BY key — would be skipped. The all-NULL group (every key column NULL, produced by unmatched-right rows) is covered explicitly via an `OR (k1 IS NULL AND k2 IS NULL ...)` clause.
 
 ## Settings
 
@@ -84,4 +85,4 @@ DELETE + re-INSERT only the affected groups.
 
 - Maximum 16 tables in a join (same as all joins)
 - GROUP BY columns are assumed to come from the left table for group-recompute key mapping
-- The MERGE mode always recomputes the NULL group (unmatched-right rows), so it is not fully incremental for that group
+- The MERGE mode also recomputes the affected groups and the NULL group (unmatched-right rows) after the MERGE, so it is not fully incremental for those groups

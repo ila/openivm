@@ -23,7 +23,7 @@ CREATE MATERIALIZED VIEW mv_auto REFRESH EVERY '5 minutes' AS
     FROM sales GROUP BY region;
 
 query I
-SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_auto';
+SELECT refresh_interval FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6175746f_';
 ----
 300
 
@@ -70,7 +70,7 @@ CREATE MATERIALIZED VIEW mv_manual AS
     SELECT region, SUM(amount) AS total FROM sales GROUP BY region;
 
 query I
-SELECT refresh_interval IS NULL FROM openivm_views WHERE view_name = 'mv_manual';
+SELECT refresh_interval IS NULL FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6d616e75616c_';
 ----
 true
 
@@ -96,7 +96,7 @@ CREATE MATERIALIZED VIEW mv_slow REFRESH EVERY '1 hour' AS
     SELECT id, qty FROM orders;
 
 query II
-SELECT view_name, refresh_interval FROM openivm_views
+SELECT view_sql_name, refresh_interval FROM openivm_views
     WHERE refresh_interval IS NOT NULL ORDER BY refresh_interval;
 ----
 mv_fast	60
@@ -148,11 +148,11 @@ INSERT INTO crash_test SELECT i, i * 10 FROM range(11, 21) t(i);
 
 # Simulate a crash: set the flag without actually refreshing
 statement ok
-UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = 'mv_crash';
+UPDATE openivm_views SET refresh_in_progress = true WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6372617368_';
 
 # Verify flag is set
 query I
-SELECT refresh_in_progress FROM openivm_views WHERE view_name = 'mv_crash';
+SELECT refresh_in_progress FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6372617368_';
 ----
 true
 
@@ -162,7 +162,7 @@ PRAGMA refresh('mv_crash');
 
 # Flag should be cleared
 query I
-SELECT refresh_in_progress FROM openivm_views WHERE view_name = 'mv_crash';
+SELECT refresh_in_progress FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6372617368_';
 ----
 false
 
@@ -197,7 +197,7 @@ PRAGMA refresh('mv_crash');
 
 # Flag should be false after a normal refresh
 query I
-SELECT refresh_in_progress FROM openivm_views WHERE view_name = 'mv_crash';
+SELECT refresh_in_progress FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6372617368_';
 ----
 false
 
@@ -218,7 +218,7 @@ statement ok
 ALTER MATERIALIZED VIEW mv_auto SET REFRESH EVERY '10 minutes';
 
 query I
-SELECT refresh_interval FROM openivm_views WHERE view_name = 'mv_auto';
+SELECT refresh_interval FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6175746f_';
 ----
 600
 
@@ -226,7 +226,7 @@ statement ok
 ALTER MATERIALIZED VIEW mv_auto SET REFRESH MANUAL;
 
 query I
-SELECT refresh_interval IS NULL FROM openivm_views WHERE view_name = 'mv_auto';
+SELECT refresh_interval IS NULL FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6175746f_';
 ----
 true
 

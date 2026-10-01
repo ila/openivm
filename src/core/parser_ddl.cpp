@@ -171,6 +171,10 @@ public:
 		refresh_id = "create_mv_" + to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 	}
 
+	bool Enabled() const {
+		return enabled;
+	}
+
 	void SetViewName(const string &view_name_p) {
 		if (view_name.empty()) {
 			view_name = view_name_p;
@@ -205,21 +209,31 @@ public:
 		}
 		flushed = true;
 		Connection profile_con(db);
+		// Retention and the new profile share one durable metadata commit.
+		profile_con.BeginTransaction();
 		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
 		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
 		                  to_string(retention_days) + " days'");
+		// Statement profiles should not add a metadata commit for every DDL operation.
+		string values;
 		for (auto &step : steps) {
-			auto result = profile_con.Query(
-			    "INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
-			    " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES ('" +
-			    SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) + "', " +
-			    to_string(step.step_order) + ", '" + SqlUtils::EscapeValue(step.step_name) + "', " +
-			    to_string(step.duration_ms) + ", '" + SqlUtils::EscapeValue(step.detail) + "')");
-			if (result->HasError()) {
-				OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record CREATE MV step '%s': %s\n", step.step_name.c_str(),
-				                    result->GetError().c_str());
-				return;
+			if (!values.empty()) {
+				values += ", ";
 			}
+			values += "('" + SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) + "', " +
+			          to_string(step.step_order) + ", '" + SqlUtils::EscapeValue(step.step_name) + "', " +
+			          to_string(step.duration_ms) + ", '" + SqlUtils::EscapeValue(step.detail) + "')";
+		}
+		auto result =
+		    profile_con.Query("INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
+		                      " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES " + values);
+		if (result->HasError()) {
+			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record CREATE MV profile: %s\n", result->GetError().c_str());
+			return;
+		}
+		auto committed = profile_con.Query("COMMIT");
+		if (committed->HasError()) {
+			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to commit CREATE MV profile: %s\n", committed->GetError().c_str());
 		}
 	}
 
@@ -364,8 +378,8 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	auto &db = DatabaseInstance::GetDatabase(context);
 	auto conn = make_uniq<Connection>(db);
 	auto &helper_lock_state = TransactionalMVLockState::Get(*conn->context);
-	helper_lock_state.SetMutationOwner(&context);
-	MutationLockGuard mutation_guard(db, &context);
+	helper_lock_state.SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	MutationLockGuard mutation_guard(context);
 	bool suspended_autocommit_transaction = false;
 	auto restore_outer_transaction = [&]() {
 		if (suspended_autocommit_transaction && !context.transaction.HasActiveTransaction()) {
@@ -386,6 +400,9 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	}
 	vector<string> cleanup_ddl;
 	auto run_cleanup = [&]() {
+		if (!conn->context->transaction.IsAutoCommit()) {
+			conn->Rollback();
+		}
 		for (const auto &cleanup : cleanup_ddl) {
 			OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Cleanup DDL: %s\n", cleanup.c_str());
 			auto cleanup_result = conn->Query(cleanup);
@@ -418,7 +435,23 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Executing DDL batch (%lu statements): %s\n",
 		                    (unsigned long)pending_ddl.size(), query.c_str());
 		auto ddl_start = std::chrono::steady_clock::now();
-		auto r = conn->Query(query);
+		unique_ptr<MaterializedQueryResult> r;
+		if (profiler.Enabled()) {
+			auto statements = SqlUtils::SplitSQLStatements(query);
+			for (idx_t i = 0; i < statements.size(); i++) {
+				auto statement_start = std::chrono::steady_clock::now();
+				r = conn->Query(statements[i]);
+				profiler.AddStep("create_mv_sql_stmt", statement_start,
+				                 "phase=" + current_profile_step + "; statement=" + to_string(i + 1) + "/" +
+				                     to_string(statements.size()) +
+				                     "; sql=" + SqlUtils::SQLStatementPreview(statements[i]));
+				if (r->HasError()) {
+					break;
+				}
+			}
+		} else {
+			r = conn->Query(query);
+		}
 		profiler.AddStep(current_profile_step, ddl_start,
 		                 current_profile_detail + "; statements=" + to_string(pending_ddl.size()) +
 		                     "; bytes=" + to_string(bytes));
@@ -480,7 +513,11 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 				                 current_profile_detail + "; delta_schema_derivation_failed=true");
 				fail_ddl(ex.what());
 			}
+			auto statement_start = std::chrono::steady_clock::now();
 			auto r = conn->Query(derived.sql);
+			profiler.AddStep("create_mv_sql_stmt", statement_start,
+			                 "phase=" + current_profile_step +
+			                     "; statement=1/1; sql=" + SqlUtils::SQLStatementPreview(derived.sql));
 			profiler.AddStep(current_profile_step, ddl_start,
 			                 current_profile_detail + "; statements=1; bytes=" + to_string(derived.sql.size()) +
 			                     "; derived_from_data_schema=true; columns=" + to_string(derived.column_count));
@@ -490,6 +527,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			continue;
 		}
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_CLEANUP_PREFIX)) {
+			flush_pending();
 			cleanup_ddl.push_back(q.substr(strlen(OPENIVM_DDL_CLEANUP_PREFIX)));
 			continue;
 		}
@@ -834,7 +872,7 @@ void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChun
 	state.finished = true;
 }
 
-string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters) {
+string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog) {
 	struct ProfileRow {
 		string view_name;
 		string step_name;
@@ -958,9 +996,12 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 			auto now = std::chrono::steady_clock::now().time_since_epoch();
 			auto refresh_id = view_name + "_create_tx_" +
 			                  to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+			// The lifecycle program restores the caller search path before these writes.
+			auto profile_table = SqlUtils::FullName(metadata_catalog, DEFAULT_SCHEMA, openivm::PROFILE_TABLE);
+			OPENIVM_DEBUG_PRINT("[PROFILE] Recording CREATE MV profile in %s\n", profile_table.c_str());
 			for (idx_t step_order = 0; step_order < profile_rows.size(); step_order++) {
 				auto &row = profile_rows[step_order];
-				append_statement("INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
+				append_statement("INSERT OR REPLACE INTO " + profile_table +
 				                     " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES ('" +
 				                     SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(row.view_name) +
 				                     "', " + to_string(step_order) + ", '" + SqlUtils::EscapeValue(row.step_name) +

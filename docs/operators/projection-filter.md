@@ -49,6 +49,8 @@ Filters and projections are **linear operators** — their incremental form is t
 
 The upsert uses **counting-based consolidation**: each distinct tuple gets a net count (_net). Net insertions are replicated via `generate_series`, net deletions are removed via `rowid` + `ROW_NUMBER`. This preserves full bag semantics including duplicate rows.
 
+When every pending delta is an insertion, OpenIVM skips consolidation and the DELETE entirely and appends the delta rows once per positive multiplicity (`openivm_skip_projection_delete`, default `true`; see [append-only](../optimizations/append-only.md)).
+
 For deletes, OpenIVM first joins the net-negative tuples to the MV data table and only ranks those matched candidate rows. The result is the same bag-semantic delete as ranking the whole MV, but large projection/join views avoid a full data-table `ROW_NUMBER()` pass when only a few tuples changed.
 
 ## Compiled SQL (projection)

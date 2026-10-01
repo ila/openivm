@@ -112,3 +112,102 @@ SELECT count(*) FROM (
 ----
 0
 
+
+# Publication must retain old keys for removed rows, NULL keys, and moved rows.
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE dl.scope_market(symbol VARCHAR, d INT, price INT);
+
+statement ok
+INSERT INTO dl.scope_market VALUES ('A',1,10),('A',1,10),('A',2,20),('B',1,30),(NULL,NULL,40),(NULL,2,50);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.scope_window AS
+SELECT *, max(price) OVER (PARTITION BY symbol ORDER BY d RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_max FROM dl.scope_market;
+
+statement ok
+CREATE VIEW dl.scope_expected AS
+SELECT *, max(price) OVER (PARTITION BY symbol ORDER BY d RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_max FROM dl.scope_market;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.scope_child AS SELECT * FROM dl.scope_window;
+
+statement ok
+INSERT INTO dl.scope_market VALUES ('A',1,10),('C',3,60);
+
+statement ok
+DELETE FROM dl.scope_market WHERE symbol IS NULL AND d IS NULL;
+
+statement ok
+UPDATE dl.scope_market SET symbol='C',d=4 WHERE symbol='B';
+
+statement ok
+PRAGMA refresh('scope_window');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.scope_window EXCEPT ALL SELECT * FROM dl.scope_expected)),
+       (SELECT count(*) FROM (SELECT * FROM dl.scope_expected EXCEPT ALL SELECT * FROM dl.scope_window));
+----
+0	0
+
+statement ok
+INSERT INTO dl.scope_market VALUES (NULL,NULL,15),('A',2,20);
+
+statement ok
+DELETE FROM dl.scope_market WHERE symbol='C';
+
+statement ok
+UPDATE dl.scope_market SET d=NULL,price=5 WHERE symbol='A' AND d=1;
+
+statement ok
+PRAGMA refresh('scope_window');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.scope_window EXCEPT ALL SELECT * FROM dl.scope_expected)),
+       (SELECT count(*) FROM (SELECT * FROM dl.scope_expected EXCEPT ALL SELECT * FROM dl.scope_window));
+----
+0	0
+
+# A lagging child must consume both preceding refreshes.
+
+statement ok
+PRAGMA refresh('scope_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.scope_child EXCEPT ALL SELECT * FROM dl.scope_expected)),
+       (SELECT count(*) FROM (SELECT * FROM dl.scope_expected EXCEPT ALL SELECT * FROM dl.scope_child));
+----
+0	0
+
+statement ok
+DELETE FROM dl.scope_market;
+
+statement ok
+PRAGMA refresh('scope_window');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.scope_window EXCEPT ALL SELECT * FROM dl.scope_expected)),
+       (SELECT count(*) FROM (SELECT * FROM dl.scope_expected EXCEPT ALL SELECT * FROM dl.scope_window));
+----
+0	0
+
+# Deleting the final partition must also reach the child.
+statement ok
+PRAGMA refresh('scope_child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.scope_child EXCEPT ALL SELECT * FROM dl.scope_expected)),
+       (SELECT count(*) FROM (SELECT * FROM dl.scope_expected EXCEPT ALL SELECT * FROM dl.scope_child));
+----
+0	0
+
+query I
+SELECT contains(content, 'openivm_old_value_0 AS symbol')
+   AND contains(content, 'WHERE openivm_old_rowid IS NOT NULL UNION ALL SELECT')
+   AND NOT contains(content, 'openivm_publish_next___openivm_mv_646c_6d61696e_73636f70655f77696e646f77_')
+   AND NOT contains(content, 'openivm_publish_changes___openivm_mv_646c_6d61696e_73636f70655f77696e646f77_')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_646c_6d61696e_73636f70655f77696e646f77_.sql');
+----
+1

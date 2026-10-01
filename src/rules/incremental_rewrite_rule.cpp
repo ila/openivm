@@ -3,9 +3,11 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/parser_ddl.hpp"
+#include "core/refresh_metadata.hpp"
 #include "core/parser_plan_helpers.hpp"
 #include "core/scoped_optimizer_settings.hpp"
 #include "core/sql_utils.hpp"
+#include "core/time_travel_pins.hpp"
 #include "delta/delta_compiler.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -74,8 +76,9 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	auto view_schema = child_get->named_parameters["view_schema_name"].ToString();
 
 	Connection con(*input.context.db);
-	if (auto metadata_state = TransactionalMVMetadataState::TryGet(input.context)) {
-		metadata_state->Apply(con);
+	RefreshMetadata::UseCatalog(input.context, con, view_catalog);
+	if (!input.context.transaction.IsAutoCommit()) {
+		RefreshMetadata(con).SnapshotTransaction(input.context);
 	}
 
 	auto v = con.Query("select sql_string from " + string(openivm::VIEWS_TABLE) + " where view_name = '" +
@@ -96,10 +99,10 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	if (parser.statements.empty()) {
 		throw Exception(ExceptionType::PARSER, "IVM: empty view definition for '" + view + "'");
 	}
-	auto statement = parser.statements[0].get();
+	openivm::TimeTravelPins::Peel(input.context, *parser.statements[0]);
 
 	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
-	planner.CreatePlan(statement->Copy());
+	planner.CreatePlan(std::move(parser.statements[0]));
 	OPENIVM_DEBUG_PRINT("[REWRITE] CreatePlan done\n");
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Unoptimized plan: \n%s\n", planner.plan->ToString().c_str());

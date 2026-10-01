@@ -12,6 +12,7 @@ namespace duckdb {
 // The caller must own the database-wide OpenIVM mutation gate.
 void UpsertDeltaQueriesLocked(ClientContext &context, const FunctionParameters &parameters);
 string TransactionalRefreshQuery(ClientContext &context, const FunctionParameters &parameters);
+string RefreshPipelineQuery(ClientContext &context, const FunctionParameters &parameters);
 
 } // namespace duckdb
 

@@ -24,10 +24,13 @@ public:
 	static void RemoveRedundantWhitespaces(string &query);
 	/// Strip SQL line comments (-- to end of line) while respecting single-quoted string literals.
 	static void StripLineComments(string &query);
+	/// Trim whitespace without stripping non-ASCII identifier bytes on signed-char builds.
+	static string TrimSQLFragment(const string &input);
 	static vector<string> SplitSQLStatements(const string &sql);
 	static string SQLStatementPreview(const string &statement);
 	static string DeltaName(const string &name);
 	static string LastIdentifierPart(string name);
+	static vector<string> ParseQualifiedIdentifier(const string &name);
 	static string FullName(const string &catalog, const string &schema, const string &table);
 	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
 	static string QualifiedPrefix(const string &catalog, const string &schema);

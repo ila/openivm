@@ -1,0 +1,75 @@
+# name: test/sql/profile_metadata_transaction.test
+# description: Profile persistence is atomic and cannot undo a successful MV operation
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+ATTACH '__TEST_DIR__/profile_metadata_transaction.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE TABLE dl.source(i INTEGER);
+
+statement ok
+INSERT INTO dl.source VALUES (1), (1), (NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv AS SELECT * FROM dl.source;
+
+# Reject a late profile step after retention cleanup and earlier refresh steps.
+# A failed profile must retain previous records, without leaving a partial run.
+statement ok
+CREATE OR REPLACE TABLE openivm_refresh_profile (
+  refresh_id VARCHAR, view_name VARCHAR, profile_timestamp TIMESTAMP DEFAULT current_timestamp,
+  step_order INTEGER, step_name VARCHAR CHECK(step_name NOT IN ('total_refresh', 'create_mv_total')),
+  duration_ms BIGINT, detail VARCHAR, PRIMARY KEY(refresh_id, step_order));
+
+statement ok
+INSERT INTO openivm_refresh_profile VALUES ('expired', 'old', TIMESTAMP '2000-01-01', 0, 'old', 0, '');
+
+statement ok
+SET openivm_profile_refresh=true;
+
+statement ok
+INSERT INTO dl.source VALUES (2);
+
+statement ok
+PRAGMA refresh('mv');
+
+query II
+SELECT (SELECT count(*) FROM openivm_refresh_profile),
+       (SELECT count(*) FROM openivm_refresh_profile WHERE refresh_id='expired');
+----
+1	1
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv2 AS SELECT * FROM dl.source;
+
+query II
+SELECT (SELECT count(*) FROM openivm_refresh_profile),
+       (SELECT count(*) FROM openivm_refresh_profile WHERE refresh_id='expired');
+----
+1	1
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.mv EXCEPT ALL SELECT * FROM dl.source)),
+       (SELECT count(*) FROM (SELECT * FROM dl.source EXCEPT ALL SELECT * FROM dl.mv));
+----
+0	0
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.mv2 EXCEPT ALL SELECT * FROM dl.source)),
+       (SELECT count(*) FROM (SELECT * FROM dl.source EXCEPT ALL SELECT * FROM dl.mv2));
+----
+0	0
