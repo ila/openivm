@@ -220,8 +220,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			Connection meta_con(*context.db.get());
 			auto meta_result = meta_con.Query(meta_pre_sql);
 			if (meta_result->HasError()) {
-				throw Exception(ExceptionType::EXECUTOR,
-				                "IVM refresh of '" + display_name + "' failed before data refresh: " + meta_result->GetError());
+				throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
+				                                             "' failed before data refresh: " + meta_result->GetError());
 			}
 			profiler.AddStep("metadata_pre_sql", meta_pre_start, "bytes=" + to_string(meta_pre_sql.size()));
 		}
@@ -313,7 +313,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			// parallel refreshes). InternalException causes DuckDB to flag the whole
 			// database as invalidated, forcing a restart. We've already rolled back, so
 			// the DB is in a clean state; the next refresh attempt should succeed.
-			throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name + "' failed: " + result->GetError());
+			throw Exception(ExceptionType::EXECUTOR,
+			                "IVM refresh of '" + display_name + "' failed: " + result->GetError());
 		}
 		if (!after_hook.empty()) {
 			auto hook_result = exec_con.Query(after_hook);
@@ -370,8 +371,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			Connection meta_con(*context.db.get());
 			auto meta_result = meta_con.Query(meta_post_sql);
 			if (meta_result->HasError()) {
-				throw Exception(ExceptionType::EXECUTOR,
-				                "IVM refresh of '" + display_name + "' failed after data refresh: " + meta_result->GetError());
+				throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
+				                                             "' failed after data refresh: " + meta_result->GetError());
 			}
 			profiler.AddStep("metadata_post_sql", meta_post_start, "bytes=" + to_string(meta_post_sql.size()));
 		}

@@ -47,6 +47,21 @@ SELECT count(*) FROM (
 ----
 0
 
+# Refresh failures report the qualified view_sql_name (failing after-hook)
+statement ok
+CREATE MATERIALIZED VIEW mv_h AS SELECT id, SUM(v) AS s FROM t GROUP BY id;
+
+statement ok
+INSERT INTO openivm_refresh_hooks VALUES ('__openivm_mv_6d656d6f7279_6d61696e_6d765f68_', 'INSERT INTO no_such_hook_table VALUES (1)', 'after');
+
+statement ok
+INSERT INTO t VALUES (2, 1);
+
+statement error
+PRAGMA refresh('mv_h');
+----
+after-hook for 'main.mv_h' failed
+
 # Missing views produce the current lookup message
 statement error
 PRAGMA refresh('main.mv_missing');
