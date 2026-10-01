@@ -62,6 +62,17 @@ PRAGMA refresh('mv_h');
 ----
 after-hook for 'main.mv_h' failed
 
+# ...and never leak the internal key
+statement error
+ALTER TABLE t DROP COLUMN v;
+----
+<!REGEX>:(?s).*__openivm_mv_.*
+
+statement error
+PRAGMA refresh('mv_h');
+----
+<!REGEX>:(?s).*__openivm_mv_.*
+
 # Missing views produce the current lookup message
 statement error
 PRAGMA refresh('main.mv_missing');
