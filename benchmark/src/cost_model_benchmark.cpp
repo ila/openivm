@@ -25,6 +25,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -198,239 +199,112 @@ struct TempDb {
 	string path;
 	string wal;
 
-	explicit TempDb(const string &tag) {
-		path = "/tmp/cost_model_bench_" + to_string(getpid()) + "_" + tag + ".db";
+	bool keep = false;
+
+	// `case_tag` identifies the case and `variant` the file's role within it. They are separated by a
+	// dot deliberately: DuckDB derives a database's catalog name from the filename up to the FIRST
+	// dot, so every file of one case resolves to the same catalog. That matters because a
+	// materialized view's metadata records the catalog it was created in, and a refresh run against a
+	// copy under a different catalog name fails with "Catalog ... does not exist".
+	//
+	// The previous naming satisfied this by accident: the delta percentage was formatted into the
+	// filename, and the resulting "1.000000" truncated every variant to the same catalog. Removing
+	// the percentage from the name broke every refresh at once.
+	TempDb(const string &case_tag, const string &variant, bool keep_p = false) : keep(keep_p) {
+		path = "/tmp/cost_model_bench_" + to_string(getpid()) + "_" + case_tag + "." + variant + ".db";
 		wal = path + ".wal";
 		std::remove(path.c_str());
 		std::remove(wal.c_str());
 	}
 
 	~TempDb() {
+		if (keep) {
+			return; // promoted to the case's live state; the caller owns it now
+		}
 		std::remove(path.c_str());
 		std::remove(wal.c_str());
 	}
 };
 
-// Build one multi-row INSERT (a single VALUES list) instead of n per-row statements. The tuple
-// values are identical to the old per-row generation, so the captured delta is unchanged; this just
-// collapses n con.Query() calls into one, which matters a lot at scale. The VALUES/constant path in
-// the delta-capture rule handles the multi-row list.
+// Generate the same deterministic batch in SQL instead of parsing one literal tuple per row.
 static vector<string> GenerateInserts(const string &table, int n, int scale, int64_t pk_offset) {
-	vector<string> tuples;
-	tuples.reserve(n);
-	for (int i = 0; i < n; i++) {
-		int64_t pk = kPkBase + pk_offset + i;
-		int w = 1 + (i % std::max(scale, 1));
-		int d = 1 + (i % 10);
-		int c = 1 + (i % 30);
-		if (table == "CUSTOMER") {
-			tuples.push_back("(" + to_string(w) + ", " + to_string(d) + ", " + to_string(pk) +
-			                 ", 0.05, 'GC', 'Last" + to_string(pk) + "', 'First" + to_string(pk) + "', 50000.00, " +
-			                 to_string(100 + (i % 500)) +
-			                 ".00, 0.0, 0, 0, 'S1', 'S2', 'City', 'ST', '12345', '1234567890', NOW(), 'M', 'data')");
-		} else if (table == "WAREHOUSE") {
-			tuples.push_back("(" + to_string(pk) + ", 0.00, 0.05, 'W', 'S1', 'S2', 'City', 'ST', '123456789')");
-		} else if (table == "DISTRICT") {
-			tuples.push_back("(" + to_string(w) + ", " + to_string(pk) +
-			                 ", 0.00, 0.05, 1, 'D', 'S1', 'S2', 'City', 'ST', '123456789')");
-		} else if (table == "OORDER") {
-			tuples.push_back("(" + to_string(w) + ", " + to_string(d) + ", " + to_string(pk) + ", " + to_string(c) +
-			                 ", NULL, 5, 1, NOW())");
-		} else if (table == "ORDER_LINE") {
-			tuples.push_back("(" + to_string(w) + ", " + to_string(d) + ", " + to_string(pk) + ", 1, " +
-			                 to_string(1 + (i % 100)) + ", NULL, " + to_string(10 + (i % 400)) + ".00, " + to_string(w) +
-			                 ", 5.00, 'D')");
-		} else if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
-			tuples.push_back("(" + to_string(1 + (i % 20)) + ", 'm" + to_string(pk) + "', " + to_string(1 + (i % 64)) +
-			                 ")");
-		} else if (table == "cm_saj_r") {
-			tuples.push_back("(" + to_string(10 + (i % 1000)) + ")");
-		} else if (table == "cm_win_src") {
-			tuples.push_back("(" + to_string(pk) + ", " + to_string(1 + (i % 20)) + ", " + to_string(i % 1000) + ")");
-		} else if (table == "cm_asof_prices") {
-			tuples.push_back("('A', TIMESTAMP '2024-01-02 00:00:00' + INTERVAL '" + to_string(i) + " minutes', " +
-			                 to_string(100 + (i % 500)) + ")");
-		} else if (table == "ed_a") {
-			tuples.push_back("(" + to_string(pk) + ", " + to_string(pk * 10) + ")");
-		} else if (table == "ed_b") {
-			tuples.push_back("(" + to_string(pk) + ", 'b_" + to_string(pk) + "')");
-		} else if (table == "ed_c") {
-			tuples.push_back("(" + to_string(pk) + ", 'c_" + to_string(pk) + "')");
-		}
-	}
-	if (tuples.empty()) {
+	if (n <= 0) {
 		return {};
 	}
 	string values;
-	for (size_t i = 0; i < tuples.size(); i++) {
-		if (i > 0) {
-			values += ", ";
-		}
-		values += tuples[i];
-	}
-	return {"INSERT INTO " + table + " VALUES " + values};
-}
-
-// Batch the TPC-C updates into a single UPDATE ... FROM (VALUES ...) join. Per-row updates full-scan
-// an unindexed table each. We dedup by key keeping the last i (the same "last write wins" the per-row
-// sequence produced), so the source has at most one row per key — no ambiguous multi-match. The
-// LOGICAL_UPDATE delta-capture handler records whatever rows actually change, so the MV stays correct.
-// Small synthetic tables keep per-row updates.
-static vector<string> GenerateUpdates(const string &table, int n, int scale) {
-	// table -> (SET column, key column list, VALUES alias columns incl. trailing value alias)
-	const char *set_col = nullptr, *alias = nullptr, *join = nullptr;
 	if (table == "CUSTOMER") {
-		set_col = "C_BALANCE";
-		alias = "m(k1, k2, k3, nv)";
-		join = "CUSTOMER.C_W_ID = m.k1 AND CUSTOMER.C_D_ID = m.k2 AND CUSTOMER.C_ID = m.k3";
+		values = "w, d, pk, 0.05, 'GC', 'Last' || pk, 'First' || pk, 50000.00, "
+		         "100 + i % 500, 0.0, 0, 0, 'S1', 'S2', 'City', 'ST', '12345', '1234567890', NOW(), 'M', 'data'";
 	} else if (table == "WAREHOUSE") {
-		set_col = "W_YTD";
-		alias = "m(k1, nv)";
-		join = "WAREHOUSE.W_ID = m.k1";
+		values = "pk, 0.00, 0.05, 'W', 'S1', 'S2', 'City', 'ST', '123456789'";
 	} else if (table == "DISTRICT") {
-		set_col = "D_YTD";
-		alias = "m(k1, k2, nv)";
-		join = "DISTRICT.D_W_ID = m.k1 AND DISTRICT.D_ID = m.k2";
+		values = "w, pk, 0.00, 0.05, 1, 'D', 'S1', 'S2', 'City', 'ST', '123456789'";
 	} else if (table == "OORDER") {
-		set_col = "O_CARRIER_ID";
-		alias = "m(k1, k2, k3, nv)";
-		join = "OORDER.O_W_ID = m.k1 AND OORDER.O_D_ID = m.k2 AND OORDER.O_ID = m.k3";
+		values = "w, d, pk, c, NULL, 5, 1, NOW()";
 	} else if (table == "ORDER_LINE") {
-		set_col = "OL_AMOUNT";
-		alias = "m(k1, k2, k3, k4, nv)";
-		join = "ORDER_LINE.OL_W_ID = m.k1 AND ORDER_LINE.OL_D_ID = m.k2 AND ORDER_LINE.OL_O_ID = m.k3 AND "
-		       "ORDER_LINE.OL_NUMBER = m.k4";
+		values = "w, d, pk, 1, 1 + i % 100, NULL, 10 + i % 400, w, 5.00, 'D'";
+	} else if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
+		values = "1 + i % 20, 'm' || pk, 1 + i % 64";
+	} else if (table == "cm_saj_r") {
+		values = "10 + i % 1000";
+	} else if (table == "cm_win_src") {
+		values = "pk, 1 + i % 20, i % 1000";
+	} else if (table == "cm_asof_prices") {
+		values = "'A', TIMESTAMP '2024-01-02 00:00:00' + i * INTERVAL '1 minute', 100 + i % 500";
+	} else if (table == "ed_a") {
+		values = "pk, pk * 10";
+	} else if (table == "ed_b") {
+		values = "pk, 'b_' || pk";
+	} else if (table == "ed_c") {
+		values = "pk, 'c_' || pk";
+	} else {
+		return {};
 	}
-	if (set_col) {
-		std::map<string, string> by_key; // key -> source tuple, last i wins
-		for (int i = 0; i < n; i++) {
-			int w = 1 + (i % std::max(scale, 1));
-			int d = 1 + (i % 10);
-			int c = 1 + (i % 30);
-			string key, tuple;
-			if (table == "CUSTOMER") {
-				key = to_string(w) + "/" + to_string(d) + "/" + to_string(c);
-				tuple = "(" + to_string(w) + ", " + to_string(d) + ", " + to_string(c) + ", " +
-				        to_string(-100 - (i % 500)) + ".00)";
-			} else if (table == "WAREHOUSE") {
-				key = to_string(w);
-				tuple = "(" + to_string(w) + ", " + to_string(300000 + i * 100) + ".00)";
-			} else if (table == "DISTRICT") {
-				key = to_string(w) + "/" + to_string(d);
-				tuple = "(" + to_string(w) + ", " + to_string(d) + ", " + to_string(30000 + i * 10) + ".00)";
-			} else if (table == "OORDER") {
-				key = to_string(w) + "/" + to_string(d) + "/" + to_string(1 + (i % 5));
-				tuple = "(" + to_string(w) + ", " + to_string(d) + ", " + to_string(1 + (i % 5)) + ", " +
-				        to_string(1 + (i % 10)) + ")";
-			} else { // ORDER_LINE
-				key = to_string(w) + "/" + to_string(d);
-				tuple = "(" + to_string(w) + ", " + to_string(d) + ", 1, 1, " + to_string(50 + (i % 400)) + ".00)";
-			}
-			by_key[key] = tuple;
-		}
-		if (by_key.empty()) {
-			return {};
-		}
-		string values;
-		for (auto &kv : by_key) {
-			if (!values.empty()) {
-				values += ", ";
-			}
-			values += kv.second;
-		}
-		return {"UPDATE " + table + " SET " + string(set_col) + " = m.nv FROM (VALUES " + values + ") AS " +
-		        string(alias) + " WHERE " + string(join)};
-	}
-
-	vector<string> out;
-	out.reserve(n);
-	for (int i = 0; i < n; i++) {
-		if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
-			out.push_back("UPDATE " + table + " SET cores = cores + 1 WHERE rowid IN (SELECT rowid FROM " + table +
-			              " LIMIT 1 OFFSET " + to_string(i % 4) + ")");
-		} else if (table == "cm_win_src") {
-			out.push_back("UPDATE cm_win_src SET val = val + 1 WHERE id = " + to_string(1 + (i % 3)));
-		} else if (table == "cm_asof_prices") {
-			out.push_back("UPDATE cm_asof_prices SET price = price + 1 WHERE rowid IN (SELECT rowid FROM "
-			              "cm_asof_prices LIMIT 1 OFFSET " +
-			              to_string(i % 2) + ")");
-		}
-	}
-	return out;
+	return {"INSERT INTO " + table + " SELECT " + values + " FROM (SELECT i, " +
+	        to_string(kPkBase + pk_offset) + " + i AS pk, 1 + i % " + to_string(std::max(scale, 1)) +
+	        " AS w, 1 + i % 10 AS d, 1 + i % 30 AS c FROM range(" + to_string(n) + ") batch(i)) batch"};
 }
 
-static bool SupportsUpdates(const string &table) {
-	return table == "CUSTOMER" || table == "WAREHOUSE" || table == "DISTRICT" || table == "OORDER" ||
-	       table == "ORDER_LINE" || table == "cm_dist_src" || table == "cm_dist_aux_src" || table == "cm_win_src" ||
-	       table == "cm_asof_prices";
+// Pick live rows each cycle. Fixed original keys eventually disappear under repeated deletes.
+// Updates and deletes use the same ordering so a mixed batch modifies overlapping rows before refresh.
+static string LiveRowIds(const string &table, int n) {
+	return "SELECT rowid FROM " + table + " ORDER BY rowid LIMIT " + to_string(n);
 }
 
-// Batch the TPC-C deletes (which target existing rows by composite key) into a single
-// DELETE ... WHERE (keys) IN (VALUES ...). Per-row deletes full-scan an unindexed table each, so n of
-// them is O(n * table); one IN-list delete is a single scan. Duplicate keys are harmless — IN is set
-// membership, and the row is deleted (and captured into the delta) exactly once either way. The
-// IN (VALUES ...) form is a subquery, captured via the DELETE rule's plan-serialization path. Small
-// synthetic tables keep per-row deletes (no scale concern, and they delete by non-key predicates).
-static vector<string> GenerateExistingDeletes(const string &table, int n, int scale) {
-	const char *key_cols = nullptr;
+static string UpdateExpression(const string &table) {
 	if (table == "CUSTOMER") {
-		key_cols = "(C_W_ID, C_D_ID, C_ID)";
+		return "C_BALANCE = -C_BALANCE + 1";
 	} else if (table == "WAREHOUSE") {
-		key_cols = "(W_ID)";
+		return "W_YTD = W_YTD + 1";
 	} else if (table == "DISTRICT") {
-		key_cols = "(D_W_ID, D_ID)";
+		return "D_YTD = D_YTD + 1";
 	} else if (table == "OORDER") {
-		key_cols = "(O_W_ID, O_D_ID, O_ID)";
+		return "O_CARRIER_ID = COALESCE(O_CARRIER_ID, 0) + 1";
 	} else if (table == "ORDER_LINE") {
-		key_cols = "(OL_W_ID, OL_D_ID, OL_O_ID, OL_NUMBER)";
+		return "OL_AMOUNT = OL_AMOUNT + 1";
+	} else if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
+		return "cores = cores + 1";
+	} else if (table == "cm_win_src") {
+		return "val = val + 1";
+	} else if (table == "cm_asof_prices") {
+		return "price = price + 1";
 	}
-	if (key_cols) {
-		string values;
-		for (int i = 0; i < n; i++) {
-			int safe_scale = std::max(scale, 1);
-			int w = 1 + ((i / 300) % safe_scale);
-			int d = 1 + ((i / 30) % 10);
-			int c = 1 + (i % 30);
-			string tuple;
-			if (table == "CUSTOMER") {
-				tuple = "(" + to_string(w) + ", " + to_string(d) + ", " + to_string(c) + ")";
-			} else if (table == "WAREHOUSE") {
-				tuple = "(" + to_string(1 + (i % safe_scale)) + ")";
-			} else if (table == "DISTRICT") {
-				tuple = "(" + to_string(1 + ((i / 10) % safe_scale)) + ", " + to_string(1 + (i % 10)) + ")";
-			} else if (table == "OORDER") {
-				tuple = "(" + to_string(1 + ((i / 50) % safe_scale)) + ", " + to_string(1 + ((i / 5) % 10)) + ", " +
-				        to_string(1 + (i % 5)) + ")";
-			} else { // ORDER_LINE
-				tuple = "(" + to_string(1 + ((i / 250) % safe_scale)) + ", " + to_string(1 + ((i / 25) % 10)) + ", " +
-				        to_string(1 + ((i / 5) % 5)) + ", " + to_string(1 + (i % 5)) + ")";
-			}
-			if (!values.empty()) {
-				values += ", ";
-			}
-			values += tuple;
-		}
-		if (values.empty()) {
-			return {};
-		}
-		return {"DELETE FROM " + table + " WHERE " + string(key_cols) + " IN (VALUES " + values + ")"};
-	}
+	return "";
+}
 
-	vector<string> out;
-	out.reserve(n);
-	for (int i = 0; i < n; i++) {
-		if (table == "cm_dist_src" || table == "cm_dist_aux_src") {
-			static const char *machines[] = {"m1", "m2", "m3"};
-			out.push_back("DELETE FROM " + table + " WHERE machine = '" + string(machines[i % 3]) + "'");
-		} else if (table == "cm_saj_r") {
-			out.push_back("DELETE FROM cm_saj_r WHERE y = " + to_string((10 * (1 + (i % 50))) + 1));
-		} else if (table == "cm_win_src") {
-			out.push_back("DELETE FROM cm_win_src WHERE id = " + to_string(1 + (i % 500)));
-		} else if (table == "cm_asof_prices") {
-			out.push_back("DELETE FROM cm_asof_prices WHERE price = " + to_string(100 + (i % 500)));
-		}
+static vector<string> GenerateUpdates(const string &table, int n) {
+	auto expression = UpdateExpression(table);
+	if (n <= 0 || expression.empty()) {
+		return {};
 	}
-	return out;
+	return {"UPDATE " + table + " SET " + expression + " WHERE rowid IN (" + LiveRowIds(table, n) + ")"};
+}
+
+static vector<string> GenerateExistingDeletes(const string &table, int n) {
+	if (n <= 0) {
+		return {};
+	}
+	return {"DELETE FROM " + table + " WHERE rowid IN (" + LiveRowIds(table, n) + ")"};
 }
 
 static vector<string> BuildWorkload(const string &table, int size, int scale, Workload wl, int64_t pk_offset) {
@@ -441,38 +315,17 @@ static vector<string> BuildWorkload(const string &table, int size, int scale, Wo
 		return GenerateInserts(table, size, scale, pk_offset);
 	}
 
-	int n_ins;
-	int n_upd;
-	int n_del;
-	if (size == 1) {
-		n_ins = 0;
-		n_upd = 0;
-		n_del = 1;
-	} else if (size == 2) {
-		n_ins = 1;
-		n_upd = 0;
-		n_del = 1;
-	} else {
-		n_ins = std::max(1, size / 2);
-		n_upd = std::max(1, (size * 30) / 100);
-		n_del = size - n_ins - n_upd;
-		if (n_del <= 0) {
-			n_del = 1;
-			if (n_ins > 1) {
-				n_ins--;
-			} else {
-				n_upd--;
-			}
-		}
-	}
-	if (!SupportsUpdates(table)) {
+	int n_ins = std::max(1, size / 2);
+	int n_upd = std::max(1, (size * 30) / 100);
+	int n_del = size - n_ins - n_upd;
+	if (UpdateExpression(table).empty()) {
 		n_del += n_upd;
 		n_upd = 0;
 	}
 	auto out = GenerateInserts(table, n_ins, scale, pk_offset);
-	auto updates = GenerateUpdates(table, n_upd, scale);
+	auto updates = GenerateUpdates(table, n_upd);
 	out.insert(out.end(), updates.begin(), updates.end());
-	auto deletes = GenerateExistingDeletes(table, n_del, scale);
+	auto deletes = GenerateExistingDeletes(table, n_del);
 	out.insert(out.end(), deletes.begin(), deletes.end());
 	return out;
 }
@@ -625,10 +478,10 @@ static vector<QueryDef> BuildQueries() {
 	               "INSERT INTO cm_win_src SELECT i, i % 20, i FROM range(1, 501) t(i)"},
 	              {},
 	              {"CREATE MATERIALIZED VIEW mv_q AS SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp "
-	               "ORDER BY val) AS rn FROM cm_win_src"},
+	               "ORDER BY val, id) AS rn FROM cm_win_src"},
 	              {"mv_q"},
 	              {"cm_win_src"},
-	              "SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val) AS rn FROM cm_win_src",
+	              "SELECT id, grp, val, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY val, id) AS rn FROM cm_win_src",
 	              {Workload::INSERT_ONLY, Workload::MIXED, Workload::EMPTY_DELTA}});
 	AddQuery(qs, {"S05",
 	              "ASOF current-diff recompute",
@@ -835,23 +688,37 @@ static vector<int> AllocateDeltas(duckdb::Connection &con, const vector<string> 
 	return allocated;
 }
 
-static int64_t ApplyDML(duckdb::Connection &con, const QueryDef &q, Workload workload, double delta_pct, int scale) {
+// `pk_cursor` is an in/out watermark over the synthetic primary-key space, advanced past whatever
+// this call inserts so a later cycle on the same database never reuses a key.
+//
+// A watermark rather than cycle * constant: the key columns are 32-bit, and a stride wide enough for
+// a large cycle exhausts that range within a few dozen cycles. At 1e8 per cycle the keys passed
+// INT32_MAX at cycle 22, every insert failed, and the mixed workload's deletes then drained the
+// table to empty while still reporting success. Tracking actual usage spends only what is needed.
+static int64_t ApplyDML(duckdb::Connection &con, const QueryDef &q, Workload workload, double delta_pct, int scale,
+                        int64_t &pk_cursor) {
 	if (workload == Workload::EMPTY_DELTA || delta_pct <= 0.0) {
 		return 0;
 	}
 	auto allocations = AllocateDeltas(con, q.touched_tables, delta_pct);
 	int64_t issued = 0;
-	int64_t pk_offset = 0;
+	int64_t pk_offset = pk_cursor;
 	for (idx_t i = 0; i < q.touched_tables.size(); i++) {
-		auto dml = BuildWorkload(q.touched_tables[i], allocations[i], scale, workload, pk_offset);
+		// At least one insert, update (where supported), and delete keeps tiny or empty
+		// tables participating in repeated mixed batches. The actual delta count is recorded.
+		int allocation = workload == Workload::MIXED ? std::max(3, allocations[i]) : allocations[i];
+		auto dml = BuildWorkload(q.touched_tables[i], allocation, scale, workload, pk_offset);
 		for (auto &sql : dml) {
 			auto result = con.Query(sql);
-			if (result && !result->HasError()) {
-				issued++;
+			if (!result || result->HasError()) {
+				throw std::runtime_error("DML on " + q.touched_tables[i] + ": " +
+				                         (result ? result->GetError() : "null result"));
 			}
+			issued++;
 		}
-		pk_offset += allocations[i] + 100000;
+		pk_offset += allocation + 1000;
 	}
+	pk_cursor = pk_offset;
 	return issued;
 }
 
@@ -998,10 +865,6 @@ static void ConfigureMode(duckdb::Connection &con, RefreshMode mode) {
 	}
 }
 
-// do_validate gates the (expensive) EXCEPT ALL correctness cross-check. We run it for the AUTO path
-// (the decision under test) and skip it for the INCREMENTAL/FULL reference-timing runs, which avoids
-// two of the three full validations per combo. Each mode still does its own independent full setup in
-// its own session, so this changes only what we verify, not how the refresh runs.
 // A case's starting state, built once and reused by every refresh mode.
 //
 // The three modes have to begin from identical state, but they used to reach it by each repeating
@@ -1014,8 +877,17 @@ static void ConfigureMode(duckdb::Connection &con, RefreshMode mode) {
 //
 // Building it once and restoring from a file copy fixes both. The copy is cheap next to what it
 // replaces: 28 MB at scale factor 25 copies in 0.02s, against seconds to minutes for the setup.
+// The case's live database, carried across refresh cycles.
+//
+// A cost model that learns from execution history cannot be measured on a database that has none.
+// Every case used to be a fresh copy refreshed exactly once, so history was empty by construction
+// and the learned weights could never reach their sample threshold: the sweep only ever exercised
+// the uncalibrated fallback. A case is now one database refreshed many times, with the accepted
+// result carried forward, so the model sees the regime it is meant to operate in.
 struct PreparedCase {
-	std::unique_ptr<TempDb> snapshot;
+	std::unique_ptr<TempDb> state;
+	string case_tag;         // shared by every file of this case, so they share a catalog name
+	int64_t pk_cursor = 0;   // advances across cycles so no two reuse a key
 	bool ok = false;
 	string error;
 	int64_t dml_statements = 0;
@@ -1024,20 +896,20 @@ struct PreparedCase {
 	int64_t mv_rows = 0;
 };
 
-static PreparedCase PrepareCase(const string &src_db_path, const QueryDef &q, Workload workload, double delta_pct,
-                                FlagConfig flag_config, int scale, int rep) {
+static PreparedCase PrepareCase(const string &src_db_path, const QueryDef &q, Workload workload,
+                                FlagConfig flag_config, int rep) {
 	PreparedCase prepared;
-	string tag = q.id + "_" + WorkloadName(workload) + "_" + to_string(delta_pct) + "_" + FlagConfigName(flag_config) +
-	             "_" + to_string(rep) + "_setup";
-	prepared.snapshot.reset(new TempDb(tag));
-	if (!CopyFile(src_db_path, prepared.snapshot->path)) {
+	prepared.case_tag =
+	    q.id + "_" + WorkloadName(workload) + "_" + FlagConfigName(flag_config) + "_" + to_string(rep);
+	prepared.state.reset(new TempDb(prepared.case_tag, "state"));
+	if (!CopyFile(src_db_path, prepared.state->path)) {
 		prepared.error = "copy db failed: " + string(strerror(errno));
 		return prepared;
 	}
 	try {
 		// Scoped so the database is closed, and therefore checkpointed, before anything copies the
 		// file. A snapshot taken while it is open could miss writes still sitting in the WAL.
-		duckdb::DuckDB db(prepared.snapshot->path);
+		duckdb::DuckDB db(prepared.state->path);
 		duckdb::Connection con(db);
 		auto load = con.Query("LOAD openivm");
 		if (!load || load->HasError()) {
@@ -1066,12 +938,6 @@ static PreparedCase PrepareCase(const string &src_db_path, const QueryDef &q, Wo
 				return prepared;
 			}
 		}
-		prepared.dml_statements = ApplyDML(con, q, workload, delta_pct, scale);
-		prepared.delta_rows = CountPendingDeltaRows(con, q);
-		if (workload == Workload::MIXED && delta_pct > 0 && prepared.delta_rows <= 0) {
-			prepared.error = "mixed workload produced no pending delta rows";
-			return prepared;
-		}
 		prepared.base_rows = ReadBaseRows(con, q);
 		prepared.mv_rows = ReadCount(con, "SELECT COUNT(*) FROM " + q.refresh_mvs.back());
 	} catch (const std::exception &e) {
@@ -1082,18 +948,56 @@ static PreparedCase PrepareCase(const string &src_db_path, const QueryDef &q, Wo
 	return prepared;
 }
 
+// Apply one cycle's delta to the live state. Returns false with `error` set on failure.
+//
+// The cycle index offsets the synthetic key space so no cycle reuses a key an earlier one inserted,
+// and it rotates the delta percentage so the recorded history covers a range of change sizes rather
+// than repeating one. A model fitted on a single delta size would have nothing to generalise from.
+static bool ApplyCycleDelta(PreparedCase &prepared, const QueryDef &q, Workload workload, double delta_pct, int scale,
+                            string &error) {
+	try {
+		duckdb::DuckDB db(prepared.state->path);
+		duckdb::Connection con(db);
+		auto load = con.Query("LOAD openivm");
+		if (!load || load->HasError()) {
+			error = "LOAD openivm: " + (load ? load->GetError() : "null result");
+			return false;
+		}
+		for (auto &sql : q.query_settings) {
+			con.Query(sql);
+		}
+		prepared.dml_statements = ApplyDML(con, q, workload, delta_pct, scale, prepared.pk_cursor);
+		prepared.delta_rows = CountPendingDeltaRows(con, q);
+		if (prepared.dml_statements == 0 && delta_pct > 0) {
+			error = "delta applied no statements — the synthetic key space may be exhausted";
+			return false;
+		}
+		if (workload == Workload::MIXED && delta_pct > 0 && prepared.delta_rows <= 0) {
+			error = "mixed workload produced no pending delta rows";
+			return false;
+		}
+		prepared.base_rows = ReadBaseRows(con, q);
+		prepared.mv_rows = ReadCount(con, "SELECT COUNT(*) FROM " + q.refresh_mvs.back());
+	} catch (const std::exception &e) {
+		error = string("exception applying delta: ") + e.what();
+		return false;
+	}
+	return true;
+}
+
 static ModeResult RunMode(const PreparedCase &prepared, const QueryDef &q, Workload workload, double delta_pct,
-                          FlagConfig flag_config, int rep, RefreshMode mode, bool read_cost, bool warm,
-                          bool do_validate) {
+                          FlagConfig flag_config, int rep, int cycle, RefreshMode mode, bool read_cost, bool warm,
+                          bool do_validate, string *promote_path) {
 	ModeResult out;
 	out.dml_statements = prepared.dml_statements;
 	out.delta_rows = prepared.delta_rows;
 	out.base_rows = prepared.base_rows;
 	out.mv_rows = prepared.mv_rows;
-	string tag = q.id + "_" + WorkloadName(workload) + "_" + to_string(delta_pct) + "_" + FlagConfigName(flag_config) +
-	             "_" + to_string(rep) + "_" + to_string(static_cast<int>(mode));
-	TempDb temp(tag);
-	if (!CopyFile(prepared.snapshot->path, temp.path)) {
+	// Each mode branches from the same state, so the three are comparable, and only the accepted one
+	// is carried forward. Retained past this scope when it is the one to promote.
+	TempDb temp(prepared.case_tag, "c" + to_string(cycle) + "m" + to_string(static_cast<int>(mode)),
+	            promote_path != nullptr);
+	if (!CopyFile(prepared.state->path, temp.path)) {
 		out.error = "restore snapshot failed: " + string(strerror(errno));
 		return out;
 	}
@@ -1163,9 +1067,12 @@ static ModeResult RunMode(const PreparedCase &prepared, const QueryDef &q, Workl
 				return out;
 			}
 		} else {
-			out.correct = true; // reference-timing run: correctness is verified on the AUTO path
+			out.correct = true; // validation explicitly disabled by --no-validate
 		}
 		out.ok = true;
+		if (promote_path) {
+			*promote_path = temp.path;
+		}
 		return out;
 	} catch (const std::exception &e) {
 		out.error = string("exception: ") + e.what();
@@ -1210,7 +1117,7 @@ static void PrintUsage() {
 	fprintf(stderr, "cost_model_benchmark --scale N --db PATH --out CSV [--reps 3]\n"
 	                "                     [--delta-pcts 0,0.01,1,2,5,10,20,50] [--filter Q01,S06,...] [--no-warm]\n"
 	                "                     [--configs all_on,all_off,skip_empty_off] [--no-validate]\n"
-	                "                     [--batch all|validated|todo]\n");
+	                "                     [--batch all|validated|todo] [--cycles 10]\n");
 }
 
 int main(int argc, char **argv) {
@@ -1218,10 +1125,15 @@ int main(int argc, char **argv) {
 	string db_path;
 	string out_csv = "cost_model_benchmark_results.csv";
 	int reps = 3;
-	vector<double> delta_pcts = {0, 0.01, 1, 2, 5, 10, 20, 50};
+	// Refreshes per case, all against one database. The cost model learns from execution history, so
+	// a case that refreshes once can only ever exercise the uncalibrated path.
+	int cycles = 10;
+	// Rotated across cycles rather than forming a dimension of the grid: a model fitted on a single
+	// delta size has nothing to generalise from. An empty delta is now just a cycle with no change.
+	vector<double> delta_pcts = {0.01, 1, 2, 5, 10, 20, 50};
 	set<string> query_filter;
 	bool warm = true;
-	bool validate = true; // EXCEPT ALL correctness cross-check on the AUTO path
+	bool validate = true; // EXCEPT ALL correctness cross-check for every refresh mode
 	string batch_sel = "all"; // "all" | "validated" | "todo"
 	vector<FlagConfig> configs = {FlagConfig::ALL_ON, FlagConfig::ALL_OFF, FlagConfig::SKIP_EMPTY_OFF};
 
@@ -1243,6 +1155,12 @@ int main(int argc, char **argv) {
 			out_csv = next("--out");
 		} else if (arg == "--reps") {
 			reps = std::stoi(next("--reps"));
+		} else if (arg == "--cycles") {
+			cycles = std::stoi(next("--cycles"));
+			if (cycles < 1) {
+				fprintf(stderr, "--cycles must be >= 1\n");
+				return 2;
+			}
 		} else if (arg == "--delta-pcts") {
 			delta_pcts = ParseDoubleList(next("--delta-pcts"));
 		} else if (arg == "--filter") {
@@ -1309,7 +1227,7 @@ int main(int argc, char **argv) {
 	auto queries = BuildQueries();
 
 	std::ofstream out(out_csv);
-	out << "scale,query_id,description,workload,delta_pct,flag_config,rep,view_name,"
+	out << "scale,query_id,description,workload,delta_pct,flag_config,rep,cycle,view_name,"
 	       "cost_decision,incremental_cost,recompute_cost,incremental_predicted_ms,recompute_predicted_ms,calibrated,"
 	       "auto_method,auto_ms,incremental_ms,full_ms,best_method,regret_ratio,inc_qerror,full_qerror,"
 	       "correct,base_rows,mv_rows,"
@@ -1327,15 +1245,10 @@ int main(int argc, char **argv) {
 			continue;
 		}
 		for (auto wl : q.workloads) {
-			for (double pct : delta_pcts) {
-				if (wl == Workload::EMPTY_DELTA && pct > 0.0) {
-					continue;
-				}
-				if (wl != Workload::EMPTY_DELTA && pct <= 0.0) {
-					continue;
-				}
-				total += static_cast<int>(configs.size()) * reps;
+			if (wl == Workload::EMPTY_DELTA) {
+				continue; // an empty delta is a cycle with no change, not a case of its own
 			}
+			total += static_cast<int>(configs.size()) * reps * cycles;
 		}
 	}
 	Log("Total cost-model benchmark rows planned: " + to_string(total));
@@ -1353,37 +1266,52 @@ int main(int argc, char **argv) {
 			continue;
 		}
 		for (auto wl : q.workloads) {
-			for (double pct : delta_pcts) {
-				if (wl == Workload::EMPTY_DELTA && pct > 0.0) {
-					continue;
-				}
-				if (wl != Workload::EMPTY_DELTA && pct <= 0.0) {
-					continue;
-				}
-				for (auto config : configs) {
-					for (int rep = 1; rep <= reps; rep++) {
+			if (wl == Workload::EMPTY_DELTA) {
+				continue;
+			}
+			for (auto config : configs) {
+				for (int rep = 1; rep <= reps; rep++) {
+					// One database per case, refreshed `cycles` times. The cost model learns from
+					// execution history, so it can only be measured on a database that accumulates
+					// some; a case that refreshes once leaves it permanently uncalibrated.
+					auto prepared = PrepareCase(db_path, q, wl, config, rep);
+					for (int cycle = 1; cycle <= cycles; cycle++) {
+						double pct = delta_pcts[(cycle - 1) % delta_pcts.size()];
 						row++;
 						Log("[" + to_string(row) + "/" + to_string(total) + "] " + q.id + " wl=" + WorkloadName(wl) +
-						    " pct=" + to_string(pct) + " flags=" + FlagConfigName(config) + " rep=" + to_string(rep));
-						// One setup, three refreshes from the same starting state.
-						auto prepared = PrepareCase(db_path, q, wl, pct, config, scale, rep);
+						    " cycle=" + to_string(cycle) + "/" + to_string(cycles) + " pct=" + to_string(pct) +
+						    " flags=" + FlagConfigName(config) + " rep=" + to_string(rep));
 						ModeResult auto_result, inc_result, full_result;
+						string promoted;
 						if (!prepared.ok) {
 							auto_result.error = prepared.error;
 							inc_result.error = prepared.error;
 							full_result.error = prepared.error;
+						} else if (!ApplyCycleDelta(prepared, q, wl, pct, scale, prepared.error)) {
+							auto_result.error = prepared.error;
+							inc_result.error = prepared.error;
+							full_result.error = prepared.error;
+							prepared.ok = false;
 						} else {
-							auto_result = RunMode(prepared, q, wl, pct, config, rep, RefreshMode::AUTO, true, warm,
-							                      /*do_validate=*/validate);
-							inc_result = RunMode(prepared, q, wl, pct, config, rep, RefreshMode::INCREMENTAL, false,
-							                     warm, /*do_validate=*/false);
-							full_result = RunMode(prepared, q, wl, pct, config, rep, RefreshMode::FULL, false, warm,
-							                      /*do_validate=*/false);
+							// All three branch from the same state so the comparison is fair; only the
+							// automatic one is carried forward, so the history the model learns from is
+							// the history of the decisions it actually made.
+							auto_result = RunMode(prepared, q, wl, pct, config, rep, cycle, RefreshMode::AUTO, true,
+							                      warm, /*do_validate=*/validate, &promoted);
+							inc_result = RunMode(prepared, q, wl, pct, config, rep, cycle, RefreshMode::INCREMENTAL,
+							                     false, warm, /*do_validate=*/validate, nullptr);
+							full_result = RunMode(prepared, q, wl, pct, config, rep, cycle, RefreshMode::FULL, false,
+							                      warm, /*do_validate=*/validate, nullptr);
+							if (!promoted.empty()) {
+								if (auto_result.ok) {
+									CopyFile(promoted, prepared.state->path);
+								}
+								std::remove(promoted.c_str());
+								std::remove((promoted + ".wal").c_str());
+							}
 						}
 
-						// Correctness is verified on the AUTO path (the decision under test); the forced
-						// inc/full runs are reference timings only.
-						bool correct = auto_result.correct;
+						bool correct = auto_result.correct && inc_result.correct && full_result.correct;
 						bool ok = auto_result.ok && inc_result.ok && full_result.ok;
 						if (!ok || !correct) {
 							errors++;
@@ -1422,7 +1350,8 @@ int main(int argc, char **argv) {
 							Log(msg.str());
 						}
 						out << scale << "," << q.id << "," << CsvQuote(q.description) << "," << WorkloadName(wl) << ","
-						    << pct << "," << FlagConfigName(config) << "," << rep << "," << q.refresh_mvs.back() << ","
+						    << pct << "," << FlagConfigName(config) << "," << rep << "," << cycle << ","
+						    << q.refresh_mvs.back() << ","
 						    << CsvQuote(auto_result.cost.decision) << "," << std::fixed << std::setprecision(6)
 						    << auto_result.cost.incremental_cost << "," << auto_result.cost.recompute_cost << ","
 						    << auto_result.cost.incremental_predicted_ms << ","

@@ -1315,3 +1315,125 @@ SELECT COUNT(*) FROM (
 );
 ----
 0
+
+# Group recompute must discover null groups created by losing a FULL OUTER match.
+statement ok
+SET openivm_refresh_mode='incremental';
+
+statement ok
+CREATE TABLE foj_transition_w(wid INTEGER);
+
+statement ok
+CREATE TABLE foj_transition_d(wid INTEGER,did INTEGER);
+
+statement ok
+INSERT INTO foj_transition_w VALUES (1),(2);
+
+statement ok
+INSERT INTO foj_transition_d VALUES (1,1),(1,2),(2,3);
+
+statement ok
+CREATE MATERIALIZED VIEW foj_transition_mv AS SELECT w.wid,COUNT(d.did) AS nd FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY w.wid;
+
+statement ok
+CREATE MATERIALIZED VIEW foj_transition_right_mv AS SELECT d.did,COUNT(w.wid) AS nw FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY d.did;
+
+statement ok
+DELETE FROM foj_transition_w WHERE wid=1;
+
+statement ok
+PRAGMA refresh('foj_transition_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM foj_transition_mv EXCEPT ALL SELECT w.wid,COUNT(d.did) AS nd FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY w.wid) UNION ALL (SELECT w.wid,COUNT(d.did) AS nd FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY w.wid EXCEPT ALL SELECT * FROM foj_transition_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('foj_transition_right_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM foj_transition_right_mv EXCEPT ALL SELECT d.did,COUNT(w.wid) AS nw FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY d.did) UNION ALL (SELECT d.did,COUNT(w.wid) AS nw FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY d.did EXCEPT ALL SELECT * FROM foj_transition_right_mv));
+----
+0
+
+statement ok
+INSERT INTO foj_transition_w VALUES (1);
+
+statement ok
+PRAGMA refresh('foj_transition_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM foj_transition_mv EXCEPT ALL SELECT w.wid,COUNT(d.did) AS nd FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY w.wid) UNION ALL (SELECT w.wid,COUNT(d.did) AS nd FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY w.wid EXCEPT ALL SELECT * FROM foj_transition_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('foj_transition_right_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM foj_transition_right_mv EXCEPT ALL SELECT d.did,COUNT(w.wid) AS nw FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY d.did) UNION ALL (SELECT d.did,COUNT(w.wid) AS nw FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY d.did EXCEPT ALL SELECT * FROM foj_transition_right_mv));
+----
+0
+
+statement ok
+INSERT INTO foj_transition_w VALUES (3),(3);
+
+statement ok
+INSERT INTO foj_transition_d VALUES (3,4),(4,5);
+
+statement ok
+UPDATE foj_transition_w SET wid=4 WHERE wid=3;
+
+statement ok
+DELETE FROM foj_transition_w WHERE wid=2;
+
+statement ok
+UPDATE foj_transition_d SET wid=5 WHERE did=3;
+
+statement ok
+DELETE FROM foj_transition_d WHERE did=4;
+
+statement ok
+PRAGMA refresh('foj_transition_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM foj_transition_mv EXCEPT ALL SELECT w.wid,COUNT(d.did) AS nd FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY w.wid) UNION ALL (SELECT w.wid,COUNT(d.did) AS nd FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY w.wid EXCEPT ALL SELECT * FROM foj_transition_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('foj_transition_right_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM foj_transition_right_mv EXCEPT ALL SELECT d.did,COUNT(w.wid) AS nw FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY d.did) UNION ALL (SELECT d.did,COUNT(w.wid) AS nw FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY d.did EXCEPT ALL SELECT * FROM foj_transition_right_mv));
+----
+0
+
+statement ok
+DELETE FROM foj_transition_w;
+
+statement ok
+INSERT INTO foj_transition_w VALUES (5);
+
+statement ok
+DELETE FROM foj_transition_d WHERE wid=1;
+
+statement ok
+INSERT INTO foj_transition_d VALUES (6,6);
+
+statement ok
+PRAGMA refresh('foj_transition_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM foj_transition_mv EXCEPT ALL SELECT w.wid,COUNT(d.did) AS nd FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY w.wid) UNION ALL (SELECT w.wid,COUNT(d.did) AS nd FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY w.wid EXCEPT ALL SELECT * FROM foj_transition_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('foj_transition_right_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM foj_transition_right_mv EXCEPT ALL SELECT d.did,COUNT(w.wid) AS nw FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY d.did) UNION ALL (SELECT d.did,COUNT(w.wid) AS nw FROM foj_transition_w w FULL OUTER JOIN foj_transition_d d ON w.wid=d.wid GROUP BY d.did EXCEPT ALL SELECT * FROM foj_transition_right_mv));
+----
+0

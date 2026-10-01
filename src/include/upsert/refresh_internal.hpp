@@ -180,6 +180,11 @@ string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &quer
 bool IsSummableLogicalType(const LogicalType &type);
 string NormalizeColumnNameForMatch(const string &name);
 string BaseTableNameFromDeltaKey(const string &delta_key);
+string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec);
+string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
+                                     const vector<string> &delta_table_names, const vector<string> &group_columns,
+                                     const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs,
+                                     const string &lpts_table_prefix);
 string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
                                  const string &extra_predicate = "");
 
