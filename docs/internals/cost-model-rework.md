@@ -4,6 +4,37 @@ Working notes for whoever picks this up next. Covers what was built, what was me
 still unproven, and the traps that cost time. Companion to [cost_model.md](cost_model.md), which
 describes the model as it stood before this work; where the two disagree, this file is newer.
 
+## Consolidation and latest validation (2026-10-01)
+
+The retained WIP branch is `ila/cost-model-plan-reuse` (PR #22). It now includes current main
+and preserves the complete history of `ila/benchmark-snapshot-setup` and
+`ila/cost-model-sweep-build`; those two redundant remote branches have been retired.
+PR #95 extracts the finished benchmark, daemon lifetime, FULL OUTER affected-group, and DISTINCT
+auxiliary-state fixes onto main. The remaining WIP covers delta-plan reuse, learned operator costs,
+exploration, and calibration. The historical investigations below are retained as evidence.
+
+[GCI run 36359401636](https://github.com/mdrakiburrahman/ivm-bench/actions/runs/36359401636)
+completed the calibration rerun on OpenIVM `c7f9aeb3809ab50554986d6551a179ab3327246d`
+and runner `ca16c3fbc4b2a2a506a2996415b132a80c352cb7` in 15h20m30s.
+SF1/10/25/50/100 each completed 5,040 correct cases: 25,200 cases and 75,600 validated
+refreshes, with no errors or scale timeouts. Faster-strategy selection accuracy was
+69.7/72.8/74.9/74.4/74.5%, respectively. AUTO still took 16–25% more recorded time than
+always-incremental; its recorded time includes the benchmark history lookup. Exploration can
+still choose a much slower strategy. These results justify keeping the model changes as WIP.
+The comparison with run 36249790313 also includes generator changes, so it does not isolate
+calibration experimentally.
+
+After integration with current main, the finished-work candidate passed 13,641 assertions across
+90 SQL test cases, plus all-query SF1 verification (168 cases, 504 refreshes). The consolidated
+WIP passed 14,083 assertions across 91 SQL test cases, plus Q01/T05/T14 at SF1 for 30 cycles
+(180 cases, 540 refreshes). Both suites had one existing ICU-dependent skip because ICU was not
+built. All benchmark cases passed correctness validation. These are integration checks, not a
+new isolated performance measurement or a rerun of the full GCI ladder on current main.
+
+Current main scopes internal view identities. The benchmark now resolves refresh history through
+`PRAGMA refresh_history`, and the model's deterministic SQL fixtures resolve identities through
+`openivm_views.view_sql_name`. Failed history lookups propagate as errors.
+
 ## Calibration follow-up (2026-09-28)
 
 Analysis of the successful rows from GCI run 36249790313 found a mid-run decision-accuracy dip:
@@ -54,7 +85,7 @@ build/release/extension/openivm/cost_model_benchmark --scale 10 \
 
 Local artifacts: `/private/tmp/calibration-before.csv`, `/private/tmp/calibration-after.csv`,
 `/private/tmp/calibration-comparison.json`, and `/private/tmp/compare-calibration.py`.
-The full GCI ladder has not been rerun with these calibration changes.
+The full GCI ladder was subsequently rerun successfully; see the 2026-10-01 update above.
 
 ## Takeover investigation (2026-09-25)
 
@@ -464,20 +495,17 @@ literal.
 
 ## Open items
 
-1. **Validate or replace the per-operator model.** See above. Model selection on held-out cycles is
-   the suggested route.
-2. **Scale 10 crashes.** The last GCI ladder aborted scale 10 with exit -6 (SIGABRT) after 130 of 504
-   cases, in 2.5 minutes. Uninvestigated. Scales 1, 25 and 50 completed clean in the same run, so it
-   is not a general breakage.
-3. **Scale 100 runtime.** Twelve hours and still unfinished under the old one-refresh-per-database
-   shape, where the timed refresh was 0.4% of wall clock at scale 50. The cycles restructure should
-   change this materially but has not been run at scale on the runners.
-4. **Re-run the ladder on a build that contains all of this.** Every GCI run so far predates either
-   the learned weights or the training-target fix. Re-merge #22 into `ila/cost-model-sweep-build`,
-   repin `ila/cost-model-sweep-run`, dispatch.
-5. **`PRAGMA refresh_cost` cannot say which model produced a number.** Diagnosing the per-operator
-   model meant inferring it from sample counts and timing. A column naming the source would have made
-   that immediate.
+1. **Improve end-to-end AUTO performance.** The successful full ladder still loses to
+   always-incremental at every scale. Separate model/planning overhead from benchmark history
+   lookup time before attributing the full gap to calibration.
+2. **Validate model selection.** Compare the pooled operator model with the per-view fit on
+   held-out cycles; a more complex model should earn its precedence.
+3. **Bound exploration regret.** The unchanged deterministic override can select full refresh
+   when both predictions and measurements favor incremental by a wide margin.
+4. **Rerun the full ladder after further model changes.** Use the retained WIP branch and pin
+   its exact commit in the runner; the old sweep-build integration branch is retired.
+5. **Expose prediction provenance.** `PRAGMA refresh_cost` does not identify the selected model,
+   and the benchmark CSV does not explicitly label exploration.
 
 ## Working notes
 
