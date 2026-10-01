@@ -6,7 +6,7 @@ OpenIVM runs inside DuckDB. Spark support means three things: it can read Spark-
 
 ## Input dialect
 
-`openivm_input_dialect` (default `duckdb`) sets the dialect of incoming `CREATE MATERIALIZED VIEW` bodies. Valid values are `duckdb` and `spark`; any other value is rejected by `SET`.
+`openivm_input_dialect` (default `duckdb`) sets the dialect of incoming `CREATE MATERIALIZED VIEW` bodies. The documented values are `duckdb` and `spark`. An unrecognised value (for example `klingon`) is rejected by `SET` (`test/sql/time_travel.test`); the validator lives in LPTS, so this page does not list any further accepted values.
 
 With `spark`, the body is translated to DuckDB syntax (via LPTS `NormalizeInputSqlToDuckDB`) before parsing. This covers backtick identifiers and Spark time-travel clauses. See [parser](internals/parser.md#input-dialect).
 
