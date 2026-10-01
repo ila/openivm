@@ -844,12 +844,11 @@ static bool ValidateMV(duckdb::Connection &con, const string &mv_name, const str
 }
 
 static string LastHistoryMethod(duckdb::Connection &con, const string &view_name) {
-	auto result = con.Query("SELECT method FROM openivm_refresh_history WHERE view_name = '" + view_name +
-	                        "' ORDER BY refresh_timestamp DESC LIMIT 1");
+	auto result = con.Query("PRAGMA refresh_cost_history(" + duckdb::Value(view_name).ToSQLString() + ")");
 	if (!result || result->HasError() || result->RowCount() == 0) {
 		return "skipped_or_unrecorded";
 	}
-	return result->GetValue(0, 0).ToString();
+	return result->GetValue(2, 0).ToString();
 }
 
 static void ConfigureMode(duckdb::Connection &con, RefreshMode mode) {
