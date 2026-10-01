@@ -1,5 +1,7 @@
 # Spark support
 
+**OpenIVM Spark (in development): <https://github.com/mdrakiburrahman/openivm-spark>**
+
 OpenIVM runs inside DuckDB. Spark support means three things: it can read Spark-dialect `CREATE MATERIALIZED VIEW` bodies, it can compile a view's refresh program as Spark SQL without executing it, and it registers a Spark-compatible `add_months` scalar. OpenIVM does not run Spark, connect to a Spark cluster, or apply the compiled statements for you.
 
 ## Input dialect
