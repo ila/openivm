@@ -3,11 +3,51 @@
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 
 string PublishedViewName(const string &view_name) {
 	return string(openivm::VISIBLE_TABLE_PREFIX) + view_name;
+}
+
+bool IsSnapshotPublication(ClientContext &context, const string &catalog, const string &schema, const string &view_name) {
+	bool snapshot_publication = false;
+	auto lookup = [&]() {
+		auto entry = Catalog::GetEntry(context, catalog, schema,
+		                               EntryLookupInfo(CatalogType::VIEW_ENTRY, PublishedViewName(view_name)),
+		                               OnEntryNotFound::RETURN_NULL);
+		snapshot_publication = entry && entry->type == CatalogType::VIEW_ENTRY;
+	};
+	if (context.transaction.HasActiveTransaction()) {
+		lookup();
+	} else {
+		context.RunFunctionInTransaction(lookup);
+	}
+	return snapshot_publication;
+}
+
+string BuildSnapshotPublicationSQL(Connection &con, const string &catalog, const string &published,
+                                   const string &data_table, const string &query) {
+	// Use this writer's commit, not a newer commit from another catalog writer.
+	// An empty refresh can have no commit of its own; its maintenance is
+	// unchanged.
+	auto quoted_catalog = SqlUtils::QuoteIdentifier(catalog);
+	auto snapshot =
+	    con.Query("SELECT COALESCE((SELECT id FROM " + quoted_catalog +
+	              ".last_committed_snapshot()), (SELECT id FROM " + quoted_catalog + ".current_snapshot()))");
+	if (snapshot->HasError() || snapshot->RowCount() != 1 || snapshot->GetValue(0, 0).IsNull()) {
+		throw CatalogException("Could not resolve committed snapshot for publication '%s'", published);
+	}
+	auto pinned = SqlUtils::ReplaceTableReferences(
+	    query, data_table, data_table + " AT (VERSION => " + snapshot->GetValue(0, 0).ToString() + ")");
+	if (pinned == query) {
+		throw InternalException("Snapshot publication query does not reference its maintenance table");
+	}
+	OPENIVM_DEBUG_PRINT("[PUBLISH] Pinning %s to committed maintenance snapshot\n", published.c_str());
+	return "CREATE OR REPLACE VIEW " + published + " AS " + pinned;
 }
 
 string PublishedSourceViewName(string source_name) {

@@ -140,3 +140,86 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# Snapshot publication must survive reopening the native metadata database.
+load __TEST_DIR__/snapshot_publication_host.db
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/snapshot_publication_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_snapshot_publication=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE SCHEMA dl.snap_bronze;
+
+statement ok
+CREATE SCHEMA dl.snap_silver;
+
+statement ok
+CREATE TABLE dl.snap_bronze.source(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.snap_bronze.source VALUES (1,10),(1,10),(2,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.snap_bronze.parent AS SELECT * FROM dl.snap_bronze.source;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.snap_silver.child AS SELECT * FROM dl.snap_bronze.parent;
+
+restart
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/snapshot_publication_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.snap_bronze.parent EXCEPT ALL SELECT * FROM dl.snap_bronze.source)),
+       (SELECT count(*) FROM (SELECT * FROM dl.snap_bronze.source EXCEPT ALL SELECT * FROM dl.snap_bronze.parent));
+----
+0	0
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.snap_silver.child EXCEPT ALL SELECT * FROM dl.snap_bronze.source)),
+       (SELECT count(*) FROM (SELECT * FROM dl.snap_bronze.source EXCEPT ALL SELECT * FROM dl.snap_silver.child));
+----
+0	0
+
+statement ok
+DELETE FROM dl.snap_bronze.source WHERE k=1;
+
+statement ok
+UPDATE dl.snap_bronze.source SET v=20 WHERE k=2;
+
+statement ok
+INSERT INTO dl.snap_bronze.source VALUES (1,11),(1,11),(NULL,NULL);
+
+statement ok
+PRAGMA refresh_options('dl','snap_bronze','parent');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.snap_bronze.parent EXCEPT ALL SELECT * FROM dl.snap_bronze.source)),
+       (SELECT count(*) FROM (SELECT * FROM dl.snap_bronze.source EXCEPT ALL SELECT * FROM dl.snap_bronze.parent));
+----
+0	0
+
+statement ok
+PRAGMA refresh_options('dl','snap_silver','child');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.snap_silver.child EXCEPT ALL SELECT * FROM dl.snap_bronze.source)),
+       (SELECT count(*) FROM (SELECT * FROM dl.snap_bronze.source EXCEPT ALL SELECT * FROM dl.snap_silver.child));
+----
+0	0

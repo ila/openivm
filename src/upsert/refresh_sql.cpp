@@ -545,7 +545,14 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string publication_prefix = internal_catalog_prefix;
 	auto publication = con.Query("SELECT published_query FROM openivm_views WHERE view_name='" +
 	                             SqlUtils::EscapeValue(view_name) + "'");
-	if (!publication->HasError() && publication->RowCount() && !publication->GetValue(0, 0).IsNull()) {
+	bool snapshot_publication =
+	    target_is_ducklake && IsSnapshotPublication(*con.context, internal_catalog_name, internal_schema_name, view_name);
+	if (snapshot_publication && active_facts.target_dialect != SqlDialect::DUCKDB) {
+		throw NotImplementedException("Snapshot publication is only supported by "
+		                              "the native DuckLake executor");
+	}
+	if (!snapshot_publication && !publication->HasError() && publication->RowCount() &&
+	    !publication->GetValue(0, 0).IsNull()) {
 		if (target_is_ducklake) {
 			publication_columns =
 			    metadata.GetTableColumns(internal_catalog_name, internal_schema_name, PublishedViewName(view_name));

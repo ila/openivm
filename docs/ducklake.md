@@ -206,6 +206,30 @@ DuckLake-backed views support the same operator families as standard DuckDB tabl
 - CTEs and decorrelated subqueries
 - Chained/cascading materialized views
 
+## Snapshot publication (experimental)
+
+```sql
+SET openivm_snapshot_publication = true;
+CREATE MATERIALIZED VIEW dl.main.sales AS
+SELECT customer_id, SUM(amount) AS total FROM dl.main.orders GROUP BY customer_id;
+PRAGMA refresh('sales');
+```
+
+New unordered DuckLake MVs without a publication HAVING filter can expose a view
+pinned to committed maintenance instead of writing a second complete table. This
+retains duplicate and NULL semantics, hides maintenance columns, and uses the
+maintenance table's DuckLake change feed for chained consumers. A child's stored
+query resolves the parent's current publication, rather than retaining its first
+snapshot. Turning the setting off affects future creation, not existing MVs.
+
+This first implementation requires retaining snapshot history: do not expire
+snapshots referenced by these views. DuckLake does not protect view references
+from explicit snapshot expiration. HAVING and ordered/limited publication retain
+the physical-table path. CREATE OR REPLACE of a snapshot-published MV is explicitly
+unsupported; use DROP VIEW and CREATE. Snapshot advancement is performed by the
+native refresh executor; exported refresh SQL alone does not perform publication.
+The option defaults to false and does not enable snapshot publication in Spark.
+
 ## Limitations
 
 - **Metadata and data are separate transactions.** OpenIVM's metadata lives in the native DuckDB database that
