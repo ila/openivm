@@ -224,7 +224,10 @@ snapshot. Turning the setting off affects future creation, not existing MVs.
 
 This first implementation requires retaining snapshot history: do not expire
 snapshots referenced by these views. DuckLake does not protect view references
-from explicit snapshot expiration. HAVING and ordered/limited publication retain
+from explicit snapshot expiration. With OpenIVM loaded, expiration and old-file
+cleanup calls warn when the catalog contains snapshot-published MVs. The warning
+is conservative, names the dependent MVs, and does not block deletion; dry runs
+and ordinary row DELETEs do not warn. HAVING and ordered/limited publication retain
 the physical-table path. CREATE OR REPLACE of a snapshot-published MV is explicitly
 unsupported; use DROP VIEW and CREATE. Snapshot advancement is performed by the
 native refresh executor; exported refresh SQL alone does not perform publication.

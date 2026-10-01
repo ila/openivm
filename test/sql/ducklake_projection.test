@@ -1187,3 +1187,41 @@ false
 
 statement ok
 DROP VIEW dl.review_snapshot;
+
+# Retention warnings must leave ordinary DML and dry-run maintenance usable.
+statement ok
+CREATE MATERIALIZED VIEW dl.retention_warning_mv AS SELECT * FROM dl.snap_source;
+
+statement ok
+CALL ducklake_expire_snapshots('dl', older_than => TIMESTAMPTZ '1900-01-01', dry_run => true);
+
+statement ok
+SELECT * FROM ducklake_cleanup_old_files('dl', older_than => TIMESTAMPTZ '1900-01-01', dry_run => true);
+
+# An empty expiration candidate set exercises the warning without deleting history.
+statement ok
+CALL ducklake_expire_snapshots('dl', older_than => TIMESTAMPTZ '1900-01-01');
+
+statement ok
+SELECT * FROM ducklake_cleanup_old_files('dl', older_than => TIMESTAMPTZ '1900-01-01');
+
+statement ok
+INSERT INTO dl.snap_source VALUES (9,90),(9,90),(NULL,8);
+
+statement ok
+DELETE FROM dl.snap_source WHERE k=8;
+
+statement ok
+UPDATE dl.snap_source SET v=95 WHERE k=9;
+
+statement ok
+PRAGMA refresh('retention_warning_mv');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.retention_warning_mv EXCEPT ALL SELECT * FROM dl.snap_source)),
+       (SELECT count(*) FROM (SELECT * FROM dl.snap_source EXCEPT ALL SELECT * FROM dl.retention_warning_mv));
+----
+0	0
+
+statement ok
+DROP VIEW dl.retention_warning_mv;

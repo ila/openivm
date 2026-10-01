@@ -3,6 +3,7 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/parser_ddl.hpp"
+#include "core/published_view.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/parser_plan_helpers.hpp"
 #include "core/scoped_optimizer_settings.hpp"
@@ -51,6 +52,7 @@ void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binde
 
 void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionInput &input,
                                                             duckdb::unique_ptr<LogicalOperator> &plan) {
+	WarnSnapshotHistoryDeletion(input.context, *plan);
 	if (plan->children.empty()) {
 		return;
 	}

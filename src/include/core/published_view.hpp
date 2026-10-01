@@ -9,6 +9,7 @@ namespace duckdb {
 // columns, independent of the maintenance plan's helper columns and filters.
 string PublishedViewName(const string &view_name);
 string PublishedSourceViewName(string source_name);
+void WarnSnapshotHistoryDeletion(ClientContext &context, LogicalOperator &plan);
 bool IsSnapshotPublication(ClientContext &context, const string &catalog, const string &schema,
                            const string &view_name);
 string BuildSnapshotPublicationSQL(Connection &con, const string &catalog, const string &published,
