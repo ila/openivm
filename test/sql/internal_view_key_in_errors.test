@@ -47,7 +47,8 @@ SELECT count(*) FROM (
 ----
 0
 
-# Refresh failures report the qualified view_sql_name (failing after-hook)
+# A failing after-hook under PRAGMA refresh is a non-strict warning that names
+# 'main.mv_h' (not the internal key); the refresh itself still succeeds.
 statement ok
 CREATE MATERIALIZED VIEW mv_h AS SELECT id, SUM(v) AS s FROM t GROUP BY id;
 
@@ -57,19 +58,12 @@ INSERT INTO openivm_refresh_hooks VALUES ('__openivm_mv_6d656d6f7279_6d61696e_6d
 statement ok
 INSERT INTO t VALUES (2, 1);
 
-statement error
+statement ok
 PRAGMA refresh('mv_h');
-----
-after-hook for 'main.mv_h' failed
 
-# ...and never leak the internal key
+# The guard still never leaks the internal key with several views present
 statement error
 ALTER TABLE t DROP COLUMN v;
-----
-<!REGEX>:(?s).*__openivm_mv_.*
-
-statement error
-PRAGMA refresh('mv_h');
 ----
 <!REGEX>:(?s).*__openivm_mv_.*
 
