@@ -781,34 +781,26 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	vector<string> column_names;
 	vector<LogicalType> column_types;
 	bool list_mode = false;
-	if (delta_view_catalog_entry) {
-		auto delta_view_entry = dynamic_cast<TableCatalogEntry *>(delta_view_catalog_entry.get());
-		const ColumnList &delta_view_columns = delta_view_entry->GetColumns();
-		column_names = delta_view_columns.GetColumnNames();
-		for (auto &col : delta_view_columns.Logical()) {
-			column_types.push_back(col.GetType());
-			if (col.GetName() != openivm::MULTIPLICITY_COL && col.GetType().id() == LogicalTypeId::LIST) {
+	auto read_delta_columns = [&](TableCatalogEntry &entry) {
+		const auto &columns = entry.GetColumns();
+		column_names = columns.GetColumnNames();
+		for (auto &column : columns.Logical()) {
+			column_types.push_back(column.GetType());
+			if (column.GetName() != openivm::MULTIPLICITY_COL && column.GetType().id() == LogicalTypeId::LIST) {
 				list_mode = true;
 			}
 		}
+	};
+	if (delta_view_catalog_entry) {
+		read_delta_columns(*delta_view_catalog_entry);
 	} else {
-		auto col_result =
-		    con.Query("SELECT column_name, data_type FROM information_schema.columns WHERE "
-		              "table_catalog = '" +
-		              SqlUtils::EscapeValue(internal_catalog_name) + "' AND table_schema = '" +
-		              SqlUtils::EscapeValue(internal_schema_name) + "' AND table_name = '" +
-		              SqlUtils::EscapeValue(SqlUtils::DeltaName(view_name)) + "' ORDER BY ordinal_position");
-		if (!col_result->HasError()) {
-			for (idx_t i = 0; i < col_result->RowCount(); i++) {
-				column_names.push_back(col_result->GetValue(0, i).ToString());
-				try {
-					column_types.push_back(
-					    TransformStringToLogicalType(col_result->GetValue(1, i).ToString(), context));
-				} catch (...) {
-					column_types.push_back(LogicalType::VARCHAR);
-				}
-			}
-		}
+		// Global column enumeration binds every snapshot publication view. Read only
+		// this delta table and copy its schema while the catalog transaction is live.
+		con.context->RunFunctionInTransaction([&]() {
+			auto &entry = Catalog::GetEntry<TableCatalogEntry>(*con.context, internal_catalog_name,
+			                                                   internal_schema_name, SqlUtils::DeltaName(view_name));
+			read_delta_columns(entry);
+		});
 	}
 	bool has_ts_col =
 	    std::find(column_names.begin(), column_names.end(), string(openivm::TIMESTAMP_COL)) != column_names.end();

@@ -13,7 +13,8 @@ string PublishedViewName(const string &view_name) {
 	return string(openivm::VISIBLE_TABLE_PREFIX) + view_name;
 }
 
-bool IsSnapshotPublication(ClientContext &context, const string &catalog, const string &schema, const string &view_name) {
+bool IsSnapshotPublication(ClientContext &context, const string &catalog, const string &schema,
+                           const string &view_name) {
 	bool snapshot_publication = false;
 	auto lookup = [&]() {
 		auto entry = Catalog::GetEntry(context, catalog, schema,
