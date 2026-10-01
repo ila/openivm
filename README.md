@@ -144,7 +144,7 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `openivm_enable_data_dependent_optimizers` | BOOLEAN | `true` | Optimize the executed refresh plan using current delta statistics | — |
 | `openivm_regular_nterm` | BOOLEAN | `true` | Use N-term telescoping for eligible regular-table inner joins compiled for external engines | [Inner join](docs/operators/inner-join.md#regular-table-n-term-compilation) |
 | `openivm_regular_nterm_left` | BOOLEAN | `true` | Extend compile-only N-term telescoping to LEFT JOIN projection views | — |
-| `openivm_emit_spark_hints` | BOOLEAN | `false` | Emit Spark optimizer hints in `target_dialect=spark` compiled refresh SQL | — |
+| `openivm_emit_spark_hints` | BOOLEAN | `false` | Emit Spark optimizer hints in `target_dialect=spark` compiled refresh SQL | [Spark](docs/spark.md#openivm_emit_spark_hints) |
 
 </details>
 
@@ -195,6 +195,7 @@ and [saving compiled SQL as rows](docs/build/building.md#inspect-or-save-compile
 ## Documentation
 
 - **[DuckLake integration](docs/ducklake.md)** — IVM over DuckLake tables with native change tracking
+- **[Spark support](docs/spark.md)** — Spark input dialect (`VERSION AS OF`), compile-only Spark output, Spark hints, and `add_months`
 - **[Operators](docs/operators/)** — How each SQL operator is incrementalized
 - **[Refresh](docs/refresh/)** — Refresh strategies, automatic refresh, pipelines, and [refresh hooks](docs/refresh_hooks.md)
 - **[Optimizations](docs/optimizations/)** — Delta consolidation, FK pruning, empty-delta skip, append-only, indexing
