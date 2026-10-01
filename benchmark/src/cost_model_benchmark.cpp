@@ -844,8 +844,11 @@ static bool ValidateMV(duckdb::Connection &con, const string &mv_name, const str
 }
 
 static string LastHistoryMethod(duckdb::Connection &con, const string &view_name) {
-	auto result = con.Query("PRAGMA refresh_cost_history(" + duckdb::Value(view_name).ToSQLString() + ")");
-	if (!result || result->HasError() || result->RowCount() == 0) {
+	auto result = con.Query("PRAGMA refresh_history(" + duckdb::Value(view_name).ToSQLString() + ")");
+	if (!result || result->HasError()) {
+		throw std::runtime_error("Refresh history: " + (result ? result->GetError() : "null result"));
+	}
+	if (result->RowCount() == 0) {
 		return "skipped_or_unrecorded";
 	}
 	return result->GetValue(2, 0).ToString();
