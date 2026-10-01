@@ -202,10 +202,9 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 			throw ParserException("Could not read IVM metadata for materialized view '%s'%s: %s", view_name, locus_text,
 			                      result->GetError());
 		}
-		throw ParserException("Materialized view '%s' does not exist in IVM metadata. Refresh currently looks up the "
-		                      "MV short name, not schema.name. Check view_name, view_catalog and view_schema in "
-		                      "openivm_views in the native metadata database, then pass its view_name to refresh.",
-		                      view_name);
+		throw CatalogException("Materialized view '%s' does not exist in IVM metadata; check view_sql_name, "
+		                       "view_catalog and view_schema in the native database's main.openivm_views",
+		                       view_name);
 	}
 	auto raw_type = result->GetValue(0, 0).GetValue<int8_t>();
 	return static_cast<RefreshType>(raw_type);

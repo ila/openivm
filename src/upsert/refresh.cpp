@@ -135,6 +135,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 	Connection probe_con(*context.db.get());
 	RefreshMetadata::UseCatalog(context, probe_con, view_catalog_name);
 	RefreshMetadata probe_meta(probe_con);
+	// User-facing name for error messages; vn is the internal storage key.
+	const string display_name = view_schema_name + "." + probe_meta.GetViewSQLName(vn);
 	DeltaActivityResult delta_activity;
 	DeltaActivityResult *precomputed_delta_activity = nullptr;
 	if (skip_empty_refresh) {
@@ -219,7 +221,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			auto meta_result = meta_con.Query(meta_pre_sql);
 			if (meta_result->HasError()) {
 				throw Exception(ExceptionType::EXECUTOR,
-				                "IVM refresh of '" + vn + "' failed before data refresh: " + meta_result->GetError());
+				                "IVM refresh of '" + display_name + "' failed before data refresh: " + meta_result->GetError());
 			}
 			profiler.AddStep("metadata_pre_sql", meta_pre_start, "bytes=" + to_string(meta_pre_sql.size()));
 		}
@@ -311,12 +313,12 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			// parallel refreshes). InternalException causes DuckDB to flag the whole
 			// database as invalidated, forcing a restart. We've already rolled back, so
 			// the DB is in a clean state; the next refresh attempt should succeed.
-			throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + vn + "' failed: " + result->GetError());
+			throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name + "' failed: " + result->GetError());
 		}
 		if (!after_hook.empty()) {
 			auto hook_result = exec_con.Query(after_hook);
 			if (hook_result->HasError()) {
-				throw InvalidInputException("after-hook for '%s' failed: %s", vn, hook_result->GetError());
+				throw InvalidInputException("after-hook for '%s' failed: %s", display_name, hook_result->GetError());
 			}
 		}
 
@@ -336,7 +338,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 				auto catalogs = snap_con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'");
 				if (catalogs->HasError()) {
 					throw Exception(ExceptionType::EXECUTOR,
-					                "IVM refresh of '" + vn +
+					                "IVM refresh of '" + display_name +
 					                    "' failed: could not list DuckLake catalogs after data "
 					                    "refresh: " +
 					                    catalogs->GetError());
@@ -352,7 +354,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 					}
 					auto snapshot_id = snap_metadata.GetCurrentDuckLakeSnapshot(dl_catalog);
 					if (snapshot_id < 0) {
-						throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + vn +
+						throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
 						                                             "' failed: could not read DuckLake snapshot for "
 						                                             "catalog '" +
 						                                             dl_catalog + "' after data refresh");
@@ -361,7 +363,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 				}
 				if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
 					throw Exception(ExceptionType::EXECUTOR,
-					                "IVM refresh of '" + vn +
+					                "IVM refresh of '" + display_name +
 					                    "' failed: unresolved DuckLake snapshot placeholder after data refresh");
 				}
 			}
@@ -369,7 +371,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			auto meta_result = meta_con.Query(meta_post_sql);
 			if (meta_result->HasError()) {
 				throw Exception(ExceptionType::EXECUTOR,
-				                "IVM refresh of '" + vn + "' failed after data refresh: " + meta_result->GetError());
+				                "IVM refresh of '" + display_name + "' failed after data refresh: " + meta_result->GetError());
 			}
 			profiler.AddStep("metadata_post_sql", meta_post_start, "bytes=" + to_string(meta_post_sql.size()));
 		}

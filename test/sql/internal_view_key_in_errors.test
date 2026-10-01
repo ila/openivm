@@ -1,0 +1,54 @@
+# name: test/sql/internal_view_key_in_errors.test
+# description: Errors name the user-facing materialized view, not the internal __openivm_mv_ key
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE t (id INT, v INT);
+
+statement ok
+INSERT INTO t VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_t AS SELECT id, SUM(v) AS s FROM t GROUP BY id;
+
+# DROP COLUMN guard reports the qualified view_sql_name
+statement error
+ALTER TABLE t DROP COLUMN v;
+----
+referenced by materialized view 'main.mv_t'. Drop the view first.
+
+# The blocked DROP leaves the view usable
+statement ok
+INSERT INTO t VALUES (1, 5);
+
+statement ok
+PRAGMA refresh('mv_t');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, s FROM mv_t
+    EXCEPT ALL
+    SELECT id, SUM(v) FROM t GROUP BY id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, SUM(v) AS s FROM t GROUP BY id
+    EXCEPT ALL
+    SELECT id, s FROM mv_t
+);
+----
+0
+
+# Missing views produce the current lookup message
+statement error
+PRAGMA refresh('main.mv_missing');
+----
+check view_sql_name, view_catalog and view_schema
