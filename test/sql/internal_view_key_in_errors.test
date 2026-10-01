@@ -47,21 +47,34 @@ SELECT count(*) FROM (
 ----
 0
 
-# A failing after-hook under PRAGMA refresh is a non-strict warning that names
-# 'main.mv_h' (not the internal key); the refresh itself still succeeds.
+# A refresh that fails while executing names 'main.mv_c', not the internal key.
+# The cast overflows only when the delta row is processed by the refresh.
+statement ok
+CREATE TABLE tc (id INT, v INT);
+
+statement ok
+INSERT INTO tc VALUES (1, 1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_c AS SELECT id, CAST(v AS TINYINT) AS c FROM tc;
+
+statement ok
+INSERT INTO tc VALUES (2, 1000);
+
+statement error
+PRAGMA refresh('mv_c');
+----
+IVM refresh of 'main.mv_c' failed
+
+statement error
+PRAGMA refresh('main.mv_c');
+----
+<!REGEX>:(?s).*__openivm_mv_.*
+
+# The guard still never leaks the internal key with several views present
 statement ok
 CREATE MATERIALIZED VIEW mv_h AS SELECT id, SUM(v) AS s FROM t GROUP BY id;
 
-statement ok
-INSERT INTO openivm_refresh_hooks VALUES ('__openivm_mv_6d656d6f7279_6d61696e_6d765f68_', 'INSERT INTO no_such_hook_table VALUES (1)', 'after');
-
-statement ok
-INSERT INTO t VALUES (2, 1);
-
-statement ok
-PRAGMA refresh('mv_h');
-
-# The guard still never leaks the internal key with several views present
 statement error
 ALTER TABLE t DROP COLUMN v;
 ----
