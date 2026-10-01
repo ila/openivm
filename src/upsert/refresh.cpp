@@ -710,8 +710,8 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 			                                                          metadata.GetViewSQLName(node))}) {
 				auto bound = con.Query("EXPLAIN " + query);
 				if (bound->HasError()) {
-					throw CatalogException("refresh_pipeline: cannot bind materialized view '%s': %s", node,
-					                       bound->GetError());
+					throw CatalogException("refresh_pipeline: cannot bind materialized view '%s': %s",
+					                       DisplayViewName(metadata, location.schema_name, node), bound->GetError());
 				}
 			}
 		}
