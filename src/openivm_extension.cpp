@@ -175,8 +175,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterSparkScalarFunctions(loader);
 
 	db_config.AddExtensionOption("openivm_files_path", "path for compiled SQL reference files", LogicalType::VARCHAR);
-	db_config.AddExtensionOption("openivm_refresh_mode", "refresh strategy: incremental, full, or auto",
-	                             LogicalType::VARCHAR, Value("incremental"));
+	// 'auto' is the non-forcing mode: like 'incremental', it never forces a full recompute; adaptive
+	// IVM-vs-full selection is controlled separately by openivm_adaptive_refresh.
+	db_config.AddExtensionOption(
+	    "openivm_refresh_mode",
+	    "refresh strategy: incremental, full, or auto (auto never forces full; see openivm_adaptive_refresh)",
+	    LogicalType::VARCHAR, Value("incremental"), [](ClientContext &, SetScope, Value &parameter) {
+		    auto mode = parameter.IsNull() ? string() : StringUtil::Lower(parameter.ToString());
+		    if (mode != "incremental" && mode != "full" && mode != "auto") {
+			    throw InvalidInputException(
+			        "Invalid openivm_refresh_mode '%s': expected one of incremental, full, auto",
+			        parameter.IsNull() ? "NULL" : parameter.ToString());
+		    }
+		    parameter = Value(mode);
+	    });
 	db_config.AddExtensionOption("openivm_adaptive_refresh",
 	                             "experimental: enable adaptive cost model (when off, always use IVM)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
