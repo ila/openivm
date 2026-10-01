@@ -9,7 +9,7 @@ describes the model as it stood before this work; where the two disagree, this f
 The retained WIP branch is `ila/cost-model-plan-reuse` (PR #22). It now includes current main
 and preserves the complete history of `ila/benchmark-snapshot-setup` and
 `ila/cost-model-sweep-build`; those two redundant remote branches have been retired.
-PR #95 extracts the finished benchmark, daemon lifetime, FULL OUTER affected-group, and DISTINCT
+PR #95 merged the finished benchmark, daemon lifetime, FULL OUTER affected-group, and DISTINCT
 auxiliary-state fixes onto main. The remaining WIP covers delta-plan reuse, learned operator costs,
 exploration, and calibration. The historical investigations below are retained as evidence.
 
