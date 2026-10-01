@@ -1104,3 +1104,86 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.snap_parent EXCEPT ALL SELECT k,v
 
 statement ok
 DROP VIEW dl.snap_parent;
+
+# Snapshot publication must also advance on full refresh and after-hook retry.
+statement ok
+CREATE TABLE dl.review_snapshot_source(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.review_snapshot_source VALUES (1,10),(1,10),(2,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.review_snapshot AS SELECT k, SUM(v) AS total, COUNT(*) AS n FROM dl.review_snapshot_source GROUP BY k;
+
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+INSERT INTO dl.review_snapshot_source VALUES (3,30),(3,30),(NULL,4);
+
+statement ok
+DELETE FROM dl.review_snapshot_source WHERE k=2;
+
+statement ok
+UPDATE dl.review_snapshot_source SET v=15 WHERE k=1;
+
+statement ok
+PRAGMA refresh('review_snapshot');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.review_snapshot EXCEPT ALL SELECT k,SUM(v) AS total,COUNT(*) AS n FROM dl.review_snapshot_source GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) AS total,COUNT(*) AS n FROM dl.review_snapshot_source GROUP BY k EXCEPT ALL SELECT * FROM dl.review_snapshot));
+----
+0	0
+
+statement ok
+SET openivm_refresh_mode='auto';
+
+statement ok
+INSERT INTO openivm_refresh_hooks SELECT view_name,'SELECT error(''snapshot review after-hook failure'')','after' FROM openivm_views WHERE view_sql_name='review_snapshot';
+
+statement ok
+INSERT INTO dl.review_snapshot_source VALUES (3,35),(4,NULL);
+
+statement ok
+DELETE FROM dl.review_snapshot_source WHERE k IS NULL;
+
+statement ok
+UPDATE dl.review_snapshot_source SET v=20 WHERE k=1;
+
+statement error
+PRAGMA refresh_pipeline('review_snapshot');
+----
+snapshot review after-hook failure
+
+query I
+SELECT pending_after_hook FROM openivm_views WHERE view_sql_name='review_snapshot';
+----
+true
+
+# A failed after-hook happens after publication and must not leave an old snapshot.
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.review_snapshot EXCEPT ALL SELECT k,SUM(v) AS total,COUNT(*) AS n FROM dl.review_snapshot_source GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) AS total,COUNT(*) AS n FROM dl.review_snapshot_source GROUP BY k EXCEPT ALL SELECT * FROM dl.review_snapshot));
+----
+0	0
+
+statement ok
+UPDATE openivm_refresh_hooks SET hook_sql='SELECT 1' WHERE view_name IN (SELECT view_name FROM openivm_views WHERE view_sql_name='review_snapshot');
+
+statement ok
+PRAGMA refresh_pipeline('review_snapshot');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.review_snapshot EXCEPT ALL SELECT k,SUM(v) AS total,COUNT(*) AS n FROM dl.review_snapshot_source GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) AS total,COUNT(*) AS n FROM dl.review_snapshot_source GROUP BY k EXCEPT ALL SELECT * FROM dl.review_snapshot));
+----
+0	0
+
+query I
+SELECT pending_after_hook FROM openivm_views WHERE view_sql_name='review_snapshot';
+----
+false
+
+statement ok
+DROP VIEW dl.review_snapshot;
