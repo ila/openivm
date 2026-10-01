@@ -183,8 +183,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    LogicalType::VARCHAR, Value("incremental"), [](ClientContext &, SetScope, Value &parameter) {
 		    auto mode = parameter.IsNull() ? string() : StringUtil::Lower(parameter.ToString());
 		    if (mode != "incremental" && mode != "full" && mode != "auto") {
-			    throw InvalidInputException("Invalid openivm_refresh_mode '%s': expected one of incremental, full, auto",
-			                                parameter.IsNull() ? "NULL" : parameter.ToString());
+			    throw InvalidInputException(
+			        "Invalid openivm_refresh_mode '%s': expected one of incremental, full, auto",
+			        parameter.IsNull() ? "NULL" : parameter.ToString());
 		    }
 		    parameter = Value(mode);
 	    });
