@@ -224,8 +224,9 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			Connection meta_con(*context.db.get());
 			auto meta_result = meta_con.Query(meta_pre_sql);
 			if (meta_result->HasError()) {
-				throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
-				                                             "' failed before data refresh: " + meta_result->GetError());
+				throw Exception(ExceptionType::EXECUTOR,
+				                "IVM refresh of '" + display_name +
+				                    "' failed before data refresh: " + meta_result->GetError());
 			}
 			profiler.AddStep("metadata_pre_sql", meta_pre_start, "bytes=" + to_string(meta_pre_sql.size()));
 		}
@@ -620,8 +621,8 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 			auto hr = con.Query(hook_sql);
 			if (hr->HasError()) {
 				if (strict_hooks) {
-					throw InvalidInputException("refresh_pipeline: %s-hook for '%s' failed: %s", hook_mode, display_name,
-					                            hr->GetError());
+					throw InvalidInputException("refresh_pipeline: %s-hook for '%s' failed: %s", hook_mode,
+					                            display_name, hr->GetError());
 				}
 				Printer::Print("Warning: " + hook_mode + "-hook for '" + display_name + "' failed: " + hr->GetError());
 			}
