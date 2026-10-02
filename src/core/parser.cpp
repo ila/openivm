@@ -306,6 +306,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	string qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
 	string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(sql_view_name);
 	bool staged_cross_catalog_replace = target_is_ducklake && parse_data_ref.is_replace;
+	if (staged_cross_catalog_replace &&
+	    IsSnapshotPublication(context, view_target_catalog, view_target_schema, view_name)) {
+		throw NotImplementedException("CREATE OR REPLACE is not supported for "
+		                              "snapshot-published materialized views");
+	}
 	string staged_data_table = "openivm_stage_" + view_name;
 	string staged_qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(staged_data_table);
 	string initial_load_target = staged_cross_catalog_replace ? staged_qdt : qdt;
@@ -536,6 +541,20 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	bool stored_query_retains_having = !having_predicate.empty() && lpts_fallback;
 	bool stored_query_retains_top_k = !top_k_suffix.empty() && lpts_fallback;
+	// A parent publication's historical scan is an implementation boundary, not
+	// a user pin. Keep the live publication reference in a child's stored query
+	// so its next refresh binds the parent's newly published snapshot.
+	for (const auto &entry : facts.source_table_info) {
+		const auto &source = entry.second;
+		if (StringUtil::StartsWith(source.table_name, openivm::DATA_TABLE_PREFIX) &&
+		    IsSnapshotPublication(context, source.catalog_name, source.schema_name,
+		                          PublishedSourceViewName(source.table_name))) {
+			view_query = SqlUtils::ReplaceTableReferences(
+			    view_query, entry.first,
+			    SqlUtils::FullName(source.catalog_name, source.schema_name,
+			                       PublishedViewName(PublishedSourceViewName(source.table_name))));
+		}
+	}
 
 	DeltaViewModelInput model_input;
 	model_input.facts = &facts;
@@ -1479,9 +1498,23 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			ddl.push_back("DROP TABLE IF EXISTS " + published);
 			ddl.push_back("DROP TABLE IF EXISTS " + published_delta);
 		}
-		ddl.push_back(string(staged_cross_catalog_replace && !has_downstream_views ? "CREATE OR REPLACE TABLE "
-		                                                                           : "CREATE TABLE IF NOT EXISTS ") +
-		              published + " AS " + published_query);
+		bool snapshot_publication = target_is_ducklake && !parse_data_ref.is_replace && having_where.empty() &&
+		                            top_k_view_suffix.empty() &&
+		                            SqlUtils::GetBoolSetting(context, "openivm_snapshot_publication", false);
+		if (snapshot_publication) {
+			// Time travel reads within a maintenance write transaction see pending
+			// changes. Pin only committed maintenance, then create the public
+			// objects.
+			ddl.push_back("COMMIT");
+			ddl.push_back("BEGIN TRANSACTION");
+			ddl.push_back(string(OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX) + view_target_catalog + "\t" + published +
+			              "\t" + qdt + "\t" + published_query);
+		} else {
+			ddl.push_back(string(staged_cross_catalog_replace && !has_downstream_views
+			                         ? "CREATE OR REPLACE TABLE "
+			                         : "CREATE TABLE IF NOT EXISTS ") +
+			              published + " AS " + published_query);
+		}
 		if (target_is_ducklake) {
 			// Derive the empty companion schema directly, as for the maintenance
 			// delta table, without running another DuckLake CTAS pipeline.
@@ -1502,7 +1535,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		ddl.push_back(string(staged_cross_catalog_replace ? "CREATE OR REPLACE VIEW " : "CREATE VIEW ") + qvn +
 		              " AS SELECT * EXCLUDE (" + string(openivm::PUBLISHED_ORDINAL_COL) + ") FROM " + published +
 		              (top_k_order_suffix.empty() ? "" : " ORDER BY " + string(openivm::PUBLISHED_ORDINAL_COL)));
-		add_cleanup("DROP TABLE IF EXISTS " + published);
+		add_cleanup(string(snapshot_publication ? "DROP VIEW IF EXISTS " : "DROP TABLE IF EXISTS ") + published);
 		add_cleanup("DROP TABLE IF EXISTS " + published_delta);
 	}
 	// Delta table for the MV — based on the DATA table (has all columns)
@@ -1659,6 +1692,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			}
 			if (i < system_ddl_end) {
 				system_tables_sql += ddl[i] + ";\n\n";
+			} else if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX)) {
+				compiled_sql += "-- OpenIVM pins publication to its own committed "
+				                "DuckLake snapshot at execution time.\n\n";
 			} else if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
 				compiled_sql += "-- OpenIVM derives the MV delta-table schema from the "
 				                "physical data table "
@@ -1761,8 +1797,10 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	program += "DROP TABLE IF EXISTS " + data_ref + ";\n";
 	program += "DROP TABLE IF EXISTS " + internal_prefix +
 	           KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name)) + ";\n";
-	program +=
-	    "DROP TABLE IF EXISTS " + internal_prefix + SqlUtils::QuoteIdentifier(PublishedViewName(view_name)) + ";\n";
+	program += string(IsSnapshotPublication(context, location.catalog_name, location.schema_name, view_name)
+	                      ? "DROP VIEW IF EXISTS "
+	                      : "DROP TABLE IF EXISTS ") +
+	           internal_prefix + SqlUtils::QuoteIdentifier(PublishedViewName(view_name)) + ";\n";
 	program += "DROP TABLE IF EXISTS " + internal_prefix +
 	           SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(PublishedViewName(view_name))) + ";\n";
 	program += "DELETE FROM openivm_refresh_hooks WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";

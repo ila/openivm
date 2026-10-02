@@ -295,6 +295,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_explain_initial_load",
 	                             "print CREATE MATERIALIZED VIEW initial-load SQL and EXPLAIN plans",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_snapshot_publication",
+	                             "publish unordered DuckLake materialized views "
+	                             "through retained snapshots",
+	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	db_config.AddExtensionOption("openivm_explain_initial_load_only",
 	                             "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));

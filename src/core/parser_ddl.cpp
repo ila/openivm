@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/published_view.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -470,6 +471,21 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		pending_ddl.clear();
 	};
 	for (auto &q : ddl) {
+		if (StringUtil::StartsWith(q, OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX)) {
+			flush_pending();
+			auto payload = q.substr(strlen(OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX));
+			auto fields = StringUtil::Split(payload, '\t');
+			if (fields.size() != 4) {
+				fail_ddl("malformed snapshot-publication payload");
+			}
+			try {
+				pending_ddl.push_back(BuildSnapshotPublicationSQL(*conn, fields[0], fields[1], fields[2], fields[3]));
+			} catch (std::exception &ex) {
+				fail_ddl(ex.what());
+			}
+			flush_pending();
+			continue;
+		}
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
 			flush_pending();
 			string marker_view_name;

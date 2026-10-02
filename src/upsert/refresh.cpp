@@ -5,6 +5,7 @@
 #include "core/parser_ddl.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/published_view.hpp"
+#include "rules/column_hider.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "core/scoped_optimizer_settings.hpp"
@@ -331,6 +332,25 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		if (tx_open) {
 			exec_con.Commit();
 			tx_open = false;
+		}
+		if (cross_system && IsSnapshotPublication(*exec_con.context, view_catalog_name, view_schema_name, vn)) {
+			auto publication_start = std::chrono::steady_clock::now();
+			auto publication = probe_con.Query("SELECT published_query FROM openivm_views WHERE view_name='" +
+			                                   SqlUtils::EscapeValue(vn) + "'");
+			if (publication->HasError() || publication->RowCount() != 1 || publication->GetValue(0, 0).IsNull()) {
+				throw CatalogException("Could not read snapshot publication query for '%s'", vn);
+			}
+			auto prefix = SqlUtils::QualifiedPrefix(view_catalog_name, view_schema_name);
+			auto publish_sql = BuildSnapshotPublicationSQL(
+			    exec_con, view_catalog_name, prefix + SqlUtils::QuoteIdentifier(PublishedViewName(vn)),
+			    prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(vn)),
+			    publication->GetValue(0, 0).ToString());
+			auto published = exec_con.Query(publish_sql);
+			if (published->HasError()) {
+				throw CatalogException("Could not advance snapshot publication for '%s': %s", vn,
+				                       published->GetError());
+			}
+			profiler.AddStep("publish_snapshot", publication_start, "no physical publication copy");
 		}
 		if (cross_system && !meta_post_sql.empty()) {
 			auto meta_post_start = std::chrono::steady_clock::now();
