@@ -85,7 +85,7 @@ SELECT count(*) FROM (
 statement error
 ALTER TABLE t DROP COLUMN val;
 ----
-referenced by materialized view
+referenced by materialized view 'main.mv'. Drop the view first.
 
 # ==========================================
 # Test 4: RENAME unreferenced column — delta synced, IVM works
@@ -1766,3 +1766,86 @@ query I
 SELECT count(*) FROM main.openivm_views WHERE view_sql_name='cross_catalog_join';
 ----
 0
+
+# ==========================================
+# Errors name the user-facing view, not the internal __openivm_mv_ key
+# ==========================================
+
+statement ok
+CREATE TABLE ike_t (id INT, v INT);
+
+statement ok
+INSERT INTO ike_t VALUES (1, 10);
+
+statement ok
+CREATE MATERIALIZED VIEW ike_mv_t AS SELECT id, SUM(v) AS s FROM ike_t GROUP BY id;
+
+# DROP COLUMN guard reports the qualified view_sql_name
+statement error
+ALTER TABLE ike_t DROP COLUMN v;
+----
+referenced by materialized view 'main.ike_mv_t'. Drop the view first.
+
+# The blocked DROP leaves the view usable
+statement ok
+INSERT INTO ike_t VALUES (1, 5);
+
+statement ok
+PRAGMA refresh('ike_mv_t');
+
+query I
+SELECT count(*) FROM (
+    SELECT id, s FROM ike_mv_t
+    EXCEPT ALL
+    SELECT id, SUM(v) FROM ike_t GROUP BY id
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT id, SUM(v) AS s FROM ike_t GROUP BY id
+    EXCEPT ALL
+    SELECT id, s FROM ike_mv_t
+);
+----
+0
+
+# A refresh that fails while executing names 'main.ike_mv_c', not the internal key.
+# The cast overflows only when the delta row is processed by the refresh.
+statement ok
+CREATE TABLE ike_tc (id INT, v INT);
+
+statement ok
+INSERT INTO ike_tc VALUES (1, 1);
+
+statement ok
+CREATE MATERIALIZED VIEW ike_mv_c AS SELECT id, CAST(v AS TINYINT) AS c FROM ike_tc;
+
+statement ok
+INSERT INTO ike_tc VALUES (2, 1000);
+
+statement error
+PRAGMA refresh('ike_mv_c');
+----
+IVM refresh of 'main.ike_mv_c' failed
+
+statement error
+PRAGMA refresh('main.ike_mv_c');
+----
+<!REGEX>:(?s).*__openivm_mv_.*
+
+# The guard still never leaks the internal key with several views present
+statement ok
+CREATE MATERIALIZED VIEW ike_mv_h AS SELECT id, SUM(v) AS s FROM ike_t GROUP BY id;
+
+statement error
+ALTER TABLE ike_t DROP COLUMN v;
+----
+<!REGEX>:(?s).*__openivm_mv_.*
+
+# Missing views produce the current lookup message
+statement error
+PRAGMA refresh('main.ike_mv_missing');
+----
+check view_sql_name, view_catalog and view_schema

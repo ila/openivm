@@ -8,7 +8,7 @@ OpenIVM handles `ALTER TABLE` on base tables that have materialized views depend
 |---|---|---|
 | ADD COLUMN | n/a | Delta table synced via `ALTER TABLE ADD COLUMN`. IVM continues to work. |
 | DROP COLUMN | No | Delta table synced via `ALTER TABLE DROP COLUMN`. IVM continues to work. |
-| DROP COLUMN | Yes | Blocked with error: *"Cannot drop column 'x': it is referenced by materialized view 'mv'. Drop the view first."* The name shown is the view's internal key (`openivm_views.view_name`). |
+| DROP COLUMN | Yes | Blocked with error: *"Cannot drop column 'x': it is referenced by materialized view 'main.mv'. Drop the view first."* The name shown is the view's schema-qualified SQL name (`openivm_views.view_sql_name`), not its internal key. |
 | RENAME COLUMN | No | Delta table synced via `ALTER TABLE RENAME COLUMN`. IVM continues to work. |
 | RENAME COLUMN | Yes | Stored MV SQL, aux metadata, lineage metadata, and delta table schema are rewritten. IVM continues to work and user-visible output aliases are preserved. |
 
