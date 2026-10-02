@@ -942,7 +942,8 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		auto location = ResolveViewLocation(metadata_con, node, view_catalog_name, view_schema_name);
 		if (location.cross_system) {
 			throw NotImplementedException(
-			    "Transactional native refresh cannot include cross-catalog dependent view '%s'", node);
+			    "Transactional native refresh cannot include cross-catalog dependent view '%s'",
+			    DisplayViewName(metadata, location.schema_name, node));
 		}
 		ordered_nodes.push_back(node);
 	}
