@@ -879,14 +879,16 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		view_name = resolved.view_name;
 		cross_system = resolved.cross_system;
 	}
+	const string requested_view_name = view_name;
 	if (!pipeline && parameters.values.size() > 1) {
 		RefreshMetadata names(metadata_con);
 		view_name = names.FindViewKey(view_catalog_name, view_schema_name, names.GetViewSQLName(view_name));
 	}
 	RefreshMetadata names_for_error(metadata_con);
-	if (names_for_error.GetViewQuery(view_name).empty()) {
+	if (view_name.empty() || names_for_error.GetViewQuery(view_name).empty()) {
+		const string &missing_name = view_name.empty() ? requested_view_name : view_name;
 		throw CatalogException("Materialized view '%s' does not exist",
-		                       DisplayViewName(names_for_error, view_schema_name, view_name));
+		                       DisplayViewName(names_for_error, view_schema_name, missing_name));
 	}
 
 	if (!view_catalog_name.empty()) {
