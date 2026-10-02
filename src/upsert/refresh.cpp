@@ -124,6 +124,11 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
                                 const string &view_name, const string &attached_db_catalog_name,
                                 const string &attached_db_schema_name, DeltaActivityResult *active_activity);
 
+// User-facing "schema.name" for error messages; view_key is the internal storage key.
+static string DisplayViewName(RefreshMetadata &metadata, const string &view_schema_name, const string &view_key) {
+	return (view_schema_name.empty() ? string("main") : view_schema_name) + "." + metadata.GetViewSQLName(view_key);
+}
+
 // Generate and execute refresh SQL for a single view while the caller owns the mutation gate.
 // When openivm_adaptive_refresh is on, also computes a cost estimate before execution
 // and records execution history for the learned cost model.
@@ -136,6 +141,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 	Connection probe_con(*context.db.get());
 	RefreshMetadata::UseCatalog(context, probe_con, view_catalog_name);
 	RefreshMetadata probe_meta(probe_con);
+	const string display_name = DisplayViewName(probe_meta, view_schema_name, vn);
 	DeltaActivityResult delta_activity;
 	DeltaActivityResult *precomputed_delta_activity = nullptr;
 	if (skip_empty_refresh) {
@@ -220,7 +226,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			auto meta_result = meta_con.Query(meta_pre_sql);
 			if (meta_result->HasError()) {
 				throw Exception(ExceptionType::EXECUTOR,
-				                "IVM refresh of '" + vn + "' failed before data refresh: " + meta_result->GetError());
+				                "IVM refresh of '" + display_name +
+				                    "' failed before data refresh: " + meta_result->GetError());
 			}
 			profiler.AddStep("metadata_pre_sql", meta_pre_start, "bytes=" + to_string(meta_pre_sql.size()));
 		}
@@ -312,12 +319,13 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			// parallel refreshes). InternalException causes DuckDB to flag the whole
 			// database as invalidated, forcing a restart. We've already rolled back, so
 			// the DB is in a clean state; the next refresh attempt should succeed.
-			throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + vn + "' failed: " + result->GetError());
+			throw Exception(ExceptionType::EXECUTOR,
+			                "IVM refresh of '" + display_name + "' failed: " + result->GetError());
 		}
 		if (!after_hook.empty()) {
 			auto hook_result = exec_con.Query(after_hook);
 			if (hook_result->HasError()) {
-				throw InvalidInputException("after-hook for '%s' failed: %s", vn, hook_result->GetError());
+				throw InvalidInputException("after-hook for '%s' failed: %s", display_name, hook_result->GetError());
 			}
 		}
 
@@ -356,7 +364,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 				auto catalogs = snap_con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'ducklake'");
 				if (catalogs->HasError()) {
 					throw Exception(ExceptionType::EXECUTOR,
-					                "IVM refresh of '" + vn +
+					                "IVM refresh of '" + display_name +
 					                    "' failed: could not list DuckLake catalogs after data "
 					                    "refresh: " +
 					                    catalogs->GetError());
@@ -372,7 +380,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 					}
 					auto snapshot_id = snap_metadata.GetCurrentDuckLakeSnapshot(dl_catalog);
 					if (snapshot_id < 0) {
-						throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + vn +
+						throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
 						                                             "' failed: could not read DuckLake snapshot for "
 						                                             "catalog '" +
 						                                             dl_catalog + "' after data refresh");
@@ -381,15 +389,15 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 				}
 				if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
 					throw Exception(ExceptionType::EXECUTOR,
-					                "IVM refresh of '" + vn +
+					                "IVM refresh of '" + display_name +
 					                    "' failed: unresolved DuckLake snapshot placeholder after data refresh");
 				}
 			}
 			Connection meta_con(*context.db.get());
 			auto meta_result = meta_con.Query(meta_post_sql);
 			if (meta_result->HasError()) {
-				throw Exception(ExceptionType::EXECUTOR,
-				                "IVM refresh of '" + vn + "' failed after data refresh: " + meta_result->GetError());
+				throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
+				                                             "' failed after data refresh: " + meta_result->GetError());
 			}
 			profiler.AddStep("metadata_post_sql", meta_post_start, "bytes=" + to_string(meta_post_sql.size()));
 		}
@@ -557,6 +565,7 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
                                  const string &attached_db_catalog_name, const string &attached_db_schema_name,
                                  bool strict_hooks) {
 	RefreshMetadata metadata(con);
+	const string display_name = DisplayViewName(metadata, view_schema_name, view_name);
 	// Check for refresh hooks (custom SQL to run before/after/instead of IVM)
 	string hook_sql;
 	string hook_mode;
@@ -583,7 +592,7 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 		auto pending = con.Query("SELECT pending_after_hook FROM openivm_views WHERE view_name = '" +
 		                         SqlUtils::EscapeValue(view_name) + "'");
 		if (pending->HasError()) {
-			throw CatalogException("Cannot read pending after-hook for '%s': %s", view_name, pending->GetError());
+			throw CatalogException("Cannot read pending after-hook for '%s': %s", display_name, pending->GetError());
 		}
 		pending_after_hook =
 		    pending->RowCount() && !pending->GetValue(0, 0).IsNull() && pending->GetValue(0, 0).GetValue<bool>();
@@ -597,7 +606,7 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 		auto result = con.Query("UPDATE openivm_views SET pending_after_hook = " + string(pending ? "true" : "false") +
 		                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 		if (result->HasError()) {
-			throw CatalogException("Cannot record after-hook state for '%s': %s", view_name, result->GetError());
+			throw CatalogException("Cannot record after-hook state for '%s': %s", display_name, result->GetError());
 		}
 	};
 
@@ -611,10 +620,10 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 			auto hr = con.Query(hook_sql);
 			if (hr->HasError()) {
 				if (strict_hooks) {
-					throw InvalidInputException("refresh_pipeline: before-hook for '%s' failed: %s", view_name,
+					throw InvalidInputException("refresh_pipeline: before-hook for '%s' failed: %s", display_name,
 					                            hr->GetError());
 				}
-				Printer::Print("Warning: before-hook for '" + view_name + "' failed: " + hr->GetError());
+				Printer::Print("Warning: before-hook for '" + display_name + "' failed: " + hr->GetError());
 			}
 		}
 
@@ -632,10 +641,10 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
 			auto hr = con.Query(hook_sql);
 			if (hr->HasError()) {
 				if (strict_hooks) {
-					throw InvalidInputException("refresh_pipeline: %s-hook for '%s' failed: %s", hook_mode, view_name,
-					                            hr->GetError());
+					throw InvalidInputException("refresh_pipeline: %s-hook for '%s' failed: %s", hook_mode,
+					                            display_name, hr->GetError());
 				}
-				Printer::Print("Warning: " + hook_mode + "-hook for '" + view_name + "' failed: " + hr->GetError());
+				Printer::Print("Warning: " + hook_mode + "-hook for '" + display_name + "' failed: " + hr->GetError());
 			}
 			if (!hr->HasError() && staged_after_hook) {
 				mark_after_hook(false);
@@ -722,8 +731,8 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 			                                                          metadata.GetViewSQLName(node))}) {
 				auto bound = con.Query("EXPLAIN " + query);
 				if (bound->HasError()) {
-					throw CatalogException("refresh_pipeline: cannot bind materialized view '%s': %s", node,
-					                       bound->GetError());
+					throw CatalogException("refresh_pipeline: cannot bind materialized view '%s': %s",
+					                       DisplayViewName(metadata, location.schema_name, node), bound->GetError());
 				}
 			}
 		}
@@ -890,12 +899,16 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		view_name = resolved.view_name;
 		cross_system = resolved.cross_system;
 	}
+	const string requested_view_name = view_name;
 	if (!pipeline && parameters.values.size() > 1) {
 		RefreshMetadata names(metadata_con);
 		view_name = names.FindViewKey(view_catalog_name, view_schema_name, names.GetViewSQLName(view_name));
 	}
-	if (RefreshMetadata(metadata_con).GetViewQuery(view_name).empty()) {
-		throw CatalogException("Materialized view '%s' does not exist", view_name);
+	RefreshMetadata names_for_error(metadata_con);
+	if (view_name.empty() || names_for_error.GetViewQuery(view_name).empty()) {
+		const string &missing_name = view_name.empty() ? requested_view_name : view_name;
+		throw CatalogException("Materialized view '%s' does not exist",
+		                       DisplayViewName(names_for_error, view_schema_name, missing_name));
 	}
 
 	if (!view_catalog_name.empty()) {
@@ -952,7 +965,8 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		auto location = ResolveViewLocation(metadata_con, node, view_catalog_name, view_schema_name);
 		if (location.cross_system) {
 			throw NotImplementedException(
-			    "Transactional native refresh cannot include cross-catalog dependent view '%s'", node);
+			    "Transactional native refresh cannot include cross-catalog dependent view '%s'",
+			    DisplayViewName(metadata, location.schema_name, node));
 		}
 		ordered_nodes.push_back(node);
 	}

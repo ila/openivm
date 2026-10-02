@@ -582,7 +582,9 @@ string FirstMVReferencingColumn(Connection &con, const string &delta_name, const
 	for (auto &view : GetDependentViews(con, delta_name, source_catalog, source_schema)) {
 		if (RewriteStoredViewQuery(con, metadata, view.name, qualified_source, col_name, col_name, /*persist=*/false) ||
 		    AuxMetadataReferencesColumn(metadata, view.name, qualified_source, col_name)) {
-			return view.name;
+			// Report the name the user created, not the internal storage key.
+			auto sql_name = metadata.GetViewSQLName(view.name);
+			return (view.schema_name.empty() ? string("main") : view.schema_name) + "." + sql_name;
 		}
 	}
 	return "";
