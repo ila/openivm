@@ -206,7 +206,15 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 		                       "view_catalog and view_schema in the native database's main.openivm_views",
 		                       view_name);
 	}
-	auto raw_type = result->GetValue(0, 0).GetValue<int8_t>();
+	auto type_value = result->GetValue(0, 0);
+	if (type_value.IsNull()) {
+		throw InvalidInputException("Invalid refresh type NULL in IVM metadata for materialized view '%s'", view_name);
+	}
+	auto raw_type = type_value.GetValue<int64_t>();
+	if (!IsValidRefreshTypeOrdinal(raw_type)) {
+		throw InvalidInputException("Invalid refresh type %lld in IVM metadata for materialized view '%s'",
+		                            static_cast<long long>(raw_type), view_name);
+	}
 	return static_cast<RefreshType>(raw_type);
 }
 
