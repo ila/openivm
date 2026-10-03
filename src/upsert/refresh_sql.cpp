@@ -1331,7 +1331,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	}
 	default:
 		throw InternalException("Invalid refresh type %d while compiling refresh for materialized view '%s'",
-		                        (int)dispatch_refresh_type, view_name);
+		                        static_cast<int>(dispatch_refresh_type), view_name);
 	}
 	add_profile_step("generate_refresh_sql.dispatch", dispatch_start,
 	                 "refresh_type=" + string(RefreshTypeName(dispatch_refresh_type)) +

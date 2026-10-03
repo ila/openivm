@@ -213,7 +213,7 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 	auto raw_type = type_value.GetValue<int64_t>();
 	if (!IsValidRefreshTypeOrdinal(raw_type)) {
 		throw InvalidInputException("Invalid refresh type %lld in IVM metadata for materialized view '%s'",
-		                            (long long)raw_type, view_name);
+		                            static_cast<long long>(raw_type), view_name);
 	}
 	return static_cast<RefreshType>(raw_type);
 }
