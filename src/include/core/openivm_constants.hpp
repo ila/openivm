@@ -104,8 +104,9 @@ enum class RefreshType : uint8_t {
 	FULL_REFRESH = 3,
 	AGGREGATE_HAVING = 4,
 	WINDOW_PARTITION = 5, // window functions — partition-level recompute
-	GROUP_RECOMPUTE = 6, // inner-DISTINCT-under-AGG fallback: DELETE+INSERT only the GROUP BY keys touched by source deltas
-	TOP_K = 7,           // Legacy enum value; current top-k support strips ORDER BY/LIMIT into the user-facing view
+	GROUP_RECOMPUTE =
+	    6,     // inner-DISTINCT-under-AGG fallback: DELETE+INSERT only the GROUP BY keys touched by source deltas
+	TOP_K = 7, // Legacy enum value; current top-k support strips ORDER BY/LIMIT into the user-facing view
 	DISTINCT_INCREMENTAL = 8, // inner-DISTINCT-under-AGG with aux state (openivm_distinct_aux_state=true): DBSP-correct
 	                          // distinct(R)=sgn(R[t]); per-tuple count table emits ±1 only on count transitions
 	SEMI_ANTI_RECOMPUTE = 9,  // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
