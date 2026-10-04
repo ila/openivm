@@ -1,0 +1,74 @@
+# name: test/sql/refresh_type_validation.test
+# description: out-of-range openivm_views.type fails refresh and does not advance the watermark
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE rtv_s(k INT, v INT);
+
+statement ok
+INSERT INTO rtv_s VALUES (1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW rtv_mv AS SELECT k, SUM(v) AS total FROM rtv_s GROUP BY k;
+
+statement ok
+UPDATE openivm_views SET type = 42;
+
+statement ok
+INSERT INTO rtv_s VALUES (1,5),(3,30);
+
+statement error
+PRAGMA refresh('rtv_mv');
+----
+Invalid refresh type 42
+
+# ordinal 10 is an unassigned gap
+statement ok
+UPDATE openivm_views SET type = 10;
+
+statement error
+PRAGMA refresh('rtv_mv');
+----
+Invalid refresh type 10
+
+statement ok
+UPDATE openivm_views SET type = -1;
+
+statement error
+PRAGMA refresh('rtv_mv');
+----
+Invalid refresh type -1
+
+# restore the valid type: the skipped delta must still be applied
+statement ok
+UPDATE openivm_views SET type = 0;
+
+statement ok
+PRAGMA refresh('rtv_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM rtv_mv
+    EXCEPT ALL
+    SELECT k, SUM(v) FROM rtv_s GROUP BY k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT k, SUM(v) FROM rtv_s GROUP BY k
+    EXCEPT ALL
+    SELECT * FROM rtv_mv
+);
+----
+0
+
+query II
+SELECT * FROM rtv_mv ORDER BY k;
+----
+1	15
+2	20
+3	30

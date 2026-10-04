@@ -1329,6 +1329,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: %s\n", RefreshTypeName(dispatch_refresh_type));
 		break;
 	}
+	default:
+		throw InternalException("Invalid refresh type %d while compiling refresh for materialized view '%s'",
+		                        static_cast<int>(dispatch_refresh_type), view_name);
 	}
 	add_profile_step("generate_refresh_sql.dispatch", dispatch_start,
 	                 "refresh_type=" + string(RefreshTypeName(dispatch_refresh_type)) +

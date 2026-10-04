@@ -97,19 +97,25 @@ constexpr const char *UTC_NOW_SQL = "make_timestamp(epoch_us(now()))";
 } // namespace openivm
 
 enum class RefreshType : uint8_t {
-	AGGREGATE_GROUP,
-	SIMPLE_AGGREGATE,
-	SIMPLE_PROJECTION,
-	FULL_REFRESH,
-	AGGREGATE_HAVING,
-	WINDOW_PARTITION, // window functions — partition-level recompute
-	GROUP_RECOMPUTE, // inner-DISTINCT-under-AGG fallback: DELETE+INSERT only the GROUP BY keys touched by source deltas
-	TOP_K,           // Legacy enum value; current top-k support strips ORDER BY/LIMIT into the user-facing view
-	DISTINCT_INCREMENTAL, // inner-DISTINCT-under-AGG with aux state (openivm_distinct_aux_state=true): DBSP-correct
-	                      // distinct(R)=sgn(R[t]); per-tuple count table emits ±1 only on count transitions
-	SEMI_ANTI_RECOMPUTE,  // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
+	// Ordinals are persisted in openivm_views.type; never renumber. Ordinal 10 is unused.
+	AGGREGATE_GROUP = 0,
+	SIMPLE_AGGREGATE = 1,
+	SIMPLE_PROJECTION = 2,
+	FULL_REFRESH = 3,
+	AGGREGATE_HAVING = 4,
+	WINDOW_PARTITION = 5, // window functions — partition-level recompute
+	GROUP_RECOMPUTE =
+	    6,     // inner-DISTINCT-under-AGG fallback: DELETE+INSERT only the GROUP BY keys touched by source deltas
+	TOP_K = 7, // Legacy enum value; current top-k support strips ORDER BY/LIMIT into the user-facing view
+	DISTINCT_INCREMENTAL = 8, // inner-DISTINCT-under-AGG with aux state (openivm_distinct_aux_state=true): DBSP-correct
+	                          // distinct(R)=sgn(R[t]); per-tuple count table emits ±1 only on count transitions
+	SEMI_ANTI_RECOMPUTE = 9,  // SEMI/ANTI join aux state: per-left-tuple match counts, transition-scoped MV updates
 	COUNT_DISTINCT_INCREMENTAL = 11 // COUNT(DISTINCT x) with per-(group,x) multiplicity aux state
 };
+
+inline bool IsValidRefreshTypeOrdinal(int64_t raw) {
+	return (raw >= 0 && raw <= 9) || raw == 11;
+}
 
 enum class GroupRecomputeAffectedMode : uint8_t {
 	SOURCE_DELTA,
