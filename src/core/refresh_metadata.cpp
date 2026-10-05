@@ -94,7 +94,15 @@ string RefreshMetadata::GetViewSQLName(const string &view_key) {
 	// Metadata written before SQL names were stored separately has no view_sql_name column (see FindViewKey).
 	auto result = con.Query("SELECT view_sql_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_key) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	if (result->HasError()) {
+		// Only the missing view_sql_name column (a binder error) is legacy metadata; anything else is a real failure.
+		if (result->GetErrorObject().Type() == ExceptionType::BINDER) {
+			return view_key;
+		}
+		throw InvalidInputException("Could not read IVM metadata column 'view_sql_name' for materialized view '%s': %s",
+		                            view_key, result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return view_key;
 	}
 	auto name = result->GetValue(0, 0).ToString();
@@ -179,10 +187,6 @@ Value RefreshMetadata::ReadViewValue(const string &view_name, const string &colu
 	auto result = con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::VIEWS_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError()) {
-		// A missing metadata table means "no such view"; any other failure (e.g. a missing column) is an error.
-		if (result->GetErrorObject().Type() == ExceptionType::CATALOG) {
-			return Value();
-		}
 		throw InvalidInputException("Could not read IVM metadata column '%s' for materialized view '%s': %s", column,
 		                            view_name, result->GetError());
 	}
