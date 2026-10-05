@@ -1,0 +1,150 @@
+# name: test/sql/list_no_elementwise_merge.test
+# description: LIST aggregate views are maintained by recompute; no element-wise list-sum merge is emitted
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE lnm_items (id INT, grp INT, val FLOAT[]);
+
+statement ok
+INSERT INTO lnm_items VALUES
+    (1, 1, [1.0, 2.0]::FLOAT[]),
+    (2, 1, [3.0, 4.0]::FLOAT[]),
+    (3, 2, [5.0, 6.0]::FLOAT[]);
+
+# --- Grouped element-wise list_reduce(list(vec)) ---
+statement ok
+CREATE MATERIALIZED VIEW mv_lg AS
+    SELECT grp,
+           list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM lnm_items GROUP BY grp;
+
+# --- Global element-wise list_reduce(list(vec)) ---
+statement ok
+CREATE MATERIALIZED VIEW mv_ls AS
+    SELECT list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2])) AS total
+    FROM lnm_items;
+
+# --- Grouped plain list(...) ---
+statement ok
+CREATE MATERIALIZED VIEW mv_lp AS
+    SELECT grp, list(id ORDER BY id) AS ids
+    FROM lnm_items GROUP BY grp;
+
+# Grouped LIST views route to group recompute (6).
+query I
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c67_';
+----
+6
+
+query I
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c70_';
+----
+6
+
+statement ok
+INSERT INTO lnm_items VALUES (4, 1, [10.0, 20.0]::FLOAT[]), (5, 3, [7.0, 8.0]::FLOAT[]);
+
+statement ok
+DELETE FROM lnm_items WHERE id = 2;
+
+statement ok
+UPDATE lnm_items SET val = [100.0, 200.0]::FLOAT[] WHERE id = 3;
+
+statement ok
+PRAGMA refresh('mv_lg');
+
+statement ok
+PRAGMA refresh('mv_ls');
+
+statement ok
+PRAGMA refresh('mv_lp');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lg
+    EXCEPT ALL
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2]))
+    FROM lnm_items GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2]))
+    FROM lnm_items GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_lg
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_ls
+    EXCEPT ALL
+    SELECT list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2]))
+    FROM lnm_items
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT list_reduce(list(val), lambda a, b: list_transform(list_zip(a, b), lambda x: x[1] + x[2]))
+    FROM lnm_items
+    EXCEPT ALL
+    SELECT * FROM mv_ls
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lp
+    EXCEPT ALL
+    SELECT grp, list(id ORDER BY id) FROM lnm_items GROUP BY grp
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT grp, list(id ORDER BY id) FROM lnm_items GROUP BY grp
+    EXCEPT ALL
+    SELECT * FROM mv_lp
+);
+----
+0
+
+# None of the generated refresh files may contain the removed element-wise Z-set merge.
+query I
+SELECT CASE WHEN content NOT LIKE '%openivm_multiplicity * x%'
+            AND content NOT LIKE '%list_zip(v.%'
+            AND content LIKE '%openivm_recompute_%'
+       THEN 1 ELSE 0 END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f6c67_.sql');
+----
+1
+
+query I
+SELECT CASE WHEN content NOT LIKE '%openivm_multiplicity * x%'
+            AND content NOT LIKE '%list_zip(v.%'
+            AND content NOT LIKE '%FOR x IN generate_series%'
+       THEN 1 ELSE 0 END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f6c73_.sql');
+----
+1
+
+query I
+SELECT CASE WHEN content NOT LIKE '%openivm_multiplicity * x%'
+            AND content NOT LIKE '%list_zip(v.%'
+       THEN 1 ELSE 0 END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f6c70_.sql');
+----
+1

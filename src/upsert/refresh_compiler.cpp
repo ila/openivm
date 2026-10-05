@@ -11,8 +11,6 @@
 
 namespace duckdb {
 
-// Zero-initialized 64-element float list, used as COALESCE default for NULL list aggregates.
-static constexpr const char *ZEROS_LIST = "[0.0::FLOAT FOR x IN generate_series(1, 64)]";
 static constexpr idx_t GROUP_RECOMPUTE_DIFF_OCCURRENCE_THRESHOLD = 32;
 static constexpr idx_t GROUP_RECOMPUTE_DIFF_SQL_BYTES_THRESHOLD = 16ULL * 1024ULL * 1024ULL;
 
@@ -529,7 +527,7 @@ static unordered_map<string, string> DetectSumNullCountColumns(const vector<stri
 
 string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry,
                               vector<string> column_names, const string &view_query_sql, bool has_minmax,
-                              bool list_mode, const string &delta_ts_filter, const vector<string> &group_column_names,
+                              const string &delta_ts_filter, const vector<string> &group_column_names,
                               const string &catalog_prefix, bool insert_only, const vector<string> &aggregate_types,
                               const vector<LogicalType> &column_types, bool use_current_diff_affected_keys,
                               const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs,
@@ -904,14 +902,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 		} else if (insert_only && agg_type == "max") {
 			// Insert-only MAX: consolidate with MAX (new max can only be >= current)
 			cte_select_string += "\n\tmax(" + column + ") as " + column + ", ";
-		} else if (list_mode) {
-			// Z-set bag-aware list sum: per-row scale every element by the row's weight,
-			// then list_reduce-add across the group.
-			cte_select_string += "\n\tlist_reduce(list(list_transform(" + column +
-			                     ", lambda x: " + string(openivm::MULTIPLICITY_COL) +
-			                     " * x)), lambda a, b: list_transform(list_zip(a, "
-			                     "b), lambda x: x[1] + x[2])) AS " +
-			                     column + ", ";
 		} else {
 			// Z-set bag-aware sum: weight w∈ℤ scales the column value before SUM.
 			cte_select_string = cte_select_string + "\n\tsum(" + string(openivm::MULTIPLICITY_COL) + " * " + column +
@@ -982,9 +972,6 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 				updated_column_expressions[raw_column] = BuildNullSafeExtremumUpdate(column, "LEAST");
 			} else if (insert_only && agg_type == "max") {
 				updated_column_expressions[raw_column] = BuildNullSafeExtremumUpdate(column, "GREATEST");
-			} else if (list_mode) {
-				updated_column_expressions[raw_column] =
-				    "list_transform(list_zip(v." + column + ", d." + column + "), lambda x: x[1] + x[2])";
 			} else {
 				updated_column_expressions[raw_column] = BuildUpdatedAggregateColumn(column);
 			}
@@ -1262,7 +1249,7 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 }
 
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
-                               const string &view_query_sql, bool has_minmax, bool list_mode,
+                               const string &view_query_sql, bool has_minmax,
                                const string &delta_ts_filter, const string &catalog_prefix, bool /*insert_only*/,
                                const vector<LogicalType> &column_types, bool *out_full_recompute) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
@@ -1318,31 +1305,19 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 			update_set += ",\n  ";
 		}
 		first = false;
-		if (list_mode) {
-			// Z-set bag-aware list sum: per-row scale every element by w∈ℤ, then
-			// list_reduce-add. NULL-list COALESCE preserves the previous semantics
-			// for empty groups.
-			cte += "COALESCE(list_reduce(list(list_transform(" + column + ", lambda x: " + mul +
-			       " * x)), lambda a, b: list_transform(list_zip(a, b), lambda x: "
-			       "x[1] + x[2])), " +
-			       string(ZEROS_LIST) + ") AS d_" + column;
-			update_set += column + " = list_transform(list_zip(" + column + ", (SELECT d_" + column +
-			              " FROM openivm_delta)), lambda x: x[1] + x[2])";
+		// Z-set bag-aware sum: weight w∈ℤ scales the column value before SUM.
+		cte += "SUM(" + mul + " * " + column + ") AS d_" + column;
+		auto sum_count = sum_null_count_cols.find(column);
+		if (sum_count == sum_null_count_cols.end()) {
+			update_set += column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column +
+			              " FROM openivm_delta), 0)";
 		} else {
-			// Z-set bag-aware sum: weight w∈ℤ scales the column value before SUM.
-			cte += "SUM(" + mul + " * " + column + ") AS d_" + column;
-			auto sum_count = sum_null_count_cols.find(column);
-			if (sum_count == sum_null_count_cols.end()) {
-				update_set += column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column +
-				              " FROM openivm_delta), 0)";
-			} else {
-				string count_col = sum_count->second;
-				string updated_sum =
-				    "COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM openivm_delta), 0)";
-				string updated_count =
-				    "COALESCE(" + count_col + ", 0) + COALESCE((SELECT d_" + count_col + " FROM openivm_delta), 0)";
-				update_set += column + " = " + BuildNullableSum(updated_sum, updated_count);
-			}
+			string count_col = sum_count->second;
+			string updated_sum =
+			    "COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM openivm_delta), 0)";
+			string updated_count =
+			    "COALESCE(" + count_col + ", 0) + COALESCE((SELECT d_" + count_col + " FROM openivm_delta), 0)";
+			update_set += column + " = " + BuildNullableSum(updated_sum, updated_count);
 		}
 	}
 	cte += "\n  FROM " + delta_view + ts_where + "\n)\n";
