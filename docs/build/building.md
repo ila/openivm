@@ -233,7 +233,12 @@ ORDER BY s.stmt_order;
   IDs and catalog references are not normalized away. A refresh inside an explicit
   transaction, for example, stamps its own timestamp, and DuckLake refreshes embed
   snapshot IDs, so these usually store a new version. Refreshes skipped because
-  deltas are empty compile nothing and store nothing.
+  deltas are empty compile nothing and store nothing. If a DuckLake refresh rolls
+  back its first delete attempt and retries with ranked deletion, only the retried
+  program that committed is stored. For snapshot-published DuckLake views, the
+  executed publication statement is stored between the data statements and the
+  watermark update. Cleanup of consumed delta rows after a refresh commits is
+  housekeeping and is not part of the stored program.
 - **Outcomes.** `last_outcome` describes the latest operation that ran the version:
   `committed` (its transaction committed), `attempted` (it failed and rolled back,
   so nothing was committed) or `unknown` (a cross-catalog refresh failed after data

@@ -224,6 +224,18 @@ WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a
 ----
 0
 
+# Without a retry, the archive stores the committed exhaustive-delete program.
+query IIII
+SELECT any_value(p.last_outcome),
+       count(*) FILTER (WHERE starts_with(s.sql, 'SELECT COALESCE(SUM(-openivm_net), 0)::BIGINT AS openivm_expected_delete_rows')),
+       count(*) FILTER (WHERE starts_with(s.sql, 'DELETE FROM dl.main.openivm_data___openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a6f696e_ openivm_target USING')),
+       count(*) FILTER (WHERE contains(s.sql, 'openivm_ranked_deletes'))
+FROM openivm_compiled_programs p JOIN openivm_compiled_statements s USING (view_name, operation, version)
+WHERE p.view_sql_name = 'mv_runtime_left_join' AND p.operation = 'refresh'
+  AND p.version = (SELECT max(version) FROM openivm_compiled_programs WHERE view_sql_name = 'mv_runtime_left_join' AND operation = 'refresh');
+----
+committed	1	1	0
+
 query I
 SELECT count(*) FROM (
   SELECT id, value, label FROM dl.mv_runtime_left_join
@@ -268,6 +280,21 @@ FROM openivm_refresh_profile
 WHERE view_name = '__openivm_mv_646c_6d61696e_6d765f72756e74696d655f6c6566745f6a6f696e_' AND step_name = 'projection_delete_retry';
 ----
 1
+
+# The archive stores the ranked fallback that committed, not the rolled-back
+# exhaustive attempt, still between the in-progress marker and the watermark.
+query IIIIII
+SELECT any_value(p.last_outcome),
+       count(*) FILTER (WHERE contains(s.sql, 'openivm_expected_delete_rows')),
+       count(*) FILTER (WHERE contains(s.sql, 'openivm_target USING')),
+       count(*) FILTER (WHERE starts_with(s.sql, 'WITH openivm_ranked_deletes AS')) = 1,
+       min(s.stmt_order) FILTER (WHERE s.sql ILIKE '%refresh_in_progress = true%') = 0,
+       max(s.stmt_order) FILTER (WHERE s.sql ILIKE '%refresh_in_progress = false%') = max(s.stmt_order)
+FROM openivm_compiled_programs p JOIN openivm_compiled_statements s USING (view_name, operation, version)
+WHERE p.view_sql_name = 'mv_runtime_left_join' AND p.operation = 'refresh'
+  AND p.version = (SELECT max(version) FROM openivm_compiled_programs WHERE view_sql_name = 'mv_runtime_left_join' AND operation = 'refresh');
+----
+committed	0	0	true	true	true
 
 query I
 SELECT count(*) FROM (

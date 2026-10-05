@@ -214,19 +214,23 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			    /*out_adaptive_estimate=*/nullptr, /*facts=*/nullptr, /*metadata_connection=*/nullptr,
 			    /*delete_retry_plan=*/nullptr, /*write_query_file=*/false);
 		}
-		// The archived program is exactly what this refresh executes, in order.
-		auto set_archived_program = [&](const string &data_program) {
+		// The archived program is exactly what this refresh executes, in order: after a
+		// delete retry, the fallback that replaced the rolled-back attempt, and for
+		// DuckLake the snapshot publication between the data and watermark statements.
+		const string *executed_program = &sql;
+		string publish_sql;
+		auto set_archived_program = [&]() {
 			archived.statements.clear();
-			vector<const string *> parts {&data_program};
+			vector<const string *> parts {executed_program};
 			if (cross_system) {
-				parts = {&meta_pre_sql, &data_program, &meta_post_sql};
+				parts = {&meta_pre_sql, executed_program, &publish_sql, &meta_post_sql};
 			}
 			for (auto part : parts) {
 				auto statements = SqlUtils::SplitSQLStatements(*part);
 				archived.statements.insert(archived.statements.end(), statements.begin(), statements.end());
 			}
 		};
-		set_archived_program(sql);
+		set_archived_program();
 		for (const auto &step : compile_profile.steps) {
 			profiler.AddMeasuredStep(step.step_name, step.duration_ms, step.detail);
 		}
@@ -348,7 +352,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			                    static_cast<long long>(expected_delete_count));
 			exec_con.BeginTransaction();
 			tx_open = true;
-			set_archived_program(fallback_sql);
+			executed_program = &fallback_sql;
+			set_archived_program();
 			result = execute_program(fallback_sql, nullptr);
 		}
 		auto end = std::chrono::steady_clock::now();
@@ -404,10 +409,11 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 				throw CatalogException("Could not read snapshot publication query for '%s'", vn);
 			}
 			auto prefix = SqlUtils::QualifiedPrefix(view_catalog_name, view_schema_name);
-			auto publish_sql = BuildSnapshotPublicationSQL(
+			publish_sql = BuildSnapshotPublicationSQL(
 			    exec_con, view_catalog_name, prefix + SqlUtils::QuoteIdentifier(PublishedViewName(vn)),
 			    prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(vn)),
 			    publication->GetValue(0, 0).ToString());
+			set_archived_program();
 			auto published = exec_con.Query(publish_sql);
 			if (published->HasError()) {
 				throw CatalogException("Could not advance snapshot publication for '%s': %s", vn,
@@ -497,7 +503,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			// it once everything committed; if that fails, report the committed refresh
 			// with an error instead of success.
 			auto archive_start = std::chrono::steady_clock::now();
-			set_archived_program(sql);
+			// Collect again so the watermark carries its resolved snapshot IDs.
+			set_archived_program();
 			archive_handled = true;
 			auto archive_error =
 			    RecordCompiledProgram(context, view_catalog_name, archived, CompiledProgramOutcome::COMMITTED);

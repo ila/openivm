@@ -970,6 +970,27 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.snap_parent EXCEPT ALL SELECT * F
 ----
 0	0
 
+# The archived refresh includes the executed snapshot publication, pinned to a
+# committed snapshot, after the data statements and before the watermark update.
+query IIII
+WITH s AS (
+  SELECT s.stmt_order, s.sql,
+         starts_with(s.sql, 'CREATE OR REPLACE VIEW ') AND contains(s.sql, 'openivm_visible_')
+             AND regexp_matches(s.sql, 'AT \(VERSION => \d+\)') AS is_publish
+  FROM openivm_compiled_programs p JOIN openivm_compiled_statements s USING (view_name, operation, version)
+  WHERE p.view_sql_name = 'snap_parent' AND p.operation = 'refresh' AND p.last_outcome = 'committed'
+    AND p.version = (SELECT max(version) FROM openivm_compiled_programs WHERE view_sql_name = 'snap_parent' AND operation = 'refresh')
+)
+SELECT count(*) FILTER (WHERE is_publish),
+       max(stmt_order) FILTER (WHERE contains(sql, 'dl.main.openivm_data_') AND NOT is_publish)
+           < min(stmt_order) FILTER (WHERE is_publish),
+       min(stmt_order) FILTER (WHERE is_publish)
+           < min(stmt_order) FILTER (WHERE regexp_matches(sql, 'SET last_snapshot_id = \d+,')),
+       max(stmt_order) FILTER (WHERE sql ILIKE '%refresh_in_progress = false%') = max(stmt_order)
+FROM s;
+----
+1	true	true	true
+
 # Two parent publications before a delayed child refresh must preserve net bags.
 statement ok
 UPDATE dl.snap_source SET v=20 WHERE k=2;

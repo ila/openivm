@@ -976,7 +976,8 @@ SELECT total FROM mv_arch WHERE grp = 'a';
 ----
 11
 
-# Recording the failed attempt hits the same broken table, so the error reports both.
+# Each failed refresh then tries to record its attempt in the same broken table, so
+# both errors report the archive failure and the failed-attempt record failure.
 statement error
 PRAGMA refresh('mv_arch');
 ----
