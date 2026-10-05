@@ -642,9 +642,10 @@ SELECT (SELECT raw FROM v WHERE version = 1) <> (SELECT raw FROM v WHERE version
 true	true	15
 
 # File export and the archive coexist: the refresh reference file holds exactly the
-# latest archived statements, in the archived order.
+# latest archived statements, in the archived order. The file is written in text
+# mode, so undo Windows' CRLF translation before comparing.
 query II
-WITH f AS (SELECT content FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f61726368_.sql')),
+WITH f AS (SELECT replace(content, chr(13) || chr(10), chr(10)) AS content FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d765f61726368_.sql')),
 s AS (
     SELECT s.stmt_order, position(s.sql IN f.content) AS pos
     FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version), f
