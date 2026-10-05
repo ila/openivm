@@ -35,16 +35,64 @@ CREATE MATERIALIZED VIEW mv_lp AS
     SELECT grp, list(id ORDER BY id) AS ids
     FROM lnm_items GROUP BY grp;
 
-# Grouped LIST views route to group recompute (6).
+# --- LIST-typed min() column: a LIST-typed delta column must not trigger any list-specific merge ---
+statement ok
+CREATE TABLE lnm_tags (id INT, grp INT, tags VARCHAR[]);
+
+statement ok
+INSERT INTO lnm_tags VALUES (1, 1, ['b', 'c']), (2, 1, ['a', 'z']), (3, 2, ['q']);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lm AS
+    SELECT grp, min(tags) AS min_tags
+    FROM lnm_tags GROUP BY grp;
+
+# View types are the classifier's: grouped -> AGGREGATE_GROUP (0), global -> SIMPLE_AGGREGATE (1).
 query I
 SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c67_';
 ----
-6
+0
+
+query I
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c73_';
+----
+1
 
 query I
 SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c70_';
 ----
-6
+0
+
+query I
+SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c6d_';
+----
+0
+
+statement ok
+INSERT INTO lnm_tags VALUES (4, 1, ['0']), (5, 3, ['x']);
+
+statement ok
+DELETE FROM lnm_tags WHERE id = 3;
+
+statement ok
+PRAGMA refresh('mv_lm');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM mv_lm EXCEPT ALL SELECT grp, min(tags) FROM lnm_tags GROUP BY grp)
+    UNION ALL
+    (SELECT grp, min(tags) FROM lnm_tags GROUP BY grp EXCEPT ALL SELECT * FROM mv_lm)
+);
+----
+0
+
+query I
+SELECT CASE WHEN content NOT LIKE '%openivm_multiplicity * x%'
+            AND content NOT LIKE '%list_zip(v.%'
+       THEN 1 ELSE 0 END
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6d_.sql');
+----
+1
 
 statement ok
 INSERT INTO lnm_items VALUES (4, 1, [10.0, 20.0]::FLOAT[]), (5, 3, [7.0, 8.0]::FLOAT[]);
@@ -136,6 +184,7 @@ query I
 SELECT CASE WHEN content NOT LIKE '%openivm_multiplicity * x%'
             AND content NOT LIKE '%list_zip(v.%'
             AND content NOT LIKE '%FOR x IN generate_series%'
+            AND content LIKE '%list_reduce%'
        THEN 1 ELSE 0 END
 FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6d656d6f7279_6d61696e_6d765f6c73_.sql');
 ----
