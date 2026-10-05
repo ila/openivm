@@ -73,6 +73,30 @@ last_snapshot_id
 statement ok
 ALTER TABLE openivm_delta_tables ADD COLUMN last_snapshot_id BIGINT;
 
+# Error reading the delta watermark must surface instead of looking like "no watermark"
+statement ok
+ALTER TABLE openivm_delta_tables DROP COLUMN last_update;
+
+statement error
+PRAGMA refresh('mv');
+----
+last_update
+
+statement ok
+ALTER TABLE openivm_delta_tables ADD COLUMN last_update TIMESTAMP;
+
+# Error reading the source location must surface instead of falling back to defaults
+statement ok
+ALTER TABLE openivm_delta_tables DROP COLUMN source_catalog;
+
+statement error
+PRAGMA refresh('mv');
+----
+source_catalog
+
+statement ok
+ALTER TABLE openivm_delta_tables ADD COLUMN source_catalog VARCHAR;
+
 # A missing has_minmax column must fail the refresh instead of disabling MIN/MAX handling
 statement ok
 ALTER TABLE openivm_views DROP COLUMN has_minmax;

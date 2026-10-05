@@ -180,7 +180,11 @@ string RefreshMetadata::ResolveViewName(const string &view_name, const string &c
 bool RefreshMetadata::IsBaseTable(const string &table_name) {
 	auto result = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(table_name) + "'");
-	return !result->HasError() && result->RowCount() == 0;
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM metadata table '%s' for '%s': %s", openivm::VIEWS_TABLE,
+		                            table_name, result->GetError());
+	}
+	return result->RowCount() == 0;
 }
 
 Value RefreshMetadata::ReadViewValue(const string &view_name, const string &column) {
@@ -272,10 +276,12 @@ vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
 	auto result = con.Query("SELECT table_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<string> tables;
-	if (!result->HasError()) {
-		for (size_t i = 0; i < result->RowCount(); i++) {
-			tables.push_back(result->GetValue(0, i).ToString());
-		}
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM delta table metadata for materialized view '%s': %s", view_name,
+		                            result->GetError());
+	}
+	for (size_t i = 0; i < result->RowCount(); i++) {
+		tables.push_back(result->GetValue(0, i).ToString());
 	}
 	return tables;
 }
@@ -284,7 +290,12 @@ string RefreshMetadata::GetLastUpdate(const string &view_name, const string &tab
 	auto result =
 	    con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
-	if (result->HasError() || result->RowCount() == 0) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM metadata column 'last_update' for materialized view '%s' "
+		                            "and table '%s': %s",
+		                            view_name, table_name, result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return "";
 	}
 	return result->GetValue(0, 0).ToString();
@@ -336,7 +347,11 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 	auto result = con.Query("SELECT source_catalog, source_schema FROM " + string(openivm::DELTA_TABLES_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 	                        SqlUtils::EscapeValue(table_name) + "'");
-	if (!result->HasError() && result->RowCount() > 0) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM source location for materialized view '%s' and table '%s': %s",
+		                            view_name, table_name, result->GetError());
+	}
+	if (result->RowCount() > 0) {
 		if (!result->GetValue(0, 0).IsNull()) {
 			loc.catalog_name = result->GetValue(0, 0).ToString();
 		}
@@ -354,7 +369,11 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
 	StoredViewLocation loc {fallback_catalog, fallback_schema};
 	auto result = con.Query("SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (!result->HasError() && result->RowCount() > 0) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM stored location for materialized view '%s': %s", view_name,
+		                            result->GetError());
+	}
+	if (result->RowCount() > 0) {
 		if (!result->GetValue(0, 0).IsNull()) {
 			loc.catalog_name = result->GetValue(0, 0).ToString();
 		}
@@ -398,7 +417,8 @@ vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const stri
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<DeltaSource> sources;
 	if (result->HasError()) {
-		return sources;
+		throw InvalidInputException("Could not read IVM delta source metadata for materialized view '%s': %s",
+		                            view_name, result->GetError());
 	}
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		DeltaSource source;
