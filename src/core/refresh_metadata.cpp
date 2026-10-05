@@ -91,7 +91,13 @@ void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
 }
 
 string RefreshMetadata::GetViewSQLName(const string &view_key) {
-	auto name = ReadViewString(view_key, "view_sql_name");
+	// Metadata written before SQL names were stored separately has no view_sql_name column (see FindViewKey).
+	auto result = con.Query("SELECT view_sql_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_key) + "'");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return view_key;
+	}
+	auto name = result->GetValue(0, 0).ToString();
 	return name.empty() ? view_key : name;
 }
 
@@ -172,7 +178,15 @@ bool RefreshMetadata::IsBaseTable(const string &table_name) {
 Value RefreshMetadata::ReadViewValue(const string &view_name, const string &column) {
 	auto result = con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::VIEWS_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	return result->HasError() || result->RowCount() == 0 ? Value() : result->GetValue(0, 0);
+	if (result->HasError()) {
+		// A missing metadata table means "no such view"; any other failure (e.g. a missing column) is an error.
+		if (result->GetErrorObject().Type() == ExceptionType::CATALOG) {
+			return Value();
+		}
+		throw InvalidInputException("Could not read IVM metadata column '%s' for materialized view '%s': %s", column,
+		                            view_name, result->GetError());
+	}
+	return result->RowCount() == 0 ? Value() : result->GetValue(0, 0);
 }
 
 string RefreshMetadata::ReadViewString(const string &view_name, const string &column) {
@@ -181,12 +195,8 @@ string RefreshMetadata::ReadViewString(const string &view_name, const string &co
 }
 
 string RefreshMetadata::GetViewQuery(const string &view_name) {
-	auto result = con.Query("SELECT sql_string FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0) {
-		return "";
-	}
-	return result->GetValue(0, 0).ToString();
+	auto value = ReadViewValue(view_name, "sql_string");
+	return value.IsNull() ? "" : value.ToString();
 }
 
 RefreshType RefreshMetadata::GetViewType(const string &view_name) {
@@ -805,7 +815,11 @@ string RefreshMetadata::GetCatalogType(const string &view_name, const string &ta
 	auto result =
 	    con.Query("SELECT catalog_type FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read catalog_type for '%s' of materialized view '%s': %s", table_name,
+		                            view_name, result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return "duckdb";
 	}
 	return result->GetValue(0, 0).ToString();
@@ -830,7 +844,11 @@ int64_t RefreshMetadata::GetCurrentDuckLakeSnapshot(const string &catalog_name) 
 		return -1;
 	}
 	auto result = con.Query("SELECT id FROM " + SqlUtils::QuoteIdentifier(catalog_name) + ".current_snapshot()");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read current snapshot of catalog '%s': %s", catalog_name,
+		                            result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return -1;
 	}
 	return result->GetValue(0, 0).GetValue<int64_t>();
@@ -840,7 +858,11 @@ int64_t RefreshMetadata::GetLastSnapshotId(const string &view_name, const string
 	auto result =
 	    con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read last_snapshot_id for '%s' of materialized view '%s': %s",
+		                            table_name, view_name, result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return -1;
 	}
 	return result->GetValue(0, 0).GetValue<int64_t>();
