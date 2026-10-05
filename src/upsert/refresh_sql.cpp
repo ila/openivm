@@ -1207,10 +1207,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                    aux_meta.sum_out.c_str());
 			break;
 		}
-		OPENIVM_DEBUG_PRINT("[UPSERT] DISTINCT_INCREMENTAL view has no aux meta — "
-		                    "falling through to "
-		                    "GROUP_RECOMPUTE\n");
-		[[fallthrough]];
+		throw InternalException("DISTINCT_INCREMENTAL view '%s' has no aux metadata", view_name);
 	}
 	case RefreshType::SEMI_ANTI_RECOMPUTE: {
 		RefreshMetadata::SemiAntiAuxMeta aux_meta;
@@ -1241,10 +1238,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                    aux_meta.join_type.c_str(), aux_meta.left_cols.size());
 			break;
 		}
-		OPENIVM_DEBUG_PRINT("[UPSERT] SEMI_ANTI_RECOMPUTE view has no aux meta — "
-		                    "falling through to "
-		                    "GROUP_RECOMPUTE\n");
-		[[fallthrough]];
+		throw InternalException("SEMI_ANTI_RECOMPUTE view '%s' has no aux metadata", view_name);
 	}
 	case RefreshType::GROUP_RECOMPUTE: {
 		auto group_columns = metadata.GetGroupColumns(view_name);
