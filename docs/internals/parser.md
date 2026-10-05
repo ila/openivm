@@ -106,7 +106,7 @@ constrained temporary shadow tables for compilation. DuckLake and other
 cross-catalog lifecycles use staged execution because DuckDB cannot commit writes to
 two attached catalogs in one transaction.
 
-1. **System tables**: `openivm_views`, `openivm_delta_tables`, `openivm_mv_dependencies`, `openivm_refresh_hooks`, `openivm_refresh_history`, and `openivm_refresh_profile`, created once in `main` of the native default database. In autocommit mode this runs in a short, serialized setup transaction; see [Concurrency](concurrency.md#locking).
+1. **System tables**: `openivm_views`, `openivm_delta_tables`, `openivm_mv_dependencies`, `openivm_refresh_hooks`, `openivm_refresh_history`, `openivm_refresh_profile`, and the compiled SQL archive (`openivm_compiled_programs`, `openivm_compiled_statements`), created once in `main` of the native default database. In autocommit mode this runs in a short, serialized setup transaction; see [Concurrency](concurrency.md#locking).
 2. **Metadata inserts**: Registers the internal key, SQL name, location, query string, type, and source table mappings.
 3. **MV table**: `CREATE TABLE openivm_data_<internal_key> AS <query>` to materialize the initial result.
 4. **Published table and view**: `openivm_visible_<internal_key>` holds the visible rows, `openivm_delta_openivm_visible_<internal_key>` their signed changes, and the SQL view `<view_name>` selects from the published table.

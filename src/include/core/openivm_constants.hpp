@@ -13,6 +13,10 @@ constexpr const char *VIEWS_TABLE = "openivm_views";
 constexpr const char *DELTA_TABLES_TABLE = "openivm_delta_tables";
 constexpr const char *HISTORY_TABLE = "openivm_refresh_history";
 constexpr const char *PROFILE_TABLE = "openivm_refresh_profile";
+// Compiled CREATE/REFRESH SQL archive: one row per distinct program version, and
+// that version's statements in execution order.
+constexpr const char *COMPILED_PROGRAMS_TABLE = "openivm_compiled_programs";
+constexpr const char *COMPILED_STATEMENTS_TABLE = "openivm_compiled_statements";
 
 // View-matching system tables.
 constexpr const char *MV_DEPS_TABLE = "openivm_mv_dependencies";

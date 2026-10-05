@@ -1981,3 +1981,139 @@ query I
 SELECT count(*) FROM ((SELECT * FROM "profile.target"."observation.data".mv EXCEPT ALL SELECT i FROM "profile.target"."observation.data".source WHERE i>0) UNION ALL (SELECT i FROM "profile.target"."observation.data".source WHERE i>0 EXCEPT ALL SELECT * FROM "profile.target"."observation.data".mv));
 ----
 0
+
+# The compiled-SQL archive follows the metadata owner: the attached catalog's MV is
+# archived there under its qualified identity, and the rolled-back CREATE left nothing.
+query IIIIII
+SELECT view_catalog, view_schema, view_sql_name, operation, version, last_outcome
+FROM "profile.target".main.openivm_compiled_programs ORDER BY view_sql_name, operation, version;
+----
+profile.target	observation.data	mv	create	1	committed
+profile.target	observation.data	mv	create	2	committed
+profile.target	observation.data	mv	refresh	1	committed
+
+query I
+SELECT count(*) FROM main.openivm_compiled_programs WHERE view_sql_name <> 'host_mv';
+----
+0
+
+# Archive writes join the caller transaction for CREATE and refresh.
+statement ok
+CREATE TABLE archive_tx_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO archive_tx_src VALUES (1, 10), (2, 20);
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW archive_tx_mv AS SELECT id, v FROM archive_tx_src;
+
+query II
+SELECT operation, last_outcome FROM openivm_compiled_programs WHERE view_sql_name = 'archive_tx_mv';
+----
+create	committed
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT (SELECT count(*) FROM openivm_compiled_programs WHERE view_sql_name = 'archive_tx_mv'),
+       (SELECT count(*) FROM openivm_compiled_statements s WHERE NOT EXISTS
+            (SELECT 1 FROM openivm_compiled_programs p WHERE p.view_name = s.view_name AND p.operation = s.operation AND p.version = s.version));
+----
+0	0
+
+statement ok
+CREATE MATERIALIZED VIEW archive_tx_mv AS SELECT id, v FROM archive_tx_src;
+
+# A refresh rolled back with its caller transaction leaves no archive row.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO archive_tx_src VALUES (3, 30);
+
+statement ok
+PRAGMA refresh('archive_tx_mv');
+
+query II
+SELECT version, last_outcome FROM openivm_compiled_programs WHERE view_sql_name = 'archive_tx_mv' AND operation = 'refresh';
+----
+1	committed
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM openivm_compiled_programs WHERE view_sql_name = 'archive_tx_mv' AND operation = 'refresh';
+----
+0
+
+query II
+SELECT id, v FROM archive_tx_mv ORDER BY id;
+----
+1	10
+2	20
+
+# A committed transactional refresh is archived with the exact program it ran,
+# including its transaction-specific timestamp literal.
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM archive_tx_src WHERE id = 1;
+
+statement ok
+INSERT INTO archive_tx_src VALUES (4, 40), (4, 40);
+
+statement ok
+UPDATE archive_tx_src SET v = 21 WHERE id = 2;
+
+statement ok
+PRAGMA refresh('archive_tx_mv');
+
+statement ok
+COMMIT;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM archive_tx_mv EXCEPT ALL SELECT id, v FROM archive_tx_src)),
+       (SELECT count(*) FROM (SELECT id, v FROM archive_tx_src EXCEPT ALL SELECT * FROM archive_tx_mv));
+----
+0	0
+
+query IIII
+SELECT p.version, p.last_outcome, p.committed_count, count(*) FILTER (WHERE regexp_matches(s.sql, '''\d{4}-\d{2}-\d{2} [0-9:.]+''::TIMESTAMP'))  > 0
+FROM openivm_compiled_programs p JOIN openivm_compiled_statements s USING (view_name, operation, version)
+WHERE p.view_sql_name = 'archive_tx_mv' AND p.operation = 'refresh'
+GROUP BY ALL ORDER BY p.version;
+----
+1	committed	1	true
+
+# Its timestamp is state-specific and not normalized away: the next transactional
+# refresh stores a new version.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO archive_tx_src VALUES (5, 50);
+
+statement ok
+PRAGMA refresh('archive_tx_mv');
+
+statement ok
+COMMIT;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM archive_tx_mv EXCEPT ALL SELECT id, v FROM archive_tx_src)),
+       (SELECT count(*) FROM (SELECT id, v FROM archive_tx_src EXCEPT ALL SELECT * FROM archive_tx_mv));
+----
+0	0
+
+query III
+SELECT version, last_outcome, committed_count FROM openivm_compiled_programs
+WHERE view_sql_name = 'archive_tx_mv' AND operation = 'refresh' ORDER BY version;
+----
+1	committed	1
+2	committed	1
