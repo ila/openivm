@@ -926,10 +926,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                           has_minmax, delta_ts_filter, group_cols, internal_catalog_prefix,
 			                           effective_insert_only, agg_types, column_types, has_unstripped_having);
 		} else {
-			upsert_query = CompileAggregateGroups(
-			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-			    /*has_minmax=*/true, delta_ts_filter, group_cols, internal_catalog_prefix,
-			    /*insert_only=*/false, agg_types, column_types, has_unstripped_having);
+			upsert_query =
+			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
+			                           /*has_minmax=*/true, delta_ts_filter, group_cols, internal_catalog_prefix,
+			                           /*insert_only=*/false, agg_types, column_types, has_unstripped_having);
 		}
 		break;
 	}
@@ -1127,9 +1127,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                    aux_meta.group_col.c_str(), aux_meta.sum_col.c_str(), aux_meta.comparison_op.c_str(),
 			                    aux_meta.threshold_sql.c_str());
 		} else {
-			upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax,
-			                                       delta_ts_filter, internal_catalog_prefix, sa_insert_only,
-			                                       column_types, &simple_aggregate_full_recompute);
+			upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, delta_ts_filter,
+			                                       internal_catalog_prefix, sa_insert_only, column_types,
+			                                       &simple_aggregate_full_recompute);
 		}
 		if (!has_minmax && aux_meta.aux_table.empty() && !simple_aggregate_full_recompute) {
 			AppendSimpleAggregateEmptySourceNulling(metadata, upsert_query, view_name, column_names, data_table,

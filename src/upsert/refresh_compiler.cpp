@@ -1249,8 +1249,8 @@ string CompileAggregateGroups(const string &view_name, optional_ptr<CatalogEntry
 }
 
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
-                               const string &view_query_sql, bool has_minmax,
-                               const string &delta_ts_filter, const string &catalog_prefix, bool /*insert_only*/,
+                               const string &view_query_sql, bool has_minmax, const string &delta_ts_filter,
+                               const string &catalog_prefix, bool /*insert_only*/,
                                const vector<LogicalType> &column_types, bool *out_full_recompute) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
@@ -1309,8 +1309,8 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 		cte += "SUM(" + mul + " * " + column + ") AS d_" + column;
 		auto sum_count = sum_null_count_cols.find(column);
 		if (sum_count == sum_null_count_cols.end()) {
-			update_set += column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column +
-			              " FROM openivm_delta), 0)";
+			update_set +=
+			    column + " = COALESCE(" + column + ", 0) + COALESCE((SELECT d_" + column + " FROM openivm_delta), 0)";
 		} else {
 			string count_col = sum_count->second;
 			string updated_sum =
