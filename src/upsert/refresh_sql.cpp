@@ -1565,6 +1565,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		string raw_refresh_sql;
 		if (IsEmptyDeltaPlan(plan.get())) {
 			raw_refresh_sql = BuildEmptyDeltaInsert(view_name, column_names, column_types, active_facts.target_dialect);
+			// The generated statement is ours (no user text), so its prefix is known exactly.
+			string empty_prefix = "INSERT INTO " + SqlUtils::DeltaName(view_name) + " SELECT ";
+			D_ASSERT(raw_refresh_sql.compare(0, empty_prefix.size(), empty_prefix) == 0);
+			raw_refresh_sql = "INSERT INTO " + delta_view_name + " (" + SqlUtils::JoinQuotedColumns(column_names) +
+			                  ") SELECT " + raw_refresh_sql.substr(empty_prefix.size());
 			OPENIVM_DEBUG_PRINT("[UPSERT] Delta plan is empty; generated no-op delta insert for '%s'\n",
 			                    view_name.c_str());
 		} else {
@@ -1577,14 +1582,20 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				bool emit_spark_hints = dialect == SqlDialect::SPARK &&
 				                        (active_facts.emit_spark_hints ||
 				                         SqlUtils::GetBoolSetting(con_ctx, "openivm_emit_spark_hints", false));
-				auto cte_list = AstToCteList(*ast, dialect, emit_spark_hints);
-				raw_refresh_sql = cte_list->ToQuery(false);
-				if (use_transient_mv_delta && ast->NodeType() == "Insert" && ast->children.size() == 1) {
-					auto inline_cte_list = AstToCteList(*ast->children[0], dialect, emit_spark_hints);
-					inline_delta_select_query = inline_cte_list->ToQuery(false, column_names);
-					if (!inline_delta_select_query.empty() && inline_delta_select_query.back() == ';') {
-						inline_delta_select_query.pop_back();
-					}
+				if (ast->NodeType() != "Insert" || ast->children.size() != 1) {
+					throw InternalException("delta plan root is not a single-child INSERT");
+				}
+				// Build the INSERT target and column list from the AST's Insert node instead of searching the
+				// serialized text (a string literal could contain the target name).
+				auto select_cte_list = AstToCteList(*ast->children[0], dialect, emit_spark_hints);
+				string delta_select = select_cte_list->ToQuery(false, column_names);
+				if (!delta_select.empty() && delta_select.back() == ';') {
+					delta_select.pop_back();
+				}
+				raw_refresh_sql = "INSERT INTO " + delta_view_name + " (" + SqlUtils::JoinQuotedColumns(column_names) +
+				                  ") " + delta_select + ";";
+				if (use_transient_mv_delta) {
+					inline_delta_select_query = delta_select;
 				}
 				add_profile_step("generate_refresh_sql.lpts", lpts_start,
 				                 "delta_sql_bytes=" + to_string(raw_refresh_sql.size()));
@@ -1595,17 +1606,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 				throw Exception(ExceptionType::EXECUTOR, "IVM: failed to serialize incremental delta plan for view '" +
 				                                             view_name + "': " + e.what());
 			}
-		}
-		string insert_target_bare = "INSERT INTO " + SqlUtils::DeltaName(view_name);
-		auto insert_pos = raw_refresh_sql.find(insert_target_bare);
-		if (insert_pos != string::npos) {
-			if (!internal_catalog_prefix.empty()) {
-				raw_refresh_sql.replace(insert_pos, insert_target_bare.size(), "INSERT INTO " + delta_view_name);
-				insert_pos = raw_refresh_sql.find("INSERT INTO " + delta_view_name);
-			}
-			string col_list = "(" + SqlUtils::JoinQuotedColumns(column_names) + ") ";
-			string full_insert = "INSERT INTO " + delta_view_name;
-			raw_refresh_sql.insert(insert_pos + full_insert.size(), " " + col_list);
 		}
 		delta_query += raw_refresh_sql;
 
