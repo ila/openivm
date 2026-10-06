@@ -105,7 +105,7 @@ Three compilation paths based on view type (`RefreshType`):
 | `SIMPLE_PROJECTION` | `CompileProjectionsFilters()` | Counting-based consolidation (GROUP BY + generate_series/rowid for bag semantics) |
 | `WINDOW_PARTITION` | `CompileWindowRecompute()` or DuckLake snapshot diff | Delete/reinsert only affected partitions |
 | `GROUP_RECOMPUTE` | `CompileGroupRecompute()` | Delete/reinsert only affected groups; used for inner DISTINCT under aggregate and other non-linear group cases |
-| `DISTINCT_INCREMENTAL` | `CompileDistinctIncremental()` | Aux-state path for single-source inner DISTINCT under one SUM when `openivm_distinct_aux_state=true`; falls back to group-recompute if metadata is missing |
+| `DISTINCT_INCREMENTAL` | `CompileDistinctIncremental()` | Aux-state path for single-source inner DISTINCT under one SUM when `openivm_distinct_aux_state=true`; refresh throws if aux metadata is missing (no silent fallback) |
 | `FULL_REFRESH` | `BuildRecomputeQuery()` | DELETE all rows from `openivm_data_<view>`, INSERT full query, then cleanup deltas |
 
 MIN/MAX and ARG_MIN/ARG_MAX usually force group-recompute unless insert-only fast paths are enabled and safe. AVG is decomposed to SUM+COUNT; STDDEV/VARIANCE are decomposed to SUM, COUNT, and sum-of-squares helper columns.
