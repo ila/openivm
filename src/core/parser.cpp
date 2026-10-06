@@ -1682,8 +1682,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	    !target_is_ducklake && (view_catalog_prefix.empty() || view_target_catalog == default_db);
 	// The view-specific program (everything after the system tables) in execution order.
 	// Caller-transaction programs are archived exactly as rendered for execution. Staged
-	// operations resolved by the DDL executor from catalog state at execution time are
-	// represented by the same comments in the reference file and the archive.
+	// programs keep the operations the DDL executor resolves from catalog state at
+	// execution time; it archives the SQL those operations ran. The reference file is
+	// written before execution, so it describes them with comments instead.
 	string system_tables_sql;
 	string compiled_sql;
 	vector<string> compiled_program;
@@ -1709,7 +1710,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			auto rendered = RenderTransactionalStatement(ddl[i]);
 			compiled_program.insert(compiled_program.end(), rendered.begin(), rendered.end());
 		} else {
-			compiled_program.push_back(executor_note.empty() ? ddl[i] : executor_note);
+			compiled_program.push_back(ddl[i]);
 		}
 	}
 
@@ -1727,7 +1728,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// dedicated metadata transaction for staged programs (whose cleanup removes
 		// the MV if this write fails). A failed or rolled-back CREATE stores nothing.
 		// A staged DuckLake replacement has no cleanup once it committed, so its
-		// archive failure is reported as committed but not archived.
+		// archive failure is reported as committed but not archived. The DDL executor
+		// writes staged archives itself, after resolving the operations it executed.
 		CompiledProgram archived;
 		archived.view_name = view_name;
 		archived.view_catalog = view_target_catalog;
@@ -1736,24 +1738,24 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		archived.operation = "create";
 		archived.compilation_id = NewCompilationId(view_name, "create");
 		archived.statements = std::move(compiled_program);
-		auto archive_ddl =
-		    BuildCompiledSQLArchiveStatements(archived, CompiledProgramOutcome::COMMITTED, default_db, default_schema);
+		vector<string> archive_ddl;
+		if (caller_transactional_ddl) {
+			archive_ddl = BuildCompiledSQLArchiveStatements(archived, CompiledProgramOutcome::COMMITTED, default_db,
+			                                                default_schema);
+		} else {
+			auto mode = batch_ducklake_creation        ? DDLArchiveMode::CURRENT_TRANSACTION
+			            : staged_cross_catalog_replace ? DDLArchiveMode::AFTER_COMMIT
+			                                           : DDLArchiveMode::OWN_TRANSACTION;
+			archive_ddl = BuildArchiveProgramOperation(archived, mode, default_db, default_schema);
+		}
 		archive_ddl.insert(archive_ddl.begin(),
 		                   string(OPENIVM_DDL_PROFILE_PREFIX) + view_name +
 		                       "\tcreate_mv_archive_compiled_sql\tstatements=" + to_string(archived.statements.size()));
 		if (batch_ducklake_creation) {
 			D_ASSERT(ddl.back() == "COMMIT");
 			ddl.insert(ddl.end() - 1, archive_ddl.begin(), archive_ddl.end());
-		} else if (caller_transactional_ddl) {
-			ddl.insert(ddl.end(), archive_ddl.begin(), archive_ddl.end());
-		} else if (staged_cross_catalog_replace) {
-			ddl.push_back(archive_ddl.front());
-			ddl.push_back(string(OPENIVM_DDL_COMMITTED_ARCHIVE_PREFIX) +
-			              StringUtil::Join(vector<string>(archive_ddl.begin() + 1, archive_ddl.end()), ";\n"));
 		} else {
-			ddl.push_back("BEGIN TRANSACTION");
 			ddl.insert(ddl.end(), archive_ddl.begin(), archive_ddl.end());
-			ddl.push_back("COMMIT");
 		}
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Archiving %zu compiled statements as %s\n", archived.statements.size(),
 		                    archived.compilation_id.c_str());

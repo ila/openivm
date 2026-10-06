@@ -1,5 +1,6 @@
 #include "core/parser_ddl.hpp"
 
+#include "core/compiled_sql_archive.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/published_view.hpp"
@@ -302,6 +303,47 @@ void ParseCreateMVProfileRecord(const string &payload, string &view_name, string
 	detail = payload.substr(third + 1);
 }
 
+// Archive payload fields are tab-separated; names may contain tabs or backslashes.
+string EncodeArchiveField(const string &field) {
+	string result;
+	for (auto c : field) {
+		if (c == '\\') {
+			result += "\\\\";
+		} else if (c == '\t') {
+			result += "\\t";
+		} else {
+			result.push_back(c);
+		}
+	}
+	return result;
+}
+
+vector<string> DecodeArchiveFields(const string &payload) {
+	vector<string> fields(1);
+	for (idx_t i = 0; i < payload.size(); i++) {
+		if (payload[i] == '\t') {
+			fields.emplace_back();
+		} else if (payload[i] == '\\' && i + 1 < payload.size()) {
+			i++;
+			fields.back().push_back(payload[i] == 't' ? '\t' : payload[i]);
+		} else {
+			fields.back().push_back(payload[i]);
+		}
+	}
+	return fields;
+}
+
+const char *ArchiveModeName(DDLArchiveMode mode) {
+	switch (mode) {
+	case DDLArchiveMode::CURRENT_TRANSACTION:
+		return "current_transaction";
+	case DDLArchiveMode::OWN_TRANSACTION:
+		return "own_transaction";
+	default:
+		return "after_commit";
+	}
+}
+
 struct DeltaSchemaDDL {
 	string sql;
 	idx_t column_count = 0;
@@ -400,6 +442,9 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		throw CatalogException("Failed to configure OpenIVM DDL connection: " + preserve_result->GetError());
 	}
 	vector<string> cleanup_ddl;
+	// The program to archive, as compiled, and the SQL each executor operation ran.
+	vector<string> archive_statements;
+	unordered_map<string, string> executed_operations;
 	auto run_cleanup = [&]() {
 		if (!conn->context->transaction.IsAutoCommit()) {
 			conn->Rollback();
@@ -479,7 +524,9 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 				fail_ddl("malformed snapshot-publication payload");
 			}
 			try {
-				pending_ddl.push_back(BuildSnapshotPublicationSQL(*conn, fields[0], fields[1], fields[2], fields[3]));
+				auto publication_sql = BuildSnapshotPublicationSQL(*conn, fields[0], fields[1], fields[2], fields[3]);
+				executed_operations[q] = publication_sql;
+				pending_ddl.push_back(std::move(publication_sql));
 			} catch (std::exception &ex) {
 				fail_ddl(ex.what());
 			}
@@ -529,6 +576,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 				                 current_profile_detail + "; delta_schema_derivation_failed=true");
 				fail_ddl(ex.what());
 			}
+			executed_operations[q] = derived.sql;
 			auto statement_start = std::chrono::steady_clock::now();
 			auto r = conn->Query(derived.sql);
 			profiler.AddStep("create_mv_sql_stmt", statement_start,
@@ -547,24 +595,75 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			cleanup_ddl.push_back(q.substr(strlen(OPENIVM_DDL_CLEANUP_PREFIX)));
 			continue;
 		}
-		if (StringUtil::StartsWith(q, OPENIVM_DDL_COMMITTED_ARCHIVE_PREFIX)) {
-			flush_pending();
-			// The program's effects have committed and cannot be cleaned up; record its
-			// archive in one metadata transaction and never report success without it.
-			auto archived = conn->Query("BEGIN TRANSACTION;\n" +
-			                            q.substr(strlen(OPENIVM_DDL_COMMITTED_ARCHIVE_PREFIX)) + ";\nCOMMIT");
-			if (archived->HasError()) {
-				if (!conn->context->transaction.IsAutoCommit()) {
-					conn->Rollback();
-				}
-				profiler.AddTotal();
-				profiler.Flush(db);
-				restore_outer_transaction();
-				throw CatalogException("CREATE OR REPLACE MATERIALIZED VIEW committed, but OpenIVM could not archive "
-				                       "its compiled SQL: " +
-				                       archived->GetError());
-			}
+		if (StringUtil::StartsWith(q, OPENIVM_DDL_ARCHIVE_STATEMENT_PREFIX)) {
+			archive_statements.push_back(q.substr(strlen(OPENIVM_DDL_ARCHIVE_STATEMENT_PREFIX)));
 			continue;
+		}
+		if (StringUtil::StartsWith(q, OPENIVM_DDL_ARCHIVE_WRITE_PREFIX)) {
+			flush_pending();
+			auto archive_start = std::chrono::steady_clock::now();
+			auto fields = DecodeArchiveFields(q.substr(strlen(OPENIVM_DDL_ARCHIVE_WRITE_PREFIX)));
+			bool after_commit = fields[0] == ArchiveModeName(DDLArchiveMode::AFTER_COMMIT);
+			bool own_transaction = fields[0] != ArchiveModeName(DDLArchiveMode::CURRENT_TRANSACTION);
+			auto write_archive = [&]() -> string {
+				if (fields.size() != 9) {
+					return "malformed compiled-SQL archive payload";
+				}
+				CompiledProgram program;
+				program.view_name = fields[3];
+				program.view_catalog = fields[4];
+				program.view_schema = fields[5];
+				program.view_sql_name = fields[6];
+				program.operation = fields[7];
+				program.compilation_id = fields[8];
+				// Archive what ran: executor operations become the SQL they executed.
+				for (auto &statement : archive_statements) {
+					auto executed = executed_operations.find(statement);
+					if (executed != executed_operations.end()) {
+						program.statements.push_back(executed->second);
+					} else if (StringUtil::StartsWith(statement, OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX) ||
+					           StringUtil::StartsWith(statement, OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
+						return "the compiled program references an executor operation that did not run";
+					} else {
+						program.statements.push_back(statement);
+					}
+				}
+				if (own_transaction) {
+					auto begun = conn->Query("BEGIN TRANSACTION");
+					if (begun->HasError()) {
+						return begun->GetError();
+					}
+				}
+				auto error = WriteCompiledProgram(*conn, program, CompiledProgramOutcome::COMMITTED, fields[1], fields[2]);
+				if (!error.empty() || !own_transaction) {
+					return error;
+				}
+				auto committed = conn->Query("COMMIT");
+				return committed->HasError() ? committed->GetError() : string();
+			};
+			auto error = write_archive();
+			profiler.AddStep(current_profile_step, archive_start,
+			                 current_profile_detail + "; mode=" + fields[0] +
+			                     "; archive_statements=" + to_string(archive_statements.size()));
+			archive_statements.clear();
+			if (error.empty()) {
+				continue;
+			}
+			if (!after_commit) {
+				// The program has not committed yet, or its cleanup removes it.
+				fail_ddl("could not archive compiled SQL: " + error);
+			}
+			// The program's effects have committed and cannot be cleaned up; never report
+			// success without the archive.
+			if (!conn->context->transaction.IsAutoCommit()) {
+				conn->Rollback();
+			}
+			profiler.AddTotal();
+			profiler.Flush(db);
+			restore_outer_transaction();
+			throw CatalogException("CREATE OR REPLACE MATERIALIZED VIEW committed, but OpenIVM could not archive "
+			                       "its compiled SQL: " +
+			                       error);
 		}
 		pending_ddl.push_back(q);
 	}
@@ -830,6 +929,26 @@ void TransactionalMVMetadataState::Clear() {
 string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace) {
 	return string(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX) + (replace ? "replace\t" : "create\t") + delta_table +
 	       "\t" + data_table;
+}
+
+vector<string> BuildArchiveProgramOperation(const CompiledProgram &program, DDLArchiveMode mode,
+                                            const string &metadata_catalog, const string &metadata_schema) {
+	vector<string> result;
+	if (program.statements.empty()) {
+		return result;
+	}
+	for (auto &statement : program.statements) {
+		result.push_back(string(OPENIVM_DDL_ARCHIVE_STATEMENT_PREFIX) + statement);
+	}
+	vector<string> fields = {ArchiveModeName(mode), metadata_catalog,      metadata_schema,
+	                         program.view_name,     program.view_catalog,  program.view_schema,
+	                         program.view_sql_name, program.operation,     program.compilation_id};
+	string payload;
+	for (idx_t i = 0; i < fields.size(); i++) {
+		payload += (i > 0 ? "\t" : "") + EncodeArchiveField(fields[i]);
+	}
+	result.push_back(string(OPENIVM_DDL_ARCHIVE_WRITE_PREFIX) + payload);
+	return result;
 }
 
 string BuildDropViewStatement(const DropInfo &drop_info) {

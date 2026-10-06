@@ -18,7 +18,8 @@ enum class CompiledProgramOutcome : uint8_t {
 	// possible, so the row only becomes visible if the operation commits.
 	COMMITTED,
 	// Execution started, but OpenIVM cannot tell whether its effects committed (for
-	// example, a cross-catalog refresh that failed after data statements ran).
+	// example, a cross-catalog refresh that failed after its own-connection metadata
+	// or data statements ran).
 	UNKNOWN
 };
 

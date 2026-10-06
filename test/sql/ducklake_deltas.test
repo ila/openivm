@@ -737,6 +737,31 @@ FROM openivm_compiled_programs WHERE view_sql_name = 'mv_arch_lake' ORDER BY ope
 dl	main	create	1	committed	1
 dl	main	refresh	1	committed	1
 
+# The archived DuckLake CREATE holds the SQL that ran. The MV and published delta
+# tables are stored as the definitions derived from their data tables' schemas, not
+# as comments or executor operations.
+query II
+SELECT count(*) FILTER (WHERE starts_with(s.sql, '--') OR starts_with(s.sql, 'openivm_')),
+       count(*) FILTER (WHERE starts_with(s.sql, 'create table if not exists ')
+           AND contains(s.sql, 'openivm_delta_')
+           AND ends_with(s.sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT now())'))
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'mv_arch_lake' AND p.operation = 'create';
+----
+0	2
+
+# Every stored delta-table definition names a DuckLake table that exists.
+query I
+SELECT count(*)
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'mv_arch_lake' AND p.operation = 'create'
+  AND starts_with(s.sql, 'create table if not exists ')
+  AND EXISTS (SELECT 1 FROM duckdb_tables() t
+              WHERE t.database_name = 'dl' AND starts_with(t.table_name, 'openivm_delta_')
+                AND (contains(s.sql, '.' || t.table_name || ' (') OR contains(s.sql, '."' || t.table_name || '" (')));
+----
+2
+
 # The archived refresh program spans both catalogs in execution order: the native
 # in-progress marker, the DuckLake data statements, then the native watermark update
 # with the snapshot ID resolved after the data commit (not a placeholder).
@@ -844,6 +869,17 @@ FROM openivm_compiled_programs WHERE view_sql_name = 'mv_arch_lake' GROUP BY ope
 ----
 create	2	committed
 refresh	2	committed
+
+# The replacement's archive holds the delta-table replacements that ran.
+query II
+SELECT count(*) FILTER (WHERE starts_with(s.sql, '--') OR starts_with(s.sql, 'openivm_')),
+       count(*) FILTER (WHERE starts_with(s.sql, 'create or replace table ')
+           AND contains(s.sql, 'openivm_delta_')
+           AND ends_with(s.sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT now())'))
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'mv_arch_lake' AND p.operation = 'create' AND p.version = 2;
+----
+0	2
 
 # A refresh that fails after its DuckLake data statements started has an unknown
 # outcome: statements outside one transaction may already have committed.

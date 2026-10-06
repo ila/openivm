@@ -10,19 +10,33 @@
 namespace duckdb {
 
 struct DropInfo;
+struct CompiledProgram;
 
 static constexpr const char *OPENIVM_DDL_CLEANUP_PREFIX = "openivm_cleanup:";
 static constexpr const char *OPENIVM_DDL_PROFILE_PREFIX = "openivm_profile:";
 static constexpr const char *OPENIVM_DDL_PROFILE_RECORD_PREFIX = "openivm_profile_record:";
 static constexpr const char *OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX = "openivm_create_delta_from_data:";
 static constexpr const char *OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX = "openivm_snapshot_publication:";
-// Compiled-SQL archive batch that runs after a staged program's effects committed and
-// no cleanup applies; a failure is reported as committed-but-not-archived.
-static constexpr const char *OPENIVM_DDL_COMMITTED_ARCHIVE_PREFIX = "openivm_committed_archive:";
+// One statement of a staged program to archive, as compiled. Executor operations
+// above are archived as the SQL they executed.
+static constexpr const char *OPENIVM_DDL_ARCHIVE_STATEMENT_PREFIX = "openivm_archive_statement:";
+// Archives the preceding archive statements; the payload describes the program.
+static constexpr const char *OPENIVM_DDL_ARCHIVE_WRITE_PREFIX = "openivm_archive_write:";
 static constexpr const char *OPENIVM_TRANSACTIONAL_DDL_FUNCTION = "openivm_transactional_ddl";
 static constexpr const char *OPENIVM_STAGED_DDL_FUNCTION = "openivm_staged_ddl";
 
 enum class DDLExecutionMode : uint8_t { CALLER_TRANSACTION, STAGED_CROSS_CATALOG };
+
+// Where the DDL executor writes a staged program's compiled-SQL archive.
+enum class DDLArchiveMode : uint8_t {
+	// In the executor's open metadata transaction, which commits with the program.
+	CURRENT_TRANSACTION,
+	// In a dedicated metadata transaction; a failure runs the program's cleanup.
+	OWN_TRANSACTION,
+	// In a dedicated metadata transaction after the program's effects committed and no
+	// cleanup applies; a failure is reported as committed but not archived.
+	AFTER_COMMIT
+};
 
 // Native lifecycle statements are rendered into a caller-transaction SQL
 // program. Helper connections cannot observe that program's uncommitted
@@ -57,6 +71,9 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 vector<string> RenderTransactionalStatement(const string &statement);
 void ExecuteStagedDDL(ClientContext &context, const vector<Value> &parameters);
 string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace);
+// Executor operations that archive `program` as committed in the metadata catalog/schema.
+vector<string> BuildArchiveProgramOperation(const CompiledProgram &program, DDLArchiveMode mode,
+                                            const string &metadata_catalog, const string &metadata_schema);
 string BuildDropViewStatement(const DropInfo &drop_info);
 string BuildDropTableStatement(const DropInfo &drop_info);
 unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindInput &input,

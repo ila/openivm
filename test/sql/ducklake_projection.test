@@ -948,6 +948,26 @@ SELECT count(*) FROM duckdb_views() WHERE database_name='dl' AND view_name LIKE 
 ----
 4
 
+# The archived CREATE holds the publication pinned to its committed snapshot and
+# the derived delta-table definitions that ran, not comments or executor operations.
+query IIII
+WITH s AS (
+  SELECT s.stmt_order, s.sql,
+         starts_with(s.sql, 'CREATE OR REPLACE VIEW ') AND contains(s.sql, 'openivm_visible_')
+             AND regexp_matches(s.sql, 'AT \(VERSION => \d+\)') AS is_publish
+  FROM openivm_compiled_programs p JOIN openivm_compiled_statements s USING (view_name, operation, version)
+  WHERE p.view_sql_name = 'snap_parent' AND p.operation = 'create'
+)
+SELECT count(*) FILTER (WHERE is_publish),
+       count(*) FILTER (WHERE starts_with(sql, 'create table if not exists ') AND contains(sql, 'openivm_delta_')
+           AND ends_with(sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT now())')),
+       count(*) FILTER (WHERE starts_with(sql, '--') OR starts_with(sql, 'openivm_')),
+       min(stmt_order) FILTER (WHERE is_publish)
+           < min(stmt_order) FILTER (WHERE starts_with(sql, 'create table if not exists ') AND contains(sql, 'openivm_delta_openivm_visible_'))
+FROM s;
+----
+1	2	0	true
+
 statement ok
 SET openivm_snapshot_publication=false;
 

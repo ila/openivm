@@ -268,6 +268,10 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		if (cross_system && !meta_pre_sql.empty()) {
 			auto meta_pre_start = std::chrono::steady_clock::now();
 			execution_started = true;
+			// These metadata statements commit on their own connection, each one even if a
+			// later statement of the batch fails, so no failure after this point rolls
+			// the whole program back.
+			effects_may_be_committed = true;
 			Connection meta_con(*context.db.get());
 			auto meta_result = meta_con.Query(meta_pre_sql);
 			if (meta_result->HasError()) {
@@ -456,6 +460,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 					}
 					meta_post_sql = StringUtil::Replace(meta_post_sql, placeholder, to_string(snapshot_id));
 				}
+				// A failing watermark update is archived with the snapshot IDs it ran with.
+				set_archived_program();
 				if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
 					throw Exception(ExceptionType::EXECUTOR,
 					                "IVM refresh of '" + display_name +
