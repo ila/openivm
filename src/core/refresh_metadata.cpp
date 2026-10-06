@@ -454,6 +454,8 @@ RefreshMetadata::DeltaChangeStats RefreshMetadata::GetStandardDeltaChangeStats(c
 	    con.Query("SELECT COUNT(*), SUM(CASE WHEN " + string(openivm::MULTIPLICITY_COL) +
 	              " < 0 THEN 1 ELSE 0 END) FROM " + delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) +
 	              " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP");
+	// This reads delta data, not metadata. Callers treat !ok conservatively (pending changes and deletes),
+	// so an unreadable delta table never makes a refresh skip work.
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return stats;
 	}
@@ -679,6 +681,11 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 	return order;
 }
 
+static bool RefreshMetadataTableExists(Connection &con, const char *table_name) {
+	return con.TableInfo(TEMP_CATALOG, DEFAULT_SCHEMA, table_name) ||
+	       con.TableInfo(INVALID_CATALOG, DEFAULT_SCHEMA, table_name);
+}
+
 bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_published) {
 	string predicate = "table_name = '" + SqlUtils::EscapeValue(SqlUtils::DeltaName(view_name)) + "'";
 	if (include_published) {
@@ -687,7 +694,16 @@ bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_p
 	}
 	auto result =
 	    con.Query("SELECT 1 FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " + predicate + " LIMIT 1");
-	return !result->HasError() && result->RowCount() > 0;
+	if (result->HasError()) {
+		// CREATE OR REPLACE may run before any view created the metadata table: nothing can depend on it yet.
+		if (result->GetErrorObject().Type() == ExceptionType::CATALOG &&
+		    !RefreshMetadataTableExists(con, openivm::DELTA_TABLES_TABLE)) {
+			return false;
+		}
+		throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view_name,
+		                       result->GetError());
+	}
+	return result->RowCount() > 0;
 }
 
 vector<string> RefreshMetadata::ReadViewList(const string &view_name, const string &column) {
@@ -859,7 +875,11 @@ bool RefreshMetadata::IsDuckLakeCatalog(const string &catalog_name) {
 	}
 	auto result = con.Query("SELECT type FROM duckdb_databases() WHERE database_name = '" +
 	                        SqlUtils::EscapeValue(catalog_name) + "' LIMIT 1");
-	return !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
+	if (result->HasError()) {
+		throw CatalogException("OpenIVM could not resolve the type of catalog '%s': %s", catalog_name,
+		                       result->GetError());
+	}
+	return result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
 	       StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "ducklake");
 }
 
@@ -900,7 +920,11 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	auto result =
 	    con.Query("SELECT source_table_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name));
-	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read source_table_id for '%s' of materialized view '%s': %s", table_name,
+		                            view_name, result->GetError());
+	}
+	if (result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
 		identity.stored_table_id = result->GetValue(0, 0).GetValue<int64_t>();
 	}
 	if (catalog_name.empty()) {

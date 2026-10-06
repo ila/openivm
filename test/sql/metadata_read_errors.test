@@ -4,6 +4,13 @@
 
 require openivm
 
+# Absent metadata tables are not errors: CREATE OR REPLACE before any view exists must succeed
+statement ok
+CREATE TABLE s0(k INT, v INT);
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW mv0 AS SELECT k, SUM(v) AS sv FROM s0 GROUP BY k;
+
 statement ok
 CREATE TABLE s(k INT, v INT);
 
@@ -96,6 +103,24 @@ source_catalog
 
 statement ok
 ALTER TABLE openivm_delta_tables ADD COLUMN source_catalog VARCHAR;
+
+# An unreadable delta metadata table must not look like "no downstream views" during CREATE OR REPLACE
+statement ok
+ALTER TABLE openivm_delta_tables RENAME TO openivm_delta_tables_saved;
+
+statement ok
+CREATE TABLE openivm_delta_tables(view_name VARCHAR);
+
+statement error
+CREATE OR REPLACE MATERIALIZED VIEW mv2 AS SELECT k, SUM(v) AS sv FROM s2 GROUP BY k;
+----
+could not resolve downstream dependencies
+
+statement ok
+DROP TABLE openivm_delta_tables;
+
+statement ok
+ALTER TABLE openivm_delta_tables_saved RENAME TO openivm_delta_tables;
 
 # A missing has_minmax column must fail the refresh instead of disabling MIN/MAX handling
 statement ok
