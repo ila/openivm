@@ -1,6 +1,6 @@
 # name: test/sql/metadata_read_errors.test
 # description: A failing openivm_views metadata read must surface as an error, not change the refresh strategy
-# group: [openivm]
+# group: [sql]
 
 require openivm
 
