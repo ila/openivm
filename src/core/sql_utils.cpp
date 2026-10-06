@@ -472,7 +472,8 @@ string SqlUtils::ExtractViewQuery(string &query) {
 	// Match only up through "AS " — then return everything after as a raw substr so
 	// multi-line CTE bodies (which contain '\n') are not truncated by regex '.' semantics.
 	std::regex rgx_create_view(
-	    R"re(create\s+(table|materialized view)\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)\s+as\s+)re");
+	    R"re(create\s+(table|materialized view)\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)\s+as\s+)re",
+	    std::regex::icase);
 	std::smatch match;
 	if (std::regex_search(query, match, rgx_create_view)) {
 		return query.substr(static_cast<size_t>(match.position()) + static_cast<size_t>(match.length()));
