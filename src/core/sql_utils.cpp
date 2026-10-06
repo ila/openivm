@@ -391,8 +391,8 @@ string SqlUtils::EscapeSingleQuotes(const string &input) {
 }
 
 void SqlUtils::ReplaceMaterializedView(string &query) {
-	query = std::regex_replace(query, std::regex("\\bmaterialized\\s+view\\b", std::regex::icase),
-	                           "table if not exists");
+	query =
+	    std::regex_replace(query, std::regex("\\bmaterialized\\s+view\\b", std::regex::icase), "table if not exists");
 	query = regex_replace(query, std::regex("\\s*;$"), "");
 }
 
