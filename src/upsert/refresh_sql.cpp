@@ -780,15 +780,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto column_metadata_start = profile_now();
 	vector<string> column_names;
 	vector<LogicalType> column_types;
-	bool list_mode = false;
 	auto read_delta_columns = [&](TableCatalogEntry &entry) {
 		const auto &columns = entry.GetColumns();
 		column_names = columns.GetColumnNames();
 		for (auto &column : columns.Logical()) {
 			column_types.push_back(column.GetType());
-			if (column.GetName() != openivm::MULTIPLICITY_COL && column.GetType().id() == LogicalTypeId::LIST) {
-				list_mode = true;
-			}
 		}
 	};
 	if (delta_view_catalog_entry) {
@@ -812,10 +808,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			column_types.erase(column_types.begin() + offset);
 		}
 	}
-	OPENIVM_DEBUG_PRINT("[UPSERT] List mode: %s\n", list_mode ? "true" : "false");
 	add_profile_step("generate_refresh_sql.column_metadata", column_metadata_start,
-	                 "columns=" + to_string(column_names.size()) +
-	                     "; list_mode=" + string(list_mode ? "true" : "false"));
+	                 "columns=" + to_string(column_names.size()));
 
 	string upsert_query;
 	string appended_projection_rows;
@@ -929,13 +923,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			    has_argminmax ? false : (has_minmax ? (insert_only && minmax_incremental) : skip_agg_delete);
 			upsert_query =
 			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-			                           has_minmax, list_mode, delta_ts_filter, group_cols, internal_catalog_prefix,
+			                           has_minmax, delta_ts_filter, group_cols, internal_catalog_prefix,
 			                           effective_insert_only, agg_types, column_types, has_unstripped_having);
 		} else {
-			upsert_query = CompileAggregateGroups(
-			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-			    /*has_minmax=*/true, list_mode, delta_ts_filter, group_cols, internal_catalog_prefix,
-			    /*insert_only=*/false, agg_types, column_types, has_unstripped_having);
+			upsert_query =
+			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
+			                           /*has_minmax=*/true, delta_ts_filter, group_cols, internal_catalog_prefix,
+			                           /*insert_only=*/false, agg_types, column_types, has_unstripped_having);
 		}
 		break;
 	}
@@ -948,7 +942,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			bool effective_insert_only = has_argminmax ? false : skip_agg_delete;
 			upsert_query =
 			    CompileAggregateGroups(view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql,
-			                           /*has_minmax=*/has_argminmax, list_mode, delta_ts_filter, group_cols,
+			                           /*has_minmax=*/has_argminmax, delta_ts_filter, group_cols,
 			                           internal_catalog_prefix, effective_insert_only, agg_types, column_types);
 			upsert_query += BuildFullOuterAffectedGroupRefresh(metadata, view_name, delta_table_names, group_cols,
 			                                                   data_table, view_query_sql, delta_ts_filter,
@@ -1072,7 +1066,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			}
 			bool ljsec_used_group_recompute = false;
 			upsert_query = CompileAggregateGroups(
-			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax, list_mode,
+			    view_name, index_delta_view_catalog_entry.get(), column_names, view_query_sql, has_minmax,
 			    delta_ts_filter, group_cols, internal_catalog_prefix, effective_insert_only, agg_types, column_types,
 			    /*use_current_diff_affected_keys=*/false, aggregate_cascade_specs_ptr, aggregate_recompute_lpts_prefix,
 			    /*emit_cascade_delta=*/aggregate_cascade_specs_ptr != nullptr,
@@ -1133,9 +1127,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                    aux_meta.group_col.c_str(), aux_meta.sum_col.c_str(), aux_meta.comparison_op.c_str(),
 			                    aux_meta.threshold_sql.c_str());
 		} else {
-			upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, list_mode,
-			                                       delta_ts_filter, internal_catalog_prefix, sa_insert_only,
-			                                       column_types, &simple_aggregate_full_recompute);
+			upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, delta_ts_filter,
+			                                       internal_catalog_prefix, sa_insert_only, column_types,
+			                                       &simple_aggregate_full_recompute);
 		}
 		if (!has_minmax && aux_meta.aux_table.empty() && !simple_aggregate_full_recompute) {
 			AppendSimpleAggregateEmptySourceNulling(metadata, upsert_query, view_name, column_names, data_table,
