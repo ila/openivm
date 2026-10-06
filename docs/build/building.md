@@ -225,8 +225,9 @@ ORDER BY s.stmt_order;
   `view_catalog`, `view_schema` and `view_sql_name` give the qualified MV name.
   `operation` is `create` or `refresh`. `compilation_id` identifies the operation that
   first stored a version; `last_compilation_id` is the latest operation that ran
-  the same program. For refreshes this is the `refresh_id` in
-  `openivm_refresh_profile` when profiling is enabled.
+  the same program. For refreshes outside an explicit transaction this is the
+  `refresh_id` in `openivm_refresh_profile` when profiling is enabled; refreshes
+  inside an explicit transaction are not profiled.
 - **Versions.** A program is the complete statement list, in execution order. A
   new version is stored only when that list differs from the view's latest stored
   version for the same operation. The comparison is exact: delta cutoffs, snapshot
