@@ -1,0 +1,42 @@
+# name: test/sql/insert_into_literal_delta_name.test
+# description: a string literal containing the internal delta INSERT target must not hijack the refresh INSERT column list
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE TABLE lit_t (grp INT, v INT, note VARCHAR);
+
+statement ok
+INSERT INTO lit_t VALUES (1, 10, 'k');
+
+statement ok
+CREATE MATERIALIZED VIEW mv_lit AS SELECT grp, SUM(v) AS s FROM lit_t
+WHERE note <> 'INSERT INTO openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6974_' GROUP BY grp;
+
+statement ok
+INSERT INTO lit_t VALUES (1, 5, 'k'), (2, 7, 'k'), (3, 1, 'INSERT INTO openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6974_');
+
+statement ok
+PRAGMA refresh('mv_lit');
+
+query II
+SELECT grp, s FROM mv_lit ORDER BY grp;
+----
+1	15
+2	7
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM mv_lit EXCEPT ALL SELECT grp, SUM(v) FROM lit_t
+        WHERE note <> 'INSERT INTO openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6974_' GROUP BY grp)
+    UNION ALL
+    (SELECT grp, SUM(v) FROM lit_t
+        WHERE note <> 'INSERT INTO openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6c6974_' GROUP BY grp
+        EXCEPT ALL SELECT * FROM mv_lit)
+);
+----
+0
