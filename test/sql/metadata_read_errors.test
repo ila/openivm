@@ -4,6 +4,8 @@
 
 require openivm
 
+require parquet
+
 # Absent metadata tables are not errors: CREATE OR REPLACE before any view exists must succeed
 statement ok
 CREATE TABLE s0(k INT, v INT);
