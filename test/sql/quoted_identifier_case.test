@@ -1,0 +1,59 @@
+# name: test/sql/quoted_identifier_case.test
+# description: Quoted mixed-case MV names and aliases keep their case, like CREATE VIEW
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE "Orders" ("CustomerId" INT, "Amount" INT);
+
+statement ok
+INSERT INTO "Orders" VALUES (1, 10), (1, 5), (2, 7);
+
+statement ok
+CREATE MATERIALIZED VIEW "OrderTotals" AS SELECT "CustomerId", SUM("Amount") AS "TotalAmount" FROM "Orders" GROUP BY "CustomerId";
+
+statement ok
+CREATE VIEW "PlainTotals" AS SELECT "CustomerId", SUM("Amount") AS "TotalAmount" FROM "Orders" GROUP BY "CustomerId";
+
+query TT
+SELECT table_name, column_name FROM information_schema.columns WHERE table_name ILIKE '%totals' ORDER BY table_name, ordinal_position;
+----
+OrderTotals	CustomerId
+OrderTotals	TotalAmount
+PlainTotals	CustomerId
+PlainTotals	TotalAmount
+
+query T
+SELECT view_sql_name FROM openivm_views WHERE view_sql_name ILIKE 'ordertotals';
+----
+OrderTotals
+
+statement ok
+INSERT INTO "Orders" VALUES (1, 100), (3, 1);
+
+statement ok
+PRAGMA refresh('OrderTotals');
+
+query II
+SELECT "CustomerId", "TotalAmount" FROM "OrderTotals" ORDER BY 1;
+----
+1	115
+2	7
+3	1
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM "OrderTotals" EXCEPT ALL SELECT * FROM "PlainTotals") UNION ALL (SELECT * FROM "PlainTotals" EXCEPT ALL SELECT * FROM "OrderTotals"));
+----
+0
+
+# Mixed-case keywords and OR REPLACE
+statement ok
+Create Or Replace Materialized View "OrderTotals" AS SELECT "CustomerId", SUM("Amount") AS "TotalAmount", COUNT(*) AS "RowCount" FROM "Orders" GROUP BY "CustomerId";
+
+query T
+SELECT column_name FROM information_schema.columns WHERE table_name = 'OrderTotals' ORDER BY ordinal_position;
+----
+CustomerId
+TotalAmount
+RowCount

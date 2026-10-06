@@ -365,7 +365,8 @@ string SqlUtils::ExtractTableName(const string &sql) {
 	}
 	// Matches: CREATE TABLE [IF NOT EXISTS] name|"quoted name" (AS ...|(...))
 	std::regex table_name_regex(
-	    R"re(create\s+table\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))re");
+	    R"re(create\s+table\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))re",
+	    std::regex::icase);
 	std::smatch match;
 	if (std::regex_search(sql, match, table_name_regex)) {
 		auto name = match[1].str();
@@ -390,7 +391,8 @@ string SqlUtils::EscapeSingleQuotes(const string &input) {
 }
 
 void SqlUtils::ReplaceMaterializedView(string &query) {
-	query = std::regex_replace(query, std::regex("\\bmaterialized\\s+view\\b"), "table if not exists");
+	query =
+	    std::regex_replace(query, std::regex("\\bmaterialized\\s+view\\b", std::regex::icase), "table if not exists");
 	query = regex_replace(query, std::regex("\\s*;$"), "");
 }
 
@@ -470,7 +472,8 @@ string SqlUtils::ExtractViewQuery(string &query) {
 	// Match only up through "AS " — then return everything after as a raw substr so
 	// multi-line CTE bodies (which contain '\n') are not truncated by regex '.' semantics.
 	std::regex rgx_create_view(
-	    R"re(create\s+(table|materialized view)\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)\s+as\s+)re");
+	    R"re(create\s+(table|materialized view)\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)\s+as\s+)re",
+	    std::regex::icase);
 	std::smatch match;
 	if (std::regex_search(query, match, rgx_create_view)) {
 		return query.substr(static_cast<size_t>(match.position()) + static_cast<size_t>(match.length()));

@@ -87,16 +87,18 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 }
 
 ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, SqlDialect input_dialect) {
-	auto query_lower = SqlUtils::SQLToLowercase(StringUtil::Replace(query, ";", ""));
+	// Keep the original case: double-quoted identifiers must retain it. Keyword detection is case-insensitive.
+	auto query_lower = StringUtil::Replace(query, ";", "");
 	StringUtil::Trim(query_lower);
 	// Strip SQL line comments (-- to end of line) before whitespace normalization.
 	// RemoveRedundantWhitespaces collapses '\n' to ' ', which would turn
 	// "-- comment\n rest" into "-- comment rest" where the rest is eaten by the comment.
 	SqlUtils::StripLineComments(query_lower);
 	SqlUtils::RemoveRedundantWhitespaces(query_lower);
+	const string keyword_probe = StringUtil::Lower(query_lower);
 
 	// Handle ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' | SET REFRESH MANUAL
-	if (StringUtil::Contains(query_lower, "alter materialized view")) {
+	if (StringUtil::Contains(keyword_probe, "alter materialized view")) {
 		const string identifier = "(?:\"(?:[^\"]|\"\")*\"|[a-zA-Z_][a-zA-Z0-9_$]*)";
 		const string qualified_identifier = identifier + "(?:\\s*\\.\\s*" + identifier + "){0,2}";
 		std::regex alter_re("^alter\\s+materialized\\s+view\\s+(" + qualified_identifier +
@@ -132,8 +134,8 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 		return ParserExtensionParseResult(std::move(parse_data));
 	}
 
-	if (!StringUtil::Contains(query_lower, "create materialized view") &&
-	    !StringUtil::Contains(query_lower, "create or replace materialized view")) {
+	if (!StringUtil::Contains(keyword_probe, "create materialized view") &&
+	    !StringUtil::Contains(keyword_probe, "create or replace materialized view")) {
 		return ParserExtensionParseResult();
 	}
 
@@ -145,7 +147,7 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 	if (std::regex_search(query_lower, or_replace_re)) {
 		is_replace = true;
 		// Strip "or replace" so the rest of the pipeline sees "create materialized view"
-		query_lower = std::regex_replace(query_lower, std::regex("\\bor\\s+replace\\s+"), "");
+		query_lower = std::regex_replace(query_lower, std::regex("\\bor\\s+replace\\s+", std::regex::icase), "");
 		SqlUtils::RemoveRedundantWhitespaces(query_lower);
 	}
 
