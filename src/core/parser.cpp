@@ -824,10 +824,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			}
 			CountDistinctExtract cd_extract;
 			if (ExtractCountDistinctAggregate(local_view_query, candidate_group_columns, output_names, cd_extract)) {
-				count_distinct_aux_candidate = {
-				    "openivm_aux_" + view_name, cd_extract.source,       candidate_group_columns,
-				    cd_extract.group_exprs,     cd_extract.distinct_col, cd_extract.distinct_expr,
-				    cd_extract.output_col,      cd_extract.filter};
+				count_distinct_aux_candidate = {"openivm_aux_" + view_name, cd_extract.source,
+				                                candidate_group_columns,    cd_extract.group_exprs,
+				                                cd_extract.distinct_col,    cd_extract.distinct_expr,
+				                                cd_extract.output_col,      cd_extract.filter};
 				model_input.count_distinct_aux_candidate = &count_distinct_aux_candidate;
 			} else {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] COUNT_DISTINCT_INCREMENTAL extractor failed — demoting to "
