@@ -1155,7 +1155,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::COUNT_DISTINCT_INCREMENTAL: {
 		RefreshMetadata::CountDistinctAuxMeta aux_meta;
 		if (!metadata.GetCountDistinctAuxMeta(view_name, aux_meta)) {
-			throw InternalException("COUNT_DISTINCT_INCREMENTAL view '%s' has no aux metadata", view_name);
+			throw InvalidInputException("COUNT_DISTINCT_INCREMENTAL view '%s' has no aux metadata", view_name);
 		} else {
 			if (!active_facts.compile_only) {
 				EnsureCountDistinctAuxState(metadata, con, view_name, aux_meta, delta_table_names,
@@ -1207,7 +1207,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                    aux_meta.sum_out.c_str());
 			break;
 		}
-		throw InternalException("DISTINCT_INCREMENTAL view '%s' has no aux metadata", view_name);
+		throw InvalidInputException("DISTINCT_INCREMENTAL view '%s' has no aux metadata", view_name);
 	}
 	case RefreshType::SEMI_ANTI_RECOMPUTE: {
 		RefreshMetadata::SemiAntiAuxMeta aux_meta;
@@ -1238,7 +1238,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                    aux_meta.join_type.c_str(), aux_meta.left_cols.size());
 			break;
 		}
-		throw InternalException("SEMI_ANTI_RECOMPUTE view '%s' has no aux metadata", view_name);
+		throw InvalidInputException("SEMI_ANTI_RECOMPUTE view '%s' has no aux metadata", view_name);
 	}
 	case RefreshType::GROUP_RECOMPUTE: {
 		auto group_columns = metadata.GetGroupColumns(view_name);
