@@ -1059,9 +1059,8 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 				                     "detail) VALUES ('" +
 				                     SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(row.view_name) +
 				                     "', CAST(current_timestamp AS TIMESTAMP), " + to_string(step_order) + ", '" +
-				                     SqlUtils::EscapeValue(row.step_name) +
-				                     "', " + to_string(row.duration_ms) + ", '" + SqlUtils::EscapeValue(row.detail) +
-				                     "')",
+				                     SqlUtils::EscapeValue(row.step_name) + "', " + to_string(row.duration_ms) + ", '" +
+				                     SqlUtils::EscapeValue(row.detail) + "')",
 				                 false);
 			}
 		}

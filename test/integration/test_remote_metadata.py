@@ -40,8 +40,7 @@ class Client:
             )
         if configure:
             preamble += (
-                "SET openivm_metadata_catalog = 'control';\n"
-                f"SET openivm_metadata_schema = {sql_literal(schema)};\n"
+                "SET openivm_metadata_catalog = 'control';\n" f"SET openivm_metadata_schema = {sql_literal(schema)};\n"
             )
         self.preamble = preamble
 
@@ -120,7 +119,9 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
         assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_views;") == "1"
         assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0"
         assert (
-            client.value("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'host' AND table_name = 'openivm_views';")
+            client.value(
+                "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'host' AND table_name = 'openivm_views';"
+            )
             == "0"
         ), "metadata leaked into the host database"
         assert (
@@ -170,13 +171,17 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
             "BEGIN;\nALTER TABLE orders RENAME COLUMN amount TO amt;\n",
             "cannot run inside an explicit transaction",
         )
-        assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_views WHERE sql_string LIKE '%amt%';") == "0"
+        assert (
+            client.value(f"SELECT count(*) FROM control.{schema}.openivm_views WHERE sql_string LIKE '%amt%';") == "0"
+        )
         # ...and a rename that fails after the rewrite committed restores the remote rows
         # with DELETE + INSERT (PostgreSQL has no INSERT OR REPLACE).
         failed = client.run("ALTER TABLE orders RENAME COLUMN amount TO id;\n", check=False)
         assert failed.returncode != 0, "renaming onto an existing column must fail"
         assert "could not restore" not in failed.stdout + failed.stderr, failed.stdout + failed.stderr
-        client.run("INSERT INTO orders VALUES (20, 'a', 20), (21, 'r', 21);\nDELETE FROM orders WHERE id = 21;\nPRAGMA refresh('sales');\n")
+        client.run(
+            "INSERT INTO orders VALUES (20, 'a', 20), (21, 'r', 21);\nDELETE FROM orders WHERE id = 21;\nPRAGMA refresh('sales');\n"
+        )
         assert client.value(bag_difference("sales", base)) == "0", "failed rename left rewritten remote metadata"
         renamed = "SELECT product, SUM(amt), COUNT(*) FROM orders GROUP BY product"
         client.run(
@@ -184,7 +189,9 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
             "UPDATE orders SET amt = amt + 1 WHERE id = 20;\nPRAGMA refresh('sales');\n"
         )
         assert client.value(bag_difference("sales", renamed)) == "0", "refresh after a remote rename diverged"
-        client.run("ALTER TABLE orders RENAME COLUMN amt TO amount;\nDELETE FROM orders WHERE id IN (20, 22);\nPRAGMA refresh('sales');\n")
+        client.run(
+            "ALTER TABLE orders RENAME COLUMN amt TO amount;\nDELETE FROM orders WHERE id IN (20, 22);\nPRAGMA refresh('sales');\n"
+        )
         assert client.value(bag_difference("sales", base)) == "0"
 
         # Another client takes the lease over just before the watermark commit. The fence
@@ -197,7 +204,9 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
             "lost the refresh lease",
         )
         assert client.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "true"
-        assert client.value(f"SELECT owner FROM control.{schema}.openivm_refresh_leases;") == "openivm-simulated-takeover"
+        assert (
+            client.value(f"SELECT owner FROM control.{schema}.openivm_refresh_leases;") == "openivm-simulated-takeover"
+        )
         client.run("PRAGMA refresh('sales');\n")
         assert client.value(bag_difference("sales", base)) == "0", "a stale watermark commit lost or doubled changes"
         assert client.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "false"
@@ -205,7 +214,9 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
 
         # Reopen without settings: the marker in the host database finds the remote schema.
         reopened = Client(binary, dsn, schema, host, configure=False)
-        reopened.run("INSERT INTO orders VALUES (8, 'e', 8);\nDELETE FROM orders WHERE id = 2;\nPRAGMA refresh('sales');\n")
+        reopened.run(
+            "INSERT INTO orders VALUES (8, 'e', 8);\nDELETE FROM orders WHERE id = 2;\nPRAGMA refresh('sales');\n"
+        )
         assert reopened.value(bag_difference("sales", base)) == "0", "refresh after reopen diverged"
 
         # A client crashes after committing MV data; its lease stays behind.

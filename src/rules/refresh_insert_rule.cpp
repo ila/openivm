@@ -139,8 +139,8 @@ static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &t
 			if (key > 0) {
 				keys += " AND ";
 			}
-			keys += SqlUtils::QuoteIdentifier(rows.names[key_indexes[key]]) +
-			        " IS NOT DISTINCT FROM " + rows.GetValue(key_indexes[key], row).ToSQLString();
+			keys += SqlUtils::QuoteIdentifier(rows.names[key_indexes[key]]) + " IS NOT DISTINCT FROM " +
+			        rows.GetValue(key_indexes[key], row).ToSQLString();
 		}
 		keys += ")";
 	}
@@ -162,11 +162,9 @@ static void RegisterMetadataRestore(ClientContext &context, Connection &con, con
 	if (location->HasError()) {
 		throw CatalogException("OpenIVM could not resolve metadata restore location: %s", location->GetError());
 	}
-	auto restore =
-	    BuildRestoreRowsSQL(*rows,
-	                        SqlUtils::FullName(location->GetValue(0, 0).ToString(),
-	                                           location->GetValue(1, 0).ToString(), table_name),
-	                        key_columns, metadata_location.catalog_type.empty() || metadata_location.IsNative());
+	auto restore = BuildRestoreRowsSQL(
+	    *rows, SqlUtils::FullName(location->GetValue(0, 0).ToString(), location->GetValue(1, 0).ToString(), table_name),
+	    key_columns, metadata_location.catalog_type.empty() || metadata_location.IsNative());
 	if (!restore.empty()) {
 		TransactionalHelperUndoState::Get(context).AddRestoreSQL(std::move(restore));
 	}
@@ -340,10 +338,10 @@ static bool TableDropNeedsMetadata(ClientContext &context, const DropInfo &drop_
 	if (table->ParentCatalog().GetCatalogType() != "duckdb") {
 		return true;
 	}
-	auto delta = Catalog::GetEntry(
-	    context, table->ParentCatalog().GetName(), table->ParentSchema().name,
-	    EntryLookupInfo(CatalogType::TABLE_ENTRY, SqlUtils::DeltaName(table->name), error_context),
-	    OnEntryNotFound::RETURN_NULL);
+	auto delta =
+	    Catalog::GetEntry(context, table->ParentCatalog().GetName(), table->ParentSchema().name,
+	                      EntryLookupInfo(CatalogType::TABLE_ENTRY, SqlUtils::DeltaName(table->name), error_context),
+	                      OnEntryNotFound::RETURN_NULL);
 	return delta ? true : false;
 }
 
@@ -460,9 +458,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 
 		auto table_name = drop_info->name;
 		auto target_locus = ResolveDDLLocus(input.context, drop_info->catalog, drop_info->schema);
-		if (drop_info->type == CatalogType::TABLE_ENTRY && !TableDropNeedsMetadata(input.context, *drop_info,
-		                                                                           target_locus.first,
-		                                                                           target_locus.second)) {
+		if (drop_info->type == CatalogType::TABLE_ENTRY &&
+		    !TableDropNeedsMetadata(input.context, *drop_info, target_locus.first, target_locus.second)) {
 			return;
 		}
 		Connection con(*input.context.db);
@@ -593,7 +590,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			}
 			string old_name = rename_info->old_name;
 			string new_name = rename_info->new_name;
-			auto source_predicate = RefreshMetadata::SourcePredicate(delta_name, source_locus.first, source_locus.second);
+			auto source_predicate =
+			    RefreshMetadata::SourcePredicate(delta_name, source_locus.first, source_locus.second);
 			auto dependent_view_predicate = "view_name IN (SELECT view_name FROM " +
 			                                string(openivm::DELTA_TABLES_TABLE) + " WHERE " + source_predicate + ")";
 			// The helper connection commits rewritten view metadata on its own, before the

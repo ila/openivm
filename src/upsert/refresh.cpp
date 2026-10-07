@@ -102,9 +102,9 @@ public:
 			    "INSERT INTO " + string(openivm::PROFILE_TABLE) +
 			    " (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail) VALUES ('" +
 			    SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) +
-			    "', CAST(current_timestamp AS TIMESTAMP), " +
-			    to_string(step.step_order) + ", '" + SqlUtils::EscapeValue(step.step_name) + "', " +
-			    to_string(step.duration_ms) + ", '" + SqlUtils::EscapeValue(step.detail) + "')");
+			    "', CAST(current_timestamp AS TIMESTAMP), " + to_string(step.step_order) + ", '" +
+			    SqlUtils::EscapeValue(step.step_name) + "', " + to_string(step.duration_ms) + ", '" +
+			    SqlUtils::EscapeValue(step.detail) + "')");
 			if (result->HasError()) {
 				OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record refresh step '%s': %s\n", step.step_name.c_str(),
 				                    result->GetError().c_str());
@@ -586,8 +586,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 						           "'full' and PRAGMA refresh";
 					}
 				}
-				throw Exception(ExceptionType::EXECUTOR,
-				                "IVM refresh of '" + display_name + "' failed after data refresh: " + meta_error + recovery);
+				throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
+				                                             "' failed after data refresh: " + meta_error + recovery);
 			}
 			profiler.AddStep("metadata_post_sql", meta_post_start, "bytes=" + to_string(meta_post_sql.size()));
 		}
@@ -682,9 +682,9 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			// The data transaction rolled back, so nothing changed: retract our marker
 			// rather than force a full recompute. Best effort; a set marker is still safe.
 			try {
-				auto cleared = run_metadata("UPDATE " + metadata_location.Table(openivm::VIEWS_TABLE) +
-				                            " SET refresh_in_progress = false WHERE view_name = " +
-				                            Value(vn).ToSQLString() + ";\n");
+				auto cleared = run_metadata(
+				    "UPDATE " + metadata_location.Table(openivm::VIEWS_TABLE) +
+				    " SET refresh_in_progress = false WHERE view_name = " + Value(vn).ToSQLString() + ";\n");
 				if (!cleared.empty()) {
 					OPENIVM_DEBUG_PRINT("[REFRESH] Could not retract marker: %s\n", cleared.c_str());
 				}
@@ -1128,10 +1128,9 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	archived.view_sql_name = metadata.GetViewSQLName(view_name);
 	archived.operation = "refresh";
 	archived.compilation_id = NewCompilationId(view_name);
-	for (auto &statement :
-	     BuildCompiledSQLArchiveStatements(archived, CompiledProgramOutcome::COMMITTED,
-	                                       archive_location->GetValue(0, 0).ToString(),
-	                                       archive_location->GetValue(1, 0).ToString())) {
+	for (auto &statement : BuildCompiledSQLArchiveStatements(archived, CompiledProgramOutcome::COMMITTED,
+	                                                         archive_location->GetValue(0, 0).ToString(),
+	                                                         archive_location->GetValue(1, 0).ToString())) {
 		stamped += statement + ";\n";
 	}
 	OPENIVM_DEBUG_PRINT("[REFRESH] Compiled transaction-local program for %s at %s\n", view_name.c_str(),

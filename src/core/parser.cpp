@@ -1395,14 +1395,14 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	vector<string> source_metadata_ddl;
 	if (!source_metadata_values.empty()) {
-		source_metadata_ddl = MetadataLocator::ReplaceRowsSQL(
-		    metadata_location,
-		    "insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
-		        " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
-		        "last_refresh_ts, source_catalog, source_schema, source_table_id) "
-		        "values " +
-		        StringUtil::Join(source_metadata_values, ", "),
-		    "view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'");
+		source_metadata_ddl =
+		    MetadataLocator::ReplaceRowsSQL(metadata_location,
+		                                    "insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
+		                                        " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
+		                                        "last_refresh_ts, source_catalog, source_schema, source_table_id) "
+		                                        "values " +
+		                                        StringUtil::Join(source_metadata_values, ", "),
+		                                    "view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'");
 	}
 
 	// --- Compiled DDL (MV creation, delta tables, delta view) ---
@@ -2024,9 +2024,10 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	// Native sources keep their delta table next to them. Without one the table is not
 	// tracked, and dropping it must not depend on a (possibly detached) metadata catalog.
 	if (table_entry->ParentCatalog().GetCatalogType() == "duckdb" &&
-	    !Catalog::GetEntry(context, drop_info.catalog, drop_info.schema,
-	                       EntryLookupInfo(CatalogType::TABLE_ENTRY, SqlUtils::DeltaName(drop_info.name), error_context),
-	                       OnEntryNotFound::RETURN_NULL)) {
+	    !Catalog::GetEntry(
+	        context, drop_info.catalog, drop_info.schema,
+	        EntryLookupInfo(CatalogType::TABLE_ENTRY, SqlUtils::DeltaName(drop_info.name), error_context),
+	        OnEntryNotFound::RETURN_NULL)) {
 		return BuildDropTableStatement(drop_info) + ";\n";
 	}
 

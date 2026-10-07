@@ -316,8 +316,7 @@ bool MetadataLocator::SpansDatabases(const MetadataLocation &location, const str
 
 void MetadataLocator::RejectExplicitTransaction(ClientContext &context, const MetadataLocation &location,
                                                 const string &data_catalog, const string &operation) {
-	if (context.transaction.IsAutoCommit() || !location.explicit_placement ||
-	    !SpansDatabases(location, data_catalog)) {
+	if (context.transaction.IsAutoCommit() || !location.explicit_placement || !SpansDatabases(location, data_catalog)) {
 		return;
 	}
 	throw TransactionException(
@@ -636,9 +635,8 @@ RefreshLease::~RefreshLease() {
 	}
 	try {
 		Connection con(db);
-		auto result = con.Query("DELETE FROM " + location.Table(openivm::REFRESH_LEASE_TABLE) +
-		                        " WHERE view_name = " + Value(view_name).ToSQLString() +
-		                        " AND owner = " + Value(token).ToSQLString());
+		auto result = con.Query("DELETE FROM " + location.Table(openivm::REFRESH_LEASE_TABLE) + " WHERE view_name = " +
+		                        Value(view_name).ToSQLString() + " AND owner = " + Value(token).ToSQLString());
 		if (result->HasError()) {
 			OPENIVM_DEBUG_PRINT("[LEASE] Release failed: %s\n", result->GetError().c_str());
 		}

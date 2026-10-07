@@ -895,10 +895,9 @@ void RefreshMetadata::RecordRefreshHistory(const string &view_name, const string
 	                        " recompute_compute_est, recompute_replace_est, actual_duration_ms)"
 	                        " VALUES ('" +
 	                        SqlUtils::EscapeValue(view_name) + "', CAST(current_timestamp AS TIMESTAMP), '" +
-	                        SqlUtils::EscapeValue(method) + "', " +
-	                        to_string(incremental_compute_est) + ", " + to_string(incremental_upsert_est) + ", " +
-	                        to_string(recompute_compute_est) + ", " + to_string(recompute_replace_est) + ", " +
-	                        to_string(actual_duration_ms) + ")");
+	                        SqlUtils::EscapeValue(method) + "', " + to_string(incremental_compute_est) + ", " +
+	                        to_string(incremental_upsert_est) + ", " + to_string(recompute_compute_est) + ", " +
+	                        to_string(recompute_replace_est) + ", " + to_string(actual_duration_ms) + ")");
 	if (result->HasError()) {
 		OPENIVM_DEBUG_PRINT("[HISTORY] Failed to record: %s\n", result->GetError().c_str());
 		return;

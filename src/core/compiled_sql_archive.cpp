@@ -168,9 +168,9 @@ string WriteCompiledProgram(Connection &con, const CompiledProgram &program, Com
 		                   " (view_name, view_catalog, view_schema, view_sql_name, operation, version, statement_count,"
 		                   " compilation_id, compiled_at, last_compilation_id, last_outcome, last_outcome_at,"
 		                   " committed_count) SELECT $1, $2, $3, $4, $5, $6, $7, $8, " +
-		                   string(openivm::UTC_NOW_SQL) + ", $8, $9, " + openivm::UTC_NOW_SQL + ", $10 WHERE NOT EXISTS" +
-		                   " (SELECT 1 FROM " + programs + " p WHERE p.view_name = $1 AND p.operation = $5" +
-		                   " AND p.version = $6)",
+		                   string(openivm::UTC_NOW_SQL) + ", $8, $9, " + openivm::UTC_NOW_SQL +
+		                   ", $10 WHERE NOT EXISTS" + " (SELECT 1 FROM " + programs +
+		                   " p WHERE p.view_name = $1 AND p.operation = $5" + " AND p.version = $6)",
 		               {view_name, Value(program.view_catalog), Value(program.view_schema),
 		                Value(program.view_sql_name), operation, Value::INTEGER(version),
 		                Value::INTEGER(static_cast<int32_t>(program.statements.size())), compilation_id, outcome_name,

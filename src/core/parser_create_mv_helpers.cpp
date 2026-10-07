@@ -102,38 +102,38 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 	// (UBIGINT/BLOB) are replaced there by the cross-client refresh epoch.
 	string matcher_columns = remote ? " refresh_epoch bigint default 0,"
 	                                : " signature_hash ubigint default null, canonical_plan_blob blob default null,";
-	ddl.push_back(
-	    "create table if not exists " + string(openivm::VIEWS_TABLE) +
-	    " (view_name varchar primary key, view_catalog varchar default null,"
-	    " view_schema varchar default null, view_sql_name varchar default null, sql_string varchar, type " +
-	    string(remote ? "smallint" : "tinyint") + ","
-	    " has_minmax boolean default false, has_left_join boolean default false,"
-	    " has_join boolean default false,"
-	    " last_update timestamp, refresh_interval bigint default null,"
-	    " refresh_in_progress boolean default false,"
-	    " group_columns varchar default null,"
-	    " window_order_columns varchar default null,"
-	    " aggregate_types varchar default null,"
-	    " derived_aggregate_outputs_json varchar default null,"
-	    " having_predicate varchar default null,"
-	    " group_recompute_affected_mode varchar default null,"
-	    " group_recompute_source_occurrences_json varchar default null,"
-	    " has_full_outer boolean default false,"
-	    " full_outer_join_cols varchar default null," +
-	    matcher_columns +
-	    " output_columns_json varchar default null,"
-	    " predicate_summary_json varchar default null,"
-	    " fd_summary_json varchar default null,"
-	    " source_tables_json varchar default null,"
-	    " aggregate_decomposition_json varchar default null,"
-	    " nullified_columns_json varchar default null,"
-	    " distinct_aux_meta_json varchar default null,"
-	    " count_distinct_aux_meta_json varchar default null,"
-	    " semi_anti_aux_meta_json varchar default null,"
-	    " lineage_json varchar default null,"
-	    " leftjoin_secondary_meta_json varchar default null,"
-	    " published_query varchar default null,"
-	    " pending_after_hook boolean default null)");
+	ddl.push_back("create table if not exists " + string(openivm::VIEWS_TABLE) +
+	              " (view_name varchar primary key, view_catalog varchar default null,"
+	              " view_schema varchar default null, view_sql_name varchar default null, sql_string varchar, type " +
+	              string(remote ? "smallint" : "tinyint") +
+	              ","
+	              " has_minmax boolean default false, has_left_join boolean default false,"
+	              " has_join boolean default false,"
+	              " last_update timestamp, refresh_interval bigint default null,"
+	              " refresh_in_progress boolean default false,"
+	              " group_columns varchar default null,"
+	              " window_order_columns varchar default null,"
+	              " aggregate_types varchar default null,"
+	              " derived_aggregate_outputs_json varchar default null,"
+	              " having_predicate varchar default null,"
+	              " group_recompute_affected_mode varchar default null,"
+	              " group_recompute_source_occurrences_json varchar default null,"
+	              " has_full_outer boolean default false,"
+	              " full_outer_join_cols varchar default null," +
+	              matcher_columns +
+	              " output_columns_json varchar default null,"
+	              " predicate_summary_json varchar default null,"
+	              " fd_summary_json varchar default null,"
+	              " source_tables_json varchar default null,"
+	              " aggregate_decomposition_json varchar default null,"
+	              " nullified_columns_json varchar default null,"
+	              " distinct_aux_meta_json varchar default null,"
+	              " count_distinct_aux_meta_json varchar default null,"
+	              " semi_anti_aux_meta_json varchar default null,"
+	              " lineage_json varchar default null,"
+	              " leftjoin_secondary_meta_json varchar default null,"
+	              " published_query varchar default null,"
+	              " pending_after_hook boolean default null)");
 	// Forward-compat ALTER for existing DBs that pre-date `distinct_aux_meta_json`
 	// (the CREATE IF NOT EXISTS above is a no-op when the table exists with the older schema).
 	add_column(ddl, openivm::VIEWS_TABLE, views, "distinct_aux_meta_json varchar default null");
@@ -143,8 +143,7 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 	add_column(ddl, openivm::VIEWS_TABLE, views, "leftjoin_secondary_meta_json varchar default null");
 	add_column(ddl, openivm::VIEWS_TABLE, views, "has_join boolean default null");
 	add_column(ddl, openivm::VIEWS_TABLE, views, "group_recompute_affected_mode varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views,
-	                     "group_recompute_source_occurrences_json varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "group_recompute_source_occurrences_json varchar default null");
 	add_column(ddl, openivm::VIEWS_TABLE, views, "derived_aggregate_outputs_json varchar default null");
 	add_column(ddl, openivm::VIEWS_TABLE, views, "published_query varchar default null");
 	add_column(ddl, openivm::VIEWS_TABLE, views, "view_catalog varchar default null");
