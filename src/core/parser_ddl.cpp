@@ -634,7 +634,8 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 						return begun->GetError();
 					}
 				}
-				auto error = WriteCompiledProgram(*conn, program, CompiledProgramOutcome::COMMITTED, fields[1], fields[2]);
+				auto error =
+				    WriteCompiledProgram(*conn, program, CompiledProgramOutcome::COMMITTED, fields[1], fields[2]);
 				if (!error.empty() || !own_transaction) {
 					return error;
 				}
@@ -940,9 +941,9 @@ vector<string> BuildArchiveProgramOperation(const CompiledProgram &program, DDLA
 	for (auto &statement : program.statements) {
 		result.push_back(string(OPENIVM_DDL_ARCHIVE_STATEMENT_PREFIX) + statement);
 	}
-	vector<string> fields = {ArchiveModeName(mode), metadata_catalog,      metadata_schema,
-	                         program.view_name,     program.view_catalog,  program.view_schema,
-	                         program.view_sql_name, program.operation,     program.compilation_id};
+	vector<string> fields = {ArchiveModeName(mode), metadata_catalog,     metadata_schema,
+	                         program.view_name,     program.view_catalog, program.view_schema,
+	                         program.view_sql_name, program.operation,    program.compilation_id};
 	string payload;
 	for (idx_t i = 0; i < fields.size(); i++) {
 		payload += (i > 0 ? "\t" : "") + EncodeArchiveField(fields[i]);
