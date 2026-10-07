@@ -967,8 +967,8 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	archived.view_sql_name = metadata.GetViewSQLName(view_name);
 	archived.operation = "refresh";
 	archived.compilation_id = NewCompilationId(view_name);
-	for (auto &statement :
-	     BuildCompiledSQLArchiveStatements(archived, CompiledProgramOutcome::COMMITTED, archive_catalog, archive_schema)) {
+	for (auto &statement : BuildCompiledSQLArchiveStatements(archived, CompiledProgramOutcome::COMMITTED,
+	                                                         archive_catalog, archive_schema)) {
 		stamped += statement + ";\n";
 	}
 	OPENIVM_DEBUG_PRINT("[REFRESH] Compiled transaction-local program for %s at %s\n", view_name.c_str(),
