@@ -216,13 +216,15 @@ string RecordCompiledProgram(ClientContext &context, const string &view_catalog,
 		TransactionalMVLockState::Get(*con.context)
 		    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 		RefreshMetadata::UseCatalog(context, con, view_catalog);
-		auto catalog = con.Query("SELECT current_database()");
-		if (catalog->HasError()) {
-			return catalog->GetError();
+		string catalog;
+		string schema;
+		auto error = ResolveCompiledSQLArchiveLocation(con, catalog, schema);
+		if (!error.empty()) {
+			return error;
 		}
 		// One metadata commit for the whole program, never one per statement.
 		con.BeginTransaction();
-		auto error = WriteCompiledProgram(con, program, outcome, catalog->GetValue(0, 0).ToString(), DEFAULT_SCHEMA);
+		error = WriteCompiledProgram(con, program, outcome, catalog, schema);
 		if (!error.empty()) {
 			con.Rollback();
 			return error;
@@ -235,6 +237,19 @@ string RecordCompiledProgram(ClientContext &context, const string &view_catalog,
 	} catch (std::exception &ex) {
 		return ErrorData(ex).RawMessage();
 	}
+}
+
+string ResolveCompiledSQLArchiveLocation(Connection &con, string &catalog, string &schema) {
+	auto location = con.Query("SELECT current_database(), current_schema()");
+	if (location->HasError()) {
+		return location->GetError();
+	}
+	if (location->RowCount() != 1 || location->GetValue(0, 0).IsNull()) {
+		return "could not resolve the metadata catalog";
+	}
+	catalog = location->GetValue(0, 0).ToString();
+	schema = location->GetValue(1, 0).IsNull() ? string(DEFAULT_SCHEMA) : location->GetValue(1, 0).ToString();
+	return string();
 }
 
 string NewCompilationId(const string &view_name, const string &operation) {

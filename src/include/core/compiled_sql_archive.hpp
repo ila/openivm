@@ -54,6 +54,10 @@ string WriteCompiledProgram(Connection &con, const CompiledProgram &program, Com
 string RecordCompiledProgram(ClientContext &context, const string &view_catalog, const CompiledProgram &program,
                              CompiledProgramOutcome outcome);
 
+// The metadata catalog/schema `con` selected (RefreshMetadata::UseCatalog), where the
+// archive lives next to openivm_views. Returns an empty string or the error message.
+string ResolveCompiledSQLArchiveLocation(Connection &con, string &catalog, string &schema);
+
 // Identifier shared by the refresh profile and the archive for one operation.
 string NewCompilationId(const string &view_name, const string &operation = "");
 

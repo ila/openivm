@@ -250,13 +250,13 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// INSERT/CREATE TABLE style refresh plans.
 		exec_con.Query("SET preserve_insertion_order=false");
 		string archive_catalog;
+		string archive_schema;
 		if (!cross_system) {
-			auto archive_catalog_result = exec_con.Query("SELECT current_database()");
-			if (archive_catalog_result->HasError()) {
-				throw CatalogException("OpenIVM could not resolve the compiled-SQL archive catalog: %s",
-				                       archive_catalog_result->GetError());
+			auto location_error = ResolveCompiledSQLArchiveLocation(exec_con, archive_catalog, archive_schema);
+			if (!location_error.empty()) {
+				throw CatalogException("OpenIVM could not resolve the compiled-SQL archive location: %s",
+				                       location_error);
 			}
-			archive_catalog = archive_catalog_result->GetValue(0, 0).ToString();
 		}
 		// Refresh SQL uses fully qualified internal data/delta names. DuckLake-targeted
 		// MVs write those objects in DuckLake; native MVs keep them in the physical DB.
@@ -389,7 +389,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			// refresh commits, and an archive failure rolls the refresh back.
 			auto archive_start = std::chrono::steady_clock::now();
 			auto archive_error = WriteCompiledProgram(exec_con, archived, CompiledProgramOutcome::COMMITTED,
-			                                          archive_catalog, DEFAULT_SCHEMA);
+			                                          archive_catalog, archive_schema);
 			if (!archive_error.empty()) {
 				throw Exception(ExceptionType::EXECUTOR,
 				                "IVM refresh of '" + display_name +
@@ -954,10 +954,11 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	}
 	// The archive write joins the caller's transaction: it commits with the refresh,
 	// a failure aborts it, and a rollback leaves no archive row.
-	auto archive_catalog = metadata_con.Query("SELECT current_database()");
-	if (archive_catalog->HasError()) {
-		throw CatalogException("OpenIVM could not resolve the compiled-SQL archive catalog: %s",
-		                       archive_catalog->GetError());
+	string archive_catalog;
+	string archive_schema;
+	auto location_error = ResolveCompiledSQLArchiveLocation(metadata_con, archive_catalog, archive_schema);
+	if (!location_error.empty()) {
+		throw CatalogException("OpenIVM could not resolve the compiled-SQL archive location: %s", location_error);
 	}
 	auto location = metadata.GetStoredViewLocation(view_name, view_catalog_name, view_schema_name);
 	archived.view_name = view_name;
@@ -966,8 +967,8 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	archived.view_sql_name = metadata.GetViewSQLName(view_name);
 	archived.operation = "refresh";
 	archived.compilation_id = NewCompilationId(view_name);
-	for (auto &statement : BuildCompiledSQLArchiveStatements(
-	         archived, CompiledProgramOutcome::COMMITTED, archive_catalog->GetValue(0, 0).ToString(), DEFAULT_SCHEMA)) {
+	for (auto &statement :
+	     BuildCompiledSQLArchiveStatements(archived, CompiledProgramOutcome::COMMITTED, archive_catalog, archive_schema)) {
 		stamped += statement + ";\n";
 	}
 	OPENIVM_DEBUG_PRINT("[REFRESH] Compiled transaction-local program for %s at %s\n", view_name.c_str(),
