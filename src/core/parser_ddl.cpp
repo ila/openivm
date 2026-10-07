@@ -1,5 +1,6 @@
 #include "core/parser_ddl.hpp"
 
+#include "core/metadata_location.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/published_view.hpp"
@@ -210,6 +211,13 @@ public:
 		}
 		flushed = true;
 		Connection profile_con(db);
+		// Profiles belong to the selected metadata location (the default database by default).
+		try {
+			MetadataLocator::Use(profile_con, MetadataLocator::Resolve(*profile_con.context, profile_con, ""));
+		} catch (std::exception &ex) {
+			OPENIVM_DEBUG_PRINT("[PROFILE] Cannot select CREATE MV profile location: %s\n", ex.what());
+			return;
+		}
 		// Retention and the new profile share one durable metadata commit.
 		profile_con.BeginTransaction();
 		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
@@ -221,13 +229,16 @@ public:
 			if (!values.empty()) {
 				values += ", ";
 			}
-			values += "('" + SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) + "', " +
-			          to_string(step.step_order) + ", '" + SqlUtils::EscapeValue(step.step_name) + "', " +
-			          to_string(step.duration_ms) + ", '" + SqlUtils::EscapeValue(step.detail) + "')";
+			values += "('" + SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) +
+			          "', CAST(current_timestamp AS TIMESTAMP), " + to_string(step.step_order) + ", '" +
+			          SqlUtils::EscapeValue(step.step_name) + "', " + to_string(step.duration_ms) + ", '" +
+			          SqlUtils::EscapeValue(step.detail) + "')";
 		}
-		auto result =
-		    profile_con.Query("INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
-		                      " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES " + values);
+		// refresh_id is unique per statement; remote catalogs support neither INSERT OR
+		// REPLACE nor DuckDB column defaults.
+		auto result = profile_con.Query(
+		    "INSERT INTO " + string(openivm::PROFILE_TABLE) +
+		    " (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail) VALUES " + values);
 		if (result->HasError()) {
 			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record CREATE MV profile: %s\n", result->GetError().c_str());
 			return;
@@ -627,13 +638,18 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		return;
 	}
 	string metadata_catalog;
-	auto current_database = connection.Query("SELECT current_database()");
+	string metadata_schema = DEFAULT_SCHEMA;
+	auto current_database = connection.Query("SELECT current_database(), current_schema()");
 	if (!current_database->HasError() && current_database->RowCount() > 0 &&
 	    !current_database->GetValue(0, 0).IsNull()) {
 		metadata_catalog = current_database->GetValue(0, 0).ToString();
+		if (!current_database->GetValue(1, 0).IsNull()) {
+			metadata_schema = current_database->GetValue(1, 0).ToString();
+		}
 	}
 	auto durable_table = [&](const string &table) {
-		return metadata_catalog.empty() ? "main." + table : SqlUtils::FullName(metadata_catalog, DEFAULT_SCHEMA, table);
+		return metadata_catalog.empty() ? SqlUtils::QuoteIdentifier(metadata_schema) + "." + table
+		                                : SqlUtils::FullName(metadata_catalog, metadata_schema, table);
 	};
 	// Build constrained TEMP schemas first. CREATE TABLE AS would discard the
 	// primary keys required by INSERT OR REPLACE metadata operations.
@@ -888,7 +904,8 @@ void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChun
 	state.finished = true;
 }
 
-string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog) {
+string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog,
+                              const string &metadata_schema) {
 	struct ProfileRow {
 		string view_name;
 		string step_name;
@@ -1013,14 +1030,16 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 			auto refresh_id = view_name + "_create_tx_" +
 			                  to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 			// The lifecycle program restores the caller search path before these writes.
-			auto profile_table = SqlUtils::FullName(metadata_catalog, DEFAULT_SCHEMA, openivm::PROFILE_TABLE);
+			auto profile_table = SqlUtils::FullName(metadata_catalog, metadata_schema, openivm::PROFILE_TABLE);
 			OPENIVM_DEBUG_PRINT("[PROFILE] Recording CREATE MV profile in %s\n", profile_table.c_str());
 			for (idx_t step_order = 0; step_order < profile_rows.size(); step_order++) {
 				auto &row = profile_rows[step_order];
-				append_statement("INSERT OR REPLACE INTO " + profile_table +
-				                     " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES ('" +
+				append_statement("INSERT INTO " + profile_table +
+				                     " (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, "
+				                     "detail) VALUES ('" +
 				                     SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(row.view_name) +
-				                     "', " + to_string(step_order) + ", '" + SqlUtils::EscapeValue(row.step_name) +
+				                     "', CAST(current_timestamp AS TIMESTAMP), " + to_string(step_order) + ", '" +
+				                     SqlUtils::EscapeValue(row.step_name) +
 				                     "', " + to_string(row.duration_ms) + ", '" + SqlUtils::EscapeValue(row.detail) +
 				                     "')",
 				                 false);

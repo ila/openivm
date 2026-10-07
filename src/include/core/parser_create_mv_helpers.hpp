@@ -6,12 +6,16 @@
 namespace duckdb {
 
 string CreateMVDependenciesSQL();
-void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema);
+// `remote`: the metadata catalog is a remote SQL database (PostgreSQL). Its tables use
+// portable column types and include the cross-client refresh lease and epoch.
+void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema,
+                          bool remote = false);
 void InitializeSourceDelta(ClientContext &context, Connection &con, const string &delta_table, const string &ddl);
 string SqlCsvLiteralOrNull(const vector<string> &values);
 void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog, const string &schema,
                                    vector<string> &ddl, const string &view_name, bool is_replace,
-                                   const string &view_catalog, const string &view_schema, const string &sql_view_name);
+                                   const string &view_catalog, const string &view_schema, const string &sql_view_name,
+                                   bool remote = false);
 string BuildUpdateViewJsonSQL(const string &column_name, const string &json, const string &view_name);
 
 } // namespace duckdb

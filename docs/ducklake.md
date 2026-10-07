@@ -79,7 +79,7 @@ ORDER BY database_name, schema_name, table_name;
 ```
 
 For DuckLake MVs, OpenIVM's control tables (`openivm_views`,
-`openivm_delta_tables`, dependency and refresh-history tables) already live in
+`openivm_delta_tables`, dependency and refresh-history tables) live by default in
 `main` of the native DuckDB frontend database, not as Parquet tables in DuckLake.
 Start the CLI with a persistent frontend file to retain them between sessions:
 
@@ -90,9 +90,29 @@ Start the CLI with a persistent frontend file to retain them between sessions:
 Then attach the lake and create views in its catalog as in the quick start. After
 reopening the same frontend file, attach the same lake under the same catalog name
 before refreshing. Starting the CLI without a filename uses an in-memory frontend;
-its OpenIVM metadata will not survive closing the process. There is currently no
-setting to relocate OpenIVM control tables into an `openivm` schema. Do not move
-those tables manually.
+its OpenIVM metadata will not survive closing the process. Do not move the control
+tables manually.
+
+To keep the control tables elsewhere, select a metadata catalog and schema before
+creating views. The catalog can be another attached DuckDB file or a PostgreSQL
+database attached with the `postgres` extension:
+
+```sql
+ATTACH 'dbname=openivm host=localhost' AS control (TYPE postgres);
+SET openivm_metadata_catalog = 'control';
+SET openivm_metadata_schema = 'openivm';
+CREATE MATERIALIZED VIEW dl.main.product_summary AS ...;
+```
+
+Backing and delta tables still live in the lake. DuckLake catalogs hold no location
+marker, so a process with an in-memory frontend sets these two settings at startup,
+before refreshing. DuckDB cannot commit the lake and the metadata catalog in one
+transaction, so refresh uses a crash-safe three-step protocol, and lifecycle statements
+and refreshes inside explicit transactions are rejected for these views. PostgreSQL
+metadata is validated only against a local PostgreSQL 16 in CI, not against managed
+providers, and a client process running OpenIVM is still required. See
+[metadata placement](internals/metadata-placement.md) for discovery, recovery and
+multi-client semantics.
 
 For native sources in another attached DuckDB database, refresh commits the MV
 and its watermark together, then cleans up external source deltas. Rollback

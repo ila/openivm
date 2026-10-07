@@ -81,3 +81,14 @@ database, their cleanup is deferred until the caller transaction commits
 (`TransactionalMVLockState::DeferDeltaCleanup`). Rollback discards it. If the deferred
 cleanup fails, the refresh still reports success and prints that cleanup was deferred;
 the committed watermark prevents the retained rows from being applied twice.
+
+## Metadata in another database
+
+With `openivm_metadata_catalog` naming another database than the view, the MV data and
+its watermarks cannot commit in one DuckDB transaction. Autocommit refresh then commits
+an interruption marker, the data and the watermarks in three transactions, and deletes
+consumed source deltas only after the watermarks commit. Any interruption leaves the
+marker set, so the next refresh recomputes. Explicit transactions that would need both
+databases are rejected. Clients sharing a PostgreSQL metadata schema also take a renewed
+per-view lease (`openivm_refresh_leases`) and fence the watermark commit on it. See
+[metadata placement](metadata-placement.md) for the full protocol and its failure table.

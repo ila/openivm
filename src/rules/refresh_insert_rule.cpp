@@ -489,8 +489,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				break;
 			}
 			string col_name = remove_info->removed_column;
-			for (auto &catalog : RefreshMetadata::MetadataCatalogs(con)) {
-				RefreshMetadata::UseCatalog(input.context, con, catalog);
+			for (auto &location : RefreshMetadata::MetadataLocations(con)) {
+				MetadataLocator::Use(con, location);
 				auto referencing_mv = FirstMVReferencingColumn(con, delta_name, source_locus.first, source_locus.second,
 				                                               table_name, col_name);
 				if (!referencing_mv.empty()) {
@@ -514,8 +514,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			auto dependent_view_predicate =
 			    "view_name IN (SELECT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 			    RefreshMetadata::SourcePredicate(delta_name, source_locus.first, source_locus.second) + ")";
-			for (auto &catalog : RefreshMetadata::MetadataCatalogs(con)) {
-				RefreshMetadata::UseCatalog(input.context, con, catalog);
+			for (auto &location : RefreshMetadata::MetadataLocations(con)) {
+				MetadataLocator::Use(con, location);
 				RegisterMetadataRestore(input.context, con, openivm::VIEWS_TABLE, dependent_view_predicate);
 				RewriteDependentViewMetadataForRename(con, delta_name, source_locus.first, source_locus.second,
 				                                      table_name, old_name, new_name);

@@ -45,7 +45,13 @@ int main(int argc, char **argv) {
 		std::cout << "READY" << std::endl;
 		string line;
 		std::getline(std::cin, line);
-		auto catalogs = RefreshMetadata::MetadataCatalogs(con);
+		vector<string> catalogs;
+		for (auto &location : RefreshMetadata::MetadataLocations(con)) {
+			if (location.schema != "main") {
+				throw InvalidInputException("Legacy metadata discovery selected a non-main schema");
+			}
+			catalogs.push_back(location.catalog);
+		}
 		if (catalogs != vector<string> {"memory", "other"}) {
 			throw InvalidInputException("Source metadata discovery did not find both native catalogs");
 		}

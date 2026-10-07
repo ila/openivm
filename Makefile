@@ -21,3 +21,12 @@ test_release_internal: test_scheduler_catalog
 test_scheduler_catalog:
 	cmake --build build/release --target scheduler_catalog_test
 	python3 test/integration/test_scheduler_catalog.py ./build/release/extension/openivm/scheduler_catalog_test
+
+.PHONY: test_remote_metadata
+
+# Skipped unless OPENIVM_POSTGRES_DSN names a disposable local PostgreSQL database
+# (see docs/build/testing.md). CI runs it with --require against a service container.
+test_release_internal: test_remote_metadata
+
+test_remote_metadata:
+	python3 test/integration/test_remote_metadata.py ./build/release/duckdb

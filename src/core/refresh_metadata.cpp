@@ -21,41 +21,31 @@
 
 namespace duckdb {
 
-void RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
-	auto catalog = view_catalog;
-	if (catalog.empty()) {
-		catalog = ClientData::Get(context).catalog_search_path->GetDefault().catalog;
-	}
-	string target = SqlUtils::QuoteIdentifier(DEFAULT_SCHEMA);
-	if (!catalog.empty()) {
-		auto type = con.Query("SELECT type FROM duckdb_databases() WHERE NOT internal AND database_name = '" +
-		                      SqlUtils::EscapeValue(catalog) + "'");
-		if (type->HasError()) {
-			throw CatalogException("OpenIVM could not resolve metadata catalog: %s", type->GetError());
-		}
-		if (type->RowCount() && type->GetValue(0, 0).ToString() == "duckdb") {
-			target = SqlUtils::QuoteIdentifier(catalog) + "." + target;
-		}
-	}
-	auto result = con.Query("USE " + target);
-	if (result->HasError()) {
-		throw CatalogException("OpenIVM could not select metadata catalog: %s", result->GetError());
-	}
-	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s for view catalog '%s'\n", target.c_str(), catalog.c_str());
+MetadataLocation RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
+	auto location = MetadataLocator::Resolve(context, con, view_catalog);
+	MetadataLocator::Use(con, location);
+	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s for view catalog '%s'\n", location.DisplayName().c_str(),
+	                    view_catalog.c_str());
+	return location;
 }
 
 // The compiler's helper connection cannot observe the caller's uncommitted metadata.
 // Read through the caller's storage transaction and shadow only the compiler's reads.
 void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
-	auto current = con.Query("SELECT current_database()");
+	auto current = con.Query("SELECT current_database(), current_schema()");
 	if (current->HasError()) {
 		throw CatalogException("Cannot resolve transaction metadata catalog: %s", current->GetError());
 	}
 	auto catalog = current->GetValue(0, 0).ToString();
+	auto schema = current->GetValue(1, 0).ToString();
+	if (!MetadataLocator::IsNativeCatalog(con, catalog)) {
+		// Remote metadata has no DuckDB storage to scan. Explicit transactions that would
+		// write it next to MV data are rejected, so committed rows are the exact state.
+		return;
+	}
 	for (auto name :
 	     {openivm::VIEWS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::MV_DEPS_TABLE, "openivm_refresh_hooks"}) {
-		auto entry =
-		    Catalog::GetEntry<TableCatalogEntry>(context, catalog, DEFAULT_SCHEMA, name, OnEntryNotFound::RETURN_NULL);
+		auto entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, name, OnEntryNotFound::RETURN_NULL);
 		if (!entry) {
 			continue;
 		}
@@ -276,22 +266,8 @@ string RefreshMetadata::GetLastUpdate(const string &view_name, const string &tab
 	return result->GetValue(0, 0).ToString();
 }
 
-vector<string> RefreshMetadata::MetadataCatalogs(Connection &con) {
-	// Source metadata lives in native catalogs. Enumerating external tables also
-	// opens their metadata transactions and can block on unrelated DuckLake writes.
-	auto rows = con.Query("SELECT database_name FROM duckdb_databases() WHERE type='duckdb' "
-	                      "AND NOT internal ORDER BY database_name");
-	if (rows->HasError()) {
-		throw CatalogException("OpenIVM could not locate source metadata: %s", rows->GetError());
-	}
-	vector<string> catalogs;
-	for (idx_t row = 0; row < rows->RowCount(); row++) {
-		auto catalog = rows->GetValue(0, row).ToString();
-		if (con.TableInfo(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE)) {
-			catalogs.push_back(std::move(catalog));
-		}
-	}
-	return catalogs;
+vector<MetadataLocation> RefreshMetadata::MetadataLocations(Connection &con) {
+	return MetadataLocator::All(con);
 }
 
 string RefreshMetadata::SourceTableName(const string &key, const string &catalog, const string &schema) {
@@ -712,21 +688,16 @@ int64_t RefreshMetadata::GetRefreshInterval(const string &view_name) {
 }
 
 vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
-	// Scheduler metadata belongs to native catalogs. Scanning duckdb_tables()
-	// also opens external catalogs, taking DuckLake/SQLite read locks while a
-	// foreground refresh may be committing its writes.
-	auto catalogs = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'duckdb' "
-	                          "AND NOT internal ORDER BY database_name");
-	if (catalogs->HasError()) {
-		throw CatalogException("OpenIVM could not enumerate metadata catalogs: %s", catalogs->GetError());
-	}
+	// Scheduler metadata belongs to native catalogs or an explicit metadata location.
+	// Scanning duckdb_tables() also opens external catalogs, taking DuckLake/SQLite
+	// read locks while a foreground refresh may be committing its writes.
 	string query;
-	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
-		auto catalog = catalogs->GetValue(0, row).ToString();
-		if (!con.TableInfo(catalog, DEFAULT_SCHEMA, openivm::VIEWS_TABLE)) {
+	for (auto &location : MetadataLocations(con)) {
+		if (!con.TableInfo(location.catalog, location.schema, openivm::VIEWS_TABLE)) {
 			continue;
 		}
-		auto catalog_literal = "'" + SqlUtils::EscapeValue(catalog) + "'";
+		auto catalog_literal = "'" + SqlUtils::EscapeValue(location.catalog) + "'";
+		auto schema_literal = "'" + SqlUtils::EscapeValue(location.schema) + "'";
 		if (!query.empty()) {
 			query += " UNION ALL ";
 		}
@@ -734,9 +705,8 @@ vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
 		         "), "
 		         "COALESCE(v.view_schema, 'main'), v.refresh_interval, "
 		         "(SELECT MIN(d.last_update) FROM " +
-		         SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE) +
-		         " d WHERE d.view_name = v.view_name), " + catalog_literal + " FROM " +
-		         SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::VIEWS_TABLE) +
+		         location.Table(openivm::DELTA_TABLES_TABLE) + " d WHERE d.view_name = v.view_name), " +
+		         catalog_literal + ", " + schema_literal + " FROM " + location.Table(openivm::VIEWS_TABLE) +
 		         " v WHERE v.refresh_interval IS NOT NULL";
 	}
 	if (query.empty()) {
@@ -751,6 +721,7 @@ vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
 		for (size_t i = 0; i < result->RowCount(); i++) {
 			ScheduledView sv;
 			sv.metadata_catalog = result->GetValue(5, i).ToString();
+			sv.metadata_schema = result->GetValue(6, i).ToString();
 			sv.view_name = result->GetValue(0, i).ToString();
 			sv.catalog_name = result->GetValue(1, i).IsNull() ? "" : result->GetValue(1, i).ToString();
 			sv.schema_name = result->GetValue(2, i).IsNull() ? DEFAULT_SCHEMA : result->GetValue(2, i).ToString();
@@ -769,7 +740,7 @@ void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_prog
 
 string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
                                              const string &delta_metadata_table, vector<string> *deferred_cleanup,
-                                             const vector<string> &metadata_catalogs) {
+                                             const vector<MetadataLocation> &metadata_locations) {
 	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 	auto consumers = "SELECT last_update FROM " + metadata_table + " WHERE table_name = '" +
@@ -778,8 +749,8 @@ string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string 
 	if (parts.size() == 3) {
 		auto predicate = SourcePredicate(parts[2], parts[0], parts[1]);
 		consumers = "SELECT last_update FROM " + metadata_table + " WHERE " + predicate;
-		for (auto &catalog : metadata_catalogs) {
-			auto other = SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE);
+		for (auto &location : metadata_locations) {
+			auto other = location.Table(openivm::DELTA_TABLES_TABLE);
 			if (!StringUtil::CIEquals(other, metadata_table)) {
 				consumers += " UNION ALL SELECT last_update FROM " + other + " WHERE " + predicate;
 			}
@@ -823,6 +794,10 @@ bool RefreshMetadata::IsDuckLakeCatalog(const string &catalog_name) {
 	                        SqlUtils::EscapeValue(catalog_name) + "' LIMIT 1");
 	return !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
 	       StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "ducklake");
+}
+
+bool RefreshMetadata::IsNativeCatalog(const string &catalog_name) {
+	return MetadataLocator::IsNativeCatalog(con, catalog_name);
 }
 
 int64_t RefreshMetadata::GetCurrentDuckLakeSnapshot(const string &catalog_name) {
@@ -914,11 +889,13 @@ void RefreshMetadata::RecordRefreshHistory(const string &view_name, const string
                                            double incremental_compute_est, double incremental_upsert_est,
                                            double recompute_compute_est, double recompute_replace_est,
                                            int64_t actual_duration_ms, idx_t max_history) {
+	// Remote metadata catalogs do not apply DuckDB column defaults; supply the key explicitly.
 	auto result = con.Query("INSERT INTO " + string(openivm::HISTORY_TABLE) +
-	                        " (view_name, method, incremental_compute_est, incremental_upsert_est,"
+	                        " (view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est,"
 	                        " recompute_compute_est, recompute_replace_est, actual_duration_ms)"
 	                        " VALUES ('" +
-	                        SqlUtils::EscapeValue(view_name) + "', '" + SqlUtils::EscapeValue(method) + "', " +
+	                        SqlUtils::EscapeValue(view_name) + "', CAST(current_timestamp AS TIMESTAMP), '" +
+	                        SqlUtils::EscapeValue(method) + "', " +
 	                        to_string(incremental_compute_est) + ", " + to_string(incremental_upsert_est) + ", " +
 	                        to_string(recompute_compute_est) + ", " + to_string(recompute_replace_est) + ", " +
 	                        to_string(actual_duration_ms) + ")");

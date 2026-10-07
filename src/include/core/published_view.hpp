@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/metadata_location.hpp"
 #include "duckdb.hpp"
 #include "sql_dialect.hpp"
 
@@ -18,6 +19,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
                            const vector<string> &columns, bool ducklake, const string &metadata_table,
                            const vector<string> &scope_columns = {}, const string &timestamp_sql = "",
                            SqlDialect dialect = SqlDialect::DUCKDB, const string &appended_rows = "",
-                           const string &scope_rows = "", const vector<string> &metadata_catalogs = {});
+                           const string &scope_rows = "",
+                           const vector<MetadataLocation> &metadata_locations = {});
 
 } // namespace duckdb

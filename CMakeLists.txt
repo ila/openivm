@@ -23,6 +23,7 @@ set(EXTENSION_SOURCES
     src/core/parser_sql_extractors.cpp
     src/core/sql_utils.cpp
     src/core/time_travel_pins.cpp
+    src/core/metadata_location.cpp
     src/core/refresh_metadata.cpp
     src/core/published_view.cpp
     src/core/incremental_checker.cpp

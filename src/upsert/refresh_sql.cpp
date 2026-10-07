@@ -470,9 +470,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	}
 	add_profile_step("generate_refresh_sql.context", context_start,
 	                 "cross_system=" + string(cross_system ? "true" : "false"));
+	// The helper connection selected the metadata location (catalog and schema).
 	string metadata_prefix;
 	if (!default_db.empty()) {
-		metadata_prefix = SqlUtils::QuoteIdentifier(default_db) + "." + SqlUtils::QuoteIdentifier(DEFAULT_SCHEMA) + ".";
+		metadata_prefix = SqlUtils::QualifiedPrefix(default_db, default_schema);
 	}
 	auto views_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::VIEWS_TABLE);
 	auto delta_metadata_table = metadata_prefix + SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
@@ -486,15 +487,22 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	string internal_catalog_prefix = catalog_prefix;
 	auto metadata_start = profile_now();
 	RefreshMetadata metadata(con);
-	auto metadata_catalogs =
-	    active_facts.target_dialect == SqlDialect::DUCKDB ? RefreshMetadata::MetadataCatalogs(con) : vector<string>();
+	vector<MetadataLocation> metadata_locations;
+	if (active_facts.target_dialect == SqlDialect::DUCKDB) {
+		metadata_locations = RefreshMetadata::MetadataLocations(con);
+	}
 	bool target_is_ducklake = metadata.IsDuckLakeCatalog(view_catalog_name);
-	if (!target_is_ducklake && cross_system && !default_db.empty() && default_db != "memory" &&
-	    view_catalog_name != default_db) {
-		internal_catalog_name = default_db;
-		internal_schema_name = default_schema;
-		internal_catalog_prefix =
-		    SqlUtils::QuoteIdentifier(default_db) + "." + SqlUtils::QuoteIdentifier(default_schema) + ".";
+	// A native view catalog keeps its internal tables even when its metadata lives in another
+	// database (openivm_metadata_catalog); only other external catalogs place them in the
+	// physical default database.
+	bool target_is_native = !view_catalog_name.empty() && metadata.IsNativeCatalog(view_catalog_name);
+	bool split_native_metadata = cross_system && target_is_native;
+	auto physical_default_db = MetadataLocator::PhysicalDefaultCatalog(*context.db);
+	if (!target_is_ducklake && !target_is_native && cross_system && !physical_default_db.empty() &&
+	    physical_default_db != "memory" && view_catalog_name != physical_default_db) {
+		internal_catalog_name = physical_default_db;
+		internal_schema_name = DEFAULT_SCHEMA;
+		internal_catalog_prefix = SqlUtils::QualifiedPrefix(physical_default_db, DEFAULT_SCHEMA);
 	}
 	string data_table_bare = IncrementalTableNames::DataTableName(view_name);
 	string data_table = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table_bare);
@@ -502,7 +510,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	                    SqlUtils::DeltaName(view_name).c_str(), view_catalog_name.c_str(), view_schema_name.c_str());
 	optional_ptr<TableCatalogEntry> delta_view_catalog_entry;
 	optional_ptr<CatalogEntry> index_delta_view_catalog_entry;
-	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db) {
+	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db || split_native_metadata) {
 		con.BeginTransaction();
 		delta_view_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
 		    planning_context, internal_catalog_name, internal_schema_name, SqlUtils::DeltaName(view_name),
@@ -586,7 +594,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		publication_sql = BuildPublishViewSQL(view_name, publication_prefix, publication_source_query,
 		                                      publication_columns, target_is_ducklake, delta_metadata_table, {}, "",
-		                                      active_facts.target_dialect, "", "", metadata_catalogs);
+		                                      active_facts.target_dialect, "", "", metadata_locations);
 	}
 	auto finalize_refresh_sql = [&](string refresh_sql, bool publish = true) {
 		if (publish) {
@@ -617,12 +625,19 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		       ";\n";
 	};
 	auto recovery_start = profile_now();
+	bool recover_with_cascade_delta = false;
 	{
 		auto flag_result = con.Query("SELECT refresh_in_progress FROM " + string(openivm::VIEWS_TABLE) +
 		                             " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-		if (!flag_result->HasError() && flag_result->RowCount() > 0 && !flag_result->GetValue(0, 0).IsNull() &&
-		    flag_result->GetValue(0, 0).GetValue<bool>()) {
+		bool interrupted = !flag_result->HasError() && flag_result->RowCount() > 0 &&
+		                   !flag_result->GetValue(0, 0).IsNull() && flag_result->GetValue(0, 0).GetValue<bool>();
+		if (interrupted) {
 			Printer::Print("Warning: recovering '" + view_name + "' from interrupted refresh via full recompute.");
+		}
+		// Dependent views read this view's delta. A plain recompute would replace the rows
+		// without emitting the change, so recover through the cascading full refresh below.
+		recover_with_cascade_delta = interrupted && metadata.HasDownstreamViews(view_name, false);
+		if (interrupted && !recover_with_cascade_delta) {
 			auto recovery_source_sql = view_query_sql;
 			if (!view_time_travel_pins.Empty() && active_facts.target_dialect != SqlDialect::DUCKDB) {
 				recovery_source_sql = RenderStoredViewQueryForDialect(
@@ -631,9 +646,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto recovery_query =
 			    BuildRecomputeQuery(metadata, view_name, recovery_source_sql, cross_system, attached_db_catalog_name,
 			                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta,
-			                        deferred_cleanup, metadata_catalogs);
+			                        deferred_cleanup, metadata_locations);
 			recovery_query += rebuild_distinct_aux();
-			if (cross_system) {
+			string flag_update = "UPDATE " + views_metadata_table + " SET refresh_in_progress = ";
+			string flag_predicate = " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
+			if (cross_system && out_pre_meta && out_post_meta) {
+				// Keep the interruption marker durable until the recomputed state and the
+				// watermarks that BuildRecomputeQuery appended have both committed.
+				*out_pre_meta = flag_update + "true" + flag_predicate;
+				*out_post_meta += flag_update + "false" + flag_predicate;
+			} else if (cross_system) {
 				metadata.SetRefreshInProgress(view_name, false);
 			} else {
 				recovery_query += "\nUPDATE " + views_metadata_table +
@@ -665,6 +687,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			force_full_refresh = true;
 		}
 	}
+	// The cascading full refresh clears refresh_in_progress with the watermarks (meta_post).
+	force_full_refresh = force_full_refresh || recover_with_cascade_delta;
 	bool metadata_requires_full_refresh =
 	    precomputed_delta_activity && precomputed_delta_activity->requires_full_refresh;
 	DeltaActivityResult local_delta_activity;
@@ -742,8 +766,15 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 		auto recompute_query = BuildRecomputeQuery(
 		    metadata, view_name, recompute_source_sql, cross_system, attached_db_catalog_name, attached_db_schema_name,
-		    internal_catalog_prefix, metadata_prefix, out_post_meta, deferred_cleanup, metadata_catalogs);
+		    internal_catalog_prefix, metadata_prefix, out_post_meta, deferred_cleanup, metadata_locations);
 		recompute_query += rebuild_distinct_aux();
+		if (cross_system && out_pre_meta && out_post_meta) {
+			// A recomputed MV committed without its new watermarks would replay the old
+			// deltas incrementally; mark the interruption until the watermarks commit.
+			auto flag_predicate = " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
+			*out_pre_meta = "UPDATE " + views_metadata_table + " SET refresh_in_progress = true" + flag_predicate;
+			*out_post_meta += "UPDATE " + views_metadata_table + " SET refresh_in_progress = false" + flag_predicate;
+		}
 		add_profile_step("generate_refresh_sql.dispatch", full_refresh_start,
 		                 "full_recompute=true; metadata_requires_full_refresh=" +
 		                     string(metadata_requires_full_refresh ? "true" : "false") +
@@ -1730,7 +1761,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			OPENIVM_DEBUG_PRINT("[UPSERT] Compact delta-view query:\n%s\n", compact_delta_view_query.c_str());
 		}
 		delete_from_view_query = RefreshMetadata::BuildDeltaCleanupSQL(
-		    delta_view_name, delta_view_name_bare, delta_metadata_table, nullptr, metadata_catalogs);
+		    delta_view_name, delta_view_name_bare, delta_metadata_table, nullptr, metadata_locations);
 	} else {
 		delete_from_view_query = inline_mv_delta          ? ""
 		                         : use_transient_mv_delta ? "DROP TABLE IF EXISTS " + transient_delta_name + ";"
@@ -1778,9 +1809,11 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                          "), last_refresh_ts = " + string(openivm::UTC_NOW_SQL) + " WHERE view_name = '" +
 		                          SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 		                          SqlUtils::EscapeValue(dt) + "';\n";
-		if (!cross_system) {
-			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt, delta_metadata_table,
-			                                                                       deferred_cleanup, metadata_catalogs);
+		// Cleanup only reads committed consumer watermarks, so a native data transaction may
+		// run it even when the watermarks themselves live in another metadata database.
+		if (!cross_system || split_native_metadata) {
+			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(
+			    resolved, dt, delta_metadata_table, deferred_cleanup, metadata_locations);
 		}
 	}
 	string set_in_progress = "UPDATE " + views_metadata_table + " SET refresh_in_progress = true WHERE view_name = '" +
@@ -1856,7 +1889,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			publication_sql = BuildPublishViewSQL(
 			    view_name, publication_prefix, publication_source_query, publication_columns, target_is_ducklake,
 			    delta_metadata_table, scope_columns, "", active_facts.target_dialect, appended_projection_rows,
-			    retained_publication_scope.rows, metadata_catalogs);
+			    retained_publication_scope.rows, metadata_locations);
 		}
 		publication_sql += retained_publication_scope.cleanup_sql;
 	}

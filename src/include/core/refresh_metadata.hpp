@@ -2,6 +2,7 @@
 #define REFRESH_METADATA_HPP
 
 #include "core/derived_aggregate_output.hpp"
+#include "core/metadata_location.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "core/openivm_constants.hpp"
@@ -21,8 +22,10 @@ public:
 	explicit RefreshMetadata(Connection &con) : con(con) {
 	}
 
-	// Native view metadata belongs to the view catalog; external catalogs use the native default.
-	static void UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
+	// Select the metadata location of a view stored in `view_catalog` on `con` and return it.
+	// Legacy placement: native view metadata belongs to the view catalog; external catalogs
+	// use the native default. openivm_metadata_catalog/_schema or a durable marker override it.
+	static MetadataLocation UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
 
 	void SnapshotTransaction(ClientContext &context);
 	string ResolveViewName(const string &view_name, const string &catalog = "", const string &schema = "");
@@ -62,8 +65,9 @@ public:
 	// Get the last_update timestamp for a specific delta table entry.
 	string GetLastUpdate(const string &view_name, const string &table_name);
 
+	// Every metadata location that may consume delta tables (see MetadataLocator::All).
+	static vector<MetadataLocation> MetadataLocations(Connection &con);
 	// Accept both legacy short keys and qualified keys for sources with colliding names.
-	static vector<string> MetadataCatalogs(Connection &con);
 	static string SourceTableName(const string &key, const string &catalog, const string &schema);
 	static string SourcePredicate(const string &table, const string &catalog, const string &schema);
 
@@ -125,6 +129,7 @@ public:
 	// Returns the stored relation identity plus its schedule and last refresh watermark.
 	struct ScheduledView {
 		string metadata_catalog;
+		string metadata_schema;
 		string view_name;
 		string catalog_name;
 		string schema_name;
@@ -142,7 +147,7 @@ public:
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
 	                                   const string &delta_metadata_table = "",
 	                                   vector<string> *deferred_cleanup = nullptr,
-	                                   const vector<string> &metadata_catalogs = {});
+	                                   const vector<MetadataLocation> &metadata_locations = {});
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);
@@ -179,6 +184,7 @@ public:
 	bool IsDuckLakeTable(const string &view_name, const string &table_name);
 
 	bool IsDuckLakeCatalog(const string &catalog_name);
+	bool IsNativeCatalog(const string &catalog_name);
 
 	int64_t GetCurrentDuckLakeSnapshot(const string &catalog_name);
 

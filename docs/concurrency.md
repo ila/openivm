@@ -17,6 +17,8 @@ day to day. For the mechanics behind this (the mutation gate, cursor bookkeeping
 | Two sessions creating the same MV | Exactly one succeeds and metadata stays consistent; the other fails with a write-write conflict naming an internal table ([#91](https://github.com/ila/openivm/issues/91)). |
 | `DROP VIEW` or `ALTER TABLE` during a refresh | Waits for the refresh to finish, then runs. |
 | Writers outside this DuckDB process (e.g. other DuckLake clients) | Not blocked by OpenIVM; their changes are picked up by the next refresh. |
+| Refresh with metadata in another database (`openivm_metadata_catalog`) | Committed in three autocommit steps; a crash between them makes the next refresh a full recompute. Rejected inside explicit transactions. See [metadata placement](internals/metadata-placement.md). |
+| Two processes refreshing one view through shared PostgreSQL metadata | Serialized by a refresh lease; the second fails with `being refreshed by another OpenIVM client` and can retry. |
 
 A table is *tracked* when at least one materialized view reads from it.
 
@@ -101,6 +103,9 @@ run any statement. See [refresh hooks](refresh_hooks.md).
 |---|---|
 | Refresh, DML on a tracked table or the daemon hangs | Another session holds the gate: look for an open transaction that wrote to a tracked table, and commit or roll it back. |
 | `Warning: recovering '<view>' from interrupted refresh via full recompute` | A previous refresh stopped mid-way; the full recompute restores the view. See [crash safety](refresh/automatic-refresh.md#crash-safety). |
+| `cannot run inside an explicit transaction` | The view's metadata is in another database; run the statement in autocommit mode. |
+| `OpenIVM metadata catalog '<name>' ... is not attached` or `... which is not attached` | Attach the metadata catalog under the recorded name. Base-table changes are still captured meanwhile. |
+| `being refreshed by another OpenIVM client` | Another process holds the view's refresh lease; retry. A crashed client's lease expires after `openivm_metadata_lease_seconds`. |
 | `OpenIVM refresh committed; external delta cleanup deferred` | Consumed deltas in another attached database couldn't be deleted after commit. The view is correct; the rows are retried on a later refresh. |
 | `... does not exist in IVM metadata` right after `CREATE` | The statements were sent in one query string; see [batching statements](#batching-statements). |
 | A scheduled view stopped updating | Check that a process with the database open is still running, then `PRAGMA refresh_status('<view>')` for the effective interval and last refresh. |

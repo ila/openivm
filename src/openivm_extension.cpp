@@ -200,6 +200,34 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_disable_daemon", "disable the refresh daemon (for shadow/compile-only DBs)",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
+	// Metadata placement is a property of the database, not of one session: two sessions
+	// using different locations would split one database's materialized views. Plain SET
+	// therefore applies globally, so helper connections and the daemon see it too.
+	auto validate_placement = [](ClientContext &, SetScope scope, Value &parameter) {
+		if (scope == SetScope::SESSION) {
+			throw InvalidInputException("OpenIVM metadata placement is database-wide; use SET or SET GLOBAL, not "
+			                            "SET SESSION");
+		}
+		if (parameter.IsNull()) {
+			parameter = Value("");
+		}
+	};
+	db_config.AddExtensionOption(openivm::METADATA_CATALOG_SETTING,
+	                             "attached catalog that stores OpenIVM metadata (empty: each native view catalog, or "
+	                             "the default database for external catalogs)",
+	                             LogicalType::VARCHAR, Value(""), validate_placement, SetScope::GLOBAL);
+	db_config.AddExtensionOption(openivm::METADATA_SCHEMA_SETTING,
+	                             "schema that stores OpenIVM metadata in the metadata catalog", LogicalType::VARCHAR,
+	                             Value(DEFAULT_SCHEMA), validate_placement, SetScope::GLOBAL);
+	db_config.AddExtensionOption(openivm::METADATA_LEASE_SETTING,
+	                             "seconds a client of a remote metadata catalog owns a view's refresh before another "
+	                             "client may take it over (renewed while the refresh runs)",
+	                             LogicalType::BIGINT, Value::BIGINT(600));
+	db_config.AddExtensionOption(openivm::TEST_FAIL_POINT_SETTING,
+	                             "testing only: simulate a crash at a refresh protocol step (after_intent, "
+	                             "before_data_commit, after_data_commit)",
+	                             LogicalType::VARCHAR, Value(""));
+
 	// Native refresh can optimize the finished incremental plan against the current deltas because the
 	// generated SQL is executed immediately. The reusable base-view template always stays data-independent.
 	db_config.AddExtensionOption("openivm_enable_data_dependent_optimizers",

@@ -1,0 +1,822 @@
+# name: test/sql/metadata_location.test
+# description: openivm_metadata_catalog/openivm_metadata_schema store OpenIVM metadata in an attached native catalog (#84)
+# group: [sql]
+
+require openivm
+
+load __TEST_DIR__/openivm_metadata_host.db
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_control.db' AS control;
+
+# Placement is database-wide: a session-local location would split one database's metadata.
+statement error
+SET SESSION openivm_metadata_catalog = 'control';
+----
+database-wide
+
+statement ok
+SET openivm_metadata_catalog = 'control';
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+statement ok
+CREATE TABLE orders (id INTEGER, product VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO orders VALUES (1, 'a', 10), (2, 'b', 20), (3, 'a', 30), (4, NULL, 40);
+
+statement ok
+CREATE MATERIALIZED VIEW product_sales AS
+SELECT product, SUM(amount) AS total, COUNT(*) AS cnt FROM orders GROUP BY product;
+
+# ==========================================
+# Placement: definitions and watermarks live in control.openivm, nowhere else
+# ==========================================
+
+query III
+SELECT view_sql_name, view_catalog, view_schema FROM control.openivm.openivm_views;
+----
+product_sales	openivm_metadata_host	main
+
+query I
+SELECT count(*) FROM control.openivm.openivm_delta_tables
+WHERE table_name = 'openivm_delta_orders' AND source_catalog = 'openivm_metadata_host';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'openivm_metadata_host' AND table_name IN ('openivm_views', 'openivm_delta_tables');
+----
+0
+
+# Backing, publication and delta tables keep their own placement: the view's catalog and
+# the source's catalog. Selecting a metadata location never relocates them.
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'control' AND table_name <> 'openivm_delta_tables'
+  AND (starts_with(table_name, 'openivm_data_') OR starts_with(table_name, 'openivm_delta_')
+       OR starts_with(table_name, 'openivm_visible_'));
+----
+0
+
+query II
+SELECT count(*) FILTER (WHERE starts_with(table_name, 'openivm_data_')),
+       count(*) FILTER (WHERE table_name = 'openivm_delta_orders')
+FROM duckdb_tables() WHERE database_name = 'openivm_metadata_host' AND schema_name = 'main';
+----
+1	1
+
+# The durable marker lets a reopened database find its metadata without settings.
+query II
+SELECT metadata_catalog, metadata_schema FROM openivm_metadata_host.main.openivm_metadata_location;
+----
+control	openivm
+
+# ==========================================
+# Incremental refresh through the split protocol
+# ==========================================
+
+statement ok
+INSERT INTO orders VALUES (5, 'c', 5), (6, 'a', 1), (7, NULL, 2);
+
+statement ok
+UPDATE orders SET amount = amount + 100 WHERE product = 'b' OR id = 3;
+
+statement ok
+DELETE FROM orders WHERE id IN (1, 6);
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'product_sales';
+----
+false
+
+# Consumed source deltas are cleaned after the watermark commit.
+query I
+SELECT count(*) FROM openivm_delta_orders;
+----
+0
+
+# ==========================================
+# Profiling and refresh history are written to the metadata location
+# ==========================================
+
+statement ok
+SET openivm_profile_refresh = true;
+
+statement ok
+SET openivm_adaptive_refresh = true;
+
+statement ok
+INSERT INTO orders VALUES (8, 'd', 8), (9, 'a', 9);
+
+statement ok
+DELETE FROM orders WHERE id = 8;
+
+statement ok
+PRAGMA refresh('product_sales');
+
+statement ok
+SET openivm_profile_refresh = false;
+
+statement ok
+SET openivm_adaptive_refresh = false;
+
+query I
+SELECT count(*) > 0 FROM control.openivm.openivm_refresh_profile WHERE step_name = 'total_refresh';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM control.openivm.openivm_refresh_profile WHERE step_name = 'metadata_post_sql';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM control.openivm.openivm_refresh_history;
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+# ==========================================
+# Explicit transactions spanning the data and metadata databases fail safely
+# ==========================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO orders VALUES (10, 'e', 10);
+
+statement error
+PRAGMA refresh('product_sales');
+----
+cannot run inside an explicit transaction
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement error
+CREATE MATERIALIZED VIEW tx_mv AS SELECT product, COUNT(*) AS cnt FROM orders GROUP BY product;
+----
+cannot run inside an explicit transaction
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement error
+DROP VIEW product_sales;
+----
+cannot run inside an explicit transaction
+
+statement ok
+ROLLBACK;
+
+# Nothing from the rejected transactions became visible.
+query I
+SELECT count(*) FROM orders WHERE id = 10;
+----
+0
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views;
+----
+1
+
+# ==========================================
+# Crash recovery: a crash at any protocol step leaves the interruption marker set,
+# and the next refresh recomputes instead of losing or re-applying changes. The
+# dependent view checks that recovery still hands every change downstream exactly once.
+# ==========================================
+
+statement ok
+CREATE MATERIALIZED VIEW big_products AS SELECT product, total FROM product_sales WHERE total > 25;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views WHERE view_sql_name = 'big_products';
+----
+1
+
+# Crash after the marker commits, before any data change.
+statement ok
+INSERT INTO orders VALUES (11, 'a', 11), (12, 'f', 12);
+
+statement ok
+UPDATE orders SET amount = amount * 2 WHERE product = 'c';
+
+statement ok
+DELETE FROM orders WHERE id = 2;
+
+statement ok
+SET openivm_test_fail_point = 'after_intent';
+
+statement error
+PRAGMA refresh('product_sales');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'product_sales';
+----
+true
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'product_sales';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM big_products
+                              EXCEPT ALL SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25
+                              EXCEPT ALL SELECT * FROM big_products));
+----
+0
+
+# Crash inside the data transaction, before COMMIT: the data change is lost with the process.
+statement ok
+INSERT INTO orders VALUES (13, 'a', 13), (14, 'g', 14), (14, 'g', 14);
+
+statement ok
+DELETE FROM orders WHERE id = 12;
+
+statement ok
+UPDATE orders SET product = 'g' WHERE id = 11;
+
+statement ok
+SET openivm_test_fail_point = 'before_data_commit';
+
+statement error
+PRAGMA refresh('product_sales');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'product_sales';
+----
+true
+
+# The MV still holds the pre-crash state, so it differs from the base tables.
+query I
+SELECT count(*) > 0 FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                          EXCEPT ALL SELECT * FROM product_sales);
+----
+true
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM big_products
+                              EXCEPT ALL SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25
+                              EXCEPT ALL SELECT * FROM big_products));
+----
+0
+
+# Crash after the data commit, before the watermarks: replaying the old deltas
+# incrementally would apply them twice.
+statement ok
+INSERT INTO orders VALUES (15, 'a', 15), (16, 'h', 16);
+
+statement ok
+UPDATE orders SET amount = amount + 1 WHERE product = 'a';
+
+statement ok
+DELETE FROM orders WHERE id = 14;
+
+statement ok
+SET openivm_test_fail_point = 'after_data_commit';
+
+statement error
+PRAGMA refresh('product_sales');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'product_sales';
+----
+true
+
+# The data committed: the MV already matches the base tables.
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+statement ok
+INSERT INTO orders VALUES (17, 'h', 17);
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'product_sales';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM big_products
+                              EXCEPT ALL SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25
+                              EXCEPT ALL SELECT * FROM big_products));
+----
+0
+
+# A full recompute takes the same protocol.
+statement ok
+INSERT INTO orders VALUES (18, 'a', 18);
+
+statement ok
+DELETE FROM orders WHERE id = 15;
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+statement ok
+SET openivm_test_fail_point = 'after_data_commit';
+
+statement error
+PRAGMA refresh('product_sales');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+statement ok
+SET openivm_refresh_mode = 'incremental';
+
+statement ok
+INSERT INTO orders VALUES (19, 'b', 19);
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM big_products
+                              EXCEPT ALL SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25
+                              EXCEPT ALL SELECT * FROM big_products));
+----
+0
+
+statement ok
+DROP VIEW big_products;
+
+# ==========================================
+# Concurrent clients of one database serialize through the mutation gate
+# ==========================================
+
+concurrentloop threadid 0 4
+
+loop k 0 3
+
+statement ok
+INSERT INTO orders VALUES (1000 + ${threadid} * 10 + ${k}, 'p' || ${threadid}::VARCHAR, ${k} + 1);
+
+statement ok
+DELETE FROM orders WHERE id = 1000 + ${threadid} * 10 + ${k} - 1;
+
+statement ok
+PRAGMA refresh('product_sales');
+
+endloop
+
+endloop
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+# ==========================================
+# Scheduling: the daemon discovers views registered in the metadata location
+# ==========================================
+
+statement ok
+INSERT INTO orders VALUES (20, 'a', 20), (21, 'z', 21);
+
+statement ok
+DELETE FROM orders WHERE id = 19;
+
+statement ok
+UPDATE control.openivm.openivm_views SET refresh_interval = 60 WHERE view_sql_name = 'product_sales';
+
+# Make the view due. Every consumed delta row was cleaned after the last refresh (asserted
+# above), so an earlier watermark only re-reads the pending rows.
+query I
+SELECT count(*) FROM openivm_delta_orders
+WHERE openivm_timestamp < (SELECT MIN(last_update) FROM control.openivm.openivm_delta_tables);
+----
+0
+
+statement ok
+UPDATE control.openivm.openivm_delta_tables SET last_update = make_timestamp(epoch_us(now())) - INTERVAL '1 day';
+
+statement ok
+PRAGMA refresh_start_daemon;
+
+statement ok
+SELECT sleep_ms(1500);
+
+statement ok
+UPDATE control.openivm.openivm_views SET refresh_interval = NULL WHERE view_sql_name = 'product_sales';
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+# ==========================================
+# Read-only and missing metadata catalogs
+# ==========================================
+
+statement ok
+DETACH control;
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_control.db' AS control (READ_ONLY);
+
+# Base-table changes are still captured; capture never reads metadata.
+statement ok
+INSERT INTO orders VALUES (22, 'a', 22), (23, 'y', 23);
+
+statement ok
+DELETE FROM orders WHERE id = 20;
+
+query I
+SELECT count(*) > 0 FROM product_sales;
+----
+true
+
+statement error
+PRAGMA refresh('product_sales');
+----
+attached read-only
+
+statement error
+CREATE MATERIALIZED VIEW ro_mv AS SELECT product, COUNT(*) AS cnt FROM orders GROUP BY product;
+----
+attached read-only
+
+statement ok
+DETACH control;
+
+statement error
+PRAGMA refresh('product_sales');
+----
+is not attached
+
+statement ok
+UPDATE orders SET amount = amount + 3 WHERE product = 'y';
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_control.db' AS control;
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+# ==========================================
+# Reopen: the marker in the host catalog rediscovers the metadata location
+# ==========================================
+
+statement ok
+INSERT INTO orders VALUES (24, 'a', 24), (25, 'x', 25);
+
+statement ok
+DELETE FROM orders WHERE id = 22;
+
+restart
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_control.db' AS control;
+
+query II
+SELECT current_setting('openivm_metadata_catalog'), current_setting('openivm_metadata_schema');
+----
+(empty)	main
+
+statement ok
+UPDATE orders SET amount = amount - 1 WHERE product = 'x';
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+# New views follow the marker too, so one database never splits its metadata.
+statement ok
+CREATE MATERIALIZED VIEW order_count AS SELECT COUNT(*) AS n, SUM(amount) AS s FROM orders;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views WHERE view_sql_name = 'order_count';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'openivm_metadata_host' AND table_name = 'openivm_views';
+----
+0
+
+# Selecting a different location contradicts the durable marker.
+statement ok
+ATTACH ':memory:' AS other_control;
+
+statement ok
+SET openivm_metadata_catalog = 'other_control';
+
+statement error
+PRAGMA refresh('product_sales');
+----
+is recorded in control.openivm
+
+statement ok
+SET openivm_metadata_catalog = '';
+
+# ==========================================
+# Existing databases: configured placement refuses to coexist with views registered
+# elsewhere instead of silently splitting the metadata
+# ==========================================
+
+statement ok
+ATTACH ':memory:' AS legacy_db;
+
+statement ok
+CREATE TABLE legacy_db.main.legacy_src (i INTEGER);
+
+statement ok
+INSERT INTO legacy_db.main.legacy_src VALUES (1), (2);
+
+statement ok
+CREATE MATERIALIZED VIEW legacy_db.main.legacy_mv AS SELECT i FROM legacy_db.main.legacy_src;
+
+query I
+SELECT count(*) FROM legacy_db.main.openivm_views;
+----
+1
+
+statement ok
+SET openivm_metadata_catalog = 'control';
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+statement error
+CREATE MATERIALIZED VIEW blocked_mv AS SELECT product FROM orders;
+----
+already registered in legacy_db.main
+
+statement ok
+DETACH legacy_db;
+
+# ==========================================
+# Replacement keeps one metadata row in the configured location
+# ==========================================
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW product_sales AS
+SELECT product, SUM(amount) AS total, COUNT(*) AS cnt, SUM(id) AS ids FROM orders GROUP BY product;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views WHERE view_sql_name = 'product_sales';
+----
+1
+
+statement ok
+INSERT INTO orders VALUES (26, 'a', 26), (27, 'w', 27);
+
+statement ok
+UPDATE orders SET amount = amount + 5 WHERE id = 26;
+
+statement ok
+DELETE FROM orders WHERE id = 24;
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*), SUM(id) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*), SUM(id) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+# ==========================================
+# Same catalog, separate schema: one database, so explicit transactions stay atomic
+# ==========================================
+
+statement ok
+CREATE TABLE control.main.items (k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO control.main.items VALUES (1, 10), (1, 20), (2, 5);
+
+statement ok
+CREATE MATERIALIZED VIEW control.main.item_totals AS
+SELECT k, SUM(v) AS s, COUNT(*) AS c FROM control.main.items GROUP BY k;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views WHERE view_sql_name = 'item_totals' AND view_catalog = 'control';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'control' AND schema_name = 'main'
+  AND starts_with(table_name, 'openivm_data_');
+----
+1
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO control.main.items VALUES (3, 30), (1, 1);
+
+statement ok
+PRAGMA refresh('control.main.item_totals');
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM control.main.item_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM control.main.items GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM control.main.items GROUP BY k
+                              EXCEPT ALL SELECT * FROM control.main.item_totals));
+----
+0
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO control.main.items VALUES (3, 30), (1, 1);
+
+statement ok
+DELETE FROM control.main.items WHERE k = 2;
+
+statement ok
+PRAGMA refresh('control.main.item_totals');
+
+statement ok
+COMMIT;
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM control.main.item_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM control.main.items GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM control.main.items GROUP BY k
+                              EXCEPT ALL SELECT * FROM control.main.item_totals));
+----
+0
+
+# ==========================================
+# DROP removes data objects first, then metadata; DROP VIEW IF EXISTS finishes an
+# interrupted drop whose view is already gone
+# ==========================================
+
+statement ok
+DROP VIEW control.main.item_totals;
+
+statement ok
+DROP VIEW order_count;
+
+statement ok
+DROP VIEW product_sales;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views;
+----
+0
+
+query I
+SELECT count(*) FROM control.openivm.openivm_delta_tables;
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name <> 'openivm_delta_tables'
+  AND (starts_with(table_name, 'openivm_data_') OR starts_with(table_name, 'openivm_delta_')
+       OR starts_with(table_name, 'openivm_visible_'));
+----
+0
+
+statement ok
+INSERT INTO control.openivm.openivm_views (view_name, view_sql_name, view_catalog, view_schema, sql_string, type)
+VALUES ('__openivm_orphan', 'orphan_mv', 'openivm_metadata_host', 'main', 'SELECT 1 AS one', 2);
+
+statement ok
+DROP VIEW IF EXISTS orphan_mv;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views;
+----
+0
+
+# The base table no longer has dependents and drops normally.
+statement ok
+DROP TABLE orders;
+
+statement ok
+SET openivm_metadata_catalog = '';
+
+statement ok
+SET openivm_metadata_schema = 'main';

@@ -729,7 +729,7 @@ string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_na
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
                            bool cross_system, const string &attached_catalog, const string &attached_schema,
                            const string &catalog_prefix, const string &metadata_prefix, string *out_post_meta,
-                           vector<string> *deferred_cleanup, const vector<string> &metadata_catalogs) {
+                           vector<string> *deferred_cleanup, const vector<MetadataLocation> &metadata_locations) {
 	string qdt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
 	// parser.cpp gives AGGREGATE_GROUP / AGGREGATE_HAVING data tables a UNIQUE index on the group
 	// keys. A plain `DELETE FROM t; INSERT INTO t ...` re-inserts keys deleted in the same
@@ -778,7 +778,7 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 		}
 		string resolved = metadata.ResolveDeltaQualifiedName(view_name, dt, attached_catalog, attached_schema);
 		delta_cleanup += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt, delta_metadata_table, deferred_cleanup,
-		                                                       metadata_catalogs);
+		                                                       metadata_locations);
 	}
 
 	return query + update_ts + "\n" + delta_cleanup;

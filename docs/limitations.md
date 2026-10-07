@@ -108,6 +108,22 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
   database are serialized by a single mutation gate, so unrelated OpenIVM writes also
   wait for each other; see [Concurrency](internals/concurrency.md).
 
+- **Separately placed metadata** (`openivm_metadata_catalog` in another database than the
+  view; see [metadata placement](internals/metadata-placement.md)):
+  - CREATE, REFRESH, DROP VIEW and DROP TABLE ... CASCADE are rejected inside explicit
+    transactions, because DuckDB cannot commit two databases atomically. Run them in
+    autocommit mode, or keep the metadata schema in the view's own database.
+  - A refresh interrupted between its data and watermark commits makes the next refresh a
+    full recompute.
+  - A database that already has views registered in another location cannot adopt a
+    configured location until those views are migrated or dropped.
+  - Remote metadata supports native DuckDB files and PostgreSQL (`TYPE postgres`) only. It
+    is validated against a local PostgreSQL 16 in CI, not against managed providers. Clients
+    sharing a remote metadata schema serialize refreshes per view through a renewed lease,
+    but changes that other processes write to DuckLake sources while a refresh runs are not
+    pinned to the refresh's snapshot range.
+  - The view-matching signature columns are not stored in remote metadata catalogs.
+
 - **Refresh in a multi-statement query string.** `PRAGMA refresh` resolves view metadata
   when DuckDB expands the pragma, before earlier statements in the same query string have
   run. A single `duckdb -c "CREATE MATERIALIZED VIEW ...; PRAGMA refresh(...)"` call

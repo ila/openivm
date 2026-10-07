@@ -90,10 +90,13 @@ public:
 		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
 		                  to_string(retention_days) + " days'");
 		for (auto &step : steps) {
+			// refresh_id is unique per refresh; remote catalogs support neither INSERT OR
+			// REPLACE nor DuckDB column defaults.
 			auto result = profile_con.Query(
-			    "INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
-			    " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES ('" +
-			    SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) + "', " +
+			    "INSERT INTO " + string(openivm::PROFILE_TABLE) +
+			    " (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail) VALUES ('" +
+			    SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) +
+			    "', CAST(current_timestamp AS TIMESTAMP), " +
 			    to_string(step.step_order) + ", '" + SqlUtils::EscapeValue(step.step_name) + "', " +
 			    to_string(step.duration_ms) + ", '" + SqlUtils::EscapeValue(step.detail) + "')");
 			if (result->HasError()) {
@@ -139,12 +142,39 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 	RefreshProfiler profiler(context, vn, view_catalog_name);
 	profiler.AddMeasuredStep("acquire_locks", 0, "database mutation gate pre-acquired");
 	Connection probe_con(*context.db.get());
-	RefreshMetadata::UseCatalog(context, probe_con, view_catalog_name);
+	auto metadata_location = RefreshMetadata::UseCatalog(context, probe_con, view_catalog_name);
 	RefreshMetadata probe_meta(probe_con);
 	const string display_name = DisplayViewName(probe_meta, view_schema_name, vn);
+	MetadataLocator::RequireWritable(metadata_location, "refresh materialized view '" + display_name + "'");
+	// Metadata stored outside the MV's database cannot commit with its data. The split
+	// protocol commits (1) the interruption marker, (2) the MV data, (3) the watermarks
+	// with the marker cleared. A failure at any point leaves the marker set, so the next
+	// refresh recomputes the view instead of losing or re-applying changes.
+	bool split_protocol = cross_system && metadata_location.explicit_placement;
+	bool split_native = split_protocol && probe_meta.IsNativeCatalog(view_catalog_name);
+	// Remote metadata can be shared by several clients; only the lease holder refreshes.
+	RefreshLease lease(context, metadata_location, vn);
+	bool was_interrupted = false;
+	int64_t refresh_epoch = 0;
+	if (split_protocol) {
+		auto state = probe_con.Query(
+		    "SELECT refresh_in_progress" + string(lease.Active() ? ", COALESCE(refresh_epoch, 0)" : "") + " FROM " +
+		    metadata_location.Table(openivm::VIEWS_TABLE) + " WHERE view_name = " + Value(vn).ToSQLString());
+		if (state->HasError() || state->RowCount() != 1) {
+			throw CatalogException("Could not read refresh state of '%s': %s", display_name,
+			                       state->HasError() ? state->GetError() : string("view is not registered"));
+		}
+		was_interrupted = !state->GetValue(0, 0).IsNull() && state->GetValue(0, 0).GetValue<bool>();
+		if (lease.Active()) {
+			refresh_epoch = state->GetValue(1, 0).GetValue<int64_t>();
+		}
+		OPENIVM_DEBUG_PRINT("[REFRESH] Split metadata protocol for %s (native data=%d, interrupted=%d)\n", vn.c_str(),
+		                    split_native, was_interrupted);
+	}
 	DeltaActivityResult delta_activity;
 	DeltaActivityResult *precomputed_delta_activity = nullptr;
-	if (skip_empty_refresh) {
+	// An interrupted view must recompute even without pending deltas, or its marker stays set.
+	if (skip_empty_refresh && !was_interrupted) {
 		if (TrySkipEmptyRefresh(context, probe_meta, probe_con, view_catalog_name, view_schema_name, vn,
 		                        attached_db_catalog_name, attached_db_schema_name, &delta_activity)) {
 			profiler.AddTotal();
@@ -165,12 +195,28 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	RefreshMetadata::UseCatalog(context, exec_con, view_catalog_name);
 	bool tx_open = false;
+	bool intent_recorded = false;
+	bool data_may_have_committed = false;
+	// Metadata statements of the split protocol run in one fenced metadata transaction.
+	auto run_metadata = [&](const string &statements) {
+		Connection meta_con(*context.db.get());
+		if (!split_protocol) {
+			return meta_con.Query(statements);
+		}
+		meta_con.BeginTransaction();
+		auto result = meta_con.Query(lease.FenceSQL() + statements);
+		if (result->HasError()) {
+			meta_con.Query("ROLLBACK");
+			return result;
+		}
+		return meta_con.Query("COMMIT");
+	};
 	try {
 		bool adaptive_refresh = SqlUtils::GetBoolSetting(context, "openivm_adaptive_refresh", false);
 		RefreshCostEstimate cost_estimate = {};
 
-		// For cross_system (DuckLake) MVs, split the refresh SQL into data ops (dl catalog)
-		// and metadata ops (physical-default catalog) to avoid the cross-catalog write error.
+		// For cross_system (DuckLake or separately stored metadata) MVs, split the refresh SQL
+		// into data ops (MV catalog) and metadata ops to avoid the cross-catalog write error.
 		string meta_pre_sql, meta_post_sql;
 		vector<string> deferred_cleanup;
 		RefreshCompileProfile compile_profile;
@@ -182,7 +228,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		                       cross_system ? &meta_post_sql : nullptr, profiler.Enabled() ? &compile_profile : nullptr,
 		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr,
 		                       /*facts=*/nullptr, /*metadata_connection=*/nullptr, &delete_retry_plan,
-		                       /*write_query_file=*/true, cross_system ? nullptr : &deferred_cleanup);
+		                       /*write_query_file=*/true, cross_system && !split_native ? nullptr : &deferred_cleanup);
 		string fallback_sql;
 		if (delete_retry_plan.IsActive()) {
 			// Compile the ranked rowid program before setting refresh_in_progress. It is only
@@ -222,22 +268,30 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// writing the physical metadata catalog and DuckLake in one transaction.
 		if (cross_system && !meta_pre_sql.empty()) {
 			auto meta_pre_start = std::chrono::steady_clock::now();
-			Connection meta_con(*context.db.get());
-			auto meta_result = meta_con.Query(meta_pre_sql);
+			auto meta_result = run_metadata(meta_pre_sql);
 			if (meta_result->HasError()) {
 				throw Exception(ExceptionType::EXECUTOR,
 				                "IVM refresh of '" + display_name +
 				                    "' failed before data refresh: " + meta_result->GetError());
 			}
+			intent_recorded = true;
 			profiler.AddStep("metadata_pre_sql", meta_pre_start, "bytes=" + to_string(meta_pre_sql.size()));
+		}
+		if (split_protocol) {
+			MetadataLocator::FailPoint(context, "after_intent");
 		}
 		// Native refreshes are always transactional. DuckLake only needs a data transaction
 		// for the exhaustive-delete attempt: a multiplicity mismatch rolls the attempt back
 		// before the ranked rowid program runs.
-		if (!cross_system || delete_retry_plan.IsActive()) {
+		if (!cross_system || delete_retry_plan.IsActive() || split_native) {
 			exec_con.BeginTransaction();
 			tx_open = true;
-			TransactionalMVLockState::Get(*exec_con.context).DeferDeltaCleanup(std::move(deferred_cleanup));
+			if (!split_native) {
+				TransactionalMVLockState::Get(*exec_con.context).DeferDeltaCleanup(std::move(deferred_cleanup));
+			}
+		} else {
+			// Autocommit data statements can commit individually.
+			data_may_have_committed = true;
 		}
 		auto start = std::chrono::steady_clock::now();
 		unique_ptr<MaterializedQueryResult> result;
@@ -330,8 +384,21 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		}
 
 		if (tx_open) {
+			if (split_protocol) {
+				MetadataLocator::FailPoint(context, "before_data_commit");
+				if (lease.Active() && lease.Lost()) {
+					throw TransactionException("IVM refresh of '%s' lost its metadata lease before committing; the "
+					                           "data change was rolled back",
+					                           display_name);
+				}
+			}
+			// A failed COMMIT has an unknown outcome; never compensate for it.
+			data_may_have_committed = true;
 			exec_con.Commit();
 			tx_open = false;
+		}
+		if (split_protocol) {
+			MetadataLocator::FailPoint(context, "after_data_commit");
 		}
 		if (cross_system && IsSnapshotPublication(*exec_con.context, view_catalog_name, view_schema_name, vn)) {
 			auto publication_start = std::chrono::steady_clock::now();
@@ -393,13 +460,43 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 					                    "' failed: unresolved DuckLake snapshot placeholder after data refresh");
 				}
 			}
-			Connection meta_con(*context.db.get());
-			auto meta_result = meta_con.Query(meta_post_sql);
+			if (lease.Active()) {
+				// A client whose lease expired mid-refresh bumps the epoch after its late data
+				// commit; then this commit must not clear the interruption marker.
+				meta_post_sql += "SELECT CASE WHEN (SELECT COALESCE(refresh_epoch, 0) FROM " +
+				                 metadata_location.Table(openivm::VIEWS_TABLE) +
+				                 " WHERE view_name = " + Value(vn).ToSQLString() + ") = " + to_string(refresh_epoch) +
+				                 " THEN NULL ELSE error('Another OpenIVM client overran its refresh lease for this "
+				                 "view; the next refresh recomputes it') END AS openivm_epoch_check;\n";
+			}
+			auto meta_result = run_metadata(meta_post_sql);
 			if (meta_result->HasError()) {
+				if (lease.Active()) {
+					// Our data may have committed after a takeover. Force recomputation even
+					// if the new owner already cleared the marker.
+					Connection poison_con(*context.db.get());
+					poison_con.Query("UPDATE " + metadata_location.Table(openivm::VIEWS_TABLE) +
+					                 " SET refresh_in_progress = true, refresh_epoch = COALESCE(refresh_epoch, 0) + 1 "
+					                 "WHERE view_name = " +
+					                 Value(vn).ToSQLString());
+				}
 				throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
 				                                             "' failed after data refresh: " + meta_result->GetError());
 			}
 			profiler.AddStep("metadata_post_sql", meta_post_start, "bytes=" + to_string(meta_post_sql.size()));
+		}
+		if (split_native && !deferred_cleanup.empty()) {
+			// Housekeeping after the watermarks advanced: delete delta rows every consumer
+			// has committed. Failures only retain rows that later refreshes exclude.
+			Connection cleanup_con(*context.db.get());
+			TransactionalMVLockState::Get(*cleanup_con.context)
+			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+			for (auto &cleanup : deferred_cleanup) {
+				auto cleaned = cleanup_con.Query(cleanup);
+				if (cleaned->HasError()) {
+					Printer::Print("OpenIVM refresh committed; delta cleanup deferred: " + cleaned->GetError());
+				}
+			}
 		}
 
 		// Record execution history for the learned cost model.
@@ -432,6 +529,18 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		profiler.AddTotal();
 		profiler.Flush(*context.db.get());
 		return;
+	} catch (SimulatedCrashException &) {
+		// A crashed process loses its open transaction and runs no compensation; the
+		// interruption marker and any lease remain for recovery to handle.
+		if (tx_open) {
+			try {
+				exec_con.Rollback();
+			} catch (...) {
+			}
+			tx_open = false;
+		}
+		lease.Abandon();
+		throw;
 	} catch (...) {
 		// Ensure the transaction is rolled back before we propagate the exception.
 		// This covers the case where Query() itself threw (vs returning HasError) —
@@ -445,6 +554,19 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 				// will still clean up. Swallow so we don't mask the original error.
 			}
 			tx_open = false;
+		}
+		if (split_protocol && intent_recorded && !data_may_have_committed && !was_interrupted) {
+			// The data transaction rolled back, so nothing changed: retract our marker
+			// rather than force a full recompute. Best effort; a set marker is still safe.
+			try {
+				auto cleared = run_metadata("UPDATE " + metadata_location.Table(openivm::VIEWS_TABLE) +
+				                            " SET refresh_in_progress = false WHERE view_name = " +
+				                            Value(vn).ToSQLString() + ";\n");
+				if (cleared->HasError()) {
+					OPENIVM_DEBUG_PRINT("[REFRESH] Could not retract marker: %s\n", cleared->GetError().c_str());
+				}
+			} catch (...) {
+			}
 		}
 		profiler.AddTotal();
 		profiler.Flush(*context.db.get());
@@ -478,10 +600,14 @@ static AuxCatalogTarget ResolveAuxCatalogTarget(RefreshMetadata &metadata, Conne
 	target.catalog_name = view_catalog_name.empty() ? default_db : view_catalog_name;
 	target.schema_name = view_schema_name.empty() ? default_schema : view_schema_name;
 	bool target_is_ducklake = metadata.IsDuckLakeCatalog(view_catalog_name);
-	if (!target_is_ducklake && !default_db.empty() && default_db != "memory" && !view_catalog_name.empty() &&
-	    view_catalog_name != default_db) {
-		target.catalog_name = default_db;
-		target.schema_name = default_schema;
+	// Native view catalogs keep their aux state even when metadata lives elsewhere; other
+	// external catalogs use the physical default database, never the metadata location.
+	auto physical_default_db = MetadataLocator::PhysicalDefaultCatalog(*con.context->db);
+	if (!target_is_ducklake && !physical_default_db.empty() && physical_default_db != "memory" &&
+	    !view_catalog_name.empty() && view_catalog_name != physical_default_db &&
+	    !metadata.IsNativeCatalog(view_catalog_name)) {
+		target.catalog_name = physical_default_db;
+		target.schema_name = DEFAULT_SCHEMA;
 	}
 	return target;
 }
@@ -566,6 +692,9 @@ static void RefreshNodeWithHooks(ClientContext &context, Connection &con, const 
                                  bool strict_hooks) {
 	RefreshMetadata metadata(con);
 	const string display_name = DisplayViewName(metadata, view_schema_name, view_name);
+	// Hooks and the refresh they wrap share one lease on remote metadata.
+	Connection lease_con(*context.db);
+	RefreshLease lease(context, MetadataLocator::Resolve(context, lease_con, view_catalog_name), view_name);
 	// Check for refresh hooks (custom SQL to run before/after/instead of IVM)
 	string hook_sql;
 	string hook_mode;
@@ -917,6 +1046,15 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		    default_result->GetValue(0, 0).ToString() != view_catalog_name) {
 			cross_system = true;
 		}
+	}
+	{
+		// The staged cross-catalog path below commits outside the caller's transaction.
+		// With an explicitly placed metadata catalog that would silently break atomicity.
+		Connection location_con(*context.db);
+		auto location = MetadataLocator::Resolve(context, location_con, view_catalog_name);
+		MetadataLocator::RejectExplicitTransaction(context, location, view_catalog_name,
+		                                           pipeline ? "PRAGMA refresh_pipeline" : "PRAGMA refresh");
+		MetadataLocator::RequireWritable(location, "refresh materialized view '" + requested_view_name + "'");
 	}
 	// Retain only the database-wide mutation gate before choosing the execution
 	// path. Cross-system refresh delegates to a helper that acquires its own view

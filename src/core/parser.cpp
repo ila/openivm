@@ -166,7 +166,8 @@ static bool RelationExists(ClientContext &context, const string &catalog_name, c
 
 static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
                                                       unique_ptr<ParserExtensionParseData> parse_data, string &view_key,
-                                                      string *metadata_catalog = nullptr) {
+                                                      string *metadata_catalog = nullptr,
+                                                      string *metadata_schema = nullptr) {
 	// CREATE MATERIALIZED VIEW stores a relation. Physical insertion order is not
 	// semantically observable unless users query with ORDER BY, so keep OpenIVM's
 	// whole execution path on DuckDB's lower-memory unordered mode.
@@ -178,8 +179,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	ParserExtensionPlanResult result;
 
 	Connection con(*context.db.get());
-	RefreshMetadata::UseCatalog(context, con,
-	                            ResolveMaterializedViewTarget(context, parse_data_ref.target_name).catalog_name);
+	auto lifecycle_target = ResolveMaterializedViewTarget(context, parse_data_ref.target_name);
+	auto metadata_location = RefreshMetadata::UseCatalog(context, con, lifecycle_target.catalog_name);
+	bool remote_metadata = metadata_location.explicit_placement && !metadata_location.IsNative();
 	struct CreateMVPreProfileStep {
 		string step_name;
 		int64_t duration_ms;
@@ -228,6 +230,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (metadata_catalog) {
 		*metadata_catalog = default_db;
 	}
+	if (metadata_schema) {
+		*metadata_schema = default_schema;
+	}
 	add_create_profile_step("create_compile_default_context", default_context_start);
 	string default_catalog_schema =
 	    KeywordHelper::WriteOptionallyQuoted(default_db) + "." + KeywordHelper::WriteOptionallyQuoted(default_schema);
@@ -236,6 +241,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	// Handle ALTER MATERIALIZED VIEW — just execute the metadata UPDATE
 	if (!parse_data_ref.alter_sql.empty()) {
+		// Only the metadata catalog is written, so explicit transactions stay atomic.
+		MetadataLocator::RequireWritable(metadata_location, "alter materialized view");
 		auto target = ResolveMaterializedViewTarget(context, parse_data_ref.target_name);
 		auto metadata_table = SqlUtils::FullName(default_db, default_schema, openivm::VIEWS_TABLE);
 		auto target_key = RefreshMetadata(con).FindViewKey(target.catalog_name, target.schema_name, target.view_name);
@@ -255,7 +262,13 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		return result;
 	}
 
-	InitializeMVMetadata(context, con, default_db, default_schema);
+	MetadataLocator::RequireWritable(metadata_location, "create materialized view");
+	MetadataLocator::ValidateExclusive(con, metadata_location);
+	// Metadata outside the view's database is committed separately from its data. The
+	// staged executor cannot join a caller transaction, so refuse rather than split it.
+	MetadataLocator::RejectExplicitTransaction(context, metadata_location, lifecycle_target.catalog_name,
+	                                           "CREATE MATERIALIZED VIEW");
+	InitializeMVMetadata(context, con, default_db, default_schema, remote_metadata);
 
 	// PAC compatibility boundary: internal planning uses a fresh connection, so
 	// forward PAC settings when that extension is loaded in the caller session.
@@ -1018,7 +1031,26 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	add_profile_marker("create_mv_system_tables", "refresh_type=" + string(RefreshTypeName(refresh_type)) +
 	                                                  "; lpts_fallback=" + string(lpts_fallback ? "true" : "false"));
 	AppendCreateMVSystemTablesDDL(context, default_db, default_schema, ddl, view_name, parse_data_ref.is_replace,
-	                              view_target_catalog, view_target_schema, sql_view_name);
+	                              view_target_catalog, view_target_schema, sql_view_name, remote_metadata);
+	// Durable pointers from every native catalog that receives OpenIVM objects to the
+	// metadata location, so a reopened database finds it without session settings.
+	{
+		unordered_set<string> marked;
+		auto add_marker = [&](const string &catalog) {
+			if (catalog.empty() || !marked.insert(StringUtil::Lower(catalog)).second) {
+				return;
+			}
+			for (auto &marker : MetadataLocator::MarkerDDL(con, metadata_location, catalog)) {
+				ddl.push_back(marker);
+			}
+		};
+		add_marker(view_target_catalog);
+		for (auto &source : facts.source_table_info) {
+			if (!facts.ducklake_table_info.count(source.first)) {
+				add_marker(source.second.catalog_name);
+			}
+		}
+	}
 	auto system_ddl_end = ddl.size();
 
 	bool has_downstream_views = false;
@@ -1129,7 +1161,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 	}
 
-	metadata_ddl.push_back(
+	auto view_row_sql =
 	    "insert or replace into " + string(openivm::VIEWS_TABLE) +
 	    " (view_name, view_sql_name, view_catalog, view_schema, sql_string, type, has_minmax, has_left_join, "
 	    "has_join, last_update, "
@@ -1144,7 +1176,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	    (analysis.found_join ? "true" : "false") + ", " + string(openivm::UTC_NOW_SQL) + ", " + refresh_val +
 	    ", false, " + group_cols_val + ", " + window_order_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
 	    group_recompute_mode_val + ", " + group_recompute_source_occurrences_val + ", " +
-	    (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
+	    (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")";
+	for (auto &statement : MetadataLocator::ReplaceRowsSQL(
+	         metadata_location, view_row_sql, "view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'")) {
+		metadata_ddl.push_back(statement);
+	}
 
 	if (!lineage_json.empty()) {
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));
@@ -1205,7 +1241,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (view_model.HasCountDistinctAux()) {
 		add_profile_marker("create_mv_count_distinct_aux");
 		const auto &meta = view_model.count_distinct_aux;
-		string source_table = QualifyCreateSourceTable(meta.source, current_catalog, current_schema, default_db);
+		string source_table =
+		    QualifyCreateSourceTable(meta.source, current_catalog, current_schema, default_db, default_schema);
 		string aux_target = get_aux_state_target(meta.aux_table);
 		string aux_create =
 		    BuildCountDistinctAuxStateCreateSQL(aux_target, source_table, meta.group_cols, meta.group_source_exprs,
@@ -1222,7 +1259,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		add_profile_marker("create_mv_filtered_group_count_aux");
 		const auto &req = view_model.filtered_group_count_aux;
 		const auto &meta = req.meta;
-		string source_table = QualifyCreateSourceTable(req.create_source, current_catalog, current_schema, default_db);
+		string source_table =
+		    QualifyCreateSourceTable(req.create_source, current_catalog, current_schema, default_db, default_schema);
 		string aux_target = get_aux_state_target(meta.aux_table);
 		string aux_create = BuildFilteredGroupCountAuxStateCreateSQL(
 		    aux_target, source_table, meta.group_col, meta.sum_col, meta.source_group_expr, meta.source_sum_expr,
@@ -1238,9 +1276,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		add_profile_marker("create_mv_semi_anti_aux");
 		const auto &meta = view_model.semi_anti_aux;
 		string left_source_table =
-		    QualifyCreateSourceTable(meta.left_table, current_catalog, current_schema, default_db);
+		    QualifyCreateSourceTable(meta.left_table, current_catalog, current_schema, default_db, default_schema);
 		string right_source_table =
-		    QualifyCreateSourceTable(meta.right_table, current_catalog, current_schema, default_db);
+		    QualifyCreateSourceTable(meta.right_table, current_catalog, current_schema, default_db, default_schema);
 		string aux_target = get_aux_state_target(meta.aux_table);
 		string aux_create = BuildSemiAntiAuxStateCreateSQL(
 		    aux_target, left_source_table, meta.left_alias, right_source_table, meta.right_alias, meta.predicate,
@@ -1336,11 +1374,14 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	vector<string> source_metadata_ddl;
 	if (!source_metadata_values.empty()) {
-		source_metadata_ddl.push_back("insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
-		                              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
-		                              "last_refresh_ts, source_catalog, source_schema, source_table_id) "
-		                              "values " +
-		                              StringUtil::Join(source_metadata_values, ", "));
+		source_metadata_ddl = MetadataLocator::ReplaceRowsSQL(
+		    metadata_location,
+		    "insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
+		        " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
+		        "last_refresh_ts, source_catalog, source_schema, source_table_id) "
+		        "values " +
+		        StringUtil::Join(source_metadata_values, ", "),
+		    "view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'");
 	}
 
 	// --- Compiled DDL (MV creation, delta tables, delta view) ---
@@ -1529,7 +1570,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			ddl.push_back(BuildPublishViewSQL(
 			    view_name, internal_catalog_prefix, published_query, visible_columns, target_is_ducklake,
 			    SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE), {}, creation_timestamp,
-			    SqlDialect::DUCKDB, "", "", RefreshMetadata::MetadataCatalogs(con)));
+			    SqlDialect::DUCKDB, "", "", RefreshMetadata::MetadataLocations(con)));
 		}
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("published_query", published_query, view_name));
 		ddl.push_back(string(staged_cross_catalog_replace ? "CREATE OR REPLACE VIEW " : "CREATE VIEW ") + qvn +
@@ -1711,7 +1752,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	ddl.insert(ddl.begin() + static_cast<vector<string>::difference_type>(system_ddl_end), cleanup_ddl.begin(),
 	           cleanup_ddl.end());
 
-	if (!target_is_ducklake &&
+	// Unqualified metadata statements must run in the metadata location. Legacy DuckLake
+	// metadata lives in the default database a staged connection already starts in.
+	if ((!target_is_ducklake || metadata_location.explicit_placement) &&
 	    (default_db != DatabaseManager::GetDefaultDatabase(context) || default_schema != current_schema)) {
 		auto original_search_path =
 		    CatalogSearchEntry::ListToString(ClientData::Get(context).catalog_search_path->GetSetPaths());
@@ -1748,7 +1791,9 @@ string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionPara
 	}
 	string view_key;
 	string metadata_catalog;
-	auto plan_result = PlanMaterializedView(context, std::move(parse_result.parse_data), view_key, &metadata_catalog);
+	string metadata_schema;
+	auto plan_result = PlanMaterializedView(context, std::move(parse_result.parse_data), view_key, &metadata_catalog,
+	                                        &metadata_schema);
 	if (plan_result.function.name == OPENIVM_TRANSACTIONAL_DDL_FUNCTION) {
 		if (!view_key.empty()) {
 			TransactionalMVLockState::Get(context).AcquireMutationLock();
@@ -1756,7 +1801,7 @@ string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionPara
 		if (!context.transaction.IsAutoCommit()) {
 			TransactionalMVMetadataState::Get(context).Register(context, plan_result.parameters, view_key);
 		}
-		return RenderTransactionalDDL(context, plan_result.parameters, metadata_catalog);
+		return RenderTransactionalDDL(context, plan_result.parameters, metadata_catalog, metadata_schema);
 	}
 	ExecuteStagedDDL(context, plan_result.parameters);
 	return "SELECT true AS \"MATERIALIZED VIEW CREATION\"";
@@ -1814,12 +1859,11 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	sources.insert(sources.end(), view_sources.begin(), view_sources.end());
 }
 
-static string QualifyDropMetadata(const string &program, const string &catalog) {
+static string QualifyDropMetadata(const string &program, const MetadataLocation &location) {
 	auto qualified = program;
 	for (auto table :
 	     {"openivm_refresh_hooks", openivm::MV_DEPS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::VIEWS_TABLE}) {
-		qualified =
-		    SqlUtils::ReplaceTableReferences(qualified, table, SqlUtils::FullName(catalog, DEFAULT_SCHEMA, table));
+		qualified = SqlUtils::ReplaceTableReferences(qualified, table, location.Table(table));
 	}
 	return qualified;
 }
@@ -1827,7 +1871,7 @@ static string QualifyDropMetadata(const string &program, const string &catalog) 
 static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshMetadata::DeltaSource> &sources,
                                           const string &excluded_views, string &program) {
 	unordered_set<string> checked_sources;
-	auto metadata_catalogs = RefreshMetadata::MetadataCatalogs(con);
+	auto metadata_locations = RefreshMetadata::MetadataLocations(con);
 	for (auto &source : sources) {
 		if (source.catalog_type == "ducklake" || RefreshMetadata(con).IsMaterializedViewDelta(source)) {
 			continue;
@@ -1837,10 +1881,9 @@ static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshM
 			continue;
 		}
 		bool has_consumers = false;
-		for (auto &catalog : metadata_catalogs) {
+		for (auto &location : metadata_locations) {
 			auto remaining =
-			    con.Query("SELECT count(*) FROM " +
-			              SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE) + " WHERE " +
+			    con.Query("SELECT count(*) FROM " + location.Table(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 			              RefreshMetadata::SourcePredicate(source.table_name, source.catalog_name, source.schema_name) +
 			              " AND view_name NOT IN (" + excluded_views + ")");
 			if (remaining->HasError()) {
@@ -1914,14 +1957,14 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(con);
 	}
-	auto catalogs = RefreshMetadata::MetadataCatalogs(con);
+	auto locations = RefreshMetadata::MetadataLocations(con);
 	vector<string> dependent_views;
 	vector<RefreshMetadata::DeltaSource> sources;
 	string program;
 	string excluded_views;
 	bool staged_drop = false;
-	for (auto &catalog : catalogs) {
-		RefreshMetadata::UseCatalog(context, con, catalog);
+	for (auto &metadata_location : locations) {
+		MetadataLocator::Use(con, metadata_location);
 		auto dependent_rows = con.Query(
 		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 		    RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(drop_info.name), drop_info.catalog, drop_info.schema) +
@@ -1941,6 +1984,9 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 			return context.transaction.IsAutoCommit() ? ExecuteAutocommitDropProgram(con, retract) : retract;
 		}
+		MetadataLocator::RequireWritable(metadata_location, "drop table '" + drop_info.name + "' with CASCADE");
+		MetadataLocator::RejectExplicitTransaction(context, metadata_location, drop_info.catalog,
+		                                           "DROP TABLE ... CASCADE");
 		RefreshMetadata metadata(con);
 		vector<string> local_views;
 		unordered_set<string> seen;
@@ -1966,9 +2012,9 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 			}
 			excluded_views += "'" + SqlUtils::EscapeValue(view_name) + "'";
 		}
-		program += QualifyDropMetadata(local_program, catalog);
+		program += QualifyDropMetadata(local_program, metadata_location);
 		dependent_views.insert(dependent_views.end(), local_views.begin(), local_views.end());
-		staged_drop |= !StringUtil::CIEquals(catalog, drop_info.catalog);
+		staged_drop |= !StringUtil::CIEquals(metadata_location.catalog, drop_info.catalog);
 	}
 	if (dependent_views.empty()) {
 		return BuildDropTableStatement(drop_info) + ";\n";
@@ -2042,7 +2088,7 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	drop.info->schema = schema_name;
 
 	Connection con(*context.db);
-	RefreshMetadata::UseCatalog(context, con, catalog_name);
+	auto metadata_location = RefreshMetadata::UseCatalog(context, con, catalog_name);
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(con);
 	}
@@ -2061,6 +2107,10 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		    !SqlUtils::FindTableReference(view.GetQuery().ToString(), PublishedViewName(view_key)).empty()) {
 			data_table_ref = SqlUtils::FullName(catalog_name, schema_name, data_table_name);
 		}
+	} else if (metadata_location.explicit_placement) {
+		// A staged DROP interrupted after removing the view leaves its metadata behind.
+		// DROP VIEW IF EXISTS finishes the cleanup; the stored location proves ownership.
+		data_table_ref = SqlUtils::FullName(catalog_name, schema_name, data_table_name);
 	}
 	auto tracked = con.Query("SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) +
 	                         " WHERE view_name = '" + SqlUtils::EscapeValue(view_key) + "'");
@@ -2114,26 +2164,28 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	for (auto &source : delta_sources) {
 		staged_drop |= !StringUtil::CIEquals(source.catalog_name, catalog_name);
 	}
+	MetadataLocator::RequireWritable(metadata_location, "drop materialized view '" + drop.info->name + "'");
+	MetadataLocator::RejectExplicitTransaction(context, metadata_location, catalog_name, "DROP VIEW");
+	staged_drop |=
+	    metadata_location.explicit_placement && MetadataLocator::SpansDatabases(metadata_location, catalog_name);
+	// Data objects are dropped before the metadata rows: an interrupted DROP leaves
+	// metadata that DROP VIEW IF EXISTS removes, never an unmaintained view.
+	auto qualified_program = QualifyDropMetadata(program, metadata_location);
 	if (staged_drop) {
 		// Keep metadata ownership explicit when the staged executor uses a fresh connection.
-		auto owner = con.Query("SELECT current_database()");
-		if (owner->HasError()) {
-			throw CatalogException("OpenIVM could not resolve DROP metadata catalog: %s", owner->GetError());
-		}
-		program = QualifyDropMetadata(program, owner->GetValue(0, 0).ToString());
-		OPENIVM_DEBUG_PRINT("[DROP] Staging DuckLake view and native metadata cleanup for '%s'\n",
-		                    drop.info->name.c_str());
-		ExecuteStagedDDL(context, {Value(program)});
+		OPENIVM_DEBUG_PRINT("[DROP] Staging view and metadata cleanup for '%s'\n", drop.info->name.c_str());
+		ExecuteStagedDDL(context, {Value(qualified_program)});
 		return "SELECT true AS Success";
 	}
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
 	if (!context.transaction.IsAutoCommit()) {
+		// The transaction-local metadata shadow replays the unqualified statements.
 		auto &state = TransactionalMVMetadataState::Get(context);
 		state.RegisterSQL(program, drop.info->name);
 		for (auto &view_name : drop_views) {
 			state.IncludeView(view_name);
 		}
 	}
-	return program;
+	return metadata_location.explicit_placement ? qualified_program : program;
 }
 } // namespace duckdb

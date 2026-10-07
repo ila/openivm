@@ -52,6 +52,26 @@ All tests live in `test/sql/*.test` using DuckDB's SQLLogicTest format.
 | `compile_refresh.test` | `openivm_compile_with_facts` compile-only refresh |
 | `time_travel.test`, `time_travel_ducklake.test` | Time-travel pins |
 | `ducklake_*.test` | The same operator families over DuckLake sources |
+| `metadata_location.test` | Metadata in an attached catalog/schema: placement, crash recovery, explicit transactions, reopen, read-only/missing catalogs, drop, replace |
+
+## Remote metadata integration test
+
+`test/integration/test_remote_metadata.py` stores OpenIVM metadata in PostgreSQL and runs
+several DuckDB processes against it. It is skipped unless `OPENIVM_POSTGRES_DSN` names a
+disposable database; CI starts a PostgreSQL 16 service container
+(`.github/workflows/RemoteMetadata.yml`). Never point it at a shared server: each run creates
+and drops its own schemas. To run it locally:
+
+```bash
+docker run --rm -d --name openivm-pg -p 5432:5432 \
+    -e POSTGRES_USER=openivm -e POSTGRES_PASSWORD=openivm -e POSTGRES_DB=openivm_test postgres:16
+export OPENIVM_POSTGRES_DSN='host=localhost port=5432 user=openivm password=openivm dbname=openivm_test'
+python3 test/integration/test_remote_metadata.py ./build/release/duckdb --require
+docker stop openivm-pg
+```
+
+The test installs the `postgres`, `ducklake` and `sqlite` extensions, so it needs network
+access the first time.
 
 ## Verification Pattern
 
