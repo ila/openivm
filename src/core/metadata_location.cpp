@@ -120,7 +120,8 @@ bool TryConfigured(ClientContext &context, Connection &con, MetadataLocation &ou
 		return false;
 	}
 	if (catalog.empty()) {
-		catalog = DatabaseManager::GetDefaultDatabase(context);
+		// Placement is database-wide, so it must not follow a session's USE.
+		catalog = MetadataLocator::PhysicalDefaultCatalog(DatabaseInstance::GetDatabase(context));
 	}
 	auto info = DescribeCatalog(con, catalog);
 	if (!info.found) {
@@ -173,8 +174,13 @@ MetadataLocation MetadataLocator::Resolve(ClientContext &context, Connection &co
 	}
 	MetadataLocation location;
 	if (TryConfigured(context, con, location)) {
+		// External (DuckLake) view catalogs keep their marker in the physical default database.
+		auto marker_catalog = catalog;
+		if (!catalog.empty() && !IsNativeCatalog(con, catalog)) {
+			marker_catalog = PhysicalDefaultCatalog(DatabaseInstance::GetDatabase(context));
+		}
 		MetadataLocation marked;
-		if (!catalog.empty() && ReadMarker(con, catalog, marked) && !marked.Matches(location)) {
+		if (!marker_catalog.empty() && ReadMarker(con, marker_catalog, marked) && !marked.Matches(location)) {
 			throw CatalogException("OpenIVM metadata for catalog '%s' is recorded in %s, but openivm_metadata_catalog/"
 			                       "openivm_metadata_schema select %s. Reset the settings or migrate the metadata; "
 			                       "OpenIVM does not split one catalog's materialized views across metadata locations.",
@@ -385,6 +391,60 @@ int64_t SteadyNowNs() {
 	    .count();
 }
 
+// One client's row in the lease table of a PostgreSQL metadata catalog.
+struct LeaseRow {
+	string catalog;
+	string table;
+	string view_name;
+	string owner;
+	int64_t lease_seconds;
+};
+
+LeaseRow MakeLeaseRow(const MetadataLocation &location, const string &view_name, const string &owner,
+                      int64_t lease_seconds) {
+	return {location.catalog, location.Table(openivm::REFRESH_LEASE_TABLE), view_name, owner, lease_seconds};
+}
+
+// Lease times come from the PostgreSQL server clock, never from a client's: DuckDB
+// evaluates now() locally, so every lease timestamp is read through postgres_query.
+// All clients then compare and extend leases on one clock, and client clock skew cannot
+// make a live lease look expired. Returns an error, or SQL literals for the server's
+// current UTC time and that time plus the lease.
+string ReadServerClock(Connection &con, const LeaseRow &row, string &server_now, string &lease_until) {
+	auto remote_sql = "SELECT server_now, server_now + INTERVAL '" + to_string(row.lease_seconds) +
+	                  " seconds' FROM (SELECT clock_timestamp() AT TIME ZONE 'UTC' AS server_now) server_clock";
+	auto clock = con.Query("SELECT * FROM postgres_query(" + Value(row.catalog).ToSQLString() + ", " +
+	                       Value(remote_sql).ToSQLString() + ")");
+	if (clock->HasError()) {
+		return "could not read the PostgreSQL server clock: " + clock->GetError();
+	}
+	if (clock->RowCount() != 1 || clock->GetValue(0, 0).IsNull() || clock->GetValue(1, 0).IsNull()) {
+		return "the PostgreSQL server clock returned no time";
+	}
+	server_now = clock->GetValue(0, 0).DefaultCastAs(LogicalType::TIMESTAMP).ToSQLString();
+	lease_until = clock->GetValue(1, 0).DefaultCastAs(LogicalType::TIMESTAMP).ToSQLString();
+	return "";
+}
+
+// Extends the lease to the server clock (read after the caller's send time) plus the lease.
+// Returns an error, or sets `owned` when exactly one row, this owner's, was extended.
+string RenewLeaseRow(Connection &con, const LeaseRow &row, bool &owned) {
+	owned = false;
+	string server_now, lease_until;
+	auto error = ReadServerClock(con, row, server_now, lease_until);
+	if (!error.empty()) {
+		return error;
+	}
+	auto renewed = con.Query("UPDATE " + row.table + " SET lease_until = " + lease_until + " WHERE view_name = " +
+	                         Value(row.view_name).ToSQLString() + " AND owner = " + Value(row.owner).ToSQLString());
+	if (renewed->HasError()) {
+		return renewed->GetError();
+	}
+	owned = renewed->RowCount() == 1 && !renewed->GetValue(0, 0).IsNull() &&
+	        renewed->GetValue(0, 0).GetValue<int64_t>() == 1;
+	return "";
+}
+
 } // namespace
 
 struct RefreshLease::Heartbeat {
@@ -392,10 +452,15 @@ struct RefreshLease::Heartbeat {
 	std::condition_variable wake;
 	bool stop = false;
 	std::atomic<bool> lost {false};
-	// Steady-clock time (ns) after which this client stops writing data. Set from the send
-	// time of the last successful renewal, which precedes the server's lease_until
-	// computation, minus a third of the lease as margin for one in-flight statement.
+	// Steady-clock time (ns) after which this client stops writing data: the send time of
+	// the last successful renewal plus two thirds of the lease. The server reads its clock
+	// for lease_until after that send time, so on the server's clock the lease ends at
+	// least a third of the lease after this deadline (assuming the two clocks advance at
+	// comparable rates; their offsets do not matter).
 	std::atomic<int64_t> deadline_ns {0};
+	// Held by a renewal and by a fenced metadata transaction, so this client's own
+	// heartbeat never writes the lease row concurrently with its fence.
+	std::timed_mutex renew_lock;
 	std::thread thread;
 
 	void Stop() {
@@ -414,7 +479,7 @@ namespace {
 
 struct HeldLease {
 	string token;
-	string renewal_sql;
+	int64_t lease_seconds = 0;
 	idx_t depth = 0;
 	bool abandoned = false;
 	shared_ptr<RefreshLease::Heartbeat> heartbeat;
@@ -447,12 +512,12 @@ RefreshLease::RefreshLease(ClientContext &context, const MetadataLocation &locat
 		if (entry != registry.held.end()) {
 			entry->second.depth++;
 			token = entry->second.token;
-			renewal_sql = entry->second.renewal_sql;
+			lease_seconds = entry->second.lease_seconds;
 			heartbeat = entry->second.heartbeat;
 			return;
 		}
 	}
-	auto lease_seconds = MetadataLocator::LeaseSeconds(context);
+	lease_seconds = MetadataLocator::LeaseSeconds(context);
 	const int64_t lease_ns = lease_seconds * 1000000000LL;
 	const int64_t usable_ns = lease_ns - lease_ns / 3;
 	auto acquire_sent_ns = SteadyNowNs();
@@ -460,16 +525,23 @@ RefreshLease::RefreshLease(ClientContext &context, const MetadataLocation &locat
 	std::mt19937_64 generator((static_cast<uint64_t>(entropy()) << 32) ^ entropy() ^
 	                          static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()));
 	auto candidate = "openivm-" + to_string(generator()) + "-" + to_string(generator());
-	auto table = location.Table(openivm::REFRESH_LEASE_TABLE);
+	auto row = MakeLeaseRow(location, view_name, candidate, lease_seconds);
 	auto view_literal = Value(view_name).ToSQLString();
 	Connection con(db);
 	con.BeginTransaction();
-	auto result = con.Query("DELETE FROM " + table + " WHERE view_name = " + view_literal + " AND lease_until < " +
-	                        string(openivm::UTC_NOW_SQL));
+	string server_now, lease_until;
+	auto clock_error = ReadServerClock(con, row, server_now, lease_until);
+	if (!clock_error.empty()) {
+		con.Query("ROLLBACK");
+		throw IOException("Cannot refresh materialized view '%s': OpenIVM %s (metadata catalog %s)", view_name,
+		                  clock_error, location.DisplayName());
+	}
+	// Both the expiry check and the new deadline are server times.
+	auto result = con.Query("DELETE FROM " + row.table + " WHERE view_name = " + view_literal + " AND lease_until < " +
+	                        server_now);
 	if (!result->HasError()) {
-		result = con.Query("INSERT INTO " + table + " (view_name, owner, lease_until) VALUES (" + view_literal + ", " +
-		                   Value(candidate).ToSQLString() + ", " + string(openivm::UTC_NOW_SQL) + " + INTERVAL '" +
-		                   to_string(lease_seconds) + " seconds')");
+		result = con.Query("INSERT INTO " + row.table + " (view_name, owner, lease_until) VALUES (" + view_literal +
+		                   ", " + Value(candidate).ToSQLString() + ", " + lease_until + ")");
 	}
 	if (!result->HasError()) {
 		result = con.Query("COMMIT");
@@ -478,13 +550,14 @@ RefreshLease::RefreshLease(ClientContext &context, const MetadataLocation &locat
 	}
 	if (result->HasError()) {
 		string holder = "unknown";
-		auto current = con.Query("SELECT lease_until FROM " + table + " WHERE view_name = " + view_literal);
+		auto current = con.Query("SELECT lease_until FROM " + row.table + " WHERE view_name = " + view_literal);
 		if (!current->HasError() && current->RowCount() > 0 && !current->GetValue(0, 0).IsNull()) {
 			holder = current->GetValue(0, 0).ToString();
 		}
 		throw TransactionException("Materialized view '%s' is being refreshed by another OpenIVM client sharing "
-		                           "metadata catalog %s (lease held until %s UTC). Retry after that refresh finishes "
-		                           "or its lease expires (openivm_metadata_lease_seconds). Details: %s",
+		                           "metadata catalog %s (lease held until %s UTC, PostgreSQL server time). Retry "
+		                           "after that refresh finishes or its lease expires "
+		                           "(openivm_metadata_lease_seconds). Details: %s",
 		                           view_name, location.DisplayName(), holder, result->GetError());
 	}
 	token = candidate;
@@ -493,13 +566,10 @@ RefreshLease::RefreshLease(ClientContext &context, const MetadataLocation &locat
 	// Renew at a third of the lease, so a healthy holder's deadline stays at least a third
 	// of the lease ahead.
 	auto renew_every = std::chrono::milliseconds(MaxValue<int64_t>(1, lease_seconds * 1000 / 3));
-	renewal_sql = "UPDATE " + table + " SET lease_until = " + string(openivm::UTC_NOW_SQL) + " + INTERVAL '" +
-	              to_string(lease_seconds) + " seconds' WHERE view_name = " + view_literal +
-	              " AND owner = " + Value(token).ToSQLString();
-	auto renewal = renewal_sql;
+	row.owner = token;
 	auto database = db.shared_from_this();
 	auto state = heartbeat.get();
-	heartbeat->thread = std::thread([state, database, renewal, renew_every, usable_ns]() {
+	heartbeat->thread = std::thread([state, database, row, renew_every, usable_ns]() {
 		while (true) {
 			{
 				std::unique_lock<std::mutex> guard(state->lock);
@@ -511,11 +581,14 @@ RefreshLease::RefreshLease(ClientContext &context, const MetadataLocation &locat
 				return;
 			}
 			try {
+				// Waits while a fenced metadata transaction of this client is open.
+				std::lock_guard<std::timed_mutex> renewing(state->renew_lock);
 				auto sent_ns = SteadyNowNs();
 				Connection renew_con(*database);
-				auto renewed = renew_con.Query(renewal);
-				if (renewed->HasError() || renewed->RowCount() != 1 || renewed->GetValue(0, 0).IsNull() ||
-				    renewed->GetValue(0, 0).GetValue<int64_t>() != 1) {
+				bool owned = false;
+				auto error = RenewLeaseRow(renew_con, row, owned);
+				if (!error.empty() || !owned) {
+					OPENIVM_DEBUG_PRINT("[LEASE] Renewal failed: %s\n", error.empty() ? "not owned" : error.c_str());
 					state->lost = true;
 				} else {
 					state->deadline_ns = sent_ns + usable_ns;
@@ -527,7 +600,7 @@ RefreshLease::RefreshLease(ClientContext &context, const MetadataLocation &locat
 	});
 	HeldLease held;
 	held.token = token;
-	held.renewal_sql = renewal_sql;
+	held.lease_seconds = lease_seconds;
 	held.depth = 1;
 	held.heartbeat = heartbeat;
 	std::lock_guard<std::mutex> guard(registry.lock);
@@ -600,15 +673,30 @@ string RefreshLease::Fence(Connection &con) const {
 	}
 	// Reading the row would not conflict with a takeover committing before this
 	// transaction; writing it does (row lock, or a serialization failure).
-	auto fenced = con.Query(renewal_sql);
-	if (fenced->HasError()) {
-		return "OpenIVM could not confirm the refresh lease for '" + view_name + "': " + fenced->GetError();
+	bool owned = false;
+	auto error = RenewLeaseRow(con, MakeLeaseRow(location, view_name, token, lease_seconds), owned);
+	if (!error.empty()) {
+		return "OpenIVM could not confirm the refresh lease for '" + view_name + "': " + error;
 	}
-	if (fenced->RowCount() != 1 || fenced->GetValue(0, 0).IsNull() || fenced->GetValue(0, 0).GetValue<int64_t>() != 1) {
+	if (!owned) {
 		return "OpenIVM lost the refresh lease for '" + view_name +
 		       "' to another client; its watermark was not advanced and the next refresh recomputes it";
 	}
 	return "";
+}
+
+std::unique_lock<std::timed_mutex> RefreshLease::PauseRenewal() const {
+	if (!heartbeat) {
+		return std::unique_lock<std::timed_mutex>();
+	}
+	std::unique_lock<std::timed_mutex> pause(heartbeat->renew_lock, std::defer_lock);
+	// A renewal hung on an unreachable server must not block the refresh indefinitely.
+	// Without the pause a concurrent renewal can only make the fenced transaction fail
+	// (a serialization failure), never commit stale watermarks.
+	if (!pause.try_lock_for(std::chrono::seconds(MaxValue<int64_t>(1, lease_seconds / 3)))) {
+		OPENIVM_DEBUG_PRINT("[LEASE] Fencing %s while a renewal is still pending\n", view_name.c_str());
+	}
+	return pause;
 }
 
 void RefreshLease::SimulateTakeover(bool notice_locally) {

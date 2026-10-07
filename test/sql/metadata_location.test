@@ -231,6 +231,38 @@ SELECT count(*) FROM control.openivm.openivm_views;
 ----
 1
 
+# A rejected CREATE leaves no trace, not even the metadata schema it would have created.
+statement ok
+ATTACH ':memory:' AS tx_host;
+
+statement ok
+CREATE TABLE tx_host.main.tx_src (i INTEGER);
+
+statement ok
+SET openivm_metadata_schema = 'openivm_tx';
+
+statement ok
+BEGIN;
+
+statement error
+CREATE MATERIALIZED VIEW tx_host.main.tx_mv AS SELECT i, COUNT(*) AS c FROM tx_host.main.tx_src GROUP BY i;
+----
+cannot run inside an explicit transaction
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'control' AND schema_name = 'openivm_tx';
+----
+0
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+statement ok
+DETACH tx_host;
+
 # ==========================================
 # RENAME COLUMN of a tracked source rewrites view metadata through a helper connection,
 # so it cannot roll back with an explicit transaction that spans both databases
@@ -663,6 +695,13 @@ CREATE TABLE scratch (i INTEGER);
 statement ok
 DROP TABLE scratch;
 
+# ADD COLUMN of a tracked source only extends its delta table; it needs no metadata.
+statement ok
+ALTER TABLE orders ADD COLUMN note VARCHAR;
+
+statement ok
+SELECT note FROM openivm_delta_orders LIMIT 0;
+
 statement ok
 UPDATE orders SET amount = amount + 3 WHERE product = 'y';
 
@@ -679,6 +718,9 @@ SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
                               EXCEPT ALL SELECT * FROM product_sales));
 ----
 0
+
+statement ok
+ALTER TABLE orders DROP COLUMN note;
 
 # ==========================================
 # Reopen: the marker in the host catalog rediscovers the metadata location

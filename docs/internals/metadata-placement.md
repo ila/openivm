@@ -16,6 +16,8 @@ SET openivm_metadata_schema = 'openivm';   -- created on first use; default 'mai
 Placement is a property of the database, not of a session: two sessions using different
 locations would split one database's views. Plain `SET` therefore applies globally,
 `SET SESSION` is rejected, and helper connections and the refresh daemon see the value.
+An empty catalog with a schema other than `main` selects that schema in the physical
+default database (the one a new connection starts in), regardless of any session's `USE`.
 
 Supported metadata catalogs are attached native DuckDB databases and PostgreSQL databases
 attached with the `postgres` extension (`TYPE postgres`). Other catalog types are
@@ -43,6 +45,10 @@ Selecting a metadata location never moves data objects:
 | `openivm_delta_<source>` | next to the source table, so delta capture stays in the writer's transaction |
 | Internal tables of a view in an external catalog that is neither native nor DuckLake | the physical default database, `main` schema (unchanged) |
 | `openivm_metadata_location` marker | `main` schema of every native catalog that holds the view or a native source; for a view in an external (for example DuckLake) catalog, the physical default database |
+
+Loading the extension still creates the legacy, empty history, profile and dependency
+tables in `main` of the default database, before any setting can apply. With a selected
+location they stay empty, and the metadata is written only to that location.
 
 A materialized view cannot be created inside a remote (PostgreSQL) metadata catalog:
 CREATE fails with `remote OpenIVM metadata catalog`. Such a view would share its database
@@ -163,41 +169,52 @@ of relying on DuckDB defaults.
 
 Refreshes of one view are serialized across clients by `openivm_refresh_leases`:
 
-- A client inserts `(view_name, owner, lease_until)`; the primary key makes acquisition
-  atomic. Expired leases are deleted first. A losing client gets
-  `being refreshed by another OpenIVM client`.
+- **Server clock.** Every lease time is a PostgreSQL server time. DuckDB evaluates
+  `now()` on the client, so OpenIVM reads `clock_timestamp() AT TIME ZONE 'UTC'` and that
+  time plus L through `postgres_query` and writes those values; no client wall clock is
+  involved. Clients on different hosts compare and extend leases on the same clock, so
+  their clock offsets cannot make a live lease look expired.
+- A client reads the server time, deletes the view's lease if `lease_until` is before that
+  time, and inserts `(view_name, owner, server time + L)`, all in one transaction. The
+  primary key makes acquisition atomic. A losing client gets `being refreshed by another
+  OpenIVM client`.
 - While the refresh runs, a background thread renews the lease every third of
-  `openivm_metadata_lease_seconds` (L, default 600, minimum 1). Only a crashed or
-  partitioned client's lease can expire.
+  `openivm_metadata_lease_seconds` (L, default 600, minimum 1), again to server time + L.
+  Only a crashed or partitioned client's lease can expire.
 - **Local deadline.** A renewal that hangs never reports failure, so the client also keeps
   a monotonic-clock deadline: the send time of its last successful acquisition or renewal
-  plus two thirds of L. The send time precedes the server's `lease_until` computation, so
-  the deadline falls at least L/3 before the lease can expire on the server. Before the
-  data phase, before every data statement (DuckLake statements commit one by one) and
-  before a native data commit, the client stops with `stopped before writing more
-  materialized view data` once a renewal reported loss or the deadline passed. A healthy
-  holder's deadline always stays at least L/3 ahead.
+  plus two thirds of L. The server reads its clock for `lease_until` after that send time,
+  so measured on the server's clock the lease ends at least L/3 after the deadline. This
+  needs only that the client's monotonic clock and the server's clock advance at comparable
+  rates; their offsets do not matter. Before the data phase, before every data statement
+  (DuckLake statements commit one by one) and before a native data commit, the client
+  stops with `stopped before writing more materialized view data` once a renewal reported
+  loss or the deadline passed. A healthy holder's deadline always stays at least L/3 ahead.
 - **Fenced watermarks.** Step 3 (and retracting the marker after a clean data rollback)
-  first runs `UPDATE openivm_refresh_leases SET lease_until = ... WHERE view_name = ... AND
-  owner = <token>` inside the metadata transaction and fails unless exactly one row is
-  affected. Writing the row, rather than reading it, orders the commit against a takeover:
-  PostgreSQL either makes the takeover's `DELETE` wait for this transaction's row lock
-  (after which the extended lease no longer qualifies as expired, or the takeover gets a
-  serialization failure, so the takeover fails), or this `UPDATE` finds the row gone or
-  concurrently changed and fails (zero rows, or a serialization failure). Step 3 also fails
-  if `refresh_epoch` changed.
+  first runs `UPDATE openivm_refresh_leases SET lease_until = <server time + L> WHERE
+  view_name = ... AND owner = <token>` inside the metadata transaction and fails unless
+  exactly one row is affected. Writing the row, rather than reading it, orders the commit
+  against a takeover: PostgreSQL either makes the takeover's `DELETE` wait for this
+  transaction's row lock (after which the extended lease no longer qualifies as expired,
+  or the takeover gets a serialization failure, so the takeover fails), or this `UPDATE`
+  finds the row gone or concurrently changed and fails (zero rows, or a serialization
+  failure). Step 3 also fails if `refresh_epoch` changed. The client's own heartbeat waits
+  while a fenced transaction is open, so the two never write the lease row at the same
+  time and spuriously fail each other.
 - A client whose step 3 fails after committing data bumps `refresh_epoch` and sets the
   marker, so the next refresh recomputes even if another client cleared it meanwhile.
   Hooks and cascaded refreshes reuse the lease of the refresh that started them.
 - A crashed client leaves its lease. Other clients wait for it to expire, then take over
   and recover via full recompute.
 
-Remaining window: a takeover can begin only after the lease expired on the server, which
-is at least L/3 after this client's deadline (assuming the client's monotonic clock and
-the server's clock advance at comparable rates). Data written before the deadline is
-therefore committed before any takeover, and the new owner recomputes over it. Only a
-single data statement that starts before the deadline and is still running L/3 later can
-commit after a takeover. If that happens, its step 3 fails; when PostgreSQL is reachable,
+Remaining window: a takeover can begin only after the lease expired on the server's
+clock, which is at least L/3 after this client's deadline. Data written before the
+deadline is therefore committed before any takeover, and the new owner recomputes over
+it. The assumptions are that the client's monotonic clock and the server's clock advance
+at comparable rates, and that the server's clock is not stepped forward by more than L/3
+during a refresh (for example by a manual clock change; NTP slews small corrections).
+Within those assumptions, only a single data statement that starts before the deadline and
+is still running L/3 later can commit after a takeover. If that happens, its step 3 fails; when PostgreSQL is reachable,
 the client then marks the view for recomputation as above. When it is not, the error says
 `could not mark the view for recomputation`, and the view can stay wrong until it is
 repaired with a forced full refresh once the metadata catalog is reachable:
@@ -243,6 +260,9 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 | Legacy discovery unchanged; scheduler discovery of a configured location | `test/integration/scheduler_catalog_test.cpp` |
 | PostgreSQL metadata: placement, reopen, crash + abandoned lease, RENAME rejection and portable restore, CREATE inside the metadata catalog rejected, DROP, concurrent DuckLake clients without a local frontend file | `test/integration/test_remote_metadata.py` (CI: `.github/workflows/RemoteMetadata.yml`) |
 | Lease lost before the data phase, after the first DuckLake statement, and taken over before the watermark commit (fence) | `test/integration/test_remote_metadata.py` |
+| Lease times written from the PostgreSQL server clock; expiry judged on that clock (live 120 s ahead refuses, 1 s past takes over) | `test/integration/test_remote_metadata.py` |
+| Rejected CREATE in an explicit transaction creates no metadata schema; ADD COLUMN of a tracked source while the metadata catalog is detached | `test/sql/metadata_location.test` |
+| Settings contradicting the frontend marker of a DuckLake view | `test/sql/metadata_location_ducklake.test` |
 
 `openivm_test_fail_point` is a testing hook. `after_intent`, `before_data_commit` and
 `after_data_commit` simulate a process crash at a protocol step and run no compensation.
@@ -250,7 +270,9 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 expired) owner and make the client observe the loss, as its deadline would;
 `lease_lost_before_watermark` hands it over without local notice, so only the fence can
 stop the watermark commit. The concurrent row-lock ordering between a fence and a
-takeover relies on PostgreSQL semantics and is not reproduced deterministically.
+takeover relies on PostgreSQL semantics and is not reproduced deterministically. CI runs
+every client on one host, so clock offsets between hosts are not reproduced either; the
+test checks that lease times are server times instead.
 
 ## Compatibility claims
 

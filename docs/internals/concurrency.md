@@ -90,7 +90,7 @@ an interruption marker, the data and the watermarks in three transactions, and d
 consumed source deltas only after the watermarks commit. Any interruption leaves the
 marker set, so the next refresh recomputes. Explicit transactions that would need both
 databases are rejected. Clients sharing a PostgreSQL metadata schema also take a renewed
-per-view lease (`openivm_refresh_leases`), stop writing data once a local deadline a third
-of the lease before its expiry passes, and fence the watermark commit with a write to
-their lease row. See
+per-view lease (`openivm_refresh_leases`) whose times come from the PostgreSQL server
+clock, stop writing data once a local deadline a third of the lease before its expiry
+passes, and fence the watermark commit with a write to their lease row. See
 [metadata placement](metadata-placement.md) for the full protocol and its failure table.

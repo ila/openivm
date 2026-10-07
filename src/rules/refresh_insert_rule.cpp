@@ -546,7 +546,11 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			return; // not an IVM-tracked table
 		}
 		Connection con(*input.context.db);
-		RefreshMetadata::UseCatalog(input.context, con, source_locus.first);
+		// ADD COLUMN only alters the delta table and never touches metadata, so it also
+		// works while the metadata catalog is detached.
+		if (alter_info->alter_table_type != AlterTableType::ADD_COLUMN) {
+			RefreshMetadata::UseCatalog(input.context, con, source_locus.first);
+		}
 		TransactionalMVLockState::Get(input.context).AcquireMutationLock();
 
 		switch (alter_info->alter_table_type) {

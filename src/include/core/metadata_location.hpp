@@ -4,6 +4,8 @@
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 
+#include <mutex>
+
 namespace duckdb {
 
 namespace openivm {
@@ -95,7 +97,7 @@ public:
 // Mutual exclusion of refreshes across clients sharing a remote metadata catalog.
 // Native metadata is single-process (DuckDB file lock) and uses the mutation gate.
 // A live holder renews its lease in the background, so only a crashed or partitioned
-// client's lease can expire and be taken over.
+// client's lease can expire and be taken over. Lease times are PostgreSQL server times.
 class RefreshLease {
 public:
 	RefreshLease(ClientContext &context, const MetadataLocation &location, const string &view_name);
@@ -118,6 +120,9 @@ public:
 	// transaction or makes it fail. Returns an error unless exactly one row was owned.
 	// Always succeeds for native metadata.
 	string Fence(Connection &con) const;
+	// Holds back this client's background renewal; keep it from before Fence() until the
+	// fenced transaction commits or rolls back. Empty for native metadata.
+	std::unique_lock<std::timed_mutex> PauseRenewal() const;
 	// Leave the lease in place, as a crashed process would.
 	void Abandon();
 	// Test-only: another client took the lease over after it expired. `notice_locally`
@@ -132,8 +137,7 @@ private:
 	string view_name;
 	string key;
 	string token;
-	// UPDATE that extends this client's lease; affects one row while it is held.
-	string renewal_sql;
+	int64_t lease_seconds = 0;
 	shared_ptr<Heartbeat> heartbeat;
 };
 

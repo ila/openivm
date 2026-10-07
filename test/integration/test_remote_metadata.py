@@ -76,6 +76,24 @@ def bag_difference(view: str, query: str) -> str:
     )
 
 
+# Evaluated by PostgreSQL itself (through postgres_query/postgres_execute), never by DuckDB.
+PG_UTC_NOW = "(clock_timestamp() AT TIME ZONE 'UTC')"
+
+
+def pg_table(schema: str, table: str) -> str:
+    return f'"{schema}".{table}'
+
+
+def pg_query(sql: str) -> str:
+    return f"SELECT * FROM postgres_query('control', {sql_literal(sql)});\n"
+
+
+def set_server_lease(schema: str, offset: str) -> str:
+    """Moves the lease deadline relative to the PostgreSQL server clock."""
+    sql = f"UPDATE {pg_table(schema, 'openivm_refresh_leases')} SET lease_until = {PG_UTC_NOW} {offset}"
+    return f"CALL postgres_execute('control', {sql_literal(sql)});\n"
+
+
 def drop_schema(binary: Path, dsn: str, schema: str):
     Client(binary, dsn, schema, ":memory:", configure=False).run(
         f"CALL postgres_execute('control', {sql_literal('DROP SCHEMA IF EXISTS ' + chr(34) + schema + chr(34) + ' CASCADE')});\n"
@@ -198,13 +216,26 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
         )
         assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "1"
         assert client.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "true"
-        # Another client cannot refresh while the lease is live...
+        # Lease times are PostgreSQL server times: the abandoned lease ends one lease
+        # (default 600 s) after the server clock at acquisition, a few seconds ago.
+        assert (
+            client.value(
+                pg_query(
+                    f"SELECT lease_until BETWEEN {PG_UTC_NOW} + interval '540 seconds' AND {PG_UTC_NOW} + "
+                    f"interval '600 seconds' FROM {pg_table(schema, 'openivm_refresh_leases')}"
+                )
+            )
+            == "true"
+        ), "lease_until was not computed from the PostgreSQL server clock"
+        # Another client cannot refresh while the lease is live on the server clock...
         client.expect_error("PRAGMA refresh('sales');\n", "being refreshed by another OpenIVM client")
-        # ...and recovers once it expires, recomputing instead of replaying the deltas.
-        client.run(
-            f"UPDATE control.{schema}.openivm_refresh_leases SET lease_until = TIMESTAMP '2000-01-01';\n"
-            "PRAGMA refresh('sales');\n"
+        client.expect_error(
+            set_server_lease(schema, "+ interval '120 seconds'") + "PRAGMA refresh('sales');\n",
+            "being refreshed by another OpenIVM client",
         )
+        # ...and recovers once it expired on the server clock, recomputing instead of
+        # replaying the deltas.
+        client.run(set_server_lease(schema, "- interval '1 second'") + "PRAGMA refresh('sales');\n")
         assert client.value(bag_difference("sales", base)) == "0", "crash recovery double-applied or lost changes"
         assert client.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "false"
         assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0"

@@ -197,6 +197,25 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.event_count
 ----
 0
 
+# Settings that contradict the frontend marker name the recorded location instead of
+# looking for the view in the wrong place.
+statement ok
+ATTACH ':memory:' AS other_control;
+
+statement ok
+SET openivm_metadata_catalog = 'other_control';
+
+statement error
+PRAGMA refresh('dl.main.totals');
+----
+is recorded in control.openivm
+
+statement ok
+SET openivm_metadata_catalog = '';
+
+statement ok
+DETACH other_control;
+
 statement ok
 DROP VIEW dl.main.event_count;
 

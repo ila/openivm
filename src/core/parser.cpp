@@ -181,7 +181,15 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	Connection con(*context.db.get());
 	auto lifecycle_target = ResolveMaterializedViewTarget(context, parse_data_ref.target_name);
-	auto metadata_location = RefreshMetadata::UseCatalog(context, con, lifecycle_target.catalog_name);
+	auto metadata_location = MetadataLocator::Resolve(context, con, lifecycle_target.catalog_name);
+	if (parse_data_ref.alter_sql.empty()) {
+		// Metadata outside the view's database is committed separately from its data. The
+		// staged executor cannot join a caller transaction, so refuse rather than split it.
+		// Refuse before selecting the location, which may create the metadata schema.
+		MetadataLocator::RejectExplicitTransaction(context, metadata_location, lifecycle_target.catalog_name,
+		                                           "CREATE MATERIALIZED VIEW");
+	}
+	MetadataLocator::Use(con, metadata_location);
 	bool remote_metadata = metadata_location.explicit_placement && !metadata_location.IsNative();
 	struct CreateMVPreProfileStep {
 		string step_name;
@@ -265,10 +273,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	MetadataLocator::RequireWritable(metadata_location, "create materialized view");
 	MetadataLocator::ValidateExclusive(con, metadata_location);
-	// Metadata outside the view's database is committed separately from its data. The
-	// staged executor cannot join a caller transaction, so refuse rather than split it.
-	MetadataLocator::RejectExplicitTransaction(context, metadata_location, lifecycle_target.catalog_name,
-	                                           "CREATE MATERIALIZED VIEW");
 	// A view inside the remote metadata catalog would share its database with the
 	// metadata and skip the split protocol; that execution model is not validated.
 	if (metadata_location.explicit_placement && !metadata_location.catalog_type.empty() &&

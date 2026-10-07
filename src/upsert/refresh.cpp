@@ -225,6 +225,9 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			auto result = meta_con.Query(statements);
 			return result->HasError() ? result->GetError() : string();
 		}
+		// This client's heartbeat would conflict with the fence on the same lease row and
+		// spuriously fail one of them; hold it back until this transaction ends.
+		auto renewal_pause = lease.PauseRenewal();
 		meta_con.BeginTransaction();
 		// The fence writes the lease row first, so a takeover that commits before this
 		// transaction makes it fail instead of letting stale watermarks commit.

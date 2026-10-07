@@ -123,8 +123,11 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
     sharing a remote metadata schema serialize refreshes per view through a renewed lease,
     but changes that other processes write to DuckLake sources while a refresh runs are not
     pinned to the refresh's snapshot range.
-  - A client stops writing view data a third of `openivm_metadata_lease_seconds` before its
-    lease can expire. A single refresh statement running longer than that margin can still
+  - Lease times are PostgreSQL server times, so client clock offsets do not matter. A
+    client stops writing view data a third of `openivm_metadata_lease_seconds` before its
+    lease can expire on the server's clock. This assumes the server's clock is not stepped
+    forward by more than that margin during a refresh. A single refresh statement running
+    longer than the margin can still
     commit after another client took over; if PostgreSQL is then unreachable, the error says
     `could not mark the view for recomputation`, and the view must be repaired with a full
     refresh (`SET openivm_refresh_mode = 'full'`).
