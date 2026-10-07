@@ -110,6 +110,28 @@ SELECT count(*) FROM openivm_delta_orders;
 ----
 0
 
+# The compiled-SQL archive is metadata too: the committed CREATE and refresh programs
+# are stored in the selected location, never next to the data.
+query II
+SELECT count(*) FILTER (WHERE p.operation = 'create'), count(*) FILTER (WHERE p.operation = 'refresh')
+FROM control.openivm.openivm_compiled_programs p JOIN control.openivm.openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'product_sales' AND p.last_outcome = 'committed';
+----
+1	1
+
+query I
+SELECT count(*) > 0 FROM control.openivm.openivm_compiled_statements s
+JOIN control.openivm.openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'product_sales' AND s.operation = 'refresh';
+----
+true
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'openivm_metadata_host' AND starts_with(table_name, 'openivm_compiled_');
+----
+0
+
 # ==========================================
 # Profiling and refresh history are written to the metadata location
 # ==========================================
@@ -759,6 +781,20 @@ PRAGMA refresh('control.main.item_totals');
 
 statement ok
 COMMIT;
+
+# The archive joined the caller transaction in the selected schema: the rolled-back
+# refresh left no program, the committed one exactly one.
+query I
+SELECT count(*) FROM control.openivm.openivm_compiled_programs p JOIN control.openivm.openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'item_totals' AND p.operation = 'refresh' AND p.last_outcome = 'committed';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'control' AND schema_name = 'main'
+  AND starts_with(table_name, 'openivm_compiled_');
+----
+0
 
 query I
 SELECT (SELECT count(*) FROM (SELECT * FROM control.main.item_totals

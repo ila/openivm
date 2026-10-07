@@ -558,6 +558,25 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			cleanup_ddl.push_back(q.substr(strlen(OPENIVM_DDL_CLEANUP_PREFIX)));
 			continue;
 		}
+		if (StringUtil::StartsWith(q, OPENIVM_DDL_COMMITTED_ARCHIVE_PREFIX)) {
+			flush_pending();
+			// The program's effects have committed and cannot be cleaned up; record its
+			// archive in one metadata transaction and never report success without it.
+			auto archived = conn->Query("BEGIN TRANSACTION;\n" +
+			                            q.substr(strlen(OPENIVM_DDL_COMMITTED_ARCHIVE_PREFIX)) + ";\nCOMMIT");
+			if (archived->HasError()) {
+				if (!conn->context->transaction.IsAutoCommit()) {
+					conn->Rollback();
+				}
+				profiler.AddTotal();
+				profiler.Flush(db);
+				restore_outer_transaction();
+				throw CatalogException("CREATE OR REPLACE MATERIALIZED VIEW committed, but OpenIVM could not archive "
+				                       "its compiled SQL: " +
+				                       archived->GetError());
+			}
+			continue;
+		}
 		pending_ddl.push_back(q);
 	}
 	flush_pending();
@@ -904,6 +923,38 @@ void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChun
 	state.finished = true;
 }
 
+vector<string> RenderTransactionalStatement(const string &statement) {
+	if (StringUtil::StartsWith(statement, OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
+		bool replace = false;
+		string delta_table;
+		string data_table;
+		ParseCreateDeltaFromDataPayload(statement.substr(strlen(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)), replace,
+		                                delta_table, data_table);
+		if (delta_table.empty() || data_table.empty()) {
+			throw InternalException("Malformed OpenIVM delta-schema operation");
+		}
+		return {string(replace ? "CREATE OR REPLACE TABLE " : "CREATE TABLE ") + delta_table +
+		            " AS SELECT *, 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", now()::TIMESTAMP AS " +
+		            string(openivm::TIMESTAMP_COL) + " FROM " + data_table + " LIMIT 0",
+		        "ALTER TABLE " + delta_table + " ALTER " + string(openivm::MULTIPLICITY_COL) + " SET DEFAULT 1",
+		        "ALTER TABLE " + delta_table + " ALTER " + string(openivm::TIMESTAMP_COL) + " SET DEFAULT now()"};
+	}
+	try {
+		Parser parser;
+		parser.ParseQuery(statement);
+		if (parser.statements.size() == 1 && parser.statements[0]->type == StatementType::DROP_STATEMENT) {
+			auto &drop = parser.statements[0]->Cast<DropStatement>();
+			if (drop.info->type == CatalogType::VIEW_ENTRY) {
+				return {BuildDropViewStatement(*drop.info)};
+			}
+		}
+	} catch (std::exception &) {
+		// The normal DuckDB parser will produce the authoritative error when the
+		// transactional program is executed.
+	}
+	return {statement};
+}
+
 string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog,
                               const string &metadata_schema) {
 	struct ProfileRow {
@@ -983,42 +1034,11 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 			}
 			continue;
 		}
-		if (StringUtil::StartsWith(statement, OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
-			bool replace = false;
-			string delta_table;
-			string data_table;
-			ParseCreateDeltaFromDataPayload(statement.substr(strlen(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)),
-			                                replace, delta_table, data_table);
-			if (delta_table.empty() || data_table.empty()) {
-				throw InternalException("Malformed OpenIVM delta-schema operation");
-			}
-			append_statement(string(replace ? "CREATE OR REPLACE TABLE " : "CREATE TABLE ") + delta_table +
-			                 " AS SELECT *, 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) +
-			                 ", now()::TIMESTAMP AS " + string(openivm::TIMESTAMP_COL) + " FROM " + data_table +
-			                 " LIMIT 0");
-			append_statement(
-			    "ALTER TABLE " + delta_table + " ALTER " + string(openivm::MULTIPLICITY_COL) + " SET DEFAULT 1", false);
-			append_statement("ALTER TABLE " + delta_table + " ALTER " + string(openivm::TIMESTAMP_COL) +
-			                     " SET DEFAULT now()",
-			                 false);
-			continue;
+		auto rendered = RenderTransactionalStatement(statement);
+		for (idx_t i = 0; i < rendered.size(); i++) {
+			// Delta-schema defaults are part of their CREATE TABLE step.
+			append_statement(rendered[i], i == 0);
 		}
-
-		try {
-			Parser parser;
-			parser.ParseQuery(statement);
-			if (parser.statements.size() == 1 && parser.statements[0]->type == StatementType::DROP_STATEMENT) {
-				auto &drop = parser.statements[0]->Cast<DropStatement>();
-				if (drop.info->type == CatalogType::VIEW_ENTRY) {
-					append_statement(BuildDropViewStatement(*drop.info));
-					continue;
-				}
-			}
-		} catch (std::exception &) {
-			// The normal DuckDB parser will produce the authoritative error when the
-			// transactional program is executed.
-		}
-		append_statement(statement);
 	}
 	if (profile_enabled) {
 		finish_profile_marker();

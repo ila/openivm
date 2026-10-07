@@ -16,6 +16,9 @@ static constexpr const char *OPENIVM_DDL_PROFILE_PREFIX = "openivm_profile:";
 static constexpr const char *OPENIVM_DDL_PROFILE_RECORD_PREFIX = "openivm_profile_record:";
 static constexpr const char *OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX = "openivm_create_delta_from_data:";
 static constexpr const char *OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX = "openivm_snapshot_publication:";
+// Compiled-SQL archive batch that runs after a staged program's effects committed and
+// no cleanup applies; a failure is reported as committed-but-not-archived.
+static constexpr const char *OPENIVM_DDL_COMMITTED_ARCHIVE_PREFIX = "openivm_committed_archive:";
 static constexpr const char *OPENIVM_TRANSACTIONAL_DDL_FUNCTION = "openivm_transactional_ddl";
 static constexpr const char *OPENIVM_STAGED_DDL_FUNCTION = "openivm_staged_ddl";
 
@@ -50,6 +53,9 @@ void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result,
                                 DDLExecutionMode mode = DDLExecutionMode::STAGED_CROSS_CATALOG);
 string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog,
                               const string &metadata_schema);
+// The caller-transaction SQL for one compiled lifecycle statement (excluding profile
+// and cleanup markers, which RenderTransactionalDDL handles itself).
+vector<string> RenderTransactionalStatement(const string &statement);
 void ExecuteStagedDDL(ClientContext &context, const vector<Value> &parameters);
 string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace);
 string BuildDropViewStatement(const DropInfo &drop_info);

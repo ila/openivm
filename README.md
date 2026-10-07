@@ -186,13 +186,15 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
   and set `openivm_files_path` before CREATE or refresh. Then call
   `PRAGMA openivm_files('dl.observation.product_summary')` to inspect exact paths.
   This pragma reports files; it does not generate them.
-- **Can compiled SQL be stored in a table?** Yes: select from
-  `openivm_compile_with_facts` into your own table. Automatic archival in OpenIVM
-  metadata is not implemented. Compiled SQL contains state-specific cutoffs;
-  compile again for later refreshes.
+- **Can compiled SQL be stored in a table?** It is archived automatically: every
+  CREATE and executed refresh program is kept in `openivm_compiled_programs` and
+  `openivm_compiled_statements`, with a new version only when the SQL changes. File
+  export stays independent. Compiled SQL contains state-specific cutoffs; it is an
+  inspection record, not a reusable refresh procedure.
 
 See [schema and metadata examples](docs/ducklake.md#schemas-metadata-and-internal-tables),
 [exporting and inspecting SQL files](docs/build/building.md#inspect-the-generated-sql),
+[the compiled SQL archive](docs/build/building.md#archived-compiled-sql),
 and [saving compiled SQL as rows](docs/build/building.md#inspect-or-save-compiled-sql-without-files).
 
 ## Documentation

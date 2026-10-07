@@ -111,6 +111,28 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
             )
             == "1"
         ), "backing table moved with the metadata"
+        # The compiled-SQL archive is metadata too: committed CREATE and refresh programs
+        # are stored in the remote schema, never in the host database.
+        assert (
+            client.value(
+                f"SELECT count(DISTINCT operation) FROM control.{schema}.openivm_compiled_programs "
+                "WHERE last_outcome = 'committed';"
+            )
+            == "2"
+        ), "compiled programs were not archived in the remote metadata schema"
+        assert (
+            client.value(
+                f"SELECT count(*) > 0 FROM control.{schema}.openivm_compiled_statements WHERE operation = 'refresh';"
+            )
+            == "true"
+        )
+        assert (
+            client.value(
+                "SELECT count(*) FROM duckdb_tables() WHERE database_name = 'host' "
+                "AND starts_with(table_name, 'openivm_compiled_');"
+            )
+            == "0"
+        ), "compiled-SQL archive leaked into the host database"
 
         client.expect_error(
             "BEGIN;\nINSERT INTO orders VALUES (7, 'd', 7);\nPRAGMA refresh('sales');\n",
@@ -211,6 +233,14 @@ def ducklake_concurrency_scenario(binary: Path, dsn: str, root: Path):
             assert checker.value(bag_difference(view, base)) == "0", f"round {round_index}: concurrent refresh diverged"
             assert checker.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0"
             assert checker.value(f"SELECT bool_or(refresh_in_progress) FROM control.{schema}.openivm_views;") == "false"
+        # Staged DuckLake CREATE and refreshes archive their programs in the remote schema.
+        assert (
+            client().value(
+                f"SELECT count(DISTINCT operation) FROM control.{schema}.openivm_compiled_programs "
+                "WHERE committed_count > 0;"
+            )
+            == "2"
+        ), "DuckLake programs were not archived in the remote metadata schema"
     finally:
         drop_schema(binary, dsn, schema)
 

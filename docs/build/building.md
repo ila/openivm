@@ -200,6 +200,67 @@ that skips empty deltas may not compile a new file. Setting the path after CREAT
 does not retroactively create the setup files; do not replace an existing MV just
 to obtain an inspection file.
 
+### Archived compiled SQL
+
+OpenIVM always archives the programs it runs for `CREATE MATERIALIZED VIEW` and
+refresh in two tables next to the view's `openivm_views` metadata (for DuckLake
+views, the native frontend database's `main` schema), independently of
+`openivm_files_path`:
+
+```sql
+SELECT view_catalog, view_schema, view_sql_name, operation, version,
+       statement_count, last_outcome, committed_count
+FROM openivm_compiled_programs ORDER BY view_name, operation, version;
+
+SELECT s.stmt_order, s.sql
+FROM openivm_compiled_statements s
+JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'regional_totals' AND p.operation = 'refresh'
+  AND p.version = (SELECT max(version) FROM openivm_compiled_programs
+                   WHERE view_name = p.view_name AND operation = 'refresh')
+ORDER BY s.stmt_order;
+```
+
+- **Identity.** `view_name` is the internal key also used by `openivm_views`;
+  `view_catalog`, `view_schema` and `view_sql_name` give the qualified MV name.
+  `operation` is `create` or `refresh`. `compilation_id` identifies the operation that
+  first stored a version; `last_compilation_id` is the latest operation that ran
+  the same program. For refreshes this is the `refresh_id` in
+  `openivm_refresh_profile` when profiling is enabled.
+- **Versions.** A program is the complete statement list, in execution order. A
+  new version is stored only when that list differs from the view's latest stored
+  version for the same operation. The comparison is exact: delta cutoffs, snapshot
+  IDs and catalog references are not normalized away. A refresh inside an explicit
+  transaction, for example, stamps its own timestamp, and DuckLake refreshes embed
+  snapshot IDs, so these usually store a new version. Refreshes skipped because
+  deltas are empty compile nothing and store nothing.
+- **Outcomes.** `last_outcome` describes the latest operation that ran the version:
+  `committed` (its transaction committed), `attempted` (it failed and rolled back,
+  so nothing was committed) or `unknown` (a cross-catalog refresh failed after data
+  statements ran, or `COMMIT` itself failed, so some effects may have committed).
+  `committed_count` counts committed runs. Compile-only calls such as
+  `openivm_compile_with_facts` are never archived, so a stored program has always
+  been executed.
+- **Transactions.** Native CREATE and refresh write the archive in their own
+  transaction, so it is visible only if they commit. A failed or rolled-back
+  operation in an explicit transaction leaves no row. An autocommit refresh that
+  fails is recorded as `attempted` (or `unknown`) in a separate metadata
+  transaction. DuckLake data cannot share a transaction with native metadata, so
+  cross-catalog refreshes are recorded in one metadata transaction after they commit.
+- **Archive failures.** OpenIVM does not report success if the archive cannot be
+  written. For native operations the archive write is part of the transaction, so
+  a failed write rolls back the CREATE or refresh with an error. If a
+  cross-catalog refresh or DuckLake `CREATE OR REPLACE` commits but its archive
+  write fails, it returns an error that says it committed. If recording a failed refresh also fails, both
+  errors are reported.
+- **Retention.** All versions are kept until you delete them. History survives
+  `DROP VIEW` and `CREATE OR REPLACE`, and a recreated view continues the same
+  version sequence. To prune, delete matching
+  `(view_name, operation, version)` rows from both tables.
+
+Archived SQL is for inspection and auditing. Later refreshes always compile against
+current state; do not run an archived program to refresh a view.
+
 ### Inspect or save compiled SQL without files
 
 The compiler also returns SQL as rows. This works without `openivm_files_path`:
@@ -217,7 +278,7 @@ SELECT * FROM openivm_compile_with_facts(
 
 This compiles a refresh without executing it or consuming the pending changes.
 The saved table is an ordinary user table, not automatically maintained OpenIVM
-metadata. The generated program depends on current state, including delta cutoffs
+metadata, and compile-only calls do not add to the compiled SQL archive. The generated program depends on current state, including delta cutoffs
 and snapshot IDs. Compile again for a later refresh; do not treat an old saved
 program as a reusable refresh procedure. Use `PRAGMA refresh` for normal execution.
 

@@ -2,7 +2,8 @@
 
 OpenIVM stores its control state in metadata tables: definitions (`openivm_views`),
 sources and watermarks (`openivm_delta_tables`), dependencies, refresh hooks, refresh
-history and refresh profiles. By default these tables live in the `main` schema of each
+history, refresh profiles and the compiled-SQL archive (`openivm_compiled_programs`,
+`openivm_compiled_statements`). By default these tables live in the `main` schema of each
 native view catalog, or of the default database for external (DuckLake) view catalogs.
 Two settings select one explicit location instead:
 
@@ -24,9 +25,12 @@ Code: `src/include/core/metadata_location.hpp` defines `MetadataLocation` and
 `MetadataLocator`. Every metadata read and write resolves its location there:
 `RefreshMetadata::UseCatalog` selects it on helper connections, and every generated
 statement that names a metadata table qualifies it with the resolved catalog **and**
-schema. Features that persist more metadata, such as the compiled-SQL archive (#83) and a
-dedicated internal schema (#82), should take their catalog and schema from
-`MetadataLocator::Resolve`, not assume `main`.
+schema. The compiled-SQL archive (#83) follows the same rule: native refreshes write it
+in their data transaction, transactional refreshes in the caller's transaction, and
+cross-catalog or remote refreshes in one metadata transaction after the refresh committed,
+always in the resolved catalog and schema. Its writes avoid `INSERT OR IGNORE`/`REPLACE`
+so they also run on PostgreSQL. Further metadata, such as a dedicated internal schema
+(#82), should take its catalog and schema from `MetadataLocator::Resolve`, not assume `main`.
 
 ## Placement rules
 

@@ -5,6 +5,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "core/parser_create_mv_helpers.hpp"
 
+#include "core/compiled_sql_archive.hpp"
 #include "core/metadata_location.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
@@ -210,6 +211,10 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 	              " step_order integer, step_name varchar, duration_ms bigint, "
 	              "detail varchar,"
 	              " primary key(refresh_id, step_order))");
+	// Compiled CREATE/REFRESH program archive (always on).
+	for (auto &statement : CompiledSQLArchiveSchemaDDL()) {
+		ddl.push_back(statement);
+	}
 }
 
 template <class BUILD_DDL>
@@ -255,11 +260,11 @@ static void InitializeSharedDDL(ClientContext &context, Connection &con, const s
 void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema,
                           bool remote) {
 	string probe = "SELECT v.view_sql_name, v.pending_after_hook, d.source_table_id, h.mode, "
-	               "r.strategy, p.step_order, dep.edge_kind" +
+	               "r.strategy, p.step_order, dep.edge_kind, cp.last_outcome, cs.sql" +
 	               string(remote ? ", v.refresh_epoch, l.owner" : "") +
 	               " FROM openivm_views v, openivm_delta_tables d, "
 	               "openivm_refresh_hooks h, openivm_refresh_history r, openivm_refresh_profile p, "
-	               "openivm_mv_dependencies dep" +
+	               "openivm_mv_dependencies dep, openivm_compiled_programs cp, openivm_compiled_statements cs" +
 	               string(remote ? ", " + string(openivm::REFRESH_LEASE_TABLE) + " l" : "") + " LIMIT 0";
 	InitializeSharedDDL(context, con, probe,
 	                    [&](vector<string> &ddl) { AppendMetadataSchemaDDL(context, catalog, schema, ddl, remote); });
