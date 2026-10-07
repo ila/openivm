@@ -110,9 +110,10 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
 
 - **Separately placed metadata** (`openivm_metadata_catalog` in another database than the
   view; see [metadata placement](internals/metadata-placement.md)):
-  - CREATE, REFRESH, DROP VIEW and DROP TABLE ... CASCADE are rejected inside explicit
-    transactions, because DuckDB cannot commit two databases atomically. Run them in
-    autocommit mode, or keep the metadata schema in the view's own database.
+  - CREATE, REFRESH, DROP VIEW, DROP TABLE ... CASCADE and RENAME COLUMN of a source that
+    views depend on are rejected inside explicit transactions, because DuckDB cannot commit
+    two databases atomically. Run them in autocommit mode, or keep the metadata schema in
+    the view's own database.
   - A refresh interrupted between its data and watermark commits makes the next refresh a
     full recompute.
   - A database that already has views registered in another location cannot adopt a
@@ -122,6 +123,12 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
     sharing a remote metadata schema serialize refreshes per view through a renewed lease,
     but changes that other processes write to DuckLake sources while a refresh runs are not
     pinned to the refresh's snapshot range.
+  - A client stops writing view data a third of `openivm_metadata_lease_seconds` before its
+    lease can expire. A single refresh statement running longer than that margin can still
+    commit after another client took over; if PostgreSQL is then unreachable, the error says
+    `could not mark the view for recomputation`, and the view must be repaired with a full
+    refresh (`SET openivm_refresh_mode = 'full'`).
+  - Materialized views cannot be created inside a PostgreSQL metadata catalog.
   - The view-matching signature columns are not stored in remote metadata catalogs.
 
 - **Refresh in a multi-statement query string.** `PRAGMA refresh` resolves view metadata

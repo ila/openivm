@@ -232,6 +232,90 @@ SELECT count(*) FROM control.openivm.openivm_views;
 1
 
 # ==========================================
+# RENAME COLUMN of a tracked source rewrites view metadata through a helper connection,
+# so it cannot roll back with an explicit transaction that spans both databases
+# ==========================================
+
+statement ok
+BEGIN;
+
+statement error
+ALTER TABLE orders RENAME COLUMN amount TO amt;
+----
+cannot run inside an explicit transaction
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views WHERE sql_string LIKE '%amt%';
+----
+0
+
+# A rename that fails after the metadata rewrite restores the snapshot: `id` exists, so the
+# ALTER fails once the stored view SQL was already rewritten and committed.
+statement error
+ALTER TABLE orders RENAME COLUMN amount TO id;
+
+statement ok
+INSERT INTO orders VALUES (30, 'a', 3), (31, 'r', 31);
+
+statement ok
+DELETE FROM orders WHERE id = 31;
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+# In autocommit mode the rename and its metadata rewrite both take effect.
+statement ok
+ALTER TABLE orders RENAME COLUMN amount TO amt;
+
+statement ok
+INSERT INTO orders VALUES (32, 'a', 32), (33, 'r', 33);
+
+statement ok
+UPDATE orders SET amt = amt + 1 WHERE id = 30;
+
+statement ok
+DELETE FROM orders WHERE id = 30;
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amt), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amt), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+statement ok
+ALTER TABLE orders RENAME COLUMN amt TO amount;
+
+statement ok
+DELETE FROM orders WHERE id IN (32, 33);
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+# ==========================================
 # Crash recovery: a crash at any protocol step leaves the interruption marker set,
 # and the next refresh recomputes instead of losing or re-applying changes. The
 # dependent view checks that recovery still hands every change downstream exactly once.
@@ -571,6 +655,13 @@ statement error
 PRAGMA refresh('product_sales');
 ----
 is not attached
+
+# Tables OpenIVM does not track never need the metadata catalog.
+statement ok
+CREATE TABLE scratch (i INTEGER);
+
+statement ok
+DROP TABLE scratch;
 
 statement ok
 UPDATE orders SET amount = amount + 3 WHERE product = 'y';

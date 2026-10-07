@@ -13,7 +13,7 @@ constexpr const char *METADATA_CATALOG_SETTING = "openivm_metadata_catalog";
 constexpr const char *METADATA_SCHEMA_SETTING = "openivm_metadata_schema";
 // Refresh lease duration for remote (shared) metadata catalogs.
 constexpr const char *METADATA_LEASE_SETTING = "openivm_metadata_lease_seconds";
-// Test-only crash injection for the split metadata/data refresh protocol.
+// Test-only crash and lease-takeover injection for the split metadata/data refresh protocol.
 constexpr const char *TEST_FAIL_POINT_SETTING = "openivm_test_fail_point";
 // Durable pointer, stored in <data catalog>.main, to the metadata location that owns
 // the OpenIVM objects of that catalog. Read on every resolution so a reopened
@@ -81,6 +81,8 @@ public:
 	// Test-only crash injection: throws SimulatedCrashException when
 	// openivm_test_fail_point equals `point`.
 	static void FailPoint(ClientContext &context, const string &point);
+	// Test-only: whether openivm_test_fail_point equals `point`.
+	static bool TestPoint(ClientContext &context, const string &point);
 };
 
 // Raised by a test fail point. Handlers must not run compensation for it: a crashed
@@ -102,14 +104,25 @@ public:
 	bool Active() const {
 		return !token.empty();
 	}
-	// The renewal found the lease taken over or could not reach the metadata catalog
-	// before the lease would have expired.
+	// A renewal found the lease taken over or failed.
 	bool Lost() const;
-	// A statement that fails the enclosing metadata transaction unless this client still
-	// holds the lease. Empty for native metadata.
-	string FenceSQL() const;
+	// Lost, or the local deadline passed: the last successful renewal was sent more than
+	// two thirds of the lease ago, so another client may take over soon. A hung renewal
+	// never reports back; only this deadline detects it.
+	bool Expired() const;
+	// Throws unless this client may still write materialized view data under the lease.
+	// Called before the data phase, before every data statement and before data commit.
+	void Require(const string &display_name) const;
+	// Runs inside the caller's open metadata transaction, before its other statements.
+	// Writes this client's lease row, so a concurrent takeover either waits for that
+	// transaction or makes it fail. Returns an error unless exactly one row was owned.
+	// Always succeeds for native metadata.
+	string Fence(Connection &con) const;
 	// Leave the lease in place, as a crashed process would.
 	void Abandon();
+	// Test-only: another client took the lease over after it expired. `notice_locally`
+	// also makes this client observe the loss, as its deadline would.
+	void SimulateTakeover(bool notice_locally);
 
 	struct Heartbeat;
 
@@ -119,6 +132,8 @@ private:
 	string view_name;
 	string key;
 	string token;
+	// UPDATE that extends this client's lease; affects one row while it is held.
+	string renewal_sql;
 	shared_ptr<Heartbeat> heartbeat;
 };
 

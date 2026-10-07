@@ -104,9 +104,11 @@ SET openivm_metadata_schema = 'openivm';
 CREATE MATERIALIZED VIEW dl.main.product_summary AS ...;
 ```
 
-Backing and delta tables still live in the lake. DuckLake catalogs hold no location
-marker, so a process with an in-memory frontend sets these two settings at startup,
-before refreshing. DuckDB cannot commit the lake and the metadata catalog in one
+Backing and delta tables still live in the lake. DuckLake catalogs cannot hold the
+location marker, so OpenIVM records it in the frontend database: a persistent frontend
+file finds the metadata again after reopening, while a process with an in-memory
+frontend sets these two settings at startup, before refreshing. Views cannot be created
+inside a PostgreSQL metadata catalog. DuckDB cannot commit the lake and the metadata catalog in one
 transaction, so refresh uses a crash-safe three-step protocol, and lifecycle statements
 and refreshes inside explicit transactions are rejected for these views. PostgreSQL
 metadata is validated only against a local PostgreSQL 16 in CI, not against managed

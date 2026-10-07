@@ -1,0 +1,209 @@
+# name: test/sql/metadata_location_ducklake.test
+# description: DuckLake materialized views with OpenIVM metadata in a configured native catalog (#84): frontend marker, reopen discovery and crash recovery
+# group: [sql]
+
+require openivm
+
+require parquet
+
+load __TEST_DIR__/openivm_metadata_dl_host.db
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_dl_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_dl_control.db' AS control;
+
+statement ok
+SET openivm_metadata_catalog = 'control';
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+statement ok
+CREATE TABLE dl.main.events (id INTEGER, k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.main.events SELECT i, i % 4, i FROM range(40) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.totals AS SELECT k, SUM(v) AS s, COUNT(*) AS c FROM dl.main.events GROUP BY k;
+
+query III
+SELECT view_sql_name, view_catalog, view_schema FROM control.openivm.openivm_views;
+----
+totals	dl	main
+
+# The backing table stays next to the view in DuckLake; no metadata lands in the frontend.
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'openivm_metadata_dl_host' AND table_name IN ('openivm_views', 'openivm_delta_tables');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dl' AND starts_with(table_name, 'openivm_data_');
+----
+1
+
+# DuckLake cannot hold the marker; the frontend database, the legacy metadata candidate
+# for external view catalogs, records the location instead.
+query II
+SELECT metadata_catalog, metadata_schema FROM openivm_metadata_dl_host.main.openivm_metadata_location;
+----
+control	openivm
+
+statement ok
+INSERT INTO dl.main.events SELECT i, i % 6, i FROM range(100, 130) t(i);
+
+statement ok
+DELETE FROM dl.main.events WHERE id % 7 = 0;
+
+statement ok
+UPDATE dl.main.events SET v = v + 1 WHERE k = 1;
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+# ==========================================
+# Crash after the DuckLake data commit, before the watermarks: the next refresh
+# recomputes instead of re-applying the same snapshots
+# ==========================================
+
+statement ok
+INSERT INTO dl.main.events SELECT i, i % 5, i FROM range(200, 220) t(i);
+
+statement ok
+DELETE FROM dl.main.events WHERE k = 2;
+
+statement ok
+UPDATE dl.main.events SET v = v * 2 WHERE k = 3;
+
+statement ok
+SET openivm_test_fail_point = 'after_data_commit';
+
+statement error
+PRAGMA refresh('dl.main.totals');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'totals';
+----
+true
+
+statement ok
+INSERT INTO dl.main.events VALUES (300, 9, 9);
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+# ==========================================
+# Reopen without settings: the frontend marker finds control.openivm, and new DuckLake
+# views register there instead of splitting the metadata
+# ==========================================
+
+statement ok
+INSERT INTO dl.main.events SELECT i, i % 3, i FROM range(400, 410) t(i);
+
+restart
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_dl_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_dl_control.db' AS control;
+
+query II
+SELECT current_setting('openivm_metadata_catalog'), current_setting('openivm_metadata_schema');
+----
+(empty)	main
+
+statement ok
+DELETE FROM dl.main.events WHERE id = 401;
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.event_count AS SELECT COUNT(*) AS n, SUM(v) AS s FROM dl.main.events;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views WHERE view_sql_name IN ('totals', 'event_count');
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'openivm_metadata_dl_host' AND table_name = 'openivm_views';
+----
+0
+
+statement ok
+INSERT INTO dl.main.events VALUES (500, 1, 50), (501, 2, 51);
+
+statement ok
+DELETE FROM dl.main.events WHERE id = 500;
+
+statement ok
+PRAGMA refresh('dl.main.event_count');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.event_count
+                              EXCEPT ALL SELECT COUNT(*), SUM(v) FROM dl.main.events))
+     + (SELECT count(*) FROM (SELECT COUNT(*), SUM(v) FROM dl.main.events
+                              EXCEPT ALL SELECT * FROM dl.main.event_count));
+----
+0
+
+statement ok
+DROP VIEW dl.main.event_count;
+
+statement ok
+DROP VIEW dl.main.totals;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views;
+----
+0

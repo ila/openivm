@@ -139,6 +139,52 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
             "cannot run inside an explicit transaction",
         )
 
+        # A view inside the remote metadata catalog would bypass the split protocol.
+        client.expect_error(
+            f"CREATE MATERIALIZED VIEW control.{schema}.misplaced AS SELECT product, COUNT(*) AS c FROM orders GROUP BY product;\n",
+            "remote OpenIVM metadata catalog",
+        )
+        assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_views;") == "1"
+
+        # RENAME COLUMN rewrites remote view metadata through a helper connection, so an
+        # explicit transaction cannot roll it back and is refused...
+        client.expect_error(
+            "BEGIN;\nALTER TABLE orders RENAME COLUMN amount TO amt;\n",
+            "cannot run inside an explicit transaction",
+        )
+        assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_views WHERE sql_string LIKE '%amt%';") == "0"
+        # ...and a rename that fails after the rewrite committed restores the remote rows
+        # with DELETE + INSERT (PostgreSQL has no INSERT OR REPLACE).
+        failed = client.run("ALTER TABLE orders RENAME COLUMN amount TO id;\n", check=False)
+        assert failed.returncode != 0, "renaming onto an existing column must fail"
+        assert "could not restore" not in failed.stdout + failed.stderr, failed.stdout + failed.stderr
+        client.run("INSERT INTO orders VALUES (20, 'a', 20), (21, 'r', 21);\nDELETE FROM orders WHERE id = 21;\nPRAGMA refresh('sales');\n")
+        assert client.value(bag_difference("sales", base)) == "0", "failed rename left rewritten remote metadata"
+        renamed = "SELECT product, SUM(amt), COUNT(*) FROM orders GROUP BY product"
+        client.run(
+            "ALTER TABLE orders RENAME COLUMN amount TO amt;\nINSERT INTO orders VALUES (22, 'a', 22);\n"
+            "UPDATE orders SET amt = amt + 1 WHERE id = 20;\nPRAGMA refresh('sales');\n"
+        )
+        assert client.value(bag_difference("sales", renamed)) == "0", "refresh after a remote rename diverged"
+        client.run("ALTER TABLE orders RENAME COLUMN amt TO amount;\nDELETE FROM orders WHERE id IN (20, 22);\nPRAGMA refresh('sales');\n")
+        assert client.value(bag_difference("sales", base)) == "0"
+
+        # Another client takes the lease over just before the watermark commit. The fence
+        # writes the owned lease row, finds it gone and refuses to advance the watermarks;
+        # the view stays marked, and the next client recomputes it.
+        client.expect_error(
+            "INSERT INTO orders VALUES (23, 'a', 23), (24, 't', 24);\nDELETE FROM orders WHERE id = 4;\n"
+            "UPDATE orders SET amount = amount + 2 WHERE product = 'b';\n"
+            "SET openivm_test_fail_point = 'lease_lost_before_watermark';\nPRAGMA refresh('sales');\n",
+            "lost the refresh lease",
+        )
+        assert client.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "true"
+        assert client.value(f"SELECT owner FROM control.{schema}.openivm_refresh_leases;") == "openivm-simulated-takeover"
+        client.run("PRAGMA refresh('sales');\n")
+        assert client.value(bag_difference("sales", base)) == "0", "a stale watermark commit lost or doubled changes"
+        assert client.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "false"
+        assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0"
+
         # Reopen without settings: the marker in the host database finds the remote schema.
         reopened = Client(binary, dsn, schema, host, configure=False)
         reopened.run("INSERT INTO orders VALUES (8, 'e', 8);\nDELETE FROM orders WHERE id = 2;\nPRAGMA refresh('sales');\n")
@@ -245,6 +291,61 @@ def ducklake_concurrency_scenario(binary: Path, dsn: str, root: Path):
         drop_schema(binary, dsn, schema)
 
 
+def ducklake_lease_scenario(binary: Path, dsn: str, root: Path):
+    """A client whose lease expires or is taken over mid-refresh never writes DuckLake data
+    after its local deadline and never commits stale watermarks."""
+    schema = "openivm_it_" + uuid.uuid4().hex[:12]
+    lake = root / "lease_lake"
+    (lake / "data").mkdir(parents=True)
+    base = "SELECT k, SUM(v), COUNT(*) FROM lake.main.events GROUP BY k"
+    view = "lake.main.event_totals"
+
+    def client():
+        return Client(binary, dsn, schema, ":memory:", lake=lake)
+
+    try:
+        client().run(
+            "CREATE TABLE lake.main.events (id INTEGER, k INTEGER, v INTEGER);\n"
+            "INSERT INTO lake.main.events SELECT i, i % 5, i FROM range(100) t(i);\n"
+            f"CREATE MATERIALIZED VIEW {view} AS SELECT k, SUM(v) AS s, COUNT(*) AS c "
+            "FROM lake.main.events GROUP BY k;\n"
+        )
+        cases = [
+            # The deadline passed before the data phase: no DuckLake statement runs.
+            ("lease_lost_before_data", "stopped before writing more materialized view data"),
+            # The deadline passed after the first DuckLake statement committed.
+            ("lease_lost_mid_data", "stopped before writing more materialized view data"),
+            # Taken over after the data committed, unnoticed locally: the fence refuses.
+            ("lease_lost_before_watermark", "lost the refresh lease"),
+        ]
+        for index, (point, message) in enumerate(cases):
+            start = 1000 + index * 100
+            client().run(
+                f"INSERT INTO lake.main.events SELECT i, i % 7, i FROM range({start}, {start + 40}) t(i);\n"
+                f"DELETE FROM lake.main.events WHERE id % 13 = {index};\n"
+                f"UPDATE lake.main.events SET v = v + 3 WHERE k = {index};\n"
+                "CREATE OR REPLACE TABLE lake.main.before_refresh AS SELECT * FROM lake.main.event_totals;\n"
+            )
+            client().expect_error(f"SET openivm_test_fail_point = '{point}';\nPRAGMA refresh('{view}');\n", message)
+            checker = client()
+            assert checker.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "true", point
+            assert (
+                checker.value(f"SELECT owner FROM control.{schema}.openivm_refresh_leases;")
+                == "openivm-simulated-takeover"
+            ), point
+            if point == "lease_lost_before_data":
+                assert (
+                    checker.value(bag_difference(view, "SELECT * FROM lake.main.before_refresh")) == "0"
+                ), "a client past its lease deadline wrote DuckLake data"
+            # The takeover's lease has expired; the next client recovers by recomputing.
+            checker.run(f"PRAGMA refresh('{view}');\n")
+            assert checker.value(bag_difference(view, base)) == "0", f"{point}: recovery lost or doubled changes"
+            assert checker.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "false"
+            assert checker.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0"
+    finally:
+        drop_schema(binary, dsn, schema)
+
+
 def main():
     if len(sys.argv) < 2:
         raise SystemExit("usage: test_remote_metadata.py <duckdb binary> [--require]")
@@ -259,7 +360,8 @@ def main():
         root = Path(directory)
         native_host_scenario(binary, dsn, root)
         ducklake_concurrency_scenario(binary, dsn, root)
-    print("Remote PostgreSQL metadata: placement, reopen, crash recovery and concurrent clients passed")
+        ducklake_lease_scenario(binary, dsn, root)
+    print("Remote PostgreSQL metadata: placement, reopen, crash recovery, lease takeover and concurrent clients passed")
 
 
 if __name__ == "__main__":

@@ -42,16 +42,24 @@ Selecting a metadata location never moves data objects:
 | `openivm_data_<key>`, `openivm_visible_<key>`, MV delta tables, aux state | next to the user-facing view (its catalog and schema) |
 | `openivm_delta_<source>` | next to the source table, so delta capture stays in the writer's transaction |
 | Internal tables of a view in an external catalog that is neither native nor DuckLake | the physical default database, `main` schema (unchanged) |
-| `openivm_metadata_location` marker | `main` schema of every native catalog that holds the view or a native source |
+| `openivm_metadata_location` marker | `main` schema of every native catalog that holds the view or a native source; for a view in an external (for example DuckLake) catalog, the physical default database |
+
+A materialized view cannot be created inside a remote (PostgreSQL) metadata catalog:
+CREATE fails with `remote OpenIVM metadata catalog`. Such a view would share its database
+with the metadata and bypass the refresh protocol below, which is not validated.
 
 Delta capture never reads metadata: a base-table write is captured whenever the source's
-delta table exists, even while the metadata catalog is detached.
+delta table exists, even while the metadata catalog is detached. `DROP TABLE` of a native
+table without a delta table (one OpenIVM does not track) does not resolve the metadata
+location either, so it also works while the metadata catalog is detached.
 
 ## Discovery on reopen
 
 DuckDB does not persist `ATTACH` or `SET`. When a view is created with an explicit
 location, OpenIVM writes `openivm_metadata_location(metadata_catalog, metadata_schema)` in
-one statement into `main` of the view's catalog and of each native source catalog.
+one statement into `main` of the view's catalog and of each native source catalog. A
+DuckLake (or other external) view catalog cannot hold the marker, so it goes into the
+physical default (frontend) database, the legacy candidate for such views.
 
 Resolution order for a view catalog:
 
@@ -63,8 +71,11 @@ Resolution order for a view catalog:
 
 After reopening, attach the metadata catalog under the alias recorded in the marker;
 no `SET` is needed. If the marker names a catalog that is not attached, operations that
-need metadata fail with an error naming the alias. DuckLake view catalogs hold no marker;
-a deployment with an in-memory frontend sets the location at startup.
+need metadata fail with an error naming the alias. With a persistent frontend file,
+DuckLake views are rediscovered the same way, and a new DuckLake view created without
+the settings registers in the recorded location instead of splitting the metadata. A
+deployment with an in-memory frontend loses its marker on exit and sets the location at
+startup.
 
 Delta cleanup and DROP consult every location that may consume a delta table: the
 configured location, marker targets, and legacy native catalogs. An unreachable marker
@@ -90,14 +101,23 @@ explicit, crash-safe protocol in autocommit mode and refuses explicit transactio
 
 ### Explicit transactions
 
-`CREATE MATERIALIZED VIEW`, `PRAGMA refresh`/`refresh_pipeline`, `DROP VIEW` and
-`DROP TABLE ... CASCADE` inside `BEGIN ... COMMIT` fail with
-`cannot run inside an explicit transaction` when the metadata location is in another
-database than the view. The caller transaction is left unchanged and must be rolled back.
-When the metadata schema is in the view's own database (for example `control.main` views
-with `control.openivm` metadata), everything is one database and explicit transactions
-stay atomic, including rollback. `ALTER MATERIALIZED VIEW` writes only metadata and is
+`CREATE MATERIALIZED VIEW`, `PRAGMA refresh`/`refresh_pipeline`, `DROP VIEW`,
+`DROP TABLE ... CASCADE` and `ALTER TABLE ... RENAME COLUMN` of a source that views depend
+on fail inside `BEGIN ... COMMIT` with `cannot run inside an explicit transaction` when the
+metadata location is in another database than the view (for RENAME, than the source). The
+caller transaction is left unchanged and must be rolled back. When the metadata schema is
+in the view's own database (for example `control.main` views with `control.openivm`
+metadata), everything is one database and explicit transactions stay atomic, including
+rollback. `ALTER MATERIALIZED VIEW` writes only metadata and is allowed. `ALTER TABLE ...
+DROP COLUMN` of a tracked source writes no metadata (it fails if a view references the
+column, otherwise it alters only the delta table in the caller transaction) and is
 allowed.
+
+`RENAME COLUMN` rewrites the stored view SQL through a helper connection, which commits
+before the caller's ALTER. In autocommit mode a failing ALTER restores the snapshotted
+metadata rows, one transaction per metadata table: `INSERT OR REPLACE` on native
+catalogs, delete by key plus insert on PostgreSQL. If that restore itself fails, OpenIVM prints
+`could not restore materialized view metadata` instead of failing silently.
 
 ### Refresh protocol (autocommit)
 
@@ -147,20 +167,50 @@ Refreshes of one view are serialized across clients by `openivm_refresh_leases`:
   atomic. Expired leases are deleted first. A losing client gets
   `being refreshed by another OpenIVM client`.
 - While the refresh runs, a background thread renews the lease every third of
-  `openivm_metadata_lease_seconds` (default 600). Only a crashed or partitioned client's
-  lease can expire. If a renewal fails, the client rolls back its native data transaction
-  before commit.
-- Step 3 is fenced: its metadata transaction fails unless this client still holds the lease
-  and `refresh_epoch` is unchanged. A client that loses its lease after committing data
-  bumps `refresh_epoch` and sets the marker, so the next refresh recomputes. Hooks and
-  cascaded refreshes reuse the lease of the refresh that started them.
+  `openivm_metadata_lease_seconds` (L, default 600, minimum 1). Only a crashed or
+  partitioned client's lease can expire.
+- **Local deadline.** A renewal that hangs never reports failure, so the client also keeps
+  a monotonic-clock deadline: the send time of its last successful acquisition or renewal
+  plus two thirds of L. The send time precedes the server's `lease_until` computation, so
+  the deadline falls at least L/3 before the lease can expire on the server. Before the
+  data phase, before every data statement (DuckLake statements commit one by one) and
+  before a native data commit, the client stops with `stopped before writing more
+  materialized view data` once a renewal reported loss or the deadline passed. A healthy
+  holder's deadline always stays at least L/3 ahead.
+- **Fenced watermarks.** Step 3 (and retracting the marker after a clean data rollback)
+  first runs `UPDATE openivm_refresh_leases SET lease_until = ... WHERE view_name = ... AND
+  owner = <token>` inside the metadata transaction and fails unless exactly one row is
+  affected. Writing the row, rather than reading it, orders the commit against a takeover:
+  PostgreSQL either makes the takeover's `DELETE` wait for this transaction's row lock
+  (after which the extended lease no longer qualifies as expired, or the takeover gets a
+  serialization failure, so the takeover fails), or this `UPDATE` finds the row gone or
+  concurrently changed and fails (zero rows, or a serialization failure). Step 3 also fails
+  if `refresh_epoch` changed.
+- A client whose step 3 fails after committing data bumps `refresh_epoch` and sets the
+  marker, so the next refresh recomputes even if another client cleared it meanwhile.
+  Hooks and cascaded refreshes reuse the lease of the refresh that started them.
 - A crashed client leaves its lease. Other clients wait for it to expire, then take over
   and recover via full recompute.
 
-Residual risk: a client partitioned from PostgreSQL but still able to commit DuckLake data
-past its lease can briefly expose rows that the next refresh recomputes. Choose a lease
-longer than the longest refresh. Concurrent DuckLake source writers in other processes
-during a refresh are outside this protocol (see [limitations](../limitations.md)).
+Remaining window: a takeover can begin only after the lease expired on the server, which
+is at least L/3 after this client's deadline (assuming the client's monotonic clock and
+the server's clock advance at comparable rates). Data written before the deadline is
+therefore committed before any takeover, and the new owner recomputes over it. Only a
+single data statement that starts before the deadline and is still running L/3 later can
+commit after a takeover. If that happens, its step 3 fails; when PostgreSQL is reachable,
+the client then marks the view for recomputation as above. When it is not, the error says
+`could not mark the view for recomputation`, and the view can stay wrong until it is
+repaired with a forced full refresh once the metadata catalog is reachable:
+
+```sql
+SET openivm_refresh_mode = 'full';
+PRAGMA refresh('<view>');
+SET openivm_refresh_mode = 'incremental';
+```
+
+Choose L so that L/3 exceeds the longest single refresh statement. Concurrent DuckLake
+source writers in other processes during a refresh are outside this protocol (see
+[limitations](../limitations.md)).
 
 ## Missing and read-only metadata catalogs
 
@@ -184,15 +234,23 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 |---|---|
 | Placement of metadata vs backing/delta tables, marker | `test/sql/metadata_location.test` |
 | Batched DML refresh, delta cleanup, profiles, history | `test/sql/metadata_location.test` |
-| Explicit-transaction rejection; atomic same-database schema | `test/sql/metadata_location.test` |
+| Explicit-transaction rejection (including RENAME COLUMN); atomic same-database schema | `test/sql/metadata_location.test` |
+| RENAME COLUMN restore after a failed ALTER; autocommit rename | `test/sql/metadata_location.test` |
 | Crash after intent, inside data transaction, after data commit; full recompute | `test/sql/metadata_location.test` (`openivm_test_fail_point`) |
 | Concurrent connections, daemon scheduling | `test/sql/metadata_location.test` |
-| Read-only and missing catalogs, reopen discovery, conflicting setting, existing databases, replace, drop, orphan cleanup | `test/sql/metadata_location.test` |
-| Legacy discovery unchanged | `test/integration/scheduler_catalog_test.cpp` |
-| PostgreSQL metadata: placement, reopen, crash + abandoned lease, DROP, concurrent DuckLake clients without a local frontend file | `test/integration/test_remote_metadata.py` (CI: `.github/workflows/RemoteMetadata.yml`) |
+| Read-only and missing catalogs, untracked DROP TABLE while detached, reopen discovery, conflicting setting, existing databases, replace, drop, orphan cleanup | `test/sql/metadata_location.test` |
+| DuckLake views: frontend marker, reopen without settings, crash after the DuckLake data commit | `test/sql/metadata_location_ducklake.test` |
+| Legacy discovery unchanged; scheduler discovery of a configured location | `test/integration/scheduler_catalog_test.cpp` |
+| PostgreSQL metadata: placement, reopen, crash + abandoned lease, RENAME rejection and portable restore, CREATE inside the metadata catalog rejected, DROP, concurrent DuckLake clients without a local frontend file | `test/integration/test_remote_metadata.py` (CI: `.github/workflows/RemoteMetadata.yml`) |
+| Lease lost before the data phase, after the first DuckLake statement, and taken over before the watermark commit (fence) | `test/integration/test_remote_metadata.py` |
 
-`openivm_test_fail_point` (`after_intent`, `before_data_commit`, `after_data_commit`) is a
-testing hook that simulates a process crash at a protocol step; it runs no compensation.
+`openivm_test_fail_point` is a testing hook. `after_intent`, `before_data_commit` and
+`after_data_commit` simulate a process crash at a protocol step and run no compensation.
+`lease_lost_before_data` and `lease_lost_mid_data` hand the lease to another (already
+expired) owner and make the client observe the loss, as its deadline would;
+`lease_lost_before_watermark` hands it over without local notice, so only the fence can
+stop the watermark commit. The concurrent row-lock ordering between a fence and a
+takeover relies on PostgreSQL semantics and is not reproduced deterministically.
 
 ## Compatibility claims
 

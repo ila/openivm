@@ -1,6 +1,7 @@
 #include "rules/refresh_insert_rule.hpp"
 #include "compile_facts.hpp"
 #include "rules/schema_evolution.hpp"
+#include "core/metadata_location.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
@@ -13,6 +14,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/database_modification_type.hpp"
+#include "duckdb/common/printer.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -53,24 +55,29 @@ public:
 		OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] restoring %zu metadata snapshots\n", restore_sql.size());
 		try {
 			Connection con(*context.db);
-			auto schema_result = con.Query("SET schema='" + string(DEFAULT_SCHEMA) + "'");
-			if (schema_result->HasError()) {
-				OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] metadata restore setup failed: %s\n",
-				                    schema_result->GetError().c_str());
-			} else {
-				for (auto it = restore_sql.rbegin(); it != restore_sql.rend(); ++it) {
-					auto result = con.Query(*it);
-					if (result->HasError()) {
-						OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] metadata restore failed: %s\n",
-						                    result->GetError().c_str());
-					}
+			// Each snapshot targets one metadata table, so it restores in one transaction
+			// even when snapshots of different metadata catalogs are pending.
+			for (auto it = restore_sql.rbegin(); it != restore_sql.rend(); ++it) {
+				con.BeginTransaction();
+				auto result = con.Query(*it);
+				if (!result->HasError()) {
+					result = con.Query("COMMIT");
+				} else {
+					con.Query("ROLLBACK");
+				}
+				if (result->HasError()) {
+					// The caller transaction already rolled back and cannot report a second
+					// failure; say so instead of leaving the metadata silently diverged.
+					Printer::Print("OpenIVM could not restore materialized view metadata after a rolled-back DDL "
+					               "statement: " +
+					               result->GetError());
 				}
 			}
 		} catch (std::exception &ex) {
-			// Transaction callbacks must always release the mutation gate. A
-			// helper-restore error is diagnostic here; the caller transaction has
-			// already rolled back and cannot report a second failure safely.
-			OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] metadata rollback callback failed: %s\n", ex.what());
+			// Transaction callbacks must always release the mutation gate.
+			Printer::Print(string("OpenIVM could not restore materialized view metadata after a rolled-back DDL "
+			                      "statement: ") +
+			               ex.what());
 		}
 		Clear();
 	}
@@ -85,9 +92,25 @@ private:
 	unique_ptr<MutationLockGuard> mutation_guard;
 };
 
-static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &table_name) {
+// Restores the snapshotted rows. Native catalogs replace them by primary key; remote SQL
+// catalogs have no INSERT OR REPLACE, so the rows sharing their key are deleted and then
+// reinserted (the caller runs both in one transaction).
+static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &table_name,
+                                  const vector<string> &key_columns, bool native) {
 	if (rows.RowCount() == 0) {
 		return "";
+	}
+	vector<idx_t> key_indexes;
+	for (auto &key : key_columns) {
+		for (idx_t col = 0; col < rows.names.size(); col++) {
+			if (StringUtil::CIEquals(rows.names[col], key)) {
+				key_indexes.push_back(col);
+				break;
+			}
+		}
+	}
+	if (key_indexes.size() != key_columns.size()) {
+		throw CatalogException("OpenIVM metadata snapshot of %s lacks its key columns", table_name);
 	}
 	string columns;
 	for (auto &name : rows.names) {
@@ -97,9 +120,11 @@ static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &t
 		columns += SqlUtils::QuoteIdentifier(name);
 	}
 	string values;
+	string keys;
 	for (idx_t row = 0; row < rows.RowCount(); row++) {
 		if (!values.empty()) {
 			values += ", ";
+			keys += " OR ";
 		}
 		values += "(";
 		for (idx_t col = 0; col < rows.ColumnCount(); col++) {
@@ -109,12 +134,26 @@ static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &t
 			values += rows.GetValue(col, row).ToSQLString();
 		}
 		values += ")";
+		keys += "(";
+		for (idx_t key = 0; key < key_indexes.size(); key++) {
+			if (key > 0) {
+				keys += " AND ";
+			}
+			keys += SqlUtils::QuoteIdentifier(rows.names[key_indexes[key]]) +
+			        " IS NOT DISTINCT FROM " + rows.GetValue(key_indexes[key], row).ToSQLString();
+		}
+		keys += ")";
 	}
-	return "INSERT OR REPLACE INTO " + table_name + " (" + columns + ") VALUES " + values;
+	if (native) {
+		return "INSERT OR REPLACE INTO " + table_name + " (" + columns + ") VALUES " + values;
+	}
+	return "DELETE FROM " + table_name + " WHERE " + keys + ";\nINSERT INTO " + table_name + " (" + columns +
+	       ") VALUES " + values + ";\n";
 }
 
-static void RegisterMetadataRestore(ClientContext &context, Connection &con, const string &table_name,
-                                    const string &predicate) {
+static void RegisterMetadataRestore(ClientContext &context, Connection &con, const MetadataLocation &metadata_location,
+                                    const string &table_name, const string &predicate,
+                                    const vector<string> &key_columns) {
 	auto rows = con.Query("SELECT * FROM " + SqlUtils::QuoteIdentifier(table_name) + " WHERE " + predicate);
 	if (rows->HasError()) {
 		throw CatalogException("OpenIVM could not snapshot helper metadata: %s", rows->GetError());
@@ -123,8 +162,11 @@ static void RegisterMetadataRestore(ClientContext &context, Connection &con, con
 	if (location->HasError()) {
 		throw CatalogException("OpenIVM could not resolve metadata restore location: %s", location->GetError());
 	}
-	auto restore = BuildRestoreRowsSQL(*rows, SqlUtils::FullName(location->GetValue(0, 0).ToString(),
-	                                                             location->GetValue(1, 0).ToString(), table_name));
+	auto restore =
+	    BuildRestoreRowsSQL(*rows,
+	                        SqlUtils::FullName(location->GetValue(0, 0).ToString(),
+	                                           location->GetValue(1, 0).ToString(), table_name),
+	                        key_columns, metadata_location.catalog_type.empty() || metadata_location.IsNative());
 	if (!restore.empty()) {
 		TransactionalHelperUndoState::Get(context).AddRestoreSQL(std::move(restore));
 	}
@@ -210,18 +252,25 @@ static string MVInternalPrefix(ClientContext &context, const RefreshMetadata::St
 	return SqlUtils::QualifiedPrefix(location.catalog_name, location.schema_name);
 }
 
-static void DropTrackedMaterializedView(ClientContext &context, Connection &con, RefreshMetadata &metadata,
+static void DropTrackedMaterializedView(ClientContext &context, Connection &con,
+                                        const MetadataLocation &metadata_location, RefreshMetadata &metadata,
                                         const string &view_name, bool drop_user_view) {
 	auto location = metadata.GetStoredViewLocation(view_name);
+	// The helper connection commits the metadata change on its own; only a rollback
+	// snapshot ties it to the caller. Refuse when the two cannot commit together.
+	MetadataLocator::RequireWritable(metadata_location, "drop materialized view '" + view_name + "'");
+	MetadataLocator::RejectExplicitTransaction(context, metadata_location, location.catalog_name, "DROP VIEW");
 	auto delta_sources = metadata.GetDeltaSources(view_name, location.catalog_name, location.schema_name);
 	auto sql_name = metadata.GetViewSQLName(view_name);
 	auto internal_prefix = MVInternalPrefix(context, location, view_name, sql_name);
 	auto escaped_view_name = SqlUtils::EscapeValue(view_name);
 	auto view_predicate = "view_name = '" + escaped_view_name + "'";
-	RegisterMetadataRestore(context, con, openivm::VIEWS_TABLE, view_predicate);
-	RegisterMetadataRestore(context, con, openivm::DELTA_TABLES_TABLE, view_predicate);
+	RegisterMetadataRestore(context, con, metadata_location, openivm::VIEWS_TABLE, view_predicate, {"view_name"});
+	RegisterMetadataRestore(context, con, metadata_location, openivm::DELTA_TABLES_TABLE, view_predicate,
+	                        {"view_name"});
 	auto dependency_predicate = "parent_view = '" + escaped_view_name + "' OR child_view = '" + escaped_view_name + "'";
-	RegisterMetadataRestore(context, con, openivm::MV_DEPS_TABLE, dependency_predicate);
+	RegisterMetadataRestore(context, con, metadata_location, openivm::MV_DEPS_TABLE, dependency_predicate,
+	                        {"parent_view", "child_view"});
 	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                                  escaped_view_name + "'");
 	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
@@ -273,6 +322,29 @@ static optional_ptr<TableCatalogEntry> TryGetTrackedDeltaTable(ClientContext &co
 		return nullptr;
 	}
 	return &delta_table->Cast<TableCatalogEntry>();
+}
+
+// A dropped native table matters to OpenIVM only when a delta table sits next to it (a
+// tracked source). Skipping the rest keeps DROP TABLE of untracked tables independent of
+// the metadata catalog, which may be detached.
+static bool TableDropNeedsMetadata(ClientContext &context, const DropInfo &drop_info, const string &catalog_name,
+                                   const string &schema_name) {
+	// Untyped lookups: a same-named view is DuckDB's error to report, not this check's.
+	QueryErrorContext error_context;
+	auto table = Catalog::GetEntry(context, catalog_name, schema_name,
+	                               EntryLookupInfo(CatalogType::TABLE_ENTRY, drop_info.name, error_context),
+	                               OnEntryNotFound::RETURN_NULL);
+	if (!table || table->type != CatalogType::TABLE_ENTRY) {
+		return false;
+	}
+	if (table->ParentCatalog().GetCatalogType() != "duckdb") {
+		return true;
+	}
+	auto delta = Catalog::GetEntry(
+	    context, table->ParentCatalog().GetName(), table->ParentSchema().name,
+	    EntryLookupInfo(CatalogType::TABLE_ENTRY, SqlUtils::DeltaName(table->name), error_context),
+	    OnEntryNotFound::RETURN_NULL);
+	return delta ? true : false;
 }
 
 static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert &insert) {
@@ -388,8 +460,13 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 
 		auto table_name = drop_info->name;
 		auto target_locus = ResolveDDLLocus(input.context, drop_info->catalog, drop_info->schema);
+		if (drop_info->type == CatalogType::TABLE_ENTRY && !TableDropNeedsMetadata(input.context, *drop_info,
+		                                                                           target_locus.first,
+		                                                                           target_locus.second)) {
+			return;
+		}
 		Connection con(*input.context.db);
-		RefreshMetadata::UseCatalog(input.context, con, target_locus.first);
+		auto metadata_location = RefreshMetadata::UseCatalog(input.context, con, target_locus.first);
 
 		auto view_check = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 		                            SqlUtils::EscapeValue(table_name) + "'");
@@ -401,7 +478,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				TransactionalMVLockState::Get(input.context).AcquireMutationLock();
 				OPENIVM_DEBUG_PRINT("[INSERT RULE] DROP TABLE '%s' — cleaning up IVM metadata\n", table_name.c_str());
 				bool drop_user_view = drop_info->type == CatalogType::VIEW_ENTRY;
-				DropTrackedMaterializedView(input.context, con, metadata, table_name, drop_user_view);
+				DropTrackedMaterializedView(input.context, con, metadata_location, metadata, table_name,
+				                            drop_user_view);
 				if (drop_user_view) {
 					// The original logical DROP remains as an idempotent no-op.
 					drop_info->if_not_found = OnEntryNotFound::RETURN_NULL;
@@ -431,7 +509,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				}
 			}
 			for (auto &dep_view : dependent_views) {
-				DropTrackedMaterializedView(input.context, con, cascade_metadata, dep_view, true);
+				DropTrackedMaterializedView(input.context, con, metadata_location, cascade_metadata, dep_view, true);
 			}
 		}
 
@@ -511,12 +589,33 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			}
 			string old_name = rename_info->old_name;
 			string new_name = rename_info->new_name;
-			auto dependent_view_predicate =
-			    "view_name IN (SELECT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
-			    RefreshMetadata::SourcePredicate(delta_name, source_locus.first, source_locus.second) + ")";
+			auto source_predicate = RefreshMetadata::SourcePredicate(delta_name, source_locus.first, source_locus.second);
+			auto dependent_view_predicate = "view_name IN (SELECT view_name FROM " +
+			                                string(openivm::DELTA_TABLES_TABLE) + " WHERE " + source_predicate + ")";
+			// The helper connection commits rewritten view metadata on its own, before the
+			// caller's ALTER. Check every location first so none is rewritten when one
+			// refuses: metadata in another database cannot roll back with the ALTER.
+			vector<MetadataLocation> rewritten;
 			for (auto &location : RefreshMetadata::MetadataLocations(con)) {
 				MetadataLocator::Use(con, location);
-				RegisterMetadataRestore(input.context, con, openivm::VIEWS_TABLE, dependent_view_predicate);
+				auto dependents = con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
+				                            source_predicate);
+				if (dependents->HasError()) {
+					throw CatalogException("OpenIVM could not resolve materialized views depending on '%s': %s",
+					                       table_name, dependents->GetError());
+				}
+				if (dependents->GetValue(0, 0).GetValue<int64_t>() == 0) {
+					continue;
+				}
+				MetadataLocator::RequireWritable(location, "rename column '" + old_name + "' of '" + table_name + "'");
+				MetadataLocator::RejectExplicitTransaction(input.context, location, source_locus.first,
+				                                           "ALTER TABLE ... RENAME COLUMN");
+				rewritten.push_back(location);
+			}
+			for (auto &location : rewritten) {
+				MetadataLocator::Use(con, location);
+				RegisterMetadataRestore(input.context, con, location, openivm::VIEWS_TABLE, dependent_view_predicate,
+				                        {"view_name"});
 				RewriteDependentViewMetadataForRename(con, delta_name, source_locus.first, source_locus.second,
 				                                      table_name, old_name, new_name);
 			}

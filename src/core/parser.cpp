@@ -269,6 +269,16 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// staged executor cannot join a caller transaction, so refuse rather than split it.
 	MetadataLocator::RejectExplicitTransaction(context, metadata_location, lifecycle_target.catalog_name,
 	                                           "CREATE MATERIALIZED VIEW");
+	// A view inside the remote metadata catalog would share its database with the
+	// metadata and skip the split protocol; that execution model is not validated.
+	if (metadata_location.explicit_placement && !metadata_location.catalog_type.empty() &&
+	    !metadata_location.IsNative() &&
+	    StringUtil::CIEquals(metadata_location.catalog, lifecycle_target.catalog_name)) {
+		throw NotImplementedException("Cannot create materialized view in '%s': it is the remote OpenIVM metadata "
+		                              "catalog. Create the view in a native DuckDB or DuckLake catalog; only its "
+		                              "metadata is stored in %s.",
+		                              metadata_location.catalog, metadata_location.DisplayName());
+	}
 	InitializeMVMetadata(context, con, default_db, default_schema, remote_metadata);
 
 	// PAC compatibility boundary: internal planning uses a fresh connection, so
@@ -1046,6 +1056,12 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			}
 		};
 		add_marker(view_target_catalog);
+		// External view catalogs cannot hold a marker. Their legacy metadata candidate, the
+		// default (frontend) database, does, so a reopened session without the settings
+		// keeps using this location instead of silently registering views elsewhere.
+		if (!MetadataLocator::IsNativeCatalog(con, view_target_catalog)) {
+			add_marker(MetadataLocator::PhysicalDefaultCatalog(*context.db));
+		}
 		for (auto &source : facts.source_table_info) {
 			if (!facts.ducklake_table_info.count(source.first)) {
 				add_marker(source.second.catalog_name);
@@ -1999,6 +2015,14 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	// Lifecycle/refresh programs own their internal state cleanup. They are not
 	// source-table deletions and must not produce a second set of retractions.
 	if (!table_entry || SqlUtils::IsDelta(drop_info.name) || IncrementalTableNames::IsDataTable(drop_info.name)) {
+		return BuildDropTableStatement(drop_info) + ";\n";
+	}
+	// Native sources keep their delta table next to them. Without one the table is not
+	// tracked, and dropping it must not depend on a (possibly detached) metadata catalog.
+	if (table_entry->ParentCatalog().GetCatalogType() == "duckdb" &&
+	    !Catalog::GetEntry(context, drop_info.catalog, drop_info.schema,
+	                       EntryLookupInfo(CatalogType::TABLE_ENTRY, SqlUtils::DeltaName(drop_info.name), error_context),
+	                       OnEntryNotFound::RETURN_NULL)) {
 		return BuildDropTableStatement(drop_info) + ";\n";
 	}
 

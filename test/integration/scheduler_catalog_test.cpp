@@ -66,6 +66,22 @@ int main(int argc, char **argv) {
 		// can fail and silently skip that synchronization.
 		Execute(con, "ALTER TABLE source ADD COLUMN extra INTEGER DEFAULT 7;");
 		Execute(con, "SELECT extra FROM openivm_delta_source LIMIT 0;");
+		// A configured metadata location (#84) is discovered with its schema, without
+		// waiting for the daemon thread.
+		{
+			DuckDB placed_db(nullptr);
+			Connection placed(placed_db);
+			Execute(placed, "LOAD openivm; SET openivm_files_path='" + path +
+			                    ".placed.files'; ATTACH ':memory:' AS control; "
+			                    "SET openivm_metadata_catalog = 'control'; SET openivm_metadata_schema = 'openivm'; "
+			                    "CREATE TABLE source(i INTEGER); INSERT INTO source VALUES (1), (2); "
+			                    "CREATE MATERIALIZED VIEW placed REFRESH EVERY '1 hour' AS SELECT * FROM source;");
+			auto placed_views = RefreshMetadata(placed).GetScheduledViews();
+			if (placed_views.size() != 1 || placed_views[0].metadata_catalog != "control" ||
+			    placed_views[0].metadata_schema != "openivm" || placed_views[0].catalog_name != "memory") {
+				throw InvalidInputException("Scheduler did not discover the configured metadata location");
+			}
+		}
 		std::cout << "PASS" << std::endl;
 	} catch (const std::exception &e) {
 		std::cerr << e.what() << std::endl;

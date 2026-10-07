@@ -225,7 +225,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BIGINT, Value::BIGINT(600));
 	db_config.AddExtensionOption(openivm::TEST_FAIL_POINT_SETTING,
 	                             "testing only: simulate a crash at a refresh protocol step (after_intent, "
-	                             "before_data_commit, after_data_commit)",
+	                             "before_data_commit, after_data_commit) or a lease takeover (lease_lost_before_data, "
+	                             "lease_lost_mid_data, lease_lost_before_watermark)",
 	                             LogicalType::VARCHAR, Value(""));
 
 	// Native refresh can optimize the finished incremental plan against the current deltas because the
