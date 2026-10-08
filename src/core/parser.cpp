@@ -1679,8 +1679,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	// --- Index DDL (for aggregate group queries) ---
 	// The index belongs to the MV state, not its sources. DuckLake-backed state cannot have it.
+	// With explicitly placed metadata the data objects are always qualified, and refresh looks
+	// the index up in every native view catalog; its full recompute upserts against it.
+	bool explicit_native = metadata_location.explicit_placement && metadata.IsNativeCatalog(view_target_catalog);
 	if ((refresh_type == RefreshType::AGGREGATE_GROUP || refresh_type == RefreshType::AGGREGATE_HAVING) &&
-	    !aggregate_columns.empty() && !target_is_ducklake && view_catalog_prefix.empty()) {
+	    !aggregate_columns.empty() && !target_is_ducklake && (view_catalog_prefix.empty() || explicit_native)) {
 		add_profile_marker("create_view_index", "columns=" + to_string(aggregate_columns.size()));
 		string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + openivm::INDEX_SUFFIX);
 		ddl.push_back("create unique index " + index_name + " on " + qdt + "(" +

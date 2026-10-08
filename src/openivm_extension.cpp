@@ -225,8 +225,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BIGINT, Value::BIGINT(600));
 	db_config.AddExtensionOption(openivm::TEST_FAIL_POINT_SETTING,
 	                             "testing only: simulate a crash at a refresh protocol step (after_intent, "
-	                             "before_data_commit, after_data_commit) or a lease takeover (lease_lost_before_data, "
-	                             "lease_lost_mid_data, lease_lost_before_watermark)",
+	                             "before_data_commit, after_data_commit), a lease takeover (lease_lost_before_data, "
+	                             "lease_lost_mid_data, lease_lost_before_watermark) or a concurrent source commit "
+	                             "(concurrent_commit_before_data, concurrent_commit_after_data)",
+	                             LogicalType::VARCHAR, Value(""));
+	db_config.AddExtensionOption(openivm::TEST_CONCURRENT_SQL_SETTING,
+	                             "testing only: SQL that a concurrent_commit_* fail point commits from another "
+	                             "connection during the first refresh attempt",
 	                             LogicalType::VARCHAR, Value(""));
 
 	// Native refresh can optimize the finished incremental plan against the current deltas because the

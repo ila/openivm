@@ -70,6 +70,44 @@ DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, C
 	return activity;
 }
 
+DuckLakeTableActivity ProbeDuckLakeTableChanges(Connection &con, const DuckLakeSourceLocation &loc, int64_t table_id,
+                                                int64_t after_snapshot_id, int64_t through_snapshot_id) {
+	DuckLakeTableActivity activity;
+	if (after_snapshot_id < 0 || through_snapshot_id < after_snapshot_id) {
+		return activity;
+	}
+	if (after_snapshot_id == through_snapshot_id) {
+		activity.ok = true;
+		return activity;
+	}
+	if (table_id >= 0) {
+		// The manifest also reports ALTER and DROP, and a recreated table drops the old id.
+		auto sql = BuildDuckLakeSnapshotActivitySQL(loc.catalog_name, table_id, after_snapshot_id, through_snapshot_id);
+		auto result = con.Query(sql);
+		if (!result->HasError() && result->RowCount() == 1) {
+			activity.ok = true;
+			for (idx_t col = 0; col < 3; col++) {
+				auto changed = result->GetValue(col, 0);
+				activity.has_changes = activity.has_changes || (!changed.IsNull() && changed.GetValue<bool>());
+			}
+			return activity;
+		}
+	}
+	// Row-level fallback; change scans include their start snapshot.
+	string insertions = SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
+	                                                    loc.table_name, after_snapshot_id + 1, through_snapshot_id);
+	string deletions = SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
+	                                                   loc.table_name, after_snapshot_id + 1, through_snapshot_id);
+	string count_sql = "SELECT (SELECT COUNT(*) FROM " + insertions + ") + (SELECT COUNT(*) FROM " + deletions + ")";
+	auto counts = con.Query(count_sql);
+	if (counts->HasError() || counts->RowCount() != 1 || counts->GetValue(0, 0).IsNull()) {
+		return activity;
+	}
+	activity.ok = true;
+	activity.has_changes = counts->GetValue(0, 0).GetValue<int64_t>() > 0;
+	return activity;
+}
+
 static void AccumulateDuckLakeDeltaSummary(DeltaActivityResult &summary, RefreshMetadata &metadata, Connection &con,
                                            const string &view_name, const string &delta_table,
                                            const string &view_catalog_name, const string &view_schema_name,

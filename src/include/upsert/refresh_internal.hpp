@@ -271,6 +271,10 @@ DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, C
                                                     const string &table_name, const string &catalog_name,
                                                     const string &schema_name, int64_t last_snapshot_id,
                                                     int64_t current_snapshot_id);
+// Whether the DuckLake table at `loc` (id `table_id`, -1 if unknown) changed in a snapshot
+// after `after_snapshot_id` up to `through_snapshot_id`. `ok` is false when unverifiable.
+DuckLakeTableActivity ProbeDuckLakeTableChanges(Connection &con, const DuckLakeSourceLocation &loc, int64_t table_id,
+                                                int64_t after_snapshot_id, int64_t through_snapshot_id);
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                    const string &view_query_sql, const vector<string> &delta_table_names,

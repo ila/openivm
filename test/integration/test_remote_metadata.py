@@ -309,11 +309,16 @@ def ducklake_concurrency_scenario(binary: Path, dsn: str, root: Path):
                 worker.join()
             for failure in failures:
                 # Losing the lease race is the expected concurrent failure. SQLite-backed
-                # DuckLake catalogs can also refuse a concurrent reader; either way the
-                # client gave up, and the bag check below proves nothing was lost or doubled.
+                # DuckLake catalogs can also refuse a concurrent reader, including the check
+                # for concurrent source changes; either way the client gave up, and the bag
+                # check below proves nothing was lost or doubled.
                 if not any(
                     expected in failure
-                    for expected in ("being refreshed by another OpenIVM client", "database is locked")
+                    for expected in (
+                        "being refreshed by another OpenIVM client",
+                        "database is locked",
+                        "could not be checked for changes while refreshing",
+                    )
                 ):
                     raise AssertionError(f"Unexpected concurrent refresh failure:\n{failure}")
             checker = client()
@@ -329,6 +334,104 @@ def ducklake_concurrency_scenario(binary: Path, dsn: str, root: Path):
             )
             == "2"
         ), "DuckLake programs were not archived in the remote metadata schema"
+    finally:
+        drop_schema(binary, dsn, schema)
+
+
+def ducklake_concurrent_writer_scenario(binary: Path, dsn: str, root: Path):
+    """Source commits by other processes land while refreshes run; none is lost or applied twice."""
+    schema = "openivm_it_" + uuid.uuid4().hex[:12]
+    lake = root / "writer_lake"
+    (lake / "data").mkdir(parents=True)
+    base = "SELECT k, SUM(v), COUNT(*) FROM lake.main.events GROUP BY k"
+    view = "lake.main.event_totals"
+
+    def client():
+        return Client(binary, dsn, schema, ":memory:", lake=lake)
+
+    def check_consistent(label: str):
+        checker = client()
+        checker.run(f"PRAGMA refresh('{view}');\n")
+        assert checker.value(bag_difference(view, base)) == "0", f"{label}: a source change was lost or doubled"
+        assert checker.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "false", label
+        assert checker.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0", label
+
+    try:
+        client().run(
+            "CREATE TABLE lake.main.events (id INTEGER, k INTEGER, v INTEGER);\n"
+            "INSERT INTO lake.main.events SELECT i, i % 5, i FROM range(100) t(i);\n"
+            f"CREATE MATERIALIZED VIEW {view} AS SELECT k, SUM(v) AS s, COUNT(*) AS c "
+            "FROM lake.main.events GROUP BY k;\n"
+        )
+        # Deterministic: another connection commits after the DuckLake data statements and
+        # before the watermarks. The refresh retries by recomputing; the watermark is never
+        # a snapshot that contains a change the refresh did not read.
+        concurrent = (
+            "INSERT INTO lake.main.events VALUES (600, 1, 60), (601, 9, 61); "
+            "UPDATE lake.main.events SET v = v + 5 WHERE k = 2"
+        )
+        injected = client()
+        injected.run(
+            "INSERT INTO lake.main.events SELECT i, i % 7, i FROM range(500, 530) t(i);\n"
+            "DELETE FROM lake.main.events WHERE id % 13 = 0;\n"
+            f"SET openivm_test_concurrent_sql = {sql_literal(concurrent)};\n"
+            "SET openivm_test_fail_point = 'concurrent_commit_after_data';\n"
+            f"PRAGMA refresh('{view}');\n"
+        )
+        assert injected.value(bag_difference(view, base)) == "0", "a commit during the refresh was lost or doubled"
+        check_consistent("injected commit")
+
+        # Racing processes: one keeps committing source changes while others refresh.
+        done = threading.Event()
+        failures = []
+        committed = []
+
+        def writer():
+            try:
+                for index in range(12):
+                    start = 2000 + index * 10
+                    result = client().run(
+                        f"INSERT INTO lake.main.events SELECT i, i % 6, i FROM range({start}, {start + 10}) t(i);\n"
+                        f"DELETE FROM lake.main.events WHERE id = {start - 7};\n"
+                        f"UPDATE lake.main.events SET v = v + 1 WHERE id % 10 = {index % 10};\n",
+                        check=False,
+                    )
+                    if result.returncode == 0:
+                        committed.append(index)
+                    else:
+                        failures.append(("writer", result.stderr))
+            finally:
+                done.set()
+
+        def refresher():
+            while not done.is_set():
+                result = client().run(f"PRAGMA refresh('{view}');\n", check=False)
+                if result.returncode != 0:
+                    failures.append(("refresh", result.stderr))
+
+        workers = [threading.Thread(target=writer)] + [threading.Thread(target=refresher) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        expected = {
+            # A partially applied writer batch is fine: the bag check compares with the base table.
+            "writer": ("database is locked",),
+            # Lease contention, SQLite-backed catalog locking, or sources that kept changing
+            # (or could not be checked) through every retry; each leaves the view consistent
+            # for the next refresh.
+            "refresh": (
+                "being refreshed by another OpenIVM client",
+                "database is locked",
+                "changed while refreshing",
+                "could not be checked for changes while refreshing",
+            ),
+        }
+        for role, failure in failures:
+            if not any(message in failure for message in expected[role]):
+                raise AssertionError(f"Unexpected concurrent {role} failure:\n{failure}")
+        assert committed, "no writer batch committed, so the race was not exercised"
+        check_consistent("racing writer")
     finally:
         drop_schema(binary, dsn, schema)
 
@@ -402,8 +505,12 @@ def main():
         root = Path(directory)
         native_host_scenario(binary, dsn, root)
         ducklake_concurrency_scenario(binary, dsn, root)
+        ducklake_concurrent_writer_scenario(binary, dsn, root)
         ducklake_lease_scenario(binary, dsn, root)
-    print("Remote PostgreSQL metadata: placement, reopen, crash recovery, lease takeover and concurrent clients passed")
+    print(
+        "Remote PostgreSQL metadata: placement, reopen, crash recovery, lease takeover, concurrent clients and "
+        "concurrent source writers passed"
+    )
 
 
 if __name__ == "__main__":

@@ -866,6 +866,29 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	return identity;
 }
 
+int64_t RefreshMetadata::GetDuckLakeTableIdAt(const string &catalog_name, const string &schema_name,
+                                              const string &table_name, int64_t snapshot_id) {
+	if (catalog_name.empty() || table_name.empty() || snapshot_id < 0) {
+		return -1;
+	}
+	string catalog_prefix = SqlUtils::QuoteIdentifier("__ducklake_metadata_" + catalog_name) + ".";
+	string schema_filter = schema_name.empty() ? "main" : schema_name;
+	string snapshot = to_string(snapshot_id);
+	auto visible = [&](const string &alias) {
+		return alias + ".begin_snapshot <= " + snapshot + " AND (" + alias + ".end_snapshot IS NULL OR " + alias +
+		       ".end_snapshot > " + snapshot + ")";
+	};
+	auto result =
+	    con.Query("SELECT t.table_id FROM " + catalog_prefix + "ducklake_table t JOIN " + catalog_prefix +
+	              "ducklake_schema s ON t.schema_id = s.schema_id WHERE " + visible("t") + " AND " + visible("s") +
+	              " AND t.table_name = '" + SqlUtils::EscapeValue(table_name) + "' AND s.schema_name = '" +
+	              SqlUtils::EscapeValue(schema_filter) + "' ORDER BY t.table_id DESC LIMIT 1");
+	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return -1;
+	}
+	return result->GetValue(0, 0).GetValue<int64_t>();
+}
+
 string RefreshMetadata::BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
                                                         const string &snapshot_expr,
                                                         const string &delta_metadata_table) {

@@ -157,6 +157,32 @@ Within one process the database-wide mutation gate serializes tracked writes wit
 refresh, so the watermarks written in step 3 equal those observed by step 2. A native
 DuckDB data file has a single writer process.
 
+DuckLake sources can change under a refresh, because other processes commit to the lake
+without the gate. A DuckLake watermark is therefore never the snapshot that is current
+when step 3 runs: such a snapshot can contain another client's commit that step 2 never
+read, and the next refresh would start after it. Instead:
+
+- Before compiling, the refresh pins the current snapshot S of every attached DuckLake
+  catalog and the table id each DuckLake source name denotes at S. Compilation, the
+  empty-delta shortcut and every data statement run later, so they read S or a later
+  snapshot.
+- After step 2 (before the commit when the data runs in one transaction), it checks the
+  DuckLake change manifest (`ducklake_snapshots().changes`) for inserts, deletes, ALTER or
+  DROP of those table ids in snapshots after S. If the manifest is unavailable it counts
+  `ducklake_table_insertions`/`deletions` instead; an unverifiable source counts as
+  changed. Only source tables are checked, so the refresh's own commits to its backing,
+  delta and aux tables are excluded explicitly.
+- No source changed: every read saw exactly the state at S, so step 3 stores S. Changes
+  committed after the check have snapshot ids above S and are read by the next refresh.
+- A source changed: step 3 does not run. A transactional data step rolls back (under the
+  split protocol the marker is then retracted); committed DuckLake data keeps the marker set. The
+  refresh then retries immediately, which for a marked view is a full recompute pinned to
+  a new S. After three such attempts it fails with `changed while refreshing`, leaving the
+  last stored watermarks or the marker in place.
+
+The same pinned watermark and check apply to every DuckLake source, whichever catalog
+holds the metadata.
+
 ### Remote SQL metadata and concurrent clients
 
 A PostgreSQL metadata schema can be shared by several processes. OpenIVM never scans
@@ -225,9 +251,9 @@ PRAGMA refresh('<view>');
 SET openivm_refresh_mode = 'incremental';
 ```
 
-Choose L so that L/3 exceeds the longest single refresh statement. Concurrent DuckLake
-source writers in other processes during a refresh are outside this protocol (see
-[limitations](../limitations.md)).
+Choose L so that L/3 exceeds the longest single refresh statement. The lease serializes
+refreshes, not source writers: DuckLake sources changed by other processes during a
+refresh are handled by the pinned watermark and source check described above.
 
 ## Missing and read-only metadata catalogs
 
@@ -268,9 +294,15 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 | Lease times written from the PostgreSQL server clock; expiry judged on that clock (live 120 s ahead refuses, 1 s past takes over) | `test/integration/test_remote_metadata.py` |
 | Rejected CREATE in an explicit transaction creates no metadata schema; ADD COLUMN of a tracked source while the metadata catalog is detached | `test/sql/metadata_location.test` |
 | Settings contradicting the frontend marker of a DuckLake view | `test/sql/metadata_location_ducklake.test` |
+| DuckLake source committed by another connection after the data statements, with metadata in `control` | `test/sql/metadata_location_ducklake.test` (`concurrent_commit_after_data`) |
+| DuckLake source committed before or after the data statements (aggregate and join views); retry count; unrelated tables cause no retry | `test/sql/ducklake_concurrent_source_commit.test` |
+| PostgreSQL metadata: injected concurrent commit, and a writer process racing two refreshing processes | `test/integration/test_remote_metadata.py` |
 
 `openivm_test_fail_point` is a testing hook. `after_intent`, `before_data_commit` and
 `after_data_commit` simulate a process crash at a protocol step and run no compensation.
+`concurrent_commit_before_data` and `concurrent_commit_after_data` commit the SQL in
+`openivm_test_concurrent_sql` from another connection during the first refresh attempt,
+after compilation or after the data statements, as a concurrent client would.
 `lease_lost_before_data` and `lease_lost_mid_data` hand the lease to another (already
 expired) owner and make the client observe the loss, as its deadline would;
 `lease_lost_before_watermark` hands it over without local notice, so only the fence can
@@ -281,7 +313,8 @@ test checks that lease times are server times instead.
 
 ## Compatibility claims
 
-Remote metadata is validated only against the PostgreSQL 16 service container in CI. No
-managed PostgreSQL provider, managed DuckLake service or provider-side extension execution
-has been validated. Running OpenIVM still requires a client process with the extension
+The remote metadata integration test runs only against the PostgreSQL 16 service
+container in CI (`.github/workflows/RemoteMetadata.yml`); without `OPENIVM_POSTGRES_DSN`,
+`make test` skips it. No managed PostgreSQL provider, managed DuckLake service or
+provider-side extension execution has been tested. Running OpenIVM still requires a client process with the extension
 loaded; storing metadata remotely removes only the persistent local frontend file.

@@ -17,6 +17,8 @@ constexpr const char *METADATA_SCHEMA_SETTING = "openivm_metadata_schema";
 constexpr const char *METADATA_LEASE_SETTING = "openivm_metadata_lease_seconds";
 // Test-only crash and lease-takeover injection for the split metadata/data refresh protocol.
 constexpr const char *TEST_FAIL_POINT_SETTING = "openivm_test_fail_point";
+// Test-only SQL that the concurrent_commit_* fail points commit from another connection.
+constexpr const char *TEST_CONCURRENT_SQL_SETTING = "openivm_test_concurrent_sql";
 // Durable pointer, stored in <data catalog>.main, to the metadata location that owns
 // the OpenIVM objects of that catalog. Read on every resolution so a reopened
 // database finds its metadata without session configuration.

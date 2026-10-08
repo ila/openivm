@@ -110,9 +110,12 @@ file finds the metadata again after reopening, while a process with an in-memory
 frontend sets these two settings at startup, before refreshing. Views cannot be created
 inside a PostgreSQL metadata catalog. DuckDB cannot commit the lake and the metadata catalog in one
 transaction, so refresh uses a crash-safe three-step protocol, and lifecycle statements
-and refreshes inside explicit transactions are rejected for these views. PostgreSQL
-metadata is validated only against a local PostgreSQL 16 in CI, not against managed
-providers, and a client process running OpenIVM is still required. See
+and refreshes inside explicit transactions are rejected for these views. The PostgreSQL
+metadata integration test runs against a local PostgreSQL 16 in CI; managed providers
+are untested, and a client process running OpenIVM is still required. A source change
+another client commits while a refresh runs is never lost: the stored watermark is the
+snapshot the refresh read, and a refresh that saw a source change retries (see
+[concurrency](concurrency.md#ducklake-sources-changing-during-a-refresh)). See
 [metadata placement](internals/metadata-placement.md) for discovery, recovery and
 multi-client semantics.
 

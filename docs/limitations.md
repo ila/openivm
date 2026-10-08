@@ -118,11 +118,15 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
     full recompute.
   - A database that already has views registered in another location cannot adopt a
     configured location until those views are migrated or dropped.
-  - Remote metadata supports native DuckDB files and PostgreSQL (`TYPE postgres`) only. It
-    is validated against a local PostgreSQL 16 in CI, not against managed providers. Clients
-    sharing a remote metadata schema serialize refreshes per view through a renewed lease,
-    but changes that other processes write to DuckLake sources while a refresh runs are not
-    pinned to the refresh's snapshot range.
+  - Remote metadata supports native DuckDB files and PostgreSQL (`TYPE postgres`) only. Its
+    integration test runs against a local PostgreSQL 16 service container in CI; managed
+    providers are untested. Clients sharing a remote metadata schema serialize refreshes per
+    view through a renewed lease.
+  - A DuckLake source change that another process commits while a refresh runs is neither
+    lost nor applied twice, but it makes that refresh retry, and a DuckLake view's retry is a
+    full recompute. A source that keeps changing through three attempts fails the refresh
+    with `changed while refreshing`; see
+    [Concurrency](concurrency.md#ducklake-sources-changing-during-a-refresh).
   - Lease times are PostgreSQL server times, so client clock offsets do not matter. A
     client stops writing view data a third of `openivm_metadata_lease_seconds` before its
     lease can expire on the server's clock. This assumes the server's clock is not stepped

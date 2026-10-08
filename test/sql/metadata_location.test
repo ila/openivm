@@ -69,6 +69,14 @@ FROM duckdb_tables() WHERE database_name = 'openivm_metadata_host' AND schema_na
 ----
 1	1
 
+# The aggregate backing table keeps its unique group-key index, as with legacy placement:
+# full recomputes (recovery below) upsert against it.
+query I
+SELECT count(*) FROM duckdb_indexes()
+WHERE database_name = 'openivm_metadata_host' AND starts_with(table_name, 'openivm_data_') AND is_unique;
+----
+1
+
 # The durable marker lets a reopened database find its metadata without settings.
 query II
 SELECT metadata_catalog, metadata_schema FROM openivm_metadata_host.main.openivm_metadata_location;

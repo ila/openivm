@@ -129,6 +129,63 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
 0
 
 # ==========================================
+# Another connection commits a source change after the DuckLake data statements and
+# before the watermarks: storing the latest snapshot would skip that change forever.
+# The watermark is the snapshot pinned before compilation; the retry recomputes.
+# ==========================================
+
+statement ok
+INSERT INTO dl.main.events SELECT i, i % 5, i FROM range(250, 270) t(i);
+
+statement ok
+DELETE FROM dl.main.events WHERE id % 8 = 1;
+
+statement ok
+SET openivm_test_concurrent_sql = 'INSERT INTO dl.main.events VALUES (280, 1, 28), (281, 7, 29); DELETE FROM dl.main.events WHERE id = 250; UPDATE dl.main.events SET v = v + 4 WHERE k = 0';
+
+statement ok
+SET openivm_test_fail_point = 'concurrent_commit_after_data';
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+statement ok
+SET openivm_test_fail_point = '';
+
+statement ok
+SET openivm_test_concurrent_sql = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+statement ok
+INSERT INTO dl.main.events VALUES (290, 2, 3), (291, 3, 4);
+
+statement ok
+DELETE FROM dl.main.events WHERE id = 280;
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+# ==========================================
 # Reopen without settings: the frontend marker finds control.openivm, and new DuckLake
 # views register there instead of splitting the metadata
 # ==========================================
