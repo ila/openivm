@@ -57,6 +57,25 @@ mv2	2
 
 # type 0 = AGGREGATE_GROUP, type 2 = SIMPLE_PROJECTION
 
+# view_name is an encoded internal key; the SQL-facing name lives only in view_sql_name.
+# Tooling (e.g. the rewriter benchmark) must resolve the SQL name to the key before reading metadata.
+query I
+SELECT count(*) FROM openivm_views WHERE view_name = 'mv1';
+----
+0
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_name LIKE '\_\_openivm\_mv\_%' ESCAPE '\' AND view_name <> view_sql_name;
+----
+2
+
+query I
+SELECT type FROM openivm_views WHERE view_name = (
+    SELECT view_name FROM openivm_views
+    WHERE view_sql_name = 'mv1' AND view_catalog = current_database() AND view_schema = current_schema());
+----
+0
+
 # Verify the stored SQL is non-empty and contains the expected table/column references
 query I
 SELECT sql_string IS NOT NULL AND LENGTH(sql_string) > 0 AND sql_string LIKE '%sum%' AND sql_string LIKE '%grp%' FROM openivm_views WHERE view_name = '__openivm_mv_6f70656e69766d5f6d657461646174615f74657374_6d61696e_6d7631_';
