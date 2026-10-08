@@ -1089,8 +1089,9 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 					// vs the refresh applied something wrong.
 					string diag;
 					auto dt_r = fin_con.Query(
-					    "SELECT table_name, last_update FROM openivm_delta_tables WHERE view_name = '" +
-					    v.name + "'");
+					    "SELECT table_name, last_update FROM openivm_delta_tables WHERE view_name IN "
+					    "(SELECT view_name FROM openivm_views WHERE lower(COALESCE(view_sql_name, view_name)) = "
+					    "lower(" + duckdb::Value(v.name).ToSQLString() + "))");
 					if (dt_r && !dt_r->HasError()) {
 						for (idx_t di = 0; di < dt_r->RowCount(); di++) {
 							string tn = dt_r->GetValue(0, di).ToString();

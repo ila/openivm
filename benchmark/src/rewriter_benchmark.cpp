@@ -10,6 +10,7 @@
 #include "duckdb/common/printer.hpp"
 #include "core/openivm_extension.hpp"
 #include "core/refresh_metadata.hpp"
+#include "benchmark_metadata.hpp"
 #include "tpcc_helpers.hpp"
 #include "tpcdi_helpers.hpp"
 
@@ -601,23 +602,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		{
 			// Metadata is keyed by an encoded internal key, not the SQL-facing mv_q* name. Record the
 			// leftover keys (and their data-table locations) before any DROP VIEW removes the rows.
-			struct LeftoverView {
-				string key;
-				string catalog;
-				string schema;
-			};
-			vector<LeftoverView> leftover_keys;
-			auto stale_meta = con.Query("SELECT view_name, view_catalog, view_schema FROM " + quoted_native_catalog +
-			                            ".main.openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv_q%'");
-			if (stale_meta && !stale_meta->HasError()) {
-				for (idx_t r = 0; r < stale_meta->RowCount(); r++) {
-					auto cat = stale_meta->GetValue(1, r);
-					auto sch = stale_meta->GetValue(2, r);
-					leftover_keys.push_back({stale_meta->GetValue(0, r).ToString(),
-					                         cat.IsNull() ? native_catalog : cat.ToString(),
-					                         sch.IsNull() ? "main" : sch.ToString()});
-				}
-			}
+			auto leftover_keys = openivm_bench::ListLeftoverViews(con, native_catalog, "mv_q%");
 			// Drop views from all catalogs
 			auto leftover = con.Query("SELECT table_catalog, table_name FROM information_schema.views "
 			                          "WHERE table_name LIKE 'mv_q%' AND table_schema = 'main'");
@@ -778,37 +763,13 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// name = filename, never "memory").
 						// openivm_views.view_name holds an encoded internal key; the SQL-facing name is in
 						// view_sql_name. Resolve the qualified identity to its key via RefreshMetadata.
-						string mv_key;
-						string key_error;
-						try {
-							auto loc = con.Query("SELECT current_database(), current_schema()");
-							if (loc && !loc->HasError() && loc->RowCount() > 0) {
-								duckdb::Connection meta_con(db);
-								duckdb::RefreshMetadata::UseCatalog(*meta_con.context, meta_con, native_catalog);
-								duckdb::RefreshMetadata metadata(meta_con);
-								mv_key = metadata.FindViewKey(loc->GetValue(0, 0).ToString(),
-								                              loc->GetValue(1, 0).ToString(), mv_name);
-							} else {
-								key_error = loc ? loc->GetError() : "no result";
-							}
-						} catch (std::exception &e) {
-							key_error = e.what();
-						}
-						duckdb::unique_ptr<duckdb::MaterializedQueryResult> check_result;
-						if (!mv_key.empty()) {
-							check_result = con.Query("SELECT type FROM " + quoted_native_catalog +
-							                         ".main.openivm_views WHERE view_name = " +
-							                         duckdb::Value(mv_key).ToSQLString());
-						}
-						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
-							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
-							is_incremental = (refresh_type != 3) ? 1 : 0;
+						auto lookup = openivm_bench::LookupViewType(db, con, native_catalog, mv_name);
+						if (lookup.found) {
+							is_incremental = (lookup.type != 3) ? 1 : 0;
 						} else {
 							error = "OpenIVM metadata lookup failed for " + mv_name;
-							if (check_result && check_result->HasError()) {
-								error += ": " + check_result->GetError();
-							} else if (!key_error.empty()) {
-								error += ": " + key_error;
+							if (!lookup.error.empty()) {
+								error += ": " + lookup.error;
 							}
 							phase_reached = PHASE_MV_CREATION_FAILED;
 						}
