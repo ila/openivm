@@ -1,0 +1,191 @@
+# name: test/sql/metadata_read_errors.test
+# description: A failing openivm_views metadata read must surface as an error, not change the refresh strategy
+# group: [sql]
+
+require openivm
+
+require parquet
+
+# Absent metadata tables are not errors: CREATE OR REPLACE before any view (or metadata table) exists must succeed
+statement ok
+CREATE TABLE s0(k INT, v INT);
+
+statement ok
+INSERT INTO s0 VALUES (1,5);
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW mv0 AS SELECT k, SUM(v) AS sv FROM s0 GROUP BY k;
+
+query II
+SELECT * FROM mv0;
+----
+1	5
+
+statement ok
+LOAD parquet;
+
+# DuckLake setup happens before any metadata table is altered, like the other DuckLake tests
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/metadata_read_errors_dl.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE TABLE dl.ls(k INT, v INT);
+
+statement ok
+INSERT INTO dl.ls VALUES (1,10),(1,20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.dl_mv AS SELECT k, MIN(v) AS lo FROM dl.ls GROUP BY k;
+
+statement ok
+DELETE FROM dl.ls WHERE v = 10;
+
+statement ok
+CREATE TABLE s(k INT, v INT);
+
+statement ok
+INSERT INTO s VALUES (1,10),(1,20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv AS SELECT k, MIN(v) AS lo FROM s GROUP BY k;
+
+# NULL columns keep their defaults (refresh_interval -> none, group_recompute_affected_mode -> current diff)
+statement ok
+CREATE TABLE s2(k INT, v INT);
+
+statement ok
+INSERT INTO s2 VALUES (1,1);
+
+statement ok
+CREATE MATERIALIZED VIEW mv2 AS SELECT k, SUM(v) AS sv FROM s2 GROUP BY k;
+
+statement ok
+INSERT INTO s2 VALUES (1,2);
+
+statement ok
+PRAGMA refresh('mv2');
+
+query II
+SELECT * FROM mv2;
+----
+1	3
+
+statement ok
+DELETE FROM s WHERE v = 10;
+
+# Catalog error: a missing metadata table must not be treated as "no such view"
+statement ok
+ALTER TABLE openivm_views RENAME TO openivm_views_gone;
+
+statement error
+PRAGMA refresh('mv');
+----
+openivm_views
+
+statement ok
+ALTER TABLE openivm_views_gone RENAME TO openivm_views;
+
+# Error reading catalog_type from the delta metadata must surface
+statement ok
+ALTER TABLE openivm_delta_tables DROP COLUMN catalog_type;
+
+statement error
+PRAGMA refresh('mv');
+----
+catalog_type
+
+statement ok
+ALTER TABLE openivm_delta_tables ADD COLUMN catalog_type VARCHAR;
+
+# Error reading last_snapshot_id must surface. Only DuckLake sources read it, so use a DuckLake view;
+# a plain DuckDB view legitimately refreshes without the column.
+statement ok
+ALTER TABLE openivm_delta_tables DROP COLUMN last_snapshot_id;
+
+statement ok
+PRAGMA refresh('mv');
+
+query II
+SELECT * FROM mv;
+----
+1	20
+
+statement ok
+DELETE FROM s WHERE v = 20;
+
+statement ok
+INSERT INTO s VALUES (1,10),(1,20);
+
+statement ok
+DELETE FROM s WHERE v = 10;
+
+statement ok
+ALTER TABLE openivm_delta_tables ADD COLUMN last_snapshot_id BIGINT;
+
+statement ok
+ALTER TABLE openivm_delta_tables DROP COLUMN last_snapshot_id;
+
+statement error
+PRAGMA refresh('dl_mv');
+----
+last_snapshot_id
+
+statement ok
+ALTER TABLE openivm_delta_tables ADD COLUMN last_snapshot_id BIGINT;
+
+# Error reading the delta watermark must surface instead of looking like "no watermark"
+statement ok
+ALTER TABLE openivm_delta_tables DROP COLUMN last_update;
+
+statement error
+PRAGMA refresh('mv');
+----
+last_update
+
+statement ok
+ALTER TABLE openivm_delta_tables ADD COLUMN last_update TIMESTAMP;
+
+# Error reading the source location must surface instead of falling back to defaults
+statement ok
+ALTER TABLE openivm_delta_tables DROP COLUMN source_catalog;
+
+statement error
+PRAGMA refresh('mv');
+----
+source_catalog
+
+statement ok
+ALTER TABLE openivm_delta_tables ADD COLUMN source_catalog VARCHAR;
+
+# An unreadable delta metadata table must not look like "no downstream views" during CREATE OR REPLACE
+statement ok
+ALTER TABLE openivm_delta_tables RENAME TO openivm_delta_tables_saved;
+
+statement ok
+CREATE TABLE openivm_delta_tables(view_name VARCHAR);
+
+statement error
+CREATE OR REPLACE MATERIALIZED VIEW mv2 AS SELECT k, SUM(v) AS sv FROM s2 GROUP BY k;
+----
+could not resolve downstream dependencies
+
+statement ok
+DROP TABLE openivm_delta_tables;
+
+statement ok
+ALTER TABLE openivm_delta_tables_saved RENAME TO openivm_delta_tables;
+
+# A missing has_minmax column must fail the refresh instead of disabling MIN/MAX handling
+statement ok
+ALTER TABLE openivm_views DROP COLUMN has_minmax;
+
+statement error
+PRAGMA refresh('mv');
+----
+has_minmax

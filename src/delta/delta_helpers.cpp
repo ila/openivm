@@ -156,7 +156,11 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 	auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) +
 	                             " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND " +
 	                             RefreshMetadata::SourcePredicate(table_name, catalog_name, schema_name));
-	if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
+	if (snap_result->HasError()) {
+		throw Exception(ExceptionType::CATALOG, "IVM: could not read DuckLake snapshot metadata for view '" +
+		                                            view_name + "': " + snap_result->GetError());
+	}
+	if (snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
 		throw Exception(ExceptionType::CATALOG,
 		                "IVM: no snapshot ID recorded for DuckLake table '" + table_name + "' in view '" + view_name +
 		                    "' (metadata may be missing — try DROP MATERIALIZED VIEW and recreate)");

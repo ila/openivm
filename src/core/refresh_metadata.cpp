@@ -91,7 +91,21 @@ void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
 }
 
 string RefreshMetadata::GetViewSQLName(const string &view_key) {
-	auto name = ReadViewString(view_key, "view_sql_name");
+	// Metadata written before SQL names were stored separately has no view_sql_name column (see FindViewKey).
+	auto result = con.Query("SELECT view_sql_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_key) + "'");
+	if (result->HasError()) {
+		// Only the missing view_sql_name column (a binder error) is legacy metadata; anything else is a real failure.
+		if (result->GetErrorObject().Type() == ExceptionType::BINDER) {
+			return view_key;
+		}
+		throw InvalidInputException("Could not read IVM metadata column 'view_sql_name' for materialized view '%s': %s",
+		                            view_key, result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return view_key;
+	}
+	auto name = result->GetValue(0, 0).ToString();
 	return name.empty() ? view_key : name;
 }
 
@@ -166,13 +180,21 @@ string RefreshMetadata::ResolveViewName(const string &view_name, const string &c
 bool RefreshMetadata::IsBaseTable(const string &table_name) {
 	auto result = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(table_name) + "'");
-	return !result->HasError() && result->RowCount() == 0;
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM metadata table '%s' for '%s': %s", openivm::VIEWS_TABLE,
+		                            table_name, result->GetError());
+	}
+	return result->RowCount() == 0;
 }
 
 Value RefreshMetadata::ReadViewValue(const string &view_name, const string &column) {
 	auto result = con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::VIEWS_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	return result->HasError() || result->RowCount() == 0 ? Value() : result->GetValue(0, 0);
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM metadata column '%s' for materialized view '%s': %s", column,
+		                            view_name, result->GetError());
+	}
+	return result->RowCount() == 0 ? Value() : result->GetValue(0, 0);
 }
 
 string RefreshMetadata::ReadViewString(const string &view_name, const string &column) {
@@ -181,12 +203,8 @@ string RefreshMetadata::ReadViewString(const string &view_name, const string &co
 }
 
 string RefreshMetadata::GetViewQuery(const string &view_name) {
-	auto result = con.Query("SELECT sql_string FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0) {
-		return "";
-	}
-	return result->GetValue(0, 0).ToString();
+	auto value = ReadViewValue(view_name, "sql_string");
+	return value.IsNull() ? "" : value.ToString();
 }
 
 RefreshType RefreshMetadata::GetViewType(const string &view_name) {
@@ -258,10 +276,12 @@ vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
 	auto result = con.Query("SELECT table_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<string> tables;
-	if (!result->HasError()) {
-		for (size_t i = 0; i < result->RowCount(); i++) {
-			tables.push_back(result->GetValue(0, i).ToString());
-		}
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM delta table metadata for materialized view '%s': %s", view_name,
+		                            result->GetError());
+	}
+	for (size_t i = 0; i < result->RowCount(); i++) {
+		tables.push_back(result->GetValue(0, i).ToString());
 	}
 	return tables;
 }
@@ -270,7 +290,12 @@ string RefreshMetadata::GetLastUpdate(const string &view_name, const string &tab
 	auto result =
 	    con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
-	if (result->HasError() || result->RowCount() == 0) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM metadata column 'last_update' for materialized view '%s' "
+		                            "and table '%s': %s",
+		                            view_name, table_name, result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return "";
 	}
 	return result->GetValue(0, 0).ToString();
@@ -322,7 +347,11 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 	auto result = con.Query("SELECT source_catalog, source_schema FROM " + string(openivm::DELTA_TABLES_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 	                        SqlUtils::EscapeValue(table_name) + "'");
-	if (!result->HasError() && result->RowCount() > 0) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM source location for materialized view '%s' and table '%s': %s",
+		                            view_name, table_name, result->GetError());
+	}
+	if (result->RowCount() > 0) {
 		if (!result->GetValue(0, 0).IsNull()) {
 			loc.catalog_name = result->GetValue(0, 0).ToString();
 		}
@@ -340,7 +369,11 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
 	StoredViewLocation loc {fallback_catalog, fallback_schema};
 	auto result = con.Query("SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (!result->HasError() && result->RowCount() > 0) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM stored location for materialized view '%s': %s", view_name,
+		                            result->GetError());
+	}
+	if (result->RowCount() > 0) {
 		if (!result->GetValue(0, 0).IsNull()) {
 			loc.catalog_name = result->GetValue(0, 0).ToString();
 		}
@@ -384,7 +417,8 @@ vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const stri
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<DeltaSource> sources;
 	if (result->HasError()) {
-		return sources;
+		throw InvalidInputException("Could not read IVM delta source metadata for materialized view '%s': %s",
+		                            view_name, result->GetError());
 	}
 	for (idx_t row = 0; row < result->RowCount(); row++) {
 		DeltaSource source;
@@ -420,6 +454,8 @@ RefreshMetadata::DeltaChangeStats RefreshMetadata::GetStandardDeltaChangeStats(c
 	    con.Query("SELECT COUNT(*), SUM(CASE WHEN " + string(openivm::MULTIPLICITY_COL) +
 	              " < 0 THEN 1 ELSE 0 END) FROM " + delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) +
 	              " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP");
+	// This reads delta data, not metadata. Callers treat !ok conservatively (pending changes and deletes),
+	// so an unreadable delta table never makes a refresh skip work.
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return stats;
 	}
@@ -645,6 +681,11 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 	return order;
 }
 
+static bool RefreshMetadataTableExists(Connection &con, const char *table_name) {
+	return con.TableInfo(TEMP_CATALOG, DEFAULT_SCHEMA, table_name) ||
+	       con.TableInfo(INVALID_CATALOG, DEFAULT_SCHEMA, table_name);
+}
+
 bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_published) {
 	string predicate = "table_name = '" + SqlUtils::EscapeValue(SqlUtils::DeltaName(view_name)) + "'";
 	if (include_published) {
@@ -653,7 +694,16 @@ bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_p
 	}
 	auto result =
 	    con.Query("SELECT 1 FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " + predicate + " LIMIT 1");
-	return !result->HasError() && result->RowCount() > 0;
+	if (result->HasError()) {
+		// CREATE OR REPLACE may run before any view created the metadata table: nothing can depend on it yet.
+		if (result->GetErrorObject().Type() == ExceptionType::CATALOG &&
+		    !RefreshMetadataTableExists(con, openivm::DELTA_TABLES_TABLE)) {
+			return false;
+		}
+		throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view_name,
+		                       result->GetError());
+	}
+	return result->RowCount() > 0;
 }
 
 vector<string> RefreshMetadata::ReadViewList(const string &view_name, const string &column) {
@@ -805,7 +855,11 @@ string RefreshMetadata::GetCatalogType(const string &view_name, const string &ta
 	auto result =
 	    con.Query("SELECT catalog_type FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read catalog_type for '%s' of materialized view '%s': %s", table_name,
+		                            view_name, result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return "duckdb";
 	}
 	return result->GetValue(0, 0).ToString();
@@ -821,7 +875,11 @@ bool RefreshMetadata::IsDuckLakeCatalog(const string &catalog_name) {
 	}
 	auto result = con.Query("SELECT type FROM duckdb_databases() WHERE database_name = '" +
 	                        SqlUtils::EscapeValue(catalog_name) + "' LIMIT 1");
-	return !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
+	if (result->HasError()) {
+		throw CatalogException("OpenIVM could not resolve the type of catalog '%s': %s", catalog_name,
+		                       result->GetError());
+	}
+	return result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
 	       StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "ducklake");
 }
 
@@ -830,7 +888,11 @@ int64_t RefreshMetadata::GetCurrentDuckLakeSnapshot(const string &catalog_name) 
 		return -1;
 	}
 	auto result = con.Query("SELECT id FROM " + SqlUtils::QuoteIdentifier(catalog_name) + ".current_snapshot()");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read current snapshot of catalog '%s': %s", catalog_name,
+		                            result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return -1;
 	}
 	return result->GetValue(0, 0).GetValue<int64_t>();
@@ -840,7 +902,11 @@ int64_t RefreshMetadata::GetLastSnapshotId(const string &view_name, const string
 	auto result =
 	    con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read last_snapshot_id for '%s' of materialized view '%s': %s",
+		                            table_name, view_name, result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return -1;
 	}
 	return result->GetValue(0, 0).GetValue<int64_t>();
@@ -854,7 +920,11 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	auto result =
 	    con.Query("SELECT source_table_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name));
-	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read source_table_id for '%s' of materialized view '%s': %s", table_name,
+		                            view_name, result->GetError());
+	}
+	if (result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
 		identity.stored_table_id = result->GetValue(0, 0).GetValue<int64_t>();
 	}
 	if (catalog_name.empty()) {
