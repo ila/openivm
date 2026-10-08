@@ -6,6 +6,21 @@ require openivm
 
 require parquet
 
+# Absent metadata tables are not errors: CREATE OR REPLACE before any view (or metadata table) exists must succeed
+statement ok
+CREATE TABLE s0(k INT, v INT);
+
+statement ok
+INSERT INTO s0 VALUES (1,5);
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW mv0 AS SELECT k, SUM(v) AS sv FROM s0 GROUP BY k;
+
+query II
+SELECT * FROM mv0;
+----
+1	5
+
 statement ok
 LOAD parquet;
 
@@ -30,13 +45,6 @@ CREATE MATERIALIZED VIEW dl.dl_mv AS SELECT k, MIN(v) AS lo FROM dl.ls GROUP BY 
 
 statement ok
 DELETE FROM dl.ls WHERE v = 10;
-
-# Absent metadata tables are not errors: CREATE OR REPLACE before any view exists must succeed
-statement ok
-CREATE TABLE s0(k INT, v INT);
-
-statement ok
-CREATE OR REPLACE MATERIALIZED VIEW mv0 AS SELECT k, SUM(v) AS sv FROM s0 GROUP BY k;
 
 statement ok
 CREATE TABLE s(k INT, v INT);
