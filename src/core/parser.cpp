@@ -221,6 +221,12 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		current_catalog = def.catalog;
 		current_schema = def.schema.empty() ? "main" : def.schema;
 	}
+	// Without USE the session's catalog is unset, meaning the default database. The helper
+	// connection runs in the explicitly placed metadata location instead, so the view's data
+	// objects and sources must name that catalog rather than resolve next to the metadata.
+	if (current_catalog.empty() && metadata_location.explicit_placement) {
+		current_catalog = DatabaseManager::GetDefaultDatabase(context);
+	}
 	add_create_profile_step("create_compile_session_context", context_start);
 	// The helper has already selected the catalog that owns this view metadata.
 	auto default_context_start = create_profile_now();
@@ -327,6 +333,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	RefreshMetadata metadata(con);
 	bool target_is_ducklake = metadata.IsDuckLakeCatalog(view_target_catalog);
+	// Metadata in another database than the view cannot commit in the view's transaction;
+	// such CREATEs take the staged program (explicit transactions were rejected above).
+	bool metadata_spans_databases =
+	    metadata_location.explicit_placement && MetadataLocator::SpansDatabases(metadata_location, view_target_catalog);
 	string internal_catalog_prefix = view_catalog_prefix;
 	string internal_target_catalog = view_target_catalog;
 	string internal_target_schema = view_target_schema;
@@ -355,7 +365,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// exist" because the fresh connection resolves against the physical-default catalog.
 	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
 		auto use_start = create_profile_now();
-		con.Query("USE " + current_catalog + "." + current_schema);
+		con.Query("USE " + current_catalog_schema);
 		add_create_profile_step("create_compile_use_context", use_start, current_catalog_schema);
 	}
 
@@ -1150,7 +1160,20 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                  KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
 		string qdv_drop =
 		    internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
-		ddl.push_back("DROP VIEW IF EXISTS " + qvn_drop);
+		if (metadata_spans_databases) {
+			// The staged helper would route DROP VIEW through OpenIVM's lifecycle DROP, which
+			// also removes the view's metadata and source delta tables no other view reads,
+			// although this CREATE already set them up. Drop only the catalog entry.
+			DropInfo view_drop;
+			view_drop.type = CatalogType::VIEW_ENTRY;
+			view_drop.catalog = view_target_catalog;
+			view_drop.schema = view_target_schema;
+			view_drop.name = sql_view_name;
+			view_drop.if_not_found = OnEntryNotFound::RETURN_NULL;
+			ddl.push_back(BuildDropViewStatement(view_drop));
+		} else {
+			ddl.push_back("DROP VIEW IF EXISTS " + qvn_drop);
+		}
 		ddl.push_back("DROP TABLE IF EXISTS " + qdt_drop);
 		ddl.push_back("DROP TABLE IF EXISTS " + qdv_drop);
 		ddl.push_back("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
@@ -1739,8 +1762,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Compiled %lu DDL queries for bind phase\n", (unsigned long)ddl.size());
 
-	bool caller_transactional_ddl =
-	    !target_is_ducklake && (view_catalog_prefix.empty() || view_target_catalog == default_db);
+	bool caller_transactional_ddl = !target_is_ducklake && !metadata_spans_databases &&
+	                                (view_catalog_prefix.empty() || view_target_catalog == default_db);
 	// The view-specific program (everything after the system tables) in execution order.
 	// Caller-transaction programs are archived exactly as rendered for execution. Staged
 	// operations resolved by the DDL executor from catalog state at execution time are
@@ -2151,7 +2174,10 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	if (catalog_name.empty() || schema_name.empty()) {
 		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
 		if (catalog_name.empty()) {
-			catalog_name = default_entry.catalog;
+			// An unset session catalog is the default database, where CREATE registered the
+			// view; DROP VIEW IF EXISTS must find leftover metadata of an interrupted DROP there.
+			catalog_name =
+			    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
 		}
 		if (schema_name.empty()) {
 			schema_name = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;

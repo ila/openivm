@@ -239,7 +239,12 @@ source writers in other processes during a refresh are outside this protocol (se
 
 ## Replacement and drop
 
-`CREATE OR REPLACE` keeps exactly one metadata row in the selected location. DROP removes
+`CREATE OR REPLACE` keeps exactly one metadata row in the selected location. When that
+location is in another database than the view, CREATE runs as a staged program in
+autocommit mode, and the replacement removes only the old view's catalog objects; the
+source delta tables it keeps reading stay in place. A staged replacement that fails after
+removing the old objects runs CREATE's cleanup, which drops the view together with its
+metadata rather than leaving a half-built view; create it again. DROP removes
 data objects before metadata rows. A DROP interrupted between the two leaves only metadata,
 never an unmaintained view; `DROP VIEW IF EXISTS <name>` removes the leftover metadata.
 CREATE writes metadata last; a CREATE interrupted earlier leaves objects that

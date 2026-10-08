@@ -136,6 +136,14 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
 statement ok
 INSERT INTO dl.main.events SELECT i, i % 3, i FROM range(400, 410) t(i);
 
+# A real reopen loses SET; the test runner's restart carries global settings over, so
+# clear them first. Only the frontend marker may lead the reopened database to control.
+statement ok
+SET openivm_metadata_catalog = '';
+
+statement ok
+SET openivm_metadata_schema = 'main';
+
 restart
 
 statement ok

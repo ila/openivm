@@ -732,6 +732,14 @@ INSERT INTO orders VALUES (24, 'a', 24), (25, 'x', 25);
 statement ok
 DELETE FROM orders WHERE id = 22;
 
+# A real reopen loses SET; the test runner's restart carries global settings over, so
+# clear them first. Only the durable marker may lead the reopened database to control.
+statement ok
+SET openivm_metadata_catalog = '';
+
+statement ok
+SET openivm_metadata_schema = 'main';
+
 restart
 
 statement ok
