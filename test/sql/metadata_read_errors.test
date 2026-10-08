@@ -6,6 +6,31 @@ require openivm
 
 require parquet
 
+statement ok
+LOAD parquet;
+
+# DuckLake setup happens before any metadata table is altered, like the other DuckLake tests
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/metadata_read_errors_dl.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE TABLE dl.ls(k INT, v INT);
+
+statement ok
+INSERT INTO dl.ls VALUES (1,10),(1,20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.dl_mv AS SELECT k, MIN(v) AS lo FROM dl.ls GROUP BY k;
+
+statement ok
+DELETE FROM dl.ls WHERE v = 10;
+
 # Absent metadata tables are not errors: CREATE OR REPLACE before any view exists must succeed
 statement ok
 CREATE TABLE s0(k INT, v INT);
@@ -94,27 +119,6 @@ DELETE FROM s WHERE v = 10;
 
 statement ok
 ALTER TABLE openivm_delta_tables ADD COLUMN last_snapshot_id BIGINT;
-
-statement ok
-INSTALL ducklake;
-
-statement ok
-LOAD ducklake;
-
-statement ok
-ATTACH '__TEST_DIR__/metadata_read_errors_dl.db' AS dl (TYPE ducklake);
-
-statement ok
-CREATE TABLE dl.ls(k INT, v INT);
-
-statement ok
-INSERT INTO dl.ls VALUES (1,10),(1,20);
-
-statement ok
-CREATE MATERIALIZED VIEW dl.dl_mv AS SELECT k, MIN(v) AS lo FROM dl.ls GROUP BY k;
-
-statement ok
-DELETE FROM dl.ls WHERE v = 10;
 
 statement ok
 ALTER TABLE openivm_delta_tables DROP COLUMN last_snapshot_id;
