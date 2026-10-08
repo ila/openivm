@@ -9,6 +9,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
 #include "core/openivm_extension.hpp"
+#include "core/refresh_metadata.hpp"
 #include "tpcc_helpers.hpp"
 #include "tpcdi_helpers.hpp"
 
@@ -598,6 +599,25 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		// DuckLake MVs (created with USE dl.main) land in dl.main.*, so we use catalog-qualified
 		// drops via information_schema which spans all catalogs.
 		{
+			// Metadata is keyed by an encoded internal key, not the SQL-facing mv_q* name. Record the
+			// leftover keys (and their data-table locations) before any DROP VIEW removes the rows.
+			struct LeftoverView {
+				string key;
+				string catalog;
+				string schema;
+			};
+			vector<LeftoverView> leftover_keys;
+			auto stale_meta = con.Query("SELECT view_name, view_catalog, view_schema FROM " + quoted_native_catalog +
+			                            ".main.openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv_q%'");
+			if (stale_meta && !stale_meta->HasError()) {
+				for (idx_t r = 0; r < stale_meta->RowCount(); r++) {
+					auto cat = stale_meta->GetValue(1, r);
+					auto sch = stale_meta->GetValue(2, r);
+					leftover_keys.push_back({stale_meta->GetValue(0, r).ToString(),
+					                         cat.IsNull() ? native_catalog : cat.ToString(),
+					                         sch.IsNull() ? "main" : sch.ToString()});
+				}
+			}
 			// Drop views from all catalogs
 			auto leftover = con.Query("SELECT table_catalog, table_name FROM information_schema.views "
 			                          "WHERE table_name LIKE 'mv_q%' AND table_schema = 'main'");
@@ -619,9 +639,21 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					con.Query("DROP TABLE IF EXISTS " + cat + ".main." + tn);
 				}
 			}
-			// Clean metadata tables (always in native catalog, unqualified)
-			con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_q%'");
-			con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_q%'");
+			// Data tables are named after the internal key, so the LIKE patterns above miss them.
+			for (auto &lv : leftover_keys) {
+				con.Query("DROP TABLE IF EXISTS " + duckdb::KeywordHelper::WriteOptionallyQuoted(lv.catalog) + "." +
+				          duckdb::KeywordHelper::WriteOptionallyQuoted(lv.schema) + "." +
+				          duckdb::KeywordHelper::WriteOptionallyQuoted("openivm_data_" + lv.key));
+				string key_literal = duckdb::Value(lv.key).ToSQLString();
+				con.Query("DELETE FROM " + quoted_native_catalog + ".main.openivm_delta_tables WHERE view_name = " +
+				          key_literal);
+				con.Query("DELETE FROM " + quoted_native_catalog + ".main.openivm_views WHERE view_name = " +
+				          key_literal);
+			}
+			// Clean metadata tables (always in native catalog) for legacy rows keyed by the SQL name
+			con.Query("DELETE FROM " + quoted_native_catalog + ".main.openivm_views WHERE view_name LIKE 'mv_q%'");
+			con.Query("DELETE FROM " + quoted_native_catalog +
+			          ".main.openivm_delta_tables WHERE view_name LIKE 'mv_q%'");
 		}
 
 		int delta_idx = 0;
@@ -744,8 +776,30 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// Qualify with native_catalog so the lookup works both when the active catalog
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
 						// name = filename, never "memory").
-						auto check_result = con.Query("SELECT type FROM " + quoted_native_catalog +
-						                              ".main.openivm_views WHERE view_name = '" + mv_name + "'");
+						// openivm_views.view_name holds an encoded internal key; the SQL-facing name is in
+						// view_sql_name. Resolve the qualified identity to its key via RefreshMetadata.
+						string mv_key;
+						string key_error;
+						try {
+							auto loc = con.Query("SELECT current_database(), current_schema()");
+							if (loc && !loc->HasError() && loc->RowCount() > 0) {
+								duckdb::Connection meta_con(db);
+								duckdb::RefreshMetadata::UseCatalog(*meta_con.context, meta_con, native_catalog);
+								duckdb::RefreshMetadata metadata(meta_con);
+								mv_key = metadata.FindViewKey(loc->GetValue(0, 0).ToString(),
+								                              loc->GetValue(1, 0).ToString(), mv_name);
+							} else {
+								key_error = loc ? loc->GetError() : "no result";
+							}
+						} catch (std::exception &e) {
+							key_error = e.what();
+						}
+						duckdb::unique_ptr<duckdb::MaterializedQueryResult> check_result;
+						if (!mv_key.empty()) {
+							check_result = con.Query("SELECT type FROM " + quoted_native_catalog +
+							                         ".main.openivm_views WHERE view_name = " +
+							                         duckdb::Value(mv_key).ToSQLString());
+						}
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
 							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
 							is_incremental = (refresh_type != 3) ? 1 : 0;
@@ -753,6 +807,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 							error = "OpenIVM metadata lookup failed for " + mv_name;
 							if (check_result && check_result->HasError()) {
 								error += ": " + check_result->GetError();
+							} else if (!key_error.empty()) {
+								error += ": " + key_error;
 							}
 							phase_reached = PHASE_MV_CREATION_FAILED;
 						}

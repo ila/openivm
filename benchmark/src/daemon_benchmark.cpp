@@ -871,10 +871,17 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 				con.Query("DROP TABLE IF EXISTS " + full);
 			}
 		}
-		con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_refresh_history WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_refresh_hooks WHERE view_name LIKE 'mv_%'");
+		// view_name holds an encoded internal key; match the SQL-facing name (view_sql_name) too,
+		// and delete dependent metadata before the openivm_views rows that identify it.
+		const string stale_keys = "SELECT view_name FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE "
+		                          "'mv\\_%' ESCAPE '\\'";
+		for (const char *dependent :
+		     {"openivm_delta_tables", "openivm_refresh_history", "openivm_refresh_hooks"}) {
+			con.Query(string("DELETE FROM ") + dependent + " WHERE view_name LIKE 'mv_%' OR view_name IN (" +
+			          stale_keys + ")");
+		}
+		con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_%' OR COALESCE(view_sql_name, view_name) LIKE "
+		          "'mv\\_%' ESCAPE '\\'");
 
 		// DuckLake attach for S9/S10/S11
 		if (subtest == "S9" || subtest == "S10" || subtest == "S11") {
