@@ -21,3 +21,11 @@ test_release_internal: test_scheduler_catalog
 test_scheduler_catalog:
 	cmake --build build/release --target scheduler_catalog_test
 	python3 test/integration/test_scheduler_catalog.py ./build/release/extension/openivm/scheduler_catalog_test
+
+.PHONY: test_benchmark_metadata
+
+test_release_internal: test_benchmark_metadata
+
+test_benchmark_metadata:
+	cmake --build build/release --target benchmark_metadata_test
+	dir=$$(mktemp -d) && ./build/release/extension/openivm/benchmark_metadata_test $$dir | grep -qx PASS; status=$$?; rm -rf $$dir; exit $$status

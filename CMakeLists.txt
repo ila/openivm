@@ -135,6 +135,10 @@ if(NOT EMSCRIPTEN)
 
     add_executable(scheduler_catalog_test test/integration/scheduler_catalog_test.cpp)
     target_link_libraries(scheduler_catalog_test ${OPENIVM_LINK_LIBS})
+
+    add_executable(benchmark_metadata_test test/integration/benchmark_metadata_test.cpp)
+    target_link_libraries(benchmark_metadata_test ${OPENIVM_LINK_LIBS})
+    target_include_directories(benchmark_metadata_test PUBLIC benchmark/src)
 endif()
 
 # Benchmark tools are currently supported on Unix native platforms.
