@@ -109,7 +109,9 @@ location marker, so OpenIVM records it in the frontend database: a persistent fr
 file finds the metadata again after reopening, while a process with an in-memory
 frontend sets these two settings at startup, before refreshing. Views cannot be created
 inside a PostgreSQL metadata catalog. DuckDB cannot commit the lake and the metadata catalog in one
-transaction, so refresh uses a crash-safe three-step protocol, and lifecycle statements
+transaction, so refresh uses a crash-safe three-step protocol whose data step is one
+lake transaction (downstream views never see a partly refreshed backing table), and
+lifecycle statements
 and refreshes inside explicit transactions are rejected for these views. The PostgreSQL
 metadata integration test runs against a local PostgreSQL 16 in CI; managed providers
 are untested, and a client process running OpenIVM is still required. A source change

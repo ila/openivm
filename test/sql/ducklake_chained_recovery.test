@@ -1,0 +1,181 @@
+# name: test/sql/ducklake_chained_recovery.test
+# description: Chained DuckLake views with default (frontend) metadata recover from an interrupted upstream refresh without losing or doubling downstream changes (#84)
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_chained_recovery.db' AS dl (TYPE ducklake);
+
+# Refresh each level explicitly so a crash in the upstream view is observed downstream.
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE dl.sales (id INTEGER, region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO dl.sales SELECT i, ['east', 'west', 'south', 'north'][i % 4 + 1], i FROM range(80) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.region_totals AS
+SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.sales GROUP BY region;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.big_regions AS SELECT region, total, cnt FROM dl.region_totals WHERE total > 800;
+
+# ==========================================
+# Crash right after the upstream view writes its own delta rows, before its backing table
+# changes. With default metadata these DuckLake statements commit one by one, so the delta
+# rows stay behind. The downstream view reads the upstream backing table's snapshot changes
+# and sees nothing; recovery and later incremental refreshes never apply the stale rows.
+# ==========================================
+
+statement ok
+INSERT INTO dl.sales SELECT i, ['east', 'west', 'south', 'north'][i % 3 + 1], i * 2 FROM range(100, 140) t(i);
+
+statement ok
+DELETE FROM dl.sales WHERE id % 7 = 0;
+
+statement ok
+UPDATE dl.sales SET amount = amount + 10 WHERE region = 'south';
+
+statement ok
+CREATE TABLE before_refresh AS SELECT * FROM dl.region_totals;
+
+statement ok
+SET openivm_test_fail_point = 'after_view_delta';
+
+statement error
+PRAGMA refresh('dl.region_totals');
+----
+'after_view_delta' simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM openivm_views WHERE view_sql_name = 'region_totals';
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.region_totals EXCEPT ALL SELECT * FROM before_refresh))
+     + (SELECT count(*) FROM (SELECT * FROM before_refresh EXCEPT ALL SELECT * FROM dl.region_totals));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.big_regions');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.big_regions EXCEPT ALL SELECT * FROM before_refresh WHERE total > 800))
+     + (SELECT count(*) FROM (SELECT * FROM before_refresh WHERE total > 800 EXCEPT ALL SELECT * FROM dl.big_regions));
+----
+0
+
+# Recovery recomputes the upstream view and emits its diff downstream exactly once.
+statement ok
+PRAGMA refresh('dl.region_totals');
+
+statement ok
+PRAGMA refresh('dl.big_regions');
+
+query I
+SELECT refresh_in_progress FROM openivm_views WHERE view_sql_name = 'region_totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.region_totals
+                              EXCEPT ALL SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region))
+     + (SELECT count(*) FROM (SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region
+                              EXCEPT ALL SELECT * FROM dl.region_totals));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.big_regions
+                              EXCEPT ALL SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 800))
+     + (SELECT count(*) FROM (SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 800
+                              EXCEPT ALL SELECT * FROM dl.big_regions));
+----
+0
+
+# ==========================================
+# A second interrupted refresh, recovered with the downstream view refreshed only after
+# the upstream recovery, followed by a normal incremental round
+# ==========================================
+
+statement ok
+INSERT INTO dl.sales VALUES (500, 'east', 900), (501, 'west', 1), (502, 'west', 1);
+
+statement ok
+DELETE FROM dl.sales WHERE region = 'north' AND id < 40;
+
+statement ok
+UPDATE dl.sales SET region = 'south' WHERE id = 101;
+
+statement ok
+SET openivm_test_fail_point = 'after_view_delta';
+
+statement error
+PRAGMA refresh('dl.region_totals');
+----
+'after_view_delta' simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+statement ok
+PRAGMA refresh('dl.region_totals');
+
+statement ok
+PRAGMA refresh('dl.big_regions');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.big_regions
+                              EXCEPT ALL SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 800))
+     + (SELECT count(*) FROM (SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 800
+                              EXCEPT ALL SELECT * FROM dl.big_regions));
+----
+0
+
+statement ok
+INSERT INTO dl.sales VALUES (600, 'north', 2000), (601, 'south', 3);
+
+statement ok
+DELETE FROM dl.sales WHERE id = 500;
+
+statement ok
+UPDATE dl.sales SET amount = amount * 3 WHERE region = 'west';
+
+statement ok
+PRAGMA refresh('dl.region_totals');
+
+statement ok
+PRAGMA refresh('dl.big_regions');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.region_totals
+                              EXCEPT ALL SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region))
+     + (SELECT count(*) FROM (SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region
+                              EXCEPT ALL SELECT * FROM dl.region_totals));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.big_regions
+                              EXCEPT ALL SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 800))
+     + (SELECT count(*) FROM (SELECT region, SUM(amount), COUNT(*) FROM dl.sales GROUP BY region HAVING SUM(amount) > 800
+                              EXCEPT ALL SELECT * FROM dl.big_regions));
+----
+0

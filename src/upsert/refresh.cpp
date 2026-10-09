@@ -259,6 +259,22 @@ static void InjectConcurrentCommit(ClientContext &context, const string &point, 
 	}
 }
 
+// Test-only: whether a refresh statement inserts into the view's own delta table (delta_<mv>).
+// Generated statements name their INSERT target without spaces.
+static bool WritesViewDelta(const string &statement, const string &view_name) {
+	const string insert = "INSERT INTO ";
+	auto delta_name = SqlUtils::DeltaName(view_name);
+	for (auto pos = statement.find(insert); pos != string::npos; pos = statement.find(insert, pos + 1)) {
+		auto start = pos + insert.size();
+		auto end = statement.find_first_of(" (\n", start);
+		auto target = statement.substr(start, end == string::npos ? string::npos : end - start);
+		if (SqlUtils::LastIdentifierPart(target) == delta_name) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // Generate and execute refresh SQL for a single view while the caller owns the mutation gate.
 // When openivm_adaptive_refresh is on, also computes a cost estimate before execution
 // and records execution history for the learned cost model.
@@ -470,10 +486,16 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 			lease.Require(display_name);
 		}
-		// Native refreshes are always transactional. DuckLake only needs a data transaction
-		// for the exhaustive-delete attempt: a multiplicity mismatch rolls the attempt back
-		// before the ranked rowid program runs.
-		if (!cross_system || delete_retry_plan.IsActive() || split_native) {
+		// Native refreshes are always transactional. DuckLake needs a data transaction for the
+		// exhaustive-delete attempt: a multiplicity mismatch rolls the attempt back before the
+		// ranked rowid program runs. Under the split protocol the data step is one transaction
+		// too, so a crash, a lost lease or a concurrent source change rolls it back instead of
+		// committing a partly refreshed backing table that downstream DuckLake views would read.
+		// Downstream views that read delta_<mv> need it as well: rows committed for a change
+		// that never reached the backing table would be emitted again by the cascading recovery.
+		bool atomic_ducklake_data =
+		    cross_system && !split_native && (split_protocol || probe_meta.HasDownstreamViews(vn));
+		if (!cross_system || delete_retry_plan.IsActive() || split_native || atomic_ducklake_data) {
 			exec_con.BeginTransaction();
 			tx_open = true;
 			if (!split_native) {
@@ -490,9 +512,11 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			execution_started = true;
 			// Cross-catalog data statements outside a transaction commit individually.
 			effects_may_be_committed = effects_may_be_committed || !tx_open;
-			// Under a lease every statement is checked first: DuckLake statements commit one
-			// by one, so a client past its deadline must stop before the next write.
-			bool split_program = profiler.Enabled() || (retry_plan && retry_plan->IsActive()) || lease.Active();
+			// Under a lease every statement is checked first, so a client past its deadline
+			// stops before the next write; the data transaction then rolls back.
+			bool crash_after_view_delta = MetadataLocator::TestPoint(context, "after_view_delta");
+			bool split_program = profiler.Enabled() || (retry_plan && retry_plan->IsActive()) || lease.Active() ||
+			                     crash_after_view_delta;
 			if (!split_program) {
 				executed_statement_count++;
 				return exec_con.Query(program);
@@ -516,6 +540,9 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 				                     ", sql=" + SqlUtils::SQLStatementPreview(statements[stmt_idx]));
 				if (program_result->HasError()) {
 					break;
+				}
+				if (crash_after_view_delta && WritesViewDelta(statements[stmt_idx], vn)) {
+					MetadataLocator::FailPoint(context, "after_view_delta");
 				}
 				if (!retry_plan || !retry_plan->IsActive()) {
 					continue;

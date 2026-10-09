@@ -291,3 +291,319 @@ query I
 SELECT count(*) FROM control.openivm.openivm_views;
 ----
 0
+
+# ==========================================
+# Chained DuckLake views: with metadata in a configured catalog, a DuckLake view's data step
+# (its own delta rows and its backing table) is one DuckLake transaction. The downstream view
+# reads the backing table's snapshot changes, so a crash anywhere in the upstream refresh,
+# before or after the downstream view refreshes, neither loses nor doubles a change.
+# ==========================================
+
+statement ok
+SET openivm_metadata_catalog = 'control';
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+# Refresh each level explicitly so a crash in the upstream view is observed downstream.
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE dl.main.chain_src (id INTEGER, k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.main.chain_src SELECT i, i % 6, i FROM range(60) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.chain_totals AS
+SELECT k, SUM(v) AS s, COUNT(*) AS c FROM dl.main.chain_src GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.chain_big AS SELECT k, s, c FROM dl.main.chain_totals WHERE s > 300;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views WHERE view_sql_name IN ('chain_totals', 'chain_big');
+----
+2
+
+# --- Crash after the interruption marker, before any data statement ---
+
+statement ok
+INSERT INTO dl.main.chain_src SELECT i, i % 7, i FROM range(100, 130) t(i);
+
+statement ok
+DELETE FROM dl.main.chain_src WHERE id % 9 = 0;
+
+statement ok
+UPDATE dl.main.chain_src SET v = v + 5 WHERE k = 3;
+
+statement ok
+SET openivm_test_fail_point = 'after_intent';
+
+statement error
+PRAGMA refresh('dl.main.chain_totals');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+true
+
+statement ok
+PRAGMA refresh('dl.main.chain_totals');
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+# --- Crash right after the statement that writes the view's own delta rows, before the
+# backing table changes. The data transaction rolls back, so neither is committed. ---
+
+statement ok
+INSERT INTO dl.main.chain_src SELECT i, i % 5, i * 3 FROM range(200, 230) t(i);
+
+statement ok
+DELETE FROM dl.main.chain_src WHERE k = 1 AND id < 50;
+
+statement ok
+UPDATE dl.main.chain_src SET v = v * 2 WHERE k = 4;
+
+statement ok
+CREATE OR REPLACE TABLE dl.main.chain_before AS SELECT * FROM dl.main.chain_totals;
+
+statement ok
+SET openivm_test_fail_point = 'after_view_delta';
+
+statement error
+PRAGMA refresh('dl.main.chain_totals');
+----
+'after_view_delta' simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+true
+
+# Nothing from the interrupted attempt committed: the backing table is unchanged ...
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals EXCEPT ALL SELECT * FROM dl.main.chain_before))
+     + (SELECT count(*) FROM (SELECT * FROM dl.main.chain_before EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+# ... and the downstream view sees no change before recovery runs.
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT * FROM dl.main.chain_before WHERE s > 300))
+     + (SELECT count(*) FROM (SELECT * FROM dl.main.chain_before WHERE s > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.main.chain_totals');
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+# --- Crash after every data statement ran, before the DuckLake COMMIT ---
+
+statement ok
+INSERT INTO dl.main.chain_src VALUES (300, 2, 400), (301, 6, 7), (302, 6, 8);
+
+statement ok
+DELETE FROM dl.main.chain_src WHERE id IN (101, 102, 203);
+
+statement ok
+UPDATE dl.main.chain_src SET k = 0 WHERE id = 104;
+
+statement ok
+CREATE OR REPLACE TABLE dl.main.chain_before AS SELECT * FROM dl.main.chain_totals;
+
+statement ok
+SET openivm_test_fail_point = 'before_data_commit';
+
+statement error
+PRAGMA refresh('dl.main.chain_totals');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals EXCEPT ALL SELECT * FROM dl.main.chain_before))
+     + (SELECT count(*) FROM (SELECT * FROM dl.main.chain_before EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+statement ok
+PRAGMA refresh('dl.main.chain_totals');
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+# --- Crash after the data committed, before the watermarks: the downstream view reads the
+# committed backing table first, and the recovery recompute adds no change twice ---
+
+statement ok
+INSERT INTO dl.main.chain_src SELECT i, i % 4, i FROM range(400, 420) t(i);
+
+statement ok
+DELETE FROM dl.main.chain_src WHERE k = 5;
+
+statement ok
+UPDATE dl.main.chain_src SET v = v - 1 WHERE k = 2;
+
+statement ok
+SET openivm_test_fail_point = 'after_data_commit';
+
+statement error
+PRAGMA refresh('dl.main.chain_totals');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+true
+
+# The downstream view consumes the committed upstream change first; recovery must not repeat it.
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+statement ok
+INSERT INTO dl.main.chain_src VALUES (500, 3, 900);
+
+statement ok
+PRAGMA refresh('dl.main.chain_totals');
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+# A normal incremental round after recovery keeps both levels exact.
+statement ok
+INSERT INTO dl.main.chain_src VALUES (600, 1, 1000), (601, 4, 2);
+
+statement ok
+DELETE FROM dl.main.chain_src WHERE id = 500;
+
+statement ok
+PRAGMA refresh('dl.main.chain_totals');
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+statement ok
+DROP VIEW dl.main.chain_big;
+
+statement ok
+DROP VIEW dl.main.chain_totals;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views;
+----
+0

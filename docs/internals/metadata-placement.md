@@ -128,8 +128,8 @@ catalogs, delete by key plus insert on PostgreSQL. If that restore itself fails,
 ### Refresh protocol (autocommit)
 
 1. **Intent.** One metadata transaction sets `refresh_in_progress = true`.
-2. **Data.** One data transaction applies the MV changes for native view catalogs (DuckLake
-   data statements keep their existing commit boundaries).
+2. **Data.** One data transaction in the view's own database (native catalog or DuckLake)
+   applies the MV changes, including the view's own delta rows.
 3. **Watermarks.** One metadata transaction advances every source watermark and clears
    `refresh_in_progress`.
 4. **Cleanup.** Consumed source-delta rows are deleted after step 3. This only removes rows
@@ -148,8 +148,23 @@ Crash and retry semantics:
 | After 3 | consistent | normal |
 
 A full recompute derives the MV from current base data, so it neither loses changes nor
-applies them twice, whatever happened before. Recomputed views emit their diff to
-downstream views, which therefore also see each change exactly once. Full recomputes take
+applies them twice, whatever happened before. Downstream views see each change exactly
+once:
+
+- A native view's downstream views read its delta table. Recovery emits the diff between
+  the committed backing table and the recomputed result. Step 2 commits the delta rows
+  together with the backing table, so an interrupted step 2 leaves neither and a committed
+  one leaves both; the diff therefore holds only changes not yet emitted.
+- A DuckLake view's downstream views read the snapshot changes of its backing table, so
+  they see exactly the committed backing-table states, and the recompute's own changes are
+  the remaining difference. Step 2 is one lake transaction, so no partial backing-table
+  state is ever committed. The view's own delta table only feeds its upsert. Its rows are
+  read only when they are newer than the last refresh, and the next incremental refresh
+  deletes them, so a delta row left by an interrupted refresh outside this protocol is
+  never applied.
+
+A non-native view with downstream views that read its delta table also runs its data
+statements in one transaction outside this protocol. Full recomputes take
 the same three steps, and recovery clears the marker only in step 3, together with the
 new watermarks. A view marked interrupted never uses the empty-delta shortcut.
 
@@ -175,7 +190,8 @@ read, and the next refresh would start after it. Instead:
 - No source changed: every read saw exactly the state at S, so step 3 stores S. Changes
   committed after the check have snapshot ids above S and are read by the next refresh.
 - A source changed: step 3 does not run. A transactional data step rolls back (under the
-  split protocol the marker is then retracted); committed DuckLake data keeps the marker set. The
+  split protocol the marker is then retracted). Outside the split protocol, a DuckLake view
+  commits its data statements one by one; its committed data keeps the marker set. The
   refresh then retries immediately, which for a marked view is a full recompute pinned to
   a new S. After three such attempts it fails with `changed while refreshing`, leaving the
   last stored watermarks or the marker in place.
@@ -213,9 +229,9 @@ Refreshes of one view are serialized across clients by `openivm_refresh_leases`:
   so measured on the server's clock the lease ends at least L/3 after the deadline. This
   needs only that the client's monotonic clock and the server's clock advance at comparable
   rates; their offsets do not matter. Before the data phase, before every data statement
-  (DuckLake statements commit one by one) and before a native data commit, the client
-  stops with `stopped before writing more materialized view data` once a renewal reported
-  loss or the deadline passed. A healthy holder's deadline always stays at least L/3 ahead.
+  and before the data commit, the client stops with `stopped before writing more
+  materialized view data` once a renewal reported loss or the deadline passed; the data
+  transaction then rolls back. A healthy holder's deadline always stays at least L/3 ahead.
 - **Fenced watermarks.** Step 3 (and retracting the marker after a clean data rollback)
   first runs `UPDATE openivm_refresh_leases SET lease_until = <server time + L> WHERE
   view_name = ... AND owner = <token>` inside the metadata transaction and fails unless
@@ -239,8 +255,8 @@ deadline is therefore committed before any takeover, and the new owner recompute
 it. The assumptions are that the client's monotonic clock and the server's clock advance
 at comparable rates, and that the server's clock is not stepped forward by more than L/3
 during a refresh (for example by a manual clock change; NTP slews small corrections).
-Within those assumptions, only a single data statement that starts before the deadline and
-is still running L/3 later can commit after a takeover. If that happens, its step 3 fails; when PostgreSQL is reachable,
+Within those assumptions, only a data commit that starts before the deadline and is still
+running L/3 later can commit after a takeover. If that happens, its step 3 fails; when PostgreSQL is reachable,
 the client then marks the view for recomputation as above. When it is not, the error says
 `could not mark the view for recomputation`, and the view can stay wrong until it is
 repaired with a forced full refresh once the metadata catalog is reachable:
@@ -288,6 +304,8 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 | Concurrent connections, daemon scheduling | `test/sql/metadata_location.test` |
 | Read-only and missing catalogs, untracked DROP TABLE while detached, reopen discovery, conflicting setting, existing databases, replace, drop, orphan cleanup | `test/sql/metadata_location.test` |
 | DuckLake views: frontend marker, reopen without settings, crash after the DuckLake data commit | `test/sql/metadata_location_ducklake.test` |
+| Chained DuckLake views: crash after intent, after the view's own delta rows, before and after the data commit; downstream refreshed before and after recovery, no lost or doubled rows | `test/sql/metadata_location_ducklake.test`, `test/sql/ducklake_chained_recovery.test` (default metadata) |
+| Chained DuckLake views under a lost PostgreSQL lease: downstream view checked before and after recovery | `test/integration/test_remote_metadata.py` |
 | Legacy discovery unchanged; scheduler discovery of a configured location | `test/integration/scheduler_catalog_test.cpp` |
 | PostgreSQL metadata: placement, reopen, crash + abandoned lease, RENAME rejection and portable restore, CREATE inside the metadata catalog rejected, DROP, concurrent DuckLake clients without a local frontend file | `test/integration/test_remote_metadata.py` (CI: `.github/workflows/RemoteMetadata.yml`) |
 | Lease lost before the data phase, after the first DuckLake statement, and taken over before the watermark commit (fence) | `test/integration/test_remote_metadata.py` |
@@ -300,6 +318,8 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 
 `openivm_test_fail_point` is a testing hook. `after_intent`, `before_data_commit` and
 `after_data_commit` simulate a process crash at a protocol step and run no compensation.
+`after_view_delta` crashes right after the statement that writes the view's own delta
+rows for downstream views, before the backing table changes.
 `concurrent_commit_before_data` and `concurrent_commit_after_data` commit the SQL in
 `openivm_test_concurrent_sql` from another connection during the first refresh attempt,
 after compilation or after the data statements, as a concurrent client would.

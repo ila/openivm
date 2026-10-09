@@ -444,6 +444,10 @@ def ducklake_lease_scenario(binary: Path, dsn: str, root: Path):
     (lake / "data").mkdir(parents=True)
     base = "SELECT k, SUM(v), COUNT(*) FROM lake.main.events GROUP BY k"
     view = "lake.main.event_totals"
+    # A downstream view reads the upstream backing table's snapshot changes: an interrupted
+    # upstream refresh must neither expose a partial change to it nor make recovery repeat one.
+    downstream = "lake.main.event_big"
+    downstream_base = "SELECT k, SUM(v), COUNT(*) FROM lake.main.events GROUP BY k HAVING SUM(v) > 1000"
 
     def client():
         return Client(binary, dsn, schema, ":memory:", lake=lake)
@@ -454,11 +458,13 @@ def ducklake_lease_scenario(binary: Path, dsn: str, root: Path):
             "INSERT INTO lake.main.events SELECT i, i % 5, i FROM range(100) t(i);\n"
             f"CREATE MATERIALIZED VIEW {view} AS SELECT k, SUM(v) AS s, COUNT(*) AS c "
             "FROM lake.main.events GROUP BY k;\n"
+            f"CREATE MATERIALIZED VIEW {downstream} AS SELECT k, s, c FROM {view} WHERE s > 1000;\n"
         )
         cases = [
             # The deadline passed before the data phase: no DuckLake statement runs.
             ("lease_lost_before_data", "stopped before writing more materialized view data"),
-            # The deadline passed after the first DuckLake statement committed.
+            # The deadline passed after the first DuckLake statement ran; the data transaction
+            # rolls it back.
             ("lease_lost_mid_data", "stopped before writing more materialized view data"),
             # Taken over after the data committed, unnoticed locally: the fence refuses.
             ("lease_lost_before_watermark", "lost the refresh lease"),
@@ -473,19 +479,34 @@ def ducklake_lease_scenario(binary: Path, dsn: str, root: Path):
             )
             client().expect_error(f"SET openivm_test_fail_point = '{point}';\nPRAGMA refresh('{view}');\n", message)
             checker = client()
-            assert checker.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "true", point
+            assert (
+                checker.value(
+                    f"SELECT refresh_in_progress FROM control.{schema}.openivm_views "
+                    "WHERE view_sql_name = 'event_totals';"
+                )
+                == "true"
+            ), point
             assert (
                 checker.value(f"SELECT owner FROM control.{schema}.openivm_refresh_leases;")
                 == "openivm-simulated-takeover"
             ), point
-            if point == "lease_lost_before_data":
+            if point in ("lease_lost_before_data", "lease_lost_mid_data"):
                 assert (
                     checker.value(bag_difference(view, "SELECT * FROM lake.main.before_refresh")) == "0"
-                ), "a client past its lease deadline wrote DuckLake data"
+                ), f"{point}: a client past its lease deadline committed DuckLake data"
+            # The downstream view refreshes before the upstream recovery: it must match the
+            # committed upstream backing table exactly.
+            checker.run(f"PRAGMA refresh('{downstream}');\n")
+            assert (
+                checker.value(bag_difference(downstream, f"SELECT * FROM {view} WHERE s > 1000")) == "0"
+            ), f"{point}: the downstream view diverged from the committed upstream view"
             # The takeover's lease has expired; the next client recovers by recomputing.
-            checker.run(f"PRAGMA refresh('{view}');\n")
+            checker.run(f"PRAGMA refresh('{view}');\nPRAGMA refresh('{downstream}');\n")
             assert checker.value(bag_difference(view, base)) == "0", f"{point}: recovery lost or doubled changes"
-            assert checker.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "false"
+            assert (
+                checker.value(bag_difference(downstream, downstream_base)) == "0"
+            ), f"{point}: recovery lost or doubled changes in the downstream view"
+            assert checker.value(f"SELECT bool_or(refresh_in_progress) FROM control.{schema}.openivm_views;") == "false"
             assert checker.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0"
     finally:
         drop_schema(binary, dsn, schema)

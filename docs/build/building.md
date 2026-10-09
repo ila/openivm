@@ -237,7 +237,8 @@ ORDER BY s.stmt_order;
 - **Outcomes.** `last_outcome` describes the latest operation that ran the version:
   `committed` (its transaction committed), `attempted` (it failed and rolled back,
   so nothing was committed) or `unknown` (a cross-catalog refresh failed after data
-  statements ran, or `COMMIT` itself failed, so some effects may have committed).
+  statements ran outside a transaction, or `COMMIT` itself failed, so some effects may
+  have committed).
   `committed_count` counts committed runs. Compile-only calls such as
   `openivm_compile_with_facts` are never archived, so a stored program has always
   been executed.

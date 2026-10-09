@@ -53,7 +53,8 @@ All tests live in `test/sql/*.test` using DuckDB's SQLLogicTest format.
 | `time_travel.test`, `time_travel_ducklake.test` | Time-travel pins |
 | `ducklake_*.test` | The same operator families over DuckLake sources |
 | `metadata_location.test` | Metadata in an attached catalog/schema: placement, crash recovery, explicit transactions, reopen, read-only/missing catalogs, drop, replace |
-| `metadata_location_ducklake.test` | DuckLake views with metadata in an attached catalog: frontend marker, reopen discovery, crash recovery, concurrent source commit |
+| `metadata_location_ducklake.test` | DuckLake views with metadata in an attached catalog: frontend marker, reopen discovery, crash recovery (including chained views), concurrent source commit |
+| `ducklake_chained_recovery.test` | Chained DuckLake views with default metadata: an interrupted upstream refresh neither loses nor doubles downstream changes |
 | `ducklake_concurrent_source_commit.test` | DuckLake source changes committed by another connection during a refresh: pinned watermark, retry, no lost or doubled changes |
 
 ## Remote metadata integration test
