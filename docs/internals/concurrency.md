@@ -68,8 +68,13 @@ rows with `Timestamp::GetCurrentTimestamp()`, and generated SQL uses
 
 The gate (`MutationGate` in `src/core/refresh_locks.cpp`) is stored in the database
 instance's object cache, so its lifetime is tied to that database and it is never
-evicted. Delta capture acquires it when a DML statement writes its first delta row.
-`TransactionalMVLockState` retains the guard through commit or rollback.
+evicted. A DML statement on a tracked table acquires it before execution: when
+`RefreshInsertRule` plans the delta capture, or, for a cached prepared plan, in
+`TransactionalMVLockState::OnExecutePrepared` or on `EXECUTE`. DuckDB's `DELETE` and
+`UPDATE` take a table lock against checkpoints when their pipeline starts. Had the
+statement waited for the gate while holding that lock, a gate holder whose commit
+triggers an automatic checkpoint would wait for the table forever. `TransactionalMVLockState`
+retains the guard through commit or rollback.
 
 First-time creation of the shared metadata tables and native source delta tables runs
 in its own short transaction under the gate; view planning and initial materialization

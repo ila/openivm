@@ -15,6 +15,7 @@
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/database_modification_type.hpp"
 #include "duckdb/common/printer.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -23,6 +24,7 @@
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_execute.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -633,6 +635,15 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		return;
 	}
 
+	// SQL EXECUTE runs a cached plan that this rule does not see again; gate it as below.
+	if (root->type == LogicalOperatorType::LOGICAL_EXECUTE) {
+		auto &prepared = root->Cast<LogicalExecute>().prepared;
+		if (prepared && prepared->physical_plan && PlanCapturesTrackedDeltas(prepared->physical_plan->Root())) {
+			TransactionalMVLockState::Get(input.context).AcquireMutationLock();
+		}
+		return;
+	}
+
 	if (plan->children.empty()) {
 		return;
 	}
@@ -719,5 +730,10 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 	default:
 		return;
 	}
+	// Take the gate now, before execution. DuckDB's DELETE and UPDATE sinks lock their table
+	// against checkpoints when the pipeline starts, ahead of the capture operator. A statement
+	// waiting for the gate while holding that lock deadlocks with a gate holder whose commit
+	// checkpoints: the checkpoint waits for the table lock, the statement for the gate.
+	TransactionalMVLockState::Get(input.context).AcquireMutationLock();
 }
 } // namespace duckdb

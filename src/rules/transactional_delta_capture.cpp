@@ -29,6 +29,8 @@ namespace duckdb {
 namespace {
 
 static void EnterDeltaWritePhase(ClientContext &context) {
+	// Normally a no-op: the statement already took the gate before execution (see
+	// RefreshInsertRule and TransactionalMVLockState::OnExecutePrepared).
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
 }
 
@@ -867,6 +869,29 @@ static vector<unique_ptr<Expression>> BindGeneratedExpressions(ClientContext &co
 }
 
 } // namespace
+
+bool PlanCapturesTrackedDeltas(PhysicalOperator &op) {
+	if (dynamic_cast<PhysicalTransactionalDeltaCapture *>(&op)) {
+		return true;
+	}
+	if (dynamic_cast<PhysicalMergeActionDeltaCapture *>(&op)) {
+		return true;
+	}
+	if (op.type == PhysicalOperatorType::MERGE_INTO) {
+		// MERGE keeps its action sinks, which the capture decorates, outside its children.
+		for (auto &action : op.Cast<PhysicalMergeInto>().actions) {
+			if (action->op && PlanCapturesTrackedDeltas(*action->op)) {
+				return true;
+			}
+		}
+	}
+	for (auto &child : op.children) {
+		if (PlanCapturesTrackedDeltas(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
 
 LogicalTransactionalDeltaCapture::LogicalTransactionalDeltaCapture(TableCatalogEntry &base_table_p,
                                                                    TableCatalogEntry &delta_table_p,
