@@ -363,9 +363,9 @@ def ducklake_concurrent_writer_scenario(binary: Path, dsn: str, root: Path):
             f"CREATE MATERIALIZED VIEW {view} AS SELECT k, SUM(v) AS s, COUNT(*) AS c "
             "FROM lake.main.events GROUP BY k;\n"
         )
-        # Deterministic: another connection commits after the DuckLake data statements and
-        # before the watermarks. The refresh retries by recomputing; the watermark is never
-        # a snapshot that contains a change the refresh did not read.
+        # Deterministic: another connection commits after the DuckLake data transaction and
+        # before the watermarks. The watermark is never a snapshot that contains a change the
+        # refresh did not read, so the next refresh applies that change exactly once.
         concurrent = (
             "INSERT INTO lake.main.events VALUES (600, 1, 60), (601, 9, 61); "
             "UPDATE lake.main.events SET v = v + 5 WHERE k = 2"
@@ -378,7 +378,9 @@ def ducklake_concurrent_writer_scenario(binary: Path, dsn: str, root: Path):
             "SET openivm_test_fail_point = 'concurrent_commit_after_data';\n"
             f"PRAGMA refresh('{view}');\n"
         )
-        assert injected.value(bag_difference(view, base)) == "0", "a commit during the refresh was lost or doubled"
+        # The concurrent commit adds group k = 9, which the committed refresh never read.
+        assert injected.value(f"SELECT count(*) FROM {view} WHERE k = 9;") == "0", "the refresh read past its snapshot"
+        # check_consistent refreshes once more and requires the exact result.
         check_consistent("injected commit")
 
         # Racing processes: one keeps committing source changes while others refresh.

@@ -187,8 +187,12 @@ read, and the next refresh would start after it. Instead:
   `ducklake_table_insertions`/`deletions` instead; an unverifiable source counts as
   changed. Only source tables are checked, so the refresh's own commits to its backing,
   delta and aux tables are excluded explicitly.
-- No source changed: every read saw exactly the state at S, so step 3 stores S. Changes
-  committed after the check have snapshot ids above S and are read by the next refresh.
+- No source changed: every read saw exactly the state at S. Step 3 stores the snapshot T
+  through which the check ran (S or later); no source changed in between, so T and S denote
+  the same source state, and T skips the refresh's own data commits. Changes committed after
+  the check have snapshot ids above T and are read by the next refresh. When the data runs
+  in one transaction, a source commit that lands after the check but before step 3 is
+  therefore applied by the next refresh, not by this one.
 - A source changed: step 3 does not run. A transactional data step rolls back (under the
   split protocol the marker is then retracted). Outside the split protocol, a DuckLake view
   commits its data statements one by one; its committed data keeps the marker set. The
@@ -312,7 +316,7 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 | Lease times written from the PostgreSQL server clock; expiry judged on that clock (live 120 s ahead refuses, 1 s past takes over) | `test/integration/test_remote_metadata.py` |
 | Rejected CREATE in an explicit transaction creates no metadata schema; ADD COLUMN of a tracked source while the metadata catalog is detached | `test/sql/metadata_location.test` |
 | Settings contradicting the frontend marker of a DuckLake view | `test/sql/metadata_location_ducklake.test` |
-| DuckLake source committed by another connection after the data statements, with metadata in `control` | `test/sql/metadata_location_ducklake.test` (`concurrent_commit_after_data`) |
+| DuckLake source committed by another connection after the data transaction, with metadata in `control`: not read by that refresh, applied once by the next | `test/sql/metadata_location_ducklake.test` (`concurrent_commit_after_data`) |
 | DuckLake source committed before or after the data statements (aggregate and join views); retry count; unrelated tables cause no retry | `test/sql/ducklake_concurrent_source_commit.test` |
 | PostgreSQL metadata: injected concurrent commit, and a writer process racing two refreshing processes | `test/integration/test_remote_metadata.py` |
 

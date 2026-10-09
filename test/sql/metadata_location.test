@@ -296,6 +296,8 @@ SELECT count(*) FROM control.openivm.openivm_views WHERE sql_string LIKE '%amt%'
 # ALTER fails once the stored view SQL was already rewritten and committed.
 statement error
 ALTER TABLE orders RENAME COLUMN amount TO id;
+----
+Column with name id already exists
 
 statement ok
 INSERT INTO orders VALUES (30, 'a', 3), (31, 'r', 31);

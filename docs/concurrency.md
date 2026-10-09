@@ -56,13 +56,14 @@ reads all happen at that snapshot or later, so once it has run it checks whether
 changed after the recorded snapshot. The refresh's own writes to its backing, delta and auxiliary tables are not
 sources and do not count.
 
-- **No source changed:** every read saw the recorded snapshot, so that snapshot is stored as the view's watermark. A
-  change committed later has a higher snapshot id and is applied by the next refresh.
+- **No source changed:** every read saw the recorded snapshot. The view's watermark becomes the snapshot up to which
+  the check ran, which has the same source state. A change committed after the check has a higher snapshot id and is
+  applied by the next refresh, including one that lands between a transactional data commit and the watermark write.
 - **A source changed:** the refresh may have read part of that change. A native view's data transaction is rolled
-  back before it commits, and so is a DuckLake view's when its metadata is placed in a configured metadata catalog.
-  Other DuckLake views have already committed their data statements one by one, so their watermarks are not written
-  and the interruption marker stays set. Either way the refresh retries at once; for a view whose marker stays set the
-  retry is a full recompute.
+  back before it commits, and so is a DuckLake view's when its metadata is placed in a configured metadata catalog or
+  when downstream views read its changes. Other DuckLake views have already committed their data statements one by
+  one, so their watermarks are not written and the interruption marker stays set. Either way the refresh retries at
+  once; for a view whose marker stays set the retry is a full recompute.
 
 After three attempts that each saw a source change, the refresh fails with `changed while refreshing`. Nothing is
 lost: the view keeps its last stored watermark, or stays marked for a full recompute by the next refresh.

@@ -129,9 +129,11 @@ SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
 0
 
 # ==========================================
-# Another connection commits a source change after the DuckLake data statements and
+# Another connection commits a source change after the DuckLake data transaction and
 # before the watermarks: storing the latest snapshot would skip that change forever.
-# The watermark is the snapshot pinned before compilation; the retry recomputes.
+# The data transaction verified its sources before committing, so the refresh stores the
+# verified snapshot, which precedes the concurrent commit, and the next refresh applies
+# that change exactly once.
 # ==========================================
 
 statement ok
@@ -159,6 +161,16 @@ query I
 SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'totals';
 ----
 false
+
+# The concurrent commit (it adds group k = 7) is not yet in the view ...
+query I
+SELECT count(*) FROM dl.main.totals WHERE k = 7;
+----
+0
+
+# ... and a refresh with no further source change applies it exactly once.
+statement ok
+PRAGMA refresh('dl.main.totals');
 
 query I
 SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals

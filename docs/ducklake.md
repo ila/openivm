@@ -115,8 +115,8 @@ lifecycle statements
 and refreshes inside explicit transactions are rejected for these views. The PostgreSQL
 metadata integration test runs against a local PostgreSQL 16 in CI; managed providers
 are untested, and a client process running OpenIVM is still required. A source change
-another client commits while a refresh runs is never lost: the stored watermark is the
-snapshot the refresh read, and a refresh that saw a source change retries (see
+another client commits while a refresh runs is never lost: the stored watermark is a
+snapshot with the source state the refresh read, and a refresh that saw a source change retries (see
 [concurrency](concurrency.md#ducklake-sources-changing-during-a-refresh)). See
 [metadata placement](internals/metadata-placement.md) for discovery, recovery and
 multi-client semantics.

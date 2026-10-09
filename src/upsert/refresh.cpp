@@ -153,7 +153,7 @@ static constexpr idx_t MAX_CONCURRENT_SOURCE_ATTEMPTS = 3;
 // The DuckLake snapshot of every attached DuckLake catalog, taken before a refresh attempt
 // compiles. Every DuckLake read of the attempt sees that snapshot or a later one. When no
 // source table changed after it, all those reads saw the pinned state, so the pinned
-// snapshot is exactly what the refresh consumed and is the watermark to store. Commits of
+// snapshot (or a later one with the same source state) is the watermark to store. Commits of
 // the refresh itself (MV data, its delta and aux tables) are excluded by checking source
 // tables only.
 struct DuckLakeSourcePins {
@@ -208,9 +208,12 @@ static DuckLakeSourcePins PinDuckLakeSources(Connection &con, RefreshMetadata &m
 }
 
 // Throws ConcurrentSourceChangeException unless every DuckLake source is unchanged since
-// its pinned snapshot. A source that cannot be verified counts as changed.
-static void RequireUnchangedSources(ClientContext &context, const DuckLakeSourcePins &pins,
-                                    const string &display_name) {
+// its pinned snapshot. A source that cannot be verified counts as changed. Returns, per
+// source catalog, the snapshot through which the sources were checked: no source changed
+// between the pin and it, so it is as valid a watermark as the pin, and it skips the
+// refresh's own commits to its backing, delta and aux tables.
+static unordered_map<string, int64_t> RequireUnchangedSources(ClientContext &context, const DuckLakeSourcePins &pins,
+                                                              const string &display_name) {
 	Connection con(*context.db.get());
 	RefreshMetadata metadata(con);
 	unordered_map<string, int64_t> current;
@@ -237,6 +240,7 @@ static void RequireUnchangedSources(ClientContext &context, const DuckLakeSource
 			throw ConcurrentSourceChangeException(message);
 		}
 	}
+	return current;
 }
 
 // Test-only: at `point` of the first attempt, commit openivm_test_concurrent_sql from another
@@ -612,8 +616,16 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// Transactional DuckLake reads all happened before this point, so verify before
 		// committing anything; a changed source rolls this attempt back.
 		bool sources_verified = false;
+		// The DuckLake watermark per catalog: the pin, or the later snapshot through which the
+		// source check proved the sources unchanged.
+		auto watermark_snapshots = source_pins.snapshots;
+		auto advance_watermarks = [&](const unordered_map<string, int64_t> &verified) {
+			for (auto &entry : verified) {
+				watermark_snapshots[entry.first] = entry.second;
+			}
+		};
 		if (tx_open && !source_pins.sources.empty()) {
-			RequireUnchangedSources(context, source_pins, display_name);
+			advance_watermarks(RequireUnchangedSources(context, source_pins, display_name));
 			sources_verified = true;
 		}
 		if (tx_open && !cross_system) {
@@ -649,7 +661,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			// DuckLake data statements committed one by one. Any source change since the pin
 			// may have been read by some of them, so the watermarks stay unwritten and the
 			// interruption marker set by meta_pre_sql makes the retry recompute the view.
-			RequireUnchangedSources(context, source_pins, display_name);
+			advance_watermarks(RequireUnchangedSources(context, source_pins, display_name));
 		}
 		if (cross_system && IsSnapshotPublication(*exec_con.context, view_catalog_name, view_schema_name, vn)) {
 			lease.Require(display_name);
@@ -674,10 +686,11 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		if (cross_system && !meta_post_sql.empty()) {
 			auto meta_post_start = std::chrono::steady_clock::now();
 			if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
-				// The watermark is the snapshot pinned before compilation: the source check
-				// above proved that the refresh read exactly that state. A later snapshot
-				// could contain another client's source commit that this refresh never read.
-				for (auto &pin : source_pins.snapshots) {
+				// The watermark is the snapshot pinned before compilation, or the later snapshot
+				// through which the source check above proved the sources unchanged: either way
+				// the refresh read exactly that source state. The snapshot current now could
+				// contain another client's source commit that this refresh never read.
+				for (auto &pin : watermark_snapshots) {
 					string placeholder = DuckLakeSnapshotPlaceholder(pin.first);
 					if (meta_post_sql.find(placeholder) == string::npos) {
 						continue;
