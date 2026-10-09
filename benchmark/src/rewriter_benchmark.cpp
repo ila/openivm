@@ -619,9 +619,11 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					con.Query("DROP TABLE IF EXISTS " + cat + ".main." + tn);
 				}
 			}
-			// Clean metadata tables (always in native catalog, unqualified)
-			con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_q%'");
-			con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_q%'");
+			// Clean metadata tables (always in native catalog, unqualified). view_name is an
+			// internal storage key; the SQL name is in view_sql_name.
+			con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_q%' OR view_name IN (SELECT "
+			          "view_name FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv_q%')");
+			con.Query("DELETE FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv_q%'");
 		}
 
 		int delta_idx = 0;
@@ -743,9 +745,15 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// Phase 2b: Check incrementability (type=3 is FULL_REFRESH, rest are incremental).
 						// Qualify with native_catalog so the lookup works both when the active catalog
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
-						// name = filename, never "memory").
-						auto check_result = con.Query("SELECT type FROM " + quoted_native_catalog +
-						                              ".main.openivm_views WHERE view_name = '" + mv_name + "'");
+						// name = filename, never "memory"). view_name is an internal storage key, so
+						// match the SQL name and location as RefreshMetadata::FindViewKey does.
+						string view_catalog = is_ducklake_query ? "dl" : native_catalog;
+						auto check_result =
+						    con.Query("SELECT type FROM " + quoted_native_catalog +
+						              ".main.openivm_views WHERE COALESCE(view_sql_name, view_name) = '" + mv_name +
+						              "' AND lower(COALESCE(view_catalog, " + duckdb::Value(view_catalog).ToSQLString() +
+						              ")) = lower(" + duckdb::Value(view_catalog).ToSQLString() +
+						              ") AND lower(COALESCE(view_schema, 'main')) = 'main'");
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
 							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
 							is_incremental = (refresh_type != 3) ? 1 : 0;
