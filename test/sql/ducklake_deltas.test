@@ -700,3 +700,207 @@ query I
 SELECT count(*) FROM (SELECT category, SUM(price), COUNT(*) FROM dl.del_test GROUP BY category EXCEPT ALL SELECT category, total, cnt FROM dl.mv_del);
 ----
 0
+
+# ==========================================
+# Compiled SQL archive for a DuckLake MV: stored in native metadata. DuckLake data
+# cannot commit with native metadata, so refreshes are archived after they commit.
+# ==========================================
+
+statement ok
+CREATE TABLE dl.arch_lake (id INTEGER, grp VARCHAR, val INTEGER);
+
+statement ok
+INSERT INTO dl.arch_lake VALUES (1, 'A', 10), (2, 'B', 20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_arch_lake AS SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dl.arch_lake GROUP BY grp;
+
+statement ok
+INSERT INTO dl.arch_lake VALUES (3, 'A', 5);
+
+statement ok
+DELETE FROM dl.arch_lake WHERE id = 2;
+
+statement ok
+PRAGMA refresh('mv_arch_lake');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.mv_arch_lake EXCEPT ALL SELECT grp, SUM(val), COUNT(*) FROM dl.arch_lake GROUP BY grp)),
+       (SELECT count(*) FROM (SELECT grp, SUM(val), COUNT(*) FROM dl.arch_lake GROUP BY grp EXCEPT ALL SELECT * FROM dl.mv_arch_lake));
+----
+0	0
+
+query IIIIII
+SELECT view_catalog, view_schema, operation, version, last_outcome, committed_count
+FROM openivm_compiled_programs WHERE view_sql_name = 'mv_arch_lake' ORDER BY operation, version;
+----
+dl	main	create	1	committed	1
+dl	main	refresh	1	committed	1
+
+# The archived DuckLake CREATE holds the SQL that ran. The MV and published delta
+# tables are stored as the definitions derived from their data tables' schemas, not
+# as comments or executor operations.
+query II
+SELECT count(*) FILTER (WHERE starts_with(s.sql, '--') OR starts_with(s.sql, 'openivm_')),
+       count(*) FILTER (WHERE starts_with(s.sql, 'create table if not exists ')
+           AND contains(s.sql, 'openivm_delta_')
+           AND ends_with(s.sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT now())'))
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'mv_arch_lake' AND p.operation = 'create';
+----
+0	2
+
+# Every stored delta-table definition names a DuckLake table that exists.
+query I
+SELECT count(*)
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'mv_arch_lake' AND p.operation = 'create'
+  AND starts_with(s.sql, 'create table if not exists ')
+  AND EXISTS (SELECT 1 FROM duckdb_tables() t
+              WHERE t.database_name = 'dl' AND starts_with(t.table_name, 'openivm_delta_')
+                AND (contains(s.sql, '.' || t.table_name || ' (') OR contains(s.sql, '."' || t.table_name || '" (')));
+----
+2
+
+# The archived refresh program spans both catalogs in execution order: the native
+# in-progress marker, the DuckLake data statements, then the native watermark update
+# with the snapshot ID resolved after the data commit (not a placeholder).
+query IIII
+SELECT min(stmt_order) FILTER (WHERE sql ILIKE '%refresh_in_progress = true%') = 0,
+       max(stmt_order) FILTER (WHERE sql ILIKE '%refresh_in_progress = false%') = max(stmt_order),
+       min(stmt_order) FILTER (WHERE sql ILIKE '%dl.main.openivm_data_%') <
+           min(stmt_order) FILTER (WHERE regexp_matches(sql, 'SET last_snapshot_id = \d+,')),
+       count(*) FILTER (WHERE sql LIKE '%__OPENIVM_DUCKLAKE_SNAPSHOT_ID%')
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'mv_arch_lake' AND p.operation = 'refresh';
+----
+true	true	true	0
+
+# If the archive write fails after the DuckLake refresh committed, the refresh
+# reports that it committed instead of succeeding silently.
+statement ok
+CREATE TABLE arch_lake_backup AS SELECT * FROM openivm_compiled_statements;
+
+statement ok
+DROP TABLE openivm_compiled_statements;
+
+statement ok
+CREATE TABLE openivm_compiled_statements (view_name varchar, operation varchar, version integer, stmt_order integer,
+    sql varchar CHECK (operation <> 'refresh'), primary key (view_name, operation, version, stmt_order));
+
+statement ok
+INSERT INTO dl.arch_lake VALUES (4, 'C', 7);
+
+statement error
+PRAGMA refresh('mv_arch_lake');
+----
+committed, but OpenIVM could not archive its compiled SQL
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.mv_arch_lake EXCEPT ALL SELECT grp, SUM(val), COUNT(*) FROM dl.arch_lake GROUP BY grp)),
+       (SELECT count(*) FROM (SELECT grp, SUM(val), COUNT(*) FROM dl.arch_lake GROUP BY grp EXCEPT ALL SELECT * FROM dl.mv_arch_lake));
+----
+0	0
+
+query II
+SELECT version, committed_count FROM openivm_compiled_programs WHERE view_sql_name = 'mv_arch_lake' AND operation = 'refresh' ORDER BY version;
+----
+1	1
+
+statement ok
+DROP TABLE openivm_compiled_statements;
+
+statement ok
+CREATE TABLE openivm_compiled_statements (view_name varchar, operation varchar, version integer, stmt_order integer,
+    sql varchar, primary key (view_name, operation, version, stmt_order));
+
+statement ok
+INSERT INTO openivm_compiled_statements SELECT * FROM arch_lake_backup;
+
+# A staged DuckLake replacement cannot be cleaned up once it committed: if its archive
+# write fails, CREATE OR REPLACE reports that it committed instead of succeeding.
+statement ok
+DROP TABLE openivm_compiled_statements;
+
+statement ok
+CREATE TABLE openivm_compiled_statements (view_name varchar, operation varchar, version integer, stmt_order integer,
+    sql varchar CHECK (operation <> 'create'), primary key (view_name, operation, version, stmt_order));
+
+statement error
+CREATE OR REPLACE MATERIALIZED VIEW dl.mv_arch_lake AS SELECT grp, SUM(val) AS total FROM dl.arch_lake GROUP BY grp;
+----
+committed, but OpenIVM could not archive its compiled SQL
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.mv_arch_lake EXCEPT ALL SELECT grp, SUM(val) FROM dl.arch_lake GROUP BY grp)),
+       (SELECT count(*) FROM (SELECT grp, SUM(val) FROM dl.arch_lake GROUP BY grp EXCEPT ALL SELECT * FROM dl.mv_arch_lake));
+----
+0	0
+
+statement ok
+DROP TABLE openivm_compiled_statements;
+
+statement ok
+CREATE TABLE openivm_compiled_statements (view_name varchar, operation varchar, version integer, stmt_order integer,
+    sql varchar, primary key (view_name, operation, version, stmt_order));
+
+statement ok
+INSERT INTO openivm_compiled_statements SELECT * FROM arch_lake_backup;
+
+# A successful replacement continues the CREATE history of the same view.
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.mv_arch_lake AS SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM dl.arch_lake GROUP BY grp;
+
+statement ok
+INSERT INTO dl.arch_lake VALUES (5, 'A', 1);
+
+statement ok
+PRAGMA refresh('mv_arch_lake');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.mv_arch_lake EXCEPT ALL SELECT grp, SUM(val), COUNT(*) FROM dl.arch_lake GROUP BY grp)),
+       (SELECT count(*) FROM (SELECT grp, SUM(val), COUNT(*) FROM dl.arch_lake GROUP BY grp EXCEPT ALL SELECT * FROM dl.mv_arch_lake));
+----
+0	0
+
+query III
+SELECT operation, max(version), arg_max(last_outcome, version)
+FROM openivm_compiled_programs WHERE view_sql_name = 'mv_arch_lake' GROUP BY operation ORDER BY operation;
+----
+create	2	committed
+refresh	2	committed
+
+# The replacement's archive holds the delta-table replacements that ran.
+query II
+SELECT count(*) FILTER (WHERE starts_with(s.sql, '--') OR starts_with(s.sql, 'openivm_')),
+       count(*) FILTER (WHERE starts_with(s.sql, 'create or replace table ')
+           AND contains(s.sql, 'openivm_delta_')
+           AND ends_with(s.sql, 'openivm_multiplicity INTEGER DEFAULT 1, openivm_timestamp TIMESTAMP DEFAULT now())'))
+FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
+WHERE p.view_sql_name = 'mv_arch_lake' AND p.operation = 'create' AND p.version = 2;
+----
+0	2
+
+# A refresh that fails after its DuckLake data statements started has an unknown
+# outcome: statements outside one transaction may already have committed.
+statement ok
+CREATE TABLE dl.arch_lake_cast (id INTEGER, txt VARCHAR);
+
+statement ok
+INSERT INTO dl.arch_lake_cast VALUES (1, '1');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_arch_lake_cast AS SELECT id, CAST(txt AS INTEGER) AS n FROM dl.arch_lake_cast;
+
+statement ok
+INSERT INTO dl.arch_lake_cast VALUES (2, 'bad');
+
+statement error
+PRAGMA refresh('mv_arch_lake_cast');
+----
+Could not convert
+
+query II
+SELECT last_outcome, committed_count FROM openivm_compiled_programs WHERE view_sql_name = 'mv_arch_lake_cast' AND operation = 'refresh';
+----
+unknown	0

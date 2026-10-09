@@ -1,5 +1,6 @@
 #include "upsert/refresh.hpp"
 
+#include "core/compiled_sql_archive.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/parser_ddl.hpp"
@@ -13,6 +14,7 @@
 #include "upsert/refresh_cost_model.hpp"
 #include "upsert/refresh_internal.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/config.hpp"
@@ -42,19 +44,23 @@ public:
 		Value profile_val;
 		enabled = context.TryGetCurrentSetting("openivm_profile_refresh", profile_val) && !profile_val.IsNull() &&
 		          profile_val.GetValue<bool>();
+		// Also identifies this refresh in the compiled-SQL archive, so profile rows join to it.
+		refresh_id = NewCompilationId(view_name);
 		if (enabled) {
 			Value retention_val;
 			if (context.TryGetCurrentSetting("openivm_profile_retention_days", retention_val) &&
 			    !retention_val.IsNull()) {
 				retention_days = std::max<int64_t>(0, retention_val.GetValue<int64_t>());
 			}
-			auto now = std::chrono::steady_clock::now().time_since_epoch();
-			refresh_id = view_name + "_" + to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 		}
 	}
 
 	bool Enabled() const {
 		return enabled;
+	}
+
+	const string &RefreshId() const {
+		return refresh_id;
 	}
 
 	void AddStep(const string &step_name, std::chrono::steady_clock::time_point start,
@@ -155,6 +161,19 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			precomputed_delta_activity = &delta_activity;
 		}
 	}
+	CompiledProgram archived;
+	archived.view_name = vn;
+	auto archived_location = probe_meta.GetStoredViewLocation(vn, view_catalog_name, view_schema_name);
+	archived.view_catalog = archived_location.catalog_name;
+	archived.view_schema = archived_location.schema_name;
+	archived.view_sql_name = probe_meta.GetViewSQLName(vn);
+	archived.operation = "refresh";
+	archived.compilation_id = profiler.RefreshId();
+	// Which archive outcome a failure implies. Native refreshes archive inside their
+	// transaction; cross-catalog refreshes archive after their last commit.
+	bool execution_started = false;
+	bool effects_may_be_committed = false;
+	bool archive_handled = false;
 	// Track whether we're inside an open exec_con transaction so any exception path can
 	// rollback cleanly. Without explicit rollback, a throw mid-transaction relies on the
 	// Connection destructor, which can leak uncommitted writes into the WAL under some
@@ -195,6 +214,23 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			    /*out_adaptive_estimate=*/nullptr, /*facts=*/nullptr, /*metadata_connection=*/nullptr,
 			    /*delete_retry_plan=*/nullptr, /*write_query_file=*/false);
 		}
+		// The archived program is exactly what this refresh executes, in order: after a
+		// delete retry, the fallback that replaced the rolled-back attempt, and for
+		// DuckLake the snapshot publication between the data and watermark statements.
+		const string *executed_program = &sql;
+		string publish_sql;
+		auto set_archived_program = [&]() {
+			archived.statements.clear();
+			vector<const string *> parts {executed_program};
+			if (cross_system) {
+				parts = {&meta_pre_sql, executed_program, &publish_sql, &meta_post_sql};
+			}
+			for (auto part : parts) {
+				auto statements = SqlUtils::SplitSQLStatements(*part);
+				archived.statements.insert(archived.statements.end(), statements.begin(), statements.end());
+			}
+		};
+		set_archived_program();
 		for (const auto &step : compile_profile.steps) {
 			profiler.AddMeasuredStep(step.step_name, step.duration_ms, step.detail);
 		}
@@ -213,6 +249,15 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// the contract. Let DuckDB avoid large order-preservation buffers for big
 		// INSERT/CREATE TABLE style refresh plans.
 		exec_con.Query("SET preserve_insertion_order=false");
+		string archive_catalog;
+		string archive_schema;
+		if (!cross_system) {
+			auto location_error = ResolveCompiledSQLArchiveLocation(exec_con, archive_catalog, archive_schema);
+			if (!location_error.empty()) {
+				throw CatalogException("OpenIVM could not resolve the compiled-SQL archive location: %s",
+				                       location_error);
+			}
+		}
 		// Refresh SQL uses fully qualified internal data/delta names. DuckLake-targeted
 		// MVs write those objects in DuckLake; native MVs keep them in the physical DB.
 		OPENIVM_DEBUG_PRINT("[UPSERT] Executing refresh SQL:\n%s\n", sql.c_str());
@@ -222,6 +267,11 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		// writing the physical metadata catalog and DuckLake in one transaction.
 		if (cross_system && !meta_pre_sql.empty()) {
 			auto meta_pre_start = std::chrono::steady_clock::now();
+			execution_started = true;
+			// These metadata statements commit on their own connection, each one even if a
+			// later statement of the batch fails, so no failure after this point rolls
+			// the whole program back.
+			effects_may_be_committed = true;
 			Connection meta_con(*context.db.get());
 			auto meta_result = meta_con.Query(meta_pre_sql);
 			if (meta_result->HasError()) {
@@ -246,6 +296,9 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		int64_t expected_delete_count = -1;
 		int64_t actual_delete_count = -1;
 		auto execute_program = [&](const string &program, const ProjectionDeleteRetryPlan *retry_plan) {
+			execution_started = true;
+			// Cross-catalog data statements outside a transaction commit individually.
+			effects_may_be_committed = effects_may_be_committed || !tx_open;
 			bool split_program = profiler.Enabled() || (retry_plan && retry_plan->IsActive());
 			if (!split_program) {
 				executed_statement_count++;
@@ -303,6 +356,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			                    static_cast<long long>(expected_delete_count));
 			exec_con.BeginTransaction();
 			tx_open = true;
+			executed_program = &fallback_sql;
+			set_archived_program();
 			result = execute_program(fallback_sql, nullptr);
 		}
 		auto end = std::chrono::steady_clock::now();
@@ -329,9 +384,26 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			}
 		}
 
+		if (tx_open && !cross_system) {
+			// Same transaction as the refresh: the archive is visible exactly when the
+			// refresh commits, and an archive failure rolls the refresh back.
+			auto archive_start = std::chrono::steady_clock::now();
+			auto archive_error = WriteCompiledProgram(exec_con, archived, CompiledProgramOutcome::COMMITTED,
+			                                          archive_catalog, archive_schema);
+			if (!archive_error.empty()) {
+				throw Exception(ExceptionType::EXECUTOR,
+				                "IVM refresh of '" + display_name +
+				                    "' failed: could not archive its compiled SQL: " + archive_error);
+			}
+			profiler.AddStep("archive_compiled_sql", archive_start,
+			                 "statements=" + to_string(archived.statements.size()));
+		}
 		if (tx_open) {
+			// A failure inside COMMIT leaves the outcome unknown.
+			effects_may_be_committed = true;
 			exec_con.Commit();
 			tx_open = false;
+			archive_handled = !cross_system;
 		}
 		if (cross_system && IsSnapshotPublication(*exec_con.context, view_catalog_name, view_schema_name, vn)) {
 			auto publication_start = std::chrono::steady_clock::now();
@@ -341,10 +413,11 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 				throw CatalogException("Could not read snapshot publication query for '%s'", vn);
 			}
 			auto prefix = SqlUtils::QualifiedPrefix(view_catalog_name, view_schema_name);
-			auto publish_sql = BuildSnapshotPublicationSQL(
+			publish_sql = BuildSnapshotPublicationSQL(
 			    exec_con, view_catalog_name, prefix + SqlUtils::QuoteIdentifier(PublishedViewName(vn)),
 			    prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(vn)),
 			    publication->GetValue(0, 0).ToString());
+			set_archived_program();
 			auto published = exec_con.Query(publish_sql);
 			if (published->HasError()) {
 				throw CatalogException("Could not advance snapshot publication for '%s': %s", vn,
@@ -387,6 +460,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 					}
 					meta_post_sql = StringUtil::Replace(meta_post_sql, placeholder, to_string(snapshot_id));
 				}
+				// A failing watermark update is archived with the snapshot IDs it ran with.
+				set_archived_program();
 				if (meta_post_sql.find(DUCKLAKE_SNAPSHOT_PLACEHOLDER) != string::npos) {
 					throw Exception(ExceptionType::EXECUTOR,
 					                "IVM refresh of '" + display_name +
@@ -429,6 +504,24 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			                    (long)duration_ms);
 			profiler.AddStep("record_refresh_history", history_start, method);
 		}
+		if (cross_system) {
+			// DuckDB cannot commit the native archive with external-catalog data. Record
+			// it once everything committed; if that fails, report the committed refresh
+			// with an error instead of success.
+			auto archive_start = std::chrono::steady_clock::now();
+			// Collect again so the watermark carries its resolved snapshot IDs.
+			set_archived_program();
+			archive_handled = true;
+			auto archive_error =
+			    RecordCompiledProgram(context, view_catalog_name, archived, CompiledProgramOutcome::COMMITTED);
+			if (!archive_error.empty()) {
+				throw Exception(ExceptionType::EXECUTOR,
+				                "IVM refresh of '" + display_name +
+				                    "' committed, but OpenIVM could not archive its compiled SQL: " + archive_error);
+			}
+			profiler.AddStep("archive_compiled_sql", archive_start,
+			                 "statements=" + to_string(archived.statements.size()));
+		}
 		profiler.AddTotal();
 		profiler.Flush(*context.db.get());
 		return;
@@ -448,7 +541,29 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		}
 		profiler.AddTotal();
 		profiler.Flush(*context.db.get());
-		throw;
+		// Record the failed execution in its own metadata transaction. If that write
+		// also fails, say so in the refresh error rather than dropping it silently.
+		string archive_error;
+		if (execution_started && !archive_handled) {
+			auto outcome =
+			    effects_may_be_committed ? CompiledProgramOutcome::UNKNOWN : CompiledProgramOutcome::ATTEMPTED;
+			archive_error = RecordCompiledProgram(context, view_catalog_name, archived, outcome);
+			OPENIVM_DEBUG_PRINT("[ARCHIVE] Failed refresh of %s recorded as %s%s%s\n", vn.c_str(),
+			                    CompiledProgramOutcomeName(outcome), archive_error.empty() ? "" : ": ",
+			                    archive_error.c_str());
+		}
+		if (archive_error.empty()) {
+			throw;
+		}
+		try {
+			throw;
+		} catch (std::exception &ex) {
+			ErrorData error(ex);
+			throw Exception(error.Type(), error.RawMessage() +
+			                                  " (OpenIVM could not record this failed refresh in the compiled-SQL "
+			                                  "archive: " +
+			                                  archive_error + ")");
+		}
 	}
 }
 
@@ -811,6 +926,7 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	Parser parser(options);
 	parser.ParseQuery(program);
 	string stamped;
+	CompiledProgram archived;
 	for (auto &statement : parser.statements) {
 		if (statement->type == StatementType::INSERT_STATEMENT) {
 			auto &insert = statement->Cast<InsertStatement>();
@@ -834,6 +950,26 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 			sql = SqlUtils::ReplaceAllOccurrences(sql, openivm::UTC_NOW_SQL, timestamp);
 		}
 		stamped += sql + ";\n";
+		archived.statements.push_back(std::move(sql));
+	}
+	// The archive write joins the caller's transaction: it commits with the refresh,
+	// a failure aborts it, and a rollback leaves no archive row.
+	string archive_catalog;
+	string archive_schema;
+	auto location_error = ResolveCompiledSQLArchiveLocation(metadata_con, archive_catalog, archive_schema);
+	if (!location_error.empty()) {
+		throw CatalogException("OpenIVM could not resolve the compiled-SQL archive location: %s", location_error);
+	}
+	auto location = metadata.GetStoredViewLocation(view_name, view_catalog_name, view_schema_name);
+	archived.view_name = view_name;
+	archived.view_catalog = location.catalog_name;
+	archived.view_schema = location.schema_name;
+	archived.view_sql_name = metadata.GetViewSQLName(view_name);
+	archived.operation = "refresh";
+	archived.compilation_id = NewCompilationId(view_name);
+	for (auto &statement : BuildCompiledSQLArchiveStatements(archived, CompiledProgramOutcome::COMMITTED,
+	                                                         archive_catalog, archive_schema)) {
+		stamped += statement + ";\n";
 	}
 	OPENIVM_DEBUG_PRINT("[REFRESH] Compiled transaction-local program for %s at %s\n", view_name.c_str(),
 	                    timestamp.c_str());

@@ -1,6 +1,7 @@
 #include "core/parser.hpp"
 
 #include "core/plan_rewrite.hpp"
+#include "core/compiled_sql_archive.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/parser_create_mv_helpers.hpp"
 #include "core/parser_ddl.hpp"
@@ -1677,34 +1678,87 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Compiled %lu DDL queries for bind phase\n", (unsigned long)ddl.size());
 
+	bool caller_transactional_ddl =
+	    !target_is_ducklake && (view_catalog_prefix.empty() || view_target_catalog == default_db);
+	// The view-specific program (everything after the system tables) in execution order.
+	// Caller-transaction programs are archived exactly as rendered for execution. Staged
+	// programs keep the operations the DDL executor resolves from catalog state at
+	// execution time; it archives the SQL those operations ran. The reference file is
+	// written before execution, so it describes them with comments instead.
+	string system_tables_sql;
+	string compiled_sql;
+	vector<string> compiled_program;
+	for (size_t i = 0; i < ddl.size(); i++) {
+		if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_PREFIX) ||
+		    StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
+			continue;
+		}
+		string executor_note;
+		if (i < system_ddl_end) {
+			system_tables_sql += ddl[i] + ";\n\n";
+			continue;
+		} else if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX)) {
+			executor_note = "-- OpenIVM pins publication to its own committed "
+			                "DuckLake snapshot at execution time.";
+		} else if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
+			executor_note = "-- OpenIVM derives the MV delta-table schema from the "
+			                "physical data table "
+			                "at DDL execution time.";
+		}
+		compiled_sql += executor_note.empty() ? ddl[i] + ";\n\n" : executor_note + "\n\n";
+		if (caller_transactional_ddl) {
+			auto rendered = RenderTransactionalStatement(ddl[i]);
+			compiled_program.insert(compiled_program.end(), rendered.begin(), rendered.end());
+		} else {
+			compiled_program.push_back(ddl[i]);
+		}
+	}
+
 	// Write reference SQL files if openivm_files_path is set
 	Value files_path_val;
 	if (context.TryGetCurrentSetting("openivm_files_path", files_path_val) && !files_path_val.IsNull()) {
 		string base_path = files_path_val.ToString();
-		// Export system setup separately from the view-specific program.
-		string system_tables_sql;
-		// Compiled queries (everything after the system tables)
-		string compiled_sql;
-		for (size_t i = 0; i < ddl.size(); i++) {
-			if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_PREFIX) ||
-			    StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
-				continue;
-			}
-			if (i < system_ddl_end) {
-				system_tables_sql += ddl[i] + ";\n\n";
-			} else if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX)) {
-				compiled_sql += "-- OpenIVM pins publication to its own committed "
-				                "DuckLake snapshot at execution time.\n\n";
-			} else if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
-				compiled_sql += "-- OpenIVM derives the MV delta-table schema from the "
-				                "physical data table "
-				                "at DDL execution time.\n\n";
-			} else {
-				compiled_sql += ddl[i] + ";\n\n";
-			}
-		}
 		SqlUtils::WriteFile(base_path + "/openivm_system_tables.sql", false, system_tables_sql);
 		SqlUtils::WriteFile(base_path + "/openivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
+	}
+
+	{
+		// Archive the program atomically with CREATE's metadata: inside the caller's
+		// transaction, inside the batched native metadata transaction, or in one
+		// dedicated metadata transaction for staged programs (whose cleanup removes
+		// the MV if this write fails). A failed or rolled-back CREATE stores nothing.
+		// A staged DuckLake replacement has no cleanup once it committed, so its
+		// archive failure is reported as committed but not archived. The DDL executor
+		// writes staged archives itself, after resolving the operations it executed.
+		CompiledProgram archived;
+		archived.view_name = view_name;
+		archived.view_catalog = view_target_catalog;
+		archived.view_schema = view_target_schema;
+		archived.view_sql_name = sql_view_name;
+		archived.operation = "create";
+		archived.compilation_id = NewCompilationId(view_name, "create");
+		archived.statements = std::move(compiled_program);
+		vector<string> archive_ddl;
+		if (caller_transactional_ddl) {
+			archive_ddl = BuildCompiledSQLArchiveStatements(archived, CompiledProgramOutcome::COMMITTED, default_db,
+			                                                default_schema);
+		} else {
+			auto mode = batch_ducklake_creation        ? DDLArchiveMode::CURRENT_TRANSACTION
+			            : staged_cross_catalog_replace ? DDLArchiveMode::AFTER_COMMIT
+			                                           : DDLArchiveMode::OWN_TRANSACTION;
+			archive_ddl = BuildArchiveProgramOperation(archived, mode, default_db, default_schema);
+		}
+		archive_ddl.insert(archive_ddl.begin(),
+		                   string(OPENIVM_DDL_PROFILE_PREFIX) + view_name +
+		                       "\tcreate_mv_archive_compiled_sql\tstatements=" + to_string(archived.statements.size()));
+		if (batch_ducklake_creation) {
+			D_ASSERT(ddl.back() == "COMMIT");
+			ddl.insert(ddl.end() - 1, archive_ddl.begin(), archive_ddl.end());
+		} else {
+			ddl.insert(ddl.end(), archive_ddl.begin(), archive_ddl.end());
+		}
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Archiving %zu compiled statements as %s\n", archived.statements.size(),
+		                    archived.compilation_id.c_str());
 	}
 
 	// Only arm cleanup after system setup and the duplicate-name guard have succeeded.
@@ -1726,8 +1780,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 
 	// Return DDL executor table function
-	bool caller_transactional_ddl =
-	    !target_is_ducklake && (view_catalog_prefix.empty() || view_target_catalog == default_db);
 	ConfigureDDLExecutorResult(result, caller_transactional_ddl ? DDLExecutionMode::CALLER_TRANSACTION
 	                                                            : DDLExecutionMode::STAGED_CROSS_CATALOG);
 	return result;
