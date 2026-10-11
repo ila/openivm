@@ -620,8 +620,13 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				}
 			}
 			// Clean metadata tables (always in native catalog, unqualified)
-			con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_q%'");
-			con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_q%'");
+			// view_name holds the internal key; the SQL name is in view_sql_name (legacy rows: NULL).
+			const string stale_keys = "SELECT view_name FROM openivm_views WHERE "
+			                          "COALESCE(view_sql_name, view_name) LIKE 'mv\\_q%' ESCAPE '\\'";
+			con.Query("DELETE FROM openivm_delta_tables WHERE view_name IN (" + stale_keys +
+			          ") OR view_name LIKE 'mv\\_q%' ESCAPE '\\'");
+			con.Query("DELETE FROM openivm_views WHERE view_name IN (" + stale_keys +
+			          ") OR view_name LIKE 'mv\\_q%' ESCAPE '\\'");
 		}
 
 		int delta_idx = 0;
@@ -745,7 +750,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
 						// name = filename, never "memory").
 						auto check_result = con.Query("SELECT type FROM " + quoted_native_catalog +
-						                              ".main.openivm_views WHERE view_name = '" + mv_name + "'");
+						                              ".main.openivm_views WHERE COALESCE(view_sql_name, view_name) = '" +
+							                              mv_name + "'");
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
 							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
 							is_incremental = (refresh_type != 3) ? 1 : 0;

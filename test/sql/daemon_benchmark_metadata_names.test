@@ -1,0 +1,125 @@
+# name: test/sql/daemon_benchmark_metadata_names.test
+# description: daemon_benchmark resolves SQL view names to internal metadata keys (cleanup and failure diagnostics)
+# group: [sql]
+
+# The statements below are the ones built by benchmark/src/daemon_metadata.hpp
+# (StaleBenchmarkMetadataCleanupSQL, ViewKeySQL, DeltaMetadataDiagnosticSQL).
+
+require openivm
+
+load __TEST_DIR__/openivm_daemon_benchmark_metadata_names.db
+
+statement ok
+CREATE TABLE bench_src (id INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO bench_src VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE SCHEMA s2;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_a AS SELECT id, v FROM bench_src;
+
+statement ok
+CREATE MATERIALIZED VIEW s2.mv_a AS SELECT id, v FROM bench_src;
+
+statement ok
+CREATE MATERIALIZED VIEW keep_me AS SELECT id, v FROM bench_src;
+
+# The internal key, not the SQL name, is stored in view_name.
+query I
+SELECT count(*) FROM openivm_views WHERE view_name LIKE 'mv_%';
+----
+0
+
+query IIII
+SELECT count(*), count(DISTINCT view_name), sum((view_name LIKE '\_\_openivm\_mv\_%' ESCAPE '\')::INTEGER),
+       sum((view_sql_name = 'mv_a')::INTEGER)
+FROM openivm_views WHERE view_sql_name IN ('mv_a');
+----
+2	2	2	2
+
+# Failure diagnostic: the unqualified name resolves to the current schema's view only.
+query I
+SELECT count(*) FROM openivm_delta_tables WHERE view_name IN (
+    SELECT view_name FROM openivm_views WHERE lower(COALESCE(view_sql_name, view_name)) = lower('mv_a')
+    AND lower(COALESCE(view_catalog, current_database())) = lower(current_database())
+    AND lower(COALESCE(view_schema, 'main')) = lower(current_schema()));
+----
+1
+
+# The old comparison against the SQL name finds nothing.
+query I
+SELECT count(*) FROM openivm_delta_tables WHERE view_name = 'mv_a';
+----
+0
+
+# Qualified name for the second schema selects that view's metadata, not the main one.
+query I
+SELECT count(*) FROM openivm_delta_tables WHERE view_name IN (
+    SELECT view_name FROM openivm_views WHERE lower(COALESCE(view_sql_name, view_name)) = lower('mv_a')
+    AND lower(COALESCE(view_catalog, 'openivm_daemon_benchmark_metadata_names')) = lower('openivm_daemon_benchmark_metadata_names')
+    AND lower(COALESCE(view_schema, 'main')) = lower('s2'))
+AND view_name = (SELECT view_name FROM openivm_views WHERE view_schema = 's2' AND view_sql_name = 'mv_a');
+----
+1
+
+# Legacy metadata: SQL name stored in view_name, view_sql_name NULL.
+statement ok
+INSERT INTO openivm_views (view_name, sql_string, type) VALUES ('mv_legacy', 'select 1', 0);
+
+statement ok
+INSERT INTO openivm_delta_tables (view_name, table_name) VALUES ('mv_legacy', 'bench_src');
+
+statement ok
+INSERT INTO openivm_refresh_hooks VALUES ('mv_legacy', 'select 1', 'after');
+
+query I
+SELECT count(*) FROM openivm_delta_tables WHERE view_name IN (
+    SELECT view_name FROM openivm_views WHERE lower(COALESCE(view_sql_name, view_name)) = lower('mv_legacy')
+    AND lower(COALESCE(view_catalog, current_database())) = lower(current_database())
+    AND lower(COALESCE(view_schema, 'main')) = lower(current_schema()));
+----
+1
+
+# Dependent rows keyed by internal keys.
+statement ok
+INSERT INTO openivm_refresh_history (view_name) SELECT view_name FROM openivm_views WHERE view_sql_name = 'mv_a' AND view_schema = 's2';
+
+statement ok
+INSERT INTO openivm_mv_dependencies (parent_view, child_view)
+SELECT p.view_name, c.view_name FROM openivm_views p, openivm_views c
+WHERE p.view_sql_name = 'mv_a' AND p.view_schema = 'main' AND c.view_sql_name = 'keep_me';
+
+# Cleanup (repeat-setup path runs it twice; the second run must be a no-op).
+loop i 0 2
+
+statement ok
+DELETE FROM openivm_delta_tables WHERE view_name IN (SELECT view_name FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv\_%' ESCAPE '\') OR view_name LIKE 'mv\_%' ESCAPE '\';
+
+statement ok
+DELETE FROM openivm_refresh_history WHERE view_name IN (SELECT view_name FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv\_%' ESCAPE '\') OR view_name LIKE 'mv\_%' ESCAPE '\';
+
+statement ok
+DELETE FROM openivm_refresh_hooks WHERE view_name IN (SELECT view_name FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv\_%' ESCAPE '\') OR view_name LIKE 'mv\_%' ESCAPE '\';
+
+statement ok
+DELETE FROM openivm_mv_dependencies WHERE parent_view IN (SELECT view_name FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv\_%' ESCAPE '\') OR child_view IN (SELECT view_name FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv\_%' ESCAPE '\') OR parent_view LIKE 'mv\_%' ESCAPE '\' OR child_view LIKE 'mv\_%' ESCAPE '\';
+
+statement ok
+DELETE FROM openivm_views WHERE view_name IN (SELECT view_name FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv\_%' ESCAPE '\') OR view_name LIKE 'mv\_%' ESCAPE '\';
+
+# Only the non-benchmark view keeps its metadata.
+query I
+SELECT string_agg(view_sql_name, ',' ORDER BY view_sql_name) FROM openivm_views;
+----
+keep_me
+
+query IIII
+SELECT (SELECT count(*) FROM openivm_delta_tables), (SELECT count(*) FROM openivm_refresh_history),
+       (SELECT count(*) FROM openivm_refresh_hooks), (SELECT count(*) FROM openivm_mv_dependencies);
+----
+1	0	0	0
+
+endloop

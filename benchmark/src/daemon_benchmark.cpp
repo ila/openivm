@@ -16,6 +16,7 @@
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
+#include "daemon_metadata.hpp"
 #include "tpcc_helpers.hpp"
 
 #include <atomic>
@@ -871,10 +872,10 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 				con.Query("DROP TABLE IF EXISTS " + full);
 			}
 		}
-		con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_refresh_history WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_refresh_hooks WHERE view_name LIKE 'mv_%'");
+		// Metadata rows are keyed by the internal view key; select them via the SQL name.
+		for (auto &stmt : openivm_bench::StaleBenchmarkMetadataCleanupSQL()) {
+			con.Query(stmt);
+		}
 
 		// DuckLake attach for S9/S10/S11
 		if (subtest == "S9" || subtest == "S10" || subtest == "S11") {
@@ -1081,9 +1082,7 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 					// last_update. Helps diagnose whether rows are "stuck" in delta (not applied)
 					// vs the refresh applied something wrong.
 					string diag;
-					auto dt_r = fin_con.Query(
-					    "SELECT table_name, last_update FROM openivm_delta_tables WHERE view_name = '" +
-					    v.name + "'");
+					auto dt_r = fin_con.Query(openivm_bench::DeltaMetadataDiagnosticSQL(v.name, v.catalog_schema));
 					if (dt_r && !dt_r->HasError()) {
 						for (idx_t di = 0; di < dt_r->RowCount(); di++) {
 							string tn = dt_r->GetValue(0, di).ToString();
