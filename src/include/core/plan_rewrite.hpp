@@ -9,7 +9,12 @@ namespace duckdb {
 
 struct CreateMVPlanFacts;
 class BoundWindowExpression;
+class LogicalComparisonJoin;
 bool IsRunningWindowCandidate(const BoundWindowExpression &window);
+
+/// Choose the innermost outer join along its preserved side, so a projection's
+/// refresh key does not come from an earlier join's nullable output.
+LogicalComparisonJoin *FindProjectionKeyJoin(LogicalOperator &plan);
 
 struct PlanRewriteNeeds {
 	bool inline_cte_refs = false;

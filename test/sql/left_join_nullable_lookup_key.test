@@ -1,0 +1,253 @@
+# name: test/sql/left_join_nullable_lookup_key.test
+# description: Optional lookup changes preserve the projection refresh key across CTEs and expressions
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE events(id INTEGER, customer VARCHAR, amount INTEGER);
+
+statement ok
+CREATE TABLE profile(customer VARCHAR, platform VARCHAR);
+
+statement ok
+CREATE TABLE platform_dim(platform VARCHAR, platform_key INTEGER);
+
+statement ok
+INSERT INTO events VALUES (1,'a',10),(2,'b',20),(3,'b',20),(4,'z',40);
+
+statement ok
+INSERT INTO profile VALUES ('a','Retail'),('b','Retail');
+
+statement ok
+INSERT INTO platform_dim VALUES ('Retail',2),('N/A',1),('Web',3);
+
+statement ok
+CREATE VIEW expected_lookup_cte AS
+WITH base AS (
+    SELECT e.id, e.customer, e.amount, COALESCE(p.platform,'N/A') AS platform
+    FROM events e LEFT JOIN profile p ON e.customer=p.customer
+)
+SELECT b.customer, b.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM base b LEFT JOIN platform_dim d ON b.platform=d.platform;
+
+statement ok
+CREATE MATERIALIZED VIEW lookup_cte AS
+WITH base AS (
+    SELECT e.id, e.customer, e.amount, COALESCE(p.platform,'N/A') AS platform
+    FROM events e LEFT JOIN profile p ON e.customer=p.customer
+)
+SELECT b.customer, b.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM base b LEFT JOIN platform_dim d ON b.platform=d.platform;
+
+statement ok
+CREATE VIEW expected_lookup_expression AS
+SELECT e.customer, e.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM events e LEFT JOIN profile p ON e.customer=p.customer
+LEFT JOIN platform_dim d ON COALESCE(p.platform,'N/A')=d.platform;
+
+statement ok
+CREATE MATERIALIZED VIEW lookup_expression AS
+SELECT e.customer, e.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM events e LEFT JOIN profile p ON e.customer=p.customer
+LEFT JOIN platform_dim d ON COALESCE(p.platform,'N/A')=d.platform;
+
+statement ok
+CREATE VIEW expected_lookup_right AS
+SELECT e.customer, e.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM platform_dim d RIGHT JOIN (
+    profile p RIGHT JOIN events e ON p.customer=e.customer
+) ON d.platform=COALESCE(p.platform,'N/A');
+
+statement ok
+CREATE MATERIALIZED VIEW lookup_right AS
+SELECT e.customer, e.amount, COALESCE(d.platform_key,1) AS platform_key
+FROM platform_dim d RIGHT JOIN (
+    profile p RIGHT JOIN events e ON p.customer=e.customer
+) ON d.platform=COALESCE(p.platform,'N/A');
+
+statement ok
+CREATE MATERIALIZED VIEW lookup_child AS SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM lookup_cte GROUP BY customer;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='lookup_cte';
+----
+2
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='lookup_expression';
+----
+2
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='lookup_right';
+----
+2
+
+# Removing the last profile changes the downstream lookup key to N/A.
+# The two identical b events must survive with default values; hidden refresh
+# keys must refer to the preserved customer, not the optional platform.
+
+statement ok
+UPDATE profile SET platform='Web' WHERE customer='b';
+
+statement ok
+DELETE FROM profile WHERE customer='b';
+
+statement ok
+UPDATE profile SET platform='Web' WHERE customer='a';
+
+statement ok
+INSERT INTO profile VALUES ('c','Retail');
+
+statement ok
+UPDATE profile SET platform='Web' WHERE customer='c';
+
+statement ok
+DELETE FROM profile WHERE customer='c';
+
+statement ok
+INSERT INTO events VALUES (5,'b',20),(6,'c',60),(7,'a',70);
+
+statement ok
+UPDATE events SET amount=amount+1 WHERE id IN (1,4,7);
+
+statement ok
+DELETE FROM events WHERE id IN (4,7);
+
+statement ok
+PRAGMA refresh('lookup_cte');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_cte) EXCEPT ALL (SELECT * FROM expected_lookup_cte));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_cte) EXCEPT ALL (SELECT * FROM lookup_cte));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_expression');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_expression) EXCEPT ALL (SELECT * FROM expected_lookup_expression));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_expression) EXCEPT ALL (SELECT * FROM lookup_expression));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_right');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_right) EXCEPT ALL (SELECT * FROM expected_lookup_right));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_right) EXCEPT ALL (SELECT * FROM lookup_right));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_child');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_child) EXCEPT ALL (SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM expected_lookup_cte GROUP BY customer));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM expected_lookup_cte GROUP BY customer) EXCEPT ALL (SELECT * FROM lookup_child));
+----
+0
+
+# Reintroduce the profile, remove a different last match, and mix conflicting
+# source changes before a second refresh.
+
+statement ok
+INSERT INTO profile VALUES ('b','Retail');
+
+statement ok
+UPDATE profile SET platform='Web' WHERE customer='b';
+
+statement ok
+DELETE FROM profile WHERE customer='a';
+
+statement ok
+UPDATE events SET amount=21 WHERE customer='b';
+
+statement ok
+DELETE FROM events WHERE id=2;
+
+statement ok
+INSERT INTO events VALUES (8,'a',80),(9,'b',21),(10,'c',100);
+
+statement ok
+UPDATE events SET amount=101 WHERE id=10;
+
+statement ok
+DELETE FROM events WHERE id=10;
+
+statement ok
+PRAGMA refresh('lookup_cte');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_cte) EXCEPT ALL (SELECT * FROM expected_lookup_cte));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_cte) EXCEPT ALL (SELECT * FROM lookup_cte));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_expression');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_expression) EXCEPT ALL (SELECT * FROM expected_lookup_expression));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_expression) EXCEPT ALL (SELECT * FROM lookup_expression));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_right');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_right) EXCEPT ALL (SELECT * FROM expected_lookup_right));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_right) EXCEPT ALL (SELECT * FROM lookup_right));
+----
+0
+
+statement ok
+PRAGMA refresh('lookup_child');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_child) EXCEPT ALL (SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM expected_lookup_cte GROUP BY customer));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM expected_lookup_cte GROUP BY customer) EXCEPT ALL (SELECT * FROM lookup_child));
+----
+0

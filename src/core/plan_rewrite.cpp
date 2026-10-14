@@ -1152,8 +1152,37 @@ static void ReadColumnRefBinding(const unique_ptr<Expression> &expr, ColumnBindi
 	type = ref.return_type;
 }
 
-static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan) {
+LogicalComparisonJoin *FindProjectionKeyJoin(LogicalOperator &plan) {
+	if (plan.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = plan.Cast<LogicalComparisonJoin>();
+		if (IsOuterJoin(join.join_type) && !join.conditions.empty()) {
+			if (join.join_type != JoinType::OUTER) {
+				auto preserved_child = join.join_type == JoinType::RIGHT ? 1 : 0;
+				if (auto nested = FindProjectionKeyJoin(*join.children[preserved_child])) {
+					return nested;
+				}
+			}
+			return &join;
+		}
+	}
+	for (auto &child : plan.children) {
+		if (auto join = FindProjectionKeyJoin(*child)) {
+			return join;
+		}
+	}
+	return nullptr;
+}
+
+static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan, bool has_aggregate) {
 	OuterJoinBindings bindings;
+	if (!has_aggregate) {
+		// A downstream lookup key can change when an earlier optional row is
+		// removed. Both old and replacement rows must share the refresh scope.
+		plan = FindProjectionKeyJoin(*plan);
+		if (!plan) {
+			return bindings;
+		}
+	}
 
 	std::function<bool(LogicalOperator *)> find = [&](LogicalOperator *node) {
 		if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
@@ -1392,7 +1421,7 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 
 static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
                                     bool has_aggregate) {
-	auto outer_join = FindFirstOuterJoinBindings(plan.get());
+	auto outer_join = FindFirstOuterJoinBindings(plan.get(), has_aggregate);
 	if (!outer_join.found) {
 		return;
 	}

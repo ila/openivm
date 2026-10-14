@@ -1581,10 +1581,8 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 }
 
 bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out) {
-	for (auto *join : facts.comparison_joins) {
-		if (!join || join->join_type != JoinType::LEFT || join->conditions.empty()) {
-			continue;
-		}
+	auto *join = FindProjectionKeyJoin(*facts.root);
+	if (join && join->join_type == JoinType::LEFT) {
 		auto *preserved_key = GetColumnRefThroughCasts(join->conditions[0].left.get());
 		if (!preserved_key) {
 			return false;
