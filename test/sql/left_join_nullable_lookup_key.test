@@ -593,3 +593,296 @@ query I
 SELECT COUNT(*) FROM ((WITH p AS (SELECT a.raw_id,TRY_CAST(CAST(a.raw_id AS VARCHAR) AS INTEGER) AS tid,COALESCE(b.label,'default') AS b_label FROM cast_raw a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.raw_id,p.b_label,d.label FROM p LEFT JOIN cast_numbers d ON p.tid IS NOT DISTINCT FROM d.tid) EXCEPT ALL (SELECT * FROM cast_try_mv));
 ----
 0
+
+# Scalar expressions over preserved columns retain their outer refresh key.
+# CASE conditions and all branches must also exclude optional dependencies.
+statement ok
+CREATE TABLE expr_a(id INTEGER,k INTEGER,offset_key INTEGER);
+
+statement ok
+CREATE TABLE expr_b(k INTEGER,label VARCHAR);
+
+statement ok
+CREATE TABLE expr_d(id INTEGER,label VARCHAR);
+
+statement ok
+INSERT INTO expr_a VALUES (1,NULL,1),(1,NULL,1),(2,2,2),(NULL,NULL,5),(5,0,1);
+
+statement ok
+INSERT INTO expr_b VALUES (0,'first'),(2,'second');
+
+statement ok
+INSERT INTO expr_d VALUES (0,'d0'),(1,'d1'),(2,'d2'),(3,'d3'),(4,'d4'),(5,'d5'),(6,'d6');
+
+statement ok
+CREATE VIEW expected_expr_add AS WITH projected AS (SELECT a.id,a.id+1 AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_add AS WITH projected AS (SELECT a.id,a.id+1 AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_coalesce AS WITH projected AS (SELECT a.id,COALESCE(a.id,0) AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_coalesce AS WITH projected AS (SELECT a.id,COALESCE(a.id,0) AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_abs AS WITH projected AS (SELECT a.id,ABS(a.id) AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_abs AS WITH projected AS (SELECT a.id,ABS(a.id) AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_multiply AS WITH projected AS (SELECT a.id,a.id*2 AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_multiply AS WITH projected AS (SELECT a.id,a.id*2 AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_case AS WITH projected AS (SELECT a.id,CASE WHEN a.id IS NULL THEN 0 ELSE a.id END AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_case AS WITH projected AS (SELECT a.id,CASE WHEN a.id IS NULL THEN 0 ELSE a.id END AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_multi_input AS WITH projected AS (SELECT a.id,a.id+a.offset_key AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_multi_input AS WITH projected AS (SELECT a.id,a.id+a.offset_key AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON COALESCE(a.k,0)=b.k), p AS (SELECT id,sid,b_label FROM projected) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE VIEW expected_expr_nullable_case AS WITH p AS (SELECT a.id,CASE WHEN b.label='first' THEN a.id ELSE a.id+1 END AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON a.k=b.k) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+statement ok
+CREATE MATERIALIZED VIEW expr_nullable_case AS WITH p AS (SELECT a.id,CASE WHEN b.label='first' THEN a.id ELSE a.id+1 END AS sid,COALESCE(b.label,'default') AS b_label FROM expr_a a LEFT JOIN expr_b b ON a.k=b.k) SELECT p.id,p.b_label,d.label AS d_label FROM p LEFT JOIN expr_d d ON p.sid=d.id;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_sql_name LIKE 'expr_%' AND type=2;
+----
+7
+
+statement ok
+UPDATE expr_b SET label='temporary' WHERE k=0;
+
+statement ok
+DELETE FROM expr_b WHERE k=0;
+
+statement ok
+UPDATE expr_d SET label='new_d2' WHERE id=2;
+
+statement ok
+INSERT INTO expr_a VALUES (4,NULL,1);
+
+statement ok
+UPDATE expr_a SET k=2 WHERE id=4;
+
+statement ok
+DELETE FROM expr_a WHERE id=4;
+
+statement ok
+PRAGMA refresh('expr_add');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_add) EXCEPT ALL (SELECT * FROM expected_expr_add));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_add) EXCEPT ALL (SELECT * FROM expr_add));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_coalesce');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_coalesce) EXCEPT ALL (SELECT * FROM expected_expr_coalesce));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_coalesce) EXCEPT ALL (SELECT * FROM expr_coalesce));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_abs');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_abs) EXCEPT ALL (SELECT * FROM expected_expr_abs));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_abs) EXCEPT ALL (SELECT * FROM expr_abs));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_multiply');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_multiply) EXCEPT ALL (SELECT * FROM expected_expr_multiply));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_multiply) EXCEPT ALL (SELECT * FROM expr_multiply));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_case');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_case) EXCEPT ALL (SELECT * FROM expected_expr_case));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_case) EXCEPT ALL (SELECT * FROM expr_case));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_multi_input');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_multi_input) EXCEPT ALL (SELECT * FROM expected_expr_multi_input));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_multi_input) EXCEPT ALL (SELECT * FROM expr_multi_input));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_nullable_case');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_nullable_case) EXCEPT ALL (SELECT * FROM expected_expr_nullable_case));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_nullable_case) EXCEPT ALL (SELECT * FROM expr_nullable_case));
+----
+0
+
+# Reintroduce duplicate optional matches and change preserved expressions.
+
+statement ok
+INSERT INTO expr_b VALUES (0,'restored'),(0,'restored');
+
+statement ok
+UPDATE expr_a SET offset_key=3 WHERE id=2;
+
+statement ok
+UPDATE expr_a SET id=3 WHERE id=2;
+
+statement ok
+INSERT INTO expr_a VALUES (4,NULL,2);
+
+statement ok
+DELETE FROM expr_a WHERE id IS NULL;
+
+statement ok
+INSERT INTO expr_a VALUES (NULL,NULL,5);
+
+statement ok
+DELETE FROM expr_d WHERE id=3;
+
+statement ok
+INSERT INTO expr_d VALUES (3,'restored_d3');
+
+statement ok
+PRAGMA refresh('expr_add');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_add) EXCEPT ALL (SELECT * FROM expected_expr_add));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_add) EXCEPT ALL (SELECT * FROM expr_add));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_coalesce');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_coalesce) EXCEPT ALL (SELECT * FROM expected_expr_coalesce));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_coalesce) EXCEPT ALL (SELECT * FROM expr_coalesce));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_abs');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_abs) EXCEPT ALL (SELECT * FROM expected_expr_abs));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_abs) EXCEPT ALL (SELECT * FROM expr_abs));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_multiply');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_multiply) EXCEPT ALL (SELECT * FROM expected_expr_multiply));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_multiply) EXCEPT ALL (SELECT * FROM expr_multiply));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_case');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_case) EXCEPT ALL (SELECT * FROM expected_expr_case));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_case) EXCEPT ALL (SELECT * FROM expr_case));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_multi_input');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_multi_input) EXCEPT ALL (SELECT * FROM expected_expr_multi_input));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_multi_input) EXCEPT ALL (SELECT * FROM expr_multi_input));
+----
+0
+
+statement ok
+PRAGMA refresh('expr_nullable_case');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expr_nullable_case) EXCEPT ALL (SELECT * FROM expected_expr_nullable_case));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_expr_nullable_case) EXCEPT ALL (SELECT * FROM expr_nullable_case));
+----
+0

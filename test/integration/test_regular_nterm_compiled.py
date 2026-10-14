@@ -306,6 +306,47 @@ LEFT JOIN arcm_tpid tpid ON bff.sub_id=tpid.sub_id
 LEFT JOIN arcm_cust cust ON COALESCE(tpid.tp_id,-1)=cust.tp_id""",
         )
 
+        run_scenario(
+            binary,
+            root,
+            "preserved_scalar_key_mixed",
+            """
+CREATE TABLE scalar_a(id INT,k INT,offset_key INT);
+CREATE TABLE scalar_b(k INT,label VARCHAR);
+CREATE TABLE scalar_d(id INT,label VARCHAR);
+INSERT INTO scalar_a VALUES (1,NULL,1),(1,NULL,1),(2,2,2),(NULL,NULL,5);
+INSERT INTO scalar_b VALUES (0,'first'),(2,'second');
+INSERT INTO scalar_d VALUES (0,'d0'),(3,'d3'),(6,'d6');
+CREATE MATERIALIZED VIEW scalar_mv AS
+WITH p AS (
+    SELECT a.id,
+           CASE WHEN a.id IS NULL THEN 0 ELSE COALESCE(ABS(a.id*2)+a.offset_key,0) END AS sid,
+           COALESCE(b.label,'default') AS b_label
+    FROM scalar_a a LEFT JOIN scalar_b b ON COALESCE(a.k,0)=b.k
+)
+SELECT p.id,p.b_label,d.label FROM p LEFT JOIN scalar_d d ON p.sid=d.id;
+UPDATE scalar_b SET label='temporary' WHERE k=0;
+DELETE FROM scalar_b WHERE k=0;
+INSERT INTO scalar_a VALUES (4,NULL,1);
+UPDATE scalar_a SET k=2 WHERE id=4;
+DELETE FROM scalar_a WHERE id=4;
+UPDATE scalar_d SET label='new_d3' WHERE id=3;
+""",
+            "scalar_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH p AS (
+    SELECT a.id,
+           CASE WHEN a.id IS NULL THEN 0 ELSE COALESCE(ABS(a.id*2)+a.offset_key,0) END AS sid,
+           COALESCE(b.label,'default') AS b_label
+    FROM scalar_a a LEFT JOIN scalar_b b ON COALESCE(a.k,0)=b.k
+)
+SELECT p.id,p.b_label,d.label FROM p LEFT JOIN scalar_d d ON p.sid=d.id""",
+        )
+
     print("regular N-term compiled SQL integration tests passed")
 
 

@@ -1152,15 +1152,13 @@ static void ReadColumnRefBinding(const unique_ptr<Expression> &expr, ColumnBindi
 	type = ref.return_type;
 }
 
+static bool IsPreservedKeyExpression(LogicalOperator &plan, Expression &expression);
+
 static bool IsPreservedKeyBinding(LogicalOperator &plan, const ColumnBinding &binding) {
 	if (plan.type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &projection = plan.Cast<LogicalProjection>();
 		if (binding.table_index == projection.table_index) {
-			auto *source = GetColumnRefThroughCasts(projection.expressions[binding.column_index].get());
-			if (!source) {
-				return false;
-			}
-			return IsPreservedKeyBinding(*projection.children[0], source->binding);
+			return IsPreservedKeyExpression(*projection.children[0], *projection.expressions[binding.column_index]);
 		}
 	}
 	if (plan.type == LogicalOperatorType::LOGICAL_GET) {
@@ -1181,6 +1179,34 @@ static bool IsPreservedKeyBinding(LogicalOperator &plan, const ColumnBinding &bi
 	return false;
 }
 
+static bool IsPreservedKeyExpression(LogicalOperator &plan, Expression &expression) {
+	if (!expression.IsConsistent()) {
+		return false;
+	}
+	switch (expression.expression_class) {
+	case ExpressionClass::BOUND_COLUMN_REF: {
+		auto &column = expression.Cast<BoundColumnRefExpression>();
+		return column.depth == 0 && IsPreservedKeyBinding(plan, column.binding);
+	}
+	case ExpressionClass::BOUND_CONSTANT:
+		return true;
+	case ExpressionClass::BOUND_CAST:
+	case ExpressionClass::BOUND_FUNCTION:
+	case ExpressionClass::BOUND_OPERATOR:
+	case ExpressionClass::BOUND_CASE:
+	case ExpressionClass::BOUND_COMPARISON:
+	case ExpressionClass::BOUND_CONJUNCTION:
+	case ExpressionClass::BOUND_BETWEEN: {
+		bool preserved = true;
+		ExpressionIterator::EnumerateChildren(
+		    expression, [&](Expression &child) { preserved = preserved && IsPreservedKeyExpression(plan, child); });
+		return preserved;
+	}
+	default:
+		return false;
+	}
+}
+
 LogicalComparisonJoin *FindProjectionKeyJoin(LogicalOperator &plan) {
 	if (plan.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &join = plan.Cast<LogicalComparisonJoin>();
@@ -1195,7 +1221,7 @@ LogicalComparisonJoin *FindProjectionKeyJoin(LogicalOperator &plan) {
 				return &join;
 			}
 			// Retain a usable outer key to keep its selective refresh scope. Only
-			// descend when that key is computed or depends on nullable join inputs.
+			// descend when that key cannot be propagated or depends on nullable inputs.
 			return FindProjectionKeyJoin(*join.children[preserved_child]);
 		}
 	}
