@@ -72,6 +72,27 @@ FROM platform_dim d RIGHT JOIN (
     profile p RIGHT JOIN events e ON p.customer=e.customer
 ) ON d.platform=COALESCE(p.platform,'N/A');
 
+
+# A forwarded column alias is still unsafe when its source is nullable.
+
+statement ok
+CREATE VIEW expected_lookup_nullable_column AS
+WITH base AS (
+    SELECT e.customer,e.amount,p.platform
+    FROM events e LEFT JOIN profile p ON e.customer=p.customer
+)
+SELECT b.customer,b.amount,COALESCE(d.platform_key,1) AS platform_key
+FROM base b LEFT JOIN platform_dim d ON b.platform=d.platform;
+
+statement ok
+CREATE MATERIALIZED VIEW lookup_nullable_column AS
+WITH base AS (
+    SELECT e.customer,e.amount,p.platform
+    FROM events e LEFT JOIN profile p ON e.customer=p.customer
+)
+SELECT b.customer,b.amount,COALESCE(d.platform_key,1) AS platform_key
+FROM base b LEFT JOIN platform_dim d ON b.platform=d.platform;
+
 statement ok
 CREATE MATERIALIZED VIEW lookup_child AS SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM lookup_cte GROUP BY customer;
 
@@ -161,6 +182,19 @@ SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_right) EXCEPT ALL (SELECT *
 0
 
 statement ok
+PRAGMA refresh('lookup_nullable_column');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_nullable_column) EXCEPT ALL (SELECT * FROM expected_lookup_nullable_column));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_nullable_column) EXCEPT ALL (SELECT * FROM lookup_nullable_column));
+----
+0
+
+statement ok
 PRAGMA refresh('lookup_child');
 
 query I
@@ -240,6 +274,19 @@ SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_right) EXCEPT ALL (SELECT *
 0
 
 statement ok
+PRAGMA refresh('lookup_nullable_column');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM lookup_nullable_column) EXCEPT ALL (SELECT * FROM expected_lookup_nullable_column));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_lookup_nullable_column) EXCEPT ALL (SELECT * FROM lookup_nullable_column));
+----
+0
+
+statement ok
 PRAGMA refresh('lookup_child');
 
 query I
@@ -251,3 +298,133 @@ query I
 SELECT COUNT(*) FROM ((SELECT customer, SUM(amount) AS total, COUNT(*) AS n FROM expected_lookup_cte GROUP BY customer) EXCEPT ALL (SELECT * FROM lookup_child));
 ----
 0
+
+# A computed inner predicate must not displace a usable outer key.
+
+statement ok
+CREATE TABLE computed_a(id INTEGER,k INTEGER);
+
+statement ok
+CREATE TABLE computed_b(k INTEGER,label VARCHAR);
+
+statement ok
+CREATE TABLE computed_d(id INTEGER,label VARCHAR);
+
+statement ok
+INSERT INTO computed_a VALUES (1,NULL),(1,NULL),(2,2);
+
+statement ok
+INSERT INTO computed_b VALUES (0,'first'),(2,'second');
+
+statement ok
+INSERT INTO computed_d VALUES (1,'d1'),(2,'d2');
+
+statement ok
+CREATE MATERIALIZED VIEW computed_mv AS SELECT a.id,COALESCE(b.label,'default') AS b_label,d.label AS d_label FROM computed_a a LEFT JOIN computed_b b ON COALESCE(a.k,0)=b.k LEFT JOIN computed_d d ON a.id=d.id;
+
+statement ok
+UPDATE computed_b SET label='temporary' WHERE k=0;
+
+statement ok
+DELETE FROM computed_b WHERE k=0;
+
+statement ok
+UPDATE computed_b SET label='second_new' WHERE k=2;
+
+statement ok
+DELETE FROM computed_d WHERE id=2;
+
+statement ok
+INSERT INTO computed_d VALUES (2,'d2_new');
+
+statement ok
+PRAGMA refresh('computed_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM computed_mv) EXCEPT ALL (SELECT a.id,COALESCE(b.label,'default') AS b_label,d.label AS d_label FROM computed_a a LEFT JOIN computed_b b ON COALESCE(a.k,0)=b.k LEFT JOIN computed_d d ON a.id=d.id));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT a.id,COALESCE(b.label,'default') AS b_label,d.label AS d_label FROM computed_a a LEFT JOIN computed_b b ON COALESCE(a.k,0)=b.k LEFT JOIN computed_d d ON a.id=d.id) EXCEPT ALL (SELECT * FROM computed_mv));
+----
+0
+
+statement ok
+INSERT INTO computed_b VALUES (0,'restored');
+
+statement ok
+UPDATE computed_a SET k=0 WHERE id=2;
+
+statement ok
+DELETE FROM computed_b WHERE k=2;
+
+statement ok
+INSERT INTO computed_d VALUES (3,'d3');
+
+statement ok
+INSERT INTO computed_a VALUES (3,NULL);
+
+statement ok
+UPDATE computed_a SET k=2 WHERE id=3;
+
+statement ok
+DELETE FROM computed_a WHERE id=3;
+
+statement ok
+PRAGMA refresh('computed_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM computed_mv) EXCEPT ALL (SELECT a.id,COALESCE(b.label,'default') AS b_label,d.label AS d_label FROM computed_a a LEFT JOIN computed_b b ON COALESCE(a.k,0)=b.k LEFT JOIN computed_d d ON a.id=d.id));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT a.id,COALESCE(b.label,'default') AS b_label,d.label AS d_label FROM computed_a a LEFT JOIN computed_b b ON COALESCE(a.k,0)=b.k LEFT JOIN computed_d d ON a.id=d.id) EXCEPT ALL (SELECT * FROM computed_mv));
+----
+0
+
+# Keep the selective fact ID when the inner category key is also preserved.
+# One changed detail must replace one backing row, not all 1,000 category rows.
+
+statement ok
+CREATE TABLE scope_fact AS SELECT i AS id,1 AS category FROM range(1000) t(i);
+
+statement ok
+CREATE TABLE scope_category AS SELECT 1 AS category,'C' AS label;
+
+statement ok
+CREATE TABLE scope_detail AS SELECT i AS id,'D' AS label FROM range(1000) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW scope_mv AS SELECT f.id,c.label AS category_label,d.label AS detail_label FROM scope_fact f LEFT JOIN scope_category c ON f.category=c.category LEFT JOIN scope_detail d ON f.id=d.id;
+
+statement ok
+CREATE TEMP TABLE scope_previous AS SELECT id,rowid AS previous_rowid FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_73636f70655f6d76_;
+
+statement ok
+UPDATE scope_detail SET label='temporary' WHERE id=0;
+
+statement ok
+DELETE FROM scope_detail WHERE id=0;
+
+statement ok
+INSERT INTO scope_detail VALUES (0,'changed');
+
+statement ok
+PRAGMA refresh('scope_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM scope_mv) EXCEPT ALL (SELECT f.id,c.label AS category_label,d.label AS detail_label FROM scope_fact f LEFT JOIN scope_category c ON f.category=c.category LEFT JOIN scope_detail d ON f.id=d.id));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT f.id,c.label AS category_label,d.label AS detail_label FROM scope_fact f LEFT JOIN scope_category c ON f.category=c.category LEFT JOIN scope_detail d ON f.id=d.id) EXCEPT ALL (SELECT * FROM scope_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM scope_previous p JOIN openivm_data___openivm_mv_6d656d6f7279_6d61696e_73636f70655f6d76_ m ON p.id=m.id WHERE p.previous_rowid<>m.rowid;
+----
+1

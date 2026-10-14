@@ -12,8 +12,8 @@ class BoundWindowExpression;
 class LogicalComparisonJoin;
 bool IsRunningWindowCandidate(const BoundWindowExpression &window);
 
-/// Choose the innermost outer join along its preserved side, so a projection's
-/// refresh key does not come from an earlier join's nullable output.
+/// Keep the first usable projection refresh key whose lineage stays on
+/// preserved inputs; search its preserved subtree when that key is unsafe.
 LogicalComparisonJoin *FindProjectionKeyJoin(LogicalOperator &plan);
 
 struct PlanRewriteNeeds {

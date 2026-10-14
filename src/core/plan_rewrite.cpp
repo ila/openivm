@@ -1152,17 +1152,51 @@ static void ReadColumnRefBinding(const unique_ptr<Expression> &expr, ColumnBindi
 	type = ref.return_type;
 }
 
+static bool IsPreservedKeyBinding(LogicalOperator &plan, const ColumnBinding &binding) {
+	if (plan.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		auto &projection = plan.Cast<LogicalProjection>();
+		if (binding.table_index == projection.table_index) {
+			auto &expression = projection.expressions[binding.column_index];
+			if (expression->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+				return false;
+			}
+			return IsPreservedKeyBinding(*projection.children[0], expression->Cast<BoundColumnRefExpression>().binding);
+		}
+	}
+	if (plan.type == LogicalOperatorType::LOGICAL_GET) {
+		auto bindings = plan.GetColumnBindings();
+		return std::find(bindings.begin(), bindings.end(), binding) != bindings.end();
+	}
+	auto *join = dynamic_cast<LogicalJoin *>(&plan);
+	for (idx_t child_idx = 0; child_idx < plan.children.size(); child_idx++) {
+		if (join && ((join->join_type == JoinType::LEFT && child_idx != 0) ||
+		             (join->join_type == JoinType::RIGHT && child_idx != 1) || join->join_type == JoinType::OUTER ||
+		             (join->join_type == JoinType::SINGLE && child_idx != 0))) {
+			continue;
+		}
+		if (IsPreservedKeyBinding(*plan.children[child_idx], binding)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 LogicalComparisonJoin *FindProjectionKeyJoin(LogicalOperator &plan) {
 	if (plan.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &join = plan.Cast<LogicalComparisonJoin>();
 		if (IsOuterJoin(join.join_type) && !join.conditions.empty()) {
-			if (join.join_type != JoinType::OUTER) {
-				auto preserved_child = join.join_type == JoinType::RIGHT ? 1 : 0;
-				if (auto nested = FindProjectionKeyJoin(*join.children[preserved_child])) {
-					return nested;
-				}
+			if (join.join_type == JoinType::OUTER) {
+				return &join;
 			}
-			return &join;
+			auto preserved_child = join.join_type == JoinType::RIGHT ? 1 : 0;
+			auto &key = preserved_child == 0 ? join.conditions[0].left : join.conditions[0].right;
+			if (key->expression_class == ExpressionClass::BOUND_COLUMN_REF &&
+			    IsPreservedKeyBinding(*join.children[preserved_child], key->Cast<BoundColumnRefExpression>().binding)) {
+				return &join;
+			}
+			// Retain a usable outer key to keep its selective refresh scope. Only
+			// descend when that key is computed or depends on nullable join inputs.
+			return FindProjectionKeyJoin(*join.children[preserved_child]);
 		}
 	}
 	for (auto &child : plan.children) {
