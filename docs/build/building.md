@@ -203,9 +203,11 @@ to obtain an inspection file.
 ### Archived compiled SQL
 
 OpenIVM always archives the programs it runs for `CREATE MATERIALIZED VIEW` and
-refresh in two tables next to the view's `openivm_views` metadata (for DuckLake
-views, the native frontend database's `main` schema), independently of
-`openivm_files_path`:
+refresh in two tables next to the view's `openivm_views` metadata (by default the
+view's native catalog, or for DuckLake views the native frontend database's `main`
+schema; `openivm_metadata_catalog`/`openivm_metadata_schema` move them together with
+the rest of the metadata, see [metadata placement](../internals/metadata-placement.md)),
+independently of `openivm_files_path`:
 
 ```sql
 SELECT view_catalog, view_schema, view_sql_name, operation, version,
@@ -245,9 +247,10 @@ ORDER BY s.stmt_order;
 - **Outcomes.** `last_outcome` describes the latest operation that ran the version:
   `committed` (its transaction committed), `attempted` (it failed and rolled back,
   so nothing was committed) or `unknown` (a cross-catalog refresh failed after its
-  first statements ran, or `COMMIT` itself failed, so some effects may have
-  committed). This includes a DuckLake refresh whose data statements roll back,
-  because its native in-progress marker has already committed.
+  first statements ran outside a transaction, or `COMMIT` itself failed, so some
+  effects may have committed). This includes a DuckLake refresh whose data statements
+  roll back, because its in-progress marker in the metadata location has already
+  committed.
   `committed_count` counts committed runs. Compile-only calls such as
   `openivm_compile_with_facts` are never archived, so a stored program has always
   been executed.

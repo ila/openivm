@@ -150,6 +150,9 @@ MIN/MAX and ARG_MIN/ARG_MAX usually force group-recompute unless insert-only fas
 | `openivm_adaptive_backoff` | BOOLEAN | `true` | Auto-increase refresh interval when refresh exceeds interval |
 | `openivm_disable_daemon` | BOOLEAN | `false` | Disable the background refresh daemon |
 | `openivm_files_path` | VARCHAR | — | Path for compiled query reference files |
+| `openivm_metadata_catalog` | VARCHAR | `""` | Database-wide attached catalog (native DuckDB or `TYPE postgres`) for OpenIVM metadata; empty keeps it next to each native view catalog. See `docs/internals/metadata-placement.md` |
+| `openivm_metadata_schema` | VARCHAR | `"main"` | Schema for OpenIVM metadata in the metadata catalog (created on first use) |
+| `openivm_metadata_lease_seconds` | BIGINT | `600` | Refresh lease for clients sharing a remote metadata catalog |
 | `openivm_cost_decay` | DOUBLE | `0.9` | Decay factor for learned cost model regression (0.0–1.0) |
 | `openivm_skip_empty_deltas` | BOOLEAN | `true` | Skip refresh or join terms when deltas are empty |
 | `openivm_ducklake_nterm` | BOOLEAN | `true` | N-term telescoping for DuckLake joins (vs 2^N-1) |

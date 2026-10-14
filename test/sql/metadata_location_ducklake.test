@@ -1,0 +1,829 @@
+# name: test/sql/metadata_location_ducklake.test
+# description: DuckLake materialized views with OpenIVM metadata in a configured native catalog (#84): frontend marker, reopen discovery and crash recovery
+# group: [sql]
+
+require openivm
+
+require parquet
+
+load __TEST_DIR__/openivm_metadata_dl_host.db
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_dl_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_dl_control.db' AS control;
+
+statement ok
+SET openivm_metadata_catalog = 'control';
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+statement ok
+CREATE TABLE dl.main.events (id INTEGER, k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.main.events SELECT i, i % 4, i FROM range(40) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.totals AS SELECT k, SUM(v) AS s, COUNT(*) AS c FROM dl.main.events GROUP BY k;
+
+query III
+SELECT view_sql_name, view_catalog, view_schema FROM control.openivm.openivm_views;
+----
+totals	dl	main
+
+# The backing table stays next to the view in DuckLake; no metadata lands in the frontend.
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'openivm_metadata_dl_host' AND table_name IN ('openivm_views', 'openivm_delta_tables');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dl' AND starts_with(table_name, 'openivm_data_');
+----
+1
+
+# DuckLake cannot hold the marker; the frontend database, the legacy metadata candidate
+# for external view catalogs, records the location instead.
+query II
+SELECT metadata_catalog, metadata_schema FROM openivm_metadata_dl_host.main.openivm_metadata_location;
+----
+control	openivm
+
+statement ok
+INSERT INTO dl.main.events SELECT i, i % 6, i FROM range(100, 130) t(i);
+
+statement ok
+DELETE FROM dl.main.events WHERE id % 7 = 0;
+
+statement ok
+UPDATE dl.main.events SET v = v + 1 WHERE k = 1;
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+# ==========================================
+# Crash after the DuckLake data commit, before the watermarks: the next refresh
+# recomputes instead of re-applying the same snapshots
+# ==========================================
+
+statement ok
+INSERT INTO dl.main.events SELECT i, i % 5, i FROM range(200, 220) t(i);
+
+statement ok
+DELETE FROM dl.main.events WHERE k = 2;
+
+statement ok
+UPDATE dl.main.events SET v = v * 2 WHERE k = 3;
+
+statement ok
+SET openivm_test_fail_point = 'after_data_commit';
+
+statement error
+PRAGMA refresh('dl.main.totals');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'totals';
+----
+true
+
+statement ok
+INSERT INTO dl.main.events VALUES (300, 9, 9);
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+# ==========================================
+# Another connection commits a source change after the DuckLake data transaction and
+# before the watermarks: storing the latest snapshot would skip that change forever.
+# The data transaction verified its sources before committing, so the refresh stores the
+# verified snapshot, which precedes the concurrent commit, and the next refresh applies
+# that change exactly once.
+# ==========================================
+
+statement ok
+INSERT INTO dl.main.events SELECT i, i % 5, i FROM range(250, 270) t(i);
+
+statement ok
+DELETE FROM dl.main.events WHERE id % 8 = 1;
+
+statement ok
+SET openivm_test_concurrent_sql = 'INSERT INTO dl.main.events VALUES (280, 1, 28), (281, 7, 29); DELETE FROM dl.main.events WHERE id = 250; UPDATE dl.main.events SET v = v + 4 WHERE k = 0';
+
+statement ok
+SET openivm_test_fail_point = 'concurrent_commit_after_data';
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+statement ok
+SET openivm_test_fail_point = '';
+
+statement ok
+SET openivm_test_concurrent_sql = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'totals';
+----
+false
+
+# The concurrent commit (it adds group k = 7) is not yet in the view ...
+query I
+SELECT count(*) FROM dl.main.totals WHERE k = 7;
+----
+0
+
+# ... and a refresh with no further source change applies it exactly once.
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+statement ok
+INSERT INTO dl.main.events VALUES (290, 2, 3), (291, 3, 4);
+
+statement ok
+DELETE FROM dl.main.events WHERE id = 280;
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+# ==========================================
+# Reopen without settings: the frontend marker finds control.openivm, and new DuckLake
+# views register there instead of splitting the metadata
+# ==========================================
+
+statement ok
+INSERT INTO dl.main.events SELECT i, i % 3, i FROM range(400, 410) t(i);
+
+# A real reopen loses SET; the test runner's restart carries global settings over, so
+# clear them first. Only the frontend marker may lead the reopened database to control.
+statement ok
+SET openivm_metadata_catalog = '';
+
+statement ok
+SET openivm_metadata_schema = 'main';
+
+restart
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_dl_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_dl_control.db' AS control;
+
+query II
+SELECT current_setting('openivm_metadata_catalog'), current_setting('openivm_metadata_schema');
+----
+(empty)	main
+
+statement ok
+DELETE FROM dl.main.events WHERE id = 401;
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.event_count AS SELECT COUNT(*) AS n, SUM(v) AS s FROM dl.main.events;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views WHERE view_sql_name IN ('totals', 'event_count');
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'openivm_metadata_dl_host' AND table_name = 'openivm_views';
+----
+0
+
+statement ok
+INSERT INTO dl.main.events VALUES (500, 1, 50), (501, 2, 51);
+
+statement ok
+DELETE FROM dl.main.events WHERE id = 500;
+
+statement ok
+PRAGMA refresh('dl.main.event_count');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.event_count
+                              EXCEPT ALL SELECT COUNT(*), SUM(v) FROM dl.main.events))
+     + (SELECT count(*) FROM (SELECT COUNT(*), SUM(v) FROM dl.main.events
+                              EXCEPT ALL SELECT * FROM dl.main.event_count));
+----
+0
+
+# Settings that contradict the frontend marker name the recorded location instead of
+# looking for the view in the wrong place.
+statement ok
+ATTACH ':memory:' AS other_control;
+
+statement ok
+SET openivm_metadata_catalog = 'other_control';
+
+statement error
+PRAGMA refresh('dl.main.totals');
+----
+is recorded in control.openivm
+
+statement ok
+SET openivm_metadata_catalog = '';
+
+statement ok
+DETACH other_control;
+
+statement ok
+DROP VIEW dl.main.event_count;
+
+statement ok
+DROP VIEW dl.main.totals;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views;
+----
+0
+
+# ==========================================
+# Chained DuckLake views: with metadata in a configured catalog, a DuckLake view's data step
+# (its own delta rows and its backing table) is one DuckLake transaction. The downstream view
+# reads the backing table's snapshot changes, so a crash anywhere in the upstream refresh,
+# before or after the downstream view refreshes, neither loses nor doubles a change.
+# ==========================================
+
+statement ok
+SET openivm_metadata_catalog = 'control';
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+# Refresh each level explicitly so a crash in the upstream view is observed downstream.
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+CREATE TABLE dl.main.chain_src (id INTEGER, k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.main.chain_src SELECT i, i % 6, i FROM range(60) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.chain_totals AS
+SELECT k, SUM(v) AS s, COUNT(*) AS c FROM dl.main.chain_src GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.chain_big AS SELECT k, s, c FROM dl.main.chain_totals WHERE s > 300;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views WHERE view_sql_name IN ('chain_totals', 'chain_big');
+----
+2
+
+# --- Crash after the interruption marker, before any data statement ---
+
+statement ok
+INSERT INTO dl.main.chain_src SELECT i, i % 7, i FROM range(100, 130) t(i);
+
+statement ok
+DELETE FROM dl.main.chain_src WHERE id % 9 = 0;
+
+statement ok
+UPDATE dl.main.chain_src SET v = v + 5 WHERE k = 3;
+
+statement ok
+SET openivm_test_fail_point = 'after_intent';
+
+statement error
+PRAGMA refresh('dl.main.chain_totals');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+true
+
+statement ok
+PRAGMA refresh('dl.main.chain_totals');
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+# --- A data statement fails without a crash: the lake transaction rolls back, so the
+# refresh retracts its interruption marker and the next refresh is incremental. ---
+
+statement ok
+INSERT INTO dl.main.chain_src SELECT i, i % 6, i * 2 FROM range(150, 170) t(i);
+
+statement ok
+DELETE FROM dl.main.chain_src WHERE id IN (110, 111, 112);
+
+statement ok
+CREATE OR REPLACE TABLE dl.main.chain_before AS SELECT * FROM dl.main.chain_totals;
+
+statement ok
+SET openivm_test_fail_point = 'data_statement_error';
+
+statement error
+PRAGMA refresh('dl.main.chain_totals');
+----
+'data_statement_error' failed a data statement
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals EXCEPT ALL SELECT * FROM dl.main.chain_before))
+     + (SELECT count(*) FROM (SELECT * FROM dl.main.chain_before EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT * FROM dl.main.chain_before WHERE s > 300))
+     + (SELECT count(*) FROM (SELECT * FROM dl.main.chain_before WHERE s > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.main.chain_totals');
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+# --- Crash right after the statement that writes the view's own delta rows, before the
+# backing table changes. The data transaction rolls back, so neither is committed. ---
+
+statement ok
+INSERT INTO dl.main.chain_src SELECT i, i % 5, i * 3 FROM range(200, 230) t(i);
+
+statement ok
+DELETE FROM dl.main.chain_src WHERE k = 1 AND id < 50;
+
+statement ok
+UPDATE dl.main.chain_src SET v = v * 2 WHERE k = 4;
+
+statement ok
+CREATE OR REPLACE TABLE dl.main.chain_before AS SELECT * FROM dl.main.chain_totals;
+
+statement ok
+SET openivm_test_fail_point = 'after_view_delta';
+
+statement error
+PRAGMA refresh('dl.main.chain_totals');
+----
+'after_view_delta' simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+true
+
+# Nothing from the interrupted attempt committed: the backing table is unchanged ...
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals EXCEPT ALL SELECT * FROM dl.main.chain_before))
+     + (SELECT count(*) FROM (SELECT * FROM dl.main.chain_before EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+# ... and the downstream view sees no change before recovery runs.
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT * FROM dl.main.chain_before WHERE s > 300))
+     + (SELECT count(*) FROM (SELECT * FROM dl.main.chain_before WHERE s > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.main.chain_totals');
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+# --- Crash after every data statement ran, before the DuckLake COMMIT ---
+
+statement ok
+INSERT INTO dl.main.chain_src VALUES (300, 2, 400), (301, 6, 7), (302, 6, 8);
+
+statement ok
+DELETE FROM dl.main.chain_src WHERE id IN (101, 102, 203);
+
+statement ok
+UPDATE dl.main.chain_src SET k = 0 WHERE id = 104;
+
+statement ok
+CREATE OR REPLACE TABLE dl.main.chain_before AS SELECT * FROM dl.main.chain_totals;
+
+statement ok
+SET openivm_test_fail_point = 'before_data_commit';
+
+statement error
+PRAGMA refresh('dl.main.chain_totals');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals EXCEPT ALL SELECT * FROM dl.main.chain_before))
+     + (SELECT count(*) FROM (SELECT * FROM dl.main.chain_before EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+statement ok
+PRAGMA refresh('dl.main.chain_totals');
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+# --- Crash after the data committed, before the watermarks: the downstream view reads the
+# committed backing table first, and the recovery recompute adds no change twice ---
+
+statement ok
+INSERT INTO dl.main.chain_src SELECT i, i % 4, i FROM range(400, 420) t(i);
+
+statement ok
+DELETE FROM dl.main.chain_src WHERE k = 5;
+
+statement ok
+UPDATE dl.main.chain_src SET v = v - 1 WHERE k = 2;
+
+statement ok
+SET openivm_test_fail_point = 'after_data_commit';
+
+statement error
+PRAGMA refresh('dl.main.chain_totals');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+true
+
+# The downstream view consumes the committed upstream change first; recovery must not repeat it.
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+statement ok
+INSERT INTO dl.main.chain_src VALUES (500, 3, 900);
+
+statement ok
+PRAGMA refresh('dl.main.chain_totals');
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'chain_totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.chain_totals));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+# A normal incremental round after recovery keeps both levels exact.
+statement ok
+INSERT INTO dl.main.chain_src VALUES (600, 1, 1000), (601, 4, 2);
+
+statement ok
+DELETE FROM dl.main.chain_src WHERE id = 500;
+
+statement ok
+PRAGMA refresh('dl.main.chain_totals');
+
+statement ok
+PRAGMA refresh('dl.main.chain_big');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.chain_big
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.chain_src GROUP BY k HAVING SUM(v) > 300
+                              EXCEPT ALL SELECT * FROM dl.main.chain_big));
+----
+0
+
+statement ok
+DROP VIEW dl.main.chain_big;
+
+statement ok
+DROP VIEW dl.main.chain_totals;
+
+# ==========================================
+# A DuckLake view over a native frontend source: the atomic DuckLake data step only reads
+# the native source delta; its cleanup runs after the watermarks, so crash recovery and
+# full refreshes work and consumed native delta rows are removed
+# ==========================================
+
+statement ok
+CREATE TABLE fe_orders (id INTEGER, k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO fe_orders SELECT i, i % 3, i FROM range(30) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.fe_totals AS SELECT k, SUM(v) AS s, COUNT(*) AS c FROM fe_orders GROUP BY k;
+
+# The native source delta stays next to its source in the frontend.
+query II
+SELECT database_name, schema_name FROM duckdb_tables() WHERE table_name = 'openivm_delta_fe_orders';
+----
+openivm_metadata_dl_host	main
+
+statement ok
+INSERT INTO fe_orders VALUES (100, 1, 7), (101, 5, 9);
+
+statement ok
+UPDATE fe_orders SET v = v + 2 WHERE k = 0;
+
+statement ok
+DELETE FROM fe_orders WHERE id IN (4, 5);
+
+statement ok
+PRAGMA refresh('dl.main.fe_totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.fe_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM fe_orders GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM fe_orders GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.fe_totals));
+----
+0
+
+# --- Crash after the DuckLake data commit; recovery recomputes in one lake transaction ---
+
+statement ok
+INSERT INTO fe_orders VALUES (102, 2, 11), (103, 6, 13);
+
+statement ok
+UPDATE fe_orders SET v = v * 3 WHERE k = 1;
+
+statement ok
+DELETE FROM fe_orders WHERE id = 7;
+
+statement ok
+SET openivm_test_fail_point = 'after_data_commit';
+
+statement error
+PRAGMA refresh('dl.main.fe_totals');
+----
+simulated a process crash
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'fe_totals';
+----
+true
+
+statement ok
+INSERT INTO fe_orders VALUES (104, 0, 1);
+
+statement ok
+PRAGMA refresh('dl.main.fe_totals');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'fe_totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.fe_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM fe_orders GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM fe_orders GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.fe_totals));
+----
+0
+
+query I
+SELECT count(*) FROM openivm_metadata_dl_host.main.openivm_delta_fe_orders;
+----
+0
+
+# --- A forced full refresh takes the same route ---
+
+statement ok
+INSERT INTO fe_orders VALUES (105, 7, 15), (106, 2, 16);
+
+statement ok
+UPDATE fe_orders SET v = v - 1 WHERE k = 2;
+
+statement ok
+DELETE FROM fe_orders WHERE id = 100;
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+statement ok
+PRAGMA refresh('dl.main.fe_totals');
+
+statement ok
+SET openivm_refresh_mode = 'auto';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'fe_totals';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.fe_totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM fe_orders GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM fe_orders GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.fe_totals));
+----
+0
+
+query I
+SELECT count(*) FROM openivm_metadata_dl_host.main.openivm_delta_fe_orders;
+----
+0
+
+statement ok
+DROP VIEW dl.main.fe_totals;
+
+statement ok
+DROP TABLE fe_orders;
+
+query I
+SELECT count(*) FROM control.openivm.openivm_views;
+----
+0

@@ -16,7 +16,9 @@ day to day. For the mechanics behind this (the mutation gate, cursor bookkeeping
 | Writing to a table no MV depends on | Not affected by OpenIVM. |
 | Two sessions creating the same MV | Exactly one succeeds and metadata stays consistent; the other fails with a write-write conflict naming an internal table ([#91](https://github.com/ila/openivm/issues/91)). |
 | `DROP VIEW` or `ALTER TABLE` during a refresh | Waits for the refresh to finish, then runs. |
-| Writers outside this DuckDB process (e.g. other DuckLake clients) | Not blocked by OpenIVM; their changes are picked up by the next refresh. |
+| Writers outside this DuckDB process (e.g. other DuckLake clients) | Not blocked by OpenIVM. A change committed before a refresh starts is applied by it; one committed while it runs is applied by it or by the next refresh, never lost or applied twice (see [below](#ducklake-sources-changing-during-a-refresh)). |
+| Refresh with metadata in another database (`openivm_metadata_catalog`) | Committed in three autocommit steps; a crash between them makes the next refresh a full recompute. Rejected inside explicit transactions. See [metadata placement](internals/metadata-placement.md). |
+| Two processes refreshing one view through shared PostgreSQL metadata | Serialized by a refresh lease; the second fails with `being refreshed by another OpenIVM client` and can retry. |
 
 A table is *tracked* when at least one materialized view reads from it.
 
@@ -44,6 +46,27 @@ Two consequences matter in practice:
   the gate ([#90](https://github.com/ila/openivm/issues/90)).
 
 Keep transactions that touch tracked tables short, and commit before doing slow work in the same session.
+
+## DuckLake sources changing during a refresh
+
+The gate cannot stop other processes (or other DuckLake clients) from committing to a DuckLake source while a
+refresh reads it. Before compiling, a refresh of a view with DuckLake sources records the current snapshot of every
+attached DuckLake catalog. Its
+reads all happen at that snapshot or later, so once it has run it checks whether any of the view's source tables
+changed after the recorded snapshot. The refresh's own writes to its backing, delta and auxiliary tables are not
+sources and do not count.
+
+- **No source changed:** every read saw the recorded snapshot. The view's watermark becomes the snapshot up to which
+  the check ran, which has the same source state. A change committed after the check has a higher snapshot id and is
+  applied by the next refresh, including one that lands between a transactional data commit and the watermark write.
+- **A source changed:** the refresh may have read part of that change. A native view's data transaction is rolled
+  back before it commits, and so is a DuckLake view's when its metadata is placed in a configured metadata catalog or
+  when downstream views read its changes. Other DuckLake views have already committed their data statements one by
+  one, so their watermarks are not written and the interruption marker stays set. Either way the refresh retries at
+  once; for a view whose marker stays set the retry is a full recompute.
+
+After three attempts that each saw a source change, the refresh fails with `changed while refreshing`. Nothing is
+lost: the view keeps its last stored watermark, or stays marked for a full recompute by the next refresh.
 
 ## Scheduled refresh needs a running process
 
@@ -101,6 +124,10 @@ run any statement. See [refresh hooks](refresh_hooks.md).
 |---|---|
 | Refresh, DML on a tracked table or the daemon hangs | Another session holds the gate: look for an open transaction that wrote to a tracked table, and commit or roll it back. |
 | `Warning: recovering '<view>' from interrupted refresh via full recompute` | A previous refresh stopped mid-way; the full recompute restores the view. See [crash safety](refresh/automatic-refresh.md#crash-safety). |
+| `cannot run inside an explicit transaction` | The view's metadata is in another database; run the statement in autocommit mode. |
+| `OpenIVM metadata catalog '<name>' ... is not attached` or `... which is not attached` | Attach the metadata catalog under the recorded name. Base-table changes are still captured meanwhile. |
+| `being refreshed by another OpenIVM client` | Another process holds the view's refresh lease; retry. A crashed client's lease expires after `openivm_metadata_lease_seconds`. |
+| `DuckLake source table '<table>' changed while refreshing '<view>' in each of 3 attempts` | Another client kept committing to a source during every attempt. No change was lost; refresh again once the writes pause. See [DuckLake sources changing during a refresh](#ducklake-sources-changing-during-a-refresh). |
 | `OpenIVM refresh committed; external delta cleanup deferred` | Consumed deltas in another attached database couldn't be deleted after commit. The view is correct; the rows are retried on a later refresh. |
 | `... does not exist in IVM metadata` right after `CREATE` | The statements were sent in one query string; see [batching statements](#batching-statements). |
 | A scheduled view stopped updating | Check that a process with the database open is still running, then `PRAGMA refresh_status('<view>')` for the effective interval and last refresh. |

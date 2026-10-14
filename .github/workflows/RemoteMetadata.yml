@@ -1,0 +1,49 @@
+#
+# Validates OpenIVM metadata stored in a remote PostgreSQL catalog (issue #84) against a
+# disposable PostgreSQL service container. No external or managed database is contacted.
+#
+name: Remote Metadata Integration
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: true
+
+jobs:
+  remote-metadata:
+    name: OpenIVM metadata in PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: openivm
+          POSTGRES_PASSWORD: openivm
+          POSTGRES_DB: openivm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U openivm -d openivm_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      GEN: ninja
+      OPENIVM_POSTGRES_DSN: host=localhost port=5432 user=openivm password=openivm dbname=openivm_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build ccache
+
+      - name: Build
+        run: make release
+
+      - name: Remote metadata integration test
+        run: python3 test/integration/test_remote_metadata.py ./build/release/duckdb --require

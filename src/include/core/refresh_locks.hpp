@@ -74,6 +74,10 @@ public:
 
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
 	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override;
+	// A prepared statement re-executes its cached plan without the optimizer rule that takes
+	// the gate for tracked DML; take it here, still before execution locks any table.
+	RebindQueryInfo OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
+	                                  RebindQueryInfo current_rebind) override;
 
 private:
 	void Release();

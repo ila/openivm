@@ -905,7 +905,9 @@ string RefreshCostHistoryQuery(ClientContext &context, const FunctionParameters 
 	       " AS view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est,"
 	       " recompute_compute_est, recompute_replace_est, actual_duration_ms"
 	       " FROM " +
-	       SqlUtils::FullName(ClientData::Get(*con.context).catalog_search_path->GetDefault().catalog, DEFAULT_SCHEMA,
+	       // The resolver left the helper in the view's metadata catalog and schema.
+	       SqlUtils::FullName(ClientData::Get(*con.context).catalog_search_path->GetDefault().catalog,
+	                          ClientData::Get(*con.context).catalog_search_path->GetDefault().schema,
 	                          openivm::HISTORY_TABLE) +
 	       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' ORDER BY refresh_timestamp DESC LIMIT 20";
 }

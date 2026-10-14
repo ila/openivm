@@ -162,12 +162,15 @@ string WriteCompiledProgram(Connection &con, const CompiledProgram &program, Com
 	Value outcome_name(CompiledProgramOutcomeName(outcome));
 	auto committed = Value::BIGINT(outcome == CompiledProgramOutcome::COMMITTED ? 1 : 0);
 	auto describe_version = [&]() {
-		// The primary key keeps an existing description, as NOT EXISTS does in the SQL form.
-		return execute("INSERT OR IGNORE INTO " + programs +
+		// Keep an existing description, as in the SQL form. NOT EXISTS rather than INSERT OR
+		// IGNORE: remote (PostgreSQL) metadata catalogs do not support conflict clauses.
+		return execute("INSERT INTO " + programs +
 		                   " (view_name, view_catalog, view_schema, view_sql_name, operation, version, statement_count,"
 		                   " compilation_id, compiled_at, last_compilation_id, last_outcome, last_outcome_at,"
-		                   " committed_count) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, " +
-		                   string(openivm::UTC_NOW_SQL) + ", $8, $9, " + openivm::UTC_NOW_SQL + ", $10)",
+		                   " committed_count) SELECT $1, $2, $3, $4, $5, $6, $7, $8, " +
+		                   string(openivm::UTC_NOW_SQL) + ", $8, $9, " + openivm::UTC_NOW_SQL +
+		                   ", $10 WHERE NOT EXISTS" + " (SELECT 1 FROM " + programs +
+		                   " p WHERE p.view_name = $1 AND p.operation = $5" + " AND p.version = $6)",
 		               {view_name, Value(program.view_catalog), Value(program.view_schema),
 		                Value(program.view_sql_name), operation, Value::INTEGER(version),
 		                Value::INTEGER(static_cast<int32_t>(program.statements.size())), compilation_id, outcome_name,
@@ -215,6 +218,7 @@ string RecordCompiledProgram(ClientContext &context, const string &view_catalog,
 		// The caller owns the database-wide mutation gate; let tracked writes re-enter it.
 		TransactionalMVLockState::Get(*con.context)
 		    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+		// The archive belongs to the view's metadata location (openivm_metadata_catalog/_schema).
 		RefreshMetadata::UseCatalog(context, con, view_catalog);
 		string catalog;
 		string schema;

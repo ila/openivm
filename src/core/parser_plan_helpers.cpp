@@ -195,9 +195,10 @@ PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, uni
 }
 
 string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
-                                const string &default_db) {
-	if (current_catalog.empty() || current_catalog == default_db || table_name.find('.') != string::npos ||
-	    table_name.find('(') != string::npos) {
+                                const string &default_db, const string &default_schema) {
+	// CREATE programs run in the metadata catalog/schema; qualify sources resolved elsewhere.
+	if (current_catalog.empty() || (current_catalog == default_db && current_schema == default_schema) ||
+	    table_name.find('.') != string::npos || table_name.find('(') != string::npos) {
 		return table_name;
 	}
 	return current_catalog + "." + current_schema + "." + table_name;

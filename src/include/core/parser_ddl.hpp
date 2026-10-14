@@ -65,7 +65,8 @@ private:
 
 void ConfigureDDLExecutorResult(ParserExtensionPlanResult &result,
                                 DDLExecutionMode mode = DDLExecutionMode::STAGED_CROSS_CATALOG);
-string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog);
+string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog,
+                              const string &metadata_schema);
 // The caller-transaction SQL for one compiled lifecycle statement (excluding profile
 // and cleanup markers, which RenderTransactionalDDL handles itself).
 vector<string> RenderTransactionalStatement(const string &statement);

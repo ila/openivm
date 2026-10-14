@@ -21,18 +21,19 @@ struct ViewTypeLookup {
 };
 
 // Resolves the MV named `sql_name` in the connection's current catalog/schema to its metadata key
-// via RefreshMetadata::FindViewKey, then reads its refresh type from the native catalog's metadata.
-// `con` may point at a DuckLake catalog (USE dl.main); metadata always lives in `native_catalog`.
+// via RefreshMetadata::FindViewKey, then reads its refresh type from the metadata location that
+// RefreshMetadata::UseCatalog selects (`native_catalog`.main unless openivm_metadata_catalog/_schema
+// or a durable marker place it elsewhere). `con` may point at a DuckLake catalog (USE dl.main).
 inline ViewTypeLookup LookupViewType(duckdb::DuckDB &db, duckdb::Connection &con, const std::string &native_catalog,
                                      const std::string &sql_name) {
 	ViewTypeLookup out;
+	duckdb::Connection meta_con(db);
 	try {
 		auto loc = con.Query("SELECT current_database(), current_schema()");
 		if (!loc || loc->HasError() || loc->RowCount() == 0) {
 			out.error = loc ? loc->GetError() : "no result";
 			return out;
 		}
-		duckdb::Connection meta_con(db);
 		duckdb::RefreshMetadata::UseCatalog(*meta_con.context, meta_con, native_catalog);
 		duckdb::RefreshMetadata metadata(meta_con);
 		out.key = metadata.FindViewKey(loc->GetValue(0, 0).ToString(), loc->GetValue(1, 0).ToString(), sql_name);
@@ -43,8 +44,8 @@ inline ViewTypeLookup LookupViewType(duckdb::DuckDB &db, duckdb::Connection &con
 	if (out.key.empty()) {
 		return out;
 	}
-	auto result = con.Query("SELECT type FROM " + duckdb::KeywordHelper::WriteOptionallyQuoted(native_catalog) +
-	                        ".main.openivm_views WHERE view_name = " + duckdb::Value(out.key).ToSQLString());
+	auto result =
+	    meta_con.Query("SELECT type FROM openivm_views WHERE view_name = " + duckdb::Value(out.key).ToSQLString());
 	if (!result || result->HasError()) {
 		out.error = result ? result->GetError() : "no result";
 		return out;

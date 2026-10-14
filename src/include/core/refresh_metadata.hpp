@@ -2,6 +2,7 @@
 #define REFRESH_METADATA_HPP
 
 #include "core/derived_aggregate_output.hpp"
+#include "core/metadata_location.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "core/openivm_constants.hpp"
@@ -21,8 +22,10 @@ public:
 	explicit RefreshMetadata(Connection &con) : con(con) {
 	}
 
-	// Native view metadata belongs to the view catalog; external catalogs use the native default.
-	static void UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
+	// Select the metadata location of a view stored in `view_catalog` on `con` and return it.
+	// Legacy placement: native view metadata belongs to the view catalog; external catalogs
+	// use the native default. openivm_metadata_catalog/_schema or a durable marker override it.
+	static MetadataLocation UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
 
 	void SnapshotTransaction(ClientContext &context);
 	string ResolveViewName(const string &view_name, const string &catalog = "", const string &schema = "");
@@ -62,8 +65,9 @@ public:
 	// Get the last_update timestamp for a specific delta table entry.
 	string GetLastUpdate(const string &view_name, const string &table_name);
 
+	// Every metadata location that may consume delta tables (see MetadataLocator::All).
+	static vector<MetadataLocation> MetadataLocations(Connection &con);
 	// Accept both legacy short keys and qualified keys for sources with colliding names.
-	static vector<string> MetadataCatalogs(Connection &con);
 	static string SourceTableName(const string &key, const string &catalog, const string &schema);
 	static string SourcePredicate(const string &table, const string &catalog, const string &schema);
 
@@ -125,6 +129,7 @@ public:
 	// Returns the stored relation identity plus its schedule and last refresh watermark.
 	struct ScheduledView {
 		string metadata_catalog;
+		string metadata_schema;
 		string view_name;
 		string catalog_name;
 		string schema_name;
@@ -139,10 +144,14 @@ public:
 	// Build SQL to delete old delta rows that all dependent views have already consumed.
 	// target: the (possibly schema-qualified) table to delete from.
 	// metadata_key: the name used in openivm_delta_tables (unqualified delta name).
+	// With deferred_cleanup, a cleanup of a table outside the metadata catalog or outside
+	// data_catalog (the database the refresh's data transaction writes) is appended to
+	// deferred_cleanup instead of returned.
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
 	                                   const string &delta_metadata_table = "",
 	                                   vector<string> *deferred_cleanup = nullptr,
-	                                   const vector<string> &metadata_catalogs = {});
+	                                   const vector<MetadataLocation> &metadata_locations = {},
+	                                   const string &data_catalog = "");
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);
@@ -179,6 +188,7 @@ public:
 	bool IsDuckLakeTable(const string &view_name, const string &table_name);
 
 	bool IsDuckLakeCatalog(const string &catalog_name);
+	bool IsNativeCatalog(const string &catalog_name);
 
 	int64_t GetCurrentDuckLakeSnapshot(const string &catalog_name);
 
@@ -195,6 +205,9 @@ public:
 	// Resolve the DuckLake table id recorded for a source table and repair stale/missing metadata.
 	DuckLakeSourceIdentity ResolveDuckLakeSourceIdentity(const string &view_name, const string &table_name,
 	                                                     const string &catalog_name, const string &schema_name);
+	// The DuckLake table id that `catalog.schema.table` named at `snapshot_id`; -1 if unknown.
+	int64_t GetDuckLakeTableIdAt(const string &catalog_name, const string &schema_name, const string &table_name,
+	                             int64_t snapshot_id);
 
 	static string BuildDuckLakeRefreshMetadataSQL(const string &view_name, const string &table_name,
 	                                              const string &snapshot_expr, const string &delta_metadata_table = "");

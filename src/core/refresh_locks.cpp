@@ -1,6 +1,9 @@
 #include "core/refresh_locks.hpp"
 #include "core/openivm_debug.hpp"
+#include "rules/transactional_delta_capture.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/common/printer.hpp"
 
 #include <cstdio>
@@ -113,6 +116,15 @@ void TransactionalMVLockState::TransactionCommit(MetaTransaction &transaction, C
 
 void TransactionalMVLockState::TransactionRollback(MetaTransaction &transaction, ClientContext &context) {
 	Release();
+}
+
+RebindQueryInfo TransactionalMVLockState::OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
+                                                            RebindQueryInfo current_rebind) {
+	auto &plan = info.prepared_statement.physical_plan;
+	if (plan && PlanCapturesTrackedDeltas(plan->Root())) {
+		AcquireMutationLock();
+	}
+	return RebindQueryInfo::DO_NOT_REBIND;
 }
 
 void TransactionalMVLockState::Release() {

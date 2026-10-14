@@ -6,7 +6,7 @@
 #include "core/parser_create_mv_helpers.hpp"
 
 #include "core/compiled_sql_archive.hpp"
-
+#include "core/metadata_location.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_locks.hpp"
@@ -76,7 +76,7 @@ string CreateMVDependenciesSQL() {
 }
 
 static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalog, const string &schema,
-                                    vector<string> &ddl) {
+                                    vector<string> &ddl, bool remote) {
 	// Inspect this transaction's catalog, not a process-wide initialization flag: older
 	// databases and other attached catalogs must still receive missing columns.
 	auto views = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::VIEWS_TABLE,
@@ -86,61 +86,79 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 	auto history = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::HISTORY_TABLE,
 	                                                    OnEntryNotFound::RETURN_NULL);
 	OPENIVM_DEBUG_PRINT("[CREATE] Checking metadata schema in %s.%s\n", catalog.c_str(), schema.c_str());
+	// Remote tables are created with every column; only migrate tables that already exist.
+	auto add_column = [&](vector<string> &target, const string &table_name, optional_ptr<TableCatalogEntry> table,
+	                      const string &column_definition) {
+		if (remote && !table) {
+			return;
+		}
+		AddColumnIfNotExists(target, table_name, table, column_definition);
+	};
 
 	ddl.push_back(CreateMVDependenciesSQL());
 	// Matcher metadata columns (signature_hash..nullified_columns_json) stay
 	// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
-	ddl.push_back(
-	    "create table if not exists " + string(openivm::VIEWS_TABLE) +
-	    " (view_name varchar primary key, view_catalog varchar default null,"
-	    " view_schema varchar default null, view_sql_name varchar default null, sql_string varchar, type tinyint,"
-	    " has_minmax boolean default false, has_left_join boolean default false,"
-	    " has_join boolean default false,"
-	    " last_update timestamp, refresh_interval bigint default null,"
-	    " refresh_in_progress boolean default false,"
-	    " group_columns varchar default null,"
-	    " window_order_columns varchar default null,"
-	    " aggregate_types varchar default null,"
-	    " derived_aggregate_outputs_json varchar default null,"
-	    " having_predicate varchar default null,"
-	    " group_recompute_affected_mode varchar default null,"
-	    " group_recompute_source_occurrences_json varchar default null,"
-	    " has_full_outer boolean default false,"
-	    " full_outer_join_cols varchar default null,"
-	    " signature_hash ubigint default null,"
-	    " canonical_plan_blob blob default null,"
-	    " output_columns_json varchar default null,"
-	    " predicate_summary_json varchar default null,"
-	    " fd_summary_json varchar default null,"
-	    " source_tables_json varchar default null,"
-	    " aggregate_decomposition_json varchar default null,"
-	    " nullified_columns_json varchar default null,"
-	    " distinct_aux_meta_json varchar default null,"
-	    " count_distinct_aux_meta_json varchar default null,"
-	    " semi_anti_aux_meta_json varchar default null,"
-	    " lineage_json varchar default null,"
-	    " leftjoin_secondary_meta_json varchar default null,"
-	    " published_query varchar default null,"
-	    " pending_after_hook boolean default null)");
+	// Remote SQL catalogs get portable types; the unused view-matching signature columns
+	// (UBIGINT/BLOB) are replaced there by the cross-client refresh epoch.
+	string matcher_columns = remote ? " refresh_epoch bigint default 0,"
+	                                : " signature_hash ubigint default null, canonical_plan_blob blob default null,";
+	ddl.push_back("create table if not exists " + string(openivm::VIEWS_TABLE) +
+	              " (view_name varchar primary key, view_catalog varchar default null,"
+	              " view_schema varchar default null, view_sql_name varchar default null, sql_string varchar, type " +
+	              string(remote ? "smallint" : "tinyint") +
+	              ","
+	              " has_minmax boolean default false, has_left_join boolean default false,"
+	              " has_join boolean default false,"
+	              " last_update timestamp, refresh_interval bigint default null,"
+	              " refresh_in_progress boolean default false,"
+	              " group_columns varchar default null,"
+	              " window_order_columns varchar default null,"
+	              " aggregate_types varchar default null,"
+	              " derived_aggregate_outputs_json varchar default null,"
+	              " having_predicate varchar default null,"
+	              " group_recompute_affected_mode varchar default null,"
+	              " group_recompute_source_occurrences_json varchar default null,"
+	              " has_full_outer boolean default false,"
+	              " full_outer_join_cols varchar default null," +
+	              matcher_columns +
+	              " output_columns_json varchar default null,"
+	              " predicate_summary_json varchar default null,"
+	              " fd_summary_json varchar default null,"
+	              " source_tables_json varchar default null,"
+	              " aggregate_decomposition_json varchar default null,"
+	              " nullified_columns_json varchar default null,"
+	              " distinct_aux_meta_json varchar default null,"
+	              " count_distinct_aux_meta_json varchar default null,"
+	              " semi_anti_aux_meta_json varchar default null,"
+	              " lineage_json varchar default null,"
+	              " leftjoin_secondary_meta_json varchar default null,"
+	              " published_query varchar default null,"
+	              " pending_after_hook boolean default null)");
 	// Forward-compat ALTER for existing DBs that pre-date `distinct_aux_meta_json`
 	// (the CREATE IF NOT EXISTS above is a no-op when the table exists with the older schema).
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "distinct_aux_meta_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "count_distinct_aux_meta_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "semi_anti_aux_meta_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "lineage_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "leftjoin_secondary_meta_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "has_join boolean default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "group_recompute_affected_mode varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views,
-	                     "group_recompute_source_occurrences_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "derived_aggregate_outputs_json varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "published_query varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "view_catalog varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "view_sql_name varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "view_schema varchar default null");
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "window_order_columns varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "distinct_aux_meta_json varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "count_distinct_aux_meta_json varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "semi_anti_aux_meta_json varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "lineage_json varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "leftjoin_secondary_meta_json varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "has_join boolean default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "group_recompute_affected_mode varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "group_recompute_source_occurrences_json varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "derived_aggregate_outputs_json varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "published_query varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "view_catalog varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "view_sql_name varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "view_schema varchar default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "window_order_columns varchar default null");
 
-	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "pending_after_hook boolean default null");
+	add_column(ddl, openivm::VIEWS_TABLE, views, "pending_after_hook boolean default null");
+	if (remote) {
+		// Clients sharing remote metadata serialize refreshes per view through a lease; an
+		// epoch bump marks a view whose lease was overrun so the next refresh recomputes it.
+		add_column(ddl, openivm::VIEWS_TABLE, views, "refresh_epoch bigint default 0");
+		ddl.push_back("create table if not exists " + string(openivm::REFRESH_LEASE_TABLE) +
+		              " (view_name varchar primary key, owner varchar not null, lease_until timestamp not null)");
+	}
 
 	// Refresh hooks: extensions can register custom SQL to run on MV refresh
 	// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
@@ -160,12 +178,12 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 	              " source_table_id bigint default null,"
 	              " primary key(view_name, table_name))");
 	// Backfill for existing databases without the columns (added post-release).
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "last_refresh_ts timestamp default null");
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "pending_row_estimate bigint default null");
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "pending_estimate_ts timestamp default null");
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_catalog varchar default null");
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_schema varchar default null");
-	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_table_id bigint default null");
+	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "last_refresh_ts timestamp default null");
+	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "pending_row_estimate bigint default null");
+	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "pending_estimate_ts timestamp default null");
+	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_catalog varchar default null");
+	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_schema varchar default null");
+	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_table_id bigint default null");
 	ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) +
 	              " SET has_join = true WHERE has_join IS NULL AND (COALESCE(has_left_join, false) OR "
 	              "COALESCE(has_full_outer, false) OR view_name IN (SELECT view_name FROM " +
@@ -185,7 +203,7 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 	              " actual_duration_ms bigint,"
 	              " strategy varchar default 'incremental',"
 	              " primary key(view_name, refresh_timestamp))");
-	AddColumnIfNotExists(ddl, openivm::HISTORY_TABLE, history, "strategy varchar default 'incremental'");
+	add_column(ddl, openivm::HISTORY_TABLE, history, "strategy varchar default 'incremental'");
 	ddl.push_back("create table if not exists " + string(openivm::PROFILE_TABLE) +
 	              " (refresh_id varchar, view_name varchar,"
 	              " profile_timestamp timestamp default current_timestamp,"
@@ -238,14 +256,17 @@ static void InitializeSharedDDL(ClientContext &context, Connection &con, const s
 	OPENIVM_DEBUG_PRINT("[METADATA] Shared tables initialized\n");
 }
 
-void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema) {
-	InitializeSharedDDL(context, con,
-	                    "SELECT v.view_sql_name, v.pending_after_hook, d.source_table_id, h.mode, "
-	                    "r.strategy, p.step_order, dep.edge_kind, cp.last_outcome, cs.sql FROM openivm_views v, "
-	                    "openivm_delta_tables d, openivm_refresh_hooks h, openivm_refresh_history r, "
-	                    "openivm_refresh_profile p, openivm_mv_dependencies dep, openivm_compiled_programs cp, "
-	                    "openivm_compiled_statements cs LIMIT 0",
-	                    [&](vector<string> &ddl) { AppendMetadataSchemaDDL(context, catalog, schema, ddl); });
+void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema,
+                          bool remote) {
+	string probe = "SELECT v.view_sql_name, v.pending_after_hook, d.source_table_id, h.mode, "
+	               "r.strategy, p.step_order, dep.edge_kind, cp.last_outcome, cs.sql" +
+	               string(remote ? ", v.refresh_epoch, l.owner" : "") +
+	               " FROM openivm_views v, openivm_delta_tables d, "
+	               "openivm_refresh_hooks h, openivm_refresh_history r, openivm_refresh_profile p, "
+	               "openivm_mv_dependencies dep, openivm_compiled_programs cp, openivm_compiled_statements cs" +
+	               string(remote ? ", " + string(openivm::REFRESH_LEASE_TABLE) + " l" : "") + " LIMIT 0";
+	InitializeSharedDDL(context, con, probe,
+	                    [&](vector<string> &ddl) { AppendMetadataSchemaDDL(context, catalog, schema, ddl, remote); });
 }
 
 void InitializeSourceDelta(ClientContext &context, Connection &con, const string &delta_table, const string &ddl) {
@@ -255,8 +276,9 @@ void InitializeSourceDelta(ClientContext &context, Connection &con, const string
 
 void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog, const string &schema,
                                    vector<string> &ddl, const string &view_name, bool is_replace,
-                                   const string &view_catalog, const string &view_schema, const string &sql_view_name) {
-	AppendMetadataSchemaDDL(context, catalog, schema, ddl);
+                                   const string &view_catalog, const string &view_schema, const string &sql_view_name,
+                                   bool remote) {
+	AppendMetadataSchemaDDL(context, catalog, schema, ddl, remote);
 	if (is_replace) {
 		// Legacy keys must still belong to the requested relation.
 		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(openivm::VIEWS_TABLE) +
@@ -287,7 +309,8 @@ void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog
 		// than report a misleading duplicate MV.
 		auto views = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::VIEWS_TABLE,
 		                                                  OnEntryNotFound::RETURN_NULL);
-		if (views && HasViewMetadata(context, *views, view_name)) {
+		// Remote catalogs have no DuckDB storage to scan; the guarded DELETE is harmless.
+		if (views && (remote || HasViewMetadata(context, *views, view_name))) {
 			ddl.push_back("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);
 		}
 		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(openivm::VIEWS_TABLE) +

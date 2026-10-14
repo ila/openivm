@@ -1,0 +1,330 @@
+# name: test/sql/ducklake_concurrent_source_commit.test
+# description: A DuckLake source change committed by another connection while a refresh reads its sources is neither lost nor applied twice (#84)
+# group: [sql]
+
+require openivm
+
+require parquet
+
+load __TEST_DIR__/openivm_concurrent_source_host.db
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_concurrent_source_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE TABLE dl.main.facts (id INTEGER, k INTEGER, v INTEGER);
+
+statement ok
+CREATE TABLE dl.main.dims (k INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO dl.main.facts SELECT i, i % 5, i FROM range(60) t(i);
+
+statement ok
+INSERT INTO dl.main.dims SELECT i, i + 1 FROM range(5) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.totals AS SELECT k, SUM(v) AS s, COUNT(*) AS c FROM dl.main.facts GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.weighted AS
+SELECT f.k, SUM(f.v * d.w) AS s, COUNT(*) AS c FROM dl.main.facts f JOIN dl.main.dims d ON f.k = d.k GROUP BY f.k;
+
+# Every refresh attempt records its own refresh_id, so the profile counts attempts.
+statement ok
+SET openivm_profile_refresh = true;
+
+# ==========================================
+# Commit between compilation and the data statements. The compiled delta range ends
+# before the commit, so the refresh must not store a watermark past it.
+# ==========================================
+
+statement ok
+INSERT INTO dl.main.facts SELECT i, i % 7, i FROM range(100, 140) t(i);
+
+statement ok
+DELETE FROM dl.main.facts WHERE id % 9 = 0;
+
+statement ok
+UPDATE dl.main.facts SET v = v + 3 WHERE k = 2;
+
+statement ok
+SET openivm_test_concurrent_sql = 'INSERT INTO dl.main.facts VALUES (900, 1, 90), (901, 6, 91); DELETE FROM dl.main.facts WHERE id = 4; UPDATE dl.main.facts SET v = v * 2 WHERE k = 3';
+
+statement ok
+SET openivm_test_fail_point = 'concurrent_commit_before_data';
+
+statement ok
+DELETE FROM openivm_refresh_profile;
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+statement ok
+SET openivm_test_fail_point = '';
+
+# The first attempt saw the source change after its pin and left the view marked;
+# the second recomputed it.
+query I
+SELECT count(DISTINCT refresh_id) FROM openivm_refresh_profile
+WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'totals');
+----
+2
+
+query I
+SELECT bool_or(refresh_in_progress) FROM openivm_views;
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+# The next incremental refresh starts exactly after the snapshot the retry consumed.
+statement ok
+INSERT INTO dl.main.facts SELECT i, i % 4, i FROM range(200, 230) t(i);
+
+statement ok
+DELETE FROM dl.main.facts WHERE id = 901;
+
+statement ok
+UPDATE dl.main.facts SET v = v - 1 WHERE id % 5 = 1;
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+# ==========================================
+# Commit after the DuckLake data statements, before the watermarks: a snapshot read at
+# that point would include a change the refresh never applied
+# ==========================================
+
+statement ok
+INSERT INTO dl.main.facts SELECT i, i % 6, i FROM range(300, 320) t(i);
+
+statement ok
+DELETE FROM dl.main.facts WHERE k = 0 AND id < 50;
+
+statement ok
+UPDATE dl.main.facts SET v = v + 10 WHERE k = 4;
+
+statement ok
+SET openivm_test_concurrent_sql = 'INSERT INTO dl.main.facts VALUES (950, 2, 95), (951, 9, 96); UPDATE dl.main.facts SET v = 0 WHERE id = 301';
+
+statement ok
+SET openivm_test_fail_point = 'concurrent_commit_after_data';
+
+statement ok
+DELETE FROM openivm_refresh_profile;
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT count(DISTINCT refresh_id) FROM openivm_refresh_profile
+WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'totals');
+----
+2
+
+query I
+SELECT bool_or(refresh_in_progress) FROM openivm_views;
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+statement ok
+INSERT INTO dl.main.facts VALUES (960, 2, 7), (961, 8, 8);
+
+statement ok
+DELETE FROM dl.main.facts WHERE id = 950;
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+# ==========================================
+# Join: the other side changes while the refresh joins one side's delta with it
+# ==========================================
+
+statement ok
+INSERT INTO dl.main.facts SELECT i, i % 5, i FROM range(400, 430) t(i);
+
+statement ok
+DELETE FROM dl.main.facts WHERE id % 11 = 3;
+
+statement ok
+UPDATE dl.main.dims SET w = w + 2 WHERE k = 1;
+
+statement ok
+SET openivm_test_concurrent_sql = 'UPDATE dl.main.dims SET w = w * 3 WHERE k IN (0, 2); INSERT INTO dl.main.dims VALUES (4, 100); INSERT INTO dl.main.facts VALUES (990, 4, 9)';
+
+statement ok
+SET openivm_test_fail_point = 'concurrent_commit_before_data';
+
+statement ok
+DELETE FROM openivm_refresh_profile;
+
+statement ok
+PRAGMA refresh('dl.main.weighted');
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT count(DISTINCT refresh_id) FROM openivm_refresh_profile
+WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'weighted');
+----
+2
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.weighted
+                              EXCEPT ALL SELECT f.k, SUM(f.v * d.w), COUNT(*)
+                                         FROM dl.main.facts f JOIN dl.main.dims d ON f.k = d.k GROUP BY f.k))
+     + (SELECT count(*) FROM (SELECT f.k, SUM(f.v * d.w), COUNT(*)
+                              FROM dl.main.facts f JOIN dl.main.dims d ON f.k = d.k GROUP BY f.k
+                              EXCEPT ALL SELECT * FROM dl.main.weighted));
+----
+0
+
+statement ok
+INSERT INTO dl.main.facts SELECT i, i % 5, i FROM range(500, 520) t(i);
+
+statement ok
+DELETE FROM dl.main.dims WHERE w = 100;
+
+statement ok
+UPDATE dl.main.facts SET v = v + 1 WHERE k = 1;
+
+statement ok
+PRAGMA refresh('dl.main.weighted');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.weighted
+                              EXCEPT ALL SELECT f.k, SUM(f.v * d.w), COUNT(*)
+                                         FROM dl.main.facts f JOIN dl.main.dims d ON f.k = d.k GROUP BY f.k))
+     + (SELECT count(*) FROM (SELECT f.k, SUM(f.v * d.w), COUNT(*)
+                              FROM dl.main.facts f JOIN dl.main.dims d ON f.k = d.k GROUP BY f.k
+                              EXCEPT ALL SELECT * FROM dl.main.weighted));
+----
+0
+
+# The other view also missed every change committed above; its refresh catches up.
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+# ==========================================
+# Changes to tables that are not sources of the view, including the refresh's own
+# writes to its backing table, do not force a retry
+# ==========================================
+
+statement ok
+CREATE TABLE dl.main.unrelated (x INTEGER);
+
+statement ok
+INSERT INTO dl.main.facts VALUES (1000, 3, 30);
+
+statement ok
+SET openivm_test_concurrent_sql = 'INSERT INTO dl.main.unrelated VALUES (1)';
+
+statement ok
+SET openivm_test_fail_point = 'concurrent_commit_before_data';
+
+statement ok
+DELETE FROM openivm_refresh_profile;
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+statement ok
+SET openivm_test_fail_point = '';
+
+statement ok
+SET openivm_test_concurrent_sql = '';
+
+# The first attempt stored its watermarks; no retry was needed.
+query I
+SELECT count(DISTINCT refresh_id) FROM openivm_refresh_profile
+WHERE view_name = (SELECT view_name FROM openivm_views WHERE view_sql_name = 'totals');
+----
+1
+
+query I
+SELECT bool_or(refresh_in_progress) FROM openivm_views;
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
+# A fail point that needs SQL refuses to run without it.
+statement ok
+SET openivm_test_fail_point = 'concurrent_commit_before_data';
+
+statement ok
+INSERT INTO dl.main.facts VALUES (1001, 3, 31);
+
+statement error
+PRAGMA refresh('dl.main.totals');
+----
+requires openivm_test_concurrent_sql
+
+statement ok
+SET openivm_test_fail_point = '';
+
+statement ok
+PRAGMA refresh('dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.facts GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0

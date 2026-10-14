@@ -11,6 +11,8 @@ from pathlib import Path
 with tempfile.TemporaryDirectory(prefix="openivm-scheduler-") as directory:
     catalog = str(Path(directory) / "lake.sqlite")
     Path(catalog + ".files").mkdir()
+    # The configured-metadata-location scenario (#84) exports compiled SQL here.
+    Path(catalog + ".placed.files").mkdir()
     with subprocess.Popen(
         [str(Path(sys.argv[1]).resolve()), catalog],
         stdin=subprocess.PIPE,

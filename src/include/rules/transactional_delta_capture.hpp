@@ -56,6 +56,10 @@ protected:
 	void ResolveTypes() override;
 };
 
+// Whether a physical plan writes a tracked base table through OpenIVM delta capture.
+// Cached plans (prepared statements) execute without the optimizer rule that inserts it.
+bool PlanCapturesTrackedDeltas(PhysicalOperator &op);
+
 } // namespace duckdb
 
 #endif // TRANSACTIONAL_DELTA_CAPTURE_HPP

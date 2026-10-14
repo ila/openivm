@@ -119,6 +119,9 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `openivm_profile_refresh` | BOOLEAN | `false` | Record per-step refresh timings in `openivm_refresh_profile` | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_profile_retention_days` | BIGINT | `31` | Delete profile rows older than this many days when profiling writes new rows | [Automatic refresh](docs/refresh/automatic-refresh.md) |
 | `openivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files (off when unset) | [Build: inspect SQL](docs/build/building.md#inspect-the-generated-sql) |
+| `openivm_metadata_catalog` | VARCHAR | `""` | Database-wide attached catalog for OpenIVM metadata (native DuckDB, or PostgreSQL via `TYPE postgres`); empty keeps metadata next to each native view catalog | [Metadata placement](docs/internals/metadata-placement.md) |
+| `openivm_metadata_schema` | VARCHAR | `main` | Schema for OpenIVM metadata in the metadata catalog | [Metadata placement](docs/internals/metadata-placement.md) |
+| `openivm_metadata_lease_seconds` | BIGINT | `600` | Refresh lease for clients sharing a PostgreSQL metadata catalog | [Metadata placement](docs/internals/metadata-placement.md) |
 | `openivm_explain_initial_load` | BOOLEAN | `false` | Print the `CREATE MATERIALIZED VIEW` initial-load SQL and its `EXPLAIN` plans | [Build: inspect SQL](docs/build/building.md#inspect-the-generated-sql) |
 | `openivm_explain_initial_load_only` | BOOLEAN | `false` | With `openivm_explain_initial_load`, print the diagnostic without creating the MV | — |
 | `openivm_input_dialect` | VARCHAR | `duckdb` | Dialect of incoming `CREATE MATERIALIZED VIEW` bodies: `duckdb` or `spark` (e.g. `VERSION AS OF`) | [Parser](docs/internals/parser.md#input-dialect) |
