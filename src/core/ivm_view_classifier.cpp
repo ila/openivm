@@ -5,7 +5,6 @@
 #include "core/vector_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 
@@ -37,17 +36,6 @@ static void DeduplicateGroupColumns(vector<string> &group_columns) {
 		seen_group.insert(candidate);
 		name = candidate;
 	}
-}
-
-static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
-	while (expr && expr->expression_class == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr->Cast<BoundCastExpression>();
-		expr = cast.child.get();
-	}
-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
-		return nullptr;
-	}
-	return &expr->Cast<BoundColumnRefExpression>();
 }
 
 static bool ResolvesToAggregateValueBinding(idx_t table_index, idx_t column_index, const CreateMVPlanFacts &facts) {

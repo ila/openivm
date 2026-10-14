@@ -256,6 +256,56 @@ SELECT p.id, d2.label
 FROM projected p LEFT JOIN left_two d2 ON p.k2 = d2.k""",
         )
 
+        run_scenario(
+            binary,
+            root,
+            "nullable_lookup_cte_mixed",
+            """
+CREATE TABLE arcm_msf(id INT, coll_key INT);
+CREATE TABLE arcm_acd(coll_key INT, sub_id INT, arm_id VARCHAR);
+CREATE TABLE arcm_hw(arm_id VARCHAR, provider VARCHAR);
+CREATE TABLE arcm_tpid(sub_id INT, tp_id INT);
+CREATE TABLE arcm_cust(tp_id INT, cust_key INT);
+INSERT INTO arcm_msf VALUES (1,100),(2,100);
+INSERT INTO arcm_acd VALUES (100,10,'arm-1');
+INSERT INTO arcm_hw VALUES ('arm-1','provider');
+INSERT INTO arcm_tpid VALUES (10,200);
+INSERT INTO arcm_cust VALUES (200,21);
+CREATE MATERIALIZED VIEW arcm_mv AS
+WITH bff AS (
+    SELECT msf.id,acd.sub_id,COALESCE(hw.provider,'N/A') AS provider
+    FROM arcm_msf msf JOIN arcm_acd acd ON msf.coll_key=acd.coll_key
+    LEFT JOIN arcm_hw hw ON acd.arm_id=hw.arm_id
+)
+SELECT bff.id,COALESCE(cust.cust_key,1) AS cust_key FROM bff
+LEFT JOIN arcm_tpid tpid ON bff.sub_id=tpid.sub_id
+LEFT JOIN arcm_cust cust ON COALESCE(tpid.tp_id,-1)=cust.tp_id;
+UPDATE arcm_tpid SET tp_id=300 WHERE sub_id=10;
+DELETE FROM arcm_tpid WHERE sub_id=10;
+UPDATE arcm_cust SET cust_key=99 WHERE tp_id=200;
+DELETE FROM arcm_msf WHERE id=2;
+INSERT INTO arcm_msf VALUES (3,100),(4,300);
+INSERT INTO arcm_acd VALUES (300,30,'arm-2');
+INSERT INTO arcm_hw VALUES ('arm-2','new_provider');
+INSERT INTO arcm_tpid VALUES (30,400);
+INSERT INTO arcm_cust VALUES (400,42);
+""",
+            "arcm_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH bff AS (
+    SELECT msf.id,acd.sub_id,COALESCE(hw.provider,'N/A') AS provider
+    FROM arcm_msf msf JOIN arcm_acd acd ON msf.coll_key=acd.coll_key
+    LEFT JOIN arcm_hw hw ON acd.arm_id=hw.arm_id
+)
+SELECT bff.id,COALESCE(cust.cust_key,1) AS cust_key FROM bff
+LEFT JOIN arcm_tpid tpid ON bff.sub_id=tpid.sub_id
+LEFT JOIN arcm_cust cust ON COALESCE(tpid.tp_id,-1)=cust.tp_id""",
+        )
+
     print("regular N-term compiled SQL integration tests passed")
 
 

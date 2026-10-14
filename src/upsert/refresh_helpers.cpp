@@ -332,13 +332,14 @@ string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &quer
 	       "DROP TABLE IF EXISTS " + old_table + ";\nDROP TABLE IF EXISTS " + new_table + ";\n";
 }
 
-static string BuildDeleteUsingInsertRefreshSQL(const string &data_table, const string &view_query_sql,
-                                               const string &recompute_alias, const string &using_source,
-                                               const string &using_alias, const string &delete_match,
-                                               const string &insert_where, const string &statement_prefix) {
-	return statement_prefix + "DELETE FROM " + data_table + " AS openivm_delete_target\nUSING " + using_source + " " +
-	       using_alias + "\nWHERE " + delete_match + ";\n" + statement_prefix + "INSERT INTO " + data_table +
-	       "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " + insert_where + ";\n";
+static string BuildAffectedSourceRefreshSQL(const string &data_table, const string &view_query_sql,
+                                            const string &recompute_alias, const string &using_source,
+                                            const string &using_alias, const string &delete_match,
+                                            const string &insert_where, const string &statement_prefix) {
+	return statement_prefix + "DELETE FROM " + data_table + " AS openivm_delete_target\nWHERE EXISTS (SELECT 1 FROM " +
+	       using_source + " " + using_alias + " WHERE " + delete_match + ");\n" + statement_prefix + "INSERT INTO " +
+	       data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " + insert_where +
+	       ";\n";
 }
 
 string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_query_sql,
@@ -847,9 +848,10 @@ static string BuildLeftJoinLineagePushedQuery(const string &view_query_sql, cons
 	}
 
 	string key_col = SqlUtils::QuoteIdentifier(key_source.column);
+	string source_key = SqlUtils::ApplyCastSpec("openivm_lj_src." + key_col, key_source.cast_type);
 	string replacement = "(SELECT openivm_lj_src.* FROM " + source_ref + " openivm_lj_src INNER JOIN " +
-	                     affected_source + " " + affected_alias + " ON openivm_lj_src." + key_col +
-	                     " IS NOT DISTINCT FROM " + affected_alias + "." + lk + ")";
+	                     affected_source + " " + affected_alias + " ON " + source_key + " IS NOT DISTINCT FROM " +
+	                     affected_alias + "." + lk + ")";
 	bool replaced = false;
 	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_source.table,
 	                                                                key_source.occurrence, replacement, replaced);
@@ -890,9 +892,8 @@ static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const s
 	OPENIVM_DEBUG_PRINT("[UPSERT] LEFT JOIN affected-key pushdown for %s via %s[%llu].%s\n", view_name.c_str(),
 	                    key_source.table.c_str(), static_cast<unsigned long long>(key_source.occurrence),
 	                    key_source.column.c_str());
-	return BuildDeleteUsingInsertRefreshSQL(data_table, pushed_query, "openivm_lj", "openivm_affected", "_d",
-	                                        delete_match, all_ducklake ? "TRUE" : affected + "openivm_lj." + lk + ")",
-	                                        affected_cte);
+	return BuildAffectedSourceRefreshSQL(data_table, pushed_query, "openivm_lj", "openivm_affected", "_d", delete_match,
+	                                     all_ducklake ? "TRUE" : affected + "openivm_lj." + lk + ")", affected_cte);
 }
 
 static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, const string &view_name,

@@ -1156,11 +1156,11 @@ static bool IsPreservedKeyBinding(LogicalOperator &plan, const ColumnBinding &bi
 	if (plan.type == LogicalOperatorType::LOGICAL_PROJECTION) {
 		auto &projection = plan.Cast<LogicalProjection>();
 		if (binding.table_index == projection.table_index) {
-			auto &expression = projection.expressions[binding.column_index];
-			if (expression->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+			auto *source = GetColumnRefThroughCasts(projection.expressions[binding.column_index].get());
+			if (!source) {
 				return false;
 			}
-			return IsPreservedKeyBinding(*projection.children[0], expression->Cast<BoundColumnRefExpression>().binding);
+			return IsPreservedKeyBinding(*projection.children[0], source->binding);
 		}
 	}
 	if (plan.type == LogicalOperatorType::LOGICAL_GET) {

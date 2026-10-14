@@ -787,7 +787,7 @@ static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t exp
 	return bcr.GetName();
 }
 
-static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, string *cast_type = nullptr) {
+BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, string *cast_type) {
 	if (cast_type) {
 		cast_type->clear();
 	}
@@ -1583,12 +1583,13 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out) {
 	auto *join = FindProjectionKeyJoin(*facts.root);
 	if (join && join->join_type == JoinType::LEFT) {
-		auto *preserved_key = GetColumnRefThroughCasts(join->conditions[0].left.get());
+		auto *preserved_key = GetColumnRefThroughCasts(join->conditions[0].left.get(), &out.cast_type);
 		if (!preserved_key) {
 			return false;
 		}
 		OccurrenceColumnRef source;
-		if (!ResolveBindingToOccurrenceRef(preserved_key->binding, facts, source)) {
+		if (!ResolveBindingToOccurrenceRefWithCast(preserved_key->binding, facts, source, out.cast_type,
+		                                           preserved_key->return_type)) {
 			return false;
 		}
 		out.table = source.table;

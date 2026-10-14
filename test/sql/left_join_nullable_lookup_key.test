@@ -428,3 +428,168 @@ query I
 SELECT COUNT(*) FROM scope_previous p JOIN openivm_data___openivm_mv_6d656d6f7279_6d61696e_73636f70655f6d76_ m ON p.id=m.id WHERE p.previous_rowid<>m.rowid;
 ----
 1
+
+# Casts of preserved columns remain usable keys. Keep the same cast chain
+# when pushing affected keys into the source, including lossy/TRY casts.
+
+statement ok
+CREATE TABLE cast_a(id INTEGER,k INTEGER);
+
+statement ok
+CREATE TABLE cast_b(k INTEGER,label VARCHAR);
+
+statement ok
+CREATE TABLE cast_d(sid VARCHAR,label VARCHAR);
+
+statement ok
+CREATE TABLE cast_flags(flag BOOLEAN,label VARCHAR);
+
+statement ok
+CREATE TABLE cast_raw(raw_id VARCHAR,k INTEGER);
+
+statement ok
+CREATE TABLE cast_numbers(tid INTEGER,label VARCHAR);
+
+statement ok
+INSERT INTO cast_a VALUES (1,NULL),(2,NULL);
+
+statement ok
+INSERT INTO cast_b VALUES (0,'first'),(2,'second');
+
+statement ok
+INSERT INTO cast_d VALUES ('1','d1'),('2','d2');
+
+statement ok
+INSERT INTO cast_flags VALUES (TRUE,'flag');
+
+statement ok
+INSERT INTO cast_raw VALUES ('1',NULL),('bad',NULL),(NULL,NULL);
+
+statement ok
+INSERT INTO cast_numbers VALUES (1,'one'),(2,'two'),(NULL,'none');
+
+statement ok
+CREATE MATERIALIZED VIEW cast_mv AS WITH p AS (SELECT a.id,CAST(CAST(a.id AS BIGINT) AS VARCHAR) AS sid,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_d d ON p.sid=d.sid;
+
+statement ok
+CREATE MATERIALIZED VIEW cast_bool_mv AS WITH p AS (SELECT a.id,CAST(a.id AS BOOLEAN) AS flag,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_flags d ON p.flag=d.flag;
+
+statement ok
+CREATE MATERIALIZED VIEW cast_try_mv AS WITH p AS (SELECT a.raw_id,TRY_CAST(CAST(a.raw_id AS VARCHAR) AS INTEGER) AS tid,COALESCE(b.label,'default') AS b_label FROM cast_raw a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.raw_id,p.b_label,d.label FROM p LEFT JOIN cast_numbers d ON p.tid IS NOT DISTINCT FROM d.tid;
+
+statement ok
+UPDATE cast_b SET label='temporary' WHERE k=0;
+
+statement ok
+DELETE FROM cast_b WHERE k=0;
+
+statement ok
+UPDATE cast_d SET label='new_d2' WHERE sid='2';
+
+statement ok
+UPDATE cast_flags SET label='new_flag' WHERE flag;
+
+statement ok
+INSERT INTO cast_a VALUES (4,NULL);
+
+statement ok
+UPDATE cast_a SET k=2 WHERE id=4;
+
+statement ok
+DELETE FROM cast_a WHERE id=4;
+
+statement ok
+PRAGMA refresh('cast_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_mv) EXCEPT ALL (WITH p AS (SELECT a.id,CAST(CAST(a.id AS BIGINT) AS VARCHAR) AS sid,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_d d ON p.sid=d.sid));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.id,CAST(CAST(a.id AS BIGINT) AS VARCHAR) AS sid,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_d d ON p.sid=d.sid) EXCEPT ALL (SELECT * FROM cast_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('cast_bool_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_bool_mv) EXCEPT ALL (WITH p AS (SELECT a.id,CAST(a.id AS BOOLEAN) AS flag,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_flags d ON p.flag=d.flag));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.id,CAST(a.id AS BOOLEAN) AS flag,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_flags d ON p.flag=d.flag) EXCEPT ALL (SELECT * FROM cast_bool_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('cast_try_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_try_mv) EXCEPT ALL (WITH p AS (SELECT a.raw_id,TRY_CAST(CAST(a.raw_id AS VARCHAR) AS INTEGER) AS tid,COALESCE(b.label,'default') AS b_label FROM cast_raw a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.raw_id,p.b_label,d.label FROM p LEFT JOIN cast_numbers d ON p.tid IS NOT DISTINCT FROM d.tid));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.raw_id,TRY_CAST(CAST(a.raw_id AS VARCHAR) AS INTEGER) AS tid,COALESCE(b.label,'default') AS b_label FROM cast_raw a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.raw_id,p.b_label,d.label FROM p LEFT JOIN cast_numbers d ON p.tid IS NOT DISTINCT FROM d.tid) EXCEPT ALL (SELECT * FROM cast_try_mv));
+----
+0
+
+statement ok
+INSERT INTO cast_b VALUES (0,'restored'),(0,'restored');
+
+statement ok
+INSERT INTO cast_a VALUES (3,NULL);
+
+statement ok
+INSERT INTO cast_raw VALUES ('2',NULL);
+
+statement ok
+UPDATE cast_numbers SET label='new_none' WHERE tid IS NULL;
+
+statement ok
+DELETE FROM cast_d WHERE sid='1';
+
+statement ok
+INSERT INTO cast_d VALUES ('1','restored_d1');
+
+statement ok
+PRAGMA refresh('cast_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_mv) EXCEPT ALL (WITH p AS (SELECT a.id,CAST(CAST(a.id AS BIGINT) AS VARCHAR) AS sid,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_d d ON p.sid=d.sid));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.id,CAST(CAST(a.id AS BIGINT) AS VARCHAR) AS sid,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_d d ON p.sid=d.sid) EXCEPT ALL (SELECT * FROM cast_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('cast_bool_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_bool_mv) EXCEPT ALL (WITH p AS (SELECT a.id,CAST(a.id AS BOOLEAN) AS flag,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_flags d ON p.flag=d.flag));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.id,CAST(a.id AS BOOLEAN) AS flag,COALESCE(b.label,'default') AS b_label FROM cast_a a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.id,p.b_label,d.label FROM p LEFT JOIN cast_flags d ON p.flag=d.flag) EXCEPT ALL (SELECT * FROM cast_bool_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('cast_try_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM cast_try_mv) EXCEPT ALL (WITH p AS (SELECT a.raw_id,TRY_CAST(CAST(a.raw_id AS VARCHAR) AS INTEGER) AS tid,COALESCE(b.label,'default') AS b_label FROM cast_raw a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.raw_id,p.b_label,d.label FROM p LEFT JOIN cast_numbers d ON p.tid IS NOT DISTINCT FROM d.tid));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((WITH p AS (SELECT a.raw_id,TRY_CAST(CAST(a.raw_id AS VARCHAR) AS INTEGER) AS tid,COALESCE(b.label,'default') AS b_label FROM cast_raw a LEFT JOIN cast_b b ON COALESCE(a.k,0)=b.k) SELECT p.raw_id,p.b_label,d.label FROM p LEFT JOIN cast_numbers d ON p.tid IS NOT DISTINCT FROM d.tid) EXCEPT ALL (SELECT * FROM cast_try_mv));
+----
+0

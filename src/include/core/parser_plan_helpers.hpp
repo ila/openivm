@@ -19,6 +19,8 @@ namespace duckdb {
 
 struct PlanRewriteNeeds;
 
+BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, string *cast_type = nullptr);
+
 struct DuckLakeSourceTableInfo {
 	string table_name;
 	string catalog_name;

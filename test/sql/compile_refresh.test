@@ -515,7 +515,7 @@ LIMIT 1;
 query I
 SELECT CASE WHEN
        string_agg(sql, ' ' ORDER BY stmt_order)
-           LIKE ('%INSERT INTO ' || current_database() || '.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6172636d_ (id, cust_key, openivm_multiplicity)%')
+           LIKE ('%INSERT INTO ' || current_database() || '.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6172636d_ (id, cust_key, openivm_col_2, openivm_left_key, openivm_multiplicity)%')
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_msf%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_acd%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_hw%'
@@ -529,6 +529,21 @@ FROM openivm_compile_with_facts(
 WHERE stmt_kind = 'data';
 ----
 1
+
+# The new keys are maintenance columns; the published view still exposes only
+# the original aliases, and the explicit delta INSERT matches its target schema.
+query T
+SELECT string_agg(column_name, ', ' ORDER BY ordinal_position)
+FROM information_schema.columns WHERE table_name='mv_arcm';
+----
+id, cust_key
+
+query T
+SELECT string_agg(column_name, ', ' ORDER BY ordinal_position)
+FROM information_schema.columns
+WHERE table_name='openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6172636d_';
+----
+id, cust_key, openivm_col_2, openivm_left_key, openivm_multiplicity, openivm_timestamp
 
 # Batched multi-leaf delta variant of the same shape: simultaneous
 # inserts/delete/update spread across ALL FIVE base tables (not just a
@@ -571,7 +586,7 @@ LIMIT 1;
 query I
 SELECT CASE WHEN
        string_agg(sql, ' ' ORDER BY stmt_order)
-           LIKE ('%INSERT INTO ' || current_database() || '.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6172636d_ (id, cust_key, openivm_multiplicity)%')
+           LIKE ('%INSERT INTO ' || current_database() || '.main.openivm_delta___openivm_mv_6d656d6f7279_6d61696e_6d765f6172636d_ (id, cust_key, openivm_col_2, openivm_left_key, openivm_multiplicity)%')
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_msf%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_acd%'
    AND string_agg(sql, ' ' ORDER BY stmt_order) LIKE '%openivm_delta_arcm_hw%'
