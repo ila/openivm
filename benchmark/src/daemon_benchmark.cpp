@@ -57,11 +57,21 @@ static string EscapeJson(const string &s) {
 	out.reserve(s.size() + 2);
 	for (char c : s) {
 		switch (c) {
-		case '"': out += "\\\""; break;
-		case '\\': out += "\\\\"; break;
-		case '\n': out += "\\n"; break;
-		case '\r': out += "\\r"; break;
-		case '\t': out += "\\t"; break;
+		case '"':
+			out += "\\\"";
+			break;
+		case '\\':
+			out += "\\\\";
+			break;
+		case '\n':
+			out += "\\n";
+			break;
+		case '\r':
+			out += "\\r";
+			break;
+		case '\t':
+			out += "\\t";
+			break;
 		default:
 			if (static_cast<unsigned char>(c) < 0x20) {
 				char buf[8];
@@ -128,7 +138,8 @@ struct Summary {
 		{
 			bool first = true;
 			for (auto &e : dml_error_samples) {
-				if (!first) o << ",";
+				if (!first)
+					o << ",";
 				first = false;
 				o << "\"" << EscapeJson(e.first) << "\":" << e.second;
 			}
@@ -147,7 +158,8 @@ struct Summary {
 		auto l = refresh_latencies_ms;
 		std::sort(l.begin(), l.end());
 		auto pct = [&](double p) -> double {
-			if (l.empty()) return 0.0;
+			if (l.empty())
+				return 0.0;
 			size_t idx = (size_t)(p * (l.size() - 1));
 			return l[idx];
 		};
@@ -161,7 +173,8 @@ struct Summary {
 		o << ",\"per_mv\":{";
 		bool first = true;
 		for (auto &e : per_mv_refreshes) {
-			if (!first) o << ",";
+			if (!first)
+				o << ",";
 			first = false;
 			o << "\"" << EscapeJson(e.first) << "\":{\"refreshes\":" << e.second;
 			auto it = per_mv_last_staleness.find(e.first);
@@ -172,7 +185,8 @@ struct Summary {
 
 		o << ",\"findings\":[";
 		for (size_t i = 0; i < findings.size(); i++) {
-			if (i > 0) o << ",";
+			if (i > 0)
+				o << ",";
 			o << "\"" << EscapeJson(findings[i]) << "\"";
 		}
 		o << "]";
@@ -190,14 +204,16 @@ struct Summary {
 
 struct MVDef {
 	string name;
-	string create_sql;  // "CREATE MATERIALIZED VIEW <name> [REFRESH EVERY ...] AS ..."
-	string base_query;  // for EXCEPT ALL correctness; empty = skip
+	string create_sql;                  // "CREATE MATERIALIZED VIEW <name> [REFRESH EVERY ...] AS ..."
+	string base_query;                  // for EXCEPT ALL correctness; empty = skip
 	int64_t refresh_interval_secs = -1; // -1 = no REFRESH EVERY clause
 	string catalog_schema;              // qualifier for reads (e.g. "dl.main."); empty = native default
 
 	// Returns the fully-qualified MV name for use in SQL that runs on a connection
 	// that might not have USE <catalog> active.
-	string QualifiedName() const { return catalog_schema + name; }
+	string QualifiedName() const {
+		return catalog_schema + name;
+	}
 };
 
 // ---------------------------------------------------------------------------
@@ -240,12 +256,10 @@ static void BuildShape(SubtestCtx &ctx) {
 	// Baseline queries (chains + independents) — all use columns known to pass
 	// Phase 1 benchmarks. Each chain level reads from the previous level.
 
-	auto mv = [](const string &name, const string &sel, const string &gt,
-	             int64_t refresh = -1) -> MVDef {
+	auto mv = [](const string &name, const string &sel, const string &gt, int64_t refresh = -1) -> MVDef {
 		string clause;
 		if (refresh > 0) {
-			clause = " REFRESH EVERY '" + std::to_string(refresh / 60) + " minute" +
-			         ((refresh / 60) == 1 ? "'" : "s'");
+			clause = " REFRESH EVERY '" + std::to_string(refresh / 60) + " minute" + ((refresh / 60) == 1 ? "'" : "s'");
 		}
 		MVDef m;
 		m.name = name;
@@ -259,45 +273,50 @@ static void BuildShape(SubtestCtx &ctx) {
 	auto chain_a = [&](int min_level, int max_level) {
 		if (min_level <= 1 && max_level >= 1) {
 			ctx.mvs.push_back(mv("mv_a1",
-			    "WITH active AS (SELECT * FROM CUSTOMER WHERE C_BALANCE > 0) "
-			    "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal, "
-			    "MAX(C_BALANCE) AS max_bal, MIN(C_BALANCE) AS min_bal "
-			    "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2 AND AVG(C_BALANCE) > 1000",
-			    "WITH active AS (SELECT * FROM CUSTOMER WHERE C_BALANCE > 0) "
-			    "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal, "
-			    "MAX(C_BALANCE) AS max_bal, MIN(C_BALANCE) AS min_bal "
-			    "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2 AND AVG(C_BALANCE) > 1000"));
+			                     "WITH active AS (SELECT * FROM CUSTOMER WHERE C_BALANCE > 0) "
+			                     "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal, "
+			                     "MAX(C_BALANCE) AS max_bal, MIN(C_BALANCE) AS min_bal "
+			                     "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2 AND AVG(C_BALANCE) > 1000",
+			                     "WITH active AS (SELECT * FROM CUSTOMER WHERE C_BALANCE > 0) "
+			                     "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal, "
+			                     "MAX(C_BALANCE) AS max_bal, MIN(C_BALANCE) AS min_bal "
+			                     "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2 AND AVG(C_BALANCE) > 1000"));
 		}
 		if (min_level <= 2 && max_level >= 2) {
 			ctx.mvs.push_back(mv("mv_a2",
-			    "WITH tall AS (SELECT * FROM mv_a1 WHERE n > 3 AND max_bal > 5000) "
-			    "SELECT C_W_ID, C_D_ID, n, avg_bal, "
-			    "CASE WHEN avg_bal > max_bal * 0.8 THEN 'concentrated' "
-			    "WHEN avg_bal < min_bal * 1.2 THEN 'bottom-heavy' ELSE 'spread' END AS distribution "
-			    "FROM tall", ""));
+			                     "WITH tall AS (SELECT * FROM mv_a1 WHERE n > 3 AND max_bal > 5000) "
+			                     "SELECT C_W_ID, C_D_ID, n, avg_bal, "
+			                     "CASE WHEN avg_bal > max_bal * 0.8 THEN 'concentrated' "
+			                     "WHEN avg_bal < min_bal * 1.2 THEN 'bottom-heavy' ELSE 'spread' END AS distribution "
+			                     "FROM tall",
+			                     ""));
 		}
 		if (min_level <= 3 && max_level >= 3) {
 			ctx.mvs.push_back(mv("mv_a3",
-			    "WITH l2 AS (SELECT * FROM mv_a2) "
-			    "SELECT l2.C_W_ID, w.W_NAME, d.D_ID, COUNT(*) AS cust_groups, "
-			    "SUM(l2.n) AS total_n, MAX(CAST(l2.avg_bal AS DOUBLE)) AS peak_avg "
-			    "FROM l2 JOIN WAREHOUSE w ON l2.C_W_ID = w.W_ID "
-			    "JOIN DISTRICT d ON l2.C_W_ID = d.D_W_ID AND l2.C_D_ID = d.D_ID "
-			    "GROUP BY l2.C_W_ID, w.W_NAME, d.D_ID", ""));
+			                     "WITH l2 AS (SELECT * FROM mv_a2) "
+			                     "SELECT l2.C_W_ID, w.W_NAME, d.D_ID, COUNT(*) AS cust_groups, "
+			                     "SUM(l2.n) AS total_n, MAX(CAST(l2.avg_bal AS DOUBLE)) AS peak_avg "
+			                     "FROM l2 JOIN WAREHOUSE w ON l2.C_W_ID = w.W_ID "
+			                     "JOIN DISTRICT d ON l2.C_W_ID = d.D_W_ID AND l2.C_D_ID = d.D_ID "
+			                     "GROUP BY l2.C_W_ID, w.W_NAME, d.D_ID",
+			                     ""));
 		}
 		if (min_level <= 4 && max_level >= 4) {
 			ctx.mvs.push_back(mv("mv_a4",
-			    "SELECT C_W_ID, W_NAME, COUNT(DISTINCT D_ID) AS districts, "
-			    "SUM(total_n) AS totaln, AVG(peak_avg) AS avg_peak_across "
-			    "FROM mv_a3 GROUP BY C_W_ID, W_NAME HAVING SUM(total_n) > 5", ""));
+			                     "SELECT C_W_ID, W_NAME, COUNT(DISTINCT D_ID) AS districts, "
+			                     "SUM(total_n) AS totaln, AVG(peak_avg) AS avg_peak_across "
+			                     "FROM mv_a3 GROUP BY C_W_ID, W_NAME HAVING SUM(total_n) > 5",
+			                     ""));
 		}
 		if (min_level <= 5 && max_level >= 5) {
-			ctx.mvs.push_back(mv("mv_a5",
-			    "WITH ranked AS (SELECT *, "
-			    "CASE WHEN totaln > 20 THEN 'tier1' WHEN totaln > 10 THEN 'tier2' ELSE 'tier3' END AS tier "
-			    "FROM mv_a4) "
-			    "SELECT C_W_ID, W_NAME, districts, totaln, avg_peak_across, tier FROM ranked "
-			    "WHERE tier IN ('tier1', 'tier2')", ""));
+			ctx.mvs.push_back(
+			    mv("mv_a5",
+			       "WITH ranked AS (SELECT *, "
+			       "CASE WHEN totaln > 20 THEN 'tier1' WHEN totaln > 10 THEN 'tier2' ELSE 'tier3' END AS tier "
+			       "FROM mv_a4) "
+			       "SELECT C_W_ID, W_NAME, districts, totaln, avg_peak_across, tier FROM ranked "
+			       "WHERE tier IN ('tier1', 'tier2')",
+			       ""));
 		}
 	};
 
@@ -305,78 +324,83 @@ static void BuildShape(SubtestCtx &ctx) {
 	auto chain_b = [&](int min_level, int max_level) {
 		if (min_level <= 1 && max_level >= 1) {
 			ctx.mvs.push_back(mv("mv_b1",
-			    "SELECT OL_W_ID AS w_id, OL_D_ID AS d_id, OL_O_ID AS o_id, "
-			    "COUNT(*) AS line_count, SUM(OL_AMOUNT) AS sum_amount "
-			    "FROM ORDER_LINE GROUP BY OL_W_ID, OL_D_ID, OL_O_ID HAVING COUNT(*) > 0",
-			    "SELECT OL_W_ID AS w_id, OL_D_ID AS d_id, OL_O_ID AS o_id, "
-			    "COUNT(*) AS line_count, SUM(OL_AMOUNT) AS sum_amount "
-			    "FROM ORDER_LINE GROUP BY OL_W_ID, OL_D_ID, OL_O_ID HAVING COUNT(*) > 0"));
+			                     "SELECT OL_W_ID AS w_id, OL_D_ID AS d_id, OL_O_ID AS o_id, "
+			                     "COUNT(*) AS line_count, SUM(OL_AMOUNT) AS sum_amount "
+			                     "FROM ORDER_LINE GROUP BY OL_W_ID, OL_D_ID, OL_O_ID HAVING COUNT(*) > 0",
+			                     "SELECT OL_W_ID AS w_id, OL_D_ID AS d_id, OL_O_ID AS o_id, "
+			                     "COUNT(*) AS line_count, SUM(OL_AMOUNT) AS sum_amount "
+			                     "FROM ORDER_LINE GROUP BY OL_W_ID, OL_D_ID, OL_O_ID HAVING COUNT(*) > 0"));
 		}
 		if (min_level <= 2 && max_level >= 2) {
 			ctx.mvs.push_back(mv("mv_b2",
-			    "SELECT w_id, d_id, o_id, line_count, sum_amount, "
-			    "CASE WHEN sum_amount > 100 THEN 'big' ELSE 'small' END AS order_class "
-			    "FROM mv_b1", ""));
+			                     "SELECT w_id, d_id, o_id, line_count, sum_amount, "
+			                     "CASE WHEN sum_amount > 100 THEN 'big' ELSE 'small' END AS order_class "
+			                     "FROM mv_b1",
+			                     ""));
 		}
 		if (min_level <= 3 && max_level >= 3) {
-			ctx.mvs.push_back(mv("mv_b3",
-			    "SELECT b2.w_id, b2.d_id, COUNT(*) AS orders_joined, "
-			    "SUM(b2.sum_amount) AS wh_total, AVG(CAST(b2.line_count AS DOUBLE)) AS avg_lines "
-			    "FROM mv_b2 b2 JOIN OORDER o ON b2.w_id = o.O_W_ID AND b2.d_id = o.O_D_ID AND b2.o_id = o.O_ID "
-			    "GROUP BY b2.w_id, b2.d_id", ""));
+			ctx.mvs.push_back(
+			    mv("mv_b3",
+			       "SELECT b2.w_id, b2.d_id, COUNT(*) AS orders_joined, "
+			       "SUM(b2.sum_amount) AS wh_total, AVG(CAST(b2.line_count AS DOUBLE)) AS avg_lines "
+			       "FROM mv_b2 b2 JOIN OORDER o ON b2.w_id = o.O_W_ID AND b2.d_id = o.O_D_ID AND b2.o_id = o.O_ID "
+			       "GROUP BY b2.w_id, b2.d_id",
+			       ""));
 		}
 		if (min_level <= 4 && max_level >= 4) {
 			ctx.mvs.push_back(mv("mv_b4",
-			    "SELECT w_id, SUM(orders_joined) AS total_orders, "
-			    "AVG(avg_lines) AS grand_avg_lines, COUNT(DISTINCT d_id) AS districts "
-			    "FROM mv_b3 GROUP BY w_id", ""));
+			                     "SELECT w_id, SUM(orders_joined) AS total_orders, "
+			                     "AVG(avg_lines) AS grand_avg_lines, COUNT(DISTINCT d_id) AS districts "
+			                     "FROM mv_b3 GROUP BY w_id",
+			                     ""));
 		}
 		if (min_level <= 5 && max_level >= 5) {
 			ctx.mvs.push_back(mv("mv_b5",
-			    "SELECT w_id, total_orders, grand_avg_lines, districts, "
-			    "CASE WHEN total_orders > 10 THEN 'busy' ELSE 'quiet' END AS state "
-			    "FROM mv_b4", ""));
+			                     "SELECT w_id, total_orders, grand_avg_lines, districts, "
+			                     "CASE WHEN total_orders > 10 THEN 'busy' ELSE 'quiet' END AS state "
+			                     "FROM mv_b4",
+			                     ""));
 		}
 	};
 
 	auto ind_set = [&]() {
 		ctx.mvs.push_back(mv("mv_ind1",
-		    "WITH d_cust AS (SELECT d.D_W_ID, d.D_ID, COUNT(c.C_ID) AS n_cust, "
-		    "COALESCE(SUM(c.C_BALANCE), 0) AS total_bal "
-		    "FROM DISTRICT d LEFT JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID "
-		    "GROUP BY d.D_W_ID, d.D_ID) "
-		    "SELECT D_W_ID, SUM(n_cust) AS total_cust, MAX(n_cust) AS peak_district, "
-		    "SUM(total_bal) AS sum_bal FROM d_cust GROUP BY D_W_ID HAVING SUM(n_cust) > 0",
-		    "WITH d_cust AS (SELECT d.D_W_ID, d.D_ID, COUNT(c.C_ID) AS n_cust, "
-		    "COALESCE(SUM(c.C_BALANCE), 0) AS total_bal "
-		    "FROM DISTRICT d LEFT JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID "
-		    "GROUP BY d.D_W_ID, d.D_ID) "
-		    "SELECT D_W_ID, SUM(n_cust) AS total_cust, MAX(n_cust) AS peak_district, "
-		    "SUM(total_bal) AS sum_bal FROM d_cust GROUP BY D_W_ID HAVING SUM(n_cust) > 0"));
+		                     "WITH d_cust AS (SELECT d.D_W_ID, d.D_ID, COUNT(c.C_ID) AS n_cust, "
+		                     "COALESCE(SUM(c.C_BALANCE), 0) AS total_bal "
+		                     "FROM DISTRICT d LEFT JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID "
+		                     "GROUP BY d.D_W_ID, d.D_ID) "
+		                     "SELECT D_W_ID, SUM(n_cust) AS total_cust, MAX(n_cust) AS peak_district, "
+		                     "SUM(total_bal) AS sum_bal FROM d_cust GROUP BY D_W_ID HAVING SUM(n_cust) > 0",
+		                     "WITH d_cust AS (SELECT d.D_W_ID, d.D_ID, COUNT(c.C_ID) AS n_cust, "
+		                     "COALESCE(SUM(c.C_BALANCE), 0) AS total_bal "
+		                     "FROM DISTRICT d LEFT JOIN CUSTOMER c ON d.D_W_ID = c.C_W_ID AND d.D_ID = c.C_D_ID "
+		                     "GROUP BY d.D_W_ID, d.D_ID) "
+		                     "SELECT D_W_ID, SUM(n_cust) AS total_cust, MAX(n_cust) AS peak_district, "
+		                     "SUM(total_bal) AS sum_bal FROM d_cust GROUP BY D_W_ID HAVING SUM(n_cust) > 0"));
 		ctx.mvs.push_back(mv("mv_ind2",
-		    "WITH pay AS (SELECT H_C_W_ID, H_C_D_ID, H_AMOUNT FROM HISTORY) "
-		    "SELECT H_C_W_ID, H_C_D_ID, "
-		    "SUM(CASE WHEN H_AMOUNT > 0  THEN H_AMOUNT ELSE 0 END) AS positive_pay, "
-		    "SUM(CASE WHEN H_AMOUNT <= 0 THEN H_AMOUNT ELSE 0 END) AS adj_pay, "
-		    "COUNT(*) AS pay_count FROM pay GROUP BY H_C_W_ID, H_C_D_ID",
-		    "WITH pay AS (SELECT H_C_W_ID, H_C_D_ID, H_AMOUNT FROM HISTORY) "
-		    "SELECT H_C_W_ID, H_C_D_ID, "
-		    "SUM(CASE WHEN H_AMOUNT > 0  THEN H_AMOUNT ELSE 0 END) AS positive_pay, "
-		    "SUM(CASE WHEN H_AMOUNT <= 0 THEN H_AMOUNT ELSE 0 END) AS adj_pay, "
-		    "COUNT(*) AS pay_count FROM pay GROUP BY H_C_W_ID, H_C_D_ID"));
+		                     "WITH pay AS (SELECT H_C_W_ID, H_C_D_ID, H_AMOUNT FROM HISTORY) "
+		                     "SELECT H_C_W_ID, H_C_D_ID, "
+		                     "SUM(CASE WHEN H_AMOUNT > 0  THEN H_AMOUNT ELSE 0 END) AS positive_pay, "
+		                     "SUM(CASE WHEN H_AMOUNT <= 0 THEN H_AMOUNT ELSE 0 END) AS adj_pay, "
+		                     "COUNT(*) AS pay_count FROM pay GROUP BY H_C_W_ID, H_C_D_ID",
+		                     "WITH pay AS (SELECT H_C_W_ID, H_C_D_ID, H_AMOUNT FROM HISTORY) "
+		                     "SELECT H_C_W_ID, H_C_D_ID, "
+		                     "SUM(CASE WHEN H_AMOUNT > 0  THEN H_AMOUNT ELSE 0 END) AS positive_pay, "
+		                     "SUM(CASE WHEN H_AMOUNT <= 0 THEN H_AMOUNT ELSE 0 END) AS adj_pay, "
+		                     "COUNT(*) AS pay_count FROM pay GROUP BY H_C_W_ID, H_C_D_ID"));
 		ctx.mvs.push_back(mv("mv_ind3",
-		    "SELECT S_W_ID, COUNT(*) AS stock_lines, SUM(S_QUANTITY) AS total_qty, "
-		    "AVG(CAST(S_QUANTITY AS DOUBLE)) AS avg_qty FROM STOCK GROUP BY S_W_ID",
-		    "SELECT S_W_ID, COUNT(*) AS stock_lines, SUM(S_QUANTITY) AS total_qty, "
-		    "AVG(CAST(S_QUANTITY AS DOUBLE)) AS avg_qty FROM STOCK GROUP BY S_W_ID"));
+		                     "SELECT S_W_ID, COUNT(*) AS stock_lines, SUM(S_QUANTITY) AS total_qty, "
+		                     "AVG(CAST(S_QUANTITY AS DOUBLE)) AS avg_qty FROM STOCK GROUP BY S_W_ID",
+		                     "SELECT S_W_ID, COUNT(*) AS stock_lines, SUM(S_QUANTITY) AS total_qty, "
+		                     "AVG(CAST(S_QUANTITY AS DOUBLE)) AS avg_qty FROM STOCK GROUP BY S_W_ID"));
 		ctx.mvs.push_back(mv("mv_ind4",
-		    "SELECT NO_W_ID, NO_D_ID, COUNT(*) AS new_cnt FROM NEW_ORDER GROUP BY NO_W_ID, NO_D_ID",
-		    "SELECT NO_W_ID, NO_D_ID, COUNT(*) AS new_cnt FROM NEW_ORDER GROUP BY NO_W_ID, NO_D_ID"));
+		                     "SELECT NO_W_ID, NO_D_ID, COUNT(*) AS new_cnt FROM NEW_ORDER GROUP BY NO_W_ID, NO_D_ID",
+		                     "SELECT NO_W_ID, NO_D_ID, COUNT(*) AS new_cnt FROM NEW_ORDER GROUP BY NO_W_ID, NO_D_ID"));
 		ctx.mvs.push_back(mv("mv_ind5",
-		    "SELECT i.I_ID, i.I_NAME, COUNT(s.S_W_ID) AS n_wh, SUM(s.S_QUANTITY) AS total_qty "
-		    "FROM ITEM i LEFT JOIN STOCK s ON i.I_ID = s.S_I_ID GROUP BY i.I_ID, i.I_NAME",
-		    "SELECT i.I_ID, i.I_NAME, COUNT(s.S_W_ID) AS n_wh, SUM(s.S_QUANTITY) AS total_qty "
-		    "FROM ITEM i LEFT JOIN STOCK s ON i.I_ID = s.S_I_ID GROUP BY i.I_ID, i.I_NAME"));
+		                     "SELECT i.I_ID, i.I_NAME, COUNT(s.S_W_ID) AS n_wh, SUM(s.S_QUANTITY) AS total_qty "
+		                     "FROM ITEM i LEFT JOIN STOCK s ON i.I_ID = s.S_I_ID GROUP BY i.I_ID, i.I_NAME",
+		                     "SELECT i.I_ID, i.I_NAME, COUNT(s.S_W_ID) AS n_wh, SUM(s.S_QUANTITY) AS total_qty "
+		                     "FROM ITEM i LEFT JOIN STOCK s ON i.I_ID = s.S_I_ID GROUP BY i.I_ID, i.I_NAME"));
 	};
 
 	int one_min = 60;
@@ -389,24 +413,27 @@ static void BuildShape(SubtestCtx &ctx) {
 		chain_b(1, 5);
 		// Final mv10 reads from mv_a5 AND mv_b5 (synthetic 10th level)
 		ctx.mvs.push_back(mv("mv_c10",
-		    "WITH a AS (SELECT * FROM mv_a5), b AS (SELECT * FROM mv_b5) "
-		    "SELECT a.C_W_ID AS w_id, a.totaln AS cust_totaln, b.total_orders AS line_orders "
-		    "FROM a LEFT JOIN b ON a.C_W_ID = b.w_id", "", one_min));
+		                     "WITH a AS (SELECT * FROM mv_a5), b AS (SELECT * FROM mv_b5) "
+		                     "SELECT a.C_W_ID AS w_id, a.totaln AS cust_totaln, b.total_orders AS line_orders "
+		                     "FROM a LEFT JOIN b ON a.C_W_ID = b.w_id",
+		                     "", one_min));
 	} else if (ctx.subtest == "S2") {
 		chain_a(1, 5);
 		ctx.mvs.front().refresh_interval_secs = one_min;
 		ctx.mvs.front().create_sql = ctx.mvs.front().create_sql; // keep
 		// rebuild mv_a1 with REFRESH EVERY
 		ctx.mvs.erase(ctx.mvs.begin());
-		ctx.mvs.insert(ctx.mvs.begin(), mv("mv_a1",
-		    "WITH active AS (SELECT * FROM CUSTOMER WHERE C_BALANCE > 0) "
-		    "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal, "
-		    "MAX(C_BALANCE) AS max_bal, MIN(C_BALANCE) AS min_bal "
-		    "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2 AND AVG(C_BALANCE) > 1000",
-		    "", one_min));
+		ctx.mvs.insert(ctx.mvs.begin(),
+		               mv("mv_a1",
+		                  "WITH active AS (SELECT * FROM CUSTOMER WHERE C_BALANCE > 0) "
+		                  "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal, "
+		                  "MAX(C_BALANCE) AS max_bal, MIN(C_BALANCE) AS min_bal "
+		                  "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2 AND AVG(C_BALANCE) > 1000",
+		                  "", one_min));
 		ind_set();
 		for (auto &v : ctx.mvs) {
-			if (v.name.find("mv_ind") == 0) v.refresh_interval_secs = one_min;
+			if (v.name.find("mv_ind") == 0)
+				v.refresh_interval_secs = one_min;
 		}
 		// Rebuild independent MVs to include the REFRESH EVERY clause
 		for (auto &v : ctx.mvs) {
@@ -414,8 +441,7 @@ static void BuildShape(SubtestCtx &ctx) {
 				// rebuild create_sql with clause
 				size_t as_pos = v.create_sql.find(" AS ");
 				if (as_pos != string::npos) {
-					v.create_sql = "CREATE MATERIALIZED VIEW " + v.name +
-					               " REFRESH EVERY '1 minute' AS " +
+					v.create_sql = "CREATE MATERIALIZED VIEW " + v.name + " REFRESH EVERY '1 minute' AS " +
 					               v.create_sql.substr(as_pos + 4);
 				}
 			}
@@ -427,23 +453,23 @@ static void BuildShape(SubtestCtx &ctx) {
 			if (v.name == "mv_a5" || v.name == "mv_b5") {
 				v.refresh_interval_secs = one_min;
 				size_t as_pos = v.create_sql.find(" AS ");
-				v.create_sql = "CREATE MATERIALIZED VIEW " + v.name +
-				               " REFRESH EVERY '1 minute' AS " + v.create_sql.substr(as_pos + 4);
+				v.create_sql = "CREATE MATERIALIZED VIEW " + v.name + " REFRESH EVERY '1 minute' AS " +
+				               v.create_sql.substr(as_pos + 4);
 			}
 		}
 		ctx.mvs.push_back(mv("mv_cross",
-		    "WITH a AS (SELECT * FROM mv_a5), b AS (SELECT * FROM mv_b5), "
-		    "combined AS (SELECT COALESCE(a.C_W_ID, b.w_id) AS w_id, "
-		    "a.totaln AS cust_totaln, a.districts AS cust_districts, "
-		    "b.total_orders AS order_lines, b.grand_avg_lines AS order_avg "
-		    "FROM a FULL OUTER JOIN b ON a.C_W_ID = b.w_id) "
-		    "SELECT w_id, cust_totaln, cust_districts, order_lines, order_avg, "
-		    "CASE WHEN cust_totaln IS NULL THEN 'order-only' "
-		    "WHEN order_lines IS NULL THEN 'cust-only' "
-		    "WHEN cust_totaln > 0 AND order_avg > 1 THEN 'active' "
-		    "ELSE 'dormant' END AS status FROM combined "
-		    "WHERE cust_totaln IS NOT NULL OR order_lines IS NOT NULL",
-		    "", one_min));
+		                     "WITH a AS (SELECT * FROM mv_a5), b AS (SELECT * FROM mv_b5), "
+		                     "combined AS (SELECT COALESCE(a.C_W_ID, b.w_id) AS w_id, "
+		                     "a.totaln AS cust_totaln, a.districts AS cust_districts, "
+		                     "b.total_orders AS order_lines, b.grand_avg_lines AS order_avg "
+		                     "FROM a FULL OUTER JOIN b ON a.C_W_ID = b.w_id) "
+		                     "SELECT w_id, cust_totaln, cust_districts, order_lines, order_avg, "
+		                     "CASE WHEN cust_totaln IS NULL THEN 'order-only' "
+		                     "WHEN order_lines IS NULL THEN 'cust-only' "
+		                     "WHEN cust_totaln > 0 AND order_avg > 1 THEN 'active' "
+		                     "ELSE 'dormant' END AS status FROM combined "
+		                     "WHERE cust_totaln IS NOT NULL OR order_lines IS NOT NULL",
+		                     "", one_min));
 	} else if (ctx.subtest == "S4") {
 		// Mixed shape, NO refresh intervals (manual only)
 		chain_a(1, 5);
@@ -460,12 +486,12 @@ static void BuildShape(SubtestCtx &ctx) {
 			// Rename in create_sql too
 			size_t p = copy.create_sql.find("MATERIALIZED VIEW " + v.name);
 			if (p != string::npos) {
-				copy.create_sql.replace(p, ("MATERIALIZED VIEW " + v.name).size(),
-				                        "MATERIALIZED VIEW " + copy.name);
+				copy.create_sql.replace(p, ("MATERIALIZED VIEW " + v.name).size(), "MATERIALIZED VIEW " + copy.name);
 			}
 			more.push_back(copy);
 		}
-		for (auto &v : more) ctx.mvs.push_back(v);
+		for (auto &v : more)
+			ctx.mvs.push_back(v);
 		ctx.disable_daemon = true;
 	} else if (ctx.subtest == "S6") {
 		// Only 3 MVs; all refresh threads target mv_ind1
@@ -480,8 +506,8 @@ static void BuildShape(SubtestCtx &ctx) {
 			if (v.name == "mv_ind1" || v.name == "mv_ind2" || v.name == "mv_ind3") {
 				v.refresh_interval_secs = five_min;
 				size_t as_pos = v.create_sql.find(" AS ");
-				v.create_sql = "CREATE MATERIALIZED VIEW " + v.name +
-				               " REFRESH EVERY '5 minutes' AS " + v.create_sql.substr(as_pos + 4);
+				v.create_sql = "CREATE MATERIALIZED VIEW " + v.name + " REFRESH EVERY '5 minutes' AS " +
+				               v.create_sql.substr(as_pos + 4);
 			}
 		}
 	} else if (ctx.subtest == "S8") {
@@ -491,43 +517,41 @@ static void BuildShape(SubtestCtx &ctx) {
 			if (v.name == "mv_a1" || v.name.find("mv_ind") == 0) {
 				v.refresh_interval_secs = one_min;
 				size_t as_pos = v.create_sql.find(" AS ");
-				v.create_sql = "CREATE MATERIALIZED VIEW " + v.name +
-				               " REFRESH EVERY '1 minute' AS " + v.create_sql.substr(as_pos + 4);
+				v.create_sql = "CREATE MATERIALIZED VIEW " + v.name + " REFRESH EVERY '1 minute' AS " +
+				               v.create_sql.substr(as_pos + 4);
 			}
 		}
 	} else if (ctx.subtest == "S9") {
 		// DuckLake pipeline: 5-chain over dl.CUSTOMER/WAREHOUSE/DISTRICT. MVs live
 		// in dl.main because the worker ran `USE dl.main` before creating them.
 		MVDef m1 = mv("mv_dl_1",
-		    "WITH active AS (SELECT * FROM dl.CUSTOMER WHERE C_BALANCE > 0) "
-		    "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
-		    "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2",
-		    "WITH active AS (SELECT * FROM dl.CUSTOMER WHERE C_BALANCE > 0) "
-		    "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
-		    "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2",
-		    one_min);
+		              "WITH active AS (SELECT * FROM dl.CUSTOMER WHERE C_BALANCE > 0) "
+		              "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
+		              "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2",
+		              "WITH active AS (SELECT * FROM dl.CUSTOMER WHERE C_BALANCE > 0) "
+		              "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
+		              "FROM active GROUP BY C_W_ID, C_D_ID HAVING COUNT(*) > 2",
+		              one_min);
 		m1.catalog_schema = "dl.main.";
 		ctx.mvs.push_back(m1);
 	} else if (ctx.subtest == "S10") {
 		// Cross-system MV: native MV reading from dl.*
 		MVDef m1 = mv("mv_cs_1",
-		    "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
-		    "FROM dl.CUSTOMER GROUP BY C_W_ID, C_D_ID",
-		    "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
-		    "FROM dl.CUSTOMER GROUP BY C_W_ID, C_D_ID",
-		    one_min);
+		              "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
+		              "FROM dl.CUSTOMER GROUP BY C_W_ID, C_D_ID",
+		              "SELECT C_W_ID, C_D_ID, COUNT(*) AS n, AVG(C_BALANCE) AS avg_bal "
+		              "FROM dl.CUSTOMER GROUP BY C_W_ID, C_D_ID",
+		              one_min);
 		ctx.mvs.push_back(m1);
 	} else if (ctx.subtest == "S11") {
 		// Parallel manual refresh on DuckLake — 2 MVs, disjoint sources. All in
 		// dl.main because worker does USE dl.main.
-		MVDef m1 = mv("mv_dl_a",
-		    "SELECT C_W_ID, COUNT(*) AS n FROM dl.CUSTOMER GROUP BY C_W_ID",
-		    "SELECT C_W_ID, COUNT(*) AS n FROM dl.CUSTOMER GROUP BY C_W_ID", -1);
+		MVDef m1 = mv("mv_dl_a", "SELECT C_W_ID, COUNT(*) AS n FROM dl.CUSTOMER GROUP BY C_W_ID",
+		              "SELECT C_W_ID, COUNT(*) AS n FROM dl.CUSTOMER GROUP BY C_W_ID", -1);
 		m1.catalog_schema = "dl.main.";
 		ctx.mvs.push_back(m1);
-		MVDef m2 = mv("mv_dl_b",
-		    "SELECT OL_W_ID, SUM(OL_AMOUNT) AS total FROM dl.ORDER_LINE GROUP BY OL_W_ID",
-		    "SELECT OL_W_ID, SUM(OL_AMOUNT) AS total FROM dl.ORDER_LINE GROUP BY OL_W_ID", -1);
+		MVDef m2 = mv("mv_dl_b", "SELECT OL_W_ID, SUM(OL_AMOUNT) AS total FROM dl.ORDER_LINE GROUP BY OL_W_ID",
+		              "SELECT OL_W_ID, SUM(OL_AMOUNT) AS total FROM dl.ORDER_LINE GROUP BY OL_W_ID", -1);
 		m2.catalog_schema = "dl.main.";
 		ctx.mvs.push_back(m2);
 	}
@@ -576,7 +600,8 @@ static void DMLThread(SubtestCtx &ctx, int interval_ms, size_t delta_start_offse
 			if (!error.empty()) {
 				ctx.summary.dml_errors++;
 				// Truncate & bucket: keep only the first 80 chars to group similar errors.
-				if (error.size() > 80) error = error.substr(0, 80);
+				if (error.size() > 80)
+					error = error.substr(0, 80);
 				auto it = ctx.summary.dml_error_samples.find(error);
 				if (it != ctx.summary.dml_error_samples.end() || ctx.summary.dml_error_samples.size() < 20) {
 					ctx.summary.dml_error_samples[error]++;
@@ -597,13 +622,17 @@ static void CheckerThread(SubtestCtx &ctx, int interval_ms) {
 	}
 	while (!ctx.stop.load()) {
 		for (auto &v : ctx.mvs) {
-			if (ctx.stop.load()) break;
-			if (v.base_query.empty()) continue;
+			if (ctx.stop.load())
+				break;
+			if (v.base_query.empty())
+				continue;
 			string q = "SELECT COUNT(*) FROM ("
-			           "  SELECT * FROM " + v.QualifiedName() + " EXCEPT ALL SELECT * FROM (" + v.base_query + ") __a"
+			           "  SELECT * FROM " +
+			           v.QualifiedName() + " EXCEPT ALL SELECT * FROM (" + v.base_query +
+			           ") __a"
 			           "  UNION ALL "
-			           "  SELECT * FROM (" + v.base_query + ") __b EXCEPT ALL SELECT * FROM " + v.QualifiedName() +
-			           ") __diff";
+			           "  SELECT * FROM (" +
+			           v.base_query + ") __b EXCEPT ALL SELECT * FROM " + v.QualifiedName() + ") __diff";
 			auto r = con.Query(q);
 			{
 				lock_guard<mutex> lk(ctx.log_mu);
@@ -650,7 +679,8 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 	map<string, int> stale_streak;   // "delta" -> consecutive violation count
 	while (!ctx.stop.load()) {
 		this_thread::sleep_for(chrono::milliseconds(interval_ms));
-		if (ctx.stop.load()) break;
+		if (ctx.stop.load())
+			break;
 		{
 			lock_guard<mutex> lk(ctx.log_mu);
 			ctx.summary.delta_sanity_checks++;
@@ -661,10 +691,10 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 		// up yet — delta should have rows. If last_dml_ts <= last_update globally
 		// across ALL views referencing this delta, the rows should have been
 		// cleaned by the DELETE FROM delta_<table> WHERE ts < MIN(last_update).
-		auto meta = con.Query(
-		    "SELECT view_name, table_name, last_update FROM openivm_delta_tables "
-		    "WHERE catalog_type = 'duckdb' OR catalog_type IS NULL");
-		if (!meta || meta->HasError()) continue;
+		auto meta = con.Query("SELECT view_name, table_name, last_update FROM openivm_delta_tables "
+		                      "WHERE catalog_type = 'duckdb' OR catalog_type IS NULL");
+		if (!meta || meta->HasError())
+			continue;
 		for (idx_t i = 0; i < meta->RowCount(); i++) {
 			string view_name = meta->GetValue(0, i).ToString();
 			string base_table = meta->GetValue(1, i).ToString();
@@ -672,14 +702,16 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 			string delta_table = "openivm_delta_" + base_table;
 			// Count delta rows newer than last_update
 			string key = view_name + "|" + delta_table;
-			string newer_q = "SELECT COUNT(*) FROM " + delta_table + " WHERE openivm_timestamp > '" +
-			                  last_update + "'::TIMESTAMP";
+			string newer_q =
+			    "SELECT COUNT(*) FROM " + delta_table + " WHERE openivm_timestamp > '" + last_update + "'::TIMESTAMP";
 			auto newer_r = con.Query(newer_q);
-			if (!newer_r || newer_r->HasError()) continue;
+			if (!newer_r || newer_r->HasError())
+				continue;
 			int64_t newer_count = newer_r->GetValue(0, 0).GetValue<int64_t>();
 			// Did DML happen for this table? Check total delta row count
 			auto total_r = con.Query("SELECT COUNT(*) FROM " + delta_table);
-			if (!total_r || total_r->HasError()) continue;
+			if (!total_r || total_r->HasError())
+				continue;
 			int64_t total_count = total_r->GetValue(0, 0).GetValue<int64_t>();
 			// Invariant 1: if total > 0 and last_update is < MAX(ts in delta), newer_count > 0
 			auto maxts_r = con.Query("SELECT MAX(openivm_timestamp) FROM " + delta_table);
@@ -706,8 +738,8 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 			    con.Query("SELECT MIN(last_update) FROM openivm_delta_tables WHERE table_name = '" + base_table + "'");
 			if (minlu_r && !minlu_r->HasError() && minlu_r->RowCount() > 0 && !minlu_r->GetValue(0, 0).IsNull()) {
 				string min_lu = minlu_r->GetValue(0, 0).ToString();
-				auto stale_r = con.Query("SELECT COUNT(*) FROM " + delta_table +
-				                          " WHERE openivm_timestamp < '" + min_lu + "'::TIMESTAMP");
+				auto stale_r = con.Query("SELECT COUNT(*) FROM " + delta_table + " WHERE openivm_timestamp < '" +
+				                         min_lu + "'::TIMESTAMP");
 				if (stale_r && !stale_r->HasError()) {
 					int64_t stale_count = stale_r->GetValue(0, 0).GetValue<int64_t>();
 					if (stale_count > 0) {
@@ -717,8 +749,7 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 							ctx.summary.delta_stale_after_refresh++;
 							ctx.summary.findings.push_back(
 							    "delta sanity: " + delta_table + " has " + std::to_string(stale_count) +
-							    " rows with ts < MIN(last_update)=" + min_lu +
-							    " (cleanup miss after refresh)");
+							    " rows with ts < MIN(last_update)=" + min_lu + " (cleanup miss after refresh)");
 						}
 					} else {
 						stale_streak[delta_table] = 0;
@@ -734,8 +765,7 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 	// Refresh bumps `openivm_delta_tables.last_update` (one row per source
 	// table per MV). Per MV we track MAX(last_update) across its source tables.
 	map<string, string> prev_update;
-	auto r0 = con.Query(
-	    "SELECT view_name, MAX(last_update) FROM openivm_delta_tables GROUP BY view_name");
+	auto r0 = con.Query("SELECT view_name, MAX(last_update) FROM openivm_delta_tables GROUP BY view_name");
 	if (r0 && !r0->HasError()) {
 		for (idx_t i = 0; i < r0->RowCount(); i++) {
 			prev_update[r0->GetValue(0, i).ToString()] =
@@ -743,8 +773,7 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 		}
 	}
 	while (!ctx.stop.load()) {
-		auto r = con.Query(
-		    "SELECT view_name, MAX(last_update) FROM openivm_delta_tables GROUP BY view_name");
+		auto r = con.Query("SELECT view_name, MAX(last_update) FROM openivm_delta_tables GROUP BY view_name");
 		if (r && !r->HasError()) {
 			for (idx_t i = 0; i < r->RowCount(); i++) {
 				string vn = r->GetValue(0, i).ToString();
@@ -757,8 +786,8 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 					ctx.summary.per_mv_refreshes[vn]++;
 					// Duration from refresh_history if populated (adaptive mode); else 0
 					auto hr = con.Query("SELECT actual_duration_ms FROM openivm_refresh_history "
-					                    "WHERE view_name = '" + vn +
-					                    "' ORDER BY refresh_timestamp DESC LIMIT 1");
+					                    "WHERE view_name = '" +
+					                    vn + "' ORDER BY refresh_timestamp DESC LIMIT 1");
 					double dur = 0;
 					if (hr && !hr->HasError() && hr->RowCount() > 0 && !hr->GetValue(0, 0).IsNull()) {
 						dur = hr->GetValue(0, 0).GetValue<int64_t>();
@@ -804,7 +833,7 @@ static void ManualRefreshThread(SubtestCtx &ctx, vector<string> target_mvs, int 
 				ctx.events.push_back(ev);
 			} else {
 				ctx.summary.findings.push_back("manual refresh failed on " + vn + ": " +
-				                                (r ? r->GetError() : "(null)"));
+				                               (r ? r->GetError() : "(null)"));
 			}
 		}
 		idx++;
@@ -839,10 +868,14 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 		con.Query("UPDATE openivm_views SET refresh_in_progress = false");
 
 		// Per-subtest cascade mode + daemon settings
-		if (subtest == "S1") ctx.cascade_mode = "upstream";
-		else if (subtest == "S2") ctx.cascade_mode = "downstream";
-		else if (subtest == "S3") ctx.cascade_mode = "both";
-		else if (subtest == "S9") ctx.cascade_mode = "upstream";
+		if (subtest == "S1")
+			ctx.cascade_mode = "upstream";
+		else if (subtest == "S2")
+			ctx.cascade_mode = "downstream";
+		else if (subtest == "S3")
+			ctx.cascade_mode = "both";
+		else if (subtest == "S9")
+			ctx.cascade_mode = "upstream";
 		con.Query("SET GLOBAL openivm_cascade_refresh = '" + ctx.cascade_mode + "'");
 		// Enable adaptive refresh GLOBALLY so the daemon (its own connection)
 		// and all worker threads see the flag and populate `openivm_refresh_history`.
@@ -857,10 +890,10 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 		// Clean up any leftover MVs / data tables / delta tables from a previous
 		// crashed sub-test. Walk ALL catalogs (native + any attached) so DuckLake
 		// artifacts left by S9/S10/S11 don't leak into the next sub-test.
-		auto leftover = con.Query(
-		    "SELECT table_catalog, table_schema, table_name FROM information_schema.tables "
-		    "WHERE table_name LIKE 'mv_%' OR table_name LIKE 'openivm_data_mv_%' OR table_name LIKE "
-		    "'openivm_delta_mv_%'");
+		auto leftover =
+		    con.Query("SELECT table_catalog, table_schema, table_name FROM information_schema.tables "
+		              "WHERE table_name LIKE 'mv_%' OR table_name LIKE 'openivm_data_mv_%' OR table_name LIKE "
+		              "'openivm_delta_mv_%'");
 		if (leftover && !leftover->HasError()) {
 			for (idx_t i = 0; i < leftover->RowCount(); i++) {
 				string cat = leftover->GetValue(0, i).ToString();
@@ -871,7 +904,7 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 				con.Query("DROP TABLE IF EXISTS " + full);
 			}
 		}
-		con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_%'");
+		con.Query("DELETE FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv_%'");
 		con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_%'");
 		con.Query("DELETE FROM openivm_refresh_history WHERE view_name LIKE 'mv_%'");
 		con.Query("DELETE FROM openivm_refresh_hooks WHERE view_name LIKE 'mv_%'");
@@ -883,14 +916,13 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 			string dl_path = db_path + ".ducklake.db";
 			auto at = con.Query("ATTACH IF NOT EXISTS '" + dl_path + "' AS dl (TYPE ducklake)");
 			if (!at || at->HasError()) {
-				ctx.summary.findings.push_back("DuckLake attach failed: " +
-				                                (at ? at->GetError() : "null"));
+				ctx.summary.findings.push_back("DuckLake attach failed: " + (at ? at->GetError() : "null"));
 			} else {
 				// Populate DuckLake TPC-C once
 				auto have = con.Query("SELECT COUNT(*) FROM information_schema.tables WHERE "
 				                      "table_catalog='dl' AND LOWER(table_name)='warehouse'");
-				bool needs_init = !have || have->HasError() || have->RowCount() == 0 ||
-				                  have->GetValue(0, 0).GetValue<int64_t>() == 0;
+				bool needs_init =
+				    !have || have->HasError() || have->RowCount() == 0 || have->GetValue(0, 0).GetValue<int64_t>() == 0;
 				if (needs_init) {
 					con.Query("USE dl.main");
 					CreateTPCCSchema(con);
@@ -905,15 +937,16 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 					if (native_cat == "dl") {
 						string b = db_path;
 						auto p = b.find_last_of('/');
-						if (p != string::npos) b = b.substr(p + 1);
+						if (p != string::npos)
+							b = b.substr(p + 1);
 						auto e = b.find(".");
-						if (e != string::npos) b = b.substr(0, e);
+						if (e != string::npos)
+							b = b.substr(0, e);
 						native_cat = b;
 					}
-					for (const char *t : {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM", "STOCK",
-					                       "OORDER", "NEW_ORDER", "ORDER_LINE", "HISTORY"}) {
-						con.Query(string("INSERT INTO ") + t + " SELECT * FROM " + native_cat +
-						          ".main." + t);
+					for (const char *t : {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM", "STOCK", "OORDER", "NEW_ORDER",
+					                      "ORDER_LINE", "HISTORY"}) {
+						con.Query(string("INSERT INTO ") + t + " SELECT * FROM " + native_cat + ".main." + t);
 					}
 					con.Query("USE " + native_cat + ".main");
 				}
@@ -933,8 +966,7 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 		for (auto &v : ctx.mvs) {
 			auto r = con.Query(v.create_sql);
 			if (!r || r->HasError()) {
-				ctx.summary.findings.push_back("MV creation failed: " + v.name + " : " +
-				                                (r ? r->GetError() : "null"));
+				ctx.summary.findings.push_back("MV creation failed: " + v.name + " : " + (r ? r->GetError() : "null"));
 				string s = ctx.summary.ToJson() + "\n";
 				WriteAllBytes(write_fd, s.data(), s.size());
 				return 3;
@@ -986,7 +1018,8 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 		// Manual refresh threads (S4/S5/S6/S11) or hybrid (S7)
 		if (subtest == "S4") {
 			vector<string> targets;
-			for (auto &v : ctx.mvs) targets.push_back(v.name);
+			for (auto &v : ctx.mvs)
+				targets.push_back(v.name);
 			workers.emplace_back(ManualRefreshThread, std::ref(ctx), targets, 250);
 		} else if (subtest == "S5") {
 			// STRESS: 8 refresh threads on 10 MVs, 250ms cadence. Each thread
@@ -994,10 +1027,12 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 			// (CUSTOMER, DISTRICT, HISTORY, STOCK, ITEM, NEW_ORDER). This is
 			// the scenario that surfaces LockDelta serialization bugs.
 			vector<string> all;
-			for (auto &v : ctx.mvs) all.push_back(v.name);
+			for (auto &v : ctx.mvs)
+				all.push_back(v.name);
 			for (int t = 0; t < 8; t++) {
 				vector<string> subset;
-				for (size_t i = t; i < all.size(); i += 8) subset.push_back(all[i]);
+				for (size_t i = t; i < all.size(); i += 8)
+					subset.push_back(all[i]);
 				if (!subset.empty()) {
 					workers.emplace_back(ManualRefreshThread, std::ref(ctx), subset, 250);
 				}
@@ -1015,11 +1050,13 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 			workers.emplace_back(ManualRefreshThread, std::ref(ctx), vector<string> {"mv_ind1"}, 20000);
 		} else if (subtest == "S11") {
 			vector<string> all;
-			for (auto &v : ctx.mvs) all.push_back(v.name);
+			for (auto &v : ctx.mvs)
+				all.push_back(v.name);
 			// STRESS: 4 DuckLake refresh threads at 250ms (was 3 @ 500ms).
 			for (int t = 0; t < 4 && t < (int)all.size(); t++) {
 				vector<string> subset = {all[t % all.size()]};
-				if ((t + 4) < (int)all.size()) subset.push_back(all[(t + 4) % all.size()]);
+				if ((t + 4) < (int)all.size())
+					subset.push_back(all[(t + 4) % all.size()]);
 				workers.emplace_back(ManualRefreshThread, std::ref(ctx), subset, 250);
 			}
 		}
@@ -1030,17 +1067,15 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 			alter_thread = thread([&]() {
 				duckdb::Connection alter_con(*ctx.db);
 				this_thread::sleep_for(chrono::seconds(120));
-				if (ctx.stop.load()) return;
-				auto r1 = alter_con.Query(
-				    "ALTER MATERIALIZED VIEW mv_ind1 SET REFRESH EVERY '1 minute'");
-				ctx.LogEvent("alter", "mv_ind1",
-				              r1 && !r1->HasError() ? "set 1m" : (r1 ? r1->GetError() : "null"));
+				if (ctx.stop.load())
+					return;
+				auto r1 = alter_con.Query("ALTER MATERIALIZED VIEW mv_ind1 SET REFRESH EVERY '1 minute'");
+				ctx.LogEvent("alter", "mv_ind1", r1 && !r1->HasError() ? "set 1m" : (r1 ? r1->GetError() : "null"));
 				this_thread::sleep_for(chrono::seconds(120));
-				if (ctx.stop.load()) return;
-				auto r2 = alter_con.Query(
-				    "ALTER MATERIALIZED VIEW mv_ind1 SET REFRESH EVERY '10 minutes'");
-				ctx.LogEvent("alter", "mv_ind1",
-				              r2 && !r2->HasError() ? "set 10m" : (r2 ? r2->GetError() : "null"));
+				if (ctx.stop.load())
+					return;
+				auto r2 = alter_con.Query("ALTER MATERIALIZED VIEW mv_ind1 SET REFRESH EVERY '10 minutes'");
+				ctx.LogEvent("alter", "mv_ind1", r2 && !r2->HasError() ? "set 10m" : (r2 ? r2->GetError() : "null"));
 			});
 		}
 
@@ -1049,9 +1084,11 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 		ctx.stop.store(true);
 
 		for (auto &t : workers) {
-			if (t.joinable()) t.join();
+			if (t.joinable())
+				t.join();
 		}
-		if (alter_thread.joinable()) alter_thread.join();
+		if (alter_thread.joinable())
+			alter_thread.join();
 
 		// Final consistency check on every MV with a base_query
 		duckdb::Connection fin_con(*ctx.db);
@@ -1059,19 +1096,22 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 			fin_con.Query("USE dl.main");
 		}
 		for (auto &v : ctx.mvs) {
-			if (v.base_query.empty()) continue;
+			if (v.base_query.empty())
+				continue;
 			// Drain deltas with multiple refreshes — catches "pending after one refresh" races.
 			fin_con.Query("PRAGMA refresh('" + v.name + "')");
 			fin_con.Query("PRAGMA refresh('" + v.name + "')");
 			string q = "SELECT COUNT(*) FROM ("
-			           "  SELECT * FROM " + v.QualifiedName() + " EXCEPT ALL SELECT * FROM (" + v.base_query + ") __a"
+			           "  SELECT * FROM " +
+			           v.QualifiedName() + " EXCEPT ALL SELECT * FROM (" + v.base_query +
+			           ") __a"
 			           "  UNION ALL "
-			           "  SELECT * FROM (" + v.base_query + ") __b EXCEPT ALL SELECT * FROM " + v.QualifiedName() +
-			           ") __diff";
+			           "  SELECT * FROM (" +
+			           v.base_query + ") __b EXCEPT ALL SELECT * FROM " + v.QualifiedName() + ") __diff";
 			auto r = fin_con.Query(q);
 			if (!r || r->HasError()) {
 				ctx.summary.findings.push_back("final check errored on " + v.name + ": " +
-				                                (r ? r->GetError() : "null"));
+				                               (r ? r->GetError() : "null"));
 				ctx.summary.correctness_failures++;
 			} else {
 				int64_t mis = r->GetValue(0, 0).GetValue<int64_t>();
@@ -1082,38 +1122,40 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 					// vs the refresh applied something wrong.
 					string diag;
 					auto dt_r = fin_con.Query(
-					    "SELECT table_name, last_update FROM openivm_delta_tables WHERE view_name = '" +
-					    v.name + "'");
+					    "SELECT table_name, last_update FROM openivm_delta_tables WHERE view_name = '" + v.name + "'");
 					if (dt_r && !dt_r->HasError()) {
 						for (idx_t di = 0; di < dt_r->RowCount(); di++) {
 							string tn = dt_r->GetValue(0, di).ToString();
 							string lu = dt_r->GetValue(1, di).IsNull() ? "NULL" : dt_r->GetValue(1, di).ToString();
 							auto cnt_r = fin_con.Query("SELECT COUNT(*) FROM delta_" + tn);
 							int64_t c = (cnt_r && !cnt_r->HasError()) ? cnt_r->GetValue(0, 0).GetValue<int64_t>() : -1;
-							auto newer_r = fin_con.Query(
-							    "SELECT COUNT(*) FROM delta_" + tn +
-							    " WHERE openivm_timestamp >= '" + lu + "'::TIMESTAMP");
-							int64_t nc = (newer_r && !newer_r->HasError()) ? newer_r->GetValue(0, 0).GetValue<int64_t>() : -1;
-							if (!diag.empty()) diag += ", ";
+							auto newer_r = fin_con.Query("SELECT COUNT(*) FROM delta_" + tn +
+							                             " WHERE openivm_timestamp >= '" + lu + "'::TIMESTAMP");
+							int64_t nc =
+							    (newer_r && !newer_r->HasError()) ? newer_r->GetValue(0, 0).GetValue<int64_t>() : -1;
+							if (!diag.empty())
+								diag += ", ";
 							diag += tn + "(rows=" + std::to_string(c) + " >=last=" + std::to_string(nc) +
-							         " last_update=" + lu + ")";
+							        " last_update=" + lu + ")";
 						}
 					}
 					// Capture the diff SHAPE so we can diagnose: which rows are off, and by how much.
 					// Show up to 5 rows only-in-MV and 5 rows only-in-base.
 					string only_mv_q = "SELECT * FROM " + v.QualifiedName() + " EXCEPT ALL SELECT * FROM (" +
-					                    v.base_query + ") __a LIMIT 5";
+					                   v.base_query + ") __a LIMIT 5";
 					string only_base_q = "SELECT * FROM (" + v.base_query + ") __b EXCEPT ALL SELECT * FROM " +
-					                      v.QualifiedName() + " LIMIT 5";
+					                     v.QualifiedName() + " LIMIT 5";
 					auto mv_r = fin_con.Query(only_mv_q);
 					auto base_r = fin_con.Query(only_base_q);
 					string detail = "final mismatch on " + v.name + ": " + std::to_string(mis) + " rows";
 					if (mv_r && !mv_r->HasError() && mv_r->RowCount() > 0) {
 						detail += "; only_in_mv=[";
 						for (idx_t i = 0; i < mv_r->RowCount(); i++) {
-							if (i > 0) detail += "; ";
+							if (i > 0)
+								detail += "; ";
 							for (idx_t c = 0; c < mv_r->ColumnCount(); c++) {
-								if (c > 0) detail += ",";
+								if (c > 0)
+									detail += ",";
 								detail += mv_r->GetValue(c, i).IsNull() ? "NULL" : mv_r->GetValue(c, i).ToString();
 							}
 						}
@@ -1122,15 +1164,18 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 					if (base_r && !base_r->HasError() && base_r->RowCount() > 0) {
 						detail += "; only_in_base=[";
 						for (idx_t i = 0; i < base_r->RowCount(); i++) {
-							if (i > 0) detail += "; ";
+							if (i > 0)
+								detail += "; ";
 							for (idx_t c = 0; c < base_r->ColumnCount(); c++) {
-								if (c > 0) detail += ",";
+								if (c > 0)
+									detail += ",";
 								detail += base_r->GetValue(c, i).IsNull() ? "NULL" : base_r->GetValue(c, i).ToString();
 							}
 						}
 						detail += "]";
 					}
-					if (!diag.empty()) detail += "; delta_state={" + diag + "}";
+					if (!diag.empty())
+						detail += "; delta_state={" + diag + "}";
 					ctx.summary.findings.push_back(detail);
 				}
 			}
@@ -1153,8 +1198,7 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 // Parent: arg parsing, setup child, per-sub-test worker fork, result capture
 
 static void PrintUsage() {
-	fprintf(stderr,
-	        "daemon_benchmark --scale N --db PATH --out JSONL --duration SECS [--subtests S1,S2,...]\n");
+	fprintf(stderr, "daemon_benchmark --scale N --db PATH --out JSONL --duration SECS [--subtests S1,S2,...]\n");
 }
 
 int main(int argc, char **argv) {
@@ -1166,14 +1210,23 @@ int main(int argc, char **argv) {
 
 	for (int i = 1; i < argc; i++) {
 		string a = argv[i];
-		if (a == "--scale" && i + 1 < argc) scale = std::stoi(argv[++i]);
-		else if (a == "--db" && i + 1 < argc) db_path = argv[++i];
-		else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
-		else if (a == "--duration" && i + 1 < argc) duration = std::stoi(argv[++i]);
-		else if (a == "--subtests" && i + 1 < argc) subtests_csv = argv[++i];
-		else if (a == "--help" || a == "-h") { PrintUsage(); return 0; }
+		if (a == "--scale" && i + 1 < argc)
+			scale = std::stoi(argv[++i]);
+		else if (a == "--db" && i + 1 < argc)
+			db_path = argv[++i];
+		else if (a == "--out" && i + 1 < argc)
+			out_path = argv[++i];
+		else if (a == "--duration" && i + 1 < argc)
+			duration = std::stoi(argv[++i]);
+		else if (a == "--subtests" && i + 1 < argc)
+			subtests_csv = argv[++i];
+		else if (a == "--help" || a == "-h") {
+			PrintUsage();
+			return 0;
+		}
 	}
-	if (db_path.empty()) db_path = "daemon_benchmark_sf" + std::to_string(scale) + ".db";
+	if (db_path.empty())
+		db_path = "daemon_benchmark_sf" + std::to_string(scale) + ".db";
 
 	// Setup child creates TPC-C if missing
 	if (!FileExists(db_path)) {
@@ -1198,15 +1251,16 @@ int main(int argc, char **argv) {
 	}
 
 	// Parse subtests list
-	vector<string> all_subtests = {"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8",
-	                                "S9", "S10", "S11"};
+	vector<string> all_subtests = {"S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11"};
 	vector<string> subtests;
 	if (subtests_csv == "all") {
 		subtests = all_subtests;
 	} else {
 		string tok;
 		istringstream iss(subtests_csv);
-		while (std::getline(iss, tok, ',')) if (!tok.empty()) subtests.push_back(tok);
+		while (std::getline(iss, tok, ','))
+			if (!tok.empty())
+				subtests.push_back(tok);
 	}
 
 	ofstream out(out_path);
@@ -1225,7 +1279,10 @@ int main(int argc, char **argv) {
 		std::remove(wal.c_str());
 
 		int pipefd[2];
-		if (pipe(pipefd) != 0) { Log("pipe() failed"); continue; }
+		if (pipe(pipefd) != 0) {
+			Log("pipe() failed");
+			continue;
+		}
 
 		pid_t child = fork();
 		if (child == 0) {
@@ -1242,17 +1299,20 @@ int main(int argc, char **argv) {
 		struct pollfd pfd = {pipefd[0], POLLIN, 0};
 		auto deadline = chrono::steady_clock::now() + chrono::seconds(duration + 120);
 		while (true) {
-			auto remaining = chrono::duration_cast<chrono::milliseconds>(
-			                      deadline - chrono::steady_clock::now())
-			                      .count();
-			if (remaining <= 0) break;
+			auto remaining =
+			    chrono::duration_cast<chrono::milliseconds>(deadline - chrono::steady_clock::now()).count();
+			if (remaining <= 0)
+				break;
 			int pr = poll(&pfd, 1, std::min<int64_t>(1000, remaining));
-			if (pr <= 0) continue;
+			if (pr <= 0)
+				continue;
 			if (pfd.revents & (POLLIN | POLLHUP)) {
 				ssize_t n = read(pipefd[0], buf, sizeof(buf));
-				if (n <= 0) break;
+				if (n <= 0)
+					break;
 				summary_line.append(buf, buf + n);
-				if (summary_line.find('\n') != string::npos) break;
+				if (summary_line.find('\n') != string::npos)
+					break;
 			}
 		}
 		close(pipefd[0]);
@@ -1261,7 +1321,8 @@ int main(int argc, char **argv) {
 		// Give child time to exit cleanly
 		for (int i = 0; i < 10; i++) {
 			pid_t r = waitpid(child, &status, WNOHANG);
-			if (r == child) break;
+			if (r == child)
+				break;
 			this_thread::sleep_for(chrono::milliseconds(100));
 		}
 		if (waitpid(child, &status, WNOHANG) == 0) {

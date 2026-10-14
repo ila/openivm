@@ -187,8 +187,7 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 // cancel rows that exist only on one side.
 static string BuildBagMismatchCountQuery(const string &left, const string &right) {
 	return "SELECT (SELECT COUNT(*) FROM ((" + left + ") EXCEPT ALL (" + right +
-	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left +
-	       ")) __right_diff)";
+	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left + ")) __right_diff)";
 }
 
 static string LowerASCII(string s) {
@@ -620,7 +619,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				}
 			}
 			// Clean metadata tables (always in native catalog, unqualified)
-			con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_q%'");
+			con.Query("DELETE FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE 'mv_q%'");
 			con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_q%'");
 		}
 
@@ -744,8 +743,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// Qualify with native_catalog so the lookup works both when the active catalog
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
 						// name = filename, never "memory").
-						auto check_result = con.Query("SELECT type FROM " + quoted_native_catalog +
-						                              ".main.openivm_views WHERE view_name = '" + mv_name + "'");
+						auto check_result = con.Query(
+						    "SELECT type FROM " + quoted_native_catalog +
+						    ".main.openivm_views WHERE COALESCE(view_sql_name, view_name) = '" + mv_name + "'");
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
 							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
 							is_incremental = (refresh_type != 3) ? 1 : 0;
