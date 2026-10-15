@@ -1984,7 +1984,7 @@ SELECT count(*) FROM ((SELECT * FROM "profile.target"."observation.data".mv EXCE
 
 # ALTER sees an MV created earlier in the same explicit transaction (issue #121).
 statement ok
-USE openivm_transactional_lifecycle.main;
+USE profile_creation_host.main;
 
 statement ok
 CREATE TABLE alter_txn_src(id INTEGER);
