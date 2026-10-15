@@ -28,7 +28,7 @@ SELECT view_name FROM duckdb_views() WHERE view_name LIKE 'my%';
 my materialized view
 
 query T
-SELECT view_name FROM openivm_views WHERE view_name LIKE 'my%';
+SELECT view_sql_name FROM openivm_views WHERE view_sql_name LIKE 'my%';
 ----
 my materialized view
 
@@ -129,6 +129,6 @@ SELECT count(*) FROM duckdb_views() WHERE view_name='my materialized view';
 0
 
 query I
-SELECT count(*) FROM openivm_views WHERE view_name='my materialized view';
+SELECT count(*) FROM openivm_views WHERE view_sql_name='my materialized view';
 ----
 0
