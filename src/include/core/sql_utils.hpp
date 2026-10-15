@@ -18,6 +18,11 @@ public:
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
 	static string ExtractTableName(const string &sql);
 	static string EscapeSingleQuotes(const string &input);
+	/// True when the statement starts with CREATE [OR REPLACE] MATERIALIZED VIEW.
+	static bool IsCreateMaterializedView(const string &query);
+	/// Remove "or replace" from the CREATE header only; returns whether it was present.
+	static bool StripOrReplace(string &query);
+	/// Rewrite only the CREATE MATERIALIZED VIEW header into CREATE TABLE IF NOT EXISTS.
 	static void ReplaceMaterializedView(string &query);
 	static string ExtractViewQuery(string &query);
 	static string SQLToLowercase(const string &sql);
