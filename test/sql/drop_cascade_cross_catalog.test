@@ -1,0 +1,540 @@
+# name: test/sql/drop_cascade_cross_catalog.test
+# description: DROP ... CASCADE removes dependent MVs whose metadata lives in another native catalog (#126)
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+# ==========================================
+# Issue #126 reproduction: separate CREATE and DROP statements
+# ==========================================
+
+statement ok
+CREATE TABLE s(i INTEGER);
+
+statement ok
+INSERT INTO s VALUES (1),(2);
+
+statement ok
+ATTACH ':memory:' AS peer;
+
+statement ok
+CREATE MATERIALIZED VIEW parent AS SELECT * FROM s;
+
+statement ok
+CREATE MATERIALIZED VIEW peer.main.child AS SELECT * FROM memory.main.parent;
+
+# The child is registered in peer's own metadata, not in the parent's.
+query II
+SELECT (SELECT count(*) FROM peer.main.openivm_views WHERE view_name='__openivm_mv_70656572_6d61696e_6368696c64_'),
+       (SELECT count(*) FROM memory.main.openivm_views WHERE view_name='__openivm_mv_70656572_6d61696e_6368696c64_');
+----
+1	0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM peer.main.child EXCEPT ALL SELECT * FROM s) UNION ALL (SELECT * FROM s EXCEPT ALL SELECT * FROM peer.main.child));
+----
+0
+
+statement ok
+DROP VIEW memory.main.parent CASCADE;
+
+query I
+SELECT count(*) FROM duckdb_views()
+WHERE database_name='peer' AND view_name='child';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_views()
+WHERE database_name='memory' AND view_name='parent';
+----
+0
+
+query IIII
+SELECT (SELECT count(*) FROM peer.main.openivm_views WHERE view_name='__openivm_mv_70656572_6d61696e_6368696c64_'),
+       (SELECT count(*) FROM peer.main.openivm_delta_tables WHERE view_name='__openivm_mv_70656572_6d61696e_6368696c64_'),
+       (SELECT count(*) FROM memory.main.openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_706172656e74_'),
+       (SELECT count(*) FROM memory.main.openivm_delta_tables WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_706172656e74_');
+----
+0	0	0	0
+
+# Every physical object of both MVs is gone; the parent was the last consumer of s.
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE (database_name='peer' AND table_name IN (
+         'openivm_data___openivm_mv_70656572_6d61696e_6368696c64_',
+         'openivm_delta___openivm_mv_70656572_6d61696e_6368696c64_',
+         'openivm_visible___openivm_mv_70656572_6d61696e_6368696c64_',
+         'openivm_delta_openivm_visible___openivm_mv_70656572_6d61696e_6368696c64_'))
+   OR (database_name='memory' AND table_name IN (
+         'openivm_data___openivm_mv_6d656d6f7279_6d61696e_706172656e74_',
+         'openivm_delta___openivm_mv_6d656d6f7279_6d61696e_706172656e74_',
+         'openivm_visible___openivm_mv_6d656d6f7279_6d61696e_706172656e74_',
+         'openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_706172656e74_',
+         'openivm_delta_s'));
+----
+0
+
+query I
+SELECT count(*) FROM s;
+----
+2
+
+# ==========================================
+# Chained descendants across three catalogs, shared source consumers,
+# and unrelated same-named views in the other catalogs
+# ==========================================
+
+statement ok
+ATTACH ':memory:' AS far;
+
+statement ok
+CREATE TABLE xc_src(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO xc_src VALUES (1,10),(1,10),(2,20),(3,NULL),(NULL,5);
+
+# memory.xc_parent -> peer.xc_child -> far.xc_grandchild -> memory.xc_great
+statement ok
+CREATE MATERIALIZED VIEW xc_parent AS SELECT k, v FROM xc_src;
+
+statement ok
+CREATE MATERIALIZED VIEW peer.main.xc_child AS SELECT k, v FROM memory.main.xc_parent;
+
+statement ok
+CREATE MATERIALIZED VIEW far.main.xc_grandchild AS SELECT k, v FROM peer.main.xc_child;
+
+statement ok
+CREATE MATERIALIZED VIEW memory.main.xc_great AS SELECT k, v FROM far.main.xc_grandchild;
+
+# Shares xc_src with the chain, so its source delta must survive the cascade.
+statement ok
+CREATE MATERIALIZED VIEW xc_sibling AS SELECT k, SUM(v) AS total, COUNT(*) AS n FROM xc_src GROUP BY k;
+
+# Same SQL names as chain members, registered in the other catalogs, reading their own sources.
+statement ok
+CREATE TABLE peer.main.xc_src(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO peer.main.xc_src VALUES (1,100),(2,200),(2,200);
+
+statement ok
+CREATE MATERIALIZED VIEW peer.main.xc_parent AS SELECT k, v FROM peer.main.xc_src;
+
+statement ok
+CREATE TABLE far.main.xc_src(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO far.main.xc_src VALUES (7,70),(8,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW far.main.xc_child AS SELECT k, v FROM far.main.xc_src;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM memory.main.xc_great EXCEPT ALL SELECT k, v FROM xc_src) UNION ALL (SELECT k, v FROM xc_src EXCEPT ALL SELECT * FROM memory.main.xc_great));
+----
+0
+
+query III
+SELECT (SELECT count(*) FROM memory.main.openivm_views WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_78635f706172656e74_', '__openivm_mv_6d656d6f7279_6d61696e_78635f6772656174_')),
+       (SELECT count(*) FROM peer.main.openivm_views WHERE view_name='__openivm_mv_70656572_6d61696e_78635f6368696c64_'),
+       (SELECT count(*) FROM far.main.openivm_views WHERE view_name='__openivm_mv_666172_6d61696e_78635f6772616e646368696c64_');
+----
+2	1	1
+
+statement ok
+DROP VIEW memory.main.xc_parent CASCADE;
+
+query I
+SELECT count(*) FROM duckdb_views()
+WHERE (database_name='memory' AND view_name IN ('xc_parent', 'xc_great'))
+   OR (database_name='peer' AND view_name='xc_child')
+   OR (database_name='far' AND view_name='xc_grandchild');
+----
+0
+
+query III
+SELECT (SELECT count(*) FROM memory.main.openivm_views WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_78635f706172656e74_', '__openivm_mv_6d656d6f7279_6d61696e_78635f6772656174_'))
+     + (SELECT count(*) FROM memory.main.openivm_delta_tables WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_78635f706172656e74_', '__openivm_mv_6d656d6f7279_6d61696e_78635f6772656174_')),
+       (SELECT count(*) FROM peer.main.openivm_views WHERE view_name='__openivm_mv_70656572_6d61696e_78635f6368696c64_')
+     + (SELECT count(*) FROM peer.main.openivm_delta_tables WHERE view_name='__openivm_mv_70656572_6d61696e_78635f6368696c64_'),
+       (SELECT count(*) FROM far.main.openivm_views WHERE view_name='__openivm_mv_666172_6d61696e_78635f6772616e646368696c64_')
+     + (SELECT count(*) FROM far.main.openivm_delta_tables WHERE view_name='__openivm_mv_666172_6d61696e_78635f6772616e646368696c64_');
+----
+0	0	0
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE (database_name='memory' AND table_name IN (
+         'openivm_data___openivm_mv_6d656d6f7279_6d61696e_78635f706172656e74_',
+         'openivm_delta___openivm_mv_6d656d6f7279_6d61696e_78635f706172656e74_',
+         'openivm_visible___openivm_mv_6d656d6f7279_6d61696e_78635f706172656e74_',
+         'openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_78635f706172656e74_',
+         'openivm_data___openivm_mv_6d656d6f7279_6d61696e_78635f6772656174_',
+         'openivm_delta___openivm_mv_6d656d6f7279_6d61696e_78635f6772656174_',
+         'openivm_visible___openivm_mv_6d656d6f7279_6d61696e_78635f6772656174_',
+         'openivm_delta_openivm_visible___openivm_mv_6d656d6f7279_6d61696e_78635f6772656174_'))
+   OR (database_name='peer' AND table_name IN (
+         'openivm_data___openivm_mv_70656572_6d61696e_78635f6368696c64_',
+         'openivm_delta___openivm_mv_70656572_6d61696e_78635f6368696c64_',
+         'openivm_visible___openivm_mv_70656572_6d61696e_78635f6368696c64_',
+         'openivm_delta_openivm_visible___openivm_mv_70656572_6d61696e_78635f6368696c64_'))
+   OR (database_name='far' AND table_name IN (
+         'openivm_data___openivm_mv_666172_6d61696e_78635f6772616e646368696c64_',
+         'openivm_delta___openivm_mv_666172_6d61696e_78635f6772616e646368696c64_',
+         'openivm_visible___openivm_mv_666172_6d61696e_78635f6772616e646368696c64_',
+         'openivm_delta_openivm_visible___openivm_mv_666172_6d61696e_78635f6772616e646368696c64_'));
+----
+0
+
+# Unrelated same-named views and the shared source consumer stay registered and visible.
+query III
+SELECT (SELECT count(*) FROM memory.main.openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_78635f7369626c696e67_'),
+       (SELECT count(*) FROM peer.main.openivm_views WHERE view_name='__openivm_mv_70656572_6d61696e_78635f706172656e74_'),
+       (SELECT count(*) FROM far.main.openivm_views WHERE view_name='__openivm_mv_666172_6d61696e_78635f6368696c64_');
+----
+1	1	1
+
+query I
+SELECT count(*) FROM duckdb_views()
+WHERE (database_name='memory' AND view_name='xc_sibling')
+   OR (database_name='peer' AND view_name='xc_parent')
+   OR (database_name='far' AND view_name='xc_child');
+----
+3
+
+query III
+SELECT (SELECT count(*) FROM duckdb_tables() WHERE database_name='memory' AND table_name='openivm_delta_xc_src'),
+       (SELECT count(*) FROM duckdb_tables() WHERE database_name='peer' AND table_name='openivm_delta_xc_src'),
+       (SELECT count(*) FROM duckdb_tables() WHERE database_name='far' AND table_name='openivm_delta_xc_src');
+----
+1	1	1
+
+# Surviving views keep maintaining conflicting batches correctly.
+statement ok
+INSERT INTO xc_src VALUES (1,1),(4,40),(4,40);
+
+statement ok
+UPDATE xc_src SET v=v+5 WHERE k IN (1,4);
+
+statement ok
+DELETE FROM xc_src WHERE k=2 OR (k=4 AND v=45);
+
+statement ok
+INSERT INTO xc_src VALUES (2,22),(NULL,NULL);
+
+statement ok
+INSERT INTO peer.main.xc_src VALUES (3,300),(3,300);
+
+statement ok
+UPDATE peer.main.xc_src SET v=v+1 WHERE k IN (2,3);
+
+statement ok
+DELETE FROM peer.main.xc_src WHERE k=1 OR (k=3 AND v=301);
+
+statement ok
+INSERT INTO far.main.xc_src VALUES (9,90),(7,70);
+
+statement ok
+UPDATE far.main.xc_src SET v=COALESCE(v,0)+1 WHERE k IN (7,8);
+
+statement ok
+DELETE FROM far.main.xc_src WHERE k=9;
+
+statement ok
+PRAGMA refresh('xc_sibling');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM xc_sibling EXCEPT ALL SELECT k, SUM(v) AS total, COUNT(*) AS n FROM xc_src GROUP BY k) UNION ALL (SELECT k, SUM(v) AS total, COUNT(*) AS n FROM xc_src GROUP BY k EXCEPT ALL SELECT * FROM xc_sibling));
+----
+0
+
+statement ok
+PRAGMA refresh('peer.xc_parent');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM peer.main.xc_parent EXCEPT ALL SELECT k, v FROM peer.main.xc_src) UNION ALL (SELECT k, v FROM peer.main.xc_src EXCEPT ALL SELECT * FROM peer.main.xc_parent));
+----
+0
+
+statement ok
+PRAGMA refresh('far.xc_child');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM far.main.xc_child EXCEPT ALL SELECT k, v FROM far.main.xc_src) UNION ALL (SELECT k, v FROM far.main.xc_src EXCEPT ALL SELECT * FROM far.main.xc_child));
+----
+0
+
+# Dropping the final consumer of xc_src removes its source delta; other catalogs keep theirs.
+statement ok
+DROP VIEW xc_sibling;
+
+query III
+SELECT (SELECT count(*) FROM duckdb_tables() WHERE database_name='memory' AND table_name='openivm_delta_xc_src'),
+       (SELECT count(*) FROM duckdb_tables() WHERE database_name='peer' AND table_name='openivm_delta_xc_src'),
+       (SELECT count(*) FROM duckdb_tables() WHERE database_name='far' AND table_name='openivm_delta_xc_src');
+----
+0	1	1
+
+# ==========================================
+# Explicit transactions
+# ==========================================
+
+statement ok
+CREATE TABLE tx_src(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO tx_src VALUES (1,1),(2,2),(2,2);
+
+statement ok
+CREATE MATERIALIZED VIEW tx_parent AS SELECT k, v FROM tx_src;
+
+statement ok
+CREATE MATERIALIZED VIEW tx_local AS SELECT k, v FROM tx_parent;
+
+statement ok
+CREATE MATERIALIZED VIEW peer.main.tx_child AS SELECT k, v FROM memory.main.tx_parent;
+
+statement ok
+CREATE TABLE tx_parent_objects AS
+SELECT table_name FROM duckdb_tables()
+WHERE database_name='memory' AND ends_with(table_name, '__openivm_mv_6d656d6f7279_6d61696e_74785f706172656e74_');
+
+query I
+SELECT count(*) >= 2 FROM tx_parent_objects;
+----
+true
+
+# One DuckDB transaction cannot write both databases, so the cascade is refused
+# before any cleanup and the rollback leaves every view intact.
+statement ok
+BEGIN TRANSACTION;
+
+statement error
+DROP VIEW memory.main.tx_parent CASCADE;
+----
+dependent materialized view 'peer.main.tx_child' is registered in database 'peer'
+
+statement ok
+ROLLBACK;
+
+query III
+SELECT (SELECT count(*) FROM memory.main.openivm_views WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_74785f706172656e74_', '__openivm_mv_6d656d6f7279_6d61696e_74785f6c6f63616c_')),
+       (SELECT count(*) FROM peer.main.openivm_views WHERE view_name='__openivm_mv_70656572_6d61696e_74785f6368696c64_'),
+       (SELECT count(*) FROM peer.main.openivm_delta_tables WHERE view_name='__openivm_mv_70656572_6d61696e_74785f6368696c64_');
+----
+2	1	1
+
+query I
+SELECT count(*) FROM duckdb_views()
+WHERE (database_name='memory' AND view_name IN ('tx_parent', 'tx_local'))
+   OR (database_name='peer' AND view_name='tx_child');
+----
+3
+
+query I
+SELECT count(*) FROM ((SELECT * FROM peer.main.tx_child EXCEPT ALL SELECT k, v FROM tx_src) UNION ALL (SELECT k, v FROM tx_src EXCEPT ALL SELECT * FROM peer.main.tx_child));
+----
+0
+
+# A transaction confined to peer can drop the foreign leaf and commit. The parent
+# owns the delta its foreign consumer read, so none of its objects is removed.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP VIEW peer.main.tx_child;
+
+statement ok
+COMMIT;
+
+query III
+SELECT (SELECT count(*) FROM peer.main.openivm_views WHERE view_name='__openivm_mv_70656572_6d61696e_74785f6368696c64_'),
+       (SELECT count(*) FROM peer.main.openivm_delta_tables WHERE view_name='__openivm_mv_70656572_6d61696e_74785f6368696c64_'),
+       (SELECT count(*) FROM duckdb_views() WHERE database_name='peer' AND view_name='tx_child');
+----
+0	0	0
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name='peer' AND ends_with(table_name, '__openivm_mv_70656572_6d61696e_74785f6368696c64_');
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT table_name FROM tx_parent_objects EXCEPT SELECT table_name FROM duckdb_tables() WHERE database_name='memory') UNION ALL (SELECT table_name FROM duckdb_tables() WHERE database_name='memory' AND ends_with(table_name, '__openivm_mv_6d656d6f7279_6d61696e_74785f706172656e74_') EXCEPT SELECT table_name FROM tx_parent_objects));
+----
+0
+
+statement ok
+INSERT INTO tx_src VALUES (3,3),(3,3),(2,2);
+
+statement ok
+UPDATE tx_src SET v=v*10 WHERE k IN (2,3);
+
+statement ok
+DELETE FROM tx_src WHERE k=1;
+
+statement ok
+INSERT INTO tx_src VALUES (1,7),(3,30);
+
+statement ok
+PRAGMA refresh('tx_parent');
+
+statement ok
+PRAGMA refresh('tx_local');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM tx_parent EXCEPT ALL SELECT k, v FROM tx_src) UNION ALL (SELECT k, v FROM tx_src EXCEPT ALL SELECT * FROM tx_parent));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM tx_local EXCEPT ALL SELECT k, v FROM tx_src) UNION ALL (SELECT k, v FROM tx_src EXCEPT ALL SELECT * FROM tx_local));
+----
+0
+
+# With every consumer in this catalog, the chained cascade is transactional.
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP VIEW memory.main.tx_parent CASCADE;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM memory.main.openivm_views WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_74785f706172656e74_', '__openivm_mv_6d656d6f7279_6d61696e_74785f6c6f63616c_');
+----
+2
+
+statement ok
+INSERT INTO tx_src VALUES (4,4),(4,4);
+
+statement ok
+UPDATE tx_src SET v=v+1 WHERE k=4;
+
+statement ok
+DELETE FROM tx_src WHERE k=2;
+
+statement ok
+PRAGMA refresh('tx_parent');
+
+statement ok
+PRAGMA refresh('tx_local');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM tx_parent EXCEPT ALL SELECT k, v FROM tx_src) UNION ALL (SELECT k, v FROM tx_src EXCEPT ALL SELECT * FROM tx_parent));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM tx_local EXCEPT ALL SELECT k, v FROM tx_src) UNION ALL (SELECT k, v FROM tx_src EXCEPT ALL SELECT * FROM tx_local));
+----
+0
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP VIEW memory.main.tx_parent CASCADE;
+
+statement ok
+COMMIT;
+
+query II
+SELECT (SELECT count(*) FROM memory.main.openivm_views WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_74785f706172656e74_', '__openivm_mv_6d656d6f7279_6d61696e_74785f6c6f63616c_')),
+       (SELECT count(*) FROM memory.main.openivm_delta_tables WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_74785f706172656e74_', '__openivm_mv_6d656d6f7279_6d61696e_74785f6c6f63616c_'));
+----
+0	0
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE database_name='memory' AND view_name IN ('tx_parent', 'tx_local');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name='memory'
+  AND (ends_with(table_name, '__openivm_mv_6d656d6f7279_6d61696e_74785f706172656e74_')
+       OR ends_with(table_name, '__openivm_mv_6d656d6f7279_6d61696e_74785f6c6f63616c_')
+       OR table_name='openivm_delta_tx_src');
+----
+0
+
+# ==========================================
+# DROP TABLE ... CASCADE reaches the same cross-catalog descendants
+# ==========================================
+
+statement ok
+CREATE TABLE tb_src(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO tb_src VALUES (1,10),(2,20),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW tb_parent AS SELECT k, v FROM tb_src;
+
+statement ok
+CREATE MATERIALIZED VIEW peer.main.tb_child AS SELECT k, v FROM memory.main.tb_parent;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement error
+DROP TABLE tb_src CASCADE;
+----
+dependent materialized view 'peer.main.tb_child' is registered in database 'peer'
+
+statement ok
+ROLLBACK;
+
+query III
+SELECT (SELECT count(*) FROM memory.main.openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_74625f706172656e74_'),
+       (SELECT count(*) FROM peer.main.openivm_views WHERE view_name='__openivm_mv_70656572_6d61696e_74625f6368696c64_'),
+       (SELECT count(*) FROM tb_src);
+----
+1	1	3
+
+statement ok
+DROP TABLE tb_src CASCADE;
+
+query IIII
+SELECT (SELECT count(*) FROM memory.main.openivm_views WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_74625f706172656e74_'),
+       (SELECT count(*) FROM memory.main.openivm_delta_tables WHERE view_name='__openivm_mv_6d656d6f7279_6d61696e_74625f706172656e74_'),
+       (SELECT count(*) FROM peer.main.openivm_views WHERE view_name='__openivm_mv_70656572_6d61696e_74625f6368696c64_'),
+       (SELECT count(*) FROM peer.main.openivm_delta_tables WHERE view_name='__openivm_mv_70656572_6d61696e_74625f6368696c64_');
+----
+0	0	0	0
+
+query I
+SELECT count(*) FROM duckdb_views()
+WHERE (database_name='memory' AND view_name='tb_parent') OR (database_name='peer' AND view_name='tb_child');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE (database_name='memory' AND (table_name IN ('tb_src', 'openivm_delta_tb_src')
+                                   OR ends_with(table_name, '__openivm_mv_6d656d6f7279_6d61696e_74625f706172656e74_')))
+   OR (database_name='peer' AND ends_with(table_name, '__openivm_mv_70656572_6d61696e_74625f6368696c64_'));
+----
+0
+
+# The same-named survivors from the earlier cascade are still intact.
+query I
+SELECT count(*) FROM ((SELECT * FROM peer.main.xc_parent EXCEPT ALL SELECT k, v FROM peer.main.xc_src) UNION ALL (SELECT k, v FROM peer.main.xc_src EXCEPT ALL SELECT * FROM peer.main.xc_parent));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM far.main.xc_child EXCEPT ALL SELECT k, v FROM far.main.xc_src) UNION ALL (SELECT k, v FROM far.main.xc_src EXCEPT ALL SELECT * FROM far.main.xc_child));
+----
+0
