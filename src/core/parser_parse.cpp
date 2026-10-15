@@ -49,9 +49,74 @@ static SqlDialect InputDialectFromInfo(ParserExtensionInfo *info) {
 	return materialized_view_info ? materialized_view_info->InputDialect() : SqlDialect::DUCKDB;
 }
 
+static bool IsCascadingDrop(SQLStatement &statement) {
+	if (statement.type != StatementType::DROP_STATEMENT) {
+		return false;
+	}
+	auto &info = *statement.Cast<DropStatement>().info;
+	return info.cascade && (info.type == CatalogType::VIEW_ENTRY || info.type == CatalogType::TABLE_ENTRY);
+}
+
+// OpenIVM never generates DROP ... CASCADE, so one in a multi-statement query string
+// is the user's. Pragmas would resolve its dependents before the earlier statements
+// of the string run, so each OpenIVM statement of such a string instead runs through
+// a table function at its own turn. Other strings keep their existing handling.
+static bool OverrideCascadeDropBatch(const string &query, const ParserOptions &options, SqlDialect input_dialect,
+                                     vector<unique_ptr<SQLStatement>> &statements) {
+	try {
+		// Generated refresh programs are large; skip the extra parse unless needed.
+		if (!StringUtil::Contains(StringUtil::Lower(query), "cascade")) {
+			return false;
+		}
+		auto pieces = SqlUtils::SplitSQLStatements(query);
+		if (pieces.size() < 2) {
+			return false;
+		}
+		ParserOptions native_options = options;
+		native_options.extensions = nullptr;
+		bool has_cascading_drop = false;
+		auto run_at_turn = [&](const string &piece) {
+			Parser parser(native_options);
+			parser.ParseQuery("SELECT * FROM " + string(OPENIVM_BATCHED_STATEMENT_FUNCTION) + "(" +
+			                  Value(piece).ToSQLString() + ")");
+			statements.push_back(std::move(parser.statements[0]));
+		};
+		for (auto &piece : pieces) {
+			if (ParseMaterializedViewStatement(piece, input_dialect).type ==
+			    ParserExtensionResultType::PARSE_SUCCESSFUL) {
+				run_at_turn(piece);
+				continue;
+			}
+			Parser parser(native_options);
+			parser.ParseQuery(piece);
+			for (auto &statement : parser.statements) {
+				if (IsCascadingDrop(*statement)) {
+					has_cascading_drop = true;
+					run_at_turn(piece);
+				} else {
+					statements.push_back(std::move(statement));
+				}
+			}
+		}
+		if (!has_cascading_drop) {
+			statements.clear();
+		}
+		return has_cascading_drop;
+	} catch (std::exception &) {
+		// Leave strings that do not split cleanly to the existing parser paths.
+		statements.clear();
+		return false;
+	}
+}
+
 ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExtensionInfo *info, const string &query,
                                                                        ParserOptions &options) {
 	try {
+		vector<unique_ptr<SQLStatement>> batch;
+		if (OverrideCascadeDropBatch(query, options, InputDialectFromInfo(info), batch)) {
+			OPENIVM_DEBUG_PRINT("[DROP] Running %zu batched statements at their own turn\n", batch.size());
+			return ParserOverrideResult(std::move(batch));
+		}
 		auto extension_result = ParseMaterializedViewStatement(query, InputDialectFromInfo(info));
 		if (extension_result.type == ParserExtensionResultType::PARSE_SUCCESSFUL) {
 			vector<unique_ptr<SQLStatement>> statements;

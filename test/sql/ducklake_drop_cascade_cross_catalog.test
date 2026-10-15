@@ -1,0 +1,134 @@
+# name: test/sql/ducklake_drop_cascade_cross_catalog.test
+# description: DuckLake DROP VIEW ... CASCADE searches every metadata catalog but drops only its own consumers (#126)
+# group: [sql]
+
+# DuckLake MVs always register in the database's default native catalog, even after
+# USE of another database, so a DuckLake parent and DuckLake child cannot have
+# different metadata owners. The cascade below therefore also searches peer's
+# metadata, which registers same-named native views that must be left alone.
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_drop_cascade_cross_catalog.db' AS dl (TYPE ducklake);
+
+statement ok
+ATTACH ':memory:' AS peer;
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE dl.lake_src(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.lake_src VALUES (1,10),(1,10),(2,20),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.lake_parent AS SELECT k, v FROM dl.lake_src;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.lake_child AS SELECT k, v FROM dl.lake_parent;
+
+# Same SQL names, registered in peer's native metadata catalog.
+statement ok
+CREATE TABLE peer.main.lake_src(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO peer.main.lake_src VALUES (1,100),(2,200),(2,200);
+
+statement ok
+CREATE MATERIALIZED VIEW peer.main.lake_parent AS SELECT k, v FROM peer.main.lake_src;
+
+statement ok
+CREATE MATERIALIZED VIEW peer.main.lake_child AS SELECT k, v FROM peer.main.lake_parent;
+
+query II
+SELECT (SELECT count(*) FROM memory.main.openivm_views WHERE view_name IN ('__openivm_mv_646c_6d61696e_6c616b655f706172656e74_', '__openivm_mv_646c_6d61696e_6c616b655f6368696c64_')),
+       (SELECT count(*) FROM peer.main.openivm_views WHERE view_name IN ('__openivm_mv_70656572_6d61696e_6c616b655f706172656e74_', '__openivm_mv_70656572_6d61696e_6c616b655f6368696c64_'));
+----
+2	2
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.lake_child EXCEPT ALL SELECT k, v FROM dl.lake_src) UNION ALL (SELECT k, v FROM dl.lake_src EXCEPT ALL SELECT * FROM dl.lake_child));
+----
+0
+
+statement ok
+DROP VIEW dl.lake_parent CASCADE;
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE database_name='dl' AND view_name IN ('lake_parent', 'lake_child');
+----
+0
+
+query II
+SELECT (SELECT count(*) FROM memory.main.openivm_views WHERE view_name IN ('__openivm_mv_646c_6d61696e_6c616b655f706172656e74_', '__openivm_mv_646c_6d61696e_6c616b655f6368696c64_')),
+       (SELECT count(*) FROM memory.main.openivm_delta_tables WHERE view_name IN ('__openivm_mv_646c_6d61696e_6c616b655f706172656e74_', '__openivm_mv_646c_6d61696e_6c616b655f6368696c64_'));
+----
+0	0
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name='dl'
+  AND (ends_with(table_name, '__openivm_mv_646c_6d61696e_6c616b655f706172656e74_')
+       OR ends_with(table_name, '__openivm_mv_646c_6d61696e_6c616b655f6368696c64_'));
+----
+0
+
+# DuckLake base tables are never dropped as OpenIVM state.
+query I
+SELECT count(*) FROM dl.lake_src;
+----
+4
+
+# The same-named peer chain is untouched and keeps maintaining conflicting batches.
+query II
+SELECT (SELECT count(*) FROM peer.main.openivm_views WHERE view_name IN ('__openivm_mv_70656572_6d61696e_6c616b655f706172656e74_', '__openivm_mv_70656572_6d61696e_6c616b655f6368696c64_')),
+       (SELECT count(*) FROM duckdb_views() WHERE database_name='peer' AND view_name IN ('lake_parent', 'lake_child'));
+----
+2	2
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='peer' AND table_name='openivm_delta_lake_src';
+----
+1
+
+statement ok
+INSERT INTO peer.main.lake_src VALUES (3,300),(3,300);
+
+statement ok
+UPDATE peer.main.lake_src SET v=v+1 WHERE k IN (2,3);
+
+statement ok
+DELETE FROM peer.main.lake_src WHERE k=1 OR (k=3 AND v=301);
+
+statement ok
+INSERT INTO peer.main.lake_src VALUES (4,NULL),(2,201);
+
+statement ok
+PRAGMA refresh('peer.lake_parent');
+
+statement ok
+PRAGMA refresh('peer.lake_child');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM peer.main.lake_parent EXCEPT ALL SELECT k, v FROM peer.main.lake_src) UNION ALL (SELECT k, v FROM peer.main.lake_src EXCEPT ALL SELECT * FROM peer.main.lake_parent));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM peer.main.lake_child EXCEPT ALL SELECT k, v FROM peer.main.lake_src) UNION ALL (SELECT k, v FROM peer.main.lake_src EXCEPT ALL SELECT * FROM peer.main.lake_child));
+----
+0

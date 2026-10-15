@@ -407,6 +407,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                                   MaterializedViewLifecycleQuery, {LogicalType::VARCHAR}));
 	loader.RegisterFunction(PragmaFunction::PragmaCall("openivm_materialized_view_drop", MaterializedViewDropQuery,
 	                                                   {LogicalType::VARCHAR}));
+	loader.RegisterFunction(BatchedStatementFunction());
 	loader.RegisterFunction(TableFunction(
 	    "openivm_execute_drop_view",
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},

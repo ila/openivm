@@ -87,6 +87,8 @@ public:
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
 	StoredViewLocation GetStoredViewLocation(const string &view_name, const string &fallback_catalog = "",
 	                                         const string &fallback_schema = "");
+	// True when the source is an MV-owned delta. The owner may be registered in any
+	// native metadata catalog, not only the one this connection selects.
 	bool IsMaterializedViewDelta(const DeltaSource &source);
 	vector<DeltaSource> GetDeltaSources(const string &view_name, const string &fallback_catalog = "",
 	                                    const string &fallback_schema = "");

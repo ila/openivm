@@ -361,19 +361,44 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
 }
 
 bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source) {
-	if (!SqlUtils::IsDelta(source.table_name)) {
+	auto table_name = SourceTableName(source.table_name, source.catalog_name, source.schema_name);
+	if (!SqlUtils::IsDelta(table_name)) {
 		return false;
 	}
-	auto owner = PublishedSourceViewName(source.table_name);
-	auto result = con.Query(
-	    "SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name='" + SqlUtils::EscapeValue(owner) +
-	    "' AND COALESCE(view_catalog,'" + SqlUtils::EscapeValue(source.catalog_name) + "')='" +
-	    SqlUtils::EscapeValue(source.catalog_name) + "' AND COALESCE(view_schema,'" +
-	    SqlUtils::EscapeValue(source.schema_name) + "')='" + SqlUtils::EscapeValue(source.schema_name) + "'");
-	if (result->HasError()) {
-		throw CatalogException("Cannot resolve delta owner for '%s': %s", source.table_name, result->GetError());
+	auto owner = PublishedSourceViewName(table_name);
+	auto has_owner = [&](const string &views_table, const string &unset_catalog) {
+		auto result = con.Query("SELECT 1 FROM " + views_table + " WHERE view_name='" + SqlUtils::EscapeValue(owner) +
+		                        "' AND COALESCE(view_catalog,'" + SqlUtils::EscapeValue(unset_catalog) + "')='" +
+		                        SqlUtils::EscapeValue(source.catalog_name) + "' AND COALESCE(view_schema,'" +
+		                        SqlUtils::EscapeValue(source.schema_name) + "')='" +
+		                        SqlUtils::EscapeValue(source.schema_name) + "'");
+		if (result->HasError()) {
+			throw CatalogException("Cannot resolve delta owner for '%s': %s", source.table_name, result->GetError());
+		}
+		return result->RowCount() != 0;
+	};
+	if (has_owner(openivm::VIEWS_TABLE, source.catalog_name)) {
+		return true;
 	}
-	return result->RowCount() != 0;
+	// A consumer may register its metadata in another native catalog than the MV
+	// that owns this delta. Legacy rows without a view catalog belong to their own catalog.
+	auto current = con.Query("SELECT current_database()");
+	if (current->HasError()) {
+		throw CatalogException("Cannot resolve delta owner for '%s': %s", source.table_name, current->GetError());
+	}
+	auto current_catalog = current->GetValue(0, 0).ToString();
+	for (auto &catalog : MetadataCatalogs(con)) {
+		if (StringUtil::CIEquals(catalog, current_catalog) ||
+		    !con.TableInfo(catalog, DEFAULT_SCHEMA, openivm::VIEWS_TABLE)) {
+			continue;
+		}
+		if (has_owner(SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::VIEWS_TABLE), catalog)) {
+			OPENIVM_DEBUG_PRINT("[DROP] Delta '%s' is owned by a materialized view registered in '%s'\n",
+			                    table_name.c_str(), catalog.c_str());
+			return true;
+		}
+	}
+	return false;
 }
 
 vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
