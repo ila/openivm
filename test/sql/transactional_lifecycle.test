@@ -1981,3 +1981,111 @@ query I
 SELECT count(*) FROM ((SELECT * FROM "profile.target"."observation.data".mv EXCEPT ALL SELECT i FROM "profile.target"."observation.data".source WHERE i>0) UNION ALL (SELECT i FROM "profile.target"."observation.data".source WHERE i>0 EXCEPT ALL SELECT * FROM "profile.target"."observation.data".mv));
 ----
 0
+
+# ALTER sees an MV created earlier in the same explicit transaction (issue #121).
+statement ok
+USE profile_creation_host.main;
+
+statement ok
+CREATE TABLE alter_txn_src(id INTEGER);
+
+statement ok
+INSERT INTO alter_txn_src VALUES (1);
+
+statement ok
+CREATE MATERIALIZED VIEW alter_txn_seed AS SELECT * FROM alter_txn_src;
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW alter_txn_new AS SELECT * FROM alter_txn_src;
+
+statement ok
+ALTER MATERIALIZED VIEW alter_txn_new SET REFRESH EVERY '1 hour';
+
+query I
+SELECT refresh_interval FROM openivm_views WHERE view_sql_name = 'alter_txn_new';
+----
+3600
+
+# Repeated ALTER in the same transaction.
+statement ok
+ALTER MATERIALIZED VIEW alter_txn_new SET REFRESH EVERY '2 hours';
+
+query I
+SELECT refresh_interval FROM openivm_views WHERE view_sql_name = 'alter_txn_new';
+----
+7200
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name = 'alter_txn_new';
+----
+0
+
+# COMMIT preserves the schedule.
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW alter_txn_new AS SELECT * FROM alter_txn_src;
+
+statement ok
+ALTER MATERIALIZED VIEW alter_txn_new SET REFRESH EVERY '1 hour';
+
+statement ok
+COMMIT;
+
+query I
+SELECT refresh_interval FROM openivm_views WHERE view_sql_name = 'alter_txn_new';
+----
+3600
+
+# Qualified and quoted names.
+statement ok
+CREATE SCHEMA "alter txn schema";
+
+statement ok
+CREATE TABLE "alter txn schema"."src rows"(id INTEGER);
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW "alter txn schema"."new mv" AS SELECT * FROM "alter txn schema"."src rows";
+
+statement ok
+ALTER MATERIALIZED VIEW "alter txn schema"."new mv" SET REFRESH EVERY '5 minutes';
+
+query I
+SELECT refresh_interval FROM openivm_views WHERE view_sql_name = 'new mv';
+----
+300
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name = 'new mv';
+----
+0
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW "alter txn schema"."new mv" AS SELECT * FROM "alter txn schema"."src rows";
+
+statement ok
+ALTER MATERIALIZED VIEW "alter txn schema"."new mv" SET REFRESH EVERY '5 minutes';
+
+statement ok
+COMMIT;
+
+query I
+SELECT refresh_interval FROM openivm_views WHERE view_sql_name = 'new mv';
+----
+300
