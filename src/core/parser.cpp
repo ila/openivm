@@ -1914,6 +1914,8 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(con);
 	}
+	bool ducklake = table_entry->ParentCatalog().GetCatalogType() == "ducklake";
+	auto owners = RefreshMetadata::SourceOwnerPredicate(drop_info.name, drop_info.catalog, drop_info.schema, ducklake);
 	auto catalogs = RefreshMetadata::MetadataCatalogs(con);
 	vector<string> dependent_views;
 	vector<RefreshMetadata::DeltaSource> sources;
@@ -1922,16 +1924,21 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	bool staged_drop = false;
 	for (auto &catalog : catalogs) {
 		RefreshMetadata::UseCatalog(context, con, catalog);
-		auto dependent_rows = con.Query(
-		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
-		    RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(drop_info.name), drop_info.catalog, drop_info.schema) +
-		    " ORDER BY view_name");
+		auto dependent_rows = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		                                " WHERE " + owners + " ORDER BY view_name");
 		if (dependent_rows->HasError()) {
 			throw CatalogException("OpenIVM could not resolve materialized views depending on '%s': %s", drop_info.name,
 			                       dependent_rows->GetError());
 		}
 		if (!dependent_rows->RowCount()) {
 			continue;
+		}
+		if (!drop_info.cascade && ducklake) {
+			// DuckLake sources have no OpenIVM delta buffer to retract into. Retained MVs
+			// observe the drop through their recorded DuckLake table id: a same-named
+			// replacement has a new id, which forces a full recompute on refresh.
+			OPENIVM_DEBUG_PRINT("[DROP] Retaining MVs of DuckLake source '%s'\n", drop_info.name.c_str());
+			return BuildDropTableStatement(drop_info) + ";\n";
 		}
 		if (!drop_info.cascade) {
 			// Retained MVs must observe removal before a same-named replacement.
@@ -1940,6 +1947,14 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 			TransactionalMVLockState::Get(*con.context)
 			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 			return context.transaction.IsAutoCommit() ? ExecuteAutocommitDropProgram(con, retract) : retract;
+		}
+		if (ducklake && !context.transaction.IsAutoCommit()) {
+			// The cascade writes both the lake and OpenIVM's native metadata, which DuckDB
+			// cannot commit in one transaction. Refuse before anything is changed.
+			throw CatalogException("Cannot run DROP TABLE %s CASCADE inside an explicit transaction: its materialized "
+			                       "views keep OpenIVM metadata in native catalog '%s', and DuckDB cannot write both "
+			                       "catalogs in one transaction. Run the DROP in autocommit mode.",
+			                       SqlUtils::FullName(drop_info.catalog, drop_info.schema, drop_info.name), catalog);
 		}
 		RefreshMetadata metadata(con);
 		vector<string> local_views;
@@ -1977,6 +1992,11 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	for (auto &source : sources) {
 		staged_drop |= !StringUtil::CIEquals(source.catalog_name, drop_info.catalog);
 	}
+	// Tracked descendants are dropped above. DuckLake rejects CASCADE syntax and tracks
+	// no dependencies of its own, so the source itself takes the supported plain DROP.
+	drop_info.cascade = drop_info.cascade && !ducklake;
+	OPENIVM_DEBUG_PRINT("[DROP] Cascading source '%s' to %lu tracked MVs\n", drop_info.name.c_str(),
+	                    (unsigned long)dependent_views.size());
 	program += BuildDropTableStatement(drop_info) + ";\n";
 	if (context.transaction.IsAutoCommit()) {
 		if (staged_drop) {

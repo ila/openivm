@@ -410,10 +410,25 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		}
 
 		// Handle CASCADE: drop dependent MVs
-		auto dep_check = con.Query(
-		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
-		    RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(table_name), target_locus.first, target_locus.second));
+		auto &drop_catalog = target_locus.first;
+		auto &drop_schema = target_locus.second;
+		bool ducklake = false;
+		auto owner = RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(table_name), drop_catalog, drop_schema);
+		if (drop_info->type == CatalogType::TABLE_ENTRY) {
+			ducklake = RefreshMetadata(con).IsDuckLakeCatalog(drop_catalog);
+			owner = RefreshMetadata::SourceOwnerPredicate(table_name, drop_catalog, drop_schema, ducklake);
+		}
+		auto dep_sql = "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " + owner;
+		auto dep_check = con.Query(dep_sql);
 		if (!dep_check->HasError() && dep_check->RowCount() > 0 && drop_info->cascade) {
+			if (ducklake) {
+				// Cleaning DuckLake MVs needs staged cross-catalog DDL, which only the
+				// single-statement DROP interception provides; DuckLake rejects CASCADE.
+				throw CatalogException("Cannot cascade DROP TABLE to the materialized views of DuckLake source '%s' "
+				                       "here. Run the DROP as a single statement so OpenIVM can remove them, or drop "
+				                       "those views first.",
+				                       table_name);
+			}
 			TransactionalMVLockState::Get(input.context).AcquireMutationLock();
 			RefreshMetadata cascade_metadata(con);
 			vector<string> dependent_views;

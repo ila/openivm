@@ -66,6 +66,9 @@ public:
 	static vector<string> MetadataCatalogs(Connection &con);
 	static string SourceTableName(const string &key, const string &catalog, const string &schema);
 	static string SourcePredicate(const string &table, const string &catalog, const string &schema);
+	// Rows owned by a physical source table. DuckLake rows store the source name itself;
+	// native rows store the source's delta-table name.
+	static string SourceOwnerPredicate(const string &table, const string &catalog, const string &schema, bool ducklake);
 
 	struct SourceLocation {
 		string catalog_name;

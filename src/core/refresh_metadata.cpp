@@ -312,6 +312,17 @@ string RefreshMetadata::SourcePredicate(const string &table, const string &catal
 	       SqlUtils::EscapeValue(schema) + "'";
 }
 
+string RefreshMetadata::SourceOwnerPredicate(const string &table, const string &catalog, const string &schema,
+                                             bool ducklake) {
+	// The catalog type keeps a native `openivm_delta_<name>` key and a DuckLake source
+	// that happens to use that name from being mistaken for each other.
+	if (ducklake) {
+		return SourcePredicate(table, catalog, schema) + " AND catalog_type = 'ducklake'";
+	}
+	return SourcePredicate(SqlUtils::DeltaName(table), catalog, schema) +
+	       " AND COALESCE(catalog_type, 'duckdb') <> 'ducklake'";
+}
+
 RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string &view_name, const string &table_name,
                                                                    const string &fallback_catalog,
                                                                    const string &fallback_schema) {

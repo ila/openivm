@@ -1,0 +1,445 @@
+# name: test/sql/ducklake_source_drop_cascade.test
+# description: DROP TABLE on a tracked DuckLake source resolves ownership by the stored source identity
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_source_drop_cascade.db' AS dl (TYPE ducklake);
+
+# ==========================================
+# Section 1: CASCADE removes every tracked consumer of the DuckLake source
+# ==========================================
+
+statement ok
+CREATE TABLE dl.s(i INTEGER);
+
+statement ok
+INSERT INTO dl.s VALUES (1), (2), (3);
+
+statement ok
+CREATE SCHEMA dl.other;
+
+statement ok
+CREATE TABLE dl.other.s(i INTEGER);
+
+statement ok
+INSERT INTO dl.other.s VALUES (1), (3), (3);
+
+# Same-named DuckLake table with no materialized views.
+statement ok
+CREATE SCHEMA dl.third;
+
+statement ok
+CREATE TABLE dl.third.s(i INTEGER);
+
+statement ok
+INSERT INTO dl.third.s VALUES (9);
+
+# Same-named native source with its own materialized view.
+statement ok
+CREATE TABLE s(i INTEGER);
+
+statement ok
+INSERT INTO s VALUES (7), (8);
+
+# Native source shared by a dropped consumer and a surviving one.
+statement ok
+CREATE TABLE shared_n(i INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO shared_n VALUES (1, 'one'), (2, 'two');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.lake_mv AS SELECT * FROM dl.s;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.lake_child AS SELECT i, COUNT(*) AS n FROM dl.lake_mv GROUP BY i;
+
+statement ok
+CREATE MATERIALIZED VIEW native_on_lake AS SELECT i FROM dl.s WHERE i > 0;
+
+statement ok
+CREATE MATERIALIZED VIEW lake_join AS SELECT l.i, n.label FROM dl.s l JOIN shared_n n ON l.i = n.i;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.both_s AS SELECT a.i FROM dl.s a JOIN dl.other.s b ON a.i = b.i;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.other.other_mv AS SELECT i, COUNT(*) AS n FROM dl.other.s GROUP BY i;
+
+statement ok
+CREATE MATERIALIZED VIEW native_s_mv AS SELECT i FROM s;
+
+statement ok
+CREATE MATERIALIZED VIEW shared_n_mv AS SELECT i, label FROM shared_n;
+
+# DuckLake ownership is recorded under the bare source name, not openivm_delta_s.
+query TTT
+SELECT d.table_name, d.source_catalog, d.source_schema
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'lake_mv';
+----
+s	dl	main
+
+# Same-named sources in one view use qualified keys.
+query I
+SELECT count(*)
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'both_s' AND d.catalog_type = 'ducklake' AND contains(d.table_name, '.');
+----
+2
+
+# Pending native changes that the surviving consumer still needs.
+statement ok
+INSERT INTO shared_n VALUES (3, 'three'), (3, 'three');
+
+statement ok
+DELETE FROM shared_n WHERE i = 1;
+
+statement ok
+DROP TABLE dl.s CASCADE;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dl' AND schema_name = 'main' AND table_name = 's';
+----
+0
+
+query III
+SELECT (SELECT count(*) FROM dl.other.s), (SELECT count(*) FROM dl.third.s), (SELECT count(*) FROM memory.main.s);
+----
+3	1	2
+
+query I
+SELECT count(*) FROM openivm_views
+WHERE view_sql_name IN ('lake_mv', 'lake_child', 'native_on_lake', 'lake_join', 'both_s');
+----
+0
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name IN ('other_mv', 'native_s_mv', 'shared_n_mv');
+----
+3
+
+statement error
+SELECT * FROM dl.lake_mv;
+----
+does not exist
+
+statement error
+SELECT * FROM dl.lake_child;
+----
+does not exist
+
+statement error
+SELECT * FROM native_on_lake;
+----
+does not exist
+
+statement error
+SELECT * FROM lake_join;
+----
+does not exist
+
+statement error
+SELECT * FROM dl.both_s;
+----
+does not exist
+
+# No metadata or backing objects survive for the dropped views.
+query I
+SELECT count(*) FROM openivm_delta_tables WHERE view_name NOT IN (SELECT view_name FROM openivm_views);
+----
+0
+
+query I
+SELECT count(*) FROM openivm_mv_dependencies
+WHERE parent_view NOT IN (SELECT view_name FROM openivm_views)
+   OR child_view NOT IN (SELECT view_name FROM openivm_views);
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() t
+WHERE contains(t.table_name, '__openivm_mv_')
+  AND NOT EXISTS (SELECT 1 FROM openivm_views v WHERE contains(t.table_name, v.view_name));
+----
+0
+
+# The shared native delta table is still consumed by shared_n_mv.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'memory' AND table_name = 'openivm_delta_shared_n';
+----
+1
+
+# Survivors keep refreshing correctly.
+statement ok
+INSERT INTO dl.other.s VALUES (5), (5);
+
+statement ok
+DELETE FROM dl.other.s WHERE i = 1;
+
+statement ok
+UPDATE dl.other.s SET i = i + 100 WHERE i = 3;
+
+statement ok
+PRAGMA refresh('dl.other.other_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT i, n FROM dl.other.other_mv
+    EXCEPT ALL
+    SELECT i, COUNT(*) FROM dl.other.s GROUP BY i
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT i, COUNT(*) FROM dl.other.s GROUP BY i
+    EXCEPT ALL
+    SELECT i, n FROM dl.other.other_mv
+);
+----
+0
+
+statement ok
+INSERT INTO s VALUES (7), (10);
+
+statement ok
+DELETE FROM s WHERE i = 8;
+
+statement ok
+UPDATE s SET i = i + 1 WHERE i = 10;
+
+statement ok
+PRAGMA refresh('native_s_mv');
+
+query I
+SELECT count(*) FROM (SELECT i FROM native_s_mv EXCEPT ALL SELECT i FROM s);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM s EXCEPT ALL SELECT i FROM native_s_mv);
+----
+0
+
+statement ok
+UPDATE shared_n SET label = 'TWO' WHERE i = 2;
+
+statement ok
+INSERT INTO shared_n VALUES (4, 'four');
+
+statement ok
+PRAGMA refresh('shared_n_mv');
+
+query I
+SELECT count(*) FROM (SELECT i, label FROM shared_n_mv EXCEPT ALL SELECT i, label FROM shared_n);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i, label FROM shared_n EXCEPT ALL SELECT i, label FROM shared_n_mv);
+----
+0
+
+# ==========================================
+# Section 2: dropping an unowned same-named native table leaves the DuckLake MV alone
+# ==========================================
+
+statement ok
+CREATE TABLE lake_only(i INTEGER);
+
+statement ok
+INSERT INTO lake_only VALUES (1);
+
+statement ok
+CREATE TABLE dl.lake_only(i INTEGER);
+
+statement ok
+INSERT INTO dl.lake_only VALUES (1), (2);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.lake_only_mv AS SELECT i FROM dl.lake_only;
+
+statement ok
+DROP TABLE lake_only CASCADE;
+
+query I
+SELECT count(*) FROM openivm_views WHERE view_sql_name = 'lake_only_mv';
+----
+1
+
+statement ok
+INSERT INTO dl.lake_only VALUES (3), (3);
+
+statement ok
+DELETE FROM dl.lake_only WHERE i = 1;
+
+statement ok
+UPDATE dl.lake_only SET i = i + 10 WHERE i = 2;
+
+statement ok
+PRAGMA refresh('dl.lake_only_mv');
+
+query I
+SELECT count(*) FROM (SELECT i FROM dl.lake_only_mv EXCEPT ALL SELECT i FROM dl.lake_only);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM dl.lake_only EXCEPT ALL SELECT i FROM dl.lake_only_mv);
+----
+0
+
+# ==========================================
+# Section 3: without CASCADE, MVs are retained and follow a same-named replacement
+# ==========================================
+
+statement ok
+CREATE TABLE dl.r(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.r VALUES (1, 10), (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.r_mv AS SELECT k, SUM(v) AS total, COUNT(*) AS n FROM dl.r GROUP BY k;
+
+# The retained MV relies on the recorded DuckLake table identity.
+query I
+SELECT count(*)
+FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'r_mv' AND d.table_name = 'r' AND d.catalog_type = 'ducklake'
+  AND d.source_table_id IS NOT NULL;
+----
+1
+
+statement ok
+DROP TABLE dl.r;
+
+query II
+SELECT
+    (SELECT count(*) FROM openivm_views WHERE view_sql_name = 'r_mv'),
+    (SELECT count(*) FROM openivm_delta_tables d JOIN openivm_views v USING (view_name)
+     WHERE v.view_sql_name = 'r_mv' AND d.table_name = 'r');
+----
+1	1
+
+statement ok
+CREATE TABLE dl.r(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO dl.r VALUES (2, 5), (3, 7), (3, 7);
+
+statement ok
+UPDATE dl.r SET v = v + 1 WHERE k = 3;
+
+statement ok
+DELETE FROM dl.r WHERE k = 2;
+
+statement ok
+INSERT INTO dl.r VALUES (2, 9), (4, 40);
+
+statement ok
+PRAGMA refresh('dl.r_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT k, total, n FROM dl.r_mv
+    EXCEPT ALL
+    SELECT k, SUM(v), COUNT(*) FROM dl.r GROUP BY k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT k, SUM(v), COUNT(*) FROM dl.r GROUP BY k
+    EXCEPT ALL
+    SELECT k, total, n FROM dl.r_mv
+);
+----
+0
+
+# ==========================================
+# Section 4: an explicit transaction refuses the cross-catalog cascade before any change
+# ==========================================
+
+statement ok
+CREATE TABLE dl.tx_src(i INTEGER);
+
+statement ok
+INSERT INTO dl.tx_src VALUES (1), (2);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.tx_mv AS SELECT * FROM dl.tx_src;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement error
+DROP TABLE dl.tx_src CASCADE;
+----
+inside an explicit transaction
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT (SELECT count(*) FROM dl.tx_src), (SELECT count(*) FROM openivm_views WHERE view_sql_name = 'tx_mv');
+----
+2	1
+
+statement ok
+INSERT INTO dl.tx_src VALUES (3), (3);
+
+statement ok
+DELETE FROM dl.tx_src WHERE i = 1;
+
+statement ok
+UPDATE dl.tx_src SET i = i + 10 WHERE i = 2;
+
+statement ok
+PRAGMA refresh('dl.tx_mv');
+
+query I
+SELECT count(*) FROM (SELECT * FROM dl.tx_mv EXCEPT ALL SELECT * FROM dl.tx_src);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM dl.tx_src EXCEPT ALL SELECT * FROM dl.tx_mv);
+----
+0
+
+statement ok
+DROP TABLE dl.tx_src CASCADE;
+
+query II
+SELECT
+    (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dl' AND table_name = 'tx_src'),
+    (SELECT count(*) FROM openivm_views WHERE view_sql_name = 'tx_mv');
+----
+0	0
+
+query I
+SELECT count(*) FROM duckdb_tables() t
+WHERE contains(t.table_name, '__openivm_mv_')
+  AND NOT EXISTS (SELECT 1 FROM openivm_views v WHERE contains(t.table_name, v.view_name));
+----
+0
