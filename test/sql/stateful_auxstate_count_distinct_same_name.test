@@ -37,13 +37,16 @@ WHERE stmt_kind = 'data' ORDER BY stmt_order LIMIT 1;
 COUNT_DISTINCT_INCREMENTAL
 
 # Aux table columns are unique and ordered (group, distinct, _count).
+# The internal name encodes the attached catalog (cd_same_name = 63645f73616d655f6e616d65), not "memory".
 query I
-SELECT count(*) FROM duckdb_columns() WHERE table_name = 'openivm_aux___openivm_mv_6d656d6f7279_6d61696e_6d76_';
+SELECT count(*) FROM duckdb_columns()
+WHERE table_name = 'openivm_aux___openivm_mv_63645f73616d655f6e616d65_6d61696e_6d76_';
 ----
 3
 
 query I
-SELECT count(DISTINCT lower(column_name)) FROM duckdb_columns() WHERE table_name = 'openivm_aux___openivm_mv_6d656d6f7279_6d61696e_6d76_';
+SELECT count(DISTINCT lower(column_name)) FROM duckdb_columns()
+WHERE table_name = 'openivm_aux___openivm_mv_63645f73616d655f6e616d65_6d61696e_6d76_';
 ----
 3
 
