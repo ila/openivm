@@ -824,6 +824,26 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			}
 			CountDistinctExtract cd_extract;
 			if (ExtractCountDistinctAggregate(local_view_query, candidate_group_columns, output_names, cd_extract)) {
+				// The aux table is (group cols, distinct col, _count); the distinct column name is only an aux
+				// identifier, so keep it distinct from group outputs (SELECT i, COUNT(DISTINCT i) ... GROUP BY i).
+				string base_distinct_col = cd_extract.distinct_col;
+				idx_t suffix = 0;
+				auto collides = [&](const string &name) {
+					if (StringUtil::CIEquals(name, "_count")) {
+						return true;
+					}
+					for (auto &group_col : candidate_group_columns) {
+						if (StringUtil::CIEquals(name, group_col)) {
+							return true;
+						}
+					}
+					return false;
+				};
+				while (collides(cd_extract.distinct_col)) {
+					cd_extract.distinct_col =
+					    base_distinct_col + "_distinct" + (suffix == 0 ? string() : to_string(suffix));
+					suffix++;
+				}
 				count_distinct_aux_candidate = {
 				    "openivm_aux_" + view_name, SqlUtils::LastIdentifierPart(cd_extract.source),
 				    candidate_group_columns,    cd_extract.group_exprs,
