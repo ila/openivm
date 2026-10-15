@@ -22,6 +22,21 @@
 
 namespace duckdb {
 
+static string FindSourceDeltaName(RefreshMetadata &metadata, const string &view_name,
+                                  const vector<string> &delta_table_names, const string &source_table) {
+	for (auto &dt_name : delta_table_names) {
+		auto loc = metadata.GetSourceLocation(view_name, dt_name);
+		string base = BaseTableNameFromDeltaKey(loc.table_name);
+		if (dt_name != loc.table_name) {
+			base = SqlUtils::FullName(loc.catalog_name, loc.schema_name, base);
+		}
+		if (StringUtil::CIEquals(base, source_table)) {
+			return dt_name;
+		}
+	}
+	return "";
+}
+
 struct FojJoinInfo {
 	string left_table, left_col, right_table, right_col;
 	string dt_left_name, dt_right_name; // delta table names
@@ -45,19 +60,8 @@ struct FojJoinInfo {
 				info.right_col = right_part.substr(rc + 1);
 			}
 		}
-		for (auto &dt_name : delta_table_names) {
-			auto loc = metadata.GetSourceLocation(view_name, dt_name);
-			string base = BaseTableNameFromDeltaKey(loc.table_name);
-			if (dt_name != loc.table_name) {
-				base = SqlUtils::FullName(loc.catalog_name, loc.schema_name, base);
-			}
-			if (StringUtil::CIEquals(base, info.left_table)) {
-				info.dt_left_name = dt_name;
-			}
-			if (StringUtil::CIEquals(base, info.right_table)) {
-				info.dt_right_name = dt_name;
-			}
-		}
+		info.dt_left_name = FindSourceDeltaName(metadata, view_name, delta_table_names, info.left_table);
+		info.dt_right_name = FindSourceDeltaName(metadata, view_name, delta_table_names, info.right_table);
 		return info;
 	}
 };
@@ -796,6 +800,77 @@ static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string
 	return predicate.empty() ? "" : " WHERE " + predicate;
 }
 
+static string BuildNestedFullOuterKeys(RefreshMetadata &metadata, const string &view_name,
+                                       const vector<string> &delta_table_names, const string &view_query_sql,
+                                       const string &delta_ts_filter) {
+	string keys;
+	for (auto &scope : metadata.GetFullOuterScopes(view_name)) {
+		for (idx_t side = 0; side < 2; side++) {
+			auto &source = side == 0 ? scope.left : scope.right;
+			auto &other = side == 0 ? scope.right : scope.left;
+			auto delta_name = FindSourceDeltaName(metadata, view_name, delta_table_names, source.table);
+			auto other_delta_name = FindSourceDeltaName(metadata, view_name, delta_table_names, other.table);
+			if (delta_name.empty() || other_delta_name.empty()) {
+				continue;
+			}
+			auto source_ref = SqlUtils::FindTableReferenceOccurrence(view_query_sql, source.table, source.occurrence);
+			auto other_ref = SqlUtils::FindTableReferenceOccurrence(view_query_sql, other.table, other.occurrence);
+			auto delta_rows = [&](const string &name) {
+				string delta = metadata.ResolveDeltaQualifiedName(view_name, name);
+				if (metadata.IsDuckLakeTable(view_name, name)) {
+					return "(SELECT * FROM " + delta + ")";
+				}
+				return BuildStandardDeltaRowsSQL(delta, "", delta_ts_filter);
+			};
+			// Keep deletes as well as current rows: both can supply an old unmatched
+			// projection. Delta timestamps are filtered before the two-side lookup.
+			string changed = delta_rows(delta_name);
+			string other_rows =
+			    "(SELECT * FROM " + other_ref + " UNION ALL SELECT * FROM " + delta_rows(other_delta_name) + ")";
+			string other_key =
+			    SqlUtils::ApplyCastSpec("openivm_other." + SqlUtils::QuoteIdentifier(other.column), other.cast_type);
+			string source_key = SqlUtils::ApplyCastSpec("openivm_changed." + SqlUtils::QuoteIdentifier(source.column),
+			                                            source.cast_type);
+			string predicate = side == 0 ? source_key + " " + scope.comparison + " " + other_key
+			                             : other_key + " " + scope.comparison + " " + source_key;
+			string affected_other = "(SELECT openivm_other.* FROM " + other_rows +
+			                        " openivm_other WHERE EXISTS (SELECT 1 FROM " + changed +
+			                        " openivm_changed WHERE " + predicate + "))";
+			for (idx_t padded_side = 0; padded_side < 2; padded_side++) {
+				string source_rows =
+				    padded_side == 0 ? delta_rows(delta_name) : "(SELECT * FROM " + source_ref + " WHERE false)";
+				string opposite_rows =
+				    padded_side == 0 ? "(SELECT * FROM " + other_ref + " WHERE false)" : affected_other;
+				string query = view_query_sql;
+				auto replace = [&](const RefreshMetadata::FullOuterScopeSource &item, const string &rows) {
+					bool replaced = false;
+					query =
+					    SqlUtils::ReplaceTableReferenceOccurrence(query, item.table, item.occurrence, rows, replaced);
+					D_ASSERT(replaced);
+				};
+				if (StringUtil::CIEquals(source.table, other.table) && source.occurrence < other.occurrence) {
+					replace(other, opposite_rows);
+					replace(source, source_rows);
+				} else {
+					replace(source, source_rows);
+					replace(other, opposite_rows);
+				}
+				string presence = padded_side == 0 ? source.presence_column : other.presence_column;
+				if (!keys.empty()) {
+					keys += "\nUNION\n";
+				}
+				keys += "SELECT openivm_left_key AS _k FROM (" + query + ") openivm_padding WHERE " +
+				        SqlUtils::QuoteIdentifier(presence) +
+				        " IS TRUE AND (openivm_left_key IS NOT NULL OR openivm_right_key IS NULL)";
+				keys += "\nUNION\nSELECT openivm_right_key AS _k FROM (" + query + ") openivm_padding WHERE " +
+				        SqlUtils::QuoteIdentifier(presence) +
+				        " IS TRUE AND (openivm_right_key IS NOT NULL OR openivm_left_key IS NULL)";
+			}
+		}
+	}
+	return keys;
+}
+
 static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const string &view_name,
                                               const vector<string> &delta_table_names, const string &data_table,
                                               const string &view_query_sql, const string &delta_ts_filter,
@@ -825,9 +900,17 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 		               delta_where_right;
 	}
 
+	string padding_keys =
+	    BuildNestedFullOuterKeys(metadata, view_name, delta_table_names, view_query_sql, delta_ts_filter);
+	if (!padding_keys.empty()) {
+		if (!union_parts.empty()) {
+			union_parts += "\nUNION\n";
+		}
+		union_parts += padding_keys;
+	}
 	string where_clause;
 	string affected_ctes;
-	if (!union_parts.empty()) {
+	{
 		// Base keys cover NULL-padding transitions at the FULL JOIN. The view delta
 		// also carries keys affected by other inputs, such as a downstream lookup.
 		string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
@@ -835,13 +918,14 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 		// refresh unrelated unmatched rows too. Retain the all-NULL key pairs.
 		string left_where = BuildGuardedDeltaWhere(delta_ts_filter, "(" + lk + " IS NOT NULL OR " + rk + " IS NULL)");
 		string right_where = BuildGuardedDeltaWhere(delta_ts_filter, "(" + rk + " IS NOT NULL OR " + lk + " IS NULL)");
-		union_parts += "\n  UNION\n  SELECT " + lk + " AS _k FROM " + qdv + left_where + "\n  UNION\n  SELECT " + rk +
+		if (!union_parts.empty()) {
+			union_parts += "\n  UNION\n  ";
+		}
+		union_parts += "SELECT " + lk + " AS _k FROM " + qdv + left_where + "\n  UNION\n  SELECT " + rk +
 		               " AS _k FROM " + qdv + right_where;
 		affected_ctes = "WITH openivm_affected AS (\n  " + union_parts + "\n)\n";
 		where_clause = "EXISTS (SELECT 1 FROM openivm_affected WHERE _k IS NOT DISTINCT FROM " + lk +
 		               " OR _k IS NOT DISTINCT FROM " + rk + ")";
-	} else {
-		where_clause = "TRUE";
 	}
 
 	return BuildDeleteInsertRefreshSQL(data_table, view_query_sql, "openivm_foj", where_clause, where_clause,

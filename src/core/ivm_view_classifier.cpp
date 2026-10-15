@@ -849,6 +849,9 @@ idx_t DeltaViewModel::LineageEntryCount() const {
 	if (has_left_join_key_source) {
 		count++;
 	}
+	if (!full_outer_scopes.empty()) {
+		count++;
+	}
 	return count;
 }
 

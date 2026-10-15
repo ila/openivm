@@ -12,6 +12,7 @@
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/deliminator.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -1513,6 +1514,62 @@ static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, uniq
 	}
 
 	RewriteLeftJoinKey(binder, plan, outer_join);
+
+	// Nested outer joins can change an ancestor's computed key when they start
+	// NULL-padding. Presence columns let key discovery retain only rows from
+	// the affected input, excluding unrelated rows padded by ancestor joins.
+	auto *selected = FindProjectionKeyJoin(*plan);
+	if (!selected || selected->join_type != JoinType::OUTER) {
+		return;
+	}
+	vector<LogicalComparisonJoin *> nested_outer;
+	std::function<void(LogicalOperator &)> collect = [&](LogicalOperator &node) {
+		if (node.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+			auto &join = node.Cast<LogicalComparisonJoin>();
+			if (&join != selected && IsOuterJoin(join.join_type)) {
+				nested_outer.push_back(&join);
+			}
+		}
+		for (auto &child : node.children) {
+			collect(*child);
+		}
+	};
+	collect(*selected);
+	for (idx_t index = 0; index < nested_outer.size(); index++) {
+		for (idx_t side = 0; side < 2; side++) {
+			auto &child = nested_outer[index]->children[side];
+			child->ResolveOperatorTypes();
+			auto bindings = child->GetColumnBindings();
+			vector<unique_ptr<Expression>> expressions;
+			for (idx_t i = 0; i < bindings.size(); i++) {
+				expressions.push_back(make_uniq<BoundColumnRefExpression>(child->types[i], bindings[i]));
+			}
+			string name = string(openivm::FULL_SCOPE_PREFIX) + to_string(index) + (side == 0 ? "_left" : "_right");
+			auto present = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+			present->alias = name;
+			expressions.push_back(std::move(present));
+			auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(expressions));
+			projection->children.push_back(std::move(child));
+			projection->ResolveOperatorTypes();
+			ColumnBinding presence(projection->table_index, bindings.size());
+			ColumnBindingReplacer replacer;
+			for (idx_t i = 0; i < bindings.size(); i++) {
+				replacer.replacement_bindings.emplace_back(bindings[i], ColumnBinding(projection->table_index, i));
+			}
+			replacer.stop_operator = projection.get();
+			child = std::move(projection);
+			replacer.VisitOperator(*plan);
+			LogicalType type = LogicalType::BOOLEAN;
+			PropagateBindingThroughOperatorPath(plan, presence, type);
+			auto &root = plan->Cast<LogicalProjection>();
+			D_ASSERT(presence.table_index == root.table_index);
+			root.expressions[presence.column_index]->alias = name;
+		}
+	}
+	if (!nested_outer.empty()) {
+		OPENIVM_DEBUG_PRINT("[PlanRewrite] Added presence columns for %zu nested outer JOIN scopes\n",
+		                    nested_outer.size());
+	}
 }
 
 struct PlanRewriteContext {

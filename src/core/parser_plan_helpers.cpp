@@ -2143,8 +2143,12 @@ static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr, const 
 }
 
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
+	auto *projection_join = facts.analysis.found_aggregation ? nullptr : FindProjectionKeyJoin(*facts.root);
 	for (auto *join : facts.comparison_joins) {
 		if (join->join_type != JoinType::OUTER || join->conditions.empty()) {
+			continue;
+		}
+		if (projection_join && join != projection_join) {
 			continue;
 		}
 		auto &condition = join->conditions[0];
@@ -2163,6 +2167,12 @@ string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
 		BaseColumnRef left_source, right_source;
 		auto left_ref = GetColumnRefThroughCasts(condition.left.get());
 		auto right_ref = GetColumnRefThroughCasts(condition.right.get());
+		if (projection_join &&
+		    (!left_ref || !right_ref || !ResolveBindingToBaseRef(left_ref->binding, facts, left_source) ||
+		     !ResolveBindingToBaseRef(right_ref->binding, facts, right_source))) {
+			// A computed alias is not a raw column of the subtree's first table.
+			return "";
+		}
 		if (left_ref && ResolveBindingToBaseRef(left_ref->binding, facts, left_source)) {
 			left_table = left_source.table;
 		}
@@ -2174,6 +2184,55 @@ string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
 		}
 	}
 	return "";
+}
+
+vector<RefreshMetadata::FullOuterScope> BuildFullOuterScopes(const CreateMVPlanFacts &facts) {
+	vector<RefreshMetadata::FullOuterScope> scopes;
+	for (auto *join : facts.comparison_joins) {
+		if ((join->join_type != JoinType::OUTER && join->join_type != JoinType::LEFT &&
+		     join->join_type != JoinType::RIGHT) ||
+		    join->conditions.empty()) {
+			continue;
+		}
+		RefreshMetadata::FullOuterScope scope;
+		scope.comparison = ExpressionTypeToOperator(join->conditions[0].comparison);
+		bool complete = true;
+		for (idx_t side = 0; side < 2; side++) {
+			auto &child = *join->children[side];
+			if (child.type != LogicalOperatorType::LOGICAL_PROJECTION) {
+				complete = false;
+				break;
+			}
+			auto &projection = child.Cast<LogicalProjection>();
+			auto &source = side == 0 ? scope.left : scope.right;
+			for (auto &expression : projection.expressions) {
+				if (expression->expression_class == ExpressionClass::BOUND_CONSTANT &&
+				    StringUtil::StartsWith(expression->alias, openivm::FULL_SCOPE_PREFIX)) {
+					source.presence_column = expression->alias;
+					break;
+				}
+			}
+			if (source.presence_column.empty()) {
+				complete = false;
+				break;
+			}
+			auto &key = side == 0 ? join->conditions[0].left : join->conditions[0].right;
+			auto *ref = GetColumnRefThroughCasts(key.get(), &source.cast_type);
+			OccurrenceColumnRef base;
+			if (!ref ||
+			    !ResolveBindingToOccurrenceRefWithCast(ref->binding, facts, base, source.cast_type, ref->return_type)) {
+				complete = false;
+				break;
+			}
+			source.table = base.table;
+			source.occurrence = base.occurrence;
+			source.column = base.column;
+		}
+		if (complete) {
+			scopes.push_back(std::move(scope));
+		}
+	}
+	return scopes;
 }
 
 static string SanitizeOutputName(const string &name) {

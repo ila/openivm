@@ -158,6 +158,7 @@ bool PlanNeedsOriginalSqlForLpts(const CreateMVPlanFacts &facts);
 void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts, vector<string> &aggregate_columns,
                                                  const vector<string> &output_names);
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts);
+vector<RefreshMetadata::FullOuterScope> BuildFullOuterScopes(const CreateMVPlanFacts &facts);
 vector<string> PrepareOutputNames(LogicalOperator *select_plan, const vector<string> &planner_names);
 bool IsPacLoaded(ClientContext &context);
 void ForwardPacSettingsIfLoaded(ClientContext &context, Connection &con);

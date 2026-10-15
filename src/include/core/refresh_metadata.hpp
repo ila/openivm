@@ -330,6 +330,21 @@ public:
 	bool GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out);
 	static string LeftJoinKeySourceToJson(const LeftJoinKeySource &source);
 
+	// Nested outer-join inputs used to discover NULL-padding keys of a FULL projection.
+	struct FullOuterScopeSource {
+		string table;
+		idx_t occurrence = 0;
+		string column;
+		string cast_type;
+		string presence_column;
+	};
+	struct FullOuterScope {
+		FullOuterScopeSource left, right;
+		string comparison;
+	};
+	vector<FullOuterScope> GetFullOuterScopes(const string &view_name);
+	static string FullOuterScopesToJson(const vector<FullOuterScope> &scopes);
+
 	struct LeftJoinNullableSources {
 		vector<string> tables;
 		bool complete = false;

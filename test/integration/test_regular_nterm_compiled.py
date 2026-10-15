@@ -416,6 +416,34 @@ DELETE FROM chain_b WHERE k=4;
 SELECT p.id,p.v,d.v AS dv FROM p FULL JOIN chain_d d ON p.k=d.id""",
         )
 
+        run_scenario(
+            binary,
+            root,
+            "full_join_computed_replacement_key",
+            """
+CREATE TABLE pad_a(id INT,k INT);
+CREATE TABLE pad_b(k INT,v INT);
+CREATE TABLE pad_d(k INT,label VARCHAR);
+INSERT INTO pad_a VALUES (1,1);
+INSERT INTO pad_b VALUES (1,2);
+INSERT INTO pad_d VALUES (0,'default'),(2,'old'),(99,'unrelated');
+CREATE MATERIALIZED VIEW pad_mv AS
+WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM pad_a a FULL JOIN pad_b b ON a.k=b.k)
+SELECT p.id,d.label FROM p FULL JOIN pad_d d ON p.lookup_key=d.k;
+UPDATE pad_b SET v=9 WHERE k=1;
+INSERT INTO pad_b VALUES (1,9);
+DELETE FROM pad_b WHERE k=1;
+""",
+            "pad_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM pad_a a FULL JOIN pad_b b ON a.k=b.k)
+SELECT p.id,d.label FROM p FULL JOIN pad_d d ON p.lookup_key=d.k""",
+        )
+
     print("regular N-term compiled SQL integration tests passed")
 
 

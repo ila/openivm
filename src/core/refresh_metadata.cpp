@@ -1339,6 +1339,51 @@ string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source)
 	       SqlUtils::JsonQuote(source.cardinality_transition_check_safe ? "true" : "false") + "}";
 }
 
+vector<RefreshMetadata::FullOuterScope> RefreshMetadata::GetFullOuterScopes(const string &view_name) {
+	vector<FullOuterScope> scopes;
+	string json;
+	if (!ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "full_outer_scopes", json)) {
+		return scopes;
+	}
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "scopes")) {
+		FullOuterScope scope;
+		bool complete = MetadataJson::ExtractJsonString(object, "comparison", scope.comparison);
+		for (idx_t side = 0; side < 2; side++) {
+			auto &source = side == 0 ? scope.left : scope.right;
+			string prefix = side == 0 ? "left_" : "right_";
+			complete = complete && MetadataJson::ExtractJsonString(object, prefix + "table", source.table) &&
+			           ParseJsonIndex(object, prefix + "occ", source.occurrence) &&
+			           MetadataJson::ExtractJsonString(object, prefix + "column", source.column) &&
+			           MetadataJson::ExtractJsonString(object, prefix + "cast", source.cast_type) &&
+			           MetadataJson::ExtractJsonString(object, prefix + "presence", source.presence_column);
+		}
+		if (complete) {
+			scopes.push_back(std::move(scope));
+		}
+	}
+	return scopes;
+}
+
+string RefreshMetadata::FullOuterScopesToJson(const vector<FullOuterScope> &scopes) {
+	vector<string> objects;
+	for (auto &scope : scopes) {
+		vector<string> fields {"\"comparison\":" + SqlUtils::JsonQuote(scope.comparison)};
+		for (idx_t side = 0; side < 2; side++) {
+			auto &source = side == 0 ? scope.left : scope.right;
+			string prefix = side == 0 ? "left_" : "right_";
+			fields.push_back(SqlUtils::JsonQuote(prefix + "table") + ":" + SqlUtils::JsonQuote(source.table));
+			fields.push_back(SqlUtils::JsonQuote(prefix + "occ") + ":" +
+			                 SqlUtils::JsonQuote(to_string(source.occurrence)));
+			fields.push_back(SqlUtils::JsonQuote(prefix + "column") + ":" + SqlUtils::JsonQuote(source.column));
+			fields.push_back(SqlUtils::JsonQuote(prefix + "cast") + ":" + SqlUtils::JsonQuote(source.cast_type));
+			fields.push_back(SqlUtils::JsonQuote(prefix + "presence") + ":" +
+			                 SqlUtils::JsonQuote(source.presence_column));
+		}
+		objects.push_back("{" + StringUtil::Join(fields, ",") + "}");
+	}
+	return "{\"k\":\"full_outer_scopes\",\"scopes\":[" + StringUtil::Join(objects, ",") + "]}";
+}
+
 string RefreshMetadata::LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src) {
 	string json = "{\"k\":\"left_join_nullable\",\"complete\":" + SqlUtils::JsonQuote(src.complete ? "true" : "false") +
 	              ",\"tables\":[";
