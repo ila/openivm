@@ -132,20 +132,17 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 		return ParserExtensionParseResult(std::move(parse_data));
 	}
 
-	if (!StringUtil::Contains(query_lower, "create materialized view") &&
-	    !StringUtil::Contains(query_lower, "create or replace materialized view")) {
+	// Only the statement header decides whether this is ours; text inside names or strings must not.
+	if (!SqlUtils::IsCreateMaterializedView(query_lower)) {
 		return ParserExtensionParseResult();
 	}
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Intercepted query: %s\n", query_lower.c_str());
 
-	// Detect CREATE OR REPLACE MATERIALIZED VIEW
-	bool is_replace = false;
-	std::regex or_replace_re("\\bcreate\\s+or\\s+replace\\s+materialized\\s+view\\b", std::regex::icase);
-	if (std::regex_search(query_lower, or_replace_re)) {
-		is_replace = true;
-		// Strip "or replace" so the rest of the pipeline sees "create materialized view"
-		query_lower = std::regex_replace(query_lower, std::regex("\\bor\\s+replace\\s+"), "");
+	// Detect CREATE OR REPLACE MATERIALIZED VIEW. Strip "or replace" from the header only so the
+	// rest of the pipeline sees "create materialized view" and user text is untouched.
+	bool is_replace = SqlUtils::StripOrReplace(query_lower);
+	if (is_replace) {
 		SqlUtils::RemoveRedundantWhitespaces(query_lower);
 	}
 

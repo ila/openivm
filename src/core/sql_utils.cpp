@@ -389,8 +389,69 @@ string SqlUtils::EscapeSingleQuotes(const string &input) {
 	return escaped_stream.str();
 }
 
+struct CreateMaterializedViewHeader {
+	bool is_replace = false;
+	size_t or_begin = 0; // start of "or replace" (valid when is_replace)
+	size_t or_end = 0;   // first character after "or replace" and following whitespace
+	size_t materialized_begin = 0;
+	size_t view_end = 0; // first character after "view"
+};
+
+// Recognizes only the statement header: CREATE [OR REPLACE] MATERIALIZED VIEW at the start of the statement.
+// Anything after the header (quoted names, strings, the view query) is never inspected.
+static bool ReadCreateMaterializedViewHeader(const string &sql, CreateMaterializedViewHeader &header) {
+	size_t pos = 0;
+	SkipWhitespace(sql, pos);
+	if (!StartsWithKeyword(sql, pos, "create")) {
+		return false;
+	}
+	pos += strlen("create");
+	SkipWhitespace(sql, pos);
+	header = CreateMaterializedViewHeader();
+	if (StartsWithKeyword(sql, pos, "or")) {
+		header.or_begin = pos;
+		pos += strlen("or");
+		SkipWhitespace(sql, pos);
+		if (!StartsWithKeyword(sql, pos, "replace")) {
+			return false;
+		}
+		pos += strlen("replace");
+		SkipWhitespace(sql, pos);
+		header.is_replace = true;
+		header.or_end = pos;
+	}
+	header.materialized_begin = pos;
+	if (!StartsWithKeyword(sql, pos, "materialized")) {
+		return false;
+	}
+	pos += strlen("materialized");
+	SkipWhitespace(sql, pos);
+	if (!StartsWithKeyword(sql, pos, "view")) {
+		return false;
+	}
+	header.view_end = pos + strlen("view");
+	return true;
+}
+
+bool SqlUtils::IsCreateMaterializedView(const string &query) {
+	CreateMaterializedViewHeader header;
+	return ReadCreateMaterializedViewHeader(query, header);
+}
+
+bool SqlUtils::StripOrReplace(string &query) {
+	CreateMaterializedViewHeader header;
+	if (!ReadCreateMaterializedViewHeader(query, header) || !header.is_replace) {
+		return false;
+	}
+	query.erase(header.or_begin, header.or_end - header.or_begin);
+	return true;
+}
+
 void SqlUtils::ReplaceMaterializedView(string &query) {
-	query = std::regex_replace(query, std::regex("\\bmaterialized\\s+view\\b"), "table if not exists");
+	CreateMaterializedViewHeader header;
+	if (ReadCreateMaterializedViewHeader(query, header)) {
+		query.replace(header.materialized_begin, header.view_end - header.materialized_begin, "table if not exists");
+	}
 	query = regex_replace(query, std::regex("\\s*;$"), "");
 }
 
