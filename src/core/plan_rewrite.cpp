@@ -1941,6 +1941,19 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 	}
 	case ExpressionClass::BOUND_OPERATOR: {
 		auto &op = expr.Cast<BoundOperatorExpression>();
+		if (expr.type == ExpressionType::OPERATOR_COALESCE) {
+			vector<string> children;
+			for (auto &child : op.children) {
+				string child_sql;
+				if (!RenderDerivedOutputExpression(*child, binding_to_column, projections, active_bindings, child_sql,
+				                                   allow_functions)) {
+					return false;
+				}
+				children.push_back(std::move(child_sql));
+			}
+			sql = "COALESCE(" + StringUtil::Join(children, ", ") + ")";
+			return true;
+		}
 		if (op.children.size() != 1) {
 			return false;
 		}

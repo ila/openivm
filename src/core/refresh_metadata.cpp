@@ -1353,8 +1353,7 @@ vector<RefreshMetadata::FullOuterScope> RefreshMetadata::GetFullOuterScopes(cons
 			string prefix = side == 0 ? "left_" : "right_";
 			complete = complete && MetadataJson::ExtractJsonString(object, prefix + "table", source.table) &&
 			           ParseJsonIndex(object, prefix + "occ", source.occurrence) &&
-			           MetadataJson::ExtractJsonString(object, prefix + "column", source.column) &&
-			           MetadataJson::ExtractJsonString(object, prefix + "cast", source.cast_type) &&
+			           MetadataJson::ExtractJsonString(object, prefix + "key_expression", source.key_expression) &&
 			           MetadataJson::ExtractJsonString(object, prefix + "presence", source.presence_column);
 		}
 		if (complete) {
@@ -1374,8 +1373,8 @@ string RefreshMetadata::FullOuterScopesToJson(const vector<FullOuterScope> &scop
 			fields.push_back(SqlUtils::JsonQuote(prefix + "table") + ":" + SqlUtils::JsonQuote(source.table));
 			fields.push_back(SqlUtils::JsonQuote(prefix + "occ") + ":" +
 			                 SqlUtils::JsonQuote(to_string(source.occurrence)));
-			fields.push_back(SqlUtils::JsonQuote(prefix + "column") + ":" + SqlUtils::JsonQuote(source.column));
-			fields.push_back(SqlUtils::JsonQuote(prefix + "cast") + ":" + SqlUtils::JsonQuote(source.cast_type));
+			fields.push_back(SqlUtils::JsonQuote(prefix + "key_expression") + ":" +
+			                 SqlUtils::JsonQuote(source.key_expression));
 			fields.push_back(SqlUtils::JsonQuote(prefix + "presence") + ":" +
 			                 SqlUtils::JsonQuote(source.presence_column));
 		}

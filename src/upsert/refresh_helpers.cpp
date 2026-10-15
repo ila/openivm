@@ -12,6 +12,9 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_join.hpp"
@@ -800,6 +803,18 @@ static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string
 	return predicate.empty() ? "" : " WHERE " + predicate;
 }
 
+static string QualifyScopeKey(const string &key_expression, const string &alias) {
+	auto expressions = Parser::ParseExpressionList(key_expression);
+	D_ASSERT(expressions.size() == 1);
+	auto &expression = *expressions[0];
+	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(expression, [&](ColumnRefExpression &column) {
+		column.column_names = {alias, column.GetColumnName()};
+	});
+	ParsedExpressionIterator::VisitExpressionMutable<CastExpression>(
+	    expression, [&](CastExpression &cast) { cast.cast_type = UnboundType::TryDefaultBind(cast.cast_type); });
+	return expression.ToString();
+}
+
 static string BuildNestedFullOuterKeys(RefreshMetadata &metadata, const string &view_name,
                                        const vector<string> &delta_table_names, const string &view_query_sql,
                                        const string &delta_ts_filter) {
@@ -827,10 +842,8 @@ static string BuildNestedFullOuterKeys(RefreshMetadata &metadata, const string &
 			string changed = delta_rows(delta_name);
 			string other_rows =
 			    "(SELECT * FROM " + other_ref + " UNION ALL SELECT * FROM " + delta_rows(other_delta_name) + ")";
-			string other_key =
-			    SqlUtils::ApplyCastSpec("openivm_other." + SqlUtils::QuoteIdentifier(other.column), other.cast_type);
-			string source_key = SqlUtils::ApplyCastSpec("openivm_changed." + SqlUtils::QuoteIdentifier(source.column),
-			                                            source.cast_type);
+			string other_key = QualifyScopeKey(other.key_expression, "openivm_other");
+			string source_key = QualifyScopeKey(source.key_expression, "openivm_changed");
 			string predicate = side == 0 ? source_key + " " + scope.comparison + " " + other_key
 			                             : other_key + " " + scope.comparison + " " + source_key;
 			string affected_other = "(SELECT openivm_other.* FROM " + other_rows +

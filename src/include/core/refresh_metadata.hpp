@@ -334,8 +334,7 @@ public:
 	struct FullOuterScopeSource {
 		string table;
 		idx_t occurrence = 0;
-		string column;
-		string cast_type;
+		string key_expression;
 		string presence_column;
 	};
 	struct FullOuterScope {

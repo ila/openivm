@@ -444,6 +444,36 @@ DELETE FROM pad_b WHERE k=1;
 SELECT p.id,d.label FROM p FULL JOIN pad_d d ON p.lookup_key=d.k""",
         )
 
+        run_scenario(
+            binary,
+            root,
+            "full_join_coalesced_inner_key",
+            """
+CREATE TABLE scalar_pad_a(id INT,k INT);
+CREATE TABLE scalar_pad_b(k INT,v INT);
+CREATE TABLE scalar_pad_d(k INT,label VARCHAR);
+INSERT INTO scalar_pad_a VALUES (1,NULL),(2,0);
+INSERT INTO scalar_pad_b VALUES (0,2);
+INSERT INTO scalar_pad_d VALUES (0,'default'),(2,'old'),(99,'unrelated');
+CREATE MATERIALIZED VIEW scalar_pad_mv AS
+WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM scalar_pad_a),
+p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized a FULL JOIN scalar_pad_b b ON a.nk=b.k)
+SELECT p.id,d.label FROM p FULL JOIN scalar_pad_d d ON p.lookup_key=d.k;
+UPDATE scalar_pad_b SET v=9 WHERE k=0;
+INSERT INTO scalar_pad_b VALUES (0,9);
+DELETE FROM scalar_pad_b WHERE k=0;
+""",
+            "scalar_pad_mv",
+            {
+                "target_dialect": "duckdb",
+                "compile_only": True,
+                "force_view_delta_cascade": True,
+            },
+            """WITH normalized AS (SELECT id,COALESCE(k,0) AS nk FROM scalar_pad_a),
+p AS (SELECT a.id,COALESCE(b.v,0) AS lookup_key FROM normalized a FULL JOIN scalar_pad_b b ON a.nk=b.k)
+SELECT p.id,d.label FROM p FULL JOIN scalar_pad_d d ON p.lookup_key=d.k""",
+        )
+
     print("regular N-term compiled SQL integration tests passed")
 
 
