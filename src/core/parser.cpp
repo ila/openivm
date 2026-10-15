@@ -238,13 +238,21 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (!parse_data_ref.alter_sql.empty()) {
 		auto target = ResolveMaterializedViewTarget(context, parse_data_ref.target_name);
 		auto metadata_table = SqlUtils::FullName(default_db, default_schema, openivm::VIEWS_TABLE);
+		// The helper connection only sees committed metadata. Inside an explicit transaction, shadow the
+		// metadata tables with the caller's uncommitted view so MVs created earlier in it are visible, and
+		// read the shadow (unqualified) rather than the committed table. The UPDATE still runs in the caller.
+		string tracked_table = metadata_table;
+		if (!context.transaction.IsAutoCommit()) {
+			RefreshMetadata(con).SnapshotTransaction(context);
+			tracked_table = openivm::VIEWS_TABLE;
+		}
 		auto target_key = RefreshMetadata(con).FindViewKey(target.catalog_name, target.schema_name, target.view_name);
 		view_key = target_key;
 		auto target_filter = "view_name = '" + SqlUtils::EscapeValue(target_key) + "' AND COALESCE(view_catalog, '" +
 		                     SqlUtils::EscapeValue(default_db) + "') = '" + SqlUtils::EscapeValue(target.catalog_name) +
 		                     "' AND COALESCE(view_schema, '" + string(DEFAULT_SCHEMA) + "') = '" +
 		                     SqlUtils::EscapeValue(target.schema_name) + "'";
-		auto tracked = con.Query("SELECT 1 FROM " + metadata_table + " WHERE " + target_filter);
+		auto tracked = con.Query("SELECT 1 FROM " + tracked_table + " WHERE " + target_filter);
 		if (tracked->HasError() || tracked->RowCount() == 0) {
 			throw CatalogException("Materialized view '%s' does not exist in OpenIVM metadata",
 			                       parse_data_ref.target_name);
